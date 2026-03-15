@@ -9,6 +9,7 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://docker.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/leducdat-profile)
 
 **Upload documents. Ask questions. Get cited answers.**
 
@@ -357,62 +358,9 @@ cp .env.example .env
 
 ---
 
-## Architecture
+## Roadmap
 
-```
-                         ┌─────────────────────────────────────┐
-                         │         Document Upload              │
-                         │   (PDF / DOCX / PPTX / HTML / TXT)  │
-                         └──────────────┬──────────────────────┘
-                                        │
-                         ┌──────────────▼──────────────────────┐
-                         │          Docling Parser              │
-                         │   → Markdown + Images + Tables       │
-                         └──────────────┬──────────────────────┘
-                                        │
-               ┌────────────────────────┼────────────────────────┐
-               │                        │                        │
-    ┌──────────▼──────────┐  ┌──────────▼──────────┐  ┌─────────▼──────────┐
-    │   Text Chunking      │  │  Image Extraction   │  │  Table Extraction  │
-    │   (512 chars,        │  │  + LLM Captioning   │  │  → Markdown +      │
-    │    overlap)           │  │  → Searchable       │  │    LLM Summary     │
-    └──────────┬───────────┘  └──────────────────────┘  └────────────────────┘
-               │
-        ┌──────┼──────────────────┐
-        │                         │
-  ┌─────▼──────────┐    ┌────────▼─────────────┐
-  │   ChromaDB     │    │     LightRAG         │
-  │   bge-m3       │    │   Entity + Relation  │
-  │   (1024-dim)   │    │   Extraction         │
-  └────────────────┘    └──────────────────────┘
-
-              Query Flow
-              ─────────
-       ┌──────────────────────┐
-       │    User Question      │
-       └──────────┬───────────┘
-                  │
-        ┌─────────┼──────────────┐
-        │ (parallel)             │
-  ┌─────▼───────────┐  ┌────────▼──────────────┐
-  │ Vector Search    │  │  KG Query             │
-  │ (prefetch top-N) │  │  (hybrid: local +     │
-  │                  │  │   global)              │
-  └────────┬─────────┘  └──────────────────────┘
-           │
-  ┌────────▼──────────────────┐
-  │  Cross-encoder Reranking   │
-  │  (bge-reranker-v2-m3)     │
-  │  → top-K results           │
-  └────────┬──────────────────┘
-           │
-  ┌────────▼──────────────────┐
-  │  Agentic LLM Generation   │
-  │  (Gemini / Ollama)        │
-  │  → Streaming answer with   │
-  │    [citation IDs]          │
-  └───────────────────────────┘
-```
+- [ ] **Multimodal Retrieval** — Integrate Gemini Embedding 2 (multimodal) for audio and video input retrieval — ask questions about podcasts, lectures, or video content directly
 
 ---
 
@@ -461,6 +409,10 @@ All endpoints prefixed with `/api/v1`. Interactive docs at http://localhost:8080
 ---
 
 <div align="center">
+
+⭐ If you find NexusRAG useful, please consider giving it a **star** — it helps others discover the project and motivates continued development!
+
+<a href="https://buymeacoffee.com/leducdat97f" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" width="180" /></a>
 
 MIT License &copy; 2026 Le Duc Dat
 
