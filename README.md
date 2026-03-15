@@ -412,8 +412,6 @@ All endpoints prefixed with `/api/v1`. Interactive docs at http://localhost:8080
 
 ⭐ If you find NexusRAG useful, please consider giving it a **star** — it helps others discover the project and motivates continued development!
 
-<a href="https://buymeacoffee.com/leducdat97f" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" width="180" /></a>
-
 MIT License &copy; 2026 Le Duc Dat
 
 </div>
