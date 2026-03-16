@@ -109,10 +109,17 @@ async def handle_parse(payload: dict) -> None:
 
             # ── Classify document type ──────────────────────────────────────
             try:
-                from app.services.document_type_classifier import classify_document_type
+                from app.services.document_type_classifier import (
+                    classify_document_type,
+                    classify_with_llm,
+                )
                 from app.models.document_type import DocumentType as _DT
-                text_preview = parsed.markdown[:600] if parsed.markdown else ""
-                slug = classify_document_type(msg.original_filename, text_preview)
+                # Use first 1 000 chars of markdown (post-Docling/OCR content only)
+                text_preview = parsed.markdown[:1000] if parsed.markdown else ""
+                slug = classify_document_type(text_preview)
+                if slug is None and text_preview:
+                    # Regex didn't match — try LLM fallback
+                    slug = await classify_with_llm(text_preview)
                 if slug:
                     dt_result = await db.execute(
                         select(_DT).where(_DT.slug == slug, _DT.is_active.is_(True))
