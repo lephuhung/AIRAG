@@ -327,13 +327,10 @@ async def reindex_document(
             detail="Document is currently being processed"
         )
 
-    from pathlib import Path
-    file_path = Path(UPLOAD_DIR) / document.filename
-
-    if not file_path.exists():
+    if not document.upload_s3_key:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document file not found on disk"
+            detail="Original file not found in MinIO — cannot reindex"
         )
 
     rag_service = get_rag_service(db, document.workspace_id)
@@ -344,32 +341,50 @@ async def reindex_document(
     except Exception as e:
         logging.getLogger(__name__).warning(f"Failed to delete old data for reindex: {e}")
 
+    # Delete old markdown object from MinIO
+    if document.markdown_s3_key:
+        try:
+            from app.services.storage_service import get_storage_service
+            await get_storage_service().delete_markdown(document.markdown_s3_key)
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                f"Failed to delete MinIO object for reindex of doc {document_id}: {e}"
+            )
+
     # Reset document metadata
     document.status = DocumentStatus.PENDING
     document.chunk_count = 0
-    document.markdown_content = None
+    document.markdown_s3_key = None
     document.image_count = 0
     document.table_count = 0
+    document.embed_done = False
+    document.captions_done = False
+    document.kg_done = False
     document.parser_version = None
     document.error_message = None
     await db.commit()
 
+    # Re-publish to parse queue — worker will download from MinIO
     try:
-        chunk_count = await rag_service.process_document(
+        from app.queue.publisher import publish_parse_task
+        await publish_parse_task(
             document_id=document_id,
-            file_path=str(file_path)
-        )
-        return DocumentProcessResponse(
-            document_id=document_id,
-            status=DocumentStatus.INDEXED.value,
-            chunk_count=chunk_count,
-            message=f"Re-indexed with NexusRAG: {chunk_count} chunks created"
+            workspace_id=document.workspace_id,
+            minio_key=document.upload_s3_key,
+            original_filename=document.original_filename,
         )
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to reindex document: {str(e)}"
+            detail=f"Failed to queue document for reindex: {str(e)}"
         )
+
+    return DocumentProcessResponse(
+        document_id=document_id,
+        status="pending",
+        chunk_count=0,
+        message="Document queued for re-processing"
+    )
 
 
 @router.post("/reindex-workspace/{workspace_id}")
@@ -412,8 +427,9 @@ async def reindex_workspace(
         logger.warning(f"Failed to delete old collection: {e}")
 
     async def _reindex_all(doc_ids: list[int], ws_id: int):
-        """Background task: reindex each document sequentially."""
+        """Background task: reindex each document sequentially via RabbitMQ."""
         from app.core.database import AsyncSessionLocal
+        from app.queue.publisher import publish_parse_task as _publish
         async with AsyncSessionLocal() as session:
             rag_service = get_rag_service(session, ws_id)
             for did in doc_ids:
@@ -425,10 +441,8 @@ async def reindex_workspace(
                     if not doc:
                         continue
 
-                    from pathlib import Path
-                    file_path = Path(UPLOAD_DIR) / doc.filename
-                    if not file_path.exists():
-                        logger.warning(f"Skipping doc {did}: file not found")
+                    if not doc.upload_s3_key:
+                        logger.warning(f"Skipping doc {did}: no upload_s3_key in MinIO")
                         continue
 
                     # Delete old chunk data for this document
@@ -441,16 +455,22 @@ async def reindex_workspace(
                     doc.status = DocumentStatus.PENDING
                     doc.chunk_count = 0
                     doc.image_count = 0
+                    doc.embed_done = False
+                    doc.captions_done = False
+                    doc.kg_done = False
                     doc.error_message = None
                     await session.commit()
 
-                    # Re-process
-                    await rag_service.process_document(
-                        document_id=did, file_path=str(file_path)
+                    # Publish to parse queue — worker downloads from MinIO
+                    await _publish(
+                        document_id=did,
+                        workspace_id=ws_id,
+                        minio_key=doc.upload_s3_key,
+                        original_filename=doc.original_filename,
                     )
-                    logger.info(f"Reindexed document {did} in workspace {ws_id}")
+                    logger.info(f"Reindex queued for document {did} in workspace {ws_id}")
                 except Exception as e:
-                    logger.error(f"Failed to reindex document {did}: {e}")
+                    logger.error(f"Failed to queue reindex for document {did}: {e}")
 
     doc_ids = [d.id for d in documents]
     background_tasks.add_task(_reindex_all, doc_ids, workspace_id)

@@ -1,4 +1,4 @@
-# NexusRAG — Dev services only (PostgreSQL + ChromaDB)
+# NexusRAG — Dev services only (PostgreSQL + ChromaDB + RabbitMQ)
 # Usage: docker compose -f docker-compose.services.yml up -d
 
 services:
@@ -30,6 +30,49 @@ services:
       - IS_PERSISTENT=TRUE
       - ANONYMIZED_TELEMETRY=FALSE
 
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: nexusrag-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"   # Management UI → http://localhost:15672  (guest/guest)
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - nexusrag_rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  minio:
+    image: minio/minio:latest
+    container_name: nexusrag-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console → http://localhost:9001
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      # Webhook notification target (used in production / full docker-compose.yml)
+      # Not active here since there's no backend container in this services-only compose.
+      # Use MINIO_WEBHOOK_ENABLED=false in .env for local dev (direct publish after upload).
+      MINIO_NOTIFY_WEBHOOK_ENABLE_NEXUSRAG: "on"
+      MINIO_NOTIFY_WEBHOOK_ENDPOINT_NEXUSRAG: "http://host.docker.internal:8080/api/v1/minio/events"
+    volumes:
+      - nexusrag_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   nexusrag_postgres_data:
   nexusrag_chroma_data:
+  nexusrag_rabbitmq_data:
+  nexusrag_minio_data:

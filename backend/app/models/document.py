@@ -7,12 +7,13 @@ from app.core.database import Base
 
 
 class DocumentStatus(str, enum.Enum):
-    PENDING = "pending"
-    PARSING = "parsing"
-    PROCESSING = "processing"
-    INDEXING = "indexing"
-    INDEXED = "indexed"
-    FAILED = "failed"
+    PENDING         = "pending"           # vừa upload, chờ worker nhận
+    PARSING         = "parsing"           # parse worker đang chạy Docling/OCR
+    PARSED          = "parsed"            # parse xong, đã dispatch embed+caption+kg
+    INDEXED_PARTIAL = "indexed_partial"   # embed xong → vector search hoạt động,
+                                          # caption và/hoặc KG vẫn đang chạy nền
+    INDEXED         = "indexed"           # tất cả 3 sub-tasks hoàn tất
+    FAILED          = "failed"
 
 
 class Document(Base):
@@ -35,12 +36,22 @@ class Document(Base):
     )
 
     # NexusRAG fields
-    markdown_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    markdown_s3_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    upload_s3_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
     page_count: Mapped[int] = mapped_column(Integer, default=0)
     image_count: Mapped[int] = mapped_column(Integer, default=0)
     table_count: Mapped[int] = mapped_column(Integer, default=0)
     parser_version: Mapped[str | None] = mapped_column(String(50), nullable=True)  # "docling" | "legacy"
     processing_time_ms: Mapped[int] = mapped_column(Integer, default=0)
+
+    # Sub-task completion flags (set independently by each worker)
+    embed_done:    Mapped[bool] = mapped_column(default=False)
+    captions_done: Mapped[bool] = mapped_column(default=False)
+    kg_done:       Mapped[bool] = mapped_column(default=False)
+
+    # Raw chunks JSON stored by parse_worker, consumed by embed_worker
+    # Cleared after embed_worker finishes to save space
+    raw_chunks_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Relationships
     workspace: Mapped["KnowledgeBase"] = relationship(back_populates="documents")

@@ -88,20 +88,46 @@ class NexusRAGService:
             raise ValueError(f"Document {document_id} not found")
 
         start_time = time.time()
+        _cleanup_tmp: str | None = None
+
+        # If file_path doesn't exist on disk but upload_s3_key is set,
+        # download from MinIO and use a temp file
+        from pathlib import Path as _P
+        if not _P(file_path).exists() and document.upload_s3_key:
+            import tempfile
+            from app.services.storage_service import get_storage_service as _get_storage
+            file_bytes = await _get_storage().download_file(document.upload_s3_key)
+            ext = _P(file_path).suffix or _P(document.upload_s3_key).suffix
+            tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+            tmp.write(file_bytes)
+            tmp.close()
+            file_path = tmp.name
+            _cleanup_tmp = file_path
+            logger.info(
+                f"[nexus_rag] doc={document_id} downloaded from MinIO "
+                f"({document.upload_s3_key}) → {file_path}"
+            )
 
         try:
             # Phase 1: PARSING
             document.status = DocumentStatus.PARSING
             await self.db.commit()
 
-            parsed = self.parser.parse(
+            parsed = await self.parser.parse(
                 file_path=file_path,
                 document_id=document_id,
                 original_filename=document.original_filename,
             )
 
             # Save markdown + images to DB
-            document.markdown_content = parsed.markdown
+            from app.services.storage_service import get_storage_service
+            storage = get_storage_service()
+            s3_key = await storage.upload_markdown(
+                workspace_id=self.workspace_id,
+                document_id=document_id,
+                content=parsed.markdown,
+            )
+            document.markdown_s3_key = s3_key
             document.page_count = parsed.page_count
             document.table_count = parsed.tables_count
             document.parser_version = (
@@ -231,6 +257,14 @@ class NexusRAGService:
             document.error_message = str(e)[:500]
             await self.db.commit()
             raise
+        finally:
+            # Clean up temp file if we downloaded from MinIO
+            if _cleanup_tmp:
+                import os as _os
+                try:
+                    _os.unlink(_cleanup_tmp)
+                except OSError:
+                    pass
 
     # ------------------------------------------------------------------
     # Querying

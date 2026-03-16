@@ -51,6 +51,9 @@ class Settings(BaseSettings):
     CHROMA_HOST: str = Field(default="localhost")
     CHROMA_PORT: int = Field(default=8002)
 
+    # RabbitMQ
+    RABBITMQ_URL: str = Field(default="amqp://guest:guest@localhost:5672/")
+
     # NexusRAG Pipeline
     NEXUSRAG_ENABLED: bool = True
     NEXUSRAG_ENABLE_KG: bool = True
@@ -71,12 +74,30 @@ class Settings(BaseSettings):
     NEXUSRAG_MAX_IMAGES_PER_DOC: int = 50
     NEXUSRAG_ENABLE_FORMULA_ENRICHMENT: bool = True
 
+    # HunyuanOCR (scanned PDF support)
+    NEXUSRAG_ENABLE_OCR: bool = Field(default=True)
+    HUNYUAN_OCR_API_URL: str = Field(default="http://10.8.0.8:8001/v1")
+    HUNYUAN_OCR_MODEL: str = Field(default="tencent/HunyuanOCR")
+    # Minimum ratio of pages without selectable text to classify a PDF as scanned
+    NEXUSRAG_OCR_SCANNED_THRESHOLD: float = Field(default=0.5)
+
     # NexusRAG Retrieval Quality
     NEXUSRAG_EMBEDDING_MODEL: str = "BAAI/bge-m3"
     NEXUSRAG_RERANKER_MODEL: str = "BAAI/bge-reranker-v2-m3"
     NEXUSRAG_VECTOR_PREFETCH: int = 20
     NEXUSRAG_RERANKER_TOP_K: int = 8
     NEXUSRAG_MIN_RELEVANCE_SCORE: float = 0.15
+
+    # MinIO (S3-compatible object storage for markdown content)
+    MINIO_ENDPOINT: str = Field(default="http://localhost:9000")
+    MINIO_ACCESS_KEY: str = Field(default="minioadmin")
+    MINIO_SECRET_KEY: str = Field(default="minioadmin")
+    MINIO_BUCKET_MARKDOWN: str = Field(default="nexusrag-markdown")
+    MINIO_BUCKET_UPLOADS: str = Field(default="nexusrag-uploads")
+    MINIO_SECURE: bool = Field(default=False)
+    # true = wait for MinIO webhook at /api/v1/minio/events (production)
+    # false = publish ParseMessage directly after upload (dev / no-webhook)
+    MINIO_WEBHOOK_ENABLED: bool = Field(default=False)
 
     # CORS
     CORS_ORIGINS: list[str] = ["http://localhost:5174", "http://localhost:3000"]

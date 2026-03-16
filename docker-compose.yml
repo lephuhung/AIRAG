@@ -30,6 +30,45 @@ services:
       - IS_PERSISTENT=TRUE
       - ANONYMIZED_TELEMETRY=FALSE
 
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: nexusrag-rabbitmq
+    ports:
+      - "5672:5672"     # AMQP
+      - "15672:15672"   # Management UI  →  http://localhost:15672  (guest/guest)
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - nexusrag_rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  minio:
+    image: minio/minio:latest
+    container_name: nexusrag-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console → http://localhost:9001
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      # Webhook notification target — id "NEXUSRAG"
+      MINIO_NOTIFY_WEBHOOK_ENABLE_NEXUSRAG: "on"
+      MINIO_NOTIFY_WEBHOOK_ENDPOINT_NEXUSRAG: "http://backend:8080/api/v1/minio/events"
+    volumes:
+      - nexusrag_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   backend:
     build:
       context: .
@@ -40,12 +79,18 @@ services:
         condition: service_healthy
       chromadb:
         condition: service_started
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     env_file: .env
     environment:
-      # Override for Docker internal networking
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/nexusrag
       CHROMA_HOST: chromadb
       CHROMA_PORT: 8000
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_WEBHOOK_ENABLED: "true"
     volumes:
       - nexusrag_uploads:/app/backend/uploads
       - nexusrag_data:/app/backend/data
@@ -57,6 +102,114 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+    restart: unless-stopped
+
+  # ── minio-init: create buckets + register webhook event ─────────────────
+  minio-init:
+    image: minio/mc:latest
+    container_name: nexusrag-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin;
+        mc mb --ignore-existing local/nexusrag-uploads;
+        mc mb --ignore-existing local/nexusrag-markdown;
+        mc event add --ignore-existing local/nexusrag-uploads
+          arn:minio:sqs::NEXUSRAG:webhook --event put;
+        exit 0
+      "
+    restart: on-failure
+
+  # ── Parse workers (CPU/IO — Docling + OCR, zero LLM) ────────────────────
+  worker-parse:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      chromadb:
+        condition: service_started
+      minio:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/nexusrag
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      MINIO_ENDPOINT: http://minio:9000
+      WORKER_TYPE: parse
+      AUTO_CREATE_TABLES: "false"
+    volumes:
+      - nexusrag_uploads:/app/backend/uploads
+      - nexusrag_data:/app/backend/data
+    deploy:
+      replicas: 4
+    command: ["python", "-m", "app.workers.runner"]
+    restart: unless-stopped
+
+  # ── Caption workers (Vision + Text LLM — images & tables) ───────────────
+  worker-caption:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      chromadb:
+        condition: service_started
+      minio:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/nexusrag
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      MINIO_ENDPOINT: http://minio:9000
+      WORKER_TYPE: caption
+      AUTO_CREATE_TABLES: "false"
+    volumes:
+      - nexusrag_uploads:/app/backend/uploads
+      - nexusrag_data:/app/backend/data
+    deploy:
+      replicas: 2
+    command: ["python", "-m", "app.workers.runner"]
+    restart: unless-stopped
+
+  # ── KG workers (LightRAG entity extraction) ──────────────────────────────
+  # Scale = number of parallel workspaces you want to process simultaneously.
+  # Each worker handles ALL documents for specific workspaces sequentially
+  # (enforced by routing_key=workspace_id + prefetch_count=1).
+  worker-kg:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/nexusrag
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      WORKER_TYPE: kg
+      AUTO_CREATE_TABLES: "false"
+    volumes:
+      - nexusrag_data:/app/backend/data
+    deploy:
+      replicas: 2
+    command: ["python", "-m", "app.workers.runner"]
     restart: unless-stopped
 
   frontend:
@@ -74,5 +227,7 @@ services:
 volumes:
   nexusrag_postgres_data:
   nexusrag_chroma_data:
+  nexusrag_rabbitmq_data:
   nexusrag_uploads:
   nexusrag_data:
+  nexusrag_minio_data:

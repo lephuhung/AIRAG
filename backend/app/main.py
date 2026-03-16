@@ -58,7 +58,46 @@ async def lifespan(app: FastAPI):
             await conn.execute(text(
                 "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS agent_steps JSON"
             ))
+            # Worker pipeline sub-task flags
+            await conn.execute(text(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS embed_done BOOLEAN DEFAULT FALSE"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS captions_done BOOLEAN DEFAULT FALSE"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS kg_done BOOLEAN DEFAULT FALSE"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS raw_chunks_json TEXT"
+            ))
+            # MinIO migration: swap markdown_content column for markdown_s3_key
+            await conn.execute(text(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS markdown_s3_key VARCHAR(500)"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE documents DROP COLUMN IF EXISTS markdown_content"
+            ))
+            # MinIO uploads: store the raw file S3 key
+            await conn.execute(text(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS upload_s3_key VARCHAR(500)"
+            ))
+            # Migrate legacy statuses to new schema
+            await conn.execute(text("""
+                UPDATE documents SET status = 'indexed'
+                WHERE status IN ('processing', 'indexing')
+            """))
         logger.info("Database tables created/verified")
+
+        # Ensure MinIO buckets exist
+        from app.services.storage_service import get_storage_service
+        try:
+            storage = get_storage_service()
+            await storage.ensure_bucket()
+            await storage.ensure_uploads_bucket()
+            logger.info("MinIO buckets verified/created")
+        except Exception as _minio_err:
+            logger.warning(f"MinIO bucket setup failed (non-fatal): {_minio_err}")
     else:
         logger.info("AUTO_CREATE_TABLES=false — skipping auto-migration")
     yield

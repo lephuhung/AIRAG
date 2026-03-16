@@ -6,7 +6,7 @@ import uuid
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -54,6 +54,19 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".docx", ".pptx"}
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
+# MIME type mapping for common extensions
+_EXT_TO_MIME: dict[str, str] = {
+    ".pdf":  "application/pdf",
+    ".txt":  "text/plain",
+    ".md":   "text/markdown",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+
+
+def _mime_for_ext(ext: str) -> str:
+    return _EXT_TO_MIME.get(ext.lower(), "application/octet-stream")
+
 
 @router.get("/workspace/{workspace_id}", response_model=list[DocumentResponse])
 async def list_documents(
@@ -74,7 +87,7 @@ async def list_documents(
 
 
 async def process_document_background(document_id: int, file_path: str, workspace_id: int):
-    """Background task to process document for RAG indexing."""
+    """Legacy fallback: process document inline when RabbitMQ is unavailable."""
     from app.core.database import async_session_maker
     from app.services.rag_service import get_rag_service
 
@@ -82,7 +95,7 @@ async def process_document_background(document_id: int, file_path: str, workspac
         try:
             rag_service = get_rag_service(db, workspace_id)
             await rag_service.process_document(document_id, file_path)
-            logger.info(f"Document {document_id} processed successfully")
+            logger.info(f"Document {document_id} processed successfully (fallback mode)")
         except Exception as e:
             logger.error(f"Failed to process document {document_id}: {e}")
 
@@ -93,7 +106,7 @@ async def upload_document(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
 ):
-    """Upload a document to a knowledge base. Processing must be triggered separately."""
+    """Upload a document to a knowledge base and store the raw file in MinIO."""
     result = await db.execute(select(KnowledgeBase).where(KnowledgeBase.id == workspace_id))
     kb = result.scalar_one_or_none()
 
@@ -115,11 +128,8 @@ async def upload_document(
         )
 
     filename = f"{uuid.uuid4()}{ext}"
-    file_path = UPLOAD_DIR / filename
 
-    with open(file_path, "wb") as f:
-        f.write(content)
-
+    # Create DB record first to get document.id for the MinIO key
     document = Document(
         workspace_id=workspace_id,
         filename=filename,
@@ -132,11 +142,49 @@ async def upload_document(
     await db.commit()
     await db.refresh(document)
 
+    # Upload raw file to MinIO nexusrag-uploads bucket
+    from app.services.storage_service import get_storage_service
+    storage = get_storage_service()
+    upload_key = storage._make_upload_key(workspace_id, document.id, ext)
+    try:
+        await storage.upload_file(
+            key=upload_key,
+            data=content,
+            content_type=_mime_for_ext(ext),
+        )
+        document.upload_s3_key = upload_key
+        await db.commit()
+    except Exception as e:
+        logger.error(f"Failed to upload file to MinIO for doc {document.id}: {e}")
+        # Still continue — document is in DB, will need manual requeue
+
+    # Publish parse task (immediate if webhook disabled, else MinIO event fires)
+    if not settings.MINIO_WEBHOOK_ENABLED:
+        try:
+            from app.queue.publisher import publish_parse_task
+            await publish_parse_task(
+                document_id=document.id,
+                workspace_id=workspace_id,
+                minio_key=upload_key,
+                original_filename=file.filename,
+            )
+            logger.info(f"Document {document.id} queued for processing (direct publish)")
+        except Exception as e:
+            logger.error(
+                f"Failed to publish parse task for doc {document.id}: {e}. "
+                f"Document is PENDING — manual requeue may be needed."
+            )
+    else:
+        logger.info(
+            f"Document {document.id} uploaded to MinIO — "
+            f"waiting for webhook event to trigger parse"
+        )
+
     return DocumentUploadResponse(
         id=document.id,
         filename=document.original_filename,
         status=document.status,
-        message="Document uploaded. Click 'Process' to extract and index content."
+        message="Document uploaded and queued for processing."
     )
 
 
@@ -167,13 +215,21 @@ async def get_document_markdown(
     if document is None:
         raise NotFoundError("Document", document_id)
 
-    if not document.markdown_content:
+    if not document.markdown_s3_key:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No markdown content available. Document may not have been processed with NexusRAG."
         )
 
-    markdown = document.markdown_content
+    from app.services.storage_service import get_storage_service
+    try:
+        markdown = await get_storage_service().download_markdown(document.markdown_s3_key)
+    except Exception as e:
+        logger.error(f"Failed to fetch markdown from MinIO for doc {document_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Markdown storage is temporarily unavailable."
+        )
 
     # Safety net: if image placeholders remain, inject real references on-the-fly
     if "<!-- image" in markdown:
@@ -245,9 +301,27 @@ async def delete_document(
         except Exception as e:
             logger.warning(f"Failed to delete chunks from vector store: {e}")
 
+    # Delete local file if it still exists (legacy / backward compat)
     file_path = UPLOAD_DIR / document.filename
     if file_path.exists():
         os.remove(file_path)
+
+    from app.services.storage_service import get_storage_service
+    storage = get_storage_service()
+
+    # Delete raw upload from MinIO
+    if document.upload_s3_key:
+        try:
+            await storage.delete_file(document.upload_s3_key)
+        except Exception as e:
+            logger.warning(f"Failed to delete upload MinIO object for doc {document_id}: {e}")
+
+    # Delete markdown object from MinIO
+    if document.markdown_s3_key:
+        try:
+            await storage.delete_markdown(document.markdown_s3_key)
+        except Exception as e:
+            logger.warning(f"Failed to delete markdown MinIO object for doc {document_id}: {e}")
 
     await db.delete(document)
     await db.commit()
