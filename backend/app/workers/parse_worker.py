@@ -107,6 +107,30 @@ async def handle_parse(payload: dict) -> None:
             )
             await db.commit()
 
+            # ── Classify document type ──────────────────────────────────────
+            try:
+                from app.services.document_type_classifier import classify_document_type
+                from app.models.document_type import DocumentType as _DT
+                text_preview = parsed.markdown[:600] if parsed.markdown else ""
+                slug = classify_document_type(msg.original_filename, text_preview)
+                if slug:
+                    dt_result = await db.execute(
+                        select(_DT).where(_DT.slug == slug, _DT.is_active.is_(True))
+                    )
+                    dt = dt_result.scalar_one_or_none()
+                    if dt:
+                        document.document_type_id = dt.id
+                        await db.commit()
+                        logger.info(
+                            f"[parse_worker] doc={msg.document_id} "
+                            f"classified as '{slug}'"
+                        )
+            except Exception as _cls_err:
+                logger.warning(
+                    f"[parse_worker] doc={msg.document_id} "
+                    f"document type classification failed (non-fatal): {_cls_err}"
+                )
+
             # ── Persist images (no captions yet) ───────────────────────────
             await db.execute(
                 delete(DocumentImage).where(DocumentImage.document_id == msg.document_id)

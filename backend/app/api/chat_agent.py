@@ -785,9 +785,56 @@ async def chat_stream_endpoint(
             detail="Knowledge base not found",
         )
 
-    # Build system prompt
+    # Build system prompt — use document-type-specific prompt if applicable
     from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
-    system_prompt = (kb.system_prompt or DEFAULT_SYSTEM_PROMPT) + HARD_SYSTEM_PROMPT
+    base_prompt = kb.system_prompt or DEFAULT_SYSTEM_PROMPT
+
+    # Check if there are documents in this workspace with a dominant document type,
+    # and use the corresponding system prompt (workspace-specific > global > default)
+    try:
+        from sqlalchemy import select as _sel, func as _func
+        from app.models.document import Document as _Doc, DocumentStatus as _DS
+        from app.models.document_type import DocumentType as _DT, DocumentTypeSystemPrompt as _DTSP
+
+        # Find most common document_type_id in INDEXED documents of this workspace
+        dominant_type_result = await db.execute(
+            _sel(_Doc.document_type_id, _func.count(_Doc.id).label("cnt"))
+            .where(
+                _Doc.workspace_id == workspace_id,
+                _Doc.status == _DS.INDEXED,
+                _Doc.document_type_id.isnot(None),
+            )
+            .group_by(_Doc.document_type_id)
+            .order_by(_func.count(_Doc.id).desc())
+            .limit(1)
+        )
+        dominant_row = dominant_type_result.first()
+        if dominant_row and dominant_row.document_type_id:
+            # Try workspace-specific prompt
+            ws_prompt_res = await db.execute(
+                _sel(_DTSP).where(
+                    _DTSP.document_type_id == dominant_row.document_type_id,
+                    _DTSP.workspace_id == workspace_id,
+                )
+            )
+            ws_prompt = ws_prompt_res.scalar_one_or_none()
+            if ws_prompt:
+                base_prompt = ws_prompt.system_prompt
+            else:
+                # Try global prompt for this document type
+                global_prompt_res = await db.execute(
+                    _sel(_DTSP).where(
+                        _DTSP.document_type_id == dominant_row.document_type_id,
+                        _DTSP.workspace_id.is_(None),
+                    )
+                )
+                global_prompt = global_prompt_res.scalar_one_or_none()
+                if global_prompt:
+                    base_prompt = global_prompt.system_prompt
+    except Exception as _sp_err:
+        logger.debug(f"Document-type system prompt resolution failed (non-fatal): {_sp_err}")
+
+    system_prompt = base_prompt + HARD_SYSTEM_PROMPT
 
     # Build history
     history = [{"role": m.role, "content": m.content} for m in request.history]

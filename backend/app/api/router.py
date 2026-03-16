@@ -8,6 +8,7 @@ from app.api.documents import router as documents_router
 from app.api.rag import router as rag_router
 from app.api.config import router as config_router
 from app.api.minio_events import router as minio_events_router
+from app.api.document_types import router as document_types_router
 
 api_router = APIRouter()
 api_router.include_router(workspaces_router)
@@ -15,3 +16,4 @@ api_router.include_router(documents_router)
 api_router.include_router(rag_router)
 api_router.include_router(config_router)
 api_router.include_router(minio_events_router)
+api_router.include_router(document_types_router)

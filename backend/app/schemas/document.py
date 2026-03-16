@@ -15,6 +15,13 @@ class DocumentCreate(DocumentBase):
     workspace_id: int
 
 
+class DocumentTypeInfo(BaseModel):
+    id: int
+    slug: str
+    name: str
+    model_config = {"from_attributes": True}
+
+
 class DocumentResponse(DocumentBase):
     id: int
     workspace_id: int
@@ -31,6 +38,9 @@ class DocumentResponse(DocumentBase):
     processing_time_ms: int = 0
     # Digital signature metadata (None if not a native PDF or no signatures found)
     digital_signatures: list[dict[str, Any]] | None = None
+    # Document type classification
+    document_type_id: int | None = None
+    document_type: DocumentTypeInfo | None = None
 
     model_config = {"from_attributes": True}
 

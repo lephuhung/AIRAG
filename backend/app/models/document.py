@@ -58,8 +58,16 @@ class Document(Base):
     #                issuer, valid_from, valid_until, signing_time, reason, location}
     digital_signatures: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
+    # Document type classification (auto-detected by classifier)
+    document_type_id: Mapped[int | None] = mapped_column(
+        ForeignKey("document_types.id", ondelete="SET NULL"), nullable=True
+    )
+
     # Relationships
     workspace: Mapped["KnowledgeBase"] = relationship(back_populates="documents")
+    document_type: Mapped["DocumentType | None"] = relationship(  # type: ignore[name-defined]
+        back_populates="documents", lazy="selectin"
+    )
     images: Mapped[list["DocumentImage"]] = relationship(
         back_populates="document", cascade="all, delete-orphan"
     )
