@@ -1,4 +1,4 @@
-from sqlalchemy import String, ForeignKey, DateTime, Integer, Text, Enum
+from sqlalchemy import String, ForeignKey, DateTime, Integer, Text, Enum, JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from datetime import datetime
 import enum
@@ -52,6 +52,11 @@ class Document(Base):
     # Raw chunks JSON stored by parse_worker, consumed by embed_worker
     # Cleared after embed_worker finishes to save space
     raw_chunks_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Digital signature metadata extracted from native PDFs (list of dicts)
+    # Each element: {field_name, page, signer_name, organization, email,
+    #                issuer, valid_from, valid_until, signing_time, reason, location}
+    digital_signatures: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     # Relationships
     workspace: Mapped["KnowledgeBase"] = relationship(back_populates="documents")

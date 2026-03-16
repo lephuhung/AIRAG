@@ -58,6 +58,31 @@ async def handle_parse(payload: dict) -> None:
                 tmp.write(file_bytes)
                 tmp_path = Path(tmp.name)
 
+            # ── Extract digital signatures (native PDF only) ────────────────
+            if ext == ".pdf":
+                try:
+                    from app.services.ocr_service import get_ocr_service
+                    from app.services.digital_signature_service import extract_digital_signatures
+                    ocr_svc = get_ocr_service()
+                    is_scanned = await ocr_svc.is_scanned_pdf(str(tmp_path))
+                    if not is_scanned:
+                        import asyncio
+                        sigs = await asyncio.to_thread(
+                            extract_digital_signatures, str(tmp_path)
+                        )
+                        if sigs:
+                            document.digital_signatures = sigs
+                            await db.commit()
+                            logger.info(
+                                f"[parse_worker] doc={msg.document_id} "
+                                f"found {len(sigs)} digital signature(s)"
+                            )
+                except Exception as _sig_err:
+                    logger.warning(
+                        f"[parse_worker] doc={msg.document_id} "
+                        f"digital signature extraction failed (non-fatal): {_sig_err}"
+                    )
+
             # ── Phase: structural parse (ZERO LLM) ─────────────────────────
             parser = DeepDocumentParser(workspace_id=msg.workspace_id)
             parsed = await parser.parse_structure(

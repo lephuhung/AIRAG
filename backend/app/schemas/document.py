@@ -1,5 +1,6 @@
 from pydantic import BaseModel
 from datetime import datetime
+from typing import Any
 from app.models.document import DocumentStatus
 
 
@@ -28,6 +29,8 @@ class DocumentResponse(DocumentBase):
     table_count: int = 0
     parser_version: str | None = None
     processing_time_ms: int = 0
+    # Digital signature metadata (None if not a native PDF or no signatures found)
+    digital_signatures: list[dict[str, Any]] | None = None
 
     model_config = {"from_attributes": True}
 

@@ -20,6 +20,9 @@ sentence-transformers>=2.2.2
 # Document parsing (Docling)
 docling>=2.0.0
 
+# PDF rendering for scanned PDF detection + OCR pre-processing
+pymupdf>=1.24.0
+
 # Text processing
 langchain-text-splitters>=0.0.1
 
@@ -37,3 +40,12 @@ pydantic-settings>=2.1.0
 httpx>=0.25.0
 aiofiles>=23.2.1
 Pillow>=10.0.0
+
+# Message queue
+aio-pika>=9.4.0
+
+# Object storage (MinIO / S3-compatible)
+aioboto3>=13.0
+
+# Digital signature extraction (PDF)
+asn1crypto>=1.5.0

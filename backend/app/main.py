@@ -82,10 +82,26 @@ async def lifespan(app: FastAPI):
             await conn.execute(text(
                 "ALTER TABLE documents ADD COLUMN IF NOT EXISTS upload_s3_key VARCHAR(500)"
             ))
-            # Migrate legacy statuses to new schema
+            # Digital signature metadata (native PDF only, JSON array)
+            await conn.execute(text(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS digital_signatures JSON"
+            ))
+            # Migrate legacy statuses to new schema (safe on fresh DB)
             await conn.execute(text("""
-                UPDATE documents SET status = 'indexed'
-                WHERE status IN ('processing', 'indexing')
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_name = 'documents'
+                    ) THEN
+                        UPDATE documents
+                        SET status = 'indexed'::documentstatus
+                        WHERE status::text IN ('processing', 'indexing');
+                    END IF;
+                EXCEPTION WHEN others THEN
+                    -- ignore: enum may not have legacy values
+                    NULL;
+                END $$;
             """))
         logger.info("Database tables created/verified")
 
