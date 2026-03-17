@@ -16,3 +16,6 @@ screenlog/
 nexusrag.db
 showcase/demo_nexus_video.mkv
 CLAUDE.md
+back_end/
+documents/
+.claude/

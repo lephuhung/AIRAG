@@ -6,11 +6,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/backend"
 
 # Activate NexusRAG's own venv
-if [ -d "$SCRIPT_DIR/venv" ]; then
-    source "$SCRIPT_DIR/venv/bin/activate"
+if [ -d "$SCRIPT_DIR/back_end" ]; then
+    source "$SCRIPT_DIR/back_end/bin/activate"
 else
     echo "ERROR: venv not found. Create it first:"
-    echo "  cd $SCRIPT_DIR && python3 -m venv venv && source venv/bin/activate && pip install -r backend/requirements.txt"
+    echo "  cd $SCRIPT_DIR && python3 -m venv back_end && source back_end/bin/activate && pip install -r backend/requirements.txt"
     exit 1
 fi
 

@@ -127,7 +127,10 @@ async def upload_document(
             detail=f"File too large. Max size: {MAX_FILE_SIZE // 1024 // 1024}MB"
         )
 
-    filename = f"{uuid.uuid4()}{ext}"
+    # Sanitize original filename: keep alphanumeric, dots, dashes, underscores
+    import re as _re
+    safe_stem = _re.sub(r"[^\w\-.]", "_", Path(file.filename).stem)
+    filename = f"{safe_stem}{ext}"
 
     # Create DB record first to get document.id for the MinIO key
     document = Document(

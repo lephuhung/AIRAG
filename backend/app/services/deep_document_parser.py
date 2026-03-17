@@ -30,6 +30,46 @@ logger = logging.getLogger(__name__)
 # File extensions handled by Docling vs legacy
 _DOCLING_EXTENSIONS = {".pdf", ".docx", ".pptx", ".html"}
 _LEGACY_EXTENSIONS = {".txt", ".md"}
+_OCR_EXTENSIONS = {".pdf"}  # Only PDFs need scanned-page detection
+
+# ---------------------------------------------------------------------------
+# Module-level Docling converter singleton
+# ---------------------------------------------------------------------------
+# Docling loads LayoutModel (~1 GB) + TableFormer (~600 MB) + RapidOCR on first
+# use and keeps them in CUDA memory.  By caching the converter at module level
+# we pay that cost only ONCE per worker process regardless of how many documents
+# are processed.  Each parse worker is a separate OS process, so there is no
+# cross-process sharing — that is intentional: CUDA contexts are per-process.
+_DOCLING_CONVERTER = None
+
+
+def _get_global_converter():
+    """Return the process-wide singleton DocumentConverter, creating it once."""
+    global _DOCLING_CONVERTER
+    if _DOCLING_CONVERTER is not None:
+        return _DOCLING_CONVERTER
+
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.pipeline_options import PdfPipelineOptions, OcrAutoOptions
+    from docling.datamodel.accelerator_options import AcceleratorOptions, AcceleratorDevice
+
+    device = settings.NEXUSRAG_DOCLING_DEVICE  # "auto" | "cpu" | "cuda"
+
+    pipeline_options = PdfPipelineOptions()
+    pipeline_options.generate_picture_images = settings.NEXUSRAG_ENABLE_IMAGE_EXTRACTION
+    pipeline_options.images_scale = settings.NEXUSRAG_DOCLING_IMAGES_SCALE
+    pipeline_options.do_formula_enrichment = settings.NEXUSRAG_ENABLE_FORMULA_ENRICHMENT
+    pipeline_options.ocr_options = OcrAutoOptions(lang=["vi", "en"])
+    pipeline_options.accelerator_options = AcceleratorOptions(device=device)
+
+    logger.info(f"[Docling] Initializing DocumentConverter (device={device})")
+    _DOCLING_CONVERTER = DocumentConverter(
+        format_options={
+            "pdf": PdfFormatOption(pipeline_options=pipeline_options),
+        }
+    )
+    logger.info("[Docling] DocumentConverter ready (singleton)")
+    return _DOCLING_CONVERTER
 
 
 class DeepDocumentParser:
@@ -47,56 +87,46 @@ class DeepDocumentParser:
         self.output_dir = output_dir or (
             settings.BASE_DIR / "data" / "docling" / f"kb_{workspace_id}"
         )
-        self._converter = None
 
     def _get_converter(self):
-        """Lazy-init Docling DocumentConverter with image extraction."""
-        if self._converter is not None:
-            return self._converter
-
-        from docling.document_converter import DocumentConverter, PdfFormatOption
-        from docling.datamodel.pipeline_options import PdfPipelineOptions
-
-        pipeline_options = PdfPipelineOptions()
-        pipeline_options.generate_picture_images = settings.NEXUSRAG_ENABLE_IMAGE_EXTRACTION
-        pipeline_options.images_scale = settings.NEXUSRAG_DOCLING_IMAGES_SCALE
-        pipeline_options.do_formula_enrichment = settings.NEXUSRAG_ENABLE_FORMULA_ENRICHMENT
-
-        self._converter = DocumentConverter(
-            format_options={
-                "pdf": PdfFormatOption(pipeline_options=pipeline_options),
-            }
-        )
-        return self._converter
+        """Return the process-wide singleton DocumentConverter."""
+        return _get_global_converter()
 
     @staticmethod
     def is_docling_supported(file_path: str | Path) -> bool:
         """Check if the file format is supported by Docling."""
         return Path(file_path).suffix.lower() in _DOCLING_EXTENSIONS
 
-    def parse(
+    async def parse_structure(
         self,
         file_path: str | Path,
         document_id: int,
         original_filename: str,
     ) -> ParsedDocument:
         """
-        Parse a document and return structured result.
+        Parse document structure — ZERO LLM calls.
 
-        Args:
-            file_path: Path to the document file
-            document_id: Database document ID
-            original_filename: Original filename for citations
+        Returns markdown, raw chunks (no caption enrichment), image files,
+        and table markdown.  Caption enrichment and KG ingest are handled
+        by separate workers after this method returns.
 
-        Returns:
-            ParsedDocument with markdown, chunks, and images
+        For scanned PDFs (when OCR is enabled), pages are first run through
+        HunyuanOCR (HTTP call, not LLM via provider) before being chunked.
         """
         path = Path(file_path)
         suffix = path.suffix.lower()
         start_time = time.time()
 
         if suffix in _DOCLING_EXTENSIONS:
-            result = self._parse_with_docling(path, document_id, original_filename)
+            # For PDFs: detect scanned pages and run OCR first if needed
+            if (
+                suffix in _OCR_EXTENSIONS
+                and settings.NEXUSRAG_ENABLE_OCR
+                and self._is_scanned(path)
+            ):
+                result = await self._parse_with_ocr(path, document_id, original_filename)
+            else:
+                result = self._parse_with_docling(path, document_id, original_filename)
         elif suffix in _LEGACY_EXTENSIONS:
             result = self._parse_legacy(path, document_id, original_filename)
         else:
@@ -113,6 +143,80 @@ class DeepDocumentParser:
         )
         return result
 
+    # ------------------------------------------------------------------
+    # OCR helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_scanned(file_path: Path) -> bool:
+        """Delegate scanned-PDF detection to HunyuanOCRService."""
+        from app.services.ocr_service import get_ocr_service
+        return get_ocr_service().is_scanned_pdf(file_path)
+
+    async def _parse_with_ocr(
+        self,
+        file_path: Path,
+        document_id: int,
+        original_filename: str,
+    ) -> ParsedDocument:
+        """
+        Parse a scanned PDF via HunyuanOCR then convert to ParsedDocument.
+
+        Pipeline:
+          1. Run OCR on every page → get full plain-text / markdown.
+          2. Write the OCR'd text to a temporary .md file.
+          3. Parse that .md file via the legacy text pipeline so chunking
+             and metadata work the same way as for normal documents.
+        """
+        import tempfile
+
+        from app.services.ocr_service import get_ocr_service
+
+        logger.info(
+            f"Document {document_id} ({original_filename}) identified as scanned PDF "
+            f"— running HunyuanOCR"
+        )
+
+        ocr_service = get_ocr_service()
+        ocr_text = await ocr_service.ocr_pdf(file_path)
+
+        if not ocr_text.strip():
+            logger.warning(
+                f"HunyuanOCR returned empty text for {original_filename}. "
+                f"Returning empty document (no Docling fallback for scanned PDFs)."
+            )
+            # Return empty ParsedDocument — do not fall back to Docling for scanned PDFs
+            return ParsedDocument(
+                document_id=document_id,
+                original_filename=original_filename,
+                markdown="",
+                chunks=[],
+                images=[],
+                tables=[],
+                tables_count=0,
+                page_count=0,
+            )
+
+        # Write OCR text to a temp file and parse it as markdown
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".md", encoding="utf-8", delete=False
+        ) as tmp:
+            tmp.write(ocr_text)
+            tmp_path = Path(tmp.name)
+
+        try:
+            result = self._parse_legacy(tmp_path, document_id, original_filename)
+            # Override markdown with OCR output so the viewer shows the right content
+            result.markdown = ocr_text
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+        logger.info(
+            f"OCR parse complete for {document_id}: "
+            f"{len(result.chunks)} chunks, {result.page_count} pages"
+        )
+        return result
+
     def _parse_with_docling(
         self,
         file_path: Path,
@@ -122,37 +226,34 @@ class DeepDocumentParser:
         """Parse with Docling for rich structural extraction."""
         converter = self._get_converter()
 
-        # Convert document
+        # Convert document (CPU-bound, no LLM)
         logger.info(f"Docling converting: {file_path}")
         conv_result = converter.convert(str(file_path))
         doc = conv_result.document
 
-        # Extract images and build URL mapping for markdown references
+        # Extract images (file save only — captions added later by caption worker)
         images, pic_url_list = self._extract_images_with_urls(doc, document_id)
 
-        # Extract tables
+        # Extract tables (markdown only — captions added later by caption worker)
         tables = self._extract_tables(doc, document_id)
-        if settings.NEXUSRAG_ENABLE_TABLE_CAPTIONING and tables:
-            self._caption_tables(tables)
 
         # Export to markdown (with page break markers if supported)
         markdown = self._export_markdown(doc)
 
         # Post-process: replace image placeholders with real markdown images
         markdown = self._inject_image_references(markdown, pic_url_list)
-
-        # Post-process: inject table captions into markdown
-        markdown = self._inject_table_captions(markdown, tables)
+        # Note: table captions NOT injected here — caption worker will update
+        # markdown_content in DB once captions are ready
 
         # Get page count
         page_count = 0
         if hasattr(doc, "pages") and doc.pages:
             page_count = len(doc.pages)
 
-        # Chunk with HybridChunker — pass images + tables for enrichment
+        # Chunk with HybridChunker — images/tables passed for page-ref tracking
+        # but enriched_text will NOT include captions yet (images have caption="")
         chunks = self._chunk_document(doc, document_id, original_filename, images, tables)
 
-        # Count tables
         tables_count = len(tables)
 
         return ParsedDocument(
@@ -412,11 +513,11 @@ class DeepDocumentParser:
 
         logger.info(f"Extracted {len(images)} images from document {document_id}")
 
-        # Caption images with Gemini Vision (updates img.caption in-place)
-        if settings.NEXUSRAG_ENABLE_IMAGE_CAPTIONING and images:
-            self._caption_images(images)
+        # NOTE: captioning is intentionally NOT done here.
+        # caption_worker.py calls caption_images() / caption_tables() separately
+        # so the parse phase stays LLM-free.
 
-        # Build pic_url_list AFTER captioning so captions are up-to-date
+        # Build pic_url_list (captions empty at this point — that's fine)
         pic_url_list: list[tuple[str, str]] = []
         for idx in pic_to_image_idx:
             if idx >= 0:

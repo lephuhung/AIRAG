@@ -40,25 +40,38 @@ async def _kg_llm_complete(
     keyword_extraction: bool = False,
     **kwargs,
 ) -> str:
-    """LightRAG-compatible LLM function using the configured provider."""
+    """
+    LightRAG-compatible LLM function using the configured provider.
+    Includes exponential-backoff retry for rate-limit errors (HTTP 429).
+    """
     provider = get_llm_provider()
 
     messages: list[LLMMessage] = []
-
     if system_prompt:
         messages.append(LLMMessage(role="system", content=system_prompt))
-
     if history_messages:
         for msg in history_messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            messages.append(LLMMessage(role=role, content=content))
-
+            messages.append(LLMMessage(role=msg.get("role", "user"), content=msg.get("content", "")))
     messages.append(LLMMessage(role="user", content=prompt))
 
-    return await provider.acomplete(
-        messages, temperature=0.0, max_tokens=4096,
-    )
+    for attempt in range(4):   # up to 3 retries
+        try:
+            return await provider.acomplete(
+                messages, temperature=0.0, max_tokens=4096,
+            )
+        except Exception as e:
+            err = str(e).lower()
+            is_rate_limit = "429" in err or "rate" in err or "quota" in err or "resource_exhausted" in err
+            if is_rate_limit and attempt < 3:
+                wait = 2 ** attempt   # 1s, 2s, 4s
+                logger.warning(
+                    f"[kg_llm] rate-limit hit (attempt {attempt + 1}/4) "
+                    f"— retrying in {wait}s"
+                )
+                await asyncio.sleep(wait)
+            else:
+                raise
+    return ""
 
 
 async def _kg_embed(texts: list[str]) -> np.ndarray:
@@ -125,6 +138,7 @@ class KnowledgeGraphService:
             embedding_func=embedding_func,
             chunk_token_size=settings.NEXUSRAG_KG_CHUNK_TOKEN_SIZE,
             enable_llm_cache=True,
+            llm_model_max_async=3,   # max 3 concurrent LLM calls → avoids rate limits
             kv_storage="JsonKVStorage",
             vector_storage="NanoVectorDBStorage",
             graph_storage="NetworkXStorage",

@@ -71,8 +71,13 @@ def get_embedding_provider() -> EmbeddingProvider:
             model=settings.KG_EMBEDDING_MODEL,
         )
 
+    if provider == "local":
+        from app.services.llm.ollama import LocalEmbeddingProvider
+
+        return LocalEmbeddingProvider(model_name=settings.KG_EMBEDDING_MODEL)
+
     raise ValueError(
-        f"Unknown KG_EMBEDDING_PROVIDER: {provider!r}. Supported: gemini, ollama"
+        f"Unknown KG_EMBEDDING_PROVIDER: {provider!r}. Supported: gemini, ollama, local"
     )
 
 

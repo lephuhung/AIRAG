@@ -184,6 +184,28 @@ class VectorStore:
             include=["documents", "metadatas"]
         )
 
+    def update_documents(
+        self,
+        ids: Sequence[str],
+        embeddings: Sequence[list[float]],
+        documents: Sequence[str],
+    ) -> None:
+        """
+        Update existing documents' embeddings and text in-place.
+        Used by caption_worker to re-embed chunks enriched with captions.
+        ChromaDB upsert semantics: inserts if id not found, updates otherwise.
+        """
+        if not ids:
+            return
+        self.collection.upsert(
+            ids=list(ids),
+            embeddings=list(embeddings),
+            documents=list(documents),
+        )
+        logger.info(
+            f"Updated {len(ids)} document embeddings in {self.collection_name}"
+        )
+
 
 def get_vector_store(workspace_id: int) -> VectorStore:
     """Factory function to create a VectorStore for a knowledge base."""

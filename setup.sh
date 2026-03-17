@@ -65,13 +65,13 @@ echo ""
 # 2. Create Python virtual environment
 # -----------------------------------------------------------
 echo "[2/7] Setting up Python virtual environment..."
-if [ ! -d "venv" ]; then
-    python3 -m venv venv
-    echo "  Created venv/"
+if [ ! -d "back_end" ]; then
+    python3 -m venv back_end
+    echo "  Created back_end/"
 else
-    echo "  venv/ already exists"
+    echo "  back_end/ already exists"
 fi
-source venv/bin/activate
+source back_end/bin/activate
 
 # -----------------------------------------------------------
 # 3. Install Python dependencies

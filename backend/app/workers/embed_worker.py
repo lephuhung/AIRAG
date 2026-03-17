@@ -112,3 +112,13 @@ async def handle_embed(payload: dict) -> None:
             document.error_message = str(e)[:500]
             await db.commit()
             raise
+        finally:
+            # Return cached GPU memory to PyTorch's allocator so the next
+            # worker (KG) can use the freed blocks.  This is a best-effort
+            # hint — PyTorch may still hold the CUDA context until process exit.
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass

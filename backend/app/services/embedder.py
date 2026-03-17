@@ -37,11 +37,15 @@ class EmbeddingService:
 
     @property
     def model(self):
-        """Lazy load the model."""
+        """Lazy load the model onto the configured device."""
         if self._model is None:
             from sentence_transformers import SentenceTransformer
-            logger.info(f"Loading embedding model: {self.model_name}")
-            self._model = SentenceTransformer(self.model_name)
+            device = settings.NEXUSRAG_EMBEDDING_DEVICE  # "auto" | "cpu" | "cuda"
+            # SentenceTransformer accepts "cpu", "cuda", "cuda:0", etc.
+            # Pass None for "auto" so sentence-transformers picks the best device.
+            st_device = None if device == "auto" else device
+            logger.info(f"Loading embedding model: {self.model_name} (device={device})")
+            self._model = SentenceTransformer(self.model_name, device=st_device)
             logger.info(
                 f"Embedding model loaded: {self.model_name} "
                 f"(dim={self._model.get_sentence_embedding_dimension()})"

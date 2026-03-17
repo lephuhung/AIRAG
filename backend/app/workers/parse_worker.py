@@ -64,9 +64,12 @@ async def handle_parse(payload: dict) -> None:
                     from app.services.ocr_service import get_ocr_service
                     from app.services.digital_signature_service import extract_digital_signatures
                     ocr_svc = get_ocr_service()
-                    is_scanned = await ocr_svc.is_scanned_pdf(str(tmp_path))
+                    # is_scanned_pdf is a sync @staticmethod — run in thread to
+                    # avoid blocking the event loop (fitz.open is blocking I/O).
+                    is_scanned = await asyncio.to_thread(
+                        ocr_svc.is_scanned_pdf, str(tmp_path)
+                    )
                     if not is_scanned:
-                        import asyncio
                         sigs = await asyncio.to_thread(
                             extract_digital_signatures, str(tmp_path)
                         )

@@ -400,3 +400,62 @@ class OllamaEmbeddingProvider(EmbeddingProvider):
         if self._dimension is None:
             self._dimension = self._detect_dimension()
         return self._dimension
+
+
+class LocalEmbeddingProvider(EmbeddingProvider):
+    """
+    Local sentence-transformers embedding provider for KG.
+
+    Uses the same BAAI/bge-m3 model that the vector search pipeline uses,
+    loaded locally via sentence-transformers.  No remote API required.
+
+    Use when KG_EMBEDDING_PROVIDER=local in .env.
+    """
+
+    def __init__(self, model_name: str = "BAAI/bge-m3"):
+        self._model_name = model_name
+        self._model = None
+        self._dimension: int | None = None
+
+    def _get_model(self):
+        if self._model is None:
+            from sentence_transformers import SentenceTransformer
+            from app.core.config import settings
+            device = settings.NEXUSRAG_EMBEDDING_DEVICE  # "auto" | "cpu" | "cuda"
+            st_device = None if device == "auto" else device
+            logger.info(f"[LocalEmbedding] Loading model: {self._model_name} (device={device})")
+            self._model = SentenceTransformer(self._model_name, device=st_device)
+            self._dimension = self._model.get_sentence_embedding_dimension()
+            logger.info(f"[LocalEmbedding] Model loaded, dim={self._dimension}")
+        return self._model
+
+    @staticmethod
+    def _sanitize(texts: list[str]) -> list[str]:
+        result = []
+        for t in texts:
+            t = t.strip() or "[empty]"
+            result.append(t[:32000])  # truncate extremely long texts
+        return result
+
+    def embed_sync(self, texts: list[str]) -> np.ndarray:
+        model = self._get_model()
+        clean = self._sanitize(texts)
+        try:
+            arr = model.encode(
+                clean,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                batch_size=32,
+            ).astype(np.float32)
+            if np.any(np.isnan(arr)):
+                logger.warning("[LocalEmbedding] NaN in embeddings — replacing with zeros")
+                arr = np.nan_to_num(arr, nan=0.0)
+            return arr
+        except Exception as e:
+            logger.error(f"[LocalEmbedding] embed_sync failed: {e}")
+            return np.zeros((len(texts), self.get_dimension()), dtype=np.float32)
+
+    def get_dimension(self) -> int:
+        if self._dimension is None:
+            self._get_model()  # forces load + sets _dimension
+        return self._dimension or 1024

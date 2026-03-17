@@ -68,3 +68,12 @@ async def handle_kg(payload: dict) -> None:
             document.error_message = f"kg_warning: {str(e)[:400]}"
             await db.commit()
             await check_and_finalize(document, db)
+        finally:
+            # Release cached GPU memory after each document so other workers
+            # (or the next document in this worker) can reclaim the blocks.
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
