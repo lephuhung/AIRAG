@@ -69,6 +69,27 @@ services:
       timeout: 5s
       retries: 5
 
+  neo4j:
+    image: neo4j:5-community
+    container_name: nexusrag-neo4j
+    ports:
+      - "7474:7474"   # Browser UI → http://localhost:7474
+      - "7687:7687"   # Bolt protocol
+    environment:
+      NEO4J_AUTH: neo4j/nexusrag123
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+      NEO4J_dbms_memory_heap_initial__size: 512m
+      NEO4J_dbms_memory_heap_max__size: 1G
+    volumes:
+      - nexusrag_neo4j_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
   backend:
     build:
       context: .
@@ -83,6 +104,8 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+      neo4j:
+        condition: service_healthy
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/nexusrag
@@ -91,6 +114,7 @@ services:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       MINIO_ENDPOINT: http://minio:9000
       MINIO_WEBHOOK_ENABLED: "true"
+      NEO4J_URI: bolt://neo4j:7687
     volumes:
       - nexusrag_uploads:/app/backend/uploads
       - nexusrag_data:/app/backend/data
@@ -199,10 +223,13 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
+      neo4j:
+        condition: service_healthy
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/nexusrag
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      NEO4J_URI: bolt://neo4j:7687
       WORKER_TYPE: kg
       AUTO_CREATE_TABLES: "false"
     volumes:
@@ -231,3 +258,4 @@ volumes:
   nexusrag_uploads:
   nexusrag_data:
   nexusrag_minio_data:
+  nexusrag_neo4j_data:

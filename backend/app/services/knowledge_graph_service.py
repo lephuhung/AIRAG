@@ -3,7 +3,20 @@ Knowledge Graph Service
 ========================
 
 Per-workspace Knowledge Graph using LightRAG with configurable LLM + embeddings.
-File-based storage (NetworkX graph + NanoVectorDB) — no extra Docker services.
+
+Two graph storage backends (selected via NEXUSRAG_KG_GRAPH_BACKEND in .env):
+
+  networkx (default)
+    → File-based per-workspace storage (NetworkX graph + NanoVectorDB).
+    → No extra services required.
+    → Each workspace's graph is stored separately under backend/data/lightrag/kb_{id}/.
+    → Documents within the same workspace share a connected graph.
+
+  neo4j
+    → Shared Neo4j instance; workspace isolation via node label "kb_{workspace_id}".
+    → Requires Neo4j 5 running (docker-compose includes nexusrag-neo4j service).
+    → All documents across all workspaces share one database; queried per-label.
+    → Cross-document entity linking within a workspace works out-of-the-box.
 
 Usage:
     kg = KnowledgeGraphService(workspace_id=1)
@@ -88,8 +101,9 @@ class KnowledgeGraphService:
     """
     Per-workspace Knowledge Graph service backed by LightRAG.
 
-    Storage: file-based (NetworkX for graph, NanoVectorDB for vectors).
-    Each knowledge base gets its own working directory.
+    Storage backend is selected by NEXUSRAG_KG_GRAPH_BACKEND:
+      - "networkx" (default): file-based per-workspace storage
+      - "neo4j": shared Neo4j instance with per-workspace node labels
     """
 
     def __init__(self, workspace_id: int):
@@ -115,22 +129,43 @@ class KnowledgeGraphService:
         emb_provider = get_embedding_provider()
         embedding_dim = emb_provider.get_dimension()
 
-        # Detect dimension mismatch when switching providers
-        dim_marker = Path(self.working_dir) / ".embedding_dim"
-        if dim_marker.exists():
-            prev_dim = int(dim_marker.read_text().strip())
-            if prev_dim != embedding_dim:
-                logger.warning(
-                    f"Embedding dimension changed ({prev_dim} → {embedding_dim}) "
-                    f"for workspace {self.workspace_id}. Clearing KG data for rebuild."
-                )
-                shutil.rmtree(self.working_dir)
-                os.makedirs(self.working_dir, exist_ok=True)
-        dim_marker.write_text(str(embedding_dim))
+        backend = settings.NEXUSRAG_KG_GRAPH_BACKEND.lower()
+
+        if backend == "networkx":
+            # Detect dimension mismatch when switching providers
+            dim_marker = Path(self.working_dir) / ".embedding_dim"
+            if dim_marker.exists():
+                prev_dim = int(dim_marker.read_text().strip())
+                if prev_dim != embedding_dim:
+                    logger.warning(
+                        f"Embedding dimension changed ({prev_dim} → {embedding_dim}) "
+                        f"for workspace {self.workspace_id}. Clearing KG data for rebuild."
+                    )
+                    shutil.rmtree(self.working_dir)
+                    os.makedirs(self.working_dir, exist_ok=True)
+            dim_marker.write_text(str(embedding_dim))
 
         @wrap_embedding_func_with_attrs(embedding_dim=embedding_dim, max_token_size=8192)
         async def embedding_func(texts: list[str]) -> np.ndarray:
             return await _kg_embed(texts)
+
+        # Graph storage + KV/vector params depend on selected backend
+        if backend == "neo4j":
+            graph_storage = "Neo4JStorage"
+            # Neo4JStorage reads NEO4J_URI/USERNAME/PASSWORD from env automatically.
+            # Pass workspace label via the LightRAG `workspace` param so all
+            # workspaces share one Neo4j DB but remain isolated by node label.
+            extra_kwargs = {"workspace": f"kb_{self.workspace_id}"}
+            logger.info(
+                f"LightRAG using Neo4j backend for workspace {self.workspace_id} "
+                f"(label=kb_{self.workspace_id}, uri={settings.NEO4J_URI})"
+            )
+        else:
+            graph_storage = "NetworkXStorage"
+            extra_kwargs = {}
+            logger.info(
+                f"LightRAG using NetworkX (file) backend for workspace {self.workspace_id}"
+            )
 
         self._rag = LightRAG(
             working_dir=self.working_dir,
@@ -141,12 +176,13 @@ class KnowledgeGraphService:
             llm_model_max_async=3,   # max 3 concurrent LLM calls → avoids rate limits
             kv_storage="JsonKVStorage",
             vector_storage="NanoVectorDBStorage",
-            graph_storage="NetworkXStorage",
+            graph_storage=graph_storage,
             doc_status_storage="JsonDocStatusStorage",
             addon_params={
                 "language": settings.NEXUSRAG_KG_LANGUAGE,
                 "entity_types": settings.NEXUSRAG_KG_ENTITY_TYPES,
             },
+            **extra_kwargs,
         )
 
         await self._rag.initialize_storages()
@@ -155,7 +191,7 @@ class KnowledgeGraphService:
 
         logger.info(
             f"LightRAG initialized for workspace {self.workspace_id} "
-            f"(embedding_dim={embedding_dim})"
+            f"(embedding_dim={embedding_dim}, backend={backend})"
         )
         return self._rag
 
@@ -249,12 +285,44 @@ class KnowledgeGraphService:
             self._rag = None
             self._initialized = False
 
-    def delete_project_data(self) -> None:
-        """Delete all KG data for this knowledge base."""
+    async def delete_project_data(self) -> None:
+        """
+        Delete all KG data for this knowledge base.
+
+        - NetworkX backend: removes the working directory tree.
+        - Neo4j backend: drops all nodes/edges with label kb_{workspace_id}
+          in Neo4j, then removes the working directory (KV/vector files).
+        """
+        backend = settings.NEXUSRAG_KG_GRAPH_BACKEND.lower()
+
+        if backend == "neo4j":
+            try:
+                from neo4j import AsyncGraphDatabase
+                async with AsyncGraphDatabase.driver(
+                    settings.NEO4J_URI,
+                    auth=(settings.NEO4J_USERNAME, settings.NEO4J_PASSWORD),
+                ) as driver:
+                    label = f"kb_{self.workspace_id}"
+                    async with driver.session() as session:
+                        # Delete all nodes with this workspace label (and their edges)
+                        await session.run(
+                            f"MATCH (n:`{label}`) DETACH DELETE n"
+                        )
+                    logger.info(
+                        f"Deleted Neo4j nodes for workspace {self.workspace_id} "
+                        f"(label={label})"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to delete Neo4j data for workspace {self.workspace_id}: {e}"
+                )
+
+        # Always remove file-based KV / vector data (working_dir)
         path = Path(self.working_dir)
         if path.exists():
             shutil.rmtree(path)
-            logger.info(f"Deleted KG data for workspace {self.workspace_id}")
+            logger.info(f"Deleted KG working dir for workspace {self.workspace_id}")
+
         self._rag = None
         self._initialized = False
 
@@ -362,6 +430,12 @@ class KnowledgeGraphService:
         Export graph data for frontend visualization.
 
         Returns {nodes: [...], edges: [...], is_truncated: bool}.
+
+        Note on Neo4j vs NetworkX:
+          - NetworkX backend: node IDs and edge source/target are entity name strings.
+          - Neo4j backend: get_knowledge_graph() returns integer internal IDs for
+            edge source/target.  We build an id→name map from the returned nodes
+            to remap edges back to entity names.
         """
         rag = await self._get_rag()
         storage = rag.chunk_entity_relation_graph
@@ -377,16 +451,27 @@ class KnowledgeGraphService:
             logger.error(f"Failed to get KG graph for workspace {self.workspace_id}: {e}")
             return {"nodes": [], "edges": [], "is_truncated": False}
 
+        # Build id → entity name map (needed for Neo4j integer IDs)
+        # For NetworkX the id is already the entity name, so this is a no-op.
+        id_to_name: dict = {}
+        for n in kg.nodes:
+            props = n.properties if hasattr(n, "properties") else {}
+            # entity_id in Neo4j is the integer node id; "id" attr on GraphNode
+            # may be int (Neo4j) or str (NetworkX)
+            entity_name = props.get("entity_id") or props.get("name") or str(n.id)
+            id_to_name[n.id] = entity_name
+
         nodes = []
         for n in kg.nodes:
             props = n.properties if hasattr(n, "properties") else {}
+            entity_name = id_to_name.get(n.id, str(n.id))
             try:
-                degree = await storage.node_degree(n.id)
+                degree = await storage.node_degree(entity_name)
             except Exception:
                 degree = 0
             nodes.append({
-                "id": n.id,
-                "label": n.id,
+                "id": entity_name,
+                "label": entity_name,
                 "entity_type": props.get("entity_type", "Unknown"),
                 "degree": degree,
             })
@@ -394,9 +479,12 @@ class KnowledgeGraphService:
         edges = []
         for e in kg.edges:
             props = e.properties if hasattr(e, "properties") else {}
+            # Remap integer IDs → entity names for Neo4j backend
+            src = id_to_name.get(e.source, str(e.source))
+            tgt = id_to_name.get(e.target, str(e.target))
             edges.append({
-                "source": e.source,
-                "target": e.target,
+                "source": src,
+                "target": tgt,
                 "label": props.get("description", "")[:80],
                 "weight": float(props.get("weight", 1.0)),
             })

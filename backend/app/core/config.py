@@ -88,6 +88,12 @@ class Settings(BaseSettings):
     HUNYUAN_OCR_API_URL: str = Field(default="http://10.8.0.8:8001/v1")
     HUNYUAN_OCR_MODEL: str = Field(default="tencent/HunyuanOCR")
 
+    # Knowledge Graph backend
+    NEXUSRAG_KG_GRAPH_BACKEND: str = Field(default="networkx")
+    NEO4J_URI: str = Field(default="bolt://localhost:7687")
+    NEO4J_USERNAME: str = Field(default="neo4j")
+    NEO4J_PASSWORD: str = Field(default="nexusrag123")
+
     # CORS
     CORS_ORIGINS: list[str] = Field(default=["http://localhost:5174", "http://localhost:3000"])
 
