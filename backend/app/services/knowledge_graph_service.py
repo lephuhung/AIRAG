@@ -152,7 +152,13 @@ class KnowledgeGraphService:
         # Graph storage + KV/vector params depend on selected backend
         if backend == "neo4j":
             graph_storage = "Neo4JStorage"
-            # Neo4JStorage reads NEO4J_URI/USERNAME/PASSWORD from env automatically.
+            # LightRAG's Neo4JStorage reads NEO4J_URI/NEO4J_USERNAME/NEO4J_PASSWORD
+            # directly from os.environ (not from pydantic-settings).
+            # Ensure they are exported here from the app settings so LightRAG can find them.
+            import os as _os
+            _os.environ.setdefault("NEO4J_URI", settings.NEO4J_URI)
+            _os.environ.setdefault("NEO4J_USERNAME", settings.NEO4J_USERNAME)
+            _os.environ.setdefault("NEO4J_PASSWORD", settings.NEO4J_PASSWORD)
             # Pass workspace label via the LightRAG `workspace` param so all
             # workspaces share one Neo4j DB but remain isolated by node label.
             extra_kwargs = {"workspace": f"kb_{self.workspace_id}"}

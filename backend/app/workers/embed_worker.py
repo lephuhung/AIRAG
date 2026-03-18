@@ -19,6 +19,7 @@ import logging
 from sqlalchemy import select
 
 from app.core.database import async_session_maker
+from app.models.document_type import DocumentType as _DocumentType  # noqa: F401
 from app.models.document import Document, DocumentStatus
 from app.queue.messages import EmbedMessage
 from app.services.embedder import get_embedding_service

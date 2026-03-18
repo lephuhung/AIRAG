@@ -6,13 +6,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR/backend"
 
 # Activate NexusRAG's own venv
-if [ -d "$SCRIPT_DIR/back_end" ]; then
-    source "$SCRIPT_DIR/back_end/bin/activate"
+if [ -d "$SCRIPT_DIR/.venv" ]; then
+    source "$SCRIPT_DIR/.venv/bin/activate"
 else
     echo "ERROR: venv not found. Create it first:"
     echo "  cd $SCRIPT_DIR && python3 -m venv back_end && source back_end/bin/activate && pip install -r backend/requirements.txt"
     exit 1
 fi
 
-echo "Starting NexusRAG backend on port 8080..."
-uvicorn app.main:app --reload --port 8080
+echo "Starting NexusRAG backend on port 8080 (GPU 1)..."
+CUDA_VISIBLE_DEVICES=1 uvicorn app.main:app --reload --port 8080

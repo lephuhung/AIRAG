@@ -21,6 +21,13 @@ export default defineConfig({
         target: 'http://localhost:8080',
         changeOrigin: true,
       },
+      // Proxy MinIO presigned PUT requests (local dev only)
+      // Frontend rewrites presigned URLs from localhost:9000 → /minio-direct/
+      '/minio-direct': {
+        target: 'http://localhost:9000',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/minio-direct/, ''),
+      },
     },
   },
 })

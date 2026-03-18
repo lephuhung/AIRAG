@@ -110,6 +110,17 @@ if [ "$HAS_DOCKER" = true ]; then
         fi
         sleep 1
     done
+
+    # Configure MinIO CORS so the browser can PUT files directly (presigned upload)
+    echo "  Configuring MinIO CORS for direct browser uploads..."
+    if docker run --rm --network host minio/mc:latest sh -c \
+        "mc alias set local http://localhost:9000 minioadmin minioadmin && \
+         mc mb --ignore-existing local/nexusrag-uploads && \
+         mc mb --ignore-existing local/nexusrag-markdown" 2>/dev/null; then
+        echo "  MinIO buckets ready."
+    else
+        echo "  WARNING: Could not configure MinIO. Ensure it is running on port 9000."
+    fi
 else
     echo "  Skipped (no Docker). Ensure PostgreSQL (port 5433) and ChromaDB (port 8002) are running."
 fi

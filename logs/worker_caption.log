@@ -1,0 +1,14 @@
+2026-03-17 20:25:13,214 [INFO] __main__ — Starting worker: WORKER_TYPE=caption
+2026-03-17 20:25:14,336 [INFO] app.queue.connection — Connecting to RabbitMQ: amqp://guest:guest@localhost:5672/
+2026-03-17 20:25:14,345 [INFO] app.queue.connection — RabbitMQ connected
+2026-03-17 20:25:14,355 [INFO] app.queue.connection — Consuming nexusrag.caption/caption → nexusrag.caption
+2026-03-17 22:05:16,702 [INFO] app.workers.caption_worker — [caption_worker] doc=7
+2026-03-17 22:05:16,910 [INFO] app.workers.caption_worker — [caption_worker] doc=7 no images/tables — done
+2026-03-17 22:09:38,638 [INFO] app.workers.caption_worker — [caption_worker] doc=7
+2026-03-17 22:09:38,657 [INFO] app.workers.caption_worker — [caption_worker] doc=7 no images/tables — done
+2026-03-17 22:24:40,530 [INFO] app.workers.caption_worker — [caption_worker] doc=8
+2026-03-17 22:24:40,553 [INFO] app.workers.caption_worker — [caption_worker] doc=8 no images/tables — done
+2026-03-17 22:26:56,139 [INFO] app.workers.caption_worker — [caption_worker] doc=9
+2026-03-17 22:26:56,153 [INFO] app.workers.caption_worker — [caption_worker] doc=9 no images/tables — done
+2026-03-17 22:50:05,493 [INFO] app.workers.caption_worker — [caption_worker] doc=10
+2026-03-17 22:50:05,513 [INFO] app.workers.caption_worker — [caption_worker] doc=10 no images/tables — done

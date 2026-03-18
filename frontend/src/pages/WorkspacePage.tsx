@@ -12,9 +12,17 @@ import type { Document, RAGStats, DocumentStatus } from "@/types";
 
 const PROCESSING_STATUSES = new Set<DocumentStatus>([
   "parsing",
-  "indexing",
-  "processing",
+  "parsed",
+  "indexed_partial",
 ]);
+
+// Also poll while KG is still running in the background on indexed docs
+function needsPolling(docs: Document[] | undefined): boolean {
+  if (!docs) return false;
+  return docs.some(
+    (d) => PROCESSING_STATUSES.has(d.status) || (d.status === "indexed" && d.kg_done === false)
+  );
+}
 
 export function WorkspacePage() {
   const { workspaceId } = useParams<{ workspaceId: string }>();
@@ -42,8 +50,7 @@ export function WorkspacePage() {
       api.get<Document[]>(`/documents/workspace/${workspaceId}`),
     enabled: !!workspaceId,
     refetchInterval: (query) => {
-      const docs = query.state.data;
-      if (docs?.some((d) => PROCESSING_STATUSES.has(d.status))) return 3000;
+      if (needsPolling(query.state.data)) return 3000;
       return false;
     },
   });
@@ -58,8 +65,7 @@ export function WorkspacePage() {
   // Refresh ragStats when processing finishes
   // -----------------------------------------------------------------------
   const processingCount = useMemo(
-    () =>
-      documents?.filter((d) => PROCESSING_STATUSES.has(d.status)).length ?? 0,
+    () => documents?.filter((d) => needsPolling([d])).length ?? 0,
     [documents]
   );
 
@@ -89,7 +95,7 @@ export function WorkspacePage() {
   // -----------------------------------------------------------------------
   const uploadDoc = useMutation({
     mutationFn: (file: File) =>
-      api.uploadFile<Document>(`/documents/upload/${workspaceId}`, file),
+      api.uploadFileDirect<Document>(Number(workspaceId), file),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["documents", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["rag-stats", workspaceId] });

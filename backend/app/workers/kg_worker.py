@@ -20,6 +20,7 @@ import logging
 from sqlalchemy import select
 
 from app.core.database import async_session_maker
+from app.models.document_type import DocumentType as _DocumentType  # noqa: F401
 from app.models.document import Document
 from app.queue.messages import KGMessage
 from app.services.knowledge_graph_service import KnowledgeGraphService

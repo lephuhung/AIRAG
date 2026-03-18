@@ -63,6 +63,9 @@ async def _run_kg_worker() -> None:
     """
     from app.workers.kg_worker import handle_kg
 
+    # Ensure all SQLAlchemy models are registered before querying
+    import app.models  # noqa: F401 — registers DocumentType and all relationships
+
     # Fetch all existing workspace IDs
     from app.core.database import async_session_maker
     from app.models.knowledge_base import KnowledgeBase

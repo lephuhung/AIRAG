@@ -198,11 +198,17 @@ async def process_document(
     if document is None:
         raise NotFoundError("Document", document_id)
 
-    if document.status in (DocumentStatus.PROCESSING, DocumentStatus.PARSING, DocumentStatus.INDEXING):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Document is already being processed"
-        )
+    if document.status in (DocumentStatus.PARSING, DocumentStatus.PARSED, DocumentStatus.INDEXED_PARTIAL):
+        # Allow re-trigger if embed never ran (e.g. message was dropped by RabbitMQ).
+        # A truly in-progress document will have embed_done or captions_done progressing.
+        truly_in_progress = document.status == DocumentStatus.PARSING or document.embed_done
+        if truly_in_progress:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Document is already being processed"
+            )
+        # embed_done=False while PARSED/INDEXED_PARTIAL → worker message was lost, allow retry
+        # Fall through to reset + requeue below
 
     if document.status == DocumentStatus.INDEXED:
         return DocumentProcessResponse(
@@ -215,29 +221,48 @@ async def process_document(
     from pathlib import Path
     file_path = Path(UPLOAD_DIR) / document.filename
 
-    if not file_path.exists():
+    if not file_path.exists() and not document.upload_s3_key:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document file not found on disk"
+            detail="Document file not found — no local file and no MinIO key"
         )
 
-    # Mark as processing immediately so UI updates
-    document.status = DocumentStatus.PROCESSING
+    # Reset sub-task flags and queue via RabbitMQ (same flow as upload)
+    document.status = DocumentStatus.PENDING
     document.error_message = None
+    document.embed_done = False
+    document.captions_done = False
+    document.kg_done = False
     await db.commit()
 
-    # Launch background task
-    from app.api.documents import process_document_background
-    import asyncio
-    asyncio.get_event_loop().create_task(
-        process_document_background(document_id, str(file_path), document.workspace_id)
-    )
+    if document.upload_s3_key:
+        # New flow: re-publish parse task so workers pick it up from MinIO
+        try:
+            from app.queue.publisher import publish_parse_task
+            await publish_parse_task(
+                document_id=document_id,
+                workspace_id=document.workspace_id,
+                minio_key=document.upload_s3_key,
+                original_filename=document.original_filename,
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to queue document for processing: {str(e)}"
+            )
+    else:
+        # Legacy fallback: file still on disk, process inline
+        from app.api.documents import process_document_background
+        import asyncio
+        asyncio.get_event_loop().create_task(
+            process_document_background(document_id, str(file_path), document.workspace_id)
+        )
 
     return DocumentProcessResponse(
         document_id=document_id,
-        status="processing",
+        status="pending",
         chunk_count=0,
-        message="Processing started. Document will be parsed and indexed in the background."
+        message="Document queued for processing."
     )
 
 
@@ -248,11 +273,8 @@ async def process_batch(
 ):
     """
     Process multiple documents sequentially in the background.
-    Marks all as PROCESSING immediately, then processes one-by-one to avoid
-    resource contention (each doc uses Docling + embeddings + KG ingest).
+    Publishes each document to the parse queue (RabbitMQ).
     """
-    from pathlib import Path as _P
-
     accepted_ids = []
     skipped_ids = []
 
@@ -263,50 +285,44 @@ async def process_batch(
             skipped_ids.append(doc_id)
             continue
 
-        # Skip documents already being processed or already indexed
+        # Skip documents already in the pipeline
         if doc.status in (
-            DocumentStatus.PROCESSING, DocumentStatus.PARSING, DocumentStatus.INDEXING,
+            DocumentStatus.PARSING, DocumentStatus.PARSED, DocumentStatus.INDEXED_PARTIAL,
         ):
             skipped_ids.append(doc_id)
             continue
 
-        file_path = _P(UPLOAD_DIR) / doc.filename
-        if not file_path.exists():
+        if not doc.upload_s3_key:
             skipped_ids.append(doc_id)
             continue
 
-        # Mark as processing immediately so UI updates
-        doc.status = DocumentStatus.PROCESSING
+        doc.status = DocumentStatus.PENDING
         doc.error_message = None
-        accepted_ids.append((doc_id, str(file_path), doc.workspace_id))
+        doc.embed_done = False
+        doc.captions_done = False
+        doc.kg_done = False
+        accepted_ids.append((doc_id, doc.upload_s3_key, doc.workspace_id, doc.original_filename))
 
     await db.commit()
 
     if accepted_ids:
-        import asyncio
-        asyncio.get_event_loop().create_task(
-            _process_batch_background(accepted_ids)
-        )
+        from app.queue.publisher import publish_parse_task
+        for doc_id, minio_key, workspace_id, original_filename in accepted_ids:
+            try:
+                await publish_parse_task(
+                    document_id=doc_id,
+                    workspace_id=workspace_id,
+                    minio_key=minio_key,
+                    original_filename=original_filename,
+                )
+            except Exception as e:
+                logger.error(f"[process_batch] Failed to queue doc {doc_id}: {e}")
 
     return {
         "message": f"Processing {len(accepted_ids)} document(s)",
-        "accepted": [aid[0] for aid in accepted_ids],
+        "accepted": [a[0] for a in accepted_ids],
         "skipped": skipped_ids,
     }
-
-
-async def _process_batch_background(
-    items: list[tuple[int, str, int]],
-):
-    """Process documents sequentially to avoid resource contention."""
-    from app.api.documents import process_document_background
-
-    for doc_id, file_path, workspace_id in items:
-        try:
-            await process_document_background(doc_id, file_path, workspace_id)
-            logger.info(f"Batch: document {doc_id} processed")
-        except Exception as e:
-            logger.error(f"Batch: document {doc_id} failed: {e}")
 
 
 @router.post("/reindex/{document_id}", response_model=DocumentProcessResponse)
@@ -321,7 +337,7 @@ async def reindex_document(
     if document is None:
         raise NotFoundError("Document", document_id)
 
-    if document.status in (DocumentStatus.PROCESSING, DocumentStatus.PARSING, DocumentStatus.INDEXING):
+    if document.status in (DocumentStatus.PARSING, DocumentStatus.PARSED, DocumentStatus.INDEXED_PARTIAL):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Document is currently being processed"
@@ -406,9 +422,9 @@ async def reindex_workspace(
         select(Document).where(
             Document.workspace_id == workspace_id,
             Document.status.notin_([
-                DocumentStatus.PROCESSING,
                 DocumentStatus.PARSING,
-                DocumentStatus.INDEXING,
+                DocumentStatus.PARSED,
+                DocumentStatus.INDEXED_PARTIAL,
             ]),
         )
     )
@@ -588,10 +604,17 @@ async def get_document_chunks(
 # Knowledge Graph exploration endpoints (Phase 9)
 # ---------------------------------------------------------------------------
 
+# Module-level cache: workspace_id → KnowledgeGraphService
+# Avoids re-initializing LightRAG (and reloading the embedding model) on every request.
+_kg_service_cache: dict[int, "KnowledgeGraphService"] = {}
+
+
 async def _get_kg_service(workspace_id: int):
-    """Get KnowledgeGraphService for a knowledge base (if NexusRAG is active)."""
+    """Get KnowledgeGraphService for a knowledge base — cached per workspace."""
     from app.services.knowledge_graph_service import KnowledgeGraphService
-    return KnowledgeGraphService(workspace_id)
+    if workspace_id not in _kg_service_cache:
+        _kg_service_cache[workspace_id] = KnowledgeGraphService(workspace_id)
+    return _kg_service_cache[workspace_id]
 
 
 @router.get("/entities/{workspace_id}", response_model=list[KGEntityResponse])

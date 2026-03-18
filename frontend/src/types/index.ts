@@ -27,6 +27,12 @@ export interface WorkspaceSummary {
   document_count: number;
 }
 
+export interface DocumentTypeInfo {
+  id: number;
+  slug: string;
+  name: string;
+}
+
 export interface Document {
   id: number;
   workspace_id: number;
@@ -39,15 +45,43 @@ export interface Document {
   error_message: string | null;
   created_at: string;
   updated_at: string;
+  // NexusRAG metadata
   page_count?: number;
   image_count?: number;
   table_count?: number;
-  parser_version?: string;
+  parser_version?: string;           // "docling" | "legacy"
   processing_time_ms?: number;
+  // Digital signature metadata (PDF only, null if no signatures found)
+  digital_signatures?: Array<{
+    field_name?: string;
+    page?: number;
+    signer_name?: string;
+    organization?: string;
+    email?: string;
+    issuer?: string;
+    valid_from?: string;
+    valid_until?: string;
+    signing_time?: string;
+    reason?: string;
+    location?: string;
+  }> | null;
+  // Document type classification (auto-detected by pipeline)
+  document_type_id?: number | null;
+  document_type?: DocumentTypeInfo | null;
+  // Sub-task completion flags (set independently by each worker after PARSED)
+  embed_done?: boolean;              // embed worker → ChromaDB done
+  captions_done?: boolean;           // caption worker → image/table captions done
+  kg_done?: boolean;                 // kg worker → LightRAG KG ingest done
 }
 
 // RAG Types
-export type DocumentStatus = "pending" | "parsing" | "indexing" | "processing" | "indexed" | "failed";
+export type DocumentStatus =
+  | "pending"          // uploaded, waiting for parse_worker
+  | "parsing"          // parse_worker: Docling/OCR running
+  | "parsed"           // parse_worker done → embed+caption+kg dispatched
+  | "indexed_partial"  // embed done → vector search works; caption/KG still running
+  | "indexed"          // embed + captions done (searchable); KG may still run in background
+  | "failed";
 
 export type RAGQueryMode = "hybrid" | "vector_only" | "naive" | "local" | "global";
 

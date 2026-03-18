@@ -155,6 +155,59 @@ class StorageService:
                 if code not in ("404", "NoSuchKey"):
                     raise
 
+    async def generate_presigned_upload_url(
+        self,
+        key: str,
+        content_type: str,
+        expires_in: int = 900,
+    ) -> str:
+        """Generate a presigned PUT URL so the client can upload directly to MinIO.
+
+        The URL is generated against ``MINIO_ENDPOINT`` (internal) then the
+        hostname is rewritten to ``MINIO_PUBLIC_ENDPOINT`` so the browser can
+        reach MinIO directly.  If ``MINIO_PUBLIC_ENDPOINT`` is empty it falls
+        back to ``MINIO_ENDPOINT``.
+
+        Args:
+            key: Object key in the uploads bucket.
+            content_type: MIME type of the file (set as Content-Type on PUT).
+            expires_in: URL expiry in seconds (default 15 min).
+
+        Returns:
+            Presigned URL string reachable from the browser.
+        """
+        async with self._client() as s3:
+            url: str = await s3.generate_presigned_url(
+                "put_object",
+                Params={
+                    "Bucket": self._bucket_uploads,
+                    "Key": key,
+                    "ContentType": content_type,
+                },
+                ExpiresIn=expires_in,
+            )
+
+        # Rewrite internal hostname → public hostname so the browser can PUT
+        public = settings.MINIO_PUBLIC_ENDPOINT.rstrip("/")
+        internal = settings.MINIO_ENDPOINT.rstrip("/")
+        if public and public != internal and url.startswith(internal):
+            url = public + url[len(internal):]
+
+        logger.debug(f"[storage] generated presigned PUT URL for {key} (expires_in={expires_in}s)")
+        return url
+
+    async def object_exists(self, key: str) -> bool:
+        """Return True if the given key exists in the uploads bucket."""
+        async with self._client() as s3:
+            try:
+                await s3.head_object(Bucket=self._bucket_uploads, Key=key)
+                return True
+            except ClientError as e:
+                code = e.response["Error"]["Code"]
+                if code in ("404", "NoSuchKey"):
+                    return False
+                raise
+
 
 # Module-level singleton
 _storage_service: StorageService | None = None

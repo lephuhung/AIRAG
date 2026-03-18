@@ -24,6 +24,7 @@ from sqlalchemy import select
 
 from app.core.config import settings
 from app.core.database import async_session_maker
+from app.models.document_type import DocumentType as _DocumentType  # noqa: F401
 from app.models.document import Document, DocumentImage, DocumentStatus, DocumentTable
 from app.queue.messages import CaptionMessage
 from app.services.deep_document_parser import DeepDocumentParser

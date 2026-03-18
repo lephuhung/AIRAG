@@ -306,6 +306,16 @@ class HunyuanOCRService:
 
         Called inside a thread (via asyncio.to_thread) since vllm.LLM.__init__
         blocks while loading model weights onto the GPU.
+
+        vLLM ≥0.6 removed the `device` constructor argument — GPU placement is
+        controlled via CUDA_VISIBLE_DEVICES env var and `gpu_memory_utilization`
+        instead.  `gpu_memory_utilization` defaults to 0.9 (≈43 GB on a 47 GB
+        card), which is far too large for a 1B OCR model; we cap it at
+        NEXUSRAG_OCR_GPU_MEMORY_UTILIZATION (default 0.15 ≈ 7 GB).
+
+        CUDA_VISIBLE_DEVICES is set here so that vLLM (which reads it at import
+        time in its sub-process) directs the model to the right GPU even when the
+        parent process has already initialised CUDA on a different GPU.
         """
         if self._llm is not None:
             return self._llm, self._processor, self._sampling_params
@@ -319,26 +329,36 @@ class HunyuanOCRService:
                 f"Missing: {e}"
             )
 
-        device = settings.NEXUSRAG_OCR_LOCAL_DEVICE
-        # vLLM uses CUDA by default; explicit "cpu" is rarely supported for vision
-        # models but we pass it through for completeness.
-        tensor_parallel = 1
+        import os
+        cuda_device = settings.NEXUSRAG_OCR_CUDA_DEVICE
+        if cuda_device not in ("", "auto"):
+            # Must be set before vLLM spawns its EngineCore subprocess
+            os.environ["CUDA_VISIBLE_DEVICES"] = cuda_device
+            logger.info(f"[OCR/local] CUDA_VISIBLE_DEVICES={cuda_device}")
+
+        gpu_mem = settings.NEXUSRAG_OCR_GPU_MEMORY_UTILIZATION
+        max_model_len = settings.NEXUSRAG_OCR_MAX_MODEL_LEN
 
         logger.info(
-            f"[OCR/local] Loading {self._model} on device={device} "
-            f"(this may take a minute the first time)"
+            f"[OCR/local] Loading {self._model} "
+            f"(gpu_memory_utilization={gpu_mem}, max_model_len={max_model_len})"
         )
-        self._llm = LLM(
+
+        llm_kwargs: dict = dict(
             model=self._model,
             trust_remote_code=True,
-            tensor_parallel_size=tensor_parallel,
-            **({"device": device} if device not in ("auto", "") else {}),
+            tensor_parallel_size=1,
+            gpu_memory_utilization=gpu_mem,
         )
+        if max_model_len is not None:
+            llm_kwargs["max_model_len"] = max_model_len
+
+        self._llm = LLM(**llm_kwargs)
         self._processor = AutoProcessor.from_pretrained(
             self._model, trust_remote_code=True
         )
         self._sampling_params = SamplingParams(temperature=0.0, max_tokens=16384)
-        logger.info(f"[OCR/local] Model {self._model} loaded")
+        logger.info(f"[OCR/local] Model {self._model} loaded successfully")
         return self._llm, self._processor, self._sampling_params
 
     def _ocr_pages_local_sync(self, page_images: list[bytes]) -> list[str]:

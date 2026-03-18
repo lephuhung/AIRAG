@@ -115,11 +115,19 @@ services:
       MINIO_ENDPOINT: http://minio:9000
       MINIO_WEBHOOK_ENABLED: "true"
       NEO4J_URI: bolt://neo4j:7687
+      CUDA_VISIBLE_DEVICES: "1"
     volumes:
       - nexusrag_uploads:/app/backend/uploads
       - nexusrag_data:/app/backend/data
     ports:
       - "8080:8080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 10s
@@ -144,6 +152,17 @@ services:
         mc mb --ignore-existing local/nexusrag-markdown;
         mc event add --ignore-existing local/nexusrag-uploads
           arn:minio:sqs::NEXUSRAG:webhook --event put;
+        mc anonymous set-json /dev/stdin local/nexusrag-uploads <<'CORS'
+        {
+          \"CORSRules\": [{
+            \"AllowedOrigins\": [\"*\"],
+            \"AllowedMethods\": [\"PUT\", \"GET\", \"HEAD\"],
+            \"AllowedHeaders\": [\"*\"],
+            \"ExposeHeaders\": [\"ETag\"],
+            \"MaxAgeSeconds\": 3000
+          }]
+        }
+        CORS
         exit 0
       "
     restart: on-failure
@@ -171,11 +190,18 @@ services:
       MINIO_ENDPOINT: http://minio:9000
       WORKER_TYPE: parse
       AUTO_CREATE_TABLES: "false"
+      CUDA_VISIBLE_DEVICES: "1"
     volumes:
       - nexusrag_uploads:/app/backend/uploads
       - nexusrag_data:/app/backend/data
     deploy:
       replicas: 4
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
     command: ["python", "-m", "app.workers.runner"]
     restart: unless-stopped
 
@@ -202,11 +228,18 @@ services:
       MINIO_ENDPOINT: http://minio:9000
       WORKER_TYPE: caption
       AUTO_CREATE_TABLES: "false"
+      CUDA_VISIBLE_DEVICES: "1"
     volumes:
       - nexusrag_uploads:/app/backend/uploads
       - nexusrag_data:/app/backend/data
     deploy:
       replicas: 2
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
     command: ["python", "-m", "app.workers.runner"]
     restart: unless-stopped
 
@@ -232,10 +265,17 @@ services:
       NEO4J_URI: bolt://neo4j:7687
       WORKER_TYPE: kg
       AUTO_CREATE_TABLES: "false"
+      CUDA_VISIBLE_DEVICES: "1"
     volumes:
       - nexusrag_data:/app/backend/data
     deploy:
       replicas: 2
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
     command: ["python", "-m", "app.workers.runner"]
     restart: unless-stopped
 

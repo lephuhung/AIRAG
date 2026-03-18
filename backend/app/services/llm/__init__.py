@@ -43,7 +43,16 @@ def get_llm_provider() -> LLMProvider:
             model=settings.OLLAMA_MODEL,
         )
 
-    raise ValueError(f"Unknown LLM_PROVIDER: {provider!r}. Supported: gemini, ollama")
+    if provider == "openai_compatible":
+        from app.services.llm.openai_compatible import OpenAICompatibleLLMProvider
+
+        return OpenAICompatibleLLMProvider(
+            base_url=settings.OPENAI_COMPATIBLE_BASE_URL,
+            model=settings.OPENAI_COMPATIBLE_MODEL,
+            api_key=settings.OPENAI_COMPATIBLE_API_KEY,
+        )
+
+    raise ValueError(f"Unknown LLM_PROVIDER: {provider!r}. Supported: gemini, ollama, openai_compatible")
 
 
 @lru_cache

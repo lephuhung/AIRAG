@@ -234,12 +234,30 @@ class RAGService:
         return self.vector_store.count()
 
 
+# Module-level cache: workspace_id → NexusRAGService
+# Models (embedder, reranker, KG) are shared across requests; only `db` is swapped.
+_nexus_service_cache: dict[int, "NexusRAGService"] = {}
+
+
 def get_rag_service(db: AsyncSession, workspace_id: int) -> "RAGService | NexusRAGService":
-    """Factory function: routes to NexusRAGService or legacy RAGService based on config."""
+    """Factory function: routes to NexusRAGService or legacy RAGService based on config.
+
+    NexusRAGService instances are cached per workspace_id so that heavy models
+    (bge-m3 embedder, bge-reranker, LightRAG KG) are loaded only once.
+    The AsyncSession is refreshed on every call since sessions are per-request.
+    """
     from app.core.config import settings
 
     if settings.NEXUSRAG_ENABLED:
         from app.services.nexus_rag_service import NexusRAGService
-        return NexusRAGService(db=db, workspace_id=workspace_id)
+
+        if workspace_id not in _nexus_service_cache:
+            _nexus_service_cache[workspace_id] = NexusRAGService(db=db, workspace_id=workspace_id)
+        else:
+            # Reuse cached service but refresh the DB session for this request
+            _nexus_service_cache[workspace_id].db = db
+            _nexus_service_cache[workspace_id].retriever.db = db
+
+        return _nexus_service_cache[workspace_id]
 
     return RAGService(db=db, workspace_id=workspace_id)

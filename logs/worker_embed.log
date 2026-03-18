@@ -1,0 +1,46 @@
+2026-03-17 20:25:13,218 [INFO] __main__ — Starting worker: WORKER_TYPE=embed
+2026-03-17 20:25:14,142 [INFO] app.queue.connection — Connecting to RabbitMQ: amqp://guest:guest@localhost:5672/
+2026-03-17 20:25:14,153 [INFO] app.queue.connection — RabbitMQ connected
+2026-03-17 20:25:14,163 [INFO] app.queue.connection — Consuming nexusrag.embed/embed → nexusrag.embed
+2026-03-17 22:05:16,690 [INFO] app.workers.embed_worker — [embed_worker] doc=7
+/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/transformers/utils/hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+2026-03-17 22:05:21,959 [INFO] app.services.embedder — Loading embedding model: BAAI/bge-m3 (device=cpu)
+2026-03-17 22:05:21,961 [INFO] sentence_transformers.SentenceTransformer — Load pretrained SentenceTransformer: BAAI/bge-m3
+2026-03-17 22:05:28,202 [INFO] app.services.embedder — Embedding model loaded: BAAI/bge-m3 (dim=1024)
+Batches:   0%|          | 0/7 [00:00<?, ?it/s]Batches:  14%|█▍        | 1/7 [00:04<00:24,  4.09s/it]Batches:  29%|██▊       | 2/7 [00:13<00:34,  6.95s/it]Batches:  43%|████▎     | 3/7 [00:20<00:28,  7.07s/it]Batches:  57%|█████▋    | 4/7 [00:22<00:15,  5.10s/it]Batches:  71%|███████▏  | 5/7 [00:23<00:07,  3.71s/it]Batches:  86%|████████▌ | 6/7 [00:24<00:02,  2.79s/it]Batches: 100%|██████████| 7/7 [00:24<00:00,  3.51s/it]
+2026-03-17 22:05:52,825 [INFO] app.services.vector_store — Connecting to ChromaDB at localhost:8002
+2026-03-17 22:05:52,923 [INFO] httpx — HTTP Request: GET http://localhost:8002/api/v2/auth/identity "HTTP/1.1 200 OK"
+2026-03-17 22:05:52,945 [INFO] httpx — HTTP Request: GET http://localhost:8002/api/v2/tenants/default_tenant "HTTP/1.1 200 OK"
+2026-03-17 22:05:52,946 [INFO] httpx — HTTP Request: GET http://localhost:8002/api/v2/tenants/default_tenant/databases/default_database "HTTP/1.1 200 OK"
+2026-03-17 22:05:52,947 [INFO] httpx — HTTP Request: GET http://localhost:8002/api/v2/heartbeat "HTTP/1.1 200 OK"
+2026-03-17 22:05:52,947 [INFO] app.services.vector_store — Connected to ChromaDB successfully
+2026-03-17 22:05:52,950 [INFO] httpx — HTTP Request: POST http://localhost:8002/api/v2/tenants/default_tenant/databases/default_database/collections "HTTP/1.1 200 OK"
+2026-03-17 22:05:52,959 [INFO] httpx — HTTP Request: GET http://localhost:8002/api/v2/pre-flight-checks "HTTP/1.1 200 OK"
+2026-03-17 22:05:53,367 [INFO] httpx — HTTP Request: POST http://localhost:8002/api/v2/tenants/default_tenant/databases/default_database/collections/9e23c648-ed44-4704-8003-e4ef3df2cf43/add "HTTP/1.1 201 Created"
+2026-03-17 22:05:53,367 [INFO] app.services.vector_store — Added 193 documents to collection kb_1
+2026-03-17 22:05:53,377 [INFO] app.workers.embed_worker — [embed_worker] doc=7 embedded 193 chunks → INDEXED_PARTIAL
+2026-03-17 22:09:38,627 [INFO] app.workers.embed_worker — [embed_worker] doc=7
+Batches:   0%|          | 0/6 [00:00<?, ?it/s]Batches:  17%|█▋        | 1/6 [00:04<00:24,  4.86s/it]Batches:  33%|███▎      | 2/6 [00:08<00:17,  4.32s/it]Batches:  50%|█████     | 3/6 [00:13<00:12,  4.29s/it]Batches:  67%|██████▋   | 4/6 [00:15<00:07,  3.75s/it]Batches:  83%|████████▎ | 5/6 [00:17<00:02,  2.83s/it]Batches: 100%|██████████| 6/6 [00:18<00:00,  2.19s/it]Batches: 100%|██████████| 6/6 [00:18<00:00,  3.02s/it]
+2026-03-17 22:09:56,797 [INFO] httpx — HTTP Request: POST http://localhost:8002/api/v2/tenants/default_tenant/databases/default_database/collections "HTTP/1.1 200 OK"
+2026-03-17 22:09:56,941 [INFO] httpx — HTTP Request: POST http://localhost:8002/api/v2/tenants/default_tenant/databases/default_database/collections/9e23c648-ed44-4704-8003-e4ef3df2cf43/add "HTTP/1.1 201 Created"
+2026-03-17 22:09:56,942 [INFO] app.services.vector_store — Added 192 documents to collection kb_1
+2026-03-17 22:09:56,945 [INFO] app.workers.embed_worker — [embed_worker] doc=7 embedded 192 chunks → INDEXED_PARTIAL
+2026-03-17 22:24:40,519 [INFO] app.workers.embed_worker — [embed_worker] doc=8
+Batches:   0%|          | 0/1 [00:00<?, ?it/s]Batches: 100%|██████████| 1/1 [00:02<00:00,  2.79s/it]Batches: 100%|██████████| 1/1 [00:02<00:00,  2.79s/it]
+2026-03-17 22:24:43,356 [INFO] httpx — HTTP Request: POST http://localhost:8002/api/v2/tenants/default_tenant/databases/default_database/collections "HTTP/1.1 200 OK"
+2026-03-17 22:24:43,412 [INFO] httpx — HTTP Request: POST http://localhost:8002/api/v2/tenants/default_tenant/databases/default_database/collections/9e23c648-ed44-4704-8003-e4ef3df2cf43/add "HTTP/1.1 201 Created"
+2026-03-17 22:24:43,413 [INFO] app.services.vector_store — Added 30 documents to collection kb_1
+2026-03-17 22:24:43,416 [INFO] app.workers.embed_worker — [embed_worker] doc=8 embedded 30 chunks → INDEXED_PARTIAL
+2026-03-17 22:26:56,123 [INFO] app.workers.embed_worker — [embed_worker] doc=9
+Batches:   0%|          | 0/3 [00:00<?, ?it/s]Batches:  33%|███▎      | 1/3 [00:19<00:38, 19.36s/it]Batches:  67%|██████▋   | 2/3 [00:25<00:11, 11.64s/it]Batches: 100%|██████████| 3/3 [00:25<00:00,  6.45s/it]Batches: 100%|██████████| 3/3 [00:25<00:00,  8.62s/it]
+2026-03-17 22:27:22,031 [INFO] httpx — HTTP Request: POST http://localhost:8002/api/v2/tenants/default_tenant/databases/default_database/collections "HTTP/1.1 200 OK"
+2026-03-17 22:27:22,202 [INFO] httpx — HTTP Request: POST http://localhost:8002/api/v2/tenants/default_tenant/databases/default_database/collections/9e23c648-ed44-4704-8003-e4ef3df2cf43/add "HTTP/1.1 201 Created"
+2026-03-17 22:27:22,202 [INFO] app.services.vector_store — Added 70 documents to collection kb_1
+2026-03-17 22:27:22,205 [INFO] app.workers.embed_worker — [embed_worker] doc=9 embedded 70 chunks → INDEXED_PARTIAL
+2026-03-17 22:50:05,480 [INFO] app.workers.embed_worker — [embed_worker] doc=10
+Batches:   0%|          | 0/8 [00:00<?, ?it/s]Batches:  12%|█▎        | 1/8 [00:04<00:32,  4.70s/it]Batches:  25%|██▌       | 2/8 [00:10<00:30,  5.08s/it]Batches:  38%|███▊      | 3/8 [00:14<00:23,  4.63s/it]Batches:  50%|█████     | 4/8 [00:16<00:15,  3.84s/it]Batches:  62%|██████▎   | 5/8 [00:17<00:08,  2.89s/it]Batches:  75%|███████▌  | 6/8 [00:18<00:04,  2.22s/it]Batches:  88%|████████▊ | 7/8 [00:20<00:01,  1.86s/it]Batches: 100%|██████████| 8/8 [00:20<00:00,  2.51s/it]
+2026-03-17 22:50:25,616 [INFO] httpx — HTTP Request: POST http://localhost:8002/api/v2/tenants/default_tenant/databases/default_database/collections "HTTP/1.1 200 OK"
+2026-03-17 22:50:26,000 [INFO] httpx — HTTP Request: POST http://localhost:8002/api/v2/tenants/default_tenant/databases/default_database/collections/9e23c648-ed44-4704-8003-e4ef3df2cf43/add "HTTP/1.1 201 Created"
+2026-03-17 22:50:26,001 [INFO] app.services.vector_store — Added 226 documents to collection kb_1
+2026-03-17 22:50:26,005 [INFO] app.workers.embed_worker — [embed_worker] doc=10 embedded 226 chunks → INDEXED_PARTIAL

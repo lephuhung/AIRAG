@@ -41,6 +41,10 @@ class DocumentResponse(DocumentBase):
     # Document type classification
     document_type_id: int | None = None
     document_type: DocumentTypeInfo | None = None
+    # Sub-task completion flags (set independently by each worker after PARSED)
+    embed_done: bool = False
+    captions_done: bool = False
+    kg_done: bool = False
 
     model_config = {"from_attributes": True}
 

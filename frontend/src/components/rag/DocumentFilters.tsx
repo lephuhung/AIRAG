@@ -13,6 +13,9 @@ const TABS: { value: FilterStatus; label: string }[] = [
   { value: "failed", label: "Failed" },
 ];
 
+// Statuses that should be aggregated under the "Processing" tab
+const PROCESSING_GROUP = new Set<DocumentStatus>(["parsing", "parsed", "indexed_partial"]);
+
 interface DocumentFiltersProps {
   searchQuery: string;
   onSearchChange: (q: string) => void;
@@ -47,10 +50,13 @@ export const DocumentFilters = memo(function DocumentFilters({
       <div className="flex items-center gap-1 bg-muted/40 rounded-lg p-0.5">
         {TABS.map((tab) => {
           const isActive = statusFilter === tab.value;
-          // Merge processing-like statuses into the "Processing" tab
+          // Merge all in-progress statuses into the "Processing" tab count
           let count = counts[tab.value] ?? 0;
           if (tab.value === "parsing") {
-            count = (counts.parsing ?? 0) + (counts.indexing ?? 0) + (counts.processing ?? 0);
+            count = Array.from(PROCESSING_GROUP).reduce(
+              (sum, s) => sum + (counts[s] ?? 0),
+              0,
+            );
           }
           return (
             <button

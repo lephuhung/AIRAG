@@ -14,6 +14,7 @@ Responsibilities:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import tempfile
 import time
@@ -22,6 +23,7 @@ from pathlib import Path
 from sqlalchemy import delete, select
 
 from app.core.database import async_session_maker
+from app.models.document_type import DocumentType as _DocumentType  # noqa: F401 — ensures SQLAlchemy mapper resolves "DocumentType" relationship
 from app.models.document import Document, DocumentImage, DocumentStatus, DocumentTable
 from app.queue import connection as mq
 from app.queue.messages import CaptionMessage, EmbedMessage, KGMessage, ParseMessage

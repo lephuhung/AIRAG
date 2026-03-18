@@ -14,6 +14,9 @@ import {
   Clock,
   File,
   Sparkles,
+  Layers,
+  ImageIcon,
+  Network,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -39,24 +42,64 @@ function getFileConfig(fileType: string) {
 // Status badge
 // ---------------------------------------------------------------------------
 const STATUS_CONFIG: Record<DocumentStatus, { label: string; className: string; icon: typeof CheckCircle2 }> = {
-  pending:    { label: "Pending",    className: "bg-muted text-muted-foreground",           icon: Clock },
-  parsing:    { label: "Parsing",    className: "bg-blue-400/15 text-blue-400",             icon: Loader2 },
-  indexing:   { label: "Indexing",   className: "bg-amber-400/15 text-amber-400",           icon: Loader2 },
-  processing: { label: "Processing", className: "bg-amber-400/15 text-amber-400",           icon: Loader2 },
-  indexed:    { label: "Indexed",    className: "bg-primary/15 text-primary",               icon: CheckCircle2 },
-  failed:     { label: "Failed",     className: "bg-destructive/15 text-destructive",       icon: XCircle },
+  pending:         { label: "Pending",  className: "bg-muted text-muted-foreground",         icon: Clock },
+  parsing:         { label: "Parsing",  className: "bg-blue-400/15 text-blue-400",           icon: Loader2 },
+  parsed:          { label: "Parsed",   className: "bg-cyan-400/15 text-cyan-400",           icon: Loader2 },
+  indexed_partial: { label: "Indexing", className: "bg-amber-400/15 text-amber-400",         icon: Loader2 },
+  indexed:         { label: "Indexed",  className: "bg-primary/15 text-primary",             icon: CheckCircle2 },
+  failed:          { label: "Failed",   className: "bg-destructive/15 text-destructive",     icon: XCircle },
 };
 
 function StatusBadge({ status }: { status: DocumentStatus }) {
   const config = STATUS_CONFIG[status] ?? STATUS_CONFIG.pending;
   const Icon = config.icon;
-  const isAnimated = status === "parsing" || status === "indexing" || status === "processing";
+  const isAnimated = status === "parsing" || status === "parsed" || status === "indexed_partial";
 
   return (
     <span className={cn("inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium rounded-full", config.className)}>
       <Icon className={cn("w-3 h-3", isAnimated && "animate-spin")} />
       {config.label}
     </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Sub-task progress pills (shown when status = parsed | indexed_partial)
+// ---------------------------------------------------------------------------
+interface SubTaskProgressProps {
+  embed_done?: boolean;
+  captions_done?: boolean;
+  kg_done?: boolean;
+}
+
+function SubTaskProgress({ embed_done, captions_done, kg_done }: SubTaskProgressProps) {
+  const tasks = [
+    { done: embed_done,    label: "Embed",    Icon: Layers },
+    { done: captions_done, label: "Captions", Icon: ImageIcon },
+    { done: kg_done,       label: "KG",       Icon: Network },
+  ];
+
+  return (
+    <div className="flex items-center gap-1.5 mt-1.5">
+      {tasks.map(({ done, label, Icon }) => (
+        <span
+          key={label}
+          className={cn(
+            "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium border",
+            done
+              ? "bg-green-500/10 text-green-400 border-green-500/20"
+              : "bg-amber-400/10 text-amber-400/70 border-amber-400/20",
+          )}
+        >
+          {done
+            ? <CheckCircle2 className="w-2.5 h-2.5" />
+            : <Loader2 className="w-2.5 h-2.5 animate-spin" />
+          }
+          <Icon className="w-2.5 h-2.5" />
+          {label}
+        </span>
+      ))}
+    </div>
   );
 }
 
@@ -96,6 +139,8 @@ interface DocumentCardProps {
   onClick?: (doc: Document) => void;
 }
 
+const ACTIVE_STATUSES: DocumentStatus[] = ["parsing", "parsed", "indexed_partial"];
+
 export const DocumentCard = memo(function DocumentCard({
   doc,
   selected,
@@ -111,7 +156,10 @@ export const DocumentCard = memo(function DocumentCard({
     ? `${(doc.file_size / (1024 * 1024)).toFixed(1)} MB`
     : `${Math.round(doc.file_size / 1024)} KB`;
 
-  const isActive = doc.status === "parsing" || doc.status === "indexing" || doc.status === "processing";
+  const isActive = ACTIVE_STATUSES.includes(doc.status);
+  const showSubTasks = doc.status === "parsed" || doc.status === "indexed_partial";
+  // KG still running in background after document is indexed
+  const kgPending = doc.status === "indexed" && doc.kg_done === false;
 
   // Flash animation when user just clicked "Analyze"
   const [justTriggered, setJustTriggered] = useState(false);
@@ -141,7 +189,6 @@ export const DocumentCard = memo(function DocumentCard({
       transition={justTriggered ? { duration: 0.4 } : undefined}
       className={cn(
         "group relative rounded-lg border bg-card transition-all duration-200",
-        // Active processing state — animated border glow
         isActive
           ? "border-blue-400/50 shadow-[0_0_12px_-3px_rgba(96,165,250,0.3)]"
           : "border-border hover:shadow-md hover:-translate-y-0.5",
@@ -182,13 +229,39 @@ export const DocumentCard = memo(function DocumentCard({
             {doc.parser_version && (
               <span className="text-xs text-muted-foreground/60">{doc.parser_version}</span>
             )}
-            {isActive && (
+            {doc.status === "parsing" && (
               <span className="text-xs text-blue-400/80 font-medium animate-pulse">
-                Analyzing document...
+                Parsing document...
+              </span>
+            )}
+            {doc.status === "parsed" && (
+              <span className="text-xs text-cyan-400/80 font-medium animate-pulse">
+                Building index...
+              </span>
+            )}
+            {doc.status === "indexed_partial" && (
+              <span className="text-xs text-amber-400/80 font-medium animate-pulse">
+                Finalizing...
               </span>
             )}
           </div>
           <MetadataChips doc={doc} />
+          {showSubTasks && (
+            <SubTaskProgress
+              embed_done={doc.embed_done}
+              captions_done={doc.captions_done}
+              kg_done={doc.kg_done}
+            />
+          )}
+          {kgPending && (
+            <div className="flex items-center gap-1 mt-1.5">
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium border bg-violet-400/10 text-violet-400/80 border-violet-400/20">
+                <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                <Network className="w-2.5 h-2.5" />
+                Building KG…
+              </span>
+            </div>
+          )}
           {doc.error_message && (
             <p className="text-xs text-destructive mt-1 truncate">{doc.error_message}</p>
           )}
@@ -196,7 +269,6 @@ export const DocumentCard = memo(function DocumentCard({
 
         {/* Actions */}
         <div className="flex items-center gap-1 flex-shrink-0">
-          {/* Analyze button — visible for pending/failed documents */}
           {(doc.status === "pending" || doc.status === "failed") && (
             <Button
               variant="default"
@@ -213,7 +285,6 @@ export const DocumentCard = memo(function DocumentCard({
               Analyze
             </Button>
           )}
-          {/* Re-process for indexed docs — hover only */}
           {doc.status === "indexed" && (
             <Button
               variant="ghost"
@@ -225,7 +296,6 @@ export const DocumentCard = memo(function DocumentCard({
               <RefreshCw className="w-3.5 h-3.5" />
             </Button>
           )}
-          {/* Delete — hover only */}
           <Button
             variant="ghost"
             size="icon"

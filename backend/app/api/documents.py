@@ -6,8 +6,9 @@ import uuid
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Body
 from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -188,6 +189,177 @@ async def upload_document(
         filename=document.original_filename,
         status=document.status,
         message="Document uploaded and queued for processing."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Presigned-upload flow (frontend uploads directly to MinIO)
+# ---------------------------------------------------------------------------
+
+class PresignRequest(BaseModel):
+    filename: str
+    file_size: int
+    content_type: str | None = None
+
+
+class PresignResponse(BaseModel):
+    document_id: int
+    upload_url: str          # Presigned PUT URL pointing directly to MinIO
+    minio_key: str           # Object key — needed for /confirm call
+
+
+class ConfirmRequest(BaseModel):
+    document_id: int
+
+
+@router.post("/upload/{workspace_id}/presign", response_model=PresignResponse)
+async def presign_upload(
+    workspace_id: int,
+    body: PresignRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Step 1 of direct-to-MinIO upload.
+
+    Creates the Document record in PENDING state and returns a presigned PUT
+    URL.  The frontend must PUT the file bytes directly to that URL, then call
+    ``/confirm`` to trigger the parse pipeline.
+    """
+    result = await db.execute(select(KnowledgeBase).where(KnowledgeBase.id == workspace_id))
+    kb = result.scalar_one_or_none()
+    if kb is None:
+        raise NotFoundError("KnowledgeBase", workspace_id)
+
+    ext = Path(body.filename).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File type {ext} not allowed. Allowed: {ALLOWED_EXTENSIONS}",
+        )
+
+    if body.file_size > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"File too large. Max size: {MAX_FILE_SIZE // 1024 // 1024}MB",
+        )
+
+    import re as _re
+    safe_stem = _re.sub(r"[^\w\-.]", "_", Path(body.filename).stem)
+    filename = f"{safe_stem}{ext}"
+
+    document = Document(
+        workspace_id=workspace_id,
+        filename=filename,
+        original_filename=body.filename,
+        file_type=ext[1:],
+        file_size=body.file_size,
+        status=DocumentStatus.PENDING,
+    )
+    db.add(document)
+    await db.commit()
+    await db.refresh(document)
+
+    from app.services.storage_service import get_storage_service
+    storage = get_storage_service()
+    upload_key = storage._make_upload_key(workspace_id, document.id, ext)
+
+    content_type = body.content_type or _mime_for_ext(ext)
+    try:
+        presigned_url = await storage.generate_presigned_upload_url(
+            key=upload_key,
+            content_type=content_type,
+        )
+    except Exception as e:
+        # Roll back the document record so the client can retry cleanly
+        await db.delete(document)
+        await db.commit()
+        logger.error(f"Failed to generate presigned URL for doc {document.id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Storage service unavailable — could not generate upload URL.",
+        )
+
+    document.upload_s3_key = upload_key
+    await db.commit()
+
+    return PresignResponse(
+        document_id=document.id,
+        upload_url=presigned_url,
+        minio_key=upload_key,
+    )
+
+
+@router.post("/upload/{workspace_id}/confirm", response_model=DocumentUploadResponse)
+async def confirm_upload(
+    workspace_id: int,
+    body: ConfirmRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Step 2 of direct-to-MinIO upload.
+
+    Call this after the frontend has successfully PUT the file to the presigned
+    URL.  Verifies the object exists in MinIO then publishes a ParseMessage to
+    kick off the pipeline.
+    """
+    result = await db.execute(
+        select(Document).where(
+            Document.id == body.document_id,
+            Document.workspace_id == workspace_id,
+        )
+    )
+    document = result.scalar_one_or_none()
+    if document is None:
+        raise NotFoundError("Document", body.document_id)
+
+    if document.status != DocumentStatus.PENDING:
+        # Already queued / processing — idempotent response
+        return DocumentUploadResponse(
+            id=document.id,
+            filename=document.original_filename,
+            status=document.status,
+            message="Document already queued for processing.",
+        )
+
+    # Verify the file actually landed in MinIO before queuing
+    from app.services.storage_service import get_storage_service
+    storage = get_storage_service()
+    if document.upload_s3_key:
+        try:
+            exists = await storage.object_exists(document.upload_s3_key)
+        except Exception as e:
+            logger.error(f"MinIO object_exists check failed for doc {document.id}: {e}")
+            exists = True  # optimistic — proceed anyway
+        if not exists:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="File not found in storage. Please retry the upload.",
+            )
+
+    if not settings.MINIO_WEBHOOK_ENABLED:
+        try:
+            from app.queue.publisher import publish_parse_task
+            await publish_parse_task(
+                document_id=document.id,
+                workspace_id=workspace_id,
+                minio_key=document.upload_s3_key or "",
+                original_filename=document.original_filename,
+            )
+            logger.info(f"Document {document.id} queued for processing (presign confirm)")
+        except Exception as e:
+            logger.error(
+                f"Failed to publish parse task for doc {document.id}: {e}. "
+                "Document stays PENDING — manual requeue may be needed."
+            )
+    else:
+        logger.info(
+            f"Document {document.id} confirmed in MinIO — "
+            "waiting for webhook event to trigger parse"
+        )
+
+    return DocumentUploadResponse(
+        id=document.id,
+        filename=document.original_filename,
+        status=document.status,
+        message="Document queued for processing.",
     )
 
 

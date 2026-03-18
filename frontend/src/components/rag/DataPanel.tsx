@@ -24,8 +24,8 @@ import type { Document, RAGStats, DocumentStatus } from "@/types";
 
 const PROCESSING_STATUSES = new Set<DocumentStatus>([
   "parsing",
-  "indexing",
-  "processing",
+  "parsed",
+  "indexed_partial",
 ]);
 const PROCESSABLE_STATUSES = new Set<DocumentStatus>(["pending", "failed"]);
 
@@ -85,8 +85,7 @@ export const DataPanel = memo(function DataPanel({
     if (statusFilter !== "all") {
       if (statusFilter === "parsing") {
         result = result.filter((d) => PROCESSING_STATUSES.has(d.status));
-      } else {
-        result = result.filter((d) => d.status === statusFilter);
+      } else {        result = result.filter((d) => d.status === statusFilter);
       }
     }
     if (searchQuery.trim()) {

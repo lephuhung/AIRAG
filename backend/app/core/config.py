@@ -27,6 +27,10 @@ class Settings(BaseSettings):
     MINIO_BUCKET_MARKDOWN: str = Field(default="nexusrag-markdown")
     MINIO_SECURE: bool = Field(default=False)
     MINIO_WEBHOOK_ENABLED: bool = Field(default=False)
+    # Public URL reachable by the browser for presigned uploads.
+    # In Docker: set to http://localhost:9000 (or your server IP).
+    # Defaults to MINIO_ENDPOINT when not set.
+    MINIO_PUBLIC_ENDPOINT: str = Field(default="")
 
     # LLM
     LLM_PROVIDER: str = Field(default="gemini")
@@ -37,6 +41,11 @@ class Settings(BaseSettings):
     OLLAMA_HOST: str = Field(default="http://localhost:11434")
     OLLAMA_MODEL: str = Field(default="gemma3:12b")
     OLLAMA_ENABLE_THINKING: bool = Field(default=False)
+
+    # OpenAI-compatible provider (vLLM, LM Studio, llama.cpp, etc.)
+    OPENAI_COMPATIBLE_BASE_URL: str = Field(default="http://127.0.0.1:8000/v1")
+    OPENAI_COMPATIBLE_MODEL: str = Field(default="default")
+    OPENAI_COMPATIBLE_API_KEY: str = Field(default="none")
 
     # KG Embedding
     KG_EMBEDDING_PROVIDER: str = Field(default="local")
@@ -84,7 +93,17 @@ class Settings(BaseSettings):
     NEXUSRAG_ENABLE_OCR: bool = Field(default=True)
     NEXUSRAG_OCR_SCANNED_THRESHOLD: float = Field(default=0.5)
     NEXUSRAG_OCR_LOCAL: bool = Field(default=False)
-    NEXUSRAG_OCR_LOCAL_DEVICE: str = Field(default="auto")
+    # GPU index for the local vLLM OCR process.
+    # Set to "1" if GPU 0 is occupied by a large LLM server.
+    # Translates to CUDA_VISIBLE_DEVICES=<value> before vLLM initialises.
+    # Use "0" for the first GPU, "1" for the second, "" or "auto" to leave
+    # CUDA_VISIBLE_DEVICES unchanged (vLLM picks the first available GPU).
+    NEXUSRAG_OCR_CUDA_DEVICE: str = Field(default="auto")
+    # Fraction of the selected GPU's VRAM vLLM may use for the OCR model KV cache.
+    # HunyuanOCR is a 1B model — 0.15 (~7 GB on a 47 GB card) is ample.
+    NEXUSRAG_OCR_GPU_MEMORY_UTILIZATION: float = Field(default=0.15)
+    # Max sequence length passed to vLLM; None = use model default.
+    NEXUSRAG_OCR_MAX_MODEL_LEN: int | None = Field(default=None)
     HUNYUAN_OCR_API_URL: str = Field(default="http://10.8.0.8:8001/v1")
     HUNYUAN_OCR_MODEL: str = Field(default="tencent/HunyuanOCR")
 
