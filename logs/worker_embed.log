@@ -44,3 +44,7 @@
 2026-03-17 22:50:26,000 [INFO] httpx — HTTP Request: POST http://localhost:8002/api/v2/tenants/default_tenant/databases/default_database/collections/9e23c648-ed44-4704-8003-e4ef3df2cf43/add "HTTP/1.1 201 Created"
 2026-03-17 22:50:26,001 [INFO] app.services.vector_store — Added 226 documents to collection kb_1
 2026-03-17 22:50:26,005 [INFO] app.workers.embed_worker — [embed_worker] doc=10 embedded 226 chunks → INDEXED_PARTIAL
+2026-03-18 17:43:58,184 [INFO] __main__ — Starting worker: WORKER_TYPE=embed
+2026-03-18 17:43:59,082 [INFO] app.queue.connection — Connecting to RabbitMQ: amqp://guest:guest@localhost:5672/
+2026-03-18 17:43:59,092 [INFO] app.queue.connection — RabbitMQ connected
+2026-03-18 17:43:59,099 [INFO] app.queue.connection — Consuming nexusrag.embed/embed → nexusrag.embed

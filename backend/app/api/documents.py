@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import os
+import io
 import re
 import uuid
 import logging
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Body
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -454,6 +455,49 @@ async def get_document_images(
         )
         for img in images
     ]
+
+
+@router.get("/{document_id}/download")
+async def download_document(
+    document_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Download the original uploaded file from MinIO."""
+    result = await db.execute(select(Document).where(Document.id == document_id))
+    document = result.scalar_one_or_none()
+
+    if document is None:
+        raise NotFoundError("Document", document_id)
+
+    if not document.upload_s3_key:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Original file not available in storage.",
+        )
+
+    from app.services.storage_service import get_storage_service
+    storage = get_storage_service()
+
+    try:
+        file_bytes = await storage.download_file(document.upload_s3_key)
+    except Exception as e:
+        logger.error(f"Failed to download file from MinIO for doc {document_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Storage service is temporarily unavailable.",
+        )
+
+    ext = Path(document.original_filename).suffix.lower()
+    content_type = _mime_for_ext(ext)
+
+    return StreamingResponse(
+        io.BytesIO(file_bytes),
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{document.original_filename}"',
+            "Content-Length": str(len(file_bytes)),
+        },
+    )
 
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -13,7 +13,7 @@
 import { create } from "zustand";
 import type { Document, ChatSourceChunk, ChatImageRef } from "@/types";
 
-export type VisualTab = "content" | "kg";
+export type VisualTab = "content" | "kg" | "pipeline";
 export type KGSubTab = "graph" | "entities";
 
 // Module-level timer so we can cancel stale deferred scrolls

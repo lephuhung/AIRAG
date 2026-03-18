@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     CHROMA_HOST: str = Field(default="localhost")
     CHROMA_PORT: int = Field(default=8002)
     RABBITMQ_URL: str = Field(default="amqp://guest:guest@localhost:5672/")
+    RABBITMQ_MANAGEMENT_URL: str = Field(default="http://localhost:15672")
+    RABBITMQ_MANAGEMENT_USER: str = Field(default="guest")
+    RABBITMQ_MANAGEMENT_PASS: str = Field(default="guest")
 
     # MinIO
     MINIO_ENDPOINT: str = Field(default="http://localhost:9000")

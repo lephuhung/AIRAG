@@ -205,6 +205,42 @@ services:
     command: ["python", "-m", "app.workers.runner"]
     restart: unless-stopped
 
+  # ── Embed workers (bge-m3 embedding → ChromaDB) ─────────────────────────
+  worker-embed:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      chromadb:
+        condition: service_started
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/nexusrag
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      MINIO_ENDPOINT: http://minio:9000
+      WORKER_TYPE: embed
+      AUTO_CREATE_TABLES: "false"
+      CUDA_VISIBLE_DEVICES: "1"
+    volumes:
+      - nexusrag_uploads:/app/backend/uploads
+      - nexusrag_data:/app/backend/data
+    deploy:
+      replicas: 2
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    command: ["python", "-m", "app.workers.runner"]
+    restart: unless-stopped
+
   # ── Caption workers (Vision + Text LLM — images & tables) ───────────────
   worker-caption:
     build:

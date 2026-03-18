@@ -7527,3 +7527,12 @@ INFO: Enqueued document processing pipeline stopped
 2026-03-17 22:50:39,681 [INFO] app.services.knowledge_graph_service — KG ingested 87371 chars for workspace 1
 2026-03-17 22:50:39,690 [INFO] app.workers.kg_worker — [kg_worker] doc=10 KG ingest done
 2026-03-17 22:50:39,705 [INFO] app.workers.utils — [finalize] doc=10 fully INDEXED (embed✓ captions✓ kg✓)
+2026-03-18 17:43:58,184 [INFO] __main__ — Starting worker: WORKER_TYPE=kg
+2026-03-18 17:43:58,611 [INFO] __main__ — [kg_runner] Starting consumers for workspaces: [1, 2, 3, 4, 5]
+2026-03-18 17:43:58,611 [INFO] app.queue.connection — Connecting to RabbitMQ: amqp://guest:guest@localhost:5672/
+2026-03-18 17:43:58,619 [INFO] app.queue.connection — RabbitMQ connected
+2026-03-18 17:43:58,633 [INFO] app.queue.connection — Consuming nexusrag.kg/1 → nexusrag.kg.1
+2026-03-18 17:43:58,643 [INFO] app.queue.connection — Consuming nexusrag.kg/2 → nexusrag.kg.2
+2026-03-18 17:43:58,644 [INFO] app.queue.connection — Consuming nexusrag.kg/5 → nexusrag.kg.5
+2026-03-18 17:43:58,645 [INFO] app.queue.connection — Consuming nexusrag.kg/4 → nexusrag.kg.4
+2026-03-18 17:43:58,645 [INFO] app.queue.connection — Consuming nexusrag.kg/3 → nexusrag.kg.3

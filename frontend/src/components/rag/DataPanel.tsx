@@ -220,9 +220,19 @@ export const DataPanel = memo(function DataPanel({
             <FileText className="w-3.5 h-3.5" />
             Documents
           </h2>
-          <span className="text-[10px] text-muted-foreground">
-            {documents?.length ?? 0} file{(documents?.length ?? 0) !== 1 ? "s" : ""}
-          </span>
+          <div className="flex items-center gap-2">
+            {workspace && (
+              <button
+                onClick={() => navigate(`/knowledge-bases/${workspace.id}/files`)}
+                className="text-[10px] text-primary hover:underline transition-colors"
+              >
+                View all &rarr;
+              </button>
+            )}
+            <span className="text-[10px] text-muted-foreground">
+              {documents?.length ?? 0} file{(documents?.length ?? 0) !== 1 ? "s" : ""}
+            </span>
+          </div>
         </div>
         <StatsBar stats={ragStats} processingCount={processingCount} />
 

@@ -27,7 +27,8 @@ class Document(Base):
     file_type: Mapped[str] = mapped_column(String(50))
     file_size: Mapped[int] = mapped_column(Integer)
     status: Mapped[DocumentStatus] = mapped_column(
-        Enum(DocumentStatus), default=DocumentStatus.PENDING
+        Enum(DocumentStatus, values_callable=lambda enum_cls: [m.value for m in enum_cls]),
+        default=DocumentStatus.PENDING,
     )
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
     error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)

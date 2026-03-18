@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -26,6 +27,144 @@ from app.services.models.parsed_document import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Vietnamese whitespace normalization
+# ---------------------------------------------------------------------------
+# Docling's PDF backend (docling-parse) reconstructs text from per-glyph
+# coordinates in the PDF content stream.  Many Vietnamese PDFs — especially
+# government legislation — encode each glyph with its own positioning
+# operator, causing Docling to insert a space between every character:
+#
+#     "L u ậ t"   instead of   "Luật"
+#
+# This is a well-known issue with CID-keyed / ToUnicode-mapped Vietnamese
+# fonts in the wild.
+#
+# The algorithm below works line-by-line:
+#   1. NFC-normalize Unicode so decomposed diacritics become single codepoints.
+#   2. Detect "single-char + single-space" runs — consecutive Unicode letters
+#      (including Vietnamese diacritics) separated by exactly ONE space.
+#      These are almost certainly spurious per-glyph spaces.
+#   3. Rejoin those runs into solid words.
+#   4. Collapse remaining multiple spaces to one space.
+#
+# Lines that look like markdown structure (headings, tables, images, code
+# fences, horizontal rules) are left untouched.
+
+# Regex: a run of >=2 single Unicode letters (including accented), each
+# separated by exactly ONE space.  We anchor on word boundaries so we don't
+# accidentally eat real single-letter words like "I" in English prose.
+# The negative lookahead/lookbehind for \S ensures we only match isolated
+# char-space-char sequences.
+_SCATTERED_CHARS_RE = re.compile(
+    r'(?<!\S)'                  # not preceded by a non-space char
+    r'(\w)'                     # first char
+    r'((?:\s\w){2,})'           # 2+ more " <char>" pairs  (min 3 chars total)
+    r'(?!\S)',                   # not followed by a non-space char
+)
+
+# Lines we should never touch
+_STRUCTURE_LINE_RE = re.compile(
+    r'^\s*(?:'
+    r'[#]{1,6}\s'              # markdown headings
+    r'|[|]'                     # table rows
+    r'|[-*_]{3,}'              # horizontal rules
+    r'|```'                     # code fences
+    r'|!\[.*\]\(.*\)'          # images
+    r'|\[.*\]\(.*\)'           # links on their own line
+    r'|<!--.*-->'              # HTML comments
+    r'|>\s'                     # blockquotes
+    r')'
+)
+
+
+def _fix_scattered_vietnamese(text: str) -> str:
+    """
+    Fix per-glyph spacing artefacts in Vietnamese text produced by Docling.
+
+    Processes each line independently so markdown structure is preserved.
+    Only activates when the text looks Vietnamese (contains Vietnamese-specific
+    diacritics) to avoid mangling non-Vietnamese content.
+    """
+    # Quick check: does this text contain Vietnamese-specific characters?
+    # Covers:  ă â đ ê ô ơ ư  +  all pre-composed Vietnamese in U+1E00–1EFF
+    #          + Latin Extended Additional (ò, ã, ũ etc. in U+00C0-024F)
+    _VN_MARKER = re.compile(r'[\u00C0-\u024F\u1E00-\u1EFF]')
+    if not _VN_MARKER.search(text):
+        return text
+
+    # NFC normalize — combine decomposed diacritics
+    text = unicodedata.normalize("NFC", text)
+
+    lines = text.split("\n")
+    result: list[str] = []
+
+    for line in lines:
+        # Skip structural markdown lines
+        if _STRUCTURE_LINE_RE.match(line):
+            result.append(line)
+            continue
+
+        # Skip empty / whitespace-only lines
+        stripped = line.strip()
+        if not stripped:
+            result.append(line)
+            continue
+
+        # Heuristic: does this line look scattered?
+        # Count tokens that are single characters.  If >=60% of tokens are
+        # single-char, the line is likely affected by per-glyph spacing.
+        tokens = stripped.split()
+        if len(tokens) < 3:
+            result.append(line)
+            continue
+
+        single_count = sum(1 for t in tokens if len(t) == 1)
+        ratio = single_count / len(tokens)
+        if ratio < 0.5:
+            # Not scattered — leave as-is
+            result.append(line)
+            continue
+
+        # Core fix: rejoin scattered single characters.
+        # Split on TWO-or-more consecutive spaces (real word/segment boundaries),
+        # then within each segment rejoin consecutive single-char tokens.
+        segments = re.split(r'  +', stripped)
+        fixed_segments: list[str] = []
+
+        for seg in segments:
+            seg = seg.strip()
+            if not seg:
+                continue
+
+            words = seg.split()
+            if not words:
+                continue
+
+            # Rejoin consecutive single-char tokens, keep multi-char tokens separate
+            merged: list[str] = []
+            buf: list[str] = []
+            for w in words:
+                if len(w) == 1:
+                    buf.append(w)
+                else:
+                    if buf:
+                        merged.append("".join(buf))
+                        buf = []
+                    merged.append(w)
+            if buf:
+                merged.append("".join(buf))
+
+            fixed_segments.append(" ".join(merged))
+
+        # Preserve leading whitespace (indentation)
+        leading = len(line) - len(line.lstrip())
+        fixed_line = line[:leading] + " ".join(fixed_segments)
+        result.append(fixed_line)
+
+    return "\n".join(result)
 
 # File extensions handled by Docling vs legacy
 _DOCLING_EXTENSIONS = {".pdf", ".docx", ".pptx", ".html"}
@@ -332,6 +471,8 @@ class DeepDocumentParser:
 
             # Detect content types
             chunk_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+            # Fix per-glyph spacing in Vietnamese text from Docling chunker
+            chunk_text = _fix_scattered_vietnamese(chunk_text)
             has_table = False
             has_code = False
             if hasattr(chunk, "meta") and chunk.meta:
@@ -423,14 +564,20 @@ class DeepDocumentParser:
         return chunks
 
     def _export_markdown(self, doc) -> str:
-        """Export document to markdown with page break markers if supported."""
+        """Export document to markdown with page break markers if supported.
+
+        Applies Vietnamese whitespace normalization to fix per-glyph spacing
+        artefacts common in Vietnamese PDFs processed by Docling.
+        """
         try:
-            return doc.export_to_markdown(
+            md = doc.export_to_markdown(
                 page_break_placeholder="\n\n---\n\n",
             )
         except TypeError:
             # Fallback for Docling versions without page_break_placeholder
-            return doc.export_to_markdown()
+            md = doc.export_to_markdown()
+
+        return _fix_scattered_vietnamese(md)
 
     def _extract_images_with_urls(
         self,

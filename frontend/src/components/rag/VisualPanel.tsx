@@ -4,6 +4,7 @@ import {
   Network,
   List,
   FileSearch,
+  Activity,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useWorkspaceStore } from "@/stores/workspaceStore";
@@ -11,6 +12,7 @@ import { DocumentViewer } from "./DocumentViewer";
 import { KnowledgeGraphView } from "./KnowledgeGraphView";
 import { AnalyticsDashboard } from "./AnalyticsDashboard";
 import { EntityList } from "./EntityList";
+import { PipelinePanel } from "./PipelinePanel";
 
 // ---------------------------------------------------------------------------
 // Tab button
@@ -76,17 +78,36 @@ function SubTabButton({
 // Empty state
 // ---------------------------------------------------------------------------
 function EmptyVisual() {
+  const { setActiveTab } = useWorkspaceStore();
+
   return (
-    <div className="h-full flex flex-col items-center justify-center px-4">
-      <div className="w-14 h-14 rounded-2xl bg-muted/50 flex items-center justify-center mb-4">
-        <FileSearch className="w-7 h-7 text-muted-foreground/40" />
+    <div className="h-full flex flex-col">
+      {/* Minimal tab bar so user can access Pipeline even without a doc */}
+      <div className="flex-shrink-0 flex items-center gap-1 px-3 py-2 border-b">
+        <TabButton
+          active={false}
+          icon={<BookOpen className="w-3.5 h-3.5" />}
+          label="Content"
+          onClick={() => setActiveTab("content")}
+        />
+        <TabButton
+          active={false}
+          icon={<Activity className="w-3.5 h-3.5" />}
+          label="Pipeline"
+          onClick={() => setActiveTab("pipeline")}
+        />
       </div>
-      <p className="text-sm font-medium text-muted-foreground">
-        Select a document to view
-      </p>
-      <p className="text-xs text-muted-foreground/60 mt-1 text-center max-w-[200px]">
-        Click on an indexed document in the data panel to view its content
-      </p>
+      <div className="flex-1 flex flex-col items-center justify-center px-4">
+        <div className="w-14 h-14 rounded-2xl bg-muted/50 flex items-center justify-center mb-4">
+          <FileSearch className="w-7 h-7 text-muted-foreground/40" />
+        </div>
+        <p className="text-sm font-medium text-muted-foreground">
+          Select a document to view
+        </p>
+        <p className="text-xs text-muted-foreground/60 mt-1 text-center max-w-[200px]">
+          Click on an indexed document in the data panel to view its content, or switch to the Pipeline tab
+        </p>
+      </div>
     </div>
   );
 }
@@ -172,7 +193,33 @@ export const VisualPanel = memo(function VisualPanel({
     clearScrollTarget,
   } = useWorkspaceStore();
 
-  if (!selectedDoc) return <EmptyVisual />;
+  if (!selectedDoc) {
+    // Show Pipeline tab even when no document is selected
+    if (activeTab === "pipeline") {
+      return (
+        <div className="h-full flex flex-col overflow-hidden min-h-0">
+          <div className="flex-shrink-0 flex items-center gap-1 px-3 py-2 border-b">
+            <TabButton
+              active={false}
+              icon={<BookOpen className="w-3.5 h-3.5" />}
+              label="Content"
+              onClick={() => setActiveTab("content")}
+            />
+            <TabButton
+              active={true}
+              icon={<Activity className="w-3.5 h-3.5" />}
+              label="Pipeline"
+              onClick={() => setActiveTab("pipeline")}
+            />
+          </div>
+          <div className="flex-1 min-h-0 overflow-hidden">
+            <PipelinePanel workspaceId={workspaceId} />
+          </div>
+        </div>
+      );
+    }
+    return <EmptyVisual />;
+  }
 
   return (
     <div className="h-full flex flex-col overflow-hidden min-h-0">
@@ -192,6 +239,12 @@ export const VisualPanel = memo(function VisualPanel({
             onClick={() => setActiveTab("kg")}
           />
         )}
+        <TabButton
+          active={activeTab === "pipeline"}
+          icon={<Activity className="w-3.5 h-3.5" />}
+          label="Pipeline"
+          onClick={() => setActiveTab("pipeline")}
+        />
         {/* Active highlights indicator */}
         {highlightChunks.length > 0 && (
           <span className="ml-auto text-[10px] text-primary bg-primary/10 px-2 py-0.5 rounded-full">
@@ -211,6 +264,8 @@ export const VisualPanel = memo(function VisualPanel({
             highlightChunks={highlightChunks}
             onScrolled={clearScrollTarget}
           />
+        ) : activeTab === "pipeline" ? (
+          <PipelinePanel workspaceId={workspaceId} />
         ) : (
           <KGContent
             workspaceId={workspaceId}

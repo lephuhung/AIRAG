@@ -4,6 +4,8 @@ import {
   Database,
   ChevronLeft,
   ChevronRight,
+  FolderOpen,
+  Activity,
 } from "lucide-react";
 import { useWorkspaces } from "@/hooks/useWorkspaces";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
@@ -19,8 +21,10 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
   const location = useLocation();
   const { data: workspaces } = useWorkspaces();
 
-  const activeWorkspaceId = location.pathname.match(/\/knowledge-bases\/(\d+)/)?.[1];
+  const urlWorkspaceId = location.pathname.match(/\/knowledge-bases\/(\d+)/)?.[1];
   const isHome = location.pathname === "/";
+  const isFilesPage = location.pathname === "/files" || location.pathname.endsWith("/files");
+  const isWorkersPage = location.pathname === "/workers";
 
   return (
     <aside
@@ -43,7 +47,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
           onClick={() => navigate("/")}
           className={cn(
             "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm transition-colors",
-            isHome && !activeWorkspaceId
+            isHome
               ? "bg-primary/10 text-primary font-medium"
               : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
           )}
@@ -51,6 +55,34 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
         >
           <Database className="w-4 h-4 flex-shrink-0" />
           {!collapsed && <span className="truncate">Knowledge Bases</span>}
+        </button>
+
+        <button
+          onClick={() => navigate("/files")}
+          className={cn(
+            "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm transition-colors",
+            isFilesPage
+              ? "bg-primary/10 text-primary font-medium"
+              : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+          )}
+          title={collapsed ? "Files" : undefined}
+        >
+          <FolderOpen className="w-4 h-4 flex-shrink-0" />
+          {!collapsed && <span className="truncate">Files</span>}
+        </button>
+
+        <button
+          onClick={() => navigate("/workers")}
+          className={cn(
+            "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm transition-colors",
+            isWorkersPage
+              ? "bg-primary/10 text-primary font-medium"
+              : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+          )}
+          title={collapsed ? "Workers" : undefined}
+        >
+          <Activity className="w-4 h-4 flex-shrink-0" />
+          {!collapsed && <span className="truncate">Workers</span>}
         </button>
       </nav>
 
@@ -63,7 +95,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
             </p>
             <div className="space-y-0.5">
               {workspaces.slice(0, 20).map((ws) => {
-                const isActive = activeWorkspaceId === String(ws.id);
+                const isActive = urlWorkspaceId === String(ws.id);
                 return (
                   <button
                     key={ws.id}
@@ -91,7 +123,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
         {collapsed && (
           <div className="mt-4 px-2 space-y-1">
             {workspaces?.slice(0, 6).map((ws) => {
-              const isActive = activeWorkspaceId === String(ws.id);
+              const isActive = urlWorkspaceId === String(ws.id);
               return (
                 <button
                   key={`ws-${ws.id}`}

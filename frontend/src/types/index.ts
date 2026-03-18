@@ -298,3 +298,44 @@ export interface AgentStep {
   sourceCount?: number;
   imageCount?: number;
 }
+
+// Worker Management Types
+export interface QueueInfo {
+  name: string;
+  messages_ready: number;
+  messages_unacked: number;
+  consumers: number;
+  message_rate_in: number;
+  message_rate_out: number;
+}
+
+export interface PipelineSummary {
+  pending: number;
+  parsing: number;
+  ocring: number;
+  chunking: number;
+  embedding: number;
+  building_kg: number;
+  indexed: number;
+  failed: number;
+}
+
+export interface WorkerOverview {
+  queues: QueueInfo[];
+  pipeline_summary: PipelineSummary;
+  active_workers: Record<string, number>;
+  rabbitmq_connected: boolean;
+}
+
+export interface PipelineDocument {
+  id: number;
+  filename: string;
+  workspace_id: number;
+  status: DocumentStatus;
+  embed_done: boolean;
+  captions_done: boolean;
+  kg_done: boolean;
+  processing_time_ms: number;
+  error_message: string | null;
+  updated_at: string;
+}

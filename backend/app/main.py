@@ -97,12 +97,18 @@ async def lifespan(app: FastAPI):
                 "ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_type_id INTEGER "
                 "REFERENCES document_types(id) ON DELETE SET NULL"
             ))
-            # Granular pipeline statuses — add new enum values to PostgreSQL type
-            for _new_val in ('ocring', 'chunking', 'embedding', 'building_kg'):
+            # Ensure ALL lowercase enum values exist in PostgreSQL.
+            # On a fresh DB, create_all() + values_callable creates them lowercase.
+            # On an existing DB from before values_callable, create_all() made them
+            # UPPERCASE — so we add lowercase variants and migrate data below.
+            for _new_val in (
+                'pending', 'parsing', 'ocring', 'chunking',
+                'embedding', 'building_kg', 'indexed', 'failed',
+            ):
                 await conn.execute(text(
                     f"ALTER TYPE documentstatus ADD VALUE IF NOT EXISTS '{_new_val}'"
                 ))
-            # Migrate legacy statuses to new schema (safe on fresh DB)
+            # Migrate UPPERCASE enum values → lowercase (safe if already lowercase)
             await conn.execute(text("""
                 DO $$
                 BEGIN
@@ -110,17 +116,24 @@ async def lifespan(app: FastAPI):
                         SELECT 1 FROM information_schema.tables
                         WHERE table_name = 'documents'
                     ) THEN
-                        UPDATE documents
-                        SET status = 'indexed'::documentstatus
-                        WHERE status::text IN ('processing', 'indexing');
-
-                        UPDATE documents
-                        SET status = 'chunking'::documentstatus
-                        WHERE status::text = 'parsed';
-
-                        UPDATE documents
-                        SET status = 'embedding'::documentstatus
-                        WHERE status::text = 'indexed_partial';
+                        -- Migrate legacy statuses first
+                        UPDATE documents SET status = 'indexed'
+                            WHERE status::text IN ('processing', 'indexing', 'INDEXED');
+                        UPDATE documents SET status = 'chunking'
+                            WHERE status::text IN ('parsed', 'CHUNKING');
+                        UPDATE documents SET status = 'embedding'
+                            WHERE status::text IN ('indexed_partial', 'EMBEDDING');
+                        -- Migrate remaining UPPERCASE → lowercase
+                        UPDATE documents SET status = 'pending'
+                            WHERE status::text = 'PENDING';
+                        UPDATE documents SET status = 'parsing'
+                            WHERE status::text = 'PARSING';
+                        UPDATE documents SET status = 'ocring'
+                            WHERE status::text = 'OCRING';
+                        UPDATE documents SET status = 'building_kg'
+                            WHERE status::text = 'BUILDING_KG';
+                        UPDATE documents SET status = 'failed'
+                            WHERE status::text = 'FAILED';
                     END IF;
                 EXCEPTION WHEN others THEN
                     -- ignore: enum may not have legacy values

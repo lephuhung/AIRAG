@@ -25,7 +25,7 @@ import type { Document, DocumentStatus } from "@/types";
 // ---------------------------------------------------------------------------
 // File-type icon mapping
 // ---------------------------------------------------------------------------
-const FILE_TYPE_CONFIG: Record<string, { icon: typeof FileText; color: string }> = {
+export const FILE_TYPE_CONFIG: Record<string, { icon: typeof FileText; color: string }> = {
   pdf:  { icon: FileText, color: "text-red-400" },
   docx: { icon: FileType, color: "text-blue-400" },
   pptx: { icon: Presentation, color: "text-orange-400" },
@@ -33,7 +33,7 @@ const FILE_TYPE_CONFIG: Record<string, { icon: typeof FileText; color: string }>
   md:   { icon: Hash, color: "text-purple-400" },
 };
 
-function getFileConfig(fileType: string) {
+export function getFileConfig(fileType: string) {
   const ext = fileType.replace(".", "").toLowerCase();
   return FILE_TYPE_CONFIG[ext] ?? { icon: File, color: "text-muted-foreground" };
 }
@@ -41,7 +41,7 @@ function getFileConfig(fileType: string) {
 // ---------------------------------------------------------------------------
 // Status badge
 // ---------------------------------------------------------------------------
-const STATUS_CONFIG: Record<DocumentStatus, { label: string; className: string; icon: typeof CheckCircle2 }> = {
+export const STATUS_CONFIG: Record<DocumentStatus, { label: string; className: string; icon: typeof CheckCircle2 }> = {
   pending:      { label: "Pending",      className: "bg-muted text-muted-foreground",         icon: Clock },
   parsing:      { label: "Parsing",      className: "bg-blue-400/15 text-blue-400",           icon: Loader2 },
   ocring:       { label: "OCR",          className: "bg-indigo-400/15 text-indigo-400",       icon: Loader2 },

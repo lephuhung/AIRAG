@@ -5,6 +5,8 @@ import { useThemeStore } from "@/stores/useThemeStore";
 import { AppShell } from "@/components/layout/AppShell";
 import { KnowledgeBasesPage } from "@/pages/KnowledgeBasesPage";
 import { WorkspacePage } from "@/pages/WorkspacePage";
+import { FilesPage } from "@/pages/FilesPage";
+import { WorkersPage } from "@/pages/WorkersPage";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -21,6 +23,9 @@ function AppRoutes() {
       <Route element={<AppShell />}>
         <Route path="/" element={<KnowledgeBasesPage />} />
         <Route path="/knowledge-bases/:workspaceId" element={<WorkspacePage />} />
+        <Route path="/knowledge-bases/:workspaceId/files" element={<FilesPage />} />
+        <Route path="/files" element={<FilesPage />} />
+        <Route path="/workers" element={<WorkersPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>
