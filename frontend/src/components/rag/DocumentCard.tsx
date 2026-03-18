@@ -42,18 +42,20 @@ function getFileConfig(fileType: string) {
 // Status badge
 // ---------------------------------------------------------------------------
 const STATUS_CONFIG: Record<DocumentStatus, { label: string; className: string; icon: typeof CheckCircle2 }> = {
-  pending:         { label: "Pending",  className: "bg-muted text-muted-foreground",         icon: Clock },
-  parsing:         { label: "Parsing",  className: "bg-blue-400/15 text-blue-400",           icon: Loader2 },
-  parsed:          { label: "Parsed",   className: "bg-cyan-400/15 text-cyan-400",           icon: Loader2 },
-  indexed_partial: { label: "Indexing", className: "bg-amber-400/15 text-amber-400",         icon: Loader2 },
-  indexed:         { label: "Indexed",  className: "bg-primary/15 text-primary",             icon: CheckCircle2 },
-  failed:          { label: "Failed",   className: "bg-destructive/15 text-destructive",     icon: XCircle },
+  pending:      { label: "Pending",      className: "bg-muted text-muted-foreground",         icon: Clock },
+  parsing:      { label: "Parsing",      className: "bg-blue-400/15 text-blue-400",           icon: Loader2 },
+  ocring:       { label: "OCR",          className: "bg-indigo-400/15 text-indigo-400",       icon: Loader2 },
+  chunking:     { label: "Chunking",     className: "bg-cyan-400/15 text-cyan-400",           icon: Loader2 },
+  embedding:    { label: "Embedding",    className: "bg-amber-400/15 text-amber-400",         icon: Loader2 },
+  building_kg:  { label: "Building KG",  className: "bg-violet-400/15 text-violet-400",       icon: Loader2 },
+  indexed:      { label: "Indexed",      className: "bg-primary/15 text-primary",             icon: CheckCircle2 },
+  failed:       { label: "Failed",       className: "bg-destructive/15 text-destructive",     icon: XCircle },
 };
 
 function StatusBadge({ status }: { status: DocumentStatus }) {
   const config = STATUS_CONFIG[status] ?? STATUS_CONFIG.pending;
   const Icon = config.icon;
-  const isAnimated = status === "parsing" || status === "parsed" || status === "indexed_partial";
+  const isAnimated = status === "parsing" || status === "ocring" || status === "chunking" || status === "embedding" || status === "building_kg";
 
   return (
     <span className={cn("inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium rounded-full", config.className)}>
@@ -64,7 +66,7 @@ function StatusBadge({ status }: { status: DocumentStatus }) {
 }
 
 // ---------------------------------------------------------------------------
-// Sub-task progress pills (shown when status = parsed | indexed_partial)
+// Sub-task progress pills (shown when status = chunking | embedding)
 // ---------------------------------------------------------------------------
 interface SubTaskProgressProps {
   embed_done?: boolean;
@@ -139,7 +141,7 @@ interface DocumentCardProps {
   onClick?: (doc: Document) => void;
 }
 
-const ACTIVE_STATUSES: DocumentStatus[] = ["parsing", "parsed", "indexed_partial"];
+const ACTIVE_STATUSES: DocumentStatus[] = ["parsing", "ocring", "chunking", "embedding", "building_kg"];
 
 export const DocumentCard = memo(function DocumentCard({
   doc,
@@ -157,9 +159,7 @@ export const DocumentCard = memo(function DocumentCard({
     : `${Math.round(doc.file_size / 1024)} KB`;
 
   const isActive = ACTIVE_STATUSES.includes(doc.status);
-  const showSubTasks = doc.status === "parsed" || doc.status === "indexed_partial";
-  // KG still running in background after document is indexed
-  const kgPending = doc.status === "indexed" && doc.kg_done === false;
+  const showSubTasks = doc.status === "chunking" || doc.status === "embedding";
 
   // Flash animation when user just clicked "Analyze"
   const [justTriggered, setJustTriggered] = useState(false);
@@ -193,7 +193,7 @@ export const DocumentCard = memo(function DocumentCard({
           ? "border-blue-400/50 shadow-[0_0_12px_-3px_rgba(96,165,250,0.3)]"
           : "border-border hover:shadow-md hover:-translate-y-0.5",
         selected && "border-primary ring-1 ring-primary/30 shadow-sm",
-        doc.status === "indexed" ? "cursor-pointer" : "cursor-default",
+        doc.status === "indexed" || doc.status === "building_kg" ? "cursor-pointer" : "cursor-default",
         justTriggered && "ring-2 ring-blue-400/60",
       )}
       onClick={() => onClick?.(doc)}
@@ -234,14 +234,24 @@ export const DocumentCard = memo(function DocumentCard({
                 Parsing document...
               </span>
             )}
-            {doc.status === "parsed" && (
-              <span className="text-xs text-cyan-400/80 font-medium animate-pulse">
-                Building index...
+            {doc.status === "ocring" && (
+              <span className="text-xs text-indigo-400/80 font-medium animate-pulse">
+                Running OCR...
               </span>
             )}
-            {doc.status === "indexed_partial" && (
+            {doc.status === "chunking" && (
+              <span className="text-xs text-cyan-400/80 font-medium animate-pulse">
+                Building chunks...
+              </span>
+            )}
+            {doc.status === "embedding" && (
               <span className="text-xs text-amber-400/80 font-medium animate-pulse">
-                Finalizing...
+                Embedding vectors...
+              </span>
+            )}
+            {doc.status === "building_kg" && (
+              <span className="text-xs text-violet-400/80 font-medium animate-pulse">
+                Building knowledge graph...
               </span>
             )}
           </div>
@@ -252,15 +262,6 @@ export const DocumentCard = memo(function DocumentCard({
               captions_done={doc.captions_done}
               kg_done={doc.kg_done}
             />
-          )}
-          {kgPending && (
-            <div className="flex items-center gap-1 mt-1.5">
-              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium border bg-violet-400/10 text-violet-400/80 border-violet-400/20">
-                <Loader2 className="w-2.5 h-2.5 animate-spin" />
-                <Network className="w-2.5 h-2.5" />
-                Building KG…
-              </span>
-            </div>
           )}
           {doc.error_message && (
             <p className="text-xs text-destructive mt-1 truncate">{doc.error_message}</p>
@@ -285,7 +286,7 @@ export const DocumentCard = memo(function DocumentCard({
               Analyze
             </Button>
           )}
-          {doc.status === "indexed" && (
+          {(doc.status === "indexed" || doc.status === "building_kg") && (
             <Button
               variant="ghost"
               size="icon"

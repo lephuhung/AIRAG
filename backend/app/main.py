@@ -97,6 +97,11 @@ async def lifespan(app: FastAPI):
                 "ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_type_id INTEGER "
                 "REFERENCES document_types(id) ON DELETE SET NULL"
             ))
+            # Granular pipeline statuses — add new enum values to PostgreSQL type
+            for _new_val in ('ocring', 'chunking', 'embedding', 'building_kg'):
+                await conn.execute(text(
+                    f"ALTER TYPE documentstatus ADD VALUE IF NOT EXISTS '{_new_val}'"
+                ))
             # Migrate legacy statuses to new schema (safe on fresh DB)
             await conn.execute(text("""
                 DO $$
@@ -108,6 +113,14 @@ async def lifespan(app: FastAPI):
                         UPDATE documents
                         SET status = 'indexed'::documentstatus
                         WHERE status::text IN ('processing', 'indexing');
+
+                        UPDATE documents
+                        SET status = 'chunking'::documentstatus
+                        WHERE status::text = 'parsed';
+
+                        UPDATE documents
+                        SET status = 'embedding'::documentstatus
+                        WHERE status::text = 'indexed_partial';
                     END IF;
                 EXCEPTION WHEN others THEN
                     -- ignore: enum may not have legacy values

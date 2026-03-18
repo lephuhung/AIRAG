@@ -845,7 +845,7 @@ async def chat_stream_endpoint(
             _sel(_Doc.document_type_id, _func.count(_Doc.id).label("cnt"))
             .where(
                 _Doc.workspace_id == workspace_id,
-                _Doc.status == _DS.INDEXED,
+                _Doc.status.in_([_DS.INDEXED, _DS.BUILDING_KG]),
                 _Doc.document_type_id.isnot(None),
             )
             .group_by(_Doc.document_type_id)

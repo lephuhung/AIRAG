@@ -7,9 +7,9 @@ Responsibilities:
   1. Load raw_chunks_json from DB
   2. Embed all chunks with bge-m3
   3. Store in ChromaDB
-  4. Set embed_done=True  →  status = INDEXED_PARTIAL (searchable now)
+  4. Set embed_done=True  →  status = EMBEDDING (searchable now)
   5. Clear raw_chunks_json to free DB space
-  6. Check if fully INDEXED
+  6. Check if fully INDEXED via check_and_finalize
 """
 from __future__ import annotations
 
@@ -41,6 +41,10 @@ async def handle_embed(payload: dict) -> None:
             return
 
         try:
+            # Set EMBEDDING at start
+            document.status = DocumentStatus.EMBEDDING
+            await db.commit()
+
             raw = document.raw_chunks_json
             if not raw:
                 logger.warning(f"[embed_worker] doc={msg.document_id} has no raw_chunks_json — skipping embed")
@@ -99,11 +103,10 @@ async def handle_embed(payload: dict) -> None:
             document.embed_done      = True
             document.chunk_count     = len(chunks_data)
             document.raw_chunks_json = None   # free space
-            document.status          = DocumentStatus.INDEXED_PARTIAL
             await db.commit()
             logger.info(
                 f"[embed_worker] doc={msg.document_id} embedded "
-                f"{len(chunks_data)} chunks → INDEXED_PARTIAL"
+                f"{len(chunks_data)} chunks → embed_done"
             )
             await check_and_finalize(document, db)
 

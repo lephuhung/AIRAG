@@ -170,7 +170,7 @@ async def handle_caption(payload: dict) -> None:
                 f"[caption_worker] doc={msg.document_id} FAILED: {e}", exc_info=True
             )
             # Caption failure does NOT fail the whole document —
-            # it stays INDEXED_PARTIAL if embed already done
+            # it stays EMBEDDING/BUILDING_KG if embed already done
             document.captions_done = True   # mark done to unblock INDEXED transition
             document.error_message = f"caption_warning: {str(e)[:400]}"
             await db.commit()

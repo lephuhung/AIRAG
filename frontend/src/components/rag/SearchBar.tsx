@@ -52,7 +52,7 @@ export const SearchBar = memo(function SearchBar({ onSearch, isSearching, docume
     setSelectedDocs((prev) => prev.includes(id) ? prev.filter((d) => d !== id) : [...prev, id]);
   }, []);
 
-  const indexedDocs = documents?.filter((d) => d.status === "indexed") ?? [];
+  const indexedDocs = documents?.filter((d) => d.status === "indexed" || d.status === "building_kg") ?? [];
 
   return (
     <div className="space-y-3">

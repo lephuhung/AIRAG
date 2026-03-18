@@ -12,16 +12,15 @@ import type { Document, RAGStats, DocumentStatus } from "@/types";
 
 const PROCESSING_STATUSES = new Set<DocumentStatus>([
   "parsing",
-  "parsed",
-  "indexed_partial",
+  "ocring",
+  "chunking",
+  "embedding",
+  "building_kg",
 ]);
 
-// Also poll while KG is still running in the background on indexed docs
 function needsPolling(docs: Document[] | undefined): boolean {
   if (!docs) return false;
-  return docs.some(
-    (d) => PROCESSING_STATUSES.has(d.status) || (d.status === "indexed" && d.kg_done === false)
-  );
+  return docs.some((d) => PROCESSING_STATUSES.has(d.status));
 }
 
 export function WorkspacePage() {
@@ -144,7 +143,7 @@ export function WorkspacePage() {
   // -----------------------------------------------------------------------
   const handleSelectDoc = useCallback(
     (doc: Document) => {
-      if (doc.status !== "indexed") return;
+      if (doc.status !== "indexed" && doc.status !== "building_kg") return;
       if (selectedDoc?.id === doc.id) {
         selectDoc(null);
       } else {

@@ -9,7 +9,7 @@ Key design decisions:
     This prevents concurrent LightRAG writes to the same graph files.
   - llm_model_max_async=3 inside LightRAG → max 3 chunk LLM calls at once.
   - Semaphore + exponential-backoff retry in _kg_llm_complete for rate limits.
-  - KG failure does NOT fail the document — it stays INDEXED_PARTIAL
+  - KG failure does NOT fail the document — it stays BUILDING_KG
     and captions_done/embed_done are unaffected.
 """
 from __future__ import annotations

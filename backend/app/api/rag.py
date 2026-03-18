@@ -45,6 +45,15 @@ logger = logging.getLogger(__name__)
 import string, random
 from app.services.rag_service import get_rag_service
 
+# In-progress statuses — documents currently in the pipeline
+_IN_PROGRESS = (
+    DocumentStatus.PARSING,
+    DocumentStatus.OCRING,
+    DocumentStatus.CHUNKING,
+    DocumentStatus.EMBEDDING,
+    DocumentStatus.BUILDING_KG,
+)
+
 # ---------------------------------------------------------------------------
 # Citation ID generation — 4-char alphanumeric IDs matching PageIndex format
 # ---------------------------------------------------------------------------
@@ -198,16 +207,16 @@ async def process_document(
     if document is None:
         raise NotFoundError("Document", document_id)
 
-    if document.status in (DocumentStatus.PARSING, DocumentStatus.PARSED, DocumentStatus.INDEXED_PARTIAL):
+    if document.status in _IN_PROGRESS:
         # Allow re-trigger if embed never ran (e.g. message was dropped by RabbitMQ).
         # A truly in-progress document will have embed_done or captions_done progressing.
-        truly_in_progress = document.status == DocumentStatus.PARSING or document.embed_done
+        truly_in_progress = document.status in (DocumentStatus.PARSING, DocumentStatus.OCRING) or document.embed_done
         if truly_in_progress:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Document is already being processed"
             )
-        # embed_done=False while PARSED/INDEXED_PARTIAL → worker message was lost, allow retry
+        # embed_done=False while CHUNKING/EMBEDDING → worker message was lost, allow retry
         # Fall through to reset + requeue below
 
     if document.status == DocumentStatus.INDEXED:
@@ -286,9 +295,7 @@ async def process_batch(
             continue
 
         # Skip documents already in the pipeline
-        if doc.status in (
-            DocumentStatus.PARSING, DocumentStatus.PARSED, DocumentStatus.INDEXED_PARTIAL,
-        ):
+        if doc.status in _IN_PROGRESS:
             skipped_ids.append(doc_id)
             continue
 
@@ -337,7 +344,7 @@ async def reindex_document(
     if document is None:
         raise NotFoundError("Document", document_id)
 
-    if document.status in (DocumentStatus.PARSING, DocumentStatus.PARSED, DocumentStatus.INDEXED_PARTIAL):
+    if document.status in _IN_PROGRESS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Document is currently being processed"
@@ -421,11 +428,7 @@ async def reindex_workspace(
     result = await db.execute(
         select(Document).where(
             Document.workspace_id == workspace_id,
-            Document.status.notin_([
-                DocumentStatus.PARSING,
-                DocumentStatus.PARSED,
-                DocumentStatus.INDEXED_PARTIAL,
-            ]),
+            Document.status.notin_(list(_IN_PROGRESS)),
         )
     )
     documents = list(result.scalars().all())
@@ -514,7 +517,7 @@ async def get_workspace_rag_stats(
     indexed_result = await db.execute(
         select(func.count(Document.id)).where(
             Document.workspace_id == workspace_id,
-            Document.status == DocumentStatus.INDEXED
+            Document.status.in_([DocumentStatus.INDEXED, DocumentStatus.BUILDING_KG])
         )
     )
     indexed_documents = indexed_result.scalar() or 0
@@ -564,7 +567,7 @@ async def get_document_chunks(
     if document is None:
         raise NotFoundError("Document", document_id)
 
-    if document.status != DocumentStatus.INDEXED:
+    if document.status not in (DocumentStatus.INDEXED, DocumentStatus.BUILDING_KG):
         return {
             "document_id": document_id,
             "status": document.status.value,
@@ -699,7 +702,7 @@ async def get_workspace_analytics(
     indexed_result = await db.execute(
         select(func.count(Document.id)).where(
             Document.workspace_id == workspace_id,
-            Document.status == DocumentStatus.INDEXED,
+            Document.status.in_([DocumentStatus.INDEXED, DocumentStatus.BUILDING_KG]),
         )
     )
     indexed_documents = indexed_result.scalar() or 0

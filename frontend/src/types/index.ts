@@ -68,7 +68,7 @@ export interface Document {
   // Document type classification (auto-detected by pipeline)
   document_type_id?: number | null;
   document_type?: DocumentTypeInfo | null;
-  // Sub-task completion flags (set independently by each worker after PARSED)
+  // Sub-task completion flags (set independently by each worker after CHUNKING)
   embed_done?: boolean;              // embed worker → ChromaDB done
   captions_done?: boolean;           // caption worker → image/table captions done
   kg_done?: boolean;                 // kg worker → LightRAG KG ingest done
@@ -77,10 +77,12 @@ export interface Document {
 // RAG Types
 export type DocumentStatus =
   | "pending"          // uploaded, waiting for parse_worker
-  | "parsing"          // parse_worker: Docling/OCR running
-  | "parsed"           // parse_worker done → embed+caption+kg dispatched
-  | "indexed_partial"  // embed done → vector search works; caption/KG still running
-  | "indexed"          // embed + captions done (searchable); KG may still run in background
+  | "parsing"          // parse_worker: Docling on native docs
+  | "ocring"           // parse_worker: OCR on scanned PDFs
+  | "chunking"         // parse done → embed+caption+kg dispatched
+  | "embedding"        // embed_worker running
+  | "building_kg"      // embed+captions done, KG still running
+  | "indexed"          // all done
   | "failed";
 
 export type RAGQueryMode = "hybrid" | "vector_only" | "naive" | "local" | "global";

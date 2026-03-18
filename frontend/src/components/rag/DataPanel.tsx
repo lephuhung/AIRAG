@@ -24,8 +24,10 @@ import type { Document, RAGStats, DocumentStatus } from "@/types";
 
 const PROCESSING_STATUSES = new Set<DocumentStatus>([
   "parsing",
-  "parsed",
-  "indexed_partial",
+  "ocring",
+  "chunking",
+  "embedding",
+  "building_kg",
 ]);
 const PROCESSABLE_STATUSES = new Set<DocumentStatus>(["pending", "failed"]);
 

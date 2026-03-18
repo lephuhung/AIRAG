@@ -6,7 +6,7 @@ Consumes nexusrag.parse queue.
 Responsibilities:
   1. Download raw file from MinIO (nexusrag-uploads bucket)
   2. Run Docling / HunyuanOCR — zero LLM calls
-  3. Save markdown, images, tables to DB  →  status = PARSED
+  3. Save markdown, images, tables to DB  →  status = CHUNKING
   4. Dispatch three independent messages:
        EmbedMessage   → nexusrag.embed
        CaptionMessage → nexusrag.caption
@@ -60,28 +60,36 @@ async def handle_parse(payload: dict) -> None:
                 tmp.write(file_bytes)
                 tmp_path = Path(tmp.name)
 
-            # ── Extract digital signatures (native PDF only) ────────────────
+            # ── Check if scanned PDF → switch to OCRING ─────────────────────
+            is_scanned = False
             if ext == ".pdf":
                 try:
                     from app.services.ocr_service import get_ocr_service
-                    from app.services.digital_signature_service import extract_digital_signatures
                     ocr_svc = get_ocr_service()
-                    # is_scanned_pdf is a sync @staticmethod — run in thread to
-                    # avoid blocking the event loop (fitz.open is blocking I/O).
                     is_scanned = await asyncio.to_thread(
                         ocr_svc.is_scanned_pdf, str(tmp_path)
                     )
-                    if not is_scanned:
-                        sigs = await asyncio.to_thread(
-                            extract_digital_signatures, str(tmp_path)
+                    if is_scanned:
+                        document.status = DocumentStatus.OCRING
+                        await db.commit()
+                except Exception:
+                    pass  # fall back to PARSING
+
+            # ── Extract digital signatures (native PDF only) ────────────────
+            if ext == ".pdf" and not is_scanned:
+                try:
+                    from app.services.ocr_service import get_ocr_service as _get_ocr  # noqa: F811
+                    from app.services.digital_signature_service import extract_digital_signatures
+                    sigs = await asyncio.to_thread(
+                        extract_digital_signatures, str(tmp_path)
+                    )
+                    if sigs:
+                        document.digital_signatures = sigs
+                        await db.commit()
+                        logger.info(
+                            f"[parse_worker] doc={msg.document_id} "
+                            f"found {len(sigs)} digital signature(s)"
                         )
-                        if sigs:
-                            document.digital_signatures = sigs
-                            await db.commit()
-                            logger.info(
-                                f"[parse_worker] doc={msg.document_id} "
-                                f"found {len(sigs)} digital signature(s)"
-                            )
                 except Exception as _sig_err:
                     logger.warning(
                         f"[parse_worker] doc={msg.document_id} "
@@ -199,7 +207,7 @@ async def handle_parse(payload: dict) -> None:
                 }
                 for c in parsed.chunks
             ])
-            document.status = DocumentStatus.PARSED
+            document.status = DocumentStatus.CHUNKING
             elapsed_ms = int((time.time() - start) * 1000)
             document.processing_time_ms = elapsed_ms
             await db.commit()

@@ -14,7 +14,7 @@ const TABS: { value: FilterStatus; label: string }[] = [
 ];
 
 // Statuses that should be aggregated under the "Processing" tab
-const PROCESSING_GROUP = new Set<DocumentStatus>(["parsing", "parsed", "indexed_partial"]);
+const PROCESSING_GROUP = new Set<DocumentStatus>(["parsing", "ocring", "chunking", "embedding", "building_kg"]);
 
 interface DocumentFiltersProps {
   searchQuery: string;

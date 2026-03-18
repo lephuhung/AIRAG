@@ -27,7 +27,7 @@ async def _enrich_response(db: AsyncSession, kb: KnowledgeBase) -> WorkspaceResp
     indexed = await db.execute(
         select(func.count(Document.id)).where(
             Document.workspace_id == kb.id,
-            Document.status == DocumentStatus.INDEXED,
+            Document.status.in_([DocumentStatus.INDEXED, DocumentStatus.BUILDING_KG]),
         )
     )
     return WorkspaceResponse(

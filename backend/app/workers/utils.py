@@ -18,18 +18,16 @@ logger = logging.getLogger(__name__)
 
 async def check_and_finalize(document: Document, db: AsyncSession) -> None:
     """
-    Transition document to INDEXED when embed + captions sub-tasks are complete.
+    Transition document status based on sub-task completion:
 
-    KG ingestion is intentionally excluded from the INDEXED condition:
-      - KG extraction via LLM can take many minutes (large docs, slow models).
-      - The document is fully searchable once embed_done + captions_done are True.
-      - KG continues running in the background; kg_done is tracked separately
-        and surfaced in the frontend as a non-blocking background indicator.
+      - embed_done + captions_done + kg_done → INDEXED
+      - embed_done + captions_done (kg still running) → BUILDING_KG
+      - otherwise → no change (still EMBEDDING or CHUNKING)
 
     Opens a *separate* session so it always reads the latest committed values
     from the other workers (avoids stale snapshot from the caller's long-lived
     transaction).  SELECT FOR UPDATE serialises concurrent calls so only one
-    worker promotes the document to INDEXED.
+    worker promotes the document.
     """
     from app.core.database import async_session_maker
 
@@ -43,13 +41,22 @@ async def check_and_finalize(document: Document, db: AsyncSession) -> None:
         if fresh is None:
             return
 
-        # Transition to INDEXED as soon as embed + captions are done.
-        # KG is a non-blocking background task — it keeps running after INDEXED.
         if fresh.embed_done and fresh.captions_done:
-            if fresh.status != DocumentStatus.INDEXED:
-                fresh.status = DocumentStatus.INDEXED
-                await fresh_db.commit()
-                logger.info(
-                    f"[finalize] doc={fresh.id} → INDEXED "
-                    f"(embed✓ captions✓ | kg={'✓' if fresh.kg_done else '⟳ background'})"
-                )
+            if fresh.kg_done:
+                # All three done → INDEXED
+                if fresh.status != DocumentStatus.INDEXED:
+                    fresh.status = DocumentStatus.INDEXED
+                    await fresh_db.commit()
+                    logger.info(
+                        f"[finalize] doc={fresh.id} → INDEXED "
+                        f"(embed✓ captions✓ kg✓)"
+                    )
+            else:
+                # embed+captions done, KG still running → BUILDING_KG
+                if fresh.status not in (DocumentStatus.BUILDING_KG, DocumentStatus.INDEXED):
+                    fresh.status = DocumentStatus.BUILDING_KG
+                    await fresh_db.commit()
+                    logger.info(
+                        f"[finalize] doc={fresh.id} → BUILDING_KG "
+                        f"(embed✓ captions✓ kg⟳)"
+                    )

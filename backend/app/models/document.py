@@ -7,13 +7,14 @@ from app.core.database import Base
 
 
 class DocumentStatus(str, enum.Enum):
-    PENDING         = "pending"           # vừa upload, chờ worker nhận
-    PARSING         = "parsing"           # parse worker đang chạy Docling/OCR
-    PARSED          = "parsed"            # parse xong, đã dispatch embed+caption+kg
-    INDEXED_PARTIAL = "indexed_partial"   # embed xong → vector search hoạt động,
-                                          # caption và/hoặc KG vẫn đang chạy nền
-    INDEXED         = "indexed"           # tất cả 3 sub-tasks hoàn tất
-    FAILED          = "failed"
+    PENDING      = "pending"        # uploaded, waiting for worker
+    PARSING      = "parsing"        # Docling on native PDF/DOCX/PPTX
+    OCRING       = "ocring"         # OCR on scanned PDFs
+    CHUNKING     = "chunking"       # parse done, sub-tasks dispatched
+    EMBEDDING    = "embedding"      # embed_worker running
+    BUILDING_KG  = "building_kg"    # embed+captions done, KG still running
+    INDEXED      = "indexed"        # all done
+    FAILED       = "failed"
 
 
 class Document(Base):
