@@ -66,6 +66,24 @@ class RabbitMQManagement:
             resp = await client.delete(f"/api/queues/{_VHOST}/{name}/contents")
             resp.raise_for_status()
 
+    async def delete_queue(self, name: str) -> None:
+        """DELETE /api/queues/%2F/{name} — delete a queue entirely."""
+        async with self._client() as client:
+            resp = await client.delete(f"/api/queues/{_VHOST}/{name}")
+            resp.raise_for_status()
+
+    async def get_messages(
+        self, queue_name: str, count: int = 10, ack_mode: str = "ack_requeue_true"
+    ) -> list[dict[str, Any]]:
+        """POST /api/queues/%2F/{queue}/get — peek at messages without consuming."""
+        async with self._client() as client:
+            resp = await client.post(
+                f"/api/queues/{_VHOST}/{queue_name}/get",
+                json={"count": count, "ackmode": ack_mode, "encoding": "auto"},
+            )
+            resp.raise_for_status()
+            return resp.json()
+
     # ------------------------------------------------------------------
     # Consumers
     # ------------------------------------------------------------------
@@ -75,6 +93,24 @@ class RabbitMQManagement:
             resp = await client.get(f"/api/consumers/{_VHOST}")
             resp.raise_for_status()
             return resp.json()
+
+    # ------------------------------------------------------------------
+    # Connections / Health
+    # ------------------------------------------------------------------
+    async def get_node_health(self) -> dict[str, Any]:
+        """GET /api/overview — cluster health and node info."""
+        async with self._client() as client:
+            resp = await client.get("/api/overview")
+            resp.raise_for_status()
+            data = resp.json()
+            return {
+                "rabbitmq_version": data.get("rabbitmq_version", "unknown"),
+                "erlang_version": data.get("erlang_version", "unknown"),
+                "cluster_name": data.get("cluster_name", "unknown"),
+                "message_stats": data.get("message_stats", {}),
+                "queue_totals": data.get("queue_totals", {}),
+                "object_totals": data.get("object_totals", {}),
+            }
 
 
 # Singleton instance

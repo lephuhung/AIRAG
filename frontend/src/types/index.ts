@@ -307,6 +307,7 @@ export interface QueueInfo {
   consumers: number;
   message_rate_in: number;
   message_rate_out: number;
+  has_dlx?: boolean;
 }
 
 export interface PipelineSummary {
@@ -324,6 +325,7 @@ export interface WorkerOverview {
   queues: QueueInfo[];
   pipeline_summary: PipelineSummary;
   active_workers: Record<string, number>;
+  managed_workers: Record<string, number>;
   rabbitmq_connected: boolean;
 }
 
@@ -338,4 +340,60 @@ export interface PipelineDocument {
   processing_time_ms: number;
   error_message: string | null;
   updated_at: string;
+}
+
+// ── Worker Health Check ──
+export interface WorkerHealthCheck {
+  status: "healthy" | "degraded" | "unhealthy";
+  checks: {
+    rabbitmq: {
+      status: string;
+      version?: string;
+      cluster?: string;
+      error?: string;
+      queue_totals?: Record<string, number>;
+    };
+    queues: Record<string, {
+      status: string;
+      consumers: number;
+      messages_ready: number;
+      messages_unacked: number;
+      has_dlx: boolean;
+      warnings: string[];
+    }>;
+    dead_letter_queue: {
+      status: string;
+      messages: number;
+    };
+    managed_workers: Record<string, {
+      running: number;
+      total_spawned: number;
+      pids: number[];
+    }>;
+    pipeline: {
+      status: string;
+      documents_in_progress: number;
+      documents_failed: number;
+    };
+  };
+}
+
+// ── Managed Worker Process ──
+export interface ManagedWorkerInfo {
+  worker_type: string;
+  pid: number | null;
+  alive: boolean;
+  started_at: number;
+  uptime_seconds: number;
+  restart_count: number;
+  return_code: number | null;
+}
+
+// ── Dead Letter Queue ──
+export interface DeadLetterMessage {
+  payload: string;
+  headers: Record<string, unknown>;
+  exchange: string;
+  routing_key: string;
+  redelivered: boolean;
 }
