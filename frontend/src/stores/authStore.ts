@@ -23,10 +23,12 @@ interface AuthState {
     password: string;
     full_name: string;
     tenant_slug?: string;
-  }) => Promise<{ message: string }>;
+    invite_token?: string;
+  }) => Promise<{ message: string; auto_activated: boolean }>;
   logout: () => void;
   refreshAccessToken: () => Promise<boolean>;
   setAuth: (token: string, refreshToken: string, user: User) => void;
+  updateUser: (updatedUser: User) => void;
 }
 
 // Load persisted auth from localStorage
@@ -77,6 +79,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     set({ token, refreshToken, user, isAuthenticated: true });
   },
 
+  updateUser: (updatedUser) => {
+    const { token, refreshToken } = get();
+    persistAuth(token, refreshToken, updatedUser);
+    set({ user: updatedUser });
+  },
+
   login: async (email, password) => {
     const res = await fetch(`${BASE_URL}/auth/login`, {
       method: "POST",
@@ -112,7 +120,15 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       throw new Error(err.detail || `Register error: ${res.status}`);
     }
 
-    return { message: "Account created. Please wait for admin approval." };
+    const user = await res.json();
+    const autoActivated = !!data.invite_token && user.is_active;
+
+    return {
+      message: autoActivated
+        ? "Account created and activated! You can sign in now."
+        : "Account created. Please wait for admin approval.",
+      auto_activated: autoActivated,
+    };
   },
 
   logout: () => {

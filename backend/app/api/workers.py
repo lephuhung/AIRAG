@@ -541,6 +541,10 @@ async def get_overview(db: AsyncSession = Depends(get_db), user: User = Depends(
             info = _extract_queue_info(q)
             queues_data.append(info)
 
+            # Skip DLQ — it has no worker consumers, don't count it
+            if name == DLQ_QUEUE:
+                continue
+
             # Extract worker type from queue name (e.g. "nexusrag.parse" → "parse")
             worker_type = name.replace(_QUEUE_PREFIX, "").split(".")[0]
             active_workers[worker_type] = (

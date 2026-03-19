@@ -4,8 +4,10 @@ Auth API — register, login, refresh, profile.
 from __future__ import annotations
 
 import logging
+import os
+from datetime import datetime
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, File, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,6 +22,7 @@ from app.core.security import (
 )
 from app.models.user import User
 from app.models.tenant import Tenant, TenantUser
+from app.models.invite_token import InviteToken
 from app.schemas.auth import (
     RegisterRequest,
     LoginRequest,
@@ -29,6 +32,7 @@ from app.schemas.auth import (
     UpdateProfileRequest,
 )
 from app.schemas.user import UserResponse
+from app.services.storage_service import get_storage_service
 
 logger = logging.getLogger(__name__)
 
@@ -40,24 +44,68 @@ async def register(
     body: RegisterRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Register a new user account. Account is inactive until admin approves."""
+    """Register a new user account. Account is inactive until admin approves,
+    unless registering via a valid invite link (auto-activated)."""
     # Check email uniqueness
     result = await db.execute(select(User).where(User.email == body.email.lower()))
     if result.scalar_one_or_none() is not None:
         raise ConflictError("Email already registered")
 
+    # ── Invite token flow ──────────────────────────────────────────────
+    invite: InviteToken | None = None
+    if body.invite_token:
+        result = await db.execute(
+            select(InviteToken).where(InviteToken.token == body.invite_token)
+        )
+        invite = result.scalar_one_or_none()
+
+        if invite is None or not invite.is_active:
+            raise BadRequestError("Invalid or expired invite link")
+
+        if datetime.utcnow() > invite.expires_at:
+            raise BadRequestError("Invite link has expired")
+
+        if invite.max_uses is not None and invite.use_count >= invite.max_uses:
+            raise BadRequestError("Invite link has reached its maximum number of uses")
+
+        if invite.email and invite.email.lower() != body.email.lower().strip():
+            raise BadRequestError("This invite link is restricted to a different email address")
+
+        # Verify the tenant is still active
+        result = await db.execute(
+            select(Tenant).where(Tenant.id == invite.tenant_id, Tenant.is_active.is_(True))
+        )
+        if result.scalar_one_or_none() is None:
+            raise BadRequestError("The organization for this invite is no longer active")
+
+    # ── Create user ────────────────────────────────────────────────────
     user = User(
         email=body.email.lower().strip(),
         password_hash=hash_password(body.password),
         full_name=body.full_name.strip(),
-        is_active=False,
+        is_active=True if invite else False,  # Auto-activate for invite registrations
     )
     db.add(user)
     await db.commit()
     await db.refresh(user)
 
-    # If tenant_slug provided, create pending membership
-    if body.tenant_slug:
+    # ── Invite: auto-approve tenant membership + increment use_count ──
+    if invite:
+        tenant_user = TenantUser(
+            tenant_id=invite.tenant_id,
+            user_id=user.id,
+            role=invite.role,
+            is_approved=True,
+        )
+        db.add(tenant_user)
+        invite.use_count += 1
+        await db.commit()
+        logger.info(
+            f"User {user.email} registered via invite (auto-activated), "
+            f"tenant_id={invite.tenant_id}, role={invite.role}"
+        )
+    elif body.tenant_slug:
+        # Standard flow: create pending membership
         result = await db.execute(
             select(Tenant).where(Tenant.slug == body.tenant_slug, Tenant.is_active.is_(True))
         )
@@ -75,7 +123,7 @@ async def register(
         else:
             logger.warning(f"Tenant slug '{body.tenant_slug}' not found during registration")
 
-    logger.info(f"User registered: {user.email} (id={user.id}, active=False)")
+    logger.info(f"User registered: {user.email} (id={user.id}, active={user.is_active})")
     return user
 
 
@@ -152,9 +200,60 @@ async def update_me(
     """Update current user profile (name, password)."""
     if body.full_name is not None:
         user.full_name = body.full_name.strip()
-    if body.password is not None:
-        user.password_hash = hash_password(body.password)
+
+    # Password change requires current_password verification
+    if body.new_password is not None:
+        if body.current_password is None:
+            raise BadRequestError("current_password is required to change password")
+        if not verify_password(body.current_password, user.password_hash):
+            raise BadRequestError("Current password is incorrect")
+        user.password_hash = hash_password(body.new_password)
 
     await db.commit()
     await db.refresh(user)
+    return user
+
+
+# Allowed MIME types for avatar uploads
+_AVATAR_ALLOWED_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+_AVATAR_MAX_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+@router.post("/me/avatar", response_model=UserResponse)
+async def upload_avatar(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upload or replace the current user's avatar image.
+
+    Accepts JPEG, PNG, GIF, or WebP up to 5 MB.
+    Returns the updated user object with a presigned avatar_url.
+    """
+    if file.content_type not in _AVATAR_ALLOWED_TYPES:
+        raise BadRequestError(
+            f"Unsupported image type '{file.content_type}'. "
+            "Allowed: jpeg, png, gif, webp."
+        )
+
+    data = await file.read()
+    if len(data) > _AVATAR_MAX_BYTES:
+        raise BadRequestError("Avatar image must be smaller than 5 MB")
+
+    # Derive file extension from content_type (image/jpeg → .jpg etc.)
+    _ext_map = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+    }
+    ext = _ext_map.get(file.content_type, os.path.splitext(file.filename or "")[1] or ".jpg")
+
+    storage = get_storage_service()
+    avatar_url = await storage.upload_avatar(user.id, data, file.content_type, ext)
+
+    user.avatar_url = avatar_url
+    await db.commit()
+    await db.refresh(user)
+    logger.info(f"User {user.id} uploaded avatar ({len(data)} bytes)")
     return user

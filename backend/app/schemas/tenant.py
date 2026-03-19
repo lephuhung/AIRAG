@@ -24,6 +24,8 @@ class TenantResponse(BaseModel):
     slug: str
     domain: str | None
     is_active: bool
+    member_count: int = 0
+    pending_count: int = 0
     created_at: datetime
     updated_at: datetime
 

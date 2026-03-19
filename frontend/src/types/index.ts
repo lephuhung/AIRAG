@@ -5,6 +5,7 @@ export interface User {
   full_name: string;
   is_active: boolean;
   is_superadmin: boolean;
+  avatar_url?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -22,6 +23,8 @@ export interface Tenant {
   slug: string;
   domain: string | null;
   is_active: boolean;
+  member_count: number;
+  pending_count: number;
   created_at: string;
   updated_at: string;
 }
@@ -35,6 +38,25 @@ export interface TenantUser {
   created_at: string;
   email: string | null;
   full_name: string | null;
+}
+
+// ── Admin Types ──
+export interface AdminUserDetail extends User {
+  tenant_memberships: TenantUser[];
+}
+
+export interface AdminUserListResponse {
+  users: AdminUserDetail[];
+  total: number;
+  page: number;
+  per_page: number;
+}
+
+export interface AdminStats {
+  total_users: number;
+  active_users: number;
+  pending_users: number;
+  total_tenants: number;
 }
 
 // Knowledge Base (Document Workspace)
@@ -440,4 +462,27 @@ export interface DeadLetterMessage {
   exchange: string;
   routing_key: string;
   redelivered: boolean;
+}
+
+// ── Invite Link Types ──
+export interface InviteValidation {
+  valid: boolean;
+  tenant_name: string | null;
+  tenant_slug: string | null;
+  email: string | null;
+  expires_at: string | null;
+}
+
+export interface InviteLink {
+  id: number;
+  token: string;
+  tenant_id: number;
+  email: string | null;
+  role: string;
+  max_uses: number | null;
+  use_count: number;
+  expires_at: string;
+  created_at: string;
+  is_active: boolean;
+  invite_url: string;
 }

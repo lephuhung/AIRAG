@@ -208,6 +208,60 @@ class StorageService:
                     return False
                 raise
 
+    # ------------------------------------------------------------------
+    # Avatar methods (nexusrag-uploads bucket, avatars/ prefix)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_avatar_key(user_id: int, ext: str) -> str:
+        """Key pattern: avatars/user_{id}.{ext}"""
+        if ext and not ext.startswith("."):
+            ext = f".{ext}"
+        return f"avatars/user_{user_id}{ext}"
+
+    async def upload_avatar(self, user_id: int, data: bytes, content_type: str, ext: str) -> str:
+        """Upload avatar image to MinIO. Returns a public URL (presigned GET, 1 year).
+
+        Stores under ``nexusrag-uploads`` at key ``avatars/user_{id}.{ext}``.
+        Returns a public-style URL by generating a long-lived presigned GET URL.
+        """
+        key = self._make_avatar_key(user_id, ext)
+        async with self._client() as s3:
+            await s3.put_object(
+                Bucket=self._bucket_uploads,
+                Key=key,
+                Body=BytesIO(data),
+                ContentType=content_type,
+                ContentLength=len(data),
+            )
+            # Generate a long-lived presigned GET URL (1 year)
+            url: str = await s3.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": self._bucket_uploads, "Key": key},
+                ExpiresIn=365 * 24 * 3600,
+            )
+
+        # Rewrite internal hostname → public hostname
+        public = settings.MINIO_PUBLIC_ENDPOINT.rstrip("/")
+        internal = settings.MINIO_ENDPOINT.rstrip("/")
+        if public and public != internal and url.startswith(internal):
+            url = public + url[len(internal):]
+
+        logger.debug(f"[storage] uploaded avatar for user {user_id} at key={key}")
+        return url
+
+    async def delete_avatar(self, user_id: int, ext: str) -> None:
+        """Delete an existing avatar from MinIO (no-op if not found)."""
+        key = self._make_avatar_key(user_id, ext)
+        async with self._client() as s3:
+            try:
+                await s3.delete_object(Bucket=self._bucket_uploads, Key=key)
+                logger.debug(f"[storage] deleted avatar for user {user_id}")
+            except ClientError as e:
+                code = e.response["Error"]["Code"]
+                if code not in ("404", "NoSuchKey"):
+                    raise
+
 
 # Module-level singleton
 _storage_service: StorageService | None = None

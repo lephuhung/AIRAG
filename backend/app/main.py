@@ -22,6 +22,7 @@ import app.models.document_type   # noqa: F401
 import app.models.chat_message    # noqa: F401
 import app.models.user            # noqa: F401
 import app.models.tenant          # noqa: F401
+import app.models.invite_token    # noqa: F401
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -207,7 +208,8 @@ async def lifespan(app: FastAPI):
                 exists = await _admin_db.execute(
                     _select(UserModel).where(UserModel.email == settings.FIRST_SUPERADMIN_EMAIL)
                 )
-                if exists.scalar_one_or_none() is None:
+                existing_admin = exists.scalar_one_or_none()
+                if existing_admin is None:
                     admin = UserModel(
                         email=settings.FIRST_SUPERADMIN_EMAIL,
                         password_hash=hash_password(settings.FIRST_SUPERADMIN_PASSWORD),
@@ -219,7 +221,14 @@ async def lifespan(app: FastAPI):
                     await _admin_db.commit()
                     logger.info(f"SuperAdmin user created: {settings.FIRST_SUPERADMIN_EMAIL}")
                 else:
-                    logger.info("SuperAdmin user already exists")
+                    # Ensure superadmin is always active and has superadmin flag
+                    if not existing_admin.is_active or not existing_admin.is_superadmin:
+                        existing_admin.is_active = True
+                        existing_admin.is_superadmin = True
+                        await _admin_db.commit()
+                        logger.info(f"SuperAdmin user re-activated: {settings.FIRST_SUPERADMIN_EMAIL}")
+                    else:
+                        logger.info("SuperAdmin user already exists and is active")
         except Exception as _admin_err:
             logger.warning(f"SuperAdmin seed failed (non-fatal): {_admin_err}")
 
@@ -239,6 +248,16 @@ async def lifespan(app: FastAPI):
                     await _migrate_db.commit()
         except Exception as _mig_err:
             logger.warning(f"Legacy workspace migration failed (non-fatal): {_mig_err}")
+
+        # ── Add avatar_url column to users (idempotent) ───────────────────────
+        try:
+            async with engine.begin() as _col_conn:
+                await _col_conn.execute(text(
+                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(1024)"
+                ))
+            logger.info("users.avatar_url column ensured")
+        except Exception as _col_err:
+            logger.warning(f"avatar_url migration failed (non-fatal): {_col_err}")
     else:
         logger.info("AUTO_CREATE_TABLES=false — skipping auto-migration")
     yield
@@ -268,6 +287,16 @@ app.add_middleware(
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    # BrokenPipeError (errno 32) and ConnectionResetError mean the client
+    # disconnected before we finished writing the response. This is normal
+    # behaviour (e.g. user cancels an upload). Log at WARNING, not ERROR.
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+        logger.warning(
+            f"Client disconnected ({type(exc).__name__}): "
+            f"{request.method} {request.url.path}"
+        )
+        # Can't send a response — the pipe is gone. Return a minimal 499.
+        return JSONResponse(status_code=499, content={"detail": "Client closed request"})
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
@@ -293,4 +322,4 @@ _docling_data.mkdir(parents=True, exist_ok=True)
 app.mount("/static/doc-images", StaticFiles(directory=str(_docling_data)), name="static_doc_images")
 
 # Import models so SQLAlchemy registers them
-from app.models import knowledge_base, document, chat_message, user, tenant  # noqa: E402, F401
+from app.models import knowledge_base, document, chat_message, user, tenant, invite_token  # noqa: E402, F401

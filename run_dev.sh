@@ -52,6 +52,11 @@ C_CAPTION='\033[1;33m'  # yellow
 C_KG='\033[1;36m'       # cyan
 C_ERR='\033[1;31m'      # red
 
+# ── Kill old processes ────────────────────────────────────────────────────────
+echo -e "${C_ERR}[run_dev] Killing old processes (API and workers)...${C_RESET}"
+lsof -t -i:8080 | xargs -r kill -9 2>/dev/null || true
+pkill -f "python -m app.workers.runner" 2>/dev/null || true
+
 # ── Track child PIDs for cleanup ──────────────────────────────────────────────
 CHILD_PIDS=()
 

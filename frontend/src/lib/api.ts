@@ -9,7 +9,7 @@ const BASE_URL = import.meta.env.VITE_API_URL || "/api/v1";
  *
  * localhost:9000/bucket/key?sig=... → /minio-direct/bucket/key?sig=...
  */
-function rewritePresignedUrl(url: string): string {
+export function rewritePresignedUrl(url: string): string {
   try {
     const parsed = new URL(url);
     // Only rewrite when running via Vite dev server (same origin, no explicit host)

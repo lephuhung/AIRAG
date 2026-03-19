@@ -27,6 +27,9 @@ export default defineConfig({
         target: 'http://localhost:9000',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/minio-direct/, ''),
+        // Large file uploads need extended timeout (default is too short)
+        timeout: 600_000,       // 10 minutes socket timeout
+        proxyTimeout: 600_000,  // 10 minutes upstream response timeout
       },
     },
   },

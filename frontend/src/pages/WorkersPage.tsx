@@ -468,6 +468,30 @@ export function WorkersPage() {
                 })}
               </div>
 
+              {/* DLQ status card — informational only, cannot be started */}
+              <div className="mt-3 rounded-xl border bg-card p-4 flex items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <div className={cn(
+                    "w-2.5 h-2.5 rounded-full flex-shrink-0",
+                    dlqCount > 0 ? "bg-amber-400" : "bg-muted-foreground/30",
+                  )} />
+                  <div>
+                    <span className="text-sm font-semibold text-muted-foreground">nexusrag.dead-letter</span>
+                    <p className="text-[11px] text-muted-foreground/60 mt-0.5">
+                      Dead-letter queue — messages that failed after all retries. Not a startable worker.
+                    </p>
+                  </div>
+                </div>
+                {dlqCount > 0 ? (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20 flex-shrink-0">
+                    <Skull className="w-3 h-3" />
+                    {dlqCount} message{dlqCount !== 1 ? "s" : ""}
+                  </span>
+                ) : (
+                  <span className="text-xs text-muted-foreground/50 flex-shrink-0">Empty</span>
+                )}
+              </div>
+
               {/* Quick actions */}
               <div className="flex items-center gap-2 mt-3">
                 <Button
@@ -518,10 +542,16 @@ export function WorkersPage() {
             </Section>
 
             {/* ── Queue Details ── */}
-            {overview && overview.queues.length > 0 && (
-              <Section title="Queue Details" icon={Inbox} badge={overview.queues.length}>
+            {overview && overview.queues.length > 0 && (() => {
+              // Exclude the dead-letter queue — it's shown separately below
+              const workerQueues = overview.queues.filter(
+                (q) => q.name !== "nexusrag.dead-letter"
+              );
+              if (workerQueues.length === 0) return null;
+              return (
+              <Section title="Queue Details" icon={Inbox} badge={workerQueues.length}>
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
-                  {overview.queues.map((q) => (
+                  {workerQueues.map((q) => (
                     <div key={q.name} className="rounded-xl border bg-card p-4 space-y-3">
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-1.5 min-w-0">
@@ -577,7 +607,8 @@ export function WorkersPage() {
                   ))}
                 </div>
               </Section>
-            )}
+              );
+            })()}
 
             {/* ── Dead Letter Queue ── */}
             {dlqCount > 0 && (

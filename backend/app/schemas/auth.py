@@ -1,7 +1,7 @@
 """
 Auth request/response schemas.
 """
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, Field
 
 
 class RegisterRequest(BaseModel):
@@ -9,6 +9,7 @@ class RegisterRequest(BaseModel):
     password: str = Field(..., min_length=6, max_length=128)
     full_name: str = Field(..., min_length=1, max_length=255)
     tenant_slug: str | None = None
+    invite_token: str | None = None
 
 
 class LoginRequest(BaseModel):
@@ -33,8 +34,10 @@ class RefreshResponse(BaseModel):
 
 
 class UpdateProfileRequest(BaseModel):
-    full_name: str | None = None
-    password: str | None = Field(default=None, min_length=6, max_length=128)
+    full_name: str | None = Field(default=None, min_length=1, max_length=255)
+    # Password change: requires current_password for verification
+    current_password: str | None = Field(default=None, min_length=1, max_length=128)
+    new_password: str | None = Field(default=None, min_length=6, max_length=128)
 
 
 # Forward ref

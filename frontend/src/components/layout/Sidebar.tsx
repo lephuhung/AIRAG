@@ -7,8 +7,10 @@ import {
   FolderOpen,
   Activity,
   Building2,
+  Users,
 } from "lucide-react";
 import { useWorkspaces } from "@/hooks/useWorkspaces";
+import { useMyTenants } from "@/hooks/useMyTenants";
 import { useAuthStore } from "@/stores/authStore";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { cn } from "@/lib/utils";
@@ -22,13 +24,15 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
   const navigate = useNavigate();
   const location = useLocation();
   const { data: workspaces } = useWorkspaces();
+  const { data: myTenants } = useMyTenants();
   const user = useAuthStore((s) => s.user);
 
   const urlWorkspaceId = location.pathname.match(/\/knowledge-bases\/(\d+)/)?.[1];
   const isHome = location.pathname === "/";
   const isFilesPage = location.pathname === "/files" || location.pathname.endsWith("/files");
   const isWorkersPage = location.pathname === "/workers";
-  const isTenantPage = location.pathname.startsWith("/tenants/");
+  const isAdminUsersPage = location.pathname === "/admin/users";
+  const isAdminTenantsPage = location.pathname === "/admin/tenants";
 
   return (
     <aside
@@ -90,6 +94,44 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
             {!collapsed && <span className="truncate">Workers</span>}
           </button>
         )}
+
+        {/* Admin section (superadmin only) */}
+        {user?.is_superadmin && (
+          <>
+            {!collapsed && (
+              <p className="px-2.5 pt-4 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                Admin
+              </p>
+            )}
+            {collapsed && <div className="my-2 mx-2 border-t border-border" />}
+            <button
+              onClick={() => navigate("/admin/users")}
+              className={cn(
+                "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm transition-colors",
+                isAdminUsersPage
+                  ? "bg-primary/10 text-primary font-medium"
+                  : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+              )}
+              title={collapsed ? "Users" : undefined}
+            >
+              <Users className="w-4 h-4 flex-shrink-0" />
+              {!collapsed && <span className="truncate">Users</span>}
+            </button>
+            <button
+              onClick={() => navigate("/admin/tenants")}
+              className={cn(
+                "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm transition-colors",
+                isAdminTenantsPage
+                  ? "bg-primary/10 text-primary font-medium"
+                  : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+              )}
+              title={collapsed ? "Tenants" : undefined}
+            >
+              <Building2 className="w-4 h-4 flex-shrink-0" />
+              {!collapsed && <span className="truncate">Tenants</span>}
+            </button>
+          </>
+        )}
       </nav>
 
       {/* Scrollable workspace list */}
@@ -143,6 +185,57 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
                   title={ws.name}
                 >
                   <Database className="w-3.5 h-3.5" />
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {/* My Tenants */}
+        {!collapsed && myTenants && myTenants.length > 0 && (
+          <div className="mt-4 px-2">
+            <p className="px-2.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">
+              My Tenants
+            </p>
+            <div className="space-y-0.5">
+              {myTenants.map((t) => {
+                const isActive = location.pathname === `/tenants/${t.id}`;
+                return (
+                  <button
+                    key={`t-${t.id}`}
+                    onClick={() => navigate(`/tenants/${t.id}`)}
+                    className={cn(
+                      "w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-sm transition-colors",
+                      isActive
+                        ? "bg-primary/10 text-primary border-l-2 border-primary font-medium"
+                        : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+                    )}
+                  >
+                    <Building2 className="w-3.5 h-3.5 flex-shrink-0" />
+                    <span className="truncate">{t.name}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+        {collapsed && myTenants && myTenants.length > 0 && (
+          <div className="mt-2 px-2 space-y-1">
+            {myTenants.map((t) => {
+              const isActive = location.pathname === `/tenants/${t.id}`;
+              return (
+                <button
+                  key={`tc-${t.id}`}
+                  onClick={() => navigate(`/tenants/${t.id}`)}
+                  className={cn(
+                    "w-full flex items-center justify-center py-1.5 rounded-lg transition-colors",
+                    isActive
+                      ? "bg-primary/10 text-primary"
+                      : "text-muted-foreground hover:bg-muted/50"
+                  )}
+                  title={t.name}
+                >
+                  <Building2 className="w-3.5 h-3.5" />
                 </button>
               );
             })}

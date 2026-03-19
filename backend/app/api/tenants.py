@@ -1,29 +1,37 @@
 """
 Tenant Management API
 =====================
-CRUD for tenants + user membership management.
+CRUD for tenants + user membership management + invite links.
 SuperAdmin: create/update/delete tenants, assign tenant admins.
-Tenant Admin: approve/reject/manage members.
+Tenant Admin: approve/reject/manage members, create invite links.
 Any authenticated: list own tenants.
 """
 from __future__ import annotations
 
 import logging
+import uuid
+from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, status
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, Request, status
+from sqlalchemy import select, func, case
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db, get_current_active_user, require_superadmin
 from app.core.exceptions import NotFoundError, ForbiddenError, ConflictError, BadRequestError
 from app.models.tenant import Tenant, TenantUser
 from app.models.user import User
+from app.models.invite_token import InviteToken
 from app.schemas.tenant import (
     TenantCreate,
     TenantUpdate,
     TenantResponse,
     TenantUserResponse,
     RoleUpdateRequest,
+)
+from app.schemas.invite import (
+    InviteCreateRequest,
+    InviteResponse,
+    InviteValidationResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -107,11 +115,43 @@ async def list_tenants(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_superadmin),
 ):
-    """List all tenants (SuperAdmin only)."""
-    result = await db.execute(
-        select(Tenant).order_by(Tenant.name)
+    """List all tenants with member/pending counts (SuperAdmin only)."""
+    # Subquery for member_count (approved) and pending_count (not approved)
+    member_count_sq = (
+        select(
+            TenantUser.tenant_id,
+            func.count(TenantUser.id).filter(TenantUser.is_approved.is_(True)).label("member_count"),
+            func.count(TenantUser.id).filter(TenantUser.is_approved.is_(False)).label("pending_count"),
+        )
+        .group_by(TenantUser.tenant_id)
+        .subquery()
     )
-    return result.scalars().all()
+
+    result = await db.execute(
+        select(
+            Tenant,
+            func.coalesce(member_count_sq.c.member_count, 0).label("member_count"),
+            func.coalesce(member_count_sq.c.pending_count, 0).label("pending_count"),
+        )
+        .outerjoin(member_count_sq, Tenant.id == member_count_sq.c.tenant_id)
+        .order_by(Tenant.name)
+    )
+    rows = result.all()
+
+    return [
+        TenantResponse(
+            id=t.id,
+            name=t.name,
+            slug=t.slug,
+            domain=t.domain,
+            is_active=t.is_active,
+            member_count=mc,
+            pending_count=pc,
+            created_at=t.created_at,
+            updated_at=t.updated_at,
+        )
+        for t, mc, pc in rows
+    ]
 
 
 @router.put("/{tenant_id}", response_model=TenantResponse)
@@ -355,3 +395,156 @@ async def get_my_tenants(
         .order_by(Tenant.name)
     )
     return result.scalars().all()
+
+
+# ── Invite Link Management ────────────────────────────────────────────────
+
+def _build_invite_url(token: str, request: Request) -> str:
+    """Build the frontend invite URL from the token."""
+    # Use the request's origin to build the URL
+    origin = request.headers.get("origin", "")
+    if not origin:
+        # Fallback: use the request base URL but point to frontend port
+        origin = str(request.base_url).rstrip("/").replace(":8080", ":5174")
+    return f"{origin}/register?invite={token}"
+
+
+def _build_invite_response(invite: InviteToken, request: Request) -> InviteResponse:
+    """Build InviteResponse from the model."""
+    return InviteResponse(
+        id=invite.id,
+        token=invite.token,
+        tenant_id=invite.tenant_id,
+        email=invite.email,
+        role=invite.role,
+        max_uses=invite.max_uses,
+        use_count=invite.use_count,
+        expires_at=invite.expires_at,
+        created_at=invite.created_at,
+        is_active=invite.is_active,
+        invite_url=_build_invite_url(invite.token, request),
+    )
+
+
+@router.post("/{tenant_id}/invites", response_model=InviteResponse, status_code=status.HTTP_201_CREATED)
+async def create_invite(
+    tenant_id: int,
+    body: InviteCreateRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
+    """Create an invite link for a tenant (Tenant Admin or SuperAdmin)."""
+    await _get_tenant(tenant_id, db)
+    await _require_tenant_admin(tenant_id, user, db)
+
+    if body.role not in ("admin", "member"):
+        raise BadRequestError("Role must be 'admin' or 'member'")
+
+    token = uuid.uuid4().hex
+    expires_at = datetime.utcnow() + timedelta(days=body.expires_in_days)
+
+    invite = InviteToken(
+        token=token,
+        tenant_id=tenant_id,
+        created_by=user.id,
+        email=body.email.lower().strip() if body.email else None,
+        role=body.role,
+        max_uses=body.max_uses,
+        expires_at=expires_at,
+    )
+    db.add(invite)
+    await db.commit()
+    await db.refresh(invite)
+
+    logger.info(f"Invite created for tenant {tenant_id} by user {user.id}, token={token[:8]}...")
+    return _build_invite_response(invite, request)
+
+
+@router.get("/{tenant_id}/invites", response_model=list[InviteResponse])
+async def list_invites(
+    tenant_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
+    """List active invite links for a tenant (Tenant Admin or SuperAdmin)."""
+    await _get_tenant(tenant_id, db)
+    await _require_tenant_admin(tenant_id, user, db)
+
+    result = await db.execute(
+        select(InviteToken)
+        .where(
+            InviteToken.tenant_id == tenant_id,
+            InviteToken.is_active.is_(True),
+        )
+        .order_by(InviteToken.created_at.desc())
+    )
+    invites = result.scalars().all()
+    return [_build_invite_response(inv, request) for inv in invites]
+
+
+@router.delete("/{tenant_id}/invites/{invite_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_invite(
+    tenant_id: int,
+    invite_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
+    """Revoke an invite link (Tenant Admin or SuperAdmin)."""
+    await _get_tenant(tenant_id, db)
+    await _require_tenant_admin(tenant_id, user, db)
+
+    result = await db.execute(
+        select(InviteToken).where(
+            InviteToken.id == invite_id,
+            InviteToken.tenant_id == tenant_id,
+        )
+    )
+    invite = result.scalar_one_or_none()
+    if invite is None:
+        raise NotFoundError("Invite", invite_id)
+
+    invite.is_active = False
+    await db.commit()
+    logger.info(f"Invite {invite_id} revoked for tenant {tenant_id} by user {user.id}")
+
+
+@router.get("/invite/{token}", response_model=InviteValidationResponse)
+async def validate_invite(
+    token: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Validate an invite token (public, no auth required). Returns tenant info if valid."""
+    result = await db.execute(
+        select(InviteToken).where(InviteToken.token == token)
+    )
+    invite = result.scalar_one_or_none()
+
+    if invite is None or not invite.is_active:
+        return InviteValidationResponse(valid=False)
+
+    # Check expiration
+    if datetime.utcnow() > invite.expires_at:
+        return InviteValidationResponse(valid=False)
+
+    # Check usage limit
+    if invite.max_uses is not None and invite.use_count >= invite.max_uses:
+        return InviteValidationResponse(valid=False)
+
+    # Get tenant info
+    result = await db.execute(
+        select(Tenant).where(Tenant.id == invite.tenant_id, Tenant.is_active.is_(True))
+    )
+    tenant = result.scalar_one_or_none()
+    if tenant is None:
+        return InviteValidationResponse(valid=False)
+
+    return InviteValidationResponse(
+        valid=True,
+        tenant_name=tenant.name,
+        tenant_slug=tenant.slug,
+        email=invite.email,
+        expires_at=invite.expires_at.isoformat(),
+    )
+

@@ -117,7 +117,16 @@ async def upload_document(
             detail=f"File type {ext} not allowed. Allowed: {ALLOWED_EXTENSIONS}"
         )
 
-    content = await file.read()
+    try:
+        content = await file.read()
+    except (ConnectionResetError, OSError) as exc:
+        # Client disconnected mid-upload (Broken pipe / Connection reset)
+        logger.warning(f"Client disconnected during file upload for workspace {workspace_id}: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Upload interrupted — client disconnected. Please retry.",
+        )
+
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

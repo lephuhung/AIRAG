@@ -11,6 +11,8 @@ import { WorkersPage } from "@/pages/WorkersPage";
 import { LoginPage } from "@/pages/LoginPage";
 import { RegisterPage } from "@/pages/RegisterPage";
 import { TenantManagePage } from "@/pages/TenantManagePage";
+import { AdminUsersPage } from "@/pages/AdminUsersPage";
+import { AdminTenantsPage } from "@/pages/AdminTenantsPage";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -41,6 +43,8 @@ function AppRoutes() {
         <Route path="/knowledge-bases/:workspaceId/files" element={<FilesPage />} />
         <Route path="/files" element={<FilesPage />} />
         <Route path="/workers" element={<WorkersPage />} />
+        <Route path="/admin/users" element={<AdminUsersPage />} />
+        <Route path="/admin/tenants" element={<AdminTenantsPage />} />
         <Route path="/tenants/:tenantId" element={<TenantManagePage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

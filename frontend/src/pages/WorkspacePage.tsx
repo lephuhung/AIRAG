@@ -101,7 +101,18 @@ export function WorkspacePage() {
       queryClient.invalidateQueries({ queryKey: ["workspaces"] });
       toast.success("Document uploaded successfully");
     },
-    onError: () => toast.error("Failed to upload document"),
+    onError: (err: Error) => {
+      const msg = err.message || "";
+      if (msg.includes("MinIO PUT failed") || msg.includes("Network error")) {
+        toast.error("Upload failed — network error", {
+          description: "Connection interrupted. Check your network and try again.",
+        });
+      } else if (msg.includes("too large")) {
+        toast.error("File too large", { description: msg });
+      } else {
+        toast.error("Failed to upload document", { description: msg || undefined });
+      }
+    },
   });
 
   const deleteDoc = useMutation({
