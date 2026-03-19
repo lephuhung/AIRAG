@@ -5,10 +5,12 @@ from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
-from app.core.deps import get_db
+from app.core.deps import get_db, get_current_active_user
+from app.core.deps import verify_workspace_access as _verify_workspace_access
 from app.core.exceptions import NotFoundError
 from app.models.knowledge_base import KnowledgeBase
 from app.models.document import Document, DocumentImage, DocumentStatus
+from app.models.user import User
 import logging
 
 from app.schemas.rag import (
@@ -82,15 +84,14 @@ from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
 async def verify_workspace_access(
     workspace_id: int,
     db: AsyncSession,
+    user: User | None = None,
 ) -> KnowledgeBase:
-    """Verify knowledge base exists."""
-    result = await db.execute(select(KnowledgeBase).where(KnowledgeBase.id == workspace_id))
-    kb = result.scalar_one_or_none()
+    """Verify knowledge base exists and user has access."""
+    return await _verify_workspace_access(workspace_id, user, db)
 
-    if kb is None:
-        raise NotFoundError("KnowledgeBase", workspace_id)
 
-    return kb
+# Convenience: create a standard user dep for all RAG endpoints
+_user_dep = Depends(get_current_active_user)
 
 
 @router.post("/query/{workspace_id}", response_model=RAGQueryResponse)
@@ -98,9 +99,10 @@ async def query_documents(
     workspace_id: int,
     request: RAGQueryRequest,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """Query indexed documents using semantic search (+ optional KG)."""
-    await verify_workspace_access(workspace_id, db)
+    await verify_workspace_access(workspace_id, db, user)
 
     rag_service = get_rag_service(db, workspace_id)
 
@@ -199,6 +201,7 @@ async def query_documents(
 async def process_document(
     document_id: int,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """Trigger document processing (parsing + indexing) as a background task."""
     result = await db.execute(select(Document).where(Document.id == document_id))
@@ -279,6 +282,7 @@ async def process_document(
 async def process_batch(
     request: BatchProcessRequest,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """
     Process multiple documents sequentially in the background.
@@ -336,6 +340,7 @@ async def process_batch(
 async def reindex_document(
     document_id: int,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """Re-process an existing document through the NexusRAG pipeline."""
     result = await db.execute(select(Document).where(Document.id == document_id))
@@ -415,6 +420,7 @@ async def reindex_workspace(
     workspace_id: int,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """
     Reindex ALL documents in a workspace.
@@ -422,7 +428,7 @@ async def reindex_workspace(
     and re-processes every document through the NexusRAG pipeline.
     Runs in background — returns immediately with document count.
     """
-    await verify_workspace_access(workspace_id, db)
+    await verify_workspace_access(workspace_id, db, user)
 
     # Find all documents in this workspace
     result = await db.execute(
@@ -505,9 +511,10 @@ async def reindex_workspace(
 async def get_workspace_rag_stats(
     workspace_id: int,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """Get RAG statistics for a knowledge base."""
-    await verify_workspace_access(workspace_id, db)
+    await verify_workspace_access(workspace_id, db, user)
 
     total_result = await db.execute(
         select(func.count(Document.id)).where(Document.workspace_id == workspace_id)
@@ -559,6 +566,7 @@ async def get_workspace_rag_stats(
 async def get_document_chunks(
     document_id: int,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """Get all chunks for a specific document."""
     result = await db.execute(select(Document).where(Document.id == document_id))
@@ -628,9 +636,10 @@ async def get_kg_entities(
     limit: int = 200,
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """List entities in the workspace's knowledge graph."""
-    await verify_workspace_access(workspace_id, db)
+    await verify_workspace_access(workspace_id, db, user)
     kg = await _get_kg_service(workspace_id)
     try:
         entities = await kg.get_entities(
@@ -648,9 +657,10 @@ async def get_kg_relationships(
     entity: str | None = None,
     limit: int = 500,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """List relationships in the workspace's knowledge graph."""
-    await verify_workspace_access(workspace_id, db)
+    await verify_workspace_access(workspace_id, db, user)
     kg = await _get_kg_service(workspace_id)
     try:
         rels = await kg.get_relationships(entity_name=entity, limit=limit)
@@ -667,9 +677,10 @@ async def get_kg_graph(
     max_depth: int = 3,
     max_nodes: int = 150,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """Export knowledge graph data for frontend visualization."""
-    await verify_workspace_access(workspace_id, db)
+    await verify_workspace_access(workspace_id, db, user)
     kg = await _get_kg_service(workspace_id)
     try:
         data = await kg.get_graph_data(
@@ -689,9 +700,10 @@ async def get_kg_graph(
 async def get_workspace_analytics(
     workspace_id: int,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """Get extended analytics for a knowledge base (stats + KG + per-doc breakdown)."""
-    await verify_workspace_access(workspace_id, db)
+    await verify_workspace_access(workspace_id, db, user)
 
     # Base stats
     total_result = await db.execute(
@@ -788,14 +800,20 @@ async def get_workspace_analytics(
 async def get_chat_history(
     workspace_id: int,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
-    """Load persisted chat history for a workspace."""
-    await verify_workspace_access(workspace_id, db)
+    """Load persisted chat history for a workspace (per user)."""
+    await verify_workspace_access(workspace_id, db, user)
 
     from app.models.chat_message import ChatMessage as ChatMessageModel
     result = await db.execute(
         select(ChatMessageModel)
-        .where(ChatMessageModel.workspace_id == workspace_id)
+        .where(
+            ChatMessageModel.workspace_id == workspace_id,
+            # Filter by user_id — show only current user's chat
+            # Also include legacy messages (user_id IS NULL) for backward compat
+            (ChatMessageModel.user_id == user.id) | (ChatMessageModel.user_id.is_(None)),
+        )
         .order_by(ChatMessageModel.created_at.asc())
     )
     messages = result.scalars().all()
@@ -825,14 +843,18 @@ async def get_chat_history(
 async def delete_chat_history(
     workspace_id: int,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
-    """Clear all chat history for a workspace."""
-    await verify_workspace_access(workspace_id, db)
+    """Clear chat history for the current user in this workspace."""
+    await verify_workspace_access(workspace_id, db, user)
 
     from app.models.chat_message import ChatMessage as ChatMessageModel
     from sqlalchemy import delete
     await db.execute(
-        delete(ChatMessageModel).where(ChatMessageModel.workspace_id == workspace_id)
+        delete(ChatMessageModel).where(
+            ChatMessageModel.workspace_id == workspace_id,
+            (ChatMessageModel.user_id == user.id) | (ChatMessageModel.user_id.is_(None)),
+        )
     )
     await db.commit()
     return {"status": "cleared", "workspace_id": workspace_id}
@@ -847,9 +869,10 @@ async def rate_source(
     workspace_id: int,
     body: RateSourceRequest,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """Rate a source citation in a chat message."""
-    await verify_workspace_access(workspace_id, db)
+    await verify_workspace_access(workspace_id, db, user)
 
     from app.models.chat_message import ChatMessage as ChatMessageModel
 
@@ -887,6 +910,7 @@ async def chat_stream(
     workspace_id: int,
     request: ChatRequest,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """SSE streaming chat with semi-agentic retrieval."""
     from app.api.chat_agent import chat_stream_endpoint
@@ -900,9 +924,10 @@ async def chat_with_documents(
     workspace_id: int,
     request: ChatRequest,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """Chat with documents using NexusRAG retrieval + LLM answer generation."""
-    kb = await verify_workspace_access(workspace_id, db)
+    kb = await verify_workspace_access(workspace_id, db, user)
 
     rag_service = get_rag_service(db, workspace_id)
 
@@ -1195,6 +1220,7 @@ async def chat_with_documents(
             message_id=str(uuid.uuid4()),
             role="user",
             content=request.message,
+            user_id=user.id,
         )
         db.add(user_row)
 
@@ -1207,6 +1233,7 @@ async def chat_with_documents(
             related_entities=related_entities[:30] if related_entities else None,
             image_refs=[img.model_dump() for img in chat_image_refs] if chat_image_refs else None,
             thinking=thinking_text,
+            user_id=user.id,
         )
         db.add(assistant_row)
         await db.commit()
@@ -1229,7 +1256,9 @@ async def chat_with_documents(
 # ---------------------------------------------------------------------------
 
 @router.get("/capabilities", response_model=LLMCapabilitiesResponse)
-async def get_llm_capabilities():
+async def get_llm_capabilities(
+    user: User = Depends(get_current_active_user),
+):
     """Check LLM provider capabilities (thinking, vision)."""
     from app.services.llm import get_llm_provider
     from app.core.config import settings
@@ -1263,12 +1292,13 @@ async def debug_chat(
     workspace_id: int,
     request: ChatRequest,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """
     Debug version of chat — returns retrieval details + system prompt + answer
     so you can inspect what the LLM received vs what it answered.
     """
-    kb = await verify_workspace_access(workspace_id, db)
+    kb = await verify_workspace_access(workspace_id, db, user)
 
     rag_service = get_rag_service(db, workspace_id)
 

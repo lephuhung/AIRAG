@@ -8,6 +8,8 @@ from datetime import datetime
 class WorkspaceCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     description: str | None = None
+    visibility: str | None = Field(default="personal", pattern="^(public|tenant|personal)$")
+    tenant_id: int | None = None
 
 
 class WorkspaceUpdate(BaseModel):
@@ -25,6 +27,9 @@ class WorkspaceResponse(BaseModel):
     indexed_count: int = 0
     created_at: datetime
     updated_at: datetime
+    visibility: str = "personal"
+    owner_id: int | None = None
+    tenant_id: int | None = None
 
     model_config = {"from_attributes": True}
 

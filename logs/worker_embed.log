@@ -48,3 +48,5 @@
 2026-03-18 17:43:59,082 [INFO] app.queue.connection — Connecting to RabbitMQ: amqp://guest:guest@localhost:5672/
 2026-03-18 17:43:59,092 [INFO] app.queue.connection — RabbitMQ connected
 2026-03-18 17:43:59,099 [INFO] app.queue.connection — Consuming nexusrag.embed/embed → nexusrag.embed
+2026-03-19 12:01:59,312 [INFO] __main__ — Received SIGTERM — shutting down worker
+2026-03-19 12:01:59,317 [INFO] __main__ — Worker stopped cleanly

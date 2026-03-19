@@ -32,4 +32,9 @@ class ChatMessage(Base):
     ratings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     agent_steps: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
+    # User who sent/received this message
+    user_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id"), nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

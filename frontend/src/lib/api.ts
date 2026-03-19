@@ -1,3 +1,5 @@
+import { useAuthStore } from "@/stores/authStore";
+
 const BASE_URL = import.meta.env.VITE_API_URL || "/api/v1";
 
 /**
@@ -20,15 +22,67 @@ function rewritePresignedUrl(url: string): string {
   return url;
 }
 
+function getAuthHeaders(): Record<string, string> {
+  const token = useAuthStore.getState().token;
+  if (token) {
+    return { Authorization: `Bearer ${token}` };
+  }
+  return {};
+}
+
+/**
+ * Handle 401 responses: try to refresh token, retry request once.
+ * If refresh fails, logout and redirect to login.
+ */
+async function handleUnauthorized(
+  originalUrl: string,
+  originalOptions?: RequestInit,
+): Promise<Response | null> {
+  const store = useAuthStore.getState();
+  const refreshed = await store.refreshAccessToken();
+
+  if (!refreshed) {
+    // Redirect to login
+    if (window.location.pathname !== "/login") {
+      window.location.href = "/login";
+    }
+    return null;
+  }
+
+  // Retry the original request with new token
+  const retryHeaders = {
+    ...originalOptions?.headers,
+    ...getAuthHeaders(),
+  };
+  return fetch(originalUrl, {
+    ...originalOptions,
+    headers: retryHeaders,
+  });
+}
+
 class ApiClient {
   private async request<T>(path: string, options?: RequestInit): Promise<T> {
-    const response = await fetch(`${BASE_URL}${path}`, {
+    const url = `${BASE_URL}${path}`;
+    const mergedOptions: RequestInit = {
       ...options,
       headers: {
         "Content-Type": "application/json",
+        ...getAuthHeaders(),
         ...options?.headers,
       },
-    });
+    };
+
+    let response = await fetch(url, mergedOptions);
+
+    // Handle 401 — try token refresh
+    if (response.status === 401) {
+      const retried = await handleUnauthorized(url, mergedOptions);
+      if (retried) {
+        response = retried;
+      } else {
+        throw new Error("Session expired. Please login again.");
+      }
+    }
 
     if (!response.ok) {
       const error = await response.json().catch(() => ({ detail: "Unknown error" }));
@@ -48,7 +102,20 @@ class ApiClient {
 
   /** Fetch a plain-text (or markdown) response as a string. */
   async getText(path: string): Promise<string> {
-    const response = await fetch(`${BASE_URL}${path}`, { method: "GET" });
+    const url = `${BASE_URL}${path}`;
+    let response = await fetch(url, {
+      method: "GET",
+      headers: getAuthHeaders(),
+    });
+
+    if (response.status === 401) {
+      const retried = await handleUnauthorized(url, {
+        method: "GET",
+        headers: getAuthHeaders(),
+      });
+      if (retried) response = retried;
+    }
+
     if (!response.ok) {
       const error = await response.json().catch(() => ({ detail: "Unknown error" }));
       throw new Error(error.detail || `API Error: ${response.status}`);
@@ -82,7 +149,9 @@ class ApiClient {
   }
 
   async downloadFile(path: string, filename: string): Promise<void> {
-    const response = await fetch(`${BASE_URL}${path}`);
+    const response = await fetch(`${BASE_URL}${path}`, {
+      headers: getAuthHeaders(),
+    });
 
     if (!response.ok) {
       const error = await response.json().catch(() => ({ detail: "Download failed" }));
@@ -106,6 +175,7 @@ class ApiClient {
 
     const response = await fetch(`${BASE_URL}${path}`, {
       method: "POST",
+      headers: getAuthHeaders(),
       body: formData,
     });
 
@@ -134,7 +204,7 @@ class ApiClient {
     // Step 1 — get presigned URL
     const presignRes = await fetch(`${BASE_URL}/documents/upload/${workspaceId}/presign`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...getAuthHeaders() },
       body: JSON.stringify({
         filename: file.name,
         file_size: file.size,
@@ -182,7 +252,7 @@ class ApiClient {
     // Step 3 — confirm and trigger pipeline
     const confirmRes = await fetch(`${BASE_URL}/documents/upload/${workspaceId}/confirm`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...getAuthHeaders() },
       body: JSON.stringify({ document_id }),
     });
 

@@ -1,3 +1,42 @@
+// ── Auth Types ──
+export interface User {
+  id: number;
+  email: string;
+  full_name: string;
+  is_active: boolean;
+  is_superadmin: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AuthTokens {
+  access_token: string;
+  refresh_token: string;
+  token_type: string;
+  user: User;
+}
+
+export interface Tenant {
+  id: number;
+  name: string;
+  slug: string;
+  domain: string | null;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TenantUser {
+  id: number;
+  tenant_id: number;
+  user_id: number;
+  role: string;
+  is_approved: boolean;
+  created_at: string;
+  email: string | null;
+  full_name: string | null;
+}
+
 // Knowledge Base (Document Workspace)
 export interface KnowledgeBase {
   id: number;
@@ -8,11 +47,16 @@ export interface KnowledgeBase {
   indexed_count: number;
   created_at: string;
   updated_at: string;
+  visibility: "public" | "tenant" | "personal";
+  owner_id: number | null;
+  tenant_id: number | null;
 }
 
 export interface CreateWorkspace {
   name: string;
   description?: string;
+  visibility?: "public" | "tenant" | "personal";
+  tenant_id?: number | null;
 }
 
 export interface UpdateWorkspace {

@@ -6,8 +6,10 @@ import {
   ChevronRight,
   FolderOpen,
   Activity,
+  Building2,
 } from "lucide-react";
 import { useWorkspaces } from "@/hooks/useWorkspaces";
+import { useAuthStore } from "@/stores/authStore";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { cn } from "@/lib/utils";
 
@@ -20,11 +22,13 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
   const navigate = useNavigate();
   const location = useLocation();
   const { data: workspaces } = useWorkspaces();
+  const user = useAuthStore((s) => s.user);
 
   const urlWorkspaceId = location.pathname.match(/\/knowledge-bases\/(\d+)/)?.[1];
   const isHome = location.pathname === "/";
   const isFilesPage = location.pathname === "/files" || location.pathname.endsWith("/files");
   const isWorkersPage = location.pathname === "/workers";
+  const isTenantPage = location.pathname.startsWith("/tenants/");
 
   return (
     <aside
@@ -71,19 +75,21 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
           {!collapsed && <span className="truncate">Files</span>}
         </button>
 
-        <button
-          onClick={() => navigate("/workers")}
-          className={cn(
-            "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm transition-colors",
-            isWorkersPage
-              ? "bg-primary/10 text-primary font-medium"
-              : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
-          )}
-          title={collapsed ? "Workers" : undefined}
-        >
-          <Activity className="w-4 h-4 flex-shrink-0" />
-          {!collapsed && <span className="truncate">Workers</span>}
-        </button>
+        {user?.is_superadmin && (
+          <button
+            onClick={() => navigate("/workers")}
+            className={cn(
+              "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm transition-colors",
+              isWorkersPage
+                ? "bg-primary/10 text-primary font-medium"
+                : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+            )}
+            title={collapsed ? "Workers" : undefined}
+          >
+            <Activity className="w-4 h-4 flex-shrink-0" />
+            {!collapsed && <span className="truncate">Workers</span>}
+          </button>
+        )}
       </nav>
 
       {/* Scrollable workspace list */}
@@ -145,19 +151,28 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
       </div>
 
       {/* Footer */}
-      <div className="flex-shrink-0 border-t border-border px-2 py-2 flex items-center justify-between">
-        <ThemeToggle />
-        <button
-          onClick={onToggle}
-          className="w-8 h-8 flex items-center justify-center rounded-lg text-muted-foreground hover:bg-muted/50 hover:text-foreground transition-colors"
-          title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-        >
-          {collapsed ? (
-            <ChevronRight className="w-4 h-4" />
-          ) : (
-            <ChevronLeft className="w-4 h-4" />
-          )}
-        </button>
+      <div className="flex-shrink-0 border-t border-border px-2 py-2 space-y-2">
+        {/* User info */}
+        {!collapsed && user && (
+          <div className="px-2.5 py-1">
+            <p className="text-xs font-medium truncate">{user.full_name}</p>
+            <p className="text-[10px] text-muted-foreground truncate">{user.email}</p>
+          </div>
+        )}
+        <div className="flex items-center justify-between">
+          <ThemeToggle />
+          <button
+            onClick={onToggle}
+            className="w-8 h-8 flex items-center justify-center rounded-lg text-muted-foreground hover:bg-muted/50 hover:text-foreground transition-colors"
+            title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          >
+            {collapsed ? (
+              <ChevronRight className="w-4 h-4" />
+            ) : (
+              <ChevronLeft className="w-4 h-4" />
+            )}
+          </button>
+        </div>
       </div>
     </aside>
   );

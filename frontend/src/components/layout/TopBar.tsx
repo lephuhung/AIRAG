@@ -3,6 +3,7 @@ import { useLocation } from "react-router-dom";
 import { ChevronRight, Cpu, Database } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
+import { UserMenu } from "@/components/layout/UserMenu";
 
 interface ConfigStatus {
   llm_provider: string;
@@ -87,6 +88,7 @@ export const TopBar = memo(function TopBar({ actions, className }: TopBarProps) 
           </div>
         )}
         {actions}
+        <UserMenu />
       </div>
     </div>
   );

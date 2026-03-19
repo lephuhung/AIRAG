@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { useWorkspaces, useCreateWorkspace, useDeleteWorkspace } from "@/hooks/useWorkspaces";
+import { useAuthStore } from "@/stores/authStore";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -12,17 +13,25 @@ import {
   Trash2,
   MoreHorizontal,
   X,
+  Globe,
+  Building2,
+  User,
 } from "lucide-react";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
-import type { KnowledgeBase } from "@/types";
+import { cn } from "@/lib/utils";
+import type { KnowledgeBase, CreateWorkspace } from "@/types";
+
+type VisibilityOption = "personal" | "tenant" | "public";
 
 export function KnowledgeBasesPage() {
   const navigate = useNavigate();
+  const user = useAuthStore((s) => s.user);
   const { data: workspaces, isLoading } = useWorkspaces();
   const createWorkspace = useCreateWorkspace();
   const deleteWorkspace = useDeleteWorkspace();
   const [showNewWorkspace, setShowNewWorkspace] = useState(false);
   const [newWorkspaceName, setNewWorkspaceName] = useState("");
+  const [newVisibility, setNewVisibility] = useState<VisibilityOption>("personal");
   const [deleteConfirm, setDeleteConfirm] = useState<number | null>(null);
   const [openMenu, setOpenMenu] = useState<number | null>(null);
 
@@ -37,9 +46,14 @@ export function KnowledgeBasesPage() {
   const handleCreateWorkspace = async () => {
     if (!newWorkspaceName.trim()) return;
     try {
-      const ws = await createWorkspace.mutateAsync({ name: newWorkspaceName });
+      const payload: CreateWorkspace = {
+        name: newWorkspaceName,
+        visibility: newVisibility,
+      };
+      const ws = await createWorkspace.mutateAsync(payload);
       toast.success("Knowledge base created");
       setNewWorkspaceName("");
+      setNewVisibility("personal");
       setShowNewWorkspace(false);
       navigate(`/knowledge-bases/${ws.id}`);
     } catch {
@@ -66,6 +80,109 @@ export function KnowledgeBasesPage() {
     if (days === 1) return "Yesterday";
     if (days < 7) return `${days} days ago`;
     return date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+  };
+
+  // Split workspaces into sections
+  const publicWorkspaces = workspaces?.filter((ws) => ws.visibility === "public") ?? [];
+  const tenantWorkspaces = workspaces?.filter((ws) => ws.visibility === "tenant") ?? [];
+  const personalWorkspaces = workspaces?.filter((ws) => ws.visibility === "personal") ?? [];
+  // Legacy workspaces (no owner) — treat as shared/public
+  const legacyWorkspaces = workspaces?.filter(
+    (ws) => !ws.owner_id && ws.visibility !== "public" && ws.visibility !== "tenant" && ws.visibility !== "personal"
+  ) ?? [];
+
+  const renderWorkspaceCard = (ws: KnowledgeBase) => (
+    <Card
+      key={ws.id}
+      className="group cursor-pointer transition-all hover:ring-1 hover:ring-primary/20 hover:-translate-y-0.5 hover:shadow-lg"
+      onClick={() => navigate(`/knowledge-bases/${ws.id}`)}
+    >
+      <CardContent className="pt-5 pb-4">
+        <div className="flex items-start justify-between mb-1">
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-8 h-8 rounded-lg bg-blue-500/10 flex items-center justify-center flex-shrink-0">
+              <Database className="w-4 h-4 text-blue-500" />
+            </div>
+            <div className="min-w-0">
+              <h3 className="font-medium text-sm truncate">{ws.name}</h3>
+              {ws.description && (
+                <p className="text-xs text-muted-foreground truncate mt-0.5">
+                  {ws.description}
+                </p>
+              )}
+            </div>
+          </div>
+          <div className="relative flex-shrink-0">
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setOpenMenu(openMenu === ws.id ? null : ws.id);
+              }}
+              className="w-7 h-7 flex items-center justify-center rounded-md text-muted-foreground opacity-0 group-hover:opacity-100 hover:bg-muted transition-all"
+            >
+              <MoreHorizontal className="w-4 h-4" />
+            </button>
+            {openMenu === ws.id && (
+              <div className="absolute right-0 top-8 z-20 bg-card border rounded-lg shadow-lg py-1 w-32">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setDeleteConfirm(ws.id);
+                    setOpenMenu(null);
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-destructive hover:bg-muted transition-colors"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Delete
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center gap-3 mt-3 text-xs text-muted-foreground">
+          <span className="flex items-center gap-1">
+            <FileText className="w-3 h-3" />
+            {ws.document_count} docs
+          </span>
+          <span className="flex items-center gap-1 text-green-500">
+            {ws.indexed_count} indexed
+          </span>
+          {ws.updated_at && (
+            <>
+              <span className="text-border">|</span>
+              <span>{formatDate(ws.updated_at)}</span>
+            </>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+
+  const renderSection = (
+    title: string,
+    icon: React.ReactNode,
+    items: KnowledgeBase[],
+    emptyText?: string,
+  ) => {
+    if (items.length === 0 && !emptyText) return null;
+    return (
+      <div className="mb-8">
+        <div className="flex items-center gap-2 mb-3">
+          {icon}
+          <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wider">
+            {title}
+          </h3>
+          <span className="text-xs text-muted-foreground/60">({items.length})</span>
+        </div>
+        {items.length === 0 ? (
+          <p className="text-sm text-muted-foreground/60 pl-6">{emptyText}</p>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {items.map(renderWorkspaceCard)}
+          </div>
+        )}
+      </div>
+    );
   };
 
   return (
@@ -108,6 +225,33 @@ export function KnowledgeBasesPage() {
                   onKeyDown={(e) => e.key === "Enter" && handleCreateWorkspace()}
                   autoFocus
                 />
+                {/* Visibility selector */}
+                <div className="mt-4">
+                  <label className="block text-sm font-medium mb-2">Visibility</label>
+                  <div className="grid grid-cols-3 gap-2">
+                    {([
+                      { value: "personal" as const, label: "Personal", icon: User, desc: "Only you" },
+                      { value: "tenant" as const, label: "Tenant", icon: Building2, desc: "Your org" },
+                      { value: "public" as const, label: "Public", icon: Globe, desc: "Everyone" },
+                    ]).map((opt) => (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        onClick={() => setNewVisibility(opt.value)}
+                        className={cn(
+                          "flex flex-col items-center gap-1 p-3 rounded-lg border text-sm transition-colors",
+                          newVisibility === opt.value
+                            ? "border-primary bg-primary/5 text-primary"
+                            : "border-border text-muted-foreground hover:bg-muted/50"
+                        )}
+                      >
+                        <opt.icon className="w-4 h-4" />
+                        <span className="font-medium text-xs">{opt.label}</span>
+                        <span className="text-[10px] text-muted-foreground">{opt.desc}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
                 <div className="flex justify-end gap-2 mt-4">
                   <Button variant="ghost" onClick={() => setShowNewWorkspace(false)}>
                     Cancel
@@ -149,74 +293,34 @@ export function KnowledgeBasesPage() {
             </Button>
           </div>
         ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {workspaces.map((ws: KnowledgeBase) => (
-              <Card
-                key={ws.id}
-                className="group cursor-pointer transition-all hover:ring-1 hover:ring-primary/20 hover:-translate-y-0.5 hover:shadow-lg"
-                onClick={() => navigate(`/knowledge-bases/${ws.id}`)}
-              >
-                <CardContent className="pt-5 pb-4">
-                  <div className="flex items-start justify-between mb-1">
-                    <div className="flex items-center gap-2.5 min-w-0">
-                      <div className="w-8 h-8 rounded-lg bg-blue-500/10 flex items-center justify-center flex-shrink-0">
-                        <Database className="w-4 h-4 text-blue-500" />
-                      </div>
-                      <div className="min-w-0">
-                        <h3 className="font-medium text-sm truncate">{ws.name}</h3>
-                        {ws.description && (
-                          <p className="text-xs text-muted-foreground truncate mt-0.5">
-                            {ws.description}
-                          </p>
-                        )}
-                      </div>
-                    </div>
-                    <div className="relative flex-shrink-0">
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setOpenMenu(openMenu === ws.id ? null : ws.id);
-                        }}
-                        className="w-7 h-7 flex items-center justify-center rounded-md text-muted-foreground opacity-0 group-hover:opacity-100 hover:bg-muted transition-all"
-                      >
-                        <MoreHorizontal className="w-4 h-4" />
-                      </button>
-                      {openMenu === ws.id && (
-                        <div className="absolute right-0 top-8 z-20 bg-card border rounded-lg shadow-lg py-1 w-32">
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setDeleteConfirm(ws.id);
-                              setOpenMenu(null);
-                            }}
-                            className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-destructive hover:bg-muted transition-colors"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                            Delete
-                          </button>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-3 mt-3 text-xs text-muted-foreground">
-                    <span className="flex items-center gap-1">
-                      <FileText className="w-3 h-3" />
-                      {ws.document_count} docs
-                    </span>
-                    <span className="flex items-center gap-1 text-green-500">
-                      {ws.indexed_count} indexed
-                    </span>
-                    {ws.updated_at && (
-                      <>
-                        <span className="text-border">|</span>
-                        <span>{formatDate(ws.updated_at)}</span>
-                      </>
-                    )}
-                  </div>
-                </CardContent>
-              </Card>
-            ))}
-          </div>
+          <>
+            {/* Legacy workspaces (no owner — from before auth) */}
+            {legacyWorkspaces.length > 0 && renderSection(
+              "Shared (Legacy)",
+              <Globe className="w-4 h-4 text-muted-foreground" />,
+              legacyWorkspaces,
+            )}
+
+            {renderSection(
+              "Public Workspaces",
+              <Globe className="w-4 h-4 text-blue-500" />,
+              publicWorkspaces,
+              "No public workspaces",
+            )}
+
+            {renderSection(
+              "Organization",
+              <Building2 className="w-4 h-4 text-amber-500" />,
+              tenantWorkspaces,
+            )}
+
+            {renderSection(
+              "My Personal Workspaces",
+              <User className="w-4 h-4 text-green-500" />,
+              personalWorkspaces,
+              "No personal workspaces yet",
+            )}
+          </>
         )}
       </div>
 

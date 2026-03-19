@@ -20,6 +20,8 @@ import app.models.knowledge_base  # noqa: F401
 import app.models.document        # noqa: F401
 import app.models.document_type   # noqa: F401
 import app.models.chat_message    # noqa: F401
+import app.models.user            # noqa: F401
+import app.models.tenant          # noqa: F401
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -96,6 +98,25 @@ async def lifespan(app: FastAPI):
             await conn.execute(text(
                 "ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_type_id INTEGER "
                 "REFERENCES document_types(id) ON DELETE SET NULL"
+            ))
+            # ── Auth & multi-tenant columns ────────────────────────────────────
+            # knowledge_bases: visibility, owner_id, tenant_id
+            await conn.execute(text(
+                "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS visibility VARCHAR(20) DEFAULT 'personal'"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS owner_id INTEGER REFERENCES users(id)"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS tenant_id INTEGER REFERENCES tenants(id)"
+            ))
+            # documents: uploaded_by
+            await conn.execute(text(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS uploaded_by INTEGER REFERENCES users(id)"
+            ))
+            # chat_messages: user_id
+            await conn.execute(text(
+                "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id)"
             ))
             # Ensure ALL lowercase enum values exist in PostgreSQL.
             # On a fresh DB, create_all() + values_callable creates them lowercase.
@@ -174,6 +195,50 @@ async def lifespan(app: FastAPI):
             logger.info("Document types seeded/verified")
         except Exception as _seed_err:
             logger.warning(f"Document type seed failed (non-fatal): {_seed_err}")
+
+        # ── Seed SuperAdmin user (idempotent) ─────────────────────────────────
+        try:
+            from app.core.database import async_session_maker
+            from app.models.user import User as UserModel
+            from app.core.security import hash_password
+            from sqlalchemy import select as _select
+
+            async with async_session_maker() as _admin_db:
+                exists = await _admin_db.execute(
+                    _select(UserModel).where(UserModel.email == settings.FIRST_SUPERADMIN_EMAIL)
+                )
+                if exists.scalar_one_or_none() is None:
+                    admin = UserModel(
+                        email=settings.FIRST_SUPERADMIN_EMAIL,
+                        password_hash=hash_password(settings.FIRST_SUPERADMIN_PASSWORD),
+                        full_name="Super Admin",
+                        is_active=True,
+                        is_superadmin=True,
+                    )
+                    _admin_db.add(admin)
+                    await _admin_db.commit()
+                    logger.info(f"SuperAdmin user created: {settings.FIRST_SUPERADMIN_EMAIL}")
+                else:
+                    logger.info("SuperAdmin user already exists")
+        except Exception as _admin_err:
+            logger.warning(f"SuperAdmin seed failed (non-fatal): {_admin_err}")
+
+        # ── Migrate legacy workspaces: set visibility='public' for ownerless ──
+        try:
+            from app.core.database import async_session_maker
+
+            async with async_session_maker() as _migrate_db:
+                result = await _migrate_db.execute(text(
+                    "UPDATE knowledge_bases SET visibility = 'public' "
+                    "WHERE owner_id IS NULL AND visibility = 'personal'"
+                ))
+                if result.rowcount > 0:
+                    await _migrate_db.commit()
+                    logger.info(f"Migrated {result.rowcount} legacy workspaces to visibility='public'")
+                else:
+                    await _migrate_db.commit()
+        except Exception as _mig_err:
+            logger.warning(f"Legacy workspace migration failed (non-fatal): {_mig_err}")
     else:
         logger.info("AUTO_CREATE_TABLES=false — skipping auto-migration")
     yield
@@ -228,4 +293,4 @@ _docling_data.mkdir(parents=True, exist_ok=True)
 app.mount("/static/doc-images", StaticFiles(directory=str(_docling_data)), name="static_doc_images")
 
 # Import models so SQLAlchemy registers them
-from app.models import knowledge_base, document, chat_message  # noqa: E402, F401
+from app.models import knowledge_base, document, chat_message, user, tenant  # noqa: E402, F401

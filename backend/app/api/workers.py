@@ -22,8 +22,9 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
-from app.core.deps import get_db
+from app.core.deps import get_db, require_superadmin
 from app.models.document import Document, DocumentStatus
+from app.models.user import User
 from app.services.rabbitmq_management import get_rabbitmq_management
 from app.queue.connection import (
     publish, EXCHANGE_PARSE, DLQ_QUEUE,
@@ -142,7 +143,7 @@ def _extract_queue_info(q: dict[str, Any]) -> dict[str, Any]:
 
 
 @router.get("/health")
-async def workers_health(db: AsyncSession = Depends(get_db)):
+async def workers_health(db: AsyncSession = Depends(get_db), user: User = Depends(require_superadmin)):
     """
     Comprehensive health check for the worker system.
     Returns status of RabbitMQ, each queue, active consumers, managed workers,
@@ -274,7 +275,7 @@ class WorkerStartRequest(BaseModel):
 
 
 @router.get("/managed")
-async def list_managed_workers():
+async def list_managed_workers(user: User = Depends(require_superadmin)):
     """List all managed worker processes started from this API server."""
     result: dict[str, Any] = {}
     async with _workers_lock:
@@ -285,7 +286,7 @@ async def list_managed_workers():
 
 
 @router.post("/start")
-async def start_worker(req: WorkerStartRequest):
+async def start_worker(req: WorkerStartRequest, user: User = Depends(require_superadmin)):
     """
     Start one or more worker processes of the given type.
     Workers run as subprocesses managed by this API server.
@@ -313,7 +314,7 @@ async def start_worker(req: WorkerStartRequest):
 
 
 @router.post("/stop/{worker_type}")
-async def stop_workers(worker_type: str, pid: int | None = None):
+async def stop_workers(worker_type: str, pid: int | None = None, user: User = Depends(require_superadmin)):
     """
     Stop managed workers of the given type.
     If pid is specified, only that worker is stopped.
@@ -355,7 +356,7 @@ async def stop_workers(worker_type: str, pid: int | None = None):
 
 
 @router.post("/restart/{worker_type}")
-async def restart_workers(worker_type: str):
+async def restart_workers(worker_type: str, user: User = Depends(require_superadmin)):
     """
     Restart all managed workers of the given type.
     Stops all existing ones and starts the same count of new ones.
@@ -397,7 +398,7 @@ async def restart_workers(worker_type: str):
 
 
 @router.delete("/managed/{worker_type}")
-async def remove_dead_workers(worker_type: str):
+async def remove_dead_workers(worker_type: str, user: User = Depends(require_superadmin)):
     """Remove dead/exited worker entries from the managed list."""
     wtype = worker_type.lower()
     async with _workers_lock:
@@ -414,7 +415,7 @@ async def remove_dead_workers(worker_type: str):
 
 
 @router.get("/dead-letter")
-async def get_dead_letter_messages(count: int = 20):
+async def get_dead_letter_messages(count: int = 20, user: User = Depends(require_superadmin)):
     """
     Peek at messages in the dead-letter queue.
     Messages are NOT consumed — they remain in the queue.
@@ -441,7 +442,7 @@ async def get_dead_letter_messages(count: int = 20):
 
 
 @router.post("/dead-letter/purge")
-async def purge_dead_letter():
+async def purge_dead_letter(user: User = Depends(require_superadmin)):
     """Clear all messages from the dead-letter queue."""
     try:
         mgmt = get_rabbitmq_management()
@@ -452,7 +453,7 @@ async def purge_dead_letter():
 
 
 @router.post("/dead-letter/retry")
-async def retry_dead_letter_messages(count: int = 100):
+async def retry_dead_letter_messages(count: int = 100, user: User = Depends(require_superadmin)):
     """
     Move messages from dead-letter queue back to their original queues.
     Reads messages from DLQ and republishes them to the original exchange.
@@ -502,7 +503,7 @@ async def retry_dead_letter_messages(count: int = 100):
 
 
 @router.delete("/queues/{queue_name}")
-async def delete_queue(queue_name: str):
+async def delete_queue(queue_name: str, user: User = Depends(require_superadmin)):
     """Delete a queue entirely. Use for migration (e.g., recreating with DLX args)."""
     if not queue_name.startswith(_QUEUE_PREFIX):
         raise HTTPException(status_code=400, detail="Can only delete nexusrag.* queues")
@@ -520,7 +521,7 @@ async def delete_queue(queue_name: str):
 
 
 @router.get("/overview")
-async def get_overview(db: AsyncSession = Depends(get_db)):
+async def get_overview(db: AsyncSession = Depends(get_db), user: User = Depends(require_superadmin)):
     """
     Combined RabbitMQ stats + DB document pipeline counts.
     Gracefully handles RabbitMQ being unreachable.
@@ -582,7 +583,7 @@ async def get_overview(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/queues")
-async def list_queues():
+async def list_queues(user: User = Depends(require_superadmin)):
     """Returns all nexusrag.* queues with full metrics."""
     try:
         mgmt = get_rabbitmq_management()
@@ -597,7 +598,7 @@ async def list_queues():
 
 
 @router.post("/queues/{queue_name}/purge")
-async def purge_queue(queue_name: str):
+async def purge_queue(queue_name: str, user: User = Depends(require_superadmin)):
     """Clear all pending messages from a specific queue."""
     if not queue_name.startswith(_QUEUE_PREFIX):
         raise HTTPException(status_code=400, detail="Can only purge nexusrag.* queues")
@@ -613,6 +614,7 @@ async def purge_queue(queue_name: str):
 async def retry_all_failed(
     workspace_id: int | None = None,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_superadmin),
 ):
     """Reset all FAILED documents to PENDING and republish ParseMessage."""
     query = select(Document).where(Document.status == DocumentStatus.FAILED)
@@ -646,6 +648,7 @@ async def retry_all_failed(
 async def retry_single_failed(
     document_id: int,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_superadmin),
 ):
     """Reset a single FAILED document to PENDING and republish ParseMessage."""
     result = await db.execute(
@@ -677,6 +680,7 @@ async def retry_single_failed(
 async def get_pipeline(
     workspace_id: int | None = None,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_superadmin),
 ):
     """
     Returns in-progress + recently failed documents with detailed status.

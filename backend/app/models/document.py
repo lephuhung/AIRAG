@@ -65,6 +65,11 @@ class Document(Base):
         ForeignKey("document_types.id", ondelete="SET NULL"), nullable=True
     )
 
+    # User who uploaded this document
+    uploaded_by: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True
+    )
+
     # Relationships
     workspace: Mapped["KnowledgeBase"] = relationship(back_populates="documents")
     document_type: Mapped["DocumentType | None"] = relationship(  # type: ignore[name-defined]

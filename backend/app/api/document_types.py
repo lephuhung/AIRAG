@@ -26,9 +26,10 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.deps import get_db
+from app.core.deps import get_db, get_current_active_user, require_superadmin
 from app.models.document_type import DocumentType, DocumentTypeSystemPrompt
 from app.models.knowledge_base import KnowledgeBase
+from app.models.user import User
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,7 @@ async def _get_workspace(ws_id: int, db: AsyncSession) -> KnowledgeBase:
 async def list_document_types(
     include_inactive: bool = False,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """List all document types."""
     q = select(DocumentType).order_by(DocumentType.name)
@@ -121,6 +123,7 @@ async def list_document_types(
 async def create_document_type(
     body: DocumentTypeCreate,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_superadmin),
 ):
     """Create a new document type."""
     existing = await db.execute(
@@ -143,7 +146,7 @@ async def create_document_type(
 
 
 @router.get("/{slug}", response_model=DocumentTypeResponse)
-async def get_document_type(slug: str, db: AsyncSession = Depends(get_db)):
+async def get_document_type(slug: str, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_active_user)):
     """Get a document type by slug."""
     return await _get_type_by_slug(slug, db)
 
@@ -153,6 +156,7 @@ async def update_document_type(
     slug: str,
     body: DocumentTypeUpdate,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_superadmin),
 ):
     """Update name, description or active status of a document type."""
     doc_type = await _get_type_by_slug(slug, db)
@@ -168,7 +172,7 @@ async def update_document_type(
 
 
 @router.delete("/{slug}", status_code=status.HTTP_204_NO_CONTENT)
-async def deactivate_document_type(slug: str, db: AsyncSession = Depends(get_db)):
+async def deactivate_document_type(slug: str, db: AsyncSession = Depends(get_db), user: User = Depends(require_superadmin)):
     """Soft-delete a document type (sets is_active=False)."""
     doc_type = await _get_type_by_slug(slug, db)
     doc_type.is_active = False
@@ -217,7 +221,7 @@ async def _resolve_system_prompt(
 
 
 @router.get("/{slug}/prompt", response_model=SystemPromptResponse)
-async def get_global_system_prompt(slug: str, db: AsyncSession = Depends(get_db)):
+async def get_global_system_prompt(slug: str, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_active_user)):
     """Get the global system prompt for a document type (workspace_id=NULL)."""
     doc_type = await _get_type_by_slug(slug, db)
     prompt_text, is_default = await _resolve_system_prompt(doc_type, None, db)
@@ -234,6 +238,7 @@ async def set_global_system_prompt(
     slug: str,
     body: SystemPromptSet,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_superadmin),
 ):
     """Set (upsert) the global system prompt for a document type."""
     doc_type = await _get_type_by_slug(slug, db)
@@ -268,6 +273,7 @@ async def get_workspace_system_prompt(
     slug: str,
     workspace_id: int,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """Get the resolved system prompt for a document type + workspace combo."""
     doc_type = await _get_type_by_slug(slug, db)
@@ -287,6 +293,7 @@ async def set_workspace_system_prompt(
     workspace_id: int,
     body: SystemPromptSet,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_superadmin),
 ):
     """Set (upsert) a workspace-specific system prompt for a document type."""
     doc_type = await _get_type_by_slug(slug, db)
@@ -322,6 +329,7 @@ async def delete_workspace_system_prompt(
     slug: str,
     workspace_id: int,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_superadmin),
 ):
     """Remove the workspace-specific override (falls back to global / default)."""
     doc_type = await _get_type_by_slug(slug, db)

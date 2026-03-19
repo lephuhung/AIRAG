@@ -14,10 +14,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.core.config import settings
-from app.core.deps import get_db
+from app.core.deps import get_db, get_current_active_user, verify_workspace_access
 from app.core.exceptions import NotFoundError
 from app.models.knowledge_base import KnowledgeBase
 from app.models.document import Document, DocumentImage, DocumentStatus
+from app.models.user import User
 from app.schemas.document import DocumentResponse, DocumentUploadResponse
 from app.schemas.rag import DocumentImageResponse
 
@@ -74,13 +75,10 @@ def _mime_for_ext(ext: str) -> str:
 async def list_documents(
     workspace_id: int,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """List all documents in a knowledge base."""
-    result = await db.execute(select(KnowledgeBase).where(KnowledgeBase.id == workspace_id))
-    kb = result.scalar_one_or_none()
-
-    if kb is None:
-        raise NotFoundError("KnowledgeBase", workspace_id)
+    await verify_workspace_access(workspace_id, user, db)
 
     result = await db.execute(
         select(Document).where(Document.workspace_id == workspace_id).order_by(Document.created_at.desc())
@@ -107,13 +105,10 @@ async def upload_document(
     workspace_id: int,
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """Upload a document to a knowledge base and store the raw file in MinIO."""
-    result = await db.execute(select(KnowledgeBase).where(KnowledgeBase.id == workspace_id))
-    kb = result.scalar_one_or_none()
-
-    if kb is None:
-        raise NotFoundError("KnowledgeBase", workspace_id)
+    await verify_workspace_access(workspace_id, user, db)
 
     ext = Path(file.filename).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
@@ -142,6 +137,7 @@ async def upload_document(
         file_type=ext[1:],
         file_size=len(content),
         status=DocumentStatus.PENDING,
+        uploaded_by=user.id,
     )
     db.add(document)
     await db.commit()
@@ -218,6 +214,7 @@ async def presign_upload(
     workspace_id: int,
     body: PresignRequest,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """Step 1 of direct-to-MinIO upload.
 
@@ -225,10 +222,7 @@ async def presign_upload(
     URL.  The frontend must PUT the file bytes directly to that URL, then call
     ``/confirm`` to trigger the parse pipeline.
     """
-    result = await db.execute(select(KnowledgeBase).where(KnowledgeBase.id == workspace_id))
-    kb = result.scalar_one_or_none()
-    if kb is None:
-        raise NotFoundError("KnowledgeBase", workspace_id)
+    await verify_workspace_access(workspace_id, user, db)
 
     ext = Path(body.filename).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
@@ -254,6 +248,7 @@ async def presign_upload(
         file_type=ext[1:],
         file_size=body.file_size,
         status=DocumentStatus.PENDING,
+        uploaded_by=user.id,
     )
     db.add(document)
     await db.commit()
@@ -294,6 +289,7 @@ async def confirm_upload(
     workspace_id: int,
     body: ConfirmRequest,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """Step 2 of direct-to-MinIO upload.
 
@@ -368,6 +364,7 @@ async def confirm_upload(
 async def get_document(
     document_id: int,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """Get document by ID"""
     result = await db.execute(select(Document).where(Document.id == document_id))
@@ -383,6 +380,7 @@ async def get_document(
 async def get_document_markdown(
     document_id: int,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """Get the full structured markdown content of a document (NexusRAG parsed)."""
     result = await db.execute(select(Document).where(Document.id == document_id))
@@ -428,6 +426,7 @@ async def get_document_markdown(
 async def get_document_images(
     document_id: int,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """List all extracted images for a document."""
     result = await db.execute(select(Document).where(Document.id == document_id))
@@ -461,6 +460,7 @@ async def get_document_images(
 async def download_document(
     document_id: int,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """Download the original uploaded file from MinIO."""
     result = await db.execute(select(Document).where(Document.id == document_id))
@@ -504,6 +504,7 @@ async def download_document(
 async def delete_document(
     document_id: int,
     db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
 ):
     """Delete a document and its chunks from vector store"""
     result = await db.execute(select(Document).where(Document.id == document_id))

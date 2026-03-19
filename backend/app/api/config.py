@@ -1,15 +1,19 @@
 """
 Config status endpoint — expose active LLM/embedding provider info to frontend.
 """
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
 from app.core.config import settings
+from app.core.deps import get_current_active_user
+from app.models.user import User
 
 router = APIRouter(prefix="/config", tags=["config"])
 
 
 @router.get("/status")
-async def get_config_status():
+async def get_config_status(
+    user: User = Depends(get_current_active_user),
+):
     """Return active provider and model names for UI display."""
     llm_provider = settings.LLM_PROVIDER.lower()
 

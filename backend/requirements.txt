@@ -35,6 +35,10 @@ openai>=1.0.0
 lightrag-hku>=1.0.0
 neo4j>=5.0
 
+# Authentication
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+
 # Utilities
 python-dotenv>=1.0.0
 pydantic>=2.5.0

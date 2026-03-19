@@ -7536,3 +7536,5 @@ INFO: Enqueued document processing pipeline stopped
 2026-03-18 17:43:58,644 [INFO] app.queue.connection — Consuming nexusrag.kg/5 → nexusrag.kg.5
 2026-03-18 17:43:58,645 [INFO] app.queue.connection — Consuming nexusrag.kg/4 → nexusrag.kg.4
 2026-03-18 17:43:58,645 [INFO] app.queue.connection — Consuming nexusrag.kg/3 → nexusrag.kg.3
+2026-03-19 12:01:59,313 [INFO] __main__ — Received SIGTERM — shutting down worker
+2026-03-19 12:01:59,320 [INFO] __main__ — Worker stopped cleanly

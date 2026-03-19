@@ -3,10 +3,14 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Toaster } from "sonner";
 import { useThemeStore } from "@/stores/useThemeStore";
 import { AppShell } from "@/components/layout/AppShell";
+import { ProtectedRoute } from "@/components/layout/ProtectedRoute";
 import { KnowledgeBasesPage } from "@/pages/KnowledgeBasesPage";
 import { WorkspacePage } from "@/pages/WorkspacePage";
 import { FilesPage } from "@/pages/FilesPage";
 import { WorkersPage } from "@/pages/WorkersPage";
+import { LoginPage } from "@/pages/LoginPage";
+import { RegisterPage } from "@/pages/RegisterPage";
+import { TenantManagePage } from "@/pages/TenantManagePage";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -20,12 +24,24 @@ const queryClient = new QueryClient({
 function AppRoutes() {
   return (
     <Routes>
-      <Route element={<AppShell />}>
+      {/* Public routes */}
+      <Route path="/login" element={<LoginPage />} />
+      <Route path="/register" element={<RegisterPage />} />
+
+      {/* Protected routes */}
+      <Route
+        element={
+          <ProtectedRoute>
+            <AppShell />
+          </ProtectedRoute>
+        }
+      >
         <Route path="/" element={<KnowledgeBasesPage />} />
         <Route path="/knowledge-bases/:workspaceId" element={<WorkspacePage />} />
         <Route path="/knowledge-bases/:workspaceId/files" element={<FilesPage />} />
         <Route path="/files" element={<FilesPage />} />
         <Route path="/workers" element={<WorkersPage />} />
+        <Route path="/tenants/:tenantId" element={<TenantManagePage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

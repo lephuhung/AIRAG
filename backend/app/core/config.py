@@ -119,6 +119,14 @@ class Settings(BaseSettings):
     # CORS
     CORS_ORIGINS: list[str] = Field(default=["http://localhost:5174", "http://localhost:3000"])
 
+    # Authentication (JWT)
+    JWT_SECRET_KEY: str = Field(default="change-me-in-production-use-a-real-secret-key")
+    JWT_ALGORITHM: str = Field(default="HS256")
+    JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=30)
+    JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=7)
+    FIRST_SUPERADMIN_EMAIL: str = Field(default="admin@nexusrag.local")
+    FIRST_SUPERADMIN_PASSWORD: str = Field(default="admin123")
+
     model_config = {
         "env_file": str(ENV_FILE),
         "env_file_encoding": "utf-8",
