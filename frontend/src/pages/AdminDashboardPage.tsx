@@ -67,13 +67,59 @@ export function AdminDashboardPage() {
             bg="bg-purple-500/10"
           />
           <StatCard
-            title="System Documents"
+            title="Total Uploaded Documents"
             value={stats.total_documents}
             icon={<FileText className="w-5 h-5 text-teal-500" />}
             color="text-teal-500"
             bg="bg-teal-500/10"
           />
         </div>
+
+        {/* Compact Breakdown Section */}
+        {stats.document_type_breakdown && stats.document_type_breakdown.length > 0 && (
+          <div className="mt-8">
+            <h2 className="text-lg font-semibold tracking-tight mb-4 text-foreground/80">Document Types Breakdown</h2>
+            <div className="bg-card border rounded-2xl p-6 shadow-sm">
+              {/* Stacked Progress Bar */}
+              <div className="w-full flex h-3 sm:h-4 bg-muted overflow-hidden rounded-full mb-4">
+                {stats.document_type_breakdown.map((item, i) => {
+                  const percentage = stats.total_documents > 0 ? (item.count / stats.total_documents) * 100 : 0;
+                  // Dynamic colors for variety (using basic tailwind classes modulo)
+                  const colors = ["bg-blue-500", "bg-teal-500", "bg-purple-500", "bg-amber-500", "bg-pink-500", "bg-green-500", "bg-indigo-500"];
+                  const color = colors[i % colors.length];
+                  
+                  return (
+                    <div
+                      key={item.name}
+                      className={cn("h-full transition-all hover:opacity-80 cursor-pointer", color)}
+                      style={{ width: `${percentage}%` }}
+                      title={`${item.name}: ${item.count} (${percentage.toFixed(1)}%)`}
+                    />
+                  );
+                })}
+              </div>
+
+              {/* Legend Grid */}
+              <div className="flex flex-wrap gap-2 sm:gap-4">
+                {stats.document_type_breakdown.map((item, i) => {
+                  const percentage = stats.total_documents > 0 ? (item.count / stats.total_documents) * 100 : 0;
+                  const colors = ["bg-blue-500", "bg-teal-500", "bg-purple-500", "bg-amber-500", "bg-pink-500", "bg-green-500", "bg-indigo-500"];
+                  const color = colors[i % colors.length];
+
+                  return (
+                    <div key={item.name} className="flex items-center gap-2 text-sm bg-muted/30 px-3 py-1.5 rounded-lg border">
+                      <span className={cn("w-2.5 h-2.5 rounded-full flex-shrink-0", color)} />
+                      <span className="font-medium text-foreground">{item.name || "Others"}</span>
+                      <span className="text-muted-foreground tabular-nums">
+                        {item.count} <span className="text-xs opacity-70">({percentage.toFixed(0)}%)</span>
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

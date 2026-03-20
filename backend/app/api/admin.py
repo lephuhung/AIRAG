@@ -17,6 +17,7 @@ from app.models.user import User
 from app.models.tenant import Tenant, TenantUser
 from app.models.document import Document
 from app.models.knowledge_base import KnowledgeBase
+from app.models.document_type import DocumentType
 
 from app.schemas.admin import (
     AdminUserUpdate,
@@ -91,6 +92,16 @@ async def get_admin_stats(
     total_tenants = await db.scalar(select(func.count(Tenant.id)))
     total_documents = await db.scalar(select(func.count(Document.id)))
     total_knowledge_bases = await db.scalar(select(func.count(KnowledgeBase.id)))
+    
+    # Document type breakdown (only types with >0 documents)
+    doctype_stats = await db.execute(
+        select(DocumentType.name, func.count(Document.id))
+        .join(Document, Document.document_type_id == DocumentType.id)
+        .group_by(DocumentType.name)
+    )
+    document_type_breakdown = [
+        {"name": row[0], "count": row[1]} for row in doctype_stats.all()
+    ]
 
     return AdminStatsResponse(
         total_users=total_users or 0,
@@ -99,6 +110,7 @@ async def get_admin_stats(
         total_tenants=total_tenants or 0,
         total_documents=total_documents or 0,
         total_knowledge_bases=total_knowledge_bases or 0,
+        document_type_breakdown=document_type_breakdown,
     )
 
 

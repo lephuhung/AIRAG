@@ -53,6 +53,11 @@ export interface AdminUserListResponse {
   per_page: number;
 }
 
+export interface DocumentTypeBreakdown {
+  name: string;
+  count: number;
+}
+
 export interface AdminStats {
   total_users: number;
   active_users: number;
@@ -60,6 +65,7 @@ export interface AdminStats {
   total_tenants: number;
   total_documents: number;
   total_knowledge_bases: number;
+  document_type_breakdown: DocumentTypeBreakdown[];
 }
 
 // Knowledge Base (Document Workspace)

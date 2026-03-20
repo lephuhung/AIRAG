@@ -38,6 +38,10 @@ class AdminUserListResponse(BaseModel):
     per_page: int
 
 
+class DocumentTypeBreakdown(BaseModel):
+    name: str
+    count: int
+
 class AdminStatsResponse(BaseModel):
     total_users: int
     active_users: int
@@ -45,3 +49,4 @@ class AdminStatsResponse(BaseModel):
     total_tenants: int
     total_documents: int
     total_knowledge_bases: int
+    document_type_breakdown: list[DocumentTypeBreakdown] = []
