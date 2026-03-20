@@ -8,8 +8,9 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, Depends, Query, status
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, desc
 from sqlalchemy.ext.asyncio import AsyncSession
+from datetime import datetime, timedelta
 
 from app.core.deps import get_db, require_superadmin
 from app.core.exceptions import NotFoundError, BadRequestError
@@ -25,9 +26,15 @@ from app.schemas.admin import (
     AdminUserListResponse,
     AdminStatsResponse,
     AdminPasswordResetRequest,
+    DateCount,
+    DocumentStatusBreakdown,
+    TopWorkspace,
+    FailedDocument,
+    PendingApproval,
 )
 from app.core.security import hash_password
 from app.schemas.tenant import TenantUserResponse
+from app.models.chat_session import ChatSession
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +110,79 @@ async def get_admin_stats(
         {"name": row[0], "count": row[1]} for row in doctype_stats.all()
     ]
 
+    # --- New Advanced Metrics ---
+
+    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+
+    # 1. Users Growth (last 30 days)
+    users_growth_res = await db.execute(
+        select(func.date(User.created_at).label("d"), func.count(User.id))
+        .where(User.created_at >= thirty_days_ago)
+        .group_by(func.date(User.created_at))
+        .order_by("d")
+    )
+    users_growth = [DateCount(date=str(row[0]), count=row[1]) for row in users_growth_res.all()]
+
+    # 2. Chat Growth (last 30 days) - counting sessions
+    chat_growth_res = await db.execute(
+        select(func.date(ChatSession.created_at).label("d"), func.count(ChatSession.id))
+        .where(ChatSession.created_at >= thirty_days_ago)
+        .group_by(func.date(ChatSession.created_at))
+        .order_by("d")
+    )
+    chat_growth = [DateCount(date=str(row[0]), count=row[1]) for row in chat_growth_res.all()]
+
+    # 3. Document Status Breakdown
+    doc_status_res = await db.execute(
+        select(Document.status, func.count(Document.id))
+        .group_by(Document.status)
+    )
+    document_status_breakdown = [DocumentStatusBreakdown(status=str(row[0].value if hasattr(row[0], 'value') else row[0]), count=row[1]) for row in doc_status_res.all()]
+
+    # 4. Top Workspaces (by total doc size)
+    top_ws_res = await db.execute(
+        select(
+            KnowledgeBase.id,
+            KnowledgeBase.name,
+            func.coalesce(func.sum(Document.file_size), 0).label("total_size"),
+            func.count(Document.id).label("doc_count")
+        )
+        .outerjoin(Document, Document.workspace_id == KnowledgeBase.id)
+        .group_by(KnowledgeBase.id)
+        .order_by(desc("total_size"))
+        .limit(5)
+    )
+    top_workspaces = [
+        TopWorkspace(id=row[0], name=row[1], total_size=int(row[2]), doc_count=row[3])
+        for row in top_ws_res.all()
+    ]
+
+    # 5. Recent Failed Docs
+    failed_docs_res = await db.execute(
+        select(Document.id, Document.filename, KnowledgeBase.name, Document.error_message)
+        .join(KnowledgeBase, Document.workspace_id == KnowledgeBase.id)
+        .where(Document.status == "failed")
+        .order_by(Document.updated_at.desc())
+        .limit(5)
+    )
+    recent_failed_docs = [
+        FailedDocument(id=row[0], filename=row[1], workspace_name=row[2], error_message=row[3])
+        for row in failed_docs_res.all()
+    ]
+
+    # 6. Pending Approvals
+    pending_res = await db.execute(
+        select(User.id, User.email, Tenant.name, TenantUser.role)
+        .join(TenantUser, TenantUser.user_id == User.id)
+        .join(Tenant, Tenant.id == TenantUser.tenant_id)
+        .where(TenantUser.is_approved.is_(False))
+        .limit(5)
+    )
+    pending_approvals = [
+        PendingApproval(user_id=row[0], email=row[1], tenant_name=row[2], role=row[3])
+        for row in pending_res.all()
+    ]
+
     return AdminStatsResponse(
         total_users=total_users or 0,
         active_users=active_users or 0,
@@ -111,6 +191,12 @@ async def get_admin_stats(
         total_documents=total_documents or 0,
         total_knowledge_bases=total_knowledge_bases or 0,
         document_type_breakdown=document_type_breakdown,
+        users_growth=users_growth,
+        chat_growth=chat_growth,
+        document_status_breakdown=document_status_breakdown,
+        top_workspaces=top_workspaces,
+        recent_failed_docs=recent_failed_docs,
+        pending_approvals=pending_approvals,
     )
 
 

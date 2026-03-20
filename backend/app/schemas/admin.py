@@ -42,6 +42,33 @@ class DocumentTypeBreakdown(BaseModel):
     name: str
     count: int
 
+
+class DateCount(BaseModel):
+    date: str
+    count: int
+
+class DocumentStatusBreakdown(BaseModel):
+    status: str
+    count: int
+
+class TopWorkspace(BaseModel):
+    id: int
+    name: str
+    total_size: int
+    doc_count: int
+
+class FailedDocument(BaseModel):
+    id: int
+    filename: str
+    workspace_name: str
+    error_message: str | None
+
+class PendingApproval(BaseModel):
+    user_id: int
+    email: str
+    tenant_name: str
+    role: str
+
 class AdminStatsResponse(BaseModel):
     total_users: int
     active_users: int
@@ -50,3 +77,11 @@ class AdminStatsResponse(BaseModel):
     total_documents: int
     total_knowledge_bases: int
     document_type_breakdown: list[DocumentTypeBreakdown] = []
+
+    # New advanced metrics
+    users_growth: list[DateCount] = []
+    chat_growth: list[DateCount] = []
+    document_status_breakdown: list[DocumentStatusBreakdown] = []
+    top_workspaces: list[TopWorkspace] = []
+    recent_failed_docs: list[FailedDocument] = []
+    pending_approvals: list[PendingApproval] = []

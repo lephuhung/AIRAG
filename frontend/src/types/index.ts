@@ -58,6 +58,37 @@ export interface DocumentTypeBreakdown {
   count: number;
 }
 
+export interface DateCount {
+  date: string;
+  count: number;
+}
+
+export interface DocumentStatusBreakdown {
+  status: string;
+  count: number;
+}
+
+export interface TopWorkspace {
+  id: number;
+  name: string;
+  total_size: number;
+  doc_count: number;
+}
+
+export interface FailedDocument {
+  id: number;
+  filename: string;
+  workspace_name: string;
+  error_message: string | null;
+}
+
+export interface PendingApproval {
+  user_id: number;
+  email: string;
+  tenant_name: string;
+  role: string;
+}
+
 export interface AdminStats {
   total_users: number;
   active_users: number;
@@ -66,6 +97,12 @@ export interface AdminStats {
   total_documents: number;
   total_knowledge_bases: number;
   document_type_breakdown: DocumentTypeBreakdown[];
+  users_growth: DateCount[];
+  chat_growth: DateCount[];
+  document_status_breakdown: DocumentStatusBreakdown[];
+  top_workspaces: TopWorkspace[];
+  recent_failed_docs: FailedDocument[];
+  pending_approvals: PendingApproval[];
 }
 
 // Knowledge Base (Document Workspace)
