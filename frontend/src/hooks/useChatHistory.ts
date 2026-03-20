@@ -2,26 +2,26 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import type { ChatHistoryResponse } from "@/types";
 
-export function useChatHistory(workspaceId: string) {
+export function useChatHistory(sessionId: number | null) {
   return useQuery({
-    queryKey: ["chat-history", workspaceId],
+    queryKey: ["chat-history", sessionId],
     queryFn: () =>
-      api.get<ChatHistoryResponse>(`/rag/chat/${workspaceId}/history`),
-    enabled: !!workspaceId,
+      api.get<ChatHistoryResponse>(`/rag/chat/sessions/${sessionId}/history`),
+    enabled: !!sessionId,
     staleTime: Infinity, // Don't auto-refetch — we invalidate manually after chat
   });
 }
 
-export function useClearChatHistory(workspaceId: string) {
+export function useClearChatHistory(sessionId: number | null) {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: () => api.delete(`/rag/chat/${workspaceId}/history`),
+    mutationFn: () => api.delete(`/rag/chat/sessions/${sessionId}/history`),
     onSuccess: () => {
       queryClient.setQueryData<ChatHistoryResponse>(
-        ["chat-history", workspaceId],
+        ["chat-history", sessionId],
         {
-          workspace_id: Number(workspaceId),
+          session_id: sessionId ?? undefined,
           messages: [],
           total: 0,
         },

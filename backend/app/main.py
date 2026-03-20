@@ -19,6 +19,7 @@ from app.core.database import engine, Base
 import app.models.knowledge_base  # noqa: F401
 import app.models.document        # noqa: F401
 import app.models.document_type   # noqa: F401
+import app.models.chat_session    # noqa: F401
 import app.models.chat_message    # noqa: F401
 import app.models.user            # noqa: F401
 import app.models.tenant          # noqa: F401
@@ -40,11 +41,24 @@ async def lifespan(app: FastAPI):
             await conn.execute(
                 text("ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS system_prompt TEXT")
             )
+            # Create chat_sessions table if not exists
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    id SERIAL PRIMARY KEY,
+                    title VARCHAR(255) NOT NULL DEFAULT 'New Chat',
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_chat_sessions_user_id ON chat_sessions(user_id)"
+            ))
+
             # Ensure chat_messages table + indexes exist (idempotent)
             await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS chat_messages (
                     id SERIAL PRIMARY KEY,
-                    workspace_id INTEGER NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
                     message_id VARCHAR(50) NOT NULL,
                     role VARCHAR(20) NOT NULL,
                     content TEXT NOT NULL,
@@ -56,7 +70,13 @@ async def lifespan(app: FastAPI):
                 )
             """))
             await conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS ix_chat_messages_workspace_id ON chat_messages(workspace_id)"
+                "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS session_id INTEGER REFERENCES chat_sessions(id) ON DELETE CASCADE"
+            ))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_chat_messages_session_id ON chat_messages(session_id)"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE chat_messages DROP COLUMN IF EXISTS workspace_id"
             ))
             await conn.execute(text(
                 "CREATE INDEX IF NOT EXISTS ix_chat_messages_message_id ON chat_messages(message_id)"
@@ -322,4 +342,4 @@ _docling_data.mkdir(parents=True, exist_ok=True)
 app.mount("/static/doc-images", StaticFiles(directory=str(_docling_data)), name="static_doc_images")
 
 # Import models so SQLAlchemy registers them
-from app.models import knowledge_base, document, chat_message, user, tenant, invite_token  # noqa: E402, F401
+from app.models import knowledge_base, document, chat_session, chat_message, user, tenant, invite_token  # noqa: E402, F401

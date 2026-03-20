@@ -85,7 +85,7 @@ function markActiveError(steps: AgentStep[]): AgentStep[] {
 // Hook
 // ---------------------------------------------------------------------------
 
-export function useRAGChatStream(workspaceId: string): RAGStreamResult {
+export function useRAGChatStream(sessionId: number | null): RAGStreamResult {
   const [status, setStatus] = useState<ChatStreamStatus>("idle");
   const [streamingContent, setStreamingContent] = useState("");
   const [thinkingText, setThinkingText] = useState("");
@@ -222,6 +222,8 @@ export function useRAGChatStream(workspaceId: string): RAGStreamResult {
       // Synchronous local tracker — avoids React 18 batching race condition
       // where agentStepsRef in ChatPanel may be stale when sendMessage resolves
       let localSteps: AgentStep[] = [];
+      let localSources: ChatSourceChunk[] = [];
+      let localImages: ChatImageRef[] = [];
       // Accumulate all thinking text in this scope so it can be flushed into
       // localSteps at complete time (onThinkingToken only updates setAgentSteps
       // via RAF, which never syncs back to localSteps)
@@ -235,6 +237,7 @@ export function useRAGChatStream(workspaceId: string): RAGStreamResult {
       abortRef.current = new AbortController();
 
       try {
+        if (!sessionId) throw new Error("No active chat session.");
         const token = useAuthStore.getState().token;
         const headers: Record<string, string> = {
           "Content-Type": "application/json",
@@ -244,7 +247,7 @@ export function useRAGChatStream(workspaceId: string): RAGStreamResult {
         }
 
         const response = await fetch(
-          `${BASE_URL}/rag/chat/${workspaceId}/stream`,
+          `${BASE_URL}/rag/chat/sessions/${sessionId}/stream`,
           {
             method: "POST",
             headers,
@@ -332,7 +335,8 @@ export function useRAGChatStream(workspaceId: string): RAGStreamResult {
 
                   case "sources": {
                     const sources = (data.sources || []) as ChatSourceChunk[];
-                    setPendingSources((prev) => [...prev, ...sources]);
+                    localSources = sources;
+                    setPendingSources([...sources]);
 
                     // Add sources_found step with badges
                     const badges = sources.map((s) => String(s.index));
@@ -349,7 +353,8 @@ export function useRAGChatStream(workspaceId: string): RAGStreamResult {
 
                   case "images": {
                     const imgs = (data.image_refs || []) as ChatImageRef[];
-                    setPendingImages((prev) => [...prev, ...imgs]);
+                    localImages = imgs;
+                    setPendingImages([...imgs]);
 
                     // Update sources_found step with image count
                     if (imgs.length > 0) {
@@ -429,9 +434,9 @@ export function useRAGChatStream(workspaceId: string): RAGStreamResult {
                       id: crypto.randomUUID(),
                       role: "assistant",
                       content: data.answer || "",
-                      sources: data.sources || [],
+                      sources: localSources, // use accumulated sources, backend complete event omits them
                       relatedEntities: data.related_entities || [],
-                      imageRefs: data.image_refs || [],
+                      imageRefs: localImages,
                       thinking: data.thinking || null,
                       agentSteps: localSteps, // include synced steps directly in finalMessage
                       timestamp: new Date().toISOString(),
@@ -469,7 +474,7 @@ export function useRAGChatStream(workspaceId: string): RAGStreamResult {
         return null;
       }
     },
-    [workspaceId, onToken, onThinkingToken],
+    [sessionId, onToken, onThinkingToken],
   );
 
   return {

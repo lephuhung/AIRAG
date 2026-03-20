@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo, memo, createContext, useContext, Children, isValidElement, type ReactNode } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { motion, AnimatePresence } from "framer-motion";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -12,16 +12,11 @@ import {
   Bot,
   User,
   Loader2,
-  Trash2,
   Sparkles,
   FileText,
-  Save,
   ImageIcon,
   Brain,
   ChevronDown,
-  Settings,
-  RotateCcw,
-  Info,
   Copy,
   ClipboardCheck,
   FileCode,
@@ -84,13 +79,12 @@ import type {
   ChatSourceChunk,
   ChatStreamStatus,
   Document,
-  KnowledgeBase,
   LLMCapabilities,
   AgentStep,
 } from "@/types";
 
-// Context to provide workspaceId and debugMode to nested components
-const WsIdCtx = createContext<string>("");
+// Context to provide sessionId and debugMode to nested components
+const SessionIdCtx = createContext<number | null>(null);
 const DebugCtx = createContext(false);
 
 // Context: accumulated sources from ALL messages in the conversation.
@@ -99,10 +93,15 @@ const AllSourcesCtx = createContext<ChatSourceChunk[]>([]);
 
 /** Look up a Document from react-query cache by document_id */
 function useFindDoc(documentId: number): Document | undefined {
-  const wsId = useContext(WsIdCtx);
   const qc = useQueryClient();
-  const docs = qc.getQueryData<Document[]>(["documents", wsId]);
-  return docs?.find((d) => d.id === documentId);
+  // Try to find the document in any cached document list
+  const queries = qc.getQueryCache().findAll({ queryKey: ["documents"] });
+  for (const query of queries) {
+    const docs = query.state.data as Document[] | undefined;
+    const found = docs?.find((d) => d.id === documentId);
+    if (found) return found;
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -584,31 +583,59 @@ function SourcesPanel({
   const [expanded, setExpanded] = useState(false);
   const [ratings, setRatings] = useState<Record<string, RelevanceRating>>({});
   const { activateCitation, activateCitationKG } = useWorkspaceStore();
-  const wsId = useContext(WsIdCtx);
+  const sessionId = useContext(SessionIdCtx);
   const debugMode = useContext(DebugCtx);
+  const queryClient = useQueryClient();
+
+  const rateMutation = useMutation({
+    mutationFn: ({
+      sessionId,
+      messageId,
+      sourceIndex,
+      rating,
+    }: {
+      sessionId: number;
+      messageId: string;
+      sourceIndex: string;
+      rating: RelevanceRating;
+    }) =>
+      api.post(`/rag/chat/${sessionId}/rate`, {
+        message_id: messageId,
+        source_index: sourceIndex,
+        rating: rating,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["chat-history", sessionId] });
+    },
+  });
 
   if (sources.length === 0) return null;
 
   const vectorSources = sources.filter((s) => s.source_type !== "kg");
   const kgSources = sources.filter((s) => s.source_type === "kg");
 
-  const handleRate = async (sourceIndex: string, rating: RelevanceRating) => {
-    // Toggle: click same rating to un-rate
-    const newRating = ratings[sourceIndex] === rating ? "partial" : rating;
-    const prev = { ...ratings };
-    setRatings((r) => ({ ...r, [sourceIndex]: newRating }));
+  const handleRate = useCallback(
+    async (sourceIndex: string, rating: RelevanceRating) => {
+      if (!sessionId || !messageId) return;
 
-    if (!messageId || !wsId) return;
-    try {
-      await api.post(`/rag/chat/${wsId}/rate`, {
-        message_id: messageId,
-        source_index: sourceIndex,
-        rating: newRating,
-      });
-    } catch {
-      setRatings(prev); // rollback
-    }
-  };
+      // Toggle: click same rating to un-rate
+      const newRating = ratings[sourceIndex] === rating ? "partial" : rating;
+      const prev = { ...ratings };
+      setRatings((r) => ({ ...r, [sourceIndex]: newRating }));
+
+      try {
+        await rateMutation.mutateAsync({
+          sessionId,
+          messageId,
+          sourceIndex,
+          rating: newRating,
+        });
+      } catch {
+        setRatings(prev); // rollback
+      }
+    },
+    [sessionId, messageId, ratings, rateMutation],
+  );
 
   return (
     <div className="mt-2 rounded-md border bg-muted/20 overflow-hidden">
@@ -1220,15 +1247,11 @@ const HARD_RULES_SUMMARY = [
 ];
 
 interface ChatPanelProps {
-  workspaceId: string;
-  hasIndexedDocs: boolean;
-  workspace: KnowledgeBase | null;
+  sessionId: number | null;
 }
 
 export const ChatPanel = memo(function ChatPanel({
-  workspaceId,
-  hasIndexedDocs,
-  workspace,
+  sessionId,
 }: ChatPanelProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -1237,10 +1260,9 @@ export const ChatPanel = memo(function ChatPanel({
   const [forceSearch, setForceSearch] = useState(false);
 
   // Load chat history from PostgreSQL
-  const { data: historyData, isLoading: historyLoading } = useChatHistory(workspaceId);
-  const clearMutation = useClearChatHistory(workspaceId);
-  const [showPromptEditor, setShowPromptEditor] = useState(false);
-  const [promptDraft, setPromptDraft] = useState("");
+  const { data: historyData, isLoading: historyLoading } = useChatHistory(sessionId);
+  const clearMutation = useClearChatHistory(sessionId);
+
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const scrollAnimRef = useRef<number | undefined>(undefined);
   const spacerRef = useRef<HTMLDivElement>(null);
@@ -1267,37 +1289,7 @@ export const ChatPanel = memo(function ChatPanel({
     return () => window.removeEventListener("keydown", handler);
   }, []);
 
-  // System prompt editor
-  const updateWorkspaceMutation = useUpdateWorkspace();
-  const savedPrompt = workspace?.system_prompt ?? "";
-  const effectivePrompt = savedPrompt || DEFAULT_SYSTEM_PROMPT;
-  const isCustom = !!savedPrompt;
 
-  // Sync draft when workspace data loads/changes
-  useEffect(() => {
-    setPromptDraft(effectivePrompt);
-  }, [effectivePrompt]);
-
-  const promptIsDirty = promptDraft !== effectivePrompt;
-
-  const handleSavePrompt = useCallback(() => {
-    if (!workspace) return;
-    // If draft equals default, save empty string → reset to default in DB
-    const toSave = promptDraft.trim() === DEFAULT_SYSTEM_PROMPT ? "" : promptDraft;
-    updateWorkspaceMutation.mutate(
-      { id: workspace.id, data: { system_prompt: toSave } },
-      { onSuccess: () => toast.success("System prompt saved") }
-    );
-  }, [workspace, promptDraft, updateWorkspaceMutation]);
-
-  const handleResetPrompt = useCallback(() => {
-    if (!workspace) return;
-    setPromptDraft(DEFAULT_SYSTEM_PROMPT);
-    updateWorkspaceMutation.mutate(
-      { id: workspace.id, data: { system_prompt: "" } },
-      { onSuccess: () => toast.success("System prompt reset to default") }
-    );
-  }, [workspace, updateWorkspaceMutation]);
 
   // Check LLM capabilities (thinking support)
   const { data: capabilities } = useQuery<LLMCapabilities>({
@@ -1344,7 +1336,7 @@ export const ChatPanel = memo(function ChatPanel({
   }, [historyData]);
 
   // SSE streaming chat
-  const stream = useRAGChatStream(workspaceId);
+  const stream = useRAGChatStream(sessionId);
   const streamingMsgIdRef = useRef<string | null>(null);
   // Snapshot agentSteps into a ref so finalize always has fresh data
   const agentStepsRef = useRef<AgentStep[]>([]);
@@ -1614,7 +1606,7 @@ export const ChatPanel = memo(function ChatPanel({
       }
       streamingMsgIdRef.current = null;
     },
-    [input, messages, stream, thinkingSupported, enableThinking],
+    [input, messages, stream, thinkingSupported, enableThinking, forceSearch, scrollUserMsgToTop],
   );
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -1634,7 +1626,7 @@ export const ChatPanel = memo(function ChatPanel({
   // When the model doesn't call search_documents but references citation IDs
   // from earlier answers, this allows those citations to still render as links.
   // NOTE: Must be declared before any early returns to satisfy Rules of Hooks.
-  const allSources = useMemo(() => {
+  const allSourcesFlat = useMemo(() => {
     const seen = new Set<string>();
     const merged: ChatSourceChunk[] = [];
     for (const m of messages) {
@@ -1659,30 +1651,18 @@ export const ChatPanel = memo(function ChatPanel({
     );
   }
 
-  if (!hasIndexedDocs) {
-    return (
-      <div className="h-full flex flex-col items-center justify-center px-4 border-r">
-        <Bot className="w-10 h-10 text-muted-foreground/30 mb-3" />
-        <p className="text-sm text-muted-foreground text-center">
-          Index some documents to start chatting
-        </p>
-        <p className="text-[11px] text-muted-foreground/60 mt-1">
-          Upload and process documents in the data panel
-        </p>
-      </div>
-    );
-  }
-
   return (
-    <WsIdCtx.Provider value={workspaceId}>
+    <SessionIdCtx.Provider value={sessionId}>
     <DebugCtx.Provider value={debugMode}>
-    <AllSourcesCtx.Provider value={allSources}>
-    <div className="h-full flex flex-col border-r min-h-0">
+    <AllSourcesCtx.Provider value={allSourcesFlat}>
+    <div className="flex flex-col h-full bg-background border-r relative z-0">
       {/* Header */}
       <div className="flex-shrink-0 flex items-center justify-between px-3 py-2 border-b">
         <div className="flex items-center gap-2">
-          <Bot className="w-4 h-4 text-primary" />
-          <span className="text-sm font-semibold">AI Assistant</span>
+          <Bot className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+          <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            Chat {sessionId ? `(Session ${sessionId})` : "(Select a session)"}
+          </h2>
         </div>
         <div className="flex items-center gap-1.5">
           {/* Thinking toggle — only visible when model supports thinking */}
@@ -1715,134 +1695,8 @@ export const ChatPanel = memo(function ChatPanel({
             <DatabaseZap className="w-3 h-3" />
             <span>Search</span>
           </button>
-          {/* System prompt settings */}
-          <button
-            onClick={() => setShowPromptEditor((p) => !p)}
-            className={cn(
-              "flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors",
-              showPromptEditor
-                ? "text-blue-500 bg-blue-500/10 hover:bg-blue-500/15"
-                : "text-muted-foreground hover:bg-muted"
-            )}
-            title="System prompt settings"
-          >
-            <Settings className="w-3 h-3" />
-          </button>
-          {messages.length > 0 && (
-            <button
-              onClick={handleClear}
-              className="p-1 rounded hover:bg-muted transition-colors"
-              title="Clear chat"
-            >
-              <Trash2 className="w-3.5 h-3.5 text-muted-foreground" />
-            </button>
-          )}
-          {debugMode && (
-            <span className="text-[8px] px-1 py-0.5 rounded bg-amber-500/15 text-amber-500 font-mono font-semibold">
-              DEBUG
-            </span>
-          )}
         </div>
       </div>
-
-      {/* System Prompt Editor */}
-      <AnimatePresence>
-        {showPromptEditor && (
-          <motion.div
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: "auto", opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            className="flex-shrink-0 overflow-visible border-b relative z-10"
-          >
-            <div className="px-3 py-2 space-y-2 bg-muted/20">
-              <div className="flex items-center justify-between">
-                <span className="text-[11px] font-medium text-muted-foreground">
-                  System Prompt
-                </span>
-                <span className={cn(
-                  "text-[9px] px-1.5 py-0.5 rounded-full font-medium",
-                  isCustom
-                    ? "bg-blue-500/15 text-blue-600 dark:text-blue-400"
-                    : "bg-muted text-muted-foreground/50"
-                )}>
-                  {isCustom ? "Custom" : "Default"}
-                </span>
-              </div>
-              <textarea
-                value={promptDraft}
-                onChange={(e) => setPromptDraft(e.target.value)}
-                placeholder="Enter your custom system prompt..."
-                rows={8}
-                className={cn(
-                  "w-full resize-none rounded-md border border-input bg-background px-2.5 py-2 text-xs",
-                  "placeholder:text-muted-foreground/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-                  "leading-relaxed"
-                )}
-              />
-              {/* Hard rules — icon with hover tooltip */}
-              <div className="flex items-center gap-1.5">
-                <div className="relative group/cite">
-                  <div className="flex items-center gap-1 cursor-help">
-                    <Info className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-                    <span className="text-[10px] text-blue-600 dark:text-blue-400 font-medium">
-                      Hard rules auto-appended
-                    </span>
-                  </div>
-                  {/* Tooltip on hover — below icon */}
-                  <div className="absolute left-0 top-full mt-1.5 z-50 w-[340px] rounded-lg border border-border bg-background shadow-xl opacity-0 pointer-events-none group-hover/cite:opacity-100 group-hover/cite:pointer-events-auto transition-opacity duration-150">
-                    <div className="px-3 py-2.5">
-                      <p className="text-[10px] font-semibold text-blue-700 dark:text-blue-300 mb-1.5">
-                        Citation + Formatting + Restrictions (always enforced)
-                      </p>
-                      <ul className="space-y-1">
-                        {HARD_RULES_SUMMARY.map((rule, i) => (
-                          <li key={i} className="text-[10px] text-foreground/70 leading-snug flex gap-1">
-                            <span className="text-blue-500 dark:text-blue-400 flex-shrink-0">•</span>
-                            {rule}
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  </div>
-                </div>
-              </div>
-              <div className="flex items-center gap-1.5 justify-end">
-                <button
-                  onClick={handleResetPrompt}
-                  disabled={!isCustom && !promptIsDirty}
-                  className={cn(
-                    "flex items-center gap-1 px-2 py-1 rounded text-[10px] transition-colors",
-                    isCustom || promptIsDirty
-                      ? "text-muted-foreground hover:bg-muted hover:text-foreground"
-                      : "text-muted-foreground/30 cursor-not-allowed"
-                  )}
-                  title="Reset to default prompt"
-                >
-                  <RotateCcw className="w-3 h-3" />
-                  Reset
-                </button>
-                <button
-                  onClick={handleSavePrompt}
-                  disabled={!promptIsDirty || updateWorkspaceMutation.isPending}
-                  className={cn(
-                    "flex items-center gap-1 px-2.5 py-1 rounded text-[10px] font-medium transition-colors",
-                    promptIsDirty && !updateWorkspaceMutation.isPending
-                      ? "bg-primary text-primary-foreground hover:bg-primary/90"
-                      : "bg-muted text-muted-foreground/50 cursor-not-allowed"
-                  )}
-                >
-                  {updateWorkspaceMutation.isPending ? (
-                    <Loader2 className="w-3 h-3 animate-spin" />
-                  ) : (
-                    <Save className="w-3 h-3" />
-                  )}
-                  Save
-                </button>
-              </div>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
 
       {/* Messages area */}
       {messages.length === 0 ? (
@@ -1917,6 +1771,6 @@ export const ChatPanel = memo(function ChatPanel({
     </div>
     </AllSourcesCtx.Provider>
     </DebugCtx.Provider>
-    </WsIdCtx.Provider>
+    </SessionIdCtx.Provider>
   );
 });

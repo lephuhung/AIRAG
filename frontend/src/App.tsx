@@ -14,6 +14,7 @@ import { TenantManagePage } from "@/pages/TenantManagePage";
 import { AdminUsersPage } from "@/pages/AdminUsersPage";
 import { AdminTenantsPage } from "@/pages/AdminTenantsPage";
 import { AdminDocumentTypesPage } from "@/pages/AdminDocumentTypesPage";
+import { ChatPage } from "@/pages/ChatPage";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -40,6 +41,8 @@ function AppRoutes() {
         }
       >
         <Route path="/" element={<KnowledgeBasesPage />} />
+        <Route path="/chat" element={<ChatPage />} />
+        <Route path="/chat/:sessionId" element={<ChatPage />} />
         <Route path="/knowledge-bases/:workspaceId" element={<WorkspacePage />} />
         <Route path="/knowledge-bases/:workspaceId/files" element={<FilesPage />} />
         <Route path="/files" element={<FilesPage />} />

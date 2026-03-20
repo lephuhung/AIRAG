@@ -9,6 +9,7 @@ import {
   Building2,
   Users,
   FileText,
+  MessageSquare,
 } from "lucide-react";
 import { useWorkspaces } from "@/hooks/useWorkspaces";
 import { useMyTenants } from "@/hooks/useMyTenants";
@@ -31,6 +32,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
   const urlWorkspaceId = location.pathname.match(/\/knowledge-bases\/(\d+)/)?.[1];
   const isHome = location.pathname === "/";
   const isFilesPage = location.pathname === "/files" || location.pathname.endsWith("/files");
+  const isChatPage = location.pathname === "/chat" || location.pathname.startsWith("/chat/");
   const isWorkersPage = location.pathname === "/workers";
   const isAdminUsersPage = location.pathname === "/admin/users";
   const isAdminTenantsPage = location.pathname === "/admin/tenants";
@@ -79,6 +81,20 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
         >
           <FolderOpen className="w-4 h-4 flex-shrink-0" />
           {!collapsed && <span className="truncate">Files</span>}
+        </button>
+
+        <button
+          onClick={() => navigate("/chat")}
+          className={cn(
+            "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm transition-colors",
+            isChatPage
+              ? "bg-primary/10 text-primary font-medium"
+              : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+          )}
+          title={collapsed ? "Global Chat" : undefined}
+        >
+          <MessageSquare className="w-4 h-4 flex-shrink-0" />
+          {!collapsed && <span className="truncate">Global Chat</span>}
         </button>
 
         {user?.is_superadmin && (

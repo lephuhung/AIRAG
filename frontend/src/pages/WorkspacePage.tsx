@@ -3,7 +3,6 @@ import { useParams } from "react-router-dom";
 import { toast } from "sonner";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { DataPanel } from "@/components/rag/DataPanel";
-import { ChatPanel } from "@/components/rag/ChatPanel";
 import { VisualPanel } from "@/components/rag/VisualPanel";
 import { useWorkspaceStore } from "@/stores/workspaceStore";
 import { useWorkspace, useUpdateWorkspace } from "@/hooks/useWorkspaces";
@@ -86,7 +85,6 @@ export function WorkspacePage() {
     }
   }, [documents, selectedDoc, selectDoc]);
 
-  const hasIndexedDocs = (ragStats?.indexed_documents ?? 0) > 0;
   const hasDeepragDocs = (ragStats?.nexusrag_documents ?? 0) > 0;
 
   // -----------------------------------------------------------------------
@@ -173,10 +171,10 @@ export function WorkspacePage() {
   );
 
   // -----------------------------------------------------------------------
-  // Render — 3-column layout
+  // Render — 2-column layout
   // -----------------------------------------------------------------------
   return (
-    <div className="h-full overflow-hidden grid grid-cols-[minmax(220px,20%)_minmax(300px,40%)_minmax(300px,40%)]">
+    <div className="h-full overflow-hidden grid grid-cols-[minmax(350px,30%)_minmax(400px,70%)]">
       {/* Column 1: Data Area */}
       <DataPanel
         workspace={workspace}
@@ -194,14 +192,7 @@ export function WorkspacePage() {
         onUpdateWorkspace={handleUpdateWorkspace}
       />
 
-      {/* Column 2: Chat Area */}
-      <ChatPanel
-        workspaceId={workspaceId || ""}
-        hasIndexedDocs={hasIndexedDocs}
-        workspace={workspace ?? null}
-      />
-
-      {/* Column 3: Visual Area */}
+      {/* Column 2: Visual Area */}
       <VisualPanel
         workspaceId={workspaceId || ""}
         hasDeepragDocs={hasDeepragDocs}

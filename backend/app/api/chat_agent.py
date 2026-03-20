@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
 from app.models.user import User
+from app.models.tenant import TenantUser
 from app.models.knowledge_base import KnowledgeBase
 from app.models.document import DocumentImage
 from app.schemas.rag import (
@@ -262,14 +263,36 @@ async def sse_with_heartbeat(
 # Tool executor — retrieval via NexusRAG
 # ---------------------------------------------------------------------------
 
+async def _get_accessible_workspaces(db: AsyncSession, user: User) -> list[int]:
+    """Get all knowledge base IDs the user has access to."""
+    if user.is_superadmin:
+        result = await db.execute(select(KnowledgeBase.id))
+        return list(result.scalars().all())
+
+    # Get user's tenants
+    tenant_result = await db.execute(select(TenantUser.tenant_id).where(TenantUser.user_id == user.id))
+    user_tenant_ids = list(tenant_result.scalars().all())
+
+    from sqlalchemy import or_
+    query = select(KnowledgeBase.id).where(
+        or_(
+            KnowledgeBase.visibility == "public",
+            KnowledgeBase.owner_id == user.id,
+            KnowledgeBase.tenant_id.in_(user_tenant_ids) if user_tenant_ids else False
+        )
+    )
+    result = await db.execute(query)
+    return list(result.scalars().all())
+
+
 async def _execute_search_documents(
-    workspace_id: int,
+    workspace_ids: list[int],
     query: str,
     top_k: int,
     db: AsyncSession,
     existing_ids: set[str],
 ) -> tuple[str, list[ChatSourceChunk], list[ChatImageRef], list[dict]]:
-    """Execute document search and return formatted context + structured sources.
+    """Execute document search across multiple workspaces and return best chunks.
 
     Returns:
         (context_text, sources, image_refs, image_parts_for_vision)
@@ -277,40 +300,73 @@ async def _execute_search_documents(
     from app.services.rag_service import get_rag_service
     from app.services.nexus_rag_service import NexusRAGService
     from pathlib import Path as _P
-    from app.core.config import settings
-
-    rag_service = get_rag_service(db, workspace_id)
-
-    chunks = []
-    citations = []
-    if isinstance(rag_service, NexusRAGService):
-        result = await rag_service.query_deep(
-            question=query,
-            top_k=min(top_k, 10),
-            mode="hybrid",
-            include_images=False,
-        )
-        chunks = result.chunks
-        citations = result.citations
-    else:
-        from types import SimpleNamespace
-        legacy = rag_service.query(question=query, top_k=min(top_k, 10))
-        for i, c in enumerate(legacy.chunks):
-            chunks.append(SimpleNamespace(
-                content=c.content,
-                document_id=int(c.metadata.get("document_id", 0)),
-                chunk_index=i,
-                page_no=int(c.metadata.get("page_no", 0)),
-                heading_path=str(c.metadata.get("heading_path", "")).split(" > ") if c.metadata.get("heading_path") else [],
-                source_file=str(c.metadata.get("source", "")),
-                image_refs=[],
-            ))
+    
+    all_chunks = []
+    all_kg_summaries = []
+    
+    # Get workspace titles for better labeling
+    from app.models.knowledge_base import KnowledgeBase
+    ws_result = await db.execute(select(KnowledgeBase).where(KnowledgeBase.id.in_(workspace_ids)))
+    ws_map = {ws.id: ws.name for ws in ws_result.scalars().all()}
+    
+    for workspace_id in workspace_ids:
+        rag_service = get_rag_service(db, workspace_id)
+        ws_name = ws_map.get(workspace_id, f"KB {workspace_id}")
+        
+        chunks = []
+        citations = []
+        if isinstance(rag_service, NexusRAGService):
+            try:
+                result = await rag_service.query_deep(
+                    question=query,
+                    top_k=min(top_k, 10),
+                    mode="hybrid",
+                    include_images=False,
+                )
+                chunks = result.chunks
+                citations = result.citations
+                if result.knowledge_graph_summary:
+                    all_kg_summaries.append(f"### KG Insights from {ws_name}\n{result.knowledge_graph_summary}")
+            except Exception as e:
+                logger.warning(f"Search failed for workspace {workspace_id}: {e}")
+        else:
+            from types import SimpleNamespace
+            try:
+                legacy = rag_service.query(question=query, top_k=min(top_k, 10))
+                for i, c in enumerate(legacy.chunks):
+                    chunks.append(SimpleNamespace(
+                        content=c.content,
+                        document_id=int(c.metadata.get("document_id", 0)),
+                        chunk_index=i,
+                        page_no=int(c.metadata.get("page_no", 0)),
+                        heading_path=str(c.metadata.get("heading_path", "")).split(" > ") if c.metadata.get("heading_path") else [],
+                        source_file=str(c.metadata.get("source", "")),
+                        image_refs=[],
+                        score=c.score
+                    ))
+            except Exception as e:
+                logger.warning(f"Legacy search failed for workspace {workspace_id}: {e}")
+                
+        # Pack chunks with their citation for sorting
+        for i, chunk in enumerate(chunks):
+            citation = citations[i] if i < len(citations) else None
+            score = getattr(chunk, "score", 0.0)
+            all_chunks.append((score, chunk, citation, workspace_id))
+            
+    # Sort all aggregated chunks by score descending
+    all_chunks.sort(key=lambda x: x[0], reverse=True)
+    
+    # Take top_k
+    best_chunks = all_chunks[:top_k]
 
     # Build sources
     sources: list[ChatSourceChunk] = []
     context_parts: list[str] = []
-    for i, chunk in enumerate(chunks):
-        citation = citations[i] if i < len(citations) else None
+    chunk_image_ids: list[str] = []
+    seen_image_ids: set[str] = set()
+    source_pages = set()
+    
+    for score, chunk, citation, workspace_id in best_chunks:
         cid = _generate_citation_id(existing_ids)
         existing_ids.add(cid)
         sources.append(ChatSourceChunk(
@@ -320,9 +376,19 @@ async def _execute_search_documents(
             document_id=chunk.document_id,
             page_no=chunk.page_no,
             heading_path=chunk.heading_path,
-            score=0.0,
+            score=score,
             source_type="vector",
         ))
+        
+        # Collect images to fetch
+        for iid in getattr(chunk, "image_refs", []) or []:
+            if iid and iid not in seen_image_ids:
+                seen_image_ids.add(iid)
+                chunk_image_ids.append(iid)
+                
+        if getattr(chunk, "page_no", 0) > 0:
+            source_pages.add((getattr(chunk, "document_id", 0), getattr(chunk, "page_no", 0)))
+        
         meta_parts = []
         if citation:
             meta_parts.append(citation.source_file)
@@ -334,16 +400,14 @@ async def _execute_search_documents(
         meta_line = f" ({', '.join(meta_parts)})" if meta_parts else ""
         context_parts.append(f"Source [{cid}]{meta_line}:\n{chunk.content}")
 
-    context = "\n\n---\n\n".join(context_parts)
-
-    # Build image references
-    seen_image_ids: set[str] = set()
-    chunk_image_ids: list[str] = []
-    for c in chunks:
-        for iid in getattr(c, "image_refs", []) or []:
-            if iid and iid not in seen_image_ids:
-                seen_image_ids.add(iid)
-                chunk_image_ids.append(iid)
+    context = ""
+    if all_kg_summaries:
+        context += "## Knowledge Graph Entities & Relationships\n"
+        context += "\n\n".join(all_kg_summaries)
+        context += "\n\n---\n\n"
+        
+    context += "## Document Chunks\n"
+    context += "\n\n---\n\n".join(context_parts)
 
     resolved_images: list[DocumentImage] = []
     if chunk_image_ids:
@@ -352,31 +416,26 @@ async def _execute_search_documents(
         )
         resolved_images = list(img_result.scalars().all())
 
-    if not resolved_images:
-        source_pages = {
-            (getattr(c, "document_id", 0), getattr(c, "page_no", 0))
-            for c in chunks if getattr(c, "page_no", 0) > 0
-        }
-        if source_pages:
-            from sqlalchemy import or_, and_
-            page_filters = [
-                and_(
-                    DocumentImage.document_id == doc_id,
-                    DocumentImage.page_no == page_no,
-                )
-                for doc_id, page_no in source_pages
-            ]
-            img_result = await db.execute(
-                select(DocumentImage).where(or_(*page_filters))
+    if not resolved_images and source_pages:
+        from sqlalchemy import or_, and_
+        page_filters = [
+            and_(
+                DocumentImage.document_id == doc_id,
+                DocumentImage.page_no == page_no,
             )
-            resolved_images = list(img_result.scalars().all())
-            seen = set()
-            deduped = []
-            for img in resolved_images:
-                if img.image_id not in seen:
-                    seen.add(img.image_id)
-                    deduped.append(img)
-            resolved_images = deduped
+            for doc_id, page_no in source_pages
+        ]
+        img_result = await db.execute(
+            select(DocumentImage).where(or_(*page_filters))
+        )
+        resolved_images = list(img_result.scalars().all())
+        seen = set()
+        deduped = []
+        for img in resolved_images:
+            if img.image_id not in seen:
+                seen.add(img.image_id)
+                deduped.append(img)
+        resolved_images = deduped
 
     chat_image_refs: list[ChatImageRef] = []
     image_context_parts: list[str] = []
@@ -385,6 +444,9 @@ async def _execute_search_documents(
     for img in resolved_images[:MAX_VISION_IMAGES]:
         img_ref_id = _generate_citation_id(existing_ids)
         existing_ids.add(img_ref_id)
+        # Figure out which workspace this image belongs to in order to construct the correct URL
+        # For simplicity we query the document's workspace_id
+        workspace_id = img.document.workspace_id if hasattr(img, "document") and img.document else workspace_ids[0] if workspace_ids else 0
         img_url = f"/static/doc-images/kb_{workspace_id}/images/{img.image_id}.png"
         chat_image_refs.append(ChatImageRef(
             ref_id=img_ref_id,
@@ -424,7 +486,7 @@ async def _execute_search_documents(
 # ---------------------------------------------------------------------------
 
 async def agent_chat_stream(
-    workspace_id: int,
+    workspace_ids: list[int],
     message: str,
     history: list[dict],
     enable_thinking: bool,
@@ -457,8 +519,8 @@ async def agent_chat_stream(
     # Build conversation messages
     messages: list[LLMMessage] = []
     for msg in history[-10:]:
-        role = "user" if msg["role"] == "user" else "assistant"
-        messages.append(LLMMessage(role=role, content=msg["content"]))
+        role = "user" if msg.role == "user" else "assistant"
+        messages.append(LLMMessage(role=role, content=msg.content))
 
     # Build user message
     messages.append(LLMMessage(role="user", content=message))
@@ -473,7 +535,7 @@ async def agent_chat_stream(
         yield {"event": "status", "data": {"step": "retrieving", "detail": f"Searching: {message[:80]}..."}}
 
         context, sources, images, img_parts = await _execute_search_documents(
-            workspace_id, message, 8, db, existing_ids,
+            workspace_ids, message, 8, db, existing_ids,
         )
         all_sources.extend(sources)
         all_images.extend(images)
@@ -586,7 +648,7 @@ async def agent_chat_stream(
                 }}
 
                 context, sources, images, img_parts = await _execute_search_documents(
-                    workspace_id, query, top_k, db, existing_ids,
+                    workspace_ids, query, top_k, db, existing_ids,
                 )
                 all_sources.extend(sources)
                 all_images.extend(images)
@@ -727,7 +789,7 @@ async def agent_chat_stream(
         }}
 
         context, sources, images, img_parts = await _execute_search_documents(
-            workspace_id, message, 8, db, existing_ids,
+            workspace_ids, message, 8, db, existing_ids,
         )
         all_sources.extend(sources)
         all_images.extend(images)

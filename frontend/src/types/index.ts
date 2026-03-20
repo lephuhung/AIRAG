@@ -269,6 +269,13 @@ export interface ProjectAnalytics {
 }
 
 // Chat Types
+export interface ChatSession {
+  id: number;
+  title: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface ChatImageRef {
   ref_id?: string;  // 4-char alphanumeric ID, e.g. "p4f2"
   image_id: string;
@@ -327,7 +334,8 @@ export interface PersistedChatMessage {
 }
 
 export interface ChatHistoryResponse {
-  workspace_id: number;
+  workspace_id?: number;
+  session_id?: number;
   messages: PersistedChatMessage[];
   total: number;
 }

@@ -1,12 +1,12 @@
 """
-ChatMessage model — persists chat history per workspace to PostgreSQL.
+ChatMessage model — persists chat history per session to PostgreSQL.
 """
 from __future__ import annotations
 
 from datetime import datetime
 
 from sqlalchemy import ForeignKey, Text, Integer, DateTime, JSON, String
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 
@@ -15,9 +15,9 @@ class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    workspace_id: Mapped[int] = mapped_column(
+    session_id: Mapped[int] = mapped_column(
         Integer,
-        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        ForeignKey("chat_sessions.id", ondelete="CASCADE"),
         index=True,
     )
     message_id: Mapped[str] = mapped_column(String(50), index=True)
@@ -38,3 +38,6 @@ class ChatMessage(Base):
     )
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    # Relationship to ChatSession
+    session: Mapped["ChatSession"] = relationship("ChatSession", back_populates="messages")
