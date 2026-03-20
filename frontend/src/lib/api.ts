@@ -42,9 +42,11 @@ async function handleUnauthorized(
   const refreshed = await store.refreshAccessToken();
 
   if (!refreshed) {
-    // Redirect to login
+    // Redirect to login forcefully
     if (window.location.pathname !== "/login") {
-      window.location.href = "/login";
+      window.location.assign("/login");
+      // Delay to allow browser navigation to take over before React Query catches an error
+      await new Promise(resolve => setTimeout(resolve, 500));
     }
     return null;
   }

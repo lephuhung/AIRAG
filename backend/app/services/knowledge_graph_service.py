@@ -161,9 +161,10 @@ class KnowledgeGraphService:
             # Pass workspace label via the LightRAG `workspace` param so all
             # workspaces share one Neo4j DB but remain isolated by node label.
             extra_kwargs = {"workspace": f"kb_{self.workspace_id}"}
-            kv_storage = "JsonKVStorage"
-            vector_storage = "NanoVectorDBStorage"
+            kv_storage = "PGKVStorage"
+            vector_storage = "PGVectorStorage"
             doc_status_storage = "JsonDocStatusStorage"
+            # Pass Neo4j addon_params but also need Postgres url for PGVectorStorage
             extra_kwargs["addon_params"] = {
                 "language": settings.NEXUSRAG_KG_LANGUAGE,
                 "entity_types": settings.NEXUSRAG_KG_ENTITY_TYPES,
@@ -175,10 +176,10 @@ class KnowledgeGraphService:
             )
         else:
             graph_storage = "NetworkXStorage"
-            kv_storage = "JsonKVStorage"
-            vector_storage = "NanoVectorDBStorage"
+            kv_storage = "PGKVStorage"
+            vector_storage = "PGVectorStorage"
             doc_status_storage = "JsonDocStatusStorage"
-            extra_kwargs = {}
+            extra_kwargs = {"workspace": f"kb_{self.workspace_id}"}
             logger.info(
                 f"LightRAG using NetworkX (file) backend for workspace {self.workspace_id}"
             )
