@@ -58,6 +58,8 @@ export interface AdminStats {
   active_users: number;
   pending_users: number;
   total_tenants: number;
+  total_documents: number;
+  total_knowledge_bases: number;
 }
 
 // Knowledge Base (Document Workspace)

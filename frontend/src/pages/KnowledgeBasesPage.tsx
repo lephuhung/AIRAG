@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { useWorkspaces, useCreateWorkspace, useDeleteWorkspace } from "@/hooks/useWorkspaces";
+import { useWorkspaces, useCreateWorkspace, useDeleteWorkspace, useUpdateWorkspace } from "@/hooks/useWorkspaces";
 import { useMyTenants } from "@/hooks/useMyTenants";
 import { useAdminTenants } from "@/hooks/useAdminTenants";
 import { useAuthStore } from "@/stores/authStore";
@@ -19,6 +19,7 @@ import {
   Building2,
   User,
   ChevronDown,
+  Edit,
 } from "lucide-react";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { cn } from "@/lib/utils";
@@ -36,12 +37,48 @@ export function KnowledgeBasesPage() {
   const tenantsForDropdown = isSuperadmin ? allTenants : myTenants;
   const createWorkspace = useCreateWorkspace();
   const deleteWorkspace = useDeleteWorkspace();
+  const updateWorkspace = useUpdateWorkspace();
   const [showNewWorkspace, setShowNewWorkspace] = useState(false);
   const [newWorkspaceName, setNewWorkspaceName] = useState("");
   const [newVisibility, setNewVisibility] = useState<VisibilityOption>("personal");
   const [selectedTenantId, setSelectedTenantId] = useState<number | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<number | null>(null);
   const [openMenu, setOpenMenu] = useState<number | null>(null);
+
+  const [editWorkspace, setEditWorkspace] = useState<KnowledgeBase | null>(null);
+  const [editWorkspaceName, setEditWorkspaceName] = useState("");
+  const [editVisibility, setEditVisibility] = useState<VisibilityOption>("personal");
+  const [editTenantId, setEditTenantId] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (editWorkspace) {
+      setEditWorkspaceName(editWorkspace.name);
+      setEditVisibility(editWorkspace.visibility as VisibilityOption);
+      setEditTenantId(editWorkspace.tenant_id);
+    }
+  }, [editWorkspace]);
+
+  const handleUpdateWorkspace = async () => {
+    if (!editWorkspace || !editWorkspaceName.trim()) return;
+    if (editVisibility === "tenant" && !editTenantId) {
+      toast.error("Please select an organization for this workspace");
+      return;
+    }
+    try {
+      await updateWorkspace.mutateAsync({
+        id: editWorkspace.id,
+        data: {
+          name: editWorkspaceName,
+          visibility: editVisibility,
+          tenant_id: editVisibility === "tenant" ? editTenantId : null,
+        }
+      });
+      toast.success("Knowledge base updated");
+      setEditWorkspace(null);
+    } catch {
+      toast.error("Failed to update knowledge base");
+    }
+  };
 
   // Close menu on outside click
   useEffect(() => {
@@ -139,6 +176,17 @@ export function KnowledgeBasesPage() {
             </button>
             {openMenu === ws.id && (
               <div className="absolute right-0 top-8 z-20 bg-card border rounded-lg shadow-lg py-1 w-32">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setEditWorkspace(ws);
+                    setOpenMenu(null);
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted transition-colors"
+                >
+                  <Edit className="w-3.5 h-3.5" />
+                  Edit
+                </button>
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
@@ -319,6 +367,102 @@ export function KnowledgeBasesPage() {
                   </Button>
                   <Button onClick={handleCreateWorkspace} disabled={createWorkspace.isPending || !newWorkspaceName.trim()}>
                     {createWorkspace.isPending ? "Creating..." : "Create"}
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        )}
+
+        {/* Edit Workspace Modal */}
+        {editWorkspace && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+            <Card className="w-full max-w-md mx-4 shadow-2xl">
+              <CardContent className="pt-6">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-lg font-semibold">Edit Knowledge Base</h3>
+                  <button
+                    onClick={() => setEditWorkspace(null)}
+                    className="w-8 h-8 flex items-center justify-center rounded-lg text-muted-foreground hover:bg-muted transition-colors"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+                <Input
+                  placeholder="Knowledge base name"
+                  value={editWorkspaceName}
+                  onChange={(e) => setEditWorkspaceName(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleUpdateWorkspace()}
+                  autoFocus
+                />
+                <div className="mt-4">
+                  <label className="block text-sm font-medium mb-2">Visibility</label>
+                  <div className="grid grid-cols-3 gap-2">
+                    {([
+                      { value: "personal" as const, label: "Personal", icon: User, desc: "Only you" },
+                      { value: "tenant" as const, label: "Tenant", icon: Building2, desc: "Your org" },
+                      { value: "public" as const, label: "Public", icon: Globe, desc: "Everyone" },
+                    ]).map((opt) => (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        onClick={() => setEditVisibility(opt.value)}
+                        className={cn(
+                          "flex flex-col items-center gap-1 p-3 rounded-lg border text-sm transition-colors",
+                          editVisibility === opt.value
+                            ? "border-primary bg-primary/5 text-primary"
+                            : "border-border text-muted-foreground hover:bg-muted/50"
+                        )}
+                      >
+                        <opt.icon className="w-4 h-4" />
+                        <span className="font-medium text-xs">{opt.label}</span>
+                        <span className="text-[10px] text-muted-foreground">{opt.desc}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {editVisibility === "tenant" && (
+                  <div className="mt-3">
+                    <label className="block text-sm font-medium mb-1.5">
+                      Organization <span className="text-destructive">*</span>
+                    </label>
+                    {!tenantsForDropdown || tenantsForDropdown.length === 0 ? (
+                      <p className="text-xs text-muted-foreground bg-muted/50 rounded-lg px-3 py-2">
+                        {isSuperadmin
+                          ? "No organizations exist yet. Create one first."
+                          : "You're not a member of any organization. Join or create one first."}
+                      </p>
+                    ) : (
+                      <div className="relative">
+                        <select
+                          value={editTenantId ?? ""}
+                          onChange={(e) => setEditTenantId(e.target.value ? Number(e.target.value) : null)}
+                          className={cn(
+                            "w-full appearance-none rounded-lg border bg-background px-3 py-2 pr-8 text-sm",
+                            "focus:outline-none focus:ring-1 focus:ring-ring",
+                            !editTenantId && "text-muted-foreground"
+                          )}
+                        >
+                          <option value="">Select organization…</option>
+                          {tenantsForDropdown.map((t) => (
+                            <option key={t.id} value={t.id}>{t.name}</option>
+                          ))}
+                        </select>
+                        <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                      </div>
+                    )}
+                  </div>
+                )}
+                <div className="flex justify-end gap-2 mt-4">
+                  <Button variant="ghost" onClick={() => setEditWorkspace(null)}>
+                    Cancel
+                  </Button>
+                  <Button 
+                    onClick={handleUpdateWorkspace} 
+                    disabled={updateWorkspace.isPending || !editWorkspaceName.trim() || (editWorkspaceName === editWorkspace.name && editVisibility === editWorkspace.visibility && editTenantId === editWorkspace.tenant_id)}
+                  >
+                    {updateWorkspace.isPending ? "Saving..." : "Save"}
                   </Button>
                 </div>
               </CardContent>

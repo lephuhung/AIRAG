@@ -14,6 +14,7 @@ import { TenantManagePage } from "@/pages/TenantManagePage";
 import { AdminUsersPage } from "@/pages/AdminUsersPage";
 import { AdminTenantsPage } from "@/pages/AdminTenantsPage";
 import { AdminDocumentTypesPage } from "@/pages/AdminDocumentTypesPage";
+import { AdminDashboardPage } from "@/pages/AdminDashboardPage";
 import { ChatPage } from "@/pages/ChatPage";
 
 const queryClient = new QueryClient({
@@ -47,6 +48,7 @@ function AppRoutes() {
         <Route path="/knowledge-bases/:workspaceId/files" element={<FilesPage />} />
         <Route path="/files" element={<FilesPage />} />
         <Route path="/workers" element={<WorkersPage />} />
+        <Route path="/admin/dashboard" element={<AdminDashboardPage />} />
         <Route path="/admin/users" element={<AdminUsersPage />} />
         <Route path="/admin/tenants" element={<AdminTenantsPage />} />
         <Route path="/admin/document-types" element={<AdminDocumentTypesPage />} />

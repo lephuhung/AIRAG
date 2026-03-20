@@ -1,11 +1,11 @@
 import { useEffect } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { Plus, MessageSquare, Trash2, X } from "lucide-react";
+import { MessageSquare, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-import { useChatSessions, useCreateChatSession, useDeleteChatSession } from "@/hooks/useChatSessions";
+import { useChatSessions, useCreateChatSession } from "@/hooks/useChatSessions";
 import { ChatPanel } from "@/components/rag/ChatPanel";
 import { DocumentViewer } from "@/components/rag/DocumentViewer";
 import { useWorkspaceStore } from "@/stores/workspaceStore";
@@ -35,7 +35,6 @@ export function ChatPage() {
   // -- Queries & Mutations --
   const { data: sessions, isLoading: loadingSessions } = useChatSessions();
   const createSession = useCreateChatSession();
-  const deleteSession = useDeleteChatSession();
 
   // Redirect to first session if none selected and sessions exist
   useEffect(() => {
@@ -54,22 +53,6 @@ export function ChatPage() {
     }
   };
 
-  const handleDeleteSession = async (e: React.MouseEvent, id: number) => {
-    e.stopPropagation();
-    e.preventDefault();
-    if (confirm("Are you sure you want to delete this chat session?")) {
-      try {
-        await deleteSession.mutateAsync(id);
-        toast.success("Chat deleted");
-        if (currentSessionId === id) {
-          navigate("/chat"); // will auto-redirect to first available
-        }
-      } catch (error) {
-        toast.error("Failed to delete chat session");
-      }
-    }
-  };
-
   return (
     <div className="h-full overflow-hidden flex flex-col">
       {/* Mobile header (hidden on md) */}
@@ -79,46 +62,6 @@ export function ChatPage() {
       </div>
 
       <div className="flex-1 flex overflow-hidden">
-        {/* Left Sidebar: Session List */}
-        <div className="w-64 flex-shrink-0 border-r flex flex-col bg-muted/10 h-full max-md:hidden">
-          <div className="p-3 border-b bg-muted/20 flex gap-2 items-center">
-            <Button onClick={handleNewSession} className="w-full text-xs h-8" variant="default">
-              <Plus className="w-3.5 h-3.5 mr-1" />
-              New Chat
-            </Button>
-          </div>
-          <div className="flex-1 overflow-y-auto p-2 space-y-1">
-            {loadingSessions ? (
-              <div className="text-xs text-muted-foreground p-3 text-center">Loading...</div>
-            ) : sessions?.length === 0 ? (
-              <div className="text-xs text-muted-foreground p-3 text-center">No chats yet.</div>
-            ) : (
-              sessions?.map((session) => (
-                <Link
-                  key={session.id}
-                  to={`/chat/${session.id}`}
-                  className={cn(
-                    "flex items-center gap-2 px-3 py-2 text-sm rounded-md transition-colors group cursor-pointer",
-                    currentSessionId === session.id
-                      ? "bg-primary/10 text-primary font-medium"
-                      : "hover:bg-muted text-foreground/80"
-                  )}
-                >
-                  <MessageSquare className="w-4 h-4 shrink-0 opacity-70" />
-                  <span className="flex-1 truncate text-xs">{session.title}</span>
-                  <button
-                    onClick={(e) => handleDeleteSession(e, session.id)}
-                    className="opacity-0 group-hover:opacity-100 hover:text-destructive shrink-0 transition-opacity"
-                    title="Delete Chat"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                  </button>
-                </Link>
-              ))
-            )}
-          </div>
-        </div>
-
         {/* Middle: Chat Panel */}
         <div className={cn(
           "flex-1 h-full min-w-[320px] transition-all",

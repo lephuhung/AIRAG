@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo, memo, createContext, useContext, Children, isValidElement, type ReactNode } from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient, QueryClient } from "@tanstack/react-query";
 import { motion, AnimatePresence } from "framer-motion";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -92,16 +92,20 @@ const DebugCtx = createContext(false);
 const AllSourcesCtx = createContext<ChatSourceChunk[]>([]);
 
 /** Look up a Document from react-query cache by document_id */
-function useFindDoc(documentId: number): Document | undefined {
-  const qc = useQueryClient();
+function findDocInCache(qc: QueryClient, documentId: number | string): Document | undefined {
   // Try to find the document in any cached document list
   const queries = qc.getQueryCache().findAll({ queryKey: ["documents"] });
   for (const query of queries) {
     const docs = query.state.data as Document[] | undefined;
-    const found = docs?.find((d) => d.id === documentId);
+    const found = docs?.find((d) => String(d.id) === String(documentId));
     if (found) return found;
   }
   return undefined;
+}
+
+function useFindDoc(documentId: number | string): Document | undefined {
+  const qc = useQueryClient();
+  return findDocInCache(qc, documentId);
 }
 
 // ---------------------------------------------------------------------------
@@ -660,7 +664,10 @@ function SourcesPanel({
               {vectorSources.map((source) => (
                 <button
                   key={source.chunk_id}
-                  onClick={() => activateCitation(source, [])}
+                  onClick={() => {
+                    const doc = findDocInCache(queryClient, source.document_id);
+                    activateCitation(source, [], doc);
+                  }}
                   className="w-full text-left px-2.5 py-2 hover:bg-muted/50 transition-colors"
                 >
                   <div className="flex items-center gap-1.5 mb-0.5">
@@ -702,7 +709,10 @@ function SourcesPanel({
               {kgSources.map((source) => (
                 <button
                   key={source.chunk_id}
-                  onClick={() => activateCitationKG(source, [])}
+                  onClick={() => {
+                    const doc = findDocInCache(queryClient, source.document_id);
+                    activateCitationKG(source, [], doc);
+                  }}
                   className="w-full text-left px-2.5 py-2 hover:bg-purple-400/5 hover:bg-muted/50 transition-colors"
                 >
                   <div className="flex items-center gap-1.5 mb-0.5">
@@ -1257,7 +1267,7 @@ export const ChatPanel = memo(function ChatPanel({
   const [input, setInput] = useState("");
   const [enableThinking, setEnableThinking] = useState(false);
   const [thinkingDefaultSynced, setThinkingDefaultSynced] = useState(false);
-  const [forceSearch, setForceSearch] = useState(false);
+  const [forceSearch, setForceSearch] = useState(true);
 
   // Load chat history from PostgreSQL
   const { data: historyData, isLoading: historyLoading } = useChatHistory(sessionId);

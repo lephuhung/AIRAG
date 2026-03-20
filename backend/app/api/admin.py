@@ -15,6 +15,8 @@ from app.core.deps import get_db, require_superadmin
 from app.core.exceptions import NotFoundError, BadRequestError
 from app.models.user import User
 from app.models.tenant import Tenant, TenantUser
+from app.models.document import Document
+from app.models.knowledge_base import KnowledgeBase
 
 from app.schemas.admin import (
     AdminUserUpdate,
@@ -87,12 +89,16 @@ async def get_admin_stats(
         select(func.count(User.id)).where(User.is_active.is_(False))
     )
     total_tenants = await db.scalar(select(func.count(Tenant.id)))
+    total_documents = await db.scalar(select(func.count(Document.id)))
+    total_knowledge_bases = await db.scalar(select(func.count(KnowledgeBase.id)))
 
     return AdminStatsResponse(
         total_users=total_users or 0,
         active_users=active_users or 0,
         pending_users=pending_users or 0,
         total_tenants=total_tenants or 0,
+        total_documents=total_documents or 0,
+        total_knowledge_bases=total_knowledge_bases or 0,
     )
 
 

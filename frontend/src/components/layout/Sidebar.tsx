@@ -1,20 +1,28 @@
-import { memo } from "react";
+import { memo, useState } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
+import { motion, AnimatePresence } from "framer-motion";
 import {
   Database,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
   FolderOpen,
   Activity,
   Building2,
   Users,
   FileText,
   MessageSquare,
+  Plus,
+  Trash2,
+  Edit,
+  PieChart,
 } from "lucide-react";
 import { useWorkspaces } from "@/hooks/useWorkspaces";
 import { useMyTenants } from "@/hooks/useMyTenants";
 import { useAuthStore } from "@/stores/authStore";
+import { useChatSessions, useCreateChatSession, useDeleteChatSession } from "@/hooks/useChatSessions";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 
 interface SidebarProps {
@@ -29,6 +37,38 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
   const { data: myTenants } = useMyTenants();
   const user = useAuthStore((s) => s.user);
 
+  const { data: sessions } = useChatSessions();
+  const createSession = useCreateChatSession();
+  const deleteSession = useDeleteChatSession();
+
+  const [workspacesExpanded, setWorkspacesExpanded] = useState(true);
+
+  const handleNewSession = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      const newSession = await createSession.mutateAsync({ title: "New Chat" });
+      navigate(`/chat/${newSession.id}`);
+    } catch (error) {
+      toast.error("Failed to create chat session");
+    }
+  };
+
+  const handleDeleteSession = async (e: React.MouseEvent, id: number) => {
+    e.stopPropagation();
+    e.preventDefault();
+    if (confirm("Are you sure you want to delete this chat session?")) {
+      try {
+        await deleteSession.mutateAsync(id);
+        toast.success("Chat deleted");
+        if (location.pathname === `/chat/${id}`) {
+          navigate("/chat");
+        }
+      } catch (error) {
+        toast.error("Failed to delete chat session");
+      }
+    }
+  };
+
   const urlWorkspaceId = location.pathname.match(/\/knowledge-bases\/(\d+)/)?.[1];
   const isHome = location.pathname === "/";
   const isFilesPage = location.pathname === "/files" || location.pathname.endsWith("/files");
@@ -37,6 +77,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
   const isAdminUsersPage = location.pathname === "/admin/users";
   const isAdminTenantsPage = location.pathname === "/admin/tenants";
   const isAdminDocTypesPage = location.pathname === "/admin/document-types";
+  const isAdminDashboardPage = location.pathname === "/admin/dashboard";
 
   return (
     <aside
@@ -55,6 +96,27 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
 
       {/* Navigation */}
       <nav className="flex-shrink-0 px-2 pt-3 space-y-0.5">
+        <button
+          onClick={handleNewSession}
+          className={cn(
+            "w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-sm transition-colors group",
+            isChatPage && !location.pathname.match(/\/chat\/\d+/)
+              ? "bg-primary/10 text-primary font-medium"
+              : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+          )}
+          title={collapsed ? "New chat" : undefined}
+        >
+          <div className="flex items-center gap-2.5">
+            <Edit className="w-4 h-4 flex-shrink-0" />
+            {!collapsed && <span className="truncate">New chat</span>}
+          </div>
+          {!collapsed && (
+            <div className="opacity-0 group-hover:opacity-100 transition-opacity p-0.5" title="New Chat">
+               <Plus className="w-4 h-4" />
+            </div>
+          )}
+        </button>
+
         <button
           onClick={() => navigate("/")}
           className={cn(
@@ -83,20 +145,6 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
           {!collapsed && <span className="truncate">Files</span>}
         </button>
 
-        <button
-          onClick={() => navigate("/chat")}
-          className={cn(
-            "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm transition-colors",
-            isChatPage
-              ? "bg-primary/10 text-primary font-medium"
-              : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
-          )}
-          title={collapsed ? "Global Chat" : undefined}
-        >
-          <MessageSquare className="w-4 h-4 flex-shrink-0" />
-          {!collapsed && <span className="truncate">Global Chat</span>}
-        </button>
-
         {user?.is_superadmin && (
           <button
             onClick={() => navigate("/workers")}
@@ -122,6 +170,19 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
               </p>
             )}
             {collapsed && <div className="my-2 mx-2 border-t border-border" />}
+            <button
+              onClick={() => navigate("/admin/dashboard")}
+              className={cn(
+                "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm transition-colors",
+                isAdminDashboardPage
+                  ? "bg-primary/10 text-primary font-medium"
+                  : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+              )}
+              title={collapsed ? "Dashboard" : undefined}
+            >
+              <PieChart className="w-4 h-4 flex-shrink-0" />
+              {!collapsed && <span className="truncate">Dashboard</span>}
+            </button>
             <button
               onClick={() => navigate("/admin/users")}
               className={cn(
@@ -165,42 +226,63 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
         )}
       </nav>
 
-      {/* Scrollable workspace list */}
-      <div className="flex-1 overflow-y-auto min-h-0">
+      {/* Scrollable lists */}
+      <div className="flex-1 overflow-y-auto min-h-0 pt-2 pb-4">
+        {/* Workspaces */}
         {!collapsed && workspaces && workspaces.length > 0 && (
-          <div className="mt-4 px-2">
-            <p className="px-2.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">
-              Workspaces
-            </p>
-            <div className="space-y-0.5">
-              {workspaces.slice(0, 20).map((ws) => {
-                const isActive = urlWorkspaceId === String(ws.id);
-                return (
-                  <button
-                    key={ws.id}
-                    onClick={() => navigate(`/knowledge-bases/${ws.id}`)}
-                    className={cn(
-                      "w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-sm transition-colors",
-                      isActive
-                        ? "bg-primary/10 text-primary border-l-2 border-primary font-medium"
-                        : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
-                    )}
-                  >
-                    <Database className="w-3.5 h-3.5 flex-shrink-0" />
-                    <span className="truncate">{ws.name}</span>
-                    <span className="ml-auto text-[10px] text-muted-foreground/60 tabular-nums">
-                      {ws.document_count}
-                    </span>
-                  </button>
-                );
-              })}
+          <div className="mt-2 px-2">
+            <div 
+              className="flex items-center justify-between px-2.5 mb-1.5 cursor-pointer group"
+              onClick={() => setWorkspacesExpanded(!workspacesExpanded)}
+            >
+              <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground group-hover:text-foreground transition-colors">
+                Workspaces
+              </p>
+              <button 
+                className="text-muted-foreground group-hover:text-foreground transition-colors"
+              >
+                {workspacesExpanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+              </button>
             </div>
+            
+            <AnimatePresence>
+              {workspacesExpanded && (
+                <motion.div 
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: "auto", opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  className="space-y-0.5 overflow-hidden"
+                >
+                  {workspaces.slice(0, 20).map((ws) => {
+                    const isActive = urlWorkspaceId === String(ws.id);
+                    return (
+                      <button
+                        key={ws.id}
+                        onClick={() => navigate(`/knowledge-bases/${ws.id}`)}
+                        className={cn(
+                          "w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-sm transition-colors",
+                          isActive
+                            ? "bg-primary/10 text-primary border-l-2 border-primary font-medium"
+                            : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+                        )}
+                      >
+                        <Database className="w-3.5 h-3.5 flex-shrink-0" />
+                        <span className="truncate">{ws.name}</span>
+                        <span className="ml-auto text-[10px] text-muted-foreground/60 tabular-nums">
+                          {ws.document_count}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
         )}
 
         {/* Collapsed indicators */}
         {collapsed && (
-          <div className="mt-4 px-2 space-y-1">
+          <div className="mt-2 px-2 space-y-1">
             {workspaces?.slice(0, 6).map((ws) => {
               const isActive = urlWorkspaceId === String(ws.id);
               return (
@@ -224,7 +306,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
 
         {/* My Tenants */}
         {!collapsed && myTenants && myTenants.length > 0 && (
-          <div className="mt-4 px-2">
+          <div className="mt-6 px-2">
             <p className="px-2.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">
               My Tenants
             </p>
@@ -251,7 +333,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
           </div>
         )}
         {collapsed && myTenants && myTenants.length > 0 && (
-          <div className="mt-2 px-2 space-y-1">
+          <div className="mt-4 px-2 space-y-1">
             {myTenants.map((t) => {
               const isActive = location.pathname === `/tenants/${t.id}`;
               return (
@@ -267,6 +349,68 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
                   title={t.name}
                 >
                   <Building2 className="w-3.5 h-3.5" />
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Chat History placed at the bottom */}
+        {!collapsed && sessions && sessions.length > 0 && (
+          <div className="mt-6 px-2">
+            <p className="px-2.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">
+              Your chats
+            </p>
+            <div className="space-y-0.5">
+              {sessions.map((session) => {
+                const isActive = location.pathname === `/chat/${session.id}`;
+                return (
+                  <button
+                    key={session.id}
+                    onClick={() => navigate(`/chat/${session.id}`)}
+                    className={cn(
+                      "w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-sm transition-colors group",
+                      isActive
+                        ? "bg-primary/10 text-primary font-medium"
+                        : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+                    )}
+                    title={session.title}
+                  >
+                    <div className="flex items-center gap-2 overflow-hidden flex-1">
+                      <MessageSquare className={cn("w-3.5 h-3.5 flex-shrink-0", isActive ? "text-primary" : "text-muted-foreground")} />
+                      <span className="truncate text-left font-medium">{session.title}</span>
+                    </div>
+                    <div
+                      onClick={(e) => handleDeleteSession(e, session.id)}
+                      className="opacity-0 group-hover:opacity-100 hover:text-destructive shrink-0 transition-opacity ml-1 p-0.5"
+                      title="Delete Chat"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+        
+        {collapsed && sessions && sessions.length > 0 && (
+          <div className="mt-4 px-2 space-y-1">
+            {sessions.map((session) => {
+              const isActive = location.pathname === `/chat/${session.id}`;
+              return (
+                <button
+                  key={`sc-${session.id}`}
+                  onClick={() => navigate(`/chat/${session.id}`)}
+                  className={cn(
+                    "w-full flex items-center justify-center py-1.5 rounded-lg transition-colors",
+                    isActive
+                      ? "bg-primary/10 text-primary"
+                      : "text-muted-foreground hover:bg-muted/50"
+                  )}
+                  title={session.title}
+                >
+                  <MessageSquare className="w-3.5 h-3.5" />
                 </button>
               );
             })}

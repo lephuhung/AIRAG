@@ -43,3 +43,5 @@ class AdminStatsResponse(BaseModel):
     active_users: int
     pending_users: int
     total_tenants: int
+    total_documents: int
+    total_knowledge_bases: int
