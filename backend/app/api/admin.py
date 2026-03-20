@@ -120,6 +120,7 @@ async def get_admin_stats(
 async def list_users(
     search: str | None = Query(None, description="Search by name or email"),
     is_active: bool | None = Query(None, description="Filter by active status"),
+    tenant_id: int | None = Query(None, description="Filter by tenant ID"),
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -141,6 +142,10 @@ async def list_users(
     if is_active is not None:
         query = query.where(User.is_active == is_active)
         count_query = count_query.where(User.is_active == is_active)
+
+    if tenant_id is not None:
+        query = query.join(TenantUser, TenantUser.user_id == User.id).where(TenantUser.tenant_id == tenant_id)
+        count_query = count_query.join(TenantUser, TenantUser.user_id == User.id).where(TenantUser.tenant_id == tenant_id)
 
     # Count total
     total = await db.scalar(count_query) or 0

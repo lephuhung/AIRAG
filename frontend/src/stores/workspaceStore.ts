@@ -62,7 +62,7 @@ function cancelPendingScroll() {
 
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   selectedDoc: null,
-  activeTab: "content",
+  activeTab: "kg",
   kgSubTab: "graph",
   scrollToPage: null,
   scrollToHeading: null,
@@ -75,7 +75,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     cancelPendingScroll();
     set({
       selectedDoc: doc,
-      activeTab: "content",
+      activeTab: doc ? "content" : "kg",
       highlightChunks: [],
       highlightEntities: [],
       activeCitationIndex: null,
@@ -188,7 +188,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     cancelPendingScroll();
     set({
       selectedDoc: null,
-      activeTab: "content",
+      activeTab: "kg",
       kgSubTab: "graph",
       scrollToPage: null,
       scrollToHeading: null,

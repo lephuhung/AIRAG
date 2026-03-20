@@ -233,7 +233,7 @@ class PersistedChatMessage(BaseModel):
 
 class ChatHistoryResponse(BaseModel):
     """Response for GET chat history."""
-    workspace_id: int
+    session_id: str
     messages: list[PersistedChatMessage]
     total: int
 

@@ -342,8 +342,7 @@ export interface PersistedChatMessage {
 }
 
 export interface ChatHistoryResponse {
-  workspace_id?: number;
-  session_id?: number;
+  session_id?: string;
   messages: PersistedChatMessage[];
   total: number;
 }

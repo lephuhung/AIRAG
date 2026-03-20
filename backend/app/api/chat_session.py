@@ -105,7 +105,7 @@ async def get_session_history(
     msgs = msg_result.scalars().all()
 
     return ChatHistoryResponse(
-        workspace_id=session_id,  # reused schema field
+        session_id=session_id,
         total=len(msgs),
         messages=[
             PersistedChatMessage(

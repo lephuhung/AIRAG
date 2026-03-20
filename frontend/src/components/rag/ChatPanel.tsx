@@ -598,7 +598,7 @@ function SourcesPanel({
       sourceIndex,
       rating,
     }: {
-      sessionId: number;
+      sessionId: string;
       messageId: string;
       sourceIndex: string;
       rating: RelevanceRating;
@@ -1258,10 +1258,12 @@ const HARD_RULES_SUMMARY = [
 
 interface ChatPanelProps {
   sessionId: string | null;
+  sessionTitle?: string;
 }
 
 export const ChatPanel = memo(function ChatPanel({
   sessionId,
+  sessionTitle,
 }: ChatPanelProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -1272,6 +1274,7 @@ export const ChatPanel = memo(function ChatPanel({
   // Load chat history from PostgreSQL
   const { data: historyData, isLoading: historyLoading } = useChatHistory(sessionId);
   const clearMutation = useClearChatHistory(sessionId);
+  const queryClient = useQueryClient();
 
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const scrollAnimRef = useRef<number | undefined>(undefined);
@@ -1450,33 +1453,24 @@ export const ChatPanel = memo(function ChatPanel({
     });
   }, []);
 
-  // Keep spacer height = container height so user message can always scroll to top
-  const hasMessages = messages.length > 0;
+  // Only set spacer height during streaming so user message can scroll to top.
+  // Otherwise, remove spacer so we don't scroll into an empty void.
   useEffect(() => {
-    if (!hasMessages) return;
     const container = scrollContainerRef.current;
-    if (!container) return;
+    if (!container || !spacerRef.current) return;
+    
+    if (stream.isStreaming) {
+      spacerRef.current.style.height = `${container.clientHeight}px`;
+    } else {
+      spacerRef.current.style.height = "0px";
+    }
+  }, [stream.isStreaming]);
 
-    const updateSpacer = () => {
-      if (spacerRef.current) {
-        spacerRef.current.style.height = `${container.clientHeight}px`;
-      }
-    };
-    updateSpacer();
-    const observer = new ResizeObserver(updateSpacer);
-    observer.observe(container);
-    return () => observer.disconnect();
-  }, [hasMessages]);
-
-  // Reset spacer when streaming ends; track transition to avoid spurious scrollToBottom
+  // Track when streaming finishes to avoid spurious scrollToBottom
   const prevIsStreamingRef = useRef(false);
   const justFinishedStreamingRef = useRef(false);
   useEffect(() => {
     if (prevIsStreamingRef.current && !stream.isStreaming) {
-      // Streaming just ended: reset spacer and mark so scrollToBottom skips this cycle
-      if (spacerRef.current) {
-        spacerRef.current.style.height = "0px";
-      }
       justFinishedStreamingRef.current = true;
     }
     prevIsStreamingRef.current = stream.isStreaming;
@@ -1577,6 +1571,9 @@ export const ChatPanel = memo(function ChatPanel({
       // Finalize the streaming message (prefer finalMsg.agentSteps — directly from SSE loop,
       // fallback to ref snapshot, then to what was synced into the message during streaming)
       if (finalMsg) {
+        // Invalidate sessions list query to fetch generated chat title from backend
+        queryClient.invalidateQueries({ queryKey: ["chat-sessions"] });
+
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantId
@@ -1670,8 +1667,8 @@ export const ChatPanel = memo(function ChatPanel({
       <div className="flex-shrink-0 flex items-center justify-between px-3 py-2 border-b">
         <div className="flex items-center gap-2">
           <Bot className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-          <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-            Chat {sessionId ? `(Session ${sessionId})` : "(Select a session)"}
+          <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground line-clamp-1 max-w-[400px]">
+            Chat {sessionTitle ? `- ${sessionTitle}` : (sessionId ? `(Session ${sessionId})` : "(Select a session)")}
           </h2>
         </div>
         <div className="flex items-center gap-1.5">

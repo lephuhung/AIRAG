@@ -25,7 +25,9 @@ import {
   useUpdateUser,
   useDeleteUser,
   useResetUserPassword,
+  useUpdateTenantMemberRole,
 } from "@/hooks/useAdminUsers";
+import { useAdminTenants } from "@/hooks/useAdminTenants";
 import type { AdminUserDetail } from "@/types";
 
 type FilterStatus = "all" | "active" | "inactive";
@@ -35,6 +37,7 @@ export function AdminUsersPage() {
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [filterStatus, setFilterStatus] = useState<FilterStatus>("all");
+  const [filterTenant, setFilterTenant] = useState<number | "all">("all");
   const [page, setPage] = useState(1);
   const perPage = 20;
 
@@ -51,17 +54,21 @@ export function AdminUsersPage() {
   };
 
   const isActiveFilter = filterStatus === "all" ? null : filterStatus === "active";
+  const tenantIdFilter = filterTenant === "all" ? null : filterTenant;
 
   const { data, isLoading } = useAdminUsers(
     debouncedSearch || undefined,
     isActiveFilter,
+    tenantIdFilter,
     page,
     perPage,
   );
   const { data: stats } = useAdminStats();
+  const { data: tenants } = useAdminTenants();
   const updateUser = useUpdateUser();
   const deleteUser = useDeleteUser();
   const resetPassword = useResetUserPassword();
+  const updateRole = useUpdateTenantMemberRole();
 
   const [confirmDelete, setConfirmDelete] = useState<AdminUserDetail | null>(null);
   const [resetTarget, setResetTarget] = useState<AdminUserDetail | null>(null);
@@ -105,6 +112,20 @@ export function AdminUsersPage() {
       setConfirmDelete(null);
     } catch (err: any) {
       toast.error(err.message || "Failed to delete user");
+    }
+  };
+
+  const handleToggleTenantRole = async (userId: number, tenantId: number, currentRole: string) => {
+    if (isSelf(userId)) {
+      toast.error("Cannot change your own tenant role here");
+      return;
+    }
+    const newRole = currentRole === "admin" ? "member" : "admin";
+    try {
+      await updateRole.mutateAsync({ tenantId, userId, role: newRole as "admin" | "member" });
+      toast.success(`Role changed to ${newRole}`);
+    } catch (err: any) {
+      toast.error(err.message || "Failed to change role");
     }
   };
 
@@ -184,24 +205,42 @@ export function AdminUsersPage() {
               className="w-full pl-9 pr-4 py-2 text-sm rounded-lg border bg-card focus:outline-none focus:ring-2 focus:ring-primary/30"
             />
           </div>
-          <div className="flex gap-1 rounded-lg border bg-card p-0.5">
-            {(["all", "active", "inactive"] as FilterStatus[]).map((f) => (
-              <button
-                key={f}
-                onClick={() => {
-                  setFilterStatus(f);
-                  setPage(1);
-                }}
-                className={cn(
-                  "px-3 py-1.5 text-xs font-medium rounded-md transition-colors capitalize",
-                  filterStatus === f
-                    ? "bg-primary text-primary-foreground"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
-                {f}
-              </button>
-            ))}
+          <div className="flex gap-2">
+            <select
+              value={filterTenant}
+              onChange={(e) => {
+                const val = e.target.value;
+                setFilterTenant(val === "all" ? "all" : Number(val));
+                setPage(1);
+              }}
+              className="px-3 py-1.5 text-xs font-medium rounded-lg border bg-card text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/30 min-w-[140px]"
+            >
+              <option value="all">All Tenants</option>
+              {tenants?.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                </option>
+              ))}
+            </select>
+            <div className="flex gap-1 rounded-lg border bg-card p-0.5">
+              {(["all", "active", "inactive"] as FilterStatus[]).map((f) => (
+                <button
+                  key={f}
+                  onClick={() => {
+                    setFilterStatus(f);
+                    setPage(1);
+                  }}
+                  className={cn(
+                    "px-3 py-1.5 text-xs font-medium rounded-md transition-colors capitalize",
+                    filterStatus === f
+                      ? "bg-primary text-primary-foreground"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {f}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 
@@ -316,14 +355,18 @@ export function AdminUsersPage() {
                                 <span className="text-xs text-foreground truncate max-w-[120px]" title={m.tenant_name ?? undefined}>
                                   {m.tenant_name ?? `Tenant #${m.tenant_id}`}
                                 </span>
-                                <span className={cn(
-                                  "inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium flex-shrink-0",
+                                <button
+                                  onClick={() => handleToggleTenantRole(u.id, m.tenant_id, m.role)}
+                                  disabled={updateRole.isPending}
+                                  title="Click to toggle Admin/Member role"
+                                  className={cn(
+                                  "inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium flex-shrink-0 cursor-pointer transition-colors",
                                   m.role === "admin"
-                                    ? "bg-blue-500/15 text-blue-600"
-                                    : "bg-muted text-muted-foreground",
+                                    ? "bg-blue-500/15 text-blue-600 hover:bg-blue-500/25"
+                                    : "bg-muted text-muted-foreground hover:bg-muted/80",
                                 )}>
                                   {m.role}
-                                </span>
+                                </button>
                                 {!m.is_approved && (
                                   <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/15 text-amber-600 flex-shrink-0">
                                     pending

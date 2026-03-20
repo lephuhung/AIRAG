@@ -14,7 +14,7 @@ export function ChatPage() {
   const { sessionId: sessionIdStr } = useParams<{ sessionId: string }>();
   const navigate = useNavigate();
 
-  const currentSessionId = sessionIdStr ? Number(sessionIdStr) : null;
+  const currentSessionId = sessionIdStr || null;
 
   // -- Store --
   const {
@@ -43,6 +43,9 @@ export function ChatPage() {
     }
   }, [currentSessionId, sessions, navigate]);
 
+  const currentSession = sessions?.find(s => s.id === currentSessionId);
+  const sessionTitle = currentSession?.title;
+
   // -- Handlers --
   const handleNewSession = async () => {
     try {
@@ -68,7 +71,7 @@ export function ChatPage() {
           selectedDoc ? "max-w-[50%]" : "max-w-7xl mx-auto"
         )}>
           {currentSessionId ? (
-            <ChatPanel sessionId={currentSessionId} />
+            <ChatPanel sessionId={currentSessionId} sessionTitle={sessionTitle} />
           ) : (
             <div className="h-full flex flex-col items-center justify-center text-center px-4 space-y-4">
               <MessageSquare className="w-12 h-12 text-muted-foreground/30" />

@@ -133,19 +133,26 @@ export const UploadZone = memo(function UploadZone({ onUpload, isUploading, comp
           onChange={(e) => { handleFiles(e.target.files); if (inputRef.current) inputRef.current.value = ""; }}
           className="hidden"
         />
-        <button
-          type="button"
+        <motion.div
+          onDrop={handleDrop}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
           onClick={() => inputRef.current?.click()}
-          disabled={isUploading}
+          animate={isDragOver ? { scale: 1.01 } : { scale: 1 }}
           className={cn(
-            "inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium",
-            "bg-primary text-primary-foreground hover:bg-primary/90",
-            "disabled:opacity-50 disabled:pointer-events-none transition-colors"
+            "flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed cursor-pointer transition-colors duration-150",
+            isDragOver
+              ? "border-primary bg-primary/5 text-primary"
+              : "border-border hover:border-primary/40 hover:bg-muted/30 text-muted-foreground",
+            isUploading && "opacity-60 pointer-events-none"
           )}
         >
-          <Upload className={cn("w-4 h-4", isUploading && "animate-pulse")} />
-          {isUploading ? "Uploading..." : "Upload"}
-        </button>
+          <Upload className={cn("w-3.5 h-3.5 flex-shrink-0", isUploading && "animate-pulse")} />
+          <span className="text-[11px] font-medium flex-1 truncate">
+            {isUploading ? "Uploading..." : isDragOver ? "Drop to upload" : "Drop files or click to upload"}
+          </span>
+          <span className="text-[10px] opacity-60 flex-shrink-0">PDF · DOCX · MD</span>
+        </motion.div>
       </>
     );
   }

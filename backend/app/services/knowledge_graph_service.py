@@ -149,7 +149,6 @@ class KnowledgeGraphService:
         async def embedding_func(texts: list[str]) -> np.ndarray:
             return await _kg_embed(texts)
 
-        # Graph storage + KV/vector params depend on selected backend
         if backend == "neo4j":
             graph_storage = "Neo4JStorage"
             # LightRAG's Neo4JStorage reads NEO4J_URI/NEO4J_USERNAME/NEO4J_PASSWORD
@@ -162,34 +161,51 @@ class KnowledgeGraphService:
             # Pass workspace label via the LightRAG `workspace` param so all
             # workspaces share one Neo4j DB but remain isolated by node label.
             extra_kwargs = {"workspace": f"kb_{self.workspace_id}"}
+            kv_storage = "JsonKVStorage"
+            vector_storage = "NanoVectorDBStorage"
+            doc_status_storage = "JsonDocStatusStorage"
+            extra_kwargs["addon_params"] = {
+                "language": settings.NEXUSRAG_KG_LANGUAGE,
+                "entity_types": settings.NEXUSRAG_KG_ENTITY_TYPES,
+            }
             logger.info(
                 f"LightRAG using Neo4j backend for workspace {self.workspace_id} "
-                f"(label=kb_{self.workspace_id}, uri={settings.NEO4J_URI})"
+                f"(label=kb_{self.workspace_id}, uri={settings.NEO4J_URI}) "
+                f"with JSON file KV+Vector storage"
             )
         else:
             graph_storage = "NetworkXStorage"
+            kv_storage = "JsonKVStorage"
+            vector_storage = "NanoVectorDBStorage"
+            doc_status_storage = "JsonDocStatusStorage"
             extra_kwargs = {}
             logger.info(
                 f"LightRAG using NetworkX (file) backend for workspace {self.workspace_id}"
             )
 
-        self._rag = LightRAG(
+        # Build LightRAG kwargs
+        rag_kwargs: dict = dict(
             working_dir=self.working_dir,
             llm_model_func=_kg_llm_complete,
             embedding_func=embedding_func,
             chunk_token_size=settings.NEXUSRAG_KG_CHUNK_TOKEN_SIZE,
             enable_llm_cache=True,
             llm_model_max_async=3,   # max 3 concurrent LLM calls → avoids rate limits
-            kv_storage="JsonKVStorage",
-            vector_storage="NanoVectorDBStorage",
+            kv_storage=kv_storage,
+            vector_storage=vector_storage,
             graph_storage=graph_storage,
-            doc_status_storage="JsonDocStatusStorage",
+            doc_status_storage=doc_status_storage,
             addon_params={
                 "language": settings.NEXUSRAG_KG_LANGUAGE,
                 "entity_types": settings.NEXUSRAG_KG_ENTITY_TYPES,
             },
-            **extra_kwargs,
         )
+
+        # Merge any backend-specific kwargs (workspace label, etc.)
+        rag_kwargs.update(extra_kwargs)
+
+        self._rag = LightRAG(**rag_kwargs)
+
 
         await self._rag.initialize_storages()
         await initialize_pipeline_status()
@@ -437,69 +453,173 @@ class KnowledgeGraphService:
 
         Returns {nodes: [...], edges: [...], is_truncated: bool}.
 
-        Note on Neo4j vs NetworkX:
-          - NetworkX backend: node IDs and edge source/target are entity name strings.
-          - Neo4j backend: get_knowledge_graph() returns integer internal IDs for
-            edge source/target.  We build an id→name map from the returned nodes
-            to remap edges back to entity names.
+        For the Neo4j backend we use a direct Cypher query to bypass the
+        LightRAG internal get_knowledge_graph() method, which can fail with
+        a 'NoneType has no attribute session' error if LightRAG's driver has
+        not been initialised yet for that session.
+
+        For NetworkX backend we fall back to the LightRAG storage API.
         """
+        backend = settings.NEXUSRAG_KG_GRAPH_BACKEND.lower()
+
+        if backend == "neo4j":
+            return await self._get_graph_data_neo4j(
+                center_entity=center_entity,
+                max_nodes=max_nodes,
+            )
+
+        # ── NetworkX path ──────────────────────────────────────────────────
         rag = await self._get_rag()
         storage = rag.chunk_entity_relation_graph
 
         try:
-            label = center_entity if center_entity else "*"
-            kg = await storage.get_knowledge_graph(
-                node_label=label,
-                max_depth=max_depth,
-                max_nodes=max_nodes,
-            )
+            all_nodes = await storage.get_all_nodes()
+            all_edges = await storage.get_all_edges()
         except Exception as e:
-            logger.error(f"Failed to get KG graph for workspace {self.workspace_id}: {e}")
+            logger.error(f"Failed to get KG data for workspace {self.workspace_id}: {e}")
             return {"nodes": [], "edges": [], "is_truncated": False}
 
-        # Build id → entity name map (needed for Neo4j integer IDs)
-        # For NetworkX the id is already the entity name, so this is a no-op.
-        id_to_name: dict = {}
-        for n in kg.nodes:
-            props = n.properties if hasattr(n, "properties") else {}
-            # entity_id in Neo4j is the integer node id; "id" attr on GraphNode
-            # may be int (Neo4j) or str (NetworkX)
-            entity_name = props.get("entity_id") or props.get("name") or str(n.id)
-            id_to_name[n.id] = entity_name
-
-        nodes = []
-        for n in kg.nodes:
-            props = n.properties if hasattr(n, "properties") else {}
-            entity_name = id_to_name.get(n.id, str(n.id))
+        nodes_out = []
+        for n in (all_nodes or []):
+            nid = n.get("id", "")
             try:
-                degree = await storage.node_degree(entity_name)
+                degree = await storage.node_degree(nid)
             except Exception:
                 degree = 0
-            nodes.append({
-                "id": entity_name,
-                "label": entity_name,
-                "entity_type": props.get("entity_type", "Unknown"),
+            nodes_out.append({
+                "id": nid,
+                "label": nid,
+                "entity_type": n.get("entity_type", "Unknown"),
                 "degree": degree,
             })
+            if len(nodes_out) >= max_nodes:
+                break
 
-        edges = []
-        for e in kg.edges:
-            props = e.properties if hasattr(e, "properties") else {}
-            # Remap integer IDs → entity names for Neo4j backend
-            src = id_to_name.get(e.source, str(e.source))
-            tgt = id_to_name.get(e.target, str(e.target))
-            edges.append({
-                "source": src,
-                "target": tgt,
-                "label": props.get("description", "")[:80],
-                "weight": float(props.get("weight", 1.0)),
+        edges_out = []
+        for e in (all_edges or []):
+            edges_out.append({
+                "source": e.get("source", ""),
+                "target": e.get("target", ""),
+                "label": str(e.get("description", ""))[:80],
+                "weight": float(e.get("weight", 1.0)),
             })
 
         return {
-            "nodes": nodes,
-            "edges": edges,
-            "is_truncated": kg.is_truncated if hasattr(kg, "is_truncated") else False,
+            "nodes": nodes_out,
+            "edges": edges_out,
+            "is_truncated": len(nodes_out) >= max_nodes,
         }
+
+    async def _get_graph_data_neo4j(
+        self,
+        center_entity: str | None,
+        max_nodes: int,
+    ) -> dict:
+        """Direct Cypher-based graph data export for Neo4j backend.
+
+        Bypasses LightRAG's get_knowledge_graph() to avoid the
+        'NoneType has no attribute session' error.
+        """
+        try:
+            from neo4j import AsyncGraphDatabase
+        except ImportError:
+            logger.warning("neo4j driver not installed")
+            return {"nodes": [], "edges": [], "is_truncated": False}
+
+        label = f"kb_{self.workspace_id}"
+
+        try:
+            async with AsyncGraphDatabase.driver(
+                settings.NEO4J_URI,
+                auth=(settings.NEO4J_USERNAME, settings.NEO4J_PASSWORD),
+            ) as driver:
+                async with driver.session(database="neo4j") as session:
+                    if center_entity:
+                        # Subgraph rooted at center_entity
+                        cypher_nodes = f"""
+                        MATCH (n:`{label}`)
+                        WHERE toLower(n.entity_id) CONTAINS toLower($center)
+                        WITH n LIMIT {max_nodes}
+                        OPTIONAL MATCH (n)-[r]-(m:`{label}`)
+                        RETURN
+                            n.entity_id AS entity_name,
+                            n.entity_type AS entity_type,
+                            m.entity_id AS neighbor,
+                            m.entity_type AS neighbor_type,
+                            r.description AS rel_desc,
+                            startNode(r).entity_id AS rel_src,
+                            endNode(r).entity_id AS rel_tgt
+                        LIMIT {max_nodes * 3}
+                        """
+                        result = await session.run(cypher_nodes, center=center_entity)
+                    else:
+                        # Full workspace overview
+                        cypher_nodes = f"""
+                        MATCH (n:`{label}`)
+                        WITH n LIMIT {max_nodes}
+                        OPTIONAL MATCH (n)-[r]-(m:`{label}`)
+                        RETURN
+                            n.entity_id AS entity_name,
+                            n.entity_type AS entity_type,
+                            m.entity_id AS neighbor,
+                            m.entity_type AS neighbor_type,
+                            r.description AS rel_desc,
+                            startNode(r).entity_id AS rel_src,
+                            endNode(r).entity_id AS rel_tgt
+                        LIMIT {max_nodes * 3}
+                        """
+                        result = await session.run(cypher_nodes)
+
+                    records = await result.data()
+
+            # ── Deduplicate and build output --
+            seen_nodes: dict[str, str] = {}  # name → type
+            seen_edges: set[tuple] = set()
+            edges_out: list[dict] = []
+
+            for rec in records:
+                if rec.get("entity_name"):
+                    seen_nodes.setdefault(rec["entity_name"], rec.get("entity_type", "Unknown"))
+                if rec.get("neighbor"):
+                    seen_nodes.setdefault(rec["neighbor"], rec.get("neighbor_type", "Unknown"))
+                src = rec.get("rel_src")
+                tgt = rec.get("rel_tgt")
+                if src and tgt:
+                    key = (src, tgt)
+                    if key not in seen_edges:
+                        seen_edges.add(key)
+                        edges_out.append({
+                            "source": src,
+                            "target": tgt,
+                            "label": str(rec.get("rel_desc") or "")[:80],
+                            "weight": 1.0,
+                        })
+
+            nodes_out = [
+                {"id": name, "label": name, "entity_type": etype, "degree": 0}
+                for name, etype in seen_nodes.items()
+            ]
+            # Fill degree from edge counts
+            degree_map: dict[str, int] = {}
+            for e in edges_out:
+                degree_map[e["source"]] = degree_map.get(e["source"], 0) + 1
+                degree_map[e["target"]] = degree_map.get(e["target"], 0) + 1
+            for n in nodes_out:
+                n["degree"] = degree_map.get(n["id"], 0)
+
+            logger.info(
+                f"KG graph (Neo4j Cypher): {len(nodes_out)} nodes, "
+                f"{len(edges_out)} edges for workspace {self.workspace_id}"
+            )
+            return {
+                "nodes": nodes_out,
+                "edges": edges_out,
+                "is_truncated": len(nodes_out) >= max_nodes,
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to fetch graph data from Neo4j for workspace {self.workspace_id}: {e}")
+            return {"nodes": [], "edges": [], "is_truncated": False}
 
     async def get_relevant_context(
         self,

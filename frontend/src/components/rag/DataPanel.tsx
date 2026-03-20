@@ -208,9 +208,9 @@ export const DataPanel = memo(function DataPanel({
         )}
       </div>
 
-      {/* Upload zone — always visible, ~20% */}
-      <div className="flex-shrink-0 px-3 pt-2 pb-1" style={{ height: "18%" }}>
-        <UploadZone onUpload={onUpload} isUploading={isUploading} mini />
+      {/* Upload strip — compact single row */}
+      <div className="flex-shrink-0 px-3 pt-2 pb-1.5">
+        <UploadZone onUpload={onUpload} isUploading={isUploading} compact />
       </div>
 
       {/* Stats bar */}

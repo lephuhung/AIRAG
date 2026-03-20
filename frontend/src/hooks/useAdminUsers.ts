@@ -5,17 +5,19 @@ import type { AdminUserListResponse, AdminUserDetail, AdminStats } from "@/types
 export function useAdminUsers(
   search?: string,
   isActive?: boolean | null,
+  tenantId?: number | null,
   page: number = 1,
   perPage: number = 20,
 ) {
   const params = new URLSearchParams();
   if (search) params.set("search", search);
   if (isActive !== null && isActive !== undefined) params.set("is_active", String(isActive));
+  if (tenantId) params.set("tenant_id", String(tenantId));
   params.set("page", String(page));
   params.set("per_page", String(perPage));
 
   return useQuery({
-    queryKey: ["admin-users", search, isActive, page, perPage],
+    queryKey: ["admin-users", search, isActive, tenantId, page, perPage],
     queryFn: () => api.get<AdminUserListResponse>(`/admin/users?${params.toString()}`),
   });
 }
@@ -70,6 +72,24 @@ export function useResetUserPassword() {
       api.post<AdminUserDetail>(`/admin/users/${userId}/reset-password`, {
         new_password: newPassword,
       }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["admin-users"] });
+    },
+  });
+}
+
+export function useUpdateTenantMemberRole() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      tenantId,
+      userId,
+      role,
+    }: {
+      tenantId: number;
+      userId: number;
+      role: "admin" | "member";
+    }) => api.put<any>(`/tenants/${tenantId}/users/${userId}/role`, { role }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["admin-users"] });
     },
