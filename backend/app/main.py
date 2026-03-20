@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI):
             # Create chat_sessions table if not exists
             await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS chat_sessions (
-                    id SERIAL PRIMARY KEY,
+                    id VARCHAR(36) PRIMARY KEY,
                     title VARCHAR(255) NOT NULL DEFAULT 'New Chat',
                     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                     created_at TIMESTAMP DEFAULT NOW(),
@@ -70,7 +70,7 @@ async def lifespan(app: FastAPI):
                 )
             """))
             await conn.execute(text(
-                "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS session_id INTEGER REFERENCES chat_sessions(id) ON DELETE CASCADE"
+                "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS session_id VARCHAR(36) REFERENCES chat_sessions(id) ON DELETE CASCADE"
             ))
             await conn.execute(text(
                 "CREATE INDEX IF NOT EXISTS ix_chat_messages_session_id ON chat_messages(session_id)"

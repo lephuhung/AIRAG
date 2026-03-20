@@ -67,7 +67,7 @@ async def create_chat_session(
 
 @router.delete("/{session_id}")
 async def delete_chat_session(
-    session_id: int,
+    session_id: str,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -85,7 +85,7 @@ async def delete_chat_session(
 
 @router.get("/{session_id}/history", response_model=ChatHistoryResponse)
 async def get_session_history(
-    session_id: int,
+    session_id: str,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -127,7 +127,7 @@ async def get_session_history(
 
 @router.delete("/{session_id}/history")
 async def clear_session_history(
-    session_id: int,
+    session_id: str,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -149,7 +149,7 @@ from app.api.chat_agent import agent_chat_stream, _get_accessible_workspaces
 
 @router.post("/{session_id}/stream")
 async def chat_stream_session(
-    session_id: int,
+    session_id: str,
     request: ChatRequest,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
@@ -257,7 +257,7 @@ from app.schemas.rag import RateSourceRequest
 
 @router.post("/{session_id}/rate")
 async def rate_source(
-    session_id: int,
+    session_id: str,
     body: RateSourceRequest,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),

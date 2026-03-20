@@ -2,7 +2,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import type { ChatHistoryResponse } from "@/types";
 
-export function useChatHistory(sessionId: number | null) {
+export function useChatHistory(sessionId: string | null) {
   return useQuery({
     queryKey: ["chat-history", sessionId],
     queryFn: () =>
@@ -12,7 +12,7 @@ export function useChatHistory(sessionId: number | null) {
   });
 }
 
-export function useClearChatHistory(sessionId: number | null) {
+export function useClearChatHistory(sessionId: string | null) {
   const queryClient = useQueryClient();
 
   return useMutation({

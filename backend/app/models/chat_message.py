@@ -15,8 +15,8 @@ class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
-    session_id: Mapped[int] = mapped_column(
-        Integer,
+    session_id: Mapped[str] = mapped_column(
+        String(36),
         ForeignKey("chat_sessions.id", ondelete="CASCADE"),
         index=True,
     )

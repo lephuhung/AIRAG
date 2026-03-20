@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import uuid
 from sqlalchemy import ForeignKey, String, Integer, DateTime
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -14,7 +15,7 @@ from app.core.database import Base
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, index=True, default=lambda: uuid.uuid4().hex)
     title: Mapped[str] = mapped_column(String(255), nullable=False, default="New Chat")
     
     # User who owns this chat session

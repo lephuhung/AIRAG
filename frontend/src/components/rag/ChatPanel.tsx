@@ -84,7 +84,7 @@ import type {
 } from "@/types";
 
 // Context to provide sessionId and debugMode to nested components
-const SessionIdCtx = createContext<number | null>(null);
+const SessionIdCtx = createContext<string | null>(null);
 const DebugCtx = createContext(false);
 
 // Context: accumulated sources from ALL messages in the conversation.
@@ -1257,7 +1257,7 @@ const HARD_RULES_SUMMARY = [
 ];
 
 interface ChatPanelProps {
-  sessionId: number | null;
+  sessionId: string | null;
 }
 
 export const ChatPanel = memo(function ChatPanel({

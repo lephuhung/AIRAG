@@ -85,7 +85,7 @@ function markActiveError(steps: AgentStep[]): AgentStep[] {
 // Hook
 // ---------------------------------------------------------------------------
 
-export function useRAGChatStream(sessionId: number | null): RAGStreamResult {
+export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
   const [status, setStatus] = useState<ChatStreamStatus>("idle");
   const [streamingContent, setStreamingContent] = useState("");
   const [thinkingText, setThinkingText] = useState("");
