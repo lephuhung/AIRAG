@@ -155,16 +155,27 @@ class KnowledgeGraphService:
             # directly from os.environ (not from pydantic-settings).
             # Ensure they are exported here from the app settings so LightRAG can find them.
             import os as _os
-            _os.environ.setdefault("NEO4J_URI", settings.NEO4J_URI)
-            _os.environ.setdefault("NEO4J_USERNAME", settings.NEO4J_USERNAME)
-            _os.environ.setdefault("NEO4J_PASSWORD", settings.NEO4J_PASSWORD)
+            _os.environ["NEO4J_URI"] = settings.NEO4J_URI
+            _os.environ["NEO4J_USERNAME"] = settings.NEO4J_USERNAME
+            _os.environ["NEO4J_PASSWORD"] = settings.NEO4J_PASSWORD
+
+            # Set PostgreSQL environment variables for LightRAG (PGKVStorage, PGVectorStorage)
+            from urllib.parse import urlparse
+            url = urlparse(settings.DATABASE_URL.replace("postgresql+asyncpg", "postgresql"))
+            _os.environ.setdefault("POSTGRES_HOST", url.hostname or "localhost")
+            _os.environ.setdefault("POSTGRES_PORT", str(url.port or 5432))
+            _os.environ.setdefault("POSTGRES_USER", url.username or "postgres")
+            _os.environ.setdefault("POSTGRES_PASSWORD", url.password or "")
+            _os.environ.setdefault("POSTGRES_DATABASE", url.path.lstrip("/") or "postgres")
+            _os.environ.setdefault("POSTGRES_ENABLE_VECTOR", "true")
+
             # Pass workspace label via the LightRAG `workspace` param so all
             # workspaces share one Neo4j DB but remain isolated by node label.
             extra_kwargs = {"workspace": f"kb_{self.workspace_id}"}
             kv_storage = "PGKVStorage"
             vector_storage = "PGVectorStorage"
             doc_status_storage = "JsonDocStatusStorage"
-            # Pass Neo4j addon_params but also need Postgres url for PGVectorStorage
+            # Pass Neo4j addon_params
             extra_kwargs["addon_params"] = {
                 "language": settings.NEXUSRAG_KG_LANGUAGE,
                 "entity_types": settings.NEXUSRAG_KG_ENTITY_TYPES,
@@ -172,16 +183,18 @@ class KnowledgeGraphService:
             logger.info(
                 f"LightRAG using Neo4j backend for workspace {self.workspace_id} "
                 f"(label=kb_{self.workspace_id}, uri={settings.NEO4J_URI}) "
-                f"with JSON file KV+Vector storage"
+                f"with PostgreSQL KV+Vector storage"
             )
         else:
             graph_storage = "NetworkXStorage"
             kv_storage = "PGKVStorage"
             vector_storage = "PGVectorStorage"
             doc_status_storage = "JsonDocStatusStorage"
-            extra_kwargs = {"workspace": f"kb_{self.workspace_id}"}
+            extra_kwargs = {
+                "workspace": f"kb_{self.workspace_id}"
+            }
             logger.info(
-                f"LightRAG using NetworkX (file) backend for workspace {self.workspace_id}"
+                f"LightRAG using NetworkX (file) backend with PostgreSQL KV+Vector storage for workspace {self.workspace_id}"
             )
 
         # Build LightRAG kwargs
@@ -930,8 +943,9 @@ class KnowledgeGraphService:
         for node in all_nodes:
             etype = node.get("entity_type", "Unknown")
             type_counts[etype] = type_counts.get(etype, 0) + 1
+            node_id = node.get("id") or node.get("entity_id") or ""
             try:
-                degree = await storage.node_degree(node.get("id", ""))
+                degree = await storage.node_degree(node_id) if node_id else 0
             except Exception:
                 degree = 0
             entities_with_degree.append({

@@ -3,7 +3,7 @@
 
 services:
   postgres:
-    image: pgvector/pgvector:15
+    image: pgvector/pgvector:pg15
     container_name: nexusrag-postgres
     environment:
       POSTGRES_USER: postgres
@@ -25,7 +25,7 @@ services:
     ports:
       - "8002:8000"
     volumes:
-      - nexusrag_chroma_data:/chroma/chroma
+      - nexusrag_chroma_data:/chroma/data
     environment:
       - IS_PERSISTENT=TRUE
       - ANONYMIZED_TELEMETRY=FALSE

@@ -3,7 +3,7 @@
 
 services:
   postgres:
-    image: pgvector/pgvector:15
+    image: pgvector/pgvector:pg15
     container_name: nexusrag-postgres
     environment:
       POSTGRES_USER: postgres

@@ -5,7 +5,6 @@ import {
   RefreshCw,
   CheckCircle2,
   Loader2,
-  Sparkles,
   Layers,
   ImageIcon,
   Network,
@@ -154,7 +153,8 @@ export const FileCard = memo(function FileCard({
     }
   }, [justTriggered]);
 
-  const handleProcess = () => {
+  const handleProcess = (e: React.MouseEvent) => {
+    e.stopPropagation();
     setJustTriggered(true);
     onProcess(doc.id);
   };
@@ -229,68 +229,88 @@ export const FileCard = memo(function FileCard({
           </p>
         </div>
 
-        {/* Overflow menu */}
-        <div className="relative flex-shrink-0">
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-7 w-7 opacity-0 group-hover:opacity-100 transition-opacity"
-            onClick={(e) => {
-              e.stopPropagation();
-              setMenuOpen((v) => !v);
-            }}
-          >
-            <MoreHorizontal className="w-4 h-4" />
-          </Button>
-
-          {menuOpen && (
-            <div className="absolute right-0 top-8 z-20 min-w-[140px] rounded-lg border bg-popover shadow-lg py-1">
-              <button
-                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-muted/50 transition-colors"
-                onClick={() => {
-                  onDownload(doc);
-                  setMenuOpen(false);
-                }}
-              >
-                <Download className="w-3.5 h-3.5" />
-                Download
-              </button>
-              {onPreview && doc.status === "indexed" && (
-                <button
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-muted/50 transition-colors"
-                  onClick={() => {
-                    onPreview(doc);
-                    setMenuOpen(false);
-                  }}
-                >
-                  <Eye className="w-3.5 h-3.5" />
-                  Preview
-                </button>
-              )}
-              {(doc.status === "indexed" || doc.status === "building_kg") && (
-                <button
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs hover:bg-muted/50 transition-colors"
-                  onClick={() => {
-                    onReindex(doc.id);
-                    setMenuOpen(false);
-                  }}
-                >
-                  <RefreshCw className="w-3.5 h-3.5" />
-                  Re-analyze
-                </button>
-              )}
-              <button
-                className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-destructive hover:bg-destructive/10 transition-colors"
-                onClick={() => {
-                  onDelete(doc.id);
-                  setMenuOpen(false);
-                }}
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                Delete
-              </button>
-            </div>
+        {/* Action Buttons */}
+        <div className="relative flex-shrink-0 flex items-center gap-1">
+          {/* Quick Analyze button for pending/failed docs */}
+          {(doc.status === "pending" || doc.status === "failed") && (
+            <Button
+              variant="default"
+              size="sm"
+              onClick={handleProcess}
+              disabled={isProcessing}
+              className="h-7 px-2 text-[10px] items-center gap-1"
+            >
+              <RefreshCw className={cn("w-3 h-3", isProcessing && "animate-spin")} />
+              Analyze
+            </Button>
           )}
+
+          <div className="relative">
+            <Button
+              variant="ghost"
+              size="icon"
+              className={cn(
+                "h-7 w-7 transition-opacity",
+                menuOpen ? "opacity-100" : "opacity-0 group-hover:opacity-100"
+              )}
+              onClick={(e) => {
+                e.stopPropagation();
+                setMenuOpen((v) => !v);
+              }}
+            >
+              <MoreHorizontal className="w-4 h-4" />
+            </Button>
+
+            {menuOpen && (
+              <div className="absolute right-0 top-8 z-20 min-w-[160px] rounded-xl border bg-card/95 backdrop-blur-md shadow-xl py-1.5 animate-in fade-in zoom-in-95 duration-100">
+                <button
+                  className="w-full flex items-center gap-2 px-3 py-2 text-xs hover:bg-accent transition-colors"
+                  onClick={() => {
+                    onDownload(doc);
+                    setMenuOpen(false);
+                  }}
+                >
+                  <Download className="w-4 h-4 text-muted-foreground" />
+                  Download
+                </button>
+                {onPreview && doc.status === "indexed" && (
+                  <button
+                    className="w-full flex items-center gap-2 px-3 py-2 text-xs hover:bg-accent transition-colors"
+                    onClick={() => {
+                      onPreview(doc);
+                      setMenuOpen(false);
+                    }}
+                  >
+                    <Eye className="w-4 h-4 text-muted-foreground" />
+                    Preview
+                  </button>
+                )}
+                {(doc.status === "indexed" || doc.status === "building_kg") && (
+                  <button
+                    className="w-full flex items-center gap-2 px-3 py-2 text-xs hover:bg-accent transition-colors"
+                    onClick={() => {
+                      onReindex(doc.id);
+                      setMenuOpen(false);
+                    }}
+                  >
+                    <RefreshCw className="w-4 h-4 text-muted-foreground" />
+                    Re-analyze
+                  </button>
+                )}
+                <div className="h-px bg-border my-1" />
+                <button
+                  className="w-full flex items-center gap-2 px-3 py-2 text-xs text-destructive hover:bg-destructive/10 transition-colors"
+                  onClick={() => {
+                    onDelete(doc.id);
+                    setMenuOpen(false);
+                  }}
+                >
+                  <Trash2 className="w-4 h-4" />
+                  Delete
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
@@ -375,69 +395,7 @@ export const FileCard = memo(function FileCard({
         )}
       </div>
 
-      {/* ── Action buttons (visible on hover) ── */}
-      <div
-        className={cn(
-          "px-4 pb-3 flex items-center gap-2 transition-opacity",
-          "opacity-0 group-hover:opacity-100",
-        )}
-      >
-        {(doc.status === "pending" || doc.status === "failed") && (
-          <Button
-            variant="default"
-            size="sm"
-            onClick={handleProcess}
-            disabled={isProcessing}
-            className="h-7 text-xs gap-1.5"
-          >
-            {isProcessing ? (
-              <Loader2 className="w-3 h-3 animate-spin" />
-            ) : (
-              <Sparkles className="w-3 h-3" />
-            )}
-            Analyze
-          </Button>
-        )}
-        {onPreview && doc.status === "indexed" && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => onPreview(doc)}
-            className="h-7 text-xs gap-1.5"
-          >
-            <Eye className="w-3 h-3" />
-            Preview
-          </Button>
-        )}
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => onDownload(doc)}
-          className="h-7 text-xs gap-1.5"
-        >
-          <Download className="w-3 h-3" />
-          Download
-        </Button>
-        {(doc.status === "indexed" || doc.status === "building_kg") && (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => onReindex(doc.id)}
-            className="h-7 text-xs gap-1.5"
-          >
-            <RefreshCw className="w-3 h-3" />
-            Re-analyze
-          </Button>
-        )}
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={() => onDelete(doc.id)}
-          className="h-7 w-7 ml-auto"
-        >
-          <Trash2 className="w-3.5 h-3.5 text-destructive" />
-        </Button>
-      </div>
+      {/* ── Action buttons (removed and consolidated into menu to avoid overlap) ── */}
     </motion.div>
   );
 });
