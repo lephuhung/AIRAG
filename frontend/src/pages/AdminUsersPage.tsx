@@ -310,10 +310,28 @@ export function AdminUsersPage() {
                       {/* Tenants */}
                       <td className="px-4 py-3">
                         {u.tenant_memberships.length > 0 ? (
-                          <span className="text-xs text-muted-foreground">
-                            {u.tenant_memberships.length} tenant
-                            {u.tenant_memberships.length > 1 ? "s" : ""}
-                          </span>
+                          <div className="flex flex-col gap-1">
+                            {u.tenant_memberships.map((m) => (
+                              <div key={m.id} className="flex items-center gap-1.5">
+                                <span className="text-xs text-foreground truncate max-w-[120px]" title={m.tenant_name ?? undefined}>
+                                  {m.tenant_name ?? `Tenant #${m.tenant_id}`}
+                                </span>
+                                <span className={cn(
+                                  "inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium flex-shrink-0",
+                                  m.role === "admin"
+                                    ? "bg-blue-500/15 text-blue-600"
+                                    : "bg-muted text-muted-foreground",
+                                )}>
+                                  {m.role}
+                                </span>
+                                {!m.is_approved && (
+                                  <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/15 text-amber-600 flex-shrink-0">
+                                    pending
+                                  </span>
+                                )}
+                              </div>
+                            ))}
+                          </div>
                         ) : (
                           <span className="text-xs text-muted-foreground/50">
                             None

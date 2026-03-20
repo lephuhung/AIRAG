@@ -15,6 +15,7 @@ from app.core.deps import get_db, require_superadmin
 from app.core.exceptions import NotFoundError, BadRequestError
 from app.models.user import User
 from app.models.tenant import Tenant, TenantUser
+
 from app.schemas.admin import (
     AdminUserUpdate,
     AdminUserDetail,
@@ -43,6 +44,8 @@ async def _build_admin_user_detail(user: User, db: AsyncSession) -> AdminUserDet
     for tu in tenant_users:
         u_result = await db.execute(select(User).where(User.id == tu.user_id))
         u = u_result.scalar_one_or_none()
+        t_result = await db.execute(select(Tenant).where(Tenant.id == tu.tenant_id))
+        t = t_result.scalar_one_or_none()
         memberships.append(TenantUserResponse(
             id=tu.id,
             tenant_id=tu.tenant_id,
@@ -52,6 +55,7 @@ async def _build_admin_user_detail(user: User, db: AsyncSession) -> AdminUserDet
             created_at=tu.created_at,
             email=u.email if u else None,
             full_name=u.full_name if u else None,
+            tenant_name=t.name if t else None,
         ))
 
     return AdminUserDetail(

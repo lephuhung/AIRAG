@@ -38,6 +38,7 @@ export interface TenantUser {
   created_at: string;
   email: string | null;
   full_name: string | null;
+  tenant_name: string | null;
 }
 
 // ── Admin Types ──
@@ -464,6 +465,22 @@ export interface DeadLetterMessage {
   exchange: string;
   routing_key: string;
   redelivered: boolean;
+}
+
+// ── Document Type Admin Types ──
+export interface DocumentTypeDetail {
+  id: number;
+  slug: string;
+  name: string;
+  description: string | null;
+  is_active: boolean;
+}
+
+export interface DocumentTypeSystemPromptResponse {
+  document_type_slug: string;
+  workspace_id: number | null;
+  system_prompt: string;
+  is_default: boolean;
 }
 
 // ── Invite Link Types ──

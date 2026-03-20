@@ -42,6 +42,8 @@ class TenantUserResponse(BaseModel):
     # Joined user info
     email: str | None = None
     full_name: str | None = None
+    # Joined tenant info
+    tenant_name: str | None = None
 
     model_config = {"from_attributes": True}
 

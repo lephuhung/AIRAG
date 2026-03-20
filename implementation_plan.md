@@ -94,4 +94,29 @@ Hiện tại pipeline đang hoạt động dựa trên background workers (Parse
 
 ---
 
+## 6. Mở rộng tính năng Lịch sử Chat (Chat Sessions)
+
+Hiện tại, model `ChatMessage` chỉ lưu các tin nhắn nhồi chung vào `Workspace` mà chưa có sự tách biệt theo từng "Phiên trò chuyện" (Thread/Session). Đồng thời, ta cần đảm bảo hệ thống lưu trữ toàn vẹn cả lịch sử tin nhắn của Người dùng (`user`) và Phản hồi của Bot (`assistant`).
+
+Để hỗ trợ người dùng tạo nhiều đoạn chat khác nhau trong cùng 1 Workspace, chúng ta cần:
+
+### 6.1 Thêm Model `ChatSession`
+Đây là bảng đóng vai trò nhóm các tin nhắn lại thành một cuộc hội thoại riêng biệt.
+- `id`: Định danh duy nhất (UUID).
+- `title`: Tiêu đề tự động sinh ra cho đoạn chat (ví dụ: "Phân tích báo cáo tài chính...").
+- `workspace_id`: Foreign Key tham chiếu tới `KnowledgeBase`.
+- `user_id`: Foreign Key tham chiếu tới `User` (Đảm bảo chỉ user đó mới thấy lịch sử chat của mình, dù ở trong Public/Tenant workspace).
+- `created_at`, `updated_at`.
+
+### 6.2 Cập nhật Model `ChatMessage`
+- Bổ sung trường `session_id`: Foreign Key tham chiếu tới `ChatSession` (thay vì chỉ gắn trực tiếp vào `workspace_id`).
+- Hệ thống backend sẽ đảm bảo lưu toàn bộ chuỗi Message: Khi user gửi 1 câu hỏi (lưu với `role = 'user'`), sau khi RAG và LLM trả lời xong, pipeline sẽ ghi phản hồi vào DB (lưu với `role = 'assistant'`) vào cùng 1 `session_id`.
+
+### 6.3 Trên Frontend
+- Nền tảng UI `WorkspacePage` sẽ có 1 thanh Sidebar hiển thị **"Recent Chats / Lịch sử chat"**.
+- Nút **"New Chat"** để tạo một `ChatSession` mới.
+- Khi người dùng click vào lịch sử cũ, hệ thống fetch mảng `ChatMessage` dựa trên `session_id` và khôi phục lại ngữ cảnh.
+
+---
+
 *Lưu ý: Nếu bạn đánh giá OK, chúng ta có thể tiến hành định hình cụ thể các file cần sửa để tạo ra các bảng này qua công cụ Alembic migrations.*

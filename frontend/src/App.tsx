@@ -13,6 +13,7 @@ import { RegisterPage } from "@/pages/RegisterPage";
 import { TenantManagePage } from "@/pages/TenantManagePage";
 import { AdminUsersPage } from "@/pages/AdminUsersPage";
 import { AdminTenantsPage } from "@/pages/AdminTenantsPage";
+import { AdminDocumentTypesPage } from "@/pages/AdminDocumentTypesPage";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -45,6 +46,7 @@ function AppRoutes() {
         <Route path="/workers" element={<WorkersPage />} />
         <Route path="/admin/users" element={<AdminUsersPage />} />
         <Route path="/admin/tenants" element={<AdminTenantsPage />} />
+        <Route path="/admin/document-types" element={<AdminDocumentTypesPage />} />
         <Route path="/tenants/:tenantId" element={<TenantManagePage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
