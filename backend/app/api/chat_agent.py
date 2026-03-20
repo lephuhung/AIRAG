@@ -32,6 +32,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
+from app.models.user import User
 from app.models.knowledge_base import KnowledgeBase
 from app.models.document import DocumentImage
 from app.schemas.rag import (
@@ -813,6 +814,7 @@ async def chat_stream_endpoint(
     workspace_id: int,
     request: ChatRequest,
     db: AsyncSession,
+    user: User,
 ):
     """SSE streaming chat endpoint.
 
@@ -891,6 +893,7 @@ async def chat_stream_endpoint(
             message_id=str(uuid.uuid4()),
             role="user",
             content=request.message,
+            user_id=user.id,
         )
         db.add(user_row)
         await db.commit()
@@ -1026,6 +1029,7 @@ async def chat_stream_endpoint(
                         image_refs=final_images if final_images else None,
                         thinking=final_thinking,
                         agent_steps=collected_steps if collected_steps else None,
+                        user_id=user.id,
                     )
                     db.add(assistant_row)
                     await db.commit()

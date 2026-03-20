@@ -17,6 +17,7 @@ import {
   Mail,
   Shield,
   UserPlus,
+  Database,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -32,6 +33,7 @@ import {
   useTenantInvites,
   useRevokeInvite,
 } from "@/hooks/useInvites";
+import { useWorkspaces, useUpdateWorkspace } from "@/hooks/useWorkspaces";
 import type { Tenant, InviteLink } from "@/types";
 
 // ── Dialog Types ──────────────────────────────────────────────────────────
@@ -60,9 +62,11 @@ const emptyInviteForm: InviteFormData = {
 export function AdminTenantsPage() {
   const navigate = useNavigate();
   const { data: tenants, isLoading } = useAdminTenants();
+  const { data: allWorkspaces } = useWorkspaces();
   const createTenant = useCreateTenant();
   const updateTenant = useUpdateTenant();
   const deactivateTenant = useDeactivateTenant();
+  const updateWorkspace = useUpdateWorkspace();
   const createInvite = useCreateInvite();
   const revokeInvite = useRevokeInvite();
 
@@ -70,6 +74,7 @@ export function AdminTenantsPage() {
   const [showDialog, setShowDialog] = useState(false);
   const [editingTenant, setEditingTenant] = useState<Tenant | null>(null);
   const [form, setForm] = useState<TenantFormData>(emptyForm);
+  const [selectedWorkspaceIds, setSelectedWorkspaceIds] = useState<number[]>([]);
   const [confirmDeactivate, setConfirmDeactivate] = useState<Tenant | null>(null);
 
   // Invite dialog state
@@ -82,6 +87,7 @@ export function AdminTenantsPage() {
   const openCreate = () => {
     setEditingTenant(null);
     setForm(emptyForm);
+    setSelectedWorkspaceIds([]);
     setShowDialog(true);
   };
 
@@ -131,12 +137,27 @@ export function AdminTenantsPage() {
         });
         toast.success("Tenant updated");
       } else {
-        await createTenant.mutateAsync({
+        const newTenant = await createTenant.mutateAsync({
           name: form.name,
           slug: form.slug,
           domain: form.domain || undefined,
         });
-        toast.success("Tenant created");
+        // Assign selected workspaces to the new tenant
+        if (selectedWorkspaceIds.length > 0) {
+          await Promise.all(
+            selectedWorkspaceIds.map((wsId) =>
+              updateWorkspace.mutateAsync({
+                id: wsId,
+                data: { tenant_id: newTenant.id, visibility: "tenant" },
+              })
+            )
+          );
+          toast.success(
+            `Tenant created and ${selectedWorkspaceIds.length} workspace${selectedWorkspaceIds.length !== 1 ? "s" : ""} assigned`
+          );
+        } else {
+          toast.success("Tenant created");
+        }
       }
       setShowDialog(false);
     } catch (err: any) {
@@ -401,6 +422,56 @@ export function AdminTenantsPage() {
                   className="w-full px-3 py-2 text-sm rounded-lg border bg-background focus:outline-none focus:ring-2 focus:ring-primary/30"
                 />
               </div>
+
+              {/* Workspace multi-select — only for new tenants */}
+              {!editingTenant && allWorkspaces && allWorkspaces.length > 0 && (
+                <div>
+                  <label className="text-xs font-medium text-muted-foreground block mb-1.5">
+                    <span className="flex items-center gap-1.5">
+                      <Database className="w-3.5 h-3.5" />
+                      Assign Workspaces{" "}
+                      <span className="text-muted-foreground/60">(optional)</span>
+                    </span>
+                  </label>
+                  <div className="max-h-44 overflow-y-auto rounded-lg border bg-background divide-y">
+                    {allWorkspaces.map((ws) => (
+                      <label
+                        key={ws.id}
+                        className="flex items-center gap-3 px-3 py-2 text-sm cursor-pointer hover:bg-muted/50 transition-colors"
+                      >
+                        <input
+                          type="checkbox"
+                          className="rounded border-border"
+                          checked={selectedWorkspaceIds.includes(ws.id)}
+                          onChange={(e) => {
+                            setSelectedWorkspaceIds((prev) =>
+                              e.target.checked
+                                ? [...prev, ws.id]
+                                : prev.filter((id) => id !== ws.id)
+                            );
+                          }}
+                        />
+                        <div className="min-w-0 flex-1">
+                          <span className="truncate font-medium">{ws.name}</span>
+                          {ws.visibility !== "personal" && (
+                            <span className="ml-2 text-[10px] text-muted-foreground/60 capitalize">
+                              ({ws.visibility})
+                            </span>
+                          )}
+                        </div>
+                        <span className="text-xs text-muted-foreground flex-shrink-0">
+                          {ws.document_count} docs
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                  {selectedWorkspaceIds.length > 0 && (
+                    <p className="text-xs text-muted-foreground mt-1.5">
+                      {selectedWorkspaceIds.length} workspace{selectedWorkspaceIds.length !== 1 ? "s" : ""} selected — visibility will be set to <strong>Tenant</strong>
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
             <div className="flex justify-end gap-2 p-5 border-t bg-muted/20 rounded-b-xl">
               <Button
@@ -414,10 +485,10 @@ export function AdminTenantsPage() {
                 size="sm"
                 onClick={handleSubmit}
                 disabled={
-                  createTenant.isPending || updateTenant.isPending
+                  createTenant.isPending || updateTenant.isPending || updateWorkspace.isPending
                 }
               >
-                {createTenant.isPending || updateTenant.isPending ? (
+                {createTenant.isPending || updateTenant.isPending || updateWorkspace.isPending ? (
                   <Loader2 className="w-4 h-4 animate-spin mr-1" />
                 ) : null}
                 {editingTenant ? "Save" : "Create"}

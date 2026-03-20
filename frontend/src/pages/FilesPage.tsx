@@ -153,17 +153,30 @@ function WorkspaceSelector({
     );
   }, [workspaces, wsSearch]);
 
+  const navigate = useNavigate();
+
   return (
     <div className="h-full flex flex-col overflow-hidden">
       {/* Header */}
       <div className="flex-shrink-0 border-b px-6 py-4">
-        <h1 className="text-lg font-bold flex items-center gap-2">
-          <FolderOpen className="w-5 h-5 text-primary" />
-          Files
-        </h1>
-        <p className="text-xs text-muted-foreground mt-0.5">
-          Select a workspace to browse its documents
-        </p>
+        <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-2">
+          <button onClick={() => navigate("/")} className="hover:text-foreground transition-colors">
+            Dashboard
+          </button>
+          <span>/</span>
+          <span className="text-foreground font-medium">Files</span>
+        </div>
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-lg font-bold flex items-center gap-2">
+              <FolderOpen className="w-5 h-5 text-primary" />
+              Files
+            </h1>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              Select a workspace to browse its documents
+            </p>
+          </div>
+        </div>
       </div>
 
       {/* Search */}

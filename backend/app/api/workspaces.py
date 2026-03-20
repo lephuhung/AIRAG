@@ -109,6 +109,10 @@ async def create_workspace(
         tenant_id=body.tenant_id,
     )
 
+    # Validate: tenant visibility requires a tenant_id
+    if (body.visibility or "personal") == "tenant" and body.tenant_id is None:
+        raise HTTPException(status_code=400, detail="tenant_id is required when visibility is 'tenant'")
+
     # Validate tenant_id if provided
     if body.tenant_id is not None:
         from app.models.tenant import Tenant
@@ -227,6 +231,19 @@ async def update_workspace(
     if body.system_prompt is not None:
         # Empty string → reset to default (None)
         kb.system_prompt = body.system_prompt or None
+
+    # Superadmin-only: reassign tenant_id / visibility
+    if body.tenant_id is not None or body.visibility is not None:
+        if not user.is_superadmin:
+            raise ForbiddenError("Only superadmin can change workspace tenant or visibility")
+        if body.tenant_id is not None:
+            from app.models.tenant import Tenant
+            t_result = await db.execute(select(Tenant).where(Tenant.id == body.tenant_id))
+            if t_result.scalar_one_or_none() is None:
+                raise HTTPException(status_code=400, detail="Tenant not found")
+            kb.tenant_id = body.tenant_id
+        if body.visibility is not None:
+            kb.visibility = body.visibility
 
     await db.commit()
     await db.refresh(kb)

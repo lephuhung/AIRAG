@@ -880,6 +880,7 @@ async def rate_source(
         select(ChatMessageModel).where(
             ChatMessageModel.workspace_id == workspace_id,
             ChatMessageModel.message_id == body.message_id,
+            (ChatMessageModel.user_id == user.id) | (ChatMessageModel.user_id.is_(None)),
         )
     )
     row = result.scalar_one_or_none()
@@ -914,7 +915,7 @@ async def chat_stream(
 ):
     """SSE streaming chat with semi-agentic retrieval."""
     from app.api.chat_agent import chat_stream_endpoint
-    return await chat_stream_endpoint(workspace_id, request, db)
+    return await chat_stream_endpoint(workspace_id, request, db, user)
 
 
 # ---------------------------------------------------------------------------

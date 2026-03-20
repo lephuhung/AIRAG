@@ -16,6 +16,9 @@ class WorkspaceUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = None
     system_prompt: str | None = None
+    # Superadmin-only: reassign workspace to a different tenant / change visibility
+    tenant_id: int | None = Field(default=None)
+    visibility: str | None = Field(default=None, pattern="^(public|tenant|personal)$")
 
 
 class WorkspaceResponse(BaseModel):

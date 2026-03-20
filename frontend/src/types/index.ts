@@ -85,6 +85,8 @@ export interface UpdateWorkspace {
   name?: string;
   description?: string;
   system_prompt?: string | null;
+  tenant_id?: number | null;
+  visibility?: "public" | "tenant" | "personal";
 }
 
 export interface WorkspaceSummary {

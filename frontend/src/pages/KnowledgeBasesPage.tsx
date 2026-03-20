@@ -2,6 +2,9 @@ import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { useWorkspaces, useCreateWorkspace, useDeleteWorkspace } from "@/hooks/useWorkspaces";
+import { useMyTenants } from "@/hooks/useMyTenants";
+import { useAdminTenants } from "@/hooks/useAdminTenants";
+import { useAuthStore } from "@/stores/authStore";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -15,6 +18,7 @@ import {
   Globe,
   Building2,
   User,
+  ChevronDown,
 } from "lucide-react";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { cn } from "@/lib/utils";
@@ -25,11 +29,17 @@ type VisibilityOption = "personal" | "tenant" | "public";
 export function KnowledgeBasesPage() {
   const navigate = useNavigate();
   const { data: workspaces, isLoading } = useWorkspaces();
+  const { data: myTenants } = useMyTenants();
+  const { data: allTenants } = useAdminTenants();
+  const isSuperadmin = useAuthStore((s) => s.user?.is_superadmin ?? false);
+  // Superadmin sees all tenants; regular users see only their own
+  const tenantsForDropdown = isSuperadmin ? allTenants : myTenants;
   const createWorkspace = useCreateWorkspace();
   const deleteWorkspace = useDeleteWorkspace();
   const [showNewWorkspace, setShowNewWorkspace] = useState(false);
   const [newWorkspaceName, setNewWorkspaceName] = useState("");
   const [newVisibility, setNewVisibility] = useState<VisibilityOption>("personal");
+  const [selectedTenantId, setSelectedTenantId] = useState<number | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<number | null>(null);
   const [openMenu, setOpenMenu] = useState<number | null>(null);
 
@@ -43,15 +53,22 @@ export function KnowledgeBasesPage() {
 
   const handleCreateWorkspace = async () => {
     if (!newWorkspaceName.trim()) return;
+    // Require tenant selection when visibility is "tenant"
+    if (newVisibility === "tenant" && !selectedTenantId) {
+      toast.error("Please select an organization for this workspace");
+      return;
+    }
     try {
       const payload: CreateWorkspace = {
         name: newWorkspaceName,
         visibility: newVisibility,
+        tenant_id: newVisibility === "tenant" ? selectedTenantId : undefined,
       };
       const ws = await createWorkspace.mutateAsync(payload);
       toast.success("Knowledge base created");
       setNewWorkspaceName("");
       setNewVisibility("personal");
+      setSelectedTenantId(null);
       setShowNewWorkspace(false);
       navigate(`/knowledge-bases/${ws.id}`);
     } catch {
@@ -186,12 +203,24 @@ export function KnowledgeBasesPage() {
   return (
     <div className="h-full overflow-y-auto">
       <div className="max-w-5xl mx-auto px-6 py-8">
+        {/* Breadcrumb */}
+        <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-4">
+          <button onClick={() => navigate("/")} className="hover:text-foreground transition-colors">
+            Dashboard
+          </button>
+          <span>/</span>
+          <span className="text-foreground font-medium">Knowledge Bases</span>
+        </div>
+
         {/* Section header + action */}
         <div className="flex items-center justify-between mb-6">
           <div>
-            <h2 className="text-lg font-semibold">Knowledge Bases</h2>
+            <h1 className="text-lg font-bold flex items-center gap-2">
+              <Database className="w-5 h-5 text-primary" />
+              Knowledge Bases
+            </h1>
             {workspaces && workspaces.length > 0 && (
-              <p className="text-sm text-muted-foreground mt-0.5">
+              <p className="text-xs text-muted-foreground mt-0.5">
                 {workspaces.length} knowledge base{workspaces.length !== 1 ? "s" : ""}
               </p>
             )}
@@ -250,6 +279,40 @@ export function KnowledgeBasesPage() {
                     ))}
                   </div>
                 </div>
+
+                {/* Tenant selector — shown only when visibility = "tenant" */}
+                {newVisibility === "tenant" && (
+                  <div className="mt-3">
+                    <label className="block text-sm font-medium mb-1.5">
+                      Organization <span className="text-destructive">*</span>
+                    </label>
+                    {!tenantsForDropdown || tenantsForDropdown.length === 0 ? (
+                      <p className="text-xs text-muted-foreground bg-muted/50 rounded-lg px-3 py-2">
+                        {isSuperadmin
+                          ? "No organizations exist yet. Create one first."
+                          : "You're not a member of any organization. Join or create one first."}
+                      </p>
+                    ) : (
+                      <div className="relative">
+                        <select
+                          value={selectedTenantId ?? ""}
+                          onChange={(e) => setSelectedTenantId(e.target.value ? Number(e.target.value) : null)}
+                          className={cn(
+                            "w-full appearance-none rounded-lg border bg-background px-3 py-2 pr-8 text-sm",
+                            "focus:outline-none focus:ring-1 focus:ring-ring",
+                            !selectedTenantId && "text-muted-foreground"
+                          )}
+                        >
+                          <option value="">Select organization…</option>
+                          {tenantsForDropdown.map((t) => (
+                            <option key={t.id} value={t.id}>{t.name}</option>
+                          ))}
+                        </select>
+                        <ChevronDown className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                      </div>
+                    )}
+                  </div>
+                )}
                 <div className="flex justify-end gap-2 mt-4">
                   <Button variant="ghost" onClick={() => setShowNewWorkspace(false)}>
                     Cancel

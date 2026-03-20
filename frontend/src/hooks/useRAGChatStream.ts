@@ -6,6 +6,7 @@
  */
 
 import { useState, useRef, useCallback, useEffect } from "react";
+import { useAuthStore } from "@/stores/authStore";
 import type {
   ChatSourceChunk,
   ChatImageRef,
@@ -234,11 +235,19 @@ export function useRAGChatStream(workspaceId: string): RAGStreamResult {
       abortRef.current = new AbortController();
 
       try {
+        const token = useAuthStore.getState().token;
+        const headers: Record<string, string> = {
+          "Content-Type": "application/json",
+        };
+        if (token) {
+          headers["Authorization"] = `Bearer ${token}`;
+        }
+
         const response = await fetch(
           `${BASE_URL}/rag/chat/${workspaceId}/stream`,
           {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers,
             body: JSON.stringify({
               message,
               history,
