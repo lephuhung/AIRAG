@@ -510,16 +510,147 @@ class KnowledgeGraphService:
         """
         Build RAG context from raw KG data (no LLM generation).
 
-        Instead of calling LightRAG's aquery() which uses LLM to generate
-        a narrative (and can hallucinate), this method:
-          1. Tokenizes the question into keywords
-          2. Finds entities whose names match any keyword
-          3. Gets relationships connecting those entities
-          4. Formats everything as structured factual text
+        Optimized paths:
+          - Neo4j backend: single Cypher query filters server-side.
+          - NetworkX backend: fast in-memory keyword match with index.
 
         Returns:
             Structured string of entities + relationships, or "" if nothing found.
         """
+        # -- 1. Extract keywords from question --
+        raw_tokens = question.lower().split()
+        keywords = set()
+        for token in raw_tokens:
+            cleaned = token.strip(".,?!:;\"'()[]{}").lower()
+            if len(cleaned) >= 2:
+                keywords.add(cleaned)
+
+        if not keywords:
+            return ""
+
+        backend = settings.NEXUSRAG_KG_GRAPH_BACKEND.lower()
+
+        if backend == "neo4j":
+            return await self._get_relevant_context_neo4j(
+                keywords, max_entities, max_relationships,
+            )
+        else:
+            return await self._get_relevant_context_networkx(
+                keywords, max_entities, max_relationships,
+            )
+
+    async def _get_relevant_context_neo4j(
+        self,
+        keywords: set[str],
+        max_entities: int,
+        max_relationships: int,
+    ) -> str:
+        """Optimized KG context retrieval using a single Cypher query."""
+        import time as _time
+        t0 = _time.time()
+
+        try:
+            from neo4j import AsyncGraphDatabase
+        except ImportError:
+            logger.warning("neo4j driver not installed — falling back to generic path")
+            return await self._get_relevant_context_networkx(
+                keywords, max_entities, max_relationships,
+            )
+
+        label = f"kb_{self.workspace_id}"
+
+        # Build a Cypher WHERE clause that does fuzzy substring matching on
+        # entity names.  toLower(n.entity_id) CONTAINS $kw for each keyword,
+        # combined with OR.
+        where_parts = []
+        params: dict = {}
+        for i, kw in enumerate(keywords):
+            param_name = f"kw{i}"
+            where_parts.append(f"toLower(n.entity_id) CONTAINS ${param_name}")
+            params[param_name] = kw
+
+        where_clause = " OR ".join(where_parts)
+
+        # One round-trip: find matching nodes + their 1-hop relationships
+        cypher = f"""
+        MATCH (n:`{label}`)
+        WHERE {where_clause}
+        WITH n LIMIT {max_entities}
+        OPTIONAL MATCH (n)-[r]-(m:`{label}`)
+        RETURN
+            n.entity_id     AS entity_name,
+            n.entity_type   AS entity_type,
+            n.description   AS entity_desc,
+            type(r)          AS rel_type,
+            r.description    AS rel_desc,
+            r.keywords       AS rel_kw,
+            startNode(r).entity_id AS rel_src,
+            endNode(r).entity_id   AS rel_tgt
+        LIMIT {max_entities + max_relationships}
+        """
+
+        entity_info: dict[str, dict] = {}
+        relevant_rels: list[dict] = []
+
+        try:
+            async with AsyncGraphDatabase.driver(
+                settings.NEO4J_URI,
+                auth=(settings.NEO4J_USERNAME, settings.NEO4J_PASSWORD),
+            ) as driver:
+                async with driver.session() as session:
+                    result = await session.run(cypher, **params)
+                    records = await result.data()
+
+            for rec in records:
+                ename = rec.get("entity_name", "")
+                if ename and ename not in entity_info:
+                    entity_info[ename] = {
+                        "entity_type": rec.get("entity_type", "Unknown"),
+                        "description": rec.get("entity_desc", ""),
+                    }
+                rel_src = rec.get("rel_src")
+                rel_tgt = rec.get("rel_tgt")
+                if rel_src and rel_tgt and len(relevant_rels) < max_relationships:
+                    relevant_rels.append({
+                        "source": rel_src,
+                        "target": rel_tgt,
+                        "description": rec.get("rel_desc", ""),
+                        "keywords": rec.get("rel_kw", ""),
+                    })
+                    # Enrich connected entities
+                    for connected in (rel_src, rel_tgt):
+                        if connected and connected not in entity_info:
+                            entity_info[connected] = {
+                                "entity_type": "Unknown",
+                                "description": "",
+                            }
+
+        except Exception as e:
+            logger.error(
+                f"Neo4j KG context query failed for workspace {self.workspace_id}: {e}"
+            )
+            return ""
+
+        elapsed_ms = int((_time.time() - t0) * 1000)
+        matched_list = list(entity_info.keys())[:max_entities]
+        result = self._format_kg_context(matched_list, entity_info, relevant_rels)
+        logger.info(
+            f"KG raw context (Neo4j): {len(matched_list)} entities, "
+            f"{len(relevant_rels)} rels for workspace {self.workspace_id} "
+            f"in {elapsed_ms}ms"
+        )
+        return result
+
+    async def _get_relevant_context_networkx(
+        self,
+        keywords: set[str],
+        max_entities: int,
+        max_relationships: int,
+    ) -> str:
+        """Optimized KG context retrieval for NetworkX (in-memory) backend."""
+        import time as _time
+        t0 = _time.time()
+
         rag = await self._get_rag()
         storage = rag.chunk_entity_relation_graph
 
@@ -533,35 +664,20 @@ class KnowledgeGraphService:
         if not all_nodes:
             return ""
 
-        # -- 1. Extract keywords from question --
-        # Simple but effective: split, lowercase, filter short words
-        raw_tokens = question.lower().split()
-        # Also handle hyphenated/versioned tokens like "deepseek-v3.2"
-        keywords = set()
-        for token in raw_tokens:
-            # Remove punctuation at edges
-            cleaned = token.strip(".,?!:;\"'()[]{}").lower()
-            if len(cleaned) >= 2:
-                keywords.add(cleaned)
+        # -- Build an O(1) lookup index: id → node --
+        node_index: dict[str, dict] = {n.get("id", ""): n for n in all_nodes}
 
-        if not keywords:
-            return ""
-
-        # -- 2. Find matching entities --
+        # -- Find matching entities --
         matched_entity_names: set[str] = set()
-        entity_info: dict[str, dict] = {}  # name → {type, description}
+        entity_info: dict[str, dict] = {}
 
-        for node in all_nodes:
-            node_id = node.get("id", "")
+        for node_id, node in node_index.items():
             node_lower = node_id.lower()
-
-            # Check if any keyword is a substring of entity name OR vice versa
             matched = False
             for kw in keywords:
                 if kw in node_lower or node_lower in kw:
                     matched = True
                     break
-                # Also check multi-word keywords (e.g., "deepseek" matches "DEEPSEEK-V3.2")
                 for part in node_lower.split("-"):
                     if kw in part or part in kw:
                         matched = True
@@ -577,7 +693,6 @@ class KnowledgeGraphService:
                 }
 
         if not matched_entity_names and len(all_nodes) <= 50:
-            # Small graph: include top entities by default
             for node in all_nodes[:10]:
                 nid = node.get("id", "")
                 matched_entity_names.add(nid)
@@ -589,10 +704,9 @@ class KnowledgeGraphService:
         if not matched_entity_names:
             return ""
 
-        # Limit entities
         matched_list = list(matched_entity_names)[:max_entities]
 
-        # -- 3. Find relationships involving matched entities --
+        # -- Find relationships using O(1) index instead of inner loop --
         relevant_rels: list[dict] = []
         matched_lower = {n.lower() for n in matched_list}
 
@@ -606,39 +720,42 @@ class KnowledgeGraphService:
                     "description": edge.get("description", ""),
                     "keywords": edge.get("keywords", ""),
                 })
-                # Also add connected entities we might have missed
-                if src not in entity_info:
-                    # Find node info
-                    for n in all_nodes:
-                        if n.get("id", "") == src:
-                            entity_info[src] = {
-                                "entity_type": n.get("entity_type", "Unknown"),
-                                "description": n.get("description", ""),
-                            }
-                            break
-                if tgt not in entity_info:
-                    for n in all_nodes:
-                        if n.get("id", "") == tgt:
-                            entity_info[tgt] = {
-                                "entity_type": n.get("entity_type", "Unknown"),
-                                "description": n.get("description", ""),
-                            }
-                            break
+                # Use index for O(1) lookups instead of inner loop
+                for connected in (src, tgt):
+                    if connected not in entity_info and connected in node_index:
+                        n = node_index[connected]
+                        entity_info[connected] = {
+                            "entity_type": n.get("entity_type", "Unknown"),
+                            "description": n.get("description", ""),
+                        }
 
             if len(relevant_rels) >= max_relationships:
                 break
 
-        # -- 4. Format as structured text --
+        elapsed_ms = int((_time.time() - t0) * 1000)
+        result = self._format_kg_context(matched_list, entity_info, relevant_rels)
+        logger.info(
+            f"KG raw context (NetworkX): {len(matched_list)} entities, "
+            f"{len(relevant_rels)} rels for workspace {self.workspace_id} "
+            f"in {elapsed_ms}ms"
+        )
+        return result
+
+    @staticmethod
+    def _format_kg_context(
+        matched_list: list[str],
+        entity_info: dict[str, dict],
+        relevant_rels: list[dict],
+    ) -> str:
+        """Format matched entities and relationships as structured text."""
         parts: list[str] = []
 
-        # Entities section
         if matched_list:
             parts.append("Entities found in documents:")
             for name in matched_list:
                 info = entity_info.get(name, {})
                 etype = info.get("entity_type", "")
                 desc = info.get("description", "")
-                # Truncate long descriptions
                 if len(desc) > 200:
                     desc = desc[:200] + "..."
                 type_str = f" [{etype}]" if etype and etype != "Unknown" else ""
@@ -647,7 +764,6 @@ class KnowledgeGraphService:
                 else:
                     parts.append(f"- {name}{type_str}")
 
-        # Relationships section
         if relevant_rels:
             parts.append("")
             parts.append("Relationships:")
@@ -660,12 +776,7 @@ class KnowledgeGraphService:
                 else:
                     parts.append(f"- {rel['source']} → {rel['target']}")
 
-        result = "\n".join(parts)
-        logger.info(
-            f"KG raw context: {len(matched_list)} entities, "
-            f"{len(relevant_rels)} relationships for workspace {self.workspace_id}"
-        )
-        return result
+        return "\n".join(parts)
 
     async def get_analytics(self) -> dict:
         """

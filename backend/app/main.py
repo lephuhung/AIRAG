@@ -280,6 +280,18 @@ async def lifespan(app: FastAPI):
             logger.warning(f"avatar_url migration failed (non-fatal): {_col_err}")
     else:
         logger.info("AUTO_CREATE_TABLES=false — skipping auto-migration")
+
+    # ── Eager Model Loading ───────────────────────────────────────────────
+    if settings.NEXUSRAG_EAGER_MODEL_LOADING:
+        logger.info("Eager model loading enabled — pre-loading retrieval models …")
+        try:
+            from app.services.models.loader import preload_retrieval_models
+            preload_retrieval_models()
+        except Exception as _preload_err:
+            logger.warning(f"Model pre-load failed (non-fatal): {_preload_err}")
+    else:
+        logger.info("NEXUSRAG_EAGER_MODEL_LOADING=false — models will load on first use")
+
     yield
     logger.info("Shutting down...")
     await engine.dispose()

@@ -21,6 +21,7 @@ import os
 import signal
 import sys
 
+from app.core.config import settings
 from app.queue import connection as mq
 
 logging.basicConfig(
@@ -34,7 +35,7 @@ async def _run_parse_worker() -> None:
     from app.workers.parse_worker import handle_parse
     await mq.consume(
         mq.EXCHANGE_PARSE, mq.QUEUE_PARSE, "parse",
-        handle_parse, prefetch_count=1,
+        handle_parse, prefetch_count=settings.WORKER_PREFETCH_PARSE,
     )
 
 
@@ -42,7 +43,7 @@ async def _run_embed_worker() -> None:
     from app.workers.embed_worker import handle_embed
     await mq.consume(
         mq.EXCHANGE_EMBED, mq.QUEUE_EMBED, "embed",
-        handle_embed, prefetch_count=2,
+        handle_embed, prefetch_count=settings.WORKER_PREFETCH_EMBED,
     )
 
 
@@ -50,16 +51,18 @@ async def _run_caption_worker() -> None:
     from app.workers.caption_worker import handle_caption
     await mq.consume(
         mq.EXCHANGE_CAPTION, mq.QUEUE_CAPTION, "caption",
-        handle_caption, prefetch_count=1,
+        handle_caption, prefetch_count=settings.WORKER_PREFETCH_CAPTION,
     )
 
 
 async def _run_kg_worker() -> None:
     """
     KG worker: dynamically subscribes to all workspace queues.
+
     On startup, scans the DB for all existing workspaces and starts
-    a consumer per workspace.  New workspaces are handled by
-    declaring their queue on-demand when the first KG message arrives.
+    a consumer per workspace.  A background polling loop runs every
+    WORKER_KG_POLL_INTERVAL seconds to discover new workspaces and
+    create additional consumers on-the-fly — no restart required.
     """
     from app.workers.kg_worker import handle_kg
 
@@ -71,27 +74,59 @@ async def _run_kg_worker() -> None:
     from app.models.knowledge_base import KnowledgeBase
     from sqlalchemy import select
 
+    active_workspaces: set[int] = set()
+    tasks: list[asyncio.Task] = []
+
+    async def _start_consumers_for(workspace_ids: list[int]) -> None:
+        """Start consumers for workspaces not already tracked."""
+        for wid in workspace_ids:
+            if wid not in active_workspaces:
+                active_workspaces.add(wid)
+                task = asyncio.create_task(
+                    mq.consume_kg(wid, handle_kg),
+                    name=f"kg-consumer-ws-{wid}",
+                )
+                tasks.append(task)
+                logger.info(f"[kg_runner] Started consumer for workspace {wid}")
+
+    async def _poll_new_workspaces() -> None:
+        """Periodically scan DB for new workspaces and start consumers."""
+        poll_interval = settings.WORKER_KG_POLL_INTERVAL
+        while True:
+            await asyncio.sleep(poll_interval)
+            try:
+                async with async_session_maker() as db:
+                    result = await db.execute(select(KnowledgeBase.id))
+                    current_ids = [row[0] for row in result.all()]
+                new_ids = [wid for wid in current_ids if wid not in active_workspaces]
+                if new_ids:
+                    logger.info(f"[kg_runner] New workspaces detected: {new_ids}")
+                    await _start_consumers_for(new_ids)
+            except Exception as e:
+                logger.warning(f"[kg_runner] Workspace poll failed: {e}")
+
+    # ── Initial startup: consume all existing workspaces ───────────────────
     async with async_session_maker() as db:
         result = await db.execute(select(KnowledgeBase.id))
         workspace_ids: list[int] = [row[0] for row in result.all()]
 
     logger.info(f"[kg_runner] Starting consumers for workspaces: {workspace_ids}")
+    await _start_consumers_for(workspace_ids)
 
-    # Start a consumer coroutine per workspace
-    tasks = [
-        asyncio.create_task(mq.consume_kg(wid, handle_kg))
-        for wid in workspace_ids
-    ]
+    # ── Start background poller for new workspaces ─────────────────────────
+    poller = asyncio.create_task(
+        _poll_new_workspaces(), name="kg-workspace-poller"
+    )
+    tasks.append(poller)
 
-    # Also listen on a "default" KG queue for new workspaces not yet in DB
-    # (parse_worker uses routing_key=workspace_id, so new workspaces create
-    #  their queue lazily when the first message is published)
-    if not tasks:
-        logger.info("[kg_runner] No workspaces yet — waiting for first KG message")
-        # Block on an empty future so the process stays alive
-        await asyncio.Future()
-    else:
-        await asyncio.gather(*tasks)
+    if not workspace_ids:
+        logger.info(
+            "[kg_runner] No workspaces yet — polling every "
+            f"{settings.WORKER_KG_POLL_INTERVAL}s for new ones"
+        )
+
+    # Wait for all tasks (they run indefinitely)
+    await asyncio.gather(*tasks)
 
 
 _WORKER_MAP = {
@@ -112,6 +147,14 @@ async def main() -> None:
         sys.exit(1)
 
     logger.info(f"Starting worker: WORKER_TYPE={worker_type}")
+
+    # ── Eager model loading for workers ──────────────────────────────────
+    if settings.NEXUSRAG_EAGER_MODEL_LOADING:
+        try:
+            from app.services.models.loader import preload_worker_models
+            preload_worker_models(worker_type)
+        except Exception as _preload_err:
+            logger.warning(f"Worker model pre-load failed (non-fatal): {_preload_err}")
 
     # Graceful shutdown on SIGTERM / SIGINT
     loop = asyncio.get_running_loop()

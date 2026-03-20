@@ -116,6 +116,17 @@ class Settings(BaseSettings):
     NEO4J_USERNAME: str = Field(default="neo4j")
     NEO4J_PASSWORD: str = Field(default="nexusrag123")
 
+    # Eager model loading — shift cold-start cost to startup
+    NEXUSRAG_EAGER_MODEL_LOADING: bool = Field(default=True)
+    NEXUSRAG_KG_PRE_INITIALIZE: bool = Field(default=True)
+
+    # Worker tuning
+    WORKER_PREFETCH_PARSE: int = Field(default=1)
+    WORKER_PREFETCH_EMBED: int = Field(default=2)
+    WORKER_PREFETCH_CAPTION: int = Field(default=1)
+    WORKER_PREFETCH_KG: int = Field(default=1)
+    WORKER_KG_POLL_INTERVAL: int = Field(default=30)  # seconds — how often to scan for new workspaces
+
     # CORS
     CORS_ORIGINS: list[str] = Field(default=["http://localhost:5174", "http://localhost:3000"])
 
