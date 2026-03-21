@@ -403,11 +403,7 @@ export const DocumentViewer = memo(function DocumentViewer({
       }
 
       if (scrollToHeading) {
-        const targetId = scrollToHeading
-          .toLowerCase()
-          .replace(/[^a-z0-9\s-]/g, "")
-          .replace(/\s+/g, "-")
-          .slice(0, 80);
+        const targetId = generateHeadingId(scrollToHeading);
         const el = contentRef.current.querySelector(
           `#${CSS.escape(targetId)}`
         ) as HTMLElement | null;
@@ -419,7 +415,7 @@ export const DocumentViewer = memo(function DocumentViewer({
         }
       }
 
-      if (scrollToPage) {
+      if (scrollToPage && scrollToPage > 0) {
         const el = contentRef.current.querySelector(
           `[data-page="${scrollToPage}"]`
         ) as HTMLElement | null;

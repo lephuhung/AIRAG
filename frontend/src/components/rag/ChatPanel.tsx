@@ -42,8 +42,9 @@ import diff from "react-syntax-highlighter/dist/esm/languages/prism/diff";
 import markdown from "react-syntax-highlighter/dist/esm/languages/prism/markdown";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
-import { api } from "@/lib/api";
+import { api, rewritePresignedUrl } from "@/lib/api";
 import { useWorkspaceStore } from "@/stores/workspaceStore";
+import { useAuthStore } from "@/stores/authStore";
 import { useThemeStore } from "@/stores/useThemeStore";
 
 SyntaxHighlighter.registerLanguage("python", python);
@@ -69,6 +70,7 @@ SyntaxHighlighter.registerLanguage("diff", diff);
 SyntaxHighlighter.registerLanguage("markdown", markdown);
 SyntaxHighlighter.registerLanguage("md", markdown);
 import { useUpdateWorkspace } from "@/hooks/useWorkspaces";
+import { useDocument } from "@/hooks/useDocuments";
 import { useChatHistory, useClearChatHistory } from "@/hooks/useChatHistory";
 import { useRAGChatStream } from "@/hooks/useRAGChatStream";
 import { StreamingMarkdown } from "@/components/rag/MemoizedMarkdown";
@@ -90,23 +92,6 @@ const DebugCtx = createContext(false);
 // Context: accumulated sources from ALL messages in the conversation.
 // Used as fallback when a message references citation IDs from previous turns.
 const AllSourcesCtx = createContext<ChatSourceChunk[]>([]);
-
-/** Look up a Document from react-query cache by document_id */
-function findDocInCache(qc: QueryClient, documentId: number | string): Document | undefined {
-  // Try to find the document in any cached document list
-  const queries = qc.getQueryCache().findAll({ queryKey: ["documents"] });
-  for (const query of queries) {
-    const docs = query.state.data as Document[] | undefined;
-    const found = docs?.find((d) => String(d.id) === String(documentId));
-    if (found) return found;
-  }
-  return undefined;
-}
-
-function useFindDoc(documentId: number | string): Document | undefined {
-  const qc = useQueryClient();
-  return findDocInCache(qc, documentId);
-}
 
 // ---------------------------------------------------------------------------
 // Helper: shorten filename for citation display
@@ -131,7 +116,7 @@ function CitationLink({
 }) {
   const { activateCitation, activateCitationKG } =
     useWorkspaceStore();
-  const doc = useFindDoc(source.document_id);
+  const { data: doc } = useDocument(source.document_id);
 
   const isKG = source.source_type === "kg";
 
@@ -200,7 +185,7 @@ function InlineImageRef({
 }) {
   const [showPreview, setShowPreview] = useState(false);
   const { activateImageCitation } = useWorkspaceStore();
-  const doc = useFindDoc(imageRef.document_id);
+  const { data: doc } = useDocument(imageRef.document_id);
 
   const handleClick = () => {
     setShowPreview((p) => !p);
@@ -250,7 +235,7 @@ function InlineImageRef({
 // components. Supports both new [a3x9] and legacy [1] citation formats.
 // Also handles grouped brackets like [a3x9, b2m7] by splitting into individual.
 // ---------------------------------------------------------------------------
-const CITATION_RE = /(\[(?:[a-z0-9]+|IMG-[a-z0-9]+)(?:,\s*(?:[a-z0-9]+|IMG-[a-z0-9]+))*\])/g;
+const CITATION_RE = /(\[\s*(?:[a-zA-Z0-9]+|IMG-[a-zA-Z0-9]+)(?:\s*,\s*(?:[a-zA-Z0-9]+|IMG-[a-zA-Z0-9]+))*\s*\])/g;
 
 function injectCitations(
   children: ReactNode,
@@ -291,9 +276,11 @@ function injectCitations(
           }
           // Text citation: match source by index (string or numeric)
           // First try current message's sources, then fallback to historical sources
+          // robust case-insensitive trim match
+          const cleanToken = token.trim().toLowerCase();
           const source =
-            sources.find((s) => String(s.index) === token) ??
-            (fallbackSources ? fallbackSources.find((s) => String(s.index) === token) : undefined);
+            sources.find((s) => String(s.index).toLowerCase() === cleanToken) ??
+            (fallbackSources ? fallbackSources.find((s) => String(s.index).toLowerCase() === cleanToken) : undefined);
           if (source) {
             result.push(
               <CitationLink key={key} index={String(source.index)} source={source} relatedEntities={relatedEntities} />
@@ -435,13 +422,13 @@ function CodeBlock({
           padding: "10px 12px",
           ...(isDark
             ? {
-                background: "oklch(0.18 0.015 155)",
-                border: "1px solid oklch(0.30 0.025 155)",
-              }
+              background: "oklch(0.18 0.015 155)",
+              border: "1px solid oklch(0.30 0.025 155)",
+            }
             : {
-                background: "oklch(0.96 0.008 105)",
-                border: "1px solid oklch(0.88 0.018 105)",
-              }),
+              background: "oklch(0.96 0.008 105)",
+              border: "1px solid oklch(0.88 0.018 105)",
+            }),
         }}
         codeTagProps={{ style: { fontFamily: '"IBM Plex Mono", "Fira Code", monospace' } }}
       >
@@ -575,6 +562,116 @@ function SourceRatingButtons({
 }
 
 // ---------------------------------------------------------------------------
+// Source item in the sources panel
+// ---------------------------------------------------------------------------
+function SourceItem({
+  source,
+  messageId,
+  ratings,
+  onRate,
+}: {
+  source: ChatSourceChunk;
+  messageId?: string;
+  ratings: Record<string, RelevanceRating>;
+  onRate: (sourceIndex: string, rating: RelevanceRating) => void;
+}) {
+  const { activateCitation } = useWorkspaceStore();
+  const { data: doc } = useDocument(source.document_id);
+  const debugMode = useContext(DebugCtx);
+
+  return (
+    <button
+      onClick={() => activateCitation(source, [], doc)}
+      className="w-full text-left px-2.5 py-2 hover:bg-muted/50 transition-colors"
+    >
+      <div className="flex items-center gap-1.5 mb-0.5">
+        <span className="inline-flex items-center justify-center w-4 h-4 text-[9px] font-bold rounded-full bg-primary/15 text-primary">
+          {source.index}
+        </span>
+        <span className="text-[10px] text-muted-foreground">p.{source.page_no}</span>
+        {source.heading_path.length > 0 && (
+          <span className="text-[10px] text-muted-foreground/60 truncate">
+            {source.heading_path.join(" > ")}
+          </span>
+        )}
+        {messageId && (
+          <SourceRatingButtons
+            sourceIndex={String(source.index)}
+            currentRating={ratings[String(source.index)]}
+            onRate={onRate}
+          />
+        )}
+      </div>
+      <p className="text-[11px] text-foreground/70 line-clamp-2 leading-relaxed">
+        {source.content.slice(0, 150)}
+        {source.content.length > 150 ? "..." : ""}
+      </p>
+      {debugMode && (
+        <div className="flex items-center gap-1.5 mt-0.5">
+          <span className="text-[8px] px-1 py-0.5 rounded bg-muted font-mono text-muted-foreground/70">
+            score: {source.score.toFixed(3)}
+          </span>
+          <span className="text-[8px] px-1 py-0.5 rounded font-medium bg-blue-400/15 text-blue-400">
+            {source.source_type || "vector"}
+          </span>
+        </div>
+      )}
+    </button>
+  );
+}
+
+function KGSourceItem({
+  source,
+  messageId,
+  ratings,
+  onRate,
+}: {
+  source: ChatSourceChunk;
+  messageId?: string;
+  ratings: Record<string, RelevanceRating>;
+  onRate: (sourceIndex: string, rating: RelevanceRating) => void;
+}) {
+  const { activateCitationKG } = useWorkspaceStore();
+  const { data: doc } = useDocument(source.document_id);
+  const debugMode = useContext(DebugCtx);
+
+  return (
+    <button
+      onClick={() => activateCitationKG(source, [], doc)}
+      className="w-full text-left px-2.5 py-2 hover:bg-purple-400/5 hover:bg-muted/50 transition-colors"
+    >
+      <div className="flex items-center gap-1.5 mb-0.5">
+        <span className="inline-flex items-center justify-center w-4 h-4 text-[9px] font-bold rounded-full bg-purple-400/15 text-purple-400">
+          {source.index}
+        </span>
+        <span className="text-[10px] text-purple-400 font-medium">Knowledge Graph</span>
+        {messageId && (
+          <SourceRatingButtons
+            sourceIndex={String(source.index)}
+            currentRating={ratings[String(source.index)]}
+            onRate={onRate}
+          />
+        )}
+      </div>
+      <p className="text-[11px] text-foreground/70 line-clamp-2 leading-relaxed">
+        {source.content.slice(0, 150)}
+        {source.content.length > 150 ? "..." : ""}
+      </p>
+      {debugMode && (
+        <div className="flex items-center gap-1.5 mt-0.5">
+          <span className="text-[8px] px-1 py-0.5 rounded bg-muted font-mono text-muted-foreground/70">
+            score: {source.score.toFixed(3)}
+          </span>
+          <span className="text-[8px] px-1 py-0.5 rounded font-medium bg-purple-400/15 text-purple-400">
+            kg
+          </span>
+        </div>
+      )}
+    </button>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Sources panel — shows the retrieved chunks
 // ---------------------------------------------------------------------------
 function SourcesPanel({
@@ -586,9 +683,7 @@ function SourcesPanel({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [ratings, setRatings] = useState<Record<string, RelevanceRating>>({});
-  const { activateCitation, activateCitationKG } = useWorkspaceStore();
   const sessionId = useContext(SessionIdCtx);
-  const debugMode = useContext(DebugCtx);
   const queryClient = useQueryClient();
 
   const rateMutation = useMutation({
@@ -662,89 +757,22 @@ function SourcesPanel({
           >
             <div className="divide-y border-t">
               {vectorSources.map((source) => (
-                <button
+                <SourceItem
                   key={source.chunk_id}
-                  onClick={() => {
-                    const doc = findDocInCache(queryClient, source.document_id);
-                    activateCitation(source, [], doc);
-                  }}
-                  className="w-full text-left px-2.5 py-2 hover:bg-muted/50 transition-colors"
-                >
-                  <div className="flex items-center gap-1.5 mb-0.5">
-                    <span className="inline-flex items-center justify-center w-4 h-4 text-[9px] font-bold rounded-full bg-primary/15 text-primary">
-                      {source.index}
-                    </span>
-                    <span className="text-[10px] text-muted-foreground">
-                      p.{source.page_no}
-                    </span>
-                    {source.heading_path.length > 0 && (
-                      <span className="text-[10px] text-muted-foreground/60 truncate">
-                        {source.heading_path.join(" > ")}
-                      </span>
-                    )}
-                    {messageId && (
-                      <SourceRatingButtons
-                        sourceIndex={String(source.index)}
-                        currentRating={ratings[String(source.index)]}
-                        onRate={handleRate}
-                      />
-                    )}
-                  </div>
-                  <p className="text-[11px] text-foreground/70 line-clamp-2 leading-relaxed">
-                    {source.content.slice(0, 150)}
-                    {source.content.length > 150 ? "..." : ""}
-                  </p>
-                  {debugMode && (
-                    <div className="flex items-center gap-1.5 mt-0.5">
-                      <span className="text-[8px] px-1 py-0.5 rounded bg-muted font-mono text-muted-foreground/70">
-                        score: {source.score.toFixed(3)}
-                      </span>
-                      <span className="text-[8px] px-1 py-0.5 rounded font-medium bg-blue-400/15 text-blue-400">
-                        {source.source_type || "vector"}
-                      </span>
-                    </div>
-                  )}
-                </button>
+                  source={source}
+                  messageId={messageId}
+                  ratings={ratings}
+                  onRate={handleRate}
+                />
               ))}
               {kgSources.map((source) => (
-                <button
+                <KGSourceItem
                   key={source.chunk_id}
-                  onClick={() => {
-                    const doc = findDocInCache(queryClient, source.document_id);
-                    activateCitationKG(source, [], doc);
-                  }}
-                  className="w-full text-left px-2.5 py-2 hover:bg-purple-400/5 hover:bg-muted/50 transition-colors"
-                >
-                  <div className="flex items-center gap-1.5 mb-0.5">
-                    <span className="inline-flex items-center justify-center w-4 h-4 text-[9px] font-bold rounded-full bg-purple-400/15 text-purple-400">
-                      {source.index}
-                    </span>
-                    <span className="text-[10px] text-purple-400 font-medium">
-                      Knowledge Graph
-                    </span>
-                    {messageId && (
-                      <SourceRatingButtons
-                        sourceIndex={String(source.index)}
-                        currentRating={ratings[String(source.index)]}
-                        onRate={handleRate}
-                      />
-                    )}
-                  </div>
-                  <p className="text-[11px] text-foreground/70 line-clamp-2 leading-relaxed">
-                    {source.content.slice(0, 150)}
-                    {source.content.length > 150 ? "..." : ""}
-                  </p>
-                  {debugMode && (
-                    <div className="flex items-center gap-1.5 mt-0.5">
-                      <span className="text-[8px] px-1 py-0.5 rounded bg-muted font-mono text-muted-foreground/70">
-                        score: {source.score.toFixed(3)}
-                      </span>
-                      <span className="text-[8px] px-1 py-0.5 rounded font-medium bg-purple-400/15 text-purple-400">
-                        kg
-                      </span>
-                    </div>
-                  )}
-                </button>
+                  source={source}
+                  messageId={messageId}
+                  ratings={ratings}
+                  onRate={handleRate}
+                />
               ))}
             </div>
           </motion.div>
@@ -759,7 +787,7 @@ function SourcesPanel({
 // ---------------------------------------------------------------------------
 function ImageRefCard({ img }: { img: ChatImageRef }) {
   const { activateImageCitation } = useWorkspaceStore();
-  const doc = useFindDoc(img.document_id);
+  const { data: doc } = useDocument(img.document_id);
   return (
     <button
       onClick={() => activateImageCitation(img, doc)}
@@ -942,6 +970,14 @@ const MessageBubble = memo(function MessageBubble({
   message: ChatMessage;
 }) {
   const isUser = message.role === "user";
+  const user = useAuthStore((s) => s.user);
+
+  const initials = user?.full_name
+    ?.split(" ")
+    .map((n) => n[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase();
 
   const proseClasses = cn(
     "prose prose-sm max-w-none text-foreground/90",
@@ -1048,8 +1084,8 @@ const MessageBubble = memo(function MessageBubble({
         {/* ThinkingPanel — only when no ThinkingTimeline with thinking log (avoid duplication) */}
         {!isUser && message.thinking && !message.isStreaming &&
           !message.agentSteps?.some((s) => s.thinkingText) && (
-          <ThinkingPanel thinking={message.thinking} />
-        )}
+            <ThinkingPanel thinking={message.thinking} />
+          )}
 
         {!isUser && !message.isStreaming && message.sources && message.sources.length > 0 && (
           <SourcesPanel sources={message.sources} messageId={message.id} />
@@ -1073,8 +1109,24 @@ const MessageBubble = memo(function MessageBubble({
       </div>
 
       {isUser && (
-        <div className="w-6 h-6 rounded-full bg-secondary flex items-center justify-center flex-shrink-0 mt-1">
-          <User className="w-3.5 h-3.5 text-muted-foreground" />
+        <div
+          className={cn(
+            "w-7 h-7 rounded-full overflow-hidden flex items-center justify-center text-[10px] font-semibold flex-shrink-0 mt-0.5",
+            user?.avatar_url
+              ? "ring-1 ring-primary/30"
+              : "bg-secondary text-muted-foreground"
+          )}
+          title={user?.full_name || "User"}
+        >
+          {user?.avatar_url ? (
+            <img
+              src={rewritePresignedUrl(user.avatar_url)}
+              alt={user.full_name || "User"}
+              className="w-full h-full object-cover"
+            />
+          ) : (
+            initials || <User className="w-3.5 h-3.5" />
+          )}
         </div>
       )}
     </motion.div>
@@ -1269,7 +1321,7 @@ export const ChatPanel = memo(function ChatPanel({
   const [input, setInput] = useState("");
   const [enableThinking, setEnableThinking] = useState(false);
   const [thinkingDefaultSynced, setThinkingDefaultSynced] = useState(false);
-  const [forceSearch, setForceSearch] = useState(true);
+  const [forceSearch, setForceSearch] = useState(false);
 
   // Load chat history from PostgreSQL
   const { data: historyData, isLoading: historyLoading } = useChatHistory(sessionId);
@@ -1458,7 +1510,7 @@ export const ChatPanel = memo(function ChatPanel({
   useEffect(() => {
     const container = scrollContainerRef.current;
     if (!container || !spacerRef.current) return;
-    
+
     if (stream.isStreaming) {
       spacerRef.current.style.height = `${container.clientHeight}px`;
     } else {
@@ -1573,20 +1625,22 @@ export const ChatPanel = memo(function ChatPanel({
       if (finalMsg) {
         // Invalidate sessions list query to fetch generated chat title from backend
         queryClient.invalidateQueries({ queryKey: ["chat-sessions"] });
+        // Invalidate the specific chat history cache to prevent stale messages on remount
+        queryClient.invalidateQueries({ queryKey: ["chat-history", sessionId] });
 
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantId
               ? {
-                  ...finalMsg,
-                  id: assistantId,
-                  isStreaming: false,
-                  agentSteps: finalMsg.agentSteps?.length
-                    ? finalMsg.agentSteps
-                    : agentStepsRef.current.length > 0
-                      ? agentStepsRef.current
-                      : m.agentSteps,
-                }
+                ...finalMsg,
+                id: assistantId,
+                isStreaming: false,
+                agentSteps: finalMsg.agentSteps?.length
+                  ? finalMsg.agentSteps
+                  : agentStepsRef.current.length > 0
+                    ? agentStepsRef.current
+                    : m.agentSteps,
+              }
               : m,
           ),
         );
@@ -1596,10 +1650,10 @@ export const ChatPanel = memo(function ChatPanel({
           prev.map((m) =>
             m.id === assistantId
               ? {
-                  ...m,
-                  content: m.content || "Sorry, I encountered an error. Please try again.",
-                  isStreaming: false,
-                }
+                ...m,
+                content: m.content || "Sorry, I encountered an error. Please try again.",
+                isStreaming: false,
+              }
               : m,
           ),
         );
@@ -1660,124 +1714,124 @@ export const ChatPanel = memo(function ChatPanel({
 
   return (
     <SessionIdCtx.Provider value={sessionId}>
-    <DebugCtx.Provider value={debugMode}>
-    <AllSourcesCtx.Provider value={allSourcesFlat}>
-    <div className="flex flex-col h-full bg-background border-r relative z-0">
-      {/* Header */}
-      <div className="flex-shrink-0 flex items-center justify-between px-3 py-2 border-b">
-        <div className="flex items-center gap-2">
-          <Bot className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
-          <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground line-clamp-1 max-w-[400px]">
-            Chat {sessionTitle ? `- ${sessionTitle}` : (sessionId ? `(Session ${sessionId})` : "(Select a session)")}
-          </h2>
-        </div>
-        <div className="flex items-center gap-1.5">
-          {/* Thinking toggle — only visible when model supports thinking */}
-          {thinkingSupported && (
-            <button
-              onClick={() => setEnableThinking((prev) => !prev)}
-              className={cn(
-                "flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors",
-                enableThinking
-                  ? "text-violet-400 bg-violet-400/10 hover:bg-violet-400/15"
-                  : "text-muted-foreground hover:bg-muted"
-              )}
-              title={enableThinking ? "Thinking mode ON" : "Thinking mode OFF"}
-            >
-              <Brain className="w-3 h-3" />
-              <span>{enableThinking ? "Think" : "Think"}</span>
-            </button>
-          )}
-          {/* Force search toggle */}
-          <button
-            onClick={() => setForceSearch((prev) => !prev)}
-            className={cn(
-              "flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors",
-              forceSearch
-                ? "text-amber-500 bg-amber-500/10 hover:bg-amber-500/15"
-                : "text-muted-foreground hover:bg-muted"
-            )}
-            title={forceSearch ? "Force Search ON — pre-searches before every answer" : "Force Search OFF — AI decides when to search"}
-          >
-            <DatabaseZap className="w-3 h-3" />
-            <span>Search</span>
-          </button>
-        </div>
-      </div>
-
-      {/* Messages area */}
-      {messages.length === 0 ? (
-        <SuggestionChips onSelect={handleSend} />
-      ) : (
-        <div ref={scrollContainerRef} className="flex-1 min-h-0 overflow-y-auto px-3 py-3 space-y-3 relative">
-          <AnimatePresence>
-            {messages.map((msg) => (
-              <div key={msg.id} data-message-id={msg.id}>
-                <MessageBubble message={msg} />
+      <DebugCtx.Provider value={debugMode}>
+        <AllSourcesCtx.Provider value={allSourcesFlat}>
+          <div className="flex flex-col h-full bg-background border-r relative z-0">
+            {/* Header */}
+            <div className="flex-shrink-0 flex items-center justify-between px-3 py-2 border-b">
+              <div className="flex items-center gap-2">
+                <Bot className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+                <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground line-clamp-1 max-w-[400px]">
+                  Chat {sessionTitle ? `- ${sessionTitle}` : (sessionId ? `(Session ${sessionId})` : "(Select a session)")}
+                </h2>
               </div>
-            ))}
-          </AnimatePresence>
-          {/* ThinkingTimeline + TypingIndicator now rendered inside MessageBubble */}
-          {/* Bottom spacer = container height, enables user-message scroll-to-top */}
-          <div ref={spacerRef} aria-hidden />
-        </div>
-      )}
+              <div className="flex items-center gap-1.5">
+                {/* Thinking toggle — only visible when model supports thinking */}
+                {thinkingSupported && (
+                  <button
+                    onClick={() => setEnableThinking((prev) => !prev)}
+                    className={cn(
+                      "flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors",
+                      enableThinking
+                        ? "text-violet-400 bg-violet-400/10 hover:bg-violet-400/15"
+                        : "text-muted-foreground hover:bg-muted"
+                    )}
+                    title={enableThinking ? "Thinking mode ON" : "Thinking mode OFF"}
+                  >
+                    <Brain className="w-3 h-3" />
+                    <span>{enableThinking ? "Think" : "Think"}</span>
+                  </button>
+                )}
+                {/* Force search toggle */}
+                <button
+                  onClick={() => setForceSearch((prev) => !prev)}
+                  className={cn(
+                    "flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors",
+                    forceSearch
+                      ? "text-amber-500 bg-amber-500/10 hover:bg-amber-500/15"
+                      : "text-muted-foreground hover:bg-muted"
+                  )}
+                  title={forceSearch ? "Force Search ON — pre-searches before every answer" : "Force Search OFF — AI decides when to search"}
+                >
+                  <DatabaseZap className="w-3 h-3" />
+                  <span>Search</span>
+                </button>
+              </div>
+            </div>
 
-      {/* Input area */}
-      <div className="flex-shrink-0 p-3 border-t">
-        <div className="flex items-end gap-2">
-          <textarea
-            ref={inputRef}
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Ask about your documents..."
-            rows={1}
-            className={cn(
-              "flex-1 resize-none rounded-lg border border-input bg-background px-3 py-2 text-sm",
-              "placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-              "max-h-[120px] min-h-[36px]"
+            {/* Messages area */}
+            {messages.length === 0 ? (
+              <SuggestionChips onSelect={handleSend} />
+            ) : (
+              <div ref={scrollContainerRef} className="flex-1 min-h-0 overflow-y-auto px-3 py-3 space-y-3 relative">
+                <AnimatePresence>
+                  {messages.map((msg) => (
+                    <div key={msg.id} data-message-id={msg.id}>
+                      <MessageBubble message={msg} />
+                    </div>
+                  ))}
+                </AnimatePresence>
+                {/* ThinkingTimeline + TypingIndicator now rendered inside MessageBubble */}
+                {/* Bottom spacer = container height, enables user-message scroll-to-top */}
+                <div ref={spacerRef} aria-hidden />
+              </div>
             )}
-            style={{
-              height: "auto",
-              minHeight: "36px",
-            }}
-            onInput={(e) => {
-              const target = e.target as HTMLTextAreaElement;
-              target.style.height = "auto";
-              target.style.height = Math.min(target.scrollHeight, 120) + "px";
-            }}
-          />
-          {stream.isStreaming ? (
-            <button
-              onClick={stream.cancel}
-              className="flex-shrink-0 w-9 h-9 rounded-lg flex items-center justify-center transition-colors bg-destructive/15 text-destructive hover:bg-destructive/25"
-              title="Stop generating"
-            >
-              <Square className="w-3.5 h-3.5 fill-current" />
-            </button>
-          ) : (
-            <button
-              onClick={() => handleSend()}
-              disabled={!input.trim()}
-              className={cn(
-                "flex-shrink-0 w-9 h-9 rounded-lg flex items-center justify-center transition-colors",
-                input.trim()
-                  ? "bg-primary text-primary-foreground hover:bg-primary/90"
-                  : "bg-muted text-muted-foreground cursor-not-allowed"
-              )}
-            >
-              <Send className="w-4 h-4" />
-            </button>
-          )}
-        </div>
-        <p className="text-[9px] text-muted-foreground/50 mt-1 text-center">
-          Press Enter to send, Shift+Enter for new line
-        </p>
-      </div>
-    </div>
-    </AllSourcesCtx.Provider>
-    </DebugCtx.Provider>
+
+            {/* Input area */}
+            <div className="flex-shrink-0 p-3 border-t">
+              <div className="flex items-end gap-2">
+                <textarea
+                  ref={inputRef}
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  placeholder="Ask about your documents..."
+                  rows={1}
+                  className={cn(
+                    "flex-1 resize-none rounded-lg border border-input bg-background px-3 py-2 text-sm",
+                    "placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+                    "max-h-[120px] min-h-[36px]"
+                  )}
+                  style={{
+                    height: "auto",
+                    minHeight: "36px",
+                  }}
+                  onInput={(e) => {
+                    const target = e.target as HTMLTextAreaElement;
+                    target.style.height = "auto";
+                    target.style.height = Math.min(target.scrollHeight, 120) + "px";
+                  }}
+                />
+                {stream.isStreaming ? (
+                  <button
+                    onClick={stream.cancel}
+                    className="flex-shrink-0 w-9 h-9 rounded-lg flex items-center justify-center transition-colors bg-destructive/15 text-destructive hover:bg-destructive/25"
+                    title="Stop generating"
+                  >
+                    <Square className="w-3.5 h-3.5 fill-current" />
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => handleSend()}
+                    disabled={!input.trim()}
+                    className={cn(
+                      "flex-shrink-0 w-9 h-9 rounded-lg flex items-center justify-center transition-colors",
+                      input.trim()
+                        ? "bg-primary text-primary-foreground hover:bg-primary/90"
+                        : "bg-muted text-muted-foreground cursor-not-allowed"
+                    )}
+                  >
+                    <Send className="w-4 h-4" />
+                  </button>
+                )}
+              </div>
+              <p className="text-[9px] text-muted-foreground/50 mt-1 text-center">
+                Press Enter to send, Shift+Enter for new line
+              </p>
+            </div>
+          </div>
+        </AllSourcesCtx.Provider>
+      </DebugCtx.Provider>
     </SessionIdCtx.Provider>
   );
 });

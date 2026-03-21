@@ -19,6 +19,8 @@ async def get_config_status(
 
     if llm_provider == "ollama":
         llm_model = settings.OLLAMA_MODEL
+    elif llm_provider == "openai_compatible":
+        llm_model = settings.OPENAI_COMPATIBLE_MODEL
     else:
         llm_model = settings.LLM_MODEL_FAST
 

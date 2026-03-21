@@ -36,10 +36,21 @@ export function useDocuments(workspaceId: string | undefined) {
     enabled: !!workspaceId,
     refetchInterval: (query) => {
       if (needsPolling(query.state.data)) return 3000;
-      return false;
     },
   });
 }
+
+// ---------------------------------------------------------------------------
+// Query hook — get a single document by ID
+// ---------------------------------------------------------------------------
+export function useDocument(documentId: number | string | undefined) {
+  return useQuery({
+    queryKey: ["documents", "single", String(documentId)],
+    queryFn: () => api.get<Document>(`/documents/${documentId}`),
+    enabled: !!documentId,
+  });
+}
+
 
 // ---------------------------------------------------------------------------
 // Mutation hooks

@@ -15,7 +15,6 @@ export function ChatPage() {
   const navigate = useNavigate();
 
   const currentSessionId = sessionIdStr || null;
-
   // -- Store --
   const {
     selectedDoc,
@@ -25,6 +24,7 @@ export function ChatPage() {
     scrollToPage,
     scrollToHeading,
     scrollToImageSrc,
+    clearScrollTarget,
   } = useWorkspaceStore();
 
   // Reset store when switching sessions
@@ -110,6 +110,7 @@ export function ChatPage() {
                 scrollToPage={scrollToPage}
                 scrollToHeading={scrollToHeading}
                 scrollToImageSrc={scrollToImageSrc}
+                onScrolled={clearScrollTarget}
               />
             </div>
           </div>

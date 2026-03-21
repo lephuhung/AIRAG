@@ -30,6 +30,7 @@ import asyncio
 import logging
 import os
 import shutil
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional
 
@@ -46,46 +47,6 @@ logger = logging.getLogger(__name__)
 # Provider-based adapters for LightRAG
 # ---------------------------------------------------------------------------
 
-async def _kg_llm_complete(
-    prompt: str,
-    system_prompt: Optional[str] = None,
-    history_messages: Optional[list] = None,
-    keyword_extraction: bool = False,
-    **kwargs,
-) -> str:
-    """
-    LightRAG-compatible LLM function using the configured provider.
-    Includes exponential-backoff retry for rate-limit errors (HTTP 429).
-    """
-    provider = get_llm_provider()
-
-    messages: list[LLMMessage] = []
-    if system_prompt:
-        messages.append(LLMMessage(role="system", content=system_prompt))
-    if history_messages:
-        for msg in history_messages:
-            messages.append(LLMMessage(role=msg.get("role", "user"), content=msg.get("content", "")))
-    messages.append(LLMMessage(role="user", content=prompt))
-
-    for attempt in range(4):   # up to 3 retries
-        try:
-            return await provider.acomplete(
-                messages, temperature=0.0, max_tokens=4096,
-            )
-        except Exception as e:
-            err = str(e).lower()
-            is_rate_limit = "429" in err or "rate" in err or "quota" in err or "resource_exhausted" in err
-            if is_rate_limit and attempt < 3:
-                wait = 2 ** attempt   # 1s, 2s, 4s
-                logger.warning(
-                    f"[kg_llm] rate-limit hit (attempt {attempt + 1}/4) "
-                    f"— retrying in {wait}s"
-                )
-                await asyncio.sleep(wait)
-            else:
-                raise
-    return ""
-
 
 async def _kg_embed(texts: list[str]) -> np.ndarray:
     """LightRAG-compatible embedding function using the configured provider."""
@@ -96,6 +57,9 @@ async def _kg_embed(texts: list[str]) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Main service
 # ---------------------------------------------------------------------------
+
+_extraction_context: ContextVar[bool] = ContextVar("extraction_context", default=False)
+
 
 class KnowledgeGraphService:
     """
@@ -113,6 +77,74 @@ class KnowledgeGraphService:
         )
         self._rag = None
         self._initialized = False
+        
+        from app.services.llm_logger import MinIOLoggerService
+        self.llm_logger = MinIOLoggerService()
+
+    async def _kg_llm_complete(
+        self,
+        prompt: str,
+        system_prompt: Optional[str] = None,
+        history_messages: Optional[list] = None,
+        keyword_extraction: bool = False,
+        **kwargs,
+    ) -> str:
+        """
+        LightRAG-compatible LLM function using the configured provider.
+        Includes exponential-backoff retry for rate-limit errors (HTTP 429)
+        and logs interactions to MinIO via LLMLoggerService.
+        """
+        provider = get_llm_provider()
+
+        messages: list[LLMMessage] = []
+        if system_prompt:
+            messages.append(LLMMessage(role="system", content=system_prompt))
+        if history_messages:
+            for msg in history_messages:
+                messages.append(LLMMessage(role=msg.get("role", "user"), content=msg.get("content", "")))
+        messages.append(LLMMessage(role="user", content=prompt))
+
+        # Identify which model is currently active
+        model_name = getattr(provider, "model", "unknown")
+        if model_name == "unknown":
+            model_name = getattr(provider, "model_name", "unknown")
+        if model_name == "unknown":
+            if settings.LLM_PROVIDER == "gemini":
+                model_name = settings.LLM_MODEL_FAST
+            elif settings.LLM_PROVIDER == "ollama":
+                model_name = settings.OLLAMA_MODEL
+            elif settings.LLM_PROVIDER == "openai":
+                model_name = settings.OPENAI_COMPATIBLE_MODEL
+
+        for attempt in range(4):   # up to 3 retries
+            try:
+                response = await provider.acomplete(
+                    messages, temperature=0.0, max_tokens=4096,
+                )
+                
+                # Log extraction info ONLY if we are in an ingestion/extraction context
+                if _extraction_context.get():
+                    self.llm_logger.log_llm_call(
+                        system_prompt=system_prompt,
+                        user_prompt=prompt,
+                        response=response,
+                        model=model_name
+                    )
+                
+                return response
+            except Exception as e:
+                err = str(e).lower()
+                is_rate_limit = "429" in err or "rate" in err or "quota" in err or "resource_exhausted" in err
+                if is_rate_limit and attempt < 3:
+                    wait = 2 ** attempt   # 1s, 2s, 4s
+                    logger.warning(
+                        f"[kg_llm] rate-limit hit (attempt {attempt + 1}/4) "
+                        f"— retrying in {wait}s"
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    raise
+        return ""
 
     async def _get_rag(self):
         """Lazy-initialize LightRAG instance."""
@@ -200,7 +232,7 @@ class KnowledgeGraphService:
         # Build LightRAG kwargs
         rag_kwargs: dict = dict(
             working_dir=self.working_dir,
-            llm_model_func=_kg_llm_complete,
+            llm_model_func=self._kg_llm_complete,
             embedding_func=embedding_func,
             chunk_token_size=settings.NEXUSRAG_KG_CHUNK_TOKEN_SIZE,
             enable_llm_cache=True,
@@ -231,10 +263,11 @@ class KnowledgeGraphService:
         )
         return self._rag
 
-    async def ingest(self, markdown_content: str) -> None:
+    async def ingest(self, markdown_content: str, document_id: Optional[int] = None) -> None:
         """
         Ingest markdown content into the knowledge graph.
         LightRAG extracts entities and relationships automatically.
+        If document_id is provided, flush the LLM extraction logs to MinIO.
         """
         rag = await self._get_rag()
 
@@ -242,6 +275,7 @@ class KnowledgeGraphService:
             logger.warning(f"Empty content for workspace {self.workspace_id}, skipping KG ingest")
             return
 
+        token = _extraction_context.set(True)
         try:
             await rag.ainsert(markdown_content)
             logger.info(
@@ -269,6 +303,14 @@ class KnowledgeGraphService:
         except Exception as e:
             logger.error(f"KG ingest failed for workspace {self.workspace_id}: {e}")
             raise
+        finally:
+            _extraction_context.reset(token)
+            # Flush buffered logs
+            if document_id is not None:
+                await self.llm_logger.flush_to_minio(
+                    workspace_id=self.workspace_id,
+                    document_id=document_id
+                )
 
     async def query(
         self,

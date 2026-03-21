@@ -81,6 +81,19 @@ class OpenAICompatibleLLMProvider(LLMProvider):
             text = _THINK_RE.sub("", text).strip()
         return text
 
+    @staticmethod
+    def _parse_xml_tool_call(xml_str: str) -> dict | None:
+        """Fallback parser for Qwen-style XML tool calls: <function=name><parameter=key>val</parameter></function>"""
+        func_match = re.search(r"<function=([^>]+)>(.*?)</function>", xml_str, re.DOTALL)
+        if func_match:
+            func_name = func_match.group(1).strip()
+            params_str = func_match.group(2)
+            args = {}
+            for param_match in re.finditer(r"<parameter=([^>]+)>(.*?)</parameter>", params_str, re.DOTALL):
+                args[param_match.group(1).strip()] = param_match.group(2).strip()
+            return {"name": func_name, "args": args}
+        return None
+
     # ------------------------------------------------------------------
     # LLMProvider interface
     # ------------------------------------------------------------------
@@ -222,15 +235,13 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                 # Handle <tool_call>...</tool_call> XML tags (Qwen-style)
                 if in_tool_call:
                     tool_buffer += content
-                    if "</tool_call>" in tool_buffer:
-                        match = re.search(
-                            r"<tool_call>(.*?)</tool_call>",
-                            tool_buffer,
-                            re.DOTALL,
-                        )
+                    if "</tool_call>" in tool_buffer or "</function>" in tool_buffer:
+                        # 1) Try <tool_call> pattern
+                        match = re.search(r"<tool_call>(.*?)</tool_call>", tool_buffer, re.DOTALL)
                         if match:
+                            raw_str = match.group(1).strip()
                             try:
-                                tool_data = json.loads(match.group(1).strip())
+                                tool_data = json.loads(raw_str)
                                 yield StreamChunk(
                                     type="function_call",
                                     function_call={
@@ -239,27 +250,50 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                                     },
                                 )
                             except json.JSONDecodeError:
-                                yield StreamChunk(type="text", text=tool_buffer)
-                        after = tool_buffer.split("</tool_call>", 1)[1]
-                        tool_buffer = ""
-                        in_tool_call = False
-                        if after.strip():
-                            yield StreamChunk(type="text", text=after)
-                elif "<tool_call>" in content:
-                    before, rest = content.split("<tool_call>", 1)
-                    if before.strip():
+                                fallback = self._parse_xml_tool_call(raw_str)
+                                if fallback:
+                                    yield StreamChunk(type="function_call", function_call=fallback)
+                                else:
+                                    yield StreamChunk(type="text", text=tool_buffer)
+                            after = tool_buffer.split("</tool_call>", 1)[1]
+                            tool_buffer = ""
+                            in_tool_call = False
+                            if after.strip():
+                                yield StreamChunk(type="text", text=after)
+                            continue
+
+                        # 2) Try raw <function=...>...</function> pattern if no <tool_call> wraps it
+                        f_match = re.search(r"(<function=[^>]+>.*?</function>)", tool_buffer, re.DOTALL)
+                        if f_match:
+                            raw_str = f_match.group(1).strip()
+                            fallback = self._parse_xml_tool_call(raw_str)
+                            if fallback:
+                                yield StreamChunk(type="function_call", function_call=fallback)
+                            else:
+                                yield StreamChunk(type="text", text=raw_str)
+                            after = tool_buffer.split("</function>", 1)[1]
+                            tool_buffer = ""
+                            in_tool_call = False
+                            # Only yield after if it doesn't contain a stray </tool_call>
+                            after = after.replace("</tool_call>", "").strip()
+                            if after:
+                                yield StreamChunk(type="text", text=after)
+
+                elif "<tool_call>" in content or "<function=" in content:
+                    trigger = "<tool_call>" if "<tool_call>" in content else "<function="
+                    before, rest = content.split(trigger, 1)
+                    if before.strip() and before.strip() != "\n":
                         yield StreamChunk(type="text", text=before)
                     in_tool_call = True
-                    tool_buffer = "<tool_call>" + rest
-                    if "</tool_call>" in tool_buffer:
-                        match = re.search(
-                            r"<tool_call>(.*?)</tool_call>",
-                            tool_buffer,
-                            re.DOTALL,
-                        )
+                    tool_buffer = trigger + rest
+                    
+                    if "</tool_call>" in tool_buffer or "</function>" in tool_buffer:
+                        # Re-run same logic if it completes instantly in one chunk
+                        match = re.search(r"<tool_call>(.*?)</tool_call>", tool_buffer, re.DOTALL)
                         if match:
+                            raw_str = match.group(1).strip()
                             try:
-                                tool_data = json.loads(match.group(1).strip())
+                                tool_data = json.loads(raw_str)
                                 yield StreamChunk(
                                     type="function_call",
                                     function_call={
@@ -268,13 +302,35 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                                     },
                                 )
                             except json.JSONDecodeError:
-                                yield StreamChunk(type="text", text=tool_buffer)
-                        after = tool_buffer.split("</tool_call>", 1)[1]
-                        tool_buffer = ""
-                        in_tool_call = False
-                        if after.strip():
-                            yield StreamChunk(type="text", text=after)
+                                fallback = self._parse_xml_tool_call(raw_str)
+                                if fallback:
+                                    yield StreamChunk(type="function_call", function_call=fallback)
+                                else:
+                                    yield StreamChunk(type="text", text=tool_buffer)
+                            after = tool_buffer.split("</tool_call>", 1)[1]
+                            tool_buffer = ""
+                            in_tool_call = False
+                            if after.strip():
+                                yield StreamChunk(type="text", text=after)
+                            continue
+                        
+                        f_match = re.search(r"(<function=[^>]+>.*?</function>)", tool_buffer, re.DOTALL)
+                        if f_match:
+                            raw_str = f_match.group(1).strip()
+                            fallback = self._parse_xml_tool_call(raw_str)
+                            if fallback:
+                                yield StreamChunk(type="function_call", function_call=fallback)
+                            else:
+                                yield StreamChunk(type="text", text=raw_str)
+                            after = tool_buffer.split("</function>", 1)[1]
+                            tool_buffer = ""
+                            in_tool_call = False
+                            after = after.replace("</tool_call>", "").strip()
+                            if after:
+                                yield StreamChunk(type="text", text=after)
                 else:
+                    if "</tool_call>" in content:
+                        content = content.replace("</tool_call>", "").strip()
                     if content:
                         yield StreamChunk(type="text", text=content)
 

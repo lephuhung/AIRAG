@@ -914,7 +914,7 @@ async def debug_chat(
         "and 15.6% in 2024. Report these numbers in your answer.\n"
         "- Use the DOCUMENT SOURCES above to answer. Do NOT add outside knowledge.\n"
         "- You MAY compare, synthesize, and reason across multiple sources.\n"
-        "- Cite every fact using the source IDs shown in brackets, e.g. [a3x9][b2m7] — one ID per bracket.\n"
+        "- Cite every fact using the source IDs shown in brackets, e.g. [id12][id34] — one ID per bracket.\n"
         "- For images: [IMG-p4f2][IMG-q7r3] — use the IDs shown in the image list.\n"
         "- NEVER say 'không có thông tin' or 'no information' for data that IS present "
         "in any source. If a source contains 'Key = Value', report that value.\n"

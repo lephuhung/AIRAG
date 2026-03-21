@@ -173,14 +173,15 @@ You have ONE tool: search_documents.  You call it by outputting EXACTLY:
    "AI model" → "AI model architecture, performance benchmarks, training details"
 
 4. After receiving search results, answer using ONLY those sources with citations.
-   Format: claim text[source_id]. Example: Doanh thu đạt 4.850 tỷ VNĐ[a3x9].
+   Format: claim text[source_id]. Example: Doanh thu đạt 4.850 tỷ VNĐ[id12].
 """
 
 OLLAMA_TOOL_REMINDER = (
     "\n\n[SYSTEM REMINDER] If this is a question or request, you MUST call search_documents FIRST. "
     "Output ONLY: <tool_call>{\"name\": \"search_documents\", \"arguments\": {\"query\": \"...\"}}</tool_call> "
     "Exception: simple greetings, thanks, or farewells do NOT require a tool call — respond directly. "
-    "For everything else, searching is MANDATORY."
+    "For everything else, searching is MANDATORY. "
+    "When answering from search results, use the provided source IDs for citations (e.g., [id12])."
 )
 
 # ---------------------------------------------------------------------------
@@ -198,15 +199,20 @@ You have a tool called `search_documents` that searches the knowledge base.
 `search_documents` FIRST before answering. Even if the conversation history \
 contains relevant information, you MUST search again to get fresh, accurate sources.
 2. Only skip the tool call for simple conversational messages:
-   - Greetings: "hello", "xin chào", "hi", "hey", etc.
-   - Acknowledgements: "cảm ơn", "thank you", "thanks", "ok", etc.
+   - Greetings: "hello", "xin chào", "hi", "hey", "good morning", etc.
+   - Acknowledgements: "cảm ơn", "thank you", "thanks", "ok", "got it", etc.
    - Farewells: "bye", "goodbye", "tạm biệt", etc.
-3. NEVER answer a question using information from previous turns without searching. \
+3. Use the unique 4-character ID provided in the search results context (e.g., [id12]) \
+for your citations. DO NOT use example IDs from these instructions unless they \
+match the search results.
+4. NEVER answer a question using information from previous turns without searching. \
 Your previous answers may contain outdated or incomplete information.
-4. NEVER reuse citation IDs from previous answers. Each answer must have its own \
+5. NEVER reuse citation IDs from previous answers. Each answer must have its own \
 fresh sources from a new search.
 5. Rewrite the user's query to be specific and detailed for better retrieval.
 """
+
+NATIVE_TOOL_REMINDER = "\n\n[SYSTEM REMINDER] You MUST call the `search_documents` tool before answering this query."
 
 
 # ---------------------------------------------------------------------------
@@ -582,11 +588,21 @@ async def agent_chat_stream(
         tools = [_get_gemini_tool()]
         # Reinforce tool-calling obligation in system prompt for Gemini
         effective_system_prompt = system_prompt + GEMINI_TOOL_SYSTEM
+        # Add a strong reminder directly to the user message
+        messages[-1] = LLMMessage(
+            role="user",
+            content=messages[-1].content + NATIVE_TOOL_REMINDER,
+        )
     elif is_openai_compatible:
         # OpenAI-compatible: use native function calling (JSON schema)
         # Do NOT inject XML <tool_call> prompt — it gets blocked by some proxies
         tools = _get_openai_tools()
         effective_system_prompt = system_prompt + GEMINI_TOOL_SYSTEM
+        # Add a strong reminder directly to the user message
+        messages[-1] = LLMMessage(
+            role="user",
+            content=messages[-1].content + NATIVE_TOOL_REMINDER,
+        )
     else:
         # Ollama: append mandatory tool prompt to system prompt
         effective_system_prompt = system_prompt + "\n\n" + OLLAMA_TOOL_SYSTEM

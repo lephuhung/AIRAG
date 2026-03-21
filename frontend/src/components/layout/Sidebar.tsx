@@ -53,7 +53,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
     }
   };
 
-  const handleDeleteSession = async (e: React.MouseEvent, id: number) => {
+  const handleDeleteSession = async (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
     e.preventDefault();
     if (confirm("Are you sure you want to delete this chat session?")) {
@@ -235,9 +235,14 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
               className="flex items-center justify-between px-2.5 mb-1.5 cursor-pointer group"
               onClick={() => setWorkspacesExpanded(!workspacesExpanded)}
             >
-              <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground group-hover:text-foreground transition-colors">
-                Workspaces
-              </p>
+              <div className="flex items-center gap-1.5">
+                <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground group-hover:text-foreground transition-colors">
+                  Workspaces
+                </p>
+                <span className="text-[10px] font-bold bg-muted group-hover:bg-muted/80 text-muted-foreground px-1.5 rounded-full min-w-[20px] text-center tabular-nums transition-colors">
+                  {workspaces.length}
+                </span>
+              </div>
               <button 
                 className="text-muted-foreground group-hover:text-foreground transition-colors"
               >
@@ -260,7 +265,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
                         key={ws.id}
                         onClick={() => navigate(`/knowledge-bases/${ws.id}`)}
                         className={cn(
-                          "w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-sm transition-colors",
+                          "w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg text-sm transition-colors group",
                           isActive
                             ? "bg-primary/10 text-primary border-l-2 border-primary font-medium"
                             : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
@@ -268,7 +273,12 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
                       >
                         <Database className="w-3.5 h-3.5 flex-shrink-0" />
                         <span className="truncate">{ws.name}</span>
-                        <span className="ml-auto text-[10px] text-muted-foreground/60 tabular-nums">
+                        <span className={cn(
+                          "ml-auto text-xs font-bold px-1.5 rounded-full min-w-[20px] tabular-nums transition-colors tracking-tight",
+                          isActive
+                            ? "bg-primary/20 text-primary"
+                            : "bg-muted text-muted-foreground group-hover:bg-muted-foreground/15 group-hover:text-foreground"
+                        )}>
                           {ws.document_count}
                         </span>
                       </button>

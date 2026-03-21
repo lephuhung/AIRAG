@@ -178,7 +178,7 @@ class ChatRequest(BaseModel):
 
 class ChatSourceChunk(BaseModel):
     """A source chunk referenced in the chat answer."""
-    index: str  # 4-char alphanumeric ID, e.g. "a3x9" (was: int)
+    index: str  # 4-char alphanumeric ID, e.g. "id12" (was: int)
     chunk_id: str
 
     @field_validator("index", mode="before")
@@ -241,7 +241,7 @@ class ChatHistoryResponse(BaseModel):
 class RateSourceRequest(BaseModel):
     """Request to rate a source citation."""
     message_id: str = Field(..., description="The message_id containing the source")
-    source_index: str = Field(..., description="Source citation ID, e.g. 'a3x9'")
+    source_index: str = Field(..., description="Source citation ID, e.g. 'id12'")
     rating: Literal["relevant", "partial", "not_relevant"] = Field(
         ..., description="Source rating"
     )

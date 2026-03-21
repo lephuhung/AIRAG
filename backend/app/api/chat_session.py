@@ -180,8 +180,8 @@ async def chat_stream_session(
     workspace_ids = await _get_accessible_workspaces(db, user)
 
     # Get system prompt (combine from workspaces if needed or default)
-    from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT
-    system_prompt_to_use = DEFAULT_SYSTEM_PROMPT
+    from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
+    system_prompt_to_use = DEFAULT_SYSTEM_PROMPT + HARD_SYSTEM_PROMPT
 
     from app.api.chat_agent import sse_with_heartbeat, format_sse_event
     

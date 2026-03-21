@@ -230,7 +230,7 @@ class NexusRAGService:
             # KG ingest (async, non-blocking failure)
             if self.kg_service and parsed.markdown:
                 try:
-                    await self.kg_service.ingest(parsed.markdown)
+                    await self.kg_service.ingest(parsed.markdown, document_id=document_id)
                 except Exception as e:
                     logger.error(
                         f"KG ingest failed for document {document_id}, "

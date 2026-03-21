@@ -44,13 +44,13 @@ fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
 # ── Colours for log prefixes ─────────────────────────────────────────────────
-C_RESET='\033[0m'
-C_API='\033[1;32m'      # green
-C_PARSE='\033[1;34m'    # blue
-C_EMBED='\033[1;35m'    # magenta
-C_CAPTION='\033[1;33m'  # yellow
-C_KG='\033[1;36m'       # cyan
-C_ERR='\033[1;31m'      # red
+C_RESET=$'\033[0m'
+C_API=$'\033[1;32m'      # green
+C_PARSE=$'\033[1;34m'    # blue
+C_EMBED=$'\033[1;35m'    # magenta
+C_CAPTION=$'\033[1;33m'  # yellow
+C_KG=$'\033[1;36m'       # cyan
+C_ERR=$'\033[1;31m'      # red
 
 # ── Kill old processes ────────────────────────────────────────────────────────
 echo -e "${C_ERR}[run_dev] Killing old processes (API and workers)...${C_RESET}"
