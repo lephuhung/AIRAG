@@ -28,7 +28,7 @@ from typing import AsyncGenerator, Optional
 
 from fastapi import Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db
@@ -101,12 +101,43 @@ def _get_gemini_tool():
                 "required": ["query"],
             },
         ),
+        types.FunctionDeclaration(
+            name="manage_memory",
+            description=(
+                "Save or query persistent facts about the user across sessions. "
+                "Use 'save' when the user shares preferences, personal info, or instructions. "
+                "Use 'query' when answering questions that may relate to the user's past interactions or preferences. "
+                "Do NOT save trivial or one-time information."
+            ),
+            parameters={
+                "type": "OBJECT",
+                "properties": {
+                    "action": {
+                        "type": "STRING",
+                        "description": "'save' to store a new fact, 'query' to search past facts.",
+                    },
+                    "content": {
+                        "type": "STRING",
+                        "description": "For save: the fact to remember. For query: the search query.",
+                    },
+                    "category": {
+                        "type": "STRING",
+                        "description": "Category: preference, fact, or instruction. Default: fact.",
+                    },
+                    "importance": {
+                        "type": "INTEGER",
+                        "description": "Importance score 1-10. Default: 5.",
+                    },
+                },
+                "required": ["action", "content"],
+            },
+        ),
     ])
 
 
 # OpenAI-compatible native function calling (JSON schema format)
 def _get_openai_tools() -> list:
-    """Return search_documents tool in OpenAI function-calling format."""
+    """Return tools in OpenAI function-calling format."""
     return [
         {
             "type": "function",
@@ -138,7 +169,43 @@ def _get_openai_tools() -> list:
                     "required": ["query"],
                 },
             },
-        }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "manage_memory",
+                "description": (
+                    "Save or query persistent facts about the user across sessions. "
+                    "Use 'save' when the user shares preferences, personal info, or instructions. "
+                    "Use 'query' when answering questions that may relate to the user's past "
+                    "interactions or preferences. Do NOT save trivial or one-time information."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["save", "query"],
+                            "description": "'save' to store a new fact, 'query' to search past facts.",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "For save: the fact to remember. For query: the search query.",
+                        },
+                        "category": {
+                            "type": "string",
+                            "enum": ["preference", "fact", "instruction"],
+                            "description": "Category of the memory. Default: fact.",
+                        },
+                        "importance": {
+                            "type": "integer",
+                            "description": "Importance score 1-10. Default: 5.",
+                        },
+                    },
+                    "required": ["action", "content"],
+                },
+            },
+        },
     ]
 
 
@@ -148,11 +215,22 @@ def _get_openai_tools() -> list:
 # ---------------------------------------------------------------------------
 
 OLLAMA_TOOL_SYSTEM = """\
-## TOOL: search_documents
+## TOOLS
 
-You have ONE tool: search_documents.  You call it by outputting EXACTLY:
+You have TWO tools: search_documents and manage_memory.
 
+### Tool 1: search_documents
+Call it by outputting EXACTLY:
 <tool_call>{"name": "search_documents", "arguments": {"query": "<rewritten query>"}}</tool_call>
+
+### Tool 2: manage_memory
+Call it to save or query persistent user facts:
+<tool_call>{"name": "manage_memory", "arguments": {"action": "save", "content": "User prefers table format", "category": "preference"}}</tool_call>
+<tool_call>{"name": "manage_memory", "arguments": {"action": "query", "content": "user preferences"}}</tool_call>
+
+Use `save` when the user shares preferences, personal info, or instructions.
+Use `query` when answering questions that may relate to past interactions.
+Do NOT mention the memory tool to the user.
 
 ### ABSOLUTE RULES (violations are FATAL errors)
 
@@ -174,6 +252,8 @@ You have ONE tool: search_documents.  You call it by outputting EXACTLY:
 
 4. After receiving search results, answer using ONLY those sources with citations.
    Format: claim text[source_id]. Example: Doanh thu đạt 4.850 tỷ VNĐ[id12].
+
+5. You may call manage_memory AFTER answering if the user shared important preferences.
 """
 
 OLLAMA_TOOL_REMINDER = (
@@ -181,7 +261,10 @@ OLLAMA_TOOL_REMINDER = (
     "Output ONLY: <tool_call>{\"name\": \"search_documents\", \"arguments\": {\"query\": \"...\"}}</tool_call> "
     "Exception: simple greetings, thanks, or farewells do NOT require a tool call — respond directly. "
     "For everything else, searching is MANDATORY. "
-    "When answering from search results, use the provided source IDs for citations (e.g., [id12])."
+    "When answering from search results, use the provided source IDs for citations (e.g., [id12]).\n"
+    "You also have manage_memory: "
+    "<tool_call>{\"name\": \"manage_memory\", \"arguments\": {\"action\": \"save\", \"content\": \"...\"}}</tool_call> "
+    "Use it to save important user preferences or query past interactions."
 )
 
 # ---------------------------------------------------------------------------
@@ -192,7 +275,16 @@ GEMINI_TOOL_SYSTEM = """\
 
 ## Tool Usage (MANDATORY)
 
-You have a tool called `search_documents` that searches the knowledge base.
+You have two tools: `search_documents` and `manage_memory`.
+
+### search_documents
+Searches the knowledge base for relevant document sections.
+
+### manage_memory
+Saves or queries persistent facts about the user across sessions.
+- Use `save` when the user shares preferences, personal info, or instructions.
+- Use `query` when answering questions about past interactions or user preferences.
+- Do NOT mention this tool to the user.
 
 ### ABSOLUTE RULES:
 1. For ALL user questions, requests, factual queries, or analysis — you MUST call \
@@ -210,9 +302,13 @@ Your previous answers may contain outdated or incomplete information.
 5. NEVER reuse citation IDs from previous answers. Each answer must have its own \
 fresh sources from a new search.
 5. Rewrite the user's query to be specific and detailed for better retrieval.
+6. You may call `manage_memory(action="save")` after answering if the user shared important preferences.
 """
 
-NATIVE_TOOL_REMINDER = "\n\n[SYSTEM REMINDER] You MUST call the `search_documents` tool before answering this query."
+NATIVE_TOOL_REMINDER = (
+    "\n\n[SYSTEM REMINDER] You MUST call the `search_documents` tool before answering this query. "
+    "If the user shared important personal info or preferences, also call `manage_memory` to save it."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +584,173 @@ async def _execute_search_documents(
 
 
 # ---------------------------------------------------------------------------
+# Memory executor — save and retrieve persistent user memories
+# ---------------------------------------------------------------------------
+
+MAX_MEMORIES_PER_USER = 200
+
+async def _save_memory(
+    user_id: int,
+    content: str,
+    category: str,
+    importance: int,
+    session_id: Optional[str],
+    db: AsyncSession,
+) -> str:
+    """Save a new memory for the user with its embedding."""
+    from app.models.user_memory import UserMemory
+    from app.services.llm import get_embedding_provider
+
+    # Check limit
+    count_result = await db.execute(
+        select(func.count()).select_from(UserMemory).where(UserMemory.user_id == user_id)
+    )
+    count = count_result.scalar() or 0
+    if count >= MAX_MEMORIES_PER_USER:
+        return f"Memory limit reached ({MAX_MEMORIES_PER_USER}). Cannot save new memory."
+
+    # Generate embedding
+    try:
+        emb_provider = get_embedding_provider()
+        embedding = await emb_provider.embed([content])
+        emb_list = embedding[0].tolist() if hasattr(embedding[0], 'tolist') else list(embedding[0])
+    except Exception as e:
+        logger.warning(f"Failed to generate memory embedding: {e}")
+        emb_list = None
+
+    memory = UserMemory(
+        user_id=user_id,
+        content=content,
+        embedding=emb_list,
+        category=category,
+        importance=max(1, min(10, importance)),
+        source_session_id=session_id,
+    )
+    db.add(memory)
+    await db.flush()
+    return f"Memory saved: {content[:80]}"
+
+
+async def _search_memories(
+    user_id: int,
+    query: str,
+    db: AsyncSession,
+    top_k: int = 5,
+) -> str:
+    """Search user memories by semantic similarity using pgvector."""
+    from app.models.user_memory import UserMemory
+    from app.services.llm import get_embedding_provider
+
+    try:
+        emb_provider = get_embedding_provider()
+        query_embedding = await emb_provider.embed([query])
+        query_vec = query_embedding[0].tolist() if hasattr(query_embedding[0], 'tolist') else list(query_embedding[0])
+    except Exception as e:
+        logger.warning(f"Failed to generate query embedding for memory search: {e}")
+        # Fallback: text search
+        result = await db.execute(
+            select(UserMemory)
+            .where(UserMemory.user_id == user_id)
+            .order_by(UserMemory.importance.desc())
+            .limit(top_k)
+        )
+        memories = result.scalars().all()
+        if not memories:
+            return "No memories found for this user."
+        return "\n".join([f"- [{m.category}] {m.content}" for m in memories])
+
+    # pgvector cosine distance search
+    try:
+        from pgvector.sqlalchemy import Vector
+        result = await db.execute(
+            select(UserMemory)
+            .where(UserMemory.user_id == user_id)
+            .where(UserMemory.embedding.isnot(None))
+            .order_by(UserMemory.embedding.cosine_distance(query_vec))
+            .limit(top_k)
+        )
+        memories = result.scalars().all()
+    except Exception as e:
+        logger.warning(f"pgvector search failed, falling back to importance sort: {e}")
+        result = await db.execute(
+            select(UserMemory)
+            .where(UserMemory.user_id == user_id)
+            .order_by(UserMemory.importance.desc())
+            .limit(top_k)
+        )
+        memories = result.scalars().all()
+
+    if not memories:
+        return "No relevant memories found."
+    return "\n".join([f"- [{m.category}] {m.content}" for m in memories])
+
+
+# Patterns that indicate the user is sharing save-worthy information
+_SAVE_TRIGGERS_VI = [
+    "tôi thích", "tôi muốn", "tôi cần", "tôi là", "tên tôi là",
+    "hãy nhớ", "hãy ghi nhớ", "luôn luôn", "luôn trả lời",
+    "tôi ưa", "tôi không thích", "tôi ghét",
+    "tôi làm việc", "tôi sống", "tôi học",
+    "từ giờ", "từ nay", "mặc định",
+]
+_SAVE_TRIGGERS_EN = [
+    "i prefer", "i like", "i want", "i need", "i am", "my name is",
+    "remember that", "always answer", "always respond", "always use",
+    "i don't like", "i hate", "i dislike",
+    "i work at", "i live in", "i study",
+    "from now on", "by default",
+]
+
+
+async def _auto_save_memory(
+    user_id: int,
+    message: str,
+    session_id: Optional[str],
+    db: AsyncSession,
+) -> None:
+    """Detect and save user preferences/facts from the message automatically."""
+    msg_lower = message.lower().strip()
+
+    # Skip very short messages or obvious greetings
+    if len(msg_lower) < 10:
+        return
+
+    # Check if the message contains any save-worthy triggers
+    matched = False
+    category = "fact"
+    importance = 5
+
+    for trigger in _SAVE_TRIGGERS_VI + _SAVE_TRIGGERS_EN:
+        if trigger in msg_lower:
+            matched = True
+            if trigger in ("tôi thích", "tôi ưa", "i prefer", "i like",
+                          "tôi không thích", "tôi ghét", "i don't like", "i hate", "i dislike"):
+                category = "preference"
+                importance = 7
+            elif trigger in ("hãy nhớ", "hãy ghi nhớ", "remember that",
+                           "luôn luôn", "luôn trả lời", "always answer",
+                           "always respond", "always use", "từ giờ", "từ nay",
+                           "from now on", "by default", "mặc định"):
+                category = "instruction"
+                importance = 8
+            break
+
+    if not matched:
+        return
+
+    # Save the message as a memory
+    result = await _save_memory(
+        user_id=user_id,
+        content=message,
+        category=category,
+        importance=importance,
+        session_id=session_id,
+        db=db,
+    )
+    logger.info(f"Auto-saved memory for user {user_id}: {result}")
+
+
+# ---------------------------------------------------------------------------
 # Agent loop — semi-agentic streaming
 # ---------------------------------------------------------------------------
 
@@ -499,6 +762,8 @@ async def agent_chat_stream(
     db: AsyncSession,
     system_prompt: str,
     force_search: bool = False,
+    user_id: Optional[int] = None,
+    session_id: Optional[str] = None,
 ) -> AsyncGenerator[dict, None]:
     """Semi-agentic chat loop with streaming.
 
@@ -534,6 +799,22 @@ async def agent_chat_stream(
     # Tool / prompt setup
     tools = None
     effective_system_prompt = system_prompt
+
+    # ── Auto-recall: inject relevant memories into system prompt ──────────
+    if user_id:
+        try:
+            memory_context = await _search_memories(user_id, message, db, top_k=5)
+            if memory_context and "No relevant memories" not in memory_context and "No memories found" not in memory_context:
+                effective_system_prompt += (
+                    "\n\n## User Context (from previous sessions)\n"
+                    "The following information was saved from past interactions with this user. "
+                    "Use it to personalize your response when relevant, but do NOT mention "
+                    "that you have a memory system.\n"
+                    f"{memory_context}\n"
+                )
+                logger.info(f"Auto-recall injected {len(memory_context)} chars of memory context for user {user_id}")
+        except Exception as e:
+            logger.warning(f"Auto-recall failed for user {user_id}: {e}")
 
     if force_search:
         # ── Force-search mode: pre-search before LLM call ──────────────────
@@ -587,7 +868,7 @@ async def agent_chat_stream(
     elif is_gemini:
         tools = [_get_gemini_tool()]
         # Reinforce tool-calling obligation in system prompt for Gemini
-        effective_system_prompt = system_prompt + GEMINI_TOOL_SYSTEM
+        effective_system_prompt += GEMINI_TOOL_SYSTEM
         # Add a strong reminder directly to the user message
         messages[-1] = LLMMessage(
             role="user",
@@ -597,7 +878,7 @@ async def agent_chat_stream(
         # OpenAI-compatible: use native function calling (JSON schema)
         # Do NOT inject XML <tool_call> prompt — it gets blocked by some proxies
         tools = _get_openai_tools()
-        effective_system_prompt = system_prompt + GEMINI_TOOL_SYSTEM
+        effective_system_prompt += GEMINI_TOOL_SYSTEM
         # Add a strong reminder directly to the user message
         messages[-1] = LLMMessage(
             role="user",
@@ -605,7 +886,7 @@ async def agent_chat_stream(
         )
     else:
         # Ollama: append mandatory tool prompt to system prompt
-        effective_system_prompt = system_prompt + "\n\n" + OLLAMA_TOOL_SYSTEM
+        effective_system_prompt += "\n\n" + OLLAMA_TOOL_SYSTEM
         # Also append a reminder directly to the user message so the model
         # sees it right before generating — reinforces the tool requirement
         messages[-1] = LLMMessage(
@@ -783,6 +1064,68 @@ async def agent_chat_stream(
                     "step": "generating",
                     "detail": "Generating answer..."
                 }}
+            elif fc_name == "manage_memory":
+                action = fc_args.get("action", "query")
+                content = fc_args.get("content", "")
+                category = fc_args.get("category", "fact")
+                importance = int(fc_args.get("importance", 5))
+
+                if not user_id:
+                    tool_result = "Memory not available (no user context)."
+                elif action == "save":
+                    yield {"event": "status", "data": {
+                        "step": "memory",
+                        "detail": "Saving to memory..."
+                    }}
+                    tool_result = await _save_memory(
+                        user_id, content, category, importance, session_id, db,
+                    )
+                elif action == "query":
+                    yield {"event": "status", "data": {
+                        "step": "memory",
+                        "detail": "Searching memory..."
+                    }}
+                    tool_result = await _search_memories(user_id, content, db)
+                else:
+                    tool_result = f"Unknown memory action: {action}"
+
+                # Feed result back to LLM
+                if is_gemini:
+                    from google.genai import types as _gtypes
+                    raw_content = getattr(provider, "last_response_content", None)
+                    if raw_content:
+                        messages.append(LLMMessage(
+                            role="assistant", content="",
+                            _raw_provider_content=raw_content,
+                        ))
+                    else:
+                        messages.append(LLMMessage(
+                            role="assistant",
+                            content=f'[Called manage_memory(action="{action}", content="{content[:60]}")]',
+                        ))
+                    func_resp_parts = [_gtypes.Part.from_function_response(
+                        name="manage_memory",
+                        response={"result": tool_result},
+                    )]
+                    func_resp_content = _gtypes.Content(role="user", parts=func_resp_parts)
+                    messages.append(LLMMessage(
+                        role="user", content="",
+                        _raw_provider_content=func_resp_content,
+                    ))
+                else:
+                    messages.append(LLMMessage(
+                        role="assistant",
+                        content=f'[Called manage_memory(action="{action}", content="{content[:60]}")]',
+                    ))
+                    messages.append(LLMMessage(
+                        role="user",
+                        content=f"Memory result: {tool_result}",
+                    ))
+
+                yield {"event": "status", "data": {
+                    "step": "generating",
+                    "detail": "Generating answer..."
+                }}
             else:
                 # Unknown tool — treat accumulated text as answer
                 logger.warning(f"Unknown tool call: {fc_name}")
@@ -882,6 +1225,13 @@ async def agent_chat_stream(
         "thinking": thinking_text or None,
         "related_entities": related_entities[:30],
     }}
+
+    # ── Auto-save: detect and save user preferences/facts ────────────────
+    if user_id and message:
+        try:
+            await _auto_save_memory(user_id, message, session_id, db)
+        except Exception as e:
+            logger.warning(f"Auto-save memory failed: {e}")
 
 
 # ---------------------------------------------------------------------------

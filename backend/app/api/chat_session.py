@@ -208,6 +208,8 @@ async def chat_stream_session(
                 db=db,
                 system_prompt=system_prompt_to_use,
                 force_search=request.force_search,
+                user_id=user.id,
+                session_id=session_id,
             ):
                 if sse_item["event"] == "token":
                     accumulated_text += sse_item["data"]["text"]

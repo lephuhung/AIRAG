@@ -418,12 +418,27 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         self._dimension: int | None = None
 
     def _get_model(self):
+        from app.core.config import settings
+        
+        # If the requested KG/memory model is the same as the main document embedding model,
+        # reuse the globally loaded instance to avoid duplicating model RAM and loading time.
+        if self._model is None and self._model_name == settings.NEXUSRAG_EMBEDDING_MODEL:
+            try:
+                from app.services.embedder import get_embedding_service
+                svc = get_embedding_service()
+                self._model = svc.model  # Access the cached SentenceTransformer instance
+                self._dimension = svc.dimension
+                logger.info(f"[LocalEmbedding] Reusing global pre-loaded model: {self._model_name}")
+                return self._model
+            except Exception as e:
+                logger.warning(f"[LocalEmbedding] Failed to reuse global model: {e}")
+
+        # Otherwise, load a separate instance
         if self._model is None:
             from sentence_transformers import SentenceTransformer
-            from app.core.config import settings
             device = settings.NEXUSRAG_EMBEDDING_DEVICE  # "auto" | "cpu" | "cuda"
             st_device = None if device == "auto" else device
-            logger.info(f"[LocalEmbedding] Loading model: {self._model_name} (device={device})")
+            logger.info(f"[LocalEmbedding] Loading separate model: {self._model_name} (device={device})")
             self._model = SentenceTransformer(self._model_name, device=st_device)
             self._dimension = self._model.get_sentence_embedding_dimension()
             logger.info(f"[LocalEmbedding] Model loaded, dim={self._dimension}")

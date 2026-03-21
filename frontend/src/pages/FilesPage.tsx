@@ -315,8 +315,8 @@ export function FilesPage() {
         layout
         initial={false}
         className={cn(
-          "flex-1 flex flex-col h-full min-w-0 relative z-10",
-          selectedDoc ? "w-1/3" : "w-full"
+          "flex-1 flex flex-col h-full min-w-0 relative z-10 transition-all duration-300 ease-in-out",
+          selectedDoc ? "hidden md:flex md:w-[35%] lg:w-[30%] xl:w-[25%]" : "w-full"
         )}
         transition={{ 
           type: "spring", 
@@ -326,7 +326,10 @@ export function FilesPage() {
         }}
       >
         {/* ── Header ── */}
-      <div className="flex-shrink-0 border-b px-6 py-4">
+      <div className={cn(
+        "flex-shrink-0 border-b transition-all duration-300",
+        selectedDoc ? "px-4 py-3" : "px-6 py-4"
+      )}>
         {/* Breadcrumb */}
         <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-2">
           <button
@@ -344,8 +347,11 @@ export function FilesPage() {
         {/* Title */}
         <div className="flex items-center justify-between">
           <div>
-            <h1 className="text-lg font-bold flex items-center gap-2">
-              <FolderOpen className="w-5 h-5 text-primary" />
+            <h1 className={cn(
+              "font-bold flex items-center gap-2 transition-all",
+              selectedDoc ? "text-base" : "text-lg"
+            )}>
+              <FolderOpen className={cn("text-primary", selectedDoc ? "w-4 h-4" : "w-5 h-5")} />
               {workspace?.name || "Files"}
             </h1>
             <p className="text-xs text-muted-foreground">
@@ -357,9 +363,15 @@ export function FilesPage() {
       </div>
 
       {/* ── Toolbar ── */}
-      <div className="flex-shrink-0 px-6 py-3 border-b flex items-center gap-3 flex-wrap">
+      <div className={cn(
+        "flex-shrink-0 border-b flex items-center gap-3 flex-wrap transition-all duration-300",
+        selectedDoc ? "px-4 py-2" : "px-6 py-3"
+      )}>
         {/* Search */}
-        <div className="relative flex-1 min-w-[200px] max-w-sm">
+        <div className={cn(
+          "relative flex-1 min-w-[200px] transition-all",
+          selectedDoc ? "max-w-[240px]" : "max-w-sm"
+        )}>
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
           <Input
             placeholder="Search files..."
@@ -491,7 +503,12 @@ export function FilesPage() {
           </div>
         ) : (
           // File grid
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
+          <div className={cn(
+            "grid gap-5 transition-all duration-300",
+            selectedDoc 
+              ? "grid-cols-1 lg:grid-cols-2" 
+              : "grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4"
+          )}>
             <AnimatePresence mode="popLayout">
               {filteredDocs.map((doc) => (
                 <FileCard
@@ -541,7 +558,7 @@ export function FilesPage() {
               damping: 38,
               mass: 0.8
             }}
-            className="w-2/3 h-full border-l bg-background flex flex-col z-20 shadow-2xl relative"
+            className="w-full md:w-[65%] lg:w-[70%] xl:w-[75%] h-full border-l bg-background flex flex-col z-20 shadow-2xl relative"
           >
             <div className="absolute inset-y-0 -left-6 w-6 bg-gradient-to-r from-transparent to-black/[0.03] pointer-events-none" />
             

@@ -327,14 +327,14 @@ export const FileCard = memo(function FileCard({
 
       {/* ── Stats grid ── */}
       {stats.length > 0 && (
-        <div className="px-4 pb-3 grid grid-cols-2 gap-x-4 gap-y-1">
+        <div className="px-4 pb-3 grid grid-cols-1 xs:grid-cols-2 gap-x-3 gap-y-1">
           {stats.map((s) => {
             const StatIcon = s.icon;
             return (
-              <div key={s.label} className="flex items-center gap-1.5 text-xs text-muted-foreground">
-                <StatIcon className="w-3.5 h-3.5 flex-shrink-0" />
-                <span className="tabular-nums">{s.value}</span>
-                <span>{s.label}</span>
+              <div key={s.label} className="flex items-center gap-1.5 text-[11px] text-muted-foreground min-w-0">
+                <StatIcon className="w-3 h-3 flex-shrink-0" />
+                <span className="tabular-nums font-medium">{s.value}</span>
+                <span className="truncate">{s.label}</span>
               </div>
             );
           })}
