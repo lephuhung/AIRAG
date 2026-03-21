@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { motion, AnimatePresence } from "framer-motion";
 import { useNavigate, useParams } from "react-router-dom";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -33,7 +34,7 @@ export function ChatPage() {
   }, [currentSessionId, resetStore]);
 
   // -- Queries & Mutations --
-  const { data: sessions, isLoading: loadingSessions } = useChatSessions();
+  const { data: sessions } = useChatSessions();
   const createSession = useCreateChatSession();
 
   // Redirect to first session if none selected and sessions exist
@@ -64,12 +65,22 @@ export function ChatPage() {
         <span className="font-semibold text-sm">NexusRAG Chat</span>
       </div>
 
-      <div className="flex-1 flex overflow-hidden">
+      <div className="flex-1 flex overflow-hidden relative">
         {/* Middle: Chat Panel */}
-        <div className={cn(
-          "flex-1 h-full min-w-[320px] transition-all",
-          selectedDoc ? "max-w-[50%]" : "max-w-7xl mx-auto"
-        )}>
+        <motion.div 
+          layout
+          initial={false}
+          className={cn(
+            "flex-1 h-full min-w-[320px] relative z-10",
+            selectedDoc ? "w-1/3" : "w-full max-w-7xl mx-auto"
+          )}
+          transition={{ 
+            type: "spring", 
+            stiffness: 300, 
+            damping: 34,
+            mass: 0.8
+          }}
+        >
           {currentSessionId ? (
             <ChatPanel sessionId={currentSessionId} sessionTitle={sessionTitle} />
           ) : (
@@ -84,37 +95,52 @@ export function ChatPage() {
               <Button onClick={handleNewSession}>Start New Chat</Button>
             </div>
           )}
-        </div>
+        </motion.div>
 
-        {/* Right: Document Viewer (conditionally rendered) */}
-        {selectedDoc && (
-          <div className="w-[50%] h-full border-l bg-background flex flex-col z-20">
-            {/* Header with close button */}
-            <div className="h-10 border-b flex items-center justify-between px-3 bg-muted/10 shrink-0">
-              <span className="text-xs font-semibold truncate text-muted-foreground">
-                Document Source
-              </span>
-              <button
-                onClick={() => selectDoc(null)}
-                className="p-1.5 rounded-md hover:bg-muted text-muted-foreground transition-colors"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            
-            {/* The actual viewer, taking remaining height */}
-            <div className="flex-1 overflow-hidden relative">
-              <DocumentViewer
-                doc={selectedDoc}
-                highlightChunks={highlightChunks}
-                scrollToPage={scrollToPage}
-                scrollToHeading={scrollToHeading}
-                scrollToImageSrc={scrollToImageSrc}
-                onScrolled={clearScrollTarget}
-              />
-            </div>
-          </div>
-        )}
+        <AnimatePresence mode="popLayout" initial={false}>
+          {selectedDoc && (
+            <motion.div 
+              key={selectedDoc.id}
+              initial={{ x: "100%", opacity: 0.5 }}
+              animate={{ x: 0, opacity: 1 }}
+              exit={{ x: "100%", opacity: 0, transition: { duration: 0.2, ease: "easeInOut" } }}
+              transition={{ 
+                type: "spring", 
+                stiffness: 350, 
+                damping: 38,
+                mass: 0.8
+              }}
+              className="w-2/3 h-full border-l bg-background flex flex-col z-20 shadow-2xl relative"
+            >
+              <div className="absolute inset-y-0 -left-6 w-6 bg-gradient-to-r from-transparent to-black/[0.03] pointer-events-none" />
+              
+              {/* Header with close button */}
+              <div className="h-10 border-b flex items-center justify-between px-3 bg-muted/20 shrink-0">
+                <span className="text-xs font-semibold truncate text-foreground/70">
+                  Document Source
+                </span>
+                <button
+                  onClick={() => selectDoc(null)}
+                  className="p-1.5 rounded-full hover:bg-muted text-muted-foreground transition-all duration-200 hover:rotate-90 active:scale-95"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              
+              {/* The actual viewer, taking remaining height */}
+              <div className="flex-1 overflow-hidden relative">
+                <DocumentViewer
+                  doc={selectedDoc}
+                  highlightChunks={highlightChunks}
+                  scrollToPage={scrollToPage}
+                  scrollToHeading={scrollToHeading}
+                  scrollToImageSrc={scrollToImageSrc}
+                  onScrolled={clearScrollTarget}
+                />
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
     </div>
   );

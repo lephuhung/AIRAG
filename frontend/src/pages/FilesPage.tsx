@@ -1,7 +1,7 @@
 import { useState, useMemo, useCallback, useEffect } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { AnimatePresence } from "framer-motion";
+import { motion, AnimatePresence } from "framer-motion";
 import {
   Search,
   FolderOpen,
@@ -17,6 +17,8 @@ import { FileCard } from "@/components/rag/FileCard";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { useDocuments, useDeleteDocument, useProcessDocument, useReindexDocument, PROCESSING_STATUSES } from "@/hooks/useDocuments";
 import { useWorkspaces, useWorkspace } from "@/hooks/useWorkspaces";
+import { DocumentViewer } from "@/components/rag/DocumentViewer";
+import { useWorkspaceStore } from "@/stores/workspaceStore";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type { Document, RAGStats } from "@/types";
@@ -62,74 +64,6 @@ function sortDocs(docs: Document[], key: SortKey): Document[] {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Preview Modal — renders fetched markdown content
-// ---------------------------------------------------------------------------
-function PreviewModal({
-  doc,
-  onClose,
-}: {
-  doc: Document | null;
-  onClose: () => void;
-}) {
-  const { data: markdown, isLoading } = useQuery({
-    queryKey: ["doc-markdown", doc?.id],
-    queryFn: () => api.getText(`/documents/${doc!.id}/markdown`),
-    enabled: !!doc,
-  });
-
-  if (!doc) return null;
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center">
-      {/* Backdrop */}
-      <div
-        className="absolute inset-0 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200"
-        onClick={onClose}
-      />
-
-      {/* Dialog */}
-      <div className="relative z-10 w-full max-w-4xl max-h-[85vh] mx-4 rounded-xl bg-card border border-border shadow-2xl animate-in zoom-in-95 fade-in duration-200 flex flex-col">
-        {/* Header */}
-        <div className="flex items-center justify-between px-5 py-3 border-b border-border flex-shrink-0">
-          <div className="min-w-0">
-            <h3 className="text-sm font-semibold truncate">{doc.original_filename}</h3>
-            <p className="text-xs text-muted-foreground">Parsed markdown preview</p>
-          </div>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={onClose}
-            className="h-8 w-8 flex-shrink-0"
-          >
-            <X className="w-4 h-4" />
-          </Button>
-        </div>
-
-        {/* Content */}
-        <div className="flex-1 overflow-y-auto px-5 py-4 min-h-0">
-          {isLoading ? (
-            <div className="flex items-center justify-center py-16">
-              <Loader2 className="w-6 h-6 animate-spin text-primary" />
-            </div>
-          ) : markdown ? (
-            <pre className="text-sm leading-relaxed whitespace-pre-wrap font-mono text-foreground/90">
-              {markdown}
-            </pre>
-          ) : (
-            <div className="flex flex-col items-center justify-center py-16 text-center">
-              <FolderOpen className="w-10 h-10 text-muted-foreground/30 mb-2" />
-              <p className="text-sm text-muted-foreground">No parsed content available.</p>
-              <p className="text-xs text-muted-foreground/70 mt-1">
-                The document may not have been processed yet.
-              </p>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Workspace Selector — grid of workspaces
@@ -288,7 +222,23 @@ export function FilesPage() {
   const [sortKey, setSortKey] = useState<SortKey>("newest");
   const [deleteDocConfirm, setDeleteDocConfirm] = useState<number | null>(null);
   const [sortMenuOpen, setSortMenuOpen] = useState(false);
-  const [previewDoc, setPreviewDoc] = useState<Document | null>(null);
+
+  // -- Store (for unified preview) --
+  const {
+    selectedDoc,
+    selectDoc,
+    reset: resetStore,
+    highlightChunks,
+    scrollToPage,
+    scrollToHeading,
+    scrollToImageSrc,
+    clearScrollTarget,
+  } = useWorkspaceStore();
+
+  // Reset store when navigating away or switching workspace
+  useEffect(() => {
+    return () => resetStore();
+  }, [workspaceId, resetStore]);
 
   // Filter + sort
   const filteredDocs = useMemo(() => {
@@ -359,14 +309,29 @@ export function FilesPage() {
 
   // ── Show files for selected workspace ──
   return (
-    <div className="h-full flex flex-col overflow-hidden">
-      {/* ── Header ── */}
+    <div className="h-full flex overflow-hidden relative">
+      {/* Left side: Search, Filters, Grid */}
+      <motion.div 
+        layout
+        initial={false}
+        className={cn(
+          "flex-1 flex flex-col h-full min-w-0 relative z-10",
+          selectedDoc ? "w-1/3" : "w-full"
+        )}
+        transition={{ 
+          type: "spring", 
+          stiffness: 300, 
+          damping: 34,
+          mass: 0.8
+        }}
+      >
+        {/* ── Header ── */}
       <div className="flex-shrink-0 border-b px-6 py-4">
         {/* Breadcrumb */}
         <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-2">
           <button
             onClick={handleBackToList}
-            className="hover:text-foreground transition-colors"
+            className="hover:text-foreground transition-colors underline-offset-4 hover:underline"
           >
             Files
           </button>
@@ -536,7 +501,7 @@ export function FilesPage() {
                   onReindex={(id) => reindexDoc.mutate(id)}
                   onProcess={(id) => processDoc.mutate(id)}
                   onDownload={handleDownload}
-                  onPreview={setPreviewDoc}
+                  onPreview={selectDoc}
                   isProcessing={processDoc.isPending}
                 />
               ))}
@@ -560,9 +525,55 @@ export function FilesPage() {
         confirmLabel="Delete"
         variant="danger"
       />
+      </motion.div>
 
-      {/* Preview modal */}
-      <PreviewModal doc={previewDoc} onClose={() => setPreviewDoc(null)} />
+      {/* Right side: Document Viewer (conditionally rendered) */}
+      <AnimatePresence mode="popLayout" initial={false}>
+        {selectedDoc && (
+          <motion.div 
+            key={selectedDoc.id}
+            initial={{ x: "100%", opacity: 0.5 }}
+            animate={{ x: 0, opacity: 1 }}
+            exit={{ x: "100%", opacity: 0, transition: { duration: 0.2, ease: "easeInOut" } }}
+            transition={{ 
+              type: "spring", 
+              stiffness: 350, 
+              damping: 38,
+              mass: 0.8
+            }}
+            className="w-2/3 h-full border-l bg-background flex flex-col z-20 shadow-2xl relative"
+          >
+            <div className="absolute inset-y-0 -left-6 w-6 bg-gradient-to-r from-transparent to-black/[0.03] pointer-events-none" />
+            
+            {/* Header with close button */}
+            <div className="h-10 border-b flex items-center justify-between px-3 bg-muted/20 shrink-0">
+              <span className="text-xs font-semibold truncate text-foreground/70">
+                Document Preview
+              </span>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => selectDoc(null)}
+                className="h-7 w-7 rounded-full text-muted-foreground transition-all duration-200 hover:rotate-90 active:scale-95"
+              >
+                <X className="w-4 h-4" />
+              </Button>
+            </div>
+            
+            {/* The actual viewer, taking remaining height */}
+            <div className="flex-1 overflow-hidden relative">
+              <DocumentViewer
+                doc={selectedDoc}
+                highlightChunks={highlightChunks}
+                scrollToPage={scrollToPage}
+                scrollToHeading={scrollToHeading}
+                scrollToImageSrc={scrollToImageSrc}
+                onScrolled={clearScrollTarget}
+              />
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

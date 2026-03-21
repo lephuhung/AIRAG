@@ -980,21 +980,21 @@ const MessageBubble = memo(function MessageBubble({
     .toUpperCase();
 
   const proseClasses = cn(
-    "prose prose-sm max-w-none text-foreground/90",
-    "[&_p]:my-1 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5",
+    "prose prose-base max-w-none text-foreground/90",
+    "[&_p]:my-1.5 [&_ul]:my-1.5 [&_ol]:my-1.5 [&_li]:my-1",
     "[&_pre]:bg-transparent [&_pre]:border-none [&_pre]:p-0 [&_pre]:m-0",
-    "[&_code]:bg-muted/50 [&_code]:px-1 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-xs [&_code]:text-foreground/90",
+    "[&_code]:bg-muted/50 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-sm [&_code]:text-foreground/90",
     "[&_a]:text-primary [&_a]:underline [&_a]:underline-offset-2",
     "[&_strong]:text-foreground [&_em]:text-foreground/80",
     "[&_h1]:text-foreground [&_h2]:text-foreground [&_h3]:text-foreground [&_h4]:text-foreground",
-    "[&_h1]:text-base [&_h1]:font-bold [&_h1]:mt-3 [&_h1]:mb-1",
-    "[&_h2]:text-sm [&_h2]:font-semibold [&_h2]:mt-2.5 [&_h2]:mb-1",
-    "[&_h3]:text-sm [&_h3]:font-semibold [&_h3]:mt-2 [&_h3]:mb-0.5",
+    "[&_h1]:text-xl [&_h1]:font-bold [&_h1]:mt-4 [&_h1]:mb-2",
+    "[&_h2]:text-lg [&_h2]:font-semibold [&_h2]:mt-3.5 [&_h2]:mb-1.5",
+    "[&_h3]:text-base [&_h3]:font-semibold [&_h3]:mt-3 [&_h3]:mb-1",
     "[&_blockquote]:border-l-2 [&_blockquote]:border-primary/30 [&_blockquote]:pl-3 [&_blockquote]:italic [&_blockquote]:text-foreground/60",
-    "[&_table]:text-xs [&_th]:px-2 [&_th]:py-1 [&_td]:px-2 [&_td]:py-1 [&_th]:text-foreground/80 [&_td]:text-foreground/80",
+    "[&_table]:text-sm [&_th]:px-2.5 [&_th]:py-1.5 [&_td]:px-2.5 [&_td]:py-1.5 [&_th]:text-foreground/80 [&_td]:text-foreground/80",
     "[&_li]:text-foreground/90",
-    "[&_.katex-display]:overflow-x-auto [&_.katex-display]:py-2",
-    "[&_.katex]:text-[0.9em]"
+    "[&_.katex-display]:overflow-x-auto [&_.katex-display]:py-2.5",
+    "[&_.katex]:text-[1em]"
   );
 
   return (
@@ -1036,7 +1036,7 @@ const MessageBubble = memo(function MessageBubble({
         )}
 
         {isUser ? (
-          <p className="text-sm leading-relaxed whitespace-pre-wrap">
+          <p className="text-base leading-relaxed whitespace-pre-wrap">
             {message.content}
           </p>
         ) : message.isStreaming ? (
@@ -1788,7 +1788,7 @@ export const ChatPanel = memo(function ChatPanel({
                   placeholder="Ask about your documents..."
                   rows={1}
                   className={cn(
-                    "flex-1 resize-none rounded-lg border border-input bg-background px-3 py-2 text-sm",
+                    "flex-1 resize-none rounded-lg border border-input bg-background px-3 py-2 text-base shadow-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50",
                     "placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
                     "max-h-[120px] min-h-[36px]"
                   )}

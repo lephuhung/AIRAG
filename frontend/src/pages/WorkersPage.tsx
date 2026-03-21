@@ -306,34 +306,53 @@ export function WorkersPage() {
               Manage workers, monitor queues, and inspect the processing pipeline
             </p>
           </div>
-          <div className="flex items-center gap-2">
-            {/* Health badge */}
-            {health && (
-              <span className={cn(
-                "inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-full border",
-                healthColor,
-              )}>
-                <Heart className="w-3 h-3" />
-                {healthStatus.charAt(0).toUpperCase() + healthStatus.slice(1)}
-              </span>
-            )}
+          <div className="flex items-center gap-3">
+            <Button
+              variant="default"
+              size="sm"
+              className="h-8 gap-1.5 text-xs shadow-sm shadow-primary/20"
+              onClick={() => {
+                WORKER_TYPES.forEach((wt) =>
+                  startWorker.mutate({ worker_type: wt, count: 1 })
+                );
+              }}
+              disabled={startWorker.isPending}
+            >
+              <Zap className={cn("w-3.5 h-3.5", startWorker.isPending && "animate-spin")} />
+              Start All Workers
+            </Button>
 
-            {failedCount > 0 && (
-              <Button
-                variant="outline"
-                size="sm"
-                className="h-8 gap-1.5 text-xs border-destructive/30 text-destructive hover:bg-destructive/10"
-                onClick={() => setRetryAllConfirm(true)}
-                disabled={retryAll.isPending}
-              >
-                {retryAll.isPending ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <RotateCcw className="w-3.5 h-3.5" />
-                )}
-                Retry All Failed ({failedCount})
-              </Button>
-            )}
+            <div className="h-6 w-px bg-border mx-1" />
+
+            <div className="flex items-center gap-2">
+              {/* Health badge */}
+              {health && (
+                <span className={cn(
+                  "inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-full border",
+                  healthColor,
+                )}>
+                  <Heart className="w-3 h-3" />
+                  {healthStatus.charAt(0).toUpperCase() + healthStatus.slice(1)}
+                </span>
+              )}
+
+              {failedCount > 0 && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 gap-1.5 text-xs border-destructive/30 text-destructive hover:bg-destructive/10"
+                  onClick={() => setRetryAllConfirm(true)}
+                  disabled={retryAll.isPending}
+                >
+                  {retryAll.isPending ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <RotateCcw className="w-3.5 h-3.5" />
+                  )}
+                  Retry All Failed ({failedCount})
+                </Button>
+              )}
+            </div>
           </div>
         </div>
       </div>
@@ -492,23 +511,6 @@ export function WorkersPage() {
                 )}
               </div>
 
-              {/* Quick actions */}
-              <div className="flex items-center gap-2 mt-3">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 text-xs gap-1.5"
-                  onClick={() => {
-                    WORKER_TYPES.forEach((wt) =>
-                      startWorker.mutate({ worker_type: wt, count: 1 })
-                    );
-                  }}
-                  disabled={startWorker.isPending}
-                >
-                  <Zap className="w-3 h-3" />
-                  Start All Workers
-                </Button>
-              </div>
             </Section>
 
             {/* ── Pipeline Summary Cards ── */}
