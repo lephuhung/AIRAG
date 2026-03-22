@@ -56,6 +56,27 @@ def get_llm_provider() -> LLMProvider:
 
 
 @lru_cache
+def get_memory_agent() -> LLMProvider:
+    """Create (and cache) a dedicated LLM provider for internal agent tasks (like memory)."""
+    from app.core.config import settings
+
+    if settings.MEMORY_AGENT_LOCAL:
+        from app.services.llm.vllm_local import LocalVLLMProvider
+        return LocalVLLMProvider(
+            model=settings.MEMORY_AGENT_MODEL,
+            gpu_memory_utilization=settings.MEMORY_AGENT_GPU_UTILIZATION,
+            cuda_device=settings.MEMORY_AGENT_CUDA_DEVICE,
+        )
+
+    from app.services.llm.openai_compatible import OpenAICompatibleLLMProvider
+    # Memory agent using remote vLLM (OpenAI compatible)
+    return OpenAICompatibleLLMProvider(
+        base_url=settings.MEMORY_AGENT_BASE_URL,
+        model=settings.MEMORY_AGENT_MODEL,
+        api_key=settings.MEMORY_AGENT_API_KEY,
+    )
+
+
 def get_embedding_provider() -> EmbeddingProvider:
     """Create (and cache) the embedding provider for KG (LightRAG)."""
     from app.core.config import settings

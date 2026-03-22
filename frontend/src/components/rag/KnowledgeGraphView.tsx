@@ -37,6 +37,11 @@ interface SimNode extends KGGraphNode {
   fy: number | null;
 }
 
+/** Node radius based on degree */
+function getRadius(degree: number): number {
+  return Math.max(6, Math.min(18, 6 + degree * 1.5));
+}
+
 // ---------------------------------------------------------------------------
 // Simple force-directed layout
 // ---------------------------------------------------------------------------
@@ -115,7 +120,6 @@ function simulateForces(
     } else {
       node.vx *= 0.6;
       node.x += node.vx;
-      node.x = Math.max(20, Math.min(width - 20, node.x));
     }
     if (node.fy !== null) {
       node.y = node.fy;
@@ -123,7 +127,6 @@ function simulateForces(
     } else {
       node.vy *= 0.6;
       node.y += node.vy;
-      node.y = Math.max(20, Math.min(height - 20, node.y));
     }
   }
 }
@@ -149,6 +152,7 @@ const GraphCanvas = memo(function GraphCanvas({ data, width, height, highlightEn
   const panStart = useRef({ x: 0, y: 0, panX: 0, panY: 0 });
   const frameRef = useRef<number>(0);
   const alphaRef = useRef(1);
+  const svgRef = useRef<SVGSVGElement>(null);
 
   // Initialize nodes
   useEffect(() => {
@@ -242,35 +246,110 @@ const GraphCanvas = memo(function GraphCanvas({ data, width, height, highlightEn
     }
   }, [pan]);
 
-  const handleWheel = useCallback((e: React.WheelEvent) => {
-    e.preventDefault();
-    setZoom((z) => Math.max(0.3, Math.min(3, z - e.deltaY * 0.001)));
-  }, []);
+  // Handle wheel zoom with non-passive listener to allow preventDefault
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
 
-  // Node radius based on degree
-  const getRadius = useCallback((degree: number) => {
-    return Math.max(6, Math.min(18, 6 + degree * 1.5));
-  }, []);
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const svgRect = svg.getBoundingClientRect();
+      const mouseX = e.clientX - svgRect.left;
+      const mouseY = e.clientY - svgRect.top;
+
+      const zoomSpeed = 0.0015;
+      const delta = -e.deltaY * zoomSpeed;
+      
+      // Use functional updates to avoid closure issues with zoom/pan
+      setZoom((prevZoom) => {
+        const newZoom = Math.max(0.1, Math.min(5, prevZoom * (1 + delta)));
+        if (newZoom !== prevZoom) {
+          const ratio = newZoom / prevZoom;
+          setPan((prevPan) => ({
+            x: mouseX - (mouseX - prevPan.x) * ratio,
+            y: mouseY - (mouseY - prevPan.y) * ratio,
+          }));
+        }
+        return newZoom;
+      });
+    };
+
+    svg.addEventListener("wheel", onWheel, { passive: false });
+    return () => svg.removeEventListener("wheel", onWheel);
+  }, []); // Empty deps because we use functional state updates
+
+  const fitToScreen = useCallback(() => {
+    if (nodes.length === 0) return;
+
+    // Calculate bounding box of nodes
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    nodes.forEach((n) => {
+      const r = getRadius(n.degree);
+      minX = Math.min(minX, n.x - r);
+      minY = Math.min(minY, n.y - r);
+      maxX = Math.max(maxX, n.x + r);
+      maxY = Math.max(maxY, n.y + r);
+    });
+
+    const graphW = maxX - minX;
+    const graphH = maxY - minY;
+    if (graphW <= 0 || graphH <= 0) return;
+
+    // Pad the bounding box
+    const padding = 40;
+    const scaleX = (width - padding * 2) / graphW;
+    const scaleY = (height - padding * 2) / graphH;
+    const newZoom = Math.max(0.2, Math.min(2, Math.min(scaleX, scaleY)));
+
+    // Center the graph
+    const centerX = minX + graphW / 2;
+    const centerY = minY + graphH / 2;
+    const newPanX = width / 2 - centerX * newZoom;
+    const newPanY = height / 2 - centerY * newZoom;
+
+    setZoom(newZoom);
+    setPan({ x: newPanX, y: newPanY });
+    alphaRef.current = 0.3; // Reheat simulation
+  }, [nodes, width, height]);
+
+  const zoomToPoint = useCallback((delta: number) => {
+    // Zoom toward center of SVG
+    const centerX = width / 2;
+    const centerY = height / 2;
+    const newZoom = Math.max(0.1, Math.min(5, zoom + delta));
+    const ratio = newZoom / zoom;
+
+    setPan({
+      x: centerX - (centerX - pan.x) * ratio,
+      y: centerY - (centerY - pan.y) * ratio,
+    });
+    setZoom(newZoom);
+  }, [zoom, pan, width, height]);
+
+  // Render SVG
 
   return (
     <div className="relative w-full h-full">
       {/* Zoom controls */}
       <div className="absolute top-2 right-2 z-10 flex flex-col gap-1">
         <button
-          onClick={() => setZoom((z) => Math.min(3, z + 0.2))}
+          onClick={() => zoomToPoint(0.25)}
           className="p-1.5 rounded-md border bg-background/80 backdrop-blur-sm hover:bg-muted transition-colors"
+          title="Zoom In"
         >
           <ZoomIn className="w-3.5 h-3.5" />
         </button>
         <button
-          onClick={() => setZoom((z) => Math.max(0.3, z - 0.2))}
+          onClick={() => zoomToPoint(-0.25)}
           className="p-1.5 rounded-md border bg-background/80 backdrop-blur-sm hover:bg-muted transition-colors"
+          title="Zoom Out"
         >
           <ZoomOut className="w-3.5 h-3.5" />
         </button>
         <button
-          onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }}
+          onClick={fitToScreen}
           className="p-1.5 rounded-md border bg-background/80 backdrop-blur-sm hover:bg-muted transition-colors"
+          title="Fit to Screen"
         >
           <Maximize2 className="w-3.5 h-3.5" />
         </button>
@@ -288,6 +367,7 @@ const GraphCanvas = memo(function GraphCanvas({ data, width, height, highlightEn
 
       {/* SVG Canvas */}
       <svg
+        ref={svgRef}
         width="100%"
         height="100%"
         viewBox={`0 0 ${width} ${height}`}
@@ -297,7 +377,6 @@ const GraphCanvas = memo(function GraphCanvas({ data, width, height, highlightEn
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
-        onWheel={handleWheel}
       >
         <g transform={`translate(${pan.x},${pan.y}) scale(${zoom})`}>
           {/* Edges */}

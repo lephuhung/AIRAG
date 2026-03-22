@@ -321,6 +321,8 @@ class HunyuanOCRService:
             return self._llm, self._processor, self._sampling_params
 
         try:
+            import os
+            os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
             from vllm import LLM, SamplingParams
             from transformers import AutoProcessor
         except ImportError as e:
@@ -349,6 +351,7 @@ class HunyuanOCRService:
             trust_remote_code=True,
             tensor_parallel_size=1,
             gpu_memory_utilization=gpu_mem,
+            enforce_eager=True,
         )
         if max_model_len is not None:
             llm_kwargs["max_model_len"] = max_model_len

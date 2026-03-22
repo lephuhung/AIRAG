@@ -1,2 +1,0 @@
-Requirement already satisfied: pgvector in ./.venv/lib/python3.12/site-packages (0.4.2)
-Requirement already satisfied: numpy in ./.venv/lib/python3.12/site-packages (from pgvector) (2.2.6)

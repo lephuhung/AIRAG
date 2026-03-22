@@ -56,6 +56,36 @@ SSE_HEARTBEAT_INTERVAL = 15  # seconds
 _CITATION_ID_CHARS = string.ascii_lowercase + string.digits
 
 
+# ---------------------------------------------------------------------------
+# Memory Extraction Agent
+# ---------------------------------------------------------------------------
+
+_MEMORY_EXTRACTION_PROMPT = (
+    "You are a memory assistant that extracts personal facts about a HUMAN USER from their message.\n\n"
+    "CRITICAL RULES:\n"
+    "- You MUST only extract information that the HUMAN USER explicitly states about themselves.\n"
+    "- NEVER extract statements made by an AI assistant or chatbot.\n"
+    "- REJECT any statement starting with phrases like 'Tôi là trợ lý', 'Tôi là một AI', 'I am an AI', "
+    "'I am a chatbot', 'As an assistant', 'Là một trợ lý AI'.\n"
+    "- NEVER extract generic greetings, chatbot self-introductions, or conversational filler.\n"
+    "- If the message is from an AI/chatbot, return exactly: []\n\n"
+    "Extract ONLY if the user says things like:\n"
+    "- Their name: 'Tôi tên là X', 'My name is X'\n"
+    "- Their job or workplace: 'Tôi làm việc tại X', 'I work at X'\n"
+    "- Their location: 'Tôi ở X', 'I live in X'\n"
+    "- Their devices or tools: 'Tôi dùng iPhone 16', 'Tôi dùng MacBook'\n"
+    "- Their preferences: 'Tôi thích X', 'I prefer X'\n"
+    "- Direct instructions: 'Hãy gọi tôi là X', 'Always respond in Vietnamese'\n\n"
+    "Target Categories:\n"
+    "1. fact: Permanent information (name, job, location, devices).\n"
+    "2. preference: Likes, dislikes, styles.\n"
+    "3. instruction: Direct rules for the assistant.\n\n"
+    "Output format: JSON array only. No explanation. Example:\n"
+    '[{"content": "User works at Công an Hà Tĩnh", "category": "fact", "importance": 8}]\n'
+    "If nothing is worth extracting: []"
+)
+
+
 def _generate_citation_id(existing: set[str]) -> str:
     """Generate a unique 4-char alphanumeric citation ID."""
     while True:
@@ -101,37 +131,6 @@ def _get_gemini_tool():
                 "required": ["query"],
             },
         ),
-        types.FunctionDeclaration(
-            name="manage_memory",
-            description=(
-                "Save or query persistent facts about the user across sessions. "
-                "Use 'save' when the user shares preferences, personal info, or instructions. "
-                "Use 'query' when answering questions that may relate to the user's past interactions or preferences. "
-                "Do NOT save trivial or one-time information."
-            ),
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "action": {
-                        "type": "STRING",
-                        "description": "'save' to store a new fact, 'query' to search past facts.",
-                    },
-                    "content": {
-                        "type": "STRING",
-                        "description": "For save: the fact to remember. For query: the search query.",
-                    },
-                    "category": {
-                        "type": "STRING",
-                        "description": "Category: preference, fact, or instruction. Default: fact.",
-                    },
-                    "importance": {
-                        "type": "INTEGER",
-                        "description": "Importance score 1-10. Default: 5.",
-                    },
-                },
-                "required": ["action", "content"],
-            },
-        ),
     ])
 
 
@@ -170,44 +169,7 @@ def _get_openai_tools() -> list:
                 },
             },
         },
-        {
-            "type": "function",
-            "function": {
-                "name": "manage_memory",
-                "description": (
-                    "Save or query persistent facts about the user across sessions. "
-                    "Use 'save' when the user shares preferences, personal info, or instructions. "
-                    "Use 'query' when answering questions that may relate to the user's past "
-                    "interactions or preferences. Do NOT save trivial or one-time information."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": ["save", "query"],
-                            "description": "'save' to store a new fact, 'query' to search past facts.",
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "For save: the fact to remember. For query: the search query.",
-                        },
-                        "category": {
-                            "type": "string",
-                            "enum": ["preference", "fact", "instruction"],
-                            "description": "Category of the memory. Default: fact.",
-                        },
-                        "importance": {
-                            "type": "integer",
-                            "description": "Importance score 1-10. Default: 5.",
-                        },
-                    },
-                    "required": ["action", "content"],
-                },
-            },
-        },
     ]
-
 
 
 # ---------------------------------------------------------------------------
@@ -217,20 +179,11 @@ def _get_openai_tools() -> list:
 OLLAMA_TOOL_SYSTEM = """\
 ## TOOLS
 
-You have TWO tools: search_documents and manage_memory.
+You have ONE tool: search_documents.
 
-### Tool 1: search_documents
+### Tool: search_documents
 Call it by outputting EXACTLY:
 <tool_call>{"name": "search_documents", "arguments": {"query": "<rewritten query>"}}</tool_call>
-
-### Tool 2: manage_memory
-Call it to save or query persistent user facts:
-<tool_call>{"name": "manage_memory", "arguments": {"action": "save", "content": "User prefers table format", "category": "preference"}}</tool_call>
-<tool_call>{"name": "manage_memory", "arguments": {"action": "query", "content": "user preferences"}}</tool_call>
-
-Use `save` when the user shares preferences, personal info, or instructions.
-Use `query` when answering questions that may relate to past interactions.
-Do NOT mention the memory tool to the user.
 
 ### ABSOLUTE RULES (violations are FATAL errors)
 
@@ -252,8 +205,6 @@ Do NOT mention the memory tool to the user.
 
 4. After receiving search results, answer using ONLY those sources with citations.
    Format: claim text[source_id]. Example: Doanh thu đạt 4.850 tỷ VNĐ[id12].
-
-5. You may call manage_memory AFTER answering if the user shared important preferences.
 """
 
 OLLAMA_TOOL_REMINDER = (
@@ -262,9 +213,6 @@ OLLAMA_TOOL_REMINDER = (
     "Exception: simple greetings, thanks, or farewells do NOT require a tool call — respond directly. "
     "For everything else, searching is MANDATORY. "
     "When answering from search results, use the provided source IDs for citations (e.g., [id12]).\n"
-    "You also have manage_memory: "
-    "<tool_call>{\"name\": \"manage_memory\", \"arguments\": {\"action\": \"save\", \"content\": \"...\"}}</tool_call> "
-    "Use it to save important user preferences or query past interactions."
 )
 
 # ---------------------------------------------------------------------------
@@ -275,16 +223,10 @@ GEMINI_TOOL_SYSTEM = """\
 
 ## Tool Usage (MANDATORY)
 
-You have two tools: `search_documents` and `manage_memory`.
+You have one tool: `search_documents`.
 
 ### search_documents
 Searches the knowledge base for relevant document sections.
-
-### manage_memory
-Saves or queries persistent facts about the user across sessions.
-- Use `save` when the user shares preferences, personal info, or instructions.
-- Use `query` when answering questions about past interactions or user preferences.
-- Do NOT mention this tool to the user.
 
 ### ABSOLUTE RULES:
 1. For ALL user questions, requests, factual queries, or analysis — you MUST call \
@@ -301,13 +243,11 @@ match the search results.
 Your previous answers may contain outdated or incomplete information.
 5. NEVER reuse citation IDs from previous answers. Each answer must have its own \
 fresh sources from a new search.
-5. Rewrite the user's query to be specific and detailed for better retrieval.
-6. You may call `manage_memory(action="save")` after answering if the user shared important preferences.
+6. Rewrite the user's query to be specific and detailed for better retrieval.
 """
 
 NATIVE_TOOL_REMINDER = (
     "\n\n[SYSTEM REMINDER] You MUST call the `search_documents` tool before answering this query. "
-    "If the user shared important personal info or preferences, also call `manage_memory` to save it."
 )
 
 
@@ -685,21 +625,49 @@ async def _search_memories(
     return "\n".join([f"- [{m.category}] {m.content}" for m in memories])
 
 
-# Patterns that indicate the user is sharing save-worthy information
-_SAVE_TRIGGERS_VI = [
-    "tôi thích", "tôi muốn", "tôi cần", "tôi là", "tên tôi là",
-    "hãy nhớ", "hãy ghi nhớ", "luôn luôn", "luôn trả lời",
-    "tôi ưa", "tôi không thích", "tôi ghét",
-    "tôi làm việc", "tôi sống", "tôi học",
-    "từ giờ", "từ nay", "mặc định",
-]
-_SAVE_TRIGGERS_EN = [
-    "i prefer", "i like", "i want", "i need", "i am", "my name is",
-    "remember that", "always answer", "always respond", "always use",
-    "i don't like", "i hate", "i dislike",
-    "i work at", "i live in", "i study",
-    "from now on", "by default",
-]
+
+# ---------------------------------------------------------------------------
+# Memory Extraction Agent
+
+async def _extract_facts_with_llm(message: str) -> list[dict]:
+    """Use the Memory Agent (small LLM) to extract structured facts from user message."""
+    from app.services.llm import get_memory_agent
+    import json
+
+    agent = get_memory_agent()
+    system_msg = LLMMessage(role="system", content=_MEMORY_EXTRACTION_PROMPT)
+    user_msg = LLMMessage(role="user", content=f"User Message: {message}")
+
+    try:
+        response = ""
+        async for chunk in agent.astream([system_msg, user_msg]):
+            if chunk.text:
+                response += chunk.text
+
+        # Clean up JSON if LLM added markdown wrappers
+        response = response.strip()
+        if "```json" in response:
+            response = response.split("```json")[-1].split("```")[0].strip()
+        elif "```" in response:
+            # Handle generic markdown block
+            parts = response.split("```")
+            if len(parts) >= 3:
+                response = parts[1].strip()
+            else:
+                response = response.strip("`").strip()
+
+        if not response or response == "[]":
+            return []
+
+        facts = json.loads(response)
+        if isinstance(facts, list):
+            return facts
+        elif isinstance(facts, dict):
+            return [facts]
+        return []
+    except Exception as e:
+        logger.error(f"Memory extraction failed (Ollama error or invalid JSON): {e}")
+        return []
 
 
 async def _auto_save_memory(
@@ -708,46 +676,28 @@ async def _auto_save_memory(
     session_id: Optional[str],
     db: AsyncSession,
 ) -> None:
-    """Detect and save user preferences/facts from the message automatically."""
-    msg_lower = message.lower().strip()
-
-    # Skip very short messages or obvious greetings
-    if len(msg_lower) < 10:
+    """Detect and save user preferences/facts using AI extraction."""
+    # Skip very short messages
+    if len(message.strip()) < 10:
         return
 
-    # Check if the message contains any save-worthy triggers
-    matched = False
-    category = "fact"
-    importance = 5
-
-    for trigger in _SAVE_TRIGGERS_VI + _SAVE_TRIGGERS_EN:
-        if trigger in msg_lower:
-            matched = True
-            if trigger in ("tôi thích", "tôi ưa", "i prefer", "i like",
-                          "tôi không thích", "tôi ghét", "i don't like", "i hate", "i dislike"):
-                category = "preference"
-                importance = 7
-            elif trigger in ("hãy nhớ", "hãy ghi nhớ", "remember that",
-                           "luôn luôn", "luôn trả lời", "always answer",
-                           "always respond", "always use", "từ giờ", "từ nay",
-                           "from now on", "by default", "mặc định"):
-                category = "instruction"
-                importance = 8
-            break
-
-    if not matched:
+    facts = await _extract_facts_with_llm(message)
+    if not facts:
         return
 
-    # Save the message as a memory
-    result = await _save_memory(
-        user_id=user_id,
-        content=message,
-        category=category,
-        importance=importance,
-        session_id=session_id,
-        db=db,
-    )
-    logger.info(f"Auto-saved memory for user {user_id}: {result}")
+    for fact in facts:
+        content = fact.get("content")
+        category = fact.get("category", "fact")
+        importance = fact.get("importance", 5)
+
+        if not content:
+            continue
+
+        try:
+            await _save_memory(user_id, content, category, importance, session_id, db)
+            logger.info(f"Auto-saved {category} for user {user_id}: {content[:50]}...")
+        except Exception as e:
+            logger.error(f"Failed to auto-save memory: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -844,7 +794,8 @@ async def agent_chat_stream(
                 "combining data from MULTIPLE sources.\n"
                 "- TABLE DATA: Sources may contain table data as 'Key, Year = Value' pairs. "
                 "Example: 'ROE, 2023 = 12,8%' means ROE was 12.8% in 2023.\n"
-                "- If no source contains relevant information, say: "
+                "- If no source contains relevant information, check if your User Context has the answer.\n"
+                "- If neither sources nor User Context have the answer, say: "
                 "\"Tài liệu không chứa thông tin này.\"\n",
             ]
             tool_result_content = "\n".join(tool_result_parts)
@@ -971,7 +922,8 @@ async def agent_chat_stream(
                     "combining data from MULTIPLE sources.\n"
                     "- TABLE DATA: Sources may contain table data as 'Key, Year = Value' pairs. "
                     "Example: 'ROE, 2023 = 12,8%' means ROE was 12.8% in 2023.\n"
-                    "- If no source contains relevant information, say: "
+                    "- If no source contains relevant information, check if your User Context has the answer.\n"
+                    "- If neither sources nor User Context have the answer, say: "
                     "\"Tài liệu không chứa thông tin này.\"\n",
                 ]
                 tool_result_content = "\n".join(tool_result_parts)
@@ -1064,68 +1016,6 @@ async def agent_chat_stream(
                     "step": "generating",
                     "detail": "Generating answer..."
                 }}
-            elif fc_name == "manage_memory":
-                action = fc_args.get("action", "query")
-                content = fc_args.get("content", "")
-                category = fc_args.get("category", "fact")
-                importance = int(fc_args.get("importance", 5))
-
-                if not user_id:
-                    tool_result = "Memory not available (no user context)."
-                elif action == "save":
-                    yield {"event": "status", "data": {
-                        "step": "memory",
-                        "detail": "Saving to memory..."
-                    }}
-                    tool_result = await _save_memory(
-                        user_id, content, category, importance, session_id, db,
-                    )
-                elif action == "query":
-                    yield {"event": "status", "data": {
-                        "step": "memory",
-                        "detail": "Searching memory..."
-                    }}
-                    tool_result = await _search_memories(user_id, content, db)
-                else:
-                    tool_result = f"Unknown memory action: {action}"
-
-                # Feed result back to LLM
-                if is_gemini:
-                    from google.genai import types as _gtypes
-                    raw_content = getattr(provider, "last_response_content", None)
-                    if raw_content:
-                        messages.append(LLMMessage(
-                            role="assistant", content="",
-                            _raw_provider_content=raw_content,
-                        ))
-                    else:
-                        messages.append(LLMMessage(
-                            role="assistant",
-                            content=f'[Called manage_memory(action="{action}", content="{content[:60]}")]',
-                        ))
-                    func_resp_parts = [_gtypes.Part.from_function_response(
-                        name="manage_memory",
-                        response={"result": tool_result},
-                    )]
-                    func_resp_content = _gtypes.Content(role="user", parts=func_resp_parts)
-                    messages.append(LLMMessage(
-                        role="user", content="",
-                        _raw_provider_content=func_resp_content,
-                    ))
-                else:
-                    messages.append(LLMMessage(
-                        role="assistant",
-                        content=f'[Called manage_memory(action="{action}", content="{content[:60]}")]',
-                    ))
-                    messages.append(LLMMessage(
-                        role="user",
-                        content=f"Memory result: {tool_result}",
-                    ))
-
-                yield {"event": "status", "data": {
-                    "step": "generating",
-                    "detail": "Generating answer..."
-                }}
             else:
                 # Unknown tool — treat accumulated text as answer
                 logger.warning(f"Unknown tool call: {fc_name}")
@@ -1171,7 +1061,8 @@ async def agent_chat_stream(
                 "=== END SOURCES ===\n",
                 "IMPORTANT:\n"
                 "- Read EVERY source above carefully.\n"
-                "- If no source contains relevant information, say: "
+                "- If no source contains relevant information, check if your User Context has the answer.\n"
+                "- If neither sources nor User Context have the answer, say: "
                 "\"Tài liệu không chứa thông tin này.\"\n",
             ]
             fallback_content = "\n".join(fallback_parts)
@@ -1229,9 +1120,19 @@ async def agent_chat_stream(
     # ── Auto-save: detect and save user preferences/facts ────────────────
     if user_id and message:
         try:
-            await _auto_save_memory(user_id, message, session_id, db)
+            from app.core.database import async_session_maker
+            async def _bg_save():
+                try:
+                    async with async_session_maker() as bg_db:
+                        await _auto_save_memory(user_id, message, session_id, bg_db)
+                        await bg_db.commit()
+                except Exception as e:
+                    logger.warning(f"Background auto-save failed: {e}")
+            
+            import asyncio
+            asyncio.create_task(_bg_save())
         except Exception as e:
-            logger.warning(f"Auto-save memory failed: {e}")
+            logger.warning(f"Auto-save memory task spawn failed: {e}")
 
 
 # ---------------------------------------------------------------------------

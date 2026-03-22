@@ -920,7 +920,8 @@ async def debug_chat(
         "in any source. If a source contains 'Key = Value', report that value.\n"
         "- Only say information is unavailable when you have checked ALL sources "
         "and none contains the answer.\n"
-        "- If no source is relevant at all, say: "
+        "- If no source contains relevant information, check if your User Context has the answer.\n"
+        "- If neither sources nor User Context have the answer, say: "
         "\"Tài liệu không chứa thông tin này.\" without any citations.\n"
         "- Answer in the same language as my question.\n"
     )

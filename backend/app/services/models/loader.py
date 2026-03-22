@@ -41,6 +41,22 @@ def preload_retrieval_models() -> None:
     elapsed = time.time() - t0
     logger.info(f"[preload] Retrieval models loaded in {elapsed:.1f}s")
 
+    # 3. Memory Agent (Qwen3.5 via local vLLM — used by chat_agent for memory extraction)
+    from app.core.config import settings
+    if settings.MEMORY_AGENT_LOCAL:
+        try:
+            t1 = time.time()
+            logger.info("[preload] Loading Memory Agent model …")
+            from app.services.llm import get_memory_agent
+            agent = get_memory_agent()
+            # Trigger the lazy vLLM engine load
+            from app.services.llm.vllm_local import LocalVLLMProvider
+            if isinstance(agent, LocalVLLMProvider):
+                agent._get_engine()
+            logger.info(f"[preload] Memory Agent ready ({settings.MEMORY_AGENT_MODEL}) in {time.time() - t1:.1f}s")
+        except Exception as e:
+            logger.warning(f"[preload] Memory Agent pre-load failed (non-fatal): {e}")
+
 
 def preload_worker_models(worker_type: str) -> None:
     """Eagerly load models specific to a worker type.
@@ -54,6 +70,7 @@ def preload_worker_models(worker_type: str) -> None:
     if worker_type == "parse":
         # Docling pipeline and (optionally) the local OCR model
         _preload_docling()
+        _preload_ocr()
 
     elif worker_type == "embed":
         # Embedding model (same as retrieval)
@@ -104,3 +121,25 @@ def _preload_docling() -> None:
         logger.info("[preload] Docling converter initialized")
     except Exception as e:
         logger.warning(f"[preload] Docling pre-load failed (non-fatal): {e}")
+
+
+def _preload_ocr() -> None:
+    """Pre-initialize the local HunyuanOCR vLLM engine so first parse is fast."""
+    from app.core.config import settings
+
+    if not settings.NEXUSRAG_OCR_LOCAL:
+        logger.info("[preload] OCR is remote (NEXUSRAG_OCR_LOCAL=false) — skipping")
+        return
+
+    try:
+        t0 = time.time()
+        logger.info("[preload] Loading local OCR model (HunyuanOCR) …")
+        from app.services.ocr_service import HunyuanOCRService
+        svc = HunyuanOCRService()
+        # Trigger the lazy vLLM engine load
+        svc._get_local_llm()
+        elapsed = time.time() - t0
+        logger.info(f"[preload] OCR model ready ({settings.HUNYUAN_OCR_MODEL}) in {elapsed:.1f}s")
+    except Exception as e:
+        logger.warning(f"[preload] OCR pre-load failed (non-fatal): {e}")
+

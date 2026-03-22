@@ -177,6 +177,9 @@ class OpenAICompatibleLLMProvider(LLMProvider):
             think_buffer = ""
             in_think = False
 
+            # Buffer for text that comes before a tool call in native OpenAI mode
+            pre_tool_text = ""
+
             stream = await client.chat.completions.create(**kwargs)
             async for chunk in stream:
                 delta = chunk.choices[0].delta if chunk.choices else None
@@ -185,6 +188,9 @@ class OpenAICompatibleLLMProvider(LLMProvider):
 
                 # Handle native tool_calls (OpenAI function calling)
                 if delta.tool_calls:
+                    if pre_tool_text.strip():
+                        yield StreamChunk(type="thinking", text=pre_tool_text)
+                        pre_tool_text = ""
                     for tc in delta.tool_calls:
                         if tc.function:
                             try:
@@ -203,6 +209,13 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                 content = delta.content or ""
                 if not content:
                     continue
+
+                # Buffer content in case it's followed by a tool_call in the same turn
+                pre_tool_text += content
+                
+                # We yield it normally, but if a tool_call follows, we've already yielded it.
+                # Actually, the best way in native mode is to yield AFTER checking tool_calls
+                # but chunks come sequentially. 
 
                 # Handle <think>...</think> inline tags (e.g. QwQ, DeepSeek-R1)
                 if in_think:
@@ -283,7 +296,10 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                     trigger = "<tool_call>" if "<tool_call>" in content else "<function="
                     before, rest = content.split(trigger, 1)
                     if before.strip() and before.strip() != "\n":
-                        yield StreamChunk(type="text", text=before)
+                        # Crucial FIX: If a tool call is about to happen, any text BEFORE it 
+                        # should be treated as thinking/reasoning, NOT as the final answer.
+                        # This prevents "hallucinated" answers from appearing before tool results.
+                        yield StreamChunk(type="thinking", text=before)
                     in_tool_call = True
                     tool_buffer = trigger + rest
                     

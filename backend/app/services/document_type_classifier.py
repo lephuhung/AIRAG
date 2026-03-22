@@ -271,22 +271,25 @@ async def classify_with_llm(markdown_text: str) -> str | None:
     Returns:
         Matching slug, or None if LLM also cannot classify.
     """
-    from app.services.llm import get_llm_provider
+    from app.services.llm import get_memory_agent
     from app.services.llm.types import LLMMessage
 
     try:
-        llm = get_llm_provider()
-        preview = markdown_text[:1000].strip()
+        # Use the dedicated memory agent (e.g. Qwen3.5-0.8B) for classification
+        llm = get_memory_agent()
+        preview = markdown_text[:1500].strip()  # Increased preview length for better context
         messages: list[LLMMessage] = [
-            LLMMessage(role="user", content=f"Nội dung văn bản:\n\n{preview}")
+            LLMMessage(role="user", content=f"Nội dung văn bản (markdown):\n\n{preview}")
         ]
         result = await llm.acomplete(
             messages,
             system_prompt=_LLM_SYSTEM_PROMPT,
-            temperature=0.0,
-            max_tokens=32,
+            temperature=0.1,
+            max_tokens=20,
         )
-        slug = result.strip().lower() if isinstance(result, str) else result.content.strip().lower()
+        # Handle both string and content object results
+        content_str = result if isinstance(result, str) else result.content
+        slug = content_str.strip().lower() if content_str else ""
         # Sanitise: remove surrounding punctuation/whitespace
         slug = re.sub(r"[^a-z_]", "", slug)
         if slug in _VALID_SLUGS:

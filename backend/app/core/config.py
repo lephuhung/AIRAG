@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     OLLAMA_HOST: str = Field(default="http://localhost:11434")
     OLLAMA_MODEL: str = Field(default="gemma3:12b")
     OLLAMA_ENABLE_THINKING: bool = Field(default=False)
+    MEMORY_AGENT_MODEL: str = Field(default="Qwen/Qwen3.5-0.8B")
+    MEMORY_AGENT_BASE_URL: str = Field(default="http://10.8.0.8:8001/v1")
+    MEMORY_AGENT_API_KEY: str = Field(default="none")
+    MEMORY_AGENT_LOCAL: bool = Field(default=True)
+    MEMORY_AGENT_GPU_UTILIZATION: float = Field(default=0.10)
+    MEMORY_AGENT_CUDA_DEVICE: str = Field(default="auto")
 
     # OpenAI-compatible provider (vLLM, LM Studio, llama.cpp, etc.)
     OPENAI_COMPATIBLE_BASE_URL: str = Field(default="http://127.0.0.1:8000/v1")
