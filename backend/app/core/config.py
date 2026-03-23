@@ -72,6 +72,13 @@ class Settings(BaseSettings):
     # Chunking
     HRAG_CHUNK_MAX_TOKENS: int = Field(default=512)
 
+    # Contextual Embeddings (Anthropic-style: prepend LLM-generated context before embedding)
+    # Reduces retrieval failure rate by ~35-49% at the cost of extra LLM calls during indexing.
+    # Uses the memory agent (Qwen3-4B) — no extra model needed.
+    HRAG_ENABLE_CONTEXTUAL_EMBEDDINGS: bool = Field(default=False)
+    HRAG_CONTEXTUAL_MAX_TOKENS: int = Field(default=120)   # max tokens for generated context sentence
+    HRAG_CONTEXTUAL_CONCURRENCY: int = Field(default=8)    # parallel LLM calls per document
+
     # Knowledge Graph
     HRAG_KG_LANGUAGE: str = Field(default="Vietnamese")
     HRAG_KG_ENTITY_TYPES: list[str] = Field(default=[
