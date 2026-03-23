@@ -1,4 +1,5 @@
 import { memo, useState, useCallback } from "react";
+import { useTranslation } from "@/hooks/useTranslation";
 import {
   ArrowRight,
   RefreshCw,
@@ -26,6 +27,7 @@ import type { QueueInfo, PipelineDocument, DocumentStatus } from "@/types";
 // Queue Health Card
 // ---------------------------------------------------------------------------
 function QueueCard({ queue }: { queue: QueueInfo }) {
+  const { t } = useTranslation();
   const hasConsumers = queue.consumers > 0;
   const hasBacklog = queue.messages_ready > 10;
 
@@ -42,7 +44,7 @@ function QueueCard({ queue }: { queue: QueueInfo }) {
       : "bg-primary";
 
   // Extract short name: "nexusrag.parse" → "parse"
-  const shortName = queue.name.replace("nexusrag.", "").split(".")[0];
+  const shortName = queue.name.replace("hrag.", "").split(".")[0];
 
   return (
     <div className={cn("rounded-lg border px-3 py-2.5 space-y-1.5", statusColor)}>
@@ -61,19 +63,19 @@ function QueueCard({ queue }: { queue: QueueInfo }) {
 
       <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[10px]">
         <div className="flex justify-between">
-          <span className="text-muted-foreground">Ready</span>
+          <span className="text-muted-foreground">{t("pipeline.stats.ready")}</span>
           <span className="font-medium">{queue.messages_ready}</span>
         </div>
         <div className="flex justify-between">
-          <span className="text-muted-foreground">In-flight</span>
+          <span className="text-muted-foreground">{t("pipeline.stats.inflight")}</span>
           <span className="font-medium">{queue.messages_unacked}</span>
         </div>
         <div className="flex justify-between">
-          <span className="text-muted-foreground">In/s</span>
+          <span className="text-muted-foreground">{t("pipeline.stats.in_s")}</span>
           <span className="font-medium">{queue.message_rate_in.toFixed(1)}</span>
         </div>
         <div className="flex justify-between">
-          <span className="text-muted-foreground">Out/s</span>
+          <span className="text-muted-foreground">{t("pipeline.stats.out_s")}</span>
           <span className="font-medium">{queue.message_rate_out.toFixed(1)}</span>
         </div>
       </div>
@@ -84,18 +86,19 @@ function QueueCard({ queue }: { queue: QueueInfo }) {
 // ---------------------------------------------------------------------------
 // Pipeline Status Flow
 // ---------------------------------------------------------------------------
-const PIPELINE_STAGES: { key: string; label: string; color: string }[] = [
-  { key: "pending", label: "Pending", color: "bg-muted text-muted-foreground" },
-  { key: "parsing", label: "Parsing", color: "bg-blue-400/15 text-blue-400" },
-  { key: "ocring", label: "OCR", color: "bg-indigo-400/15 text-indigo-400" },
-  { key: "chunking", label: "Chunking", color: "bg-cyan-400/15 text-cyan-400" },
-  { key: "embedding", label: "Embedding", color: "bg-amber-400/15 text-amber-400" },
-  { key: "building_kg", label: "Building KG", color: "bg-violet-400/15 text-violet-400" },
-  { key: "indexed", label: "Indexed", color: "bg-primary/15 text-primary" },
-  { key: "failed", label: "Failed", color: "bg-destructive/15 text-destructive" },
-];
-
 function PipelineFlow({ summary }: { summary: Record<string, number> | { [K: string]: number } }) {
+  const { t } = useTranslation();
+  const PIPELINE_STAGES: { key: string; label: string; color: string }[] = [
+    { key: "pending", label: t("common.pending"), color: "bg-muted text-muted-foreground" },
+    { key: "parsing", label: t("files.status.parsing"), color: "bg-blue-400/15 text-blue-400" },
+    { key: "ocring", label: t("files.status.ocring"), color: "bg-indigo-400/15 text-indigo-400" },
+    { key: "chunking", label: t("files.status.chunking"), color: "bg-cyan-400/15 text-cyan-400" },
+    { key: "embedding", label: t("files.status.embedding"), color: "bg-amber-400/15 text-amber-400" },
+    { key: "building_kg", label: t("files.status.building_kg"), color: "bg-violet-400/15 text-violet-400" },
+    { key: "indexed", label: t("files.status.indexed"), color: "bg-primary/15 text-primary" },
+    { key: "failed", label: t("common.error"), color: "bg-destructive/15 text-destructive" },
+  ];
+
   return (
     <div className="flex items-center gap-1 flex-wrap">
       {PIPELINE_STAGES.map((stage, i) => {
@@ -209,11 +212,12 @@ function ActiveDocuments({
   onRetry: (id: number) => void;
   retryingId: number | null;
 }) {
+  const { t } = useTranslation();
   if (documents.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-8 text-muted-foreground">
         <CheckCircle2 className="w-8 h-8 mb-2 opacity-40" />
-        <p className="text-xs">No active pipeline documents</p>
+        <p className="text-xs">{t("pipeline.no_active")}</p>
       </div>
     );
   }
@@ -267,7 +271,7 @@ function ActiveDocuments({
               ) : (
                 <RefreshCw className="w-3 h-3" />
               )}
-              Retry
+              {t("pipeline.retry")}
             </button>
           )}
         </div>
@@ -286,6 +290,7 @@ interface PipelinePanelProps {
 export const PipelinePanel = memo(function PipelinePanel({
   workspaceId,
 }: PipelinePanelProps) {
+  const { t } = useTranslation();
   const { data: overview, isLoading: overviewLoading } = useWorkerOverview();
   const { data: pipelineData, isLoading: pipelineLoading } =
     usePipelineDocuments(workspaceId);
@@ -312,7 +317,7 @@ export const PipelinePanel = memo(function PipelinePanel({
 
   const handlePurge = useCallback(
     (queueName: string) => {
-      if (!confirm(`Purge all pending messages from ${queueName}? This cannot be undone.`)) {
+      if (!confirm(t("pipeline.purge_confirm", { queue: queueName }))) {
         return;
       }
       setPurgeTarget(queueName);
@@ -343,16 +348,16 @@ export const PipelinePanel = memo(function PipelinePanel({
           {overview?.rabbitmq_connected ? (
             <div className="flex items-center gap-1.5 text-primary text-xs">
               <Wifi className="w-3.5 h-3.5" />
-              <span className="font-medium">RabbitMQ Connected</span>
+              <span className="font-medium">{t("pipeline.rabbitmq_connected")}</span>
             </div>
           ) : (
             <div className="flex items-center gap-1.5 text-destructive text-xs">
               <WifiOff className="w-3.5 h-3.5" />
-              <span className="font-medium">RabbitMQ Disconnected</span>
+              <span className="font-medium">{t("pipeline.rabbitmq_disconnected")}</span>
             </div>
           )}
           <span className="text-[10px] text-muted-foreground ml-auto">
-            Auto-refresh 5s
+            {t("pipeline.auto_refresh", { seconds: 5 })}
           </span>
         </div>
 
@@ -360,7 +365,7 @@ export const PipelinePanel = memo(function PipelinePanel({
         {overview?.queues && overview.queues.length > 0 && (
           <div>
             <h3 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
-              Queue Health
+              {t("pipeline.queue_health")}
             </h3>
             <div className="grid grid-cols-2 gap-2">
               {overview.queues.map((q) => (
@@ -374,7 +379,7 @@ export const PipelinePanel = memo(function PipelinePanel({
         {overview?.pipeline_summary && (
           <div>
             <h3 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
-              Pipeline Status
+              {t("pipeline.pipeline_status")}
             </h3>
             <PipelineFlow summary={overview.pipeline_summary as unknown as Record<string, number>} />
           </div>
@@ -384,7 +389,7 @@ export const PipelinePanel = memo(function PipelinePanel({
         <div>
           <div className="flex items-center justify-between mb-2">
             <h3 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-              Active Documents
+              {t("pipeline.active_docs")}
             </h3>
             {failedCount > 0 && (
               <button
@@ -397,7 +402,7 @@ export const PipelinePanel = memo(function PipelinePanel({
                 ) : (
                   <RefreshCw className="w-3 h-3" />
                 )}
-                Retry All Failed ({failedCount})
+                {t("pipeline.retry_all", { count: failedCount })}
               </button>
             )}
           </div>
@@ -412,7 +417,7 @@ export const PipelinePanel = memo(function PipelinePanel({
         {overview?.queues && overview.queues.length > 0 && (
           <div>
             <h3 className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-2">
-              Queue Actions
+              {t("pipeline.queue_actions")}
             </h3>
             <div className="flex flex-wrap gap-2">
               {overview.queues.map((q) => (
@@ -427,7 +432,7 @@ export const PipelinePanel = memo(function PipelinePanel({
                   ) : (
                     <Trash2 className="w-3 h-3" />
                   )}
-                  Purge {q.name.replace("nexusrag.", "")}
+                  {t("common.purge")} {q.name.replace("hrag.", "")}
                   {q.messages_ready > 0 && (
                     <span className="bg-muted px-1 rounded-full">{q.messages_ready}</span>
                   )}
@@ -442,9 +447,9 @@ export const PipelinePanel = memo(function PipelinePanel({
           <div className="flex items-start gap-2 p-3 rounded-lg border border-amber-400/30 bg-amber-400/5">
             <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
             <div className="text-xs text-amber-400">
-              <p className="font-medium">RabbitMQ Management API is unreachable</p>
+              <p className="font-medium">{t("pipeline.rabbitmq_error")}</p>
               <p className="mt-0.5 opacity-80">
-                Queue health and worker counts are unavailable. Pipeline status from the database is still shown.
+                {t("pipeline.rabbitmq_error_desc")}
               </p>
             </div>
           </div>

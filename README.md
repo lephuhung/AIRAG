@@ -1,6 +1,6 @@
 <div align="center">
 
-# NexusRAG
+# HRAG
 
 ### Hybrid Knowledge Base with Agentic Chat, Citations & Knowledge Graph
 
@@ -13,7 +13,7 @@
 
 **Upload documents. Ask questions. Get cited answers.**
 
-NexusRAG combines vector search, knowledge graph, and cross-encoder reranking into one seamless RAG pipeline — powered by Gemini or local Ollama models.
+HRAG combines vector search, knowledge graph, and cross-encoder reranking into one seamless RAG pipeline — powered by Gemini or local Ollama models.
 
 [Features](#features) · [Quick Start](#quick-start) · [Model Recommendations](#multi-provider-llm) · [Tech Stack](#tech-stack)
 
@@ -25,7 +25,7 @@ NexusRAG combines vector search, knowledge graph, and cross-encoder reranking in
 
 <div align="center">
 
-![NexusRAG Architecture](showcase/nexusrag_architecture.jpg)
+![HRAG Architecture](showcase/nexusrag_architecture.jpg)
 
 </div>
 
@@ -33,7 +33,7 @@ NexusRAG combines vector search, knowledge graph, and cross-encoder reranking in
 
 <div align="center">
 
-![NexusRAG Demo](showcase/demo_nexus_video.gif)
+![HRAG Demo](showcase/demo_nexus_video.gif)
 
 </div>
 
@@ -41,9 +41,9 @@ NexusRAG combines vector search, knowledge graph, and cross-encoder reranking in
 
 ## Beyond Traditional RAG
 
-Most RAG systems follow a simple pipeline: split text → embed → retrieve → generate. NexusRAG goes further at every stage:
+Most RAG systems follow a simple pipeline: split text → embed → retrieve → generate. HRAG goes further at every stage:
 
-| Aspect | Traditional RAG | NexusRAG |
+| Aspect | Traditional RAG | HRAG |
 |---|---|---|
 | **Document Parsing** | Plain text extraction, structure lost | Docling: preserves headings, page boundaries, formulas, layout |
 | **Images & Tables** | Ignored entirely | Extracted, captioned by vision LLM, embedded as searchable vectors |
@@ -62,7 +62,7 @@ Most RAG systems follow a simple pipeline: split text → embed → retrieve →
 <details>
 <summary><b>Deep Document Parsing (Docling)</b></summary>
 
-NexusRAG uses [Docling](https://github.com/docling-project/docling) for structural document understanding — not just text extraction:
+HRAG uses [Docling](https://github.com/docling-project/docling) for structural document understanding — not just text extraction:
 
 - **Structural preservation** — Heading hierarchy (`H1 > H2 > H3`), page boundaries, paragraph grouping
 - **Formula enrichment** — LaTeX math notation preserved during conversion
@@ -299,8 +299,8 @@ The chat system uses a semi-agentic architecture with real-time SSE streaming:
 ### Option A: Docker (Full Stack)
 
 ```bash
-git clone https://github.com/LeDat98/NexusRAG.git
-cd NexusRAG
+git clone https://github.com/LeDat98/HRAG.git
+cd HRAG
 cp .env.example .env
 # Edit .env — set GOOGLE_AI_API_KEY (or switch to Ollama)
 docker compose up -d
@@ -311,8 +311,8 @@ First build takes ~5-10 minutes (downloads ML models ~2.5GB). Open http://localh
 ### Option B: Local Development
 
 ```bash
-git clone https://github.com/LeDat98/NexusRAG.git
-cd NexusRAG
+git clone https://github.com/LeDat98/HRAG.git
+cd HRAG
 ./setup.sh
 ```
 
@@ -373,14 +373,14 @@ cp .env.example .env
 
 | Variable | Default | Description |
 |---|---|---|
-| `NEXUSRAG_EMBEDDING_MODEL` | `BAAI/bge-m3` | Embedding model (1024-dim) |
-| `NEXUSRAG_RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` | Cross-encoder reranker |
-| `NEXUSRAG_VECTOR_PREFETCH` | `20` | Candidates before reranking |
-| `NEXUSRAG_RERANKER_TOP_K` | `8` | Final results after reranking |
-| `NEXUSRAG_ENABLE_KG` | `true` | Enable knowledge graph extraction |
-| `NEXUSRAG_ENABLE_IMAGE_EXTRACTION` | `true` | Extract images from documents |
-| `NEXUSRAG_ENABLE_IMAGE_CAPTIONING` | `true` | LLM-caption images for search |
-| `NEXUSRAG_KG_LANGUAGE` | `Vietnamese` | KG extraction language |
+| `HRAG_EMBEDDING_MODEL` | `BAAI/bge-m3` | Embedding model (1024-dim) |
+| `HRAG_RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` | Cross-encoder reranker |
+| `HRAG_VECTOR_PREFETCH` | `20` | Candidates before reranking |
+| `HRAG_RERANKER_TOP_K` | `8` | Final results after reranking |
+| `HRAG_ENABLE_KG` | `true` | Enable knowledge graph extraction |
+| `HRAG_ENABLE_IMAGE_EXTRACTION` | `true` | Extract images from documents |
+| `HRAG_ENABLE_IMAGE_CAPTIONING` | `true` | LLM-caption images for search |
+| `HRAG_KG_LANGUAGE` | `Vietnamese` | KG extraction language |
 
 </details>
 
@@ -438,7 +438,7 @@ All endpoints prefixed with `/api/v1`. Interactive docs at http://localhost:8080
 
 <div align="center">
 
-⭐ If you find NexusRAG useful, please consider giving it a **star** — it helps others discover the project and motivates continued development!
+⭐ If you find HRAG useful, please consider giving it a **star** — it helps others discover the project and motivates continued development!
 
 MIT License &copy; 2026 Le Duc Dat
 

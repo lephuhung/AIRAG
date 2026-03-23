@@ -10,10 +10,12 @@ import { useChatSessions, useCreateChatSession } from "@/hooks/useChatSessions";
 import { ChatPanel } from "@/components/rag/ChatPanel";
 import { DocumentViewer } from "@/components/rag/DocumentViewer";
 import { useWorkspaceStore } from "@/stores/workspaceStore";
+import { useTranslation } from "@/hooks/useTranslation";
 
 export function ChatPage() {
   const { sessionId: sessionIdStr } = useParams<{ sessionId: string }>();
   const navigate = useNavigate();
+  const { t } = useTranslation();
 
   const currentSessionId = sessionIdStr || null;
   // -- Store --
@@ -50,10 +52,10 @@ export function ChatPage() {
   // -- Handlers --
   const handleNewSession = async () => {
     try {
-      const newSession = await createSession.mutateAsync({ title: "New Chat" });
+      const newSession = await createSession.mutateAsync({ title: t("nav.new_chat") });
       navigate(`/chat/${newSession.id}`);
     } catch (error) {
-      toast.error("Failed to create chat session");
+      toast.error(t("chat.create_failed"));
     }
   };
 
@@ -62,7 +64,7 @@ export function ChatPage() {
       {/* Mobile header (hidden on md) */}
       <div className="md:hidden flex h-14 items-center gap-3 border-b bg-background px-4 z-10">
         <MessageSquare className="w-5 h-5 text-primary" />
-        <span className="font-semibold text-sm">NexusRAG Chat</span>
+        <span className="font-semibold text-sm">{t("chat.mobile_title")}</span>
       </div>
 
       <div className="flex-1 flex overflow-hidden relative">
@@ -87,12 +89,12 @@ export function ChatPage() {
             <div className="h-full flex flex-col items-center justify-center text-center px-4 space-y-4">
               <MessageSquare className="w-12 h-12 text-muted-foreground/30" />
               <div className="space-y-1">
-                <h3 className="font-medium text-lg">NexusRAG Global Chat</h3>
+                <h3 className="font-medium text-lg">{t("chat.welcome_title")}</h3>
                 <p className="text-sm text-muted-foreground max-w-sm">
-                  Create a new chat or select an existing one to start exploring all your accessible knowledge bases.
+                  {t("chat.welcome_description")}
                 </p>
               </div>
-              <Button onClick={handleNewSession}>Start New Chat</Button>
+              <Button onClick={handleNewSession}>{t("nav.new_chat")}</Button>
             </div>
           )}
         </motion.div>
@@ -117,7 +119,7 @@ export function ChatPage() {
               {/* Header with close button */}
               <div className="h-10 border-b flex items-center justify-between px-3 bg-muted/20 shrink-0">
                 <span className="text-xs font-semibold truncate text-foreground/70">
-                  Document Source
+                  {t("chat.doc_source")}
                 </span>
                 <button
                   onClick={() => selectDoc(null)}

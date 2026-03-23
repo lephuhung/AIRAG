@@ -1,6 +1,7 @@
 import { useState, memo, useCallback } from "react";
 import { motion } from "framer-motion";
 import { Copy, Check, ChevronDown, ChevronUp, FileText } from "lucide-react";
+import { useTranslation } from "@/hooks/useTranslation";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import type { RetrievedChunk, Citation } from "@/types";
@@ -84,6 +85,7 @@ interface ResultCardProps {
 }
 
 export const ResultCard = memo(function ResultCard({ chunk, index, query }: ResultCardProps) {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
 
@@ -93,9 +95,9 @@ export const ResultCard = memo(function ResultCard({ chunk, index, query }: Resu
   const handleCopy = useCallback(() => {
     navigator.clipboard.writeText(chunk.content);
     setCopied(true);
-    toast.success("Copied to clipboard");
+    toast.success(t("common.copied"));
     setTimeout(() => setCopied(false), 2000);
-  }, [chunk.content]);
+  }, [chunk.content, t]);
 
   const similarity = Math.max(0, 1 - chunk.score);
   const citation = chunk.citation;
@@ -137,7 +139,7 @@ export const ResultCard = memo(function ResultCard({ chunk, index, query }: Resu
             <button
               onClick={handleCopy}
               className="opacity-0 group-hover:opacity-100 transition-opacity p-1 rounded hover:bg-muted"
-              title="Copy content"
+              title={t("common.copy")}
             >
               {copied ? (
                 <Check className="w-3.5 h-3.5 text-primary" />
@@ -160,9 +162,9 @@ export const ResultCard = memo(function ResultCard({ chunk, index, query }: Resu
             className="flex items-center gap-1 text-xs text-primary hover:text-primary/80 transition-colors"
           >
             {expanded ? (
-              <><ChevronUp className="w-3 h-3" /> Show less</>
+              <><ChevronUp className="w-3 h-3" /> {t("common.show_less")}</>
             ) : (
-              <><ChevronDown className="w-3 h-3" /> Show more</>
+              <><ChevronDown className="w-3 h-3" /> {t("common.show_more")}</>
             )}
           </button>
         )}

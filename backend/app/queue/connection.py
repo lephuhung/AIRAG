@@ -5,10 +5,10 @@ Async connection singleton using aio-pika.
 
 Exchange layout
 ---------------
-nexusrag.parse   direct   routing_key="parse"
-nexusrag.embed   direct   routing_key="embed"
-nexusrag.caption direct   routing_key="caption"
-nexusrag.kg      direct   routing_key=<workspace_id>   ← per-workspace serialisation
+hrag.parse   direct   routing_key="parse"
+hrag.embed   direct   routing_key="embed"
+hrag.caption direct   routing_key="caption"
+hrag.kg      direct   routing_key=<workspace_id>   ← per-workspace serialisation
 
 All queues are durable so messages survive broker restarts.
 
@@ -42,19 +42,20 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 # ── Exchange / queue names ──────────────────────────────────────────────────
-EXCHANGE_PARSE   = "nexusrag.parse"
-EXCHANGE_EMBED   = "nexusrag.embed"
-EXCHANGE_CAPTION = "nexusrag.caption"
-EXCHANGE_KG      = "nexusrag.kg"
+EXCHANGE_PARSE   = "hrag.parse"
+EXCHANGE_EMBED   = "hrag.embed"
+EXCHANGE_CAPTION = "hrag.caption"
+EXCHANGE_KG      = "hrag.kg"
 
-QUEUE_PARSE   = "nexusrag.parse"
-QUEUE_EMBED   = "nexusrag.embed"
-QUEUE_CAPTION = "nexusrag.caption"
-# KG queues are named nexusrag.kg.<workspace_id> and created on-demand
+QUEUE_PARSE   = "hrag.parse"
+QUEUE_EMBED   = "hrag.embed"
+QUEUE_CAPTION = "hrag.caption"
+# KG queues are named hrag.kg.<workspace_id> and created on-demand
+QUEUE_KG_PREFIX = "hrag.kg"
 
 # ── Dead-letter exchange for failed messages ────────────────────────────────
-DLX_EXCHANGE = "nexusrag.dlx"
-DLQ_QUEUE    = "nexusrag.dead-letter"
+DLX_EXCHANGE = "hrag.dlx"
+DLQ_QUEUE    = "hrag.dead-letter"
 
 # ── Retry settings ──────────────────────────────────────────────────────────
 MAX_RETRIES   = 3              # Total attempts = MAX_RETRIES + 1 (first try + retries)
@@ -64,9 +65,9 @@ RETRY_DELAYS  = [5, 15, 60]   # Seconds — mapped to per-message TTL
 # fans out to the original exchange via x-dead-letter-exchange on each
 # delay queue.  We use a single HEADERS exchange so that we can route
 # each message back to its original exchange/routing_key using headers.
-RETRY_EXCHANGE = "nexusrag.retry"
+RETRY_EXCHANGE = "hrag.retry"
 _RETRY_QUEUE_NAMES = [
-    f"nexusrag.retry.{d}s" for d in RETRY_DELAYS
+    f"hrag.retry.{d}s" for d in RETRY_DELAYS
 ]
 
 
@@ -120,8 +121,8 @@ async def _ensure_retry_queues(channel: aio_pika.Channel) -> None:
     ``x-original-routing-key`` header stored on the message.
 
     Flow:
-        handler fail → publish to nexusrag.retry.Xs (with TTL = X s)
-            → TTL expires → DLX to nexusrag.retry (DIRECT)
+        handler fail → publish to hrag.retry.Xs (with TTL = X s)
+            → TTL expires → DLX to hrag.retry (DIRECT)
             → route back to original exchange/routing_key
     """
     # Retry exchange — messages land here after TTL expires
@@ -203,7 +204,7 @@ async def _start_retry_consumer(channel: aio_pika.Channel) -> None:
     # We need a queue bound to the retry exchange to catch expired messages.
     # Since delay queues DLX to RETRY_EXCHANGE with routing_key = original
     # queue name, we create a single catch-all queue.
-    retry_requeue_name = "nexusrag.retry.requeue"
+    retry_requeue_name = "hrag.retry.requeue"
     try:
         retry_queue = await channel.declare_queue(
             retry_requeue_name, durable=True,
@@ -385,7 +386,7 @@ async def consume_kg(workspace_id: int, handler: MessageHandler) -> None:
     Consume KG messages for a specific workspace.
     prefetch_count=1 ensures sequential processing within the workspace.
     """
-    queue_name = f"nexusrag.kg.{workspace_id}"
+    queue_name = f"hrag.kg.{workspace_id}"
     routing_key = str(workspace_id)
     await consume(
         EXCHANGE_KG, queue_name, routing_key,

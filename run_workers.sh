@@ -1,5 +1,5 @@
 #!/bin/bash
-# NexusRAG Workers — start all 4 worker processes for local dev
+# HRAG Workers — start all 4 worker processes for local dev
 #
 # Workers:
 #   parse   — downloads from MinIO, runs Docling parser, publishes to embed/caption/kg
@@ -33,7 +33,7 @@ WORKERS="${WORKERS:-${*:-parse embed caption kg}}"
 mkdir -p "$LOG_DIR"
 
 echo "============================================"
-echo " NexusRAG Worker Launcher"
+echo " HRAG Worker Launcher"
 echo " Workers: $WORKERS"
 echo " Logs: $LOG_DIR/worker_<type>.log"
 echo " Press Ctrl+C to stop all workers"

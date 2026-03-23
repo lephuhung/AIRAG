@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useTranslation } from "@/hooks/useTranslation";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -43,10 +44,11 @@ function ViewerSkeleton() {
 // Error state
 // ---------------------------------------------------------------------------
 function ViewerError({ message }: { message: string }) {
+  const { t } = useTranslation();
   return (
     <div className="flex flex-col items-center justify-center py-16 px-6 text-center">
       <FileText className="w-10 h-10 text-muted-foreground/40 mb-3" />
-      <p className="text-sm font-medium">Unable to load document</p>
+      <p className="text-sm font-medium">{t("viewer.error_loading")}</p>
       <p className="text-xs text-muted-foreground mt-1 max-w-xs">{message}</p>
     </div>
   );
@@ -56,14 +58,15 @@ function ViewerError({ message }: { message: string }) {
 // Empty state
 // ---------------------------------------------------------------------------
 function ViewerEmpty() {
+  const { t } = useTranslation();
   return (
     <div className="flex flex-col items-center justify-center py-16 px-6 text-center">
       <FileText className="w-10 h-10 text-muted-foreground/30 mb-3" />
       <p className="text-sm text-muted-foreground">
-        No parsed content available for this document
+        {t("viewer.no_content")}
       </p>
       <p className="text-xs text-muted-foreground/60 mt-1">
-        The document may not have been processed with NexusRAG yet
+        {t("rag.not_processed_message")}
       </p>
     </div>
   );
@@ -81,13 +84,14 @@ const TOCSidebar = memo(function TOCSidebar({
   activeId: string | null;
   onSelect: (id: string) => void;
 }) {
+  const { t } = useTranslation();
   if (headings.length === 0) return null;
 
   return (
     <nav className="w-52 flex-shrink-0 border-r overflow-y-auto py-3 px-2 hidden xl:block">
       <div className="flex items-center gap-1.5 px-2 mb-2">
         <List className="w-3.5 h-3.5 text-muted-foreground" />
-        <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Contents</span>
+        <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">{t("viewer.contents")}</span>
       </div>
       <ul className="space-y-0.5">
         {headings.map((h) => (
@@ -117,11 +121,12 @@ const TOCSidebar = memo(function TOCSidebar({
 // Page divider — inserted between pages in the markdown
 // ---------------------------------------------------------------------------
 function PageDivider({ pageNo }: { pageNo: number }) {
+  const { t } = useTranslation();
   return (
     <div className="flex items-center gap-3 py-4 select-none" data-page={pageNo}>
       <div className="flex-1 border-t border-dashed border-muted-foreground/20" />
       <span className="text-[10px] font-medium text-muted-foreground/50 uppercase tracking-wider">
-        Page {pageNo}
+        {t("common.page_x", { page: pageNo })}
       </span>
       <div className="flex-1 border-t border-dashed border-muted-foreground/20" />
     </div>
@@ -185,6 +190,7 @@ export const DocumentViewer = memo(function DocumentViewer({
   highlightChunks,
   onScrolled,
 }: DocumentViewerProps) {
+  const { t } = useTranslation();
   const contentRef = useRef<HTMLDivElement>(null);
   const pageCounterRef = useRef(1);
   const [activeHeading, setActiveHeading] = useState<string | null>(null);
@@ -533,9 +539,9 @@ export const DocumentViewer = memo(function DocumentViewer({
           <div className="mb-4 pb-3 border-b">
             <h2 className="text-lg font-semibold">{doc.original_filename}</h2>
             <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
-              {doc.page_count && doc.page_count > 0 && <span>{doc.page_count} pages</span>}
-              {doc.chunk_count > 0 && <span>{doc.chunk_count} chunks</span>}
-              {doc.parser_version && <span>Parsed by {doc.parser_version}</span>}
+              {doc.page_count && doc.page_count > 0 && <span>{doc.page_count} {t("files.metadata.pages")}</span>}
+              {doc.chunk_count > 0 && <span>{doc.chunk_count} {t("files.metadata.chunks")}</span>}
+              {doc.parser_version && <span>{t("viewer.parsed_by", { version: doc.parser_version })}</span>}
             </div>
           </div>
 

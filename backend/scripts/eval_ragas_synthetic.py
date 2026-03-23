@@ -1,15 +1,15 @@
 """
-NexusRAG Phase 3 — RAGAS Synthetic Testset Generation + Evaluation.
+HRAG Phase 3 — RAGAS Synthetic Testset Generation + Evaluation.
 
 Workflow:
   1. Extract document chunks from workspace via API
   2. Generate synthetic Q&A pairs with ground truth using RAGAS TestsetGenerator
-  3. Run each question through the NexusRAG chat endpoint
+  3. Run each question through the HRAG chat endpoint
   4. Evaluate with RAGAS reference-based metrics + custom rule-based metrics
   5. Output detailed scoring table
 
 Usage:
-    cd NexusRAG/backend
+    cd HRAG/backend
     source ../venv/bin/activate
 
     # Step 1: Generate testset (requires Gemini API key)
@@ -257,14 +257,14 @@ def generate_testset(
     return all_samples[:testset_size]
 
 
-# ── Step 3: Run testset through NexusRAG chat ─────────────────────────────────
+# ── Step 3: Run testset through HRAG chat ─────────────────────────────────
 
 def run_testset_through_chat(
     workspace_id: int,
     samples: list[dict],
 ) -> list[dict]:
     """Send each question to the debug-chat endpoint and collect responses."""
-    print(f"\n[3/4] Running {len(samples)} questions through NexusRAG chat...")
+    print(f"\n[3/4] Running {len(samples)} questions through HRAG chat...")
 
     results = []
     for i, sample in enumerate(samples):
@@ -678,7 +678,7 @@ def cmd_all(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="NexusRAG Phase 3 — RAGAS Synthetic Testset Generation + Evaluation"
+        description="HRAG Phase 3 — RAGAS Synthetic Testset Generation + Evaluation"
     )
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 

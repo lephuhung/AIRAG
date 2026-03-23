@@ -50,3 +50,27 @@
 2026-03-18 17:43:59,099 [INFO] app.queue.connection — Consuming nexusrag.embed/embed → nexusrag.embed
 2026-03-19 12:01:59,312 [INFO] __main__ — Received SIGTERM — shutting down worker
 2026-03-19 12:01:59,317 [INFO] __main__ — Worker stopped cleanly
+2026-03-23 08:56:00,364 [INFO] __main__ — Starting worker: WORKER_TYPE=embed
+2026-03-23 08:56:00,364 [INFO] app.services.models.loader — [preload] Loading models for worker=embed …
+/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/transformers/utils/hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+2026-03-23 08:56:06,008 [INFO] app.services.embedder — Loading embedding model: BAAI/bge-m3 (device=cuda)
+2026-03-23 08:56:06,009 [INFO] sentence_transformers.SentenceTransformer — Load pretrained SentenceTransformer: BAAI/bge-m3
+2026-03-23 08:56:12,993 [INFO] app.services.embedder — Embedding model loaded: BAAI/bge-m3 (dim=1024)
+2026-03-23 08:56:12,993 [INFO] app.services.models.loader — [preload] Embedding model ready (BAAI/bge-m3)
+2026-03-23 08:56:12,993 [INFO] app.services.models.loader — [preload] Worker=embed models loaded in 12.6s
+2026-03-23 08:56:13,948 [INFO] app.queue.connection — Connecting to RabbitMQ: amqp://guest:guest@localhost:5672/
+2026-03-23 08:56:13,954 [INFO] app.queue.connection — RabbitMQ connected
+2026-03-23 08:56:13,960 [INFO] __main__ — Worker stopped cleanly
+2026-03-23 08:59:07,657 [INFO] __main__ — Starting worker: WORKER_TYPE=embed
+2026-03-23 08:59:07,658 [INFO] app.services.models.loader — [preload] Loading models for worker=embed …
+/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/transformers/utils/hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+2026-03-23 08:59:12,161 [INFO] app.services.embedder — Loading embedding model: BAAI/bge-m3 (device=cuda)
+2026-03-23 08:59:12,163 [INFO] sentence_transformers.SentenceTransformer — Load pretrained SentenceTransformer: BAAI/bge-m3
+2026-03-23 08:59:18,598 [INFO] app.services.embedder — Embedding model loaded: BAAI/bge-m3 (dim=1024)
+2026-03-23 08:59:18,598 [INFO] app.services.models.loader — [preload] Embedding model ready (BAAI/bge-m3)
+2026-03-23 08:59:18,598 [INFO] app.services.models.loader — [preload] Worker=embed models loaded in 10.9s
+2026-03-23 08:59:19,311 [INFO] app.queue.connection — Connecting to RabbitMQ: amqp://guest:guest@localhost:5672/
+2026-03-23 08:59:19,319 [INFO] app.queue.connection — RabbitMQ connected
+2026-03-23 08:59:19,349 [INFO] app.queue.connection — Consuming hrag.embed/embed → hrag.embed

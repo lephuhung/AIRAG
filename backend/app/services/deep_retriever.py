@@ -7,8 +7,8 @@ Hybrid retrieval combining Knowledge Graph (LightRAG) + Vector Search (ChromaDB)
 
 Pipeline:
   1. KG query  (parallel) → entity/relationship summary
-  2. Vector search → over-fetch top-N candidates (NEXUSRAG_VECTOR_PREFETCH)
-  3. Cross-encoder rerank → precision filter to top-K (NEXUSRAG_RERANKER_TOP_K)
+  2. Vector search → over-fetch top-N candidates (HRAG_VECTOR_PREFETCH)
+  3. Cross-encoder rerank → precision filter to top-K (HRAG_RERANKER_TOP_K)
   4. Merge with citations + optional image references
 """
 from __future__ import annotations
@@ -70,7 +70,7 @@ class DeepRetriever:
         Execute hybrid retrieval with reranking.
 
         Flow:
-          1. [parallel] KG query + Vector over-fetch (NEXUSRAG_VECTOR_PREFETCH)
+          1. [parallel] KG query + Vector over-fetch (HRAG_VECTOR_PREFETCH)
           2. Cross-encoder rerank vector results → final top_k
           3. Optionally find related images from chunk pages
           4. Assemble structured context for LLM
@@ -93,7 +93,7 @@ class DeepRetriever:
             )
 
         # Over-fetch from vector DB for reranking
-        prefetch_k = max(settings.NEXUSRAG_VECTOR_PREFETCH, top_k * 3)
+        prefetch_k = max(settings.HRAG_VECTOR_PREFETCH, top_k * 3)
         vector_task = asyncio.create_task(
             asyncio.to_thread(
                 self._vector_query, question, prefetch_k, document_ids
@@ -151,7 +151,7 @@ class DeepRetriever:
         try:
             return await asyncio.wait_for(
                 self.kg_service.get_relevant_context(question),
-                timeout=settings.NEXUSRAG_KG_QUERY_TIMEOUT,
+                timeout=settings.HRAG_KG_QUERY_TIMEOUT,
             )
         except asyncio.TimeoutError:
             logger.warning("KG raw context retrieval timed out")
@@ -244,14 +244,14 @@ class DeepRetriever:
             query=question,
             documents=doc_texts,
             top_k=top_k,
-            min_score=settings.NEXUSRAG_MIN_RELEVANCE_SCORE,
+            min_score=settings.HRAG_MIN_RELEVANCE_SCORE,
         )
 
         if not reranked:
             # Fallback: if reranker filtered everything, keep top 3 by original order
             logger.warning(
                 f"Reranker filtered all {len(chunks)} chunks below threshold "
-                f"{settings.NEXUSRAG_MIN_RELEVANCE_SCORE}, falling back to top 3"
+                f"{settings.HRAG_MIN_RELEVANCE_SCORE}, falling back to top 3"
             )
             return chunks[:min(3, len(chunks))], citations[:min(3, len(citations))]
 

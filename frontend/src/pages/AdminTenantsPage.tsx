@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "@/hooks/useTranslation";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import {
@@ -60,6 +61,7 @@ const emptyInviteForm: InviteFormData = {
 };
 
 export function AdminTenantsPage() {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const { data: tenants, isLoading } = useAdminTenants();
   const { data: allWorkspaces } = useWorkspaces();
@@ -121,7 +123,7 @@ export function AdminTenantsPage() {
 
   const handleSubmit = async () => {
     if (!form.name.trim() || !form.slug.trim()) {
-      toast.error("Name and slug are required");
+      toast.error(t("admin.tenants.toast.required"));
       return;
     }
 
@@ -135,7 +137,7 @@ export function AdminTenantsPage() {
             domain: form.domain || undefined,
           },
         });
-        toast.success("Tenant updated");
+        toast.success(t("admin.tenants.toast.updated"));
       } else {
         const newTenant = await createTenant.mutateAsync({
           name: form.name,
@@ -152,16 +154,14 @@ export function AdminTenantsPage() {
               })
             )
           );
-          toast.success(
-            `Tenant created and ${selectedWorkspaceIds.length} workspace${selectedWorkspaceIds.length !== 1 ? "s" : ""} assigned`
-          );
+          toast.success(t("admin.tenants.toast.assigned", { count: selectedWorkspaceIds.length }));
         } else {
-          toast.success("Tenant created");
+          toast.success(t("admin.tenants.toast.created"));
         }
       }
       setShowDialog(false);
     } catch (err: any) {
-      toast.error(err.message || "Failed to save tenant");
+      toast.error(err.message || t("admin.tenants.toast.save_failed"));
     }
   };
 
@@ -169,10 +169,10 @@ export function AdminTenantsPage() {
     if (!confirmDeactivate) return;
     try {
       await deactivateTenant.mutateAsync(confirmDeactivate.id);
-      toast.success("Tenant deactivated");
+      toast.success(t("admin.tenants.toast.deactivated"));
       setConfirmDeactivate(null);
     } catch (err: any) {
-      toast.error(err.message || "Failed to deactivate tenant");
+      toast.error(err.message || t("admin.tenants.toast.deactivate_failed"));
     }
   };
 
@@ -189,9 +189,9 @@ export function AdminTenantsPage() {
         },
       });
       setGeneratedInvite(result);
-      toast.success("Invite link created");
+      toast.success(t("admin.tenants.toast.invite_created"));
     } catch (err: any) {
-      toast.error(err.message || "Failed to create invite");
+      toast.error(err.message || t("admin.tenants.toast.invite_failed"));
     }
   };
 
@@ -202,18 +202,18 @@ export function AdminTenantsPage() {
         tenantId: inviteTenant.id,
         inviteId,
       });
-      toast.success("Invite revoked");
+      toast.success(t("admin.tenants.toast.invite_revoked"));
       if (generatedInvite?.id === inviteId) {
         setGeneratedInvite(null);
       }
     } catch (err: any) {
-      toast.error(err.message || "Failed to revoke invite");
+      toast.error(err.message || t("admin.tenants.toast.invite_revoke_failed"));
     }
   };
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
-    toast.success("Copied to clipboard");
+    toast.success(t("admin.tenants.toast.copied"));
   };
 
   return (
@@ -226,15 +226,15 @@ export function AdminTenantsPage() {
               <Building2 className="w-5 h-5 text-amber-500" />
             </div>
             <div>
-              <h1 className="text-xl font-bold">Tenant Management</h1>
+              <h1 className="text-xl font-bold">{t("admin.tenants.title")}</h1>
               <p className="text-sm text-muted-foreground">
-                Manage organizations and their members
+                {t("admin.tenants.subtitle")}
               </p>
             </div>
           </div>
           <Button size="sm" onClick={openCreate}>
             <Plus className="w-4 h-4 mr-1" />
-            Create Tenant
+            {t("admin.tenants.create")}
           </Button>
         </div>
 
@@ -246,7 +246,7 @@ export function AdminTenantsPage() {
         ) : !tenants || tenants.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-20 text-muted-foreground">
             <Building2 className="w-10 h-10 mb-3 opacity-30" />
-            <p className="text-sm">No tenants yet</p>
+            <p className="text-sm">{t("admin.tenants.no_tenants")}</p>
             <Button
               size="sm"
               variant="ghost"
@@ -254,35 +254,35 @@ export function AdminTenantsPage() {
               onClick={openCreate}
             >
               <Plus className="w-4 h-4 mr-1" />
-              Create your first tenant
+              {t("admin.tenants.create_first")}
             </Button>
           </div>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {tenants.map((t) => (
+            {tenants.map((tenant) => (
               <div
-                key={t.id}
+                key={tenant.id}
                 className={cn(
                   "rounded-xl border bg-card p-5 transition-colors hover:border-primary/30",
-                  !t.is_active && "opacity-60",
+                  !tenant.is_active && "opacity-60",
                 )}
               >
                 {/* Title + status */}
                 <div className="flex items-start justify-between mb-3">
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
-                      <h3 className="font-semibold truncate">{t.name}</h3>
-                      {!t.is_active && (
+                      <h3 className="font-semibold truncate">{tenant.name}</h3>
+                      {!tenant.is_active && (
                         <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-destructive/15 text-destructive font-medium">
-                          Inactive
+                          {t("admin.tenants.inactive")}
                         </span>
                       )}
                     </div>
                     <p className="text-xs text-muted-foreground mt-0.5">
-                      /{t.slug}
-                      {t.domain && (
+                      /{tenant.slug}
+                      {tenant.domain && (
                         <span className="ml-2 text-muted-foreground/60">
-                          {t.domain}
+                          {tenant.domain}
                         </span>
                       )}
                     </p>
@@ -295,17 +295,17 @@ export function AdminTenantsPage() {
                     <Users className="w-3.5 h-3.5" />
                     <span>
                       <span className="font-medium text-foreground">
-                        {t.member_count}
+                        {tenant.member_count}
                       </span>{" "}
-                      members
+                      {t("admin.tenants.members_count", { count: tenant.member_count })}
                     </span>
                   </div>
-                  {t.pending_count > 0 && (
+                  {tenant.pending_count > 0 && (
                     <div className="flex items-center gap-1.5 text-xs text-amber-500">
                       <Clock className="w-3.5 h-3.5" />
                       <span>
-                        <span className="font-medium">{t.pending_count}</span>{" "}
-                        pending
+                        <span className="font-medium">{tenant.pending_count}</span>{" "}
+                        {t("admin.tenants.pending_count", { count: tenant.pending_count })}
                       </span>
                     </div>
                   )}
@@ -317,39 +317,39 @@ export function AdminTenantsPage() {
                     size="sm"
                     variant="ghost"
                     className="h-7 px-2 text-xs"
-                    onClick={() => navigate(`/tenants/${t.id}`)}
-                    title="Manage members"
+                    onClick={() => navigate(`/tenants/${tenant.id}`)}
+                    title={t("admin.tenants.members_btn")}
                   >
                     <ExternalLink className="w-3.5 h-3.5 mr-1" />
-                    Members
+                    {t("admin.members")}
                   </Button>
                   <Button
                     size="sm"
                     variant="ghost"
                     className="h-7 px-2 text-xs"
-                    onClick={() => openInviteDialog(t)}
-                    title="Create invite link"
+                    onClick={() => openInviteDialog(tenant)}
+                    title={t("admin.tenants.invite_btn")}
                   >
                     <LinkIcon className="w-3.5 h-3.5 mr-1" />
-                    Invite
+                    {t("admin.tenants.invite_btn")}
                   </Button>
                   <Button
                     size="sm"
                     variant="ghost"
                     className="h-7 px-2 text-xs"
-                    onClick={() => openEdit(t)}
-                    title="Edit tenant"
+                    onClick={() => openEdit(tenant)}
+                    title={t("admin.tenants.edit")}
                   >
                     <Pencil className="w-3.5 h-3.5 mr-1" />
-                    Edit
+                    {t("common.edit")}
                   </Button>
-                  {t.is_active && (
+                  {tenant.is_active && (
                     <Button
                       size="sm"
                       variant="ghost"
                       className="h-7 px-2 text-xs text-destructive hover:bg-destructive/10 ml-auto"
-                      onClick={() => setConfirmDeactivate(t)}
-                      title="Deactivate tenant"
+                      onClick={() => setConfirmDeactivate(tenant)}
+                      title={t("admin.tenants.deactivate_confirm_title")}
                     >
                       <Power className="w-3.5 h-3.5" />
                     </Button>
@@ -371,7 +371,7 @@ export function AdminTenantsPage() {
           <div className="relative z-10 w-full max-w-md mx-4 rounded-xl bg-card border shadow-2xl animate-in zoom-in-95 fade-in duration-200">
             <div className="flex items-center justify-between p-5 border-b">
               <h3 className="font-semibold">
-                {editingTenant ? "Edit Tenant" : "Create Tenant"}
+                {editingTenant ? t("admin.tenants.edit") : t("admin.tenants.create")}
               </h3>
               <button
                 onClick={() => setShowDialog(false)}
@@ -383,7 +383,7 @@ export function AdminTenantsPage() {
             <div className="p-5 space-y-4">
               <div>
                 <label className="text-xs font-medium text-muted-foreground block mb-1.5">
-                  Name
+                  {t("admin.tenants.form.name")}
                 </label>
                 <input
                   type="text"
@@ -409,8 +409,8 @@ export function AdminTenantsPage() {
               </div>
               <div>
                 <label className="text-xs font-medium text-muted-foreground block mb-1.5">
-                  Domain{" "}
-                  <span className="text-muted-foreground/60">(optional)</span>
+                  {t("admin.tenants.form.domain")}{" "}
+                  <span className="text-muted-foreground/60">({t("common.optional")})</span>
                 </label>
                 <input
                   type="text"
@@ -429,8 +429,8 @@ export function AdminTenantsPage() {
                   <label className="text-xs font-medium text-muted-foreground block mb-1.5">
                     <span className="flex items-center gap-1.5">
                       <Database className="w-3.5 h-3.5" />
-                      Assign Workspaces{" "}
-                      <span className="text-muted-foreground/60">(optional)</span>
+                      {t("admin.tenants.form.assign_workspaces")}{" "}
+                      <span className="text-muted-foreground/60">({t("common.optional")})</span>
                     </span>
                   </label>
                   <div className="max-h-44 overflow-y-auto rounded-lg border bg-background divide-y">
@@ -460,14 +460,14 @@ export function AdminTenantsPage() {
                           )}
                         </div>
                         <span className="text-xs text-muted-foreground flex-shrink-0">
-                          {ws.document_count} docs
+                          {t("kb.docs_count", { count: ws.document_count })}
                         </span>
                       </label>
                     ))}
                   </div>
                   {selectedWorkspaceIds.length > 0 && (
                     <p className="text-xs text-muted-foreground mt-1.5">
-                      {selectedWorkspaceIds.length} workspace{selectedWorkspaceIds.length !== 1 ? "s" : ""} selected — visibility will be set to <strong>Tenant</strong>
+                      {t("admin.tenants.form.assign_hint", { count: selectedWorkspaceIds.length })}
                     </p>
                   )}
                 </div>
@@ -479,7 +479,7 @@ export function AdminTenantsPage() {
                 variant="ghost"
                 onClick={() => setShowDialog(false)}
               >
-                Cancel
+                {t("common.cancel")}
               </Button>
               <Button
                 size="sm"
@@ -491,7 +491,7 @@ export function AdminTenantsPage() {
                 {createTenant.isPending || updateTenant.isPending || updateWorkspace.isPending ? (
                   <Loader2 className="w-4 h-4 animate-spin mr-1" />
                 ) : null}
-                {editingTenant ? "Save" : "Create"}
+                {editingTenant ? t("common.save") : t("common.create")}
               </Button>
             </div>
           </div>
@@ -510,10 +510,10 @@ export function AdminTenantsPage() {
               <div>
                 <h3 className="font-semibold flex items-center gap-2">
                   <UserPlus className="w-4 h-4" />
-                  Invite to {inviteTenant.name}
+                  {t("admin.tenants.invite_dialog.title", { name: inviteTenant.name })}
                 </h3>
                 <p className="text-xs text-muted-foreground mt-0.5">
-                  Create an invite link for new members
+                  {t("admin.tenants.invite_dialog.subtitle")}
                 </p>
               </div>
               <button
@@ -529,8 +529,8 @@ export function AdminTenantsPage() {
               <div className="space-y-3">
                 <div>
                   <label className="text-xs font-medium text-muted-foreground block mb-1.5">
-                    Email{" "}
-                    <span className="text-muted-foreground/60">(optional — lock to specific email)</span>
+                    {t("common.email")}{" "}
+                    <span className="text-muted-foreground/60">({t("admin.tenants.invite_dialog.email_lock")})</span>
                   </label>
                   <input
                     type="email"
@@ -546,7 +546,7 @@ export function AdminTenantsPage() {
                 <div className="grid grid-cols-3 gap-3">
                   <div>
                     <label className="text-xs font-medium text-muted-foreground block mb-1.5">
-                      Role
+                      {t("admin.tenants.invite_dialog.role")}
                     </label>
                     <select
                       value={inviteForm.role}
@@ -555,13 +555,13 @@ export function AdminTenantsPage() {
                       }
                       className="w-full px-3 py-2 text-sm rounded-lg border bg-background focus:outline-none focus:ring-2 focus:ring-primary/30"
                     >
-                      <option value="member">Member</option>
-                      <option value="admin">Admin</option>
+                      <option value="member">{t("admin.tenants.member_role")}</option>
+                      <option value="admin">{t("admin.tenants.admin_role")}</option>
                     </select>
                   </div>
                   <div>
                     <label className="text-xs font-medium text-muted-foreground block mb-1.5">
-                      Expires (days)
+                      {t("admin.tenants.invite_dialog.expires_days")}
                     </label>
                     <input
                       type="number"
@@ -579,7 +579,7 @@ export function AdminTenantsPage() {
                   </div>
                   <div>
                     <label className="text-xs font-medium text-muted-foreground block mb-1.5">
-                      Max uses
+                      {t("admin.tenants.invite_dialog.max_uses")}
                     </label>
                     <input
                       type="number"
@@ -591,7 +591,7 @@ export function AdminTenantsPage() {
                           max_uses: e.target.value,
                         }))
                       }
-                      placeholder="Unlimited"
+                      placeholder={t("admin.tenants.invite_dialog.unlimited")}
                       className="w-full px-3 py-2 text-sm rounded-lg border bg-background focus:outline-none focus:ring-2 focus:ring-primary/30"
                     />
                   </div>
@@ -608,7 +608,7 @@ export function AdminTenantsPage() {
                   ) : (
                     <LinkIcon className="w-4 h-4 mr-1" />
                   )}
-                  Generate Invite Link
+                  {t("admin.tenants.invite_dialog.generate_btn")}
                 </Button>
               </div>
 
@@ -616,7 +616,7 @@ export function AdminTenantsPage() {
               {generatedInvite && (
                 <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
                   <p className="text-xs font-medium text-emerald-700 dark:text-emerald-400 mb-2">
-                    Invite link created!
+                    {t("admin.tenants.invite_dialog.success")}
                   </p>
                   <div className="flex items-center gap-2">
                     <input
@@ -641,7 +641,7 @@ export function AdminTenantsPage() {
               {activeInvites && activeInvites.length > 0 && (
                 <div>
                   <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">
-                    Active Invites ({activeInvites.length})
+                    {t("admin.tenants.invite_dialog.active_invites", { count: activeInvites.length })}
                   </h4>
                   <div className="space-y-2">
                     {activeInvites.map((inv) => {
@@ -665,7 +665,7 @@ export function AdminTenantsPage() {
                                 </span>
                               ) : (
                                 <span className="text-muted-foreground">
-                                  Anyone
+                                  {t("admin.tenants.invite_dialog.anyone")}
                                 </span>
                               )}
                               <span className="flex items-center gap-0.5 text-muted-foreground/60">
@@ -675,21 +675,20 @@ export function AdminTenantsPage() {
                             </div>
                             <div className="flex items-center gap-3 text-muted-foreground/60">
                               <span>
-                                Uses: {inv.use_count}
+                                {t("admin.tenants.invite_dialog.uses", { count: inv.use_count })}
                                 {inv.max_uses !== null ? `/${inv.max_uses}` : ""}
                               </span>
                               <span>
-                                Expires:{" "}
-                                {new Date(inv.expires_at).toLocaleDateString()}
+                                {t("admin.tenants.invite_dialog.expires", { date: new Date(inv.expires_at).toLocaleDateString() })}
                               </span>
                               {expired && (
                                 <span className="text-destructive font-medium">
-                                  Expired
+                                  {t("admin.tenants.invite_dialog.expired_badge")}
                                 </span>
                               )}
                               {maxedOut && (
                                 <span className="text-amber-500 font-medium">
-                                  Max reached
+                                  {t("admin.tenants.invite_dialog.max_reached_badge")}
                                 </span>
                               )}
                             </div>
@@ -711,7 +710,7 @@ export function AdminTenantsPage() {
                               variant="ghost"
                               className="h-7 w-7 p-0 text-destructive hover:bg-destructive/10"
                               onClick={() => handleRevokeInvite(inv.id)}
-                              title="Revoke invite"
+                              title={t("admin.tenants.invite_dialog.revoke_title")}
                             >
                               <Trash2 className="w-3.5 h-3.5" />
                             </Button>
@@ -730,7 +729,7 @@ export function AdminTenantsPage() {
                 variant="ghost"
                 onClick={() => setInviteTenant(null)}
               >
-                Close
+                {t("common.close")}
               </Button>
             </div>
           </div>
@@ -742,9 +741,9 @@ export function AdminTenantsPage() {
         open={!!confirmDeactivate}
         onCancel={() => setConfirmDeactivate(null)}
         onConfirm={handleDeactivate}
-        title="Deactivate Tenant"
-        message={`Are you sure you want to deactivate "${confirmDeactivate?.name}"? Members will lose access to tenant workspaces.`}
-        confirmLabel="Deactivate"
+        title={t("admin.tenants.deactivate_confirm_title")}
+        message={t("admin.tenants.deactivate_confirm_msg", { name: confirmDeactivate?.name })}
+        confirmLabel={t("admin.tenants.deactivate")}
         variant="danger"
       />
     </div>

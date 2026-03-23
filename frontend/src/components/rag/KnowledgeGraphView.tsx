@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef, useMemo, useCallback, memo } from "react";
+import { useTranslation } from "@/hooks/useTranslation";
 import { useQuery } from "@tanstack/react-query";
+
 import {
   ZoomIn,
   ZoomOut,
@@ -139,9 +141,17 @@ interface GraphCanvasProps {
   width: number;
   height: number;
   highlightEntities?: string[];
+  onEntityClick?: (entity: string) => void;
 }
 
-const GraphCanvas = memo(function GraphCanvas({ data, width, height, highlightEntities = [] }: GraphCanvasProps) {
+const GraphCanvas = memo(function GraphCanvas({
+  data,
+  width,
+  height,
+  highlightEntities = [],
+  onEntityClick,
+}: GraphCanvasProps) {
+  const { t } = useTranslation();
   const [nodes, setNodes] = useState<SimNode[]>([]);
   const [hoveredNode, setHoveredNode] = useState<string | null>(null);
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
@@ -335,21 +345,21 @@ const GraphCanvas = memo(function GraphCanvas({ data, width, height, highlightEn
         <button
           onClick={() => zoomToPoint(0.25)}
           className="p-1.5 rounded-md border bg-background/80 backdrop-blur-sm hover:bg-muted transition-colors"
-          title="Zoom In"
+          title={t("kg.zoom_in")}
         >
           <ZoomIn className="w-3.5 h-3.5" />
         </button>
         <button
           onClick={() => zoomToPoint(-0.25)}
           className="p-1.5 rounded-md border bg-background/80 backdrop-blur-sm hover:bg-muted transition-colors"
-          title="Zoom Out"
+          title={t("kg.zoom_out")}
         >
           <ZoomOut className="w-3.5 h-3.5" />
         </button>
         <button
           onClick={fitToScreen}
           className="p-1.5 rounded-md border bg-background/80 backdrop-blur-sm hover:bg-muted transition-colors"
-          title="Fit to Screen"
+          title={t("kg.fit_to_screen")}
         >
           <Maximize2 className="w-3.5 h-3.5" />
         </button>
@@ -419,7 +429,10 @@ const GraphCanvas = memo(function GraphCanvas({ data, width, height, highlightEn
                 onMouseEnter={() => setHoveredNode(node.id)}
                 onMouseLeave={() => setHoveredNode(null)}
                 onMouseDown={(e) => handleNodeMouseDown(node.id, e)}
-                onClick={() => setSelectedNode(node.id === selectedNode ? null : node.id)}
+                onClick={() => {
+                  setSelectedNode(node.id === selectedNode ? null : node.id);
+                  onEntityClick?.(node.label);
+                }}
                 className="cursor-pointer"
               >
                 {/* Glow ring */}
@@ -477,14 +490,16 @@ const GraphCanvas = memo(function GraphCanvas({ data, width, height, highlightEn
           <div className="absolute top-2 left-2 z-10 bg-background/95 backdrop-blur-sm border rounded-lg p-3 shadow-lg max-w-[220px]">
             <p className="text-sm font-semibold truncate">{node.label}</p>
             <p className="text-[10px] text-muted-foreground capitalize mt-0.5">{node.entity_type}</p>
-            <p className="text-xs text-muted-foreground/70 mt-1">{node.degree} connection{node.degree !== 1 ? "s" : ""}</p>
+            <p className="text-xs text-muted-foreground/70 mt-1">
+              {node.degree} {node.degree === 1 ? t("kg.connection") : t("kg.connections")}
+            </p>
           </div>
         );
       })()}
 
       {data.is_truncated && (
         <div className="absolute bottom-2 right-2 z-10 text-[10px] text-amber-400 bg-background/80 backdrop-blur-sm border border-amber-400/30 rounded px-2 py-1">
-          Graph truncated (too many nodes)
+          {t("kg.truncated")}
         </div>
       )}
     </div>
@@ -494,12 +509,15 @@ const GraphCanvas = memo(function GraphCanvas({ data, width, height, highlightEn
 // ---------------------------------------------------------------------------
 // KnowledgeGraphView — main export
 // ---------------------------------------------------------------------------
+
 interface KnowledgeGraphViewProps {
   projectId: string;
   highlightEntities?: string[];
+  onEntityClick?: (entity: string) => void;
 }
 
-export const KnowledgeGraphView = memo(function KnowledgeGraphView({ projectId, highlightEntities = [] }: KnowledgeGraphViewProps) {
+export const KnowledgeGraphView = memo(function KnowledgeGraphView({ projectId, highlightEntities = [], onEntityClick }: KnowledgeGraphViewProps) {
+  const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: 600, height: 400 });
 
@@ -529,7 +547,7 @@ export const KnowledgeGraphView = memo(function KnowledgeGraphView({ projectId, 
     return (
       <div className="flex items-center justify-center py-12">
         <Loader2 className="w-5 h-5 animate-spin text-muted-foreground mr-2" />
-        <span className="text-sm text-muted-foreground">Loading knowledge graph...</span>
+        <span className="text-sm text-muted-foreground">{t("kg.loading")}</span>
       </div>
     );
   }
@@ -538,9 +556,9 @@ export const KnowledgeGraphView = memo(function KnowledgeGraphView({ projectId, 
     return (
       <div className="flex flex-col items-center py-10 text-center">
         <Network className="w-10 h-10 text-muted-foreground/30 mb-3" />
-        <p className="text-sm text-muted-foreground">No graph data available</p>
+        <p className="text-sm text-muted-foreground">{t("kg.no_data")}</p>
         <p className="text-xs text-muted-foreground/60 mt-1">
-          Process documents with NexusRAG to build the knowledge graph
+          {t("rag.build_kg")}
         </p>
       </div>
     );
@@ -548,7 +566,13 @@ export const KnowledgeGraphView = memo(function KnowledgeGraphView({ projectId, 
 
   return (
     <div ref={containerRef} className="w-full h-full">
-      <GraphCanvas data={data} width={dimensions.width} height={dimensions.height} highlightEntities={highlightEntities} />
+      <GraphCanvas
+        data={data}
+        width={dimensions.width}
+        height={dimensions.height}
+        highlightEntities={highlightEntities}
+        onEntityClick={onEntityClick}
+      />
     </div>
   );
 });

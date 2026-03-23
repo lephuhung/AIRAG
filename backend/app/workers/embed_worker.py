@@ -1,7 +1,7 @@
 """
 Embed Worker
 ============
-Consumes nexusrag.embed queue.
+Consumes hrag.embed queue.
 
 Responsibilities:
   1. Load raw_chunks_json from DB

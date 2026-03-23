@@ -2,14 +2,14 @@
 MinIO Events Webhook
 ====================
 Receives S3 event notifications from MinIO when a file is PUT into the
-nexusrag-uploads bucket and publishes a ParseMessage to RabbitMQ.
+ hrag-uploads bucket and publishes a ParseMessage to RabbitMQ.
 
 MinIO must be configured with:
-  MINIO_NOTIFY_WEBHOOK_ENABLE_NEXUSRAG=on
-  MINIO_NOTIFY_WEBHOOK_ENDPOINT_NEXUSRAG=http://backend:8080/api/v1/minio/events
+  MINIO_NOTIFY_WEBHOOK_ENABLE_HRAG=on
+  MINIO_NOTIFY_WEBHOOK_ENDPOINT_HRAG=http://backend:8080/api/v1/minio/events
 
 And the bucket event must be registered:
-  mc event add local/nexusrag-uploads arn:minio:sqs::NEXUSRAG:webhook --event put
+  mc event add local/hrag-uploads arn:minio:sqs::HRAG:webhook --event put
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ async def handle_minio_event(
     """
     Receive S3 event notification from MinIO.
 
-    For each ObjectCreated event in nexusrag-uploads, look up the matching
+    For each ObjectCreated event in hrag-uploads, look up the matching
     Document record and publish a ParseMessage to RabbitMQ (idempotent —
     duplicate events for already-processing documents are silently ignored).
     """

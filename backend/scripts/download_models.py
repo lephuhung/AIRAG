@@ -4,16 +4,16 @@ Usage:
     python backend/scripts/download_models.py
 
 Environment variables (optional):
-    NEXUSRAG_EMBEDDING_MODEL  — default: BAAI/bge-m3
-    NEXUSRAG_RERANKER_MODEL   — default: BAAI/bge-reranker-v2-m3
+    HRAG_EMBEDDING_MODEL  — default: BAAI/bge-m3
+    HRAG_RERANKER_MODEL   — default: BAAI/bge-reranker-v2-m3
 """
 import os
 import sys
 
 
 def download_models():
-    embedding_model = os.environ.get("NEXUSRAG_EMBEDDING_MODEL", "BAAI/bge-m3")
-    reranker_model = os.environ.get("NEXUSRAG_RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
+    embedding_model = os.environ.get("HRAG_EMBEDDING_MODEL", "BAAI/bge-m3")
+    reranker_model = os.environ.get("HRAG_RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 
     from sentence_transformers import SentenceTransformer, CrossEncoder
 

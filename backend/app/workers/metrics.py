@@ -10,8 +10,8 @@ an external metrics stack.
 
 Usage (already wired into ``connection.consume``):
     from app.workers.metrics import worker_metrics
-    worker_metrics.record_success("nexusrag.parse", elapsed=1.23)
-    worker_metrics.record_failure("nexusrag.embed", elapsed=0.45)
+    worker_metrics.record_success("hrag.parse", elapsed=1.23)
+    worker_metrics.record_failure("hrag.embed", elapsed=0.45)
 """
 from __future__ import annotations
 

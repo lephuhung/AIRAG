@@ -107,8 +107,8 @@ async def query_documents(
     rag_service = get_rag_service(db, workspace_id)
 
     # Try deep query if available
-    from app.services.nexus_rag_service import NexusRAGService
-    if isinstance(rag_service, NexusRAGService) and request.mode != "vector_only":
+    from app.services.hrag_service import HRAGService
+    if isinstance(rag_service, HRAGService) and request.mode != "vector_only":
         result = await rag_service.query_deep(
             question=request.question,
             top_k=request.top_k,
@@ -342,7 +342,7 @@ async def reindex_document(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
-    """Re-process an existing document through the NexusRAG pipeline."""
+    """Re-process an existing document through the HRAG pipeline."""
     result = await db.execute(select(Document).where(Document.id == document_id))
     document = result.scalar_one_or_none()
 
@@ -425,7 +425,7 @@ async def reindex_workspace(
     """
     Reindex ALL documents in a workspace.
     Deletes the old vector collection (handles embedding dimension changes)
-    and re-processes every document through the NexusRAG pipeline.
+    and re-processes every document through the HRAG pipeline.
     Runs in background — returns immediately with document count.
     """
     await verify_workspace_access(workspace_id, db, user)
@@ -529,14 +529,14 @@ async def get_workspace_rag_stats(
     )
     indexed_documents = indexed_result.scalar() or 0
 
-    # Count NexusRAG documents (parser_version = 'docling')
-    nexusrag_result = await db.execute(
+    # Count HRAG documents (parser_version = 'docling')
+    hrag_result = await db.execute(
         select(func.count(Document.id)).where(
             Document.workspace_id == workspace_id,
             Document.parser_version == "docling"
         )
     )
-    nexusrag_documents = nexusrag_result.scalar() or 0
+    hrag_documents = hrag_result.scalar() or 0
 
     # Count total images
     image_result = await db.execute(
@@ -558,7 +558,7 @@ async def get_workspace_rag_stats(
         indexed_documents=indexed_documents,
         total_chunks=total_chunks,
         image_count=image_count,
-        nexusrag_documents=nexusrag_documents,
+        hrag_documents=hrag_documents,
     )
 
 
@@ -719,13 +719,13 @@ async def get_workspace_analytics(
     )
     indexed_documents = indexed_result.scalar() or 0
 
-    nexusrag_result = await db.execute(
+    hrag_result = await db.execute(
         select(func.count(Document.id)).where(
             Document.workspace_id == workspace_id,
             Document.parser_version == "docling",
         )
     )
-    nexusrag_documents = nexusrag_result.scalar() or 0
+    hrag_documents = hrag_result.scalar() or 0
 
     image_result = await db.execute(
         select(func.count(DocumentImage.id))
@@ -746,12 +746,12 @@ async def get_workspace_analytics(
         indexed_documents=indexed_documents,
         total_chunks=total_chunks,
         image_count=image_count,
-        nexusrag_documents=nexusrag_documents,
+        hrag_documents=hrag_documents,
     )
 
-    # KG analytics (optional — only if NexusRAG active)
+    # KG analytics (optional — only if HRAG active)
     kg_analytics = None
-    if nexusrag_documents > 0:
+    if hrag_documents > 0:
         try:
             kg = await _get_kg_service(workspace_id)
             analytics_data = await kg.get_analytics()
@@ -848,8 +848,8 @@ async def debug_chat(
     citations = []
     kg_summary = ""
 
-    from app.services.nexus_rag_service import NexusRAGService
-    if isinstance(rag_service, NexusRAGService):
+    from app.services.hrag_service import HRAGService
+    if isinstance(rag_service, HRAGService):
         result = await rag_service.query_deep(
             question=request.message,
             top_k=8,

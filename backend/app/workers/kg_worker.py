@@ -1,7 +1,7 @@
 """
 KG Worker
 =========
-Consumes nexusrag.kg.<workspace_id> queue.
+Consumes hrag.kg.<workspace_id> queue.
 
 Key design decisions:
   - routing_key = workspace_id → RabbitMQ delivers all docs for a workspace

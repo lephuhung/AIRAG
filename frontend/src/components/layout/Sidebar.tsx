@@ -21,9 +21,11 @@ import { useWorkspaces } from "@/hooks/useWorkspaces";
 import { useMyTenants } from "@/hooks/useMyTenants";
 import { useAuthStore } from "@/stores/authStore";
 import { useChatSessions, useCreateChatSession, useDeleteChatSession } from "@/hooks/useChatSessions";
+import { useTranslation } from "@/hooks/useTranslation";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
+import logo from "@/assets/logo.png";
 
 interface SidebarProps {
   collapsed: boolean;
@@ -40,31 +42,32 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
   const { data: sessions } = useChatSessions();
   const createSession = useCreateChatSession();
   const deleteSession = useDeleteChatSession();
+  const { t } = useTranslation();
 
   const [workspacesExpanded, setWorkspacesExpanded] = useState(true);
 
   const handleNewSession = async (e: React.MouseEvent) => {
     e.stopPropagation();
     try {
-      const newSession = await createSession.mutateAsync({ title: "New Chat" });
+      const newSession = await createSession.mutateAsync({ title: t("nav.new_chat") });
       navigate(`/chat/${newSession.id}`);
     } catch (error) {
-      toast.error("Failed to create chat session");
+      toast.error(t("chat.create_failed"));
     }
   };
 
   const handleDeleteSession = async (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
     e.preventDefault();
-    if (confirm("Are you sure you want to delete this chat session?")) {
+    if (confirm(t("chat.delete_confirm"))) {
       try {
         await deleteSession.mutateAsync(id);
-        toast.success("Chat deleted");
+        toast.success(t("chat.delete_success"));
         if (location.pathname === `/chat/${id}`) {
           navigate("/chat");
         }
       } catch (error) {
-        toast.error("Failed to delete chat session");
+        toast.error(t("chat.delete_failed"));
       }
     }
   };
@@ -88,9 +91,9 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
     >
       {/* Logo */}
       <div className="flex items-center gap-2.5 px-3 h-12 border-b border-border flex-shrink-0">
-        <Database className="w-6 h-6 text-primary flex-shrink-0" />
+        <img src={logo} alt="Logo" className="w-7 h-7 object-contain flex-shrink-0" />
         {!collapsed && (
-          <span className="font-bold text-primary text-base truncate">NexusRAG</span>
+          <span className="font-bold text-primary text-base truncate">{t("app.name")}</span>
         )}
       </div>
 
@@ -108,7 +111,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
         >
           <div className="flex items-center gap-2.5">
             <Edit className="w-4 h-4 flex-shrink-0" />
-            {!collapsed && <span className="truncate">New chat</span>}
+            {!collapsed && <span className="truncate">{t("nav.new_chat")}</span>}
           </div>
           {!collapsed && (
             <div className="opacity-0 group-hover:opacity-100 transition-opacity p-0.5" title="New Chat">
@@ -125,10 +128,10 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
               ? "bg-primary/10 text-primary font-medium"
               : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
           )}
-          title={collapsed ? "Knowledge Bases" : undefined}
+          title={collapsed ? t("nav.knowledge_bases") : undefined}
         >
           <Database className="w-4 h-4 flex-shrink-0" />
-          {!collapsed && <span className="truncate">Knowledge Bases</span>}
+          {!collapsed && <span className="truncate">{t("nav.knowledge_bases")}</span>}
         </button>
 
         <button
@@ -139,10 +142,10 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
               ? "bg-primary/10 text-primary font-medium"
               : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
           )}
-          title={collapsed ? "Files" : undefined}
+          title={collapsed ? t("nav.files") : undefined}
         >
           <FolderOpen className="w-4 h-4 flex-shrink-0" />
-          {!collapsed && <span className="truncate">Files</span>}
+          {!collapsed && <span className="truncate">{t("nav.files")}</span>}
         </button>
 
         {user?.is_superadmin && (
@@ -154,10 +157,10 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
                 ? "bg-primary/10 text-primary font-medium"
                 : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
             )}
-            title={collapsed ? "Workers" : undefined}
+            title={collapsed ? t("nav.workers") : undefined}
           >
             <Activity className="w-4 h-4 flex-shrink-0" />
-            {!collapsed && <span className="truncate">Workers</span>}
+            {!collapsed && <span className="truncate">{t("nav.workers")}</span>}
           </button>
         )}
 
@@ -166,7 +169,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
           <>
             {!collapsed && (
               <p className="px-2.5 pt-4 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-                Admin
+                {t("common.admin")}
               </p>
             )}
             {collapsed && <div className="my-2 mx-2 border-t border-border" />}
@@ -178,10 +181,10 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
                   ? "bg-primary/10 text-primary font-medium"
                   : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
               )}
-              title={collapsed ? "Dashboard" : undefined}
+              title={collapsed ? t("nav.admin.dashboard") : undefined}
             >
               <PieChart className="w-4 h-4 flex-shrink-0" />
-              {!collapsed && <span className="truncate">Dashboard</span>}
+              {!collapsed && <span className="truncate">{t("nav.admin.dashboard")}</span>}
             </button>
             <button
               onClick={() => navigate("/admin/users")}
@@ -191,10 +194,10 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
                   ? "bg-primary/10 text-primary font-medium"
                   : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
               )}
-              title={collapsed ? "Users" : undefined}
+              title={collapsed ? t("nav.admin.users") : undefined}
             >
               <Users className="w-4 h-4 flex-shrink-0" />
-              {!collapsed && <span className="truncate">Users</span>}
+              {!collapsed && <span className="truncate">{t("nav.admin.users")}</span>}
             </button>
             <button
               onClick={() => navigate("/admin/tenants")}
@@ -204,10 +207,10 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
                   ? "bg-primary/10 text-primary font-medium"
                   : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
               )}
-              title={collapsed ? "Tenants" : undefined}
+              title={collapsed ? t("nav.admin.tenants") : undefined}
             >
               <Building2 className="w-4 h-4 flex-shrink-0" />
-              {!collapsed && <span className="truncate">Tenants</span>}
+              {!collapsed && <span className="truncate">{t("nav.admin.tenants")}</span>}
             </button>
             <button
               onClick={() => navigate("/admin/document-types")}
@@ -217,10 +220,10 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
                   ? "bg-primary/10 text-primary font-medium"
                   : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
               )}
-              title={collapsed ? "Document Types" : undefined}
+              title={collapsed ? t("nav.admin.document_types") : undefined}
             >
               <FileText className="w-4 h-4 flex-shrink-0" />
-              {!collapsed && <span className="truncate">Document Types</span>}
+              {!collapsed && <span className="truncate">{t("nav.admin.document_types")}</span>}
             </button>
           </>
         )}
@@ -237,7 +240,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
             >
               <div className="flex items-center gap-1.5">
                 <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground group-hover:text-foreground transition-colors">
-                  Workspaces
+                  {t("nav.knowledge_bases")}
                 </p>
                 <span className="text-[10px] font-bold bg-muted group-hover:bg-muted/80 text-muted-foreground px-1.5 rounded-full min-w-[20px] text-center tabular-nums transition-colors">
                   {workspaces.length}
@@ -318,7 +321,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
         {!collapsed && myTenants && myTenants.length > 0 && (
           <div className="mt-6 px-2">
             <p className="px-2.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">
-              My Tenants
+              {t("nav.my_tenants")}
             </p>
             <div className="space-y-0.5">
               {myTenants.map((t) => {
@@ -369,7 +372,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
         {!collapsed && sessions && sessions.length > 0 && (
           <div className="mt-6 px-2">
             <p className="px-2.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground mb-1.5">
-              Your chats
+              {t("nav.your_chats")}
             </p>
             <div className="space-y-0.5">
               {sessions.map((session) => {

@@ -1,5 +1,6 @@
 import { memo, useState, useEffect } from "react";
 import { motion } from "framer-motion";
+import { useTranslation } from "@/hooks/useTranslation";
 import {
   Trash2,
   RefreshCw,
@@ -63,10 +64,11 @@ function SubTaskProgress({
   captions_done?: boolean;
   kg_done?: boolean;
 }) {
+  const { t } = useTranslation();
   const tasks = [
-    { done: embed_done, label: "Embed", Icon: Layers },
-    { done: captions_done, label: "Captions", Icon: ImageIcon },
-    { done: kg_done, label: "KG", Icon: Network },
+    { done: embed_done, label: t("files.tasks.embed"), Icon: Layers },
+    { done: captions_done, label: t("files.tasks.captions"), Icon: ImageIcon },
+    { done: kg_done, label: t("files.tasks.kg"), Icon: Network },
   ];
 
   return (
@@ -127,6 +129,7 @@ export const FileCard = memo(function FileCard({
   onPreview,
   isProcessing,
 }: FileCardProps) {
+  const { t } = useTranslation();
   const fileConfig = getFileConfig(doc.file_type);
   const FileIcon = fileConfig.icon;
   const isActive = ACTIVE_STATUSES.includes(doc.status);
@@ -241,7 +244,7 @@ export const FileCard = memo(function FileCard({
               className="h-7 px-2 text-[10px] items-center gap-1"
             >
               <RefreshCw className={cn("w-3 h-3", isProcessing && "animate-spin")} />
-              Analyze
+              {t("files.analyze")}
             </Button>
           )}
 
@@ -271,7 +274,7 @@ export const FileCard = memo(function FileCard({
                   }}
                 >
                   <Download className="w-4 h-4 text-muted-foreground" />
-                  Download
+                  {t("common.download")}
                 </button>
                 {onPreview && doc.status === "indexed" && (
                   <button
@@ -282,7 +285,7 @@ export const FileCard = memo(function FileCard({
                     }}
                   >
                     <Eye className="w-4 h-4 text-muted-foreground" />
-                    Preview
+                    {t("files.preview")}
                   </button>
                 )}
                 {(doc.status === "indexed" || doc.status === "building_kg") && (
@@ -294,7 +297,7 @@ export const FileCard = memo(function FileCard({
                     }}
                   >
                     <RefreshCw className="w-4 h-4 text-muted-foreground" />
-                    Re-analyze
+                    {t("files.re_analyze")}
                   </button>
                 )}
                 <div className="h-px bg-border my-1" />
@@ -306,7 +309,7 @@ export const FileCard = memo(function FileCard({
                   }}
                 >
                   <Trash2 className="w-4 h-4" />
-                  Delete
+                  {t("common.delete")}
                 </button>
               </div>
             )}

@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo, memo, createContext, useContext, Children, isValidElement, type ReactNode } from "react";
-import { useQuery, useMutation, useQueryClient, QueryClient } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { motion, AnimatePresence } from "framer-motion";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -69,10 +69,10 @@ SyntaxHighlighter.registerLanguage("c", cpp);
 SyntaxHighlighter.registerLanguage("diff", diff);
 SyntaxHighlighter.registerLanguage("markdown", markdown);
 SyntaxHighlighter.registerLanguage("md", markdown);
-import { useUpdateWorkspace } from "@/hooks/useWorkspaces";
 import { useDocument } from "@/hooks/useDocuments";
-import { useChatHistory, useClearChatHistory } from "@/hooks/useChatHistory";
+import { useChatHistory } from "@/hooks/useChatHistory";
 import { useRAGChatStream } from "@/hooks/useRAGChatStream";
+import { useTranslation } from "@/hooks/useTranslation";
 import { StreamingMarkdown } from "@/components/rag/MemoizedMarkdown";
 import { ThinkingTimeline } from "@/components/rag/ThinkingTimeline";
 import type {
@@ -80,7 +80,6 @@ import type {
   ChatImageRef,
   ChatSourceChunk,
   ChatStreamStatus,
-  Document,
   LLMCapabilities,
   AgentStep,
 } from "@/types";
@@ -114,6 +113,7 @@ function CitationLink({
   source: ChatSourceChunk;
   relatedEntities: string[];
 }) {
+  const { t } = useTranslation();
   const { activateCitation, activateCitationKG } =
     useWorkspaceStore();
   const { data: doc } = useDocument(source.document_id);
@@ -138,7 +138,7 @@ function CitationLink({
       <button
         onClick={handleContentClick}
         className="inline-flex items-center gap-0.5 h-[18px] px-1.5 mx-0.5 text-[10px] font-medium rounded-full bg-purple-400/15 text-purple-500 dark:text-purple-400 hover:bg-purple-400/25 transition-colors align-middle whitespace-nowrap"
-        title="View in Knowledge Graph"
+        title={t("chat.view_kg")}
       >
         <Brain className="w-2.5 h-2.5 flex-shrink-0" />
         <span>KG-{index}</span>
@@ -146,10 +146,9 @@ function CitationLink({
     );
   }
 
-  // Vector source — blue chip with FileText icon + docname-P.N
   const docName = doc?.original_filename
     ? shortenDocName(doc.original_filename)
-    : `Source ${index}`;
+    : t("rag.source") + ` ${index}`;
   const label = `${docName}-P.${source.page_no || "?"}`;
 
   return (
@@ -157,7 +156,7 @@ function CitationLink({
       <button
         onClick={handleContentClick}
         className="inline-flex items-center gap-0.5 h-[18px] px-1.5 text-[10px] font-medium rounded-full bg-primary/12 text-primary hover:bg-primary/20 transition-colors whitespace-nowrap"
-        title={`View source: ${doc?.original_filename || "unknown"} (p.${source.page_no})`}
+        title={t("chat.view_source", { name: doc?.original_filename || "unknown", page: source.page_no })}
       >
         <FileText className="w-2.5 h-2.5 flex-shrink-0" />
         <span>{label}</span>
@@ -165,7 +164,7 @@ function CitationLink({
       <button
         onClick={handleKGClick}
         className="inline-flex items-center justify-center w-[18px] h-[18px] text-[10px] font-bold rounded-full bg-purple-400/15 text-purple-500 dark:text-purple-400 hover:bg-purple-400/25 transition-colors"
-        title="Highlight in Knowledge Graph"
+        title={t("chat.highlight_kg")}
       >
         <Brain className="w-2.5 h-2.5" />
       </button>
@@ -183,6 +182,7 @@ function InlineImageRef({
   imgRefId: string;
   imageRef: ChatImageRef;
 }) {
+  const { t } = useTranslation();
   const [showPreview, setShowPreview] = useState(false);
   const { activateImageCitation } = useWorkspaceStore();
   const { data: doc } = useDocument(imageRef.document_id);
@@ -194,7 +194,7 @@ function InlineImageRef({
 
   const docName = doc?.original_filename
     ? shortenDocName(doc.original_filename)
-    : `Image ${imgRefId}`;
+    : t("rag.image") + ` ${imgRefId}`;
   const label = `${docName}-P.${imageRef.page_no || "?"}`;
 
   return (
@@ -202,7 +202,7 @@ function InlineImageRef({
       <button
         onClick={handleClick}
         className="inline-flex items-center gap-0.5 h-[18px] px-1.5 text-[10px] font-medium rounded-full bg-emerald-400/15 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-400/25 transition-colors align-middle whitespace-nowrap"
-        title={imageRef.caption || `Image from page ${imageRef.page_no}`}
+        title={imageRef.caption || t("common.page_x", { page: imageRef.page_no })}
       >
         <ImageIcon className="w-2.5 h-2.5 flex-shrink-0" />
         <span>{label}</span>
@@ -216,7 +216,7 @@ function InlineImageRef({
         >
           <img
             src={imageRef.url}
-            alt={imageRef.caption || `Image from page ${imageRef.page_no}`}
+            alt={imageRef.caption || t("common.page_x", { page: imageRef.page_no })}
             className="w-full h-auto max-h-[180px] object-contain"
           />
           {imageRef.caption && (
@@ -378,6 +378,7 @@ function CodeBlock({
   language: string;
   children: ReactNode;
 }) {
+  const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
   const theme = useThemeStore((s) => s.theme);
   const isDark = theme === "dark";
@@ -403,7 +404,7 @@ function CodeBlock({
           "absolute top-2 left-2 p-1 rounded-md text-muted-foreground/50 hover:text-muted-foreground transition-all opacity-0 group-hover:opacity-100 z-10",
           isDark ? "bg-white/5 hover:bg-white/10" : "bg-black/5 hover:bg-black/10"
         )}
-        title="Copy code"
+        title={t("chat.copy_code")}
       >
         {copied ? (
           <ClipboardCheck className="w-3 h-3 text-emerald-500" />
@@ -631,6 +632,7 @@ function KGSourceItem({
   ratings: Record<string, RelevanceRating>;
   onRate: (sourceIndex: string, rating: RelevanceRating) => void;
 }) {
+  const { t } = useTranslation();
   const { activateCitationKG } = useWorkspaceStore();
   const { data: doc } = useDocument(source.document_id);
   const debugMode = useContext(DebugCtx);
@@ -644,7 +646,7 @@ function KGSourceItem({
         <span className="inline-flex items-center justify-center w-4 h-4 text-[9px] font-bold rounded-full bg-purple-400/15 text-purple-400">
           {source.index}
         </span>
-        <span className="text-[10px] text-purple-400 font-medium">Knowledge Graph</span>
+        <span className="text-[10px] text-purple-400 font-medium">{t("common.knowledge_graph")}</span>
         {messageId && (
           <SourceRatingButtons
             sourceIndex={String(source.index)}
@@ -681,6 +683,7 @@ function SourcesPanel({
   sources: ChatSourceChunk[];
   messageId?: string;
 }) {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const [ratings, setRatings] = useState<Record<string, RelevanceRating>>({});
   const sessionId = useContext(SessionIdCtx);
@@ -717,7 +720,6 @@ function SourcesPanel({
     async (sourceIndex: string, rating: RelevanceRating) => {
       if (!sessionId || !messageId) return;
 
-      // Toggle: click same rating to un-rate
       const newRating = ratings[sourceIndex] === rating ? "partial" : rating;
       const prev = { ...ratings };
       setRatings((r) => ({ ...r, [sourceIndex]: newRating }));
@@ -730,20 +732,20 @@ function SourcesPanel({
           rating: newRating,
         });
       } catch {
-        setRatings(prev); // rollback
+        setRatings(prev);
       }
     },
     [sessionId, messageId, ratings, rateMutation],
   );
 
   return (
-    <div className="mt-2 rounded-md border bg-muted/20 overflow-hidden">
+    <div className="mt-2 rounded-md border bg-muted/20 overflow-hidden text-left">
       <button
         onClick={() => setExpanded(!expanded)}
         className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-[10px] font-medium text-muted-foreground hover:text-foreground transition-colors"
       >
         <FileText className="w-3 h-3" />
-        {vectorSources.length} source{vectorSources.length > 1 ? "s" : ""}
+        {sources.length} {sources.length > 1 ? t("rag.sources") : t("rag.source")}
         {kgSources.length > 0 && " + KG"}
         <span className="ml-auto text-[10px]">{expanded ? "▲" : "▼"}</span>
       </button>
@@ -809,6 +811,7 @@ function ImageRefCard({ img }: { img: ChatImageRef }) {
 }
 
 function ImageRefsPanel({ images }: { images: ChatImageRef[] }) {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(true);
 
   if (images.length === 0) return null;
@@ -820,7 +823,7 @@ function ImageRefsPanel({ images }: { images: ChatImageRef[] }) {
         className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-[10px] font-medium text-muted-foreground hover:text-foreground transition-colors"
       >
         <ImageIcon className="w-3 h-3" />
-        {images.length} image{images.length > 1 ? "s" : ""} from documents
+        {t("chat.images_from_docs", { count: images.length })}
         <span className="ml-auto text-[10px]">{expanded ? "▲" : "▼"}</span>
       </button>
       <AnimatePresence>
@@ -847,6 +850,7 @@ function ImageRefsPanel({ images }: { images: ChatImageRef[] }) {
 // Thinking panel — collapsible violet-themed thinking process display
 // ---------------------------------------------------------------------------
 function ThinkingPanel({ thinking }: { thinking: string }) {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
 
   if (!thinking) return null;
@@ -858,7 +862,7 @@ function ThinkingPanel({ thinking }: { thinking: string }) {
         className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-[10px] font-medium text-violet-400 hover:text-violet-300 [[data-theme='light']_&]:text-violet-600 [[data-theme='light']_&]:hover:text-violet-700 transition-colors"
       >
         <Brain className="w-3 h-3" />
-        Thinking process
+        {t("chat.thinking_process")}
         <ChevronDown
           className={cn(
             "w-3 h-3 ml-auto transition-transform",
@@ -917,8 +921,8 @@ function markdownToPlainText(md: string): string {
 }
 
 function CopyMessageActions({ content }: { content: string }) {
+  const { t } = useTranslation();
   const [copiedMode, setCopiedMode] = useState<"text" | "markdown" | null>(null);
-
   const handleCopy = useCallback(
     (mode: "text" | "markdown") => {
       const value =
@@ -936,26 +940,26 @@ function CopyMessageActions({ content }: { content: string }) {
       <button
         onClick={() => handleCopy("text")}
         className="flex items-center gap-1 px-1.5 py-0.5 rounded-md text-muted-foreground/50 hover:text-muted-foreground hover:bg-muted/60 transition-all text-[10px]"
-        title="Copy as plain text"
+        title={t("chat.copy_text")}
       >
         {copiedMode === "text" ? (
           <ClipboardCheck className="w-3 h-3 text-emerald-500" />
         ) : (
           <Copy className="w-3 h-3" />
         )}
-        <span>{copiedMode === "text" ? "Copied!" : "Copy text"}</span>
+        <span>{copiedMode === "text" ? t("chat.copied") : t("chat.copy_text")}</span>
       </button>
       <button
         onClick={() => handleCopy("markdown")}
         className="flex items-center gap-1 px-1.5 py-0.5 rounded-md text-muted-foreground/50 hover:text-muted-foreground hover:bg-muted/60 transition-all text-[10px]"
-        title="Copy as markdown"
+        title={t("chat.copy_markdown")}
       >
         {copiedMode === "markdown" ? (
           <ClipboardCheck className="w-3 h-3 text-emerald-500" />
         ) : (
           <FileCode className="w-3 h-3" />
         )}
-        <span>{copiedMode === "markdown" ? "Copied!" : "Copy markdown"}</span>
+        <span>{copiedMode === "markdown" ? t("chat.copied") : t("chat.copy_markdown")}</span>
       </button>
     </div>
   );
@@ -969,6 +973,7 @@ const MessageBubble = memo(function MessageBubble({
 }: {
   message: ChatMessage;
 }) {
+  const { t } = useTranslation();
   const isUser = message.role === "user";
   const user = useAuthStore((s) => s.user);
 
@@ -1116,7 +1121,7 @@ const MessageBubble = memo(function MessageBubble({
               ? "ring-1 ring-primary/30"
               : "bg-secondary text-muted-foreground"
           )}
-          title={user?.full_name || "User"}
+          title={user?.full_name || t("common.you")}
         >
           {user?.avatar_url ? (
             <img
@@ -1138,6 +1143,7 @@ const MessageBubble = memo(function MessageBubble({
 // ---------------------------------------------------------------------------
 
 function InlineThinkingPreview({ text }: { text: string }) {
+  const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
   const isUserScrolledRef = useRef(false);
 
@@ -1158,7 +1164,7 @@ function InlineThinkingPreview({ text }: { text: string }) {
     <div className="mt-1">
       <div className="flex items-center gap-1.5 mb-1.5">
         <Brain className="w-3.5 h-3.5 text-violet-400 animate-pulse" />
-        <span className="text-xs font-medium text-violet-400">Thinking...</span>
+        <span className="text-xs font-medium text-violet-400">{t("chat.thinking")}</span>
       </div>
       <div
         ref={containerRef}
@@ -1181,13 +1187,15 @@ function InlineThinkingPreview({ text }: { text: string }) {
 // Typing indicator
 // ---------------------------------------------------------------------------
 const STATUS_LABELS: Record<string, string> = {
-  analyzing: "Analyzing your question...",
-  retrieving: "Searching documents...",
-  generating: "Generating answer...",
+  analyzing: "rag.status.analyzing",
+  retrieving: "rag.status.retrieving",
+  generating: "rag.status.generating",
 };
 
 function TypingIndicator({ status }: { status?: ChatStreamStatus }) {
-  const label = (status && STATUS_LABELS[status]) || "Analyzing documents...";
+  const { t } = useTranslation();
+  const labelKey = (status && STATUS_LABELS[status]) || "rag.status.default";
+  const label = t(labelKey);
   return (
     <div className="flex gap-2 items-start">
       <div className="relative w-6 h-6 flex-shrink-0">
@@ -1214,11 +1222,12 @@ function SuggestionChips({
 }: {
   onSelect: (q: string) => void;
 }) {
+  const { t } = useTranslation();
   const suggestions = [
-    "Summarize the key findings",
-    "What are the main topics?",
-    "List important entities mentioned",
-    "Explain the methodology used",
+    t("chat.suggestion_summary"),
+    t("chat.suggestion_topics"),
+    t("chat.suggestion_entities"),
+    t("chat.suggestion_methodology"),
   ];
 
   return (
@@ -1226,9 +1235,9 @@ function SuggestionChips({
       <div className="w-12 h-12 rounded-2xl bg-primary/10 flex items-center justify-center mb-4">
         <Sparkles className="w-6 h-6 text-primary" />
       </div>
-      <h3 className="text-sm font-semibold mb-1">AI Document Assistant</h3>
+      <h3 className="text-sm font-semibold mb-1">{t("chat.assistant_title")}</h3>
       <p className="text-xs text-muted-foreground text-center mb-4 max-w-[240px]">
-        Ask questions about your documents. I'll find relevant information and cite my sources.
+        {t("chat.assistant_desc")}
       </p>
       <div className="flex flex-wrap gap-1.5 justify-center max-w-[300px]">
         {suggestions.map((s) => (
@@ -1248,65 +1257,7 @@ function SuggestionChips({
 // ---------------------------------------------------------------------------
 // ChatPanel — main export
 // ---------------------------------------------------------------------------
-const DEFAULT_SYSTEM_PROMPT =
-  "You are a document Q&A assistant. Your goal is to write an accurate, " +
-  "detailed, and comprehensive answer to the user's question, drawing from " +
-  "the provided document sources. You will be given retrieved document sources " +
-  "from a knowledge base to help you answer. Your answer should be informed by " +
-  "these provided sources. Your answer must be self-contained and respond fully " +
-  "to the question. Your answer must be correct, high-quality, well-formatted, " +
-  "and written by an expert using an unbiased and journalistic tone.\n\n" +
-  "## Core Behavior\n" +
-  "- Answer questions ONLY using the provided document sources. " +
-  "Do NOT add any information from your own knowledge.\n" +
-  "- Extract ALL relevant information from sources: numbers, percentages, " +
-  "dates, names, statistics, data from tables, and specific details.\n" +
-  "- You may synthesize, compare, and draw logical conclusions from " +
-  "multiple sources when the question requires it.\n" +
-  "- If sources contain partial information, use what is available and " +
-  "clearly note what is missing.\n" +
-  "- When asked about specific data, always provide exact numbers rather " +
-  "than vague descriptions.\n\n" +
-  "## Question Type Handling\n\n" +
-  "**Factual / Data:** Direct answers with exact figures, percentages, " +
-  "time periods. Present multi-row data in tables.\n\n" +
-  "**Comparison / Analysis:** Use Markdown tables for side-by-side comparisons. " +
-  "Draw logical conclusions from data.\n\n" +
-  "**Technical / Academic:** Long detailed answers with sections and headings. " +
-  "Include formulas (LaTeX), code blocks.\n\n" +
-  "**Summary:** Organize by themes, not by source document. " +
-  "Highlight key findings.\n\n" +
-  "**Coding:** Use ```language code blocks. Code first, explain after.\n\n" +
-  "**Science / Math:** Include formulas in LaTeX. For simple calculations, " +
-  "answer with final result.\n\n" +
-  "## Reasoning\n" +
-  "- Determine question type and apply appropriate handling.\n" +
-  "- Break complex questions into sub-questions.\n" +
-  "- A partial correct answer is better than a complete wrong one.\n" +
-  "- Make sure your answer addresses ALL parts of the question.\n\n" +
-  "## Response Quality\n" +
-  "- Prioritize accuracy over completeness.\n" +
-  "- When sources conflict, acknowledge and present both perspectives.\n" +
-  "- NEVER say 'information not found' when data IS present in any source.\n" +
-  "- If the premise is incorrect based on sources, explain why.";
 
-// Hard rules always appended — shown in tooltip, not editable
-const HARD_RULES_SUMMARY = [
-  // Language (MANDATORY)
-  "MUST answer in the SAME language as user's question.",
-  // Citation
-  "Cite EVERY claim: [a3x9][b2m7]. No space before citation.",
-  "Images: [IMG-p4f2][IMG-q7r3]. Never group or mix brackets.",
-  "Max 3 citations per sentence. No References section at end.",
-  // Formatting
-  "Start with summary, NEVER with heading or \"Based on...\".",
-  "## for sections. Tables for comparisons. Flat lists only.",
-  "LaTeX: $inline$ and $$block$$. Never Unicode for math.",
-  "```language for code. > for quotes. **bold** for key terms.",
-  // Restrictions
-  "No hedging (\"It is important...\"). State answers directly.",
-  "No emojis. Never end with a question.",
-];
 
 interface ChatPanelProps {
   sessionId: string | null;
@@ -1317,6 +1268,7 @@ export const ChatPanel = memo(function ChatPanel({
   sessionId,
   sessionTitle,
 }: ChatPanelProps) {
+  const { t } = useTranslation();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [enableThinking, setEnableThinking] = useState(false);
@@ -1325,7 +1277,6 @@ export const ChatPanel = memo(function ChatPanel({
 
   // Load chat history from PostgreSQL
   const { data: historyData, isLoading: historyLoading } = useChatHistory(sessionId);
-  const clearMutation = useClearChatHistory(sessionId);
   const queryClient = useQueryClient();
 
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -1335,7 +1286,7 @@ export const ChatPanel = memo(function ChatPanel({
 
   // Debug mode (Ctrl+Shift+D toggle, persisted in localStorage)
   const [debugMode, setDebugMode] = useState(() =>
-    localStorage.getItem("nexusrag-debug-mode") === "true",
+    localStorage.getItem("hrag-debug-mode") === "true",
   );
 
   useEffect(() => {
@@ -1344,8 +1295,8 @@ export const ChatPanel = memo(function ChatPanel({
         e.preventDefault();
         setDebugMode((prev) => {
           const next = !prev;
-          localStorage.setItem("nexusrag-debug-mode", String(next));
-          toast.success(next ? "Debug mode ON" : "Debug mode OFF");
+          localStorage.setItem("hrag-debug-mode", String(next));
+          toast.success(next ? t("chat.debug_on") : t("chat.debug_off"));
           return next;
         });
       }
@@ -1645,13 +1596,13 @@ export const ChatPanel = memo(function ChatPanel({
           ),
         );
       } else if (stream.error) {
-        toast.error("Chat failed: " + stream.error);
+        toast.error(t("chat.failed", { error: stream.error }));
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantId
               ? {
                 ...m,
-                content: m.content || "Sorry, I encountered an error. Please try again.",
+                content: m.content || t("chat.error_fallback"),
                 isStreaming: false,
               }
               : m,
@@ -1675,12 +1626,6 @@ export const ChatPanel = memo(function ChatPanel({
       e.preventDefault();
       handleSend();
     }
-  };
-
-  const handleClear = () => {
-    setMessages([]);
-    clearMutation.mutate();
-    useWorkspaceStore.getState().clearHighlights();
   };
 
   // Collect all sources from all assistant messages for citation fallback.
@@ -1722,7 +1667,7 @@ export const ChatPanel = memo(function ChatPanel({
               <div className="flex items-center gap-2">
                 <Bot className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
                 <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground line-clamp-1 max-w-[400px]">
-                  Chat {sessionTitle ? `- ${sessionTitle}` : (sessionId ? `(Session ${sessionId})` : "(Select a session)")}
+                  {t("chat.chat")} {sessionTitle ? `- ${sessionTitle}` : (sessionId ? `${t("chat.session", { id: sessionId })}` : t("chat.select_session"))}
                 </h2>
               </div>
               <div className="flex items-center gap-1.5">
@@ -1736,10 +1681,10 @@ export const ChatPanel = memo(function ChatPanel({
                         ? "text-violet-400 bg-violet-400/10 hover:bg-violet-400/15"
                         : "text-muted-foreground hover:bg-muted"
                     )}
-                    title={enableThinking ? "Thinking mode ON" : "Thinking mode OFF"}
+                    title={enableThinking ? t("chat.think_on") : t("chat.think_off")}
                   >
                     <Brain className="w-3 h-3" />
-                    <span>{enableThinking ? "Think" : "Think"}</span>
+                    <span>{t("chat.think_toggle")}</span>
                   </button>
                 )}
                 {/* Force search toggle */}
@@ -1751,10 +1696,10 @@ export const ChatPanel = memo(function ChatPanel({
                       ? "text-amber-500 bg-amber-500/10 hover:bg-amber-500/15"
                       : "text-muted-foreground hover:bg-muted"
                   )}
-                  title={forceSearch ? "Force Search ON — pre-searches before every answer" : "Force Search OFF — AI decides when to search"}
+                  title={forceSearch ? t("chat.search_on") : t("chat.search_off")}
                 >
                   <DatabaseZap className="w-3 h-3" />
-                  <span>Search</span>
+                  <span>{t("chat.search_toggle")}</span>
                 </button>
               </div>
             </div>
@@ -1785,7 +1730,7 @@ export const ChatPanel = memo(function ChatPanel({
                   value={input}
                   onChange={(e) => setInput(e.target.value)}
                   onKeyDown={handleKeyDown}
-                  placeholder="Ask about your documents..."
+                  placeholder={t("chat.input_placeholder")}
                   rows={1}
                   className={cn(
                     "flex-1 resize-none rounded-lg border border-input bg-background px-3 py-2 text-base shadow-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50",
@@ -1806,7 +1751,7 @@ export const ChatPanel = memo(function ChatPanel({
                   <button
                     onClick={stream.cancel}
                     className="flex-shrink-0 w-9 h-9 rounded-lg flex items-center justify-center transition-colors bg-destructive/15 text-destructive hover:bg-destructive/25"
-                    title="Stop generating"
+                    title={t("chat.stop")}
                   >
                     <Square className="w-3.5 h-3.5 fill-current" />
                   </button>
@@ -1826,7 +1771,7 @@ export const ChatPanel = memo(function ChatPanel({
                 )}
               </div>
               <p className="text-[9px] text-muted-foreground/50 mt-1 text-center">
-                Press Enter to send, Shift+Enter for new line
+                {t("chat.input_hint")}
               </p>
             </div>
           </div>

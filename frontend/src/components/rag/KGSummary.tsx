@@ -1,6 +1,7 @@
 import { useState, memo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Brain, ChevronDown, ChevronUp } from "lucide-react";
+import { useTranslation } from "@/hooks/useTranslation";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -9,6 +10,7 @@ interface KGSummaryProps {
 }
 
 export const KGSummary = memo(function KGSummary({ summary }: KGSummaryProps) {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(true);
 
   if (!summary || summary.trim().length === 0) return null;
@@ -21,7 +23,7 @@ export const KGSummary = memo(function KGSummary({ summary }: KGSummaryProps) {
       >
         <div className="flex items-center gap-2">
           <Brain className="w-4 h-4 text-primary" />
-          <span className="text-sm font-medium text-primary">Knowledge Graph Insights</span>
+          <span className="text-sm font-medium text-primary">{t("rag.kg_insights")}</span>
         </div>
         {expanded ? (
           <ChevronUp className="w-4 h-4 text-primary/60" />

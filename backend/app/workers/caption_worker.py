@@ -1,7 +1,7 @@
 """
 Caption Worker
 ==============
-Consumes nexusrag.caption queue.
+Consumes hrag.caption queue.
 
 Responsibilities:
   1. Load images (no caption) + tables (no caption) from DB
@@ -51,8 +51,8 @@ async def handle_caption(payload: dict) -> None:
             logger.error(f"[caption_worker] doc={msg.document_id} not found")
             return
 
-        has_images  = settings.NEXUSRAG_ENABLE_IMAGE_CAPTIONING
-        has_tables  = settings.NEXUSRAG_ENABLE_TABLE_CAPTIONING
+        has_images  = settings.HRAG_ENABLE_IMAGE_CAPTIONING
+        has_tables  = settings.HRAG_ENABLE_TABLE_CAPTIONING
 
         try:
             # ── Load images and tables from DB ──────────────────────────────
@@ -247,8 +247,8 @@ async def _caption_tables_concurrent(tables: list[ExtractedTable]) -> None:
         async with _CAPTION_SEMAPHORE:
             try:
                 table_md = tbl.content_markdown
-                if len(table_md) > settings.NEXUSRAG_MAX_TABLE_MARKDOWN_CHARS:
-                    table_md = table_md[:settings.NEXUSRAG_MAX_TABLE_MARKDOWN_CHARS] + "\n...(truncated)"
+                if len(table_md) > settings.HRAG_MAX_TABLE_MARKDOWN_CHARS:
+                    table_md = table_md[:settings.HRAG_MAX_TABLE_MARKDOWN_CHARS] + "\n...(truncated)"
                 from app.services.llm.types import LLMMessage
                 message = LLMMessage(role="user", content=_TABLE_PROMPT + table_md)
                 result = await asyncio.to_thread(provider.complete, [message])

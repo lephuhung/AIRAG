@@ -7,11 +7,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent } from "@/components/ui/card";
 import { Database, UserPlus, Building2, Loader2, AlertCircle, CheckCircle2 } from "lucide-react";
+import { useTranslation } from "@/hooks/useTranslation";
 
 export function RegisterPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const inviteToken = searchParams.get("invite");
+  const { t } = useTranslation();
 
   const register = useAuthStore((s) => s.register);
   const { data: inviteData, isLoading: inviteLoading } = useValidateInvite(inviteToken);
@@ -65,15 +67,15 @@ export function RegisterPage() {
             <div className="w-14 h-14 rounded-2xl bg-primary/10 flex items-center justify-center mb-3">
               <Database className="w-7 h-7 text-primary" />
             </div>
-            <h1 className="text-xl font-bold">NexusRAG</h1>
-            <p className="text-sm text-muted-foreground mt-1">Create a new account</p>
+            <h1 className="text-xl font-bold">{t("app.name")}</h1>
+            <p className="text-sm text-muted-foreground mt-1">{t("auth.register_title")}</p>
           </div>
 
           {/* Invite validation status */}
           {inviteToken && inviteLoading && (
             <div className="flex items-center gap-2 p-3 mb-4 rounded-lg bg-muted/50 border">
               <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
-              <span className="text-sm text-muted-foreground">Validating invite link...</span>
+              <span className="text-sm text-muted-foreground">{t("auth.invite_validating")}</span>
             </div>
           )}
 
@@ -82,10 +84,10 @@ export function RegisterPage() {
               <Building2 className="w-4 h-4 text-emerald-600 flex-shrink-0" />
               <div className="min-w-0">
                 <p className="text-sm font-medium text-emerald-700 dark:text-emerald-400">
-                  Invited to {inviteData.tenant_name}
+                  {t("auth.invited_to")} {inviteData.tenant_name}
                 </p>
                 <p className="text-xs text-emerald-600/70 dark:text-emerald-400/70">
-                  Your account will be activated automatically
+                  {t("auth.invite_auto_activate")}
                 </p>
               </div>
             </div>
@@ -96,10 +98,10 @@ export function RegisterPage() {
               <AlertCircle className="w-4 h-4 text-destructive flex-shrink-0" />
               <div className="min-w-0">
                 <p className="text-sm font-medium text-destructive">
-                  Invalid or expired invite link
+                  {t("auth.invalid_invite")}
                 </p>
                 <p className="text-xs text-destructive/70">
-                  You can still register normally below
+                  {t("auth.invite_can_register")}
                 </p>
               </div>
             </div>
@@ -107,7 +109,7 @@ export function RegisterPage() {
 
           <form onSubmit={handleRegister} className="space-y-4">
             <div>
-              <label className="block text-sm font-medium mb-1.5">Full Name</label>
+              <label className="block text-sm font-medium mb-1.5">{t("auth.full_name")}</label>
               <Input
                 placeholder="Your full name"
                 value={form.full_name}
@@ -117,7 +119,7 @@ export function RegisterPage() {
               />
             </div>
             <div>
-              <label className="block text-sm font-medium mb-1.5">Email</label>
+              <label className="block text-sm font-medium mb-1.5">{t("auth.email")}</label>
               <Input
                 type="email"
                 placeholder="you@example.com"
@@ -130,12 +132,12 @@ export function RegisterPage() {
               {emailLocked && (
                 <p className="text-xs text-muted-foreground mt-1 flex items-center gap-1">
                   <CheckCircle2 className="w-3 h-3" />
-                  Email set by invite link
+                  {t("auth.invite_locked_email")}
                 </p>
               )}
             </div>
             <div>
-              <label className="block text-sm font-medium mb-1.5">Password</label>
+              <label className="block text-sm font-medium mb-1.5">{t("auth.password")}</label>
               <Input
                 type="password"
                 placeholder="Min 6 characters"
@@ -150,29 +152,26 @@ export function RegisterPage() {
             {!isInviteValid && (
               <div>
                 <label className="block text-sm font-medium mb-1.5">
-                  Tenant Code <span className="text-muted-foreground font-normal">(optional)</span>
+                  {t("auth.tenant_code")} <span className="text-muted-foreground font-normal">(optional)</span>
                 </label>
                 <Input
                   placeholder="e.g. my-company"
                   value={form.tenant_slug}
                   onChange={(e) => setForm((s) => ({ ...s, tenant_slug: e.target.value }))}
                 />
-                <p className="text-xs text-muted-foreground mt-1">
-                  Enter a tenant code if you want to join an organization.
-                </p>
               </div>
             )}
 
             <Button type="submit" className="w-full" disabled={loading || inviteLoading}>
               <UserPlus className="w-4 h-4 mr-2" />
-              {loading ? "Creating account..." : "Create Account"}
+              {loading ? t("auth.creating_account") : t("auth.create_account")}
             </Button>
           </form>
 
           <div className="mt-4 text-center text-sm text-muted-foreground">
-            Already have an account?{" "}
+            {t("auth.have_account")}{" "}
             <Link to="/login" className="text-primary hover:underline font-medium">
-              Sign in
+              {t("auth.sign_in")}
             </Link>
           </div>
         </CardContent>

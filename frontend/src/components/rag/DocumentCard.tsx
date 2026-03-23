@@ -1,5 +1,6 @@
 import { memo, useState, useEffect } from "react";
 import { motion } from "framer-motion";
+import { useTranslation } from "@/hooks/useTranslation";
 import {
   FileText,
   FileType,
@@ -7,16 +8,15 @@ import {
   FileCode,
   Hash,
   Trash2,
-  RefreshCw,
   CheckCircle2,
   XCircle,
   Loader2,
   Clock,
   File,
-  Sparkles,
   Layers,
   ImageIcon,
   Network,
+  Play,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -41,18 +41,19 @@ export function getFileConfig(fileType: string) {
 // ---------------------------------------------------------------------------
 // Status badge
 // ---------------------------------------------------------------------------
-export const STATUS_CONFIG: Record<DocumentStatus, { label: string; className: string; icon: typeof CheckCircle2 }> = {
-  pending:      { label: "Pending",      className: "bg-muted text-muted-foreground",         icon: Clock },
-  parsing:      { label: "Parsing",      className: "bg-blue-400/15 text-blue-400",           icon: Loader2 },
-  ocring:       { label: "OCR",          className: "bg-indigo-400/15 text-indigo-400",       icon: Loader2 },
-  chunking:     { label: "Chunking",     className: "bg-cyan-400/15 text-cyan-400",           icon: Loader2 },
-  embedding:    { label: "Embedding",    className: "bg-amber-400/15 text-amber-400",         icon: Loader2 },
-  building_kg:  { label: "Building KG",  className: "bg-violet-400/15 text-violet-400",       icon: Loader2 },
-  indexed:      { label: "Indexed",      className: "bg-primary/15 text-primary",             icon: CheckCircle2 },
-  failed:       { label: "Failed",       className: "bg-destructive/15 text-destructive",     icon: XCircle },
+export const STATUS_CONFIG: Record<DocumentStatus, { labelKey: string; className: string; icon: typeof CheckCircle2 }> = {
+  pending:      { labelKey: "files.status.pending",      className: "bg-muted text-muted-foreground",         icon: Clock },
+  parsing:      { labelKey: "files.status.parsing",      className: "bg-blue-400/15 text-blue-400",           icon: Loader2 },
+  ocring:       { labelKey: "files.status.ocring",       className: "bg-indigo-400/15 text-indigo-400",       icon: Loader2 },
+  chunking:     { labelKey: "files.status.chunking",     className: "bg-cyan-400/15 text-cyan-400",           icon: Loader2 },
+  embedding:    { labelKey: "files.status.embedding",    className: "bg-amber-400/15 text-amber-400",         icon: Loader2 },
+  building_kg:  { labelKey: "files.status.building_kg",  className: "bg-violet-400/15 text-violet-400",       icon: Loader2 },
+  indexed:      { labelKey: "files.status.indexed",      className: "bg-primary/15 text-primary",             icon: CheckCircle2 },
+  failed:       { labelKey: "files.status.failed",       className: "bg-destructive/15 text-destructive",     icon: XCircle },
 };
 
 function StatusBadge({ status }: { status: DocumentStatus }) {
+  const { t } = useTranslation();
   const config = STATUS_CONFIG[status] ?? STATUS_CONFIG.pending;
   const Icon = config.icon;
   const isAnimated = status === "parsing" || status === "ocring" || status === "chunking" || status === "embedding" || status === "building_kg";
@@ -60,7 +61,7 @@ function StatusBadge({ status }: { status: DocumentStatus }) {
   return (
     <span className={cn("inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium rounded-full", config.className)}>
       <Icon className={cn("w-3 h-3", isAnimated && "animate-spin")} />
-      {config.label}
+      {t(config.labelKey)}
     </span>
   );
 }
@@ -75,10 +76,11 @@ interface SubTaskProgressProps {
 }
 
 function SubTaskProgress({ embed_done, captions_done, kg_done }: SubTaskProgressProps) {
+  const { t } = useTranslation();
   const tasks = [
-    { done: embed_done,    label: "Embed",    Icon: Layers },
-    { done: captions_done, label: "Captions", Icon: ImageIcon },
-    { done: kg_done,       label: "KG",       Icon: Network },
+    { done: embed_done,    label: t("files.tasks.embed"),    Icon: Layers },
+    { done: captions_done, label: t("files.tasks.captions"), Icon: ImageIcon },
+    { done: kg_done,       label: t("files.tasks.kg"),       Icon: Network },
   ];
 
   return (
@@ -109,11 +111,12 @@ function SubTaskProgress({ embed_done, captions_done, kg_done }: SubTaskProgress
 // Metadata chips
 // ---------------------------------------------------------------------------
 function MetadataChips({ doc }: { doc: Document }) {
+  const { t } = useTranslation();
   const chips: { label: string; value: number }[] = [];
-  if (doc.page_count && doc.page_count > 0) chips.push({ label: "pages", value: doc.page_count });
-  if (doc.chunk_count > 0) chips.push({ label: "chunks", value: doc.chunk_count });
-  if (doc.image_count && doc.image_count > 0) chips.push({ label: "images", value: doc.image_count });
-  if (doc.table_count && doc.table_count > 0) chips.push({ label: "tables", value: doc.table_count });
+  if (doc.page_count && doc.page_count > 0) chips.push({ label: t("files.metadata.pages"), value: doc.page_count });
+  if (doc.chunk_count > 0) chips.push({ label: t("files.metadata.chunks"), value: doc.chunk_count });
+  if (doc.image_count && doc.image_count > 0) chips.push({ label: t("files.metadata.images"), value: doc.image_count });
+  if (doc.table_count && doc.table_count > 0) chips.push({ label: t("files.metadata.tables"), value: doc.table_count });
 
   if (chips.length === 0) return null;
 
@@ -134,24 +137,27 @@ function MetadataChips({ doc }: { doc: Document }) {
 interface DocumentCardProps {
   doc: Document;
   selected?: boolean;
+  onToggleSelect?: (id: number) => void;
   onDelete: (id: number) => void;
-  onReindex: (id: number) => void;
   onProcess: (id: number) => void;
-  isProcessing?: boolean;
   onClick?: (doc: Document) => void;
+  showSubTasks?: boolean;
+  isProcessing?: boolean;
 }
 
 const ACTIVE_STATUSES: DocumentStatus[] = ["parsing", "ocring", "chunking", "embedding", "building_kg"];
 
-export const DocumentCard = memo(function DocumentCard({
+export const DocumentCard = memo(({
   doc,
   selected,
+  onToggleSelect,
   onDelete,
-  onReindex,
   onProcess,
-  isProcessing,
   onClick,
-}: DocumentCardProps) {
+  showSubTasks: forceShowSubTasks,
+  isProcessing,
+}: DocumentCardProps) => {
+  const { t } = useTranslation();
   const fileConfig = getFileConfig(doc.file_type);
   const FileIcon = fileConfig.icon;
   const sizeStr = doc.file_size >= 1024 * 1024
@@ -159,14 +165,14 @@ export const DocumentCard = memo(function DocumentCard({
     : `${Math.round(doc.file_size / 1024)} KB`;
 
   const isActive = ACTIVE_STATUSES.includes(doc.status);
-  const showSubTasks = doc.status === "chunking" || doc.status === "embedding";
+  const shouldShowSubTasks = forceShowSubTasks ?? (doc.status === "chunking" || doc.status === "embedding");
 
   // Flash animation when user just clicked "Analyze"
   const [justTriggered, setJustTriggered] = useState(false);
   useEffect(() => {
     if (justTriggered) {
-      const t = setTimeout(() => setJustTriggered(false), 1200);
-      return () => clearTimeout(t);
+      const timer = setTimeout(() => setJustTriggered(false), 1200);
+      return () => clearTimeout(timer);
     }
   }, [justTriggered]);
 
@@ -205,106 +211,117 @@ export const DocumentCard = memo(function DocumentCard({
         </div>
       )}
 
-      <div className="relative px-4 py-3 flex items-start gap-3">
-        {/* File icon */}
-        <div className={cn(
-          "w-10 h-10 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5 transition-colors",
-          isActive ? "bg-blue-400/10" : "bg-muted/50",
-        )}>
-          {isActive ? (
-            <Loader2 className="w-5 h-5 text-blue-400 animate-spin" />
-          ) : (
-            <FileIcon className={cn("w-5 h-5", fileConfig.color)} />
-          )}
+      <div className="relative px-4 py-3 flex flex-col gap-2">
+        {onToggleSelect && (
+          <div 
+            className="absolute top-3 right-3 z-10 opacity-0 group-hover:opacity-100 transition-opacity"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <input
+              type="checkbox"
+              checked={selected}
+              onChange={() => onToggleSelect(doc.id)}
+              className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+            />
+          </div>
+        )}
+        <div className="flex items-start gap-3">
+          {/* File icon */}
+          <div className={cn(
+            "w-10 h-10 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5 transition-colors",
+            isActive ? "bg-blue-400/10" : "bg-muted/50",
+          )}>
+            {isActive ? (
+              <Loader2 className="w-5 h-5 text-blue-400 animate-spin" />
+            ) : (
+              <FileIcon className={cn("w-5 h-5", fileConfig.color)} />
+            )}
+          </div>
+
+          {/* Content */}
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2">
+              <p className="font-medium text-sm truncate">{doc.original_filename}</p>
+              <StatusBadge status={doc.status} />
+            </div>
+            <div className="flex items-center gap-2 mt-0.5">
+              <span className="text-xs text-muted-foreground">{sizeStr}</span>
+              {doc.parser_version && (
+                <span className="text-xs text-muted-foreground/60">{doc.parser_version}</span>
+              )}
+            </div>
+          </div>
+
+          {/* Actions */}
+          <div className="flex items-center gap-1 flex-shrink-0">
+            {doc.status === "pending" && (
+              <button
+                onClick={handleProcess}
+                disabled={isProcessing}
+                className="flex items-center gap-1.5 px-2 py-1 rounded bg-blue-500/10 text-blue-500 hover:bg-blue-500/20 transition-colors disabled:opacity-50"
+                title={t("workspace.analyze_all")}
+              >
+                <Play className="w-3 h-3 fill-current" />
+                <span className="font-semibold uppercase tracking-wider text-[10px]">{t("files.status.pending")}</span>
+              </button>
+            )}
+
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={(e) => {
+                e.stopPropagation();
+                onDelete(doc.id);
+              }}
+              className="h-7 w-7 opacity-0 group-hover:opacity-100 transition-opacity"
+              disabled={isProcessing}
+            >
+              <Trash2 className="w-3.5 h-3.5 text-destructive" />
+            </Button>
+          </div>
         </div>
 
-        {/* Content */}
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
-            <p className="font-medium text-sm truncate">{doc.original_filename}</p>
-            <StatusBadge status={doc.status} />
-          </div>
-          <div className="flex items-center gap-2 mt-0.5">
-            <span className="text-xs text-muted-foreground">{sizeStr}</span>
-            {doc.parser_version && (
-              <span className="text-xs text-muted-foreground/60">{doc.parser_version}</span>
-            )}
-            {doc.status === "parsing" && (
-              <span className="text-xs text-blue-400/80 font-medium animate-pulse">
-                Parsing document...
-              </span>
-            )}
-            {doc.status === "ocring" && (
-              <span className="text-xs text-indigo-400/80 font-medium animate-pulse">
-                Running OCR...
-              </span>
-            )}
-            {doc.status === "chunking" && (
-              <span className="text-xs text-cyan-400/80 font-medium animate-pulse">
-                Building chunks...
-              </span>
-            )}
-            {doc.status === "embedding" && (
-              <span className="text-xs text-amber-400/80 font-medium animate-pulse">
-                Embedding vectors...
-              </span>
-            )}
-            {doc.status === "building_kg" && (
-              <span className="text-xs text-violet-400/80 font-medium animate-pulse">
-                Building knowledge graph...
-              </span>
-            )}
-          </div>
+        {/* Status specific messages */}
+        <div className="flex flex-col gap-1 pl-13">
+          {doc.status === "parsing" && (
+            <span className="text-xs text-blue-400/80 font-medium animate-pulse">
+              {t("files.msg.parsing")}
+            </span>
+          )}
+          {doc.status === "ocring" && (
+            <span className="text-xs text-indigo-400/80 font-medium animate-pulse">
+              {t("files.msg.ocring")}
+            </span>
+          )}
+          {doc.status === "chunking" && (
+            <span className="text-xs text-cyan-400/80 font-medium animate-pulse">
+              {t("files.msg.chunking")}
+            </span>
+          )}
+          {doc.status === "embedding" && (
+            <span className="text-xs text-amber-400/80 font-medium animate-pulse">
+              {t("files.msg.embedding")}
+            </span>
+          )}
+          {doc.status === "building_kg" && (
+            <span className="text-xs text-violet-400/80 font-medium animate-pulse">
+              {t("files.msg.building_kg")}
+            </span>
+          )}
+          
           <MetadataChips doc={doc} />
-          {showSubTasks && (
+          
+          {shouldShowSubTasks && (
             <SubTaskProgress
               embed_done={doc.embed_done}
               captions_done={doc.captions_done}
               kg_done={doc.kg_done}
             />
           )}
+          
           {doc.error_message && (
             <p className="text-xs text-destructive mt-1 truncate">{doc.error_message}</p>
           )}
-        </div>
-
-        {/* Actions */}
-        <div className="flex items-center gap-1 flex-shrink-0">
-          {(doc.status === "pending" || doc.status === "failed") && (
-            <Button
-              variant="default"
-              size="sm"
-              onClick={handleProcess}
-              disabled={isProcessing}
-              className="h-7 text-xs gap-1.5"
-            >
-              {isProcessing ? (
-                <Loader2 className="w-3 h-3 animate-spin" />
-              ) : (
-                <Sparkles className="w-3 h-3" />
-              )}
-              Analyze
-            </Button>
-          )}
-          {(doc.status === "indexed" || doc.status === "building_kg") && (
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={(e) => { e.stopPropagation(); onReindex(doc.id); }}
-              className="h-7 w-7 opacity-0 group-hover:opacity-100 transition-opacity"
-              title="Re-analyze"
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-            </Button>
-          )}
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={(e) => { e.stopPropagation(); onDelete(doc.id); }}
-            className="h-7 w-7 opacity-0 group-hover:opacity-100 transition-opacity"
-          >
-            <Trash2 className="w-3.5 h-3.5 text-destructive" />
-          </Button>
         </div>
       </div>
     </motion.div>

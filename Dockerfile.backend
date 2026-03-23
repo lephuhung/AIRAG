@@ -1,5 +1,5 @@
 # ============================================================
-# NexusRAG Backend — Multi-stage Docker build
+# HRAG Backend — Multi-stage Docker build
 # ============================================================
 
 # Stage 1: Install Python dependencies

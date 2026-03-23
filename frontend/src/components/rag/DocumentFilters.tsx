@@ -1,20 +1,10 @@
 import { memo } from "react";
-import { Search } from "lucide-react";
-import { Input } from "@/components/ui/input";
+import { Search, X } from "lucide-react";
+import { useTranslation } from "@/hooks/useTranslation";
 import { cn } from "@/lib/utils";
 import type { DocumentStatus } from "@/types";
 
 type FilterStatus = "all" | DocumentStatus;
-
-const TABS: { value: FilterStatus; label: string }[] = [
-  { value: "all", label: "All" },
-  { value: "indexed", label: "Indexed" },
-  { value: "parsing", label: "Processing" },
-  { value: "failed", label: "Failed" },
-];
-
-// Statuses that should be aggregated under the "Processing" tab
-const PROCESSING_GROUP = new Set<DocumentStatus>(["parsing", "ocring", "chunking", "embedding", "building_kg"]);
 
 interface DocumentFiltersProps {
   searchQuery: string;
@@ -26,56 +16,67 @@ interface DocumentFiltersProps {
 
 export type { FilterStatus };
 
-export const DocumentFilters = memo(function DocumentFilters({
+export const DocumentFilters = memo(({
   searchQuery,
   onSearchChange,
   statusFilter,
   onStatusChange,
   counts,
-}: DocumentFiltersProps) {
+}: DocumentFiltersProps) => {
+  const { t } = useTranslation();
+
+  const TABS = [
+    { id: "all", label: t("common.all"), count: counts.all },
+    { id: "indexed", label: t("files.tabs.indexed"), color: "bg-green-500", count: counts.indexed },
+    { id: "processing", label: t("files.tabs.processing"), color: "bg-blue-500", count: counts.parsing },
+    { id: "failed", label: t("files.tabs.failed"), color: "bg-destructive", count: counts.failed },
+  ];
+
   return (
     <div className="flex items-center gap-3 flex-wrap">
       {/* Search */}
       <div className="relative flex-1 min-w-[180px] max-w-xs">
-        <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
-        <Input
-          placeholder="Filter by name..."
+        <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
+        <input
+          type="text"
+          placeholder={t("workspace.filter_placeholder")}
           value={searchQuery}
           onChange={(e) => onSearchChange(e.target.value)}
-          className="pl-8 h-8 text-sm"
+          className="w-full bg-muted/50 border-none rounded-md py-1.5 pl-8 pr-3 text-xs focus:ring-1 focus:ring-primary/30 transition-all"
         />
+        {searchQuery && (
+          <button
+            onClick={() => onSearchChange("")}
+            className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 hover:bg-muted rounded"
+          >
+            <X className="w-3 h-3 text-muted-foreground" />
+          </button>
+        )}
       </div>
 
       {/* Status tabs */}
       <div className="flex items-center gap-1 bg-muted/40 rounded-lg p-0.5">
         {TABS.map((tab) => {
-          const isActive = statusFilter === tab.value;
-          // Merge all in-progress statuses into the "Processing" tab count
-          let count = counts[tab.value] ?? 0;
-          if (tab.value === "parsing") {
-            count = Array.from(PROCESSING_GROUP).reduce(
-              (sum, s) => sum + (counts[s] ?? 0),
-              0,
-            );
-          }
+          const isActive = statusFilter === tab.id;
           return (
             <button
-              key={tab.value}
-              onClick={() => onStatusChange(tab.value)}
+              key={tab.id}
+              onClick={() => onStatusChange(tab.id as FilterStatus)}
               className={cn(
-                "px-2.5 py-1 text-xs font-medium rounded-md transition-colors",
+                "flex items-center gap-2 px-2 py-1.5 rounded-md text-[11px] transition-colors",
                 isActive
-                  ? "bg-card text-foreground shadow-sm"
-                  : "text-muted-foreground hover:text-foreground"
+                  ? "bg-primary/10 text-primary font-medium"
+                  : "text-muted-foreground hover:bg-muted"
               )}
             >
+              {tab.color && <div className={cn("w-1.5 h-1.5 rounded-full", tab.color)} />}
               {tab.label}
-              {count > 0 && (
+              {tab.count > 0 && (
                 <span className={cn(
                   "ml-1 text-[10px]",
                   isActive ? "text-primary" : "text-muted-foreground/60"
                 )}>
-                  {count}
+                  {tab.count}
                 </span>
               )}
             </button>

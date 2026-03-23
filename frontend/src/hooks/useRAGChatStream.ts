@@ -1,5 +1,5 @@
 /**
- * useRAGChatStream — SSE streaming hook for NexusRAG chat.
+ * useRAGChatStream — SSE streaming hook for HRAG chat.
  *
  * Handles Server-Sent Events from the /chat/{workspace_id}/stream endpoint,
  * with rAF-buffered token rendering, AgentStep tracking, and AbortController cleanup.

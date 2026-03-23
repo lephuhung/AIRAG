@@ -33,6 +33,6 @@ async def get_config_status(
         "kg_embedding_provider": kg_provider,
         "kg_embedding_model": kg_model,
         "kg_embedding_dimension": settings.KG_EMBEDDING_DIMENSION,
-        "nexusrag_embedding_model": settings.NEXUSRAG_EMBEDDING_MODEL,
-        "nexusrag_reranker_model": settings.NEXUSRAG_RERANKER_MODEL,
+        "hrag_embedding_model": settings.HRAG_EMBEDDING_MODEL,
+        "hrag_reranker_model": settings.HRAG_RERANKER_MODEL,
     }

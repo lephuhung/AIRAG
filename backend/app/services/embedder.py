@@ -4,7 +4,7 @@ Embedding Service
 Generates vector embeddings using sentence-transformers.
 
 Default model: BAAI/bge-m3 (1024-dim, multilingual, 100+ languages).
-Configurable via NEXUSRAG_EMBEDDING_MODEL in settings.
+Configurable via HRAG_EMBEDDING_MODEL in settings.
 """
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ class EmbeddingService:
     }
 
     def __init__(self, model_name: Optional[str] = None):
-        self.model_name = model_name or settings.NEXUSRAG_EMBEDDING_MODEL
+        self.model_name = model_name or settings.HRAG_EMBEDDING_MODEL
         self._model = None
 
     @property
@@ -40,7 +40,7 @@ class EmbeddingService:
         """Lazy load the model onto the configured device."""
         if self._model is None:
             from sentence_transformers import SentenceTransformer
-            device = settings.NEXUSRAG_EMBEDDING_DEVICE  # "auto" | "cpu" | "cuda"
+            device = settings.HRAG_EMBEDDING_DEVICE  # "auto" | "cpu" | "cuda"
             # SentenceTransformer accepts "cpu", "cuda", "cuda:0", etc.
             # Pass None for "auto" so sentence-transformers picks the best device.
             st_device = None if device == "auto" else device

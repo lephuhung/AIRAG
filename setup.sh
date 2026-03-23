@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# NexusRAG — Local Development Setup
+# HRAG — Local Development Setup
 # ============================================================
 set -e
 
@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "============================================"
-echo "  NexusRAG — Local Development Setup"
+echo "  HRAG — Local Development Setup"
 echo "============================================"
 echo ""
 

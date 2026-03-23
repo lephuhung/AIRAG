@@ -5,8 +5,8 @@ Eagerly initializes heavy ML model singletons at startup so that
 the first user request does not pay the cold-start penalty.
 
 Usage (API server — inside lifespan):
-    from app.services.models.loader import preload_retrieval_models
-    preload_retrieval_models()
+    from app.services.models.loader import preload_models
+    preload_models()
 
 Usage (Worker — before consuming):
     from app.services.models.loader import preload_worker_models
@@ -21,7 +21,7 @@ import time
 logger = logging.getLogger(__name__)
 
 
-def preload_retrieval_models() -> None:
+def preload_models() -> None:
     """Eagerly load Embedding + Reranker models used by the API server."""
     t0 = time.time()
     logger.info("[preload] Loading retrieval models …")
@@ -106,7 +106,7 @@ def _preload_docling() -> None:
 
         ocr_options = EasyOcrOptions(force_full_page_ocr=True)
         pipeline_options = PdfPipelineOptions(
-            do_ocr=settings.NEXUSRAG_ENABLE_OCR,
+            do_ocr=settings.HRAG_ENABLE_OCR,
             ocr_options=ocr_options,
         )
 
@@ -127,8 +127,8 @@ def _preload_ocr() -> None:
     """Pre-initialize the local HunyuanOCR vLLM engine so first parse is fast."""
     from app.core.config import settings
 
-    if not settings.NEXUSRAG_OCR_LOCAL:
-        logger.info("[preload] OCR is remote (NEXUSRAG_OCR_LOCAL=false) — skipping")
+    if not settings.HRAG_OCR_LOCAL:
+        logger.info("[preload] OCR is remote (HRAG_OCR_LOCAL=false) — skipping")
         return
 
     try:

@@ -1,4 +1,5 @@
 import { useState, useMemo, useCallback, useEffect } from "react";
+import { useTranslation } from "@/hooks/useTranslation";
 import { useParams, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { motion, AnimatePresence } from "framer-motion";
@@ -8,7 +9,6 @@ import {
   ArrowUpDown,
   Database,
   X,
-  Loader2,
   ChevronRight,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -28,12 +28,12 @@ import type { Document, RAGStats } from "@/types";
 // ---------------------------------------------------------------------------
 type FilterTab = "all" | "indexed" | "processing" | "failed" | "pending";
 
-const FILTER_TABS: { value: FilterTab; label: string }[] = [
-  { value: "all", label: "All" },
-  { value: "indexed", label: "Indexed" },
-  { value: "processing", label: "Processing" },
-  { value: "failed", label: "Failed" },
-  { value: "pending", label: "Pending" },
+const FILTER_TABS: { value: FilterTab; label: string; key: string }[] = [
+  { value: "all", label: "All", key: "common.all" },
+  { value: "indexed", label: "Indexed", key: "files.tabs.indexed" },
+  { value: "processing", label: "Processing", key: "files.tabs.processing" },
+  { value: "failed", label: "Failed", key: "files.tabs.failed" },
+  { value: "pending", label: "Pending", key: "files.tabs.pending" },
 ];
 
 // ---------------------------------------------------------------------------
@@ -41,11 +41,11 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
 // ---------------------------------------------------------------------------
 type SortKey = "newest" | "oldest" | "name" | "size";
 
-const SORT_OPTIONS: { value: SortKey; label: string }[] = [
-  { value: "newest", label: "Newest first" },
-  { value: "oldest", label: "Oldest first" },
-  { value: "name", label: "Name A-Z" },
-  { value: "size", label: "Size" },
+const SORT_OPTIONS: { value: SortKey; label: string; key: string }[] = [
+  { value: "newest", label: "Newest first", key: "files.sort.newest" },
+  { value: "oldest", label: "Oldest first", key: "files.sort.oldest" },
+  { value: "name", label: "Name A-Z", key: "files.sort.name" },
+  { value: "size", label: "Size", key: "files.sort.size" },
 ];
 
 function sortDocs(docs: Document[], key: SortKey): Document[] {
@@ -73,6 +73,7 @@ function WorkspaceSelector({
 }: {
   onSelect: (wsId: number) => void;
 }) {
+  const { t } = useTranslation();
   const { data: workspaces, isLoading } = useWorkspaces();
   const [wsSearch, setWsSearch] = useState("");
 
@@ -95,19 +96,19 @@ function WorkspaceSelector({
       <div className="flex-shrink-0 border-b px-6 py-4">
         <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-2">
           <button onClick={() => navigate("/")} className="hover:text-foreground transition-colors">
-            Dashboard
+            {t("nav.dashboard")}
           </button>
           <span>/</span>
-          <span className="text-foreground font-medium">Files</span>
+          <span className="text-foreground font-medium">{t("files.title")}</span>
         </div>
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-lg font-bold flex items-center gap-2">
               <FolderOpen className="w-5 h-5 text-primary" />
-              Files
+              {t("files.title")}
             </h1>
             <p className="text-xs text-muted-foreground mt-0.5">
-              Select a workspace to browse its documents
+              {t("files.select_workspace")}
             </p>
           </div>
         </div>
@@ -118,7 +119,7 @@ function WorkspaceSelector({
         <div className="relative max-w-sm">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
           <Input
-            placeholder="Search workspaces..."
+            placeholder={t("files.search_ws")}
             value={wsSearch}
             onChange={(e) => setWsSearch(e.target.value)}
             className="pl-9 h-9"
@@ -138,12 +139,12 @@ function WorkspaceSelector({
           <div className="flex flex-col items-center justify-center h-full text-center">
             <Database className="w-10 h-10 text-muted-foreground/30 mb-3" />
             <h3 className="text-sm font-medium text-muted-foreground mb-1">
-              {workspaces && workspaces.length > 0 ? "No matching workspaces" : "No workspaces yet"}
+              {workspaces && workspaces.length > 0 ? t("files.no_ws_match") : t("files.no_ws_yet")}
             </h3>
             <p className="text-xs text-muted-foreground/70">
               {workspaces && workspaces.length > 0
-                ? "Try adjusting your search."
-                : "Create a workspace from the Knowledge Bases page."}
+                ? t("files.search_ws_hint")
+                : t("files.create_ws_hint")}
             </p>
           </div>
         ) : (
@@ -162,9 +163,9 @@ function WorkspaceSelector({
                     <div className="min-w-0">
                       <p className="font-medium text-sm truncate">{ws.name}</p>
                       <p className="text-xs text-muted-foreground mt-0.5">
-                        {ws.document_count} document{ws.document_count !== 1 ? "s" : ""}
+                        {t("kb.docs_count", { count: ws.document_count })}
                         {" · "}
-                        {ws.indexed_count} indexed
+                        {t("kb.indexed_count", { count: ws.indexed_count })}
                       </p>
                     </div>
                   </div>
@@ -188,6 +189,7 @@ function WorkspaceSelector({
 // FilesPage
 // ---------------------------------------------------------------------------
 export function FilesPage() {
+  const { t } = useTranslation();
   const { workspaceId: urlWorkspaceId } = useParams<{ workspaceId: string }>();
   const navigate = useNavigate();
 
@@ -336,11 +338,11 @@ export function FilesPage() {
             onClick={handleBackToList}
             className="hover:text-foreground transition-colors underline-offset-4 hover:underline"
           >
-            Files
+            {t("files.title")}
           </button>
           <span>/</span>
           <span className="text-foreground font-medium truncate max-w-[200px]">
-            {workspace?.name || "Workspace"}
+            {workspace?.name || t("common.pending")}
           </span>
         </div>
 
@@ -352,10 +354,10 @@ export function FilesPage() {
               selectedDoc ? "text-base" : "text-lg"
             )}>
               <FolderOpen className={cn("text-primary", selectedDoc ? "w-4 h-4" : "w-5 h-5")} />
-              {workspace?.name || "Files"}
+              {workspace?.name || t("files.title")}
             </h1>
             <p className="text-xs text-muted-foreground">
-              {documents?.length ?? 0} document{(documents?.length ?? 0) !== 1 ? "s" : ""}
+              {t("kb.docs_count", { count: documents?.length ?? 0 })}
               {ragStats && ` \u00b7 ${ragStats.total_chunks} chunks`}
             </p>
           </div>
@@ -374,7 +376,7 @@ export function FilesPage() {
         )}>
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
           <Input
-            placeholder="Search files..."
+            placeholder={t("files.search_files")}
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="pl-9 h-9"
@@ -397,7 +399,7 @@ export function FilesPage() {
                     : "text-muted-foreground hover:text-foreground",
                 )}
               >
-                {tab.label}
+                {t(tab.key)}
                 {count > 0 && (
                   <span
                     className={cn(
@@ -422,7 +424,7 @@ export function FilesPage() {
             onClick={() => setSortMenuOpen((v) => !v)}
           >
             <ArrowUpDown className="w-3.5 h-3.5" />
-            {SORT_OPTIONS.find((o) => o.value === sortKey)?.label}
+            {t(SORT_OPTIONS.find((o) => o.value === sortKey)?.key || "")}
           </Button>
           {sortMenuOpen && (
             <>
@@ -440,7 +442,7 @@ export function FilesPage() {
                       setSortMenuOpen(false);
                     }}
                   >
-                    {opt.label}
+                    {t(opt.key)}
                   </button>
                 ))}
               </div>
@@ -484,10 +486,10 @@ export function FilesPage() {
           <div className="flex flex-col items-center justify-center h-full text-center">
             <FolderOpen className="w-12 h-12 text-muted-foreground/30 mb-3" />
             <h3 className="text-sm font-medium text-muted-foreground mb-1">
-              No documents yet
+              {t("files.no_files_yet")}
             </h3>
             <p className="text-xs text-muted-foreground/70">
-              Upload documents from the workspace to get started.
+              {t("files.upload_hint")}
             </p>
           </div>
         ) : filteredDocs.length === 0 ? (
@@ -495,10 +497,10 @@ export function FilesPage() {
           <div className="flex flex-col items-center justify-center h-full text-center">
             <Search className="w-10 h-10 text-muted-foreground/30 mb-3" />
             <h3 className="text-sm font-medium text-muted-foreground mb-1">
-              No matching files
+              {t("files.no_files_match")}
             </h3>
             <p className="text-xs text-muted-foreground/70">
-              Try adjusting your search or filters.
+              {t("files.adjust_search_hint")}
             </p>
           </div>
         ) : (
@@ -537,9 +539,9 @@ export function FilesPage() {
           }
         }}
         onCancel={() => setDeleteDocConfirm(null)}
-        title="Delete Document"
-        message="Are you sure? This removes the document and its indexed data."
-        confirmLabel="Delete"
+        title={t("files.delete_confirm_title")}
+        message={t("files.delete_confirm_msg")}
+        confirmLabel={t("common.delete")}
         variant="danger"
       />
       </motion.div>
@@ -565,7 +567,7 @@ export function FilesPage() {
             {/* Header with close button */}
             <div className="h-10 border-b flex items-center justify-between px-3 bg-muted/20 shrink-0">
               <span className="text-xs font-semibold truncate text-foreground/70">
-                Document Preview
+                {t("files.preview")}
               </span>
               <Button
                 variant="ghost"

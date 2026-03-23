@@ -192,12 +192,12 @@ def _get_global_converter():
     from docling.datamodel.pipeline_options import PdfPipelineOptions, OcrAutoOptions
     from docling.datamodel.accelerator_options import AcceleratorOptions, AcceleratorDevice
 
-    device = settings.NEXUSRAG_DOCLING_DEVICE  # "auto" | "cpu" | "cuda"
+    device = settings.HRAG_DOCLING_DEVICE  # "auto" | "cpu" | "cuda"
 
     pipeline_options = PdfPipelineOptions()
-    pipeline_options.generate_picture_images = settings.NEXUSRAG_ENABLE_IMAGE_EXTRACTION
-    pipeline_options.images_scale = settings.NEXUSRAG_DOCLING_IMAGES_SCALE
-    pipeline_options.do_formula_enrichment = settings.NEXUSRAG_ENABLE_FORMULA_ENRICHMENT
+    pipeline_options.generate_picture_images = settings.HRAG_ENABLE_IMAGE_EXTRACTION
+    pipeline_options.images_scale = settings.HRAG_DOCLING_IMAGES_SCALE
+    pipeline_options.do_formula_enrichment = settings.HRAG_ENABLE_FORMULA_ENRICHMENT
     pipeline_options.ocr_options = OcrAutoOptions(lang=["vi", "en"])
     pipeline_options.accelerator_options = AcceleratorOptions(device=device)
 
@@ -260,7 +260,7 @@ class DeepDocumentParser:
             # For PDFs: detect scanned pages and run OCR first if needed
             if (
                 suffix in _OCR_EXTENSIONS
-                and settings.NEXUSRAG_ENABLE_OCR
+                and settings.HRAG_ENABLE_OCR
                 and self._is_scanned(path)
             ):
                 result = await self._parse_with_ocr(path, document_id, original_filename)
@@ -424,7 +424,7 @@ class DeepDocumentParser:
         from docling_core.transforms.chunker import HybridChunker
 
         chunker = HybridChunker(
-            max_tokens=settings.NEXUSRAG_CHUNK_MAX_TOKENS,
+            max_tokens=settings.HRAG_CHUNK_MAX_TOKENS,
             merge_peers=True,
         )
 
@@ -591,7 +591,7 @@ class DeepDocumentParser:
             (images, pic_url_list) where pic_url_list has one (caption, url)
             tuple per doc.pictures element, in order.
         """
-        if not settings.NEXUSRAG_ENABLE_IMAGE_EXTRACTION:
+        if not settings.HRAG_ENABLE_IMAGE_EXTRACTION:
             return [], []
 
         images_dir = self.output_dir / "images"
@@ -605,7 +605,7 @@ class DeepDocumentParser:
             return [], []
 
         for pic in doc.pictures:
-            if picture_count >= settings.NEXUSRAG_MAX_IMAGES_PER_DOC:
+            if picture_count >= settings.HRAG_MAX_IMAGES_PER_DOC:
                 pic_to_image_idx.append(-1)
                 continue
 
@@ -793,8 +793,8 @@ class DeepDocumentParser:
             try:
                 table_md = tbl.content_markdown
                 # Truncate large tables
-                if len(table_md) > settings.NEXUSRAG_MAX_TABLE_MARKDOWN_CHARS:
-                    table_md = table_md[:settings.NEXUSRAG_MAX_TABLE_MARKDOWN_CHARS] + "\n... (truncated)"
+                if len(table_md) > settings.HRAG_MAX_TABLE_MARKDOWN_CHARS:
+                    table_md = table_md[:settings.HRAG_MAX_TABLE_MARKDOWN_CHARS] + "\n... (truncated)"
 
                 message = LLMMessage(
                     role="user",

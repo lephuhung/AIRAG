@@ -1,5 +1,6 @@
 import { useState, useMemo, useCallback, useRef, useEffect, memo } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useTranslation } from "@/hooks/useTranslation";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Image,
@@ -42,12 +43,13 @@ function GallerySkeleton() {
 // Empty state
 // ---------------------------------------------------------------------------
 function GalleryEmpty() {
+  const { t } = useTranslation();
   return (
     <div className="flex flex-col items-center justify-center py-16 px-6 text-center">
       <ImageOff className="w-10 h-10 text-muted-foreground/30 mb-3" />
-      <p className="text-sm text-muted-foreground">No images extracted</p>
+      <p className="text-sm text-muted-foreground">{t("rag.no_images")}</p>
       <p className="text-xs text-muted-foreground/60 mt-1">
-        This document does not contain any extractable images
+        {t("rag.no_images_desc")}
       </p>
     </div>
   );
@@ -67,6 +69,7 @@ function GalleryLightbox({
   onClose: () => void;
   onNavigate: (index: number) => void;
 }) {
+  const { t } = useTranslation();
   const img = images[currentIndex];
   if (!img) return null;
 
@@ -122,14 +125,14 @@ function GalleryLightbox({
       <div className="flex gap-6 max-w-[90vw] max-h-[85vh]" onClick={(e) => e.stopPropagation()}>
         <img
           src={img.url}
-          alt={img.caption || `Image from page ${img.page_no}`}
+          alt={img.caption || t("common.page_x", { page: img.page_no })}
           className="max-w-full max-h-[80vh] rounded-lg object-contain"
         />
         <div className="w-64 flex-shrink-0 text-white/90 space-y-3 self-end hidden lg:block">
           {img.caption && <p className="text-sm leading-relaxed">{img.caption}</p>}
           <div className="space-y-1 text-xs text-white/60">
-            <p>Page {img.page_no}</p>
-            {img.width > 0 && <p>{img.width} x {img.height}px</p>}
+            <p>{t("common.page_x", { page: img.page_no })}</p>
+            {img.width > 0 && <p>{t("common.dimensions", { w: img.width, h: img.height })}</p>}
           </div>
           <p className="text-xs text-white/40">
             {currentIndex + 1} / {images.length}
@@ -210,6 +213,7 @@ const PageSection = memo(function PageSection({
   allImages: DocumentImage[];
   onImageClick: (globalIndex: number) => void;
 }) {
+  const { t } = useTranslation();
   const [collapsed, setCollapsed] = useState(false);
 
   return (
@@ -220,8 +224,8 @@ const PageSection = memo(function PageSection({
         className="flex items-center gap-2 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors w-full"
       >
         {collapsed ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronUp className="w-3.5 h-3.5" />}
-        <span>Page {group.pageNo}</span>
-        <span className="text-muted-foreground/50">({group.images.length} image{group.images.length !== 1 ? "s" : ""})</span>
+        <span>{t("common.page_x", { page: group.pageNo })}</span>
+        <span className="text-muted-foreground/50">({t("files.metadata.images", { count: group.images.length })})</span>
       </button>
 
       {/* Image grid */}
@@ -247,7 +251,7 @@ const PageSection = memo(function PageSection({
                   >
                     <LazyImage
                       src={img.url}
-                      alt={img.caption || `Page ${img.page_no}`}
+                      alt={img.caption || t("common.page_x", { page: img.page_no })}
                       className="w-full h-full relative"
                     />
                     {/* Hover overlay */}
@@ -277,6 +281,7 @@ interface ImageGalleryProps {
 }
 
 export const ImageGallery = memo(function ImageGallery({ doc }: ImageGalleryProps) {
+  const { t } = useTranslation();
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
 
   // ---- Fetch images ----
@@ -324,10 +329,10 @@ export const ImageGallery = memo(function ImageGallery({ doc }: ImageGalleryProp
       <div className="flex items-center gap-2">
         <Image className="w-4 h-4 text-muted-foreground" />
         <span className="text-sm font-medium">
-          {images.length} Image{images.length !== 1 ? "s" : ""}
+          {t("files.metadata.images", { count: images.length })}
         </span>
         <span className="text-xs text-muted-foreground">
-          across {pageGroups.length} page{pageGroups.length !== 1 ? "s" : ""}
+          {t("files.metadata.across_pages", { count: pageGroups.length })}
         </span>
       </div>
 
@@ -346,7 +351,7 @@ export const ImageGallery = memo(function ImageGallery({ doc }: ImageGalleryProp
             >
               <LazyImage
                 src={img.url}
-                alt={img.caption || `Page ${img.page_no}`}
+                alt={img.caption || t("common.page_x", { page: img.page_no })}
                 className="w-full h-full relative"
               />
               <div className="absolute inset-0 bg-black/0 group-hover:bg-black/40 transition-colors flex items-end">

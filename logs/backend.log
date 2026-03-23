@@ -1,0 +1,174 @@
+/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/transformers/utils/hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+INFO:     Started server process [1459312]
+INFO:     Waiting for application startup.
+INFO:app.main:Starting HRAG API...
+INFO:app.main:Database tables created/verified
+INFO:app.main:MinIO buckets verified/created
+INFO:app.main:Document types seeded/verified
+INFO:app.main:SuperAdmin user already exists and is active
+INFO:app.main:users.avatar_url column ensured
+INFO:app.main:Eager loading HRAG models...
+INFO:app.services.models.loader:[preload] Loading retrieval models …
+INFO:app.services.embedder:Loading embedding model: BAAI/bge-m3 (device=cuda)
+INFO:sentence_transformers.SentenceTransformer:Load pretrained SentenceTransformer: BAAI/bge-m3
+INFO:app.services.embedder:Embedding model loaded: BAAI/bge-m3 (dim=1024)
+INFO:app.services.models.loader:[preload] Embedding model ready (BAAI/bge-m3)
+INFO:app.services.reranker:Loading reranker model: BAAI/bge-reranker-v2-m3
+INFO:sentence_transformers.cross_encoder.CrossEncoder:Use pytorch device: cuda:0
+INFO:app.services.reranker:Reranker model loaded: BAAI/bge-reranker-v2-m3
+INFO:app.services.models.loader:[preload] Reranker model ready (BAAI/bge-reranker-v2-m3)
+INFO:app.services.models.loader:[preload] Retrieval models loaded in 10.6s
+INFO:app.services.models.loader:[preload] Loading Memory Agent model …
+INFO:app.services.llm.vllm_local:[vLLM/local] Loading model Qwen/Qwen3.5-0.8B (gpu_mem=0.1)
+INFO 03-23 08:56:09 [utils.py:238] non-default args: {'trust_remote_code': True, 'gpu_memory_utilization': 0.1, 'disable_log_stats': True, 'enforce_eager': True, 'model': 'Qwen/Qwen3.5-0.8B'}
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+INFO 03-23 08:56:11 [model.py:531] Resolved architecture: Qwen3_5ForConditionalGeneration
+INFO 03-23 08:56:11 [model.py:1554] Using max model len 262144
+INFO 03-23 08:56:11 [scheduler.py:231] Chunked prefill is enabled with max_num_batched_tokens=8192.
+INFO 03-23 08:56:12 [config.py:544] Setting attention block size to 544 tokens to ensure that attention page size is >= mamba page size.
+INFO 03-23 08:56:12 [config.py:575] Padding mamba page size by 2.64% to ensure that mamba page size and attention page size are exactly equal.
+INFO 03-23 08:56:12 [vllm.py:747] Asynchronous scheduling is enabled.
+WARNING 03-23 08:56:12 [vllm.py:781] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 03-23 08:56:12 [vllm.py:792] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 03-23 08:56:12 [vllm.py:957] Cudagraph is disabled under eager mode
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/transformers/utils/hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+(EngineCore_DP0 pid=1462173) INFO 03-23 08:56:37 [core.py:101] Initializing a V1 LLM engine (v0.17.1) with config: model='Qwen/Qwen3.5-0.8B', speculative_config=None, tokenizer='Qwen/Qwen3.5-0.8B', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=262144, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=False, quantization=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False), seed=0, served_model_name=Qwen/Qwen3.5-0.8B, enable_prefix_caching=False, enable_chunked_prefill=True, pooler_config=None, compilation_config={'level': None, 'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'splitting_ops': [], 'compile_mm_encoder': False, 'compile_sizes': [], 'compile_ranges_split_points': [8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': True, 'static_all_moe_layers': []}
+(EngineCore_DP0 pid=1462173) INFO 03-23 08:56:41 [parallel_state.py:1393] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://192.168.1.2:59295 backend=nccl
+(EngineCore_DP0 pid=1462173) INFO 03-23 08:56:41 [parallel_state.py:1715] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100] EngineCore failed to start.
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100] Traceback (most recent call last):
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1090, in run_engine_core
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]     return func(*args, **kwargs)
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 834, in __init__
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]     super().__init__(
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 110, in __init__
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]     self.model_executor = executor_class(vllm_config)
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]     return func(*args, **kwargs)
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/executor/abstract.py", line 103, in __init__
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]     self._init_executor()
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/executor/uniproc_executor.py", line 48, in _init_executor
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]     self.driver_worker.init_device()
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/worker/worker_base.py", line 326, in init_device
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]     self.worker.init_device()  # type: ignore
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]     ^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]     return func(*args, **kwargs)
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_worker.py", line 285, in init_device
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]     self.requested_memory = request_memory(init_snapshot, self.cache_config)
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/worker/utils.py", line 413, in request_memory
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100]     raise ValueError(
+(EngineCore_DP0 pid=1462173) ERROR 03-23 08:56:41 [core.py:1100] ValueError: Free memory on device cuda:0 (0.9/47.4 GiB) on startup is less than desired GPU memory utilization (0.1, 4.74 GiB). Decrease GPU memory utilization or reduce GPU memory used by other processes.
+(EngineCore_DP0 pid=1462173) Process EngineCore_DP0:
+(EngineCore_DP0 pid=1462173) Traceback (most recent call last):
+(EngineCore_DP0 pid=1462173)   File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+(EngineCore_DP0 pid=1462173)     self.run()
+(EngineCore_DP0 pid=1462173)   File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+(EngineCore_DP0 pid=1462173)     self._target(*self._args, **self._kwargs)
+(EngineCore_DP0 pid=1462173)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1104, in run_engine_core
+(EngineCore_DP0 pid=1462173)     raise e
+(EngineCore_DP0 pid=1462173)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1090, in run_engine_core
+(EngineCore_DP0 pid=1462173)     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore_DP0 pid=1462173)                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1462173)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP0 pid=1462173)     return func(*args, **kwargs)
+(EngineCore_DP0 pid=1462173)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1462173)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 834, in __init__
+(EngineCore_DP0 pid=1462173)     super().__init__(
+(EngineCore_DP0 pid=1462173)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 110, in __init__
+(EngineCore_DP0 pid=1462173)     self.model_executor = executor_class(vllm_config)
+(EngineCore_DP0 pid=1462173)                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1462173)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP0 pid=1462173)     return func(*args, **kwargs)
+(EngineCore_DP0 pid=1462173)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1462173)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/executor/abstract.py", line 103, in __init__
+(EngineCore_DP0 pid=1462173)     self._init_executor()
+(EngineCore_DP0 pid=1462173)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/executor/uniproc_executor.py", line 48, in _init_executor
+(EngineCore_DP0 pid=1462173)     self.driver_worker.init_device()
+(EngineCore_DP0 pid=1462173)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/worker/worker_base.py", line 326, in init_device
+(EngineCore_DP0 pid=1462173)     self.worker.init_device()  # type: ignore
+(EngineCore_DP0 pid=1462173)     ^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1462173)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP0 pid=1462173)     return func(*args, **kwargs)
+(EngineCore_DP0 pid=1462173)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1462173)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_worker.py", line 285, in init_device
+(EngineCore_DP0 pid=1462173)     self.requested_memory = request_memory(init_snapshot, self.cache_config)
+(EngineCore_DP0 pid=1462173)                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1462173)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/worker/utils.py", line 413, in request_memory
+(EngineCore_DP0 pid=1462173)     raise ValueError(
+(EngineCore_DP0 pid=1462173) ValueError: Free memory on device cuda:0 (0.9/47.4 GiB) on startup is less than desired GPU memory utilization (0.1, 4.74 GiB). Decrease GPU memory utilization or reduce GPU memory used by other processes.
+[rank0]:[W323 08:56:42.387263014 ProcessGroupNCCL.cpp:1553] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+WARNING:app.services.models.loader:[preload] Memory Agent pre-load failed (non-fatal): Engine core initialization failed. See root cause above. Failed core proc(s): {}
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)
+INFO:     127.0.0.1:38816 - "GET /api/v1/workers/overview HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38838 - "GET /api/v1/workers/managed HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38818 - "GET /api/v1/workers/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38832 - "GET /api/v1/workers/dead-letter HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38820 - "GET /api/v1/workers/pipeline HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38842 - "GET /api/v1/workers/overview HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57646 - "GET /api/v1/workers/managed HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57652 - "GET /api/v1/workers/pipeline HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57668 - "GET /api/v1/workers/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57680 - "GET /api/v1/workers/overview HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57688 - "GET /api/v1/workers/managed HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57702 - "GET /api/v1/workers/pipeline HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57714 - "GET /api/v1/workers/pipeline?workspace_id=6 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57722 - "GET /api/v1/documents/workspace/6 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57726 - "GET /api/v1/workspaces/6 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57712 - "GET /api/v1/workers/overview HTTP/1.1" 200 OK
+INFO:app.services.knowledge_graph_service:KG graph (Neo4j Cypher): 106 nodes, 61 edges for workspace 6
+INFO:     127.0.0.1:57748 - "GET /api/v1/rag/graph/6?max_nodes=150&max_depth=3 HTTP/1.1" 200 OK
+INFO:app.services.vector_store:Connecting to ChromaDB at localhost:8002
+INFO:app.services.vector_store:Connected to ChromaDB successfully
+INFO:     127.0.0.1:57736 - "GET /api/v1/rag/stats/6 HTTP/1.1" 200 OK
+INFO:app.services.llm.ollama:[LocalEmbedding] Reusing global pre-loaded model: BAAI/bge-m3
+INFO:app.services.knowledge_graph_service:LightRAG using Neo4j backend for workspace 6 (label=kb_6, uri=bolt://localhost:7687) with PostgreSQL KV+Vector storage
+WARNING: PostgreSQL table: LIGHTRAG_VDB_ENTITY missing suffix. Pls add model_name to embedding_func for proper workspace data isolation.
+WARNING: PostgreSQL table: LIGHTRAG_VDB_RELATION missing suffix. Pls add model_name to embedding_func for proper workspace data isolation.
+WARNING: PostgreSQL table: LIGHTRAG_VDB_CHUNKS missing suffix. Pls add model_name to embedding_func for proper workspace data isolation.
+INFO: PostgreSQL, Retry config: attempts=10, backoff=3.0s, backoff_max=30.0s, pool_close_timeout=5.0s
+INFO: PostgreSQL, VECTOR extension enabled
+INFO: PostgreSQL, Connected to database at localhost:5433/nexusrag without SSL
+INFO: chunk_id column already exists in LIGHTRAG_LLM_CACHE table
+INFO: cache_type column already exists in LIGHTRAG_LLM_CACHE table
+INFO: queryparam column already exists in LIGHTRAG_LLM_CACHE table
+INFO: mode column does not exist in LIGHTRAG_LLM_CACHE table
+INFO: Skipping migration: LIGHTRAG_VDB_CHUNKS already contains data.
+INFO: chunks_list column already exists in LIGHTRAG_DOC_STATUS table
+INFO: llm_cache_list column already exists in LIGHTRAG_DOC_CHUNKS table
+INFO: track_id column already exists in LIGHTRAG_DOC_STATUS table
+INFO: Index on track_id column already exists for LIGHTRAG_DOC_STATUS table
+INFO: metadata column already exists in LIGHTRAG_DOC_STATUS table
+INFO: error_msg column already exists in LIGHTRAG_DOC_STATUS table
+INFO: HNSW vector index idx_lightrag_vdb_entity_hnsw_cosine already exists on table LIGHTRAG_VDB_ENTITY
+INFO: HNSW vector index idx_lightrag_vdb_relation_hnsw_cosine already exists on table LIGHTRAG_VDB_RELATION
+INFO: HNSW vector index idx_lightrag_vdb_chunks_hnsw_cosine already exists on table LIGHTRAG_VDB_CHUNKS
+INFO: [kb_6] Database chunk-entity-relation at bolt://localhost:7687 not found. Try to create specified database.
+WARNING: [kb_6] This Neo4j instance does not support creating databases. Try to use Neo4j Desktop/Enterprise version or DozerDB instead. Fallback to use the default database.
+INFO: [kb_6] Connected to None at bolt://localhost:7687
+INFO: [kb_6] Ensured B-Tree index on entity_id for kb_6 in None
+INFO: [kb_6] Found existing index 'entity_id_fulltext_idx_kb_6' with state: ONLINE
+INFO: [kb_6] Full-text index 'entity_id_fulltext_idx_kb_6' already exists and is online. Skipping recreation.
+INFO: [kb_6] Process 1459312 doc status load doc_status with 1 records
+INFO:app.services.knowledge_graph_service:LightRAG initialized for workspace 6 (embedding_dim=1024, backend=neo4j)
+INFO:     127.0.0.1:57750 - "GET /api/v1/rag/analytics/6 HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+INFO:app.main:Shutting down...
+INFO:     Application shutdown complete.
+INFO:     Finished server process [1459312]

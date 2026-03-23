@@ -1,5 +1,5 @@
 # ============================================================
-# NexusRAG Frontend — Multi-stage Docker build
+# HRAG Frontend — Multi-stage Docker build
 # ============================================================
 
 # Stage 1: Build the frontend

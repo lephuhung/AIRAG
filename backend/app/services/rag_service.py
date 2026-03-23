@@ -234,30 +234,30 @@ class RAGService:
         return self.vector_store.count()
 
 
-# Module-level cache: workspace_id → NexusRAGService
+# Module-level cache: workspace_id → HRAGService
 # Models (embedder, reranker, KG) are shared across requests; only `db` is swapped.
-_nexus_service_cache: dict[int, "NexusRAGService"] = {}
+_hrag_service_cache: dict[int, "HRAGService"] = {}
 
 
-def get_rag_service(db: AsyncSession, workspace_id: int) -> "RAGService | NexusRAGService":
-    """Factory function: routes to NexusRAGService or legacy RAGService based on config.
+def get_rag_service(db: AsyncSession, workspace_id: int) -> "RAGService | HRAGService":
+    """Factory function: routes to HRAGService or legacy RAGService based on config.
 
-    NexusRAGService instances are cached per workspace_id so that heavy models
+    HRAGService instances are cached per workspace_id so that heavy models
     (bge-m3 embedder, bge-reranker, LightRAG KG) are loaded only once.
     The AsyncSession is refreshed on every call since sessions are per-request.
     """
     from app.core.config import settings
 
-    if settings.NEXUSRAG_ENABLED:
-        from app.services.nexus_rag_service import NexusRAGService
+    if settings.HRAG_ENABLED:
+        from app.services.hrag_service import HRAGService
 
-        if workspace_id not in _nexus_service_cache:
-            _nexus_service_cache[workspace_id] = NexusRAGService(db=db, workspace_id=workspace_id)
+        if workspace_id not in _hrag_service_cache:
+            _hrag_service_cache[workspace_id] = HRAGService(db=db, workspace_id=workspace_id)
         else:
             # Reuse cached service but refresh the DB session for this request
-            _nexus_service_cache[workspace_id].db = db
-            _nexus_service_cache[workspace_id].retriever.db = db
+            _hrag_service_cache[workspace_id].db = db
+            _hrag_service_cache[workspace_id].retriever.db = db
 
-        return _nexus_service_cache[workspace_id]
+        return _hrag_service_cache[workspace_id]
 
     return RAGService(db=db, workspace_id=workspace_id)

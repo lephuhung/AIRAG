@@ -159,7 +159,7 @@ export interface Document {
   error_message: string | null;
   created_at: string;
   updated_at: string;
-  // NexusRAG metadata
+  // HRAG metadata
   page_count?: number;
   image_count?: number;
   table_count?: number;
@@ -250,7 +250,7 @@ export interface RAGStats {
   indexed_documents: number;
   total_chunks: number;
   image_count?: number;
-  nexusrag_documents?: number;
+  hrag_documents?: number;
 }
 
 // Knowledge Graph Types
@@ -393,6 +393,7 @@ export interface LLMCapabilities {
 }
 
 // SSE Streaming Types
+// * useRAGChatStream — SSE streaming hook for HRAG chat.
 export type ChatStreamStatus = "idle" | "analyzing" | "retrieving" | "generating" | "error";
 
 // Agent Step Types (ThinkingTimeline)

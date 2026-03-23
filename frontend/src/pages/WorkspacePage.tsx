@@ -1,3 +1,4 @@
+import { useTranslation } from "@/hooks/useTranslation";
 import { useMemo, useCallback, useEffect, useRef } from "react";
 import { useParams } from "react-router-dom";
 import { toast } from "sonner";
@@ -23,6 +24,7 @@ function needsPolling(docs: Document[] | undefined): boolean {
 }
 
 export function WorkspacePage() {
+  const { t } = useTranslation();
   const { workspaceId } = useParams<{ workspaceId: string }>();
   const queryClient = useQueryClient();
   const wsId = workspaceId ? Number(workspaceId) : null;
@@ -85,7 +87,7 @@ export function WorkspacePage() {
     }
   }, [documents, selectedDoc, selectDoc]);
 
-  const hasDeepragDocs = (ragStats?.nexusrag_documents ?? 0) > 0;
+  const hasDeepragDocs = (ragStats?.hrag_documents ?? 0) > 0;
 
   // -----------------------------------------------------------------------
   // Mutations
@@ -97,18 +99,18 @@ export function WorkspacePage() {
       queryClient.invalidateQueries({ queryKey: ["documents", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["rag-stats", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["workspaces"] });
-      toast.success("Document uploaded successfully");
+      toast.success(t("workspace.upload_success"));
     },
     onError: (err: Error) => {
       const msg = err.message || "";
       if (msg.includes("MinIO PUT failed") || msg.includes("Network error")) {
-        toast.error("Upload failed — network error", {
-          description: "Connection interrupted. Check your network and try again.",
+        toast.error(t("workspace.upload_failed_network"), {
+          description: t("workspace.upload_failed_network_desc"),
         });
       } else if (msg.includes("too large")) {
-        toast.error("File too large", { description: msg });
+        toast.error(t("workspace.file_too_large"), { description: msg });
       } else {
-        toast.error("Failed to upload document", { description: msg || undefined });
+        toast.error(t("workspace.upload_failed"), { description: msg || undefined });
       }
     },
   });
@@ -120,9 +122,9 @@ export function WorkspacePage() {
       queryClient.invalidateQueries({ queryKey: ["rag-stats", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["workspaces"] });
       if (selectedDoc?.id === docId) selectDoc(null);
-      toast.success("Document deleted");
+      toast.success(t("workspace.delete_success"));
     },
-    onError: () => toast.error("Failed to delete document"),
+    onError: () => toast.error(t("workspace.delete_failed")),
   });
 
   const processDoc = useMutation({
@@ -130,22 +132,14 @@ export function WorkspacePage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["documents", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["rag-stats", workspaceId] });
-      toast.info("Analyzing document...", {
-        description: "Parsing content and building search index.",
+      toast.info(t("rag.analyzing"), {
+        description: t("rag.analyzing_desc"),
       });
     },
-    onError: () => toast.error("Failed to start analysis"),
+    onError: () => toast.error(t("workspace.process_failed")),
   });
 
-  const reindexDoc = useMutation({
-    mutationFn: (docId: number) => api.post(`/rag/reindex/${docId}`),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["documents", workspaceId] });
-      queryClient.invalidateQueries({ queryKey: ["rag-stats", workspaceId] });
-      toast.success("Document re-processing started");
-    },
-    onError: () => toast.error("Failed to re-process document"),
-  });
+
 
   // -----------------------------------------------------------------------
   // Handlers
@@ -187,7 +181,6 @@ export function WorkspacePage() {
         isUploading={uploadDoc.isPending}
         onDelete={(id) => deleteDoc.mutate(id)}
         onProcess={(id) => processDoc.mutate(id)}
-        onReindex={(id) => reindexDoc.mutate(id)}
         isProcessing={processDoc.isPending}
         onUpdateWorkspace={handleUpdateWorkspace}
       />

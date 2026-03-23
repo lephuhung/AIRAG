@@ -1,11 +1,11 @@
 """
-NexusRAG Evaluation Script — Production-grade RAG quality assessment.
+HRAG Evaluation Script — Production-grade RAG quality assessment.
 
 Uses DeepEval metrics (LLM-as-judge) + custom rule-based checks.
 Supports Ollama (local) and Gemini (cloud) as judge models.
 
 Usage:
-    cd NexusRAG/backend
+    cd HRAG/backend
     source ../venv/bin/activate
     python scripts/eval_rag.py --workspace 11 [--judge ollama|gemini]
 """
@@ -660,14 +660,14 @@ def print_results_table(results: list[TestResult], show_llm: bool = False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="NexusRAG Evaluation")
+    parser = argparse.ArgumentParser(description="HRAG Evaluation")
     parser.add_argument("--workspace", type=int, default=11, help="Workspace ID")
     parser.add_argument("--judge", choices=["ollama", "gemini", "none"], default="none",
                         help="LLM judge for DeepEval metrics (default: none = rule-based only)")
     parser.add_argument("--test-ids", nargs="*", help="Run specific test IDs only")
     args = parser.parse_args()
 
-    print(f"NexusRAG Evaluation — Workspace {args.workspace}")
+    print(f"HRAG Evaluation — Workspace {args.workspace}")
     print(f"Judge: {args.judge}")
     print(f"Endpoint: {BASE_URL}")
 

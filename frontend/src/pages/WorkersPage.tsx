@@ -1,4 +1,5 @@
 import { useState, useMemo } from "react";
+import { useTranslation } from "@/hooks/useTranslation";
 import { useNavigate } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -46,16 +47,16 @@ import type {
 // ---------------------------------------------------------------------------
 const PIPELINE_STATUS: Record<
   string,
-  { label: string; color: string; bgColor: string; icon: typeof Clock }
+  { labelKey: string; color: string; bgColor: string; icon: typeof Clock }
 > = {
-  pending:     { label: "Pending",      color: "text-muted-foreground", bgColor: "bg-muted",                icon: Clock },
-  parsing:     { label: "Parsing",      color: "text-blue-400",        bgColor: "bg-blue-400/15",          icon: Loader2 },
-  ocring:      { label: "OCR",          color: "text-indigo-400",      bgColor: "bg-indigo-400/15",        icon: Loader2 },
-  chunking:    { label: "Chunking",     color: "text-cyan-400",        bgColor: "bg-cyan-400/15",          icon: Loader2 },
-  embedding:   { label: "Embedding",    color: "text-amber-400",       bgColor: "bg-amber-400/15",         icon: Loader2 },
-  building_kg: { label: "Building KG",  color: "text-violet-400",      bgColor: "bg-violet-400/15",        icon: Loader2 },
-  indexed:     { label: "Indexed",      color: "text-primary",         bgColor: "bg-primary/15",           icon: CheckCircle2 },
-  failed:      { label: "Failed",       color: "text-destructive",     bgColor: "bg-destructive/15",       icon: XCircle },
+  pending:     { labelKey: "files.tabs.pending",      color: "text-muted-foreground", bgColor: "bg-muted",                icon: Clock },
+  parsing:     { labelKey: "files.tabs.processing",   color: "text-blue-400",        bgColor: "bg-blue-400/15",          icon: Loader2 },
+  ocring:      { labelKey: "files.tabs.processing",   color: "text-indigo-400",      bgColor: "bg-indigo-400/15",        icon: Loader2 },
+  chunking:    { labelKey: "files.tabs.processing",   color: "text-cyan-400",        bgColor: "bg-cyan-400/15",          icon: Loader2 },
+  embedding:   { labelKey: "files.tabs.processing",   color: "text-amber-400",       bgColor: "bg-amber-400/15",         icon: Loader2 },
+  building_kg: { labelKey: "files.tabs.processing",   color: "text-violet-400",      bgColor: "bg-violet-400/15",        icon: Loader2 },
+  indexed:     { labelKey: "files.tabs.indexed",      color: "text-primary",         bgColor: "bg-primary/15",           icon: CheckCircle2 },
+  failed:      { labelKey: "files.tabs.failed",       color: "text-destructive",     bgColor: "bg-destructive/15",       icon: XCircle },
 };
 
 const PROCESSING_KEYS = ["parsing", "ocring", "chunking", "embedding", "building_kg"] as const;
@@ -73,13 +74,7 @@ const WORKER_COLORS: Record<WorkerType, string> = {
 // ---------------------------------------------------------------------------
 // Helper: format uptime
 // ---------------------------------------------------------------------------
-function formatUptime(seconds: number): string {
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  return `${h}h ${m}m`;
-}
+
 
 // ---------------------------------------------------------------------------
 // Collapsible Section
@@ -131,6 +126,19 @@ function Section({
 // WorkersPage
 // ---------------------------------------------------------------------------
 export function WorkersPage() {
+  const { t } = useTranslation();
+  const formatUptime = (seconds: number): string => {
+    if (seconds < 60) return t("workers.uptime.seconds", { count: Math.round(seconds) });
+    if (seconds < 3600) {
+      return t("workers.uptime.minutes_seconds", {
+        m: Math.floor(seconds / 60),
+        s: Math.round(seconds % 60),
+      });
+    }
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    return t("workers.uptime.hours_minutes", { h, m });
+  };
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
@@ -180,7 +188,7 @@ export function WorkersPage() {
       api.post("/workers/start", params),
     onSuccess: (_, params) => {
       invalidateAll();
-      toast.success(`Started ${params.count || 1} ${params.worker_type} worker(s)`);
+      toast.success(t("workers.start_success", { count: params.count || 1, type: params.worker_type }));
     },
     onError: (err: Error) => toast.error(err.message),
   });
@@ -189,7 +197,7 @@ export function WorkersPage() {
     mutationFn: (workerType: string) => api.post(`/workers/stop/${workerType}`),
     onSuccess: (_, wt) => {
       invalidateAll();
-      toast.success(`Stopped ${wt} worker(s)`);
+      toast.success(t("workers.stop_success", { type: wt }));
     },
     onError: (err: Error) => toast.error(err.message),
   });
@@ -198,7 +206,7 @@ export function WorkersPage() {
     mutationFn: (workerType: string) => api.post(`/workers/restart/${workerType}`),
     onSuccess: (_, wt) => {
       invalidateAll();
-      toast.success(`Restarted ${wt} worker(s)`);
+      toast.success(t("workers.restart_success", { type: wt }));
     },
     onError: (err: Error) => toast.error(err.message),
   });
@@ -208,36 +216,36 @@ export function WorkersPage() {
     mutationFn: () => api.post<{ retried_count: number }>("/workers/retry-failed"),
     onSuccess: (data) => {
       invalidateAll();
-      toast.success(`Retrying ${(data as any)?.retried_count ?? 0} failed documents`);
+      toast.success(t("workers.retry_all_success", { count: (data as any)?.retried_count ?? 0 }));
     },
-    onError: () => toast.error("Failed to retry documents"),
+    onError: () => toast.error(t("workers.retry_all_failed")),
   });
 
   const retrySingle = useMutation({
     mutationFn: (docId: number) => api.post(`/workers/retry-failed/${docId}`),
     onSuccess: () => {
       invalidateAll();
-      toast.success("Document queued for retry");
+      toast.success(t("workers.retry_single_success"));
     },
-    onError: () => toast.error("Failed to retry document"),
+    onError: () => toast.error(t("workers.retry_single_failed")),
   });
 
   const purgeQueue = useMutation({
     mutationFn: (queueName: string) => api.post(`/workers/queues/${queueName}/purge`),
     onSuccess: (_, queueName) => {
       invalidateAll();
-      toast.success(`Queue ${queueName} purged`);
+      toast.success(t("workers.queue_purged", { name: queueName }));
     },
-    onError: () => toast.error("Failed to purge queue"),
+    onError: () => toast.error(t("workers.queue_purge_failed")),
   });
 
   const deleteQueue = useMutation({
     mutationFn: (queueName: string) => api.delete(`/workers/queues/${queueName}`),
     onSuccess: (_, queueName) => {
       invalidateAll();
-      toast.success(`Queue ${queueName} deleted`);
+      toast.success(t("workers.queue_deleted", { name: queueName }));
     },
-    onError: () => toast.error("Failed to delete queue"),
+    onError: () => toast.error(t("workers.queue_delete_failed")),
   });
 
   // ── DLQ mutations ──
@@ -245,18 +253,18 @@ export function WorkersPage() {
     mutationFn: () => api.post("/workers/dead-letter/purge"),
     onSuccess: () => {
       invalidateAll();
-      toast.success("Dead letter queue purged");
+      toast.success(t("workers.dlq_purged"));
     },
-    onError: () => toast.error("Failed to purge DLQ"),
+    onError: () => toast.error(t("workers.dlq_purge_failed")),
   });
 
   const retryDlq = useMutation({
     mutationFn: () => api.post<{ retried: number }>("/workers/dead-letter/retry"),
     onSuccess: (data) => {
       invalidateAll();
-      toast.success(`Retried ${(data as any)?.retried ?? 0} messages from DLQ`);
+      toast.success(t("workers.dlq_retry_success", { count: (data as any)?.retried ?? 0 }));
     },
-    onError: () => toast.error("Failed to retry DLQ messages"),
+    onError: () => toast.error(t("workers.dlq_retry_failed")),
   });
 
   // ── UI state ──
@@ -285,25 +293,34 @@ export function WorkersPage() {
     healthStatus === "degraded" ? "text-amber-400 bg-amber-500/10 border-amber-500/20" :
     "text-destructive bg-destructive/10 border-destructive/20";
 
+  const getHealthStatusLabel = (status: string) => {
+    switch (status) {
+      case "healthy": return t("workers.healthy");
+      case "degraded": return t("workers.degraded");
+      case "unhealthy": return t("workers.unhealthy");
+      default: return t("common.unknown");
+    }
+  };
+
   return (
     <div className="h-full flex flex-col overflow-hidden">
       {/* ── Header ── */}
       <div className="flex-shrink-0 border-b px-6 py-4">
         <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-2">
           <button onClick={() => navigate("/")} className="hover:text-foreground transition-colors">
-            Dashboard
+            {t("nav.dashboard")}
           </button>
           <span>/</span>
-          <span className="text-foreground font-medium">Workers</span>
+          <span className="text-foreground font-medium">{t("workers.title_short")}</span>
         </div>
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-lg font-bold flex items-center gap-2">
               <Activity className="w-5 h-5 text-primary" />
-              Worker Pipeline
+              {t("workers.title")}
             </h1>
             <p className="text-xs text-muted-foreground">
-              Manage workers, monitor queues, and inspect the processing pipeline
+              {t("workers.desc")}
             </p>
           </div>
           <div className="flex items-center gap-3">
@@ -319,7 +336,7 @@ export function WorkersPage() {
               disabled={startWorker.isPending}
             >
               <Zap className={cn("w-3.5 h-3.5", startWorker.isPending && "animate-spin")} />
-              Start All Workers
+              {t("workers.start_all")}
             </Button>
 
             <div className="h-6 w-px bg-border mx-1" />
@@ -332,7 +349,7 @@ export function WorkersPage() {
                   healthColor,
                 )}>
                   <Heart className="w-3 h-3" />
-                  {healthStatus.charAt(0).toUpperCase() + healthStatus.slice(1)}
+                  {getHealthStatusLabel(healthStatus)}
                 </span>
               )}
 
@@ -349,7 +366,7 @@ export function WorkersPage() {
                   ) : (
                     <RotateCcw className="w-3.5 h-3.5" />
                   )}
-                  Retry All Failed ({failedCount})
+                  {t("workers.retry_all_with_count", { count: failedCount })}
                 </Button>
               )}
             </div>
@@ -372,12 +389,12 @@ export function WorkersPage() {
               {overview?.rabbitmq_connected ? (
                 <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-full bg-green-500/10 text-green-400 border border-green-500/20">
                   <Wifi className="w-3 h-3" />
-                  RabbitMQ Connected
+                  {t("workers.rabbitmq_connected")}
                 </span>
               ) : (
                 <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-full bg-destructive/10 text-destructive border border-destructive/20">
                   <WifiOff className="w-3 h-3" />
-                  RabbitMQ Disconnected
+                  {t("workers.rabbitmq_disconnected")}
                 </span>
               )}
               {health?.checks?.rabbitmq?.version && (
@@ -388,13 +405,13 @@ export function WorkersPage() {
               {dlqCount > 0 && (
                 <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20">
                   <Skull className="w-3 h-3" />
-                  {dlqCount} dead-letter msg{dlqCount !== 1 ? "s" : ""}
+                  {t(dlqCount === 1 ? 'workers.dlq_msg' : 'workers.dlq_msg_plural', { count: dlqCount })}
                 </span>
               )}
             </div>
 
             {/* ── Worker Management ── */}
-            <Section title="Worker Management" icon={Cpu} defaultOpen={true}>
+            <Section title={t("workers.management")} icon={Cpu} defaultOpen={true}>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
                 {WORKER_TYPES.map((wtype) => {
                   const rmqConsumers = overview?.active_workers?.[wtype] ?? 0;
@@ -442,7 +459,7 @@ export function WorkersPage() {
 
                       {managedCount > 0 && aliveList.length === 0 && (
                         <p className="text-[11px] text-muted-foreground/50">
-                          {managedCount} managed (external)
+                          {t("workers.managed_external", { count: managedCount })}
                         </p>
                       )}
 
@@ -456,7 +473,7 @@ export function WorkersPage() {
                           disabled={startWorker.isPending}
                         >
                           <Play className="w-3 h-3" />
-                          Start
+                          {t("common.start")}
                         </Button>
                         {isRunning && (
                           <>
@@ -468,7 +485,7 @@ export function WorkersPage() {
                               disabled={restartWorker.isPending}
                             >
                               <RefreshCw className={cn("w-3 h-3", restartWorker.isPending && "animate-spin")} />
-                              Restart
+                              {t("common.restart")}
                             </Button>
                             <Button
                               variant="ghost"
@@ -495,26 +512,26 @@ export function WorkersPage() {
                     dlqCount > 0 ? "bg-amber-400" : "bg-muted-foreground/30",
                   )} />
                   <div>
-                    <span className="text-sm font-semibold text-muted-foreground">nexusrag.dead-letter</span>
+                    <span className="text-sm font-semibold text-muted-foreground">hrag.dead-letter</span>
                     <p className="text-[11px] text-muted-foreground/60 mt-0.5">
-                      Dead-letter queue — messages that failed after all retries. Not a startable worker.
+                      {t("workers.dlq_desc")}
                     </p>
                   </div>
                 </div>
                 {dlqCount > 0 ? (
                   <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20 flex-shrink-0">
                     <Skull className="w-3 h-3" />
-                    {dlqCount} message{dlqCount !== 1 ? "s" : ""}
+                    {t(dlqCount === 1 ? 'workers.dlq_msg' : 'workers.dlq_msg_plural', { count: dlqCount })}
                   </span>
                 ) : (
-                  <span className="text-xs text-muted-foreground/50 flex-shrink-0">Empty</span>
+                  <span className="text-xs text-muted-foreground/50 flex-shrink-0">{t("common.empty")}</span>
                 )}
               </div>
 
             </Section>
 
             {/* ── Pipeline Summary Cards ── */}
-            <Section title="Pipeline Summary" icon={Layers}>
+            <Section title={t("workers.pipeline_summary")} icon={Layers}>
               <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-8 gap-3">
                 {pipeline &&
                   Object.entries(pipeline).map(([key, count]) => {
@@ -535,7 +552,7 @@ export function WorkersPage() {
                         </div>
                         <span className="text-lg font-bold tabular-nums">{count}</span>
                         <span className="text-[10px] text-muted-foreground font-medium uppercase tracking-wider">
-                          {config.label}
+                          {t(config.labelKey)}
                         </span>
                       </div>
                     );
@@ -547,11 +564,11 @@ export function WorkersPage() {
             {overview && overview.queues.length > 0 && (() => {
               // Exclude the dead-letter queue — it's shown separately below
               const workerQueues = overview.queues.filter(
-                (q) => q.name !== "nexusrag.dead-letter"
+                (q) => q.name !== "hrag.dead-letter"
               );
               if (workerQueues.length === 0) return null;
               return (
-              <Section title="Queue Details" icon={Inbox} badge={workerQueues.length}>
+              <Section title={t("workers.queue_details")} icon={Inbox} badge={workerQueues.length}>
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
                   {workerQueues.map((q) => (
                     <div key={q.name} className="rounded-xl border bg-card p-4 space-y-3">
@@ -569,7 +586,7 @@ export function WorkersPage() {
                             variant="ghost"
                             size="icon"
                             className="h-6 w-6"
-                            title="Purge queue"
+                            title={t("workers.purge_queue")}
                             onClick={() => setPurgeConfirm(q.name)}
                           >
                             <Trash2 className="w-3 h-3 text-muted-foreground hover:text-destructive" />
@@ -578,7 +595,7 @@ export function WorkersPage() {
                             variant="ghost"
                             size="icon"
                             className="h-6 w-6"
-                            title="Delete queue"
+                            title={t("workers.delete_queue")}
                             onClick={() => setDeleteConfirm(q.name)}
                           >
                             <Minus className="w-3 h-3 text-muted-foreground hover:text-destructive" />
@@ -588,15 +605,15 @@ export function WorkersPage() {
                       <div className="grid grid-cols-3 gap-2">
                         <div className="text-center">
                           <p className="text-lg font-bold tabular-nums">{q.messages_ready}</p>
-                          <p className="text-[10px] text-muted-foreground">Ready</p>
+                          <p className="text-[10px] text-muted-foreground">{t("workers.ready")}</p>
                         </div>
                         <div className="text-center">
                           <p className="text-lg font-bold tabular-nums">{q.messages_unacked}</p>
-                          <p className="text-[10px] text-muted-foreground">Processing</p>
+                          <p className="text-[10px] text-muted-foreground">{t("workers.processing")}</p>
                         </div>
                         <div className="text-center">
                           <p className="text-lg font-bold tabular-nums text-primary">{q.consumers}</p>
-                          <p className="text-[10px] text-muted-foreground">Workers</p>
+                          <p className="text-[10px] text-muted-foreground">{t("workers.consumers")}</p>
                         </div>
                       </div>
                       {(q.message_rate_in > 0 || q.message_rate_out > 0) && (
@@ -615,7 +632,7 @@ export function WorkersPage() {
             {/* ── Dead Letter Queue ── */}
             {dlqCount > 0 && (
               <Section
-                title="Dead Letter Queue"
+                title={t("workers.dead_letter_queue")}
                 icon={MailWarning}
                 badge={dlqCount}
                 badgeColor="bg-amber-500/10 text-amber-400"
@@ -636,7 +653,7 @@ export function WorkersPage() {
                       ) : (
                         <RotateCcw className="w-3 h-3" />
                       )}
-                      Retry All
+                      {t("common.retry_all")}
                     </Button>
                     <Button
                       variant="outline"
@@ -646,20 +663,20 @@ export function WorkersPage() {
                       disabled={purgeDlq.isPending}
                     >
                       <Trash2 className="w-3 h-3" />
-                      Purge
+                      {t("common.purge")}
                     </Button>
                     <span className="text-xs text-muted-foreground ml-auto">
-                      Messages that failed after {3 + 1} attempts
+                      {t("workers.dlq_retry_msg")}
                     </span>
                   </div>
                   {/* DLQ messages */}
                   <table className="w-full text-sm">
                     <thead>
                       <tr className="border-b bg-muted/30">
-                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">Exchange</th>
-                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">Routing Key</th>
-                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">Retries</th>
-                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">Payload</th>
+                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.exchange")}</th>
+                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.routing_key")}</th>
+                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.retries")}</th>
+                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.payload")}</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -685,16 +702,16 @@ export function WorkersPage() {
 
             {/* ── Active Documents (Processing) ── */}
             {!pipelineLoading && activeDocs.length > 0 && (
-              <Section title={`Processing (${activeDocs.length})`} icon={Loader2}>
+              <Section title={t("workers.processing_with_count", { count: activeDocs.length })} icon={Loader2}>
                 <div className="rounded-xl border bg-card overflow-hidden">
                   <table className="w-full text-sm">
                     <thead>
                       <tr className="border-b bg-muted/30">
-                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">File</th>
-                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">Status</th>
-                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">Sub-tasks</th>
-                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">Time</th>
-                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">Updated</th>
+                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.file")}</th>
+                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.status")}</th>
+                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.sub_tasks")}</th>
+                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.time")}</th>
+                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.updated")}</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -715,7 +732,7 @@ export function WorkersPage() {
                             <td className="px-4 py-2.5">
                               <span className={cn("inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium rounded-full", config.bgColor, config.color)}>
                                 <Icon className={cn("w-3 h-3", isAnimated && "animate-spin")} />
-                                {config.label}
+                                {t(config.labelKey)}
                               </span>
                             </td>
                             <td className="px-4 py-2.5">
@@ -745,7 +762,7 @@ export function WorkersPage() {
             {/* ── Failed Documents ── */}
             {!pipelineLoading && failedDocs.length > 0 && (
               <Section
-                title={`Failed (${failedDocs.length})`}
+                title={t("workers.failed_with_count", { count: failedDocs.length })}
                 icon={AlertTriangle}
                 badge={failedDocs.length}
                 badgeColor="bg-destructive/10 text-destructive"
@@ -754,10 +771,10 @@ export function WorkersPage() {
                   <table className="w-full text-sm">
                     <thead>
                       <tr className="border-b bg-destructive/5">
-                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">File</th>
-                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">Error</th>
-                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">Updated</th>
-                        <th className="text-right px-4 py-2 text-xs font-medium text-muted-foreground">Actions</th>
+                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.file")}</th>
+                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.error")}</th>
+                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.updated")}</th>
+                        <th className="text-right px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.actions")}</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -788,7 +805,7 @@ export function WorkersPage() {
                               disabled={retrySingle.isPending}
                             >
                               <RefreshCw className={cn("w-3 h-3", retrySingle.isPending && "animate-spin")} />
-                              Retry
+                              {t("common.retry")}
                             </Button>
                           </td>
                         </tr>
@@ -801,7 +818,7 @@ export function WorkersPage() {
 
             {/* ── Health Details (collapsed by default) ── */}
             {health && (
-              <Section title="Health Details" icon={Heart} defaultOpen={false}>
+              <Section title={t("workers.health_details")} icon={Heart} defaultOpen={false}>
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
                   {/* RabbitMQ */}
                   <HealthCard
@@ -856,10 +873,10 @@ export function WorkersPage() {
               <div className="flex flex-col items-center justify-center py-16 text-center">
                 <CheckCircle2 className="w-10 h-10 text-primary/30 mb-3" />
                 <h3 className="text-sm font-medium text-muted-foreground mb-1">
-                  All clear
+                  {t("workers.all_clear")}
                 </h3>
                 <p className="text-xs text-muted-foreground/70">
-                  No documents currently processing or failed.
+                  {t("workers.all_clear_desc")}
                 </p>
               </div>
             )}
@@ -877,9 +894,9 @@ export function WorkersPage() {
           }
         }}
         onCancel={() => setPurgeConfirm(null)}
-        title="Purge Queue"
-        message={`Are you sure you want to purge "${purgeConfirm}"? All pending messages will be permanently deleted.`}
-        confirmLabel="Purge"
+        title={t("workers.purge_queue_title")}
+        message={t("workers.purge_queue_msg", { name: purgeConfirm })}
+        confirmLabel={t("common.purge")}
         variant="danger"
       />
 
@@ -892,9 +909,9 @@ export function WorkersPage() {
           }
         }}
         onCancel={() => setDeleteConfirm(null)}
-        title="Delete Queue"
-        message={`Delete queue "${deleteConfirm}" entirely? It will be recreated with DLX support when a worker restarts.`}
-        confirmLabel="Delete"
+        title={t("workers.delete_queue_title")}
+        message={t("workers.delete_queue_msg", { name: deleteConfirm })}
+        confirmLabel={t("common.delete")}
         variant="danger"
       />
 
@@ -905,9 +922,9 @@ export function WorkersPage() {
           setRetryAllConfirm(false);
         }}
         onCancel={() => setRetryAllConfirm(false)}
-        title="Retry All Failed"
-        message={`This will reset ${failedCount} failed document${failedCount !== 1 ? "s" : ""} and re-queue them for processing. Continue?`}
-        confirmLabel="Retry All"
+        title={t("workers.retry_all_title")}
+        message={t("workers.retry_all_msg", { count: failedCount })}
+        confirmLabel={t("common.retry_all")}
         variant="default"
       />
 
@@ -920,9 +937,9 @@ export function WorkersPage() {
           }
         }}
         onCancel={() => setStopConfirm(null)}
-        title="Stop Workers"
-        message={`Stop all managed ${stopConfirm} workers? Any in-progress tasks will be interrupted.`}
-        confirmLabel="Stop"
+        title={t("workers.stop_workers_title")}
+        message={t("workers.stop_workers_msg", { type: stopConfirm })}
+        confirmLabel={t("common.stop")}
         variant="danger"
       />
     </div>

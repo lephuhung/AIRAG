@@ -1,15 +1,16 @@
 import { useState, useMemo, useCallback, memo } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
+import { useTranslation } from "@/hooks/useTranslation";
 import { AnimatePresence } from "framer-motion";
 import {
-  ArrowLeft,
   FileText,
-  Pencil,
+  Sparkles,
+  Loader2,
+  ArrowLeft,
   Check,
   X,
-  Loader2,
-  Sparkles,
+  Pencil,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -42,7 +43,6 @@ interface DataPanelProps {
   isUploading: boolean;
   onDelete: (id: number) => void;
   onProcess: (id: number) => void;
-  onReindex: (id: number) => void;
   isProcessing: boolean;
   onUpdateWorkspace: (data: { name: string; description?: string }) => Promise<void>;
 }
@@ -58,10 +58,10 @@ export const DataPanel = memo(function DataPanel({
   isUploading,
   onDelete,
   onProcess,
-  onReindex,
   isProcessing,
   onUpdateWorkspace,
 }: DataPanelProps) {
+  const { t } = useTranslation();
   const navigate = useNavigate();
   const [deleteDocConfirm, setDeleteDocConfirm] = useState<number | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
@@ -115,8 +115,8 @@ export const DataPanel = memo(function DataPanel({
 
     setBatchProcessing(true);
     const count = processable.length;
-    toast.info(`Analyzing ${count} document${count > 1 ? "s" : ""}...`, {
-      description: "Documents will be processed sequentially.",
+    toast.info(t("workspace.analyzing_batch", { count }), {
+      description: t("workspace.analyzing_batch_desc"),
     });
 
     try {
@@ -124,11 +124,11 @@ export const DataPanel = memo(function DataPanel({
         document_ids: processable.map((d) => d.id),
       });
     } catch {
-      toast.error("Failed to start batch analysis");
+      toast.error(t("workspace.batch_failed"));
     } finally {
       setBatchProcessing(false);
     }
-  }, [documents, batchProcessing]);
+  }, [documents, batchProcessing, t]);
 
   const handleStartEdit = () => {
     if (workspace) {
@@ -156,7 +156,7 @@ export const DataPanel = memo(function DataPanel({
           className="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors"
         >
           <ArrowLeft className="w-3 h-3" />
-          Dashboard
+          {t("nav.dashboard")}
         </button>
 
         {isEditingName ? (
@@ -165,22 +165,22 @@ export const DataPanel = memo(function DataPanel({
               value={editName}
               onChange={(e) => setEditName(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && handleSaveEdit()}
-              placeholder="Name"
+              placeholder={t("common.name")}
               autoFocus
               className="text-sm font-semibold h-8"
             />
             <Input
               value={editDesc}
               onChange={(e) => setEditDesc(e.target.value)}
-              placeholder="Description"
+              placeholder={t("common.description")}
               className="text-xs h-7"
             />
             <div className="flex items-center gap-1">
               <Button size="sm" onClick={handleSaveEdit} disabled={!editName.trim()} className="h-6 text-[10px] px-2">
-                <Check className="w-3 h-3 mr-0.5" /> Save
+                <Check className="w-3 h-3 mr-0.5" /> {t("common.save")}
               </Button>
               <Button size="sm" variant="ghost" onClick={() => setIsEditingName(false)} className="h-6 text-[10px] px-2">
-                <X className="w-3 h-3 mr-0.5" /> Cancel
+                <X className="w-3 h-3 mr-0.5" /> {t("common.cancel")}
               </Button>
             </div>
           </div>
@@ -188,7 +188,7 @@ export const DataPanel = memo(function DataPanel({
           <div className="flex items-center gap-1.5">
             <div className="flex-1 min-w-0">
               <h1 className="text-sm font-bold truncate">
-                {workspace?.name || "Knowledge Base"}
+                {workspace?.name || t("nav.knowledge_bases")}
               </h1>
               {workspace?.description && (
                 <p className="text-[10px] text-muted-foreground truncate">
@@ -218,7 +218,7 @@ export const DataPanel = memo(function DataPanel({
         <div className="flex items-center justify-between">
           <h2 className="text-xs font-semibold flex items-center gap-1.5">
             <FileText className="w-3.5 h-3.5" />
-            Documents
+            {t("nav.files")}
           </h2>
           <div className="flex items-center gap-2">
             {workspace && (
@@ -226,11 +226,11 @@ export const DataPanel = memo(function DataPanel({
                 onClick={() => navigate(`/knowledge-bases/${workspace.id}/files`)}
                 className="text-[10px] text-primary hover:underline transition-colors"
               >
-                View all &rarr;
+                {t("common.view_all")} &rarr;
               </button>
             )}
             <span className="text-[10px] text-muted-foreground">
-              {documents?.length ?? 0} file{(documents?.length ?? 0) !== 1 ? "s" : ""}
+              {t("kb.docs_count", { count: documents?.length ?? 0 })}
             </span>
           </div>
         </div>
@@ -251,11 +251,11 @@ export const DataPanel = memo(function DataPanel({
             <div className="flex items-center gap-2 min-w-0">
               <Sparkles className={cn("w-3.5 h-3.5 text-blue-400 flex-shrink-0", batchProcessing && "animate-spin")} />
               <span className="text-[11px] font-medium text-blue-400 truncate">
-                {batchProcessing ? "Starting..." : `Analyze All (${pendingCount})`}
+                {batchProcessing ? t("common.starting") : `${t("workspace.analyze_all")} (${pendingCount})`}
               </span>
             </div>
             <span className="text-[10px] text-muted-foreground flex-shrink-0">
-              {pendingCount} pending
+              {t("common.pending_count", { count: pendingCount })}
             </span>
           </button>
         )}
@@ -266,12 +266,12 @@ export const DataPanel = memo(function DataPanel({
         {docsLoading ? (
           <div className="flex items-center justify-center py-8">
             <Loader2 className="w-4 h-4 animate-spin text-muted-foreground mr-2" />
-            <span className="text-xs text-muted-foreground">Loading...</span>
+            <span className="text-xs text-muted-foreground">{t("common.loading")}</span>
           </div>
         ) : !documents || documents.length === 0 ? (
           <div className="flex-1 flex items-center justify-center px-3">
             <p className="text-xs text-muted-foreground text-center">
-              No documents yet. Drop files above to get started.
+              {t("workspace.no_docs")}
             </p>
           </div>
         ) : (
@@ -293,8 +293,7 @@ export const DataPanel = memo(function DataPanel({
                     key={doc.id}
                     doc={doc}
                     selected={doc.id === selectedDocId}
-                    onDelete={setDeleteDocConfirm}
-                    onReindex={onReindex}
+                    onDelete={(id) => setDeleteDocConfirm(id)}
                     onProcess={onProcess}
                     isProcessing={isProcessing}
                     onClick={onSelectDoc}
@@ -303,7 +302,7 @@ export const DataPanel = memo(function DataPanel({
               </AnimatePresence>
               {filteredDocs.length === 0 && documents.length > 0 && (
                 <div className="text-center py-4 text-[11px] text-muted-foreground">
-                  No documents match your filter
+                  {t("workspace.no_match")}
                 </div>
               )}
             </div>
@@ -321,9 +320,9 @@ export const DataPanel = memo(function DataPanel({
           }
         }}
         onCancel={() => setDeleteDocConfirm(null)}
-        title="Delete Document"
-        message="Are you sure? This removes the document and its indexed data."
-        confirmLabel="Delete"
+        title={t("files.delete_confirm_title")}
+        message={t("files.delete_confirm_msg")}
+        confirmLabel={t("common.delete")}
         variant="danger"
       />
     </div>

@@ -37,7 +37,7 @@ class Document(Base):
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )
 
-    # NexusRAG fields
+    # HRAG fields
     markdown_s3_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
     upload_s3_key: Mapped[str | None] = mapped_column(String(500), nullable=True)
     page_count: Mapped[int] = mapped_column(Integer, default=0)

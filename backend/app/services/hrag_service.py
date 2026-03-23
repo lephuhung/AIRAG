@@ -2,7 +2,7 @@
 Deep RAG Service
 =================
 
-Orchestrator for the NexusRAG pipeline:
+Orchestrator for the HRAG pipeline:
   Document → Docling Parse → ChromaDB Index + LightRAG KG → Hybrid Retrieval
 
 Backward-compatible: exposes the same `process_document()`, `query()`,
@@ -31,9 +31,9 @@ from app.services.models.parsed_document import DeepRetrievalResult
 logger = logging.getLogger(__name__)
 
 
-class NexusRAGService:
+class HRAGService:
     """
-    Full NexusRAG pipeline orchestrator.
+    Full HRAG pipeline orchestrator.
 
     Phases:
       1. PARSING  — Docling parse → markdown + chunks + images
@@ -56,7 +56,7 @@ class NexusRAGService:
 
         # KG service (optional, gated by config)
         self.kg_service: Optional[KnowledgeGraphService] = None
-        if settings.NEXUSRAG_ENABLE_KG:
+        if settings.HRAG_ENABLE_KG:
             self.kg_service = KnowledgeGraphService(workspace_id=workspace_id)
 
         # Retriever (with cross-encoder reranker)
@@ -75,7 +75,7 @@ class NexusRAGService:
 
     async def process_document(self, document_id: int, file_path: str) -> int:
         """
-        Process a document through the full NexusRAG pipeline.
+        Process a document through the full HRAG pipeline.
 
         Returns:
             Number of chunks created
@@ -104,7 +104,7 @@ class NexusRAGService:
             file_path = tmp.name
             _cleanup_tmp = file_path
             logger.info(
-                f"[nexus_rag] doc={document_id} downloaded from MinIO "
+                f"[hrag] doc={document_id} downloaded from MinIO "
                 f"({document.upload_s3_key}) → {file_path}"
             )
 
@@ -245,14 +245,14 @@ class NexusRAGService:
             await self.db.commit()
 
             logger.info(
-                f"NexusRAG processed document {document_id}: "
+                f"HRAG processed document {document_id}: "
                 f"{chunk_count} chunks, {len(parsed.images)} images, "
                 f"{parsed.tables_count} tables in {elapsed_ms}ms"
             )
             return chunk_count
 
         except Exception as e:
-            logger.error(f"NexusRAG failed for document {document_id}: {e}")
+            logger.error(f"HRAG failed for document {document_id}: {e}")
             document.status = DocumentStatus.FAILED
             document.error_message = str(e)[:500]
             await self.db.commit()
@@ -362,7 +362,7 @@ class NexusRAGService:
             if img_path.exists():
                 img_path.unlink()
 
-        logger.info(f"Deleted document {document_id} from NexusRAG stores")
+        logger.info(f"Deleted document {document_id} from HRAG stores")
 
     def get_chunk_count(self) -> int:
         """Return total number of chunks in the knowledge base's vector store."""

@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, memo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Upload, FileUp } from "lucide-react";
+import { useTranslation } from "@/hooks/useTranslation";
 import { cn } from "@/lib/utils";
 
 const ACCEPTED_TYPES = ".pdf,.txt,.docx,.md,.pptx";
@@ -16,15 +17,16 @@ interface UploadZoneProps {
 }
 
 export const UploadZone = memo(function UploadZone({ onUpload, isUploading, compact, mini }: UploadZoneProps) {
+  const { t } = useTranslation();
   const [isDragOver, setIsDragOver] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const validateFile = useCallback((file: File): string | null => {
     const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
-    if (!ACCEPTED_EXTENSIONS.has(ext)) return `Unsupported format: .${ext}`;
-    if (file.size > MAX_SIZE_MB * 1024 * 1024) return `File too large (max ${MAX_SIZE_MB}MB)`;
+    if (!ACCEPTED_EXTENSIONS.has(ext)) return t("workspace.unsupported_format", { ext });
+    if (file.size > MAX_SIZE_MB * 1024 * 1024) return t("workspace.file_size_error", { size: MAX_SIZE_MB });
     return null;
-  }, []);
+  }, [t]);
 
   const handleFiles = useCallback(
     (files: FileList | null) => {
@@ -97,7 +99,7 @@ export const UploadZone = memo(function UploadZone({ onUpload, isUploading, comp
                 className="flex flex-col items-center"
               >
                 <FileUp className="w-6 h-6 text-primary mb-1" />
-                <p className="text-xs font-medium text-primary">Drop files here</p>
+                <p className="text-xs font-medium text-primary">{t("workspace.drop_here")}</p>
               </motion.div>
             ) : (
               <motion.div
@@ -109,7 +111,7 @@ export const UploadZone = memo(function UploadZone({ onUpload, isUploading, comp
               >
                 <Upload className={cn("w-6 h-6 text-muted-foreground mb-1", isUploading && "animate-pulse")} />
                 <p className="text-xs font-medium">
-                  {isUploading ? "Uploading..." : "Drop files or click to upload"}
+                  {isUploading ? t("workspace.uploading") : t("workspace.drop_click")}
                 </p>
                 <p className="text-[10px] text-muted-foreground/60 mt-0.5">
                   PDF, DOCX, PPTX, TXT, MD (max {MAX_SIZE_MB}MB)
@@ -140,18 +142,20 @@ export const UploadZone = memo(function UploadZone({ onUpload, isUploading, comp
           onClick={() => inputRef.current?.click()}
           animate={isDragOver ? { scale: 1.01 } : { scale: 1 }}
           className={cn(
-            "flex items-center gap-2 px-3 py-2 rounded-lg border border-dashed cursor-pointer transition-colors duration-150",
+            "flex items-center gap-3 px-4 py-5 rounded-lg border border-dashed cursor-pointer transition-colors duration-150",
             isDragOver
               ? "border-primary bg-primary/5 text-primary"
               : "border-border hover:border-primary/40 hover:bg-muted/30 text-muted-foreground",
             isUploading && "opacity-60 pointer-events-none"
           )}
         >
-          <Upload className={cn("w-3.5 h-3.5 flex-shrink-0", isUploading && "animate-pulse")} />
-          <span className="text-[11px] font-medium flex-1 truncate">
-            {isUploading ? "Uploading..." : isDragOver ? "Drop to upload" : "Drop files or click to upload"}
-          </span>
-          <span className="text-[10px] opacity-60 flex-shrink-0">PDF · DOCX · MD</span>
+          <Upload className={cn("w-5 h-5 flex-shrink-0", isUploading && "animate-pulse")} />
+          <div className="flex flex-col flex-1 min-w-0">
+            <span className="text-[11px] font-medium truncate">
+              {isUploading ? t("workspace.uploading") : isDragOver ? t("workspace.drop_to_upload") : t("workspace.drop_click")}
+            </span>
+            <span className="text-[10px] opacity-60">PDF · DOCX · PPTX · TXT · MD</span>
+          </div>
         </motion.div>
       </>
     );
@@ -192,7 +196,7 @@ export const UploadZone = memo(function UploadZone({ onUpload, isUploading, comp
               className="flex flex-col items-center"
             >
               <FileUp className="w-8 h-8 text-primary mb-2" />
-              <p className="text-sm font-medium text-primary">Drop files here</p>
+              <p className="text-sm font-medium text-primary">{t("workspace.drop_here")}</p>
             </motion.div>
           ) : (
             <motion.div
@@ -204,7 +208,7 @@ export const UploadZone = memo(function UploadZone({ onUpload, isUploading, comp
             >
               <Upload className="w-8 h-8 text-muted-foreground mb-2" />
               <p className="text-sm font-medium">
-                {isUploading ? "Uploading..." : "Drop files or click to upload"}
+                {isUploading ? t("workspace.uploading") : t("workspace.drop_click")}
               </p>
               <p className="text-xs text-muted-foreground mt-1">
                 PDF, DOCX, PPTX, TXT, MD (max {MAX_SIZE_MB}MB)

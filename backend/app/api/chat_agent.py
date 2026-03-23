@@ -1,5 +1,5 @@
 """
-Chat Agent — Semi-Agentic SSE Streaming for NexusRAG
+Chat Agent — Semi-Agentic SSE Streaming for HRAG
 ====================================================
 
 Provides an SSE streaming endpoint where the LLM decides whether to call
@@ -302,7 +302,7 @@ async def sse_with_heartbeat(
 
 
 # ---------------------------------------------------------------------------
-# Tool executor — retrieval via NexusRAG
+# Tool executor — retrieval via HRAG
 # ---------------------------------------------------------------------------
 
 async def _get_accessible_workspaces(db: AsyncSession, user: User) -> list[int]:
@@ -340,7 +340,7 @@ async def _execute_search_documents(
         (context_text, sources, image_refs, image_parts_for_vision)
     """
     from app.services.rag_service import get_rag_service
-    from app.services.nexus_rag_service import NexusRAGService
+    from app.services.hrag_service import HRAGService
     from pathlib import Path as _P
     
     all_chunks = []
@@ -357,7 +357,7 @@ async def _execute_search_documents(
         
         chunks = []
         citations = []
-        if isinstance(rag_service, NexusRAGService):
+        if isinstance(rag_service, HRAGService):
             try:
                 result = await rag_service.query_deep(
                     question=query,
@@ -746,6 +746,13 @@ async def agent_chat_stream(
     # Build user message
     messages.append(LLMMessage(role="user", content=message))
 
+    # 1. Detect if it's a simple greeting (bypass search logic)
+    greeting_detected = False
+    import string
+    low_msg = message.lower().strip(string.punctuation + " ")
+    if low_msg in ["hi", "hello", "xin chào", "chào", "hey", "greetings", "cảm ơn", "thanks", "tạm biệt", "bye"]:
+        greeting_detected = True
+
     # Tool / prompt setup
     tools = None
     effective_system_prompt = system_prompt
@@ -827,14 +834,12 @@ async def agent_chat_stream(
         )
     elif is_openai_compatible:
         # OpenAI-compatible: use native function calling (JSON schema)
-        # Do NOT inject XML <tool_call> prompt — it gets blocked by some proxies
-        tools = _get_openai_tools()
-        effective_system_prompt += GEMINI_TOOL_SYSTEM
-        # Add a strong reminder directly to the user message
-        messages[-1] = LLMMessage(
-            role="user",
-            content=messages[-1].content + NATIVE_TOOL_REMINDER,
-        )
+        # Do NOT inject aggressive Gemini tool prompt — it often blocks small models
+        # and even confuses Qwen3.
+        if not greeting_detected:
+            tools = _get_openai_tools()
+        # No extra system prompt addition needed for OpenAI-compatible by default,
+        # relies on tool definitions.
     else:
         # Ollama: append mandatory tool prompt to system prompt
         effective_system_prompt += "\n\n" + OLLAMA_TOOL_SYSTEM

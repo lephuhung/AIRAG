@@ -4,7 +4,7 @@ Reranker Service
 Cross-encoder reranker for improving retrieval precision.
 
 Default model: BAAI/bge-reranker-v2-m3 (multilingual, 100+ languages).
-Configurable via NEXUSRAG_RERANKER_MODEL in settings.
+Configurable via HRAG_RERANKER_MODEL in settings.
 
 Usage:
     reranker = get_reranker_service()
@@ -37,7 +37,7 @@ class RerankerService:
     """
 
     def __init__(self, model_name: Optional[str] = None):
-        self.model_name = model_name or settings.NEXUSRAG_RERANKER_MODEL
+        self.model_name = model_name or settings.HRAG_RERANKER_MODEL
         self._model = None
 
     @property

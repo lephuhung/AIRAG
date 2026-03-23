@@ -4,7 +4,7 @@ Knowledge Graph Service
 
 Per-workspace Knowledge Graph using LightRAG with configurable LLM + embeddings.
 
-Two graph storage backends (selected via NEXUSRAG_KG_GRAPH_BACKEND in .env):
+Two graph storage backends (selected via HRAG_KG_GRAPH_BACKEND in .env):
 
   networkx (default)
     → File-based per-workspace storage (NetworkX graph + NanoVectorDB).
@@ -14,7 +14,7 @@ Two graph storage backends (selected via NEXUSRAG_KG_GRAPH_BACKEND in .env):
 
   neo4j
     → Shared Neo4j instance; workspace isolation via node label "kb_{workspace_id}".
-    → Requires Neo4j 5 running (docker-compose includes nexusrag-neo4j service).
+    → Requires Neo4j 5 running (docker-compose includes hrag-neo4j service).
     → All documents across all workspaces share one database; queried per-label.
     → Cross-document entity linking within a workspace works out-of-the-box.
 
@@ -65,7 +65,7 @@ class KnowledgeGraphService:
     """
     Per-workspace Knowledge Graph service backed by LightRAG.
 
-    Storage backend is selected by NEXUSRAG_KG_GRAPH_BACKEND:
+    Storage backend is selected by HRAG_KG_GRAPH_BACKEND:
       - "networkx" (default): file-based per-workspace storage
       - "neo4j": shared Neo4j instance with per-workspace node labels
     """
@@ -161,7 +161,7 @@ class KnowledgeGraphService:
         emb_provider = get_embedding_provider()
         embedding_dim = emb_provider.get_dimension()
 
-        backend = settings.NEXUSRAG_KG_GRAPH_BACKEND.lower()
+        backend = settings.HRAG_KG_GRAPH_BACKEND.lower()
 
         if backend == "networkx":
             # Detect dimension mismatch when switching providers
@@ -181,25 +181,24 @@ class KnowledgeGraphService:
         async def embedding_func(texts: list[str]) -> np.ndarray:
             return await _kg_embed(texts)
 
+        # Set PostgreSQL environment variables for LightRAG (PGKVStorage, PGVectorStorage)
+        # These must be set for all modes since we use PGKVStorage + PGVectorStorage by default.
+        from urllib.parse import urlparse
+        import os as _os
+        url = urlparse(settings.DATABASE_URL.replace("postgresql+asyncpg", "postgresql"))
+        _os.environ.setdefault("POSTGRES_HOST", url.hostname or "localhost")
+        _os.environ.setdefault("POSTGRES_PORT", str(url.port or 5432))
+        _os.environ.setdefault("POSTGRES_USER", url.username or "postgres")
+        _os.environ.setdefault("POSTGRES_PASSWORD", url.password or "")
+        _os.environ.setdefault("POSTGRES_DATABASE", url.path.lstrip("/") or "postgres")
+        _os.environ.setdefault("POSTGRES_ENABLE_VECTOR", "true")
+
         if backend == "neo4j":
             graph_storage = "Neo4JStorage"
             # LightRAG's Neo4JStorage reads NEO4J_URI/NEO4J_USERNAME/NEO4J_PASSWORD
-            # directly from os.environ (not from pydantic-settings).
-            # Ensure they are exported here from the app settings so LightRAG can find them.
-            import os as _os
             _os.environ["NEO4J_URI"] = settings.NEO4J_URI
             _os.environ["NEO4J_USERNAME"] = settings.NEO4J_USERNAME
             _os.environ["NEO4J_PASSWORD"] = settings.NEO4J_PASSWORD
-
-            # Set PostgreSQL environment variables for LightRAG (PGKVStorage, PGVectorStorage)
-            from urllib.parse import urlparse
-            url = urlparse(settings.DATABASE_URL.replace("postgresql+asyncpg", "postgresql"))
-            _os.environ.setdefault("POSTGRES_HOST", url.hostname or "localhost")
-            _os.environ.setdefault("POSTGRES_PORT", str(url.port or 5432))
-            _os.environ.setdefault("POSTGRES_USER", url.username or "postgres")
-            _os.environ.setdefault("POSTGRES_PASSWORD", url.password or "")
-            _os.environ.setdefault("POSTGRES_DATABASE", url.path.lstrip("/") or "postgres")
-            _os.environ.setdefault("POSTGRES_ENABLE_VECTOR", "true")
 
             # Pass workspace label via the LightRAG `workspace` param so all
             # workspaces share one Neo4j DB but remain isolated by node label.
@@ -209,8 +208,8 @@ class KnowledgeGraphService:
             doc_status_storage = "JsonDocStatusStorage"
             # Pass Neo4j addon_params
             extra_kwargs["addon_params"] = {
-                "language": settings.NEXUSRAG_KG_LANGUAGE,
-                "entity_types": settings.NEXUSRAG_KG_ENTITY_TYPES,
+                "language": settings.HRAG_KG_LANGUAGE,
+                "entity_types": settings.HRAG_KG_ENTITY_TYPES,
             }
             logger.info(
                 f"LightRAG using Neo4j backend for workspace {self.workspace_id} "
@@ -226,7 +225,7 @@ class KnowledgeGraphService:
                 "workspace": f"kb_{self.workspace_id}"
             }
             logger.info(
-                f"LightRAG using NetworkX (file) backend with PostgreSQL KV+Vector storage for workspace {self.workspace_id}"
+                f"LightRAG using NetworkX (file) backend with PostgreSQL KV+Vector storage for workspace {self.workspace_id} (host={_os.environ['POSTGRES_HOST']}, port={_os.environ['POSTGRES_PORT']})"
             )
 
         # Build LightRAG kwargs
@@ -234,7 +233,7 @@ class KnowledgeGraphService:
             working_dir=self.working_dir,
             llm_model_func=self._kg_llm_complete,
             embedding_func=embedding_func,
-            chunk_token_size=settings.NEXUSRAG_KG_CHUNK_TOKEN_SIZE,
+            chunk_token_size=settings.HRAG_KG_CHUNK_TOKEN_SIZE,
             enable_llm_cache=True,
             llm_model_max_async=3,   # max 3 concurrent LLM calls → avoids rate limits
             kv_storage=kv_storage,
@@ -242,8 +241,8 @@ class KnowledgeGraphService:
             graph_storage=graph_storage,
             doc_status_storage=doc_status_storage,
             addon_params={
-                "language": settings.NEXUSRAG_KG_LANGUAGE,
-                "entity_types": settings.NEXUSRAG_KG_ENTITY_TYPES,
+                "language": settings.HRAG_KG_LANGUAGE,
+                "entity_types": settings.HRAG_KG_ENTITY_TYPES,
             },
         )
 
@@ -339,12 +338,12 @@ class KnowledgeGraphService:
                     question,
                     param=QueryParam(mode=mode, top_k=top_k),
                 ),
-                timeout=settings.NEXUSRAG_KG_QUERY_TIMEOUT,
+                timeout=settings.HRAG_KG_QUERY_TIMEOUT,
             )
             return result or ""
         except asyncio.TimeoutError:
             logger.warning(
-                f"KG query timed out after {settings.NEXUSRAG_KG_QUERY_TIMEOUT}s "
+                f"KG query timed out after {settings.HRAG_KG_QUERY_TIMEOUT}s "
                 f"for workspace {self.workspace_id}"
             )
             return ""
@@ -371,7 +370,7 @@ class KnowledgeGraphService:
         - Neo4j backend: drops all nodes/edges with label kb_{workspace_id}
           in Neo4j, then removes the working directory (KV/vector files).
         """
-        backend = settings.NEXUSRAG_KG_GRAPH_BACKEND.lower()
+        backend = settings.HRAG_KG_GRAPH_BACKEND.lower()
 
         if backend == "neo4j":
             try:
@@ -516,7 +515,7 @@ class KnowledgeGraphService:
 
         For NetworkX backend we fall back to the LightRAG storage API.
         """
-        backend = settings.NEXUSRAG_KG_GRAPH_BACKEND.lower()
+        backend = settings.HRAG_KG_GRAPH_BACKEND.lower()
 
         if backend == "neo4j":
             return await self._get_graph_data_neo4j(
@@ -704,7 +703,7 @@ class KnowledgeGraphService:
         if not keywords:
             return ""
 
-        backend = settings.NEXUSRAG_KG_GRAPH_BACKEND.lower()
+        backend = settings.HRAG_KG_GRAPH_BACKEND.lower()
 
         if backend == "neo4j":
             return await self._get_relevant_context_neo4j(

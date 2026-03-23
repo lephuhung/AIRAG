@@ -13,7 +13,7 @@ class ParseMessage(BaseModel):
     """Dispatched by the API after a file is uploaded."""
     document_id: int
     workspace_id: int
-    minio_key: str          # key in nexusrag-uploads bucket
+    minio_key: str          # key in hrag-uploads bucket
     original_filename: str
 
 

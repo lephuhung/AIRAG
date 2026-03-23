@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════════════════════
-# NexusRAG — Development Mode (Backend API + All Workers)
+# HRAG — Development Mode (Backend API + All Workers)
 # ═══════════════════════════════════════════════════════════════════════════════
 # Starts uvicorn (API server) + 4 worker processes in one terminal.
 # Workers auto-restart on crash (up to 10 times each, with 3s backoff).
@@ -184,7 +184,7 @@ fi
 
 echo ""
 echo -e "${C_API}═══════════════════════════════════════════════════════${C_RESET}"
-echo -e "${C_API}  NexusRAG Dev Mode Running${C_RESET}"
+echo -e "${C_API}  HRAG Dev Mode Running${C_RESET}"
 if [ "$START_API" = true ]; then
     echo -e "${C_API}  API:     http://localhost:8080${C_RESET}"
     echo -e "${C_API}  Docs:    http://localhost:8080/docs${C_RESET}"

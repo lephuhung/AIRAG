@@ -34,8 +34,8 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/workers", tags=["workers"])
 
-# Queue name prefix for filtering nexusrag queues only
-_QUEUE_PREFIX = "nexusrag."
+# Queue name prefix for filtering hrag queues only
+_QUEUE_PREFIX = "hrag."
 
 # ══════════════════════════════════════════════════════════════════════════════
 # In-process worker management
@@ -481,7 +481,7 @@ async def retry_dead_letter_messages(count: int = 100, user: User = Depends(requ
                     original_routing_key = x_death[0].get("routing-keys", [routing_key])[0]
                 else:
                     # Fallback: infer from routing key
-                    original_exchange = f"nexusrag.{routing_key}" if routing_key else ""
+                    original_exchange = f"hrag.{routing_key}" if routing_key else ""
                     original_routing_key = routing_key
 
                 if original_exchange:
@@ -506,7 +506,7 @@ async def retry_dead_letter_messages(count: int = 100, user: User = Depends(requ
 async def delete_queue(queue_name: str, user: User = Depends(require_superadmin)):
     """Delete a queue entirely. Use for migration (e.g., recreating with DLX args)."""
     if not queue_name.startswith(_QUEUE_PREFIX):
-        raise HTTPException(status_code=400, detail="Can only delete nexusrag.* queues")
+        raise HTTPException(status_code=400, detail="Can only delete hrag.* queues")
     try:
         mgmt = get_rabbitmq_management()
         await mgmt.delete_queue(queue_name)
@@ -545,7 +545,7 @@ async def get_overview(db: AsyncSession = Depends(get_db), user: User = Depends(
             if name == DLQ_QUEUE:
                 continue
 
-            # Extract worker type from queue name (e.g. "nexusrag.parse" → "parse")
+            # Extract worker type from queue name (e.g. "hrag.parse" → "parse")
             worker_type = name.replace(_QUEUE_PREFIX, "").split(".")[0]
             active_workers[worker_type] = (
                 active_workers.get(worker_type, 0) + info["consumers"]
@@ -588,7 +588,7 @@ async def get_overview(db: AsyncSession = Depends(get_db), user: User = Depends(
 
 @router.get("/queues")
 async def list_queues(user: User = Depends(require_superadmin)):
-    """Returns all nexusrag.* queues with full metrics."""
+    """Returns all hrag.* queues with full metrics."""
     try:
         mgmt = get_rabbitmq_management()
         raw_queues = await mgmt.list_queues()
@@ -605,7 +605,7 @@ async def list_queues(user: User = Depends(require_superadmin)):
 async def purge_queue(queue_name: str, user: User = Depends(require_superadmin)):
     """Clear all pending messages from a specific queue."""
     if not queue_name.startswith(_QUEUE_PREFIX):
-        raise HTTPException(status_code=400, detail="Can only purge nexusrag.* queues")
+        raise HTTPException(status_code=400, detail="Can only purge hrag.* queues")
     try:
         mgmt = get_rabbitmq_management()
         await mgmt.purge_queue(queue_name)

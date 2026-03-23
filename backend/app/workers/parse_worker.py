@@ -1,16 +1,16 @@
 """
 Parse Worker
 ============
-Consumes nexusrag.parse queue.
+Consumes hrag.parse queue.
 
 Responsibilities:
-  1. Download raw file from MinIO (nexusrag-uploads bucket)
+  1. Download raw file from MinIO (hrag-uploads bucket)
   2. Run Docling / HunyuanOCR — zero LLM calls
   3. Save markdown, images, tables to DB  →  status = CHUNKING
   4. Dispatch three independent messages:
-       EmbedMessage   → nexusrag.embed
-       CaptionMessage → nexusrag.caption
-       KGMessage      → nexusrag.kg  (routing_key = workspace_id)
+       EmbedMessage   → hrag.embed
+       CaptionMessage → hrag.caption
+       KGMessage      → hrag.kg  (routing_key = workspace_id)
 """
 from __future__ import annotations
 

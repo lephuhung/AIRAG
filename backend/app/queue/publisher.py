@@ -15,7 +15,7 @@ async def publish_parse_task(
     minio_key: str,
     original_filename: str,
 ) -> None:
-    """Publish a ParseMessage to nexusrag.parse queue."""
+    """Publish a ParseMessage to hrag.parse queue."""
     await mq.publish(
         mq.EXCHANGE_PARSE,
         "parse",

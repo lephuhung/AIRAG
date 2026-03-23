@@ -1,6 +1,7 @@
 import { memo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { SearchX, Inbox } from "lucide-react";
+import { useTranslation } from "@/hooks/useTranslation";
 import { ResultCard } from "./ResultCard";
 import { KGSummary } from "./KGSummary";
 import { ImageResultGrid } from "./ImageResultGrid";
@@ -35,6 +36,7 @@ function ResultSkeleton() {
 // Empty states
 // ---------------------------------------------------------------------------
 function NoResults({ query }: { query: string }) {
+  const { t } = useTranslation();
   return (
     <motion.div
       initial={{ opacity: 0, y: 8 }}
@@ -42,20 +44,21 @@ function NoResults({ query }: { query: string }) {
       className="flex flex-col items-center py-10 text-center"
     >
       <SearchX className="w-10 h-10 text-muted-foreground/40 mb-3" />
-      <p className="text-sm font-medium">No relevant content found</p>
+      <p className="text-sm font-medium">{t("chat.no_relevant")}</p>
       <p className="text-xs text-muted-foreground mt-1 max-w-xs">
-        Try rephrasing your query or check that your documents are indexed. Query: &quot;{query}&quot;
+        {t("chat.no_results_desc")} {t("chat.query")}: &quot;{query}&quot;
       </p>
     </motion.div>
   );
 }
 
 function SearchPrompt() {
+  const { t } = useTranslation();
   return (
     <div className="flex flex-col items-center py-10 text-center">
       <Inbox className="w-10 h-10 text-muted-foreground/30 mb-3" />
       <p className="text-sm text-muted-foreground">
-        Ask a question to search across your indexed documents
+        {t("chat.search_prompt")}
       </p>
     </div>
   );
@@ -77,6 +80,7 @@ export const SearchResults = memo(function SearchResults({
   hasSearched,
   query,
 }: SearchResultsProps) {
+  const { t } = useTranslation();
   if (isSearching) return <ResultSkeleton />;
 
   if (!hasSearched) return <SearchPrompt />;
@@ -89,7 +93,7 @@ export const SearchResults = memo(function SearchResults({
     <div className="space-y-4">
       {/* Summary header */}
       <p className="text-xs text-muted-foreground">
-        Found {results.total_chunks} relevant chunk{results.total_chunks !== 1 ? "s" : ""} for &quot;{results.query}&quot;
+        {t("chat.found_chunks", { count: results.total_chunks, query: results.query })}
       </p>
 
       {/* Knowledge Graph summary */}

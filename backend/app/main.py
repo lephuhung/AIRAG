@@ -1,5 +1,5 @@
 """
-NexusRAG — standalone Knowledge Base + RAG application.
+HRAG — standalone Knowledge Base + RAG application.
 """
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -28,10 +28,12 @@ import app.models.invite_token    # noqa: F401
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Update HRAG prefix in settings if needed (but currently we just use the val)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Starting NexusRAG API...")
+    logger.info("Starting HRAG API...")
     import os
     auto_create = os.environ.get("AUTO_CREATE_TABLES", "true").lower() == "true"
     if auto_create:
@@ -282,15 +284,14 @@ async def lifespan(app: FastAPI):
         logger.info("AUTO_CREATE_TABLES=false — skipping auto-migration")
 
     # ── Eager Model Loading ───────────────────────────────────────────────
-    if settings.NEXUSRAG_EAGER_MODEL_LOADING:
-        logger.info("Eager model loading enabled — pre-loading retrieval models …")
-        try:
-            from app.services.models.loader import preload_retrieval_models
-            preload_retrieval_models()
-        except Exception as _preload_err:
-            logger.warning(f"Model pre-load failed (non-fatal): {_preload_err}")
+    if settings.HRAG_EAGER_MODEL_LOADING:
+        logger.info("Eager loading HRAG models...")
+        from app.services.models.loader import preload_models
+        # Pre-load embedder and reranker (and optionally local OCR)
+        # to ensure the first request is fast.
+        preload_models()
     else:
-        logger.info("NEXUSRAG_EAGER_MODEL_LOADING=false — models will load on first use")
+        logger.info("HRAG_EAGER_MODEL_LOADING=false — models will load on first use")
 
     yield
     logger.info("Shutting down...")
@@ -299,7 +300,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.APP_NAME,
-    description="NexusRAG — Knowledge Base with semantic search, knowledge graph, and LLM chat",
+    description="HRAG — Knowledge Base with semantic search, knowledge graph, and LLM chat",
     version="1.0.0",
     lifespan=lifespan,
     docs_url="/docs",
@@ -348,7 +349,7 @@ from app.api.router import api_router  # noqa: E402
 
 app.include_router(api_router, prefix="/api/v1")
 
-# Static files — document images extracted by NexusRAG (Docling)
+# Static files — document images extracted by HRAG (Docling)
 _docling_data = Path(__file__).resolve().parent.parent / "data" / "docling"
 _docling_data.mkdir(parents=True, exist_ok=True)
 app.mount("/static/doc-images", StaticFiles(directory=str(_docling_data)), name="static_doc_images")

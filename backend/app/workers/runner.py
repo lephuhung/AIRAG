@@ -149,7 +149,7 @@ async def main() -> None:
     logger.info(f"Starting worker: WORKER_TYPE={worker_type}")
 
     # ── Eager model loading for workers ──────────────────────────────────
-    if settings.NEXUSRAG_EAGER_MODEL_LOADING:
+    if settings.HRAG_EAGER_MODEL_LOADING:
         try:
             from app.services.models.loader import preload_worker_models
             preload_worker_models(worker_type)

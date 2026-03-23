@@ -30,7 +30,7 @@ class DocumentResponse(DocumentBase):
     error_message: str | None
     created_at: datetime
     updated_at: datetime
-    # NexusRAG fields
+    # HRAG fields
     page_count: int = 0
     image_count: int = 0
     table_count: int = 0

@@ -84,6 +84,7 @@ const KGContent = memo(function KGContent({
   workspaceId: string;
   highlightEntities: string[];
 }) {
+  const { t } = useTranslation();
   const { kgSubTab, setKgSubTab } = useWorkspaceStore();
 
   return (
@@ -93,13 +94,13 @@ const KGContent = memo(function KGContent({
         <SubTabButton
           active={kgSubTab === "graph"}
           icon={<Network className="w-3 h-3" />}
-          label="Graph"
+          label={t("common.relationships")}
           onClick={() => setKgSubTab("graph")}
         />
         <SubTabButton
           active={kgSubTab === "entities"}
           icon={<List className="w-3 h-3" />}
-          label="Entities"
+          label={t("common.entities")}
           onClick={() => setKgSubTab("entities")}
         />
       </div>
@@ -134,6 +135,8 @@ const KGContent = memo(function KGContent({
 // ---------------------------------------------------------------------------
 // VisualPanel — main export
 // ---------------------------------------------------------------------------
+import { useTranslation } from "@/hooks/useTranslation";
+
 interface VisualPanelProps {
   workspaceId: string;
   hasDeepragDocs: boolean;
@@ -143,6 +146,7 @@ export const VisualPanel = memo(function VisualPanel({
   workspaceId,
   hasDeepragDocs,
 }: VisualPanelProps) {
+  const { t } = useTranslation();
   const {
     selectedDoc,
     activeTab,
@@ -161,26 +165,26 @@ export const VisualPanel = memo(function VisualPanel({
       <TabButton
         active={activeTab === "content"}
         icon={<BookOpen className="w-3.5 h-3.5" />}
-        label="Content"
+        label={t("visual_panel.content")}
         onClick={() => setActiveTab("content")}
       />
       {hasDeepragDocs && (
         <TabButton
           active={activeTab === "kg"}
           icon={<Network className="w-3.5 h-3.5" />}
-          label="Knowledge Graph"
+          label={t("visual_panel.kg")}
           onClick={() => setActiveTab("kg")}
         />
       )}
       <TabButton
         active={activeTab === "pipeline"}
         icon={<Activity className="w-3.5 h-3.5" />}
-        label="Pipeline"
+        label={t("visual_panel.pipeline")}
         onClick={() => setActiveTab("pipeline")}
       />
       {highlightChunks.length > 0 && (
         <span className="ml-auto text-[10px] text-primary bg-primary/10 px-2 py-0.5 rounded-full">
-          {highlightChunks.length} highlighted
+          {t("visual_panel.highlighted_count", { count: highlightChunks.length })}
         </span>
       )}
     </div>
@@ -207,10 +211,10 @@ export const VisualPanel = memo(function VisualPanel({
             <FileSearch className="w-7 h-7 text-muted-foreground/40" />
           </div>
           <p className="text-sm font-medium text-muted-foreground">
-            Select a document to view
+            {t("visual_panel.select_doc")}
           </p>
           <p className="text-xs text-muted-foreground/60 mt-1 text-center max-w-[200px]">
-            Click on an indexed document in the panel to view its content
+            {t("visual_panel.select_doc_desc")}
           </p>
         </div>
       );

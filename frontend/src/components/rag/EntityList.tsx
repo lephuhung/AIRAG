@@ -1,5 +1,6 @@
 import { useState, useMemo, memo } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { useTranslation } from "@/hooks/useTranslation";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Search,
@@ -83,6 +84,7 @@ const EntityRow = memo(function EntityRow({
   entity: KGEntity;
   projectId: string;
 }) {
+  const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
 
   // Lazy-load relationships only when expanded
@@ -141,7 +143,7 @@ const EntityRow = memo(function EntityRow({
               {relsLoading && (
                 <div className="flex items-center gap-2 py-2 px-1">
                   <Loader2 className="w-3 h-3 animate-spin text-muted-foreground" />
-                  <span className="text-xs text-muted-foreground">Loading relationships...</span>
+                  <span className="text-xs text-muted-foreground">{t("rag.loading_rels")}</span>
                 </div>
               )}
               {relationships && relationships.length > 0 && (
@@ -152,7 +154,7 @@ const EntityRow = memo(function EntityRow({
                 </div>
               )}
               {relationships && relationships.length === 0 && (
-                <p className="text-xs text-muted-foreground/50 pl-1">No relationships found</p>
+                <p className="text-xs text-muted-foreground/50 pl-1">{t("rag.no_rels")}</p>
               )}
             </div>
           </motion.div>
@@ -176,6 +178,7 @@ interface EntityListProps {
 }
 
 export const EntityList = memo(function EntityList({ projectId, highlightEntities = [] }: EntityListProps) {
+  const { t } = useTranslation();
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState<string | null>(null);
   const [sortBy, setSortBy] = useState<SortKey>("degree");
@@ -231,9 +234,9 @@ export const EntityList = memo(function EntityList({ projectId, highlightEntitie
     return (
       <div className="flex flex-col items-center py-10 text-center">
         <Network className="w-10 h-10 text-muted-foreground/30 mb-3" />
-        <p className="text-sm text-muted-foreground">No entities extracted yet</p>
+        <p className="text-sm text-muted-foreground">{t("entities.no_entities")}</p>
         <p className="text-xs text-muted-foreground/60 mt-1">
-          Entities are automatically extracted when documents are processed with NexusRAG
+          {t("rag.entities_extracted")}
         </p>
       </div>
     );
@@ -248,7 +251,7 @@ export const EntityList = memo(function EntityList({ projectId, highlightEntitie
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground pointer-events-none" />
           <input
             type="text"
-            placeholder="Search entities..."
+            placeholder={t("entities.search_placeholder")}
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="w-full h-8 pl-8 pr-3 rounded-md border border-input bg-background text-xs placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
@@ -261,9 +264,9 @@ export const EntityList = memo(function EntityList({ projectId, highlightEntitie
           onChange={(e) => setTypeFilter(e.target.value || null)}
           className="h-8 px-2 rounded-md border border-input bg-background text-xs"
         >
-          <option value="">All types</option>
-          {entityTypes.map((t) => (
-            <option key={t} value={t}>{t}</option>
+          <option value="">{t("entities.all_types")}</option>
+          {entityTypes.map((t_node) => (
+            <option key={t_node} value={t_node}>{t_node}</option>
           ))}
         </select>
 
@@ -273,16 +276,16 @@ export const EntityList = memo(function EntityList({ projectId, highlightEntitie
           onChange={(e) => setSortBy(e.target.value as SortKey)}
           className="h-8 px-2 rounded-md border border-input bg-background text-xs"
         >
-          <option value="degree">Most connected</option>
-          <option value="name">Name A-Z</option>
-          <option value="type">By type</option>
+          <option value="degree">{t("entities.sort.most_connected")}</option>
+          <option value="name">{t("entities.sort.name_az")}</option>
+          <option value="type">{t("entities.sort.by_type")}</option>
         </select>
       </div>
 
       {/* Count + type chips */}
       <div className="flex items-center gap-2 flex-wrap">
         <span className="text-xs text-muted-foreground">
-          {filtered.length} entit{filtered.length !== 1 ? "ies" : "y"}
+          {t("entities.count", { count: filtered.length })}{filtered.length !== 1 ? t("entities.ies") : t("entities.y")}
         </span>
         {typeFilter && (
           <button
@@ -296,9 +299,9 @@ export const EntityList = memo(function EntityList({ projectId, highlightEntitie
 
       {/* Table header */}
       <div className="flex items-center gap-3 px-3 py-1.5 text-[10px] font-medium text-muted-foreground uppercase tracking-wider border-b">
-        <span className="flex-1">Entity</span>
-        <span className="w-24">Type</span>
-        <span className="w-8 text-right">Links</span>
+        <span className="flex-1">{t("entities.headers.entity")}</span>
+        <span className="w-24">{t("entities.headers.type")}</span>
+        <span className="w-8 text-right">{t("entities.headers.links")}</span>
         <span className="w-4" />
       </div>
 
@@ -323,7 +326,7 @@ export const EntityList = memo(function EntityList({ projectId, highlightEntitie
 
       {filtered.length === 0 && entities.length > 0 && (
         <p className="text-center text-xs text-muted-foreground py-4">
-          No entities match your filters
+          {t("entities.no_matches")}
         </p>
       )}
     </div>

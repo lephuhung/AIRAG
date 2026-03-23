@@ -422,7 +422,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         
         # If the requested KG/memory model is the same as the main document embedding model,
         # reuse the globally loaded instance to avoid duplicating model RAM and loading time.
-        if self._model is None and self._model_name == settings.NEXUSRAG_EMBEDDING_MODEL:
+        if self._model is None and self._model_name == settings.HRAG_EMBEDDING_MODEL:
             try:
                 from app.services.embedder import get_embedding_service
                 svc = get_embedding_service()
@@ -436,7 +436,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         # Otherwise, load a separate instance
         if self._model is None:
             from sentence_transformers import SentenceTransformer
-            device = settings.NEXUSRAG_EMBEDDING_DEVICE  # "auto" | "cpu" | "cuda"
+            device = settings.HRAG_EMBEDDING_DEVICE  # "auto" | "cpu" | "cuda"
             st_device = None if device == "auto" else device
             logger.info(f"[LocalEmbedding] Loading separate model: {self._model_name} (device={device})")
             self._model = SentenceTransformer(self._model_name, device=st_device)

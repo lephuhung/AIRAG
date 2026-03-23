@@ -7538,3 +7538,25 @@ INFO: Enqueued document processing pipeline stopped
 2026-03-18 17:43:58,645 [INFO] app.queue.connection — Consuming nexusrag.kg/3 → nexusrag.kg.3
 2026-03-19 12:01:59,313 [INFO] __main__ — Received SIGTERM — shutting down worker
 2026-03-19 12:01:59,320 [INFO] __main__ — Worker stopped cleanly
+2026-03-23 08:56:00,363 [INFO] __main__ — Starting worker: WORKER_TYPE=kg
+2026-03-23 08:56:00,364 [INFO] app.services.models.loader — [preload] Loading models for worker=kg …
+2026-03-23 08:56:00,364 [INFO] app.services.models.loader — [preload] Worker=kg models loaded in 0.0s
+2026-03-23 08:56:00,804 [INFO] __main__ — [kg_runner] Starting consumers for workspaces: [1, 7, 6]
+2026-03-23 08:56:00,804 [INFO] __main__ — [kg_runner] Started consumer for workspace 1
+2026-03-23 08:56:00,804 [INFO] __main__ — [kg_runner] Started consumer for workspace 7
+2026-03-23 08:56:00,804 [INFO] __main__ — [kg_runner] Started consumer for workspace 6
+2026-03-23 08:56:00,805 [INFO] app.queue.connection — Connecting to RabbitMQ: amqp://guest:guest@localhost:5672/
+2026-03-23 08:56:00,814 [INFO] app.queue.connection — RabbitMQ connected
+2026-03-23 08:56:00,829 [INFO] __main__ — Worker stopped cleanly
+2026-03-23 08:59:07,659 [INFO] __main__ — Starting worker: WORKER_TYPE=kg
+2026-03-23 08:59:07,659 [INFO] app.services.models.loader — [preload] Loading models for worker=kg …
+2026-03-23 08:59:07,659 [INFO] app.services.models.loader — [preload] Worker=kg models loaded in 0.0s
+2026-03-23 08:59:08,078 [INFO] __main__ — [kg_runner] Starting consumers for workspaces: [1, 7, 6]
+2026-03-23 08:59:08,078 [INFO] __main__ — [kg_runner] Started consumer for workspace 1
+2026-03-23 08:59:08,078 [INFO] __main__ — [kg_runner] Started consumer for workspace 7
+2026-03-23 08:59:08,078 [INFO] __main__ — [kg_runner] Started consumer for workspace 6
+2026-03-23 08:59:08,079 [INFO] app.queue.connection — Connecting to RabbitMQ: amqp://guest:guest@localhost:5672/
+2026-03-23 08:59:08,084 [INFO] app.queue.connection — RabbitMQ connected
+2026-03-23 08:59:08,120 [INFO] app.queue.connection — Consuming hrag.kg/7 → hrag.kg.7
+2026-03-23 08:59:08,123 [INFO] app.queue.connection — Consuming hrag.kg/6 → hrag.kg.6
+2026-03-23 08:59:08,124 [INFO] app.queue.connection — Consuming hrag.kg/1 → hrag.kg.1

@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent } from "@/components/ui/card";
 import { Database, LogIn } from "lucide-react";
+import { useTranslation } from "@/hooks/useTranslation";
 
 export function LoginPage() {
   const navigate = useNavigate();
@@ -13,6 +14,7 @@ export function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
+  const { t } = useTranslation();
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -38,13 +40,13 @@ export function LoginPage() {
             <div className="w-14 h-14 rounded-2xl bg-primary/10 flex items-center justify-center mb-3">
               <Database className="w-7 h-7 text-primary" />
             </div>
-            <h1 className="text-xl font-bold">NexusRAG</h1>
-            <p className="text-sm text-muted-foreground mt-1">Sign in to your account</p>
+            <h1 className="text-xl font-bold">{t("app.name")}</h1>
+            <p className="text-sm text-muted-foreground mt-1">{t("auth.login_title")}</p>
           </div>
 
           <form onSubmit={handleLogin} className="space-y-4">
             <div>
-              <label className="block text-sm font-medium mb-1.5">Email</label>
+              <label className="block text-sm font-medium mb-1.5">{t("auth.email")}</label>
               <Input
                 type="email"
                 placeholder="you@example.com"
@@ -55,7 +57,7 @@ export function LoginPage() {
               />
             </div>
             <div>
-              <label className="block text-sm font-medium mb-1.5">Password</label>
+              <label className="block text-sm font-medium mb-1.5">{t("auth.password")}</label>
               <Input
                 type="password"
                 placeholder="Enter your password"
@@ -66,14 +68,14 @@ export function LoginPage() {
             </div>
             <Button type="submit" className="w-full" disabled={loading}>
               <LogIn className="w-4 h-4 mr-2" />
-              {loading ? "Signing in..." : "Sign In"}
+              {loading ? t("auth.signing_in") : t("auth.login")}
             </Button>
           </form>
 
           <div className="mt-4 text-center text-sm text-muted-foreground">
-            Don't have an account?{" "}
+            {t("auth.no_account")}{" "}
             <Link to="/register" className="text-primary hover:underline font-medium">
-              Register
+              {t("auth.register")}
             </Link>
           </div>
         </CardContent>

@@ -1,5 +1,5 @@
 """
-NexusRAG API router — aggregates workspace, document, and RAG endpoints.
+HRAG API router — aggregates workspace, document, and RAG endpoints.
 """
 from fastapi import APIRouter
 

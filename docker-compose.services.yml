@@ -1,4 +1,4 @@
-# NexusRAG — Dev services only (PostgreSQL + ChromaDB + RabbitMQ)
+# HRAG — Dev services only (PostgreSQL + ChromaDB + RabbitMQ)
 # Usage: docker compose -f docker-compose.services.yml up -d
 
 services:

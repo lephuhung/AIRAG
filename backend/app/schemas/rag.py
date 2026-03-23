@@ -83,7 +83,7 @@ class ProjectRAGStatsResponse(BaseModel):
     indexed_documents: int
     total_chunks: int
     image_count: int = 0
-    nexusrag_documents: int = 0
+    hrag_documents: int = 0
 
 
 # ---------------------------------------------------------------------------

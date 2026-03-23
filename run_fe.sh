@@ -1,5 +1,5 @@
 #!/bin/bash
-# NexusRAG Frontend — start Vite dev server
+# HRAG Frontend — start Vite dev server
 set -e
 
 # Load nvm if available
@@ -14,5 +14,5 @@ if [ ! -d "node_modules" ]; then
     pnpm install
 fi
 
-echo "Starting NexusRAG frontend on port 5174..."
+echo "Starting HRAG frontend on port 5174..."
 pnpm dev

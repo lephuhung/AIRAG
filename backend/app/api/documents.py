@@ -152,7 +152,7 @@ async def upload_document(
     await db.commit()
     await db.refresh(document)
 
-    # Upload raw file to MinIO nexusrag-uploads bucket
+    # Upload raw file to MinIO hrag-uploads bucket
     from app.services.storage_service import get_storage_service
     storage = get_storage_service()
     upload_key = storage._make_upload_key(workspace_id, document.id, ext)
@@ -391,7 +391,7 @@ async def get_document_markdown(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
-    """Get the full structured markdown content of a document (NexusRAG parsed)."""
+    """Get the full structured markdown content of a document (HRAG parsed)."""
     result = await db.execute(select(Document).where(Document.id == document_id))
     document = result.scalar_one_or_none()
 
@@ -401,7 +401,7 @@ async def get_document_markdown(
     if not document.markdown_s3_key:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="No markdown content available. Document may not have been processed with NexusRAG."
+            detail="No markdown content available. Document may not have been processed with HRAG."
         )
 
     from app.services.storage_service import get_storage_service

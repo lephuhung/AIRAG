@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "@/hooks/useTranslation";
 import { toast } from "sonner";
 import {
   Users,
@@ -33,6 +34,7 @@ import type { AdminUserDetail } from "@/types";
 type FilterStatus = "all" | "active" | "inactive";
 
 export function AdminUsersPage() {
+  const { t } = useTranslation();
   const currentUser = useAuthStore((s) => s.user);
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
@@ -84,9 +86,10 @@ export function AdminUsersPage() {
         userId: user.id,
         data: { is_active: !user.is_active },
       });
-      toast.success(user.is_active ? "User deactivated" : "User activated");
+      const msg = user.is_active ? t("admin.users.toast.deactivated") : t("admin.users.toast.activated");
+      toast.success(msg);
     } catch (err: any) {
-      toast.error(err.message || "Failed to update user");
+      toast.error(err.message || t("admin.users.toast.update_failed"));
     }
   };
 
@@ -97,10 +100,10 @@ export function AdminUsersPage() {
         data: { is_superadmin: !user.is_superadmin },
       });
       toast.success(
-        user.is_superadmin ? "Superadmin removed" : "Superadmin granted",
+        user.is_superadmin ? t("admin.users.toast.superadmin_removed") : t("admin.users.toast.superadmin_granted"),
       );
     } catch (err: any) {
-      toast.error(err.message || "Failed to update user");
+      toast.error(err.message || t("admin.users.toast.update_failed"));
     }
   };
 
@@ -108,35 +111,35 @@ export function AdminUsersPage() {
     if (!confirmDelete) return;
     try {
       await deleteUser.mutateAsync(confirmDelete.id);
-      toast.success("User deleted");
+      toast.success(t("admin.users.toast.deleted"));
       setConfirmDelete(null);
     } catch (err: any) {
-      toast.error(err.message || "Failed to delete user");
+      toast.error(err.message || t("admin.users.toast.delete_failed"));
     }
   };
 
   const handleToggleTenantRole = async (userId: number, tenantId: number, currentRole: string) => {
     if (isSelf(userId)) {
-      toast.error("Cannot change your own tenant role here");
+      toast.error(t("admin.users.toast.self_role_error"));
       return;
     }
     const newRole = currentRole === "admin" ? "member" : "admin";
     try {
       await updateRole.mutateAsync({ tenantId, userId, role: newRole as "admin" | "member" });
-      toast.success(`Role changed to ${newRole}`);
+      toast.success(t("admin.users.toast.role_changed", { role: newRole }));
     } catch (err: any) {
-      toast.error(err.message || "Failed to change role");
+      toast.error(err.message || t("admin.users.toast.role_failed"));
     }
   };
 
   const handleResetPassword = async () => {
     if (!resetTarget) return;
     if (!resetNewPassword || resetNewPassword.length < 6) {
-      toast.error("New password must be at least 6 characters");
+      toast.error(t("admin.users.toast.pw_min_chars"));
       return;
     }
     if (resetNewPassword !== resetConfirm) {
-      toast.error("Passwords do not match");
+      toast.error(t("admin.users.toast.pw_mismatch"));
       return;
     }
     try {
@@ -144,12 +147,12 @@ export function AdminUsersPage() {
         userId: resetTarget.id,
         newPassword: resetNewPassword,
       });
-      toast.success(`Password reset for ${resetTarget.full_name}`);
+      toast.success(t("admin.users.toast.pw_reset_success", { name: resetTarget.full_name }));
       setResetTarget(null);
       setResetNewPassword("");
       setResetConfirm("");
     } catch (err: any) {
-      toast.error(err.message || "Failed to reset password");
+      toast.error(err.message || t("admin.users.toast.password_failed"));
     }
   };
 
@@ -164,9 +167,9 @@ export function AdminUsersPage() {
             <Users className="w-5 h-5 text-primary" />
           </div>
           <div>
-            <h1 className="text-xl font-bold">User Management</h1>
+            <h1 className="text-xl font-bold">{t("admin.users.title")}</h1>
             <p className="text-sm text-muted-foreground">
-              Manage all system users
+              {t("admin.users.subtitle")}
             </p>
           </div>
         </div>
@@ -174,19 +177,19 @@ export function AdminUsersPage() {
         {/* Stat cards */}
         {stats && (
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
-            <StatCard label="Total Users" value={stats.total_users} />
+            <StatCard label={t("admin.dashboard.stat_total_users")} value={stats.total_users} />
             <StatCard
-              label="Active"
+              label={t("admin.users.status.active")}
               value={stats.active_users}
               color="text-green-500"
             />
             <StatCard
-              label="Pending"
+              label={t("admin.users.status.pending")}
               value={stats.pending_users}
               color="text-amber-500"
             />
             <StatCard
-              label="Tenants"
+              label={t("admin.users.table.tenants")}
               value={stats.total_tenants}
               color="text-blue-500"
             />
@@ -201,7 +204,7 @@ export function AdminUsersPage() {
               type="text"
               value={search}
               onChange={(e) => handleSearchChange(e.target.value)}
-              placeholder="Search by name or email..."
+              placeholder={t("admin.users.search_placeholder")}
               className="w-full pl-9 pr-4 py-2 text-sm rounded-lg border bg-card focus:outline-none focus:ring-2 focus:ring-primary/30"
             />
           </div>
@@ -215,7 +218,7 @@ export function AdminUsersPage() {
               }}
               className="px-3 py-1.5 text-xs font-medium rounded-lg border bg-card text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/30 min-w-[140px]"
             >
-              <option value="all">All Tenants</option>
+              <option value="all">{t("admin.users.all_tenants")}</option>
               {tenants?.map((t) => (
                 <option key={t.id} value={t.id}>
                   {t.name}
@@ -237,7 +240,7 @@ export function AdminUsersPage() {
                       : "text-muted-foreground hover:text-foreground",
                   )}
                 >
-                  {f}
+                  {t("admin.users.status." + f)}
                 </button>
               ))}
             </div>
@@ -252,7 +255,7 @@ export function AdminUsersPage() {
         ) : !data || data.users.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-20 text-muted-foreground">
             <Users className="w-10 h-10 mb-3 opacity-30" />
-            <p className="text-sm">No users found</p>
+            <p className="text-sm">{t("admin.users.no_users")}</p>
           </div>
         ) : (
           <div className="border rounded-xl overflow-hidden">
@@ -261,19 +264,19 @@ export function AdminUsersPage() {
                 <thead>
                   <tr className="border-b bg-muted/30">
                     <th className="px-4 py-3 text-left font-medium text-muted-foreground">
-                      User
+                      {t("admin.users.table.user")}
                     </th>
                     <th className="px-4 py-3 text-left font-medium text-muted-foreground">
-                      Status
+                      {t("admin.users.table.status")}
                     </th>
                     <th className="px-4 py-3 text-left font-medium text-muted-foreground">
-                      Role
+                      {t("admin.users.table.role")}
                     </th>
                     <th className="px-4 py-3 text-left font-medium text-muted-foreground">
-                      Tenants
+                      {t("admin.users.table.tenants")}
                     </th>
-                    <th className="px-4 py-3 text-right font-medium text-muted-foreground">
-                      Actions
+                    <th className="px-4 py-3 text-center font-medium text-muted-foreground">
+                      {t("admin.users.table.actions")}
                     </th>
                   </tr>
                 </thead>
@@ -301,7 +304,7 @@ export function AdminUsersPage() {
                               </p>
                               {isSelf(u.id) && (
                                 <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-primary/15 text-primary font-medium">
-                                  You
+                                  {t("common.you")}
                                 </span>
                               )}
                             </div>
@@ -328,20 +331,21 @@ export function AdminUsersPage() {
                               u.is_active ? "bg-green-500" : "bg-amber-500",
                             )}
                           />
-                          {u.is_active ? "Active" : "Pending"}
+                          {u.is_active ? t("admin.users.status.active") : t("admin.users.status.pending")}
                         </span>
                       </td>
 
                       {/* Role */}
                       <td className="px-4 py-3">
                         {u.is_superadmin ? (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-amber-500/15 text-amber-600">
+                          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-medium bg-amber-500/15 text-amber-600 border border-amber-500/20">
                             <Crown className="w-3 h-3" />
-                            SuperAdmin
+                            {t("admin.users.roles.superadmin")}
                           </span>
                         ) : (
-                          <span className="text-xs text-muted-foreground">
-                            User
+                          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-medium bg-slate-500/15 text-slate-600 border border-slate-500/20">
+                            <Users className="w-3 h-3" />
+                            {t("admin.users.roles.user")}
                           </span>
                         )}
                       </td>
@@ -353,12 +357,12 @@ export function AdminUsersPage() {
                             {u.tenant_memberships.map((m) => (
                               <div key={m.id} className="flex items-center gap-1.5">
                                 <span className="text-xs text-foreground truncate max-w-[120px]" title={m.tenant_name ?? undefined}>
-                                  {m.tenant_name ?? `Tenant #${m.tenant_id}`}
+                                  {m.tenant_name ?? (t("admin.users.table.tenant_id", { id: m.tenant_id }))}
                                 </span>
                                 <button
                                   onClick={() => handleToggleTenantRole(u.id, m.tenant_id, m.role)}
                                   disabled={updateRole.isPending}
-                                  title="Click to toggle Admin/Member role"
+                                  title={t("admin.users.actions.toggle_role_tooltip")}
                                   className={cn(
                                   "inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium flex-shrink-0 cursor-pointer transition-colors",
                                   m.role === "admin"
@@ -369,7 +373,7 @@ export function AdminUsersPage() {
                                 </button>
                                 {!m.is_approved && (
                                   <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/15 text-amber-600 flex-shrink-0">
-                                    pending
+                                    {t("admin.users.status.pending")}
                                   </span>
                                 )}
                               </div>
@@ -377,87 +381,91 @@ export function AdminUsersPage() {
                           </div>
                         ) : (
                           <span className="text-xs text-muted-foreground/50">
-                            None
+                            {t("common.none")}
                           </span>
                         )}
                       </td>
 
                       {/* Actions */}
                       <td className="px-4 py-3">
-                        <div className="flex items-center justify-end gap-1">
+                        <div className="flex items-center justify-center gap-1">
                           {!isSelf(u.id) && (
                             <>
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                className={cn(
-                                  "h-7 px-2 text-xs",
-                                  u.is_active
-                                    ? "text-amber-600 hover:bg-amber-500/10"
-                                    : "text-green-600 hover:bg-green-500/10",
-                                )}
-                                onClick={() => handleToggleActive(u)}
-                                title={
-                                  u.is_active ? "Deactivate" : "Activate"
-                                }
-                              >
-                                {u.is_active ? (
-                                  <>
-                                    <UserX className="w-3.5 h-3.5 mr-1" />
-                                    Deactivate
-                                  </>
-                                ) : (
-                                  <>
-                                    <UserCheck className="w-3.5 h-3.5 mr-1" />
-                                    Activate
-                                  </>
-                                )}
-                              </Button>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className={cn(
+                                    "h-7 px-2 text-[11px] flex items-center gap-1.5 transition-all duration-200 min-w-[110px] justify-start",
+                                    u.is_active
+                                      ? "text-amber-600 hover:bg-amber-500/10 hover:text-amber-700"
+                                      : "text-green-600 hover:bg-green-500/10 hover:text-green-700",
+                                  )}
+                                  onClick={() => handleToggleActive(u)}
+                                  title={
+                                    u.is_active ? t("admin.users.actions.deactivate") : t("admin.users.actions.activate")
+                                  }
+                                >
+                                  {u.is_active ? (
+                                    <>
+                                      <UserX className="w-3.5 h-3.5 flex-shrink-0" />
+                                      <span className="leading-none">{t("admin.users.actions.deactivate")}</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <UserCheck className="w-3.5 h-3.5 flex-shrink-0" />
+                                      <span className="leading-none">{t("admin.users.actions.activate")}</span>
+                                    </>
+                                  )}
+                                </Button>
 
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                className={cn(
-                                  "h-7 px-2 text-xs",
-                                  u.is_superadmin
-                                    ? "text-muted-foreground hover:bg-muted"
-                                    : "text-amber-600 hover:bg-amber-500/10",
-                                )}
-                                onClick={() => handleToggleSuperadmin(u)}
-                                title={
-                                  u.is_superadmin
-                                    ? "Remove SuperAdmin"
-                                    : "Grant SuperAdmin"
-                                }
-                              >
-                                <Shield className="w-3.5 h-3.5 mr-1" />
-                                {u.is_superadmin ? "Revoke" : "Promote"}
-                              </Button>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className={cn(
+                                    "h-7 px-2 text-[11px] flex items-center gap-1.5 transition-all duration-200 min-w-[90px] justify-start",
+                                    u.is_superadmin
+                                      ? "text-muted-foreground hover:bg-muted"
+                                      : "text-amber-600 hover:bg-amber-500/10 hover:text-amber-700",
+                                  )}
+                                  onClick={() => handleToggleSuperadmin(u)}
+                                  title={
+                                    u.is_superadmin
+                                      ? t("admin.users.actions.remove_superadmin")
+                                      : t("admin.users.actions.grant_superadmin")
+                                  }
+                                >
+                                  <Shield className="w-3.5 h-3.5 flex-shrink-0" />
+                                  <span className="leading-none">
+                                    {u.is_superadmin ? t("admin.users.actions.revoke") : t("admin.users.actions.promote")}
+                                  </span>
+                                </Button>
 
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                className="h-7 px-2 text-xs text-destructive hover:bg-destructive/10"
-                                onClick={() => setConfirmDelete(u)}
-                                title="Delete user"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </Button>
+                                <div className="flex items-center gap-1 pl-2 border-l ml-1">
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-7 w-7 p-0 text-destructive hover:bg-destructive/10"
+                                    onClick={() => setConfirmDelete(u)}
+                                    title={t("admin.users.actions.delete")}
+                                  >
+                                    <Trash2 className="w-3.5 h-3.5" />
+                                  </Button>
 
-                              <Button
-                                size="sm"
-                                variant="ghost"
-                                className="h-7 px-2 text-xs text-muted-foreground hover:bg-muted"
-                                onClick={() => {
-                                  setResetTarget(u);
-                                  setResetNewPassword("");
-                                  setResetConfirm("");
-                                  setShowResetPw(false);
-                                }}
-                                title="Reset password"
-                              >
-                                <KeyRound className="w-3.5 h-3.5" />
-                              </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-7 w-7 p-0 text-muted-foreground hover:bg-muted"
+                                    onClick={() => {
+                                      setResetTarget(u);
+                                      setResetNewPassword("");
+                                      setResetConfirm("");
+                                      setShowResetPw(false);
+                                    }}
+                                    title={t("admin.users.actions.reset_password")}
+                                  >
+                                    <KeyRound className="w-3.5 h-3.5" />
+                                  </Button>
+                                </div>
                             </>
                           )}
                         </div>
@@ -474,8 +482,11 @@ export function AdminUsersPage() {
         {data && totalPages > 1 && (
           <div className="flex items-center justify-between mt-4">
             <p className="text-xs text-muted-foreground">
-              Showing {(page - 1) * perPage + 1}–
-              {Math.min(page * perPage, data.total)} of {data.total}
+              {t("admin.users.pagination", {
+                start: (page - 1) * perPage + 1,
+                end: Math.min(page * perPage, data.total),
+                total: data.total,
+              })}
             </p>
             <div className="flex items-center gap-1">
               <Button
@@ -509,9 +520,12 @@ export function AdminUsersPage() {
         open={!!confirmDelete}
         onCancel={() => setConfirmDelete(null)}
         onConfirm={handleConfirmDelete}
-        title="Delete User"
-        message={`Are you sure you want to delete "${confirmDelete?.full_name}" (${confirmDelete?.email})? This action cannot be undone.`}
-        confirmLabel="Delete"
+        title={t("admin.users.delete_confirm_title")}
+        message={t("admin.users.delete_confirm_message", {
+          name: confirmDelete?.full_name,
+          email: confirmDelete?.email,
+        })}
+        confirmLabel={t("admin.users.actions.delete")}
         variant="danger"
       />
 
@@ -524,10 +538,9 @@ export function AdminUsersPage() {
           />
           <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-full max-w-sm bg-card border rounded-2xl shadow-2xl p-5 space-y-4">
             <div>
-              <h3 className="text-sm font-semibold">Reset Password</h3>
+              <h3 className="text-sm font-semibold">{t("admin.users.reset_password_title")}</h3>
               <p className="text-xs text-muted-foreground mt-1">
-                Set a new password for{" "}
-                <span className="font-medium">{resetTarget.full_name}</span>.
+                {t("admin.users.reset_password_desc", { name: resetTarget.full_name })}
               </p>
             </div>
 
@@ -535,14 +548,14 @@ export function AdminUsersPage() {
               {/* New password */}
               <div className="space-y-1.5">
                 <label className="text-xs font-medium text-muted-foreground">
-                  New Password
+                  {t("admin.users.new_password")}
                 </label>
                 <div className="relative">
                   <input
                     type={showResetPw ? "text" : "password"}
                     value={resetNewPassword}
                     onChange={(e) => setResetNewPassword(e.target.value)}
-                    placeholder="Min 6 characters"
+                    placeholder={t("admin.users.min_chars")}
                     className="w-full px-3 py-2 pr-9 text-sm rounded-lg border bg-background focus:outline-none focus:ring-2 focus:ring-primary/30"
                   />
                   <button
@@ -562,13 +575,13 @@ export function AdminUsersPage() {
               {/* Confirm */}
               <div className="space-y-1.5">
                 <label className="text-xs font-medium text-muted-foreground">
-                  Confirm New Password
+                  {t("admin.users.confirm_password")}
                 </label>
                 <input
                   type={showResetPw ? "text" : "password"}
                   value={resetConfirm}
                   onChange={(e) => setResetConfirm(e.target.value)}
-                  placeholder="Repeat new password"
+                  placeholder={t("admin.users.repeat_password")}
                   className="w-full px-3 py-2 text-sm rounded-lg border bg-background focus:outline-none focus:ring-2 focus:ring-primary/30"
                 />
               </div>
@@ -580,7 +593,7 @@ export function AdminUsersPage() {
                 size="sm"
                 onClick={() => setResetTarget(null)}
               >
-                Cancel
+                {t("common.cancel")}
               </Button>
               <Button
                 size="sm"
@@ -590,7 +603,7 @@ export function AdminUsersPage() {
                 {resetPassword.isPending && (
                   <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
                 )}
-                Reset Password
+                {t("admin.users.actions.reset_password")}
               </Button>
             </div>
           </div>

@@ -2,8 +2,8 @@
 Storage Service — MinIO (S3-compatible) object storage for markdown content
 and raw uploaded files.
 
-Markdown bucket: nexusrag-markdown  (key: kb_{workspace_id}/doc_{document_id}.md)
-Uploads bucket:  nexusrag-uploads   (key: kb_{workspace_id}/doc_{document_id}.{ext})
+Markdown bucket: hrag-markdown  (key: kb_{workspace_id}/doc_{document_id}.md)
+Uploads bucket:  hrag-uploads   (key: kb_{workspace_id}/doc_{document_id}.{ext})
 """
 from __future__ import annotations
 
@@ -120,7 +120,7 @@ class StorageService:
                     raise
 
     # ------------------------------------------------------------------
-    # Raw file methods (nexusrag-uploads bucket)
+    # Raw file methods (hrag-uploads bucket)
     # ------------------------------------------------------------------
 
     async def upload_file(self, key: str, data: bytes, content_type: str) -> str:
@@ -209,7 +209,7 @@ class StorageService:
                 raise
 
     # ------------------------------------------------------------------
-    # Avatar methods (nexusrag-uploads bucket, avatars/ prefix)
+    # Avatar methods (hrag-uploads bucket, avatars/ prefix)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -222,7 +222,7 @@ class StorageService:
     async def upload_avatar(self, user_id: int, data: bytes, content_type: str, ext: str) -> str:
         """Upload avatar image to MinIO. Returns a public URL (presigned GET, 1 year).
 
-        Stores under ``nexusrag-uploads`` at key ``avatars/user_{id}.{ext}``.
+        Stores under ``hrag-uploads`` at key ``avatars/user_{id}.{ext}``.
         Returns a public-style URL by generating a long-lived presigned GET URL.
         """
         key = self._make_avatar_key(user_id, ext)

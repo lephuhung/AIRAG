@@ -1,8 +1,8 @@
 """
-NexusRAG Data Models
+HRAG Data Models
 ===================
 
-Dataclasses for the NexusRAG pipeline: document parsing, enriched chunks,
+Dataclasses for the HRAG pipeline: document parsing, enriched chunks,
 citations, and retrieval results.
 """
 from __future__ import annotations

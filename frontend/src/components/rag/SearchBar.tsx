@@ -1,18 +1,9 @@
-import { useState, useRef, useCallback, memo, useEffect } from "react";
+import { useState, useRef, useCallback, memo, useEffect, useMemo } from "react";
 import { Search, Loader2, Sparkles, X } from "lucide-react";
+import { useTranslation } from "@/hooks/useTranslation";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { RAGQueryMode, Document } from "@/types";
-
-// ---------------------------------------------------------------------------
-// Mode selector
-// ---------------------------------------------------------------------------
-const MODES: { value: RAGQueryMode; label: string; description: string }[] = [
-  { value: "hybrid", label: "Hybrid", description: "Knowledge Graph + Vector search combined" },
-  { value: "vector_only", label: "Vector", description: "Semantic similarity search only" },
-  { value: "local", label: "Local KG", description: "Entity-focused graph traversal" },
-  { value: "global", label: "Global KG", description: "High-level theme extraction" },
-];
 
 // ---------------------------------------------------------------------------
 // SearchBar
@@ -24,12 +15,20 @@ interface SearchBarProps {
 }
 
 export const SearchBar = memo(function SearchBar({ onSearch, isSearching, documents }: SearchBarProps) {
+  const { t } = useTranslation();
   const [query, setQuery] = useState("");
   const [mode, setMode] = useState<RAGQueryMode>("hybrid");
   const [topK, setTopK] = useState(5);
   const [showFilters, setShowFilters] = useState(false);
   const [selectedDocs, setSelectedDocs] = useState<number[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  const MODES = useMemo(() => [
+    { value: "hybrid", label: t("chat.modes.hybrid"), description: "Knowledge Graph + Vector search combined" },
+    { value: "vector_only", label: t("chat.modes.vector"), description: "Semantic similarity search only" },
+    { value: "local", label: t("chat.modes.local"), description: "Entity-focused graph traversal" },
+    { value: "global", label: t("chat.modes.global"), description: "High-level theme extraction" },
+  ] as { value: RAGQueryMode; label: string; description: string }[], [t]);
 
   // Keyboard shortcut: `/` to focus search
   useEffect(() => {
@@ -63,7 +62,7 @@ export const SearchBar = memo(function SearchBar({ onSearch, isSearching, docume
           <input
             ref={inputRef}
             type="text"
-            placeholder="Ask a question about your documents..."
+            placeholder={t("chat.ask_placeholder")}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
@@ -105,7 +104,7 @@ export const SearchBar = memo(function SearchBar({ onSearch, isSearching, docume
           size="icon"
           onClick={() => setShowFilters(!showFilters)}
           className={cn("h-10 w-10", showFilters && "bg-primary/10 border-primary/30")}
-          title="Search options"
+          title={t("common.settings")}
         >
           <Sparkles className="w-4 h-4" />
         </Button>
@@ -116,7 +115,7 @@ export const SearchBar = memo(function SearchBar({ onSearch, isSearching, docume
         <div className="rounded-lg border bg-card/50 p-3 space-y-3">
           {/* Mode selector */}
           <div>
-            <label className="text-xs font-medium text-muted-foreground mb-1.5 block">Search Mode</label>
+            <label className="text-xs font-medium text-muted-foreground mb-1.5 block">{t("chat.search_mode")}</label>
             <div className="flex gap-1.5 flex-wrap">
               {MODES.map((m) => (
                 <button
@@ -138,7 +137,7 @@ export const SearchBar = memo(function SearchBar({ onSearch, isSearching, docume
 
           {/* Top-K */}
           <div className="flex items-center gap-3">
-            <label className="text-xs font-medium text-muted-foreground whitespace-nowrap">Results</label>
+            <label className="text-xs font-medium text-muted-foreground whitespace-nowrap">{t("chat.results")}</label>
             <input
               type="range"
               min={1}
@@ -161,7 +160,9 @@ export const SearchBar = memo(function SearchBar({ onSearch, isSearching, docume
           {indexedDocs.length > 1 && (
             <div>
               <label className="text-xs font-medium text-muted-foreground mb-1.5 block">
-                Search within {selectedDocs.length > 0 ? `(${selectedDocs.length} selected)` : "(all documents)"}
+                {selectedDocs.length > 0 
+                  ? t("chat.search_within", { count: selectedDocs.length }) 
+                  : t("chat.search_within").split("(")[0].trim() + " " + t("chat.search_all")}
               </label>
               <div className="flex gap-1.5 flex-wrap max-h-20 overflow-y-auto">
                 {indexedDocs.map((d) => (

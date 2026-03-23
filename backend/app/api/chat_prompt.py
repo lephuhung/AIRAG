@@ -1,5 +1,5 @@
 """
-NexusRAG Chat System Prompts
+HRAG Chat System Prompts
 ===========================
 
 Two-part prompt architecture adapted from Perplexity AI for document Q&A.
@@ -14,7 +14,7 @@ Two-part prompt architecture adapted from Perplexity AI for document Q&A.
 Assembly:
     system_prompt = (workspace.system_prompt or DEFAULT_SYSTEM_PROMPT) + HARD_SYSTEM_PROMPT
 
-See also: NexusRAG/.agent/systemprompt_ex/chat_prompt.md
+See also: HRAG/.agent/systemprompt_ex/chat_prompt.md
 """
 
 # ---------------------------------------------------------------------------

@@ -4,15 +4,15 @@ HunyuanOCR Service
 
 Handles OCR for scanned / image-based PDFs using Tencent HunyuanOCR.
 
-Two backends (selected via NEXUSRAG_OCR_LOCAL in .env):
+Two backends (selected via HRAG_OCR_LOCAL in .env):
 
-  NEXUSRAG_OCR_LOCAL=false  (default)
+  HRAG_OCR_LOCAL=false  (default)
     → Remote vLLM server at HUNYUAN_OCR_API_URL (OpenAI-compatible API).
     → One async httpx call per page; up to 4 pages in parallel.
     → No local GPU required.
 
-  NEXUSRAG_OCR_LOCAL=true
-    → vllm.LLM loaded in-process on NEXUSRAG_OCR_LOCAL_DEVICE.
+  HRAG_OCR_LOCAL=true
+    → vllm.LLM loaded in-process on HRAG_OCR_LOCAL_DEVICE.
     → Requires: pip install vllm  (~10 GB VRAM for HunyuanOCR).
     → Model is loaded lazily on first OCR call and kept warm.
     → Pages are processed sequentially (vLLM handles its own batching).
@@ -96,15 +96,15 @@ class HunyuanOCRService:
     OCR service for scanned PDFs.
 
     Backends:
-      - API  (NEXUSRAG_OCR_LOCAL=false): async HTTP calls to a remote vLLM server.
-      - Local (NEXUSRAG_OCR_LOCAL=true): in-process vllm.LLM inference.
+      - API  (HRAG_OCR_LOCAL=false): async HTTP calls to a remote vLLM server.
+      - Local (HRAG_OCR_LOCAL=true): in-process vllm.LLM inference.
     """
 
     def __init__(self) -> None:
         self._api_url   = settings.HUNYUAN_OCR_API_URL.rstrip("/")
         self._model     = settings.HUNYUAN_OCR_MODEL
-        self._threshold = settings.NEXUSRAG_OCR_SCANNED_THRESHOLD
-        self._local     = settings.NEXUSRAG_OCR_LOCAL
+        self._threshold = settings.HRAG_OCR_SCANNED_THRESHOLD
+        self._local     = settings.HRAG_OCR_LOCAL
 
         # API backend: reuse a single async HTTP client
         self._client: httpx.AsyncClient | None = None
@@ -124,7 +124,7 @@ class HunyuanOCRService:
         Return True if the PDF is predominantly scanned (image-based).
 
         Counts pages with fewer than _MIN_CHARS_PER_PAGE selectable characters.
-        If that fraction meets or exceeds NEXUSRAG_OCR_SCANNED_THRESHOLD the
+        If that fraction meets or exceeds HRAG_OCR_SCANNED_THRESHOLD the
         file is classified as scanned.
         """
         try:
@@ -147,9 +147,9 @@ class HunyuanOCRService:
             logger.info(
                 f"PDF scan-check: {file_path} — {text_poor_pages}/{total_pages} "
                 f"pages below text threshold (ratio={ratio:.2f}, "
-                f"threshold={settings.NEXUSRAG_OCR_SCANNED_THRESHOLD})"
+                f"threshold={settings.HRAG_OCR_SCANNED_THRESHOLD})"
             )
-            return ratio >= settings.NEXUSRAG_OCR_SCANNED_THRESHOLD
+            return ratio >= settings.HRAG_OCR_SCANNED_THRESHOLD
 
         except ImportError:
             logger.warning(
@@ -166,7 +166,7 @@ class HunyuanOCRService:
         Run OCR on a scanned PDF and return the full extracted text.
 
         Dispatches to the local vLLM backend or the remote API backend
-        depending on NEXUSRAG_OCR_LOCAL.
+        depending on HRAG_OCR_LOCAL.
         """
         try:
             import fitz  # PyMuPDF
@@ -311,7 +311,7 @@ class HunyuanOCRService:
         controlled via CUDA_VISIBLE_DEVICES env var and `gpu_memory_utilization`
         instead.  `gpu_memory_utilization` defaults to 0.9 (≈43 GB on a 47 GB
         card), which is far too large for a 1B OCR model; we cap it at
-        NEXUSRAG_OCR_GPU_MEMORY_UTILIZATION (default 0.15 ≈ 7 GB).
+        HRAG_OCR_GPU_MEMORY_UTILIZATION (default 0.15 ≈ 7 GB).
 
         CUDA_VISIBLE_DEVICES is set here so that vLLM (which reads it at import
         time in its sub-process) directs the model to the right GPU even when the
@@ -332,14 +332,14 @@ class HunyuanOCRService:
             )
 
         import os
-        cuda_device = settings.NEXUSRAG_OCR_CUDA_DEVICE
+        cuda_device = settings.HRAG_OCR_CUDA_DEVICE
         if cuda_device not in ("", "auto"):
             # Must be set before vLLM spawns its EngineCore subprocess
             os.environ["CUDA_VISIBLE_DEVICES"] = cuda_device
-            logger.info(f"[OCR/local] CUDA_VISIBLE_DEVICES={cuda_device}")
+            logger.info( f"[OCR/local] CUDA_VISIBLE_DEVICES={cuda_device}")
 
-        gpu_mem = settings.NEXUSRAG_OCR_GPU_MEMORY_UTILIZATION
-        max_model_len = settings.NEXUSRAG_OCR_MAX_MODEL_LEN
+        gpu_mem = settings.HRAG_OCR_GPU_MEMORY_UTILIZATION
+        max_model_len = settings.HRAG_OCR_MAX_MODEL_LEN
 
         logger.info(
             f"[OCR/local] Loading {self._model} "
