@@ -64,6 +64,8 @@ class Document(Base):
     document_type_id: Mapped[int | None] = mapped_column(
         ForeignKey("document_types.id", ondelete="SET NULL"), nullable=True
     )
+    # Official document reference number extracted by classifier (e.g. "13/2023/NĐ-CP")
+    document_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     # User who uploaded this document
     uploaded_by: Mapped[int | None] = mapped_column(

@@ -122,17 +122,10 @@ async def handle_parse(payload: dict) -> None:
 
             # ── Classify document type ──────────────────────────────────────
             try:
-                from app.services.document_type_classifier import (
-                    classify_document_type,
-                    classify_with_llm,
-                )
+                from app.services.document_type_classifier import classify_with_llm
                 from app.models.document_type import DocumentType as _DT
-                # Use first 1 000 chars of markdown (post-Docling/OCR content only)
-                # Prioritize LLM classification (Qwen via vLLM) as requested by user
-                slug = await classify_with_llm(text_preview) if text_preview else None
-                if slug is None and text_preview:
-                    # Fallback to regex if LLM fails or returns unknown
-                    slug = classify_document_type(text_preview)
+                # LLM-only classification (Qwen3-4B via vLLM memory agent)
+                slug, document_number = await classify_with_llm(text_preview) if text_preview else (None, None)
                 if slug:
                     dt_result = await db.execute(
                         select(_DT).where(_DT.slug == slug, _DT.is_active.is_(True))
@@ -140,11 +133,14 @@ async def handle_parse(payload: dict) -> None:
                     dt = dt_result.scalar_one_or_none()
                     if dt:
                         document.document_type_id = dt.id
-                        await db.commit()
-                        logger.info(
-                            f"[parse_worker] doc={msg.document_id} "
-                            f"classified as '{slug}'"
-                        )
+                if document_number:
+                    document.document_number = document_number
+                if slug or document_number:
+                    await db.commit()
+                    logger.info(
+                        f"[parse_worker] doc={msg.document_id} "
+                        f"classified as '{slug}', number='{document_number}'"
+                    )
             except Exception as _cls_err:
                 logger.warning(
                     f"[parse_worker] doc={msg.document_id} "
@@ -195,15 +191,16 @@ async def handle_parse(payload: dict) -> None:
             import json
             document.raw_chunks_json = json.dumps([
                 {
-                    "content":      c.content,
-                    "chunk_index":  c.chunk_index,
-                    "source_file":  c.source_file,
-                    "page_no":      c.page_no,
-                    "heading_path": c.heading_path,
-                    "image_refs":   c.image_refs,
-                    "table_refs":   c.table_refs,
-                    "has_table":    c.has_table,
-                    "has_code":     c.has_code,
+                    "content":         c.content,
+                    "chunk_index":     c.chunk_index,
+                    "source_file":     c.source_file,
+                    "page_no":         c.page_no,
+                    "heading_path":    c.heading_path,
+                    "image_refs":      c.image_refs,
+                    "table_refs":      c.table_refs,
+                    "has_table":       c.has_table,
+                    "has_code":        c.has_code,
+                    "document_number": document.document_number or "",
                 }
                 for c in parsed.chunks
             ])

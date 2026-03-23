@@ -1,16 +1,17 @@
 """
 Document Type Classifier
 ========================
-Classify Vietnamese administrative / legal documents from their markdown content.
+Classify Vietnamese administrative / legal documents from their markdown content
+using an LLM (Qwen3-4B via vLLM / memory agent).
 
-Flow:
-  1. Regex pass on first ~1 000 chars of markdown content.
-  2. If no regex match → async LLM fallback (returns the closest slug or None).
-
-Returns `slug` matching `DocumentType.slug` in DB, or `None` if unrecognised.
+Returns a tuple (slug, document_number):
+  - slug          matches DocumentType.slug in DB, or None if unrecognised.
+  - document_number  the official document reference number (e.g. "13/2023/NĐ-CP"),
+                  or None if not found.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -19,287 +20,130 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Broad document-type definitions
+# Document-type definitions  (slug + metadata only — no regex patterns)
 # ---------------------------------------------------------------------------
 
 @dataclass
-class _DocTypePattern:
+class _DocType:
     slug: str
     name: str
     description: str
-    patterns: list[str]   # case-insensitive, UNICODE regex patterns
 
 
-# Ordered most-specific → most-general so the first match wins.
-_PATTERNS: list[_DocTypePattern] = [
-    _DocTypePattern(
-        slug="luat",
-        name="Luật",
-        description="Luật do Quốc hội ban hành",
-        patterns=[
-            r"LUẬT\s+[A-ZĐÀÁẢÃẠĂẮẶẶẢẸẺẼẸÍÌỈĨỊ]",
-            r"(?:^|[\s_\-])lu[ậa]t[\s_\-]",
-            r"(?:^|[\s_\-])luat[\s_\-]",
-        ],
-    ),
-    _DocTypePattern(
-        slug="phap_lenh",
-        name="Pháp lệnh",
-        description="Pháp lệnh của Ủy ban Thường vụ Quốc hội",
-        patterns=[
-            r"PHÁP\s+LỆNH",
-            r"\bph[áa]p\s*l[ệe]nh\b",
-            r"\bphap[\s_\-]?lenh\b",
-        ],
-    ),
-    _DocTypePattern(
-        slug="nghi_quyet",
-        name="Nghị quyết",
-        description="Nghị quyết của Quốc hội, HĐND, Đảng, tổ chức",
-        patterns=[
-            r"NGHỊ\s+QUYẾT",
-            r"\bngh[ịi]\s*quy[ếe]t\b",
-            r"\bnghi[\s_\-]?quyet\b",
-            r"\bNQ[\s\-_/]\d+",
-        ],
-    ),
-    _DocTypePattern(
-        slug="nghi_dinh",
-        name="Nghị định",
-        description="Nghị định của Chính phủ",
-        patterns=[
-            r"NGHỊ\s+ĐỊNH",
-            r"\bngh[ịi]\s*[đd][ịi]nh\b",
-            r"\bnghi[\s_\-]?dinh\b",
-            r"\bND[\s\-_/]\d+",
-        ],
-    ),
-    _DocTypePattern(
-        slug="quyet_dinh",
-        name="Quyết định",
-        description="Quyết định hành chính của cơ quan nhà nước",
-        patterns=[
-            r"QUYẾT\s+ĐỊNH",
-            r"\bquy[ếe]t\s*[đd][ịi]nh\b",
-            r"\bquyet[\s_\-]?dinh\b",
-            r"\bQĐ[\s\-_/]\d+",
-            r"\bQD[\s\-_/]\d+",
-        ],
-    ),
-    _DocTypePattern(
-        slug="thong_tu",
-        name="Thông tư",
-        description="Thông tư (bao gồm Thông tư liên tịch) của Bộ, cơ quan ngang Bộ",
-        patterns=[
-            r"THÔNG\s+TƯ",
-            r"\bth[ôo]ng\s*t[ưu]\b",
-            r"\bthong[\s_\-]?tu\b",
-            r"\bTTLT[\s\-_/]\d+",
-            r"\bTT[\s\-_/]\d+",
-        ],
-    ),
-    _DocTypePattern(
-        slug="chi_thi",
-        name="Chỉ thị",
-        description="Chỉ thị của Thủ tướng, Bộ trưởng",
-        patterns=[
-            r"CHỈ\s+THỊ",
-            r"\bch[ỉi]\s*th[ịi]\b",
-            r"\bchi[\s_\-]?thi\b",
-            r"\bCT[\s\-_/]\d+",
-        ],
-    ),
-    _DocTypePattern(
-        slug="cong_van",
-        name="Công văn",
-        description="Công văn hành chính",
-        patterns=[
-            r"CÔNG\s+VĂN",
-            r"\bc[ôo]ng\s*v[ăa]n\b",
-            r"\bcong[\s_\-]?van\b",
-            r"\bCV[\s\-_/]\d+",
-        ],
-    ),
-    _DocTypePattern(
-        slug="thong_bao",
-        name="Thông báo",
-        description="Thông báo hành chính",
-        patterns=[
-            r"THÔNG\s+BÁO",
-            r"\bth[ôo]ng\s*b[áa]o\b",
-            r"\bthong[\s_\-]?bao\b",
-            r"\bTB[\s\-_/]\d+",
-        ],
-    ),
-    _DocTypePattern(
-        slug="bao_cao",
-        name="Báo cáo",
-        description="Báo cáo định kỳ, chuyên đề, tài chính",
-        patterns=[
-            r"BÁO\s+CÁO",
-            r"\bb[áa]o\s*c[áa]o\b",
-            r"\bbao[\s_\-]?cao\b",
-            r"\bBC[\s\-_/]\d+",
-            r"\bbctc\b",
-            r"\bfinancial\s+(report|statement)\b",
-        ],
-    ),
-    _DocTypePattern(
-        slug="to_trinh",
-        name="Tờ trình",
-        description="Tờ trình lên cấp trên",
-        patterns=[
-            r"TỜ\s+TRÌNH",
-            r"\bt[ờo]\s*tr[ìi]nh\b",
-            r"\bto[\s_\-]?trinh\b",
-            r"\bTTr[\s\-_/]\d+",
-        ],
-    ),
-    _DocTypePattern(
-        slug="bien_ban",
-        name="Biên bản",
-        description="Biên bản họp, làm việc, kiểm tra",
-        patterns=[
-            r"BIÊN\s+BẢN",
-            r"\bbi[êe]n\s*b[ảa]n\b",
-            r"\bbien[\s_\-]?ban\b",
-            r"\bBB[\s\-_/]\d+",
-        ],
-    ),
-    _DocTypePattern(
-        slug="hop_dong",
-        name="Hợp đồng",
-        description="Hợp đồng kinh tế, dân sự, lao động",
-        patterns=[
-            r"HỢP\s+ĐỒNG",
-            r"\bh[ợo]p\s*[đd][ồo]ng\b",
-            r"\bhop[\s_\-]?dong\b",
-            r"\bHĐ[\s\-_/]\d+",
-            r"\bHD[\s\-_/]\d+",
-        ],
-    ),
-    _DocTypePattern(
-        slug="ke_hoach",
-        name="Kế hoạch",
-        description="Kế hoạch công tác, triển khai",
-        patterns=[
-            r"KẾ\s+HOẠCH",
-            r"\bk[ếe]\s*ho[ạa]ch\b",
-            r"\bke[\s_\-]?hoach\b",
-            r"\bKH[\s\-_/]\d+",
-        ],
-    ),
-    _DocTypePattern(
-        slug="huong_dan",
-        name="Hướng dẫn",
-        description="Hướng dẫn thực hiện, nghiệp vụ",
-        patterns=[
-            r"HƯỚNG\s+DẪN",
-            r"\bh[ướu]ng\s*d[ẫa]n\b",
-            r"\bhuong[\s_\-]?dan\b",
-        ],
-    ),
-    _DocTypePattern(
-        slug="don_tu",
-        name="Đơn, Tờ khai",
-        description="Đơn xin, đơn đề nghị, tờ khai",
-        patterns=[
-            r"ĐƠN\s+(XIN|ĐỀ\s+NGHỊ)",
-            r"\b[đd][ơo]n\s*(xin|[đd][ềe]\s*ngh[ịi]|khi[ếe]u\s*n[ạa]i)\b",
-            r"\bdon[\s_\-]?(xin|de[\s_\-]nghi)\b",
-            r"\bt[ờo]\s*khai\b",
-        ],
-    ),
-]
-
-# Compile once at module load
-_COMPILED: list[tuple[str, str, list[re.Pattern]]] = [
-    (
-        p.slug,
-        p.name,
-        [re.compile(pat, re.IGNORECASE | re.UNICODE) for pat in p.patterns],
-    )
-    for p in _PATTERNS
+_DOC_TYPES: list[_DocType] = [
+    _DocType("luat",        "Luật",         "Luật do Quốc hội ban hành"),
+    _DocType("phap_lenh",   "Pháp lệnh",    "Pháp lệnh của Ủy ban Thường vụ Quốc hội"),
+    _DocType("nghi_quyet",  "Nghị quyết",   "Nghị quyết của Quốc hội, HĐND, Đảng, tổ chức"),
+    _DocType("nghi_dinh",   "Nghị định",    "Nghị định của Chính phủ"),
+    _DocType("quyet_dinh",  "Quyết định",   "Quyết định hành chính của cơ quan nhà nước"),
+    _DocType("thong_tu",    "Thông tư",     "Thông tư (bao gồm Thông tư liên tịch) của Bộ, cơ quan ngang Bộ"),
+    _DocType("chi_thi",     "Chỉ thị",      "Chỉ thị của Thủ tướng, Bộ trưởng"),
+    _DocType("cong_van",    "Công văn",     "Công văn hành chính"),
+    _DocType("thong_bao",   "Thông báo",    "Thông báo hành chính"),
+    _DocType("bao_cao",     "Báo cáo",      "Báo cáo định kỳ, chuyên đề, tài chính"),
+    _DocType("to_trinh",    "Tờ trình",     "Tờ trình lên cấp trên"),
+    _DocType("bien_ban",    "Biên bản",     "Biên bản họp, làm việc, kiểm tra"),
+    _DocType("hop_dong",    "Hợp đồng",     "Hợp đồng kinh tế, dân sự, lao động"),
+    _DocType("ke_hoach",    "Kế hoạch",     "Kế hoạch công tác, triển khai"),
+    _DocType("huong_dan",   "Hướng dẫn",    "Hướng dẫn thực hiện, nghiệp vụ"),
+    _DocType("don_tu",      "Đơn, Tờ khai", "Đơn xin, đơn đề nghị, tờ khai"),
 ]
 
 # Slug set for LLM response validation
-_VALID_SLUGS: frozenset[str] = frozenset(p.slug for p in _PATTERNS)
+_VALID_SLUGS: frozenset[str] = frozenset(d.slug for d in _DOC_TYPES)
 
-# Prompt for LLM fallback
+# ---------------------------------------------------------------------------
+# LLM classification prompt
+# ---------------------------------------------------------------------------
+
 _LLM_SYSTEM_PROMPT = (
-    "Bạn là chuyên gia phân loại văn bản hành chính và pháp luật Việt Nam. "
-    "Nhiệm vụ: xác định loại văn bản từ nội dung được cung cấp.\n\n"
-    "Các loại văn bản hợp lệ (trả về đúng slug sau đây):\n"
-    + "\n".join(f"  - {p.slug}: {p.name} — {p.description}" for p in _PATTERNS)
-    + "\n\nNếu không xác định được loại văn bản, trả về: unknown\n"
-    "Chỉ trả về một slug duy nhất, không giải thích thêm."
+    "Bạn là chuyên gia phân loại văn bản hành chính và pháp luật Việt Nam.\n"
+    "Nhiệm vụ: đọc phần đầu nội dung văn bản (markdown) và trả về JSON với 2 trường:\n\n"
+    "1. \"slug\": loại văn bản (chọn từ danh sách bên dưới, hoặc \"unknown\")\n"
+    "2. \"document_number\": số hiệu văn bản chính thức (ví dụ: \"13/2023/NĐ-CP\", "
+    "\"1234/CV-BTC\", \"45/2021/QH15\"). Nếu không có thì null.\n\n"
+    "Các slug hợp lệ:\n"
+    + "\n".join(f"  - {d.slug}: {d.name} — {d.description}" for d in _DOC_TYPES)
+    + "\n\n"
+    "Quy tắc:\n"
+    "- Chỉ trả về JSON thuần, không giải thích, không markdown.\n"
+    "- document_number phải là chuỗi số hiệu gốc trong văn bản, "
+    "KHÔNG tự suy luận hay bịa đặt.\n"
+    "- Nếu số hiệu xuất hiện nhiều lần, lấy lần đầu tiên.\n\n"
+    "Ví dụ đầu vào:\n"
+    "\"NGHỊ ĐỊNH\\nSố: 13/2023/NĐ-CP\\nQuy định về bảo vệ dữ liệu cá nhân\"\n\n"
+    "Ví dụ đầu ra:\n"
+    "{\"slug\": \"nghi_dinh\", \"document_number\": \"13/2023/NĐ-CP\"}"
 )
 
 
-def classify_document_type(markdown_text: str) -> str | None:
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+async def classify_with_llm(markdown_text: str) -> tuple[str | None, str | None]:
     """
-    Regex-based classification on markdown content.
+    Classify a document and extract its official number using the memory agent LLM.
 
     Args:
-        markdown_text: First ~1 000 chars of parsed markdown content.
+        markdown_text: Parsed markdown content (first ~1 500 chars used).
 
     Returns:
-        Matching slug or None (no match).
-    """
-    if not markdown_text:
-        return None
-
-    for slug, _name, patterns in _COMPILED:
-        for pat in patterns:
-            if pat.search(markdown_text):
-                logger.debug(
-                    f"[classifier] matched '{slug}' via pattern '{pat.pattern[:40]}'"
-                )
-                return slug
-
-    logger.debug("[classifier] no regex match")
-    return None
-
-
-async def classify_with_llm(markdown_text: str) -> str | None:
-    """
-    LLM fallback classification when regex returns None.
-
-    Args:
-        markdown_text: First ~1 000 chars of parsed markdown content.
-
-    Returns:
-        Matching slug, or None if LLM also cannot classify.
+        Tuple of (slug, document_number). Either may be None if not found/recognised.
     """
     from app.services.llm import get_memory_agent
     from app.services.llm.types import LLMMessage
 
+    if not markdown_text:
+        return None, None
+
     try:
-        # Use the dedicated memory agent (e.g. Qwen3-4B via vLLM) for classification
         llm = get_memory_agent()
-        preview = markdown_text[:1500].strip()  # Increased preview length for better context
+        preview = markdown_text[:1500].strip()
         messages: list[LLMMessage] = [
             LLMMessage(role="user", content=f"Nội dung văn bản (markdown):\n\n{preview}")
         ]
         result = await llm.acomplete(
             messages,
             system_prompt=_LLM_SYSTEM_PROMPT,
-            temperature=0.1,
-            max_tokens=20,
+            temperature=0.0,
+            max_tokens=60,
         )
-        # Handle both string and content object results
         content_str = result if isinstance(result, str) else result.content
-        slug = content_str.strip().lower() if content_str else ""
-        # Sanitise: remove surrounding punctuation/whitespace
-        slug = re.sub(r"[^a-z_]", "", slug)
-        if slug in _VALID_SLUGS:
-            logger.info(f"[classifier] LLM classified as '{slug}'")
-            return slug
-        logger.debug(f"[classifier] LLM returned unrecognised slug: {slug!r}")
-    except Exception as _err:
-        logger.warning(f"[classifier] LLM fallback failed (non-fatal): {_err}")
+        if not content_str:
+            return None, None
 
-    return None
+        # Strip markdown fences if the model wrapped the JSON
+        content_str = content_str.strip()
+        if content_str.startswith("```"):
+            content_str = re.sub(r"^```[a-z]*\n?", "", content_str)
+            content_str = content_str.rstrip("`").strip()
+
+        parsed = json.loads(content_str)
+
+        # --- slug ---
+        raw_slug = str(parsed.get("slug", "")).strip().lower()
+        raw_slug = re.sub(r"[^a-z_]", "", raw_slug)
+        slug = raw_slug if raw_slug in _VALID_SLUGS else None
+
+        # --- document_number ---
+        raw_number = parsed.get("document_number")
+        document_number = str(raw_number).strip() if raw_number else None
+        # Reject suspiciously long or empty strings
+        if document_number and (len(document_number) > 60 or document_number == "null"):
+            document_number = None
+
+        logger.info(
+            f"[classifier] slug={slug!r} document_number={document_number!r}"
+        )
+        return slug, document_number
+
+    except (json.JSONDecodeError, KeyError, TypeError) as parse_err:
+        logger.debug(f"[classifier] JSON parse failed: {parse_err} — raw: {content_str!r}")
+    except Exception as err:
+        logger.warning(f"[classifier] LLM classification failed (non-fatal): {err}")
+
+    return None, None
 
 
 def get_all_document_types() -> list[dict]:
@@ -308,10 +152,6 @@ def get_all_document_types() -> list[dict]:
     Used to seed the document_types table on startup (idempotent).
     """
     return [
-        {
-            "slug": p.slug,
-            "name": p.name,
-            "description": p.description,
-        }
-        for p in _PATTERNS
+        {"slug": d.slug, "name": d.name, "description": d.description}
+        for d in _DOC_TYPES
     ]

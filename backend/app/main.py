@@ -122,6 +122,10 @@ async def lifespan(app: FastAPI):
                 "ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_type_id INTEGER "
                 "REFERENCES document_types(id) ON DELETE SET NULL"
             ))
+            # Official document reference number (e.g. "13/2023/NĐ-CP")
+            await conn.execute(text(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_number VARCHAR(100)"
+            ))
             # ── Auth & multi-tenant columns ────────────────────────────────────
             # knowledge_bases: visibility, owner_id, tenant_id
             await conn.execute(text(

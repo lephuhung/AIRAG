@@ -180,7 +180,6 @@ class OpenAICompatibleLLMProvider(LLMProvider):
             # Buffer for text that comes before a tool call in native OpenAI mode
             pre_tool_text = ""
 
-            logger.info(f"[OpenAI-compatible] Request kwargs: {list(kwargs.keys())}")
             stream = await client.chat.completions.create(**kwargs)
             async for chunk in stream:
                 delta = chunk.choices[0].delta if chunk.choices else None

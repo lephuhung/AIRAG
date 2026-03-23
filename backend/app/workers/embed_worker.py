@@ -75,19 +75,20 @@ async def handle_embed(payload: dict) -> None:
             img_url_prefix = f"/static/doc-images/kb_{msg.workspace_id}/images"
             metadatas = [
                 {
-                    "document_id":  msg.document_id,
-                    "chunk_index":  c["chunk_index"],
-                    "source":       c["source_file"],
-                    "file_type":    document.file_type,
-                    "page_no":      c["page_no"],
-                    "heading_path": " > ".join(c["heading_path"]) if c["heading_path"] else "",
-                    "has_table":    c["has_table"],
-                    "has_code":     c["has_code"],
-                    "image_ids":    "|".join(c["image_refs"]) if c["image_refs"] else "",
-                    "table_ids":    "|".join(c["table_refs"]) if c["table_refs"] else "",
-                    "image_urls":   "|".join(
+                    "document_id":     msg.document_id,
+                    "chunk_index":     c["chunk_index"],
+                    "source":          c["source_file"],
+                    "file_type":       document.file_type,
+                    "page_no":         c["page_no"],
+                    "heading_path":    " > ".join(c["heading_path"]) if c["heading_path"] else "",
+                    "has_table":       c["has_table"],
+                    "has_code":        c["has_code"],
+                    "image_ids":       "|".join(c["image_refs"]) if c["image_refs"] else "",
+                    "table_ids":       "|".join(c["table_refs"]) if c["table_refs"] else "",
+                    "image_urls":      "|".join(
                         f"{img_url_prefix}/{iid}.png" for iid in c["image_refs"]
                     ) if c["image_refs"] else "",
+                    "document_number": c.get("document_number", ""),
                 }
                 for c in chunks_data
             ]

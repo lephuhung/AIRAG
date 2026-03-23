@@ -19,6 +19,13 @@ export function formatRelativeDate(dateStr: string): string {
 }
 
 /**
+ * Format a date string as a fixed date (DD/MM/YYYY).
+ */
+export function formatDate(dateStr: string): string {
+  return dayjs(dateStr).format("DD/MM/YYYY");
+}
+
+/**
  * Format a byte count as a human-readable file size.
  */
 export function formatFileSize(bytes: number): string {

@@ -23,13 +23,14 @@ import {
   STATUS_CONFIG,
   getFileConfig,
 } from "@/components/rag/DocumentCard";
-import { formatFileSize, formatRelativeDate, formatProcessingTime } from "@/lib/format";
+import { formatFileSize, formatDate, formatProcessingTime } from "@/lib/format";
 import type { Document, DocumentStatus } from "@/types";
 
 // ---------------------------------------------------------------------------
 // Status badge (reused pattern from DocumentCard)
 // ---------------------------------------------------------------------------
 function StatusBadge({ status }: { status: DocumentStatus }) {
+  const { t } = useTranslation();
   const config = STATUS_CONFIG[status] ?? STATUS_CONFIG.pending;
   const Icon = config.icon;
   const isAnimated =
@@ -47,7 +48,7 @@ function StatusBadge({ status }: { status: DocumentStatus }) {
       )}
     >
       <Icon className={cn("w-3 h-3", isAnimated && "animate-spin")} />
-      {config.label}
+      {status !== "indexed" && t(config.labelKey)}
     </span>
   );
 }
@@ -216,9 +217,14 @@ export const FileCard = memo(function FileCard({
 
         {/* Name + meta */}
         <div className="flex-1 min-w-0">
-          <p className="font-medium text-sm truncate" title={doc.original_filename}>
-            {doc.original_filename}
-          </p>
+          <div className="flex items-center gap-1.5 min-w-0">
+            <p className="font-medium text-sm truncate" title={doc.original_filename}>
+              {doc.original_filename}
+            </p>
+            {doc.status === "indexed" && (
+              <CheckCircle2 className="w-4 h-4 text-emerald-500 fill-emerald-500/10 flex-shrink-0" />
+            )}
+          </div>
           <p className="text-xs text-muted-foreground mt-0.5">
             {doc.file_type.toUpperCase()}
             <span className="mx-1.5 text-muted-foreground/40">&middot;</span>
@@ -392,9 +398,9 @@ export const FileCard = memo(function FileCard({
 
       {/* ── Timestamps ── */}
       <div className="px-4 pb-3 mt-auto flex items-center gap-3 text-[11px] text-muted-foreground/70">
-        <span>Uploaded: {formatRelativeDate(doc.created_at)}</span>
+        <span>Uploaded: {formatDate(doc.created_at)}</span>
         {doc.updated_at !== doc.created_at && (
-          <span>Updated: {formatRelativeDate(doc.updated_at)}</span>
+          <span>Updated: {formatDate(doc.updated_at)}</span>
         )}
       </div>
 

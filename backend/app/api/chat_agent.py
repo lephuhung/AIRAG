@@ -63,11 +63,13 @@ _CITATION_ID_CHARS = string.ascii_lowercase + string.digits
 _MEMORY_EXTRACTION_PROMPT = (
     "You are a memory assistant that extracts personal facts about a HUMAN USER from their message.\n\n"
     "CRITICAL RULES:\n"
-    "- You MUST only extract information that the HUMAN USER explicitly states about themselves.\n"
+    "- You MUST only extract information that the HUMAN USER explicitly states about themselves RIGHT NOW (present tense).\n"
     "- NEVER extract statements made by an AI assistant or chatbot.\n"
     "- REJECT any statement starting with phrases like 'Tôi là trợ lý', 'Tôi là một AI', 'I am an AI', "
     "'I am a chatbot', 'As an assistant', 'Là một trợ lý AI'.\n"
     "- NEVER extract generic greetings, chatbot self-introductions, or conversational filler.\n"
+    "- NEVER extract questions (sentences ending with '?' or starting with 'Bạn có biết', 'What is', 'Tại sao', 'How', etc.).\n"
+    "- IGNORE past-tense or hypothetical statements (e.g., 'tôi đã từng dùng', 'tôi muốn dùng').\n"
     "- If the message is from an AI/chatbot, return exactly: []\n\n"
     "Extract ONLY if the user says things like:\n"
     "- Their name: 'Tôi tên là X', 'My name is X'\n"
@@ -78,10 +80,11 @@ _MEMORY_EXTRACTION_PROMPT = (
     "- Direct instructions: 'Hãy gọi tôi là X', 'Always respond in Vietnamese'\n\n"
     "Target Categories:\n"
     "1. fact: Permanent information (name, job, location, devices). IMPORTANCE 10 for name, job.\n"
-    "2. preference: Likes, dislikes, styles. IMPORTANCE 5-8.\n"
+    "2. preference: Likes/dislikes that affect how the assistant should respond (e.g. language, format) → IMPORTANCE 8. "
+    "General personal tastes (e.g. food, hobbies) → IMPORTANCE 5.\n"
     "3. instruction: Direct rules for the assistant. IMPORTANCE 10.\n\n"
-    "Output format: JSON array only. No explanation. Example:\n"
-    '[{"content": "Tên người dùng là Hùng", "category": "fact", "importance": 10}, '
+    "Output format: JSON array only. No explanation. Keep 'content' short (under 15 words). Example:\n"
+    '[{"content": "Tên: Hùng", "category": "fact", "importance": 10}, '
     '{"content": "Thiết bị: iPhone 16", "category": "fact", "importance": 10}]\n'
     "If nothing is worth extracting: []"
 )
@@ -664,7 +667,7 @@ async def _extract_facts_with_llm(message: str) -> list[dict]:
 
     agent = get_memory_agent()
     system_msg = LLMMessage(role="system", content=_MEMORY_EXTRACTION_PROMPT)
-    user_msg = LLMMessage(role="user", content=f"User Message: {message}")
+    user_msg = LLMMessage(role="user", content=message)
 
     try:
         response = ""
@@ -775,11 +778,25 @@ async def agent_chat_stream(
     # Build user message
     messages.append(LLMMessage(role="user", content=message))
 
-    # 1. Detect if it's a simple greeting (bypass search logic)
+    # 1. Detect if it's a simple greeting/acknowledgement (bypass search logic)
     greeting_detected = False
     import string
     low_msg = message.lower().strip(string.punctuation + " ")
-    if low_msg in ["hi", "hello", "xin chào", "chào", "hey", "greetings", "cảm ơn", "thanks", "tạm biệt", "bye"]:
+    _GREETING_TOKENS = {
+        # Greetings
+        "hi", "hello", "hey", "greetings", "howdy",
+        "xin chào", "chào", "chào bạn", "alo",
+        # Acknowledgements / thanks
+        "cảm ơn", "cảm ơn bạn", "cảm ơn nhiều", "cảm ơn nha",
+        "thanks", "thank you", "thx", "ty",
+        "ok", "okay", "oke", "okie", "got it", "understood", "sure",
+        "được", "được rồi", "rồi", "vâng", "dạ", "ừ", "ừm",
+        "tuyệt", "tuyệt vời", "hay quá", "tốt", "tốt lắm",
+        "great", "nice", "cool", "awesome", "perfect",
+        # Farewells
+        "bye", "goodbye", "tạm biệt", "bái bai", "hẹn gặp lại",
+    }
+    if low_msg in _GREETING_TOKENS:
         greeting_detected = True
 
     # Tool / prompt setup
@@ -858,14 +875,15 @@ async def agent_chat_stream(
             ))
         # tools remain None — model answers directly with provided context
     elif is_gemini:
-        tools = [_get_gemini_tool()]
-        # Reinforce tool-calling obligation in system prompt for Gemini
-        effective_system_prompt += GEMINI_TOOL_SYSTEM
-        # Add a strong reminder directly to the user message
-        messages[-1] = LLMMessage(
-            role="user",
-            content=messages[-1].content + NATIVE_TOOL_REMINDER,
-        )
+        if not greeting_detected:
+            tools = [_get_gemini_tool()]
+            # Reinforce tool-calling obligation in system prompt for Gemini
+            effective_system_prompt += GEMINI_TOOL_SYSTEM
+            # Add a strong reminder directly to the user message
+            messages[-1] = LLMMessage(
+                role="user",
+                content=messages[-1].content + NATIVE_TOOL_REMINDER,
+            )
     elif is_openai_compatible:
         # OpenAI-compatible (vLLM): Reverting to XML-based tool calling for higher reliability with 30B/Local models
         if not greeting_detected:
@@ -1174,10 +1192,6 @@ async def agent_chat_stream(
     # Strip artifacts
     if accumulated_text:
         accumulated_text = re.sub(r'<unused\d+>:?\s*', '', accumulated_text).strip()
-        logger.info(f"[AGENT] Final Answer: {accumulated_text[:200]}...")
-
-    logger.info(f"--- AGENT CHAT COMPLETE (Length={len(accumulated_text) if accumulated_text else 0}) ---")
-    logger.info(f"Related Entities Found: {related_entities}")
 
     yield {"event": "complete", "data": {
         "answer": accumulated_text or "Unable to generate a response.",

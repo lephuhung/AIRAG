@@ -286,7 +286,7 @@ export const DataPanel = memo(function DataPanel({
               />
             </div>
 
-            <div className="flex-1 overflow-y-auto px-3 py-2 space-y-1.5">
+            <div className="flex-1 overflow-y-auto px-3 py-2 grid grid-cols-2 gap-2 auto-rows-min">
               <AnimatePresence mode="popLayout">
                 {filteredDocs.map((doc) => (
                   <DocumentCard
