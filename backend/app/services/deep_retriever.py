@@ -302,6 +302,12 @@ class DeepRetriever:
         return merged_chunks, merged_citations
 
     def _vector_query(
+        self,
+        question: str,
+        top_k: int,
+        document_ids: Optional[list[int]],
+    ) -> tuple[list[EnrichedChunk], list[Citation]]:
+        """Synchronous vector search via ChromaDB (over-fetch stage)."""
         query_embedding = self.embedder.embed_query(question)
 
         where = None
