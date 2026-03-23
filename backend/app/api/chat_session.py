@@ -242,7 +242,9 @@ async def chat_stream_session(
             db.add(ai_msg)
             
             # Update session timestamp
-            session.title = request.message[:50] + "..." if session.title == "New Chat" else session.title
+            DEFAULT_TITLES = ["New Chat", "New chat", "Chat mới", "Kho tri thức"]
+            if session.title in DEFAULT_TITLES or not session.title:
+                session.title = request.message[:50] + ("..." if len(request.message) > 50 else "")
             
             await db.commit()
             

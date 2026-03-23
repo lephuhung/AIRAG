@@ -74,7 +74,7 @@ export function ChatPage() {
           initial={false}
           className={cn(
             "flex-1 h-full min-w-[320px] relative z-10",
-            selectedDoc ? "w-1/3" : "w-full max-w-7xl mx-auto"
+            selectedDoc ? "w-1/3" : "w-full max-w-2xl lg:max-w-3xl xl:max-w-4xl mx-auto"
           )}
           transition={{ 
             type: "spring", 

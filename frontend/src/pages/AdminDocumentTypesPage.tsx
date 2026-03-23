@@ -397,7 +397,6 @@ function DocumentTypeRow({
                 onClick={onTogglePrompt}
               >
                 {t(isPromptOpen ? "common.close" : "admin.doc_types.prompt_label")}
-                <span className="text-[11px]">{t("admin.prompt")}</span>
                 {isPromptOpen ? (
                   <ChevronUp className="w-3 h-3" />
                 ) : (
@@ -473,7 +472,7 @@ function SystemPromptPanel({ slug, name }: { slug: string; name: string }) {
             onChange={(e) => setValue(e.target.value)}
             rows={6}
             className="w-full px-3 py-2 text-xs font-mono rounded-lg border bg-background focus:outline-none focus:ring-2 focus:ring-primary/30 resize-y"
-            placeholder={t("admin.prompt_placeholder")}
+            placeholder={t("admin.doc_types.prompt_placeholder")}
           />
         )}
       </div>

@@ -40,6 +40,7 @@ function StatusBadge({ status }: { status: DocumentStatus }) {
     status === "embedding" ||
     status === "building_kg";
 
+  const showIcon = status !== "indexed";
   return (
     <span
       className={cn(
@@ -47,7 +48,7 @@ function StatusBadge({ status }: { status: DocumentStatus }) {
         config.className,
       )}
     >
-      <Icon className={cn("w-3 h-3", isAnimated && "animate-spin")} />
+      {showIcon && <Icon className={cn("w-3 h-3", isAnimated && "animate-spin")} />}
       {status !== "indexed" && t(config.labelKey)}
     </span>
   );
@@ -336,7 +337,7 @@ export const FileCard = memo(function FileCard({
 
       {/* ── Stats grid ── */}
       {stats.length > 0 && (
-        <div className="px-4 pb-3 grid grid-cols-1 xs:grid-cols-2 gap-x-3 gap-y-1">
+        <div className="px-4 pb-3 grid grid-cols-2 sm:grid-cols-3 gap-x-3 gap-y-1">
           {stats.map((s) => {
             const StatIcon = s.icon;
             return (
@@ -362,28 +363,40 @@ export const FileCard = memo(function FileCard({
       )}
 
       {/* ── Document type ── */}
-      {doc.document_type && (
-        <div className="px-4 pb-3 flex items-center gap-1.5 text-xs text-muted-foreground">
-          <Tag className="w-3.5 h-3.5 flex-shrink-0" />
-          <span>{doc.document_type.name}</span>
-        </div>
-      )}
+      <div className="px-4 pb-3 flex items-center gap-1.5 text-xs text-muted-foreground">
+        <Tag className="w-3.5 h-3.5 flex-shrink-0" />
+        <span>{doc.document_type?.name || t("common.unknown")}</span>
+      </div>
 
-      {/* ── Digital signatures ── */}
-      {hasSigs && (
-        <div className="px-4 pb-3 space-y-1">
-          {doc.digital_signatures!.map((sig, i) => (
-            <div
-              key={i}
-              className="flex items-center gap-1.5 text-xs text-emerald-400"
-            >
+      {/* ── Digital signatures (always shown if not failed) ── */}
+      {doc.status !== "failed" && (
+        <div className="px-4 pb-3 space-y-1 text-emerald-600 dark:text-emerald-400">
+          {!hasSigs ? (
+            <div className="flex items-center gap-1.5 text-xs">
               <ShieldCheck className="w-3.5 h-3.5 flex-shrink-0" />
-              <span className="truncate">
-                Signed by: {sig.signer_name || "Unknown"}
-                {sig.organization && ` (${sig.organization})`}
-              </span>
+              <span className="truncate">{t("files.metadata.signed_by")}: {t("common.unknown")}</span>
             </div>
-          ))}
+          ) : (
+            Array.from(
+              new Map(
+                doc.digital_signatures!.map((sig) => [
+                  sig.signer_name?.toLowerCase() || "unknown",
+                  sig,
+                ])
+              ).values()
+            ).map((sig, i) => (
+              <div
+                key={i}
+                className="flex items-center gap-1.5 text-xs"
+              >
+                <ShieldCheck className="w-3.5 h-3.5 flex-shrink-0" />
+                <span className="truncate">
+                  {t("files.metadata.signed_by")}: {sig.signer_name || t("common.unknown")}
+                  {sig.organization && ` (${sig.organization})`}
+                </span>
+              </div>
+            ))
+          )}
         </div>
       )}
 

@@ -97,6 +97,7 @@ async def classify_with_llm(markdown_text: str) -> tuple[str | None, str | None]
     if not markdown_text:
         return None, None
 
+    content_str = ""
     try:
         llm = get_memory_agent()
         preview = markdown_text[:1500].strip()

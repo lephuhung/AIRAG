@@ -125,7 +125,8 @@ async def handle_parse(payload: dict) -> None:
                 from app.services.document_type_classifier import classify_with_llm
                 from app.models.document_type import DocumentType as _DT
                 # LLM-only classification (Qwen3-4B via vLLM memory agent)
-                slug, document_number = await classify_with_llm(text_preview) if text_preview else (None, None)
+                # Pass the beginning of parsed markdown — the header/number is almost always there
+                slug, document_number = await classify_with_llm(parsed.markdown) if parsed.markdown else (None, None)
                 if slug:
                     dt_result = await db.execute(
                         select(_DT).where(_DT.slug == slug, _DT.is_active.is_(True))

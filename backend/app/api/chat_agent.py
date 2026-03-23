@@ -387,7 +387,7 @@ async def _execute_search_documents(
                 chunks = result.chunks
                 citations = result.citations
                 if result.knowledge_graph_summary:
-                    all_kg_summaries.append(f"### KG Insights from {ws_name}\n{result.knowledge_graph_summary}")
+                    all_kg_summaries.append(f"### Knowledge Graph Insights\n{result.knowledge_graph_summary}")
             except Exception as e:
                 logger.warning(f"Search failed for workspace {workspace_id}: {e}")
         else:
@@ -651,7 +651,7 @@ async def _search_memories(
     # Format and log memories
     context_parts = []
     for i, m in enumerate(memories):
-        context_parts.append(f"• [{m.category}] {m.content}")
+        context_parts.append(f"• [MEM-{i+1}] [{m.category}] {m.content}")
     context = "\n".join(context_parts)
     logger.info(f"[MEMORY] Found {len(memories)} relevant snippets for user_id={user_id}. Content preview: {context[:200]}...")
     return context
@@ -778,7 +778,10 @@ async def agent_chat_stream(
     # Build user message
     messages.append(LLMMessage(role="user", content=message))
 
-    # 1. Detect if it's a simple greeting/acknowledgement (bypass search logic)
+    # 1. Detect messages that do NOT need a document search:
+    #    a) simple greetings / acknowledgements / farewells
+    #    b) personal statements where the user shares info about themselves
+    #       (these should be acknowledged from memory, not trigger a KB search)
     greeting_detected = False
     import string
     low_msg = message.lower().strip(string.punctuation + " ")
@@ -796,7 +799,17 @@ async def agent_chat_stream(
         # Farewells
         "bye", "goodbye", "tạm biệt", "bái bai", "hẹn gặp lại",
     }
-    if low_msg in _GREETING_TOKENS:
+    # Personal-statement prefixes — user is sharing info about themselves,
+    # not asking about documents. No KB search needed; just acknowledge.
+    _PERSONAL_PREFIXES = (
+        "tôi tên", "tên tôi", "tôi là ", "mình là ", "tôi làm việc",
+        "tôi ở ", "tôi sống", "tôi dùng ", "tôi đang dùng", "tôi thích ",
+        "tôi không thích", "tôi muốn bạn", "hãy gọi tôi", "call me ",
+        "my name is", "i am ", "i'm ", "i work at", "i live in",
+        "i use ", "i like ", "i don't like", "i prefer ",
+        "always call me", "please call me",
+    )
+    if low_msg in _GREETING_TOKENS or any(low_msg.startswith(p) for p in _PERSONAL_PREFIXES):
         greeting_detected = True
 
     # Tool / prompt setup
@@ -812,13 +825,18 @@ async def agent_chat_stream(
                 logger.info(f"Auto-recall injected {len(memory_context)} chars of memory context for user {user_id}")
                 # Move User Context to a separate system block or make it VERY prominent
                 messages.insert(0, LLMMessage(
-                    role="system", 
-                    content=f"AUTHENTICATED USER PROFILE (PERSONAL HISTORY):\n{memory_context}\n\n"
-                            "The above data is from our internal database for this specific user. "
-                            "If the user asks 'Who am I?', 'What is my name?', 'Where do I work?', or 'What device am I using?', "
-                            "you MUST answer based ONLY on the data above. "
-                            "When mentioning these facts, simply add the brain icon 🧠 to mark it as a memory. "
-                            "DO NOT use numerical IDs like [1] or tags like [MEM-1]."
+                    role="system",
+                    content=(
+                        f"AUTHENTICATED USER PROFILE (PERSONAL HISTORY):\n{memory_context}\n\n"
+                        "Rules for using this profile:\n"
+                        "1. If the user asks about themselves (name, job, device, preferences, etc.), "
+                        "answer DIRECTLY from this profile. Do NOT search documents. Do NOT mix in document content.\n"
+                        "2. When citing a fact from this profile, add the 🧠 icon after the claim. "
+                        "Do NOT use numeric tags like [MEM-1] or [1].\n"
+                        "3. For all other questions (about documents, data, topics), IGNORE this profile "
+                        "and answer from document sources only. Do NOT volunteer personal facts unprompted.\n"
+                        "4. NEVER blend personal facts with document answers in the same sentence."
+                    ),
                 ))
         except Exception as e:
             logger.warning(f"Auto-recall failed for user {user_id}: {e}")
@@ -852,8 +870,7 @@ async def agent_chat_stream(
                 "combining data from MULTIPLE sources.\n"
                 "- TABLE DATA: Sources may contain table data as 'Key, Year = Value' pairs. "
                 "Example: 'ROE, 2023 = 12,8%' means ROE was 12.8% in 2023.\n"
-                "- If no source contains relevant information, check if your User Context has the answer.\n"
-                "- If neither sources nor User Context have the answer, say: "
+                "- If no source contains relevant information, say: "
                 "\"Tài liệu không chứa thông tin này.\"\n",
             ]
             tool_result_content = "\n".join(tool_result_parts)

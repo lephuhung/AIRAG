@@ -9,6 +9,14 @@ export function useAdminTenants() {
   });
 }
 
+export function useTenant(tenantId: number | null) {
+  return useQuery({
+    queryKey: ["tenant", tenantId],
+    queryFn: () => (tenantId ? api.get<Tenant>(`/tenants/${tenantId}`) : null),
+    enabled: !!tenantId,
+  });
+}
+
 export function useCreateTenant() {
   const queryClient = useQueryClient();
   return useMutation({

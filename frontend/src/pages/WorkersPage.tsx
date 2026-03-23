@@ -441,7 +441,7 @@ export function WorkersPage() {
                           </span>
                         </div>
                         <span className="text-xs text-muted-foreground">
-                          {totalConsumers} consumer{totalConsumers !== 1 ? "s" : ""}
+                          {t("workers.consumers", { count: totalConsumers })}
                         </span>
                       </div>
 
@@ -613,7 +613,7 @@ export function WorkersPage() {
                         </div>
                         <div className="text-center">
                           <p className="text-lg font-bold tabular-nums text-primary">{q.consumers}</p>
-                          <p className="text-[10px] text-muted-foreground">{t("workers.consumers")}</p>
+                          <p className="text-[10px] text-muted-foreground">{t("workers.consumers_label")}</p>
                         </div>
                       </div>
                       {(q.message_rate_in > 0 || q.message_rate_out > 0) && (
@@ -836,8 +836,8 @@ export function WorkersPage() {
                     title="Pipeline"
                     status={health.checks.pipeline.status}
                     details={[
-                      `In progress: ${health.checks.pipeline.documents_in_progress}`,
-                      `Failed: ${health.checks.pipeline.documents_failed}`,
+                      t("workers.health.in_progress", { count: health.checks.pipeline.documents_in_progress }),
+                      t("workers.health.failed", { count: health.checks.pipeline.documents_failed }),
                     ]}
                   />
 
@@ -846,7 +846,7 @@ export function WorkersPage() {
                     title="Dead Letter Queue"
                     status={health.checks.dead_letter_queue.status}
                     details={[
-                      `Messages: ${health.checks.dead_letter_queue.messages}`,
+                      t("workers.health.messages", { count: health.checks.dead_letter_queue.messages }),
                     ]}
                   />
 
@@ -857,9 +857,9 @@ export function WorkersPage() {
                       title={qName}
                       status={qInfo.status}
                       details={[
-                        `Consumers: ${qInfo.consumers}`,
-                        `Ready: ${qInfo.messages_ready}`,
-                        qInfo.has_dlx ? "DLX: ✓" : "DLX: ✗",
+                        t("workers.health.consumers", { count: qInfo.consumers }),
+                        t("workers.health.ready", { count: qInfo.messages_ready }),
+                        t("workers.health.dlx", { status: qInfo.has_dlx ? "✓" : "✗" }),
                         ...qInfo.warnings.map((w) => `⚠ ${w}`),
                       ]}
                     />

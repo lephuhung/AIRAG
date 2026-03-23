@@ -16,6 +16,7 @@ import {
   Trash2,
   Edit,
   PieChart,
+  Loader2,
 } from "lucide-react";
 import { useWorkspaces } from "@/hooks/useWorkspaces";
 import { useMyTenants } from "@/hooks/useMyTenants";
@@ -101,19 +102,25 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
       <nav className="flex-shrink-0 px-2 pt-3 space-y-0.5">
         <button
           onClick={handleNewSession}
+          disabled={createSession.isPending}
           className={cn(
             "w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-sm transition-colors group",
             isChatPage && !location.pathname.match(/\/chat\/\d+/)
               ? "bg-primary/10 text-primary font-medium"
-              : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+              : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+            createSession.isPending && "opacity-70 cursor-not-allowed"
           )}
-          title={collapsed ? "New chat" : undefined}
+          title={collapsed ? t("nav.new_chat") : undefined}
         >
           <div className="flex items-center gap-2.5">
-            <Edit className="w-4 h-4 flex-shrink-0" />
+            {createSession.isPending ? (
+              <Loader2 className="w-4 h-4 animate-spin flex-shrink-0" />
+            ) : (
+              <Edit className="w-4 h-4 flex-shrink-0" />
+            )}
             {!collapsed && <span className="truncate">{t("nav.new_chat")}</span>}
           </div>
-          {!collapsed && (
+          {!collapsed && !createSession.isPending && (
             <div className="opacity-0 group-hover:opacity-100 transition-opacity p-0.5" title="New Chat">
                <Plus className="w-4 h-4" />
             </div>

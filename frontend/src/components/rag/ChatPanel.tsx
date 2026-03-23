@@ -172,6 +172,21 @@ function CitationLink({
 }
 
 // ---------------------------------------------------------------------------
+// Memory citation badge — clickable [MEM-N] → Brain icon + text
+// ---------------------------------------------------------------------------
+function MemoryCitation({ index }: { index: string }) {
+  const { t } = useTranslation();
+  return (
+    <span
+      className="inline-flex items-center justify-center w-[18px] h-[18px] mx-0.5 text-[10px] font-medium rounded-full bg-amber-400/15 text-amber-600 dark:text-amber-400 border border-amber-400/20 align-middle shadow-sm"
+      title={`${t("chat.memory_citation")}: ${index}`}
+    >
+      <Brain className="w-2.5 h-2.5 flex-shrink-0" />
+    </span>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Inline image badge — clickable [IMG-N] → icon + docname-P.N with preview
 // ---------------------------------------------------------------------------
 function InlineImageRef({
@@ -234,7 +249,7 @@ function InlineImageRef({
 // components. Supports both new [a3x9] and legacy [1] citation formats.
 // Also handles grouped brackets like [a3x9, b2m7] by splitting into individual.
 // ---------------------------------------------------------------------------
-const CITATION_RE = /(\[\s*(?:[a-zA-Z0-9]+|IMG-[a-zA-Z0-9]+)(?:\s*,\s*(?:[a-zA-Z0-9]+|IMG-[a-zA-Z0-9]+))*\s*\])/g;
+const CITATION_RE = /(\[\s*(?:[a-zA-Z0-9-]+|IMG-[a-zA-Z0-9-]+)(?:\s*,\s*(?:[a-zA-Z0-9-]+|IMG-[a-zA-Z0-9-]+))*\s*\])/g;
 
 function injectCitations(
   children: ReactNode,
@@ -272,6 +287,13 @@ function injectCitations(
               result.push(<InlineImageRef key={key} imgRefId={imgId} imageRef={imageRef} />);
               return;
             }
+          }
+          // Memory citation: MEM-xxxx
+          const memMatch = token.match(/^MEM-(.+)$/i);
+          if (memMatch) {
+            const memId = memMatch[1];
+            result.push(<MemoryCitation key={key} index={`MEM-${memId}`} />);
+            return;
           }
           // Text citation: match source by index (string or numeric)
           // First try current message's sources, then fallback to historical sources
@@ -984,21 +1006,21 @@ const MessageBubble = memo(function MessageBubble({
     .toUpperCase();
 
   const proseClasses = cn(
-    "prose prose-base max-w-none text-foreground/90",
+    "prose prose-sm max-w-none text-foreground/90 font-chat",
     "[&_p]:my-1.5 [&_p]:text-justify [&_ul]:my-1.5 [&_ol]:my-1.5 [&_li]:my-1 [&_li]:text-justify",
     "[&_pre]:bg-transparent [&_pre]:border-none [&_pre]:p-0 [&_pre]:m-0",
-    "[&_code]:bg-muted/50 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-sm [&_code]:text-foreground/90",
+    "[&_code]:bg-muted/50 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-[13px] [&_code]:text-foreground/90",
     "[&_a]:text-primary [&_a]:underline [&_a]:underline-offset-2",
     "[&_strong]:text-foreground [&_em]:text-foreground/80",
     "[&_h1]:text-foreground [&_h2]:text-foreground [&_h3]:text-foreground [&_h4]:text-foreground",
-    "[&_h1]:text-xl [&_h1]:font-bold [&_h1]:mt-4 [&_h1]:mb-2",
-    "[&_h2]:text-lg [&_h2]:font-semibold [&_h2]:mt-3.5 [&_h2]:mb-1.5",
-    "[&_h3]:text-base [&_h3]:font-semibold [&_h3]:mt-3 [&_h3]:mb-1",
+    "[&_h1]:text-lg [&_h1]:font-bold [&_h1]:mt-4 [&_h1]:mb-2",
+    "[&_h2]:text-base [&_h2]:font-semibold [&_h2]:mt-3.5 [&_h2]:mb-1.5",
+    "[&_h3]:text-sm [&_h3]:font-semibold [&_h3]:mt-3 [&_h3]:mb-1",
     "[&_blockquote]:border-l-2 [&_blockquote]:border-primary/30 [&_blockquote]:pl-3 [&_blockquote]:italic [&_blockquote]:text-foreground/60",
-    "[&_table]:text-sm [&_th]:px-2.5 [&_th]:py-1.5 [&_td]:px-2.5 [&_td]:py-1.5 [&_th]:text-foreground/80 [&_td]:text-foreground/80",
+    "[&_table]:text-[13px] [&_th]:px-2.5 [&_th]:py-1.5 [&_td]:px-2.5 [&_td]:py-1.5 [&_th]:text-foreground/80 [&_td]:text-foreground/80",
     "[&_li]:text-foreground/90",
     "[&_.katex-display]:overflow-x-auto [&_.katex-display]:py-2.5",
-    "[&_.katex]:text-[1em]"
+    "[&_.katex]:text-[0.95em]"
   );
 
   return (
@@ -1040,7 +1062,7 @@ const MessageBubble = memo(function MessageBubble({
         )}
 
         {isUser ? (
-          <p className="text-base leading-relaxed whitespace-pre-wrap">
+          <p className="text-sm leading-relaxed whitespace-pre-wrap font-chat">
             {message.content}
           </p>
         ) : message.isStreaming ? (

@@ -5,7 +5,7 @@
   "nav": {
     "new_chat": "Chat mới",
     "dashboard": "Bảng điều khiển",
-    "knowledge_bases": "kho tri thức",
+    "knowledge_bases": "Kho tri thức",
     "files": "Tệp tin",
     "workers": "Tiến trình",
     "admin": {
@@ -37,6 +37,7 @@
     "create": "Tạo mới",
     "creating": "Đang tạo...",
     "none": "Không có",
+    "empty": "Trống",
     "you": "Bạn",
     "edit": "Sửa",
     "search": "Tìm kiếm",
@@ -80,7 +81,7 @@
     "deactivate": "Vô hiệu hóa",
     "restart": "Khởi động lại",
     "start": "Khởi động",
-    "unknown": "Không xác định",
+    "unknown": "Không rõ",
     "entities": "Thực thể",
     "relationships": "Mối quan hệ",
     "loading_rels": "Đang tải mối quan hệ...",
@@ -178,7 +179,8 @@
     "view_kg": "Xem trong biểu đồ tri thức",
     "highlight_kg": "Làm nổi bật trong biểu đồ tri thức",
     "view_source": "Xem nguồn: {{name}} (trang {{page}})",
-    "copy_code": "Sao chép mã"
+    "copy_code": "Sao chép mã",
+    "memory_citation": "Trích dẫn từ trí nhớ"
   },
   "rag": {
     "status": {
@@ -209,7 +211,8 @@
     "no_markdown": "Tài liệu này không có nội dung văn bản khả dụng",
     "analyzing_desc": "Đang trích xuất nội dung và xây dựng chỉ mục tìm kiếm.",
     "reindex_started": "Đã bắt đầu xử lý lại tài liệu",
-    "reindex_failed": "Xử lý lại tài liệu thất bại"
+    "reindex_failed": "Xử lý lại tài liệu thất bại",
+    "unknown": "Không rõ"
   },
   "kg": {
     "no_data": "Không có dữ liệu biểu đồ tri thức",
@@ -271,12 +274,12 @@
     "delete_confirm_title": "Xóa kho tri thức",
     "delete_confirm_msg": "Bạn có chắc chắn? Tất cả tài liệu, dữ liệu chỉ mục và biểu đồ tri thức sẽ bị xóa vĩnh viễn.",
     "empty_title": "Tạo kho tri thức đầu tiên của bạn",
-    "empty_desc1": "kho tri thức lưu trữ tài liệu và cho phép tìm kiếm bằng AI.",
+    "empty_desc1": "Kho tri thức lưu trữ tài liệu và cho phép tìm kiếm bằng AI.",
     "empty_desc2": "Kết nối chúng với các dự án như một nguồn dữ liệu.",
     "section_legacy": "Chia sẻ (Cũ)",
-    "section_public": "kho tri thức công khai",
+    "section_public": "Kho tri thức công khai",
     "section_org": "Tổ chức",
-    "section_personal": "kho tri thức cá nhân",
+    "section_personal": "Kho tri thức cá nhân",
     "no_public": "Không có kho tri thức công khai",
     "no_personal": "Chưa có kho tri thức cá nhân",
     "docs_count": "{{count}} tài liệu",
@@ -325,7 +328,6 @@
     "chunks_count": "{{count}} đoạn",
     "uploaded": "Đã tải lên",
     "updated": "Đã cập nhật",
-    "signed_by": "Ký bởi: {{name}}",
     "status": {
       "pending": "Chờ xử lý",
       "parsing": "Đang phân tích",
@@ -347,7 +349,8 @@
       "pages": "trang",
       "chunks": "mảnh",
       "images": "hình ảnh",
-      "tables": "bảng"
+      "tables": "bảng",
+      "signed_by": "Ký bởi"
     },
     "tasks": {
       "embed": "Nhúng",
@@ -388,7 +391,7 @@
     "healthy": "Khỏe mạnh",
     "degraded": "Suy giảm",
     "critical": "Nghiêm trọng",
-    "unknown": "Không xác định",
+    "unknown": "Không rõ",
     "rabbitmq_connected": "RabbitMQ Đã kết nối",
     "rabbitmq_disconnected": "RabbitMQ Đã ngắt kết nối",
     "dlq_msg": "{{count}} tin nhắn lỗi (DLQ)",
@@ -418,6 +421,7 @@
     "management": "Quản lý tiến trình",
     "consumers": "{{count}} consumer",
     "consumers_plural": "{{count}} consumers",
+    "consumers_label": "Người thực thi",
     "start_success": "Đã chạy {{count}} tiến trình {{type}}",
     "stop_success": "Đã dừng tiến trình {{type}}",
     "restart_success": "Đã khởi động lại tiến trình {{type}}",
@@ -469,6 +473,14 @@
       "building_kg": "Đang xây biểu đồ",
       "indexed": "Đã chỉ mục",
       "failed": "Thất bại"
+    },
+    "health": {
+      "in_progress": "Đang xử lý: {{count}}",
+      "failed": "Thất bại: {{count}}",
+      "messages": "Tin nhắn: {{count}}",
+      "consumers": "Người tiêu thụ: {{count}}",
+      "ready": "Sẵn sàng: {{count}}",
+      "dlx": "DLX: {{status}}"
     }
   },
   "admin": {
@@ -582,6 +594,24 @@
       },
       "member_role": "Thành viên",
       "admin_role": "Quản trị viên",
+      "manage": {
+        "title": "Quản lý tổ chức",
+        "members": "Thành viên",
+        "pending": "Chờ phê duyệt",
+        "approve": "Phê duyệt",
+        "reject": "Từ chối",
+        "remove": "Loại bỏ",
+        "promote": "Thăng cấp",
+        "demote": "Hạ cấp",
+        "invite_btn": "Mời thành viên",
+        "no_members": "Chưa có thành viên nào được duyệt.",
+        "loading": "Đang tải dữ liệu tổ chức...",
+        "unknown_user": "Không rõ",
+        "role_changed": "Đã thay đổi vai trò thành {{role}}",
+        "remove_success": "Đã xóa người dùng",
+        "approve_success": "Đã phê duyệt người dùng",
+        "reject_success": "Đã từ chối người dùng"
+      },
       "toast": {
         "required": "Tên và mã tổ chức là bắt buộc",
         "updated": "Đã cập nhật tổ chức",

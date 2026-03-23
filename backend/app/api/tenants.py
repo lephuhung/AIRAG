@@ -154,6 +154,41 @@ async def list_tenants(
     ]
 
 
+@router.get("/{tenant_id}", response_model=TenantResponse)
+async def get_tenant(
+    tenant_id: int,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
+    """Get single tenant details (SuperAdmin or Tenant Admin)."""
+    tenant = await _get_tenant(tenant_id, db)
+    await _require_tenant_admin(tenant_id, user, db)
+
+    # We need mc and pc for TenantResponse
+    member_count = await db.scalar(
+        select(func.count(TenantUser.id)).where(
+            TenantUser.tenant_id == tenant_id, TenantUser.is_approved.is_(True)
+        )
+    )
+    pending_count = await db.scalar(
+        select(func.count(TenantUser.id)).where(
+            TenantUser.tenant_id == tenant_id, TenantUser.is_approved.is_(False)
+        )
+    )
+
+    return TenantResponse(
+        id=tenant.id,
+        name=tenant.name,
+        slug=tenant.slug,
+        domain=tenant.domain,
+        is_active=tenant.is_active,
+        member_count=member_count or 0,
+        pending_count=pending_count or 0,
+        created_at=tenant.created_at,
+        updated_at=tenant.updated_at,
+    )
+
+
 @router.put("/{tenant_id}", response_model=TenantResponse)
 async def update_tenant(
     tenant_id: int,
