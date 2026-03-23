@@ -79,6 +79,13 @@ class Settings(BaseSettings):
     HRAG_CONTEXTUAL_MAX_TOKENS: int = Field(default=120)   # max tokens for generated context sentence
     HRAG_CONTEXTUAL_CONCURRENCY: int = Field(default=8)    # parallel LLM calls per document
 
+    # BM25 hybrid search (lexical search merged with vector via Reciprocal Rank Fusion)
+    # Reduces retrieval failure rate by an additional ~14% on top of contextual embeddings.
+    # No extra model needed — pure BM25 over in-memory corpus (per workspace, lazy-built).
+    HRAG_ENABLE_BM25: bool = Field(default=True)
+    HRAG_BM25_PREFETCH: int = Field(default=20)   # top-N BM25 candidates before RRF merge
+    HRAG_RRF_K: int = Field(default=60)           # RRF constant (higher = smoother, 60 is standard)
+
     # Knowledge Graph
     HRAG_KG_LANGUAGE: str = Field(default="Vietnamese")
     HRAG_KG_ENTITY_TYPES: list[str] = Field(default=[

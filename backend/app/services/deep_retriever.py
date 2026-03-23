@@ -3,13 +3,15 @@ Deep Retriever
 ===============
 
 Hybrid retrieval combining Knowledge Graph (LightRAG) + Vector Search (ChromaDB)
-+ Cross-encoder Reranking (bge-reranker-v2-m3).
++ BM25 Lexical Search + Cross-encoder Reranking (bge-reranker-v2-m3).
 
 Pipeline:
   1. KG query  (parallel) → entity/relationship summary
   2. Vector search → over-fetch top-N candidates (HRAG_VECTOR_PREFETCH)
-  3. Cross-encoder rerank → precision filter to top-K (HRAG_RERANKER_TOP_K)
-  4. Merge with citations + optional image references
+  3. BM25 search  (parallel with vector, optional) → top-N lexical candidates
+  4. Merge vector + BM25 via Reciprocal Rank Fusion (RRF)
+  5. Cross-encoder rerank → precision filter to top-K (HRAG_RERANKER_TOP_K)
+  6. Merge with citations + optional image references
 """
 from __future__ import annotations
 
@@ -71,9 +73,11 @@ class DeepRetriever:
 
         Flow:
           1. [parallel] KG query + Vector over-fetch (HRAG_VECTOR_PREFETCH)
-          2. Cross-encoder rerank vector results → final top_k
-          3. Optionally find related images from chunk pages
-          4. Assemble structured context for LLM
+                        + BM25 lexical search (when HRAG_ENABLE_BM25=true)
+          2. Merge vector + BM25 via Reciprocal Rank Fusion (RRF)
+          3. Cross-encoder rerank merged results → final top_k
+          4. Optionally find related images from chunk pages
+          5. Assemble structured context for LLM
 
         Args:
             question: Natural language query
@@ -100,6 +104,15 @@ class DeepRetriever:
             )
         )
 
+        # BM25 lexical search (parallel with vector search)
+        bm25_task = None
+        if settings.HRAG_ENABLE_BM25:
+            bm25_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self._bm25_query, question, settings.HRAG_BM25_PREFETCH, document_ids
+                )
+            )
+
         # Await results
         kg_summary = ""
         if kg_task:
@@ -109,6 +122,19 @@ class DeepRetriever:
                 logger.warning(f"KG query failed, continuing with vector only: {e}")
 
         raw_chunks, raw_citations = await vector_task
+
+        bm25_results: list[dict] = []
+        if bm25_task:
+            try:
+                bm25_results = await bm25_task
+            except Exception as e:
+                logger.warning(f"[deep_retriever] BM25 search failed (non-fatal): {e}")
+
+        # Merge vector + BM25 via RRF, then rerank
+        if bm25_results:
+            raw_chunks, raw_citations = self._rrf_merge(
+                raw_chunks, raw_citations, bm25_results
+            )
 
         # Rerank: cross-encoder scoring for precision
         chunks, citations = await asyncio.to_thread(
@@ -160,13 +186,122 @@ class DeepRetriever:
             logger.warning(f"KG raw context failed: {e}")
             return ""
 
-    def _vector_query(
+    def _bm25_query(
         self,
         question: str,
-        top_k: int,
+        top_n: int,
         document_ids: Optional[list[int]],
+    ) -> list[dict]:
+        """
+        BM25 lexical search (synchronous, CPU-bound — run in thread).
+        Returns list of dicts with id, metadata, document, bm25_rank.
+        """
+        from app.services.bm25_index import bm25_search
+        return bm25_search(
+            vector_store=self.vector_store,
+            query=question,
+            top_n=top_n,
+            document_ids=document_ids,
+        )
+
+    def _rrf_merge(
+        self,
+        vector_chunks: list[EnrichedChunk],
+        vector_citations: list[Citation],
+        bm25_results: list[dict],
+        k: int | None = None,
     ) -> tuple[list[EnrichedChunk], list[Citation]]:
-        """Synchronous vector search via ChromaDB (over-fetch stage)."""
+        """
+        Reciprocal Rank Fusion: merge vector search and BM25 results.
+
+        RRF score = 1/(k + rank_vector) + 1/(k + rank_bm25)
+        where rank is 1-indexed; items only in one list get only that term.
+
+        Returns deduplicated list sorted by RRF score descending, preserving
+        EnrichedChunk / Citation objects from the vector results when available
+        (BM25-only hits are added from bm25_results metadata).
+        """
+        rrf_k = k or settings.HRAG_RRF_K
+
+        # Map chunk_id → (EnrichedChunk, Citation, vector_rank 1-indexed)
+        vector_map: dict[str, tuple[EnrichedChunk, Citation, int]] = {}
+        for rank, (chunk, citation) in enumerate(zip(vector_chunks, vector_citations), start=1):
+            chunk_id = f"doc_{chunk.document_id}_chunk_{chunk.chunk_index}"
+            vector_map[chunk_id] = (chunk, citation, rank)
+
+        # Map chunk_id → bm25_rank 1-indexed
+        bm25_map: dict[str, tuple[dict, int]] = {}
+        for rank, result in enumerate(bm25_results, start=1):
+            bm25_map[result["id"]] = (result, rank)
+
+        # Collect all unique IDs
+        all_ids = set(vector_map.keys()) | set(bm25_map.keys())
+
+        scored: list[tuple[float, str]] = []
+        for cid in all_ids:
+            rrf_score = 0.0
+            if cid in vector_map:
+                rrf_score += 1.0 / (rrf_k + vector_map[cid][2])
+            if cid in bm25_map:
+                rrf_score += 1.0 / (rrf_k + bm25_map[cid][1])
+            scored.append((rrf_score, cid))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        merged_chunks: list[EnrichedChunk] = []
+        merged_citations: list[Citation] = []
+
+        for _, cid in scored:
+            if cid in vector_map:
+                chunk, citation, _ = vector_map[cid]
+                merged_chunks.append(chunk)
+                merged_citations.append(citation)
+            else:
+                # BM25-only hit: reconstruct EnrichedChunk from metadata
+                bm25_hit, _ = bm25_map[cid]
+                meta = bm25_hit.get("metadata", {})
+                heading_path = []
+                heading_str = meta.get("heading_path", "")
+                if heading_str and isinstance(heading_str, str):
+                    heading_path = heading_str.split(" > ")
+                image_refs = [x for x in (meta.get("image_ids") or "").split("|") if x]
+                table_refs = [x for x in (meta.get("table_ids") or "").split("|") if x]
+                chunk = EnrichedChunk(
+                    content=bm25_hit.get("document", ""),
+                    chunk_index=meta.get("chunk_index", 0),
+                    source_file=meta.get("source", ""),
+                    document_id=meta.get("document_id", 0),
+                    page_no=meta.get("page_no", 0),
+                    heading_path=heading_path,
+                    image_refs=image_refs,
+                    table_refs=table_refs,
+                    has_table=meta.get("has_table", False),
+                    has_code=meta.get("has_code", False),
+                )
+                merged_chunks.append(chunk)
+                merged_citations.append(Citation(
+                    source_file=meta.get("source", "Unknown"),
+                    document_id=meta.get("document_id", 0),
+                    page_no=meta.get("page_no", 0),
+                    heading_path=heading_path,
+                ))
+
+        bm25_only = len(all_ids) - len(vector_map)
+        if bm25_only > 0:
+            logger.debug(
+                f"[deep_retriever] RRF merged {len(vector_chunks)} vector + "
+                f"{len(bm25_results)} BM25 → {len(merged_chunks)} unique "
+                f"({bm25_only} BM25-only hits promoted)"
+            )
+        else:
+            logger.debug(
+                f"[deep_retriever] RRF merged {len(vector_chunks)} vector + "
+                f"{len(bm25_results)} BM25 → {len(merged_chunks)} unique"
+            )
+
+        return merged_chunks, merged_citations
+
+    def _vector_query(
         query_embedding = self.embedder.embed_query(question)
 
         where = None
