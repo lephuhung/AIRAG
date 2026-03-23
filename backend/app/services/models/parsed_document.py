@@ -51,6 +51,7 @@ class EnrichedChunk:
     has_table: bool = False
     has_code: bool = False
     contextualized: str = ""  # heading_path joined for context
+    score: float = 0.0
 
 
 @dataclass

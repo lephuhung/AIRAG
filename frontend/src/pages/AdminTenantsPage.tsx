@@ -321,7 +321,7 @@ export function AdminTenantsPage() {
                     title={t("admin.tenants.members_btn")}
                   >
                     <ExternalLink className="w-3.5 h-3.5 mr-1" />
-                    {t("admin.members")}
+                    {t("admin.tenants.members")}
                   </Button>
                   <Button
                     size="sm"

@@ -40,15 +40,15 @@ class Settings(BaseSettings):
     GOOGLE_AI_API_KEY: str = Field(default="")
     LLM_MODEL_FAST: str = Field(default="gemini-2.5-flash")
     LLM_THINKING_LEVEL: str = Field(default="medium")
-    LLM_MAX_OUTPUT_TOKENS: int = Field(default=8192)
+    LLM_MAX_OUTPUT_TOKENS: int = Field(default=4096)
     OLLAMA_HOST: str = Field(default="http://localhost:11434")
     OLLAMA_MODEL: str = Field(default="gemma3:12b")
     OLLAMA_ENABLE_THINKING: bool = Field(default=False)
-    MEMORY_AGENT_MODEL: str = Field(default="Qwen/Qwen3.5-0.8B")
-    MEMORY_AGENT_BASE_URL: str = Field(default="http://10.8.0.8:8001/v1")
+    MEMORY_AGENT_MODEL: str = Field(default="qwen-memory")
+    MEMORY_AGENT_BASE_URL: str = Field(default="http://localhost:8082/v1")
     MEMORY_AGENT_API_KEY: str = Field(default="none")
-    MEMORY_AGENT_LOCAL: bool = Field(default=True)
-    MEMORY_AGENT_GPU_UTILIZATION: float = Field(default=0.10)
+    MEMORY_AGENT_LOCAL: bool = Field(default=False)
+    MEMORY_AGENT_GPU_UTILIZATION: float = Field(default=0.15)
     MEMORY_AGENT_CUDA_DEVICE: str = Field(default="auto")
 
     # OpenAI-compatible provider (vLLM, LM Studio, llama.cpp, etc.)
@@ -113,8 +113,8 @@ class Settings(BaseSettings):
     HRAG_OCR_GPU_MEMORY_UTILIZATION: float = Field(default=0.15)
     # Max sequence length passed to vLLM; None = use model default.
     HRAG_OCR_MAX_MODEL_LEN: int | None = Field(default=None)
-    HUNYUAN_OCR_API_URL: str = Field(default="http://10.8.0.8:8001/v1")
-    HUNYUAN_OCR_MODEL: str = Field(default="tencent/HunyuanOCR")
+    HUNYUAN_OCR_API_URL: str = Field(default="http://localhost:8001/v1")
+    HUNYUAN_OCR_MODEL: str = Field(default="hunyuan-ocr")
 
     # Knowledge Graph backend
     HRAG_KG_GRAPH_BACKEND: str = Field(default="networkx")

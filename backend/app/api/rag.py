@@ -615,17 +615,8 @@ async def get_document_chunks(
 # Knowledge Graph exploration endpoints (Phase 9)
 # ---------------------------------------------------------------------------
 
-# Module-level cache: workspace_id → KnowledgeGraphService
-# Avoids re-initializing LightRAG (and reloading the embedding model) on every request.
-_kg_service_cache: dict[int, "KnowledgeGraphService"] = {}
-
-
-async def _get_kg_service(workspace_id: int):
-    """Get KnowledgeGraphService for a knowledge base — cached per workspace."""
-    from app.services.knowledge_graph_service import KnowledgeGraphService
-    if workspace_id not in _kg_service_cache:
-        _kg_service_cache[workspace_id] = KnowledgeGraphService(workspace_id)
-    return _kg_service_cache[workspace_id]
+# --- Knowledge Graph Service Factory Moved to rag_service.py ---
+from app.services.rag_service import get_kg_service as _get_kg_service
 
 
 @router.get("/entities/{workspace_id}", response_model=list[KGEntityResponse])

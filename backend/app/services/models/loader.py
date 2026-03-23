@@ -41,7 +41,7 @@ def preload_models() -> None:
     elapsed = time.time() - t0
     logger.info(f"[preload] Retrieval models loaded in {elapsed:.1f}s")
 
-    # 3. Memory Agent (Qwen3.5 via local vLLM — used by chat_agent for memory extraction)
+    # 3. Memory Agent (Qwen via vLLM API — used by chat_agent for memory extraction)
     from app.core.config import settings
     if settings.MEMORY_AGENT_LOCAL:
         try:

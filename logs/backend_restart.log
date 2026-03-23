@@ -551,3 +551,215 @@ INFO:     127.0.0.1:53292 - "GET /api/v1/tenants HTTP/1.1" 200 OK
 INFO:     127.0.0.1:53286 - "GET /api/v1/admin/users?page=1&per_page=20 HTTP/1.1" 200 OK
 INFO:     127.0.0.1:53290 - "GET /api/v1/admin/stats HTTP/1.1" 200 OK
 INFO:     127.0.0.1:35634 - "POST /api/v1/auth/refresh HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59852 - "GET /api/v1/tenants HTTP/1.1" 200 OK
+INFO:     127.0.0.1:59858 - "GET /api/v1/workspaces HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60518 - "GET /api/v1/tenants/my HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60530 - "GET /api/v1/tenants/2/users HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60542 - "GET /api/v1/tenants/my HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60550 - "GET /api/v1/tenants/2/users HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60562 - "GET /api/v1/tenants HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60568 - "GET /api/v1/workspaces HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60580 - "GET /api/v1/tenants/my HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60594 - "GET /api/v1/tenants/2/users HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60610 - "GET /api/v1/tenants/my HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60624 - "GET /api/v1/tenants/2/users HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60628 - "GET /api/v1/tenants HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60638 - "GET /api/v1/workspaces HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45390 - "GET /api/v1/config/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45380 - "GET /api/v1/tenants/my HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45370 - "GET /api/v1/rag/chat/sessions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45362 - "GET /api/v1/workspaces HTTP/1.1" 200 OK
+INFO:app.services.knowledge_graph_service:KG graph (Neo4j Cypher): 202 nodes, 305 edges for workspace 1
+INFO:     127.0.0.1:45404 - "GET /api/v1/rag/graph/1?max_nodes=150&max_depth=3 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45442 - "GET /api/v1/config/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45424 - "GET /api/v1/workspaces/1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45426 - "GET /api/v1/documents/workspace/1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45440 - "GET /api/v1/rag/stats/1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45408 - "GET /api/v1/rag/analytics/1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:32776 - "GET /api/v1/workspaces/7 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60976 - "GET /api/v1/rag/stats/7 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:32788 - "GET /api/v1/documents/workspace/7 HTTP/1.1" 200 OK
+INFO:app.services.knowledge_graph_service:KG graph (Neo4j Cypher): 212 nodes, 338 edges for workspace 7
+INFO:     127.0.0.1:60972 - "GET /api/v1/rag/graph/7?max_nodes=150&max_depth=3 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60992 - "GET /api/v1/rag/analytics/7 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:32794 - "GET /api/v1/workspaces HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54460 - "GET /api/v1/workspaces/7 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54478 - "GET /api/v1/documents/workspace/7 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54462 - "GET /api/v1/rag/stats/7 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54492 - "GET /api/v1/workspaces/7 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54502 - "GET /api/v1/documents/workspace/7 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54504 - "GET /api/v1/rag/stats/7 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54506 - "GET /api/v1/workspaces HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54514 - "GET /api/v1/workspaces/1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54528 - "GET /api/v1/documents/workspace/1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:54542 - "GET /api/v1/rag/stats/1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53898 - "GET /api/v1/tenants/my HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53918 - "GET /api/v1/rag/chat/sessions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53906 - "GET /api/v1/workspaces HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53932 - "GET /api/v1/config/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53940 - "GET /api/v1/config/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49760 - "GET /api/v1/workspaces/1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49762 - "GET /api/v1/documents/workspace/1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49766 - "GET /api/v1/rag/stats/1 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57684 - "GET /api/v1/admin/stats HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57694 - "GET /api/v1/admin/users?page=1&per_page=20 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57724 - "GET /api/v1/tenants HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57708 - "GET /api/v1/admin/stats HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55524 - "GET /api/v1/tenants HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55512 - "GET /api/v1/workspaces HTTP/1.1" 200 OK
+INFO:     127.0.0.1:47452 - "GET /api/v1/config/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:47456 - "GET /api/v1/rag/chat/sessions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:47462 - "GET /api/v1/tenants/my HTTP/1.1" 200 OK
+INFO:     127.0.0.1:47474 - "GET /api/v1/tenants HTTP/1.1" 200 OK
+INFO:     127.0.0.1:47436 - "GET /api/v1/workspaces HTTP/1.1" 200 OK
+INFO:     127.0.0.1:47478 - "GET /api/v1/config/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45090 - "GET /api/v1/rag/chat/sessions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45096 - "GET /api/v1/tenants/my HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45074 - "GET /api/v1/workspaces HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45106 - "GET /api/v1/tenants HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45146 - "GET /api/v1/config/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45132 - "GET /api/v1/rag/chat/sessions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45122 - "GET /api/v1/tenants/my HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45162 - "GET /api/v1/tenants HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45112 - "GET /api/v1/workspaces HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45168 - "GET /api/v1/config/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48994 - "GET /api/v1/config/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48980 - "GET /api/v1/tenants HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49002 - "GET /api/v1/rag/chat/sessions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49012 - "GET /api/v1/tenants/my HTTP/1.1" 200 OK
+INFO:     127.0.0.1:48972 - "GET /api/v1/workspaces HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49026 - "GET /api/v1/config/status HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45886 - "GET /api/v1/tenants/my HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45882 - "GET /api/v1/tenants/1/users HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45888 - "GET /api/v1/tenants/my HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45900 - "GET /api/v1/tenants/1/users HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45560 - "GET /api/v1/tenants HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45546 - "GET /api/v1/admin/users?page=1&per_page=20 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45572 - "GET /api/v1/admin/stats HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45588 - "GET /api/v1/admin/stats HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45596 - "GET /api/v1/tenants HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45598 - "GET /api/v1/workspaces HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45602 - "GET /api/v1/document-types HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45620 - "GET /api/v1/workspaces/6 HTTP/1.1" 200 OK
+INFO:app.services.knowledge_graph_service:KG graph (Neo4j Cypher): 106 nodes, 61 edges for workspace 6
+INFO:     127.0.0.1:45604 - "GET /api/v1/rag/graph/6?max_nodes=150&max_depth=3 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45664 - "GET /api/v1/documents/workspace/6 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45650 - "GET /api/v1/rag/stats/6 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45636 - "GET /api/v1/rag/analytics/6 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:51632 - "POST /api/v1/auth/refresh HTTP/1.1" 200 OK
+INFO:     127.0.0.1:38208 - "GET /api/v1/admin/stats HTTP/1.1" 200 OK
+INFO:     127.0.0.1:35468 - "GET /api/v1/tenants/my HTTP/1.1" 200 OK
+INFO:     127.0.0.1:35470 - "GET /api/v1/rag/chat/sessions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:35482 - "GET /api/v1/workspaces HTTP/1.1" 200 OK
+INFO:     127.0.0.1:35484 - "GET /api/v1/admin/stats HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56820 - "GET /api/v1/tenants/my HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56836 - "GET /api/v1/rag/chat/sessions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56824 - "GET /api/v1/workspaces HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56840 - "GET /api/v1/admin/stats HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57936 - "GET /api/v1/rag/chat/sessions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57940 - "GET /api/v1/rag/chat/sessions/ecd778560ef94f0eb2064499d7ebe71e/history HTTP/1.1" 200 OK
+INFO:     127.0.0.1:57942 - "GET /api/v1/rag/capabilities HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60780 - "POST /api/v1/rag/chat/sessions/ecd778560ef94f0eb2064499d7ebe71e/stream HTTP/1.1" 200 OK
+INFO:app.services.llm.ollama:[LocalEmbedding] Reusing global pre-loaded model: BAAI/bge-m3
+Batches:   0%|          | 0/1 [00:00<?, ?it/s]Batches: 100%|██████████| 1/1 [00:00<00:00, 18.52it/s]
+INFO:app.api.chat_agent:Auto-recall injected 335 chars of memory context for user 3
+INFO:app.services.llm.vllm_local:[vLLM/local] Loading model Qwen/Qwen3.5-0.8B (gpu_mem=0.1)
+INFO 03-23 09:44:05 [utils.py:238] non-default args: {'trust_remote_code': True, 'gpu_memory_utilization': 0.1, 'disable_log_stats': True, 'enforce_eager': True, 'model': 'Qwen/Qwen3.5-0.8B'}
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+INFO:     127.0.0.1:49972 - "GET /api/v1/rag/chat/sessions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49988 - "GET /api/v1/rag/chat/sessions/ecd778560ef94f0eb2064499d7ebe71e/history HTTP/1.1" 200 OK
+INFO 03-23 09:44:06 [model.py:531] Resolved architecture: Qwen3_5ForConditionalGeneration
+INFO 03-23 09:44:06 [model.py:1554] Using max model len 262144
+INFO 03-23 09:44:06 [scheduler.py:231] Chunked prefill is enabled with max_num_batched_tokens=8192.
+INFO 03-23 09:44:06 [config.py:544] Setting attention block size to 544 tokens to ensure that attention page size is >= mamba page size.
+INFO 03-23 09:44:06 [config.py:575] Padding mamba page size by 2.64% to ensure that mamba page size and attention page size are exactly equal.
+WARNING 03-23 09:44:06 [vllm.py:781] Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none
+WARNING 03-23 09:44:06 [vllm.py:792] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+INFO 03-23 09:44:06 [vllm.py:957] Cudagraph is disabled under eager mode
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/transformers/utils/hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
+  warnings.warn(
+INFO:     127.0.0.1:49992 - "POST /api/v1/rag/chat/sessions/ecd778560ef94f0eb2064499d7ebe71e/stream HTTP/1.1" 200 OK
+INFO:app.services.llm.ollama:[LocalEmbedding] Reusing global pre-loaded model: BAAI/bge-m3
+Batches:   0%|          | 0/1 [00:00<?, ?it/s]Batches: 100%|██████████| 1/1 [00:00<00:00, 26.12it/s]
+INFO:app.api.chat_agent:Auto-recall injected 249 chars of memory context for user 3
+(EngineCore_DP0 pid=1557271) INFO 03-23 09:44:14 [core.py:101] Initializing a V1 LLM engine (v0.17.1) with config: model='Qwen/Qwen3.5-0.8B', speculative_config=None, tokenizer='Qwen/Qwen3.5-0.8B', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=262144, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=False, quantization=None, enforce_eager=True, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False), seed=0, served_model_name=Qwen/Qwen3.5-0.8B, enable_prefix_caching=False, enable_chunked_prefill=True, pooler_config=None, compilation_config={'level': None, 'mode': <CompilationMode.NONE: 0>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'splitting_ops': [], 'compile_mm_encoder': False, 'compile_sizes': [], 'compile_ranges_split_points': [8192], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False}, 'max_cudagraph_capture_size': 0, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': True, 'static_all_moe_layers': []}
+INFO:     127.0.0.1:45798 - "GET /api/v1/rag/chat/sessions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:45810 - "GET /api/v1/rag/chat/sessions/ecd778560ef94f0eb2064499d7ebe71e/history HTTP/1.1" 200 OK
+(EngineCore_DP0 pid=1557271) INFO 03-23 09:44:18 [parallel_state.py:1393] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://192.168.1.2:56899 backend=nccl
+(EngineCore_DP0 pid=1557271) INFO 03-23 09:44:18 [parallel_state.py:1715] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100] EngineCore failed to start.
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100] Traceback (most recent call last):
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1090, in run_engine_core
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]     return func(*args, **kwargs)
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 834, in __init__
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]     super().__init__(
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 110, in __init__
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]     self.model_executor = executor_class(vllm_config)
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]     return func(*args, **kwargs)
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/executor/abstract.py", line 103, in __init__
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]     self._init_executor()
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/executor/uniproc_executor.py", line 48, in _init_executor
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]     self.driver_worker.init_device()
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/worker/worker_base.py", line 326, in init_device
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]     self.worker.init_device()  # type: ignore
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]     ^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]     return func(*args, **kwargs)
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_worker.py", line 285, in init_device
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]     self.requested_memory = request_memory(init_snapshot, self.cache_config)
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/worker/utils.py", line 413, in request_memory
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100]     raise ValueError(
+(EngineCore_DP0 pid=1557271) ERROR 03-23 09:44:18 [core.py:1100] ValueError: Free memory on device cuda:0 (0.82/47.4 GiB) on startup is less than desired GPU memory utilization (0.1, 4.74 GiB). Decrease GPU memory utilization or reduce GPU memory used by other processes.
+(EngineCore_DP0 pid=1557271) Process EngineCore_DP0:
+(EngineCore_DP0 pid=1557271) Traceback (most recent call last):
+(EngineCore_DP0 pid=1557271)   File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+(EngineCore_DP0 pid=1557271)     self.run()
+(EngineCore_DP0 pid=1557271)   File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+(EngineCore_DP0 pid=1557271)     self._target(*self._args, **self._kwargs)
+(EngineCore_DP0 pid=1557271)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1104, in run_engine_core
+(EngineCore_DP0 pid=1557271)     raise e
+(EngineCore_DP0 pid=1557271)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 1090, in run_engine_core
+(EngineCore_DP0 pid=1557271)     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore_DP0 pid=1557271)                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1557271)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP0 pid=1557271)     return func(*args, **kwargs)
+(EngineCore_DP0 pid=1557271)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1557271)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 834, in __init__
+(EngineCore_DP0 pid=1557271)     super().__init__(
+(EngineCore_DP0 pid=1557271)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/engine/core.py", line 110, in __init__
+(EngineCore_DP0 pid=1557271)     self.model_executor = executor_class(vllm_config)
+(EngineCore_DP0 pid=1557271)                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1557271)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP0 pid=1557271)     return func(*args, **kwargs)
+(EngineCore_DP0 pid=1557271)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1557271)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/executor/abstract.py", line 103, in __init__
+(EngineCore_DP0 pid=1557271)     self._init_executor()
+(EngineCore_DP0 pid=1557271)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/executor/uniproc_executor.py", line 48, in _init_executor
+(EngineCore_DP0 pid=1557271)     self.driver_worker.init_device()
+(EngineCore_DP0 pid=1557271)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/worker/worker_base.py", line 326, in init_device
+(EngineCore_DP0 pid=1557271)     self.worker.init_device()  # type: ignore
+(EngineCore_DP0 pid=1557271)     ^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1557271)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore_DP0 pid=1557271)     return func(*args, **kwargs)
+(EngineCore_DP0 pid=1557271)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1557271)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/worker/gpu_worker.py", line 285, in init_device
+(EngineCore_DP0 pid=1557271)     self.requested_memory = request_memory(init_snapshot, self.cache_config)
+(EngineCore_DP0 pid=1557271)                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore_DP0 pid=1557271)   File "/home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/vllm/v1/worker/utils.py", line 413, in request_memory
+(EngineCore_DP0 pid=1557271)     raise ValueError(
+(EngineCore_DP0 pid=1557271) ValueError: Free memory on device cuda:0 (0.82/47.4 GiB) on startup is less than desired GPU memory utilization (0.1, 4.74 GiB). Decrease GPU memory utilization or reduce GPU memory used by other processes.
+[rank0]:[W323 09:44:19.681936564 ProcessGroupNCCL.cpp:1553] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+ERROR:app.api.chat_agent:Memory extraction failed (Ollama error or invalid JSON): Engine core initialization failed. See root cause above. Failed core proc(s): {}

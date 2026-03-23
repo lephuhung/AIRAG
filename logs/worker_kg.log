@@ -7560,3 +7560,5 @@ INFO: Enqueued document processing pipeline stopped
 2026-03-23 08:59:08,120 [INFO] app.queue.connection — Consuming hrag.kg/7 → hrag.kg.7
 2026-03-23 08:59:08,123 [INFO] app.queue.connection — Consuming hrag.kg/6 → hrag.kg.6
 2026-03-23 08:59:08,124 [INFO] app.queue.connection — Consuming hrag.kg/1 → hrag.kg.1
+2026-03-23 09:44:40,615 [INFO] __main__ — Received SIGTERM — shutting down worker
+2026-03-23 09:44:40,625 [INFO] __main__ — Worker stopped cleanly

@@ -234,18 +234,23 @@ class RAGService:
         return self.vector_store.count()
 
 
+# --- Knowledge Graph Service Factory ---
+_kg_service_cache: dict[int, "KnowledgeGraphService"] = {}
+
+async def get_kg_service(workspace_id: int):
+    """Get KnowledgeGraphService for a knowledge base — cached per workspace."""
+    from app.services.knowledge_graph_service import KnowledgeGraphService
+    if workspace_id not in _kg_service_cache:
+        _kg_service_cache[workspace_id] = KnowledgeGraphService(workspace_id)
+    return _kg_service_cache[workspace_id]
+
+
+# --- RAG Service Factory ---
 # Module-level cache: workspace_id → HRAGService
-# Models (embedder, reranker, KG) are shared across requests; only `db` is swapped.
 _hrag_service_cache: dict[int, "HRAGService"] = {}
 
-
 def get_rag_service(db: AsyncSession, workspace_id: int) -> "RAGService | HRAGService":
-    """Factory function: routes to HRAGService or legacy RAGService based on config.
-
-    HRAGService instances are cached per workspace_id so that heavy models
-    (bge-m3 embedder, bge-reranker, LightRAG KG) are loaded only once.
-    The AsyncSession is refreshed on every call since sessions are per-request.
-    """
+    """Factory function: routes to HRAGService or legacy RAGService based on config."""
     from app.core.config import settings
 
     if settings.HRAG_ENABLED:

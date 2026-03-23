@@ -74,3 +74,5 @@
 2026-03-23 08:59:19,311 [INFO] app.queue.connection — Connecting to RabbitMQ: amqp://guest:guest@localhost:5672/
 2026-03-23 08:59:19,319 [INFO] app.queue.connection — RabbitMQ connected
 2026-03-23 08:59:19,349 [INFO] app.queue.connection — Consuming hrag.embed/embed → hrag.embed
+2026-03-23 09:44:40,616 [INFO] __main__ — Received SIGTERM — shutting down worker
+2026-03-23 09:44:40,620 [INFO] __main__ — Worker stopped cleanly

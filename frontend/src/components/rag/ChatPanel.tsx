@@ -9,7 +9,6 @@ import "katex/dist/katex.min.css";
 import {
   Send,
   Square,
-  Bot,
   User,
   Loader2,
   Sparkles,
@@ -986,7 +985,7 @@ const MessageBubble = memo(function MessageBubble({
 
   const proseClasses = cn(
     "prose prose-base max-w-none text-foreground/90",
-    "[&_p]:my-1.5 [&_ul]:my-1.5 [&_ol]:my-1.5 [&_li]:my-1",
+    "[&_p]:my-1.5 [&_p]:text-justify [&_ul]:my-1.5 [&_ol]:my-1.5 [&_li]:my-1 [&_li]:text-justify",
     "[&_pre]:bg-transparent [&_pre]:border-none [&_pre]:p-0 [&_pre]:m-0",
     "[&_code]:bg-muted/50 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-sm [&_code]:text-foreground/90",
     "[&_a]:text-primary [&_a]:underline [&_a]:underline-offset-2",
@@ -1012,8 +1011,8 @@ const MessageBubble = memo(function MessageBubble({
       {!isUser && (
         <div className="relative w-6 h-6 flex-shrink-0 mt-1">
           {message.isStreaming && <div className="icon-glow-ring" />}
-          <div className="w-6 h-6 rounded-full bg-primary/15 flex items-center justify-center">
-            <Bot className="w-3.5 h-3.5 text-primary" />
+          <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center overflow-hidden border border-primary/20">
+            <img src="/logo.png" alt="HRAG" className="w-4 h-4 object-contain shadow-sm" />
           </div>
         </div>
       )}
@@ -1200,8 +1199,8 @@ function TypingIndicator({ status }: { status?: ChatStreamStatus }) {
     <div className="flex gap-2 items-start">
       <div className="relative w-6 h-6 flex-shrink-0">
         <div className="icon-glow-ring" />
-        <div className="w-6 h-6 rounded-full bg-primary/15 flex items-center justify-center">
-          <Bot className="w-3.5 h-3.5 text-primary" />
+        <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center overflow-hidden border border-primary/20">
+          <img src="/logo.png" alt="HRAG" className="w-4 h-4 object-contain shadow-sm" />
         </div>
       </div>
       <div className="py-1">
@@ -1665,7 +1664,9 @@ export const ChatPanel = memo(function ChatPanel({
             {/* Header */}
             <div className="flex-shrink-0 flex items-center justify-between px-3 py-2 border-b">
               <div className="flex items-center gap-2">
-                <Bot className="w-4 h-4 text-emerald-600 dark:text-emerald-400" />
+                <div className="w-5 h-5 rounded flex items-center justify-center bg-primary/5 border border-primary/10 overflow-hidden">
+                  <img src="/logo.png" alt="HRAG" className="w-3.5 h-3.5 object-contain" />
+                </div>
                 <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground line-clamp-1 max-w-[400px]">
                   {t("chat.chat")} {sessionTitle ? `- ${sessionTitle}` : (sessionId ? `${t("chat.session", { id: sessionId })}` : t("chat.select_session"))}
                 </h2>

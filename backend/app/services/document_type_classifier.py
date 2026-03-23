@@ -275,7 +275,7 @@ async def classify_with_llm(markdown_text: str) -> str | None:
     from app.services.llm.types import LLMMessage
 
     try:
-        # Use the dedicated memory agent (e.g. Qwen3.5-0.8B) for classification
+        # Use the dedicated memory agent (e.g. Qwen3-4B via vLLM) for classification
         llm = get_memory_agent()
         preview = markdown_text[:1500].strip()  # Increased preview length for better context
         messages: list[LLMMessage] = [

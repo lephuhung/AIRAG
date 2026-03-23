@@ -77,11 +77,12 @@ _MEMORY_EXTRACTION_PROMPT = (
     "- Their preferences: 'Tôi thích X', 'I prefer X'\n"
     "- Direct instructions: 'Hãy gọi tôi là X', 'Always respond in Vietnamese'\n\n"
     "Target Categories:\n"
-    "1. fact: Permanent information (name, job, location, devices).\n"
-    "2. preference: Likes, dislikes, styles.\n"
-    "3. instruction: Direct rules for the assistant.\n\n"
+    "1. fact: Permanent information (name, job, location, devices). IMPORTANCE 10 for name, job.\n"
+    "2. preference: Likes, dislikes, styles. IMPORTANCE 5-8.\n"
+    "3. instruction: Direct rules for the assistant. IMPORTANCE 10.\n\n"
     "Output format: JSON array only. No explanation. Example:\n"
-    '[{"content": "User works at Công an Hà Tĩnh", "category": "fact", "importance": 8}]\n'
+    '[{"content": "Tên người dùng là Hùng", "category": "fact", "importance": 10}, '
+    '{"content": "Thiết bị: iPhone 16", "category": "fact", "importance": 10}]\n'
     "If nothing is worth extracting: []"
 )
 
@@ -246,6 +247,20 @@ fresh sources from a new search.
 6. Rewrite the user's query to be specific and detailed for better retrieval.
 """
 
+# ---------------------------------------------------------------------------
+# OpenAI-compatible system prompt reinforcement
+# ---------------------------------------------------------------------------
+
+OPENAI_COMPATIBLE_TOOL_SYSTEM = """
+## Tool Usage (MANDATORY)
+
+You have access to the `search_documents` tool.
+- You MUST use this tool to answer any questions about document content, specific data, or analysis.
+- Do NOT rely on your internal knowledge or previous answers for document-related facts.
+- Skipping the tool call for document-related questions is a failure to follow instructions.
+- If you are unsure whether a search is needed, PERFORM THE SEARCH.
+"""
+
 NATIVE_TOOL_REMINDER = (
     "\n\n[SYSTEM REMINDER] You MUST call the `search_documents` tool before answering this query. "
 )
@@ -333,11 +348,11 @@ async def _execute_search_documents(
     top_k: int,
     db: AsyncSession,
     existing_ids: set[str],
-) -> tuple[str, list[ChatSourceChunk], list[ChatImageRef], list[dict]]:
+) -> tuple[str, list[ChatSourceChunk], list[ChatImageRef], list[dict], list[str]]:
     """Execute document search across multiple workspaces and return best chunks.
 
     Returns:
-        (context_text, sources, image_refs, image_parts_for_vision)
+        (context_text, sources, image_refs, image_parts_for_vision, kg_summaries)
     """
     from app.services.rag_service import get_rag_service
     from app.services.hrag_service import HRAGService
@@ -352,6 +367,7 @@ async def _execute_search_documents(
     ws_map = {ws.id: ws.name for ws in ws_result.scalars().all()}
     
     for workspace_id in workspace_ids:
+        logger.info(f"[RAG] External Search: query='{query}' on workspace {workspace_id}")
         rag_service = get_rag_service(db, workspace_id)
         ws_name = ws_map.get(workspace_id, f"KB {workspace_id}")
         
@@ -397,6 +413,7 @@ async def _execute_search_documents(
             
     # Sort all aggregated chunks by score descending
     all_chunks.sort(key=lambda x: x[0], reverse=True)
+    logger.info(f"[RAG] Found total {len(all_chunks)} potential chunks across {len(workspace_ids)} workspaces")
     
     # Take top_k
     best_chunks = all_chunks[:top_k]
@@ -421,6 +438,7 @@ async def _execute_search_documents(
             score=score,
             source_type="vector",
         ))
+        logger.info(f"[RAG] Selected Chunk [{cid}] (KB {workspace_id}) score={score:.3f}: {chunk.content[:60]}...")
         
         # Collect images to fetch
         for iid in getattr(chunk, "image_refs", []) or []:
@@ -520,7 +538,7 @@ async def _execute_search_documents(
     if image_context_parts:
         context += "\n\nDocument Images:\n" + "\n".join(image_context_parts)
 
-    return context, sources, chat_image_refs, image_parts
+    return context, sources, chat_image_refs, image_parts, all_kg_summaries
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +596,7 @@ async def _search_memories(
     top_k: int = 5,
 ) -> str:
     """Search user memories by semantic similarity using pgvector."""
+    logger.info(f"[MEMORY] Searching personal history for: '{query}'")
     from app.models.user_memory import UserMemory
     from app.services.llm import get_embedding_provider
 
@@ -599,19 +618,21 @@ async def _search_memories(
             return "No memories found for this user."
         return "\n".join([f"- [{m.category}] {m.content}" for m in memories])
 
-    # pgvector cosine distance search
+    # pgvector cosine distance search. We combine distance with importance.
     try:
         from pgvector.sqlalchemy import Vector
+        # Higher importance and lower distance is better.
+        # We order by (distance / importance) to favor important matches even if slightly less similar.
         result = await db.execute(
             select(UserMemory)
             .where(UserMemory.user_id == user_id)
             .where(UserMemory.embedding.isnot(None))
-            .order_by(UserMemory.embedding.cosine_distance(query_vec))
-            .limit(top_k)
+            .order_by(UserMemory.embedding.cosine_distance(query_vec) * (10.0 / (UserMemory.importance + 1)))
+            .limit(top_k + 5) # Retrieve more to be sure
         )
-        memories = result.scalars().all()
+        memories = list(result.scalars().all())
     except Exception as e:
-        logger.warning(f"pgvector search failed, falling back to importance sort: {e}")
+        logger.warning(f"pgvector search failed, falling back to importance: {e}")
         result = await db.execute(
             select(UserMemory)
             .where(UserMemory.user_id == user_id)
@@ -621,9 +642,16 @@ async def _search_memories(
         memories = result.scalars().all()
 
     if not memories:
+        logger.info(f"[MEMORY] No memories found for user_id={user_id} and query='{query}'.")
         return "No relevant memories found."
-    return "\n".join([f"- [{m.category}] {m.content}" for m in memories])
-
+    
+    # Format and log memories
+    context_parts = []
+    for i, m in enumerate(memories):
+        context_parts.append(f"• [{m.category}] {m.content}")
+    context = "\n".join(context_parts)
+    logger.info(f"[MEMORY] Found {len(memories)} relevant snippets for user_id={user_id}. Content preview: {context[:200]}...")
+    return context
 
 
 # ---------------------------------------------------------------------------
@@ -736,6 +764,7 @@ async def agent_chat_stream(
     all_sources: list[ChatSourceChunk] = []
     all_images: list[ChatImageRef] = []
     all_image_parts: list[dict] = []
+    all_kg_summaries_collected: list[str] = []
 
     # Build conversation messages
     messages: list[LLMMessage] = []
@@ -761,15 +790,19 @@ async def agent_chat_stream(
     if user_id:
         try:
             memory_context = await _search_memories(user_id, message, db, top_k=5)
+            # Add memory context if available
             if memory_context and "No relevant memories" not in memory_context and "No memories found" not in memory_context:
-                effective_system_prompt += (
-                    "\n\n## User Context (from previous sessions)\n"
-                    "The following information was saved from past interactions with this user. "
-                    "Use it to personalize your response when relevant, but do NOT mention "
-                    "that you have a memory system.\n"
-                    f"{memory_context}\n"
-                )
                 logger.info(f"Auto-recall injected {len(memory_context)} chars of memory context for user {user_id}")
+                # Move User Context to a separate system block or make it VERY prominent
+                messages.insert(0, LLMMessage(
+                    role="system", 
+                    content=f"AUTHENTICATED USER PROFILE (PERSONAL HISTORY):\n{memory_context}\n\n"
+                            "The above data is from our internal database for this specific user. "
+                            "If the user asks 'Who am I?', 'What is my name?', 'Where do I work?', or 'What device am I using?', "
+                            "you MUST answer based ONLY on the data above. "
+                            "When mentioning these facts, simply add the brain icon 🧠 to mark it as a memory. "
+                            "DO NOT use numerical IDs like [1] or tags like [MEM-1]."
+                ))
         except Exception as e:
             logger.warning(f"Auto-recall failed for user {user_id}: {e}")
 
@@ -778,12 +811,13 @@ async def agent_chat_stream(
         # Retrieve sources immediately, inject as context. No tool calling needed.
         yield {"event": "status", "data": {"step": "retrieving", "detail": f"Searching: {message[:80]}..."}}
 
-        context, sources, images, img_parts = await _execute_search_documents(
+        context, sources, images, img_parts, kg_summaries = await _execute_search_documents(
             workspace_ids, message, 8, db, existing_ids,
         )
         all_sources.extend(sources)
         all_images.extend(images)
         all_image_parts.extend(img_parts)
+        all_kg_summaries_collected.extend(kg_summaries)
 
         if sources:
             yield {"event": "sources", "data": {"sources": [s.model_dump() for s in sources]}}
@@ -833,13 +867,15 @@ async def agent_chat_stream(
             content=messages[-1].content + NATIVE_TOOL_REMINDER,
         )
     elif is_openai_compatible:
-        # OpenAI-compatible: use native function calling (JSON schema)
-        # Do NOT inject aggressive Gemini tool prompt — it often blocks small models
-        # and even confuses Qwen3.
+        # OpenAI-compatible (vLLM): Reverting to XML-based tool calling for higher reliability with 30B/Local models
         if not greeting_detected:
-            tools = _get_openai_tools()
-        # No extra system prompt addition needed for OpenAI-compatible by default,
-        # relies on tool definitions.
+            # Switch back to XML prompt-based tool calling
+            effective_system_prompt += "\n\n" + OLLAMA_TOOL_SYSTEM
+            messages[-1] = LLMMessage(
+                role="user",
+                content=messages[-1].content + OLLAMA_TOOL_REMINDER,
+            )
+            logger.info(f"[AGENT] Using XML-based tool calling for {provider_name}")
     else:
         # Ollama: append mandatory tool prompt to system prompt
         effective_system_prompt += "\n\n" + OLLAMA_TOOL_SYSTEM
@@ -855,7 +891,13 @@ async def agent_chat_stream(
     accumulated_text = ""
     thinking_text = ""
 
+    logger.info(f"--- AGENT CHAT START (provider={provider_name}, user_id={user_id}, workspaces={workspace_ids}) ---")
+    logger.info(f"User Question: {message}")
+    logger.info(f"System Prompt Length: {len(effective_system_prompt)}")
+
     for iteration in range(MAX_AGENT_ITERATIONS):
+        iteration_idx = iteration + 1
+        logger.info(f"[AGENT] Iteration {iteration_idx}/{MAX_AGENT_ITERATIONS} (tools_available={tools is not None})")
         iteration_text = ""
         function_calls: list[dict] = []
         tokens_yielded = False
@@ -890,6 +932,7 @@ async def agent_chat_stream(
             fc = function_calls[0]
             fc_name = fc.get("name", "")
             fc_args = fc.get("args", {})
+            logger.info(f"[AGENT] LLM requested tool: {fc_name} with args: {fc_args}")
 
             if fc_name == "search_documents":
                 query = fc_args.get("query", message)
@@ -900,12 +943,14 @@ async def agent_chat_stream(
                     "detail": f"Searching: {query[:80]}..."
                 }}
 
-                context, sources, images, img_parts = await _execute_search_documents(
+                context, sources, images, img_parts, kg_summaries = await _execute_search_documents(
                     workspace_ids, query, top_k, db, existing_ids,
                 )
+                logger.info(f"Search found {len(sources)} chunks and {len(kg_summaries)} KG summaries")
                 all_sources.extend(sources)
                 all_images.extend(images)
                 all_image_parts.extend(img_parts)
+                all_kg_summaries_collected.extend(kg_summaries)
 
                 if sources:
                     yield {"event": "sources", "data": {
@@ -1033,7 +1078,7 @@ async def agent_chat_stream(
     # Small Ollama models (e.g. qwen3.5:4b) may output thinking about
     # needing to search but never produce a <tool_call> tag or any text.
     # Auto-search and retry once to avoid "Unable to generate a response."
-    if not accumulated_text and not all_sources and not is_gemini and not is_openai_compatible:
+    if not accumulated_text and not all_sources and not is_gemini:
         logger.warning(
             "Ollama produced no text and no tool call — fallback to auto-search"
         )
@@ -1042,9 +1087,10 @@ async def agent_chat_stream(
             "detail": f"Searching: {message[:80]}..."
         }}
 
-        context, sources, images, img_parts = await _execute_search_documents(
+        context, sources, images, img_parts, kg_summaries = await _execute_search_documents(
             workspace_ids, message, 8, db, existing_ids,
         )
+        all_kg_summaries_collected.extend(kg_summaries)
         all_sources.extend(sources)
         all_images.extend(images)
         all_image_parts.extend(img_parts)
@@ -1099,20 +1145,39 @@ async def agent_chat_stream(
     # Extract related entities from KG (best-effort)
     related_entities: list[str] = []
     try:
-        from app.api.rag import _get_kg_service
-        kg = await _get_kg_service(workspace_id)
-        entities = await kg.get_entities(limit=200)
-        entity_names = {e["name"].lower(): e["name"] for e in entities}
+        from app.services.rag_service import get_kg_service
+        # Use first workspace for KG summary extraction (best effort)
+        target_kg_id = workspace_ids[0] if workspace_ids else None
+        if target_kg_id:
+            kg = await get_kg_service(target_kg_id)
+            entities = await kg.get_entities(limit=500)
+            entity_names = {e["name"].lower(): e["name"] for e in entities}
+        else:
+            entity_names = {}
+        
+        # Search in generated answer
         text_lower = accumulated_text.lower()
         for lower_name, original_name in entity_names.items():
-            if len(lower_name) >= 2 and lower_name in text_lower:
+            if len(lower_name) >= 3 and lower_name in text_lower:
                 related_entities.append(original_name)
+        
+        # Also search in KG summaries from search results (ensure graph shows relevant context)
+        if all_kg_summaries_collected:
+            summary_text_lower = "\n".join(all_kg_summaries_collected).lower()
+            for lower_name, original_name in entity_names.items():
+                if original_name not in related_entities:
+                    if len(lower_name) >= 3 and lower_name in summary_text_lower:
+                        related_entities.append(original_name)
     except Exception:
         pass
 
     # Strip artifacts
     if accumulated_text:
         accumulated_text = re.sub(r'<unused\d+>:?\s*', '', accumulated_text).strip()
+        logger.info(f"[AGENT] Final Answer: {accumulated_text[:200]}...")
+
+    logger.info(f"--- AGENT CHAT COMPLETE (Length={len(accumulated_text) if accumulated_text else 0}) ---")
+    logger.info(f"Related Entities Found: {related_entities}")
 
     yield {"event": "complete", "data": {
         "answer": accumulated_text or "Unable to generate a response.",
@@ -1126,10 +1191,13 @@ async def agent_chat_stream(
     if user_id and message:
         try:
             from app.core.database import async_session_maker
+            uid = user_id
+            sid = session_id
             async def _bg_save():
                 try:
                     async with async_session_maker() as bg_db:
-                        await _auto_save_memory(user_id, message, session_id, bg_db)
+                        if uid is not None:
+                            await _auto_save_memory(uid, message, sid, bg_db)
                         await bg_db.commit()
                 except Exception as e:
                     logger.warning(f"Background auto-save failed: {e}")
@@ -1145,24 +1213,29 @@ async def agent_chat_stream(
 # ---------------------------------------------------------------------------
 
 async def chat_stream_endpoint(
-    workspace_id: int,
+    workspace_ids: list[int],
     request: ChatRequest,
     db: AsyncSession,
     user: User,
+    session_id: str | None = None,
 ):
     """SSE streaming chat endpoint.
 
     Called from rag.py router — not a standalone router to avoid circular imports.
     """
-    # Verify workspace
+    # Verify first workspace access (or all? for now just first as primary)
+    primary_id = workspace_ids[0] if workspace_ids else None
+    if not primary_id:
+        raise HTTPException(status_code=400, detail="No workspace IDs provided")
+
     result = await db.execute(
-        select(KnowledgeBase).where(KnowledgeBase.id == workspace_id)
+        select(KnowledgeBase).where(KnowledgeBase.id == primary_id)
     )
     kb = result.scalar_one_or_none()
     if not kb:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Knowledge base not found",
+            detail=f"Primary knowledge base {primary_id} not found",
         )
 
     # Build system prompt — use document-type-specific prompt if applicable
@@ -1176,11 +1249,11 @@ async def chat_stream_endpoint(
         from app.models.document import Document as _Doc, DocumentStatus as _DS
         from app.models.document_type import DocumentType as _DT, DocumentTypeSystemPrompt as _DTSP
 
-        # Find most common document_type_id in INDEXED documents of this workspace
+        # Find most common document_type_id in INDEXED documents of these workspaces
         dominant_type_result = await db.execute(
             _sel(_Doc.document_type_id, _func.count(_Doc.id).label("cnt"))
             .where(
-                _Doc.workspace_id == workspace_id,
+                _Doc.workspace_id.in_(workspace_ids),
                 _Doc.status.in_([_DS.INDEXED, _DS.BUILDING_KG]),
                 _Doc.document_type_id.isnot(None),
             )
@@ -1190,11 +1263,11 @@ async def chat_stream_endpoint(
         )
         dominant_row = dominant_type_result.first()
         if dominant_row and dominant_row.document_type_id:
-            # Try workspace-specific prompt
+            # Try workspace-specific prompt (from primary or any?)
             ws_prompt_res = await db.execute(
                 _sel(_DTSP).where(
                     _DTSP.document_type_id == dominant_row.document_type_id,
-                    _DTSP.workspace_id == workspace_id,
+                    _DTSP.workspace_id == primary_id,
                 )
             )
             ws_prompt = ws_prompt_res.scalar_one_or_none()
@@ -1223,11 +1296,12 @@ async def chat_stream_endpoint(
     try:
         from app.models.chat_message import ChatMessage as ChatMessageModel
         user_row = ChatMessageModel(
-            workspace_id=workspace_id,
+            workspace_id=primary_id,
             message_id=str(uuid.uuid4()),
             role="user",
             content=request.message,
             user_id=user.id,
+            session_id=session_id,
         )
         db.add(user_row)
         await db.commit()
@@ -1251,13 +1325,15 @@ async def chat_stream_endpoint(
 
         try:
             async for event in agent_chat_stream(
-                workspace_id=workspace_id,
+                workspace_ids=workspace_ids,
                 message=request.message,
                 history=history,
                 enable_thinking=request.enable_thinking,
                 db=db,
                 system_prompt=system_prompt,
                 force_search=request.force_search,
+                session_id=session_id,
+                user_id=user.id,
             ):
                 event_type = event["event"]
                 event_data = event["data"]
@@ -1349,12 +1425,17 @@ async def chat_stream_endpoint(
             logger.error(f"Stream error: {e}", exc_info=True)
             yield format_sse_event("error", {"message": str(e)})
         finally:
-            # Persist assistant message
-            if final_answer:
+            # Persist assistant message ONLY if it's NOT a session-based chat
+            # (session-based chat persistence is handled by the caller in chat_session.py)
+            if final_answer and not session_id:
                 try:
                     from app.models.chat_message import ChatMessage as ChatMessageModel
+                    # Note: for multi-workspace search, we associate with the first workspace
+                    # or leave NULL if no workspaces.
+                    target_workspace_id = workspace_ids[0] if workspace_ids else None
+                    
                     assistant_row = ChatMessageModel(
-                        workspace_id=workspace_id,
+                        workspace_id=target_workspace_id,
                         message_id=str(uuid.uuid4()),
                         role="assistant",
                         content=final_answer,

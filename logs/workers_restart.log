@@ -185,3 +185,27 @@ INFO 03-23 09:00:01 [llm.py:388] Supported tasks: ['generate']
 2026-03-23 09:00:08,156 [INFO] app.queue.connection — Connecting to RabbitMQ: amqp://guest:guest@localhost:5672/
 2026-03-23 09:00:08,167 [INFO] app.queue.connection — RabbitMQ connected
 2026-03-23 09:00:08,203 [INFO] app.queue.connection — Consuming hrag.parse/parse → hrag.parse
+
+==> /home/lph/Documents/GitHub/AIRAG/logs/worker_caption.log <==
+2026-03-23 09:44:40,615 [INFO] __main__ — Received SIGTERM — shutting down worker
+
+==> /home/lph/Documents/GitHub/AIRAG/logs/worker_kg.log <==
+2026-03-23 09:44:40,615 [INFO] __main__ — Received SIGTERM — shutting down worker
+
+==> /home/lph/Documents/GitHub/AIRAG/logs/worker_parse.log <==
+2026-03-23 09:44:40,615 [INFO] __main__ — Received SIGTERM — shutting down worker
+
+==> /home/lph/Documents/GitHub/AIRAG/logs/worker_embed.log <==
+2026-03-23 09:44:40,616 [INFO] __main__ — Received SIGTERM — shutting down worker
+
+==> /home/lph/Documents/GitHub/AIRAG/logs/worker_caption.log <==
+2026-03-23 09:44:40,617 [INFO] __main__ — Worker stopped cleanly
+
+==> /home/lph/Documents/GitHub/AIRAG/logs/worker_parse.log <==
+2026-03-23 09:44:40,619 [INFO] __main__ — Worker stopped cleanly
+
+==> /home/lph/Documents/GitHub/AIRAG/logs/worker_embed.log <==
+2026-03-23 09:44:40,620 [INFO] __main__ — Worker stopped cleanly
+
+==> /home/lph/Documents/GitHub/AIRAG/logs/worker_kg.log <==
+2026-03-23 09:44:40,625 [INFO] __main__ — Worker stopped cleanly

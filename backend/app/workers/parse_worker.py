@@ -128,7 +128,7 @@ async def handle_parse(payload: dict) -> None:
                 )
                 from app.models.document_type import DocumentType as _DT
                 # Use first 1 000 chars of markdown (post-Docling/OCR content only)
-                # Prioritize LLM classification (Qwen 0.8B) as requested by user
+                # Prioritize LLM classification (Qwen via vLLM) as requested by user
                 slug = await classify_with_llm(text_preview) if text_preview else None
                 if slug is None and text_preview:
                     # Fallback to regex if LLM fails or returns unknown

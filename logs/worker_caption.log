@@ -30,3 +30,5 @@
 2026-03-23 08:59:08,763 [INFO] app.queue.connection — Connecting to RabbitMQ: amqp://guest:guest@localhost:5672/
 2026-03-23 08:59:08,771 [INFO] app.queue.connection — RabbitMQ connected
 2026-03-23 08:59:08,798 [INFO] app.queue.connection — Consuming hrag.caption/caption → hrag.caption
+2026-03-23 09:44:40,615 [INFO] __main__ — Received SIGTERM — shutting down worker
+2026-03-23 09:44:40,617 [INFO] __main__ — Worker stopped cleanly

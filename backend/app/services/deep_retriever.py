@@ -253,11 +253,19 @@ class DeepRetriever:
                 f"Reranker filtered all {len(chunks)} chunks below threshold "
                 f"{settings.HRAG_MIN_RELEVANCE_SCORE}, falling back to top 3"
             )
-            return chunks[:min(3, len(chunks))], citations[:min(3, len(citations))]
+            fallback_chunks = chunks[:min(3, len(chunks))]
+            for c in fallback_chunks:
+                c.score = 0.001 # Small non-zero score for fallback visibility
+            return fallback_chunks, citations[:min(3, len(citations))]
 
-        # Map reranked results back to original chunks/citations
-        reranked_chunks = [chunks[r.index] for r in reranked]
-        reranked_citations = [citations[r.index] for r in reranked]
+        # Map reranked results back to original chunks/citations and set scores
+        reranked_chunks = []
+        reranked_citations = []
+        for r in reranked:
+            chunk = chunks[r.index]
+            chunk.score = r.score
+            reranked_chunks.append(chunk)
+            reranked_citations.append(citations[r.index])
 
         logger.info(
             f"Reranked {len(chunks)} → {len(reranked)} chunks "
