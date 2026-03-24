@@ -154,7 +154,13 @@ async def chat_stream_session(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
-    """SSE endpoint for session chat."""
+    """SSE endpoint for session chat.
+
+    Routes to LangGraph agent or legacy agent based on NEXUSRAG_AGENT_BACKEND config.
+    Frontend URL stays the same — zero frontend changes required.
+    """
+    from app.core.config import settings
+
     result = await db.execute(
         select(ChatSession).where(ChatSession.id == session_id, ChatSession.user_id == user.id)
     )
@@ -164,7 +170,7 @@ async def chat_stream_session(
 
     import uuid
     user_msg_id = f"msg_{uuid.uuid4().hex[:8]}"
-    
+
     # Save user message
     user_msg = ChatMessage(
         session_id=session_id,
@@ -179,14 +185,133 @@ async def chat_stream_session(
     # Get accessible workspaces for cross-workspace search
     workspace_ids = await _get_accessible_workspaces(db, user)
 
-    # Get system prompt (combine from workspaces if needed or default)
+    # Get system prompt
     from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
     system_prompt_to_use = DEFAULT_SYSTEM_PROMPT + HARD_SYSTEM_PROMPT
 
     from app.api.chat_agent import sse_with_heartbeat, format_sse_event
-    
-    # Send default AI message id immediately
+
+    # Send AI message id immediately
     ai_msg_id = f"msg_{uuid.uuid4().hex[:8]}"
+
+    # ── Route: LangGraph agent ──────────────────────────────────────────────
+    use_langgraph = settings.NEXUSRAG_AGENT_BACKEND.lower() == "langgraph"
+
+    if use_langgraph:
+        logger.info(f"[session/{session_id}] Routing to LangGraph agent backend")
+
+        async def _event_generator_lg():
+            yield format_sse_event("status", {"step": "starting", "detail": "Initializing LangGraph agent..."})
+            yield format_sse_event("ai_message_id", {"message_id": ai_msg_id})
+
+            accumulated_text = ""
+            accumulated_thinking = ""
+            final_sources: list = []
+            final_images: list = []
+
+            try:
+                from app.services.agent.graph import get_agent_graph
+                from app.services.agent.streaming import stream_agent_to_sse, build_initial_state
+                import json as _json
+
+                history = []
+                for m in request.history:
+                    role = m.role if hasattr(m, "role") else m.get("role", "user")
+                    content = m.content if hasattr(m, "content") else m.get("content", "")
+                    history.append({"role": role, "content": content})
+
+                initial_state = build_initial_state(
+                    workspace_ids=workspace_ids,
+                    message=request.message,
+                    history=history,
+                    system_prompt=system_prompt_to_use,
+                    enable_thinking=getattr(request, "enable_thinking", False),
+                    db=db,
+                    user_id=user.id,
+                    session_id=session_id,
+                )
+
+                graph = get_agent_graph()
+
+                async for sse_str in stream_agent_to_sse(graph, initial_state):
+                    # Collect data for DB persistence while yielding
+                    try:
+                        if sse_str.startswith("event:"):
+                            lines = sse_str.strip().split("\n")
+                            ev_type = lines[0].replace("event: ", "").strip()
+                            data_line = next((l for l in lines if l.startswith("data:")), None)
+                            if data_line:
+                                ev_data = _json.loads(data_line[5:].strip())
+                                if ev_type == "token":
+                                    accumulated_text += ev_data.get("text", "")
+                                elif ev_type == "thinking":
+                                    accumulated_thinking += ev_data.get("text", "")
+                                elif ev_type == "sources":
+                                    final_sources = ev_data.get("sources", [])
+                                elif ev_type == "images":
+                                    final_images = ev_data.get("image_refs", ev_data.get("images", []))
+                                elif ev_type == "complete":
+                                    if "answer" in ev_data:
+                                        accumulated_text = ev_data["answer"]
+                    except Exception:
+                        pass
+
+                    yield sse_str
+
+                # Save assistant message
+                ai_msg = ChatMessage(
+                    session_id=session_id,
+                    message_id=ai_msg_id,
+                    role="assistant",
+                    content=accumulated_text,
+                    sources=final_sources,
+                    image_refs=final_images,
+                    thinking=accumulated_thinking or None,
+                )
+                db.add(ai_msg)
+
+                # Update session title if still default
+                DEFAULT_TITLES = ["New Chat", "New chat", "Chat mới", "Kho tri thức"]
+                if session.title in DEFAULT_TITLES or not session.title:
+                    session.title = request.message[:50] + ("..." if len(request.message) > 50 else "")
+
+                await db.commit()
+
+                # Background: auto-save user memories
+                if user.id and request.message:
+                    try:
+                        from app.api.chat_agent import _auto_save_memory
+                        from app.core.database import async_session_maker
+                        import asyncio as _asyncio
+
+                        uid = user.id
+                        sid = session_id
+                        msg = request.message
+
+                        async def _bg_save():
+                            try:
+                                async with async_session_maker() as bg_db:
+                                    await _auto_save_memory(uid, msg, sid, bg_db)
+                                    await bg_db.commit()
+                            except Exception as _e:
+                                logger.warning(f"[lg/session] Background auto-save failed: {_e}")
+
+                        _asyncio.create_task(_bg_save())
+                    except Exception as _e:
+                        logger.warning(f"[lg/session] Auto-save task spawn failed: {_e}")
+
+            except Exception as e:
+                logger.error(f"[lg/session] LangGraph stream error: {e}", exc_info=True)
+                yield format_sse_event("error", {"message": str(e)})
+
+        return StreamingResponse(
+            sse_with_heartbeat(_event_generator_lg()),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    # ── Route: Legacy agent (default) ──────────────────────────────────────
+    logger.info(f"[session/{session_id}] Routing to legacy agent backend")
 
     async def _event_generator():
         yield format_sse_event("status", {"step": "starting", "detail": "Initializing agent..."})
@@ -240,14 +365,14 @@ async def chat_stream_session(
                 thinking=accumulated_thinking,
             )
             db.add(ai_msg)
-            
+
             # Update session timestamp
             DEFAULT_TITLES = ["New Chat", "New chat", "Chat mới", "Kho tri thức"]
             if session.title in DEFAULT_TITLES or not session.title:
                 session.title = request.message[:50] + ("..." if len(request.message) > 50 else "")
-            
+
             await db.commit()
-            
+
         except Exception as e:
             logger.error(f"Chat stream error: {e}", exc_info=True)
             yield format_sse_event("error", {"message": str(e)})

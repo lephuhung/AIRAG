@@ -147,6 +147,24 @@ class Settings(BaseSettings):
     WORKER_PREFETCH_KG: int = Field(default=1)
     WORKER_KG_POLL_INTERVAL: int = Field(default=30)  # seconds — how often to scan for new workspaces
 
+    # ── LangGraph Agent ──────────────────────────────────────────────────────
+    # Choose the chat agent backend:
+    #   "legacy"    — original manual agent loop in chat_agent.py (default, safe fallback)
+    #   "langgraph" — new LangGraph StateGraph agent (feature/langgraph-agent branch)
+    NEXUSRAG_AGENT_BACKEND: str = Field(default="legacy")
+
+    # Max agent iterations (loop guard for LangGraph tool_executor → answer cycle)
+    NEXUSRAG_LG_MAX_ITERATIONS: int = Field(default=3)
+
+    # Classifier model: reuse the memory agent (Qwen3-4B) for intent classification.
+    # Set to False to use the main LLM provider instead (slower but no extra model needed).
+    NEXUSRAG_LG_USE_MEMORY_AGENT_AS_CLASSIFIER: bool = Field(default=True)
+
+    # LangGraph checkpointer backend:
+    #   "memory" — in-memory (no cross-request persistence, default)
+    #   "none"   — no checkpointer
+    NEXUSRAG_LG_CHECKPOINTER: str = Field(default="memory")
+
     # CORS
     CORS_ORIGINS: list[str] = Field(default=["http://localhost:5174", "http://localhost:3000"])
 
