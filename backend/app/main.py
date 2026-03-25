@@ -297,6 +297,16 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("HRAG_EAGER_MODEL_LOADING=false — models will load on first use")
 
+    # ── Graphiti Memory Initialization ───────────────────────────────────
+    # Build Neo4j indices and constraints required by Graphiti's knowledge
+    # graph memory layer.  Idempotent — safe to call on every startup.
+    # Non-fatal: if Neo4j is unavailable, memory falls back to empty context.
+    try:
+        from app.services.graphiti_client import initialize_graphiti
+        await initialize_graphiti()
+    except Exception as _graphiti_err:
+        logger.warning(f"Graphiti memory init failed (non-fatal): {_graphiti_err}")
+
     yield
     logger.info("Shutting down...")
     await engine.dispose()

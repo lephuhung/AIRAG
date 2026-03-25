@@ -175,7 +175,6 @@ async def langgraph_chat_stream(
     try:
         from app.models.chat_message import ChatMessage as ChatMessageModel
         user_row = ChatMessageModel(
-            workspace_id=primary_id,
             message_id=str(uuid.uuid4()),
             role="user",
             content=request.message,
@@ -242,7 +241,6 @@ async def langgraph_chat_stream(
         from app.models.chat_message import ChatMessage as ChatMessageModel
         import json as _json
         assistant_row = ChatMessageModel(
-            workspace_id=primary_id,
             message_id=str(uuid.uuid4()),
             role="assistant",
             content=final_answer,
@@ -257,28 +255,32 @@ async def langgraph_chat_stream(
         logger.warning(f"[lg_endpoint] Failed to persist assistant message: {e}")
         await db.rollback()
 
-    # Background: auto-save user memories
-    if user.id and request.message:
+    # Background: save conversation episode to Graphiti knowledge graph
+    # Graphiti will extract entities and temporal facts from the turn automatically.
+    if user.id and request.message and final_answer:
         try:
-            from app.api.chat_agent import _auto_save_memory
-            from app.core.database import async_session_maker
+            from app.services.graphiti_client import add_conversation_episode
             import asyncio
 
             uid = user.id
             sid = session_id
             msg = request.message
+            ans = final_answer
 
             async def _bg_save():
                 try:
-                    async with async_session_maker() as bg_db:
-                        await _auto_save_memory(uid, msg, sid, bg_db)
-                        await bg_db.commit()
+                    await add_conversation_episode(
+                        user_id=uid,
+                        user_message=msg,
+                        assistant_message=ans,
+                        session_id=sid,
+                    )
                 except Exception as e:
-                    logger.warning(f"[lg_endpoint] Background auto-save failed: {e}")
+                    logger.warning(f"[lg_endpoint] Graphiti episode save failed: {e}")
 
             asyncio.create_task(_bg_save())
         except Exception as e:
-            logger.warning(f"[lg_endpoint] Auto-save task spawn failed: {e}")
+            logger.warning(f"[lg_endpoint] Graphiti save task spawn failed: {e}")
 
 
 # ---------------------------------------------------------------------------

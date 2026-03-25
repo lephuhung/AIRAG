@@ -58,7 +58,7 @@ echo "[2/2] Starting Qwen3-4B-Instruct-2507-FP8 on port 8082..."
 nohup "$VIRTUAL_ENV/bin/python3" -m vllm.entrypoints.openai.api_server \
     --model Qwen/Qwen3-4B-Instruct-2507-FP8 \
     --port 8082 \
-    --max-model-len 15312 \
+    --max-model-len 17000 \
     --gpu-memory-utilization 0.2 \
     --trust-remote-code \
     --served-model-name qwen-memory > qwen_vllm.log 2>&1 &

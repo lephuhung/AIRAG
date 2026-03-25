@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     OLLAMA_ENABLE_THINKING: bool = Field(default=False)
     MEMORY_AGENT_MODEL: str = Field(default="qwen-memory")
     MEMORY_AGENT_BASE_URL: str = Field(default="http://localhost:8082/v1")
-    MEMORY_AGENT_API_KEY: str = Field(default="none")
+    MEMORY_AGENT_API_KEY: str = Field(default="sk-nexusrag")
     MEMORY_AGENT_LOCAL: bool = Field(default=False)
     MEMORY_AGENT_GPU_UTILIZATION: float = Field(default=0.15)
     MEMORY_AGENT_CUDA_DEVICE: str = Field(default="auto")
@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     # OpenAI-compatible provider (vLLM, LM Studio, llama.cpp, etc.)
     OPENAI_COMPATIBLE_BASE_URL: str = Field(default="http://127.0.0.1:8000/v1")
     OPENAI_COMPATIBLE_MODEL: str = Field(default="default")
-    OPENAI_COMPATIBLE_API_KEY: str = Field(default="none")
+    OPENAI_COMPATIBLE_API_KEY: str = Field(default="sk-nexusrag")
 
     # KG Embedding
     KG_EMBEDDING_PROVIDER: str = Field(default="local")
@@ -164,6 +164,17 @@ class Settings(BaseSettings):
     #   "memory" — in-memory (no cross-request persistence, default)
     #   "none"   — no checkpointer
     NEXUSRAG_LG_CHECKPOINTER: str = Field(default="memory")
+
+    # ── Graphiti Memory (temporal knowledge graph, backed by Neo4j) ──────────
+    # Graphiti uses the existing Neo4j instance (NEO4J_URI / NEO4J_USERNAME /
+    # NEO4J_PASSWORD above) for graph storage.
+    # LLM used by Graphiti for entity/fact extraction from conversations.
+    # Defaults to the memory agent (Qwen3-4B) — no extra model needed.
+    GRAPHITI_LLM_BASE_URL: str = Field(default="http://localhost:8082/v1")
+    GRAPHITI_LLM_MODEL: str = Field(default="qwen-memory")
+    GRAPHITI_LLM_API_KEY: str = Field(default="sk-nexusrag")
+    # Embedding dimension — must match HRAG_EMBEDDING_MODEL (BAAI/bge-m3 = 1024).
+    GRAPHITI_EMBEDDING_DIM: int = Field(default=1024)
 
     # CORS
     CORS_ORIGINS: list[str] = Field(default=["http://localhost:5174", "http://localhost:3000"])

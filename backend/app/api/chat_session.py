@@ -277,28 +277,31 @@ async def chat_stream_session(
 
                 await db.commit()
 
-                # Background: auto-save user memories
-                if user.id and request.message:
+                # Background: save conversation episode to Graphiti knowledge graph
+                if user.id and request.message and accumulated_text:
                     try:
-                        from app.api.chat_agent import _auto_save_memory
-                        from app.core.database import async_session_maker
+                        from app.services.graphiti_client import add_conversation_episode
                         import asyncio as _asyncio
 
                         uid = user.id
                         sid = session_id
                         msg = request.message
+                        ans = accumulated_text
 
                         async def _bg_save():
                             try:
-                                async with async_session_maker() as bg_db:
-                                    await _auto_save_memory(uid, msg, sid, bg_db)
-                                    await bg_db.commit()
+                                await add_conversation_episode(
+                                    user_id=uid,
+                                    user_message=msg,
+                                    assistant_message=ans,
+                                    session_id=sid,
+                                )
                             except Exception as _e:
-                                logger.warning(f"[lg/session] Background auto-save failed: {_e}")
+                                logger.warning(f"[lg/session] Graphiti episode save failed: {_e}")
 
                         _asyncio.create_task(_bg_save())
                     except Exception as _e:
-                        logger.warning(f"[lg/session] Auto-save task spawn failed: {_e}")
+                        logger.warning(f"[lg/session] Graphiti save task spawn failed: {_e}")
 
             except Exception as e:
                 logger.error(f"[lg/session] LangGraph stream error: {e}", exc_info=True)

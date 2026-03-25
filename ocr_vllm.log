@@ -1,106 +1,96 @@
 /home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/transformers/utils/hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
   warnings.warn(
-(APIServer pid=2002513) INFO 03-23 12:22:41 [utils.py:302] 
-(APIServer pid=2002513) INFO 03-23 12:22:41 [utils.py:302]        █     █     █▄   ▄█
-(APIServer pid=2002513) INFO 03-23 12:22:41 [utils.py:302]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.17.1
-(APIServer pid=2002513) INFO 03-23 12:22:41 [utils.py:302]   █▄█▀ █     █     █     █  model   tencent/HunyuanOCR
-(APIServer pid=2002513) INFO 03-23 12:22:41 [utils.py:302]    ▀▀  ▀▀▀▀▀ ▀▀▀▀▀ ▀     ▀
-(APIServer pid=2002513) INFO 03-23 12:22:41 [utils.py:302] 
-(APIServer pid=2002513) INFO 03-23 12:22:41 [utils.py:238] non-default args: {'port': 8001, 'model': 'tencent/HunyuanOCR', 'trust_remote_code': True, 'served_model_name': ['hunyuan-ocr'], 'gpu_memory_utilization': 0.4}
-(APIServer pid=2002513) The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
-(APIServer pid=2002513) The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
-(APIServer pid=2002513) The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
-(APIServer pid=2002513) INFO 03-23 12:22:42 [config.py:385] Replacing legacy 'type' key with 'rope_type'
-(APIServer pid=2002513) INFO 03-23 12:22:43 [model.py:531] Resolved architecture: HunYuanVLForConditionalGeneration
-(APIServer pid=2002513) INFO 03-23 12:22:43 [model.py:1554] Using max model len 32768
-(APIServer pid=2002513) INFO 03-23 12:22:43 [scheduler.py:231] Chunked prefill is enabled with max_num_batched_tokens=2048.
-(APIServer pid=2002513) INFO 03-23 12:22:43 [vllm.py:747] Asynchronous scheduling is enabled.
-(APIServer pid=2002513) /home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/transformers/models/auto/image_processing_auto.py:647: FutureWarning: The image_processor_class argument is deprecated and will be removed in v4.42. Please use `slow_image_processor_class`, or `fast_image_processor_class` instead
-(APIServer pid=2002513)   warnings.warn(
-(APIServer pid=2002513) Using a slow image processor as `use_fast` is unset and a slow processor was saved with this model. `use_fast=True` will be the default behavior in v4.52, even if the model was saved with a slow processor. This will result in minor differences in outputs. You'll still be able to use a slow processor with `use_fast=False`.
-(APIServer pid=2002513) `use_fast` is set to `True` but the image processor class does not have a fast version.  Falling back to the slow version.
+(APIServer pid=1919446) INFO 03-24 22:21:08 [utils.py:302] 
+(APIServer pid=1919446) INFO 03-24 22:21:08 [utils.py:302]        █     █     █▄   ▄█
+(APIServer pid=1919446) INFO 03-24 22:21:08 [utils.py:302]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.17.1
+(APIServer pid=1919446) INFO 03-24 22:21:08 [utils.py:302]   █▄█▀ █     █     █     █  model   tencent/HunyuanOCR
+(APIServer pid=1919446) INFO 03-24 22:21:08 [utils.py:302]    ▀▀  ▀▀▀▀▀ ▀▀▀▀▀ ▀     ▀
+(APIServer pid=1919446) INFO 03-24 22:21:08 [utils.py:302] 
+(APIServer pid=1919446) INFO 03-24 22:21:08 [utils.py:238] non-default args: {'port': 8001, 'model': 'tencent/HunyuanOCR', 'trust_remote_code': True, 'served_model_name': ['hunyuan-ocr'], 'gpu_memory_utilization': 0.4}
+(APIServer pid=1919446) The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+(APIServer pid=1919446) The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+(APIServer pid=1919446) The argument `trust_remote_code` is to be used with Auto classes. It has no effect here and is ignored.
+(APIServer pid=1919446) INFO 03-24 22:21:10 [config.py:385] Replacing legacy 'type' key with 'rope_type'
+(APIServer pid=1919446) INFO 03-24 22:21:10 [model.py:531] Resolved architecture: HunYuanVLForConditionalGeneration
+(APIServer pid=1919446) INFO 03-24 22:21:10 [model.py:1554] Using max model len 32768
+(APIServer pid=1919446) INFO 03-24 22:21:10 [scheduler.py:231] Chunked prefill is enabled with max_num_batched_tokens=2048.
+(APIServer pid=1919446) INFO 03-24 22:21:10 [vllm.py:747] Asynchronous scheduling is enabled.
+(APIServer pid=1919446) /home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/transformers/models/auto/image_processing_auto.py:647: FutureWarning: The image_processor_class argument is deprecated and will be removed in v4.42. Please use `slow_image_processor_class`, or `fast_image_processor_class` instead
+(APIServer pid=1919446)   warnings.warn(
+(APIServer pid=1919446) Using a slow image processor as `use_fast` is unset and a slow processor was saved with this model. `use_fast=True` will be the default behavior in v4.52, even if the model was saved with a slow processor. This will result in minor differences in outputs. You'll still be able to use a slow processor with `use_fast=False`.
+(APIServer pid=1919446) `use_fast` is set to `True` but the image processor class does not have a fast version.  Falling back to the slow version.
 /home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/transformers/utils/hub.py:110: FutureWarning: Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers. Use `HF_HOME` instead.
   warnings.warn(
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:05 [core.py:101] Initializing a V1 LLM engine (v0.17.1) with config: model='tencent/HunyuanOCR', speculative_config=None, tokenizer='tencent/HunyuanOCR', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=32768, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=False, quantization=None, enforce_eager=False, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False), seed=0, served_model_name=hunyuan-ocr, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'level': None, 'mode': <CompilationMode.VLLM_COMPILE: 3>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['none'], 'splitting_ops': ['vllm::unified_attention', 'vllm::unified_attention_with_output', 'vllm::unified_mla_attention', 'vllm::unified_mla_attention_with_output', 'vllm::mamba_mixer2', 'vllm::mamba_mixer', 'vllm::short_conv', 'vllm::linear_attention', 'vllm::plamo2_mamba_mixer', 'vllm::gdn_attention_core', 'vllm::kda_attention', 'vllm::sparse_attn_indexer', 'vllm::rocm_aiter_sparse_attn_indexer', 'vllm::unified_kv_cache_update', 'vllm::unified_mla_kv_cache_update'], 'compile_mm_encoder': False, 'compile_sizes': [], 'compile_ranges_split_points': [2048], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_AND_PIECEWISE: (2, 1)>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': False, 'fuse_act_quant': False, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False}, 'max_cudagraph_capture_size': 512, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': True, 'static_all_moe_layers': []}
-(EngineCore_DP0 pid=2004385) /home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/transformers/models/auto/image_processing_auto.py:647: FutureWarning: The image_processor_class argument is deprecated and will be removed in v4.42. Please use `slow_image_processor_class`, or `fast_image_processor_class` instead
-(EngineCore_DP0 pid=2004385)   warnings.warn(
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:08 [parallel_state.py:1393] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://192.168.1.2:48687 backend=nccl
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:08 [parallel_state.py:1715] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
-(EngineCore_DP0 pid=2004385) Using a slow image processor as `use_fast` is unset and a slow processor was saved with this model. `use_fast=True` will be the default behavior in v4.52, even if the model was saved with a slow processor. This will result in minor differences in outputs. You'll still be able to use a slow processor with `use_fast=False`.
-(EngineCore_DP0 pid=2004385) `use_fast` is set to `True` but the image processor class does not have a fast version.  Falling back to the slow version.
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:17 [base.py:106] Offloader set to NoopOffloader
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:17 [gpu_model_runner.py:4281] Starting to load model tencent/HunyuanOCR...
-(EngineCore_DP0 pid=2004385) <frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
-(EngineCore_DP0 pid=2004385) <frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:18 [cuda.py:453] Using backend AttentionBackendEnum.FLASH_ATTN for vit attention
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:18 [mm_encoder_attention.py:215] Using AttentionBackendEnum.FLASH_ATTN for MMEncoderAttention.
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:18 [vllm.py:747] Asynchronous scheduling is enabled.
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:18 [cuda.py:405] Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'FLASHINFER', 'TRITON_ATTN', 'FLEX_ATTENTION'].
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:18 [flash_attn.py:587] Using FlashAttention version 2
-(EngineCore_DP0 pid=2004385) Loading safetensors checkpoint shards:   0% Completed | 0/4 [00:00<?, ?it/s]
-(EngineCore_DP0 pid=2004385) Loading safetensors checkpoint shards:  25% Completed | 1/4 [00:00<00:00,  8.40it/s]
-(EngineCore_DP0 pid=2004385) Loading safetensors checkpoint shards:  75% Completed | 3/4 [00:00<00:00, 10.27it/s]
-(EngineCore_DP0 pid=2004385) Loading safetensors checkpoint shards: 100% Completed | 4/4 [00:00<00:00,  9.64it/s]
-(EngineCore_DP0 pid=2004385) 
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:20 [default_loader.py:293] Loading weights took 0.42 seconds
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:21 [gpu_model_runner.py:4364] Model loading took 1.9 GiB memory and 2.931843 seconds
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:21 [gpu_model_runner.py:5280] Encoder cache will be initialized with a budget of 4354 tokens, and profiled with 1 image items of the maximum feature size.
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:31 [decorators.py:465] Directly load AOT compilation from path /home/lph/.cache/vllm/torch_compile_cache/torch_aot_compile/c93b14808418de6ddf12edc6fcfe2d691a92b230d8e75188fe55827b9d5476bc/rank_0_0/model
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:31 [backends.py:916] Using cache directory: /home/lph/.cache/vllm/torch_compile_cache/68f9c5327e/rank_0_0/backbone for vLLM's torch.compile
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:31 [backends.py:976] Dynamo bytecode transform time: 3.18 s
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:33 [backends.py:266] Directly load the compiled graph(s) for compile range (1, 2048) from the cache, took 0.924 s
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:33 [monitor.py:35] torch.compile takes 4.67 s in total
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:34 [gpu_worker.py:424] Available KV cache memory: 13.53 GiB
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:34 [kv_cache_utils.py:1314] GPU KV cache size: 147,776 tokens
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:34 [kv_cache_utils.py:1319] Maximum concurrency for 32,768 tokens per request: 4.51x
-(EngineCore_DP0 pid=2004385) Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):   0%|          | 0/51 [00:00<?, ?it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):   6%|▌         | 3/51 [00:00<00:01, 29.73it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  12%|█▏        | 6/51 [00:00<00:04, 11.12it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  18%|█▊        | 9/51 [00:00<00:02, 15.51it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  24%|██▎       | 12/51 [00:00<00:03, 11.41it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  27%|██▋       | 14/51 [00:01<00:04,  8.98it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  33%|███▎      | 17/51 [00:01<00:02, 11.74it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  37%|███▋      | 19/51 [00:01<00:03,  8.91it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  43%|████▎     | 22/51 [00:02<00:03,  8.33it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  49%|████▉     | 25/51 [00:02<00:03,  7.99it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  55%|█████▍    | 28/51 [00:03<00:03,  7.61it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  61%|██████    | 31/51 [00:03<00:02,  9.69it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  65%|██████▍   | 33/51 [00:03<00:02,  8.28it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  71%|███████   | 36/51 [00:03<00:01,  8.00it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  76%|███████▋  | 39/51 [00:04<00:01,  7.78it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  82%|████████▏ | 42/51 [00:04<00:01,  7.61it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  86%|████████▋ | 44/51 [00:04<00:00,  8.79it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  90%|█████████ | 46/51 [00:05<00:00,  7.57it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  96%|█████████▌| 49/51 [00:05<00:00,  9.88it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE): 100%|██████████| 51/51 [00:05<00:00,  8.19it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE): 100%|██████████| 51/51 [00:05<00:00,  8.88it/s]
-(EngineCore_DP0 pid=2004385) Capturing CUDA graphs (decode, FULL):   0%|          | 0/35 [00:00<?, ?it/s]Capturing CUDA graphs (decode, FULL):   6%|▌         | 2/35 [00:00<00:06,  5.32it/s]Capturing CUDA graphs (decode, FULL):  17%|█▋        | 6/35 [00:00<00:03,  8.13it/s]Capturing CUDA graphs (decode, FULL):  26%|██▌       | 9/35 [00:00<00:02, 11.85it/s]Capturing CUDA graphs (decode, FULL):  31%|███▏      | 11/35 [00:01<00:02,  8.70it/s]Capturing CUDA graphs (decode, FULL):  40%|████      | 14/35 [00:01<00:02,  8.30it/s]Capturing CUDA graphs (decode, FULL):  49%|████▊     | 17/35 [00:01<00:01, 10.80it/s]Capturing CUDA graphs (decode, FULL):  54%|█████▍    | 19/35 [00:02<00:01,  8.90it/s]Capturing CUDA graphs (decode, FULL):  63%|██████▎   | 22/35 [00:02<00:01,  8.55it/s]Capturing CUDA graphs (decode, FULL):  71%|███████▏  | 25/35 [00:02<00:00, 10.96it/s]Capturing CUDA graphs (decode, FULL):  77%|███████▋  | 27/35 [00:02<00:00,  8.77it/s]Capturing CUDA graphs (decode, FULL):  86%|████████▌ | 30/35 [00:03<00:00,  8.47it/s]Capturing CUDA graphs (decode, FULL):  91%|█████████▏| 32/35 [00:03<00:00,  9.86it/s]Capturing CUDA graphs (decode, FULL):  97%|█████████▋| 34/35 [00:03<00:00,  8.50it/s]Capturing CUDA graphs (decode, FULL): 100%|██████████| 35/35 [00:03<00:00,  9.12it/s]
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:44 [gpu_model_runner.py:5386] Graph capturing finished in 11 secs, took 1.00 GiB
-(EngineCore_DP0 pid=2004385) INFO 03-23 12:23:45 [core.py:282] init engine (profile, create kv cache, warmup model) took 23.93 seconds
-(APIServer pid=2002513) INFO 03-23 12:23:45 [api_server.py:495] Supported tasks: ['generate']
-(APIServer pid=2002513) WARNING 03-23 12:23:46 [model.py:1355] Default vLLM sampling parameters have been overridden by the model's `generation_config.json`: `{'repetition_penalty': 1.03, 'temperature': 0.0, 'top_k': 1}`. If this is not intended, please relaunch vLLM instance with `--generation-config vllm`.
-(APIServer pid=2002513) INFO 03-23 12:23:46 [serving.py:185] Warming up chat template processing...
-(APIServer pid=2002513) INFO 03-23 12:23:51 [hf.py:318] Detected the chat template content format to be 'openai'. You can set `--chat-template-content-format` to override this.
-(APIServer pid=2002513) INFO 03-23 12:23:51 [serving.py:210] Chat template warmup completed in 4747.5ms
-(APIServer pid=2002513) INFO 03-23 12:23:51 [api_server.py:500] Starting vLLM API server 0 on http://0.0.0.0:8001
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:38] Available routes are:
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /openapi.json, Methods: HEAD, GET
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /docs, Methods: HEAD, GET
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /docs/oauth2-redirect, Methods: HEAD, GET
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /redoc, Methods: HEAD, GET
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /tokenize, Methods: POST
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /detokenize, Methods: POST
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /load, Methods: GET
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /version, Methods: GET
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /health, Methods: GET
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /metrics, Methods: GET
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /v1/models, Methods: GET
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /ping, Methods: GET
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /ping, Methods: POST
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /invocations, Methods: POST
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /v1/chat/completions, Methods: POST
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /v1/chat/completions/render, Methods: POST
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /v1/responses, Methods: POST
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /v1/responses/{response_id}, Methods: GET
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /v1/responses/{response_id}/cancel, Methods: POST
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /v1/completions, Methods: POST
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /v1/completions/render, Methods: POST
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /v1/messages, Methods: POST
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /v1/messages/count_tokens, Methods: POST
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /inference/v1/generate, Methods: POST
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /scale_elastic_ep, Methods: POST
-(APIServer pid=2002513) INFO 03-23 12:23:51 [launcher.py:47] Route: /is_scaling_elastic_ep, Methods: POST
-(APIServer pid=2002513) INFO:     Started server process [2002513]
-(APIServer pid=2002513) INFO:     Waiting for application startup.
-(APIServer pid=2002513) INFO:     Application startup complete.
-(APIServer pid=2002513) INFO:     127.0.0.1:53768 - "GET /v1 HTTP/1.1" 404 Not Found
-(APIServer pid=2002513) INFO:     127.0.0.1:53768 - "GET /favicon.ico HTTP/1.1" 404 Not Found
-(APIServer pid=2002513) INFO:     127.0.0.1:34680 - "GET /v1/models HTTP/1.1" 200 OK
-(APIServer pid=2002513) INFO:     10.8.0.44:56887 - "GET /docs HTTP/1.1" 200 OK
-(APIServer pid=2002513) INFO:     10.8.0.44:56887 - "GET /openapi.json HTTP/1.1" 200 OK
-(APIServer pid=2002513) INFO:     127.0.0.1:44160 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-(APIServer pid=2002513) INFO:     127.0.0.1:44148 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-(APIServer pid=2002513) INFO:     127.0.0.1:44144 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-(APIServer pid=2002513) INFO:     127.0.0.1:44136 - "POST /v1/chat/completions HTTP/1.1" 200 OK
-(APIServer pid=2002513) INFO 03-23 18:04:38 [loggers.py:259] Engine 000: Avg prompt throughput: 899.1 tokens/s, Avg generation throughput: 305.2 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%, MM cache hit rate: 0.0%
-(APIServer pid=2002513) INFO 03-23 18:04:48 [loggers.py:259] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 0.0 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%, MM cache hit rate: 0.0%
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:21:31 [core.py:101] Initializing a V1 LLM engine (v0.17.1) with config: model='tencent/HunyuanOCR', speculative_config=None, tokenizer='tencent/HunyuanOCR', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=True, dtype=torch.bfloat16, max_seq_len=32768, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, disable_custom_all_reduce=False, quantization=None, enforce_eager=False, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_fallback=False, disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False), seed=0, served_model_name=hunyuan-ocr, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'level': None, 'mode': <CompilationMode.VLLM_COMPILE: 3>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['none'], 'splitting_ops': ['vllm::unified_attention', 'vllm::unified_attention_with_output', 'vllm::unified_mla_attention', 'vllm::unified_mla_attention_with_output', 'vllm::mamba_mixer2', 'vllm::mamba_mixer', 'vllm::short_conv', 'vllm::linear_attention', 'vllm::plamo2_mamba_mixer', 'vllm::gdn_attention_core', 'vllm::kda_attention', 'vllm::sparse_attn_indexer', 'vllm::rocm_aiter_sparse_attn_indexer', 'vllm::unified_kv_cache_update', 'vllm::unified_mla_kv_cache_update'], 'compile_mm_encoder': False, 'compile_sizes': [], 'compile_ranges_split_points': [2048], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_AND_PIECEWISE: (2, 1)>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': False, 'fuse_act_quant': False, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False}, 'max_cudagraph_capture_size': 512, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': True, 'static_all_moe_layers': []}
+(EngineCore_DP0 pid=1921258) /home/lph/Documents/GitHub/AIRAG/.venv/lib/python3.12/site-packages/transformers/models/auto/image_processing_auto.py:647: FutureWarning: The image_processor_class argument is deprecated and will be removed in v4.42. Please use `slow_image_processor_class`, or `fast_image_processor_class` instead
+(EngineCore_DP0 pid=1921258)   warnings.warn(
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:21:35 [parallel_state.py:1393] world_size=1 rank=0 local_rank=0 distributed_init_method=tcp://192.168.1.2:39249 backend=nccl
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:21:35 [parallel_state.py:1715] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank 0, EPLB rank N/A
+(EngineCore_DP0 pid=1921258) Using a slow image processor as `use_fast` is unset and a slow processor was saved with this model. `use_fast=True` will be the default behavior in v4.52, even if the model was saved with a slow processor. This will result in minor differences in outputs. You'll still be able to use a slow processor with `use_fast=False`.
+(EngineCore_DP0 pid=1921258) `use_fast` is set to `True` but the image processor class does not have a fast version.  Falling back to the slow version.
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:21:44 [base.py:106] Offloader set to NoopOffloader
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:21:44 [gpu_model_runner.py:4281] Starting to load model tencent/HunyuanOCR...
+(EngineCore_DP0 pid=1921258) <frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.cudart module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.runtime module instead.
+(EngineCore_DP0 pid=1921258) <frozen importlib._bootstrap_external>:1297: FutureWarning: The cuda.nvrtc module is deprecated and will be removed in a future release, please switch to use the cuda.bindings.nvrtc module instead.
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:21:45 [cuda.py:453] Using backend AttentionBackendEnum.FLASH_ATTN for vit attention
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:21:45 [mm_encoder_attention.py:215] Using AttentionBackendEnum.FLASH_ATTN for MMEncoderAttention.
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:21:45 [vllm.py:747] Asynchronous scheduling is enabled.
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:21:45 [cuda.py:405] Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'FLASHINFER', 'TRITON_ATTN', 'FLEX_ATTENTION'].
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:21:45 [flash_attn.py:587] Using FlashAttention version 2
+(EngineCore_DP0 pid=1921258) Loading safetensors checkpoint shards:   0% Completed | 0/4 [00:00<?, ?it/s]
+(EngineCore_DP0 pid=1921258) Loading safetensors checkpoint shards:  25% Completed | 1/4 [00:00<00:00,  7.90it/s]
+(EngineCore_DP0 pid=1921258) Loading safetensors checkpoint shards:  75% Completed | 3/4 [00:00<00:00, 10.11it/s]
+(EngineCore_DP0 pid=1921258) Loading safetensors checkpoint shards: 100% Completed | 4/4 [00:00<00:00,  9.14it/s]
+(EngineCore_DP0 pid=1921258) Loading safetensors checkpoint shards: 100% Completed | 4/4 [00:00<00:00,  9.20it/s]
+(EngineCore_DP0 pid=1921258) 
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:21:47 [default_loader.py:293] Loading weights took 0.44 seconds
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:21:48 [gpu_model_runner.py:4364] Model loading took 1.9 GiB memory and 2.924265 seconds
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:21:48 [gpu_model_runner.py:5280] Encoder cache will be initialized with a budget of 4354 tokens, and profiled with 1 image items of the maximum feature size.
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:21:58 [decorators.py:465] Directly load AOT compilation from path /home/lph/.cache/vllm/torch_compile_cache/torch_aot_compile/c93b14808418de6ddf12edc6fcfe2d691a92b230d8e75188fe55827b9d5476bc/rank_0_0/model
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:21:58 [backends.py:916] Using cache directory: /home/lph/.cache/vllm/torch_compile_cache/68f9c5327e/rank_0_0/backbone for vLLM's torch.compile
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:21:58 [backends.py:976] Dynamo bytecode transform time: 3.32 s
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:22:00 [backends.py:266] Directly load the compiled graph(s) for compile range (1, 2048) from the cache, took 0.859 s
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:22:00 [monitor.py:35] torch.compile takes 4.90 s in total
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:22:01 [gpu_worker.py:424] Available KV cache memory: 11.01 GiB
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:22:01 [kv_cache_utils.py:1314] GPU KV cache size: 120,208 tokens
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:22:01 [kv_cache_utils.py:1319] Maximum concurrency for 32,768 tokens per request: 3.67x
+(EngineCore_DP0 pid=1921258) Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):   0%|          | 0/51 [00:00<?, ?it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):   2%|▏         | 1/51 [00:00<00:13,  3.81it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  10%|▉         | 5/51 [00:00<00:02, 16.09it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  20%|█▉        | 10/51 [00:00<00:02, 13.67it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  27%|██▋       | 14/51 [00:00<00:02, 17.99it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  37%|███▋      | 19/51 [00:01<00:02, 15.41it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  45%|████▌     | 23/51 [00:01<00:01, 18.71it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  55%|█████▍    | 28/51 [00:01<00:00, 23.60it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  63%|██████▎   | 32/51 [00:01<00:01, 16.52it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  71%|███████   | 36/51 [00:02<00:00, 20.00it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  76%|███████▋  | 39/51 [00:02<00:00, 14.16it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  84%|████████▍ | 43/51 [00:02<00:00, 17.60it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  90%|█████████ | 46/51 [00:02<00:00, 13.98it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE):  98%|█████████▊| 50/51 [00:03<00:00, 16.97it/s]Capturing CUDA graphs (mixed prefill-decode, PIECEWISE): 100%|██████████| 51/51 [00:03<00:00, 16.58it/s]
+(EngineCore_DP0 pid=1921258) Capturing CUDA graphs (decode, FULL):   0%|          | 0/35 [00:00<?, ?it/s]Capturing CUDA graphs (decode, FULL):   3%|▎         | 1/35 [00:00<00:10,  3.39it/s]Capturing CUDA graphs (decode, FULL):  11%|█▏        | 4/35 [00:00<00:02, 10.74it/s]Capturing CUDA graphs (decode, FULL):  20%|██        | 7/35 [00:00<00:01, 15.68it/s]Capturing CUDA graphs (decode, FULL):  26%|██▌       | 9/35 [00:00<00:02, 10.01it/s]Capturing CUDA graphs (decode, FULL):  34%|███▍      | 12/35 [00:00<00:01, 13.68it/s]Capturing CUDA graphs (decode, FULL):  43%|████▎     | 15/35 [00:01<00:01, 10.56it/s]Capturing CUDA graphs (decode, FULL):  51%|█████▏    | 18/35 [00:01<00:01, 13.17it/s]Capturing CUDA graphs (decode, FULL):  60%|██████    | 21/35 [00:01<00:00, 15.95it/s]Capturing CUDA graphs (decode, FULL):  69%|██████▊   | 24/35 [00:02<00:00, 11.91it/s]Capturing CUDA graphs (decode, FULL):  77%|███████▋  | 27/35 [00:02<00:00, 14.43it/s]Capturing CUDA graphs (decode, FULL):  83%|████████▎ | 29/35 [00:02<00:00, 11.08it/s]Capturing CUDA graphs (decode, FULL):  91%|█████████▏| 32/35 [00:02<00:00, 13.31it/s]Capturing CUDA graphs (decode, FULL): 100%|██████████| 35/35 [00:02<00:00, 16.06it/s]Capturing CUDA graphs (decode, FULL): 100%|██████████| 35/35 [00:02<00:00, 13.06it/s]
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:22:07 [gpu_model_runner.py:5386] Graph capturing finished in 7 secs, took 0.39 GiB
+(EngineCore_DP0 pid=1921258) INFO 03-24 22:22:08 [core.py:282] init engine (profile, create kv cache, warmup model) took 20.05 seconds
+(APIServer pid=1919446) INFO 03-24 22:22:08 [api_server.py:495] Supported tasks: ['generate']
+(APIServer pid=1919446) WARNING 03-24 22:22:09 [model.py:1355] Default vLLM sampling parameters have been overridden by the model's `generation_config.json`: `{'repetition_penalty': 1.03, 'temperature': 0.0, 'top_k': 1}`. If this is not intended, please relaunch vLLM instance with `--generation-config vllm`.
+(APIServer pid=1919446) INFO 03-24 22:22:09 [serving.py:185] Warming up chat template processing...
+(APIServer pid=1919446) INFO 03-24 22:22:14 [hf.py:318] Detected the chat template content format to be 'openai'. You can set `--chat-template-content-format` to override this.
+(APIServer pid=1919446) INFO 03-24 22:22:14 [serving.py:210] Chat template warmup completed in 4904.3ms
+(APIServer pid=1919446) INFO 03-24 22:22:15 [api_server.py:500] Starting vLLM API server 0 on http://0.0.0.0:8001
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:38] Available routes are:
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /openapi.json, Methods: GET, HEAD
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /docs, Methods: GET, HEAD
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /docs/oauth2-redirect, Methods: GET, HEAD
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /redoc, Methods: GET, HEAD
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /tokenize, Methods: POST
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /detokenize, Methods: POST
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /load, Methods: GET
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /version, Methods: GET
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /health, Methods: GET
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /metrics, Methods: GET
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /v1/models, Methods: GET
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /ping, Methods: GET
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /ping, Methods: POST
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /invocations, Methods: POST
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /v1/chat/completions, Methods: POST
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /v1/chat/completions/render, Methods: POST
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /v1/responses, Methods: POST
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /v1/responses/{response_id}, Methods: GET
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /v1/responses/{response_id}/cancel, Methods: POST
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /v1/completions, Methods: POST
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /v1/completions/render, Methods: POST
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /v1/messages, Methods: POST
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /v1/messages/count_tokens, Methods: POST
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /inference/v1/generate, Methods: POST
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /scale_elastic_ep, Methods: POST
+(APIServer pid=1919446) INFO 03-24 22:22:15 [launcher.py:47] Route: /is_scaling_elastic_ep, Methods: POST
+(APIServer pid=1919446) INFO:     Started server process [1919446]
+(APIServer pid=1919446) INFO:     Waiting for application startup.
+(APIServer pid=1919446) INFO:     Application startup complete.

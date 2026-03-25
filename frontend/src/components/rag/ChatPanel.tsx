@@ -132,14 +132,14 @@ function CitationLink({
   };
 
   if (isKG) {
-    // KG source — purple chip with Brain icon
+    // KG source — purple chip with Brain emoji
     return (
       <button
         onClick={handleContentClick}
-        className="inline-flex items-center gap-0.5 h-[18px] px-1.5 mx-0.5 text-[10px] font-medium rounded-full bg-purple-400/15 text-purple-500 dark:text-purple-400 hover:bg-purple-400/25 transition-colors align-middle whitespace-nowrap"
+className="inline-flex items-center gap-0.5 h-[18px] px-1.5 mx-0.5 text-[10px] font-medium rounded-full bg-purple-400/15 text-purple-500 dark:text-purple-400 hover:bg-purple-400/25 transition-colors align-middle whitespace-nowrap"
         title={t("chat.view_kg")}
       >
-        <Brain className="w-2.5 h-2.5 flex-shrink-0" />
+                <Brain className="w-2.5 h-2.5 flex-shrink-0" />
         <span>KG-{index}</span>
       </button>
     );
@@ -165,7 +165,7 @@ function CitationLink({
         className="inline-flex items-center justify-center w-[18px] h-[18px] text-[10px] font-bold rounded-full bg-purple-400/15 text-purple-500 dark:text-purple-400 hover:bg-purple-400/25 transition-colors"
         title={t("chat.highlight_kg")}
       >
-        <Brain className="w-2.5 h-2.5" />
+                <Brain className="w-2.5 h-2.5" />
       </button>
     </span>
   );
@@ -178,10 +178,10 @@ function MemoryCitation({ index }: { index: string }) {
   const { t } = useTranslation();
   return (
     <span
-      className="inline-flex items-center justify-center w-[18px] h-[18px] mx-0.5 text-[10px] font-medium rounded-full bg-amber-400/15 text-amber-600 dark:text-amber-400 border border-amber-400/20 align-middle shadow-sm"
+      className="inline-flex items-center justify-center w-[18px] h-[18px] mx-0.5 text-[11px] font-medium rounded-full bg-amber-400/15 text-amber-600 dark:text-amber-400 align-middle"
       title={`${t("chat.memory_citation")}: ${index}`}
     >
-      <Brain className="w-2.5 h-2.5 flex-shrink-0" />
+      🧠
     </span>
   );
 }
@@ -298,17 +298,27 @@ function injectCitations(
           // Text citation: match source by index (string or numeric)
           // First try current message's sources, then fallback to historical sources
           // robust case-insensitive trim match
+          // Also support legacy "cidN" format from older LLM outputs
           const cleanToken = token.trim().toLowerCase();
+          const cidMatch = cleanToken.match(/^cid(\d+)$/i);
+          const normalizedToken = cidMatch ? cidMatch[1] : cleanToken;
           const source =
-            sources.find((s) => String(s.index).toLowerCase() === cleanToken) ??
-            (fallbackSources ? fallbackSources.find((s) => String(s.index).toLowerCase() === cleanToken) : undefined);
+            sources.find((s) => String(s.index).toLowerCase() === normalizedToken) ??
+            (fallbackSources ? fallbackSources.find((s) => String(s.index).toLowerCase() === normalizedToken) : undefined);
           if (source) {
             result.push(
               <CitationLink key={key} index={String(source.index)} source={source} relatedEntities={relatedEntities} />
             );
             return;
           }
-          // Unmatched — render as-is
+          // Unmatched — check if it looks like a memory/fact citation (e.g. [id1], [ref2], [mem3])
+          // LLMs sometimes hallucinate citation markers when referencing memory facts
+          const looksLikeCitation = /^(id|ref|mem|fact|src|doc|cid)\d+$/i.test(cleanToken);
+          if (looksLikeCitation) {
+            result.push(<MemoryCitation key={key} index={token.trim()} />);
+            return;
+          }
+          // Truly unmatched — render as-is
           result.push(`[${token}]`);
         });
       });
@@ -371,7 +381,13 @@ function preprocessMarkdown(text: string): string {
     prevWasTable = isTable;
   }
 
-  return result.join("\n");
+  // Convert memory section markers to a styled markdown heading for ReactMarkdown.
+  // Backend emits "[Memory]" (current) — also handle legacy "<memory_section>" tag.
+  let processed = result.join("\n");
+  processed = processed.replace(/\[Memory\]/gi, "\n---\n🧠 ");
+  processed = processed.replace(/<memory_section>/gi, "\n---\n🧠 ");
+
+  return processed;
 }
 
 // ---------------------------------------------------------------------------

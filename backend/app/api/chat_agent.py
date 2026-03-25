@@ -1218,25 +1218,30 @@ async def agent_chat_stream(
         "related_entities": related_entities[:30],
     }}
 
-    # ── Auto-save: detect and save user preferences/facts ────────────────
-    if user_id and message:
+    # ── Auto-save: persist conversation episode to Graphiti knowledge graph ──
+    if user_id and message and accumulated_text:
         try:
-            from app.core.database import async_session_maker
+            from app.services.graphiti_client import add_conversation_episode
+            import asyncio
             uid = user_id
             sid = session_id
+            msg = message
+            ans = accumulated_text
+
             async def _bg_save():
                 try:
-                    async with async_session_maker() as bg_db:
-                        if uid is not None:
-                            await _auto_save_memory(uid, message, sid, bg_db)
-                        await bg_db.commit()
+                    await add_conversation_episode(
+                        user_id=uid,
+                        user_message=msg,
+                        assistant_message=ans,
+                        session_id=sid,
+                    )
                 except Exception as e:
-                    logger.warning(f"Background auto-save failed: {e}")
-            
-            import asyncio
+                    logger.warning(f"Graphiti episode save failed: {e}")
+
             asyncio.create_task(_bg_save())
         except Exception as e:
-            logger.warning(f"Auto-save memory task spawn failed: {e}")
+            logger.warning(f"Graphiti save task spawn failed: {e}")
 
 
 # ---------------------------------------------------------------------------

@@ -47,8 +47,8 @@ def _route_by_intent(state: AgentState) -> str:
     """
     intent = state.get("intent", "search")
 
-    if intent == "greeting":
-        logger.debug("[router] intent=greeting → direct_answer")
+    if intent in ("greeting", "personal"):
+        logger.debug(f"[router] intent={intent!r} → direct_answer")
         return "direct_answer"
 
     logger.debug(f"[router] intent={intent!r} → tool_executor")

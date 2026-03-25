@@ -19,6 +19,7 @@ SSE streaming:
     shared asyncio.Queue injected by stream_agent_to_sse. answer_generator and
     direct_answer use provider.astream() to push tokens one-by-one in real-time.
 """
+
 from __future__ import annotations
 
 import json
@@ -42,6 +43,8 @@ Respond ONLY with valid JSON. No explanation, no markdown, no extra text.
 
 Intent categories:
 - "greeting"  : greetings, thanks, farewells, simple chitchat → no document search needed
+- "personal"  : questions about the user themselves (where they work, their name, their role, \
+their preferences, anything about "tôi/I/me/my") → answer from personal memory, no document search
 - "search"    : questions about document content, data, facts, analysis → needs search
 - "list_docs" : user wants to know what documents/files are available
 - "summarize" : user wants a summary of a specific document
@@ -52,19 +55,30 @@ Output format:
 
 Rules:
 - For "greeting": set rewritten_query to "" and needs_tool to false
+- For "personal": set rewritten_query to the user's question verbatim and needs_tool to false
 - For all other intents: rewrite the query to be specific and detailed for retrieval
 - If the message contains a document ID, preserve it in the output
 - Default to "search" when uncertain
 
 Examples:
 User: "xin chào"  → {"intent": "greeting", "rewritten_query": "", "needs_tool": false}
+User: "tôi đang công tác ở đâu?" → {"intent": "personal", "rewritten_query": "tôi đang công tác ở đâu?", "needs_tool": false}
+User: "tôi tên là gì?" → {"intent": "personal", "rewritten_query": "tôi tên là gì?", "needs_tool": false}
+User: "tôi làm việc ở đơn vị nào?" → {"intent": "personal", "rewritten_query": "tôi làm việc ở đơn vị nào?", "needs_tool": false}
 User: "doanh thu 2024 là bao nhiêu?" → {"intent": "search", "rewritten_query": "doanh thu thuần tổng doanh thu năm 2024 theo quý", "needs_tool": true}
 User: "có tài liệu gì trong hệ thống?" → {"intent": "list_docs", "rewritten_query": "danh sách tài liệu", "needs_tool": true}
 User: "tóm tắt tài liệu ID 5" → {"intent": "summarize", "rewritten_query": "tóm tắt tài liệu 5", "needs_tool": true}
 User: "mối quan hệ giữa VietcomBank và VCB" → {"intent": "kg_query", "rewritten_query": "VietcomBank VCB relationship entities", "needs_tool": true}
 """
 
-_VALID_INTENTS = {"greeting", "search", "list_docs", "summarize", "kg_query"}
+_VALID_INTENTS = {
+    "greeting",
+    "personal",
+    "search",
+    "list_docs",
+    "summarize",
+    "kg_query",
+}
 
 
 def _parse_classifier_output(raw: str) -> dict:
@@ -83,7 +97,9 @@ def _parse_classifier_output(raw: str) -> dict:
         data = json.loads(raw)
         intent = data.get("intent", "search")
         if intent not in _VALID_INTENTS:
-            logger.warning(f"[classifier] Unknown intent '{intent}', defaulting to 'search'")
+            logger.warning(
+                f"[classifier] Unknown intent '{intent}', defaulting to 'search'"
+            )
             intent = "search"
         return {
             "intent": intent,
@@ -91,7 +107,9 @@ def _parse_classifier_output(raw: str) -> dict:
             "needs_tool": data.get("needs_tool", True),
         }
     except json.JSONDecodeError:
-        logger.warning(f"[classifier] Failed to parse JSON: {raw[:100]!r}, defaulting to search")
+        logger.warning(
+            f"[classifier] Failed to parse JSON: {raw[:100]!r}, defaulting to search"
+        )
         return {"intent": "search", "rewritten_query": "", "needs_tool": True}
 
 
@@ -99,45 +117,72 @@ def _parse_classifier_output(raw: str) -> dict:
 # Node: memory_recall
 # ---------------------------------------------------------------------------
 
+
+def _get_msg_role(msg) -> str:
+    """Extract role from a LangChain message or plain dict."""
+    if isinstance(msg, dict):
+        return msg.get("role", "")
+    # LangChain messages use .type ("human"/"ai"/"system"), not .role
+    msg_type = getattr(msg, "type", None)
+    if msg_type == "human":
+        return "user"
+    if msg_type == "ai":
+        return "assistant"
+    # Fallback: some messages may have .role
+    return getattr(msg, "role", "") or ""
+
+
+def _extract_last_user_message(state: "AgentState") -> str:
+    """Extract the most recent user message text from state messages."""
+    messages = state.get("messages", [])
+    for msg in reversed(messages):
+        if _get_msg_role(msg) == "user":
+            content = getattr(msg, "content", None) or (
+                msg.get("content") if isinstance(msg, dict) else ""
+            )
+            return content or ""
+    return ""
+
+
 async def memory_recall(state: "AgentState") -> dict:
     """
-    Load relevant user memories from pgvector and inject into state.
-    Non-blocking — if memory search fails, pipeline continues normally.
-    """
-    from app.services.agent.streaming import push_event, get_current_db
+    Load relevant user memories from Graphiti (temporal knowledge graph) and
+    inject into state as a formatted string.
 
-    await push_event(state, "status", {"step": "analyzing", "detail": "Đang tải bộ nhớ người dùng..."})
+    Graphiti stores conversation episodes in Neo4j and extracts temporal facts
+    (entities + relationships) from them. Search is hybrid: semantic + BM25 +
+    graph traversal — significantly richer than flat pgvector similarity search.
+
+    Non-blocking — if Graphiti is unavailable, the pipeline continues normally
+    with an empty memory context.
+    """
+    from app.services.agent.streaming import push_event
+
+    await push_event(
+        state,
+        "status",
+        {"step": "analyzing", "detail": "Đang tải bộ nhớ người dùng..."},
+    )
 
     user_id = state.get("user_id")
     if not user_id:
         return {"user_memory_context": ""}
 
-    # Extract the last user message text for memory search query
-    messages = state.get("messages", [])
-    user_message = ""
-    for msg in reversed(messages):
-        role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else None)
-        if role == "user":
-            content = getattr(msg, "content", None) or (msg.get("content") if isinstance(msg, dict) else "")
-            user_message = content
-            break
-
+    user_message = _extract_last_user_message(state)
     if not user_message:
         return {"user_memory_context": ""}
 
     try:
-        from app.api.chat_agent import _search_memories
-        # Đọc db từ ContextVar — bypass LangGraph TypedDict key filtering
-        db = get_current_db()
-        if db is None:
-            return {"user_memory_context": ""}
+        from app.services.graphiti_client import search_user_memory
 
-        memory_context = await _search_memories(user_id, user_message, db, top_k=5)
-        if memory_context and "No relevant memories" not in memory_context and "No memories found" not in memory_context:
-            logger.info(f"[memory_recall] Injected {len(memory_context)} chars for user {user_id}")
+        memory_context = await search_user_memory(user_id, user_message, top_k=5)
+        if memory_context:
+            logger.info(
+                f"[memory_recall] Graphiti injected {len(memory_context)} chars for user {user_id}"
+            )
             return {"user_memory_context": memory_context}
     except Exception as e:
-        logger.warning(f"[memory_recall] Failed: {e}")
+        logger.warning(f"[memory_recall] Graphiti search failed: {e}")
 
     return {"user_memory_context": ""}
 
@@ -145,6 +190,7 @@ async def memory_recall(state: "AgentState") -> dict:
 # ---------------------------------------------------------------------------
 # Node: intent_classifier
 # ---------------------------------------------------------------------------
+
 
 async def intent_classifier(state: "AgentState") -> dict:
     """
@@ -155,15 +201,18 @@ async def intent_classifier(state: "AgentState") -> dict:
     """
     from app.services.agent.streaming import push_event
 
-    await push_event(state, "status", {"step": "analyzing", "detail": "Đang phân tích câu hỏi..."})
+    await push_event(
+        state, "status", {"step": "analyzing", "detail": "Đang phân tích câu hỏi..."}
+    )
 
     messages = state.get("messages", [])
     user_message = ""
     for msg in reversed(messages):
-        role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else None)
-        if role == "user":
-            content = getattr(msg, "content", None) or (msg.get("content") if isinstance(msg, dict) else "")
-            user_message = content
+        if _get_msg_role(msg) == "user":
+            content = getattr(msg, "content", None) or (
+                msg.get("content") if isinstance(msg, dict) else ""
+            )
+            user_message = content or ""
             break
 
     if not user_message:
@@ -200,10 +249,14 @@ async def intent_classifier(state: "AgentState") -> dict:
             "kg_query": "Truy vấn đồ thị tri thức",
         }
         intent_label = intent_labels.get(result["intent"], "Tìm kiếm")
-        await push_event(state, "status", {
-            "step": "searching",
-            "detail": f"Phân loại: {intent_label}",
-        })
+        await push_event(
+            state,
+            "status",
+            {
+                "step": "searching",
+                "detail": f"Phân loại: {intent_label}",
+            },
+        )
 
         return {
             "intent": result["intent"],
@@ -211,13 +264,16 @@ async def intent_classifier(state: "AgentState") -> dict:
         }
 
     except Exception as e:
-        logger.error(f"[intent_classifier] Classifier failed: {e} — defaulting to 'search'")
+        logger.error(
+            f"[intent_classifier] Classifier failed: {e} — defaulting to 'search'"
+        )
         return {"intent": "search", "rewritten_query": user_message}
 
 
 # ---------------------------------------------------------------------------
 # Node: tool_executor
 # ---------------------------------------------------------------------------
+
 
 async def tool_executor(state: "AgentState") -> dict:
     """
@@ -246,10 +302,14 @@ async def tool_executor(state: "AgentState") -> dict:
         "summarize": "Đang tóm tắt tài liệu...",
         "kg_query": "Đang truy vấn đồ thị tri thức...",
     }
-    await push_event(state, "status", {
-        "step": "searching",
-        "detail": tool_status_map.get(intent, "Đang xử lý yêu cầu..."),
-    })
+    await push_event(
+        state,
+        "status",
+        {
+            "step": "searching",
+            "detail": tool_status_map.get(intent, "Đang xử lý yêu cầu..."),
+        },
+    )
 
     result_update: dict = {
         "tool_called": True,
@@ -263,6 +323,7 @@ async def tool_executor(state: "AgentState") -> dict:
     try:
         if intent == "search":
             from app.core.config import settings
+
             top_k = settings.HRAG_RERANKER_TOP_K
 
             tool_result = await _tools.search_documents(
@@ -288,7 +349,10 @@ async def tool_executor(state: "AgentState") -> dict:
         elif intent == "summarize":
             # Extract document ID from query if present, else use first doc
             import re
-            doc_id_match = re.search(r"\b(?:id\s*[:=]?\s*)?(\d+)\b", query, re.IGNORECASE)
+
+            doc_id_match = re.search(
+                r"\b(?:id\s*[:=]?\s*)?(\d+)\b", query, re.IGNORECASE
+            )
             doc_id = int(doc_id_match.group(1)) if doc_id_match else 0
 
             if doc_id:
@@ -299,8 +363,11 @@ async def tool_executor(state: "AgentState") -> dict:
                 result_update["kg_summaries"] = [tool_result["text"]]
             else:
                 # Fallback to search if no doc ID found
-                logger.warning("[tool_executor] summarize intent but no doc_id found — falling back to search")
+                logger.warning(
+                    "[tool_executor] summarize intent but no doc_id found — falling back to search"
+                )
                 from app.core.config import settings
+
                 tool_result = await _tools.search_documents(
                     query=query,
                     top_k=settings.HRAG_RERANKER_TOP_K,
@@ -322,8 +389,11 @@ async def tool_executor(state: "AgentState") -> dict:
             result_update["kg_summaries"] = [tool_result["text"]]
 
         else:
-            logger.warning(f"[tool_executor] Unknown intent {intent!r}, defaulting to search")
+            logger.warning(
+                f"[tool_executor] Unknown intent {intent!r}, defaulting to search"
+            )
             from app.core.config import settings
+
             tool_result = await _tools.search_documents(
                 query=query,
                 top_k=settings.HRAG_RERANKER_TOP_K,
@@ -346,10 +416,14 @@ async def tool_executor(state: "AgentState") -> dict:
     if sources:
         logger.info(f"[tool_executor] Pushing {len(sources)} sources to SSE queue")
         await push_event(state, "sources", sources)
-        await push_event(state, "status", {
-            "step": "retrieved",
-            "detail": f"Tìm thấy {len(sources)} nguồn tài liệu liên quan",
-        })
+        await push_event(
+            state,
+            "status",
+            {
+                "step": "retrieved",
+                "detail": f"Tìm thấy {len(sources)} nguồn tài liệu liên quan",
+            },
+        )
 
     if images:
         logger.info(f"[tool_executor] Pushing {len(images)} images to SSE queue")
@@ -361,6 +435,7 @@ async def tool_executor(state: "AgentState") -> dict:
 # ---------------------------------------------------------------------------
 # Node: answer_generator
 # ---------------------------------------------------------------------------
+
 
 async def answer_generator(state: "AgentState") -> dict:
     """
@@ -376,7 +451,9 @@ async def answer_generator(state: "AgentState") -> dict:
 
     provider = get_llm_provider()
 
-    await push_event(state, "status", {"step": "generating", "detail": "Đang tạo câu trả lời..."})
+    await push_event(
+        state, "status", {"step": "generating", "detail": "Đang tạo câu trả lời..."}
+    )
 
     # Build context from accumulated retrieval results
     sources = state.get("sources", [])
@@ -390,17 +467,17 @@ async def answer_generator(state: "AgentState") -> dict:
     effective_system = system_prompt
     if user_memory and "No relevant memories" not in user_memory:
         effective_system = (
-            f"AUTHENTICATED USER PROFILE (PERSONAL HISTORY):\n{user_memory}\n\n"
-            "Rules for using this profile:\n"
-            "1. If the user asks about themselves, answer DIRECTLY from this profile.\n"
-            "2. For all other questions, answer from document sources only.\n"
-            "3. NEVER blend personal facts with document answers.\n\n"
+            f"USER MEMORY:\n{user_memory}\n\n"
+            "Use this info when relevant. Do NOT include the header 'USER MEMORY' in your response.\n"
+            "IMPORTANT: Do NOT add any citation markers like [id1], [mem1], [1] etc. when using memory facts.\n\n"
         ) + effective_system
 
     # Build context string
     context_parts = []
     if kg_summaries:
-        context_parts.append("## Knowledge Graph / Tool Results\n" + "\n\n".join(kg_summaries))
+        context_parts.append(
+            "## Knowledge Graph / Tool Results\n" + "\n\n".join(kg_summaries)
+        )
 
     if sources:
         chunk_parts = []
@@ -429,7 +506,7 @@ async def answer_generator(state: "AgentState") -> dict:
             role = msg.get("role", "user")
             content = msg.get("content", "")
         else:
-            role = getattr(msg, "role", "user")
+            role = _get_msg_role(msg) or "user"
             content = getattr(msg, "content", "")
         llm_messages.append(_LLMMsg(role=role, content=content))
 
@@ -442,7 +519,7 @@ async def answer_generator(state: "AgentState") -> dict:
             + "\n=== END CONTEXT ===\n\n"
             "IMPORTANT:\n"
             "- Answer using ONLY the retrieved sources above.\n"
-            "- Cite sources using their IDs: e.g. claim text[cid1][cid2].\n"
+            "- Cite sources using their IDs: e.g. claim text[1][2].\n"
             "- If the context does not contain the answer, say: 'Tài liệu không chứa thông tin này.'\n"
             "- TABLE DATA: 'Key, Year = Value' pairs are table cells.\n"
         )
@@ -490,7 +567,11 @@ async def answer_generator(state: "AgentState") -> dict:
                 system_prompt=effective_system,
                 think=enable_thinking,
             )
-            fallback_answer = result if isinstance(result, str) else getattr(result, "content", str(result))
+            fallback_answer = (
+                result
+                if isinstance(result, str)
+                else getattr(result, "content", str(result))
+            )
             answer_parts.append(fallback_answer)
             await push_event(state, "token", fallback_answer)
         except Exception as e2:
@@ -506,6 +587,7 @@ async def answer_generator(state: "AgentState") -> dict:
 # ---------------------------------------------------------------------------
 # Node: direct_answer
 # ---------------------------------------------------------------------------
+
 
 async def direct_answer(state: "AgentState") -> dict:
     """
@@ -524,14 +606,25 @@ async def direct_answer(state: "AgentState") -> dict:
     user_memory = state.get("user_memory_context", "")
     enable_thinking = state.get("enable_thinking", False)
 
-    await push_event(state, "status", {"step": "generating", "detail": "Đang trả lời..."})
+    await push_event(
+        state, "status", {"step": "generating", "detail": "Đang trả lời..."}
+    )
 
+    intent = state.get("intent", "greeting")
     effective_system = system_prompt
     if user_memory and "No relevant memories" not in user_memory:
-        effective_system = (
-            f"AUTHENTICATED USER PROFILE:\n{user_memory}\n\n"
-            "Answer based on user profile when relevant. Do not search documents.\n\n"
-        ) + effective_system
+        if intent == "personal":
+            effective_system = (
+                f"USER MEMORY:\n{user_memory}\n\n"
+                "Answer directly about the user. Do NOT include the header 'USER MEMORY' in your response.\n"
+                "IMPORTANT: Do NOT add any citation markers like [id1], [mem1], [1] etc. when using memory facts.\n\n"
+            ) + effective_system
+        else:
+            effective_system = (
+                f"USER MEMORY:\n{user_memory}\n\n"
+                "Use this info when relevant. Do NOT include the header 'USER MEMORY' in your response.\n"
+                "IMPORTANT: Do NOT add any citation markers like [id1], [mem1], [1] etc. when using memory facts.\n\n"
+            ) + effective_system
 
     llm_messages: list[_LLMMsg] = []
     for msg in (messages or [])[-6:]:
@@ -566,7 +659,11 @@ async def direct_answer(state: "AgentState") -> dict:
                 system_prompt=effective_system,
                 think=enable_thinking,
             )
-            fallback = result if isinstance(result, str) else getattr(result, "content", str(result))
+            fallback = (
+                result
+                if isinstance(result, str)
+                else getattr(result, "content", str(result))
+            )
             answer_parts.append(fallback)
             await push_event(state, "token", fallback)
         except Exception as e2:
