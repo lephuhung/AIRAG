@@ -136,10 +136,10 @@ function CitationLink({
     return (
       <button
         onClick={handleContentClick}
-className="inline-flex items-center gap-0.5 h-[18px] px-1.5 mx-0.5 text-[10px] font-medium rounded-full bg-purple-400/15 text-purple-500 dark:text-purple-400 hover:bg-purple-400/25 transition-colors align-middle whitespace-nowrap"
+        className="inline-flex items-center gap-0.5 h-[18px] px-1.5 mx-0.5 text-[10px] font-medium rounded-full bg-purple-400/15 text-purple-500 dark:text-purple-400 hover:bg-purple-400/25 transition-colors align-middle whitespace-nowrap"
         title={t("chat.view_kg")}
       >
-                <Brain className="w-2.5 h-2.5 flex-shrink-0" />
+        <Brain className="w-2.5 h-2.5 flex-shrink-0" />
         <span>KG-{index}</span>
       </button>
     );
@@ -165,7 +165,7 @@ className="inline-flex items-center gap-0.5 h-[18px] px-1.5 mx-0.5 text-[10px] f
         className="inline-flex items-center justify-center w-[18px] h-[18px] text-[10px] font-bold rounded-full bg-purple-400/15 text-purple-500 dark:text-purple-400 hover:bg-purple-400/25 transition-colors"
         title={t("chat.highlight_kg")}
       >
-                <Brain className="w-2.5 h-2.5" />
+        <Brain className="w-2.5 h-2.5" />
       </button>
     </span>
   );
@@ -1234,12 +1234,6 @@ function TypingIndicator({ status }: { status?: ChatStreamStatus }) {
   const label = t(labelKey);
   return (
     <div className="flex gap-2 items-start">
-      <div className="relative w-6 h-6 flex-shrink-0">
-        <div className="icon-glow-ring" />
-        <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center overflow-hidden border border-primary/20">
-          <img src="/logo.png" alt="HRAG" className="w-4 h-4 object-contain shadow-sm" />
-        </div>
-      </div>
       <div className="py-1">
         <div className="flex items-center gap-1.5">
           <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" />
