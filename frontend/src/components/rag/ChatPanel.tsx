@@ -175,11 +175,10 @@ className="inline-flex items-center gap-0.5 h-[18px] px-1.5 mx-0.5 text-[10px] f
 // Memory citation badge — clickable [MEM-N] → Brain icon + text
 // ---------------------------------------------------------------------------
 function MemoryCitation({ index }: { index: string }) {
-  const { t } = useTranslation();
   return (
     <span
       className="inline-flex items-center justify-center w-[18px] h-[18px] mx-0.5 text-[11px] font-medium rounded-full bg-amber-400/15 text-amber-600 dark:text-amber-400 align-middle"
-      title={`${t("chat.memory_citation")}: ${index}`}
+      title="Thông tin cá nhân của bạn"
     >
       🧠
     </span>
