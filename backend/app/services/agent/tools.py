@@ -14,6 +14,7 @@ Available tools:
     summarize_document — get a summary of a specific document
     query_knowledge_graph — query LightRAG knowledge graph for entity relationships
 """
+
 from __future__ import annotations
 
 import logging
@@ -34,6 +35,8 @@ TOOL_REGISTRY: dict[str, str] = {
     "list_documents": "list all documents available in the current workspace",
     "summarize_document": "get a comprehensive summary of a specific document",
     "query_knowledge_graph": "query the knowledge graph for entity relationships",
+    "search_documents_number": "search for documents by their official document number (văn bản số)",
+    "search_abbreviation": "search for the meaning of an abbreviation or acronym",
 }
 
 
@@ -41,6 +44,7 @@ TOOL_REGISTRY: dict[str, str] = {
 # Tool 1: search_documents
 # Wraps the existing _execute_search_documents from chat_agent.py
 # ---------------------------------------------------------------------------
+
 
 async def search_documents(
     query: str,
@@ -57,14 +61,18 @@ async def search_documents(
     """
     from app.api.chat_agent import _execute_search_documents
 
-    context_text, sources, image_refs, image_parts, kg_summaries = (
-        await _execute_search_documents(
-            workspace_ids=workspace_ids,
-            query=query,
-            top_k=top_k,
-            db=db,
-            existing_ids=existing_citation_ids,
-        )
+    (
+        context_text,
+        sources,
+        image_refs,
+        image_parts,
+        kg_summaries,
+    ) = await _execute_search_documents(
+        workspace_ids=workspace_ids,
+        query=query,
+        top_k=top_k,
+        db=db,
+        existing_ids=existing_citation_ids,
     )
     return {
         "context_text": context_text,
@@ -78,6 +86,7 @@ async def search_documents(
 # ---------------------------------------------------------------------------
 # Tool 2: list_documents
 # ---------------------------------------------------------------------------
+
 
 async def list_documents(
     workspace_ids: list[int],
@@ -151,6 +160,7 @@ async def list_documents(
 # Tool 3: summarize_document
 # ---------------------------------------------------------------------------
 
+
 async def summarize_document(
     document_id: int,
     db: "AsyncSession",
@@ -169,9 +179,7 @@ async def summarize_document(
 
     try:
         # Fetch document
-        result = await db.execute(
-            select(Document).where(Document.id == document_id)
-        )
+        result = await db.execute(select(Document).where(Document.id == document_id))
         doc = result.scalar_one_or_none()
 
         if not doc:
@@ -220,7 +228,11 @@ async def summarize_document(
             temperature=0.1,
             max_tokens=1024,
         )
-        summary_text = summary if isinstance(summary, str) else getattr(summary, "content", str(summary))
+        summary_text = (
+            summary
+            if isinstance(summary, str)
+            else getattr(summary, "content", str(summary))
+        )
 
         return {
             "text": summary_text,
@@ -240,6 +252,7 @@ async def summarize_document(
 # ---------------------------------------------------------------------------
 # Tool 4: query_knowledge_graph
 # ---------------------------------------------------------------------------
+
 
 async def query_knowledge_graph(
     entity: str,
@@ -266,7 +279,9 @@ async def query_knowledge_graph(
             if kg_result and kg_result.strip():
                 results.append(f"**Workspace {ws_id}:**\n{kg_result}")
         except Exception as e:
-            logger.warning(f"[tool:query_knowledge_graph] KG query failed for ws {ws_id}: {e}")
+            logger.warning(
+                f"[tool:query_knowledge_graph] KG query failed for ws {ws_id}: {e}"
+            )
 
     if not results:
         return {
@@ -274,3 +289,148 @@ async def query_knowledge_graph(
         }
 
     return {"text": "\n\n".join(results)}
+
+
+# ---------------------------------------------------------------------------
+# Tool 5: search_documents_number
+# ---------------------------------------------------------------------------
+
+
+async def search_documents_number(
+    query: str,
+    workspace_ids: list[int],
+    db: "AsyncSession",
+) -> dict:
+    """
+    Search for documents by their official document number (văn bản số).
+
+    Returns:
+        dict with keys: text (formatted results), documents (list of doc info)
+    """
+    from sqlalchemy import select, or_
+    from app.models.document import Document, DocumentStatus
+
+    try:
+        result = await db.execute(
+            select(Document)
+            .where(
+                Document.workspace_id.in_(workspace_ids),
+                Document.status == DocumentStatus.INDEXED,
+                or_(
+                    Document.document_number.ilike(f"%{query}%"),
+                    Document.original_filename.ilike(f"%{query}%"),
+                ),
+            )
+            .order_by(Document.created_at.desc())
+            .limit(20)
+        )
+        docs = result.scalars().all()
+
+        if not docs:
+            return {
+                "text": f"Không tìm thấy tài liệu nào có số văn bản '{query}'.",
+                "documents": [],
+            }
+
+        lines = [f"Tìm thấy **{len(docs)} tài liệu** có số văn bản liên quan:"]
+        doc_list = []
+        for i, doc in enumerate(docs, 1):
+            doc_info = {
+                "id": doc.id,
+                "filename": doc.original_filename,
+                "document_number": doc.document_number,
+            }
+            doc_list.append(doc_info)
+            lines.append(
+                f"{i}. **{doc.original_filename}**\n"
+                f"   Số văn bản: {doc.document_number or 'N/A'}\n"
+                f"   ID: {doc.id}"
+            )
+
+        return {
+            "text": "\n".join(lines),
+            "documents": doc_list,
+        }
+
+    except Exception as e:
+        logger.error(f"[tool:search_documents_number] Failed: {e}")
+        return {
+            "text": "Không thể tìm kiếm theo số văn bản. Vui lòng thử lại.",
+            "documents": [],
+        }
+
+
+# ---------------------------------------------------------------------------
+# Tool 6: search_abbreviation
+# ---------------------------------------------------------------------------
+
+
+async def search_abbreviation(
+    abbreviation: str,
+    workspace_ids: list[int],
+    db: "AsyncSession",
+) -> dict:
+    """
+    Search for the meaning of an abbreviation or acronym.
+
+    Returns:
+        dict with keys: text (meaning or ask for clarification), abbreviation, found
+    """
+    from sqlalchemy import select
+    from app.models.abbreviation import Abbreviation
+
+    try:
+        result = await db.execute(
+            select(Abbreviation)
+            .where(
+                Abbreviation.short_form.ilike(f"%{abbreviation}%"),
+                Abbreviation.is_active == True,
+            )
+            .limit(10)
+        )
+        abbreviations = result.scalars().all()
+
+        if not abbreviations:
+            return {
+                "text": f"Không tìm thấy nghĩa của '{abbreviation}'. "
+                f"Bạn có thể cho biết '{abbreviation}' là viết tắt của gì không?",
+                "abbreviation": abbreviation,
+                "found": False,
+            }
+
+        if len(abbreviations) == 1:
+            ab = abbreviations[0]
+            return {
+                "text": f"**{ab.short_form}** = {ab.full_form}\n"
+                f"{f'Mô tả: {ab.description}' if ab.description else ''}",
+                "abbreviation": ab.short_form,
+                "full_form": ab.full_form,
+                "description": ab.description,
+                "found": True,
+            }
+
+        lines = [f"Tìm thấy **{len(abbreviations)} kết quả** cho '{abbreviation}':"]
+        for i, ab in enumerate(abbreviations, 1):
+            lines.append(f"{i}. **{ab.short_form}** = {ab.full_form}")
+
+        return {
+            "text": "\n".join(lines),
+            "abbreviation": abbreviation,
+            "found": True,
+            "results": [
+                {
+                    "short_form": ab.short_form,
+                    "full_form": ab.full_form,
+                    "description": ab.description,
+                }
+                for ab in abbreviations
+            ],
+        }
+
+    except Exception as e:
+        logger.error(f"[tool:search_abbreviation] Failed: {e}")
+        return {
+            "text": f"Không thể tìm kiếm nghĩa của '{abbreviation}'. Vui lòng thử lại.",
+            "abbreviation": abbreviation,
+            "found": False,
+        }

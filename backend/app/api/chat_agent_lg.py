@@ -38,6 +38,7 @@ from app.models.knowledge_base import KnowledgeBase
 from app.models.tenant import TenantUser
 from app.schemas.rag import ChatRequest
 from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
+from app.services.abbreviation_service import AbbreviationService
 
 logger = logging.getLogger(__name__)
 
@@ -171,13 +172,16 @@ async def langgraph_chat_stream(
         content = m.content if hasattr(m, "content") else m.get("content", "")
         history.append({"role": role, "content": content})
 
+    # Expand abbreviations in the incoming message
+    message = await AbbreviationService.expand_ab_in_text(db, request.message)
+
     # Persist user message
     try:
         from app.models.chat_message import ChatMessage as ChatMessageModel
         user_row = ChatMessageModel(
             message_id=str(uuid.uuid4()),
             role="user",
-            content=request.message,
+            content=message,
             user_id=user.id,
             session_id=session_id,
         )
@@ -190,7 +194,7 @@ async def langgraph_chat_stream(
     # Build initial LangGraph state
     initial_state = build_initial_state(
         workspace_ids=workspace_ids,
-        message=request.message,
+        message=message,
         history=history,
         system_prompt=system_prompt,
         enable_thinking=getattr(request, "enable_thinking", False),

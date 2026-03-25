@@ -8,6 +8,7 @@ import {
   ChevronDown,
   FolderOpen,
   Activity,
+  BookMarked,
   Building2,
   Users,
   FileText,
@@ -81,6 +82,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
   const isAdminUsersPage = location.pathname === "/admin/users";
   const isAdminTenantsPage = location.pathname === "/admin/tenants";
   const isAdminDocTypesPage = location.pathname === "/admin/document-types";
+  const isAdminAbbreviationsPage = location.pathname === "/admin/abbreviations";
   const isAdminDashboardPage = location.pathname === "/admin/dashboard";
 
   return (
@@ -231,6 +233,19 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
             >
               <FileText className="w-4 h-4 flex-shrink-0" />
               {!collapsed && <span className="truncate">{t("nav.admin.document_types")}</span>}
+            </button>
+            <button
+              onClick={() => navigate("/admin/abbreviations")}
+              className={cn(
+                "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm transition-colors",
+                isAdminAbbreviationsPage
+                  ? "bg-primary/10 text-primary font-medium"
+                  : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+              )}
+              title={collapsed ? t("nav.admin.abbreviations") : undefined}
+            >
+              <BookMarked className="w-4 h-4 flex-shrink-0" />
+              {!collapsed && <span className="truncate">{t("nav.admin.abbreviations")}</span>}
             </button>
           </>
         )}

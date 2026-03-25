@@ -98,8 +98,9 @@ async def stream_agent_to_sse(
 
     # ── Background task: chạy toàn bộ LangGraph pipeline ───────────────────
     async def _run_graph():
+        from app.core.config import settings
         try:
-            await graph.ainvoke(initial_state)
+            await graph.ainvoke(initial_state, debug=settings.NEXUSRAG_LG_DEBUG)
         except Exception as e:
             logger.error(f"[stream] Graph execution error: {e}", exc_info=True)
             await event_queue.put(("error", str(e)))

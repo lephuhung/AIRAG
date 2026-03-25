@@ -43,12 +43,13 @@ Respond ONLY with valid JSON. No explanation, no markdown, no extra text.
 
 Intent categories:
 - "greeting"  : greetings, thanks, farewells, simple chitchat → no document search needed
-- "personal"  : questions about the user themselves (where they work, their name, their role, \
-their preferences, anything about "tôi/I/me/my") → answer from personal memory, no document search
+- "personal"  : questions about the user themselves (where they work, their name, their role, their preferences, anything about "tôi/I/me/my") → answer from personal memory, no document search
 - "search"    : questions about document content, data, facts, analysis → needs search
 - "list_docs" : user wants to know what documents/files are available
 - "summarize" : user wants a summary of a specific document
 - "kg_query"  : user asks about entity relationships, organizational charts, knowledge graph
+- "search_doc_num" : user asks about document numbers (văn bản số), reference numbers, official document IDs
+- "search_abbr" : user asks about abbreviations, acronyms, or their meanings
 
 Output format:
 {"intent": "<category>", "rewritten_query": "<improved Vietnamese/English search query>", "needs_tool": true|false}
@@ -56,6 +57,7 @@ Output format:
 Rules:
 - For "greeting": set rewritten_query to "" and needs_tool to false
 - For "personal": set rewritten_query to the user's question verbatim and needs_tool to false
+- For "search_abbr" (abbreviation queries): extract ONLY the abbreviation itself - remove "là gì?", "có nghĩa là gì?", "là viết tắt của gì?", etc. EXACT abbreviation must be preserved (e.g., "BMNN" stays "BMNN", NOT "BMM")
 - For all other intents: rewrite the query to be specific and detailed for retrieval
 - If the message contains a document ID, preserve it in the output
 - Default to "search" when uncertain
@@ -69,6 +71,9 @@ User: "doanh thu 2024 là bao nhiêu?" → {"intent": "search", "rewritten_query
 User: "có tài liệu gì trong hệ thống?" → {"intent": "list_docs", "rewritten_query": "danh sách tài liệu", "needs_tool": true}
 User: "tóm tắt tài liệu ID 5" → {"intent": "summarize", "rewritten_query": "tóm tắt tài liệu 5", "needs_tool": true}
 User: "mối quan hệ giữa VietcomBank và VCB" → {"intent": "kg_query", "rewritten_query": "VietcomBank VCB relationship entities", "needs_tool": true}
+User: "BMNN là gì?" → {"intent": "search_abbr", "rewritten_query": "BMNN", "needs_tool": true}
+User: "UBND có nghĩa là gì?" → {"intent": "search_abbr", "rewritten_query": "UBND", "needs_tool": true}
+User: "viết tắt CNM là viết tắt của từ gì?" → {"intent": "search_abbr", "rewritten_query": "CNM", "needs_tool": true}
 """
 
 _VALID_INTENTS = {
@@ -78,6 +83,8 @@ _VALID_INTENTS = {
     "list_docs",
     "summarize",
     "kg_query",
+    "search_doc_num",
+    "search_abbr",
 }
 
 
@@ -235,9 +242,13 @@ async def intent_classifier(state: "AgentState") -> dict:
                 response_text += chunk.text
 
         result = _parse_classifier_output(response_text)
+
+        # Detailed logging for debugging intent classification
+        logger.info(f"[intent_classifier] RAW_LLM_RESPONSE: {response_text!r}")
         logger.info(
-            f"[intent_classifier] intent={result['intent']!r} "
-            f"rewritten={result['rewritten_query']!r}"
+            f"[intent_classifier] PARSED_RESULT: intent={result['intent']!r} "
+            f"rewritten={result['rewritten_query']!r} "
+            f"needs_tool={result.get('needs_tool', True)!r}"
         )
 
         # Emit a meaningful status based on intent
@@ -247,6 +258,8 @@ async def intent_classifier(state: "AgentState") -> dict:
             "list_docs": "Liệt kê tài liệu",
             "summarize": "Tóm tắt tài liệu",
             "kg_query": "Truy vấn đồ thị tri thức",
+            "search_abbr": "Tra cứu viết tắt",
+            "search_doc_num": "Tra cứu số văn bản",
         }
         intent_label = intent_labels.get(result["intent"], "Tìm kiếm")
         await push_event(
@@ -388,19 +401,95 @@ async def tool_executor(state: "AgentState") -> dict:
             )
             result_update["kg_summaries"] = [tool_result["text"]]
 
+        elif intent == "search_doc_num":
+            tool_result = await _tools.search_documents_number(
+                query=query,
+                workspace_ids=workspace_ids,
+                db=db,
+            )
+            result_update["doc_numbers"] = tool_result.get("results", [])
+            result_update["tool_status"] = tool_result.get("status", "completed")
+
+        elif intent == "search_abbr":
+            logger.info(
+                f"[tool_executor] SEARCH_ABBR: querying abbreviation for query={query!r}"
+            )
+            tool_result = await _tools.search_abbreviation(
+                abbreviation=query,
+                workspace_ids=workspace_ids,
+                db=db,
+            )
+            logger.info(f"[tool_executor] SEARCH_ABBR: tool_result={tool_result!r}")
+            # DEBUG: Log what we're storing
+            if tool_result.get("results"):
+                logger.info(
+                    f"[tool_executor] SEARCH_ABBR: storing results={tool_result.get('results')!r}"
+                )
+            elif tool_result.get("found") and tool_result.get("abbreviation"):
+                logger.info(
+                    f"[tool_executor] SEARCH_ABBR: storing single result abbreviation={tool_result.get('abbreviation')!r}, full_form={tool_result.get('full_form')!r}"
+                )
+            else:
+                logger.info(f"[tool_executor] SEARCH_ABBR: no results found")
+            if tool_result.get("results"):
+                result_update["abbreviation_results"] = tool_result.get("results", [])
+            elif tool_result.get("found") and tool_result.get("abbreviation"):
+                result_update["abbreviation_results"] = [
+                    {
+                        "short_form": tool_result.get("abbreviation"),
+                        "full_form": tool_result.get("full_form"),
+                        "description": tool_result.get("description"),
+                    }
+                ]
+            else:
+                result_update["abbreviation_results"] = []
+            result_update["needs_clarification"] = tool_result.get(
+                "needs_clarification", False
+            )
+            result_update["tool_status"] = tool_result.get("status", "completed")
+
+            # Check if we should expand query for routing instead of direct answer
+            abbreviation_results = tool_result.get("results") or (
+                [tool_result] if tool_result.get("found") else []
+            )
+            if abbreviation_results:
+                first_result = abbreviation_results[0]
+                full_form = first_result.get("full_form", "")
+                if full_form:
+                    # Check if query contains additional context beyond the abbreviation
+                    # Simple heuristic: query length significantly longer than abbrev
+                    abbrev_len = len(first_result.get("abbreviation", ""))
+                    query_len = len(query)
+                    has_context = query_len > abbrev_len + 10
+                    if has_context:
+                        # Replace abbreviation with full form in the original query
+                        abbrev = first_result.get("abbreviation", "")
+                        expanded = query.replace(abbrev, full_form)
+                        result_update["expanded_query"] = expanded
+                        logger.info(
+                            f"[tool_executor] SEARCH_ABBR: Expanding query for routing. "
+                            f"Original: {query!r}, Expanded: {expanded!r}"
+                        )
+
         else:
             logger.warning(
                 f"[tool_executor] Unknown intent {intent!r}, defaulting to search"
             )
             from app.core.config import settings
 
+            # Use expanded_query if available (from abbreviation + context detection)
+            search_query = state.get("expanded_query") or query
             tool_result = await _tools.search_documents(
-                query=query,
+                query=search_query,
                 top_k=settings.HRAG_RERANKER_TOP_K,
                 workspace_ids=workspace_ids,
                 existing_citation_ids=existing_ids,
                 db=db,
             )
+            if search_query != query:
+                logger.info(
+                    f"[tool_executor] Using expanded_query for search: {search_query!r}"
+                )
             result_update["sources"] = tool_result["sources"]
             result_update["images"] = tool_result["images"]
             result_update["image_parts"] = tool_result["image_parts"]
@@ -458,10 +547,22 @@ async def answer_generator(state: "AgentState") -> dict:
     # Build context from accumulated retrieval results
     sources = state.get("sources", [])
     kg_summaries = state.get("kg_summaries", [])
+    abbreviation_results = state.get("abbreviation_results", [])
+    intent = state.get("intent", "")
+    rewritten_query = state.get("rewritten_query", "")
     system_prompt = state.get("system_prompt", "")
     user_memory = state.get("user_memory_context", "")
     messages = state.get("messages", [])
     enable_thinking = state.get("enable_thinking", False)
+
+    # DEBUG: Log state at start of answer_generator
+    logger.info(
+        f"[answer_generator] START - intent={intent!r}, rewritten_query={rewritten_query!r}"
+    )
+    logger.info(
+        f"[answer_generator] sources={len(sources)} items, kg_summaries={len(kg_summaries)} items"
+    )
+    logger.info(f"[answer_generator] abbreviation_results={abbreviation_results!r}")
 
     # Inject memory into system prompt if available
     effective_system = system_prompt
@@ -477,6 +578,22 @@ async def answer_generator(state: "AgentState") -> dict:
     if kg_summaries:
         context_parts.append(
             "## Knowledge Graph / Tool Results\n" + "\n\n".join(kg_summaries)
+        )
+
+    # Add abbreviation search results to context
+    abbreviation_results = state.get("abbreviation_results", [])
+    if abbreviation_results:
+        ab_parts = ["## Abbreviation Results\n"]
+        for ab in abbreviation_results:
+            short_form = ab.get("short_form", "")
+            full_form = ab.get("full_form", "")
+            description = ab.get("description", "")
+            ab_parts.append(f"- **{short_form}** = {full_form}")
+            if description:
+                ab_parts.append(f"  Mô tả: {description}")
+        context_parts.append("\n".join(ab_parts))
+        logger.info(
+            f"[answer_generator] Added {len(abbreviation_results)} abbreviation results to context"
         )
 
     if sources:

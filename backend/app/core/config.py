@@ -165,6 +165,9 @@ class Settings(BaseSettings):
     #   "none"   — no checkpointer
     NEXUSRAG_LG_CHECKPOINTER: str = Field(default="memory")
 
+    # Toggle LangGraph internal debug logging (prints node execution/state to console)
+    NEXUSRAG_LG_DEBUG: bool = Field(default=False)
+
     # ── Graphiti Memory (temporal knowledge graph, backed by Neo4j) ──────────
     # Graphiti uses the existing Neo4j instance (NEO4J_URI / NEO4J_USERNAME /
     # NEO4J_PASSWORD above) for graph storage.

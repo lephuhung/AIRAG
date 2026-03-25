@@ -39,9 +39,11 @@ from app.models.document import DocumentImage
 from app.schemas.rag import (
     ChatRequest,
     ChatSourceChunk,
+    ChatSourceChunk,
     ChatImageRef,
 )
 from app.services.llm.types import LLMMessage, LLMImagePart, StreamChunk
+from app.services.abbreviation_service import AbbreviationService
 
 logger = logging.getLogger(__name__)
 
@@ -768,6 +770,9 @@ async def agent_chat_stream(
     all_images: list[ChatImageRef] = []
     all_image_parts: list[dict] = []
     all_kg_summaries_collected: list[str] = []
+
+    # Expand abbreviations in the incoming message
+    message = await AbbreviationService.expand_ab_in_text(db, message)
 
     # Build conversation messages
     messages: list[LLMMessage] = []

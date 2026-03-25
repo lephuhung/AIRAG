@@ -12,7 +12,8 @@
       "dashboard": "Thống kê",
       "users": "Người dùng",
       "tenants": "Tổ chức",
-      "document_types": "Loại tài liệu"
+      "document_types": "Loại tài liệu",
+      "abbreviations": "Từ viết tắt"
     },
     "my_tenants": "Tổ chức của tôi",
     "your_chats": "Lịch sử chat"
@@ -655,6 +656,44 @@
         "status_failed": "Cập nhật trạng thái thất bại",
         "prompt_saved": "Đã lưu câu lệnh cho \"{{name}}\"",
         "prompt_failed": "Lưu câu lệnh thất bại"
+      }
+    },
+    "abbreviations": {
+      "title": "Quản lý từ viết tắt",
+      "subtitle": "Cấu hình tự động giải mã từ viết tắt trong các truy vấn hệ thống",
+      "create": "Thêm từ viết tắt",
+      "edit": "Sửa từ viết tắt",
+      "no_items": "Chưa có từ viết tắt nào",
+      "search_placeholder": "Tìm kiếm từ viết tắt hoặc từ gốc...",
+      "table": {
+        "short_form": "Viết tắt",
+        "full_form": "Từ gốc",
+        "description": "Mô tả",
+        "user": "Người tạo",
+        "status": "Trạng thái",
+        "actions": "Hành động"
+      },
+      "status": {
+        "all": "Tất cả",
+        "active": "Đã kích hoạt",
+        "pending": "Chờ duyệt",
+        "inactive": "Ngừng kích hoạt"
+      },
+      "actions": {
+        "activate": "Kích hoạt",
+        "deactivate": "Ngừng kích hoạt",
+        "delete": "Xóa"
+      },
+      "delete_confirm_title": "Xóa từ viết tắt",
+      "delete_confirm_msg": "Bạn có chắc chắn muốn xóa từ viết tắt \"{{short}}\"? Hành động này không thể hoàn tác.",
+      "toast": {
+        "required": "Từ viết tắt và từ gốc là bắt buộc",
+        "created": "Đã thêm từ viết tắt",
+        "updated": "Đã cập nhật",
+        "deleted": "Đã xóa",
+        "activated": "Đã kích hoạt: {{short}}",
+        "deactivated": "Đã ngừng kích hoạt: {{short}}",
+        "error": "Thao tác thất bại"
       }
     }
   },

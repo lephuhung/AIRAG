@@ -46,6 +46,7 @@ from app.schemas.rag import (
 logger = logging.getLogger(__name__)
 import string, random
 from app.services.rag_service import get_rag_service
+from app.services.abbreviation_service import AbbreviationService
 
 # In-progress statuses — documents currently in the pipeline
 _IN_PROGRESS = (
@@ -105,6 +106,9 @@ async def query_documents(
     await verify_workspace_access(workspace_id, db, user)
 
     rag_service = get_rag_service(db, workspace_id)
+
+    # Expand abbreviations in the query question
+    request.question = await AbbreviationService.expand_ab_in_text(db, request.question)
 
     # Try deep query if available
     from app.services.hrag_service import HRAGService

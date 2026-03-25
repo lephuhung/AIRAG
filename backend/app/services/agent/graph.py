@@ -19,6 +19,7 @@ Usage::
     async for event in graph.astream_events(initial_state, version="v2"):
         ...
 """
+
 from __future__ import annotations
 
 import logging
@@ -40,6 +41,7 @@ logger = logging.getLogger(__name__)
 # Routing function — decides next node after intent_classifier
 # ---------------------------------------------------------------------------
 
+
 def _route_by_intent(state: AgentState) -> str:
     """
     Conditional edge: route to direct_answer for greetings,
@@ -59,9 +61,12 @@ def _route_by_intent(state: AgentState) -> str:
 # Guard: check iteration limit after tool_executor
 # ---------------------------------------------------------------------------
 
+
 def _should_continue_after_tool(state: AgentState) -> str:
     """
-    After tool execution, always proceed to answer_generator.
+    After tool execution:
+    - If expanded_query is set (abbreviation + context detected), route to search_documents
+    - Otherwise proceed to answer_generator.
     Guard against excessive iterations.
     """
     from app.core.config import settings
@@ -70,7 +75,17 @@ def _should_continue_after_tool(state: AgentState) -> str:
     iterations = state.get("iterations", 0)
 
     if iterations >= max_iter:
-        logger.warning(f"[router] Max iterations ({max_iter}) reached — forcing answer_generator")
+        logger.warning(
+            f"[router] Max iterations ({max_iter}) reached — forcing answer_generator"
+        )
+
+    # Check if abbreviation expansion should trigger routing to search_documents
+    expanded_query = state.get("expanded_query")
+    if expanded_query:
+        logger.info(
+            f"[router] Routing to search_documents with expanded query: {expanded_query!r}"
+        )
+        return "search_documents"
 
     return "answer_generator"
 
@@ -78,6 +93,7 @@ def _should_continue_after_tool(state: AgentState) -> str:
 # ---------------------------------------------------------------------------
 # Graph builder
 # ---------------------------------------------------------------------------
+
 
 def build_agent_graph() -> StateGraph:
     """

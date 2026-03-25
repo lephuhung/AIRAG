@@ -24,6 +24,7 @@ import app.models.chat_message    # noqa: F401
 import app.models.user            # noqa: F401
 import app.models.tenant          # noqa: F401
 import app.models.invite_token    # noqa: F401
+import app.models.abbreviation    # noqa: F401
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -144,6 +145,23 @@ async def lifespan(app: FastAPI):
             # chat_messages: user_id
             await conn.execute(text(
                 "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id)"
+            ))
+
+            # --- Abbreviations Table (Explicit for clarity or metadata sync) ---
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS abbreviations (
+                    id SERIAL PRIMARY KEY,
+                    short_form VARCHAR(50) NOT NULL,
+                    full_form VARCHAR(255) NOT NULL,
+                    description TEXT,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    is_active BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    updated_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_abbreviations_short_form ON abbreviations(short_form)"
             ))
             # Ensure ALL lowercase enum values exist in PostgreSQL.
             # On a fresh DB, create_all() + values_callable creates them lowercase.

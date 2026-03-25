@@ -558,3 +558,35 @@ export interface InviteLink {
   is_active: boolean;
   invite_url: string;
 }
+
+// ── Abbreviation Types ──
+export interface Abbreviation {
+  id: number;
+  short_form: string;
+  full_form: string;
+  description: string | null;
+  user_id: number;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AbbreviationCreate {
+  short_form: string;
+  full_form: string;
+  description?: string;
+}
+
+export interface AbbreviationUpdate {
+  short_form?: string;
+  full_form?: string;
+  description?: string;
+  is_active?: boolean;
+}
+
+export interface AbbreviationListResponse {
+  items: Abbreviation[];
+  total: number;
+  page: number;
+  per_page: number;
+}
