@@ -58,6 +58,10 @@ class AgentState(TypedDict):
     ]  # [{"short_form": ..., "full_form": ..., "description": ...}]
     expanded_query: str  # query expanded with abbreviation full_form for routing
 
+    # ── Write agent ───────────────────────────────────────────────────────
+    write_action: str   # "summarize" | "suggest_edits" | "grammar_check" | "extract_key_points"
+    text_input: str     # raw text to process (extracted from message or provided directly)
+
 
 # Valid intents recognised by the classifier
 VALID_INTENTS = {
@@ -69,6 +73,10 @@ VALID_INTENTS = {
     "kg_query",
     "search_doc_num",
     "search_abbr",
+    # write intents
+    "write_summarize",
+    "write_suggest_edits",
+    "write_grammar_check",
 }
 
 # Default initial values — merge with per-request values when building state
@@ -92,4 +100,6 @@ DEFAULT_STATE: dict = {
     "user_memory_context": "",
     "final_answer": "",
     "citation_map": {},
+    "write_action": "",
+    "text_input": "",
 }

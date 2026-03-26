@@ -110,11 +110,14 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         oai_msgs = _to_openai_messages(messages, system_prompt)
         try:
             client = self._sync_client()
+            # Qwen3 vLLM: control thinking via extra_body
+            extra_body = {"enable_thinking": think} if not think else {}
             response = client.chat.completions.create(
                 model=self._model,
                 messages=oai_msgs,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                extra_body=extra_body or None,
             )
             content = response.choices[0].message.content or ""
             content = self._strip_think(content)
@@ -135,11 +138,14 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         oai_msgs = _to_openai_messages(messages, system_prompt)
         try:
             client = self._async_client()
+            # Qwen3 vLLM: control thinking via extra_body
+            extra_body = {"enable_thinking": think} if not think else {}
             response = await client.chat.completions.create(
                 model=self._model,
                 messages=oai_msgs,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                extra_body=extra_body or None,
             )
             content = response.choices[0].message.content or ""
             content = self._strip_think(content)
@@ -168,6 +174,9 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         )
         if tools:
             kwargs["tools"] = tools
+        # Qwen3 vLLM: disable thinking by default unless caller explicitly requests it
+        if not think:
+            kwargs["extra_body"] = {"enable_thinking": False}
 
         try:
             client = self._async_client()
@@ -362,7 +371,8 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         return True
 
     def supports_thinking(self) -> bool:
-        return False
+        # Qwen3 and other thinking-capable models support extended reasoning
+        return True
 
 
 class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):

@@ -10,9 +10,10 @@ Nodes are pure async functions — LangGraph merges the returned dict into state
 Nodes:
     memory_recall       — load user memories from pgvector
     intent_classifier   — Qwen3-4B: classify intent + rewrite query
-    tool_executor       — dispatch to the correct tool based on intent
+    agent_rag_executor  — invoke agent_rag subgraph (search/list/summarize/kg/abbr)
     answer_generator    — main LLM: generate answer with sources in context
     direct_answer       — main LLM: answer greetings/chitchat directly
+    write_executor      — invoke agent_write subgraph (summarize/edit/grammar)
 
 SSE streaming:
     All nodes call push_event(state, ev_type, ev_data) to push events into the
@@ -50,30 +51,35 @@ Intent categories:
 - "kg_query"  : user asks about entity relationships, organizational charts, knowledge graph
 - "search_doc_num" : user asks about document numbers (văn bản số), reference numbers, official document IDs
 - "search_abbr" : user asks about abbreviations, acronyms, or their meanings
+- "write_summarize"     : user provides a TEXT PASSAGE and wants it summarized or key points extracted
+- "write_suggest_edits" : user provides a TEXT PASSAGE and wants editing/improvement suggestions
+- "write_grammar_check" : user provides a TEXT PASSAGE and wants grammar/style checking
 
 Output format:
-{"intent": "<category>", "rewritten_query": "<improved Vietnamese/English search query>", "needs_tool": true|false}
+{"intent": "<category>", "rewritten_query": "<improved Vietnamese/English search query>", "needs_tool": true|false, "write_action": "<action or empty>", "text_input": "<extracted text or empty>"}
 
 Rules:
 - For "greeting": set rewritten_query to "" and needs_tool to false
 - For "personal": set rewritten_query to the user's question verbatim and needs_tool to false
 - For "search_abbr" (abbreviation queries): extract ONLY the abbreviation itself - remove "là gì?", "có nghĩa là gì?", "là viết tắt của gì?", etc. EXACT abbreviation must be preserved (e.g., "BMNN" stays "BMNN", NOT "BMM")
+- For write intents: extract the text to process into "text_input", set write_action to the specific action, set needs_tool to false
+- For "write_summarize": write_action = "summarize" (or "extract_key_points" if user asks for key points)
+- For "write_suggest_edits": write_action = "suggest_edits"
+- For "write_grammar_check": write_action = "grammar_check"
 - For all other intents: rewrite the query to be specific and detailed for retrieval
 - If the message contains a document ID, preserve it in the output
 - Default to "search" when uncertain
 
 Examples:
-User: "xin chào"  → {"intent": "greeting", "rewritten_query": "", "needs_tool": false}
-User: "tôi đang công tác ở đâu?" → {"intent": "personal", "rewritten_query": "tôi đang công tác ở đâu?", "needs_tool": false}
-User: "tôi tên là gì?" → {"intent": "personal", "rewritten_query": "tôi tên là gì?", "needs_tool": false}
-User: "tôi làm việc ở đơn vị nào?" → {"intent": "personal", "rewritten_query": "tôi làm việc ở đơn vị nào?", "needs_tool": false}
-User: "doanh thu 2024 là bao nhiêu?" → {"intent": "search", "rewritten_query": "doanh thu thuần tổng doanh thu năm 2024 theo quý", "needs_tool": true}
-User: "có tài liệu gì trong hệ thống?" → {"intent": "list_docs", "rewritten_query": "danh sách tài liệu", "needs_tool": true}
-User: "tóm tắt tài liệu ID 5" → {"intent": "summarize", "rewritten_query": "tóm tắt tài liệu 5", "needs_tool": true}
-User: "mối quan hệ giữa VietcomBank và VCB" → {"intent": "kg_query", "rewritten_query": "VietcomBank VCB relationship entities", "needs_tool": true}
-User: "BMNN là gì?" → {"intent": "search_abbr", "rewritten_query": "BMNN", "needs_tool": true}
-User: "UBND có nghĩa là gì?" → {"intent": "search_abbr", "rewritten_query": "UBND", "needs_tool": true}
-User: "viết tắt CNM là viết tắt của từ gì?" → {"intent": "search_abbr", "rewritten_query": "CNM", "needs_tool": true}
+User: "xin chào"  → {"intent": "greeting", "rewritten_query": "", "needs_tool": false, "write_action": "", "text_input": ""}
+User: "tôi đang công tác ở đâu?" → {"intent": "personal", "rewritten_query": "tôi đang công tác ở đâu?", "needs_tool": false, "write_action": "", "text_input": ""}
+User: "doanh thu 2024 là bao nhiêu?" → {"intent": "search", "rewritten_query": "doanh thu thuần tổng doanh thu năm 2024 theo quý", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "có tài liệu gì trong hệ thống?" → {"intent": "list_docs", "rewritten_query": "danh sách tài liệu", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "tóm tắt tài liệu ID 5" → {"intent": "summarize", "rewritten_query": "tóm tắt tài liệu 5", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "BMNN là gì?" → {"intent": "search_abbr", "rewritten_query": "BMNN", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "tóm tắt đoạn văn sau: [đoạn văn dài]" → {"intent": "write_summarize", "rewritten_query": "", "needs_tool": false, "write_action": "summarize", "text_input": "[đoạn văn dài]"}
+User: "kiểm tra ngữ pháp: Hôm nay tôi đi học." → {"intent": "write_grammar_check", "rewritten_query": "", "needs_tool": false, "write_action": "grammar_check", "text_input": "Hôm nay tôi đi học."}
+User: "đề xuất chỉnh sửa văn bản này: [nội dung]" → {"intent": "write_suggest_edits", "rewritten_query": "", "needs_tool": false, "write_action": "suggest_edits", "text_input": "[nội dung]"}
 """
 
 _VALID_INTENTS = {
@@ -85,6 +91,9 @@ _VALID_INTENTS = {
     "kg_query",
     "search_doc_num",
     "search_abbr",
+    "write_summarize",
+    "write_suggest_edits",
+    "write_grammar_check",
 }
 
 
@@ -112,12 +121,14 @@ def _parse_classifier_output(raw: str) -> dict:
             "intent": intent,
             "rewritten_query": data.get("rewritten_query", ""),
             "needs_tool": data.get("needs_tool", True),
+            "write_action": data.get("write_action", ""),
+            "text_input": data.get("text_input", ""),
         }
     except json.JSONDecodeError:
         logger.warning(
             f"[classifier] Failed to parse JSON: {raw[:100]!r}, defaulting to search"
         )
-        return {"intent": "search", "rewritten_query": "", "needs_tool": True}
+        return {"intent": "search", "rewritten_query": "", "needs_tool": True, "write_action": "", "text_input": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +271,9 @@ async def intent_classifier(state: "AgentState") -> dict:
             "kg_query": "Truy vấn đồ thị tri thức",
             "search_abbr": "Tra cứu viết tắt",
             "search_doc_num": "Tra cứu số văn bản",
+            "write_summarize": "Tóm tắt văn bản",
+            "write_suggest_edits": "Đề xuất chỉnh sửa",
+            "write_grammar_check": "Kiểm tra ngữ pháp",
         }
         intent_label = intent_labels.get(result["intent"], "Tìm kiếm")
         await push_event(
@@ -274,6 +288,8 @@ async def intent_classifier(state: "AgentState") -> dict:
         return {
             "intent": result["intent"],
             "rewritten_query": result["rewritten_query"] or user_message,
+            "write_action": result.get("write_action", ""),
+            "text_input": result.get("text_input", ""),
         }
 
     except Exception as e:
@@ -790,3 +806,297 @@ async def direct_answer(state: "AgentState") -> dict:
             await push_event(state, "token", greeting)
 
     return {"final_answer": "".join(answer_parts)}
+
+
+# ---------------------------------------------------------------------------
+# Node: write_executor  (true subgraph invocation)
+# ---------------------------------------------------------------------------
+
+# Cached compiled write subgraph — built once on first use
+_write_subgraph = None
+
+
+def _get_write_subgraph():
+    """Lazy singleton for the compiled agent_write subgraph."""
+    global _write_subgraph
+    if _write_subgraph is None:
+        from app.services.agents.agent_write import create_agent_write
+        _write_subgraph = create_agent_write()
+        logger.info("[write_executor] agent_write subgraph compiled and cached")
+    return _write_subgraph
+
+
+def _transform_input(state: "AgentState") -> dict:
+    """
+    Map AgentState → AgentWriteState.
+
+    AgentWriteState keys: messages, user_id, workspace_ids,
+                          text_input, write_action, result, error
+    """
+    intent = state.get("intent", "")
+    write_action = state.get("write_action", "")
+    text_input = state.get("text_input", "")
+
+    # Fallback: extract text from last user message if classifier didn't isolate it
+    if not text_input:
+        text_input = _extract_last_user_message(state)
+
+    # Fallback: derive action from intent when classifier left write_action blank
+    if not write_action:
+        write_action = {
+            "write_summarize": "summarize",
+            "write_suggest_edits": "suggest_edits",
+            "write_grammar_check": "grammar_check",
+        }.get(intent, "summarize")
+
+    return {
+        "messages": [],            # write subgraph doesn't need chat history
+        "user_id": state.get("user_id"),
+        "workspace_ids": state.get("workspace_ids", []),
+        "text_input": text_input,
+        "write_action": write_action,
+        "result": "",
+        "error": None,
+    }
+
+
+def _transform_output(write_result: dict) -> dict:
+    """
+    Map AgentWriteState output → AgentState partial update.
+
+    Picks the final answer from result (or error fallback) and
+    returns only the keys that belong to AgentState.
+    """
+    result_text = write_result.get("result", "")
+    error = write_result.get("error")
+    if error and not result_text:
+        result_text = f"Lỗi xử lý văn bản: {error}"
+    return {"final_answer": result_text}
+
+
+async def write_executor(state: "AgentState") -> dict:
+    """
+    True subgraph node: invokes the compiled agent_write LangGraph as a child graph.
+
+    Flow:
+        AgentState
+          ↓  _transform_input()
+        AgentWriteState  ──▶  agent_write subgraph
+          (route_write_action → summarize/suggest_edits/grammar → answer node)
+          ↓  _transform_output()
+        AgentState partial update  { final_answer: str }
+
+    Handles intents: write_summarize, write_suggest_edits, write_grammar_check.
+    Streams the result as tokens into SSE after subgraph completes.
+    """
+    from app.services.agent.streaming import push_event
+
+    intent = state.get("intent", "")
+    write_action = state.get("write_action", "") or {
+        "write_summarize": "summarize",
+        "write_suggest_edits": "suggest_edits",
+        "write_grammar_check": "grammar_check",
+    }.get(intent, "summarize")
+
+    logger.info(
+        f"[write_executor] intent={intent!r} write_action={write_action!r} "
+        f"text_input={str(state.get('text_input', ''))[:80]!r}"
+    )
+
+    await push_event(
+        state,
+        "status",
+        {"step": "processing", "detail": "Đang xử lý văn bản..."},
+    )
+
+    # ── Transform: AgentState → AgentWriteState ──────────────────────────
+    write_input = _transform_input(state)
+
+    # ── Invoke child graph ────────────────────────────────────────────────
+    try:
+        subgraph = _get_write_subgraph()
+        write_output = await subgraph.ainvoke(write_input)
+        logger.info(
+            f"[write_executor] subgraph completed, result_len={len(write_output.get('result', ''))}"
+        )
+    except Exception as e:
+        logger.error(f"[write_executor] subgraph invocation failed: {e}", exc_info=True)
+        write_output = {"result": "", "error": str(e)}
+
+    # ── Transform: AgentWriteState → AgentState partial update ───────────
+    partial = _transform_output(write_output)
+    result_text = partial.get("final_answer", "")
+
+    # ── Stream result as tokens (~80 chars per chunk for smooth UX) ───────
+    if result_text:
+        chunk_size = 80
+        for i in range(0, len(result_text), chunk_size):
+            await push_event(state, "token", result_text[i : i + chunk_size])
+
+    return partial
+
+
+# ---------------------------------------------------------------------------
+# Node: agent_rag_executor  (true subgraph invocation)
+# ---------------------------------------------------------------------------
+
+# Cached compiled rag subgraph — built once on first use
+_rag_subgraph = None
+
+
+def _get_rag_subgraph():
+    """Lazy singleton for the compiled agent_rag subgraph."""
+    global _rag_subgraph
+    if _rag_subgraph is None:
+        from app.services.agents.agent_rag import create_agent_rag
+        _rag_subgraph = create_agent_rag()
+        logger.info("[agent_rag_executor] agent_rag subgraph compiled and cached")
+    return _rag_subgraph
+
+
+def _transform_rag_input(state: "AgentState") -> dict:
+    """
+    Map AgentState → AgentRagState dict for the RAG subgraph.
+
+    AgentRagState fields: messages, intent, rewritten_query, workspace_ids,
+                          document_ids, sources, images, image_parts,
+                          kg_summaries, abbreviation_results, final_answer
+    """
+    return {
+        "messages": state.get("messages", []),
+        "intent": state.get("intent", "search"),
+        "rewritten_query": state.get("rewritten_query", ""),
+        "workspace_ids": state.get("workspace_ids", []),
+        "document_ids": state.get("document_ids"),
+        "sources": [],
+        "images": [],
+        "image_parts": [],
+        "kg_summaries": [],
+        "abbreviation_results": [],
+        "final_answer": None,
+    }
+
+
+def _transform_rag_output(rag_result: dict, existing_ids: set) -> dict:
+    """
+    Map AgentRagState output → AgentState partial update.
+
+    Extracts: sources, images, image_parts, kg_summaries,
+              abbreviation_results, tool_called, iterations.
+    Does NOT set final_answer — that's left to answer_generator.
+    """
+    sources = rag_result.get("sources", []) or []
+    images = rag_result.get("images", []) or []
+    image_parts = rag_result.get("image_parts", []) or []
+    kg_summaries = rag_result.get("kg_summaries", []) or []
+    abbreviation_results = rag_result.get("abbreviation_results", []) or []
+
+    # Inject the final_answer from RAG node into kg_summaries so answer_generator
+    # can use it as context (for list_docs, summarize, kg_query, search_doc_num)
+    # For search_documents, the context is already in sources.
+    final_answer_from_rag = rag_result.get("final_answer") or ""
+    if final_answer_from_rag and not sources:
+        # Non-search intents: the RAG node already built the full answer text.
+        # Pass it through kg_summaries so answer_generator has context to polish.
+        kg_summaries = [final_answer_from_rag] + list(kg_summaries)
+
+    return {
+        "sources": sources,
+        "images": images,
+        "image_parts": image_parts,
+        "kg_summaries": kg_summaries,
+        "abbreviation_results": abbreviation_results,
+        "tool_called": True,
+        "iterations": 1,
+    }
+
+
+async def agent_rag_executor(state: "AgentState") -> dict:
+    """
+    True subgraph node: invokes the compiled agent_rag LangGraph as a child graph.
+
+    Flow:
+        AgentState
+          ↓  _transform_rag_input()
+        AgentRagState  ──▶  agent_rag subgraph
+          (routes by intent → search_documents | list_documents | ... )
+          ↓  _transform_rag_output()
+        AgentState partial update  → answer_generator
+
+    Handles all RAG intents: search, list_docs, summarize, kg_query,
+    search_doc_num, search_abbr.
+    """
+    from app.services.agent.streaming import push_event
+
+    intent = state.get("intent", "search")
+    query = state.get("rewritten_query", "")
+    workspace_ids = state.get("workspace_ids", [])
+    existing_ids = state.get("existing_citation_ids", set())
+
+    logger.info(
+        f"[agent_rag_executor] intent={intent!r} query={query!r} "
+        f"workspaces={workspace_ids}"
+    )
+
+    # Emit status event
+    tool_status_map = {
+        "search": "Đang tìm kiếm tài liệu liên quan...",
+        "list_docs": "Đang lấy danh sách tài liệu...",
+        "summarize": "Đang tóm tắt tài liệu...",
+        "kg_query": "Đang truy vấn đồ thị tri thức...",
+        "search_doc_num": "Đang tra cứu số văn bản...",
+        "search_abbr": "Đang tra cứu viết tắt...",
+    }
+    await push_event(
+        state,
+        "status",
+        {
+            "step": "searching",
+            "detail": tool_status_map.get(intent, "Đang xử lý yêu cầu..."),
+        },
+    )
+
+    # ── Transform: AgentState → AgentRagState ────────────────────────────
+    rag_input = _transform_rag_input(state)
+
+    # ── Invoke child graph ────────────────────────────────────────────────
+    try:
+        subgraph = _get_rag_subgraph()
+        rag_output = await subgraph.ainvoke(rag_input)
+        logger.info(
+            f"[agent_rag_executor] subgraph completed, "
+            f"sources={len(rag_output.get('sources', []))}, "
+            f"final_answer_len={len(str(rag_output.get('final_answer', '')))}"
+        )
+    except Exception as e:
+        logger.error(f"[agent_rag_executor] subgraph invocation failed: {e}", exc_info=True)
+        rag_output = {
+            "sources": [], "images": [], "image_parts": [],
+            "kg_summaries": [], "abbreviation_results": [], "final_answer": None,
+        }
+
+    # ── Transform: AgentRagState → AgentState partial update ─────────────
+    partial = _transform_rag_output(rag_output, existing_ids)
+
+    # ── Push sources and images events into the SSE queue ────────────────
+    sources = partial.get("sources", [])
+    images = partial.get("images", [])
+
+    if sources:
+        logger.info(f"[agent_rag_executor] Pushing {len(sources)} sources to SSE")
+        await push_event(state, "sources", sources)
+        await push_event(
+            state,
+            "status",
+            {
+                "step": "retrieved",
+                "detail": f"Tìm thấy {len(sources)} nguồn tài liệu liên quan",
+            },
+        )
+
+    if images:
+        logger.info(f"[agent_rag_executor] Pushing {len(images)} images to SSE")
+        await push_event(state, "images", images)
+
+    return partial
+

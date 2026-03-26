@@ -25,6 +25,7 @@ import { useAuthStore } from "@/stores/authStore";
 import { useChatSessions, useCreateChatSession, useDeleteChatSession } from "@/hooks/useChatSessions";
 import { useTranslation } from "@/hooks/useTranslation";
 import { ThemeToggle } from "@/components/ui/theme-toggle";
+import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import logo from "@/assets/logo.png";
@@ -47,6 +48,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
   const { t } = useTranslation();
 
   const [workspacesExpanded, setWorkspacesExpanded] = useState(true);
+  const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
 
   const handleNewSession = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -58,19 +60,24 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
     }
   };
 
-  const handleDeleteSession = async (e: React.MouseEvent, id: string) => {
+  const handleDeleteSession = (e: React.MouseEvent, id: string) => {
     e.stopPropagation();
     e.preventDefault();
-    if (confirm(t("chat.delete_confirm"))) {
-      try {
-        await deleteSession.mutateAsync(id);
-        toast.success(t("chat.delete_success"));
-        if (location.pathname === `/chat/${id}`) {
-          navigate("/chat");
-        }
-      } catch (error) {
-        toast.error(t("chat.delete_failed"));
+    setDeleteConfirmId(id);
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!deleteConfirmId) return;
+    try {
+      await deleteSession.mutateAsync(deleteConfirmId);
+      toast.success(t("chat.delete_success"));
+      if (location.pathname === `/chat/${deleteConfirmId}`) {
+        navigate("/chat");
       }
+    } catch (error) {
+      toast.error(t("chat.delete_failed"));
+    } finally {
+      setDeleteConfirmId(null);
     }
   };
 
@@ -477,6 +484,17 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
           </button>
         </div>
       </div>
+
+      <ConfirmDialog
+        open={deleteConfirmId !== null}
+        onConfirm={handleConfirmDelete}
+        onCancel={() => setDeleteConfirmId(null)}
+        title={t("common.delete")}
+        message={t("chat.delete_confirm")}
+        confirmLabel={t("common.confirm")}
+        cancelLabel={t("common.cancel")}
+        variant="danger"
+      />
     </aside>
   );
 });

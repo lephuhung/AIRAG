@@ -113,7 +113,7 @@ class KnowledgeGraphService:
                 model_name = settings.LLM_MODEL_FAST
             elif settings.LLM_PROVIDER == "ollama":
                 model_name = settings.OLLAMA_MODEL
-            elif settings.LLM_PROVIDER == "openai":
+            elif settings.LLM_PROVIDER in ("openai", "openai_compatible"):
                 model_name = settings.OPENAI_COMPATIBLE_MODEL
 
         for attempt in range(4):   # up to 3 retries

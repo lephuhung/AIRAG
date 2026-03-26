@@ -19,3 +19,4 @@ CLAUDE.md
 back_end/
 documents/
 .claude/
+*.log
