@@ -102,7 +102,9 @@
     "chunking": "Đang cắt nhỏ",
     "embedding": "Đang nhúng",
     "building_kg": "Xây dựng KG",
-    "indexed": "Đã lập chỉ mục"
+    "indexed": "Đã lập chỉ mục",
+    "completed": "Hoàn thành",
+    "processed": "Đã xử lý"
   },
   "auth": {
     "login": "Đăng nhập",
@@ -186,6 +188,15 @@
     "add_abbreviation": "Thêm từ viết tắt ({{abbr}})"
   },
   "rag": {
+    "timeline": {
+      "analyzing": "Đang phân tích",
+      "understood": "Đã hiểu",
+      "retrieving": "Đang tìm kiếm",
+      "sources_found": "Đã tìm thấy nguồn",
+      "generating": "Đang tạo",
+      "done": "Xong",
+      "error": "Lỗi"
+    },
     "status": {
       "analyzing": "Đang phân tích câu hỏi...",
       "retrieving": "Đang tìm kiếm tài liệu...",

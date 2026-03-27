@@ -21,6 +21,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useTranslation } from "@/hooks/useTranslation";
 import type { AgentStep, AgentStepType } from "@/types";
 
 // ---------------------------------------------------------------------------
@@ -29,17 +30,17 @@ import type { AgentStep, AgentStepType } from "@/types";
 
 interface StepConfig {
   icon: LucideIcon;
-  label: string;
+  labelKey: string;
 }
 
 export const STEP_CONFIG: Record<AgentStepType, StepConfig> = {
-  analyzing: { icon: Brain, label: "Analyzing" },
-  understood: { icon: Lightbulb, label: "Understood" },
-  retrieving: { icon: Search, label: "Searching" },
-  sources_found: { icon: Database, label: "Sources found" },
-  generating: { icon: PenLine, label: "Generating" },
-  done: { icon: CheckCircle2, label: "Done" },
-  error: { icon: AlertCircle, label: "Error" },
+  analyzing: { icon: Brain, labelKey: "rag.timeline.analyzing" },
+  understood: { icon: Lightbulb, labelKey: "rag.timeline.understood" },
+  retrieving: { icon: Search, labelKey: "rag.timeline.retrieving" },
+  sources_found: { icon: Database, labelKey: "rag.timeline.sources_found" },
+  generating: { icon: PenLine, labelKey: "rag.timeline.generating" },
+  done: { icon: CheckCircle2, labelKey: "rag.timeline.done" },
+  error: { icon: AlertCircle, labelKey: "rag.timeline.error" },
 };
 
 function formatMs(ms: number): string {
@@ -126,6 +127,7 @@ interface StepNodeProps {
 }
 
 function StepNode({ step, isLast, isLive }: StepNodeProps) {
+  const { t } = useTranslation();
   const config = STEP_CONFIG[step.step] || STEP_CONFIG.analyzing;
   const Icon = config.icon;
   const isActive = isLive && step.status === "active";
@@ -182,7 +184,7 @@ function StepNode({ step, isLast, isLive }: StepNodeProps) {
               isError && "text-destructive font-medium",
             )}
           >
-            {step.detail || config.label}
+            {step.detail || t(config.labelKey)}
           </span>
 
           <span className="ml-auto flex-shrink-0">
@@ -224,49 +226,41 @@ function StepNode({ step, isLast, isLive }: StepNodeProps) {
 // TimelineSummary — collapsed 1-line summary for embedded mode
 // ---------------------------------------------------------------------------
 
-function buildSummary(steps: AgentStep[], isLive: boolean): string {
-  const sourcesStep = steps.find((s) => s.step === "sources_found");
+function buildSummary(steps: AgentStep[], isLive: boolean, t: any): string {
   const doneStep = steps.find((s) => s.step === "done");
 
-  const parts: string[] = [];
+  let durationPart = "";
 
-  if (sourcesStep) {
-    let sourceText = `${sourcesStep.sourceCount || 0} source${(sourcesStep.sourceCount || 0) > 1 ? "s" : ""}`;
-    if (sourcesStep.imageCount) {
-      sourceText += ` + ${sourcesStep.imageCount} image${sourcesStep.imageCount > 1 ? "s" : ""}`;
-    }
-    parts.push(sourceText);
-  }
-
-  if (doneStep?.durationMs) {
-    parts.push(formatMs(doneStep.durationMs));
+  if (doneStep?.durationMs != null) {
+    durationPart = formatMs(doneStep.durationMs);
   } else if (doneStep) {
     // Extract duration from detail if available
     const match = doneStep.detail.match(/[\d.]+[sm]/);
     if (match) {
-      parts.push(match[0]);
+      durationPart = match[0];
     } else if (steps.length > 0) {
       // Fallback: total time from start to done
-      parts.push(formatMs(doneStep.timestamp - steps[0].timestamp));
+      durationPart = formatMs(doneStep.timestamp - steps[0].timestamp);
     }
+  }
+
+  // Fallback if no done step or duration yet
+  if (!durationPart && steps.length > 0 && !isLive) {
+    durationPart = formatMs(steps[steps.length - 1].timestamp - steps[0].timestamp);
   }
 
   const activeStep = steps.find((s) => s.status === "active");
 
-  if (parts.length === 0) {
-    // Still in progress, show active step label
-    if (activeStep && isLive) {
-      const cfg = STEP_CONFIG[activeStep.step] || STEP_CONFIG.analyzing;
-      return `${cfg.label}...`;
-    }
-    return "Processed";
+  if (durationPart) {
+    return `${t("common.completed")} - ${durationPart}`;
   }
-  if (sourcesStep) {
-    const isGenerating = activeStep && isLive;
-    const suffix = parts[1] ? ` in ${parts[1]}` : isGenerating ? " — generating..." : "";
-    return `Found ${parts[0]}${suffix}`;
+
+  if (isLive && activeStep) {
+    const cfg = STEP_CONFIG[activeStep.step] || STEP_CONFIG.analyzing;
+    return `${t(cfg.labelKey)}...`;
   }
-  return `Completed in ${parts[0]}`;
+
+  return t("common.processed");
 }
 
 // ---------------------------------------------------------------------------
@@ -308,23 +302,24 @@ export function ThinkingTimeline({
     prevModeRef.current = mode;
   }, [mode]);
 
+  const { t } = useTranslation();
   if (steps.length === 0) return null;
 
   // Collapsed summary — styled like ThinkingPanel header for visibility
   const isStillActive = mode === "live" && steps.some((s) => s.status === "active");
   if (!expanded) {
     return (
-      <div className={cn("rounded-md border border-border/60 bg-background overflow-hidden", className)}>
+      <div className={cn("w-fit max-w-full rounded-md border border-border/60 bg-background overflow-hidden", className)}>
         <button
           onClick={() => setExpanded(true)}
-          className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-primary/80 hover:text-primary transition-colors"
+          className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-primary/80 hover:text-primary transition-colors whitespace-nowrap"
         >
           {isStillActive ? (
             <Loader2 className="w-3 h-3 animate-spin text-primary/80 flex-shrink-0" />
           ) : (
             <CheckCircle2 className="w-3 h-3 text-emerald-500/80 flex-shrink-0" />
           )}
-          <span className="flex-1 text-left">{buildSummary(steps, mode === "live")}</span>
+          <span className="text-left">{buildSummary(steps, mode === "live", t)}</span>
           <ChevronDown className="w-3 h-3 flex-shrink-0" />
         </button>
       </div>
@@ -338,7 +333,7 @@ export function ThinkingTimeline({
     <div
       className={cn(
         "relative",
-        isEmbedded && "rounded-md border border-border/60 bg-background overflow-hidden",
+        isEmbedded && "w-fit max-w-2xl rounded-md border border-border/60 bg-background overflow-hidden",
         className,
       )}
     >
@@ -346,10 +341,10 @@ export function ThinkingTimeline({
       {isEmbedded && (
         <button
           onClick={() => setExpanded(false)}
-          className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-primary/80 hover:text-primary transition-colors border-b border-border/40"
+          className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-primary/80 hover:text-primary transition-colors border-b border-border/40 whitespace-nowrap"
         >
           <CheckCircle2 className="w-3 h-3 text-emerald-500/80 flex-shrink-0" />
-          <span className="flex-1 text-left">{buildSummary(steps, mode === "live")}</span>
+          <span className="text-left">{buildSummary(steps, mode === "live", t)}</span>
           <ChevronDown className="w-3 h-3 flex-shrink-0 rotate-180" />
         </button>
       )}

@@ -97,7 +97,9 @@
     "ocring": "OCR",
     "chunking": "Chunking",
     "embedding": "Embedding",
-    "building_kg": "Building KG"
+    "building_kg": "Building KG",
+    "completed": "Completed",
+    "processed": "Processed"
   },
   "auth": {
     "login": "Login",
@@ -181,6 +183,15 @@
     "add_abbreviation": "Add abbreviation ({{abbr}})"
   },
   "rag": {
+    "timeline": {
+      "analyzing": "Analyzing",
+      "understood": "Understood",
+      "retrieving": "Searching",
+      "sources_found": "Sources found",
+      "generating": "Generating",
+      "done": "Done",
+      "error": "Error"
+    },
     "source": "source",
     "sources": "sources",
     "image": "image",

@@ -95,8 +95,8 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
   return (
     <aside
       className={cn(
-        "flex flex-col h-full bg-card border-r border-border transition-all duration-200 flex-shrink-0",
-        collapsed ? "w-14" : "w-60"
+        "absolute top-0 left-0 z-50 flex flex-col h-full bg-card border-r border-border transition-all duration-200",
+        collapsed ? "w-14" : "w-60 shadow-xl"
       )}
     >
       {/* Logo */}
