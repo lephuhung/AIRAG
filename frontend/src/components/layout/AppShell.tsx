@@ -43,6 +43,13 @@ export function AppShell() {
     return () => window.removeEventListener("resize", check);
   }, []);
 
+  useEffect(() => {
+    document.documentElement.style.setProperty(
+      "--sidebar-width",
+      isCollapsed ? "56px" : "240px",
+    );
+  }, [isCollapsed]);
+
   return (
     <div className="h-screen flex overflow-hidden relative">
       <div className="w-14 flex-shrink-0" aria-hidden="true" />

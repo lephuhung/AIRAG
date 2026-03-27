@@ -22,6 +22,11 @@ import {
   ThumbsUp,
   ThumbsDown,
   DatabaseZap,
+  X,
+  Share2,
+  RotateCcw,
+  Zap,
+  BookOpen,
 } from "lucide-react";
 import { PrismLight as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
@@ -602,6 +607,136 @@ function SourceRatingButtons({
 }
 
 // ---------------------------------------------------------------------------
+// Sources Sidebar — Right slide-over
+// ---------------------------------------------------------------------------
+
+function SourcesSidebar({
+  activeSources,
+  onClose,
+}: {
+  activeSources: { sources: ChatSourceChunk[]; messageId?: string } | null;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const [ratings, setRatings] = useState<Record<string, RelevanceRating>>({});
+  const sessionId = useContext(SessionIdCtx);
+  const queryClient = useQueryClient();
+
+  const rateMutation = useMutation({
+    mutationFn: ({
+      sessionId,
+      messageId,
+      sourceIndex,
+      rating,
+    }: {
+      sessionId: string;
+      messageId: string;
+      sourceIndex: string;
+      rating: RelevanceRating;
+    }) =>
+      api.post(`/rag/chat/${sessionId}/rate`, {
+        message_id: messageId,
+        source_index: sourceIndex,
+        rating: rating,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["chat-history", sessionId] });
+    },
+  });
+
+  const handleRate = useCallback(
+    async (sourceIndex: string, rating: RelevanceRating) => {
+      if (!sessionId || !activeSources?.messageId) return;
+
+      const newRating = ratings[sourceIndex] === rating ? "partial" : rating;
+      const prev = { ...ratings };
+      setRatings((r) => ({ ...r, [sourceIndex]: newRating }));
+
+      try {
+        await rateMutation.mutateAsync({
+          sessionId,
+          messageId: activeSources.messageId,
+          sourceIndex,
+          rating: newRating,
+        });
+      } catch {
+        setRatings(prev);
+      }
+    },
+    [sessionId, activeSources?.messageId, ratings, rateMutation],
+  );
+
+  return (
+    <AnimatePresence>
+      {activeSources && (
+        <>
+          {/* Backdrop */}
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={onClose}
+            className="fixed inset-0 z-[60] bg-background/20 backdrop-blur-sm"
+          />
+
+          {/* Sidebar */}
+          <motion.div
+            initial={{ x: "-100%" }}
+            animate={{ x: 0 }}
+            exit={{ x: "-100%" }}
+            transition={{ type: "spring", damping: 25, stiffness: 200 }}
+            className="fixed top-0 bottom-0 w-80 z-[70] bg-background border-r shadow-2xl flex flex-col"
+            style={{ left: "var(--sidebar-width, 0px)" }}
+          >
+            <div className="flex items-center justify-between px-4 py-3 border-b">
+              <div className="flex items-center gap-2">
+                <FileText className="w-4 h-4 text-primary" />
+                <h3 className="text-sm font-semibold">{t("rag.sources")}</h3>
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted font-medium text-muted-foreground">
+                  {activeSources.sources.length}
+                </span>
+              </div>
+              <button
+                onClick={onClose}
+                className="p-1 rounded-md hover:bg-muted transition-colors"
+                title={t("common.close")}
+              >
+                <X className="w-4 h-4 text-muted-foreground" />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto divide-y">
+              {activeSources.sources
+                .filter((s) => s.source_type !== "kg")
+                .map((source) => (
+                  <SourceItem
+                    key={String(source.index)}
+                    source={source}
+                    messageId={activeSources.messageId}
+                    ratings={ratings}
+                    onRate={handleRate}
+                  />
+                ))}
+              {activeSources.sources
+                .filter((s) => s.source_type === "kg")
+                .map((source) => (
+                  <KGSourceItem
+                    key={String(source.index)}
+                    source={source}
+                    messageId={activeSources.messageId}
+                    ratings={ratings}
+                    onRate={handleRate}
+                  />
+                ))}
+            </div>
+          </motion.div>
+        </>
+      )}
+    </AnimatePresence>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Source item in the sources panel
 // ---------------------------------------------------------------------------
 function SourceItem({
@@ -624,9 +759,10 @@ function SourceItem({
       onClick={() => activateCitation(source, [], doc)}
       className="w-full text-left px-2.5 py-2 hover:bg-muted/50 transition-colors"
     >
-      <div className="flex items-center gap-1.5 mb-0.5">
-        <span className="inline-flex items-center justify-center w-4 h-4 text-[9px] font-bold rounded-full bg-primary/15 text-primary">
-          {source.index}
+      <div className="flex items-center gap-2 mb-1">
+        <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 flex-shrink-0" />
+        <span className="text-[10px] font-medium text-foreground/80">
+          {doc?.original_filename || t("rag.source")}
         </span>
         <span className="text-[10px] text-muted-foreground">p.{source.page_no}</span>
         {source.heading_path.length > 0 && (
@@ -681,11 +817,11 @@ function KGSourceItem({
       onClick={() => activateCitationKG(source, [], doc)}
       className="w-full text-left px-2.5 py-2 hover:bg-purple-400/5 hover:bg-muted/50 transition-colors"
     >
-      <div className="flex items-center gap-1.5 mb-0.5">
-        <span className="inline-flex items-center justify-center w-4 h-4 text-[9px] font-bold rounded-full bg-purple-400/15 text-purple-400">
-          {source.index}
+      <div className="flex items-center gap-2 mb-1">
+        <div className="w-1.5 h-1.5 rounded-full bg-purple-500 flex-shrink-0" />
+        <span className="text-[10px] font-medium text-purple-600 dark:text-purple-400">
+          {t("common.knowledge_graph")}
         </span>
-        <span className="text-[10px] text-purple-400 font-medium">{t("common.knowledge_graph")}</span>
         {messageId && (
           <SourceRatingButtons
             sourceIndex={String(source.index)}
@@ -713,116 +849,6 @@ function KGSourceItem({
 }
 
 // ---------------------------------------------------------------------------
-// Sources panel — shows the retrieved chunks
-// ---------------------------------------------------------------------------
-function SourcesPanel({
-  sources,
-  messageId,
-}: {
-  sources: ChatSourceChunk[];
-  messageId?: string;
-}) {
-  const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(false);
-  const [ratings, setRatings] = useState<Record<string, RelevanceRating>>({});
-  const sessionId = useContext(SessionIdCtx);
-  const queryClient = useQueryClient();
-
-  const rateMutation = useMutation({
-    mutationFn: ({
-      sessionId,
-      messageId,
-      sourceIndex,
-      rating,
-    }: {
-      sessionId: string;
-      messageId: string;
-      sourceIndex: string;
-      rating: RelevanceRating;
-    }) =>
-      api.post(`/rag/chat/${sessionId}/rate`, {
-        message_id: messageId,
-        source_index: sourceIndex,
-        rating: rating,
-      }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["chat-history", sessionId] });
-    },
-  });
-
-  if (sources.length === 0) return null;
-
-  const vectorSources = sources.filter((s) => s.source_type !== "kg");
-  const kgSources = sources.filter((s) => s.source_type === "kg");
-
-  const handleRate = useCallback(
-    async (sourceIndex: string, rating: RelevanceRating) => {
-      if (!sessionId || !messageId) return;
-
-      const newRating = ratings[sourceIndex] === rating ? "partial" : rating;
-      const prev = { ...ratings };
-      setRatings((r) => ({ ...r, [sourceIndex]: newRating }));
-
-      try {
-        await rateMutation.mutateAsync({
-          sessionId,
-          messageId,
-          sourceIndex,
-          rating: newRating,
-        });
-      } catch {
-        setRatings(prev);
-      }
-    },
-    [sessionId, messageId, ratings, rateMutation],
-  );
-
-  return (
-    <div className="mt-2 rounded-md border bg-muted/20 overflow-hidden text-left">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-[10px] font-medium text-muted-foreground hover:text-foreground transition-colors"
-      >
-        <FileText className="w-3 h-3" />
-        {sources.length} {sources.length > 1 ? t("rag.sources") : t("rag.source")}
-        {kgSources.length > 0 && " + KG"}
-        <span className="ml-auto text-[10px]">{expanded ? "▲" : "▼"}</span>
-      </button>
-      <AnimatePresence>
-        {expanded && (
-          <motion.div
-            initial={{ height: 0 }}
-            animate={{ height: "auto" }}
-            exit={{ height: 0 }}
-            className="overflow-hidden"
-          >
-            <div className="divide-y border-t">
-              {vectorSources.map((source) => (
-                <SourceItem
-                  key={source.chunk_id}
-                  source={source}
-                  messageId={messageId}
-                  ratings={ratings}
-                  onRate={handleRate}
-                />
-              ))}
-              {kgSources.map((source) => (
-                <KGSourceItem
-                  key={source.chunk_id}
-                  source={source}
-                  messageId={messageId}
-                  ratings={ratings}
-                  onRate={handleRate}
-                />
-              ))}
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </div>
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Image references panel — shows retrieved images in chat
 // ---------------------------------------------------------------------------
@@ -851,9 +877,10 @@ function ImageRefCard({ img }: { img: ChatImageRef }) {
 
 function ImageRefsPanel({ images }: { images: ChatImageRef[] }) {
   const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(true);
 
   if (images.length === 0) return null;
+
+  const [expanded, setExpanded] = useState(true);
 
   return (
     <div className="mt-2 rounded-md border bg-muted/20 overflow-hidden">
@@ -959,47 +986,112 @@ function markdownToPlainText(md: string): string {
   return text.trim();
 }
 
-function CopyMessageActions({ content }: { content: string }) {
+function AssistantMessageFooter({
+  message,
+  onOpenSources,
+}: {
+  message: ChatMessage;
+  onOpenSources: (sources: ChatSourceChunk[], id?: string) => void;
+}) {
   const { t } = useTranslation();
   const [copiedMode, setCopiedMode] = useState<"text" | "markdown" | null>(null);
+
   const handleCopy = useCallback(
     (mode: "text" | "markdown") => {
       const value =
-        mode === "text" ? markdownToPlainText(content) : stripCitations(content);
+        mode === "text"
+          ? markdownToPlainText(message.content)
+          : stripCitations(message.content);
       navigator.clipboard.writeText(value).then(() => {
         setCopiedMode(mode);
         setTimeout(() => setCopiedMode(null), 2000);
       });
     },
-    [content]
+    [message.content],
   );
 
+  const durationMs = useMemo(() => {
+    if (!message.agentSteps || message.agentSteps.length === 0) return null;
+    const doneStep = message.agentSteps.find((s) => s.step === "done");
+    if (doneStep?.durationMs) return doneStep.durationMs;
+    // Fallback: total time
+    const last = message.agentSteps[message.agentSteps.length - 1];
+    const first = message.agentSteps[0];
+    return last.timestamp - first.timestamp;
+  }, [message.agentSteps]);
+
+  const hasSources = message.sources && message.sources.length > 0;
+
   return (
-    <div className="flex items-center gap-0.5 mt-1.5">
-      <button
-        onClick={() => handleCopy("text")}
-        className="flex items-center gap-1 px-1.5 py-0.5 rounded-md text-muted-foreground/50 hover:text-muted-foreground hover:bg-muted/60 transition-all text-[10px]"
-        title={t("chat.copy_text")}
-      >
-        {copiedMode === "text" ? (
-          <ClipboardCheck className="w-3 h-3 text-emerald-500" />
-        ) : (
-          <Copy className="w-3 h-3" />
+    <div className="flex items-center justify-between gap-1.5 mt-2 pt-1 border-t border-muted/30">
+      {/* Action Icons (Left) */}
+      <div className="flex items-center gap-1">
+        <button className="p-1 rounded-md text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted/60 transition-all">
+          <ThumbsUp className="w-3.5 h-3.5" />
+        </button>
+        <button className="p-1 rounded-md text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted/60 transition-all">
+          <ThumbsDown className="w-3.5 h-3.5" />
+        </button>
+        <button
+          onClick={() => handleCopy("text")}
+          className={cn(
+            "p-1 rounded-md transition-all",
+            copiedMode === "text"
+              ? "text-emerald-500 bg-emerald-500/5"
+              : "text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted/60",
+          )}
+          title={t("chat.copy_text")}
+        >
+          {copiedMode === "text" ? (
+            <ClipboardCheck className="w-3.5 h-3.5" />
+          ) : (
+            <Copy className="w-3.5 h-3.5" />
+          )}
+        </button>
+        <button
+          onClick={() => handleCopy("markdown")}
+          className={cn(
+            "p-1 rounded-md transition-all",
+            copiedMode === "markdown"
+              ? "text-emerald-500 bg-emerald-500/5"
+              : "text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted/60",
+          )}
+          title={t("chat.copy_markdown")}
+        >
+          {copiedMode === "markdown" ? (
+            <ClipboardCheck className="w-3.5 h-3.5" />
+          ) : (
+            <FileCode className="w-3.5 h-3.5" />
+          )}
+        </button>
+        <button className="p-1 rounded-md text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted/60 transition-all">
+          <Share2 className="w-3.5 h-3.5" />
+        </button>
+        <button className="p-1 rounded-md text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted/60 transition-all">
+          <RotateCcw className="w-3.5 h-3.5" />
+        </button>
+      </div>
+
+      {/* Metadata & Sources (Right) */}
+      <div className="flex items-center gap-3">
+
+        <div className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-[10px] font-bold tracking-wider">
+          <Zap className="w-3 h-3 fill-current" />
+          <span>Fast</span>
+        </div>
+
+        {hasSources && (
+          <button
+            onClick={() => onOpenSources(message.sources!, message.id)}
+            className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-primary/10 border border-primary/20 text-primary hover:bg-primary/20 transition-colors text-[10px] font-semibold"
+          >
+            <BookOpen className="w-3 h-3" />
+            <span>
+              {message.sources!.length} {t("rag.sources")}
+            </span>
+          </button>
         )}
-        <span>{copiedMode === "text" ? t("chat.copied") : t("chat.copy_text")}</span>
-      </button>
-      <button
-        onClick={() => handleCopy("markdown")}
-        className="flex items-center gap-1 px-1.5 py-0.5 rounded-md text-muted-foreground/50 hover:text-muted-foreground hover:bg-muted/60 transition-all text-[10px]"
-        title={t("chat.copy_markdown")}
-      >
-        {copiedMode === "markdown" ? (
-          <ClipboardCheck className="w-3 h-3 text-emerald-500" />
-        ) : (
-          <FileCode className="w-3 h-3" />
-        )}
-        <span>{copiedMode === "markdown" ? t("chat.copied") : t("chat.copy_markdown")}</span>
-      </button>
+      </div>
     </div>
   );
 }
@@ -1034,9 +1126,11 @@ function AddAbbreviationButton({
 const MessageBubble = memo(function MessageBubble({
   message,
   onAddAbbreviation,
+  onOpenSources,
 }: {
   message: ChatMessage;
   onAddAbbreviation: (short: string) => void;
+  onOpenSources: (sources: ChatSourceChunk[], id?: string) => void;
 }) {
   const { t } = useTranslation();
   const isUser = message.role === "user";
@@ -1159,9 +1253,9 @@ className={cn("mb-1.5", message.isStreaming && "mt-1")}
           </div>
         )}
 
-        {/* Copy actions for assistant messages */}
+        {/* Footer actions for assistant messages */}
         {!isUser && message.content && (
-          <CopyMessageActions content={message.content} />
+          <AssistantMessageFooter message={message} onOpenSources={onOpenSources} />
         )}
 
         {/* ThinkingPanel — only when no ThinkingTimeline with thinking log (avoid duplication) */}
@@ -1169,10 +1263,6 @@ className={cn("mb-1.5", message.isStreaming && "mt-1")}
           !message.agentSteps?.some((s) => s.thinkingText) && (
             <ThinkingPanel thinking={message.thinking} />
           )}
-
-        {!isUser && !message.isStreaming && message.sources && message.sources.length > 0 && (
-          <SourcesPanel sources={message.sources} messageId={message.id} />
-        )}
 
         {!isUser && !message.isStreaming && message.imageRefs && message.imageRefs.length > 0 && (
           <ImageRefsPanel images={message.imageRefs} />
@@ -1184,9 +1274,11 @@ className={cn("mb-1.5", message.isStreaming && "mt-1")}
             isUser ? "text-muted-foreground/50" : "text-muted-foreground/50"
           )}
         >
-          {new Date(message.timestamp).toLocaleTimeString([], {
+          {new Date(message.timestamp).toLocaleTimeString("vi-VN", {
             hour: "2-digit",
             minute: "2-digit",
+            hour12: false,
+            timeZone: "Asia/Ho_Chi_Minh",
           })}
         </p>
       </div>
@@ -1346,6 +1438,10 @@ export const ChatPanel = memo(function ChatPanel({
   const [enableThinking, setEnableThinking] = useState(false);
   const [thinkingDefaultSynced, setThinkingDefaultSynced] = useState(false);
   const [forceSearch, setForceSearch] = useState(false);
+  const [activeSources, setActiveSources] = useState<{
+    sources: ChatSourceChunk[];
+    messageId?: string;
+  } | null>(null);
 
   // Abbreviation modal state
   const [isAbbModalOpen, setIsAbbModalOpen] = useState(false);
@@ -1366,6 +1462,13 @@ export const ChatPanel = memo(function ChatPanel({
       toast.error(err.message || t("admin.abbreviations.toast.error"));
     }
   };
+
+  const handleOpenSources = useCallback(
+    (sources: ChatSourceChunk[], id?: string) => {
+      setActiveSources({ sources, messageId: id });
+    },
+    [],
+  );
 
   // Load chat history from PostgreSQL
   const { data: historyData, isLoading: historyLoading } = useChatHistory(sessionId);
@@ -1818,7 +1921,7 @@ export const ChatPanel = memo(function ChatPanel({
     <SessionIdCtx.Provider value={sessionId}>
       <DebugCtx.Provider value={debugMode}>
         <AllSourcesCtx.Provider value={allSourcesFlat}>
-          <div className="flex flex-col h-full bg-background border-r relative z-0">
+          <div className="flex flex-col h-full bg-background border-r relative z-0 overflow-hidden">
             {/* Header */}
             <div className="flex-shrink-0 flex items-center justify-between px-3 py-2 border-b">
               <div className="flex items-center gap-2">
@@ -1871,9 +1974,10 @@ export const ChatPanel = memo(function ChatPanel({
                 <AnimatePresence>
                   {messages.map((msg) => (
                     <div key={msg.id} data-message-id={msg.id}>
-                      <MessageBubble 
-                        message={msg} 
+                      <MessageBubble
+                        message={msg}
                         onAddAbbreviation={handleOpenAbbModal}
+                        onOpenSources={handleOpenSources}
                       />
                     </div>
                   ))}
@@ -1936,6 +2040,10 @@ export const ChatPanel = memo(function ChatPanel({
                 {t("chat.input_hint")}
               </p>
             </div>
+            <SourcesSidebar
+              activeSources={activeSources}
+              onClose={() => setActiveSources(null)}
+            />
           </div>
         </AllSourcesCtx.Provider>
       </DebugCtx.Provider>

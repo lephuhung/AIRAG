@@ -104,7 +104,8 @@
     "building_kg": "Xây dựng KG",
     "indexed": "Đã lập chỉ mục",
     "completed": "Hoàn thành",
-    "processed": "Đã xử lý"
+    "processed": "Đã xử lý",
+    "milliseconds": "mili giây"
   },
   "auth": {
     "login": "Đăng nhập",

@@ -99,7 +99,8 @@
     "embedding": "Embedding",
     "building_kg": "Building KG",
     "completed": "Completed",
-    "processed": "Processed"
+    "processed": "Processed",
+    "milliseconds": "ms"
   },
   "auth": {
     "login": "Login",
