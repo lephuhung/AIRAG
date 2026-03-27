@@ -90,6 +90,9 @@ async def lifespan(app: FastAPI):
             await conn.execute(text(
                 "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS agent_steps JSON"
             ))
+            await conn.execute(text(
+                "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS potential_abbreviations JSON"
+            ))
             # Worker pipeline sub-task flags
             await conn.execute(text(
                 "ALTER TABLE documents ADD COLUMN IF NOT EXISTS embed_done BOOLEAN DEFAULT FALSE"
@@ -126,6 +129,10 @@ async def lifespan(app: FastAPI):
             # Official document reference number (e.g. "13/2023/NĐ-CP")
             await conn.execute(text(
                 "ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_number VARCHAR(100)"
+            ))
+            # Manual signer name override
+            await conn.execute(text(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS signer_name VARCHAR(255)"
             ))
             # ── Auth & multi-tenant columns ────────────────────────────────────
             # knowledge_bases: visibility, owner_id, tenant_id

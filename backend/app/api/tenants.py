@@ -154,6 +154,64 @@ async def list_tenants(
     ]
 
 
+@router.get("/invite/{token}", response_model=InviteValidationResponse)
+async def validate_invite(
+    token: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Validate an invite token (public, no auth required). Returns tenant info if valid."""
+    result = await db.execute(
+        select(InviteToken).where(InviteToken.token == token)
+    )
+    invite = result.scalar_one_or_none()
+
+    if invite is None or not invite.is_active:
+        return InviteValidationResponse(valid=False)
+
+    # Check expiration
+    if datetime.utcnow() > invite.expires_at:
+        return InviteValidationResponse(valid=False)
+
+    # Check usage limit
+    if invite.max_uses is not None and invite.use_count >= invite.max_uses:
+        return InviteValidationResponse(valid=False)
+
+    # Get tenant info
+    result = await db.execute(
+        select(Tenant).where(Tenant.id == invite.tenant_id, Tenant.is_active.is_(True))
+    )
+    tenant = result.scalar_one_or_none()
+    if tenant is None:
+        return InviteValidationResponse(valid=False)
+
+    return InviteValidationResponse(
+        valid=True,
+        tenant_name=tenant.name,
+        tenant_slug=tenant.slug,
+        email=invite.email,
+        expires_at=invite.expires_at.isoformat(),
+    )
+
+
+@router.get("/my", response_model=list[TenantResponse])
+async def get_my_tenants(
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
+    """List tenants the current user belongs to."""
+    result = await db.execute(
+        select(Tenant)
+        .join(TenantUser, TenantUser.tenant_id == Tenant.id)
+        .where(
+            TenantUser.user_id == user.id,
+            TenantUser.is_approved.is_(True),
+            Tenant.is_active.is_(True),
+        )
+        .order_by(Tenant.name)
+    )
+    return result.scalars().all()
+
+
 @router.get("/{tenant_id}", response_model=TenantResponse)
 async def get_tenant(
     tenant_id: int,
@@ -413,24 +471,6 @@ async def update_user_role(
 
 # ── Any Authenticated: My Tenants ───────────────────────────────────────────
 
-@router.get("/my", response_model=list[TenantResponse])
-async def get_my_tenants(
-    db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_active_user),
-):
-    """List tenants the current user belongs to."""
-    result = await db.execute(
-        select(Tenant)
-        .join(TenantUser, TenantUser.tenant_id == Tenant.id)
-        .where(
-            TenantUser.user_id == user.id,
-            TenantUser.is_approved.is_(True),
-            Tenant.is_active.is_(True),
-        )
-        .order_by(Tenant.name)
-    )
-    return result.scalars().all()
-
 
 # ── Invite Link Management ────────────────────────────────────────────────
 
@@ -545,41 +585,4 @@ async def revoke_invite(
     logger.info(f"Invite {invite_id} revoked for tenant {tenant_id} by user {user.id}")
 
 
-@router.get("/invite/{token}", response_model=InviteValidationResponse)
-async def validate_invite(
-    token: str,
-    db: AsyncSession = Depends(get_db),
-):
-    """Validate an invite token (public, no auth required). Returns tenant info if valid."""
-    result = await db.execute(
-        select(InviteToken).where(InviteToken.token == token)
-    )
-    invite = result.scalar_one_or_none()
-
-    if invite is None or not invite.is_active:
-        return InviteValidationResponse(valid=False)
-
-    # Check expiration
-    if datetime.utcnow() > invite.expires_at:
-        return InviteValidationResponse(valid=False)
-
-    # Check usage limit
-    if invite.max_uses is not None and invite.use_count >= invite.max_uses:
-        return InviteValidationResponse(valid=False)
-
-    # Get tenant info
-    result = await db.execute(
-        select(Tenant).where(Tenant.id == invite.tenant_id, Tenant.is_active.is_(True))
-    )
-    tenant = result.scalar_one_or_none()
-    if tenant is None:
-        return InviteValidationResponse(valid=False)
-
-    return InviteValidationResponse(
-        valid=True,
-        tenant_name=tenant.name,
-        tenant_slug=tenant.slug,
-        email=invite.email,
-        expires_at=invite.expires_at.isoformat(),
-    )
 

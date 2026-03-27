@@ -41,6 +41,7 @@
     "empty": "Trống",
     "you": "Bạn",
     "edit": "Sửa",
+    "download": "Tải xuống",
     "search": "Tìm kiếm",
     "actions": "Thao tác",
     "status": "Trạng thái",
@@ -181,7 +182,8 @@
     "highlight_kg": "Làm nổi bật trong biểu đồ tri thức",
     "view_source": "Xem nguồn: {{name}} (trang {{page}})",
     "copy_code": "Sao chép mã",
-    "memory_citation": "Trích dẫn từ trí nhớ"
+    "memory_citation": "Trích dẫn từ trí nhớ",
+    "add_abbreviation": "Thêm từ viết tắt ({{abbr}})"
   },
   "rag": {
     "status": {
@@ -351,7 +353,9 @@
       "chunks": "mảnh",
       "images": "hình ảnh",
       "tables": "bảng",
-      "signed_by": "Ký bởi"
+      "signed_by": "Ký bởi",
+      "document_number": "Số văn bản",
+      "signer": "Người ký"
     },
     "tasks": {
       "embed": "Nhúng",
@@ -366,6 +370,7 @@
       "pending": "Chờ xử lý"
     },
     "re_analyze": "Phân tích lại",
+    "edit_metadata": "Sửa thông tin",
     "sort": {
       "newest": "Mới nhất",
       "oldest": "Cũ nhất",

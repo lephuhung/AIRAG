@@ -61,6 +61,7 @@ class AgentState(TypedDict):
     # ── Write agent ───────────────────────────────────────────────────────
     write_action: str   # "summarize" | "suggest_edits" | "grammar_check" | "extract_key_points"
     text_input: str     # raw text to process (extracted from message or provided directly)
+    # potential_abbreviations: list[str]  # candidates that look like abbreviations but not in DB
 
 
 # Valid intents recognised by the classifier
@@ -102,4 +103,7 @@ DEFAULT_STATE: dict = {
     "citation_map": {},
     "write_action": "",
     "text_input": "",
+    "abbreviation_results": [],
+    "expanded_query": "",
+    "potential_abbreviations": [],
 }

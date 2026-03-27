@@ -19,7 +19,7 @@ from app.core.exceptions import NotFoundError
 from app.models.knowledge_base import KnowledgeBase
 from app.models.document import Document, DocumentImage, DocumentStatus
 from app.models.user import User
-from app.schemas.document import DocumentResponse, DocumentUploadResponse
+from app.schemas.document import DocumentResponse, DocumentUploadResponse, DocumentUpdate
 from app.schemas.rag import DocumentImageResponse
 
 logger = logging.getLogger(__name__)
@@ -507,6 +507,41 @@ async def download_document(
             "Content-Length": str(len(file_bytes)),
         },
     )
+
+
+@router.patch("/{document_id}", response_model=DocumentResponse)
+async def update_document(
+    document_id: int,
+    body: DocumentUpdate,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
+    """Update document metadata (document_number, signer_name)."""
+    result = await db.execute(select(Document).where(Document.id == document_id))
+    document = result.scalar_one_or_none()
+
+    if document is None:
+        raise NotFoundError("Document", document_id)
+
+    # Check workspace access
+    workspace_result = await db.execute(
+        select(KnowledgeBase).where(KnowledgeBase.id == document.workspace_id)
+    )
+    workspace = workspace_result.scalar_one_or_none()
+    if workspace is None:
+        raise NotFoundError("KnowledgeBase", document.workspace_id)
+    
+    await verify_workspace_access(workspace.id, user, db)
+
+    # Update fields
+    if body.document_number is not None:
+        document.document_number = body.document_number
+    if body.signer_name is not None:
+        document.signer_name = body.signer_name
+
+    await db.commit()
+    await db.refresh(document)
+    return document
 
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)

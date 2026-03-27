@@ -182,6 +182,10 @@ export interface Document {
   // Document type classification (auto-detected by pipeline)
   document_type_id?: number | null;
   document_type?: DocumentTypeInfo | null;
+  // Official document reference number
+  document_number?: string | null;
+  // Manual signer name override
+  signer_name?: string | null;
   // Sub-task completion flags (set independently by each worker after CHUNKING)
   embed_done?: boolean;              // embed worker → ChromaDB done
   captions_done?: boolean;           // caption worker → image/table captions done
@@ -343,6 +347,7 @@ export interface ChatMessage {
   timestamp: string;
   isStreaming?: boolean;
   agentSteps?: AgentStep[];
+  potential_abbreviations?: string[];
 }
 
 export interface ChatSourceChunk {
@@ -363,6 +368,7 @@ export interface ChatResponseData {
   kg_summary: string | null;
   image_refs: ChatImageRef[];
   thinking: string | null;
+  potential_abbreviations?: string[];
 }
 
 export interface PersistedChatMessage {
@@ -375,6 +381,7 @@ export interface PersistedChatMessage {
   image_refs?: ChatImageRef[] | null;
   thinking?: string | null;
   agent_steps?: AgentStep[] | null;
+  potential_abbreviations?: string[] | null;
   created_at: string;
 }
 

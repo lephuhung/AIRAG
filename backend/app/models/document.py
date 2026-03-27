@@ -66,6 +66,8 @@ class Document(Base):
     )
     # Official document reference number extracted by classifier (e.g. "13/2023/NĐ-CP")
     document_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Manual signer name override
+    signer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # User who uploaded this document
     uploaded_by: Mapped[int | None] = mapped_column(

@@ -40,6 +40,7 @@
     "none": "None",
     "you": "You",
     "edit": "Edit",
+    "download": "Download",
     "search": "Search",
     "actions": "Actions",
     "status": "Status",
@@ -176,7 +177,8 @@
     "highlight_kg": "Highlight in Knowledge Graph",
     "view_source": "View source: {{name}} (page {{page}})",
     "copy_code": "Copy code",
-    "memory_citation": "Memory citation"
+    "memory_citation": "Memory citation",
+    "add_abbreviation": "Add abbreviation ({{abbr}})"
   },
   "rag": {
     "source": "source",
@@ -301,6 +303,7 @@
     "uploaded": "Uploaded",
     "updated": "Updated",
     "signed_by": "Signed by: {{name}}",
+    "edit_metadata": "Edit Info",
     "status": {
       "pending": "Pending",
       "parsing": "Parsing",
@@ -322,7 +325,9 @@
       "pages": "pages",
       "chunks": "chunks",
       "images": "images",
-      "tables": "tables"
+      "tables": "tables",
+      "document_number": "Document Number",
+      "signer": "Signer"
     },
     "tasks": {
       "embed": "Embed",

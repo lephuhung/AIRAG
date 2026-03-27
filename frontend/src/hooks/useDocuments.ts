@@ -99,3 +99,17 @@ export function useReindexDocument(workspaceId: string | undefined) {
     onError: () => toast.error("Failed to re-process document"),
   });
 }
+
+export function useUpdateDocument(workspaceId: string | undefined) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ docId, data }: { docId: number; data: { document_number?: string; signer_name?: string } }) =>
+      api.patch(`/documents/${docId}`, data),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["documents", workspaceId] });
+      toast.success("Document updated successfully");
+    },
+    onError: () => toast.error("Failed to update document metadata"),
+  });
+}

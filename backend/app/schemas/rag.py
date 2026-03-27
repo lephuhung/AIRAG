@@ -213,6 +213,7 @@ class ChatResponse(BaseModel):
     kg_summary: str | None = None
     image_refs: list[ChatImageRef] = []
     thinking: str | None = None
+    potential_abbreviations: list[str] | None = None
 
 
 class PersistedChatMessage(BaseModel):
@@ -226,6 +227,7 @@ class PersistedChatMessage(BaseModel):
     image_refs: list[ChatImageRef] | None = None
     thinking: str | None = None
     agent_steps: list | None = None
+    potential_abbreviations: list[str] | None = None
     created_at: str  # ISO format
 
     model_config = {"from_attributes": True}

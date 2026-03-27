@@ -14,8 +14,16 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { FileCard } from "@/components/rag/FileCard";
+import { EditDocumentDialog } from "@/components/rag/EditDocumentDialog";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
-import { useDocuments, useDeleteDocument, useProcessDocument, useReindexDocument, PROCESSING_STATUSES } from "@/hooks/useDocuments";
+import { 
+  useDocuments, 
+  useDeleteDocument, 
+  useProcessDocument, 
+  useReindexDocument, 
+  useUpdateDocument,
+  PROCESSING_STATUSES 
+} from "@/hooks/useDocuments";
 import { useWorkspaces, useWorkspace } from "@/hooks/useWorkspaces";
 import { DocumentViewer } from "@/components/rag/DocumentViewer";
 import { useWorkspaceStore } from "@/stores/workspaceStore";
@@ -217,12 +225,14 @@ export function FilesPage() {
   const deleteDoc = useDeleteDocument(workspaceId);
   const processDoc = useProcessDocument(workspaceId);
   const reindexDoc = useReindexDocument(workspaceId);
+  const updateDoc = useUpdateDocument(workspaceId);
 
   // UI state
   const [searchQuery, setSearchQuery] = useState("");
   const [filterTab, setFilterTab] = useState<FilterTab>("all");
   const [sortKey, setSortKey] = useState<SortKey>("newest");
   const [deleteDocConfirm, setDeleteDocConfirm] = useState<number | null>(null);
+  const [editDoc, setEditDoc] = useState<Document | null>(null);
   const [sortMenuOpen, setSortMenuOpen] = useState(false);
 
   // -- Store (for unified preview) --
@@ -521,6 +531,7 @@ export function FilesPage() {
                   onProcess={(id) => processDoc.mutate(id)}
                   onDownload={handleDownload}
                   onPreview={selectDoc}
+                  onClickEdit={setEditDoc}
                   isProcessing={processDoc.isPending}
                 />
               ))}
@@ -543,6 +554,16 @@ export function FilesPage() {
         message={t("files.delete_confirm_msg")}
         confirmLabel={t("common.delete")}
         variant="danger"
+      />
+
+      {/* Edit document metadata dialog */}
+      <EditDocumentDialog
+        open={editDoc !== null}
+        onOpenChange={(open) => !open && setEditDoc(null)}
+        document={editDoc}
+        onSave={async (docId, data) => {
+          await updateDoc.mutateAsync({ docId, data });
+        }}
       />
       </motion.div>
 

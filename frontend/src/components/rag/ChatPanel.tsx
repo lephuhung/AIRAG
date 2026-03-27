@@ -72,8 +72,10 @@ import { useDocument } from "@/hooks/useDocuments";
 import { useChatHistory } from "@/hooks/useChatHistory";
 import { useRAGChatStream } from "@/hooks/useRAGChatStream";
 import { useTranslation } from "@/hooks/useTranslation";
+import { useCreateAbbreviation } from "@/hooks/useAbbreviations";
+import { AbbreviationModal } from "@/components/rag/AbbreviationModal";
 import { StreamingMarkdown } from "@/components/rag/MemoizedMarkdown";
-import { ThinkingTimeline } from "@/components/rag/ThinkingTimeline";
+import { ThinkingTimeline, STEP_CONFIG } from "@/components/rag/ThinkingTimeline";
 import type {
   ChatMessage,
   ChatImageRef,
@@ -81,6 +83,7 @@ import type {
   ChatStreamStatus,
   LLMCapabilities,
   AgentStep,
+  AgentStepType,
 } from "@/types";
 
 // Context to provide sessionId and debugMode to nested components
@@ -174,7 +177,7 @@ function CitationLink({
 // ---------------------------------------------------------------------------
 // Memory citation badge — clickable [MEM-N] → Brain icon + text
 // ---------------------------------------------------------------------------
-function MemoryCitation({ index }: { index: string }) {
+function MemoryCitation() {
   return (
     <span
       className="inline-flex items-center justify-center w-[18px] h-[18px] mx-0.5 text-[11px] font-medium rounded-full bg-amber-400/15 text-amber-600 dark:text-amber-400 align-middle"
@@ -1002,12 +1005,38 @@ function CopyMessageActions({ content }: { content: string }) {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: Add Abbreviation Button
+// ---------------------------------------------------------------------------
+function AddAbbreviationButton({
+  shortForm,
+  onClick,
+}: {
+  shortForm: string;
+  onClick: (s: string) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <button
+      onClick={() => onClick(shortForm)}
+      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-primary/5 border border-primary/20 text-primary text-xs font-medium hover:bg-primary/10 transition-colors shadow-sm"
+    >
+      <DatabaseZap className="w-3.5 h-3.5" />
+      <span>
+        {t("chat.add_abbreviation", { abbr: shortForm })}
+      </span>
+    </button>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Single message bubble
 // ---------------------------------------------------------------------------
 const MessageBubble = memo(function MessageBubble({
   message,
+  onAddAbbreviation,
 }: {
   message: ChatMessage;
+  onAddAbbreviation: (short: string) => void;
 }) {
   const { t } = useTranslation();
   const isUser = message.role === "user";
@@ -1066,7 +1095,7 @@ const MessageBubble = memo(function MessageBubble({
           <ThinkingTimeline
             steps={message.agentSteps}
             mode={message.isStreaming ? "live" : "embedded"}
-            className={cn("mb-1.5", message.isStreaming && "mt-1")}
+className={cn("mb-1.5", message.isStreaming && "mt-1")}
             autoCollapse={message.isStreaming && !!message.content}
           />
         )}
@@ -1114,6 +1143,19 @@ const MessageBubble = memo(function MessageBubble({
               relatedEntities={message.relatedEntities || []}
               imageRefs={message.imageRefs}
             />
+          </div>
+        )}
+
+        {/* Potential Abbreviation Suggestion Buttons */}
+        {!isUser && !message.isStreaming && message.potential_abbreviations && message.potential_abbreviations.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {message.potential_abbreviations.map((abbr) => (
+              <AddAbbreviationButton
+                key={abbr}
+                shortForm={abbr}
+                onClick={onAddAbbreviation}
+              />
+            ))}
           </div>
         )}
 
@@ -1305,6 +1347,26 @@ export const ChatPanel = memo(function ChatPanel({
   const [thinkingDefaultSynced, setThinkingDefaultSynced] = useState(false);
   const [forceSearch, setForceSearch] = useState(false);
 
+  // Abbreviation modal state
+  const [isAbbModalOpen, setIsAbbModalOpen] = useState(false);
+  const [selectedAbbShort, setSelectedAbbShort] = useState("");
+  const createAbb = useCreateAbbreviation();
+
+  const handleOpenAbbModal = useCallback((short: string) => {
+    setSelectedAbbShort(short);
+    setIsAbbModalOpen(true);
+  }, []);
+
+  const handleSaveAbb = async (data: { short_form: string; full_form: string; description?: string }) => {
+    try {
+      await createAbb.mutateAsync(data);
+      toast.success(t("admin.abbreviations.toast.created"));
+      setIsAbbModalOpen(false);
+    } catch (err: any) {
+      toast.error(err.message || t("admin.abbreviations.toast.error"));
+    }
+  };
+
   // Load chat history from PostgreSQL
   const { data: historyData, isLoading: historyLoading } = useChatHistory(sessionId);
   const queryClient = useQueryClient();
@@ -1360,12 +1422,14 @@ export const ChatPanel = memo(function ChatPanel({
   useEffect(() => {
     if (historyData?.messages) {
       setMessages((prev) => {
-        // Build a map of existing agentSteps by message id so we can re-attach them after DB sync
+        // Build a map of existing agentSteps by message id so we can re-attach them 
+        // if they are not yet in DB, or if local live steps are more detailed.
         const stepsMap = new Map<string, AgentStep[]>();
         for (const m of prev) {
           if (m.agentSteps?.length) stepsMap.set(m.id, m.agentSteps);
         }
-        return historyData.messages.map((m) => ({
+
+        const dbMessages = historyData.messages.map((m) => ({
           id: m.message_id,
           role: m.role as "user" | "assistant",
           content: m.content,
@@ -1374,9 +1438,35 @@ export const ChatPanel = memo(function ChatPanel({
           imageRefs: m.image_refs ?? undefined,
           thinking: m.thinking ?? undefined,
           timestamp: m.created_at,
+          potential_abbreviations: m.potential_abbreviations ?? undefined,
           // Priority: local live steps (from current session) > DB-persisted synthetic steps
-          agentSteps: stepsMap.get(m.message_id) ?? (m.agent_steps?.length ? m.agent_steps as AgentStep[] : undefined),
+          agentSteps: stepsMap.get(m.message_id) ?? (m.agent_steps?.length 
+            ? (m.agent_steps as any[]).map((s, i) => ({
+                id: s.id || `hist-${m.message_id}-${i}`,
+                step: s.step || 'analyzing',
+                status: (m.isStreaming ? s.status : 'completed') || 'completed',
+                detail: s.detail || (STEP_CONFIG[s.step as AgentStepType]?.label || 'Processing'),
+                timestamp: s.timestamp || (m.created_at ? new Date(m.created_at).getTime() : Date.now()),
+                ...s
+              })) as AgentStep[] 
+            : undefined),
         }));
+
+        // Merge: keep local messages that are NOT in DB yet (e.g. still streaming or just finished background save)
+        const dbIds = new Set(dbMessages.map((m) => m.id));
+        // Also check by content/role for user messages to avoid duplication if IDs haven't synced yet
+        const dbUserContents = new Set(dbMessages.filter(m => m.role === 'user').map(m => m.content));
+        
+        const localOnly = prev.filter((m) => {
+          if (dbIds.has(m.id)) return false;
+          if (m.role === 'user' && dbUserContents.has(m.content)) return false;
+          return true;
+        });
+
+        if (localOnly.length === 0) return dbMessages;
+
+        // Combine — usually local-only messages (recent stream) belong at the end
+        return [...dbMessages, ...localOnly];
       });
     }
   }, [historyData]);
@@ -1391,6 +1481,40 @@ export const ChatPanel = memo(function ChatPanel({
       agentStepsRef.current = stream.agentSteps;
     }
   }, [stream.agentSteps]);
+
+  // Sync server-assigned message ID to local streaming message
+  useEffect(() => {
+    if (stream.aiMessageId && streamingMsgIdRef.current) {
+      const serverId = stream.aiMessageId;
+      const localId = streamingMsgIdRef.current;
+      if (serverId !== localId) {
+        setMessages((prev) =>
+          prev.map((m) => (m.id === localId ? { ...m, id: serverId } : m))
+        );
+        streamingMsgIdRef.current = serverId;
+      }
+    }
+  }, [stream.aiMessageId]);
+
+  // Sync server-assigned user message ID to local message
+  useEffect(() => {
+    if (stream.userMessageId) {
+      const serverId = stream.userMessageId;
+      setMessages((prev) => {
+        // Find the most recent user message that doesn't have a UUID-like ID
+        // UUIDs from backend are 36 chars. Local IDs are timestamp strings.
+        const lastUserIdx = [...prev].reverse().findIndex(m => m.role === 'user' && m.id.length !== 36);
+        if (lastUserIdx === -1) return prev;
+        
+        const idx = prev.length - 1 - lastUserIdx;
+        if (prev[idx].id === serverId) return prev;
+        
+        const updated = [...prev];
+        updated[idx] = { ...updated[idx], id: serverId };
+        return updated;
+      });
+    }
+  }, [stream.userMessageId]);
 
   // Double-rAF + easeOutCubic scroll to bottom
   const scrollToBottom = useCallback((smooth = true) => {
@@ -1523,7 +1647,7 @@ export const ChatPanel = memo(function ChatPanel({
 
   // Sync streaming content + agentSteps → messages state for the streaming message
   useEffect(() => {
-    if (!stream.isStreaming || !streamingMsgIdRef.current) return;
+    if (!streamingMsgIdRef.current) return;
     const id = streamingMsgIdRef.current;
     setMessages((prev) => {
       const idx = prev.findIndex((m) => m.id === id);
@@ -1536,13 +1660,15 @@ export const ChatPanel = memo(function ChatPanel({
       const newImages = stream.pendingImages.length > 0 ? stream.pendingImages : m.imageRefs;
       const newThinking = stream.thinkingText || m.thinking;
       const newSteps = stream.agentSteps.length > 0 ? stream.agentSteps : m.agentSteps;
+      const newPotentials = stream.potentialAbbreviations.length > 0 ? stream.potentialAbbreviations : m.potential_abbreviations;
 
       if (
         m.content === newContent &&
         m.sources === newSources &&
         m.imageRefs === newImages &&
         m.thinking === newThinking &&
-        m.agentSteps === newSteps
+        m.agentSteps === newSteps &&
+        m.potential_abbreviations === newPotentials
       ) {
         return prev; // no change → skip setMessages re-render
       }
@@ -1555,6 +1681,7 @@ export const ChatPanel = memo(function ChatPanel({
         imageRefs: newImages,
         thinking: newThinking,
         agentSteps: newSteps,
+        potential_abbreviations: newPotentials,
       };
       return updated;
     });
@@ -1744,7 +1871,10 @@ export const ChatPanel = memo(function ChatPanel({
                 <AnimatePresence>
                   {messages.map((msg) => (
                     <div key={msg.id} data-message-id={msg.id}>
-                      <MessageBubble message={msg} />
+                      <MessageBubble 
+                        message={msg} 
+                        onAddAbbreviation={handleOpenAbbModal}
+                      />
                     </div>
                   ))}
                 </AnimatePresence>
@@ -1809,6 +1939,15 @@ export const ChatPanel = memo(function ChatPanel({
           </div>
         </AllSourcesCtx.Provider>
       </DebugCtx.Provider>
+
+      <AbbreviationModal
+        open={isAbbModalOpen}
+        onOpenChange={setIsAbbModalOpen}
+        abbreviation={null}
+        initialShortForm={selectedAbbShort}
+        onSave={handleSaveAbb}
+        isPending={createAbb.isPending}
+      />
     </SessionIdCtx.Provider>
   );
 });

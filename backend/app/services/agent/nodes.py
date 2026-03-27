@@ -50,7 +50,7 @@ Intent categories:
 - "summarize" : user wants a summary of a specific document
 - "kg_query"  : user asks about entity relationships, organizational charts, knowledge graph
 - "search_doc_num" : user asks about document numbers (văn bản số), reference numbers, official document IDs
-- "search_abbr" : user asks about abbreviations, acronyms, or their meanings
+- "search_abbr" : user asks about SHORT abbreviations, acronyms, or their meanings (e.g., "BMNN", "TTGT"). Do NOT use for general concepts or multiple words (e.g., "an ninh mạng" is "search").
 - "write_summarize"     : user provides a TEXT PASSAGE and wants it summarized or key points extracted
 - "write_suggest_edits" : user provides a TEXT PASSAGE and wants editing/improvement suggestions
 - "write_grammar_check" : user provides a TEXT PASSAGE and wants grammar/style checking
@@ -61,7 +61,7 @@ Output format:
 Rules:
 - For "greeting": set rewritten_query to "" and needs_tool to false
 - For "personal": set rewritten_query to the user's question verbatim and needs_tool to false
-- For "search_abbr" (abbreviation queries): extract ONLY the abbreviation itself - remove "là gì?", "có nghĩa là gì?", "là viết tắt của gì?", etc. EXACT abbreviation must be preserved (e.g., "BMNN" stays "BMNN", NOT "BMM")
+- For "search_abbr" (abbreviation queries): ONLY if the target is a short abbreviation (usually uppercase, 2-6 chars). Otherwise default to "search".
 - For write intents: extract the text to process into "text_input", set write_action to the specific action, set needs_tool to false
 - For "write_summarize": write_action = "summarize" (or "extract_key_points" if user asks for key points)
 - For "write_suggest_edits": write_action = "suggest_edits"
@@ -74,6 +74,7 @@ Examples:
 User: "xin chào"  → {"intent": "greeting", "rewritten_query": "", "needs_tool": false, "write_action": "", "text_input": ""}
 User: "tôi đang công tác ở đâu?" → {"intent": "personal", "rewritten_query": "tôi đang công tác ở đâu?", "needs_tool": false, "write_action": "", "text_input": ""}
 User: "doanh thu 2024 là bao nhiêu?" → {"intent": "search", "rewritten_query": "doanh thu thuần tổng doanh thu năm 2024 theo quý", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "an ninh mạng là gì?" → {"intent": "search", "rewritten_query": "định nghĩa an ninh mạng khái niệm", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "có tài liệu gì trong hệ thống?" → {"intent": "list_docs", "rewritten_query": "danh sách tài liệu", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "tóm tắt tài liệu ID 5" → {"intent": "summarize", "rewritten_query": "tóm tắt tài liệu 5", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "BMNN là gì?" → {"intent": "search_abbr", "rewritten_query": "BMNN", "needs_tool": true, "write_action": "", "text_input": ""}
@@ -186,7 +187,16 @@ async def memory_recall(state: "AgentState") -> dict:
     if not user_id:
         return {"user_memory_context": ""}
 
-    user_message = _extract_last_user_message(state)
+    # ── Input: use expanded_query from abbr_expander if available, else extract original ──
+    expanded_query = state.get("rewritten_query", "")
+    user_message = ""
+
+    if expanded_query:
+        user_message = expanded_query
+        logger.debug(f"[memory_recall] Using expanded query: {user_message!r}")
+    else:
+        user_message = _extract_last_user_message(state)
+
     if not user_message:
         return {"user_memory_context": ""}
 
@@ -223,15 +233,23 @@ async def intent_classifier(state: "AgentState") -> dict:
         state, "status", {"step": "analyzing", "detail": "Đang phân tích câu hỏi..."}
     )
 
-    messages = state.get("messages", [])
+    # ── Input: use expanded_query from abbr_expander if available, else extract original ──
+    expanded_query = state.get("rewritten_query", "")
     user_message = ""
-    for msg in reversed(messages):
-        if _get_msg_role(msg) == "user":
-            content = getattr(msg, "content", None) or (
-                msg.get("content") if isinstance(msg, dict) else ""
-            )
-            user_message = content or ""
-            break
+
+    if expanded_query:
+        user_message = expanded_query
+        logger.debug(f"[intent_classifier] Using expanded query: {user_message!r}")
+    else:
+        messages = state.get("messages", [])
+        if messages and isinstance(messages, list):
+            for msg in reversed(messages):
+                if _get_msg_role(msg) == "user":
+                    content = getattr(msg, "content", None) or (
+                        msg.get("content") if isinstance(msg, dict) else ""
+                    )
+                    user_message = content or ""
+                    break
 
     if not user_message:
         return {"intent": "search", "rewritten_query": ""}
@@ -249,8 +267,8 @@ async def intent_classifier(state: "AgentState") -> dict:
             temperature=0.0,
             max_tokens=128,
         ):
-            if chunk.text:
-                response_text += chunk.text
+            if hasattr(chunk, "text") and chunk.text:
+                response_text += str(chunk.text)
 
         result = _parse_classifier_output(response_text)
 
@@ -297,6 +315,83 @@ async def intent_classifier(state: "AgentState") -> dict:
             f"[intent_classifier] Classifier failed: {e} — defaulting to 'search'"
         )
         return {"intent": "search", "rewritten_query": user_message}
+
+
+# ---------------------------------------------------------------------------
+# Node: abbr_expander  (global — runs after intent_classifier, before routing)
+# ---------------------------------------------------------------------------
+
+
+async def abbr_expander(state: "AgentState") -> dict:
+    """
+    Initial abbreviation check — runs START → memory_recall → intent_classifier.
+    Identifies candidates for expansion and records potential ones not in DB.
+    """
+    from app.services.agent.streaming import push_event
+
+    user_message = _extract_last_user_message(state)
+    if not user_message:
+        return {}
+
+    # Tìm tất cả token viết hoa liên tiếp có khả năng là viết tắt (2+ ký tự)
+    import re
+    abbr_candidates = re.findall(r"\b[A-ZĐẮẰẶẤẦẨẪẬẮẶẪẨẦ]{2,}\b", user_message)
+    if not abbr_candidates:
+        return {}
+
+    try:
+        from app.services.agent.streaming import get_current_db
+        from sqlalchemy import select
+        from app.models.abbreviation import Abbreviation
+
+        db = get_current_db()
+        if db is None:
+            return {}
+
+        expanded_message = user_message
+        found_any = False
+        potential_abbreviations = []
+
+        for candidate in abbr_candidates:
+            result = await db.execute(
+                select(Abbreviation)
+                .where(
+                    Abbreviation.short_form.ilike(candidate),
+                    Abbreviation.is_active == True,
+                )
+                .limit(1)
+            )
+            abbr = result.scalar_one_or_none()
+            if abbr and abbr.full_form:
+                expanded_message = expanded_message.replace(candidate, abbr.full_form)
+                found_any = True
+                logger.info(
+                    f"[abbr_expander] Expanded {candidate!r} → {abbr.full_form!r}"
+                )
+            else:
+                # Không thấy trong DB → record as potential
+                potential_abbreviations.append(candidate)
+                logger.debug(f"[abbr_expander] Potential missing abbr: {candidate!r}")
+
+        updates = {}
+        if found_any:
+            await push_event(
+                state,
+                "status",
+                {"step": "searching", "detail": f"Mở rộng viết tắt: {expanded_message}"},
+            )
+            updates["rewritten_query"] = expanded_message
+        
+        if potential_abbreviations:
+            updates["potential_abbreviations"] = potential_abbreviations
+            await push_event(state, "potential_abbreviations", potential_abbreviations)
+
+        return updates
+
+    except Exception as e:
+        logger.warning(f"[abbr_expander] Failed to expand abbreviations: {e}")
+
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +665,7 @@ async def answer_generator(state: "AgentState") -> dict:
     user_memory = state.get("user_memory_context", "")
     messages = state.get("messages", [])
     enable_thinking = state.get("enable_thinking", False)
+    potential_abbreviations = state.get("potential_abbreviations", [])
 
     # DEBUG: Log state at start of answer_generator
     logger.info(
@@ -646,14 +742,18 @@ async def answer_generator(state: "AgentState") -> dict:
     # Inject context as the last "user" turn supplement
     if context_parts:
         context_text = "\n\n".join(context_parts)
+        query_msg = f"Question: {rewritten_query}" if rewritten_query else ""
         inject = (
             "\n\n=== RETRIEVED CONTEXT ===\n"
+            + (f"{query_msg}\n\n" if query_msg else "")
             + context_text
             + "\n=== END CONTEXT ===\n\n"
-            "IMPORTANT:\n"
+            "INSTRUCTIONS:\n"
             "- Answer using ONLY the retrieved sources above.\n"
-            "- Cite sources using their IDs: e.g. claim text[1][2].\n"
-            "- If the context does not contain the answer, say: 'Tài liệu không chứa thông tin này.'\n"
+            "- Cite sources using their unique IDs after each sentence, e.g. [id1][id2].\n"
+            "- If the sources do not contain enough information to answer fully, "
+            "provide as much detail as possible and clearly state what is missing.\n"
+            "- Avoid saying 'information not found' if you can provide a partial answer.\n"
             "- TABLE DATA: 'Key, Year = Value' pairs are table cells.\n"
         )
         # Append to last user message
@@ -714,6 +814,16 @@ async def answer_generator(state: "AgentState") -> dict:
             await push_event(state, "token", error_msg)
 
     final_answer = "".join(answer_parts)
+
+    # Nếu không tìm thấy tài liệu và có từ viết tắt tiềm năng -> gợi ý thêm
+    is_not_found = "không tìm thấy tài liệu phù hợp câu hỏi" in [s.lower() for s in kg_summaries]
+    if is_not_found and potential_abbreviations:
+        suggestion = "\n\nBạn có muốn thêm giải thích cho các từ viết tắt này không?"
+        final_answer += suggestion
+        await push_event(state, "token", suggestion)
+        await push_event(state, "potential_abbreviations", potential_abbreviations)
+        logger.info(f"[answer_generator] Pushed potential_abbreviations: {potential_abbreviations}")
+
     return {"final_answer": final_answer}
 
 
@@ -832,10 +942,26 @@ def _transform_input(state: "AgentState") -> dict:
 
     AgentWriteState keys: messages, user_id, workspace_ids,
                           text_input, write_action, result, error
+
+    Ưu tiên text_input:
+    1. text_input từ intent_classifier (write_summarize / write_suggest_edits / write_grammar_check)
+    2. kg_summaries[0] nếu intent = summarize (RAG đã fetch raw document content)
+    3. Fallback: last user message
     """
     intent = state.get("intent", "")
     write_action = state.get("write_action", "")
     text_input = state.get("text_input", "")
+
+    # Khi intent = "summarize": RAG subgraph đã fetch raw doc content vào kg_summaries
+    # → dùng kg_summaries[0] làm text_input cho write agent
+    if not text_input and intent == "summarize":
+        kg_summaries = state.get("kg_summaries", [])
+        if kg_summaries:
+            text_input = kg_summaries[0]
+            logger.info(
+                f"[_transform_input] Using kg_summaries[0] as text_input for summarize "
+                f"(len={len(text_input)})"
+            )
 
     # Fallback: extract text from last user message if classifier didn't isolate it
     if not text_input:
@@ -847,6 +973,7 @@ def _transform_input(state: "AgentState") -> dict:
             "write_summarize": "summarize",
             "write_suggest_edits": "suggest_edits",
             "write_grammar_check": "grammar_check",
+            "summarize": "summarize",  # RAG-triggered summarize intent
         }.get(intent, "summarize")
 
     return {
@@ -977,7 +1104,7 @@ def _transform_rag_input(state: "AgentState") -> dict:
     }
 
 
-def _transform_rag_output(rag_result: dict, existing_ids: set) -> dict:
+def _transform_rag_output(rag_result: dict, state: "AgentState") -> dict:
     """
     Map AgentRagState output → AgentState partial update.
 
@@ -993,12 +1120,19 @@ def _transform_rag_output(rag_result: dict, existing_ids: set) -> dict:
 
     # Inject the final_answer from RAG node into kg_summaries so answer_generator
     # can use it as context (for list_docs, summarize, kg_query, search_doc_num)
-    # For search_documents, the context is already in sources.
+    # For search_documents, the context is already in sources, but final_answer
+    # might contain extra formatting or KG summaries that are useful.
     final_answer_from_rag = rag_result.get("final_answer") or ""
-    if final_answer_from_rag and not sources:
-        # Non-search intents: the RAG node already built the full answer text.
-        # Pass it through kg_summaries so answer_generator has context to polish.
-        kg_summaries = [final_answer_from_rag] + list(kg_summaries)
+    if final_answer_from_rag:
+        # If it's a search intent, we prepend it to kg_summaries as a "Formatted Context Hint"
+        # If it's a non-search intent, it's the primary answer content.
+        if sources and isinstance(sources, list):
+            # Check if final_answer_from_rag is just a concatenation of sources
+            # to avoid extreme redundancy. If it's short or seems processed, keep it.
+            if len(final_answer_from_rag) > 100:
+                kg_summaries = [f"### PRE-FORMATTED RAG CONTEXT:\n{final_answer_from_rag}"] + list(kg_summaries)
+        else:
+            kg_summaries = [final_answer_from_rag] + list(kg_summaries)
 
     return {
         "sources": sources,
@@ -1007,7 +1141,7 @@ def _transform_rag_output(rag_result: dict, existing_ids: set) -> dict:
         "kg_summaries": kg_summaries,
         "abbreviation_results": abbreviation_results,
         "tool_called": True,
-        "iterations": 1,
+        "iterations": state.get("iterations", 0) + 1,  # Increment properly
     }
 
 
@@ -1076,7 +1210,7 @@ async def agent_rag_executor(state: "AgentState") -> dict:
         }
 
     # ── Transform: AgentRagState → AgentState partial update ─────────────
-    partial = _transform_rag_output(rag_output, existing_ids)
+    partial = _transform_rag_output(rag_output, state)
 
     # ── Push sources and images events into the SSE queue ────────────────
     sources = partial.get("sources", [])

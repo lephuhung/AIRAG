@@ -85,7 +85,7 @@ async def search_documents_node(state: AgentRagState) -> AgentRagState:
             if not workspace_ids:
                 # Fallback: load all workspaces
                 from sqlalchemy import select
-                from app.models.workspace import Workspace
+                from app.models.knowledge_base import KnowledgeBase as Workspace
                 result = await db.execute(select(Workspace))
                 workspaces = result.scalars().all()
                 workspace_ids = [ws.id for ws in workspaces]
@@ -114,7 +114,7 @@ async def search_documents_node(state: AgentRagState) -> AgentRagState:
             state.kg_summaries = kg_summaries
 
             if not context_text:
-                state.final_answer = f"Không tìm thấy kết quả cho: {query}"
+                state.final_answer = "không tìm thấy tài liệu phù hợp câu hỏi"
             else:
                 state.final_answer = context_text
             break
@@ -128,7 +128,7 @@ async def list_documents_node(state: AgentRagState) -> AgentRagState:
     """List all documents in workspace."""
     from sqlalchemy import select
     from app.models.document import Document, DocumentStatus
-    from app.models.workspace import Workspace
+    from app.models.knowledge_base import KnowledgeBase as Workspace
     from app.core.deps import get_db
 
     try:
@@ -173,25 +173,39 @@ async def list_documents_node(state: AgentRagState) -> AgentRagState:
 
 
 async def summarize_document_node(state: AgentRagState) -> AgentRagState:
-    """Summarize a specific document."""
+    """
+    Fetch raw document content for summarization.
+
+    Không tự gọi LLM tại đây — chỉ đọc raw markdown từ storage và lưu vào
+    kg_summaries. Flow sẽ route sang write_executor (agent_write) để tóm tắt,
+    đảm bảo pipeline RAG → Write được kết nối đầy đủ.
+    """
     from app.core.deps import get_db
 
-    messages = state.messages
-    if not messages:
+    # Ưu tiên rewritten_query (từ intent_classifier), fallback sang last message
+    query = state.rewritten_query
+    if not query and state.messages:
+        last_message = state.messages[-1]
+        query = (
+            last_message.content if hasattr(last_message, "content") else str(last_message)
+        )
+
+    if not query:
         state.final_answer = "No document specified."
         return state
-
-    last_message = messages[-1]
-    query = (
-        last_message.content if hasattr(last_message, "content") else str(last_message)
-    )
 
     try:
         import re
 
-        doc_id_match = re.search(
-            r"(?:doc|document|tài liệu)[^\d]*(\d+)", query, re.IGNORECASE
-        )
+        # Thử trích document ID từ rewritten_query trước, rồi messages
+        doc_id_match = re.search(r"\b(\d+)\b", query, re.IGNORECASE)
+        if not doc_id_match and state.messages:
+            last_message = state.messages[-1]
+            raw_msg = last_message.content if hasattr(last_message, "content") else str(last_message)
+            doc_id_match = re.search(
+                r"(?:doc|document|tài liệu)[^\d]*(\d+)", raw_msg, re.IGNORECASE
+            )
+
         if doc_id_match:
             document_id = int(doc_id_match.group(1))
         else:
@@ -203,8 +217,6 @@ async def summarize_document_node(state: AgentRagState) -> AgentRagState:
         from sqlalchemy import select
         from app.models.document import Document, DocumentStatus
         from app.services.storage_service import get_storage_service
-        from app.services.llm import get_llm_provider
-        from app.services.llm.types import LLMMessage
 
         async for db in get_db():
             result = await db.execute(
@@ -237,29 +249,17 @@ async def summarize_document_node(state: AgentRagState) -> AgentRagState:
             if len(markdown_text) > MAX_CHARS:
                 truncated += "\n\n[... nội dung đã được cắt bớt ...]"
 
-            llm = get_llm_provider()
-            summary_prompt = (
-                f"Hãy tóm tắt toàn diện tài liệu sau bằng tiếng Việt. "
-                f"Bao gồm: mục đích chính, các điểm quan trọng, số liệu, và kết luận.\n\n"
-                f"Tài liệu: {doc.original_filename}\n\n"
-                f"Nội dung:\n{truncated}"
+            # Lưu raw content vào kg_summaries — write_executor sẽ đọc và tóm tắt
+            doc_context = (
+                f"## Tài liệu: {doc.original_filename} (ID: {document_id})\n\n"
+                f"{truncated}"
             )
-
-            summary = await llm.acomplete(
-                messages=[LLMMessage(role="user", content=summary_prompt)],
-                temperature=0.1,
-                max_tokens=1024,
-            )
-            summary_text = (
-                summary
-                if isinstance(summary, str)
-                else getattr(summary, "content", str(summary))
-            )
-
-            state.final_answer = summary_text
+            state.kg_summaries = [doc_context]
+            # Đặt final_answer tạm để signal thành công (write_executor sẽ ghi đè)
+            state.final_answer = doc_context
             break
     except Exception as e:
-        state.final_answer = f"Lỗi tóm tắt: {str(e)}"
+        state.final_answer = f"Lỗi đọc tài liệu: {str(e)}"
 
     return state
 
@@ -269,7 +269,7 @@ async def kg_query_node(state: AgentRagState) -> AgentRagState:
     from app.services.knowledge_graph_service import KnowledgeGraphService
     from app.core.deps import get_db
     from sqlalchemy import select
-    from app.models.workspace import Workspace
+    from app.models.knowledge_base import KnowledgeBase as Workspace
 
     messages = state.messages
     if not messages:
@@ -316,7 +316,7 @@ async def search_doc_num_node(state: AgentRagState) -> AgentRagState:
     """Search by document number."""
     from sqlalchemy import select, or_
     from app.models.document import Document, DocumentStatus
-    from app.models.workspace import Workspace
+    from app.models.knowledge_base import KnowledgeBase as Workspace
     from app.core.deps import get_db
 
     messages = state.messages
@@ -382,20 +382,33 @@ async def search_abbr_node(state: AgentRagState) -> AgentRagState:
     from app.models.abbreviation import Abbreviation
     from app.core.deps import get_db
 
-    messages = state.messages
-    if not messages:
-        state.final_answer = "No abbreviation specified."
-        return state
-
-    last_message = messages[-1]
-    query = (
-        last_message.content if hasattr(last_message, "content") else str(last_message)
-    )
-
     import re
 
-    abbr_match = re.search(r"(?:abbr|viết tắt của)[:\s]+(\w+)", query, re.IGNORECASE)
-    search_term = abbr_match.group(1) if abbr_match else query.strip()
+    # Prefer rewritten_query (already extracted/normalized by intent_classifier, e.g. "BMNN")
+    # over raw message content (e.g. "BMNN là gì?" which breaks DB ilike matching)
+    search_term = (state.rewritten_query or "").strip()
+
+    if not search_term:
+        # Fallback: extract from last message
+        messages = state.messages
+        if not messages:
+            state.final_answer = "No abbreviation specified."
+            return state
+        last_message = messages[-1]
+        raw_query = (
+            last_message.content if hasattr(last_message, "content") else str(last_message)
+        )
+        abbr_match = re.search(r"(?:abbr|viết tắt của)[:\s]+(\w+)", raw_query, re.IGNORECASE)
+        if abbr_match:
+            search_term = abbr_match.group(1)
+        else:
+            # Extract uppercase tokens as abbreviation candidates from the raw message
+            candidates = re.findall(r"\b[A-ZĐẮẰẶẤẦẨẪẬẮẶẪẨẦ]{2,}\b", raw_query)
+            search_term = candidates[0] if candidates else raw_query.strip()
+
+    if not search_term:
+        state.final_answer = "No abbreviation specified."
+        return state
 
     try:
         async for db in get_db():

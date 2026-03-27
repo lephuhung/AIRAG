@@ -41,12 +41,21 @@ class DocumentResponse(DocumentBase):
     # Document type classification
     document_type_id: int | None = None
     document_type: DocumentTypeInfo | None = None
+    # Official document reference number
+    document_number: str | None = None
+    # Manual signer name override
+    signer_name: str | None = None
     # Sub-task completion flags (set independently by each worker after CHUNKING)
     embed_done: bool = False
     captions_done: bool = False
     kg_done: bool = False
 
     model_config = {"from_attributes": True}
+
+
+class DocumentUpdate(BaseModel):
+    document_number: str | None = None
+    signer_name: str | None = None
 
 
 class DocumentUploadResponse(BaseModel):

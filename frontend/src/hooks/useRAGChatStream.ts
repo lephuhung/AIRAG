@@ -35,6 +35,12 @@ export interface RAGStreamResult {
   isStreaming: boolean;
   /** Agent processing steps for ThinkingTimeline */
   agentSteps: AgentStep[];
+  /** Potential abbreviations identified by backend but missing from DB */
+  potentialAbbreviations: string[];
+  /** Server-assigned ID for the assistant message current streaming */
+  aiMessageId: string | null;
+  /** Server-assigned ID for the user message that started this stream */
+  userMessageId: string | null;
   /** Send a message — returns the finalized ChatMessage on complete */
   sendMessage: (
     message: string,
@@ -94,6 +100,9 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
   const [error, setError] = useState<string | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
   const [agentSteps, setAgentSteps] = useState<AgentStep[]>([]);
+  const [potentialAbbreviations, setPotentialAbbreviations] = useState<string[]>([]);
+  const [aiMessageId, setAiMessageId] = useState<string | null>(null);
+  const [userMessageId, setUserMessageId] = useState<string | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
   const bufferRef = useRef("");
@@ -124,6 +133,9 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
     setError(null);
     setIsStreaming(false);
     setAgentSteps([]);
+    setPotentialAbbreviations([]);
+    setAiMessageId(null);
+    setUserMessageId(null);
     bufferRef.current = "";
     thinkingBufferRef.current = "";
     if (rafRef.current) {
@@ -215,6 +227,9 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
       setStatus("analyzing");
       setIsStreaming(true);
       setAgentSteps([]);
+      setPotentialAbbreviations([]);
+      setAiMessageId(null);
+      setUserMessageId(null);
       bufferRef.current = "";
       thinkingBufferRef.current = "";
       streamStartRef.current = Date.now();
@@ -328,6 +343,13 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
                     break;
                   }
 
+                  case "ai_message_id":
+                    setAiMessageId(data.message_id || null);
+                    break;
+                  case "user_id":
+                    setUserMessageId(data.id || null);
+                    break;
+
                   case "thinking":
                     onThinkingToken(data.text || "");
                     thinkingAccumulator += data.text || "";
@@ -384,6 +406,10 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
                     onToken(data.text || "");
                     break;
 
+                  case "potential_abbreviations":
+                    setPotentialAbbreviations(data.abbreviations || []);
+                    break;
+
                   case "token_rollback":
                     // Clear speculative tokens
                     bufferRef.current = "";
@@ -427,7 +453,10 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
                     const totalMs = Date.now() - streamStartRef.current;
                     syncUpdateSteps((prev) => [
                       ...completeActiveStep(prev),
-                      createStep("done", `Done in ${totalMs >= 1000 ? `${(totalMs / 1000).toFixed(1)}s` : `${totalMs}ms`}`, "completed"),
+                      {
+                        ...createStep("done", `Done in ${totalMs >= 1000 ? `${(totalMs / 1000).toFixed(1)}s` : `${totalMs}ms`}`, "completed"),
+                        durationMs: totalMs
+                      },
                     ]);
 
                     finalMessage = {
@@ -439,10 +468,20 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
                       imageRefs: localImages,
                       thinking: data.thinking || null,
                       agentSteps: localSteps, // include synced steps directly in finalMessage
+                      potential_abbreviations: data.potential_abbreviations || potentialAbbreviations,
                       timestamp: new Date().toISOString(),
                     };
+
+                    // Immediately clear loading UI state on backend 'complete' event, 
+                    // without waiting for the underlying HTTP connection to close.
+                    setStatus("idle");
+                    setIsStreaming(false);
+
                     break;
                   }
+
+
+
 
                   case "error":
                     setError(data.message || "Unknown error");
@@ -486,6 +525,9 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
     error,
     isStreaming,
     agentSteps,
+    potentialAbbreviations,
+    aiMessageId,
+    userMessageId,
     sendMessage,
     cancel,
     reset,

@@ -1,0 +1,211 @@
+# AIRAG LangGraph Agent Implementation - Complete File Read
+# Date: 2026-03-26
+# All source files have been thoroughly analyzed and documented
+
+## Source Files Read (6 files, ~2,000 lines total)
+
+1. backend/app/services/agent/__init__.py
+   - 29 lines
+   - Exports: build_agent_graph, AgentState
+   - Module docstring with graph flow diagram
+
+2. backend/app/services/agent/state.py
+   - 106 lines
+   - AgentState TypedDict with 65 fields
+   - Field definitions with type hints and reducers
+   - VALID_INTENTS set with 11 intent types
+   - DEFAULT_STATE dict with initial values
+
+3. backend/app/services/agent/nodes.py (MAIN FILE)
+   - 1,103 lines
+   - Classifier system prompt (_CLASSIFIER_SYSTEM)
+     * 11 intent categories with detailed rules
+     * Special rule for "search_abbr": extract abbreviation only
+     * 7 examples provided
+   - 6 async node functions:
+     * memory_recall(state)
+     * intent_classifier(state)
+     * agent_rag_executor(state)
+     * answer_generator(state)
+     * direct_answer(state)
+     * write_executor(state)
+   - Helper functions:
+     * _parse_classifier_output()
+     * _get_msg_role()
+     * _extract_last_user_message()
+     * _transform_rag_input/output()
+     * _transform_input/output()
+     * _get_rag_subgraph()
+     * _get_write_subgraph()
+
+4. backend/app/services/agent/graph.py
+   - 177 lines
+   - Routing functions:
+     * _route_by_intent(state) → direct_answer | write_executor | agent_rag_executor
+     * _should_continue_after_rag(state) → agent_rag_executor (retry) | answer_generator
+   - Graph builder:
+     * build_agent_graph() → StateGraph compiler
+     * get_agent_graph() → cached singleton
+     * reset_agent_graph() → force rebuild
+
+5. backend/app/services/agent/tools.py
+   - 437 lines
+   - Tool registry with 6 tools
+   - 6 async tool functions:
+     * search_documents()        - Hybrid search
+     * list_documents()          - List indexed docs
+     * summarize_document()      - LLM summarization
+     * query_knowledge_graph()   - LightRAG lookup
+     * search_documents_number() - Search by document number
+     * search_abbreviation()     - KEY: Abbreviation lookup
+   - Database queries using SQLAlchemy
+   - LLM integration for summarization
+
+6. backend/app/services/agent/streaming.py
+   - 254 lines
+   - ContextVar workaround:
+     * _event_queue_ctx - asyncio.Queue for SSE
+     * _db_ctx - DB session access in nodes
+   - Functions:
+     * get_current_db() - Access DB from context
+     * push_event() - Push event to SSE queue
+     * stream_agent_to_sse() - Main streaming adapter
+     * build_initial_state() - State builder
+     * _sse() - SSE event formatter
+   - SSE event types: status, thinking, sources, images, token, complete, error
+   - Heartbeat interval: 15 seconds
+
+## Documentation Created (4 files, ~70KB total)
+
+1. LANGGRAPH_README.md (366 lines, 12K)
+   - Overview and index of all documentation
+   - Source files overview with line counts
+   - Graph flow diagram
+   - Key features (11 intents, abbreviation expansion, memory, streaming, ContextVar)
+   - Focus on search_abbr feature
+   - Development patterns
+   - Debugging checklist
+   - Configuration settings
+   - Quick start code
+
+2. LANGGRAPH_ANALYSIS.md (833 lines, 26K) ⭐ COMPREHENSIVE
+   - Complete state definition (65 fields documented)
+   - 6 node implementations with full code details
+   - Graph builder and routing logic
+   - 6 tool implementations with return signatures
+   - SSE streaming architecture (critical ContextVar workaround explanation)
+   - Abbreviation search flow (detailed 2-scenario walkthrough)
+   - Design patterns (subgraph delegation, lazy singletons, routing, citation mgmt)
+   - Configuration & settings
+   - Error handling & logging strategies
+
+3. LANGGRAPH_QUICK_REFERENCE.md (335 lines, 13K)
+   - State fields reference table (organized by category)
+   - Graph topology ASCII diagram
+   - Intent routing table
+   - Abbreviation search flow examples (simple vs context)
+   - Key functions reference (nodes & tools)
+   - SSE event types
+   - ContextVar workaround explanation
+   - Configuration reference
+   - Error handling strategies
+   - Logging patterns
+   - Debugging checklist
+
+4. LANGGRAPH_CODE_EXAMPLES.md (679 lines, 19K)
+   - 12 sections with practical code examples:
+     1. Using the agent (basic & with history)
+     2. State management (manual creation, node access patterns)
+     3. Custom node implementation (simple & with tools)
+     4. Routing logic (custom router, loop-back for abbreviation)
+     5. State transformation (subgraph patterns)
+     6. Tool implementation (new tool creation example)
+     7. Abbreviation search deep dive (expansion logic, test cases)
+     8. SSE event handling (frontend JS + backend endpoint)
+     9. Context variables (usage pattern, how it works)
+     10. Error handling (graceful degradation patterns)
+     11. Logging best practices
+     12. Testing nodes (pytest examples)
+
+## Key Findings
+
+### search_abbr Function Location
+- Defined in: backend/app/services/agent/tools.py (lines 368-437)
+- Called by: tool_executor in nodes.py (line 433)
+- Database query: Abbreviation.short_form ILIKE "%{abbreviation}%"
+- Three return scenarios: not found, single match, multiple matches
+- Stored in state: abbreviation_results list[dict]
+
+### RAG & Writing Nodes Interaction
+- RAG path: agent_rag_executor (line 1014) → invokes agent_rag subgraph
+  * Handles: search, list_docs, summarize, kg_query, search_doc_num, search_abbr
+  * Returns: sources, images, kg_summaries, abbreviation_results
+  * Can loop back if abbreviation expansion detected
+  
+- Write path: write_executor (line 877) → invokes agent_write subgraph
+  * Handles: write_summarize, write_suggest_edits, write_grammar_check
+  * State transform: AgentState → AgentWriteState
+  * Output transform: AgentWriteState → AgentState
+
+- Both subgraphs are lazy-loaded singletons
+- State transformation uses _transform_*_input() and _transform_*_output()
+
+### ContextVar Workaround Details
+- Problem: LangGraph strips non-TypedDict keys before passing to nodes
+- Solution: Python contextvars module
+- _event_queue_ctx: ContextVar[asyncio.Queue | None]
+- _db_ctx: ContextVar
+- nodes call: get_current_db() instead of state.get("_db")
+- stream_agent_to_sse() sets context before creating task
+- asyncio.create_task() inherits context from parent
+
+## Intent Classification Rules
+
+From _CLASSIFIER_SYSTEM (83 lines of detailed rules):
+- greeting: no tool needed
+- personal: about user, use memory, no tool
+- search: document search needed
+- list_docs: list documents needed
+- summarize: specific document summary needed
+- kg_query: knowledge graph entity lookup
+- search_doc_num: search by document number
+- search_abbr: ⭐ SPECIAL RULE
+  * Extract abbreviation ONLY
+  * Remove "là gì?", "có nghĩa là gì?", "là viết tắt của gì?"
+  * Preserve exact form (BMNN ≠ BMM)
+- write_summarize/suggest_edits/grammar_check: text processing
+
+## Graph Topology
+
+START
+  → memory_recall (Graphiti search)
+  → intent_classifier (Qwen3-4B)
+  → [route by intent]
+     ├ greeting/personal → direct_answer → END
+     ├ write_* → write_executor → END
+     └ search/list/summarize/kg/abbr/doc_num
+        → agent_rag_executor
+           → [check expanded_query]
+              ├ YES + iterations < 3 → loop back to agent_rag_executor
+              └ NO → answer_generator → END
+
+## Statistics
+
+- Total source code: 2,078 lines
+- Documentation: 2,213 lines (equal to source code!)
+- Node types: 6 (memory_recall, intent_classifier, agent_rag_executor, 
+                 answer_generator, direct_answer, write_executor)
+- Tools: 6 (search_documents, list_documents, summarize_document,
+             query_knowledge_graph, search_documents_number, search_abbreviation)
+- Intent types: 11 (greeting, personal, search, list_docs, summarize, kg_query,
+                     search_doc_num, search_abbr, write_summarize, 
+                     write_suggest_edits, write_grammar_check)
+- State fields: 65 total
+  * Control flow: 5 (intent, rewritten_query, iterations, expanded_query, tool_called)
+  * Accumulators: 5 (sources, images, image_parts, kg_summaries, abbreviation_results)
+  * User context: 6 (messages, user_memory_context, workspace_ids, user_id, session_id, document_ids)
+  * System config: 2 (system_prompt, enable_thinking)
+  * Output: 2 (final_answer, citation_map)
+  * Write ops: 2 (write_action, text_input)
+  * Other: 38
+

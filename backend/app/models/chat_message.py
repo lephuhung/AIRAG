@@ -31,6 +31,7 @@ class ChatMessage(Base):
     thinking: Mapped[str | None] = mapped_column(Text, nullable=True)
     ratings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     agent_steps: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    potential_abbreviations: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     # User who sent/received this message
     user_id: Mapped[int | None] = mapped_column(

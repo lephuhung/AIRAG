@@ -6,10 +6,11 @@ Builds and compiles the NexusRAG chat StateGraph.
 
 Graph topology:
     START
+      → abbr_expander              ← NEW: expand abbreviations immediately
       → memory_recall
       → intent_classifier
       → [direct_answer | write_executor | agent_rag_executor]
-      → [answer_generator]
+      → [answer_generator | write_executor]   ← write_executor also receives summarize
       → END
 
 Usage::
@@ -30,6 +31,7 @@ from app.services.agent.state import AgentState, VALID_INTENTS
 from app.services.agent.nodes import (
     memory_recall,
     intent_classifier,
+    abbr_expander,
     agent_rag_executor,
     answer_generator,
     direct_answer,
@@ -39,7 +41,7 @@ from app.services.agent.nodes import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Routing function — decides next node after intent_classifier
+# Routing function — decides next node after abbr_expander
 # ---------------------------------------------------------------------------
 
 
@@ -70,6 +72,7 @@ def _route_by_intent(state: AgentState) -> str:
 def _should_continue_after_rag(state: AgentState) -> str:
     """
     After agent_rag_executor:
+    - If intent = summarize: route → write_executor (RAG fetched raw doc, Write will summarize)
     - If expanded_query is set (abbreviation + context detected), route back to agent_rag_executor
     - Otherwise proceed to answer_generator.
     Guard against excessive iterations.
@@ -78,11 +81,22 @@ def _should_continue_after_rag(state: AgentState) -> str:
 
     max_iter = getattr(settings, "NEXUSRAG_LG_MAX_ITERATIONS", 3)
     iterations = state.get("iterations", 0)
+    intent = state.get("intent", "search")
 
     if iterations >= max_iter:
         logger.warning(
             f"[router] Max iterations ({max_iter}) reached — forcing answer_generator"
         )
+        return "answer_generator"
+
+    # summarize intent: RAG đã lấy raw doc content → route sang write_executor để tóm tắt
+    if intent == "summarize":
+        kg_summaries = state.get("kg_summaries", [])
+        if kg_summaries:
+            logger.info(
+                f"[router] intent=summarize, kg_summaries present → write_executor"
+            )
+            return "write_executor"
 
     # Check if abbreviation expansion should trigger re-routing to agent_rag_executor
     expanded_query = state.get("expanded_query")
@@ -111,14 +125,16 @@ def build_agent_graph() -> StateGraph:
     # ── Add nodes ─────────────────────────────────────────────────────────
     graph.add_node("memory_recall", memory_recall)
     graph.add_node("intent_classifier", intent_classifier)
+    graph.add_node("abbr_expander", abbr_expander)
     graph.add_node("agent_rag_executor", agent_rag_executor)
     graph.add_node("answer_generator", answer_generator)
     graph.add_node("direct_answer", direct_answer)
     graph.add_node("write_executor", write_executor)
 
     # ── Add edges ──────────────────────────────────────────────────────────
-    # Linear: START → memory_recall → intent_classifier
-    graph.add_edge(START, "memory_recall")
+    # Linear: START → abbr_expander → memory_recall → intent_classifier
+    graph.add_edge(START, "abbr_expander")
+    graph.add_edge("abbr_expander", "memory_recall")
     graph.add_edge("memory_recall", "intent_classifier")
 
     # Conditional: intent_classifier → [direct_answer | write_executor | agent_rag_executor]
@@ -132,12 +148,13 @@ def build_agent_graph() -> StateGraph:
         },
     )
 
-    # After RAG: agent_rag_executor → [agent_rag_executor (retry) | answer_generator]
+    # After RAG: agent_rag_executor → [agent_rag_executor (retry) | write_executor | answer_generator]
     graph.add_conditional_edges(
         "agent_rag_executor",
         _should_continue_after_rag,
         {
             "agent_rag_executor": "agent_rag_executor",
+            "write_executor": "write_executor",
             "answer_generator": "answer_generator",
         },
     )
@@ -152,8 +169,8 @@ def build_agent_graph() -> StateGraph:
 
     logger.info(
         "[agent_graph] Graph compiled: "
-        "memory_recall → intent_classifier → "
-        "[direct_answer | write_executor | agent_rag_executor → answer_generator]"
+        "memory_recall → intent_classifier → abbr_expander → "
+        "[direct_answer | write_executor | agent_rag_executor → (write_executor | answer_generator)]"
     )
     return compiled
 
@@ -174,3 +191,4 @@ def reset_agent_graph() -> None:
     """Force the singleton to rebuild on next call (e.g. after hot-reload in dev)."""
     global _agent_graph
     _agent_graph = None
+

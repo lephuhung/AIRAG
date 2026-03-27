@@ -95,6 +95,7 @@ async def stream_agent_to_sse(
     final_answer = ""
     all_sources: list = []
     all_images: list = []
+    all_potentials: list = []
 
     # ── Background task: chạy toàn bộ LangGraph pipeline ───────────────────
     async def _run_graph():
@@ -133,6 +134,7 @@ async def stream_agent_to_sse(
                     "answer": final_answer,
                     "sources": all_sources,
                     "images": all_images,
+                    "potential_abbreviations": all_potentials,
                 })
                 logger.info(
                     f"[stream] Complete: {len(final_answer)} chars, "
@@ -159,6 +161,10 @@ async def stream_agent_to_sse(
 
             elif ev_type == "thinking":
                 yield _sse("thinking", {"text": item[1]})
+
+            elif ev_type == "potential_abbreviations":
+                all_potentials = item[1]
+                yield _sse("potential_abbreviations", {"abbreviations": all_potentials})
 
             elif ev_type == "error":
                 yield _sse("error", {"message": item[1]})

@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
+import { AbbreviationModal } from "@/components/rag/AbbreviationModal";
 import { cn } from "@/lib/utils";
 import { useAuthStore } from "@/stores/authStore";
 import {
@@ -65,54 +66,29 @@ export function AdminAbbreviationsPage() {
   const [confirmDelete, setConfirmDelete] = useState<Abbreviation | null>(null);
   const [editingItem, setEditingItem] = useState<Abbreviation | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
-  
-  // Form state
-  const [formShort, setFormShort] = useState("");
-  const [formFull, setFormFull] = useState("");
-  const [formDesc, setFormDesc] = useState("");
 
   const totalPages = data ? Math.ceil(data.total / perPage) : 1;
 
   const handleOpenCreate = () => {
     setEditingItem(null);
-    setFormShort("");
-    setFormFull("");
-    setFormDesc("");
     setIsModalOpen(true);
   };
 
   const handleOpenEdit = (item: Abbreviation) => {
     setEditingItem(item);
-    setFormShort(item.short_form);
-    setFormFull(item.full_form);
-    setFormDesc(item.description || "");
     setIsModalOpen(true);
   };
 
-  const handleSave = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!formShort || !formFull) {
-      toast.error(t("admin.abbreviations.toast.required"));
-      return;
-    }
-
+  const handleSave = async (data: { short_form: string; full_form: string; description?: string }) => {
     try {
       if (editingItem) {
         await updateAbb.mutateAsync({
           id: editingItem.id,
-          data: {
-            short_form: formShort,
-            full_form: formFull,
-            description: formDesc,
-          },
+          data,
         });
         toast.success(t("admin.abbreviations.toast.updated"));
       } else {
-        await createAbb.mutateAsync({
-          short_form: formShort,
-          full_form: formFull,
-          description: formDesc,
-        });
+        await createAbb.mutateAsync(data);
         toast.success(t("admin.abbreviations.toast.created"));
       }
       setIsModalOpen(false);
@@ -339,76 +315,13 @@ export function AdminAbbreviationsPage() {
       </div>
 
       {/* Create/Edit Modal */}
-      {isModalOpen && (
-        <>
-          <div className="fixed inset-0 z-50 bg-background/80 backdrop-blur-sm" onClick={() => setIsModalOpen(false)} />
-          <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-full max-w-md bg-card border rounded-2xl shadow-2xl p-6 space-y-4 animate-in fade-in zoom-in duration-200">
-            <div>
-              <h3 className="text-lg font-bold">
-                {editingItem ? t("admin.abbreviations.edit") : t("admin.abbreviations.create")}
-              </h3>
-              <p className="text-sm text-muted-foreground mt-1">
-                {t("admin.abbreviations.subtitle")}
-              </p>
-            </div>
-
-            <form onSubmit={handleSave} className="space-y-4">
-              <div className="space-y-1.5">
-                <label className="text-sm font-medium text-foreground">
-                  {t("admin.abbreviations.table.short_form")} <span className="text-destructive">*</span>
-                </label>
-                <input
-                  autoFocus
-                  type="text"
-                  value={formShort}
-                  onChange={(e) => setFormShort(e.target.value)}
-                  placeholder="e.g. NV"
-                  className="w-full px-3 py-2 text-sm rounded-lg border bg-background focus:outline-none focus:ring-2 focus:ring-primary/30"
-                  required
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-sm font-medium text-foreground">
-                  {t("admin.abbreviations.table.full_form")} <span className="text-destructive">*</span>
-                </label>
-                <input
-                  type="text"
-                  value={formFull}
-                  onChange={(e) => setFormFull(e.target.value)}
-                  placeholder="e.g. Nhân viên"
-                  className="w-full px-3 py-2 text-sm rounded-lg border bg-background focus:outline-none focus:ring-2 focus:ring-primary/30"
-                  required
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-sm font-medium text-foreground">
-                  {t("admin.abbreviations.table.description")}
-                </label>
-                <textarea
-                  value={formDesc}
-                  onChange={(e) => setFormDesc(e.target.value)}
-                  rows={3}
-                  className="w-full px-3 py-2 text-sm rounded-lg border bg-background focus:outline-none focus:ring-2 focus:ring-primary/30 resize-none"
-                />
-              </div>
-
-              <div className="flex items-center justify-end gap-3 pt-2">
-                <Button variant="ghost" type="button" onClick={() => setIsModalOpen(false)}>
-                  {t("common.cancel")}
-                </Button>
-                <Button type="submit" disabled={createAbb.isPending || updateAbb.isPending}>
-                  {(createAbb.isPending || updateAbb.isPending) && (
-                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                  )}
-                  {t("common.save")}
-                </Button>
-              </div>
-            </form>
-          </div>
-        </>
-      )}
+      <AbbreviationModal
+        open={isModalOpen}
+        onOpenChange={setIsModalOpen}
+        abbreviation={editingItem}
+        onSave={handleSave}
+        isPending={createAbb.isPending || updateAbb.isPending}
+      />
 
       {/* Delete Confirmation */}
       <ConfirmDialog

@@ -58,10 +58,12 @@ function StatusBadge({ status }: { status: DocumentStatus }) {
   const Icon = config.icon;
   const isAnimated = status === "parsing" || status === "ocring" || status === "chunking" || status === "embedding" || status === "building_kg";
 
+  if (status === "indexed") return null;
+
   return (
-    <span className={cn("inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium rounded-full", config.className)}>
+    <span className={cn("inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium rounded-full border shadow-sm", config.className)}>
       <Icon className={cn("w-3 h-3", isAnimated && "animate-spin")} />
-      {status !== "indexed" && t(config.labelKey)}
+      {t(config.labelKey)}
     </span>
   );
 }
