@@ -1559,10 +1559,13 @@ export const ChatPanel = memo(function ChatPanel({
         const dbIds = new Set(dbMessages.map((m) => m.id));
         // Also check by content/role for user messages to avoid duplication if IDs haven't synced yet
         const dbUserContents = new Set(dbMessages.filter(m => m.role === 'user').map(m => m.content));
+        // Add safety-net content deduplication for assistant messages too
+        const dbAssistantContents = new Set(dbMessages.filter(m => m.role === 'assistant').map(m => m.content));
         
         const localOnly = prev.filter((m) => {
           if (dbIds.has(m.id)) return false;
           if (m.role === 'user' && dbUserContents.has(m.content)) return false;
+          if (m.role === 'assistant' && dbAssistantContents.has(m.content)) return false;
           return true;
         });
 
@@ -1604,9 +1607,8 @@ export const ChatPanel = memo(function ChatPanel({
     if (stream.userMessageId) {
       const serverId = stream.userMessageId;
       setMessages((prev) => {
-        // Find the most recent user message that doesn't have a UUID-like ID
-        // UUIDs from backend are 36 chars. Local IDs are timestamp strings.
-        const lastUserIdx = [...prev].reverse().findIndex(m => m.role === 'user' && m.id.length !== 36);
+        // Find the most recent user message that doesn't have a server-assigned ID (starts with 'msg_')
+        const lastUserIdx = [...prev].reverse().findIndex(m => m.role === 'user' && !m.id.startsWith('msg_'));
         if (lastUserIdx === -1) return prev;
         
         const idx = prev.length - 1 - lastUserIdx;
@@ -1844,7 +1846,7 @@ export const ChatPanel = memo(function ChatPanel({
             m.id === assistantId
               ? {
                 ...finalMsg,
-                id: assistantId,
+                id: finalMsg.id, // Use the official server-assigned ID from finalMsg
                 isStreaming: false,
                 agentSteps: finalMsg.agentSteps?.length
                   ? finalMsg.agentSteps

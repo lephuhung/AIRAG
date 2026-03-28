@@ -205,8 +205,14 @@ async def summarize_document(
             }
 
         storage = get_storage_service()
-        markdown_bytes = await storage.download_file(doc.markdown_s3_key)
-        markdown_text = markdown_bytes.decode("utf-8", errors="replace")
+        try:
+            markdown_text = await storage.download_markdown(doc.markdown_s3_key)
+        except Exception as e:
+            return {
+                "text": f"Lỗi tải markdown từ S3: {e}",
+                "document_name": doc.original_filename,
+                "document_id": document_id,
+            }
 
         # Truncate to avoid exceeding context window (~16k chars ≈ 4k tokens)
         MAX_CHARS = 16000
@@ -309,16 +315,24 @@ async def search_documents_number(
     """
     from sqlalchemy import select, or_
     from app.models.document import Document, DocumentStatus
+    import re
 
     try:
+        # Create a fuzzy pattern by replacing spaces, punctuation with %
+        # e.g., "60/QĐ-UBND" -> "60%QĐ%UBND", to match both "60/QĐ-UBND" and "60_QÐ_UBND.pdf"
+        fuzzy_query = re.sub(r"[\s/\-_.,]+", "%", query.strip())
+        fuzzy_pattern = f"%{fuzzy_query}%"
+
         result = await db.execute(
             select(Document)
             .where(
                 Document.workspace_id.in_(workspace_ids),
                 Document.status == DocumentStatus.INDEXED,
                 or_(
-                    Document.document_number.ilike(f"%{query}%"),
-                    Document.original_filename.ilike(f"%{query}%"),
+                    Document.document_number.ilike(fuzzy_pattern),
+                    Document.original_filename.ilike(fuzzy_pattern),
+                    Document.markdown_s3_key.ilike(fuzzy_pattern),
+                    Document.upload_s3_key.ilike(fuzzy_pattern),
                 ),
             )
             .order_by(Document.created_at.desc())

@@ -62,6 +62,7 @@ Rules:
 - For "greeting": set rewritten_query to "" and needs_tool to false
 - For "personal": set rewritten_query to the user's question verbatim and needs_tool to false
 - For "search_abbr" (abbreviation queries): ONLY if the target is a short abbreviation (usually uppercase, 2-6 chars). Otherwise default to "search".
+- For "search_doc_num": set rewritten_query to ONLY the exact document number or ID (e.g., "172/GM-UBND"), without any extra words.
 - For write intents: extract the text to process into "text_input", set write_action to the specific action, set needs_tool to false
 - For "write_summarize": write_action = "summarize" (or "extract_key_points" if user asks for key points)
 - For "write_suggest_edits": write_action = "suggest_edits"
@@ -77,6 +78,7 @@ User: "doanh thu 2024 là bao nhiêu?" → {"intent": "search", "rewritten_query
 User: "an ninh mạng là gì?" → {"intent": "search", "rewritten_query": "định nghĩa an ninh mạng khái niệm", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "có tài liệu gì trong hệ thống?" → {"intent": "list_docs", "rewritten_query": "danh sách tài liệu", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "tóm tắt tài liệu ID 5" → {"intent": "summarize", "rewritten_query": "tóm tắt tài liệu 5", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "tìm văn bản số 60/QĐ-UBND giúp tôi" → {"intent": "search_doc_num", "rewritten_query": "60/QĐ-UBND", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "BMNN là gì?" → {"intent": "search_abbr", "rewritten_query": "BMNN", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "tóm tắt đoạn văn sau: [đoạn văn dài]" → {"intent": "write_summarize", "rewritten_query": "", "needs_tool": false, "write_action": "summarize", "text_input": "[đoạn văn dài]"}
 User: "kiểm tra ngữ pháp: Hôm nay tôi đi học." → {"intent": "write_grammar_check", "rewritten_query": "", "needs_tool": false, "write_action": "grammar_check", "text_input": "Hôm nay tôi đi học."}
@@ -334,8 +336,9 @@ async def abbr_expander(state: "AgentState") -> dict:
         return {}
 
     # Tìm tất cả token viết hoa liên tiếp có khả năng là viết tắt (2+ ký tự)
+    # Loại trừ các token dính với dấu / hoặc - (như trong số hiệu văn bản 172/GM-UBND)
     import re
-    abbr_candidates = re.findall(r"\b[A-ZĐẮẰẶẤẦẨẪẬẮẶẪẨẦ]{2,}\b", user_message)
+    abbr_candidates = re.findall(r"(?<!/)(?<!-)\b[A-ZĐẮẰẶẤẦẨẪẬẮẶẪẨẦ]{2,}\b(?!/)(?!-)", user_message)
     if not abbr_candidates:
         return {}
 
@@ -513,13 +516,80 @@ async def tool_executor(state: "AgentState") -> dict:
             result_update["kg_summaries"] = [tool_result["text"]]
 
         elif intent == "search_doc_num":
+            import re
+            # Fallback: exact document number pattern extraction in case LLM outputs extra words
+            # e.g., "thông tin về văn bản số 60/QĐ-UBND" -> "60/QĐ-UBND"
+            doc_num_match = re.search(r"([a-zA-Z0-9ĐẮẰẶẤẦẨẪẬẮẶẪẨẦ_]+/[A-Za-z0-9ĐẮẰẶẤẦẨẪẬẮẶẪẨẦ_\-]+)", query)
+            clean_query = doc_num_match.group(1) if doc_num_match else query
+
             tool_result = await _tools.search_documents_number(
-                query=query,
+                query=clean_query.strip(),
                 workspace_ids=workspace_ids,
                 db=db,
             )
-            result_update["doc_numbers"] = tool_result.get("results", [])
+            docs = tool_result.get("documents", [])
+            result_update["doc_numbers"] = docs
             result_update["tool_status"] = tool_result.get("status", "completed")
+            
+            # Fetch markdown content for the matched document(s) so LLM can read it
+            if docs:
+                # We take the best matched document
+                target_doc_id = docs[0]["id"]
+                doc_num = docs[0]["document_number"] or docs[0]["filename"]
+                # Fetch raw markdown from MinIO instead of summarizing
+                from sqlalchemy import select
+                from app.models.document import Document
+                from app.services.storage_service import get_storage_service
+                
+                result = await db.execute(select(Document).where(Document.id == target_doc_id))
+                doc = result.scalar_one_or_none()
+                
+                summary_text = ""
+                if doc and doc.markdown_s3_key:
+                    try:
+                        storage = get_storage_service()
+                        markdown_text = await storage.download_markdown(doc.markdown_s3_key)
+                        
+                        MAX_CHARS = 16000
+                        summary_text = markdown_text[:MAX_CHARS]
+                        if len(markdown_text) > MAX_CHARS:
+                            summary_text += "\n\n[... nội dung đã được cắt bớt ...]"
+                    except Exception as e:
+                        logger.error(f"[search_doc_num] Lỗi tải markdown từ S3: {e}")
+                        summary_text = "Lỗi hệ thống khi tải nội dung văn bản."
+                else:
+                    summary_text = "Tài liệu này chưa có nội dung markdown hoặc chưa được lập chỉ mục."
+                
+                if "kg_summaries" not in result_update:
+                    result_update["kg_summaries"] = []
+                    
+                result_update["kg_summaries"].append(
+                    f"Nội dung chi tiết của văn bản {doc_num}:\n{summary_text}"
+                )
+            else:
+                # Metadata match failed. The document number might only exist within the file contents.
+                # Fallback to full-text vector search to retrieve the document chunks!
+                from app.core.config import settings
+                logger.info(f"[search_doc_num] Không tìm thấy metadata cho '{clean_query.strip()}'. Chuyển sang tìm kiếm vector.")
+                
+                fallback_result = await _tools.search_documents(
+                    query=clean_query.strip(),
+                    top_k=settings.HRAG_RERANKER_TOP_K,
+                    workspace_ids=workspace_ids,
+                    existing_citation_ids=existing_ids,
+                    db=db,
+                )
+                
+                result_update["sources"] = fallback_result.get("sources", [])
+                result_update["images"] = fallback_result.get("images", [])
+                result_update["image_parts"] = fallback_result.get("image_parts", [])
+                
+                if "kg_summaries" not in result_update:
+                    result_update["kg_summaries"] = []
+                result_update["kg_summaries"].extend(fallback_result.get("kg_summaries", []))
+                
+                if not result_update["sources"] and not result_update["kg_summaries"]:
+                    result_update["kg_summaries"].append(f"Sau khi quét toàn bộ dữ liệu, không tìm thấy văn bản nào có số: {clean_query}")
 
         elif intent == "search_abbr":
             logger.info(

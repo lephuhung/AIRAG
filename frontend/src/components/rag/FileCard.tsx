@@ -1,4 +1,4 @@
-import { memo, useState } from "react";
+import { memo, useState, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useTranslation } from "@/hooks/useTranslation";
 import {
@@ -47,12 +47,12 @@ function StatusBadge({ status }: { status: DocumentStatus }) {
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.5 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded-md border shadow-sm",
+        "inline-flex items-center gap-1.5 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider rounded-md border shadow-sm whitespace-nowrap min-w-fit",
         config.className,
         status === "failed" ? "border-destructive/20" : "border-border/50"
       )}
     >
-      <Icon className={cn("w-3 h-3", isAnimated && "animate-spin")} />
+      <Icon className={cn("w-3 h-3 shrink-0", isAnimated && "animate-spin")} />
       {t(config.labelKey)}
     </span>
   );
@@ -78,15 +78,15 @@ function SubTaskProgress({
   ];
 
   return (
-    <div className="flex items-center gap-1.5 flex-wrap">
+    <div className="flex items-center gap-1 flex-wrap">
       {tasks.map(({ done, label, Icon }) => (
         <span
           key={label}
           className={cn(
-            "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium border",
+            "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold border transition-colors",
             done
-              ? "bg-green-500/10 text-green-400 border-green-500/20"
-              : "bg-amber-400/10 text-amber-400/70 border-amber-400/20",
+              ? "bg-green-500/10 text-green-500 border-green-500/20"
+              : "bg-amber-500/10 text-amber-600 border-amber-500/20",
           )}
         >
           {done ? (
@@ -136,6 +136,18 @@ export const FileCard = memo(function FileCard({
   const FileIcon = fileConfig.icon;
 
   const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!isMenuOpen) return;
+    const handleClick = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setIsMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [isMenuOpen]);
 
   return (
     <motion.div
@@ -143,117 +155,14 @@ export const FileCard = memo(function FileCard({
       initial={{ opacity: 0, scale: 0.95 }}
       animate={{ opacity: 1, scale: 1 }}
       className={cn(
-        "group relative flex flex-col bg-card/50 backdrop-blur-sm border rounded-xl overflow-hidden hover:shadow-lg transition-all duration-300",
-        status === "failed" ? "border-destructive/30" : "border-border/50",
+        "group relative flex flex-col bg-card/60 backdrop-blur-md border rounded-xl shadow-sm hover:shadow-xl hover:-translate-y-0.5 transition-all duration-300",
+        status === "failed" ? "border-destructive/30" : "border-border/60",
         className
       )}
     >
-      {/* Top Banner: Status & Menu */}
-      <div className="flex items-center justify-between px-4 py-3 bg-muted/30">
-        <StatusBadge status={status} />
-        
-        <div className="flex items-center gap-1 ml-auto">
-          {/* Action Menu */}
-          <div className="relative">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="w-8 h-8 rounded-full hover:bg-muted/80"
-              onClick={() => setIsMenuOpen(!isMenuOpen)}
-            >
-              <MoreHorizontal className="w-4 h-4" />
-            </Button>
-
-            <AnimatePresence>
-              {isMenuOpen && (
-                <>
-                  <motion.div 
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    className="fixed inset-0 z-10" 
-                    onClick={() => setIsMenuOpen(false)}
-                  />
-                  <motion.div 
-                    initial={{ opacity: 0, scale: 0.95, y: -10 }}
-                    animate={{ opacity: 1, scale: 1, y: 0 }}
-                    exit={{ opacity: 0, scale: 0.95, y: -10 }}
-                    className="absolute right-0 top-full mt-1 w-48 bg-card border rounded-lg shadow-xl z-20 py-1 overflow-hidden"
-                  >
-                    <button
-                      className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted transition-colors text-left font-medium text-blue-500"
-                      onClick={() => {
-                        onProcess(doc.id);
-                        setIsMenuOpen(false);
-                      }}
-                      disabled={isProcessing}
-                    >
-                      <RefreshCw className={cn("w-4 h-4", isProcessing && "animate-spin")} />
-                      {t("files.analyze")}
-                    </button>
-                    <button
-                      className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted transition-colors text-left"
-                      onClick={() => {
-                        onDownload(doc);
-                        setIsMenuOpen(false);
-                      }}
-                    >
-                      <Download className="w-4 h-4 text-muted-foreground" />
-                      {t("common.download")}
-                    </button>
-                    <button
-                      className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted transition-colors text-left"
-                      onClick={() => {
-                        onPreview(doc);
-                        setIsMenuOpen(false);
-                      }}
-                    >
-                      <Eye className="w-4 h-4 text-muted-foreground" />
-                      {t("files.preview")}
-                    </button>
-                    {onClickEdit && (
-                      <button
-                        className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted transition-colors text-left font-medium text-primary"
-                        onClick={() => {
-                          onClickEdit(doc);
-                          setIsMenuOpen(false);
-                        }}
-                      >
-                        <Tag className="w-4 h-4" />
-                        {t("files.edit_metadata")}
-                      </button>
-                    )}
-                    <button
-                      className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted transition-colors text-left"
-                      onClick={() => {
-                        onReindex(doc.id);
-                        setIsMenuOpen(false);
-                      }}
-                    >
-                      <RefreshCw className="w-4 h-4 text-muted-foreground" />
-                      {t("files.re_analyze")}
-                    </button>
-                    <div className="h-px bg-border my-1" />
-                    <button
-                      className="w-full flex items-center gap-2 px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors text-left"
-                      onClick={() => {
-                        onDelete(doc.id);
-                        setIsMenuOpen(false);
-                      }}
-                    >
-                      <Trash2 className="w-4 h-4" />
-                      {t("common.delete")}
-                    </button>
-                  </motion.div>
-                </>
-              )}
-            </AnimatePresence>
-          </div>
-        </div>
-      </div>
 
       {/* Document Content */}
-      <div className="p-4 flex flex-col gap-3">
+      <div className="p-4 flex flex-col gap-2.5">
         {/* Main Info */}
         <div className="flex items-start gap-3">
           <div className={cn(
@@ -264,50 +173,178 @@ export const FileCard = memo(function FileCard({
           </div>
           
           <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-1.5 min-w-0">
-              <h3 className="font-semibold text-sm truncate leading-tight" title={filename || original_filename}>
-                {filename || original_filename}
-              </h3>
-              {status === "indexed" && (
-                <CheckCircle2 className="w-4 h-4 text-primary shrink-0" />
-              )}
+            <div className="mb-2">
+              <StatusBadge status={status} />
             </div>
-            <div className="flex items-center gap-2 mt-1 text-[10px] text-muted-foreground uppercase font-medium tracking-wider">
-              <span>{file_type?.replace(".", "") || "FILE"}</span>
-              <span className="w-1 h-1 rounded-full bg-border" />
-              <span>{formatFileSize(file_size)}</span>
+            <div className="flex items-center gap-1.5 min-w-0">
+              <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                <h3 className="font-semibold text-sm truncate leading-tight" title={filename || original_filename}>
+                  {filename || original_filename}
+                </h3>
+                {status === "indexed" && (
+                  <CheckCircle2 className="w-4 h-4 text-primary shrink-0" />
+                )}
+              </div>
+
+              {/* Action Menu moved inline */}
+              <div className="relative shrink-0">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="w-7 h-7 rounded-full hover:bg-muted/80 ml-auto"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setIsMenuOpen(!isMenuOpen);
+                  }}
+                >
+                  <MoreHorizontal className="w-3.5 h-3.5" />
+                </Button>
+
+                <AnimatePresence>
+                  {isMenuOpen && (
+                    <>
+                      <motion.div 
+                        ref={menuRef}
+                        initial={{ opacity: 0, scale: 0.95, y: -10 }}
+                        animate={{ opacity: 1, scale: 1, y: 0 }}
+                        exit={{ opacity: 0, scale: 0.95, y: -10 }}
+                        className="absolute right-0 top-full mt-1 w-44 bg-card border rounded-lg shadow-xl z-20 py-1 overflow-hidden"
+                      >
+                        {status === "pending" && (
+                          <button
+                            className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted transition-colors text-left font-semibold text-blue-500"
+                            onClick={() => {
+                              onProcess(doc.id);
+                              setIsMenuOpen(false);
+                            }}
+                            disabled={isProcessing}
+                          >
+                            <RefreshCw className={cn("w-3.5 h-3.5", isProcessing && "animate-spin")} />
+                            {t("files.analyze")}
+                          </button>
+                        )}
+                        <button
+                          className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted transition-colors text-left"
+                          onClick={() => {
+                            onDownload(doc);
+                            setIsMenuOpen(false);
+                          }}
+                        >
+                          <Download className="w-3.5 h-3.5 text-muted-foreground" />
+                          {t("common.download")}
+                        </button>
+                        <button
+                          className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted transition-colors text-left"
+                          onClick={() => {
+                            onPreview(doc);
+                            setIsMenuOpen(false);
+                          }}
+                        >
+                          <Eye className="w-3.5 h-3.5 text-muted-foreground" />
+                          {t("files.preview")}
+                        </button>
+                        {onClickEdit && (
+                          <button
+                            className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted transition-colors text-left font-medium text-foreground/80"
+                            onClick={() => {
+                              onClickEdit(doc);
+                              setIsMenuOpen(false);
+                            }}
+                          >
+                            <Tag className="w-3.5 h-3.5" />
+                            {t("files.edit_metadata")}
+                          </button>
+                        )}
+                        <button
+                          className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted transition-colors text-left"
+                          onClick={() => {
+                            onReindex(doc.id);
+                            setIsMenuOpen(false);
+                          }}
+                        >
+                          <RefreshCw className="w-3.5 h-3.5 text-muted-foreground/70" />
+                          {t("files.re_analyze")}
+                        </button>
+                        <div className="h-px bg-border my-1" />
+                        <button
+                          className="w-full flex items-center gap-2 px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors text-left"
+                          onClick={() => {
+                            onDelete(doc.id);
+                            setIsMenuOpen(false);
+                          }}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          {t("common.delete")}
+                        </button>
+                      </motion.div>
+                    </>
+                  )}
+                </AnimatePresence>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 mt-1 text-[10px] text-muted-foreground uppercase font-medium tracking-wider">
+              <span className="shrink-0">{file_type?.replace(".", "") || "FILE"}</span>
+              <span className="w-1 h-1 rounded-full bg-border shrink-0" />
+              <span className="shrink-0">{formatFileSize(file_size)}</span>
               {doc.parser_version && (
-                <>
+                <div className="hidden sm:flex items-center gap-2 shrink-0">
                   <span className="w-1 h-1 rounded-full bg-border" />
                   <span>{doc.parser_version}</span>
-                </>
+                </div>
               )}
             </div>
           </div>
         </div>
 
-        {/* Status indicator for failed documents */}
-        {status === "failed" && doc.error_message && (
-          <div className="p-2 bg-destructive/5 border border-destructive/10 rounded flex items-start gap-2">
-            <AlertCircle className="w-3.5 h-3.5 text-destructive shrink-0 mt-0.5" />
-            <p className="text-[11px] text-destructive leading-relaxed font-medium">
+        {/* Status indicator for failed OR processing info */}
+        {doc.error_message && (
+          <div className={cn(
+            "p-2 border rounded flex items-start gap-2",
+            status === "failed" 
+              ? "bg-destructive/5 border-destructive/10" 
+              : "bg-amber-500/5 border-amber-500/10"
+          )}>
+            <AlertCircle className={cn(
+              "w-3.5 h-3.5 shrink-0 mt-0.5",
+              status === "failed" ? "text-destructive" : "text-amber-500"
+            )} />
+            <p className={cn(
+              "text-[11px] leading-relaxed font-semibold",
+              status === "failed" ? "text-destructive" : "text-amber-600"
+            )}>
               {doc.error_message}
             </p>
           </div>
         )}
 
         {/* Metadata Chips */}
-        <div className="flex flex-col gap-2 pt-1 border-t border-border/30">
-          {/* Counts */}
-          <div className="flex items-center gap-3 text-[11px] text-muted-foreground">
-            <div className="flex items-center gap-1">
-              <FileText className="w-3 h-3" />
-              <span>{t("count", { count: doc.page_count || 0, unit: t("common.pages") })}</span>
-            </div>
-            <div className="flex items-center gap-1">
-              <Layers className="w-3 h-3" />
-              <span>{t("count", { count: doc.chunk_count || 0, unit: t("common.chunks") })}</span>
-            </div>
+        <div className="flex flex-col gap-1.5 pt-2 mt-0.5 border-t border-border/30">
+          {/* Counts row with better layout */}
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] uppercase font-bold tracking-tight text-muted-foreground/80">
+            {doc.page_count !== undefined && doc.page_count > 0 && (
+              <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-muted/40 border border-border/10">
+                <FileText className="w-3 h-3 text-muted-foreground/60" />
+                <span>{t("common.count", { count: doc.page_count, unit: t("common.pages") })}</span>
+              </div>
+            )}
+            {doc.chunk_count > 0 && (
+              <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-muted/40 border border-border/10">
+                <Layers className="w-3 h-3 text-muted-foreground/60" />
+                <span>{t("common.count", { count: doc.chunk_count, unit: t("common.chunks") })}</span>
+              </div>
+            )}
+            {doc.table_count !== undefined && doc.table_count > 0 && (
+              <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-muted/40 border border-border/10">
+                <Network className="w-3 h-3 text-muted-foreground/60" />
+                <span>{t("common.count", { count: doc.table_count, unit: t("common.tables") })}</span>
+              </div>
+            )}
+            {doc.image_count !== undefined && doc.image_count > 0 && (
+              <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-muted/40 border border-border/10">
+                <ImageIcon className="w-3 h-3 text-muted-foreground/60" />
+                <span>{t("common.count", { count: doc.image_count, unit: t("common.images") })}</span>
+              </div>
+            )}
           </div>
 
           {/* Doc Number & Type */}
@@ -327,11 +364,25 @@ export const FileCard = memo(function FileCard({
             </div>
           )}
 
-          {/* Signer Info */}
+          {/* Enhanced Signer Info Display */}
           {displaySigner && (
-            <div className="flex items-center gap-1.5 text-[11px] text-green-500 font-semibold mt-1">
-              <ShieldCheck className="w-3.5 h-3.5" />
-              <span className="truncate">{t("files.signed_by", { name: displaySigner })}</span>
+            <div className="flex flex-col gap-0.5 mt-0.5 px-2 py-1 rounded-lg bg-green-500/5 border border-green-500/10 w-fit max-w-full">
+              <div className="flex items-center gap-1.5 text-[11px] text-green-600 dark:text-green-400 font-bold">
+                <ShieldCheck className="w-3.5 h-3.5" />
+                <span className="truncate">
+                  {t("files.metadata.signed_by")}: {displaySigner}
+                  {digital_signatures && digital_signatures.length > 1 && (
+                    <span className="text-[9px] font-normal opacity-70 ml-1">
+                      (+{digital_signatures.length - 1})
+                    </span>
+                  )}
+                </span>
+              </div>
+              {digital_signatures?.[0]?.organization && (
+                <p className="text-[9px] text-muted-foreground/60 truncate ml-5 leading-none">
+                  {digital_signatures[0].organization}
+                </p>
+              )}
             </div>
           )}
           
@@ -349,7 +400,7 @@ export const FileCard = memo(function FileCard({
       </div>
       
       {/* Footer Timestamps */}
-      <div className="mt-auto px-4 py-2 border-t border-border/30 bg-muted/10 flex items-center justify-between text-[9px] text-muted-foreground/60 uppercase tracking-tighter">
+      <div className="mt-auto px-4 py-2 border-t border-border/30 bg-muted/10 flex items-center justify-between text-[9px] text-muted-foreground/60 uppercase tracking-tighter rounded-b-xl">
         <span>Uploaded: {formatDate(created_at)}</span>
         <Clock className="w-2.5 h-2.5" />
       </div>

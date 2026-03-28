@@ -98,8 +98,9 @@ class AbbreviationService:
         active_abs.sort(key=lambda x: len(x.short_form), reverse=True)
 
         for abb in active_abs:
-            # Use regex with word boundaries (\b) for robust expansion
-            pattern = rf"\b{re.escape(abb.short_form)}\b"
+            # Use regex with word boundaries (\b) and negative lookbehinds/lookaheads for / and - 
+            # to prevent expanding parts of document numbers like 172/GM-UBND
+            pattern = rf"(?<!/)(?<!-)\b{re.escape(abb.short_form)}\b(?!/)(?!-)"
             # Case-insensitive replacement while keeping word boundaries
             expanded_text = re.sub(pattern, abb.full_form, expanded_text, flags=re.IGNORECASE)
 

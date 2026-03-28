@@ -239,6 +239,8 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
       let localSteps: AgentStep[] = [];
       let localSources: ChatSourceChunk[] = [];
       let localImages: ChatImageRef[] = [];
+      let localAiMessageId: string | null = null;
+      let localUserMessageId: string | null = null;
       // Accumulate all thinking text in this scope so it can be flushed into
       // localSteps at complete time (onThinkingToken only updates setAgentSteps
       // via RAF, which never syncs back to localSteps)
@@ -344,10 +346,12 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
                   }
 
                   case "ai_message_id":
-                    setAiMessageId(data.message_id || null);
+                    localAiMessageId = data.message_id || null;
+                    setAiMessageId(localAiMessageId);
                     break;
                   case "user_id":
-                    setUserMessageId(data.id || null);
+                    localUserMessageId = data.id || null;
+                    setUserMessageId(localUserMessageId);
                     break;
 
                   case "thinking":
@@ -460,7 +464,7 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
                     ]);
 
                     finalMessage = {
-                      id: crypto.randomUUID(),
+                      id: localAiMessageId || crypto.randomUUID(),
                       role: "assistant",
                       content: data.answer || "",
                       sources: localSources, // use accumulated sources, backend complete event omits them

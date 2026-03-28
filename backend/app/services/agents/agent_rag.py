@@ -318,21 +318,22 @@ async def search_doc_num_node(state: AgentRagState) -> AgentRagState:
     from app.models.document import Document, DocumentStatus
     from app.models.knowledge_base import KnowledgeBase as Workspace
     from app.core.deps import get_db
-
-    messages = state.messages
-    if not messages:
-        state.final_answer = "No document number specified."
-        return state
-
-    last_message = messages[-1]
-    query = (
-        last_message.content if hasattr(last_message, "content") else str(last_message)
-    )
-
     import re
 
-    doc_num_match = re.search(r"\d+", query)
-    search_term = doc_num_match.group(0) if doc_num_match else query
+    query = state.rewritten_query or ""
+    if not query:
+        messages = state.messages
+        if not messages:
+            state.final_answer = "No document number specified."
+            return state
+        last_message = messages[-1]
+        query = (
+            last_message.content if hasattr(last_message, "content") else str(last_message)
+        )
+
+    # 1. Regex to extract the pure document number, ignoring chatty words
+    doc_num_match = re.search(r"([a-zA-Z0-9ĐẮẰẶẤẦẨẪẬẮẶẪẨẦ_]+/[A-Za-z0-9ĐẮẰẶẤẦẨẪẬẮẶẪẨẦ_\-]+)", query)
+    search_term = doc_num_match.group(1) if doc_num_match else query.strip()
 
     try:
         async for db in get_db():
@@ -342,33 +343,64 @@ async def search_doc_num_node(state: AgentRagState) -> AgentRagState:
                 workspaces = result.scalars().all()
                 workspace_ids = [ws.id for ws in workspaces]
 
+            if not workspace_ids:
+                state.final_answer = "No workspaces found."
+                return state
+
+            # 2. Fuzzy pattern to match DB strings ignoring separator differences
+            fuzzy_query = re.sub(r"[\s/\-_.,]+", "%", search_term)
+            fuzzy_pattern = f"%{fuzzy_query}%"
+
             doc_result = await db.execute(
                 select(Document)
                 .where(
                     Document.workspace_id.in_(workspace_ids),
                     Document.status == DocumentStatus.INDEXED,
                     or_(
-                        Document.document_number.ilike(f"%{search_term}%"),
-                        Document.original_filename.ilike(f"%{search_term}%"),
+                        Document.document_number.ilike(fuzzy_pattern),
+                        Document.original_filename.ilike(fuzzy_pattern),
+                        Document.markdown_s3_key.ilike(fuzzy_pattern),
+                        Document.upload_s3_key.ilike(fuzzy_pattern),
                     ),
                 )
+                .order_by(Document.created_at.desc())
                 .limit(10)
             )
             docs = doc_result.scalars().all()
 
             if not docs:
-                state.final_answer = (
-                    f"Không tìm thấy tài liệu nào có số văn bản '{search_term}'."
-                )
+                # 4. Fallback: No metadata match -> Vector Search Fallback
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.info(f"[search_doc_num_node] Không tìm thấy metadata cho '{search_term}'. Chuyển sang tìm kiếm vector.")
+                state.rewritten_query = search_term  # Optional: constrain vector search to pure term
+                return await search_documents_node(state)
             else:
-                lines = [f"Tìm thấy **{len(docs)} tài liệu**:"]
-                for i, doc in enumerate(docs, 1):
-                    lines.append(
-                        f"{i}. **{doc.original_filename}**\n"
-                        f"   Số văn bản: {doc.document_number or 'N/A'}\n"
-                        f"   ID: {doc.id}"
-                    )
-                state.final_answer = "\n".join(lines)
+                # 3. Found document -> Inject S3 Markdown Content directly into state for LLM
+                from app.services.storage_service import get_storage_service
+                doc = docs[0]
+                doc_title = doc.document_number or doc.original_filename
+                
+                content_text = ""
+                if doc.markdown_s3_key:
+                    try:
+                        storage = get_storage_service()
+                        markdown_text = await storage.download_markdown(doc.markdown_s3_key)
+                        
+                        MAX_CHARS = 16000
+                        content_text = markdown_text[:MAX_CHARS]
+                        if len(markdown_text) > MAX_CHARS:
+                            content_text += "\n\n[... nội dung đã được cắt bớt ...]"
+                    except Exception as e:
+                        import logging
+                        logger = logging.getLogger(__name__)
+                        logger.error(f"[search_doc_num_node] Lỗi tải markdown từ S3 cho '{doc_title}': {e}")
+                        content_text = f"Không thể tải chi tiết nội dung từ hệ thống lưu trữ: {e}"
+                else:
+                    content_text = "Tài liệu này chưa được trích xuất nội dung chữ Markdown."
+
+                state.final_answer = f"Tài liệu tìm thấy: {doc_title}\n\nNội dung chi tiết:\n{content_text}"
+            
             break
     except Exception as e:
         state.final_answer = f"Lỗi: {str(e)}"
