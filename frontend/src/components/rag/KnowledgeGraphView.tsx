@@ -41,7 +41,7 @@ interface SimNode extends KGGraphNode {
 
 /** Node radius based on degree */
 function getRadius(degree: number): number {
-  return Math.max(6, Math.min(18, 6 + degree * 1.5));
+  return Math.max(4, Math.min(14, 4 + degree * 1.2));
 }
 
 // ---------------------------------------------------------------------------
@@ -98,7 +98,7 @@ function simulateForces(
     const dx = tgt.x - src.x;
     const dy = tgt.y - src.y;
     const dist = Math.max(Math.sqrt(dx * dx + dy * dy), 1);
-    const targetDist = 120;
+    const targetDist = 150;
     const force = (dist - targetDist) * 0.01 * alpha;
     const fx = (dx / dist) * force;
     const fy = (dy / dist) * force;
@@ -468,7 +468,7 @@ const GraphCanvas = memo(function GraphCanvas({
                   <text
                     y={r + 12}
                     textAnchor="middle"
-                    fontSize={10}
+                    fontSize={8.5}
                     fill="currentColor"
                     fillOpacity={dimmed ? 0.15 : 0.7}
                     className="pointer-events-none select-none"

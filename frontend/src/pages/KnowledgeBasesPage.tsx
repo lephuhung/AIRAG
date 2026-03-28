@@ -251,19 +251,20 @@ export function KnowledgeBasesPage() {
   };
 
   return (
-    <div className="h-full overflow-y-auto">
-      <div className="max-w-5xl mx-auto px-6 py-8">
-        {/* Breadcrumb */}
-        <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-4">
-          <button onClick={() => navigate("/")} className="hover:text-foreground transition-colors">
+    <div className="h-full flex flex-col overflow-hidden">
+      {/* ── Header ── */}
+      <div className="flex-shrink-0 border-b px-6 py-4">
+        <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-2">
+          <button 
+            onClick={() => navigate("/")} 
+            className="hover:text-foreground transition-colors underline-offset-4 hover:underline"
+          >
             {t("nav.dashboard")}
           </button>
           <span>/</span>
           <span className="text-foreground font-medium">{t("kb.title")}</span>
         </div>
-
-        {/* Section header + action */}
-        <div className="flex items-center justify-between mb-6">
+        <div className="flex items-center justify-between">
           <div>
             <h1 className="text-lg font-bold flex items-center gap-2">
               <Database className="w-5 h-5 text-primary" />
@@ -275,11 +276,15 @@ export function KnowledgeBasesPage() {
               </p>
             )}
           </div>
-          <Button onClick={() => setShowNewWorkspace(true)} size="sm">
+          <Button onClick={() => setShowNewWorkspace(true)} size="sm" className="shadow-sm shadow-primary/20">
             <Plus className="w-4 h-4 mr-1.5" />
             {t("kb.new")}
           </Button>
         </div>
+      </div>
+
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-5xl mx-auto px-6 py-8">
 
         {/* New Workspace Modal */}
         {showNewWorkspace && (
@@ -541,6 +546,8 @@ export function KnowledgeBasesPage() {
         confirmLabel={t("common.delete")}
         variant="danger"
       />
+        </div>
+      </div>
     </div>
   );
 }

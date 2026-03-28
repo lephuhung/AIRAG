@@ -41,6 +41,10 @@
   --font-chat: "Inter", "system-ui", sans-serif;
 }
 
+html {
+  font-size: 15px; /* Setup a slightly smaller zoom for better display */
+}
+
 html, body, #root {
   height: 100%;
   margin: 0;

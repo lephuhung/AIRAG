@@ -37,11 +37,6 @@ export const TopBar = memo(function TopBar({ actions, className, onToggle, isNar
     { label: t("app.name"), active: false },
   ];
 
-  if (location.pathname === "/") {
-    segments.push({ label: t("nav.knowledge_bases"), active: true });
-  } else if (location.pathname.startsWith("/knowledge-bases/")) {
-    segments.push({ label: t("common.workspace"), active: true });
-  }
 
   return (
     <div
@@ -60,11 +55,8 @@ export const TopBar = memo(function TopBar({ actions, className, onToggle, isNar
             <Menu className="w-4 h-4 text-muted-foreground" />
           </button>
         )}
-        <div className="flex items-center gap-1.5 flex-shrink-0">
-           <img src={logo} alt="Logo" className="w-6 h-6 object-contain" />
-        </div>
         <div className="flex items-center gap-1.5 min-w-0">
-          {segments.map((seg, i) => (
+          {segments.slice(1).map((seg, i) => (
             <div key={i} className="flex items-center gap-1.5 min-w-0">
               {i > 0 && <ChevronRight className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />}
               <span
