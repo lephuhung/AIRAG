@@ -1,6 +1,6 @@
 import { memo, useEffect, useState } from "react";
 import { useLocation } from "react-router-dom";
-import { ChevronRight, Cpu, Languages } from "lucide-react";
+import { ChevronRight, Cpu, Languages, Menu } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
 import { UserMenu } from "@/components/layout/UserMenu";
@@ -20,9 +20,11 @@ interface ConfigStatus {
 interface TopBarProps {
   actions?: React.ReactNode;
   className?: string;
+  onToggle?: () => void;
+  isNarrow?: boolean;
 }
 
-export const TopBar = memo(function TopBar({ actions, className }: TopBarProps) {
+export const TopBar = memo(function TopBar({ actions, className, onToggle, isNarrow }: TopBarProps) {
   const location = useLocation();
   const [config, setConfig] = useState<ConfigStatus | null>(null);
   const { t, language, setLanguage } = useTranslation();
@@ -50,6 +52,14 @@ export const TopBar = memo(function TopBar({ actions, className }: TopBarProps) 
     >
       {/* Breadcrumbs */}
       <div className="flex items-center gap-3 text-sm min-w-0">
+        {isNarrow && (
+          <button
+            onClick={onToggle}
+            className="p-1.5 rounded-md hover:bg-muted transition-colors -ml-1"
+          >
+            <Menu className="w-4 h-4 text-muted-foreground" />
+          </button>
+        )}
         <div className="flex items-center gap-1.5 flex-shrink-0">
            <img src={logo} alt="Logo" className="w-6 h-6 object-contain" />
         </div>

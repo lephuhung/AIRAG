@@ -18,6 +18,7 @@ import {
   Edit,
   PieChart,
   Loader2,
+  X,
 } from "lucide-react";
 import { useWorkspaces } from "@/hooks/useWorkspaces";
 import { useMyTenants } from "@/hooks/useMyTenants";
@@ -33,9 +34,10 @@ import logo from "@/assets/logo.png";
 interface SidebarProps {
   collapsed: boolean;
   onToggle: () => void;
+  isNarrow?: boolean;
 }
 
-export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarProps) {
+export const Sidebar = memo(function Sidebar({ collapsed, onToggle, isNarrow }: SidebarProps) {
   const navigate = useNavigate();
   const location = useLocation();
   const { data: workspaces } = useWorkspaces();
@@ -95,15 +97,31 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle }: SidebarPro
   return (
     <aside
       className={cn(
-        "absolute top-0 left-0 z-50 flex flex-col h-full bg-card border-r border-border transition-all duration-200",
-        collapsed ? "w-14" : "w-60 shadow-xl"
+        "absolute top-0 left-0 z-50 flex flex-col h-full bg-card border-r border-border transition-all duration-300 ease-in-out",
+        isNarrow && "fixed",
+        collapsed ? "w-14" : "w-60 shadow-xl",
+        isNarrow && collapsed && "-translate-x-full"
       )}
     >
-      {/* Logo */}
-      <div className="flex items-center gap-2.5 px-3 h-12 border-b border-border flex-shrink-0">
-        <img src={logo} alt="Logo" className="w-7 h-7 object-contain flex-shrink-0" />
-        {!collapsed && (
-          <span className="font-bold text-primary text-base truncate">{t("app.name")}</span>
+      {/* Logo / Header */}
+      <div className="flex items-center justify-between px-3 h-12 border-b border-border flex-shrink-0">
+        <div className="flex items-center gap-2.5 overflow-hidden">
+          <img src={logo} alt="Logo" className="w-7 h-7 object-contain flex-shrink-0" />
+          {!collapsed && (
+            <span className="font-bold text-primary text-base truncate whitespace-nowrap">
+              {t("app.name")}
+            </span>
+          )}
+        </div>
+        
+        {/* Close button for responsive drawer */}
+        {isNarrow && !collapsed && (
+          <button
+            onClick={onToggle}
+            className="p-1 rounded-md hover:bg-muted transition-colors ml-2"
+          >
+            <X className="w-4 h-4 text-muted-foreground" />
+          </button>
         )}
       </div>
 
