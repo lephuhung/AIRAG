@@ -546,7 +546,6 @@ export function KnowledgeBasesPage() {
         confirmLabel={t("common.delete")}
         variant="danger"
       />
-        </div>
       </div>
     </div>
   );
