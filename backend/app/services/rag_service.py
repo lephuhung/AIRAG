@@ -235,13 +235,15 @@ class RAGService:
 
 
 # --- Knowledge Graph Service Factory ---
-_kg_service_cache: dict[int, "KnowledgeGraphService"] = {}
+# Re-export the central factory from knowledge_graph_service so existing callers
+# that import get_kg_service from rag_service continue to work.
+_kg_service_cache: dict = {}
 
 async def get_kg_service(workspace_id: int):
-    """Get KnowledgeGraphService for a knowledge base — cached per workspace."""
-    from app.services.knowledge_graph_service import KnowledgeGraphService
+    """Get KG service for a workspace — cached, routed via HRAG_KG_MODE."""
+    from app.services.knowledge_graph_service import get_kg_service as _factory
     if workspace_id not in _kg_service_cache:
-        _kg_service_cache[workspace_id] = KnowledgeGraphService(workspace_id)
+        _kg_service_cache[workspace_id] = _factory(workspace_id)
     return _kg_service_cache[workspace_id]
 
 

@@ -266,7 +266,7 @@ async def summarize_document_node(state: AgentRagState) -> AgentRagState:
 
 async def kg_query_node(state: AgentRagState) -> AgentRagState:
     """Query knowledge graph."""
-    from app.services.knowledge_graph_service import KnowledgeGraphService
+    from app.services.knowledge_graph_service import get_kg_service
     from app.core.deps import get_db
     from sqlalchemy import select
     from app.models.knowledge_base import KnowledgeBase as Workspace
@@ -292,7 +292,7 @@ async def kg_query_node(state: AgentRagState) -> AgentRagState:
             results = []
             for ws_id in workspace_ids[:3]:
                 try:
-                    kg_service = KnowledgeGraphService(workspace_id=ws_id)
+                    kg_service = get_kg_service(workspace_id=ws_id)
                     kg_result = await kg_service.query(query=query, mode="naive")
                     if kg_result and kg_result.strip():
                         results.append(f"**Workspace {ws_id}:**\n{kg_result}")

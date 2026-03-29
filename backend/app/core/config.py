@@ -89,9 +89,15 @@ class Settings(BaseSettings):
     # Knowledge Graph
     HRAG_KG_LANGUAGE: str = Field(default="Vietnamese")
     HRAG_KG_ENTITY_TYPES: list[str] = Field(default=[
-        "Organization", "Person", "Product", "Location", "Event",
-        "Financial_Metric", "Technology", "Date", "Regulation",
+        "Article", "Person", "Organization", "Task"
     ])
+    HRAG_KG_RELATION_TYPES: list[str] = Field(default=[
+        "CAN_CU", "VIEN_DAN", "SUA_DOI", "CHU_TRI", "PHOI_HOP", "CHIU_TRACH_NHIEM"
+    ])
+    # KG pipeline mode:
+    #   "legal"    → LegalKGService (Vietnamese admin/legal docs, purpose-built)
+    #   "lightrag" → original LightRAG generic pipeline (backward compat)
+    HRAG_KG_MODE: str = Field(default="legal")
     HRAG_KG_CHUNK_TOKEN_SIZE: int = Field(default=1200)
     HRAG_KG_QUERY_TIMEOUT: float = Field(default=30.0)
 

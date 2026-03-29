@@ -271,12 +271,12 @@ async def query_knowledge_graph(
     Returns:
         dict with keys: text (formatted KG results)
     """
-    from app.services.knowledge_graph_service import KnowledgeGraphService
+    from app.services.knowledge_graph_service import get_kg_service
 
     results = []
     for ws_id in workspace_ids:
         try:
-            kg_service = KnowledgeGraphService(workspace_id=ws_id)
+            kg_service = get_kg_service(workspace_id=ws_id)
             # Use naive mode for entity lookup (faster than hybrid)
             kg_result = await kg_service.query(
                 query=entity,

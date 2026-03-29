@@ -1013,3 +1013,25 @@ class KnowledgeGraphService:
             "top_entities": top_entities,
             "avg_degree": round(avg_degree, 2),
         }
+
+
+# ---------------------------------------------------------------------------
+# Factory function — route to LegalKGService or KnowledgeGraphService
+# ---------------------------------------------------------------------------
+
+
+def get_kg_service(workspace_id: int):
+    """
+    Factory: returns the appropriate KG service based on HRAG_KG_MODE config.
+
+      HRAG_KG_MODE=legal     → LegalKGService  (Vietnamese admin/legal documents)
+      HRAG_KG_MODE=lightrag  → KnowledgeGraphService (generic LightRAG pipeline)
+
+    All callers (kg_worker, hrag_service, rag_service, agent tools, etc.)
+    should use this factory instead of instantiating KnowledgeGraphService directly.
+    """
+    mode = getattr(settings, "HRAG_KG_MODE", "lightrag").lower()
+    if mode == "legal":
+        from app.services.legal_kg_service import LegalKGService
+        return LegalKGService(workspace_id=workspace_id)
+    return KnowledgeGraphService(workspace_id=workspace_id)

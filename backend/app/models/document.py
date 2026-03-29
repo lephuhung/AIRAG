@@ -66,6 +66,13 @@ class Document(Base):
     )
     # Official document reference number extracted by classifier (e.g. "13/2023/NĐ-CP")
     document_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    
+    # Rich Header Metadata extracted by LLM from Page 1 OCR
+    location: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    issuing_agency: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    parent_agency: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    published_date: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    
     # Manual signer name override
     signer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 

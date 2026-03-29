@@ -134,6 +134,19 @@ async def lifespan(app: FastAPI):
             await conn.execute(text(
                 "ALTER TABLE documents ADD COLUMN IF NOT EXISTS signer_name VARCHAR(255)"
             ))
+            # Rich Header Metadata extracted by LLM from Page 1 OCR
+            await conn.execute(text(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS location VARCHAR(255)"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS issuing_agency VARCHAR(255)"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS parent_agency VARCHAR(255)"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS published_date VARCHAR(100)"
+            ))
             # ── Auth & multi-tenant columns ────────────────────────────────────
             # knowledge_bases: visibility, owner_id, tenant_id
             await conn.execute(text(

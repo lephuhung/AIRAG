@@ -23,7 +23,7 @@ from app.core.database import async_session_maker
 from app.models.document_type import DocumentType as _DocumentType  # noqa: F401
 from app.models.document import Document
 from app.queue.messages import KGMessage
-from app.services.knowledge_graph_service import KnowledgeGraphService
+from app.services.knowledge_graph_service import get_kg_service
 from app.workers.utils import check_and_finalize
 
 logger = logging.getLogger(__name__)
@@ -51,8 +51,8 @@ async def handle_kg(payload: dict) -> None:
             return
 
         try:
-            kg_service = KnowledgeGraphService(workspace_id=msg.workspace_id)
-            await kg_service.ingest(msg.markdown)
+            kg_service = get_kg_service(workspace_id=msg.workspace_id)
+            await kg_service.ingest(msg.markdown, document_id=msg.document_id)
 
             document.kg_done = True
             await db.commit()

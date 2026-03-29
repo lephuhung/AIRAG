@@ -20,7 +20,7 @@ from sqlalchemy import select, delete
 from app.core.config import settings
 from app.models.document import Document, DocumentImage, DocumentTable, DocumentStatus
 from app.services.deep_document_parser import DeepDocumentParser
-from app.services.knowledge_graph_service import KnowledgeGraphService
+from app.services.knowledge_graph_service import get_kg_service
 from app.services.deep_retriever import DeepRetriever
 from app.services.embedder import EmbeddingService, get_embedding_service
 from app.services.vector_store import VectorStore, get_vector_store
@@ -55,9 +55,9 @@ class HRAGService:
         self.vector_store = get_vector_store(workspace_id)
 
         # KG service (optional, gated by config)
-        self.kg_service: Optional[KnowledgeGraphService] = None
+        self.kg_service = None
         if settings.HRAG_ENABLE_KG:
-            self.kg_service = KnowledgeGraphService(workspace_id=workspace_id)
+            self.kg_service = get_kg_service(workspace_id=workspace_id)
 
         # Retriever (with cross-encoder reranker)
         self.retriever = DeepRetriever(
