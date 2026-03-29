@@ -8,6 +8,7 @@ and images with structural metadata (page numbers, headings).
 Supported formats: PDF, DOCX, PPTX, HTML (via Docling)
 Fallback: TXT, MD (via legacy loader)
 """
+
 from __future__ import annotations
 
 import logging
@@ -59,28 +60,28 @@ logger = logging.getLogger(__name__)
 # The negative lookahead/lookbehind for \S ensures we only match isolated
 # char-space-char sequences.
 _SCATTERED_CHARS_RE = re.compile(
-    r'(?<!\S)'                  # not preceded by a non-space char
-    r'(\w)'                     # first char
-    r'((?:\s\w){2,})'           # 2+ more " <char>" pairs  (min 3 chars total)
-    r'(?!\S)',                   # not followed by a non-space char
+    r"(?<!\S)"  # not preceded by a non-space char
+    r"(\w)"  # first char
+    r"((?:\s\w){2,})"  # 2+ more " <char>" pairs  (min 3 chars total)
+    r"(?!\S)",  # not followed by a non-space char
 )
 
 # Lines we should never touch
 _STRUCTURE_LINE_RE = re.compile(
-    r'^\s*(?:'
-    r'[#]{1,6}\s'              # markdown headings
-    r'|[|]'                     # table rows
-    r'|[-*_]{3,}'              # horizontal rules
-    r'|```'                     # code fences
-    r'|!\[.*\]\(.*\)'          # images
-    r'|\[.*\]\(.*\)'           # links on their own line
-    r'|<!--.*-->'              # HTML comments
-    r'|>\s'                     # blockquotes
-    r')'
+    r"^\s*(?:"
+    r"[#]{1,6}\s"  # markdown headings
+    r"|[|]"  # table rows
+    r"|[-*_]{3,}"  # horizontal rules
+    r"|```"  # code fences
+    r"|!\[.*\]\(.*\)"  # images
+    r"|\[.*\]\(.*\)"  # links on their own line
+    r"|<!--.*-->"  # HTML comments
+    r"|>\s"  # blockquotes
+    r")"
 )
 
 
-def _fix_scattered_vietnamese(text: str) -> str:
+def _fix_scattered_vietnamese(text: str, debug: bool = False) -> str:
     """
     Fix per-glyph spacing artefacts in Vietnamese text produced by Docling.
 
@@ -88,50 +89,93 @@ def _fix_scattered_vietnamese(text: str) -> str:
     Only activates when the text looks Vietnamese (contains Vietnamese-specific
     diacritics) to avoid mangling non-Vietnamese content.
     """
+    logger = logging.getLogger(__name__)
+
     # Quick check: does this text contain Vietnamese-specific characters?
     # Covers:  ă â đ ê ô ơ ư  +  all pre-composed Vietnamese in U+1E00–1EFF
     #          + Latin Extended Additional (ò, ã, ũ etc. in U+00C0-024F)
-    _VN_MARKER = re.compile(r'[\u00C0-\u024F\u1E00-\u1EFF]')
+    _VN_MARKER = re.compile(r"[\u00C0-\u024F\u1E00-\u1EFF]")
     if not _VN_MARKER.search(text):
         return text
 
     # NFC normalize — combine decomposed diacritics
     text = unicodedata.normalize("NFC", text)
 
+    # Regex to detect Vietnamese "CÔNG BÁO" headers/footers (Furniture)
+    # Examples: "4 CÔNG BÁO/Số 1133 + 1134/Ngày 22-12-2018", "CÔNG BÁO/Số 1133..."
+    # We handle potential scattered chars too: "C Ô N G  B Á O"
+    _CONG_BAO_FURNITURE_RE = re.compile(
+        r"^\d*\s*(?:C\s*Ô\s*N\s*G\s+B\s*Á\s*O\s*|CÔNG\s+BÁO\s*)[/\\].*?S\s*ố\s*\d+",
+        re.IGNORECASE,
+    )
+
+    # Regex to detect markdown heading prefix: "## " or "### " etc.
+    _HEADING_PREFIX_RE = re.compile(r"^(\s*#{1,6}\s+)")
+
     lines = text.split("\n")
     result: list[str] = []
 
     for line in lines:
-        # Skip structural markdown lines
-        if _STRUCTURE_LINE_RE.match(line):
+        stripped = line.strip()
+        
+        # Skip predictable government furniture (headers/footers)
+        if _CONG_BAO_FURNITURE_RE.match(stripped):
+            if debug:
+                logger.debug(f"[VIETNAMESE_DEBUG] Furniture skipped: {stripped[:50]}...")
+            continue
+
+        # Skip non-heading structural markdown lines (tables, code, images...)
+        # BUT process heading lines — they often contain scattered Vietnamese
+        is_heading = bool(_HEADING_PREFIX_RE.match(line))
+        
+        if _STRUCTURE_LINE_RE.match(line) and not is_heading:
             result.append(line)
             continue
 
         # Skip empty / whitespace-only lines
-        stripped = line.strip()
         if not stripped:
             result.append(line)
             continue
 
+        # For headings: extract the prefix ("## ") and process the rest
+        heading_prefix = ""
+        text_to_fix = stripped
+        if is_heading:
+            m = _HEADING_PREFIX_RE.match(line)
+            heading_prefix = m.group(1)
+            text_to_fix = line[m.end() :]
+
         # Heuristic: does this line look scattered?
         # Count tokens that are single characters.  If >=60% of tokens are
         # single-char, the line is likely affected by per-glyph spacing.
-        tokens = stripped.split()
+        tokens = text_to_fix.split()
         if len(tokens) < 3:
+            if debug:
+                logger.debug(
+                    f"[VIETNAMESE_DEBUG] Line skipped (len < 3): {line[:50]}..."
+                )
             result.append(line)
             continue
 
         single_count = sum(1 for t in tokens if len(t) == 1)
         ratio = single_count / len(tokens)
+        if debug:
+            logger.debug(
+                f"[VIETNAMESE_DEBUG] Line: '{text_to_fix[:50]}...' tokens={len(tokens)} single={single_count} ratio={ratio:.2f}"
+            )
         if ratio < 0.5:
             # Not scattered — leave as-is
+            if debug:
+                logger.debug(
+                    f"[VIETNAMESE_DEBUG] Line skipped (ratio {ratio:.2f} < 0.5): {text_to_fix[:50]}..."
+                )
             result.append(line)
             continue
 
         # Core fix: rejoin scattered single characters.
         # Split on TWO-or-more consecutive spaces (real word/segment boundaries),
         # then within each segment rejoin consecutive single-char tokens.
-        segments = re.split(r'  +', stripped)
+        segments = re.split(r"  +", text_to_fix.strip())
         fixed_segments: list[str] = []
 
         for seg in segments:
@@ -159,12 +203,17 @@ def _fix_scattered_vietnamese(text: str) -> str:
 
             fixed_segments.append(" ".join(merged))
 
-        # Preserve leading whitespace (indentation)
-        leading = len(line) - len(line.lstrip())
-        fixed_line = line[:leading] + " ".join(fixed_segments)
-        result.append(fixed_line)
+        fixed_body = " ".join(fixed_segments)
+
+        if is_heading:
+            result.append(heading_prefix + fixed_body)
+        else:
+            # Preserve leading whitespace (indentation)
+            leading = len(line) - len(line.lstrip())
+            result.append(line[:leading] + fixed_body)
 
     return "\n".join(result)
+
 
 # File extensions handled by Docling vs legacy
 _DOCLING_EXTENSIONS = {".pdf", ".docx", ".pptx", ".html"}
@@ -189,12 +238,20 @@ def _get_global_converter():
         return _DOCLING_CONVERTER
 
     from docling.document_converter import DocumentConverter, PdfFormatOption
-    from docling.datamodel.pipeline_options import PdfPipelineOptions, OcrAutoOptions
-    from docling.datamodel.accelerator_options import AcceleratorOptions, AcceleratorDevice
+    from docling.datamodel.pipeline_options import (
+        PdfPipelineOptions,
+        OcrAutoOptions,
+    )
+    from docling.datamodel.accelerator_options import (
+        AcceleratorOptions,
+        AcceleratorDevice,
+    )
+    from docling.datamodel.base_models import InputFormat
+    from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
 
     device = settings.HRAG_DOCLING_DEVICE  # "auto" | "cpu" | "cuda"
 
-    pipeline_options = PdfPipelineOptions()
+    pipeline_options = PdfPipelineOptions(do_ocr=settings.HRAG_ENABLE_OCR)
     pipeline_options.generate_picture_images = settings.HRAG_ENABLE_IMAGE_EXTRACTION
     pipeline_options.images_scale = settings.HRAG_DOCLING_IMAGES_SCALE
     pipeline_options.do_formula_enrichment = settings.HRAG_ENABLE_FORMULA_ENRICHMENT
@@ -204,7 +261,10 @@ def _get_global_converter():
     logger.info(f"[Docling] Initializing DocumentConverter (device={device})")
     _DOCLING_CONVERTER = DocumentConverter(
         format_options={
-            "pdf": PdfFormatOption(pipeline_options=pipeline_options),
+            InputFormat.PDF: PdfFormatOption(
+                pipeline_options=pipeline_options,
+                backend=PyPdfiumDocumentBackend,
+            ),
         }
     )
     logger.info("[Docling] DocumentConverter ready (singleton)")
@@ -263,7 +323,9 @@ class DeepDocumentParser:
                 and settings.HRAG_ENABLE_OCR
                 and self._is_scanned(path)
             ):
-                result = await self._parse_with_ocr(path, document_id, original_filename)
+                result = await self._parse_with_ocr(
+                    path, document_id, original_filename
+                )
             else:
                 result = self._parse_with_docling(path, document_id, original_filename)
         elif suffix in _LEGACY_EXTENSIONS:
@@ -290,6 +352,7 @@ class DeepDocumentParser:
     def _is_scanned(file_path: Path) -> bool:
         """Delegate scanned-PDF detection to HunyuanOCRService."""
         from app.services.ocr_service import get_ocr_service
+
         return get_ocr_service().is_scanned_pdf(file_path)
 
     async def _parse_with_ocr(
@@ -391,7 +454,9 @@ class DeepDocumentParser:
 
         # Chunk with HybridChunker — images/tables passed for page-ref tracking
         # but enriched_text will NOT include captions yet (images have caption="")
-        chunks = self._chunk_document(doc, document_id, original_filename, images, tables)
+        chunks = self._chunk_document(
+            doc, document_id, original_filename, images, tables
+        )
 
         tables_count = len(tables)
 
@@ -509,9 +574,7 @@ class DeepDocumentParser:
                             f"[Image on page {img.page_no}]: {img.caption}"
                         )
                 if desc_parts:
-                    enriched_text = (
-                        chunk_text + "\n\n" + "\n".join(desc_parts)
-                    )
+                    enriched_text = chunk_text + "\n\n" + "\n".join(desc_parts)
 
             # ── Table-aware enrichment ────────────────────────────────
             chunk_table_refs: list[str] = []
@@ -533,19 +596,21 @@ class DeepDocumentParser:
                 if tbl_parts:
                     enriched_text = enriched_text + "\n\n" + "\n".join(tbl_parts)
 
-            chunks.append(EnrichedChunk(
-                content=enriched_text,
-                chunk_index=i,
-                source_file=original_filename,
-                document_id=document_id,
-                page_no=page_no,
-                heading_path=heading_path,
-                image_refs=chunk_image_refs,
-                table_refs=chunk_table_refs,
-                has_table=has_table,
-                has_code=has_code,
-                contextualized=contextualized,
-            ))
+            chunks.append(
+                EnrichedChunk(
+                    content=enriched_text,
+                    chunk_index=i,
+                    source_file=original_filename,
+                    document_id=document_id,
+                    page_no=page_no,
+                    heading_path=heading_path,
+                    image_refs=chunk_image_refs,
+                    table_refs=chunk_table_refs,
+                    has_table=has_table,
+                    has_code=has_code,
+                    contextualized=contextualized,
+                )
+            )
 
         if images:
             assigned_count = len(assigned_images)
@@ -637,24 +702,32 @@ class DeepDocumentParser:
                 # Get caption
                 caption = ""
                 if hasattr(pic, "caption_text"):
-                    caption = pic.caption_text(doc) if callable(pic.caption_text) else str(pic.caption_text or "")
+                    caption = (
+                        pic.caption_text(doc)
+                        if callable(pic.caption_text)
+                        else str(pic.caption_text or "")
+                    )
                 elif hasattr(pic, "text"):
                     caption = str(pic.text or "")
 
-                images.append(ExtractedImage(
-                    image_id=image_id,
-                    document_id=document_id,
-                    page_no=page_no,
-                    file_path=str(image_path),
-                    caption=caption,
-                    width=width,
-                    height=height,
-                ))
+                images.append(
+                    ExtractedImage(
+                        image_id=image_id,
+                        document_id=document_id,
+                        page_no=page_no,
+                        file_path=str(image_path),
+                        caption=caption,
+                        width=width,
+                        height=height,
+                    )
+                )
                 pic_to_image_idx.append(len(images) - 1)
                 picture_count += 1
 
             except Exception as e:
-                logger.warning(f"Failed to extract image from document {document_id}: {e}")
+                logger.warning(
+                    f"Failed to extract image from document {document_id}: {e}"
+                )
                 pic_to_image_idx.append(-1)
                 continue
 
@@ -712,7 +785,7 @@ class DeepDocumentParser:
             except StopIteration:
                 return ""
 
-        result = re.sub(r'<!--\s*image\s*-->', replacer, markdown)
+        result = re.sub(r"<!--\s*image\s*-->", replacer, markdown)
         logger.info(f"Injected {injected}/{placeholder_count} image references")
         return result
 
@@ -753,14 +826,16 @@ class DeepDocumentParser:
                 num_rows = getattr(table.data, "num_rows", 0) or 0
                 num_cols = getattr(table.data, "num_cols", 0) or 0
 
-            tables.append(ExtractedTable(
-                table_id=table_id,
-                document_id=document_id,
-                page_no=page_no,
-                content_markdown=content_md,
-                num_rows=num_rows,
-                num_cols=num_cols,
-            ))
+            tables.append(
+                ExtractedTable(
+                    table_id=table_id,
+                    document_id=document_id,
+                    page_no=page_no,
+                    content_markdown=content_md,
+                    num_rows=num_rows,
+                    num_cols=num_cols,
+                )
+            )
 
         logger.info(f"Extracted {len(tables)} tables from document {document_id}")
         return tables
@@ -794,7 +869,10 @@ class DeepDocumentParser:
                 table_md = tbl.content_markdown
                 # Truncate large tables
                 if len(table_md) > settings.HRAG_MAX_TABLE_MARKDOWN_CHARS:
-                    table_md = table_md[:settings.HRAG_MAX_TABLE_MARKDOWN_CHARS] + "\n... (truncated)"
+                    table_md = (
+                        table_md[: settings.HRAG_MAX_TABLE_MARKDOWN_CHARS]
+                        + "\n... (truncated)"
+                    )
 
                 message = LLMMessage(
                     role="user",
@@ -808,9 +886,7 @@ class DeepDocumentParser:
                 logger.debug(f"Failed to caption table {tbl.table_id}: {e}")
 
     @staticmethod
-    def _inject_table_captions(
-        markdown: str, tables: list[ExtractedTable]
-    ) -> str:
+    def _inject_table_captions(markdown: str, tables: list[ExtractedTable]) -> str:
         """Inject table captions as blockquotes after matching table blocks in markdown."""
         if not tables:
             return markdown
@@ -854,7 +930,7 @@ class DeepDocumentParser:
                     result_lines.append(lines[i])
 
                 # Try to match this table block to a captioned table
-                block_lines = lines[table_block_start:i + 1]
+                block_lines = lines[table_block_start : i + 1]
                 for bl in block_lines:
                     bl_stripped = bl.strip()
                     if bl_stripped.startswith("|") and "---" not in bl_stripped:
@@ -885,7 +961,9 @@ class DeepDocumentParser:
 
         provider = get_llm_provider()
         if not provider.supports_vision():
-            logger.warning("LLM provider does not support vision — skipping image captioning")
+            logger.warning(
+                "LLM provider does not support vision — skipping image captioning"
+            )
             return
 
         _CAPTION_PROMPT = (

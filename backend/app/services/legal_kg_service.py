@@ -149,12 +149,12 @@ def normalize_org_name(name: str) -> str:
 def normalize_entity_id(name: str, entity_type: str) -> str:
     """
     Return canonical entity_id for MERGE key:
-    - Organization, Document, Article → normalize_org_name (case-folded canonical)
+    - Organization, Document, Article, Location → normalize_org_name (case-folded canonical)
     - Person → unchanged (Person uses composite key for disambiguation)
     - Task → whitespace-normalized only
     """
     name = " ".join(name.strip().split())  # strip + collapse spaces
-    if entity_type in ("Organization", "Document", "Article"):
+    if entity_type in ("Organization", "Document", "Article", "Location"):
         return normalize_org_name(name)
     return name
 
@@ -164,14 +164,37 @@ def normalize_entity_id(name: str, entity_type: str) -> str:
 # ---------------------------------------------------------------------------
 
 # Patterns for Vietnamese legal document structure boundaries
+# Matches "Điều 1. ..." with optional markdown heading prefix "## "
 _DIEU_PATTERN = re.compile(
-    r"^(Điều\s+\d+[a-zA-Z]?\.?\s*.{0,120})",
+    r"^(?:#{1,6}\s+)?(Điều\s+\d+[a-zA-Z]?\.?\s*.{0,120})",
+    re.MULTILINE | re.IGNORECASE,
+)
+# Docling broken-spacing format: "Đ i ề u 1", "## Đ i ề u 7"
+_DIEU_BROKEN_PATTERN = re.compile(
+    r"^(?:#{1,4}\s*)?Đ\s*i\s*ề\s*u\s+\d+",
     re.MULTILINE | re.IGNORECASE,
 )
 _SECTION_HEADERS = re.compile(
     r"^(CHƯƠNG\s+\w+[^\n]*|MỤC\s+\d+[^\n]*|PHẦN\s+\w+[^\n]*)",
     re.MULTILINE | re.IGNORECASE,
 )
+
+
+def _normalize_broken_dieu(text: str) -> str:
+    """
+    Fix Docling's broken spacing where 'Điều' becomes 'Đ i ề u'.
+    
+    Transforms:
+      '## Đ i ề u 7. Ph ạ m vi ...'  →  '## Điều 7. Ph ạ m vi ...'
+    
+    This ensures the standard regex can match article boundaries.
+    """
+    # Fix "Đ i ề u" → "Điều" (with optional markdown heading prefix)
+    return re.sub(
+        r'((?:^|\n)(?:#{1,4}\s*)?)Đ\s*i\s*ề\s*u(\s+\d+)',
+        r'\1Điều\2',
+        text,
+    )
 
 
 def split_articles(markdown: str) -> list[dict]:
@@ -185,6 +208,17 @@ def split_articles(markdown: str) -> list[dict]:
         "index": 5              # article number for reference
       }
     """
+    # Pre-process: apply Vietnamese scattered-char fix from the parser
+    # This handles Docling's per-glyph spacing issues in both headings and body
+    from app.services.deep_document_parser import _fix_scattered_vietnamese
+    markdown = _fix_scattered_vietnamese(markdown)
+
+    # Pre-process: fix broken spacing "Đ i ề u" → "Điều"
+    has_broken = bool(_DIEU_BROKEN_PATTERN.search(markdown))
+    if has_broken:
+        markdown = _normalize_broken_dieu(markdown)
+        logger.info("split_articles: fixed broken 'Đ i ề u' spacing from Docling")
+
     # Find all Điều boundaries
     matches = list(_DIEU_PATTERN.finditer(markdown))
     if not matches:
@@ -465,24 +499,52 @@ class LegalKGService:
             await self._upsert_node(session, doc_name, "Document", doc_meta.get("so_hieu", ""), document_id)
             
             # --- Store Root Context (Location & Org Hierarchy) ---
+            loc_name = ""
             if loc:
                 loc_name = loc if "tỉnh" in loc.lower() or "thành phố" in loc.lower() else f"Tỉnh {loc}"
                 await self._upsert_node(session, loc_name, "Location", "", document_id)
-                await self._upsert_relation(session, doc_name, "BAN_HANH_TAI", loc_name, "Phạm vi địa lý", document_id)
+                await self._upsert_relation(
+                    session, doc_name, "BAN_HANH_TAI", loc_name, "Phạm vi địa lý", document_id,
+                    source_type="Document", target_type="Location",
+                )
                 
             if parent_org and issue_org:
                 combined_issue_org = f"{issue_org} {parent_org}"
                 await self._upsert_node(session, combined_issue_org, "Organization", "", document_id)
                 await self._upsert_node(session, parent_org, "Organization", "", document_id)
                 
-                await self._upsert_relation(session, doc_name, "BAN_HANH_BOI", combined_issue_org, "", document_id)
-                await self._upsert_relation(session, combined_issue_org, "TRUC_THUOC", parent_org, "", document_id)
+                await self._upsert_relation(
+                    session, doc_name, "BAN_HANH_BOI", combined_issue_org, "", document_id,
+                    source_type="Document", target_type="Organization",
+                )
+                await self._upsert_relation(
+                    session, combined_issue_org, "TRUC_THUOC", parent_org, "", document_id,
+                    source_type="Organization", target_type="Organization",
+                )
                 
                 if loc_name:
-                    await self._upsert_relation(session, parent_org, "THUOC_TINH", loc_name, "", document_id)
+                    await self._upsert_relation(
+                        session, parent_org, "THUOC_TINH", loc_name, "", document_id,
+                        source_type="Organization", target_type="Location",
+                    )
             elif issue_org:
                 await self._upsert_node(session, issue_org, "Organization", "", document_id)
-                await self._upsert_relation(session, doc_name, "BAN_HANH_BOI", issue_org, "", document_id)
+                await self._upsert_relation(
+                    session, doc_name, "BAN_HANH_BOI", issue_org, "", document_id,
+                    source_type="Document", target_type="Organization",
+                )
+            elif parent_org:
+                # Only parent org, no issuing org (e.g., Quốc Hội)
+                await self._upsert_node(session, parent_org, "Organization", "", document_id)
+                await self._upsert_relation(
+                    session, doc_name, "BAN_HANH_BOI", parent_org, "", document_id,
+                    source_type="Document", target_type="Organization",
+                )
+                if loc_name:
+                    await self._upsert_relation(
+                        session, parent_org, "THUOC_TINH", loc_name, "", document_id,
+                        source_type="Organization", target_type="Location",
+                    )
 
 
             # Store CAN_CU relations from preamble
@@ -490,7 +552,8 @@ class LegalKGService:
                 await self._upsert_node(session, ref_doc, "Document", ref_doc, document_id)
                 await self._upsert_relation(
                     session, doc_name, "CAN_CU", ref_doc,
-                    f"Căn cứ pháp lý: {ref_doc}", document_id
+                    f"Căn cứ pháp lý: {ref_doc}", document_id,
+                    source_type="Document", target_type="Document",
                 )
 
             # Store article extraction results
@@ -641,15 +704,20 @@ class LegalKGService:
         document_id: Optional[int] = None,
         article_ref: str = "",
         extra_props: Optional[dict] = None,
+        source_type: str = "Organization",
+        target_type: str = "Organization",
     ) -> None:
         if not source or not target or not relation_type:
             return
         label = self._label
+        # Normalize source/target to canonical form so MATCH finds _upsert_node's MERGE keys
+        source_canonical = normalize_entity_id(source, source_type)
+        target_canonical = normalize_entity_id(target, target_type)
         # Build extra properties SET clause
         extra_props = extra_props or {}
         prop_sets = []
         params: dict[str, Any] = {
-            "src": source, "tgt": target,
+            "src": source_canonical, "tgt": target_canonical,
             "desc": description, "doc_id": document_id, "art_ref": article_ref,
         }
         for k, v in extra_props.items():
@@ -707,7 +775,8 @@ class LegalKGService:
             if etype == "Article":
                 await self._upsert_relation(
                     session, canonical, "PART_OF", doc_name,
-                    "Thuộc văn bản", document_id
+                    "Thuộc văn bản", document_id,
+                    source_type="Article", target_type="Document",
                 )
 
         for rel in data.get("relations", []):
@@ -753,7 +822,8 @@ class LegalKGService:
 
             await self._upsert_relation(
                 session, source_canonical, relation_type, target_canonical,
-                desc, doc_id, art_ref, flat_props
+                desc, doc_id, art_ref, flat_props,
+                source_type=src_type, target_type=tgt_type,
             )
 
     # ------------------------------------------------------------------
