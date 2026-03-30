@@ -23,7 +23,7 @@ Nhiệm vụ của bạn là trích xuất các thực thể (entities) và mố
 ## Các loại thực thể được phép (entity types):
 - Article: Điều, Khoản, Điểm của văn bản hiện tại. Ví dụ: "Điều 5", "Khoản 2 Điều 3"
 - Document: Văn bản pháp luật được viện dẫn. Ví dụ: "Nghị định 123/2024/NĐ-CP"
-- Organization: Cơ quan, tổ chức. PHẢI viết tên đầy đủ dựa vào thông tin văn bản (document_meta). KHÔNG dùng tên tắt. Ví dụ: "UBND Tỉnh Nghệ An" (không dùng "UBND tỉnh")
+- Organization: Cơ quan, tổ chức cụ thể, không chung chung. PHẢI viết tên đầy đủ dựa vào thông tin văn bản (document_meta). KHÔNG dùng tên tắt. Ví dụ: "UBND Tỉnh Nghệ An" (không dùng "UBND tỉnh"). Các tổ chức chung chung như "Người có trách nhiệm", "Cơ quan có thẩm quyền", "Cơ quan, tổ chức có liên quan" không được coi là thực thể.
 - Person: Cá nhân. PHẢI dùng Composite Key theo quy tắc ưu tiên (xem bên dưới).
 - Task: Nhiệm vụ, công việc cụ thể được giao. Ví dụ: "lập kế hoạch thanh tra hàng năm"
 
@@ -34,6 +34,7 @@ Nhiệm vụ của bạn là trích xuất các thực thể (entities) và mố
 4. "[Họ Tên] (không xác định)" — nếu không có thông tin định danh nào
 
 ## Quy tắc Canonicalization cho Organization:
+- Các entity name được format không có các ký tự đặc biệt như: #, ?, *, ...
 - Luôn dùng tên đầy đủ. Ví dụ: "UBND Tỉnh Nghệ An", không dùng "UBND tỉnh" hay "UBND"
 - Sử dụng document_meta (thông tin văn bản) để suy diễn tên đầy đủ khi văn bản dùng tên tắt
 

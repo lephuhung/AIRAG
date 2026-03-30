@@ -307,13 +307,13 @@ export const EntityList = memo(function EntityList({ projectId, highlightEntitie
 
       {/* Entity rows */}
       <div className="rounded-lg border divide-y max-h-[500px] overflow-y-auto">
-        {filtered.map((entity) => {
+        {filtered.map((entity, i) => {
           const isHighlighted = highlightEntities.some(
             (e) => e.toLowerCase() === entity.name.toLowerCase()
           );
           return (
             <div
-              key={entity.name}
+              key={`${entity.name}-${entity.entity_type}-${i}`}
               className={cn(
                 isHighlighted && "bg-amber-400/10 border-l-2 border-l-amber-400"
               )}

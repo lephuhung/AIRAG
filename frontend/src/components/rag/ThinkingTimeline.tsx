@@ -202,9 +202,9 @@ function StepNode({ step, isLast, isLive }: StepNodeProps) {
         {/* Source badges for sources_found step */}
         {step.sourceBadges && step.sourceBadges.length > 0 && (
           <div className="flex flex-wrap gap-1 mt-1">
-            {step.sourceBadges.map((badge) => (
+            {step.sourceBadges.map((badge, i) => (
               <span
-                key={badge}
+                key={`${badge}-${i}`}
                 className="inline-flex items-center px-1 py-0.5 text-[10px] font-mono font-bold rounded bg-primary/10 text-primary/80"
               >
                 {badge}

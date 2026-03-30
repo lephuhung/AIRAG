@@ -217,7 +217,7 @@ export const AnalyticsDashboard = memo(function AnalyticsDashboard({ projectId, 
             <span className="text-xs font-medium text-muted-foreground">{t("analytics.top_entities")}</span>
             <div className="space-y-1">
               {kg_analytics.top_entities.slice(0, 8).map((entity, i) => (
-                <div key={entity.name} className="flex items-center gap-2">
+                <div key={`${entity.name}-${i}`} className="flex items-center gap-2">
                   <span className="text-[10px] text-muted-foreground/50 w-4 text-right">{i + 1}</span>
                   <span className="text-xs truncate flex-1">{entity.name}</span>
                   <span className="text-[10px] text-muted-foreground capitalize">{entity.entity_type}</span>

@@ -128,7 +128,8 @@ def normalize_org_name(name: str) -> str:
 
     The canonical form is stored as entity_id; original kept as display_name.
     """
-    # Step 1: normalize whitespace
+    # Step 1: remove '#' and normalize whitespace
+    name = name.replace("#", "")
     name = " ".join(name.strip().split())
     if not name:
         return name
@@ -144,6 +145,16 @@ def normalize_org_name(name: str) -> str:
         else:
             result.append(word)
     return " ".join(result)
+
+
+# Pattern for Vietnamese legal document numbers (e.g., 29/2018/QH14, 01/2023/ND-CP)
+_DOC_NUM_PATTERN = re.compile(r"\d+/\d+/[A-Z0-9-]+", re.IGNORECASE)
+
+# Keywords that indicate an entity MUST be a Document type
+_LEGAL_DOC_PREFIXES = re.compile(
+    r"^(Luật|Bộ luật|Nghị định|Thông tư|Quyết định|Chỉ thị|Nghị quyết|Hiến pháp|Pháp lệnh)\b",
+    re.IGNORECASE
+)
 
 
 def normalize_entity_id(name: str, entity_type: str) -> str:
@@ -673,7 +684,8 @@ class LegalKGService:
         # Normalize entity_id to canonical form (deduplication key)
         canonical_id = normalize_entity_id(entity_id, entity_type)
         # Keep original as display_name only on CREATE (human-readable)
-        display_name = entity_id.strip()
+        # Clean noise characters specifically for display consistency
+        display_name = entity_id.replace("#", "").strip()
 
         cypher = f"""
         MERGE (n:`{label}`:`{entity_type}` {{entity_id: $entity_id}})
@@ -753,11 +765,22 @@ class LegalKGService:
 
         for ent in data.get("entities", []):
             raw_name = str(ent.get("name", "")).strip()
+            # Clean common markdown/list prefixes (e.g. "# ", "- ", "* ")
+            raw_name = re.sub(r"^[#\*\- \t]+", "", raw_name).strip()
+            
             etype = str(ent.get("type", "Organization")).strip()
             desc = str(ent.get("description", "")).strip()
 
             if not raw_name:
                 continue
+
+            # Coreference resolution: "Luật này", "Quyết định này" -> Current Document Root Node
+            if raw_name.lower().endswith(" này") or raw_name.lower() == "này":
+                raw_name = doc_name
+                etype = "Document"
+            # Force Document type for document numbers or legal titles
+            elif _DOC_NUM_PATTERN.search(raw_name) or _LEGAL_DOC_PREFIXES.search(raw_name):
+                etype = "Document"
 
             # Normalize Person composite key
             if etype == "Person":
@@ -781,8 +804,13 @@ class LegalKGService:
 
         for rel in data.get("relations", []):
             source_raw = str(rel.get("source", "")).strip()
+            source_raw = re.sub(r"^[#\*\- \t]+", "", source_raw).strip()
+            
             relation_type = str(rel.get("relation", "")).strip().upper()
+            
             target_raw = str(rel.get("target", "")).strip()
+            target_raw = re.sub(r"^[#\*\- \t]+", "", target_raw).strip()
+            
             desc = str(rel.get("description", "")).strip()
             art_ref = rel.get("article_ref", "")
             doc_id = rel.get("document_id", document_id)
@@ -791,15 +819,34 @@ class LegalKGService:
             if not source_raw or not target_raw or not relation_type:
                 continue
 
-            # Resolve canonical IDs — fall back to normalize if not in entity_map
-            src_type = entity_map.get(
-                canonical_lookup.get(source_raw, source_raw),
-                "Document" if source_raw == doc_name else "Organization",
-            )
-            tgt_type = entity_map.get(
-                canonical_lookup.get(target_raw, target_raw),
-                "Person" if person_props else "Organization",
-            )
+            # Coreference resolution for relations: "Luật này" -> Current Document
+            if source_raw.lower().endswith(" này") or source_raw.lower() == "này":
+                source_raw = doc_name
+                src_type = "Document"
+            else:
+                is_legal_doc = (
+                    source_raw == doc_name or 
+                    _DOC_NUM_PATTERN.search(source_raw) or 
+                    _LEGAL_DOC_PREFIXES.search(source_raw)
+                )
+                src_type = entity_map.get(
+                    canonical_lookup.get(source_raw, source_raw),
+                    "Document" if is_legal_doc else "Organization",
+                )
+
+            if target_raw.lower().endswith(" này") or target_raw.lower() == "này":
+                target_raw = doc_name
+                tgt_type = "Document"
+            else:
+                is_legal_doc_target = (
+                    target_raw == doc_name or
+                    _DOC_NUM_PATTERN.search(target_raw) or
+                    _LEGAL_DOC_PREFIXES.search(target_raw)
+                )
+                tgt_type = entity_map.get(
+                    canonical_lookup.get(target_raw, target_raw),
+                    "Document" if is_legal_doc_target else ("Person" if person_props else "Organization"),
+                )
 
             # Normalize Person target composite key if person_props available
             if tgt_type == "Person" and person_props:

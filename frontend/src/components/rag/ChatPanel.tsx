@@ -182,11 +182,11 @@ function CitationLink({
 // ---------------------------------------------------------------------------
 // Memory citation badge — clickable [MEM-N] → Brain icon + text
 // ---------------------------------------------------------------------------
-function MemoryCitation() {
+function MemoryCitation({ index }: { index?: string }) {
   return (
     <span
       className="inline-flex items-center justify-center w-[18px] h-[18px] mx-0.5 text-[11px] font-medium rounded-full bg-amber-400/15 text-amber-600 dark:text-amber-400 align-middle"
-      title="Thông tin cá nhân của bạn"
+      title={index || "Thông tin cá nhân của bạn"}
     >
       🧠
     </span>
@@ -750,6 +750,7 @@ function SourceItem({
   ratings: Record<string, RelevanceRating>;
   onRate: (sourceIndex: string, rating: RelevanceRating) => void;
 }) {
+  const { t } = useTranslation();
   const { activateCitation } = useWorkspaceStore();
   const { data: doc } = useDocument(source.document_id);
   const debugMode = useContext(DebugCtx);
@@ -1443,6 +1444,13 @@ export const ChatPanel = memo(function ChatPanel({
     messageId?: string;
   } | null>(null);
 
+  // Reset session state when switching chats/starting a new chat
+  useEffect(() => {
+    setMessages([]);
+    setInput("");
+    setActiveSources(null);
+  }, [sessionId]);
+
   // Abbreviation modal state
   const [isAbbModalOpen, setIsAbbModalOpen] = useState(false);
   const [selectedAbbShort, setSelectedAbbShort] = useState("");
@@ -1547,8 +1555,8 @@ export const ChatPanel = memo(function ChatPanel({
             ? (m.agent_steps as any[]).map((s, i) => ({
                 id: s.id || `hist-${m.message_id}-${i}`,
                 step: s.step || 'analyzing',
-                status: (m.isStreaming ? s.status : 'completed') || 'completed',
-                detail: s.detail || (STEP_CONFIG[s.step as AgentStepType]?.label || 'Processing'),
+                status: (s.status) || 'completed',
+                detail: s.detail || (STEP_CONFIG[s.step as AgentStepType]?.labelKey ? t(STEP_CONFIG[s.step as AgentStepType].labelKey) : 'Processing'),
                 timestamp: s.timestamp || (m.created_at ? new Date(m.created_at).getTime() : Date.now()),
                 ...s
               })) as AgentStep[] 

@@ -27,6 +27,7 @@ import app.models.invite_token    # noqa: F401
 import app.models.abbreviation    # noqa: F401
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("neo4j.notifications").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Update HRAG prefix in settings if needed (but currently we just use the val)
@@ -238,25 +239,13 @@ async def lifespan(app: FastAPI):
         except Exception as _minio_err:
             logger.warning(f"MinIO bucket setup failed (non-fatal): {_minio_err}")
 
-        # Seed document types from classifier (idempotent — only inserts missing)
+        # Seed document types from classifier defaults (idempotent — only inserts missing)
         try:
             from app.core.database import async_session_maker
-            from app.models.document_type import DocumentType
-            from app.services.document_type_classifier import get_all_document_types
-            from sqlalchemy import select as _select
+            from app.services.document_type_classifier import seed_document_types
 
             async with async_session_maker() as _seed_db:
-                for dt in get_all_document_types():
-                    exists = await _seed_db.execute(
-                        _select(DocumentType).where(DocumentType.slug == dt["slug"])
-                    )
-                    if exists.scalar_one_or_none() is None:
-                        _seed_db.add(DocumentType(
-                            slug=dt["slug"],
-                            name=dt["name"],
-                            description=dt["description"],
-                        ))
-                await _seed_db.commit()
+                await seed_document_types(_seed_db)
             logger.info("Document types seeded/verified")
         except Exception as _seed_err:
             logger.warning(f"Document type seed failed (non-fatal): {_seed_err}")

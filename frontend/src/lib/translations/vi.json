@@ -107,6 +107,26 @@
     "processed": "Đã xử lý",
     "milliseconds": "mili giây"
   },
+  "entities": {
+    "title": "Thực thể",
+    "search_placeholder": "Tìm kiếm thực thể...",
+    "all_types": "Tất cả các loại",
+    "count": "Tổng cộng {{count}} thực thể",
+    "ies": "",
+    "y": "",
+    "no_entities": "Chưa có thực thể nào được trích xuất",
+    "no_matches": "Không tìm thấy thực thể nào phù hợp",
+    "sort": {
+      "most_connected": "Kết nối nhiều nhất",
+      "name_az": "Tên A-Z",
+      "by_type": "Theo loại"
+    },
+    "headers": {
+      "entity": "Thực thể",
+      "type": "Loại",
+      "links": "Liên kết"
+    }
+  },
   "auth": {
     "login": "Đăng nhập",
     "register": "Đăng ký",

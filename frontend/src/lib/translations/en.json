@@ -102,6 +102,26 @@
     "processed": "Processed",
     "milliseconds": "ms"
   },
+  "entities": {
+    "title": "Entities",
+    "search_placeholder": "Search entities...",
+    "all_types": "All types",
+    "count": "Total {{count}} entit",
+    "ies": "ies",
+    "y": "y",
+    "no_entities": "No entities extracted yet",
+    "no_matches": "No entities match your search",
+    "sort": {
+      "most_connected": "Most connected",
+      "name_az": "Name A-Z",
+      "by_type": "By type"
+    },
+    "headers": {
+      "entity": "Entity",
+      "type": "Type",
+      "links": "Links"
+    }
+  },
   "auth": {
     "login": "Login",
     "register": "Register",
