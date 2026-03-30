@@ -57,11 +57,19 @@ Nhiệm vụ của bạn là trích xuất các thực thể (entities) và mố
 5. Nếu không trích xuất được gì, trả về: {"entities": [], "relations": []}
 """
 
-LEGAL_KG_USER_PROMPT = """Thông tin văn bản (document_meta):
-{document_meta}
+LEGAL_KG_USER_PROMPT = """## Thông tin văn bản (document_meta)
+Tiêu đề văn bản: "{document_title}"
+Số hiệu: {document_number}
+Cơ quan ban hành: {issuing_agency}
+Ngày ban hành: {published_date}
 
 Nội dung cần phân tích:
 {article_text}
+
+## Lưu ý quan trọng khi trích xuất:
+- **Phân biệt Document vs Organization**: Tiêu đề văn bản (document_title) thường là TÊN ĐẦY ĐỦ của văn bản pháp luật (VD: "Luật Bảo vệ Bí mật nhà nước", "Kế hoạch triển khai"). Nếu entity trùng hoặc gần trùng với tiêu đề → đây là Document (văn bản), KHÔNG phải Organization.
+- **Số hiệu**: Nếu entity chứa số hiệu văn bản (VD: "13/2024/QH15") → đây là Document.
+- **Organization**: Là cơ quan/tổ chức CỤ THỂ được nhắc đến trong điều khoản, không phải tên văn bản.
 
 Hãy trích xuất entities và relations theo đúng schema đã quy định.
 Trả về JSON có dạng:
@@ -112,8 +120,11 @@ hinh_thuc, ly_do, ngay_hieu_luc (DD/MM/YYYY), description, document_id, article_
 5. Nếu không trích xuất được gì, trả về: {"entities": [], "relations": []}
 """
 
-PERSON_EXTRACT_USER_PROMPT = """Thông tin văn bản (document_meta):
-{document_meta}
+PERSON_EXTRACT_USER_PROMPT = """## Thông tin văn bản (document_meta)
+Tiêu đề văn bản: "{document_title}"
+Số hiệu: {document_number}
+Cơ quan ban hành: {issuing_agency}
+Ngày ban hành: {published_date}
 
 Nội dung cần phân tích:
 {article_text}
@@ -166,3 +177,133 @@ PERSON_DOCUMENT_TRIGGERS = [
     "nghỉ hưu", "khen thưởng", "kỷ luật", "kỉ luật", "phê duyệt danh sách",
     "tiếp nhận và bổ nhiệm", "hưu trí", "thôi việc",
 ]
+
+# ---------------------------------------------------------------------------
+# Entity Resolution (Post-Extraction Deduplication)
+# ---------------------------------------------------------------------------
+
+ENTITY_RESOLVE_SYSTEM_PROMPT = """Bạn là chuyên gia phân tích đồng thuật thực thể (Entity Consensus) trong văn bản pháp luật Việt Nam.
+Nhiệm vụ: Với danh sách các thực thể đã được trích xuất từ nhiều điều khoản khác nhau của cùng một văn bản, hãy phân tích và gộp các thực thể trùng lặp.
+
+## Đầu vào:
+Một danh sách các thực thể, mỗi thực thể có:
+- name: tên thực thể (sau khi đã normalize)
+- type: loại thực thể (Organization, Person, Document, Article, Location, Task)
+- article_ref: điều khoản nguồn
+
+## Lưu ý quan trọng: Ưu tiên Node Cha (Document Root)
+
+Trong quá trình extract, các điều khoản thường viện dẫn trực tiếp tên văn bản hiện tại:
+- "theo Nghị định này"
+- "quy định tại Điều 5 Nghị định 13/2024/NĐ-CP"
+- "Căn cứ Nghị định 13/2024/NĐ-CP"
+
+Khi gặp các trường hợp này:
+1. **Ưu tiên Node Cha** — nếu entity trùng tên, số hiệu hoặc gần trùng với Document Root đã được tạo ở bước trước,
+   KHÔNG tạo node mới. Đánh dấu entity đó là tham chiếu tới Document Root.
+   ví dụ: Luật Bảo Vệ Bí Mật Nhà Nước Số 29/2018/qh14" trùng "29/2018/qh14" và trùng "Luật Bảo Vệ Bí Mật Nhà Nước 2018"
+   
+2. **Chỉ tạo node mới** khi entity thực sự là một văn bản PHÂN BIỆT (khác số hiệu, khác ngày ban hành)
+3. **Sai type**: nếu trích xuất "Nghị Định 13/2024" làm Document nhưng trùng node cha →
+   BỎ entity này (đã có node Document cha rồi), KHÔNG tạo duplicate
+
+## Các loại xung đột cần xử lý:
+
+### 1. Trùng tên, khác type:
+Ví dụ:
+- "Bộ Tài Chính" (Organization) ở Điều 3
+- "Bộ Tài Chính" (Document) ở Điều 7
+→ PHẢI giữ loại đúng theo ngữ cảnh văn bản. Thường "Bộ Tài Chính" là Organization (cơ quan), không phải Document (văn bản).
+
+### 2. Cùng type, khác tên gần giống (alias):
+Ví dụ:
+- "Hai node Document gần giống nhau: Luật Bảo Vệ Bí Mật Nhà Nước Số 29/2018/qh14" trùng "29/2018/qh14" (do trùng số hiệu văn bản) và trùng "Luật Bảo Vệ Bí Mật Nhà Nước 2018" (do trùng tên)
+- "Sở Thông Tin Và Truyền Thông" (Organization)
+- "Sở Thông tin và Truyền thông" (Organization)
+→ Cùng một cơ quan, giữ tên đầy đủ nhất, bỏ phần duplicates.
+
+### 3. Cùng tên, cùng type:
+Giữ một bản duy nhất và luôn ưu tiên Document Root, gộp descriptions.
+
+## Ví dụ thực tế:
+
+**Input:**
+- Document Root: "Nghị Định 13/2024/NĐ-CP (UBND Tỉnh Hà Tĩnh, 2024)"
+- Entity from Điều 3: "Nghị Định 13/2024/NĐ-CP" (type=Document)
+- Entity from Điều 5: "Nghị định này" (type=Document)
+
+**Expected Output:**
+- "Nghị Định 13/2024/NĐ-CP" → MERGE vào Document Root (cùng một văn bản)
+- "Nghị định này" → BỎ, đã có Document Root
+
+**Input:**
+- Document Root: "Nghị Định 13/2024/NĐ-CP (UBND Tỉnh Hà Tĩnh, 2024)"
+- Entity from preamble: "Nghị Định 100/2019/NĐ-CP" (type=Document)
+
+**Expected Output:**
+- "Nghị Định 100/2019/NĐ-CP" → TẠO NODE MỚI (văn bản khác, có số hiệu riêng)
+
+## Quy tắc nghiêm ngặt:
+1. Mỗi thực thể thực sự chỉ tạo MỘT node trong graph
+2. Nếu cùng một tên nhưng type khác nhau → CHỌN MỘT type đúng, bỏ cái còn lại
+3. Organization: Kiểm tra xem có phải là tên viết tắt của Organization khác không
+4. Document: Chỉ giữ type=Document nếu entity_name chứa số hiệu văn bản (VD: "Nghị định 123/2024")
+5. Trả về JSON hợp lệ, không markdown, không giải thích
+
+## Output format:
+{{
+  "resolved_entities": [
+    {{
+      "canonical_name": "Tên chuẩn hóa cuối cùng",
+      "type": "Organization|Person|Document|Article|Location|Task",
+      "representative_description": "Mô tả tổng hợp từ tất cả bản",
+      "source_articles": ["Điều 3", "Điều 7"],
+      "merged_from": ["Tên gốc 1 (từ Điều 3)", "Tên gốc 2 (từ Điều 7)"]
+    }}
+  ],
+  "dropped_entities": [
+    {{
+      "name": "Tên entity bị loại hoàn toàn",
+      "reason": "Lý do loại bỏ: trùng Document Root, sai type, không phải thực thể hợp lệ..."
+    }}
+  ],
+  "type_conflicts": [
+    {{
+      "name": "Tên entity",
+      "types": ["Organization", "Document"],
+      "resolved_type": "Organization",
+      "reason": "Giải thích tại sao chọn type này"
+    }}
+  ]
+}}
+
+Lưu ý:
+- resolved_entities: những entity được GIỮ LẠI và tạo node trong graph
+- merged_from: danh sách TẤT CẢ các tên gốc đã được gộp vào canonical này (bao gồm cả canonical gốc)
+- dropped_entities: những entity bị LOẠI BỎ hoàn toàn, KHÔNG tạo node, KHÔNG tạo relation
+- Nếu một entity được gộp (merged), nó phải xuất hiện trong merged_from của entity canonical, KHÔNG nằm trong dropped_entities"""
+
+ENTITY_RESOLVE_USER_PROMPT = """## Document Root (Node Cha)
+
+Tên đầy đủ của Document Root trong graph: "{doc_name}"
+
+Các entity SAU ĐÂY đã được tự động phát hiện là tham chiếu tới Document Root (đã xử lý bằng code):
+- Entity chứa cùng số hiệu văn bản (VD: "Nghị Định 13/2024/NĐ-CP" → Document Root)
+- Entity là self-reference rõ ràng ("văn bản này", "quyết định này", "Nghị định này")
+- Entity trùng hoặc gần trùng với tiêu đề văn bản
+
+## Nhiệm vụ
+
+Với danh sách các entity CÒN LẠI bên dưới (không phải Document Root), hãy:
+1. Gộp các entity trùng lặp (cùng tên, cùng type)
+2. Resolve type conflicts (cùng tên, khác type) — **ưu tiên Organization cho các cơ quan nhà nước thông thường**
+3. Đánh dấu entity nào bị DROP (sai type, không hợp lệ, trùng Document Root)
+
+## Metadata văn bản
+Tiêu đề: {document_title}
+{doc_meta}
+
+## Danh sách entity cần phân tích
+{entity_list}
+
+Trả về JSON theo format đã quy định."""

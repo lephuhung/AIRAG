@@ -77,6 +77,47 @@ def get_memory_agent() -> LLMProvider:
     )
 
 
+@lru_cache
+def get_kg_llm_provider() -> LLMProvider:
+    """
+    Create (and cache) a dedicated LLM provider for LegalKG extraction tasks.
+    Uses LEGAL_KG_LLM_PROVIDER + LEGAL_KG_LLM_BASE_URL + LEGAL_KG_LLM_MODEL + LEGAL_KG_LLM_API_KEY.
+    """
+    from app.core.config import settings
+
+    provider = settings.LEGAL_KG_LLM_PROVIDER.lower()
+
+    if provider == "gemini":
+        from app.services.llm.gemini import GeminiLLMProvider
+
+        if not settings.GOOGLE_AI_API_KEY:
+            raise ValueError("GOOGLE_AI_API_KEY is required when LEGAL_KG_LLM_PROVIDER=gemini")
+        return GeminiLLMProvider(
+            api_key=settings.GOOGLE_AI_API_KEY,
+            model=settings.LEGAL_KG_LLM_MODEL,
+            thinking_level=settings.LLM_THINKING_LEVEL,
+        )
+
+    if provider == "ollama":
+        from app.services.llm.ollama import OllamaLLMProvider
+
+        return OllamaLLMProvider(
+            host=settings.LEGAL_KG_LLM_BASE_URL,
+            model=settings.LEGAL_KG_LLM_MODEL,
+        )
+
+    if provider == "openai_compatible":
+        from app.services.llm.openai_compatible import OpenAICompatibleLLMProvider
+
+        return OpenAICompatibleLLMProvider(
+            base_url=settings.LEGAL_KG_LLM_BASE_URL,
+            model=settings.LEGAL_KG_LLM_MODEL,
+            api_key=settings.LEGAL_KG_LLM_API_KEY,
+        )
+
+    raise ValueError(f"Unknown LEGAL_KG_LLM_PROVIDER: {provider!r}. Supported: gemini, ollama, openai_compatible")
+
+
 def get_embedding_provider() -> EmbeddingProvider:
     """Create (and cache) the embedding provider for KG (LightRAG)."""
     from app.core.config import settings
@@ -113,6 +154,7 @@ def get_embedding_provider() -> EmbeddingProvider:
 
 __all__ = [
     "get_llm_provider",
+    "get_kg_llm_provider",
     "get_embedding_provider",
     "LLMProvider",
     "EmbeddingProvider",

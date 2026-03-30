@@ -61,6 +61,13 @@ class Settings(BaseSettings):
     KG_EMBEDDING_MODEL: str = Field(default="BAAI/bge-m3")
     KG_EMBEDDING_DIMENSION: int = Field(default=1024)
 
+    # LegalKG Extraction LLM — model for KG entity/relation extraction
+    # Can use same provider as LLM_PROVIDER but specify different URL + model
+    LEGAL_KG_LLM_PROVIDER: str = Field(default="openai_compatible")  # gemini | ollama | openai_compatible
+    LEGAL_KG_LLM_BASE_URL: str = Field(default="http://127.0.0.1:8000/v1")
+    LEGAL_KG_LLM_MODEL: str = Field(default="Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8")
+    LEGAL_KG_LLM_API_KEY: str = Field(default="sk-nexusrag")
+
     # Pipeline features
     HRAG_ENABLED: bool = Field(default=True)
     HRAG_ENABLE_KG: bool = Field(default=True)

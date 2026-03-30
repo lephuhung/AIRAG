@@ -31,9 +31,11 @@ from datetime import datetime
 from typing import Any, Optional
 
 from app.core.config import settings
-from app.services.llm import get_llm_provider
+from app.services.llm import get_kg_llm_provider
 from app.services.llm.types import LLMMessage
 from app.services.legal_kg_prompts import (
+    ENTITY_RESOLVE_SYSTEM_PROMPT,
+    ENTITY_RESOLVE_USER_PROMPT,
     LEGAL_KG_SYSTEM_PROMPT,
     LEGAL_KG_USER_PROMPT,
     PERSON_EXTRACT_SYSTEM_PROMPT,
@@ -337,8 +339,8 @@ async def _call_llm(
     user_prompt: str,
     max_tokens: int = 4096,
 ) -> str:
-    """Call LLM with exponential-backoff retry for rate limits."""
-    provider = get_llm_provider()
+    """Call LegalKG LLM with exponential-backoff retry for rate limits."""
+    provider = get_kg_llm_provider()
     messages = [
         LLMMessage(role="system", content=system_prompt),
         LLMMessage(role="user", content=user_prompt),
@@ -477,41 +479,43 @@ class LegalKGService:
         # --- Fetch Rich Header Metadata from Database ---
         doc_type = ""
         doc_num = ""
+        doc_title = ""
         loc = ""
         issue_org = ""
         parent_org = ""
         year = "Không rõ năm"
-        
+
         if document_id:
             try:
                 from app.core.database import async_session_maker
                 from app.models.document import Document
                 from sqlalchemy import select
                 from sqlalchemy.orm import selectinload
-                
+
                 async with async_session_maker() as _db:
                     stmt = select(Document).options(selectinload(Document.document_type)).where(Document.id == document_id)
                     db_doc = await _db.scalar(stmt)
                     if db_doc:
                         # Extract what we injected in parse_worker
                         doc_num = db_doc.document_number or ""
+                        doc_title = db_doc.document_title or ""
                         doc_type = db_doc.document_type.name if db_doc.document_type else ""
                         loc = db_doc.location or ""
                         issue_org = db_doc.issuing_agency or ""
                         parent_org = db_doc.parent_agency or ""
-                        
+
                         # Fallback for published year
                         pd = db_doc.published_date or ""
                         import re
                         m = re.search(r'\b(20\d{2})\b', pd)
                         if m:
                             year = m.group(1)
-                            
+
                         # Build super-structured doc_name if we found metadata
                         if doc_num and doc_type:
                             context_str = f"{parent_org}, {year}" if parent_org else year
                             doc_name = f"{doc_type} {doc_num} ({context_str})"
-                            
+
             except Exception as _e:
                 logger.warning(f"LegalKG: Failed to fetch Document metadata: {_e}")
 
@@ -555,13 +559,52 @@ class LegalKGService:
         articles = split_articles(markdown_content)
         logger.info(f"LegalKG: split into {len(articles)} articles")
 
-        # Step 4: LLM extraction (concurrent, semaphore-controlled)
-        doc_meta_str = self._format_doc_meta(doc_meta)
+        # Step 4: Build rich doc_meta with DB-extracted fields (including document_title)
+        rich_meta = dict(doc_meta)
+        if doc_title:
+            rich_meta["tieu_de"] = doc_title
+        doc_meta_str = self._format_doc_meta(rich_meta)
         tasks = [
-            self._extract_with_llm(article, doc_meta_str, doc_name, is_personnel, document_id, custom_kg_prompt)
+            self._extract_with_llm(
+                article, doc_meta_str, doc_name, is_personnel, document_id, custom_kg_prompt,
+                doc_title=doc_title,
+                doc_num=doc_num,
+                issuing_agency=issue_org,
+                published_date=year,
+            )
             for article in articles
         ]
         article_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Step 4.5: Collect all entities + LLM entity resolution
+        all_raw_entities: list[dict] = []
+        for result in article_results:
+            if isinstance(result, Exception) or not result:
+                continue
+            for ent in result.get("entities", []):
+                all_raw_entities.append({
+                    "name": ent.get("name", ""),
+                    "type": ent.get("type", "Organization"),
+                    "description": ent.get("description", ""),
+                    "article_ref": ent.get("article_ref", ""),
+                })
+
+        # LLM resolution pass — deduplicate + resolve type conflicts + prefer Document Root
+        resolved_entities: list[dict] = []
+        merged_map: dict[str, str] = {}  # raw_name → canonical_name
+        skipped_entities: set[str] = set()  # entity names that were dropped
+        if all_raw_entities:
+            try:
+                resolved_entities, merged_map, skipped_entities = await self._resolve_entities_with_llm(
+                    all_raw_entities, doc_meta_str, doc_name, doc_title
+                )
+                logger.info(
+                    f"LegalKG: resolved {len(all_raw_entities)} raw entities → "
+                    f"{len(resolved_entities)} unique, {len(merged_map)} merged, {len(skipped_entities)} dropped"
+                )
+            except Exception as e:
+                logger.warning(f"LegalKG: entity resolution failed, using fallback: {e}")
+                resolved_entities, merged_map, skipped_entities = self._basic_entity_normalize(all_raw_entities)
 
         # Step 5: Store all results
         driver = await self._get_driver()
@@ -627,14 +670,53 @@ class LegalKGService:
                     source_type="Document", target_type="Document",
                 )
 
-            # Store article extraction results
+            # Step 5.5: Upsert resolved (deduplicated) entities
+            entity_type_map: dict[str, str] = {}   # canonical → entity_type
+
+            # Build entity_type_map from resolved entities
+            for ent in resolved_entities:
+                canonical = ent.get("canonical_name", "")
+                if not canonical:
+                    continue
+                entity_type_map[canonical] = ent.get("type", "Organization")
+
+            # Build canonical_lookup: any name → canonical (from merged_map + merged_from)
+            canonical_lookup: dict[str, str] = {}
+            # Add from merged_map (LLM-computed raw→canonical)
+            for raw_name, canonical in merged_map.items():
+                canonical_lookup[raw_name] = canonical
+            # Add from resolved entities merged_from (canonical itself + merged raw names)
+            for ent in resolved_entities:
+                canonical = ent.get("canonical_name", "")
+                if not canonical:
+                    continue
+                ent_type = ent.get("type", "Organization")
+                canonical_lookup[canonical] = canonical
+                for raw_name in ent.get("merged_from", []):
+                    canonical_lookup[raw_name] = canonical
+                # Also map normalized form
+                normalized = normalize_entity_id(canonical, ent_type)
+                if normalized != canonical:
+                    canonical_lookup[normalized] = canonical
+
+            # Upsert resolved entities (only canonical ones, not duplicates)
+            for ent in resolved_entities:
+                canonical = ent.get("canonical_name", "")
+                if not canonical:
+                    continue
+                await self._upsert_node(
+                    session, canonical, ent.get("type", "Organization"),
+                    ent.get("representative_description", ""), document_id,
+                )
+
+            # Step 5.6: Store article relations using resolved entity lookup
             for i, result in enumerate(article_results):
-                if isinstance(result, Exception):
-                    logger.warning(f"LegalKG: article {i} extraction failed: {result}")
+                if isinstance(result, Exception) or not result:
                     continue
-                if not result:
-                    continue
-                await self._store_extraction(session, result, doc_name, document_id)
+                await self._store_relations_from_extraction(
+                    session, result, doc_name, document_id,
+                    canonical_lookup, merged_map, skipped_entities, entity_type_map,
+                )
 
         entity_count = sum(
             len(r.get("entities", [])) for r in article_results
@@ -653,6 +735,8 @@ class LegalKGService:
         parts = []
         if meta.get("so_hieu"):
             parts.append(f"Số hiệu: {meta['so_hieu']}")
+        if meta.get("tieu_de"):
+            parts.append(f"Tiêu đề: {meta['tieu_de']}")
         if meta.get("co_quan_ban_hanh"):
             parts.append(f"Cơ quan ban hành: {meta['co_quan_ban_hanh']}")
         if meta.get("ngay_ban_hanh"):
@@ -691,6 +775,10 @@ class LegalKGService:
         is_personnel: bool,
         document_id: Optional[int],
         custom_system_prompt: str | None = None,
+        doc_title: str = "",
+        doc_num: str = "",
+        issuing_agency: str = "",
+        published_date: str = "",
     ) -> dict:
         """Run LLM extraction on a single article chunk."""
         text = article["text"]
@@ -701,19 +789,28 @@ class LegalKGService:
         if custom_system_prompt:
             system_prompt = custom_system_prompt
             user_prompt = LEGAL_KG_USER_PROMPT.format(
-                document_meta=doc_meta_str,
+                document_title=doc_title or "Không có tiêu đề",
+                document_number=doc_num or "Không có số hiệu",
+                issuing_agency=issuing_agency or "Không xác định",
+                published_date=published_date or "Không xác định",
                 article_text=text[:3000],
             )
         elif is_personnel:
             system_prompt = PERSON_EXTRACT_SYSTEM_PROMPT
             user_prompt = PERSON_EXTRACT_USER_PROMPT.format(
-                document_meta=doc_meta_str,
+                document_title=doc_title or "Không có tiêu đề",
+                document_number=doc_num or "Không có số hiệu",
+                issuing_agency=issuing_agency or "Không xác định",
+                published_date=published_date or "Không xác định",
                 article_text=text[:3000],
             )
         else:
             system_prompt = LEGAL_KG_SYSTEM_PROMPT
             user_prompt = LEGAL_KG_USER_PROMPT.format(
-                document_meta=doc_meta_str,
+                document_title=doc_title or "Không có tiêu đề",
+                document_number=doc_num or "Không có số hiệu",
+                issuing_agency=issuing_agency or "Không xác định",
+                published_date=published_date or "Không xác định",
                 article_text=text[:3000],
             )
 
@@ -731,6 +828,318 @@ class LegalKGService:
         except Exception as e:
             logger.warning(f"LegalKG LLM extraction failed for {heading}: {e}")
             return {"entities": [], "relations": []}
+
+    # ------------------------------------------------------------------
+    # Entity Resolution (Step 4.5 — deduplicate after LLM extraction)
+    # ------------------------------------------------------------------
+
+    # Self-reference patterns for Vietnamese legal documents
+    _SELF_REF_PATTERNS = re.compile(
+        r"^(văn bản này|quyết định này|nghị định này|thông tư này|"
+        r"luật này|bộ luật này|pháp lệnh này|nghị quyết này|chỉ thị này)\s*$",
+        re.IGNORECASE,
+    )
+    # Document number pattern (e.g., 13/2024/NĐ-CP)
+    _DOC_NUM_IN_NAME = re.compile(r"\d+/\d+/[A-Z0-9\-]+", re.IGNORECASE)
+
+    def _premark_document_root_references(
+        self,
+        entity_entries: list[dict],
+        doc_name: str,
+        doc_title: str = "",
+    ) -> tuple[list[dict], dict[str, str], set[str]]:
+        """
+        Pre-mark entities that are references to the Document Root (Node Cha).
+
+        Returns:
+          - remaining_entries: entities that need LLM resolution
+          - auto_merged_map: raw_name → doc_name for auto-detected root references
+          - auto_dropped: set of entity names auto-dropped
+        """
+        # Extract all document numbers from doc_name
+        doc_numbers = set(self._DOC_NUM_IN_NAME.findall(doc_name))
+        # Normalize doc_numbers for comparison
+        doc_numbers_normalized = {n.lower() for n in doc_numbers}
+
+        auto_merged: dict[str, str] = {}   # raw_name → doc_name
+        auto_dropped: set[str] = set()    # names that are self-refs without meaning
+        remaining: list[dict] = []
+
+        for e in entity_entries:
+            name = e["raw_name"]
+            name_lower = name.lower()
+
+            # Check 1: Self-reference patterns ("văn bản này", "Nghị định này", etc.)
+            if self._SELF_REF_PATTERNS.match(name_lower):
+                auto_merged[name] = doc_name
+                logger.debug(f"LegalKG: auto-merged self-ref '{name}' → {doc_name}")
+                continue
+
+            # Check 2: Entity contains same document number as doc_name
+            entity_numbers = set(self._DOC_NUM_IN_NAME.findall(name))
+            if entity_numbers and entity_numbers == doc_numbers_normalized:
+                # Same document number → merge into Document Root
+                auto_merged[name] = doc_name
+                logger.debug(f"LegalKG: auto-merged same doc number '{name}' → {doc_name}")
+                continue
+
+            # Check 3: Normalize and compare with normalized doc_name
+            doc_name_norm = normalize_entity_id(doc_name, "Document")
+            name_norm = normalize_entity_id(name, e["type"])
+            # Remove common suffixes like "(UBND Tỉnh X, 2024)" for comparison
+            doc_name_base = re.sub(r"\s*\([^)]+\)\s*$", "", doc_name_norm).strip()
+            name_base = re.sub(r"\s*\([^)]+\)\s*$", "", name_norm).strip()
+            if name_base and name_base == doc_name_base:
+                auto_merged[name] = doc_name
+                logger.debug(f"LegalKG: auto-merged base-match '{name}' → {doc_name}")
+                continue
+
+            # Check 4: Match against document_title (Tiêu đề văn bản)
+            if doc_title:
+                doc_title_norm = normalize_entity_id(doc_title, "Document")
+                doc_title_base = re.sub(r"\s*\([^)]+\)\s*$", "", doc_title_norm).strip()
+                # If entity matches document_title (after normalization), merge to doc_name
+                if name_base and doc_title_base and name_base == doc_title_base:
+                    auto_merged[name] = doc_name
+                    logger.debug(f"LegalKG: auto-merged title-match '{name}' → {doc_name}")
+                    continue
+                # Also check if document_title is a substring or vice versa (for partial matches)
+                if len(name_base) > 5 and (name_base in doc_title_base or doc_title_base in name_base):
+                    auto_merged[name] = doc_name
+                    logger.debug(f"LegalKG: auto-merged partial-title-match '{name}' → {doc_name}")
+                    continue
+
+            remaining.append(e)
+
+        return remaining, auto_merged, auto_dropped
+
+    async def _resolve_entities_with_llm(
+        self,
+        raw_entities: list[dict],
+        doc_meta_str: str,
+        doc_name: str,
+        doc_title: str = "",
+    ) -> tuple[list[dict], dict[str, str], set[str]]:
+        """
+        Two-phase entity resolution:
+          1. Pre-mark Document Root references (code-based, exact match)
+          2. LLM resolution for remaining entities
+
+        Returns 3-tuple:
+          - resolved_entities: canonical entities with merged_from
+          - merged_map: raw_name → canonical_name (for relation rerouting)
+          - skipped_entities: entity names that were dropped
+        """
+        if not raw_entities:
+            return [], {}, set()
+
+        # Pre-normalize: keep raw name + normalized name for each entity
+        entity_entries: list[dict] = []
+        for ent in raw_entities:
+            name = str(ent.get("name", "")).strip()
+            name = re.sub(r"^[#\*\- \t]+", "", name).strip()
+            if not name:
+                continue
+            etype = str(ent.get("type", "Organization")).strip()
+            norm_name = normalize_entity_id(name, etype)
+            entity_entries.append({
+                "raw_name": name,
+                "norm_name": norm_name,
+                "type": etype,
+                "description": ent.get("description", ""),
+                "article_ref": ent.get("article_ref", ""),
+            })
+
+        # === Phase 1: Pre-mark Document Root references (code-based) ===
+        remaining_entries, auto_merged, auto_dropped = self._premark_document_root_references(
+            entity_entries, doc_name, doc_title
+        )
+        logger.info(
+            f"LegalKG: [Phase1 Pre-mark] doc={doc_name[:50]}... "
+            f"total_input={len(entity_entries)} | "
+            f"auto_merged={len(auto_merged)} | "
+            f"auto_dropped={len(auto_dropped)} | "
+            f"remaining_for_llm={len(remaining_entries)}"
+        )
+        # Detailed log: auto-merged entities
+        if auto_merged:
+            for raw_name, canonical in auto_merged.items():
+                logger.info(f"LegalKG:   [AUTO-MERGED] '{raw_name}' → '{canonical}'")
+        # Detailed log: auto-dropped entities
+        if auto_dropped:
+            for name in auto_dropped:
+                logger.info(f"LegalKG:   [AUTO-DROPPED] '{name}'")
+
+        # === Phase 2: LLM resolution for remaining entities ===
+        resolved_entities = []
+        llm_merged_map: dict[str, str] = {}
+        llm_dropped: set[str] = set()
+
+        if remaining_entries:
+            # Format entity list for LLM
+            entity_lines = []
+            for e in remaining_entries:
+                entity_lines.append(
+                    f'- raw: "{e["raw_name"]}" | norm: "{e["norm_name"]}" | type: {e["type"]} | article: {e["article_ref"]}'
+                )
+            entity_list_str = "\n".join(entity_lines)
+
+            user_prompt = ENTITY_RESOLVE_USER_PROMPT.format(
+                doc_name=doc_name,
+                document_title=doc_title or "Không có tiêu đề",
+                doc_meta=doc_meta_str,
+                entity_list=entity_list_str,
+            )
+
+            try:
+                raw = await _call_llm(ENTITY_RESOLVE_SYSTEM_PROMPT, user_prompt, max_tokens=2048)
+                data = _parse_llm_json(raw)
+
+                conflicts = data.get("type_conflicts", [])
+                if conflicts:
+                    logger.info(f"LegalKG: LLM resolved {len(conflicts)} type conflicts")
+
+                dropped = data.get("dropped_entities", [])
+                if dropped:
+                    logger.info(f"LegalKG: LLM dropped {len(dropped)} entities")
+
+                # Build norm_name → canonical from LLM resolved_entities
+                name_to_canonical: dict[str, str] = {}
+                for ent in data.get("resolved_entities", []):
+                    canonical = ent.get("canonical_name", "")
+                    if not canonical:
+                        continue
+                    merged_from = ent.get("merged_from", [])
+                    for n in merged_from:
+                        name_to_canonical[n] = canonical
+
+                for ent in dropped:
+                    dropped_name = ent.get("name", "")
+                    if dropped_name:
+                        llm_dropped.add(dropped_name)
+                    reason = ent.get("reason", "")
+                    logger.debug(f"LegalKG: LLM dropped '{dropped_name}' reason: {reason}")
+
+                # Group remaining_entries by canonical to build resolved list
+                canonical_map: dict[tuple, dict] = {}
+                for e in remaining_entries:
+                    canonical = name_to_canonical.get(e["norm_name"], e["norm_name"])
+                    key = (canonical, e["type"])
+                    if key not in canonical_map:
+                        canonical_map[key] = {
+                            "canonical_name": canonical,
+                            "type": e["type"],
+                            "representative_description": e["description"],
+                            "source_articles": [e["article_ref"]],
+                            "merged_from": [e["raw_name"]],
+                        }
+                    else:
+                        existing = canonical_map[key]
+                        if e["description"] and not existing["representative_description"]:
+                            existing["representative_description"] = e["description"]
+                        if e["article_ref"] not in existing["source_articles"]:
+                            existing["source_articles"].append(e["article_ref"])
+                        if e["raw_name"] not in existing["merged_from"]:
+                            existing["merged_from"].append(e["raw_name"])
+
+                # Build merged_map from LLM resolution
+                for (canonical_name, _etype), ent_data in canonical_map.items():
+                    for n in ent_data.get("merged_from", []):
+                        if n != canonical_name:
+                            llm_merged_map[n] = canonical_name
+
+                resolved_entities = list(canonical_map.values())
+
+            except Exception as e:
+                logger.warning(f"LegalKG: LLM resolution failed, using fallback: {e}")
+                # Fallback: basic normalization for remaining entries
+                seen: dict[tuple, dict] = {}
+                for e in remaining_entries:
+                    key = (e["norm_name"], e["type"])
+                    if key not in seen:
+                        seen[key] = {
+                            "canonical_name": e["norm_name"],
+                            "type": e["type"],
+                            "representative_description": e["description"],
+                            "source_articles": [e["article_ref"]],
+                            "merged_from": [e["raw_name"]],
+                        }
+                resolved_entities = list(seen.values())
+
+        # === Combine Phase 1 (auto) + Phase 2 (LLM) ===
+        # merged_map: auto_merged + llm_merged_map
+        merged_map = {**auto_merged, **llm_merged_map}
+        # skipped_entities: auto_dropped + llm_dropped
+        skipped_entities = auto_dropped | llm_dropped
+
+        # === Detailed logging: BEFORE vs AFTER ===
+        logger.info(f"LegalKG: ========== ENTITY RESOLUTION SUMMARY ==========")
+        logger.info(f"LegalKG: [BEFORE] Total raw entities: {len(raw_entities)}")
+        for i, e in enumerate(raw_entities):
+            logger.info(f"LegalKG:   [{i+1:3d}] '{e.get('name', '')}' | type={e.get('type', '?')} | article={e.get('article_ref', '?')}")
+
+        logger.info(f"LegalKG: [AFTER] Canonical entities: {len(resolved_entities)}")
+        for i, ent in enumerate(resolved_entities):
+            canonical = ent.get("canonical_name", "")
+            ent_type = ent.get("type", "?")
+            merged_from = ent.get("merged_from", [])
+            source_articles = ent.get("source_articles", [])
+            logger.info(f"LegalKG:   [{i+1:3d}] CANONICAL: '{canonical}' | type={ent_type}")
+            logger.info(f"LegalKG:          merged_from: {merged_from}")
+            logger.info(f"LegalKG:          articles: {source_articles}")
+
+        if merged_map:
+            logger.info(f"LegalKG: [MERGED_MAP] {len(merged_map)} mappings:")
+            for raw_name, canonical in merged_map.items():
+                logger.info(f"LegalKG:   '{raw_name}' → '{canonical}'")
+
+        if skipped_entities:
+            logger.info(f"LegalKG: [SKIPPED] {len(skipped_entities)} entities dropped:")
+            for name in skipped_entities:
+                logger.info(f"LegalKG:   DROPPED: '{name}'")
+
+        logger.info(f"LegalKG: ==============================================")
+
+        return resolved_entities, merged_map, skipped_entities
+
+    def _basic_entity_normalize(self, raw_entities: list[dict]) -> tuple[list[dict], dict[str, str], set[str]]:
+        """
+        Fallback resolver when LLM fails: basic normalization only, no deduplication.
+        Returns 3-tuple: (resolved_entities, merged_map, skipped_entities)
+        - merged_map is empty (no LLM merging in fallback)
+        - skipped_entities is empty (no drops in fallback)
+        """
+        seen: dict[tuple, dict] = {}
+        for ent in raw_entities:
+            name = str(ent.get("name", "")).strip()
+            name = re.sub(r"^[#\*\- \t]+", "", name).strip()
+            if not name:
+                continue
+            etype = str(ent.get("type", "Organization")).strip()
+            key = (normalize_entity_id(name, etype), etype)
+            if key not in seen:
+                seen[key] = {
+                    "canonical_name": normalize_entity_id(name, etype),
+                    "type": etype,
+                    "representative_description": ent.get("description", ""),
+                    "source_articles": [ent.get("article_ref", "")],
+                    "merged_from": [name],
+                }
+        return list(seen.values()), {}, set()
+
+    def _build_canonical_lookup(self, resolved_entities: list[dict]) -> dict[str, str]:
+        """
+        Build name→canonical mapping from resolved entity list using merged_from.
+        """
+        lookup: dict[str, str] = {}
+        for ent in resolved_entities:
+            canonical = ent.get("canonical_name", "")
+            if not canonical:
+                continue
+            for name in ent.get("merged_from", []):
+                lookup[name] = canonical
+            lookup[canonical] = canonical
+        return lookup
 
     # ------------------------------------------------------------------
     # Neo4j storage helpers
@@ -926,6 +1335,96 @@ class LegalKGService:
 
             await self._upsert_node(session, source_raw, src_type, "", doc_id)
             await self._upsert_node(session, target_raw, tgt_type, "", doc_id)
+
+            # Flatten and normalize person_props dates
+            flat_props: dict = {}
+            for k, v in person_props.items():
+                if k in ("ngay_sinh", "ngay_hieu_luc") and v:
+                    v = normalize_date(str(v))
+                flat_props[k] = v
+
+            await self._upsert_relation(
+                session, source_canonical, relation_type, target_canonical,
+                desc, doc_id, art_ref, flat_props,
+                source_type=src_type, target_type=tgt_type,
+            )
+
+    async def _store_relations_from_extraction(
+        self,
+        session,
+        data: dict,
+        doc_name: str,
+        document_id: Optional[int],
+        canonical_lookup: dict[str, str],
+        merged_map: dict[str, str],
+        skipped_entities: set[str],
+        entity_type_map: dict[str, str],
+    ) -> None:
+        """
+        Upsert relations from one article's extraction result, using pre-resolved
+        canonical entity names from the entity resolution pass.
+
+        Edge handling:
+          - dropped entities (in skipped_entities): relation is SKIPPED entirely
+          - merged entities (in merged_map): source/target is rerouted to canonical
+          - canonical entities: relation upserted normally
+        """
+        for rel in data.get("relations", []):
+            source_raw = str(rel.get("source", "")).strip()
+            source_raw = re.sub(r"^[#\*\- \t]+", "", source_raw).strip()
+
+            relation_type = str(rel.get("relation", "")).strip().upper()
+
+            target_raw = str(rel.get("target", "")).strip()
+            target_raw = re.sub(r"^[#\*\- \t]+", "", target_raw).strip()
+
+            desc = str(rel.get("description", "")).strip()
+            art_ref = rel.get("article_ref", "")
+            doc_id = rel.get("document_id", document_id)
+            person_props: dict = rel.get("person_props", {})
+
+            if not source_raw or not target_raw or not relation_type:
+                continue
+
+            # --- Handle dropped entities ---
+            # If source was explicitly dropped → skip this relation
+            if source_raw in skipped_entities:
+                logger.debug(f"LegalKG: skipping relation (source dropped): {source_raw}")
+                continue
+            # If target was explicitly dropped → skip this relation
+            if target_raw in skipped_entities:
+                logger.debug(f"LegalKG: skipping relation (target dropped): {target_raw}")
+                continue
+
+            # --- Resolve source ---
+            # Coreference: "Luật này" / "quyết định này" → Document Root
+            if source_raw.lower().endswith(" này") or source_raw.lower() == "này":
+                source_canonical = doc_name
+                src_type = "Document"
+            else:
+                # Check merged_map first (LLM-detected aliases)
+                source_key = merged_map.get(source_raw, source_raw)
+                src_canonical_key = canonical_lookup.get(source_key, source_key)
+                src_type = entity_type_map.get(src_canonical_key, "Organization")
+                source_canonical = src_canonical_key
+
+            # --- Resolve target ---
+            if target_raw.lower().endswith(" này") or target_raw.lower() == "này":
+                target_canonical = doc_name
+                tgt_type = "Document"
+            else:
+                # Check merged_map first (LLM-detected aliases)
+                target_key = merged_map.get(target_raw, target_raw)
+                tgt_canonical_key = canonical_lookup.get(target_key, target_key)
+                tgt_type = entity_type_map.get(tgt_canonical_key, "Organization")
+                target_canonical = tgt_canonical_key
+
+            # Person composite key for target
+            if tgt_type == "Person" and person_props:
+                target_canonical = build_person_composite_key(target_raw, person_props)
+            # Person composite key for source
+            if src_type == "Person" and person_props:
+                source_canonical = build_person_composite_key(source_raw, person_props)
 
             # Flatten and normalize person_props dates
             flat_props: dict = {}

@@ -131,6 +131,10 @@ async def lifespan(app: FastAPI):
             await conn.execute(text(
                 "ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_number VARCHAR(100)"
             ))
+            # Document title/subject extracted from header (e.g. "Luật Bảo vệ Bí mật nhà nước")
+            await conn.execute(text(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_title VARCHAR(500)"
+            ))
             # Manual signer name override
             await conn.execute(text(
                 "ALTER TABLE documents ADD COLUMN IF NOT EXISTS signer_name VARCHAR(255)"

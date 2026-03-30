@@ -175,6 +175,7 @@ async def handle_parse(payload: dict) -> None:
                         
                 # Update all rich fields
                 document.document_number = meta_res.get("document_number")
+                document.document_title = meta_res.get("document_title")
                 document.location = meta_res.get("location")
                 document.issuing_agency = meta_res.get("issuing_agency")
                 document.parent_agency = meta_res.get("parent_agency")

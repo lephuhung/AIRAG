@@ -66,7 +66,9 @@ class Document(Base):
     )
     # Official document reference number extracted by classifier (e.g. "13/2023/NĐ-CP")
     document_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    
+    # Document title/subject extracted from header (e.g. "Luật Bảo vệ Bí mật nhà nước")
+    document_title: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
     # Rich Header Metadata extracted by LLM from Page 1 OCR
     location: Mapped[str | None] = mapped_column(String(255), nullable=True)
     issuing_agency: Mapped[str | None] = mapped_column(String(255), nullable=True)

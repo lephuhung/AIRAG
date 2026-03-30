@@ -43,6 +43,8 @@ class DocumentResponse(DocumentBase):
     document_type: DocumentTypeInfo | None = None
     # Official document reference number
     document_number: str | None = None
+    # Document title/subject extracted from header
+    document_title: str | None = None
     # Manual signer name override
     signer_name: str | None = None
     # Sub-task completion flags (set independently by each worker after CHUNKING)

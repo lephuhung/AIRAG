@@ -200,13 +200,14 @@ def _build_llm_system_prompt(doc_types: list[dict]) -> str:
     return (
         "Bạn là chuyên gia phân tích siêu dữ liệu văn bản hành chính Việt Nam.\n"
         "Nhiệm vụ: Đọc phần đầu của văn bản (markdown hoặc text OCR trang đầu) và bóc tách các trường thông tin tiêu chuẩn của Header.\n"
-        "Trả về JSON thuần với đúng 6 trường sau (không dùng markdown):\n\n"
+        "Trả về JSON thuần với đúng 7 trường sau (không dùng markdown):\n\n"
         "1. \"slug\": loại văn bản (chọn từ danh sách bên dưới, hoặc \"unknown\")\n"
-        "2. \"document_number\": số hiệu chính thức, thường bắt đầu bằng Luật số:, số: (ví dụ: \"13/2023/NĐ-CP\", \"23/BC-VPUB\"). Bỏ qua chữ 'Số:', 'Luật số:'.\n"
-        "3. \"parent_agency\": Tên cơ quan chủ quản / cấp trên, thường ở góc TRÊN CÙNG BÊN TRÁI, có trường hợp nằm trên 2 h (VD: \"UBND TỈNH HÀ TĨNH\", \"Ủy ban nhân dân \n Tỉnh Hà Tĩnh\").\n"
-        "4. \"issuing_agency\": Tên đơn vị ban hành trực tiếp, thường nằm ngay dưới parent_agency (VD: \"VĂN PHÒNG\").\n"
-        "5. \"location\": Địa danh ban hành ở góc TRÊN CÙNG BÊN PHẢI (VD: \"Hà Tĩnh\", \"Hà Nội\").\n"
-        "6. \"published_date\": Ngày tháng năm ban hành (VD: \"15/01/2026\").\n\n"
+        "2. \"document_number\": số hiệu chính thức, thường bắt đầu bằng Luật số:, số: (ví dụ: \"13/2023/NĐ-CP\", \"29/2018/QH14\",\"23/BC-VPUB\"). Bỏ qua chữ 'Số:', 'Luật số:'. Thường nằm bên dưới parent_agency\n"
+        "3. \"document_title\": Tên/Tiêu đề văn bản, thường nằm ngay dưới số ký hiệu (VD: \"Luật Bảo vệ Bí mật nhà nước\", \"Kế hoạch triển khai thực hiện\", \"Giấy mời tham gia\").\n"
+        "4. \"parent_agency\": Tên cơ quan chủ quản / cấp trên, thường ở góc TRÊN CÙNG BÊN TRÁI, có trường hợp nằm trên 2 dòng (VD: \"UBND TỈNH HÀ TĨNH\", \"Ủy ban nhân dân \n Tỉnh Hà Tĩnh\").\n"
+        "5. \"issuing_agency\": Tên đơn vị ban hành trực tiếp, thường nằm ngay dưới parent_agency (VD: \"VĂN PHÒNG\").\n"
+        "6. \"location\": Địa danh ban hành ở góc TRÊN CÙNG BÊN PHẢI (VD: \"Hà Tĩnh\", \"Hà Nội\").\n"
+        "7. \"published_date\": Ngày tháng năm ban hành (VD: \"15/01/2026\").\n\n"
         "Các slug hợp lệ:\n"
         + types_list
         + "\n\n"
@@ -215,7 +216,7 @@ def _build_llm_system_prompt(doc_types: list[dict]) -> str:
         "- Nếu giá trị nào không có, đặt là `null`.\n"
         "- Mọi text nên giữ nguyên case gốc nếu được hoặc chuẩn hoá Title Case.\n"
         "Ví dụ đầu ra:\n"
-        "{\"slug\": \"bao_cao\", \"document_number\": \"23/BC-VPUB\", \"parent_agency\": \"UBND TỈNH HÀ TĨNH\", \"issuing_agency\": \"VĂN PHÒNG\", \"location\": \"Hà Tĩnh\", \"published_date\": \"15/01/2026\"}"
+        "{\"slug\": \"luat\", \"document_number\": \"13/2024/QH15\", \"document_title\": \"Luật Bảo vệ Bí mật nhà nước\", \"parent_agency\": \"QUỐC HỘI\", \"issuing_agency\": \"VP QUỐC HỘI\", \"location\": \"Hà Nội\", \"published_date\": \"15/06/2024\"}"
     )
 
 
@@ -234,8 +235,8 @@ async def classify_with_llm(markdown_text: str, db=None) -> dict:
     from app.services.llm.types import LLMMessage
 
     default_result = {
-        "slug": None, "document_number": None, "location": None,
-        "issuing_agency": None, "parent_agency": None, "published_date": None
+        "slug": None, "document_number": None, "document_title": None,
+        "location": None, "issuing_agency": None, "parent_agency": None, "published_date": None
     }
     if not markdown_text:
         return default_result
@@ -285,9 +286,15 @@ async def classify_with_llm(markdown_text: str, db=None) -> dict:
         if document_number and len(document_number) > 60:
             document_number = None
 
+        # Clean document_title (truncate if too long)
+        document_title = _clean_str(parsed.get("document_title"))
+        if document_title and len(document_title) > 300:
+            document_title = document_title[:300]
+
         final_res = {
             "slug": slug,
             "document_number": document_number,
+            "document_title": document_title,
             "location": _clean_str(parsed.get("location")),
             "issuing_agency": _clean_str(parsed.get("issuing_agency")),
             "parent_agency": _clean_str(parsed.get("parent_agency")),

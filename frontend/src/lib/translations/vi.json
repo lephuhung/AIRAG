@@ -378,7 +378,7 @@
       "ocring": "Đang chạy OCR...",
       "chunking": "Đang xây dựng các mảnh dữ liệu...",
       "embedding": "Đang nhúng vector...",
-      "building_kg": "Đang xây dựng biểu đồ tri thức..."
+      "building_kg": "Đang xây dựng biểu đồ..."
     },
     "metadata": {
       "pages": "trang",
@@ -668,7 +668,7 @@
     },
     "doc_types": {
       "title": "Loại tài liệu",
-      "subtitle": "Quản lý các phân loại tài liệu và lời nhắc hệ thống của chúng",
+      "subtitle": "Quản lý các phân loại tài liệu và prompt hệ thống của chúng",
       "new_type": "Loại mới",
       "create_title": "Tạo loại tài liệu",
       "create_doc_type": "Tạo loại tài liệu",

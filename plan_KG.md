@@ -28,9 +28,14 @@ LegalKGService.ingest(markdown)
    ├─ 1. Structural splitter: split by Điều/Khoản/Điểm
    ├─ 2. Header parser: extract document meta (số hiệu, ngày ban hành, loại VB)
    ├─ 3. Preamble parser: extract CAN_CU list from header block
-   └─ 4. LLM extractor (per article/section):
-           → entities: Article, Person, Organization, Task
-           → relations: CAN_CU, VIEN_DAN, SUA_DOI, CHU_TRI, PHOI_HOP, CHIU_TRACH_NHIEM
+   ├─ 4. LLM extractor (per article/section, concurrent):
+   │      → entities: Article, Person, Organization, Task
+   │      → relations: CAN_CU, VIEN_DAN, SUA_DOI, CHU_TRI, PHOI_HOP, CHIU_TRACH_NHIEM
+   ├─ 4.5. [MỚI] LLM Entity Resolution Pass:
+   │      → Collect all raw entities from all articles
+   │      → LLM deduplicates + resolves type conflicts + prefers Document Root
+   │      → Falls back to rule-based normalization if LLM fails
+   └─ 5. Neo4j MERGE upsert (deduplicated entities + relations)
    ↓
 Neo4j graph (per workspace, label kb_{workspace_id})
    ↓
