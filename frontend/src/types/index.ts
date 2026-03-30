@@ -540,6 +540,7 @@ export interface DocumentTypeSystemPromptResponse {
   document_type_slug: string;
   workspace_id: number | null;
   system_prompt: string;
+  kg_system_prompt: string | null;
   is_default: boolean;
 }
 

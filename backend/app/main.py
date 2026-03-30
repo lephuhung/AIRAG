@@ -168,6 +168,11 @@ async def lifespan(app: FastAPI):
                 "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id)"
             ))
 
+            # document_type_system_prompts: kg_system_prompt
+            await conn.execute(text(
+                "ALTER TABLE document_type_system_prompts ADD COLUMN IF NOT EXISTS kg_system_prompt TEXT"
+            ))
+
             # --- Abbreviations Table (Explicit for clarity or metadata sync) ---
             await conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS abbreviations (

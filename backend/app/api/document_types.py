@@ -66,11 +66,13 @@ class SystemPromptResponse(BaseModel):
     document_type_slug: str
     workspace_id: int | None
     system_prompt: str
+    kg_system_prompt: str | None
     is_default: bool  # True nếu chưa có bản ghi riêng → dùng DEFAULT_SYSTEM_PROMPT
 
 
 class SystemPromptSet(BaseModel):
     system_prompt: str
+    kg_system_prompt: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +127,7 @@ async def create_document_type(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_superadmin),
 ):
-    """Create a new document type."""
+    """Create a new document type. Auto-seeds default KG system prompt."""
     existing = await db.execute(
         select(DocumentType).where(DocumentType.slug == body.slug)
     )
@@ -140,6 +142,19 @@ async def create_document_type(
         description=body.description,
     )
     db.add(doc_type)
+    await db.flush()  # get doc_type.id before creating related row
+
+    # Auto-seed default KG system prompt (LEGAL_KG_SYSTEM_PROMPT)
+    from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT
+    from app.services.legal_kg_prompts import LEGAL_KG_SYSTEM_PROMPT
+
+    prompt_row = DocumentTypeSystemPrompt(
+        document_type_id=doc_type.id,
+        workspace_id=None,
+        system_prompt=DEFAULT_SYSTEM_PROMPT,
+        kg_system_prompt=LEGAL_KG_SYSTEM_PROMPT,
+    )
+    db.add(prompt_row)
     await db.commit()
     await db.refresh(doc_type)
     return doc_type
@@ -224,12 +239,28 @@ async def _resolve_system_prompt(
 async def get_global_system_prompt(slug: str, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_active_user)):
     """Get the global system prompt for a document type (workspace_id=NULL)."""
     doc_type = await _get_type_by_slug(slug, db)
-    prompt_text, is_default = await _resolve_system_prompt(doc_type, None, db)
+    res = await db.execute(
+        select(DocumentTypeSystemPrompt).where(
+            DocumentTypeSystemPrompt.document_type_id == doc_type.id,
+            DocumentTypeSystemPrompt.workspace_id.is_(None),
+        )
+    )
+    row = res.scalar_one_or_none()
+    if row:
+        return SystemPromptResponse(
+            document_type_slug=slug,
+            workspace_id=None,
+            system_prompt=row.system_prompt,
+            kg_system_prompt=row.kg_system_prompt,
+            is_default=False,
+        )
+    from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT
     return SystemPromptResponse(
         document_type_slug=slug,
         workspace_id=None,
-        system_prompt=prompt_text,
-        is_default=is_default,
+        system_prompt=DEFAULT_SYSTEM_PROMPT,
+        kg_system_prompt=None,
+        is_default=True,
     )
 
 
@@ -252,18 +283,23 @@ async def set_global_system_prompt(
     row = res.scalar_one_or_none()
     if row:
         row.system_prompt = body.system_prompt
+        if body.kg_system_prompt is not None:
+            row.kg_system_prompt = body.kg_system_prompt
     else:
         row = DocumentTypeSystemPrompt(
             document_type_id=doc_type.id,
             workspace_id=None,
             system_prompt=body.system_prompt,
+            kg_system_prompt=body.kg_system_prompt,
         )
         db.add(row)
     await db.commit()
+    await db.refresh(row)
     return SystemPromptResponse(
         document_type_slug=slug,
         workspace_id=None,
-        system_prompt=body.system_prompt,
+        system_prompt=row.system_prompt,
+        kg_system_prompt=row.kg_system_prompt,
         is_default=False,
     )
 
@@ -278,12 +314,48 @@ async def get_workspace_system_prompt(
     """Get the resolved system prompt for a document type + workspace combo."""
     doc_type = await _get_type_by_slug(slug, db)
     await _get_workspace(workspace_id, db)
-    prompt_text, is_default = await _resolve_system_prompt(doc_type, workspace_id, db)
+
+    # Try workspace-specific first
+    res = await db.execute(
+        select(DocumentTypeSystemPrompt).where(
+            DocumentTypeSystemPrompt.document_type_id == doc_type.id,
+            DocumentTypeSystemPrompt.workspace_id == workspace_id,
+        )
+    )
+    row = res.scalar_one_or_none()
+    if row:
+        return SystemPromptResponse(
+            document_type_slug=slug,
+            workspace_id=workspace_id,
+            system_prompt=row.system_prompt,
+            kg_system_prompt=row.kg_system_prompt,
+            is_default=False,
+        )
+
+    # Fallback to global
+    res = await db.execute(
+        select(DocumentTypeSystemPrompt).where(
+            DocumentTypeSystemPrompt.document_type_id == doc_type.id,
+            DocumentTypeSystemPrompt.workspace_id.is_(None),
+        )
+    )
+    row = res.scalar_one_or_none()
+    if row:
+        return SystemPromptResponse(
+            document_type_slug=slug,
+            workspace_id=workspace_id,
+            system_prompt=row.system_prompt,
+            kg_system_prompt=row.kg_system_prompt,
+            is_default=False,
+        )
+
+    from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT
     return SystemPromptResponse(
         document_type_slug=slug,
         workspace_id=workspace_id,
-        system_prompt=prompt_text,
-        is_default=is_default,
+        system_prompt=DEFAULT_SYSTEM_PROMPT,
+        kg_system_prompt=None,
+        is_default=True,
     )
 
 
@@ -308,18 +380,23 @@ async def set_workspace_system_prompt(
     row = res.scalar_one_or_none()
     if row:
         row.system_prompt = body.system_prompt
+        if body.kg_system_prompt is not None:
+            row.kg_system_prompt = body.kg_system_prompt
     else:
         row = DocumentTypeSystemPrompt(
             document_type_id=doc_type.id,
             workspace_id=workspace_id,
             system_prompt=body.system_prompt,
+            kg_system_prompt=body.kg_system_prompt,
         )
         db.add(row)
     await db.commit()
+    await db.refresh(row)
     return SystemPromptResponse(
         document_type_slug=slug,
         workspace_id=workspace_id,
-        system_prompt=body.system_prompt,
+        system_prompt=row.system_prompt,
+        kg_system_prompt=row.kg_system_prompt,
         is_default=False,
     )
 

@@ -76,13 +76,15 @@ export function useSetGlobalPrompt() {
     mutationFn: ({
       slug,
       system_prompt,
+      kg_system_prompt,
     }: {
       slug: string;
       system_prompt: string;
+      kg_system_prompt?: string | null;
     }) =>
       api.put<DocumentTypeSystemPromptResponse>(
         `/document-types/${slug}/prompt`,
-        { system_prompt },
+        { system_prompt, kg_system_prompt },
       ),
     onSuccess: (_data, variables) => {
       queryClient.invalidateQueries({

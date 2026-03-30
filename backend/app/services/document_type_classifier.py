@@ -133,10 +133,13 @@ def get_cached_slugs() -> frozenset[str]:
 async def seed_document_types(db) -> None:
     """
     Seed missing document types into the DB using default list.
-    Called by main.py on startup. Idempotent — only inserts missing slugs.
+    Also seeds default kg_system_prompt (LEGAL_KG_SYSTEM_PROMPT) for each document type
+    that doesn't have one yet. Called by main.py on startup. Idempotent.
     """
     from sqlalchemy import select
-    from app.models.document_type import DocumentType
+    from app.models.document_type import DocumentType, DocumentTypeSystemPrompt
+    from app.services.legal_kg_prompts import LEGAL_KG_SYSTEM_PROMPT
+    from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT
 
     existing = await db.execute(select(DocumentType).where(DocumentType.slug.in_(
         d.slug for d in _DEFAULT_DOC_TYPES
@@ -145,12 +148,47 @@ async def seed_document_types(db) -> None:
 
     for dt in _DEFAULT_DOC_TYPES:
         if dt.slug not in existing_slugs:
-            db.add(DocumentType(
+            doc_type = DocumentType(
                 slug=dt.slug,
                 name=dt.name,
                 description=dt.description,
+            )
+            db.add(doc_type)
+            await db.flush()  # get id for the new doc_type
+
+            # Seed default DocumentTypeSystemPrompt with kg_system_prompt
+            db.add(DocumentTypeSystemPrompt(
+                document_type_id=doc_type.id,
+                workspace_id=None,
+                system_prompt=DEFAULT_SYSTEM_PROMPT,
+                kg_system_prompt=LEGAL_KG_SYSTEM_PROMPT,
             ))
             logger.info(f"[doc_type] Seeding: {dt.slug}")
+
+    # Backfill kg_system_prompt for existing document types that don't have one
+    all_doc_types = await db.execute(
+        select(DocumentType).where(DocumentType.is_active.is_(True))
+    )
+    for doc_type in all_doc_types.scalars().all():
+        # Check if this doc_type already has a prompt row (workspace_id=NULL)
+        existing_prompt = await db.execute(
+            select(DocumentTypeSystemPrompt).where(
+                DocumentTypeSystemPrompt.document_type_id == doc_type.id,
+                DocumentTypeSystemPrompt.workspace_id.is_(None),
+            )
+        )
+        prompt_row = existing_prompt.scalar_one_or_none()
+        if prompt_row is None:
+            db.add(DocumentTypeSystemPrompt(
+                document_type_id=doc_type.id,
+                workspace_id=None,
+                system_prompt=DEFAULT_SYSTEM_PROMPT,
+                kg_system_prompt=LEGAL_KG_SYSTEM_PROMPT,
+            ))
+            logger.info(f"[doc_type] Backfilling kg_system_prompt for: {doc_type.slug}")
+        elif prompt_row.kg_system_prompt is None:
+            prompt_row.kg_system_prompt = LEGAL_KG_SYSTEM_PROMPT
+            logger.info(f"[doc_type] Setting default kg_system_prompt for: {doc_type.slug}")
 
     await db.commit()
 

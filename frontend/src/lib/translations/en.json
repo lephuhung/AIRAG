@@ -652,6 +652,8 @@
       "global_prompt": "Global System Prompt",
       "using_default": "using default",
       "prompt_placeholder": "Enter system prompt for this type...",
+      "kg_global_prompt": "KG Extraction Prompt",
+      "kg_prompt_placeholder": "Enter knowledge graph extraction prompt for this type...",
       "toast": {
         "required": "Slug and name are required",
         "created": "Document type created",

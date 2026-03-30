@@ -515,6 +515,31 @@ class LegalKGService:
             except Exception as _e:
                 logger.warning(f"LegalKG: Failed to fetch Document metadata: {_e}")
 
+        # --- Resolve custom KG system prompt from document_type ---
+        custom_kg_prompt: str | None = None
+        if document_id:
+            try:
+                from app.core.database import async_session_maker
+                from app.models.document import Document
+                from app.models.document_type import DocumentTypeSystemPrompt
+                from sqlalchemy import select
+
+                async with async_session_maker() as _db:
+                    stmt = select(Document).where(Document.id == document_id)
+                    db_doc = await _db.scalar(stmt)
+                    if db_doc and db_doc.document_type_id:
+                        doc_type_id = db_doc.document_type_id
+                        # Lookup custom KG prompt (workspace_id=NULL for global)
+                        res = await _db.execute(
+                            select(DocumentTypeSystemPrompt.kg_system_prompt).where(
+                                DocumentTypeSystemPrompt.document_type_id == doc_type_id,
+                                DocumentTypeSystemPrompt.workspace_id.is_(None),
+                            )
+                        )
+                        custom_kg_prompt = res.scalar_one_or_none()
+            except Exception as _e:
+                logger.warning(f"LegalKG: failed to resolve custom KG prompt: {_e}")
+
         is_personnel = is_personnel_document(markdown_content)
 
         logger.info(
@@ -533,7 +558,7 @@ class LegalKGService:
         # Step 4: LLM extraction (concurrent, semaphore-controlled)
         doc_meta_str = self._format_doc_meta(doc_meta)
         tasks = [
-            self._extract_with_llm(article, doc_meta_str, doc_name, is_personnel, document_id)
+            self._extract_with_llm(article, doc_meta_str, doc_name, is_personnel, document_id, custom_kg_prompt)
             for article in articles
         ]
         article_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -665,14 +690,21 @@ class LegalKGService:
         doc_name: str,
         is_personnel: bool,
         document_id: Optional[int],
+        custom_system_prompt: str | None = None,
     ) -> dict:
         """Run LLM extraction on a single article chunk."""
         text = article["text"]
         heading = article["heading"]
         article_ref = f"Điều {article['index']}"
 
-        # Choose prompt variant
-        if is_personnel:
+        # Choose prompt variant: custom per-document-type > personnel > general
+        if custom_system_prompt:
+            system_prompt = custom_system_prompt
+            user_prompt = LEGAL_KG_USER_PROMPT.format(
+                document_meta=doc_meta_str,
+                article_text=text[:3000],
+            )
+        elif is_personnel:
             system_prompt = PERSON_EXTRACT_SYSTEM_PROMPT
             user_prompt = PERSON_EXTRACT_USER_PROMPT.format(
                 document_meta=doc_meta_str,

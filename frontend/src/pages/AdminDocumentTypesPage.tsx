@@ -421,22 +421,32 @@ function SystemPromptPanel({ slug, name }: { slug: string; name: string }) {
   const { data, isLoading } = useDocumentTypeGlobalPrompt(slug);
   const setPrompt = useSetGlobalPrompt();
   const [value, setValue] = useState<string | null>(null);
+  const [kgValue, setKgValue] = useState<string | null>(null);
 
   const currentPrompt = value ?? data?.system_prompt ?? "";
+  const currentKgPrompt = kgValue ?? data?.kg_system_prompt ?? "";
   const isDirty = value !== null && value !== data?.system_prompt;
+  const isKgDirty = kgValue !== null && kgValue !== (data?.kg_system_prompt ?? null);
+  const hasChanges = isDirty || isKgDirty;
 
   const handleSave = async () => {
     try {
-      await setPrompt.mutateAsync({ slug, system_prompt: currentPrompt });
+      await setPrompt.mutateAsync({
+        slug,
+        system_prompt: currentPrompt,
+        kg_system_prompt: isKgDirty ? currentKgPrompt || null : undefined,
+      });
       toast.success(t("admin.doc_types.toast.prompt_saved", { name }));
       setValue(null);
+      setKgValue(null);
     } catch (err: any) {
       toast.error(err.message || t("admin.doc_types.toast.prompt_failed"));
     }
   };
 
   return (
-    <div className="px-4 pb-4 border-t bg-muted/10">
+    <div className="px-4 pb-4 border-t bg-muted/10 space-y-4">
+      {/* Chat System Prompt */}
       <div className="pt-3 space-y-2">
         <div className="flex items-center justify-between">
           <p className="text-xs font-medium text-muted-foreground">
@@ -447,7 +457,30 @@ function SystemPromptPanel({ slug, name }: { slug: string; name: string }) {
               </span>
             )}
           </p>
-          {isDirty && (
+        </div>
+        {isLoading ? (
+          <div className="flex items-center gap-2 py-2">
+            <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
+            <span className="text-xs text-muted-foreground">{t("common.loading")}...</span>
+          </div>
+        ) : (
+          <textarea
+            value={currentPrompt}
+            onChange={(e) => setValue(e.target.value)}
+            rows={8}
+            className="w-full px-3 py-2 text-xs font-mono rounded-lg border bg-background focus:outline-none focus:ring-2 focus:ring-primary/30 resize-y"
+            placeholder={t("admin.doc_types.prompt_placeholder")}
+          />
+        )}
+      </div>
+
+      {/* KG System Prompt */}
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <p className="text-xs font-medium text-muted-foreground">
+            {t("admin.doc_types.kg_global_prompt")}
+          </p>
+          {hasChanges && (
             <Button
               size="sm"
               className="h-6 px-2.5 text-xs"
@@ -461,20 +494,13 @@ function SystemPromptPanel({ slug, name }: { slug: string; name: string }) {
             </Button>
           )}
         </div>
-        {isLoading ? (
-          <div className="flex items-center gap-2 py-2">
-            <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
-            <span className="text-xs text-muted-foreground">{t("common.loading")}...</span>
-          </div>
-        ) : (
-          <textarea
-            value={currentPrompt}
-            onChange={(e) => setValue(e.target.value)}
-            rows={6}
-            className="w-full px-3 py-2 text-xs font-mono rounded-lg border bg-background focus:outline-none focus:ring-2 focus:ring-primary/30 resize-y"
-            placeholder={t("admin.doc_types.prompt_placeholder")}
-          />
-        )}
+        <textarea
+          value={currentKgPrompt}
+          onChange={(e) => setKgValue(e.target.value || null)}
+          rows={12}
+          className="w-full px-3 py-2 text-xs font-mono rounded-lg border bg-background focus:outline-none focus:ring-2 focus:ring-primary/30 resize-y"
+          placeholder={t("admin.doc_types.kg_prompt_placeholder")}
+        />
       </div>
     </div>
   );

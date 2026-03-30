@@ -69,6 +69,8 @@ class DocumentTypeSystemPrompt(Base):
         ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=True
     )
     system_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    # Custom KG extraction prompt for this document type (NULL = use default LEGAL_KG_SYSTEM_PROMPT)
+    kg_system_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow

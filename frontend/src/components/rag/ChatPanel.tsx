@@ -988,6 +988,7 @@ function AssistantMessageFooter({
   message: ChatMessage;
   onOpenSources: (sources: ChatSourceChunk[], id?: string) => void;
 }) {
+  const agentSteps = message.agentSteps;
   const { t } = useTranslation();
   const [copiedMode, setCopiedMode] = useState<"text" | "markdown" | null>(null);
 
@@ -1018,7 +1019,8 @@ function AssistantMessageFooter({
   const hasSources = message.sources && message.sources.length > 0;
 
   return (
-    <div className="flex items-center justify-between gap-1.5 mt-2 pt-1 border-t border-muted/30">
+    <>
+      <div className="flex items-center justify-between gap-1.5 mt-2 pt-1 border-t border-muted/30">
       {/* Action Icons (Left) */}
       <div className="flex items-center gap-1">
         <button className="p-1 rounded-md text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted/60 transition-all">
@@ -1068,7 +1070,7 @@ function AssistantMessageFooter({
       </div>
 
       {/* Metadata & Sources (Right) */}
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-2">
 
         <div className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-[11px] font-semibold tracking-wide">
           <Zap className="w-3.5 h-3.5 fill-current" />
@@ -1088,6 +1090,7 @@ function AssistantMessageFooter({
         )}
       </div>
     </div>
+    </>
   );
 }
 
@@ -1180,15 +1183,6 @@ const MessageBubble = memo(function MessageBubble({
         )}
       >
         {/* ThinkingTimeline — single instance, never unmounts between streaming→completed */}
-        {!isUser && message.agentSteps && message.agentSteps.length > 0 && (
-          <ThinkingTimeline
-            steps={message.agentSteps}
-            mode={message.isStreaming ? "live" : "embedded"}
-className={cn("mb-1.5", message.isStreaming && "mt-1")}
-            autoCollapse={message.isStreaming && !!message.content}
-          />
-        )}
-
         {/* Typing indicator — only when streaming with no steps and no content yet */}
         {!isUser && message.isStreaming && !message.content && !message.agentSteps?.length && (
           <TypingIndicator status="analyzing" />
@@ -1250,7 +1244,10 @@ className={cn("mb-1.5", message.isStreaming && "mt-1")}
 
         {/* Footer actions for assistant messages */}
         {!isUser && message.content && (
-          <AssistantMessageFooter message={message} onOpenSources={onOpenSources} />
+          <AssistantMessageFooter
+            message={message}
+            onOpenSources={onOpenSources}
+          />
         )}
 
         {/* ThinkingPanel — only when no ThinkingTimeline with thinking log (avoid duplication) */}
@@ -2063,3 +2060,4 @@ export const ChatPanel = memo(function ChatPanel({
     </SessionIdCtx.Provider>
   );
 });
+

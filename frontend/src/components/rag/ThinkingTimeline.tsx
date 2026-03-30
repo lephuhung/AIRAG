@@ -274,6 +274,12 @@ interface ThinkingTimelineProps {
   className?: string;
   /** When true, auto-collapse the timeline (used when answer starts streaming). */
   autoCollapse?: boolean;
+  /** When true, the expanded view is constrained to max-w-xs to avoid breaking inline layouts. */
+  inline?: boolean;
+  /** When provided, the parent controls the expanded state instead of internal state. */
+  expanded?: boolean;
+  /** Callback when expanded state changes (used with controlled `expanded` prop). */
+  onExpandedChange?: (expanded: boolean) => void;
 }
 
 export function ThinkingTimeline({
@@ -281,9 +287,15 @@ export function ThinkingTimeline({
   mode,
   className,
   autoCollapse = false,
+  inline = false,
+  expanded: controlledExpanded,
+  onExpandedChange,
 }: ThinkingTimelineProps) {
-  // Live mode starts expanded; embedded mode (completed message) starts collapsed
-  const [expanded, setExpanded] = useState(mode === "live");
+  // Controlled: parent manages state; otherwise use internal
+  const [internalExpanded, setInternalExpanded] = useState(mode === "live");
+  const expanded = controlledExpanded !== undefined ? controlledExpanded : internalExpanded;
+  const setExpanded = onExpandedChange ?? setInternalExpanded;
+
   const hasAutoCollapsedRef = useRef(false);
   const prevModeRef = useRef(mode);
 
@@ -334,7 +346,11 @@ export function ThinkingTimeline({
     <div
       className={cn(
         "relative",
-        isEmbedded && "w-fit max-w-2xl rounded-md border border-border/60 bg-background overflow-hidden",
+        isEmbedded && cn(
+          inline
+            ? "max-w-xs rounded-md border border-border/60 bg-background overflow-hidden"
+            : "w-fit max-w-2xl rounded-md border border-border/60 bg-background overflow-hidden",
+        ),
         className,
       )}
     >
@@ -350,17 +366,77 @@ export function ThinkingTimeline({
         </button>
       )}
 
-      <div className={cn(isEmbedded && "px-2.5 py-2")}>
-        <AnimatePresence mode="popLayout">
-          {steps.map((step, i) => (
-            <StepNode
-              key={step.id || i}
-              step={step}
-              isLast={i === steps.length - 1}
-              isLive={mode === "live"}
-            />
-          ))}
-        </AnimatePresence>
+      {/* Horizontal Timeline Track */}
+      <div className={cn(isEmbedded && "px-3 py-2.5")}>
+        <div className="flex items-start gap-0 relative">
+          {/* Horizontal connecting line */}
+          <div className="absolute top-[9px] left-0 right-0 h-px bg-border/50" />
+
+          <AnimatePresence mode="popLayout">
+            {steps.map((step, i) => {
+              const config = STEP_CONFIG[step.step] || STEP_CONFIG.analyzing;
+              const Icon = config.icon;
+              const isActive = mode === "live" && step.status === "active";
+              const isError = step.status === "error";
+              return (
+                <motion.div
+                  key={step.id || i}
+                  initial={{ opacity: 0, scale: 0.8 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  transition={{ duration: 0.2, delay: i * 0.05 }}
+                  className="flex-1 flex flex-col items-center gap-1 relative z-10"
+                >
+                  {/* Dot */}
+                  <div
+                    className={cn(
+                      "w-[18px] h-[18px] rounded-full flex items-center justify-center flex-shrink-0",
+                      isActive && "bg-primary/15 ring-1 ring-primary/30",
+                      isError && "bg-destructive/15",
+                      step.step === "done" && "bg-emerald-500/15",
+                      !isActive && !isError && step.step !== "done" && "bg-muted",
+                    )}
+                  >
+                    {isActive ? (
+                      <Loader2 className="w-2.5 h-2.5 animate-spin text-primary" />
+                    ) : (
+                      <Icon className={cn(
+                        "w-2.5 h-2.5",
+                        isError && "text-destructive",
+                        step.step === "done" && "text-emerald-500",
+                        !isActive && !isError && step.step !== "done" && "text-muted-foreground/80",
+                      )} />
+                    )}
+                  </div>
+
+                  {/* Label */}
+                  <span className={cn(
+                    "text-[10px] text-center leading-tight whitespace-nowrap",
+                    isActive && "text-foreground font-medium",
+                    step.step === "done" && "text-emerald-500",
+                    isError && "text-destructive",
+                    !isActive && !isError && step.step !== "done" && "text-muted-foreground/80",
+                  )}>
+                    {step.detail || t(config.labelKey)}
+                  </span>
+
+                  {/* Duration */}
+                  {step.durationMs != null && step.durationMs > 0 && (
+                    <span className="text-[10px] font-mono tabular-nums text-muted-foreground/60">
+                      {formatMs(step.durationMs)}
+                    </span>
+                  )}
+
+                  {/* Thinking indicator for analyzing step */}
+                  {step.step === "analyzing" && step.thinkingText && !isActive && (
+                    <div className="mt-0.5">
+                      <ThinkingLogSection text={step.thinkingText} />
+                    </div>
+                  )}
+                </motion.div>
+              );
+            })}
+          </AnimatePresence>
+        </div>
       </div>
     </div>
   );
