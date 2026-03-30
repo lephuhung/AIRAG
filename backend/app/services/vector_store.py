@@ -98,6 +98,14 @@ class VectorStore:
                 documents=list(documents),
                 metadatas=list(metadatas) if metadatas else None
             )
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            logger.error(
+                f"[vector_store] ChromaDB collection.add FAILED "
+                f"({type(e).__name__}): collection={self.collection_name} "
+                f"count={len(ids)} — {e}",
+                exc_info=True,
+            )
+            raise
         except Exception as e:
             error_msg = str(e).lower()
             if "dimension" in error_msg:
@@ -158,9 +166,18 @@ class VectorStore:
 
     def delete_by_document_id(self, document_id: int) -> None:
         """Delete all chunks belonging to a specific document."""
-        self.collection.delete(
-            where={"document_id": document_id}
-        )
+        try:
+            self.collection.delete(
+                where={"document_id": document_id}
+            )
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            logger.error(
+                f"[vector_store] ChromaDB delete FAILED "
+                f"({type(e).__name__}): collection={self.collection_name} "
+                f"document_id={document_id} — {e}",
+                exc_info=True,
+            )
+            raise
         logger.info(f"Deleted chunks for document {document_id} from collection {self.collection_name}")
 
     def delete_collection(self) -> None:

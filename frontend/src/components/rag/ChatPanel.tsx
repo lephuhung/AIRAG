@@ -256,7 +256,12 @@ function InlineImageRef({
 // components. Supports both new [a3x9] and legacy [1] citation formats.
 // Also handles grouped brackets like [a3x9, b2m7] by splitting into individual.
 // ---------------------------------------------------------------------------
-const CITATION_RE = /(\[\s*(?:[a-zA-Z0-9-]+|IMG-[a-zA-Z0-9-]+)(?:\s*,\s*(?:[a-zA-Z0-9-]+|IMG-[a-zA-Z0-9-]+))*\s*\])/g;
+// Citation regex — matches:
+//   - New format: [a3z9], [IMG-p4f2], [MEM-xxx]
+//   - Grouped: [a3z9, b2m7, IMG-p4f2]
+//   - Legacy numeric: [1], [2]
+// Does NOT match random bracketed text like [id1], [ref2] — those render as plain text.
+const CITATION_RE = /(\[\s*(?:(?:[a-zA-Z0-9]{2,6}|IMG-[a-zA-Z0-9]+|MEM-[a-zA-Z0-9_-]+)(?:\s*,\s*(?:[a-zA-Z0-9]{2,6}|IMG-[a-zA-Z0-9]+|MEM-[a-zA-Z0-9_-]+))*|\d+)(?:\s*,\s*(?:[a-zA-Z0-9]{2,6}|IMG-[a-zA-Z0-9]+|MEM-[a-zA-Z0-9_-]+|\d+))*\s*\])/g;
 
 function injectCitations(
   children: ReactNode,
@@ -283,7 +288,7 @@ function injectCitations(
         tokens.forEach((token, ti) => {
           const key = `${i}-${ti}`;
           // Image citation: IMG-xxxx
-          const imgMatch = token.match(/^IMG-(.+)$/);
+          const imgMatch = token.match(/^IMG-(.+)$/i);
           if (imgMatch && imageRefs && imageRefs.length > 0) {
             const imgId = imgMatch[1];
             // Match by ref_id first, then fallback to legacy numeric index
@@ -295,7 +300,7 @@ function injectCitations(
               return;
             }
           }
-          // Memory citation: MEM-xxxx
+          // Memory citation: MEM-xxxx — 🧠 emoji only for genuine MEM- citations
           const memMatch = token.match(/^MEM-(.+)$/i);
           if (memMatch) {
             const memId = memMatch[1];
@@ -304,28 +309,17 @@ function injectCitations(
           }
           // Text citation: match source by index (string or numeric)
           // First try current message's sources, then fallback to historical sources
-          // robust case-insensitive trim match
-          // Also support legacy "cidN" format from older LLM outputs
           const cleanToken = token.trim().toLowerCase();
-          const cidMatch = cleanToken.match(/^cid(\d+)$/i);
-          const normalizedToken = cidMatch ? cidMatch[1] : cleanToken;
           const source =
-            sources.find((s) => String(s.index).toLowerCase() === normalizedToken) ??
-            (fallbackSources ? fallbackSources.find((s) => String(s.index).toLowerCase() === normalizedToken) : undefined);
+            sources.find((s) => String(s.index).toLowerCase() === cleanToken) ??
+            (fallbackSources ? fallbackSources.find((s) => String(s.index).toLowerCase() === cleanToken) : undefined);
           if (source) {
             result.push(
               <CitationLink key={key} index={String(source.index)} source={source} relatedEntities={relatedEntities} />
             );
             return;
           }
-          // Unmatched — check if it looks like a memory/fact citation (e.g. [id1], [ref2], [mem3])
-          // LLMs sometimes hallucinate citation markers when referencing memory facts
-          const looksLikeCitation = /^(id|ref|mem|fact|src|doc|cid)\d+$/i.test(cleanToken);
-          if (looksLikeCitation) {
-            result.push(<MemoryCitation key={key} index={token.trim()} />);
-            return;
-          }
-          // Truly unmatched — render as-is
+          // Truly unmatched — render as-is (no 🧠 for non-MEM citations)
           result.push(`[${token}]`);
         });
       });
@@ -1076,8 +1070,8 @@ function AssistantMessageFooter({
       {/* Metadata & Sources (Right) */}
       <div className="flex items-center gap-3">
 
-        <div className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-[10px] font-bold tracking-wider">
-          <Zap className="w-3 h-3 fill-current" />
+        <div className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 text-[11px] font-semibold tracking-wide">
+          <Zap className="w-3.5 h-3.5 fill-current" />
           <span>Fast</span>
         </div>
 
@@ -1111,7 +1105,7 @@ function AddAbbreviationButton({
   return (
     <button
       onClick={() => onClick(shortForm)}
-      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-primary/5 border border-primary/20 text-primary text-xs font-medium hover:bg-primary/10 transition-colors shadow-sm"
+      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-primary/8 border border-primary/20 text-primary text-[12px] font-medium hover:bg-primary/15 transition-colors shadow-sm suggestion-chip-hover"
     >
       <DatabaseZap className="w-3.5 h-3.5" />
       <span>
@@ -1148,13 +1142,13 @@ const MessageBubble = memo(function MessageBubble({
     "prose prose-sm max-w-none text-foreground/90 font-chat",
     "[&_p]:my-1.5 [&_p]:text-justify [&_ul]:my-1.5 [&_ol]:my-1.5 [&_li]:my-1 [&_li]:text-justify",
     "[&_pre]:bg-transparent [&_pre]:border-none [&_pre]:p-0 [&_pre]:m-0",
-    "[&_code]:bg-muted/50 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-[13px] [&_code]:text-foreground/90",
+    "[&_code]:bg-muted/50 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-[13px] [&_code]:text-foreground/90 [&_code]:font-[400]",
     "[&_a]:text-primary [&_a]:underline [&_a]:underline-offset-2",
     "[&_strong]:text-foreground [&_em]:text-foreground/80",
     "[&_h1]:text-foreground [&_h2]:text-foreground [&_h3]:text-foreground [&_h4]:text-foreground",
-    "[&_h1]:text-lg [&_h1]:font-bold [&_h1]:mt-4 [&_h1]:mb-2",
-    "[&_h2]:text-base [&_h2]:font-semibold [&_h2]:mt-3.5 [&_h2]:mb-1.5",
-    "[&_h3]:text-sm [&_h3]:font-semibold [&_h3]:mt-3 [&_h3]:mb-1",
+    "[&_h1]:text-base [&_h1]:font-bold [&_h1]:mt-4 [&_h1]:mb-2 [&_h1]:tracking-tight",
+    "[&_h2]:text-[15px] [&_h2]:font-semibold [&_h2]:mt-3 [&_h2]:mb-1.5 [&_h2]:tracking-tight",
+    "[&_h3]:text-sm [&_h3]:font-semibold [&_h3]:mt-2.5 [&_h3]:mb-1 [&_h3]:tracking-tight",
     "[&_blockquote]:border-l-2 [&_blockquote]:border-primary/30 [&_blockquote]:pl-3 [&_blockquote]:italic [&_blockquote]:text-foreground/60",
     "[&_table]:text-[13px] [&_th]:px-2.5 [&_th]:py-1.5 [&_td]:px-2.5 [&_td]:py-1.5 [&_th]:text-foreground/80 [&_td]:text-foreground/80",
     "[&_li]:text-foreground/90",
@@ -1287,10 +1281,10 @@ className={cn("mb-1.5", message.isStreaming && "mt-1")}
       {isUser && (
         <div
           className={cn(
-            "w-7 h-7 rounded-full overflow-hidden flex items-center justify-center text-[10px] font-semibold flex-shrink-0 mt-0.5",
+            "w-8 h-8 rounded-full overflow-hidden flex items-center justify-center text-[10px] font-semibold flex-shrink-0 mt-0.5 avatar-ring cursor-pointer transition-all duration-200",
             user?.avatar_url
-              ? "ring-1 ring-primary/30"
-              : "bg-secondary text-muted-foreground"
+              ? "ring-2 ring-primary/25 shadow-sm"
+              : "bg-secondary/80 border border-border/50 text-muted-foreground"
           )}
           title={user?.full_name || t("common.you")}
         >
@@ -1301,7 +1295,7 @@ className={cn("mb-1.5", message.isStreaming && "mt-1")}
               className="w-full h-full object-cover"
             />
           ) : (
-            initials || <User className="w-3.5 h-3.5" />
+            initials || <User className="w-4 h-4" />
           )}
         </div>
       )}
@@ -1397,19 +1391,19 @@ function SuggestionChips({
 
   return (
     <div className="flex-1 flex flex-col items-center justify-center px-4">
-      <div className="w-12 h-12 rounded-2xl bg-primary/10 flex items-center justify-center mb-4">
-        <Sparkles className="w-6 h-6 text-primary" />
+      <div className="w-14 h-14 rounded-2xl bg-primary/10 flex items-center justify-center mb-5 shadow-sm border border-primary/10">
+        <Sparkles className="w-7 h-7 text-primary" />
       </div>
-      <h3 className="text-sm font-semibold mb-1">{t("chat.assistant_title")}</h3>
-      <p className="text-xs text-muted-foreground text-center mb-4 max-w-[240px]">
+      <h3 className="text-[15px] font-semibold mb-1 tracking-tight">{t("chat.assistant_title")}</h3>
+      <p className="text-[13px] text-muted-foreground text-center mb-5 max-w-[260px] leading-relaxed">
         {t("chat.assistant_desc")}
       </p>
-      <div className="flex flex-wrap gap-1.5 justify-center max-w-[300px]">
+      <div className="flex flex-wrap gap-2 justify-center max-w-[320px]">
         {suggestions.map((s) => (
           <button
             key={s}
             onClick={() => onSelect(s)}
-            className="text-[11px] px-2.5 py-1 rounded-full border bg-card hover:bg-muted transition-colors text-muted-foreground hover:text-foreground"
+            className="text-[12px] px-4 py-2 rounded-xl border border-border bg-card hover:bg-muted/80 suggestion-chip-hover transition-colors text-muted-foreground hover:text-foreground font-medium shadow-sm"
           >
             {s}
           </button>
@@ -1933,12 +1927,12 @@ export const ChatPanel = memo(function ChatPanel({
         <AllSourcesCtx.Provider value={allSourcesFlat}>
           <div className="flex flex-col h-full bg-background border-r relative z-0 overflow-hidden">
             {/* Header */}
-            <div className="flex-shrink-0 flex items-center justify-between px-3 py-2 border-b">
-              <div className="flex items-center gap-2">
-                <div className="w-5 h-5 rounded flex items-center justify-center bg-primary/5 border border-primary/10 overflow-hidden">
-                  <img src="/logo.png" alt="HRAG" className="w-3.5 h-3.5 object-contain" />
+            <div className="flex-shrink-0 flex items-center justify-between px-4 py-2.5 border-b bg-background/50">
+              <div className="flex items-center gap-2.5">
+                <div className="w-7 h-7 rounded-lg flex items-center justify-center bg-primary/10 border border-primary/15 overflow-hidden shadow-sm">
+                  <img src="/logo.png" alt="HRAG" className="w-4 h-4 object-contain" />
                 </div>
-                <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground line-clamp-1 max-w-[400px]">
+                <h2 className="text-[13px] font-semibold tracking-tight text-muted-foreground/80 line-clamp-1 max-w-[400px]">
                   {t("chat.chat")} {sessionTitle ? `- ${sessionTitle}` : (sessionId ? `${t("chat.session", { id: sessionId })}` : t("chat.select_session"))}
                 </h2>
               </div>
@@ -2009,13 +2003,13 @@ export const ChatPanel = memo(function ChatPanel({
                   placeholder={t("chat.input_placeholder")}
                   rows={1}
                   className={cn(
-                    "flex-1 resize-none rounded-lg border border-input bg-background px-3 py-2 text-base shadow-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50",
-                    "placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
-                    "max-h-[120px] min-h-[36px]"
+                    "flex-1 resize-none rounded-xl border border-input bg-background px-4 py-2.5 text-[14px] shadow-sm ring-offset-background placeholder:text-muted-foreground/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:border-primary/30 disabled:cursor-not-allowed disabled:opacity-50",
+                    "max-h-[120px] min-h-[40px]",
+                    "font-chat leading-relaxed tracking-tight"
                   )}
                   style={{
                     height: "auto",
-                    minHeight: "36px",
+                    minHeight: "40px",
                   }}
                   onInput={(e) => {
                     const target = e.target as HTMLTextAreaElement;
@@ -2026,23 +2020,23 @@ export const ChatPanel = memo(function ChatPanel({
                 {stream.isStreaming ? (
                   <button
                     onClick={stream.cancel}
-                    className="flex-shrink-0 w-9 h-9 rounded-lg flex items-center justify-center transition-colors bg-destructive/15 text-destructive hover:bg-destructive/25"
+                    className="flex-shrink-0 w-10 h-10 rounded-xl flex items-center justify-center transition-all duration-200 bg-destructive/15 text-destructive hover:bg-destructive/25 shadow-sm border border-destructive/20"
                     title={t("chat.stop")}
                   >
-                    <Square className="w-3.5 h-3.5 fill-current" />
+                    <Square className="w-4 h-4 fill-current" />
                   </button>
                 ) : (
                   <button
                     onClick={() => handleSend()}
                     disabled={!input.trim()}
                     className={cn(
-                      "flex-shrink-0 w-9 h-9 rounded-lg flex items-center justify-center transition-colors",
+                      "flex-shrink-0 w-10 h-10 rounded-xl flex items-center justify-center transition-all duration-200 shadow-sm",
                       input.trim()
-                        ? "bg-primary text-primary-foreground hover:bg-primary/90"
-                        : "bg-muted text-muted-foreground cursor-not-allowed"
+                        ? "bg-primary text-primary-foreground hover:bg-primary/90 hover:shadow-md active:scale-95"
+                        : "bg-muted/60 text-muted-foreground/40 cursor-not-allowed"
                     )}
                   >
-                    <Send className="w-4 h-4" />
+                    <Send className="w-[18px] h-[18px]" />
                   </button>
                 )}
               </div>

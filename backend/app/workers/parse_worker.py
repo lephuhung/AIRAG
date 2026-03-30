@@ -52,7 +52,19 @@ async def handle_parse(payload: dict) -> None:
 
             # ── Download raw file from MinIO ────────────────────────────────
             storage = get_storage_service()
-            file_bytes = await storage.download_file(msg.minio_key)
+            try:
+                file_bytes = await storage.download_file(msg.minio_key)
+                logger.info(
+                    f"[parse_worker] doc={msg.document_id} downloaded "
+                    f"{len(file_bytes)} bytes from MinIO key={msg.minio_key}"
+                )
+            except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                logger.error(
+                    f"[parse_worker] doc={msg.document_id} MINIO DOWNLOAD FAILED "
+                    f"({type(e).__name__}): key={msg.minio_key} — {e}",
+                    exc_info=True,
+                )
+                raise
             ext = Path(msg.minio_key).suffix.lower()
 
             # Write to temp file (Docling requires a file path)

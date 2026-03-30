@@ -419,6 +419,41 @@ class LegalKGService:
             self._driver = None
 
     # ------------------------------------------------------------------
+    # Document deletion
+    # ------------------------------------------------------------------
+
+    async def delete_document(self, document_id: int) -> None:
+        """
+        Delete all Neo4j nodes and relationships for a specific document.
+        Called before reprocessing a document to prevent KG duplicates/orphans.
+        """
+        driver = await self._get_driver()
+        label = self._label
+        try:
+            async with driver.session() as session:
+                # Delete relationships first, then nodes with matching document_id
+                result = await session.run(
+                    f"""
+                    MATCH (n:`{label}`) WHERE n.document_id = $doc_id
+                    DETACH DELETE n
+                    """,
+                    doc_id=document_id,
+                )
+                summary = await result.consume()
+                logger.info(
+                    f"LegalKG delete_document({document_id}): "
+                    f"{summary.counters.nodes_deleted} nodes, "
+                    f"{summary.counters.relationships_deleted} rels deleted "
+                    f"for workspace {self.workspace_id}"
+                )
+        except Exception as e:
+            logger.error(
+                f"LegalKG delete_document({document_id}) failed: {e}",
+                exc_info=True,
+            )
+            raise
+
+    # ------------------------------------------------------------------
     # Ingestion pipeline
     # ------------------------------------------------------------------
 

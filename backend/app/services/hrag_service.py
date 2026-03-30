@@ -350,7 +350,19 @@ class HRAGService:
 
     async def delete_document(self, document_id: int) -> None:
         """Delete a document's data from vector store and KG."""
+        # Delete from ChromaDB
         self.vector_store.delete_by_document_id(document_id)
+
+        # Delete from KG (Neo4j / LightRAG) — LegalKGService and KnowledgeGraphService
+        # both implement delete_document(document_id)
+        try:
+            kg_service = get_kg_service(workspace_id=self.workspace_id)
+            await kg_service.delete_document(document_id)
+        except Exception as e:
+            logger.warning(
+                f"[hrag_service] KG deletion failed for doc={document_id}: {e}"
+            )
+            # Non-fatal: vector data is already deleted; continue
 
         # Delete images from DB (cascade handles it, but clean up files)
         result = await self.db.execute(

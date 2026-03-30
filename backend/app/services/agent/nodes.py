@@ -820,7 +820,8 @@ async def answer_generator(state: "AgentState") -> dict:
             + "\n=== END CONTEXT ===\n\n"
             "INSTRUCTIONS:\n"
             "- Answer using ONLY the retrieved sources above.\n"
-            "- Cite sources using their unique IDs after each sentence, e.g. [id1][id2].\n"
+            "- Cite sources using their unique IDs in brackets, e.g. [a3z9] or [b2m7].\n"
+            "- Knowledge Graph / memory facts: cite as [MEM-{id}] (e.g. [MEM-1]).\n"
             "- If the sources do not contain enough information to answer fully, "
             "provide as much detail as possible and clearly state what is missing.\n"
             "- Avoid saying 'information not found' if you can provide a partial answer.\n"
@@ -929,14 +930,14 @@ async def direct_answer(state: "AgentState") -> dict:
         if intent == "personal":
             effective_system = (
                 f"USER MEMORY:\n{user_memory}\n\n"
-                "Answer directly about the user. Do NOT include the header 'USER MEMORY' in your response.\n"
-                "IMPORTANT: Do NOT add any citation markers like [id1], [mem1], [1] etc. when using memory facts.\n\n"
+                "Answer directly about the user. Cite memory facts as [MEM-1], [MEM-2], etc.\n"
+                "Do NOT include the header 'USER MEMORY' in your response.\n\n"
             ) + effective_system
         else:
             effective_system = (
                 f"USER MEMORY:\n{user_memory}\n\n"
-                "Use this info when relevant. Do NOT include the header 'USER MEMORY' in your response.\n"
-                "IMPORTANT: Do NOT add any citation markers like [id1], [mem1], [1] etc. when using memory facts.\n\n"
+                "Use this info when relevant. Cite memory facts as [MEM-1], [MEM-2], etc.\n"
+                "Do NOT include the header 'USER MEMORY' in your response.\n\n"
             ) + effective_system
 
     llm_messages: list[_LLMMsg] = []

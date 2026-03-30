@@ -403,6 +403,58 @@ class KnowledgeGraphService:
         self._rag = None
         self._initialized = False
 
+    async def delete_document(self, document_id: int) -> None:
+        """
+        Delete KG data for a specific document.
+
+        - Neo4j backend: deletes all nodes and relationships where document_id
+          matches the stored property. Safe for per-document reprocessing.
+        - LightRAG backend: LightRAG does not track document_id internally,
+          so per-document KG deletion is NOT possible. KG data will accumulate
+          on reprocess (entities/relations are added but never removed).
+          Recommend: use delete_project_data() for full workspace wipe, or
+          accept KG duplicates after document reprocess with LightRAG.
+        """
+        backend = settings.HRAG_KG_GRAPH_BACKEND.lower()
+        if backend == "neo4j":
+            try:
+                from neo4j import AsyncGraphDatabase
+
+                async with AsyncGraphDatabase.driver(
+                    settings.NEO4J_URI,
+                    auth=(settings.NEO4J_USERNAME, settings.NEO4J_PASSWORD),
+                ) as driver:
+                    label = f"kb_{self.workspace_id}"
+                    async with driver.session() as session:
+                        result = await session.run(
+                            f"""
+                            MATCH (n:`{label}`) WHERE n.document_id = $doc_id
+                            DETACH DELETE n
+                            """,
+                            doc_id=document_id,
+                        )
+                        summary = await result.consume()
+                        logger.info(
+                            f"KnowledgeGraphService delete_document({document_id}): "
+                            f"{summary.counters.nodes_deleted} nodes, "
+                            f"{summary.counters.relationships_deleted} rels deleted "
+                            f"(workspace={self.workspace_id}, backend=neo4j)"
+                        )
+            except Exception as e:
+                logger.error(
+                    f"KnowledgeGraphService delete_document({document_id}) failed: {e}",
+                    exc_info=True,
+                )
+                raise
+        else:
+            logger.warning(
+                f"KnowledgeGraphService.delete_document({document_id}): "
+                f"LightRAG backend does not support per-document KG deletion. "
+                f"KG data for this document will persist after reprocess. "
+                f"Workspace={self.workspace_id}. "
+                f"Consider using delete_project_data() for full workspace wipe."
+            )
+
     # ------------------------------------------------------------------
     # Knowledge Graph exploration (Phase 9)
     # ------------------------------------------------------------------

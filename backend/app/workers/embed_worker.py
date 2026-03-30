@@ -137,12 +137,25 @@ async def handle_embed(payload: dict) -> None:
                 for c in chunks_data
             ]
 
-            vector_store.add_documents(
-                ids=ids,
-                embeddings=embeddings,
-                documents=[c["content"] for c in chunks_data],   # store original for display
-                metadatas=metadatas,
-            )
+            try:
+                vector_store.add_documents(
+                    ids=ids,
+                    embeddings=embeddings,
+                    documents=[c["content"] for c in chunks_data],   # store original for display
+                    metadatas=metadatas,
+                )
+                logger.info(
+                    f"[embed_worker] doc={msg.document_id} added "
+                    f"{len(ids)} chunks to ChromaDB collection={vector_store.collection_name}"
+                )
+            except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                logger.error(
+                    f"[embed_worker] doc={msg.document_id} CHROMADB ADD FAILED "
+                    f"({type(e).__name__}): collection={vector_store.collection_name} "
+                    f"chunk_count={len(ids)} — {e}",
+                    exc_info=True,
+                )
+                raise
 
             # ── Mark searchable ─────────────────────────────────────────────
             document.embed_done      = True

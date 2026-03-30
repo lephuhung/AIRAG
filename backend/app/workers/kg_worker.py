@@ -52,7 +52,16 @@ async def handle_kg(payload: dict) -> None:
 
         try:
             kg_service = get_kg_service(workspace_id=msg.workspace_id)
-            await kg_service.ingest(msg.markdown, document_id=msg.document_id)
+            logger.info(f"[kg_worker] doc={msg.document_id} starting KG ingest...")
+            try:
+                await kg_service.ingest(msg.markdown, document_id=msg.document_id)
+            except (BrokenPipeError, ConnectionResetError, OSError) as kg_e:
+                logger.error(
+                    f"[kg_worker] doc={msg.document_id} KG INGEST FAILED "
+                    f"({type(kg_e).__name__}): {kg_e}",
+                    exc_info=True,
+                )
+                raise  # re-raise to outer handler
 
             document.kg_done = True
             await db.commit()

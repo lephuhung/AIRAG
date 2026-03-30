@@ -139,8 +139,16 @@ class StorageService:
     async def download_file(self, key: str) -> bytes:
         """Download raw file bytes from the uploads bucket."""
         async with self._client() as s3:
-            response = await s3.get_object(Bucket=self._bucket_uploads, Key=key)
-            body = await response["Body"].read()
+            try:
+                response = await s3.get_object(Bucket=self._bucket_uploads, Key=key)
+                body = await response["Body"].read()
+            except (BrokenPipeError, ConnectionResetError, OSError) as e:
+                logger.error(
+                    f"[storage] download_file FAILED ({type(e).__name__}): "
+                    f"bucket={self._bucket_uploads} key={key} — {e}",
+                    exc_info=True,
+                )
+                raise
         logger.debug(f"[storage] downloaded raw file {key} ({len(body)} bytes)")
         return body
 
