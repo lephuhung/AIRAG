@@ -190,6 +190,11 @@ export interface Document {
   embed_done?: boolean;              // embed worker → ChromaDB done
   captions_done?: boolean;           // caption worker → image/table captions done
   kg_done?: boolean;                 // kg worker → LightRAG KG ingest done
+  document_title?: string | null;    // Title/Subject extracted from header
+  location?: string | null;          // Location/Place
+  issuing_agency?: string | null;    // Issuing organization
+  parent_agency?: string | null;     // Parent organization
+  published_date?: string | null;    // Date of publication
 }
 
 // RAG Types

@@ -142,7 +142,6 @@
     },
     "headers": {
       "entity": "Thực thể",
-      "type": "Loại",
       "links": "Liên kết"
     }
   },
@@ -406,7 +405,12 @@
       "tables": "bảng",
       "signed_by": "Ký bởi",
       "document_number": "Số văn bản",
-      "signer": "Người ký"
+      "signer": "Người ký",
+      "document_title": "Tiêu đề/Trích yếu",
+      "issuing_agency": "Cơ quan ban hành",
+      "parent_agency": "Cơ quan chủ quản",
+      "published_date": "Ngày ban hành",
+      "location": "Địa danh"
     },
     "tasks": {
       "embed": "Nhúng",

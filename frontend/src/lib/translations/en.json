@@ -378,7 +378,12 @@
       "images": "images",
       "tables": "tables",
       "document_number": "Document Number",
-      "signer": "Signer"
+      "signer": "Signer",
+      "document_title": "Document Title",
+      "issuing_agency": "Issuing Agency",
+      "parent_agency": "Parent Agency",
+      "published_date": "Published Date",
+      "location": "Location"
     },
     "tasks": {
       "embed": "Embed",

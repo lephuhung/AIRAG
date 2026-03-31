@@ -48,16 +48,23 @@ class DocumentResponse(DocumentBase):
     # Manual signer name override
     signer_name: str | None = None
     # Sub-task completion flags (set independently by each worker after CHUNKING)
-    embed_done: bool = False
-    captions_done: bool = False
     kg_done: bool = False
+    location: str | None = None
+    issuing_agency: str | None = None
+    parent_agency: str | None = None
+    published_date: str | None = None
 
     model_config = {"from_attributes": True}
 
 
 class DocumentUpdate(BaseModel):
     document_number: str | None = None
+    document_title: str | None = None
     signer_name: str | None = None
+    published_date: str | None = None
+    issuing_agency: str | None = None
+    location: str | None = None
+    parent_agency: str | None = None
 
 
 class DocumentUploadResponse(BaseModel):

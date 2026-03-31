@@ -139,6 +139,10 @@ async def lifespan(app: FastAPI):
             await conn.execute(text(
                 "ALTER TABLE documents ADD COLUMN IF NOT EXISTS signer_name VARCHAR(255)"
             ))
+            # Root Document node entity_id in Neo4j KG (used for metadata updates)
+            await conn.execute(text(
+                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS kg_root_entity_id VARCHAR(500)"
+            ))
             # Rich Header Metadata extracted by LLM from Page 1 OCR
             await conn.execute(text(
                 "ALTER TABLE documents ADD COLUMN IF NOT EXISTS location VARCHAR(255)"

@@ -78,6 +78,9 @@ class Document(Base):
     # Manual signer name override
     signer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
+    # Root Document node entity_id in Neo4j (used for KG metadata updates)
+    kg_root_entity_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
     # User who uploaded this document
     uploaded_by: Mapped[int | None] = mapped_column(
         ForeignKey("users.id"), nullable=True

@@ -455,6 +455,125 @@ class LegalKGService:
             )
             raise
 
+    async def update_document_metadata(
+        self,
+        document_id: int,
+        doc_number: str | None = None,
+        doc_title: str | None = None,
+        signer_name: str | None = None,
+        issuing_agency: str | None = None,
+        published_date: str | None = None,
+        kg_root_entity_id: str | None = None,
+    ) -> None:
+        """
+        Update Document node properties in Neo4j when document metadata changes.
+        Uses entity_id directly if provided, otherwise falls back to document_id.
+        """
+        logger.info(
+            f"LegalKG.update_document_metadata: doc_id={document_id}, "
+            f"kg_root_entity_id='{kg_root_entity_id}', "
+            f"doc_num='{doc_number}', doc_title='{doc_title}', "
+            f"signer='{signer_name}', issuing_agency='{issuing_agency}', "
+            f"published_date='{published_date}'"
+        )
+        driver = await self._get_driver()
+        label = self._label
+
+        # Build new doc_name from provided metadata (same logic as ingest())
+        doc_type = ""
+        doc_num = doc_number or ""
+        year = "Không rõ năm"
+
+        if published_date:
+            import re
+            m = re.search(r'\b(20\d{2})\b', published_date)
+            if m:
+                year = m.group(1)
+
+        # Prefer doc_title if available, otherwise build from type/number
+        if doc_title:
+            doc_name = doc_title
+        elif doc_num and doc_type:
+            doc_name = f"{doc_type} {doc_num} ({year})"
+        elif doc_num:
+            doc_name = f"{doc_num} ({year})"
+        else:
+            doc_name = f"Tài liệu {document_id}"
+
+        # Compute entity_id (same normalization as _upsert_node uses)
+        new_entity_id = normalize_entity_id(doc_name, "Document")
+
+        # Build description
+        desc_parts = []
+        if signer_name:
+            desc_parts.append(f"Người ký: {signer_name}")
+        if issuing_agency:
+            desc_parts.append(f"Cơ quan ban hành: {issuing_agency}")
+        description = "; ".join(desc_parts) if desc_parts else doc_name
+
+        # Use provided kg_root_entity_id (Neo4j internal <id>) or fall back to entity_id lookup
+        logger.info(f"LegalKG: Looking up node by kg_root_entity_id='{kg_root_entity_id}'")
+
+        try:
+            async with driver.session() as session:
+                if kg_root_entity_id:
+                    # Direct lookup by Neo4j internal <id> - update existing node only
+                    # Extract integer id from format like "4:ab68e1b0-...:1832" or use as integer
+                    try:
+                        node_id = int(kg_root_entity_id.split(":")[-1])
+                    except (ValueError, IndexError):
+                        node_id = int(kg_root_entity_id)
+
+                    result = await session.run(
+                        f"""
+                        MATCH (n:`{label}`:`Document`)
+                        WHERE id(n) = $node_id
+                        SET n.display_name = $display_name,
+                            n.description = $description,
+                            n.updated_at = datetime()
+                        RETURN n
+                        """,
+                        node_id=node_id,
+                        display_name=doc_name,
+                        description=description,
+                    )
+                    summary = await result.consume()
+                    logger.info(
+                        f"LegalKG update_document_metadata: "
+                        f"nodes_created={summary.counters.nodes_created or 0}, "
+                        f"properties_set={summary.counters.properties_set}"
+                    )
+                else:
+                    # Fallback: use MERGE with computed entity_id
+                    result = await session.run(
+                        f"""
+                        MERGE (n:`{label}`:`Document` {{entity_id: $entity_id}})
+                        ON MATCH SET
+                            n.display_name = $display_name,
+                            n.description = $description,
+                            n.updated_at = datetime()
+                        ON CREATE SET
+                            n.entity_id = $entity_id,
+                            n.entity_type = 'Document',
+                            n.display_name = $display_name,
+                            n.description = $description,
+                            n.document_id = $doc_id,
+                            n.created_at = datetime()
+                        """,
+                        doc_id=document_id,
+                        display_name=doc_name,
+                        description=description,
+                        entity_id=new_entity_id,
+                    )
+                    summary = await result.consume()
+                    logger.info(
+                        f"LegalKG update_document_metadata({document_id}): "
+                        f"properties_set={summary.counters.properties_set}"
+                    )
+        except Exception as e:
+            logger.error(f"LegalKG update_document_metadata({document_id}) failed: {e}", exc_info=True)
+            raise
+
     # ------------------------------------------------------------------
     # Ingestion pipeline
     # ------------------------------------------------------------------
@@ -608,10 +727,14 @@ class LegalKGService:
 
         # Step 5: Store all results
         driver = await self._get_driver()
+        neo4j_node_id = ""  # Will hold the Neo4j internal <id> for the root Document node
         async with driver.session() as session:
-            # Store Document node
-            await self._upsert_node(session, doc_name, "Document", doc_meta.get("so_hieu", ""), document_id)
-            
+            # Store Document node and get its internal Neo4j <id>
+            neo4j_node_id = await self._upsert_document_root(
+                session, doc_name, doc_meta.get("so_hieu", ""), document_id
+            )
+            logger.info(f"LegalKG: created root Document node with Neo4j id={neo4j_node_id}")
+
             # --- Store Root Context (Location & Org Hierarchy) ---
             loc_name = ""
             if loc:
@@ -730,6 +853,21 @@ class LegalKGService:
             f"LegalKG stored: {entity_count} entities, {rel_count} relations "
             f"for workspace {self.workspace_id}"
         )
+
+        # Save kg_root_entity_id (Neo4j internal <id>) back to Document table for future metadata updates
+        if document_id and neo4j_node_id:
+            try:
+                from app.core.database import async_session_maker
+                from sqlalchemy import text
+                async with async_session_maker() as _db:
+                    await _db.execute(
+                        text("UPDATE documents SET kg_root_entity_id = :node_id WHERE id = :doc_id"),
+                        {"node_id": neo4j_node_id, "doc_id": document_id}
+                    )
+                    await _db.commit()
+                logger.info(f"LegalKG: saved kg_root_entity_id='{neo4j_node_id}' for doc_id={document_id}")
+            except Exception as _e:
+                logger.warning(f"LegalKG: failed to save kg_root_entity_id for doc_id={document_id}: {_e}")
 
     def _format_doc_meta(self, meta: dict) -> str:
         parts = []
@@ -1144,6 +1282,43 @@ class LegalKGService:
     # ------------------------------------------------------------------
     # Neo4j storage helpers
     # ------------------------------------------------------------------
+
+    async def _upsert_document_root(
+        self,
+        session,
+        doc_name: str,
+        description: str = "",
+        document_id: Optional[int] = None,
+    ) -> str:
+        """
+        Create or update the root Document node and return its Neo4j internal <id>.
+        This <id> is stored in documents.kg_root_entity_id for future metadata updates.
+        """
+        label = self._label
+        canonical_id = normalize_entity_id(doc_name, "Document")
+        display_name = doc_name.replace("#", "").strip()
+
+        cypher = f"""
+        MERGE (n:`{label}`:`Document` {{entity_id: $entity_id}})
+        ON CREATE SET n.entity_type  = 'Document',
+                      n.display_name = $display_name,
+                      n.description  = $description,
+                      n.document_id  = $document_id,
+                      n.created_at   = datetime()
+        ON MATCH SET  n.description  = CASE WHEN $description <> '' THEN $description ELSE n.description END
+        RETURN id(n) as node_id
+        """
+        result = await session.run(
+            cypher,
+            entity_id=canonical_id,
+            display_name=display_name,
+            description=description,
+            document_id=document_id,
+        )
+        record = await result.single()
+        if record:
+            return str(record["node_id"])  # Neo4j internal <id> as string
+        return ""
 
     async def _upsert_node(
         self,

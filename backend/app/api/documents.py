@@ -536,11 +536,39 @@ async def update_document(
     # Update fields
     if body.document_number is not None:
         document.document_number = body.document_number
+    if body.document_title is not None:
+        document.document_title = body.document_title
     if body.signer_name is not None:
         document.signer_name = body.signer_name
+    if body.published_date is not None:
+        document.published_date = body.published_date
+    if body.issuing_agency is not None:
+        document.issuing_agency = body.issuing_agency
 
     await db.commit()
     await db.refresh(document)
+
+    # Update LegalKG (Neo4j) if document was indexed
+    logger.info(f"update_document: doc_id={document_id}, status={document.status}, workspace_id={document.workspace_id}, kg_root_entity_id={document.kg_root_entity_id}")
+    if document.status == DocumentStatus.INDEXED:
+        try:
+            from app.services.legal_kg_service import LegalKGService
+            kg_service = LegalKGService(document.workspace_id)
+            logger.info(f"Calling LegalKG update_document_metadata for doc_id={document_id}")
+            await kg_service.update_document_metadata(
+                document_id=document.id,
+                doc_number=document.document_number,
+                doc_title=document.document_title,
+                signer_name=document.signer_name,
+                issuing_agency=document.issuing_agency,
+                published_date=document.published_date,
+                kg_root_entity_id=document.kg_root_entity_id,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to update LegalKG metadata: {e}")
+    else:
+        logger.info(f"Skipping LegalKG update - document status is {document.status}, not INDEXED")
+
     return document
 
 
@@ -564,6 +592,14 @@ async def delete_document(
             await rag_service.delete_document(document_id)
         except Exception as e:
             logger.warning(f"Failed to delete chunks from vector store: {e}")
+
+        # Also delete from LegalKG (Neo4j) if KG was built
+        try:
+            from app.services.legal_kg_service import LegalKGService
+            kg_service = LegalKGService(document.workspace_id)
+            await kg_service.delete_document(document_id)
+        except Exception as e:
+            logger.warning(f"Failed to delete document from LegalKG (Neo4j): {e}")
 
     # Delete local file if it still exists (legacy / backward compat)
     file_path = UPLOAD_DIR / document.filename

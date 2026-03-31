@@ -104,7 +104,7 @@ export function useUpdateDocument(workspaceId: string | undefined) {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: ({ docId, data }: { docId: number; data: { document_number?: string; signer_name?: string } }) =>
+    mutationFn: ({ docId, data }: { docId: number; data: Partial<Document> }) =>
       api.patch(`/documents/${docId}`, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["documents", workspaceId] });
