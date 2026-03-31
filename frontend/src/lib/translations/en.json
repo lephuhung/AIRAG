@@ -8,15 +8,34 @@
     "knowledge_bases": "Knowledge Bases",
     "files": "Files",
     "workers": "Workers",
+    "system_logs": "System Logs",
     "admin": {
       "dashboard": "Dashboard",
       "users": "Users",
       "tenants": "Tenants",
       "document_types": "Document Types",
-      "abbreviations": "Abbreviations"
+      "abbreviations": "Abbreviations",
+      "system_logs": "System Logs"
     },
     "my_tenants": "My Tenants",
     "your_chats": "Your chats"
+  },
+  "logs": {
+    "streaming": "Streaming",
+    "paused": "Paused",
+    "resume": "Resume",
+    "pause": "Pause",
+    "clear": "Clear",
+    "stop": "Stop",
+    "start": "Start",
+    "no_logs": "No logs to display",
+    "select_and_start": "Select log files and click Start to begin streaming",
+    "lines": "lines",
+    "files_selected": "files selected",
+    "select_file": "Select log file",
+    "waiting": "Waiting for logs...",
+    "file": "File",
+    "new": "new"
   },
   "common": {
     "admin": "Admin",

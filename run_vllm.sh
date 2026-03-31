@@ -50,7 +50,7 @@ nohup "$VIRTUAL_ENV/bin/python3" -m vllm.entrypoints.openai.api_server \
     --port 8001 \
     --gpu-memory-utilization 0.4 \
     --trust-remote-code \
-    --served-model-name hunyuan-ocr > ocr_vllm.log 2>&1 &
+    --served-model-name hunyuan-ocr > ./logs/ocr_vllm.log 2>&1 &
 
 # 2. Start Qwen3-4B-Instruct-2507-FP8 (Memory Agent Model)
 # Port: 8082, GPU Memory: 0.15 (approx 7.3 GB)
@@ -61,7 +61,7 @@ nohup "$VIRTUAL_ENV/bin/python3" -m vllm.entrypoints.openai.api_server \
     --max-model-len 17000 \
     --gpu-memory-utilization 0.2 \
     --trust-remote-code \
-    --served-model-name qwen-memory > qwen_vllm.log 2>&1 &
+    --served-model-name qwen-memory > ./logs/qwen_vllm.log 2>&1 &
 
 echo "----------------------------------------------------------"
 echo "Both models are starting in the background."

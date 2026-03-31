@@ -17,6 +17,7 @@ import { AdminDocumentTypesPage } from "@/pages/AdminDocumentTypesPage";
 import { AdminAbbreviationsPage } from "@/pages/AdminAbbreviationsPage";
 import { AdminDashboardPage } from "@/pages/AdminDashboardPage";
 import { ChatPage } from "@/pages/ChatPage";
+import { SystemLogsPage } from "@/pages/SystemLogsPage";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -54,6 +55,7 @@ function AppRoutes() {
         <Route path="/admin/tenants" element={<AdminTenantsPage />} />
         <Route path="/admin/document-types" element={<AdminDocumentTypesPage />} />
         <Route path="/admin/abbreviations" element={<AdminAbbreviationsPage />} />
+        <Route path="/system-logs" element={<SystemLogsPage />} />
         <Route path="/tenants/:tenantId" element={<TenantManagePage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

@@ -90,6 +90,11 @@ async def handle_embed(payload: dict) -> None:
                         embed_texts = await enrich_chunks_with_context(
                             document_markdown=document_markdown,
                             chunks=chunks_data,
+                            document_title=getattr(document, "document_title", "") or "",
+                            document_type=getattr(document.document_type, "name", "") if document.document_type else "",
+                            document_number=getattr(document, "document_number", "") or "",
+                            issuing_agency=getattr(document, "issuing_agency", "") or "",
+                            published_date=getattr(document, "published_date", "") or "",
                         )
                         logger.info(
                             f"[embed_worker] doc={msg.document_id} "

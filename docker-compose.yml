@@ -195,7 +195,7 @@ services:
       - hrag_uploads:/app/backend/uploads
       - hrag_data:/app/backend/data
     deploy:
-      replicas: 4
+      replicas: 8
       resources:
         reservations:
           devices:
@@ -231,7 +231,7 @@ services:
       - hrag_uploads:/app/backend/uploads
       - hrag_data:/app/backend/data
     deploy:
-      replicas: 2
+      replicas: 4
       resources:
         reservations:
           devices:
@@ -269,7 +269,7 @@ services:
       - hrag_uploads:/app/backend/uploads
       - hrag_data:/app/backend/data
     deploy:
-      replicas: 2
+      replicas: 4
       resources:
         reservations:
           devices:
@@ -305,7 +305,7 @@ services:
     volumes:
       - hrag_data:/app/backend/data
     deploy:
-      replicas: 2
+      replicas: 4
       resources:
         reservations:
           devices:

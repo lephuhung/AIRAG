@@ -49,7 +49,14 @@ _CONTEXT_SYSTEM_PROMPT = (
 )
 
 _CONTEXT_USER_TEMPLATE = (
-    "<document>\n{document_preview}\n</document>\n\n"
+    "<document>\n"
+    "<title>{document_title}</title>\n"
+    "<type>{document_type}</type>\n"
+    "<number>{document_number}</number>\n"
+    "<issued_by>{issuing_agency}</issued_by>\n"
+    "<date>{published_date}</date>\n"
+    "{document_preview}\n"
+    "</document>\n\n"
     "Đây là đoạn văn bản cần được định vị:\n"
     "<chunk>\n{chunk_content}\n</chunk>\n\n"
     "Viết mô tả ngắn (1-2 câu) định vị đoạn này trong tài liệu."
@@ -62,6 +69,11 @@ _DOCUMENT_PREVIEW_CHARS = 6000
 
 async def _generate_context_for_chunk(
     llm,
+    document_title: str,
+    document_type: str,
+    document_number: str,
+    issuing_agency: str,
+    published_date: str,
     document_preview: str,
     chunk_content: str,
     max_tokens: int,
@@ -74,6 +86,11 @@ async def _generate_context_for_chunk(
     from app.services.llm.types import LLMMessage
 
     user_content = _CONTEXT_USER_TEMPLATE.format(
+        document_title=document_title,
+        document_type=document_type,
+        document_number=document_number,
+        issuing_agency=issuing_agency,
+        published_date=published_date,
         document_preview=document_preview,
         chunk_content=chunk_content[:800],   # cap chunk to keep prompt small
     )
@@ -101,6 +118,11 @@ async def _generate_context_for_chunk(
 async def enrich_chunks_with_context(
     document_markdown: str,
     chunks: Sequence[dict],
+    document_title: str = "",
+    document_type: str = "",
+    document_number: str = "",
+    issuing_agency: str = "",
+    published_date: str = "",
     max_tokens: int | None = None,
     concurrency: int | None = None,
 ) -> list[str]:
@@ -110,6 +132,11 @@ async def enrich_chunks_with_context(
     Args:
         document_markdown: Full parsed markdown of the document.
         chunks:            List of chunk dicts (each has at least a "content" key).
+        document_title:    Title of the document for additional context.
+        document_type:     Type of the document (e.g. "Công văn", "Nghị định").
+        document_number:   Document number (e.g. "123/BCD-TTHT").
+        issuing_agency:   Agency that issued the document.
+        published_date:    Publication/issue date of the document.
         max_tokens:        Max tokens for generated context.  Defaults to settings value.
         concurrency:       Max parallel LLM calls.  Defaults to settings value.
 
@@ -134,6 +161,11 @@ async def enrich_chunks_with_context(
     tasks = [
         _generate_context_for_chunk(
             llm=llm,
+            document_title=document_title,
+            document_type=document_type,
+            document_number=document_number,
+            issuing_agency=issuing_agency,
+            published_date=published_date,
             document_preview=document_preview,
             chunk_content=c["content"],
             max_tokens=_max_tokens,

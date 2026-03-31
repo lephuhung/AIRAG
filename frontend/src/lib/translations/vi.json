@@ -8,15 +8,34 @@
     "knowledge_bases": "Kho tri thức",
     "files": "Tệp tin",
     "workers": "Tiến trình",
+    "system_logs": "Nhật ký hệ thống",
     "admin": {
       "dashboard": "Thống kê",
       "users": "Người dùng",
       "tenants": "Tổ chức",
       "document_types": "Loại tài liệu",
-      "abbreviations": "Từ viết tắt"
+      "abbreviations": "Từ viết tắt",
+      "system_logs": "Nhật ký hệ thống"
     },
     "my_tenants": "Tổ chức của tôi",
     "your_chats": "Lịch sử chat"
+  },
+  "logs": {
+    "streaming": "Đang stream",
+    "paused": "Tạm dừng",
+    "resume": "Tiếp tục",
+    "pause": "Tạm dừng",
+    "clear": "Xóa",
+    "stop": "Dừng",
+    "start": "Bắt đầu",
+    "no_logs": "Không có log để hiển thị",
+    "select_and_start": "Chọn file log và nhấn Bắt đầu để stream",
+    "lines": "dòng",
+    "files_selected": "file được chọn",
+    "select_file": "Chọn file log",
+    "waiting": "Đang đợi log...",
+    "file": "File",
+    "new": "mới"
   },
   "common": {
     "admin": "Quản trị",
