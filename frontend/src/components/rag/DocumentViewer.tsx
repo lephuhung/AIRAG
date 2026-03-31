@@ -5,6 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
+import rehypeRaw from "rehype-raw";
 import "katex/dist/katex.min.css";
 import { FileText, List, ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -139,16 +140,24 @@ function PageDivider({ pageNo }: { pageNo: number }) {
 function extractHeadings(markdown: string): Heading[] {
   const headings: Heading[] = [];
   const lines = markdown.split("\n");
+  const seenCounts = new Map<string, number>();
   for (const line of lines) {
     const match = line.match(/^(#{1,4})\s+(.+)/);
     if (match) {
       const level = match[1].length;
       const text = match[2].replace(/[*_`#]/g, "").trim();
-      const id = text
+      const baseId = text
         .toLowerCase()
         .replace(/[^a-z0-9\s-]/g, "")
         .replace(/\s+/g, "-")
         .slice(0, 80);
+      // Track occurrences of the BASE id (before suffix), not the final id.
+      // First occurrence: count=1 → no suffix
+      // Second occurrence: count=2 → "-1" suffix
+      // Third occurrence: count=3 → "-2" suffix
+      const count = (seenCounts.get(baseId) ?? 0) + 1;
+      seenCounts.set(baseId, count);
+      const id = count > 1 ? `${baseId}-${count - 1}` : baseId;
       headings.push({ id, text, level });
     }
   }
@@ -156,18 +165,41 @@ function extractHeadings(markdown: string): Heading[] {
 }
 
 // ---------------------------------------------------------------------------
+// Fix unsupported LaTeX commands before KaTeX processing
+// ---------------------------------------------------------------------------
 // Insert page dividers into markdown text
 // ---------------------------------------------------------------------------
 function insertPageDividers(markdown: string): string {
-  // Docling inserts page markers like "<!-- page 3 -->" or "---\n\n## Page 3"
-  // We normalize them into a custom token that we render
-  return markdown.replace(
-    /(?:<!--\s*page\s+(\d+)\s*-->|(?:^|\n)---+\s*\n+(?=##?\s))/gi,
-    (match, pageNo) => {
-      if (pageNo) return `\n\n<page-break data-page="${pageNo}" />\n\n`;
-      return match; // Keep regular hr
+  // Two source formats are handled:
+  //
+  // OCR (HunyuanOCR):  "<!-- page N -->\n\nContent\n\n---\n\n<!-- page N+1 -->"
+  //   → The --- is just a separator; page info is in the <!-- comment.
+  //   → We consume the --- that follows <!-- page N --> so it doesn't become
+  //     a spurious PageDivider with the wrong auto-incremented number.
+  //
+  // Docling:  "---\n\n## Page N" (or <!-- page N -->) in the exported markdown.
+  //   → The --- followed by a heading IS the page marker; we keep it for
+  //     the hr override to turn into a PageDivider.
+
+  // Step 1 — OCR format: <!-- page N --> ...content... \n\n---\n\n<!-- page M -->
+  let result = markdown.replace(
+    /<!--\s*page\s+(\d+)\s*-->\s*\n+([\s\S]*?)\n+---\n+/gi,
+    (_, pageNo, content) => {
+      return `<hr data-page="${pageNo}" />\n\n${content.trim()}\n\n`;
     }
   );
+
+  // Step 2 — Remaining <!-- page N --> without trailing --- (standalone Docling style)
+  result = result.replace(
+    /<!--\s*page\s+(\d+)\s*-->/gi,
+    (_, pageNo) => `<hr data-page="${pageNo}" />`
+  );
+
+  // Step 3 — Consume orphaned trailing --- that has no page marker after it
+  result = result.replace(/\n+---\n+$/gi, '\n\n');
+
+  // Step 4 — Docling ---\n\n## Page N pattern → left for hr override (auto-increment)
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -210,9 +242,14 @@ export const DocumentViewer = memo(function DocumentViewer({
     [markdown]
   );
 
+  // Reset page counter whenever the document changes (not just markdown content).
+  // This prevents the counter from leaking between documents when markdown is cached.
+  useEffect(() => {
+    pageCounterRef.current = 1;
+  }, [doc.id]);
+
   // ---- Process markdown (insert page dividers) ----
   const processedMarkdown = useMemo(() => {
-    pageCounterRef.current = 1; // reset on re-process
     return markdown ? insertPageDividers(markdown) : "";
   }, [markdown]);
 
@@ -240,9 +277,13 @@ export const DocumentViewer = memo(function DocumentViewer({
       const id = generateHeadingId(text);
       return <h4 id={id} {...props}>{children}</h4>;
     },
-    hr: () => {
-      pageCounterRef.current += 1;
-      return <PageDivider pageNo={pageCounterRef.current} />;
+    hr: (props) => {
+      // If data-page is set (from <!-- page N --> marker), parse and use it;
+      // otherwise auto-increment for Docling's ---## style markers.
+      const dp = (props as Record<string, unknown>)["data-page"];
+      const pageNo =
+        dp != null ? Number(dp) : (pageCounterRef.current += 1, pageCounterRef.current);
+      return <PageDivider pageNo={pageNo} />;
     },
     p: ({ children, node, ...props }) => {
       const hasImage = (node as any)?.children?.some(
@@ -284,7 +325,7 @@ export const DocumentViewer = memo(function DocumentViewer({
 
   // Stable plugin arrays
   const remarkPlugins = useMemo(() => [remarkGfm, remarkMath], []);
-  const rehypePlugins = useMemo(() => [rehypeKatex], []);
+  const rehypePlugins = useMemo(() => [rehypeKatex, rehypeRaw], []);
 
   // ---- Intersection observer for active heading ----
   useEffect(() => {
@@ -452,7 +493,7 @@ export const DocumentViewer = memo(function DocumentViewer({
     if (!highlightChunks || highlightChunks.length === 0) return;
 
     for (const chunk of highlightChunks) {
-      // Strategy: find the heading from heading_path, highlight it + siblings
+      // Strategy 1: find the heading from heading_path, highlight it + siblings
       const lastHeading =
         chunk.heading_path.length > 0
           ? chunk.heading_path[chunk.heading_path.length - 1]
@@ -484,6 +525,19 @@ export const DocumentViewer = memo(function DocumentViewer({
         }
       }
 
+      // Strategy 2: No heading_path - find text content matching chunk.content
+      // and highlight its container element
+      if (chunk.content) {
+        // Get first 100 chars of chunk content for matching (avoid very long searches)
+        const searchText = chunk.content.slice(0, 100).replace(/[<>]/g, "");
+        const allElements = contentRef.current.querySelectorAll("p, div, li, td, th");
+        for (const el of allElements) {
+          if (el.textContent && el.textContent.includes(searchText.slice(0, 50))) {
+            el.classList.add("chunk-hl", "chunk-hl-sibling");
+            break;
+          }
+        }
+      }
     }
     // Scroll is handled by the scroll-to effect above — don't compete here
   }, [highlightChunks, processedMarkdown]);

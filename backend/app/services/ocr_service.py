@@ -193,7 +193,13 @@ class HunyuanOCRService:
         else:
             page_texts = await self._ocr_pages_api(page_images)
 
-        full_text = "\n\n---\n\n".join(t for t in page_texts if t.strip())
+        # Add page number markers that both frontend (insertPageDividers) and
+        # backend (_parse_legacy) can parse
+        marked_pages = []
+        for i, text in enumerate(page_texts):
+            if text.strip():
+                marked_pages.append(f"<!-- page {i + 1} -->\n\n{text.strip()}")
+        full_text = "\n\n---\n\n".join(marked_pages)
         logger.info(
             f"[OCR/{backend}] Complete: {len(full_text)} chars from {total_pages} pages"
         )

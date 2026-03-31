@@ -26,6 +26,7 @@ Nhiệm vụ của bạn là trích xuất các thực thể (entities) và mố
 - Organization: Cơ quan, tổ chức cụ thể, không chung chung. PHẢI viết tên đầy đủ dựa vào thông tin văn bản (document_meta). KHÔNG dùng tên tắt. Ví dụ: "UBND Tỉnh Nghệ An" (không dùng "UBND tỉnh"). Các tổ chức chung chung như "Người có trách nhiệm", "Cơ quan có thẩm quyền", "Cơ quan, tổ chức có liên quan" không được coi là thực thể.
 - Person: Cá nhân. PHẢI dùng Composite Key theo quy tắc ưu tiên (xem bên dưới).
 - Task: Nhiệm vụ, công việc cụ thể được giao. Ví dụ: "lập kế hoạch thanh tra hàng năm"
+- Location: Địa điểm, địa danh cụ thể liên quan đến nội dung văn bản hoặc nơi ban hành văn bản.
 
 ## Quy tắc Composite Key cho Person (theo thứ tự ưu tiên):
 1. "[Họ Tên] (DD/MM/YYYY)" — nếu có ngày sinh
@@ -75,7 +76,7 @@ Hãy trích xuất entities và relations theo đúng schema đã quy định.
 Trả về JSON có dạng:
 {{
   "entities": [
-    {{"name": "...", "type": "Article|Document|Organization|Person|Task", "description": "..."}}
+    {{"name": "...", "type": "Article|Document|Organization|Person|Task|Location", "description": "..."}}
   ],
   "relations": [
     {{"source": "...", "relation": "CAN_CU|VIEN_DAN|SUA_DOI|CHU_TRI|PHOI_HOP|CHIU_TRACH_NHIEM|PART_OF|REFERENCES|KY", "target": "...", "description": "..."}}

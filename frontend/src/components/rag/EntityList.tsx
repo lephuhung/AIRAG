@@ -10,11 +10,12 @@ import {
   Users,
   Building2,
   MapPin,
-  Lightbulb,
-  Calendar,
+  FileText,
+  CheckSquare,
+  Network,
   Tag,
   Loader2,
-  Network,
+  Database,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
@@ -24,11 +25,12 @@ import type { KGEntity, KGRelationship } from "@/types";
 // Entity type config — icon + color
 // ---------------------------------------------------------------------------
 const ENTITY_TYPE_CONFIG: Record<string, { icon: typeof Tag; color: string; bg: string }> = {
-  person:       { icon: Users,     color: "text-blue-400",   bg: "bg-blue-400/15" },
-  organization: { icon: Building2, color: "text-primary",    bg: "bg-primary/15" },
-  location:     { icon: MapPin,    color: "text-amber-400",  bg: "bg-amber-400/15" },
-  event:        { icon: Calendar,  color: "text-orange-400", bg: "bg-orange-400/15" },
-  concept:      { icon: Lightbulb, color: "text-purple-400", bg: "bg-purple-400/15" },
+  article:      { icon: FileText,    color: "text-slate-400",   bg: "bg-slate-400/15" },
+  document:     { icon: Database,    color: "text-indigo-500",  bg: "bg-indigo-500/15" },
+  organization: { icon: Building2,   color: "text-emerald-500", bg: "bg-emerald-500/15" },
+  person:       { icon: Users,       color: "text-cyan-500",    bg: "bg-cyan-500/15" },
+  location:     { icon: MapPin,      color: "text-amber-500",   bg: "bg-amber-500/15" },
+  task:         { icon: CheckSquare, color: "text-rose-500",    bg: "bg-rose-500/15" },
 };
 
 function getEntityConfig(type: string) {

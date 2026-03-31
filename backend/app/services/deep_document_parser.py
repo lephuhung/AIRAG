@@ -1012,34 +1012,72 @@ class DeepDocumentParser:
         original_filename: str,
     ) -> ParsedDocument:
         """Fallback: parse TXT/MD with legacy loader + RecursiveCharacterTextSplitter."""
+        import re
         from app.services.document_loader import load_document
         from app.services.chunker import DocumentChunker
 
         loaded = load_document(str(file_path))
         chunker = DocumentChunker(chunk_size=500, chunk_overlap=50)
+        content = loaded.content
+
+        # For OCR documents with page markers (<!-- page N -->), extract page numbers
+        # and split content preserving markers for proper page assignment
+        page_marker_pattern = re.compile(r"<!--\s*page\s+(\d+)\s*-->")
+        page_break_marker = "\n\n---\n\n"
+
+        # page_ranges: list of (page_no, char_start) in reconstructed content
+        page_ranges: list[tuple[int, int]] = []
+        reconstructed_parts: list[str] = []
+        if page_marker_pattern.search(content):
+            # OCR document with page markers: parse each page segment
+            segments = content.split(page_break_marker)
+            current_pos = 0
+            for seg in segments:
+                match = page_marker_pattern.search(seg)
+                if match:
+                    page_no = int(match.group(1))
+                    clean_seg = page_marker_pattern.sub("", seg).strip()
+                else:
+                    page_no = len(page_ranges) + 1
+                    clean_seg = seg.strip()
+                reconstructed_parts.append(f"<!-- page {page_no} -->\n\n{clean_seg}")
+                page_ranges.append((page_no, current_pos))
+                current_pos += len(reconstructed_parts[-1]) + len(page_break_marker)
+            page_count = len(page_ranges)
+            content = page_break_marker.join(reconstructed_parts)
+        else:
+            page_count = loaded.page_count or 1
+
         text_chunks = chunker.split_text(
-            text=loaded.content,
+            text=content,
             source=original_filename,
             extra_metadata={"document_id": document_id, "file_type": loaded.file_type},
         )
 
-        # Wrap legacy chunks as EnrichedChunks
-        chunks = [
-            EnrichedChunk(
+        # Wrap legacy chunks as EnrichedChunks with correct page_no
+        chunks = []
+        for tc in text_chunks:
+            chunk_page = 0
+            if page_ranges:
+                # Find which page this chunk belongs to based on its char_start
+                for i, (page_no, page_start) in enumerate(page_ranges):
+                    page_end = page_ranges[i + 1][1] if i + 1 < len(page_ranges) else len(content)
+                    if page_start <= tc.char_start < page_end:
+                        chunk_page = page_no
+                        break
+            chunks.append(EnrichedChunk(
                 content=tc.content,
                 chunk_index=tc.chunk_index,
                 source_file=original_filename,
                 document_id=document_id,
-                page_no=0,
-            )
-            for tc in text_chunks
-        ]
+                page_no=chunk_page,
+            ))
 
         return ParsedDocument(
             document_id=document_id,
             original_filename=original_filename,
-            markdown=loaded.content,
-            page_count=loaded.page_count,
+            markdown=content,
+            page_count=page_count,
             chunks=chunks,
             images=[],
             tables_count=0,

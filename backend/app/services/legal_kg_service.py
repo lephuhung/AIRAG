@@ -528,12 +528,14 @@ class LegalKGService:
                         f"""
                         MATCH (n:`{label}`:`Document`)
                         WHERE id(n) = $node_id
-                        SET n.display_name = $display_name,
+                        SET n.entity_id = $entity_id,
+                            n.display_name = $display_name,
                             n.description = $description,
                             n.updated_at = datetime()
                         RETURN n
                         """,
                         node_id=node_id,
+                        entity_id=new_entity_id,
                         display_name=doc_name,
                         description=description,
                     )
@@ -549,6 +551,7 @@ class LegalKGService:
                         f"""
                         MERGE (n:`{label}`:`Document` {{entity_id: $entity_id}})
                         ON MATCH SET
+                            n.entity_id = $entity_id,
                             n.display_name = $display_name,
                             n.description = $description,
                             n.updated_at = datetime()

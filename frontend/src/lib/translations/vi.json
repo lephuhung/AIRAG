@@ -392,11 +392,11 @@
       "failed": "Thất bại"
     },
     "msg": {
-      "parsing": "Đang phân tích tài liệu...",
+      "parsing": "Đang phân tích...",
       "ocring": "Đang chạy OCR...",
-      "chunking": "Đang xây dựng các mảnh dữ liệu...",
+      "chunking": "Đang xây dựng dữ liệu...",
       "embedding": "Đang nhúng vector...",
-      "building_kg": "Đang xây dựng biểu đồ..."
+      "building_kg": "Xây dựng biểu đồ..."
     },
     "metadata": {
       "pages": "trang",

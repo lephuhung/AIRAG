@@ -56,11 +56,12 @@ function TypeDistribution({ types }: { types: Record<string, number> }) {
   if (entries.length === 0) return null;
 
   const TYPE_COLORS: Record<string, string> = {
-    person:       "bg-blue-400",
-    organization: "bg-primary",
-    location:     "bg-amber-400",
-    event:        "bg-orange-400",
-    concept:      "bg-purple-400",
+    article:      "bg-slate-400",
+    document:     "bg-indigo-500",
+    organization: "bg-emerald-500",
+    person:       "bg-cyan-500",
+    location:     "bg-amber-500",
+    task:         "bg-rose-500",
   };
 
   return (

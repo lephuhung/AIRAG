@@ -16,11 +16,12 @@ import type { KGGraphData, KGGraphNode, KGGraphEdge } from "@/types";
 // Entity type → color mapping
 // ---------------------------------------------------------------------------
 const TYPE_COLORS: Record<string, string> = {
-  person:       "#60a5fa", // blue-400
-  organization: "#4ade80", // green-400 (primary-ish)
-  location:     "#fbbf24", // amber-400
-  event:        "#fb923c", // orange-400
-  concept:      "#c084fc", // purple-400
+  article:      "#94a3b8", // slate-400
+  document:     "#6366f1", // indigo-500
+  organization: "#10b981", // emerald-500
+  person:       "#06b6d4", // cyan-500
+  location:     "#f59e0b", // amber-400
+  task:         "#f43f5e", // rose-500
 };
 
 function getNodeColor(type: string): string {
