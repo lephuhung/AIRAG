@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback, useMemo, memo, createContext, useContext, Children, isValidElement, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { motion, AnimatePresence } from "framer-motion";
 import ReactMarkdown from "react-markdown";
@@ -27,6 +28,12 @@ import {
   RotateCcw,
   Zap,
   BookOpen,
+  Plus,
+  Mic,
+  Settings2,
+  Music,
+  GraduationCap,
+  Pencil,
 } from "lucide-react";
 import { PrismLight as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
@@ -80,7 +87,7 @@ import { useTranslation } from "@/hooks/useTranslation";
 import { useCreateAbbreviation } from "@/hooks/useAbbreviations";
 import { AbbreviationModal } from "@/components/rag/AbbreviationModal";
 import { StreamingMarkdown } from "@/components/rag/MemoizedMarkdown";
-import { ThinkingTimeline, STEP_CONFIG } from "@/components/rag/ThinkingTimeline";
+import { STEP_CONFIG } from "@/components/rag/ThinkingTimeline";
 import type {
   ChatMessage,
   ChatImageRef,
@@ -601,136 +608,6 @@ function SourceRatingButtons({
 }
 
 // ---------------------------------------------------------------------------
-// Sources Sidebar — Right slide-over
-// ---------------------------------------------------------------------------
-
-function SourcesSidebar({
-  activeSources,
-  onClose,
-}: {
-  activeSources: { sources: ChatSourceChunk[]; messageId?: string } | null;
-  onClose: () => void;
-}) {
-  const { t } = useTranslation();
-  const [ratings, setRatings] = useState<Record<string, RelevanceRating>>({});
-  const sessionId = useContext(SessionIdCtx);
-  const queryClient = useQueryClient();
-
-  const rateMutation = useMutation({
-    mutationFn: ({
-      sessionId,
-      messageId,
-      sourceIndex,
-      rating,
-    }: {
-      sessionId: string;
-      messageId: string;
-      sourceIndex: string;
-      rating: RelevanceRating;
-    }) =>
-      api.post(`/rag/chat/${sessionId}/rate`, {
-        message_id: messageId,
-        source_index: sourceIndex,
-        rating: rating,
-      }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["chat-history", sessionId] });
-    },
-  });
-
-  const handleRate = useCallback(
-    async (sourceIndex: string, rating: RelevanceRating) => {
-      if (!sessionId || !activeSources?.messageId) return;
-
-      const newRating = ratings[sourceIndex] === rating ? "partial" : rating;
-      const prev = { ...ratings };
-      setRatings((r) => ({ ...r, [sourceIndex]: newRating }));
-
-      try {
-        await rateMutation.mutateAsync({
-          sessionId,
-          messageId: activeSources.messageId,
-          sourceIndex,
-          rating: newRating,
-        });
-      } catch {
-        setRatings(prev);
-      }
-    },
-    [sessionId, activeSources?.messageId, ratings, rateMutation],
-  );
-
-  return (
-    <AnimatePresence>
-      {activeSources && (
-        <>
-          {/* Backdrop */}
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            onClick={onClose}
-            className="fixed inset-0 z-[60] bg-background/20 backdrop-blur-sm"
-          />
-
-          {/* Sidebar */}
-          <motion.div
-            initial={{ x: "-100%" }}
-            animate={{ x: 0 }}
-            exit={{ x: "-100%" }}
-            transition={{ type: "spring", damping: 25, stiffness: 200 }}
-            className="fixed top-0 bottom-0 w-80 z-[70] bg-background border-r shadow-2xl flex flex-col"
-            style={{ left: "var(--sidebar-width, 0px)" }}
-          >
-            <div className="flex items-center justify-between px-4 py-3 border-b">
-              <div className="flex items-center gap-2">
-                <FileText className="w-4 h-4 text-primary" />
-                <h3 className="text-sm font-semibold">{t("rag.sources")}</h3>
-                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted font-medium text-muted-foreground">
-                  {activeSources.sources.length}
-                </span>
-              </div>
-              <button
-                onClick={onClose}
-                className="p-1 rounded-md hover:bg-muted transition-colors"
-                title={t("common.close")}
-              >
-                <X className="w-4 h-4 text-muted-foreground" />
-              </button>
-            </div>
-
-            <div className="flex-1 overflow-y-auto divide-y">
-              {activeSources.sources
-                .filter((s) => s.source_type !== "kg")
-                .map((source) => (
-                  <SourceItem
-                    key={String(source.index)}
-                    source={source}
-                    messageId={activeSources.messageId}
-                    ratings={ratings}
-                    onRate={handleRate}
-                  />
-                ))}
-              {activeSources.sources
-                .filter((s) => s.source_type === "kg")
-                .map((source) => (
-                  <KGSourceItem
-                    key={String(source.index)}
-                    source={source}
-                    messageId={activeSources.messageId}
-                    ratings={ratings}
-                    onRate={handleRate}
-                  />
-                ))}
-            </div>
-          </motion.div>
-        </>
-      )}
-    </AnimatePresence>
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Source item in the sources panel
 // ---------------------------------------------------------------------------
 function SourceItem({
@@ -738,11 +615,13 @@ function SourceItem({
   messageId,
   ratings,
   onRate,
+  onClosePopover,
 }: {
   source: ChatSourceChunk;
   messageId?: string;
   ratings: Record<string, RelevanceRating>;
   onRate: (sourceIndex: string, rating: RelevanceRating) => void;
+  onClosePopover?: () => void;
 }) {
   const { t } = useTranslation();
   const { activateCitation } = useWorkspaceStore();
@@ -751,7 +630,10 @@ function SourceItem({
 
   return (
     <button
-      onClick={() => activateCitation(source, [], doc)}
+      onClick={() => {
+        activateCitation(source, [], doc);
+        onClosePopover?.();
+      }}
       className="w-full text-left px-2.5 py-2 hover:bg-muted/50 transition-colors"
     >
       <div className="flex items-center gap-2 mb-1">
@@ -796,11 +678,13 @@ function KGSourceItem({
   messageId,
   ratings,
   onRate,
+  onClosePopover,
 }: {
   source: ChatSourceChunk;
   messageId?: string;
   ratings: Record<string, RelevanceRating>;
   onRate: (sourceIndex: string, rating: RelevanceRating) => void;
+  onClosePopover?: () => void;
 }) {
   const { t } = useTranslation();
   const { activateCitationKG } = useWorkspaceStore();
@@ -809,7 +693,10 @@ function KGSourceItem({
 
   return (
     <button
-      onClick={() => activateCitationKG(source, [], doc)}
+      onClick={() => {
+        activateCitationKG(source, [], doc);
+        onClosePopover?.();
+      }}
       className="w-full text-left px-2.5 py-2 hover:bg-purple-400/5 hover:bg-muted/50 transition-colors"
     >
       <div className="flex items-center gap-2 mb-1">
@@ -983,14 +870,97 @@ function markdownToPlainText(md: string): string {
 
 function AssistantMessageFooter({
   message,
-  onOpenSources,
 }: {
   message: ChatMessage;
-  onOpenSources: (sources: ChatSourceChunk[], id?: string) => void;
 }) {
-  const agentSteps = message.agentSteps;
   const { t } = useTranslation();
   const [copiedMode, setCopiedMode] = useState<"text" | "markdown" | null>(null);
+  const [showSourcesPopover, setShowSourcesPopover] = useState(false);
+  const [ratings, setRatings] = useState<Record<string, RelevanceRating>>({});
+  const popoverRef = useRef<HTMLDivElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const [popoverCoords, setPopoverCoords] = useState<{ bottom: number; right: number } | null>(null);
+  const sessionId = useContext(SessionIdCtx);
+  const queryClient = useQueryClient();
+
+  // Close popover when clicking outside
+  useEffect(() => {
+    if (!showSourcesPopover) return;
+    const handler = (e: MouseEvent) => {
+      if (popoverRef.current && !popoverRef.current.contains(e.target as Node)) {
+        setShowSourcesPopover(false);
+      }
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [showSourcesPopover]);
+
+  // Update popover coordinates when opening or window resizing
+  const updateCoords = useCallback(() => {
+    if (buttonRef.current) {
+      const rect = buttonRef.current.getBoundingClientRect();
+      setPopoverCoords({
+        bottom: window.innerHeight - rect.top + 8,
+        right: window.innerWidth - rect.right - 50, // Shift 50px right as requested
+      });
+    }
+  }, []);
+
+  useEffect(() => {
+    if (showSourcesPopover) {
+      updateCoords();
+      window.addEventListener("resize", updateCoords);
+      window.addEventListener("scroll", updateCoords, true);
+      return () => {
+        window.removeEventListener("resize", updateCoords);
+        window.removeEventListener("scroll", updateCoords, true);
+      };
+    }
+  }, [showSourcesPopover, updateCoords]);
+
+  const rateMutation = useMutation({
+    mutationFn: ({
+      sessionId,
+      messageId,
+      sourceIndex,
+      rating,
+    }: {
+      sessionId: string;
+      messageId: string;
+      sourceIndex: string;
+      rating: RelevanceRating;
+    }) =>
+      api.post(`/rag/chat/${sessionId}/rate`, {
+        message_id: messageId,
+        source_index: sourceIndex,
+        rating: rating,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["chat-history", sessionId] });
+    },
+  });
+
+  const handleRate = useCallback(
+    async (sourceIndex: string, rating: RelevanceRating) => {
+      if (!sessionId || !message.id) return;
+
+      const newRating = ratings[sourceIndex] === rating ? "partial" : rating;
+      const prev = { ...ratings };
+      setRatings((r) => ({ ...r, [sourceIndex]: newRating }));
+
+      try {
+        await rateMutation.mutateAsync({
+          sessionId,
+          messageId: message.id,
+          sourceIndex,
+          rating: newRating,
+        });
+      } catch {
+        setRatings(prev);
+      }
+    },
+    [sessionId, message.id, ratings, rateMutation],
+  );
 
   const handleCopy = useCallback(
     (mode: "text" | "markdown") => {
@@ -1005,16 +975,6 @@ function AssistantMessageFooter({
     },
     [message.content],
   );
-
-  const durationMs = useMemo(() => {
-    if (!message.agentSteps || message.agentSteps.length === 0) return null;
-    const doneStep = message.agentSteps.find((s) => s.step === "done");
-    if (doneStep?.durationMs) return doneStep.durationMs;
-    // Fallback: total time
-    const last = message.agentSteps[message.agentSteps.length - 1];
-    const first = message.agentSteps[0];
-    return last.timestamp - first.timestamp;
-  }, [message.agentSteps]);
 
   const hasSources = message.sources && message.sources.length > 0;
 
@@ -1078,15 +1038,82 @@ function AssistantMessageFooter({
         </div>
 
         {hasSources && (
-          <button
-            onClick={() => onOpenSources(message.sources!, message.id)}
-            className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-primary/10 border border-primary/20 text-primary hover:bg-primary/20 transition-colors text-[10px] font-semibold"
-          >
-            <BookOpen className="w-3 h-3" />
-            <span>
-              {message.sources!.length} {t("rag.sources")}
-            </span>
-          </button>
+          <div className="relative">
+            <button
+              ref={buttonRef}
+              onClick={() => setShowSourcesPopover((v) => !v)}
+              className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-primary/10 border border-primary/20 text-primary hover:bg-primary/20 transition-colors text-[10px] font-semibold"
+            >
+              <BookOpen className="w-3 h-3" />
+              <span>
+                {message.sources!.length} {t("rag.sources")}
+              </span>
+            </button>
+
+            {/* Portal-based Floating Popover — bypasses ChatPanel overflow constraints */}
+            {typeof document !== "undefined" && createPortal(
+              <AnimatePresence>
+                {showSourcesPopover && popoverCoords && (
+                  <motion.div
+                    ref={popoverRef}
+                    initial={{ opacity: 0, scale: 0.95, y: 8 }}
+                    animate={{ opacity: 1, scale: 1, y: 0 }}
+                    exit={{ opacity: 0, scale: 0.95, y: 8 }}
+                    transition={{ duration: 0.15, ease: "easeOut" }}
+                    className="fixed w-80 max-h-[360px] overflow-hidden bg-background/95 backdrop-blur-sm border rounded-xl shadow-2xl z-[9999] flex flex-col origin-bottom-right"
+                    style={{
+                      bottom: popoverCoords.bottom,
+                      right: popoverCoords.right,
+                    }}
+                  >
+                    <div className="flex-shrink-0 flex items-center justify-between px-3 py-2 border-b bg-muted/30">
+                      <div className="flex items-center gap-2">
+                        <FileText className="w-3.5 h-3.5 text-primary" />
+                        <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground/80">{t("rag.sources")}</span>
+                        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-primary/10 text-primary font-bold">
+                          {message.sources!.length}
+                        </span>
+                      </div>
+                      <button
+                        onClick={() => setShowSourcesPopover(false)}
+                        className="p-1 rounded-md hover:bg-muted transition-colors"
+                      >
+                        <X className="w-3 h-3 text-muted-foreground" />
+                      </button>
+                    </div>
+
+                    <div className="flex-1 overflow-y-auto divide-y divide-muted/50 scrollbar-none">
+                      {message.sources!
+                        .filter((s) => s.source_type !== "kg")
+                        .map((source) => (
+                          <SourceItem
+                            key={String(source.index)}
+                            source={source}
+                            messageId={message.id}
+                            ratings={ratings}
+                            onRate={handleRate}
+                            onClosePopover={() => setShowSourcesPopover(false)}
+                          />
+                        ))}
+                      {message.sources!
+                        .filter((s) => s.source_type === "kg")
+                        .map((source) => (
+                          <KGSourceItem
+                            key={String(source.index)}
+                            source={source}
+                            messageId={message.id}
+                            ratings={ratings}
+                            onRate={handleRate}
+                            onClosePopover={() => setShowSourcesPopover(false)}
+                          />
+                        ))}
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>,
+              document.body
+            )}
+          </div>
         )}
       </div>
     </div>
@@ -1124,11 +1151,9 @@ function AddAbbreviationButton({
 const MessageBubble = memo(function MessageBubble({
   message,
   onAddAbbreviation,
-  onOpenSources,
 }: {
   message: ChatMessage;
   onAddAbbreviation: (short: string) => void;
-  onOpenSources: (sources: ChatSourceChunk[], id?: string) => void;
 }) {
   const { t } = useTranslation();
   const isUser = message.role === "user";
@@ -1244,10 +1269,7 @@ const MessageBubble = memo(function MessageBubble({
 
         {/* Footer actions for assistant messages */}
         {!isUser && message.content && (
-          <AssistantMessageFooter
-            message={message}
-            onOpenSources={onOpenSources}
-          />
+          <AssistantMessageFooter message={message} />
         )}
 
         {/* ThinkingPanel — only when no ThinkingTimeline with thinking log (avoid duplication) */}
@@ -1373,38 +1395,158 @@ function TypingIndicator({ status }: { status?: ChatStreamStatus }) {
 // ---------------------------------------------------------------------------
 // Suggestion chips (empty state)
 // ---------------------------------------------------------------------------
-function SuggestionChips({
-  onSelect,
-}: {
-  onSelect: (q: string) => void;
-}) {
+function SuggestionChips({ onSelect }: { onSelect: (text: string) => void }) {
   const { t } = useTranslation();
+  
   const suggestions = [
-    t("chat.suggestion_summary"),
-    t("chat.suggestion_topics"),
-    t("chat.suggestion_entities"),
-    t("chat.suggestion_methodology"),
+    { text: t("chat.suggestion_topics"), icon: <ImageIcon className="w-3.5 h-3.5 text-orange-400" /> },
+    { text: t("chat.suggestion_entities"), icon: <Music className="w-3.5 h-3.5 text-pink-400" /> },
+    { text: t("chat.suggestion_methodology"), icon: <GraduationCap className="w-3.5 h-3.5 text-blue-400" /> },
+    { text: "Viết bất cứ thứ gì", icon: <Pencil className="w-3.5 h-3.5 text-gray-400" /> },
   ];
 
   return (
-    <div className="flex-1 flex flex-col items-center justify-center px-4">
-      <div className="w-14 h-14 rounded-2xl bg-primary/10 flex items-center justify-center mb-5 shadow-sm border border-primary/10">
-        <Sparkles className="w-7 h-7 text-primary" />
+    <div className="flex flex-wrap gap-2.5 justify-center max-w-[800px] mt-8 animate-in fade-in slide-in-from-bottom-4 duration-700 delay-300 fill-mode-both px-4">
+      {suggestions.map((s) => (
+        <button
+          key={s.text}
+          onClick={() => onSelect(s.text)}
+          className="flex items-center gap-2.5 text-[13px] px-5 py-2.5 rounded-full bg-secondary/30 hover:bg-secondary/60 border border-transparent hover:border-secondary transition-all duration-300 text-muted-foreground hover:text-foreground font-medium shadow-sm active:scale-95 whitespace-nowrap"
+        >
+          {s.icon}
+          <span>{s.text}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Chat Input Area — Gemini-style floating card
+// ---------------------------------------------------------------------------
+function ChatInputArea({
+  input,
+  setInput,
+  isStreaming,
+  onSend,
+  onCancel,
+  thinkingSupported,
+  enableThinking,
+  onToggleThinking,
+  forceSearch,
+  onToggleSearch,
+  inputRef,
+  handleKeyDown,
+  t
+}: {
+  input: string;
+  setInput: (v: string) => void;
+  isStreaming: boolean;
+  onSend: () => void;
+  onCancel: () => void;
+  thinkingSupported: boolean;
+  enableThinking: boolean;
+  onToggleThinking: () => void;
+  forceSearch: boolean;
+  onToggleSearch: () => void;
+  inputRef: React.RefObject<HTMLTextAreaElement | null>;
+  handleKeyDown: (e: React.KeyboardEvent) => void;
+  t: any;
+}) {
+  return (
+    <div className="relative flex flex-col bg-background/80 backdrop-blur-3xl border border-border/60 rounded-[22px] shadow-[0_8px_30px_rgb(0,0,0,0.06)] transition-all duration-300 focus-within:shadow-primary/8 focus-within:border-primary/20 overflow-hidden ring-1 ring-black/5 dark:ring-white/5">
+      {/* Input Text Area */}
+      <div className="px-4 pt-3.5 pb-1">
+        <textarea
+          ref={inputRef}
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder={t("chat.input_placeholder")}
+          rows={1}
+          className={cn(
+            "w-full resize-none bg-transparent px-0 py-1 text-[15.5px] placeholder:text-muted-foreground/45 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50",
+            "max-h-[200px] min-h-[38px]",
+            "font-chat leading-relaxed tracking-tight text-foreground/90 selection:bg-primary/20"
+          )}
+          style={{ height: "auto" }}
+          onInput={(e) => {
+            const target = e.target as HTMLTextAreaElement;
+            target.style.height = "auto";
+            target.style.height = Math.min(target.scrollHeight, 200) + "px";
+          }}
+        />
       </div>
-      <h3 className="text-[15px] font-semibold mb-1 tracking-tight">{t("chat.assistant_title")}</h3>
-      <p className="text-[13px] text-muted-foreground text-center mb-5 max-w-[260px] leading-relaxed">
-        {t("chat.assistant_desc")}
-      </p>
-      <div className="flex flex-wrap gap-2 justify-center max-w-[320px]">
-        {suggestions.map((s) => (
-          <button
-            key={s}
-            onClick={() => onSelect(s)}
-            className="text-[12px] px-4 py-2 rounded-xl border border-border bg-card hover:bg-muted/80 suggestion-chip-hover transition-colors text-muted-foreground hover:text-foreground font-medium shadow-sm"
+
+      {/* Toolbar Row */}
+      <div className="flex items-center justify-between px-2.5 pb-2.5 pt-0.5">
+        <div className="flex items-center gap-1">
+          {/* Add / Upload */}
+          <button 
+            className="w-9 h-9 rounded-full flex items-center justify-center text-muted-foreground/60 hover:text-primary hover:bg-primary/5 transition-all"
+            title={t("chat.upload")}
           >
-            {s}
+            <Plus className="w-5 h-5" />
           </button>
-        ))}
+          
+          {/* Tools Toggle */}
+          <button 
+            onClick={onToggleSearch}
+            className={cn(
+              "flex items-center gap-1.5 px-3 h-9 rounded-full transition-all text-[13px] font-medium",
+              forceSearch 
+                ? "text-amber-600 bg-amber-500/10 hover:bg-amber-500/15" 
+                : "text-muted-foreground/60 hover:text-foreground hover:bg-muted/80"
+            )}
+          >
+            <Settings2 className="w-4 h-4" />
+            <span>Công cụ</span>
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2">
+          {/* Thinking Toggle — Styled as a pill dropdown */}
+          {thinkingSupported && (
+            <button
+              onClick={onToggleThinking}
+              className={cn(
+                "flex items-center gap-1.5 px-3 h-9 rounded-full transition-all text-xs font-semibold tracking-tight",
+                enableThinking
+                  ? "text-violet-500 bg-violet-500/10 hover:bg-violet-500/15"
+                  : "text-muted-foreground/50 hover:text-muted-foreground hover:bg-muted/80"
+              )}
+            >
+              <span>{t("chat.think_toggle")}</span>
+              <ChevronDown className={cn("w-3.5 h-3.5 transition-transform", enableThinking && "rotate-180")} />
+            </button>
+          )}
+
+          {/* Action Button (Mic / Send / Stop) */}
+          <div className="ml-1">
+            {isStreaming ? (
+              <button
+                onClick={onCancel}
+                className="w-10 h-10 rounded-full flex items-center justify-center bg-destructive/10 text-destructive hover:bg-destructive/15 transition-all shadow-sm ring-1 ring-destructive/20"
+              >
+                <Square className="w-3.5 h-3.5 fill-current" />
+              </button>
+            ) : input.trim() ? (
+              <button
+                onClick={onSend}
+                className="w-10 h-10 rounded-full flex items-center justify-center bg-primary text-primary-foreground hover:bg-primary/90 hover:scale-105 active:scale-95 transition-all shadow-lg shadow-primary/20"
+              >
+                <Send className="w-4 h-4 translate-x-0.5" />
+              </button>
+            ) : (
+              <button
+                className="w-10 h-10 rounded-full flex items-center justify-center text-muted-foreground/60 hover:text-primary hover:bg-primary/5 transition-all"
+                title={t("chat.voice")}
+              >
+                <Mic className="w-4 h-4" />
+              </button>
+            )}
+          </div>
+        </div>
       </div>
     </div>
   );
@@ -1425,21 +1567,18 @@ export const ChatPanel = memo(function ChatPanel({
   sessionTitle,
 }: ChatPanelProps) {
   const { t } = useTranslation();
+  const { user } = useAuthStore();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
-  const [enableThinking, setEnableThinking] = useState(false);
+  const [enableThinking, setEnableThinking] = useState(true);
   const [thinkingDefaultSynced, setThinkingDefaultSynced] = useState(false);
+
   const [forceSearch, setForceSearch] = useState(false);
-  const [activeSources, setActiveSources] = useState<{
-    sources: ChatSourceChunk[];
-    messageId?: string;
-  } | null>(null);
 
   // Reset session state when switching chats/starting a new chat
   useEffect(() => {
     setMessages([]);
     setInput("");
-    setActiveSources(null);
   }, [sessionId]);
 
   // Abbreviation modal state
@@ -1461,13 +1600,6 @@ export const ChatPanel = memo(function ChatPanel({
       toast.error(err.message || t("admin.abbreviations.toast.error"));
     }
   };
-
-  const handleOpenSources = useCallback(
-    (sources: ChatSourceChunk[], id?: string) => {
-      setActiveSources({ sources, messageId: id });
-    },
-    [],
-  );
 
   // Load chat history from PostgreSQL
   const { data: historyData, isLoading: historyLoading } = useChatHistory(sessionId);
@@ -1509,6 +1641,13 @@ export const ChatPanel = memo(function ChatPanel({
     retry: 1,
   });
   const thinkingSupported = capabilities?.supports_thinking ?? false;
+ 
+  // Auto-focus input for new chat sessions
+  useEffect(() => {
+    if (messages.length === 0 && !historyLoading && inputRef.current) {
+      inputRef.current.focus();
+    }
+  }, [messages.length, historyLoading]);
 
   // Sync thinking toggle default from server (once per mount)
   useEffect(() => {
@@ -1924,127 +2063,107 @@ export const ChatPanel = memo(function ChatPanel({
         <AllSourcesCtx.Provider value={allSourcesFlat}>
           <div className="flex flex-col h-full bg-background border-r relative z-0 overflow-hidden">
             {/* Header */}
-            <div className="flex-shrink-0 flex items-center justify-between px-4 py-2.5 border-b bg-background/50">
+            {/* Header */}
+            <div className="flex-shrink-0 flex items-center justify-between px-4 py-3 bg-background/50 backdrop-blur-md">
               <div className="flex items-center gap-2.5">
-                <div className="w-7 h-7 rounded-lg flex items-center justify-center bg-primary/10 border border-primary/15 overflow-hidden shadow-sm">
-                  <img src="/logo.png" alt="HRAG" className="w-4 h-4 object-contain" />
+                <div className="w-8 h-8 rounded-xl flex items-center justify-center bg-primary/10 border border-primary/15 overflow-hidden shadow-sm">
+                  <img src="/logo.png" alt="HRAG" className="w-5 h-5 object-contain" />
                 </div>
-                <h2 className="text-[13px] font-semibold tracking-tight text-muted-foreground/80 line-clamp-1 max-w-[400px]">
-                  {t("chat.chat")} {sessionTitle ? `- ${sessionTitle}` : (sessionId ? `${t("chat.session", { id: sessionId })}` : t("chat.select_session"))}
+                <h2 className="text-[14px] font-bold tracking-tight text-foreground line-clamp-1">
+                  {sessionTitle || (sessionId ? `${t("chat.session", { id: sessionId })}` : t("chat.select_session"))}
                 </h2>
               </div>
-              <div className="flex items-center gap-1.5">
-                {/* Thinking toggle — only visible when model supports thinking */}
-                {thinkingSupported && (
-                  <button
-                    onClick={() => setEnableThinking((prev) => !prev)}
-                    className={cn(
-                      "flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors",
-                      enableThinking
-                        ? "text-violet-400 bg-violet-400/10 hover:bg-violet-400/15"
-                        : "text-muted-foreground hover:bg-muted"
-                    )}
-                    title={enableThinking ? t("chat.think_on") : t("chat.think_off")}
-                  >
-                    <Brain className="w-3 h-3" />
-                    <span>{t("chat.think_toggle")}</span>
-                  </button>
-                )}
-                {/* Force search toggle */}
-                <button
-                  onClick={() => setForceSearch((prev) => !prev)}
-                  className={cn(
-                    "flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] transition-colors",
-                    forceSearch
-                      ? "text-amber-500 bg-amber-500/10 hover:bg-amber-500/15"
-                      : "text-muted-foreground hover:bg-muted"
-                  )}
-                  title={forceSearch ? t("chat.search_on") : t("chat.search_off")}
-                >
-                  <DatabaseZap className="w-3 h-3" />
-                  <span>{t("chat.search_toggle")}</span>
-                </button>
-              </div>
             </div>
 
-            {/* Messages area */}
+            {/* Main Content Area */}
             {messages.length === 0 ? (
-              <SuggestionChips onSelect={handleSend} />
-            ) : (
-              <div ref={scrollContainerRef} className="flex-1 min-h-0 overflow-y-auto px-3 py-3 space-y-3 relative">
-                <AnimatePresence>
-                  {messages.map((msg) => (
-                    <div key={msg.id} data-message-id={msg.id}>
-                      <MessageBubble
-                        message={msg}
-                        onAddAbbreviation={handleOpenAbbModal}
-                        onOpenSources={handleOpenSources}
-                      />
-                    </div>
-                  ))}
-                </AnimatePresence>
-                {/* ThinkingTimeline + TypingIndicator now rendered inside MessageBubble */}
-                {/* Bottom spacer = container height, enables user-message scroll-to-top */}
-                <div ref={spacerRef} aria-hidden />
-              </div>
-            )}
+              <div className="flex-1 flex flex-col items-center justify-center px-4 overflow-y-auto pb-[10vh] scrollbar-none">
+                <div className="w-full max-w-[720px] flex flex-col items-center translate-y-[-4vh]">
+                  {/* Greeting */}
+                  <div className="mb-10 text-center animate-in fade-in zoom-in-95 duration-1000 ease-out">
+                  <div className="inline-flex items-center gap-2 mb-4 px-3 py-1 rounded-full bg-primary/5 border border-primary/10 text-primary">
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span className="text-[11px] font-bold uppercase tracking-wider">Assistant</span>
+                  </div>
+                  <h1 className="text-3xl md:text-5xl font-bold tracking-tight text-foreground mb-4">
+                    Xin chào {user?.full_name || "XayDung"}!
+                  </h1>
+                  <p className="text-lg md:text-2xl text-muted-foreground/60 font-medium">
+                    {t("chat.assistant_desc")}
+                  </p>
+                </div>
 
-            {/* Input area */}
-            <div className="flex-shrink-0 p-3 border-t">
-              <div className="flex items-end gap-2">
-                <textarea
-                  ref={inputRef}
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={handleKeyDown}
-                  placeholder={t("chat.input_placeholder")}
-                  rows={1}
-                  className={cn(
-                    "flex-1 resize-none rounded-xl border border-input bg-background px-4 py-2.5 text-[14px] shadow-sm ring-offset-background placeholder:text-muted-foreground/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:border-primary/30 disabled:cursor-not-allowed disabled:opacity-50",
-                    "max-h-[120px] min-h-[40px]",
-                    "font-chat leading-relaxed tracking-tight"
-                  )}
-                  style={{
-                    height: "auto",
-                    minHeight: "40px",
-                  }}
-                  onInput={(e) => {
-                    const target = e.target as HTMLTextAreaElement;
-                    target.style.height = "auto";
-                    target.style.height = Math.min(target.scrollHeight, 120) + "px";
-                  }}
-                />
-                {stream.isStreaming ? (
-                  <button
-                    onClick={stream.cancel}
-                    className="flex-shrink-0 w-10 h-10 rounded-xl flex items-center justify-center transition-all duration-200 bg-destructive/15 text-destructive hover:bg-destructive/25 shadow-sm border border-destructive/20"
-                    title={t("chat.stop")}
-                  >
-                    <Square className="w-4 h-4 fill-current" />
-                  </button>
-                ) : (
-                  <button
-                    onClick={() => handleSend()}
-                    disabled={!input.trim()}
-                    className={cn(
-                      "flex-shrink-0 w-10 h-10 rounded-xl flex items-center justify-center transition-all duration-200 shadow-sm",
-                      input.trim()
-                        ? "bg-primary text-primary-foreground hover:bg-primary/90 hover:shadow-md active:scale-95"
-                        : "bg-muted/60 text-muted-foreground/40 cursor-not-allowed"
-                    )}
-                  >
-                    <Send className="w-[18px] h-[18px]" />
-                  </button>
-                )}
+                {/* Input Area (Centered) */}
+                <div className="w-full max-w-[720px] px-2 mb-6">
+                  <ChatInputArea 
+                    input={input}
+                    setInput={setInput}
+                    isStreaming={stream.isStreaming}
+                    onSend={handleSend}
+                    onCancel={stream.cancel}
+                    thinkingSupported={thinkingSupported}
+                    enableThinking={enableThinking}
+                    onToggleThinking={() => setEnableThinking(!enableThinking)}
+                    forceSearch={forceSearch}
+                    onToggleSearch={() => setForceSearch(!forceSearch)}
+                    inputRef={inputRef}
+                    handleKeyDown={handleKeyDown}
+                    t={t}
+                  />
+                </div>
+
+                {/* Suggestions Pills (Below) */}
+                <SuggestionChips onSelect={handleSend} />
+                </div>
               </div>
-              <p className="text-[9px] text-muted-foreground/50 mt-1 text-center">
-                {t("chat.input_hint")}
-              </p>
-            </div>
-            <SourcesSidebar
-              activeSources={activeSources}
-              onClose={() => setActiveSources(null)}
-            />
+            ) : (
+              <>
+                {/* Messages List */}
+                <div ref={scrollContainerRef} className="flex-1 min-h-0 overflow-y-auto px-3 py-3 space-y-4 relative scrollbar-none">
+                  <AnimatePresence mode="popLayout">
+                    {messages.map((msg) => (
+                      <motion.div 
+                        key={msg.id} 
+                        data-message-id={msg.id}
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, transition: { duration: 0.1 } }}
+                      >
+                        <MessageBubble
+                          message={msg}
+                          onAddAbbreviation={handleOpenAbbModal}
+                        />
+                      </motion.div>
+                    ))}
+                  </AnimatePresence>
+                  <div ref={spacerRef} aria-hidden />
+                </div>
+
+                {/* Sticky Input Area (Fixed at bottom) */}
+                <div className="flex-shrink-0 p-4 border-t/0 pb-8 last-msg-focus-fix bg-gradient-to-t from-background via-background/80 to-transparent">
+                  <div className="w-full max-w-[720px] mx-auto px-2">
+                    <ChatInputArea 
+                      input={input}
+                      setInput={setInput}
+                      isStreaming={stream.isStreaming}
+                      onSend={handleSend}
+                      onCancel={stream.cancel}
+                      thinkingSupported={thinkingSupported}
+                      enableThinking={enableThinking}
+                      onToggleThinking={() => setEnableThinking(!enableThinking)}
+                      forceSearch={forceSearch}
+                      onToggleSearch={() => setForceSearch(!forceSearch)}
+                      inputRef={inputRef}
+                      handleKeyDown={handleKeyDown}
+                      t={t}
+                    />
+                    <p className="text-[10px] text-muted-foreground/40 mt-3 text-center font-medium">
+                      {t("chat.input_hint")}
+                    </p>
+                  </div>
+                </div>
+              </>
+            )}
           </div>
         </AllSourcesCtx.Provider>
       </DebugCtx.Provider>

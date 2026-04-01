@@ -802,13 +802,8 @@ async def get_llm_capabilities(
     provider = get_llm_provider()
     provider_name = settings.LLM_PROVIDER.lower()
 
-    # Per-provider thinking default:
-    # Gemini: thinking ON by default (fast, cloud-based)
-    # Ollama: thinking OFF by default (slow on local hardware), configurable via OLLAMA_ENABLE_THINKING
-    if provider_name == "ollama":
-        thinking_default = settings.OLLAMA_ENABLE_THINKING
-    else:
-        thinking_default = provider.supports_thinking()
+    # Default to thinking ON if the provider supports it, as requested by the user.
+    thinking_default = provider.supports_thinking()
 
     return LLMCapabilitiesResponse(
         provider=settings.LLM_PROVIDER,
