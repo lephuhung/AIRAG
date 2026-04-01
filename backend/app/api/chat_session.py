@@ -193,6 +193,17 @@ async def chat_stream_session(
     from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
     system_prompt_to_use = DEFAULT_SYSTEM_PROMPT + HARD_SYSTEM_PROMPT
 
+    # Build conversation context from exchange summaries (if session has history)
+    from app.services.conversation_summary_service import get_conversation_summary_service
+    summary_svc = get_conversation_summary_service()
+    conversation_context = await summary_svc.get_context_for_session(db, session_id, limit=10)
+    if conversation_context:
+        system_prompt_to_use += (
+            "\n\n=== CONVERSATION HISTORY (from previous exchanges) ===\n"
+            + conversation_context
+            + "\n=== END CONVERSATION HISTORY ===\n"
+        )
+
     from app.api.chat_agent import sse_with_heartbeat, format_sse_event
 
     # Send AI message id immediately
@@ -200,13 +211,15 @@ async def chat_stream_session(
 
     # Helper to perform post-stream updates without blocking connection close
     async def _perform_post_stream_updates(
-        text: str, 
-        thinking: str, 
-        sources: list, 
-        images: list, 
-        steps: list, 
+        text: str,
+        thinking: str,
+        sources: list,
+        images: list,
+        steps: list,
         potentials: list,
-        user_message: str
+        user_message: str,
+        user_msg_id: str,
+        ai_msg_id: str,
     ):
         try:
             from app.core.database import async_session_maker
@@ -265,6 +278,23 @@ async def chat_stream_session(
                         assistant_message=text,
                         session_id=session_id,
                     )
+
+                # Generate exchange summary for conversation context
+                try:
+                    from app.services.conversation_summary_service import get_conversation_summary_service
+                    summary_svc = get_conversation_summary_service()
+                    await summary_svc.save_exchange_summary(
+                        db=bg_db,
+                        session_id=session_id,
+                        user_message_id=user_msg_id,
+                        assistant_message_id=ai_msg_id,
+                        user_message=user_message,
+                        assistant_message=text,
+                        cited_sources=sources,
+                    )
+                    logger.info(f"[session/{session_id}] Exchange summary saved for msg {user_msg_id}")
+                except Exception as e:
+                    logger.warning(f"[session/{session_id}] Failed to save exchange summary: {e}")
         except Exception as e:
             logger.error(f"[session/{session_id}] Background persistence failed: {e}", exc_info=True)
 
@@ -348,7 +378,9 @@ async def chat_stream_session(
                     images=final_images,
                     steps=final_steps,
                     potentials=final_potential_abbreviations,
-                    user_message=request.message
+                    user_message=request.message,
+                    user_msg_id=user_msg_id,
+                    ai_msg_id=ai_msg_id,
                 )
 
             except Exception as e:
@@ -417,7 +449,9 @@ async def chat_stream_session(
                 images=final_images,
                 steps=final_steps,
                 potentials=[], # Legacy agent doesn't send abbreviations
-                user_message=request.message
+                user_message=request.message,
+                user_msg_id=user_msg_id,
+                ai_msg_id=ai_msg_id,
             )
 
         except Exception as e:

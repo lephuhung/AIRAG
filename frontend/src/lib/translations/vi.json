@@ -142,6 +142,7 @@
     },
     "headers": {
       "entity": "Thực thể",
+      "type": "Loại",
       "links": "Liên kết"
     }
   },
@@ -437,6 +438,7 @@
   "workers": {
     "title": "Tiến trình xử lý",
     "title_short": "Tiến trình",
+    "status": "Trạng thái",
     "subtitle": "Quản lý các công nhân xử lý, theo dõi hàng đợi và kiểm tra luồng xử lý tài liệu",
     "desc": "Quản lý các công nhân xử lý, theo dõi hàng đợi và kiểm tra luồng xử lý tài liệu",
     "start_all": "Khởi động tất cả tiến trình",
@@ -774,5 +776,9 @@
     "chunks": "Mảnh dữ liệu",
     "images": "Hình ảnh",
     "processing_msg": "Đang xử lý {{count}} tài liệu..."
+  },
+  "viewer": {
+    "contents": "Nội dung",
+    "parsed_by": "Được phân tích bởi {{version}}"
   }
 }

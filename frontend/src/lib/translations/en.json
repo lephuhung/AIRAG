@@ -100,8 +100,8 @@
     "documents": "Documents",
     "workspace": "Workspace",
     "close": "Close",
-    "activate": "Kích hoạt",
-    "deactivate": "Vô hiệu hóa",
+    "activate": "Activate",
+    "deactivate": "Deactivate",
     "restart": "Restart",
     "start": "Start",
     "unknown": "Unknown",
@@ -408,6 +408,7 @@
   "workers": {
     "title": "Worker Processes",
     "title_short": "Processes",
+    "status": "Status",
     "subtitle": "Manage workers, monitor queues, and inspect the processing pipeline",
     "desc": "Manage workers, monitor queues, and inspect the processing pipeline",
     "start_all": "Start All Workers",
@@ -744,5 +745,9 @@
     "chunks": "Data Chunks",
     "images": "Images",
     "processing_msg": "Processing {{count}} documents..."
+  },
+  "viewer": {
+    "contents": "Contents",
+    "parsed_by": "Parsed by {{version}}"
   }
 }

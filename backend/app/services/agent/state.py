@@ -42,6 +42,7 @@ class AgentState(TypedDict):
     # ── Agent control ─────────────────────────────────────────────────────────
     intent: str  # "greeting" | "search" | "list_docs" | "summarize" | "kg_query"
     rewritten_query: str  # query after Qwen3-4B rewrite (used by tool_executor)
+    original_query: str  # original user message (for validating fabricated search values)
     iterations: int  # loop guard — nodes increment, graph checks max
     tool_called: bool  # True after first tool execution
 
@@ -57,6 +58,9 @@ class AgentState(TypedDict):
         dict
     ]  # [{"short_form": ..., "full_form": ..., "description": ...}]
     expanded_query: str  # query expanded with abbreviation full_form for routing
+
+    # ── MongoDB people search results ────────────────────────────────────
+    mongo_results: list[dict]  # person records from MongoDB people collection
 
     # ── Write agent ───────────────────────────────────────────────────────
     write_action: str   # "summarize" | "suggest_edits" | "grammar_check" | "extract_key_points"
@@ -78,6 +82,11 @@ VALID_INTENTS = {
     "write_summarize",
     "write_suggest_edits",
     "write_grammar_check",
+    # mongo people search intents
+    "mongo_search_cccd",
+    "mongo_search_name",
+    "mongo_search_bhxh",
+    "mongo_search_phone",
 }
 
 # Default initial values — merge with per-request values when building state
@@ -96,6 +105,7 @@ DEFAULT_STATE: dict = {
     "existing_citation_ids": set(),
     "intent": "search",
     "rewritten_query": "",
+    "original_query": "",
     "iterations": 0,
     "tool_called": False,
     "user_memory_context": "",
@@ -105,5 +115,6 @@ DEFAULT_STATE: dict = {
     "text_input": "",
     "abbreviation_results": [],
     "expanded_query": "",
+    "mongo_results": [],
     "potential_abbreviations": [],
 }

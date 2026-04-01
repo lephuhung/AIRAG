@@ -192,6 +192,14 @@ class Settings(BaseSettings):
     # Embedding dimension — must match HRAG_EMBEDDING_MODEL (BAAI/bge-m3 = 1024).
     GRAPHITI_EMBEDDING_DIM: int = Field(default=1024)
 
+    # MongoDB — People Search
+    MONGO_HOST: str = Field(default="localhost")
+    MONGO_PORT: int = Field(default=27017)
+    MONGO_USER: str = Field(default="admin")
+    MONGO_PASSWORD: str = Field(default="changeme")
+    MONGO_DATABASE: str = Field(default="people_db")
+    MONGO_AUTH_SOURCE: str = Field(default="admin")
+
     # CORS
     CORS_ORIGINS: list[str] = Field(default=["http://localhost:5174", "http://localhost:3000"])
 

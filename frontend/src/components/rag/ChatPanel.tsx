@@ -1167,7 +1167,7 @@ const MessageBubble = memo(function MessageBubble({
     .toUpperCase();
 
   const proseClasses = cn(
-    "prose prose-sm max-w-none text-foreground/90 font-chat",
+    "prose max-w-none text-foreground/90 font-chat text-[15.5px] leading-relaxed",
     "[&_p]:my-1.5 [&_p]:text-justify [&_ul]:my-1.5 [&_ol]:my-1.5 [&_li]:my-1 [&_li]:text-justify",
     "[&_pre]:bg-transparent [&_pre]:border-none [&_pre]:p-0 [&_pre]:m-0",
     "[&_code]:bg-muted/50 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-[13px] [&_code]:text-foreground/90 [&_code]:font-[400]",
@@ -1214,7 +1214,7 @@ const MessageBubble = memo(function MessageBubble({
         )}
 
         {isUser ? (
-          <p className="text-sm leading-relaxed whitespace-pre-wrap font-chat">
+          <p className="text-[15.5px] leading-relaxed whitespace-pre-wrap font-chat">
             {message.content}
           </p>
         ) : message.isStreaming ? (
@@ -1491,6 +1491,7 @@ function ChatInputArea({
           
           {/* Tools Toggle */}
           <button 
+            type="button"
             onClick={onToggleSearch}
             className={cn(
               "flex items-center gap-1.5 px-3 h-9 rounded-full transition-all text-[13px] font-medium",
@@ -1508,7 +1509,8 @@ function ChatInputArea({
           {/* Thinking Toggle — Styled as a pill dropdown */}
           {thinkingSupported && (
             <button
-              onClick={onToggleThinking}
+              type="button"
+              onClick={() => onToggleThinking()}
               className={cn(
                 "flex items-center gap-1.5 px-3 h-9 rounded-full transition-all text-xs font-semibold tracking-tight",
                 enableThinking
@@ -1525,21 +1527,24 @@ function ChatInputArea({
           <div className="ml-1">
             {isStreaming ? (
               <button
-                onClick={onCancel}
-                className="w-10 h-10 rounded-full flex items-center justify-center bg-destructive/10 text-destructive hover:bg-destructive/15 transition-all shadow-sm ring-1 ring-destructive/20"
+                type="button"
+                onClick={() => onCancel()}
+                className="w-10 h-10 rounded-full flex items-center justify-center bg-destructive/10 text-destructive hover:bg-destructive/15 transition-all shadow-sm ring-1 ring-destructive/20 cursor-pointer"
               >
                 <Square className="w-3.5 h-3.5 fill-current" />
               </button>
             ) : input.trim() ? (
               <button
-                onClick={onSend}
-                className="w-10 h-10 rounded-full flex items-center justify-center bg-primary text-primary-foreground hover:bg-primary/90 hover:scale-105 active:scale-95 transition-all shadow-lg shadow-primary/20"
+                type="button"
+                onClick={() => onSend()}
+                className="w-10 h-10 rounded-full flex items-center justify-center bg-primary text-primary-foreground hover:bg-primary/90 hover:scale-105 active:scale-95 transition-all shadow-lg shadow-primary/20 cursor-pointer"
               >
                 <Send className="w-4 h-4 translate-x-0.5" />
               </button>
             ) : (
               <button
-                className="w-10 h-10 rounded-full flex items-center justify-center text-muted-foreground/60 hover:text-primary hover:bg-primary/5 transition-all"
+                type="button"
+                className="w-10 h-10 rounded-full flex items-center justify-center text-muted-foreground/60 hover:text-primary hover:bg-primary/5 transition-all cursor-default"
                 title={t("chat.voice")}
               >
                 <Mic className="w-4 h-4" />

@@ -37,6 +37,11 @@ TOOL_REGISTRY: dict[str, str] = {
     "query_knowledge_graph": "query the knowledge graph for entity relationships",
     "search_documents_number": "search for documents by their official document number (văn bản số)",
     "search_abbreviation": "search for the meaning of an abbreviation or acronym",
+    # MongoDB people search tools
+    "search_people_by_cccd": "search for a person by their CCCD (Căn cước công dân) national ID number",
+    "search_people_by_name": "search for persons by their full name or partial name",
+    "search_people_by_bhxh": "search for a person by their BHXH (Bảo hiểm xã hội) number",
+    "search_people_by_phone": "search for persons by their phone number",
 }
 
 
@@ -447,4 +452,83 @@ async def search_abbreviation(
             "text": f"Không thể tìm kiếm nghĩa của '{abbreviation}'. Vui lòng thử lại.",
             "abbreviation": abbreviation,
             "found": False,
+        }
+
+
+# ---------------------------------------------------------------------------
+# MongoDB People Search Tools
+# ---------------------------------------------------------------------------
+
+
+async def search_people_by_cccd(cccd: str) -> dict:
+    """
+    Search for a person by CCCD (Căn cước công dân) number.
+    Exact match on the cccd field.
+
+    Returns:
+        dict with keys: found, person, display
+    """
+    from app.services.mongo_people_service import search_by_cccd as _svc
+    try:
+        return await _svc(cccd)
+    except Exception as e:
+        logger.error(f"[tool:search_people_by_cccd] Failed: {e}")
+        return {"found": False, "person": None, "display": f"Lỗi tìm kiếm CCCD: {e}"}
+
+
+async def search_people_by_name(name: str, limit: int = 10) -> dict:
+    """
+    Search for persons by name (ho_ten).
+    Case-insensitive partial regex match.
+
+    Returns:
+        dict with keys: found, count, persons, display
+    """
+    from app.services.mongo_people_service import search_by_name as _svc
+    try:
+        return await _svc(name, limit=limit)
+    except Exception as e:
+        logger.error(f"[tool:search_people_by_name] Failed: {e}")
+        return {
+            "found": False,
+            "count": 0,
+            "persons": [],
+            "display": f"Lỗi tìm kiếm tên: {e}",
+        }
+
+
+async def search_people_by_bhxh(so_bhxh: str) -> dict:
+    """
+    Search for a person by BHXH (Bảo hiểm xã hội) number.
+    Exact or loose regex match.
+
+    Returns:
+        dict with keys: found, person, display
+    """
+    from app.services.mongo_people_service import search_by_bhxh as _svc
+    try:
+        return await _svc(so_bhxh)
+    except Exception as e:
+        logger.error(f"[tool:search_people_by_bhxh] Failed: {e}")
+        return {"found": False, "person": None, "display": f"Lỗi tìm kiếm BHXH: {e}"}
+
+
+async def search_people_by_phone(phone: str, limit: int = 10) -> dict:
+    """
+    Search for persons by phone number (so_dien_thoai).
+    Exact, ends-with, or contains match.
+
+    Returns:
+        dict with keys: found, count, persons, display
+    """
+    from app.services.mongo_people_service import search_by_phone as _svc
+    try:
+        return await _svc(phone, limit=limit)
+    except Exception as e:
+        logger.error(f"[tool:search_people_by_phone] Failed: {e}")
+        return {
+            "found": False,
+            "count": 0,
+            "persons": [],
+            "display": f"Lỗi tìm kiếm SĐT: {e}",
         }

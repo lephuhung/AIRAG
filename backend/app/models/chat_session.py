@@ -30,8 +30,14 @@ class ChatSession(Base):
 
     # Relationships
     messages: Mapped[list["ChatMessage"]] = relationship(
-        "ChatMessage", 
+        "ChatMessage",
         back_populates="session",
         cascade="all, delete-orphan",
         order_by="ChatMessage.created_at"
+    )
+    exchange_summaries: Mapped[list["ExchangeSummary"]] = relationship(
+        "ExchangeSummary",
+        back_populates="session",
+        cascade="all, delete-orphan",
+        order_by="ExchangeSummary.exchange_index"
     )

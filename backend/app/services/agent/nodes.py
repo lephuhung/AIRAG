@@ -54,6 +54,10 @@ Intent categories:
 - "write_summarize"     : user provides a TEXT PASSAGE and wants it summarized or key points extracted
 - "write_suggest_edits" : user provides a TEXT PASSAGE and wants editing/improvement suggestions
 - "write_grammar_check" : user provides a TEXT PASSAGE and wants grammar/style checking
+- "mongo_search_cccd"  : user asks to look up a person by their CCCD (Căn cước công dân) number. The query contains a national ID number (12 digits).
+- "mongo_search_name"  : user asks to find/search for a person by their name.
+- "mongo_search_bhxh"  : user asks to look up a person by their BHXH (Bảo hiểm xã hội) number.
+- "mongo_search_phone"  : user asks to find a person by their phone number.
 
 Output format:
 {"intent": "<category>", "rewritten_query": "<improved Vietnamese/English search query>", "needs_tool": true|false, "write_action": "<action or empty>", "text_input": "<extracted text or empty>"}
@@ -67,6 +71,10 @@ Rules:
 - For "write_summarize": write_action = "summarize" (or "extract_key_points" if user asks for key points)
 - For "write_suggest_edits": write_action = "suggest_edits"
 - For "write_grammar_check": write_action = "grammar_check"
+- For "mongo_search_cccd": rewritten_query = the CCCD number itself (digits only, 9-12 digits)
+- For "mongo_search_name": rewritten_query = the person's name or partial name
+- For "mongo_search_bhxh": rewritten_query = the BHXH number
+- For "mongo_search_phone": rewritten_query = the phone number
 - For all other intents: rewrite the query to be specific and detailed for retrieval
 - If the message contains a document ID, preserve it in the output
 - Default to "search" when uncertain
@@ -80,6 +88,12 @@ User: "có tài liệu gì trong hệ thống?" → {"intent": "list_docs", "rew
 User: "tóm tắt tài liệu ID 5" → {"intent": "summarize", "rewritten_query": "tóm tắt tài liệu 5", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "tìm văn bản số 60/QĐ-UBND giúp tôi" → {"intent": "search_doc_num", "rewritten_query": "60/QĐ-UBND", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "BMNN là gì?" → {"intent": "search_abbr", "rewritten_query": "BMNN", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "tìm người có CCCD 079203012345" → {"intent": "mongo_search_cccd", "rewritten_query": "079203012345", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "tra cứu CCCD 079203012345" → {"intent": "mongo_search_cccd", "rewritten_query": "079203012345", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "tìm ông Nguyễn Văn A" → {"intent": "mongo_search_name", "rewritten_query": "Nguyễn Văn A", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "ai có mã BHXH 1234567890" → {"intent": "mongo_search_bhxh", "rewritten_query": "1234567890", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "số điện thoại 0909123456" → {"intent": "mongo_search_phone", "rewritten_query": "0909123456", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "tìm người qua số BHXH 001234567890" → {"intent": "mongo_search_bhxh", "rewritten_query": "001234567890", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "tóm tắt đoạn văn sau: [đoạn văn dài]" → {"intent": "write_summarize", "rewritten_query": "", "needs_tool": false, "write_action": "summarize", "text_input": "[đoạn văn dài]"}
 User: "kiểm tra ngữ pháp: Hôm nay tôi đi học." → {"intent": "write_grammar_check", "rewritten_query": "", "needs_tool": false, "write_action": "grammar_check", "text_input": "Hôm nay tôi đi học."}
 User: "đề xuất chỉnh sửa văn bản này: [nội dung]" → {"intent": "write_suggest_edits", "rewritten_query": "", "needs_tool": false, "write_action": "suggest_edits", "text_input": "[nội dung]"}
@@ -97,6 +111,11 @@ _VALID_INTENTS = {
     "write_summarize",
     "write_suggest_edits",
     "write_grammar_check",
+    # mongo people search intents
+    "mongo_search_cccd",
+    "mongo_search_name",
+    "mongo_search_bhxh",
+    "mongo_search_phone",
 }
 
 
@@ -308,6 +327,7 @@ async def intent_classifier(state: "AgentState") -> dict:
         return {
             "intent": result["intent"],
             "rewritten_query": result["rewritten_query"] or user_message,
+            "original_query": user_message,  # Store actual user message for validation
             "write_action": result.get("write_action", ""),
             "text_input": result.get("text_input", ""),
         }
@@ -746,6 +766,46 @@ async def answer_generator(state: "AgentState") -> dict:
     )
     logger.info(f"[answer_generator] abbreviation_results={abbreviation_results!r}")
 
+    # ── MongoDB people search: use LLM to format nicely (but include ALL results) ──
+    mongo_intents = {"mongo_search_cccd", "mongo_search_name", "mongo_search_bhxh", "mongo_search_phone"}
+    if intent in mongo_intents and state.get("final_answer"):
+        mongo_context = state["final_answer"]
+        logger.info(f"[answer_generator] Mongo search — formatting via LLM ({len(mongo_context)} chars)")
+
+        format_system = (
+            "Bạn là một trợ lý truy vấn cơ sở dữ liệu.\n"
+            "Nhiệm vụ: Đọc dữ liệu hồ sơ người dân bên dưới và trình bày lại "
+            "NGẮN GỌN, SẠCH SẼ, DỄ ĐỌC bằng TIẾNG VIỆT.\n\n"
+            "QUY TẮC BẮT BUỘC:\n"
+            "1. LIỆT KÊ ĐỦ VÀ ĐÚNG TẤT CẢ các kết quả có trong dữ liệu. "
+            "Nếu có 4 người → phải trình bày đủ 4 người. Không được bỏ bớt.\n"
+            "2. Mỗi người = 1 block riêng, có tiêu đề tên.\n"
+            "3. Chỉ dùng thông tin CÓ TRONG dữ liệu. Không bịa, không thêm, không suy đoán.\n"
+            "4. Bỏ qua các trường không có giá trị (để trống/null).\n"
+            "5. Dùng gạch đầu dòng (•) cho các trường có dữ liệu.\n"
+            "6. KHÔNG dùng ký hiệu [xxx] hay ObjectId trong câu trả lời.\n"
+        )
+        format_user = (
+            f"Dữ liệu truy vấn:\n{mongo_context}\n\n"
+            "Hãy trình bày lại đẹp hơn cho người dùng."
+        )
+
+        mongo_messages = [_LLMMsg(role="system", content=format_system)]
+        mongo_messages.append(_LLMMsg(role="user", content=format_user))
+
+        try:
+            mongo_answer_parts: list[str] = []
+            async for chunk in provider.astream(messages=mongo_messages, temperature=0.1, max_tokens=4096):
+                if chunk.type == "text" and chunk.text:
+                    await push_event(state, "token", chunk.text)
+                    mongo_answer_parts.append(chunk.text)
+            final = "".join(mongo_answer_parts)
+            return {"final_answer": final}
+        except Exception as e:
+            logger.error(f"[answer_generator] Mongo LLM format failed: {e} — falling back to raw")
+            await push_event(state, "token", mongo_context)
+            return {"final_answer": mongo_context}
+
     # Inject memory into system prompt if available
     effective_system = system_prompt
     if user_memory and "No relevant memories" not in user_memory:
@@ -761,6 +821,17 @@ async def answer_generator(state: "AgentState") -> dict:
         context_parts.append(
             "## Knowledge Graph / Tool Results\n" + "\n\n".join(kg_summaries)
         )
+
+    # Add MongoDB people search results to context
+    # Use kg_summaries (already has formatted mongo display from _transform_rag_output)
+    # or state.final_answer — do NOT rebuild from raw mongo_results fields
+    if kg_summaries and any("Cơ Sở Dữ Liệu" in s or "PRE-FORMATTED" in s for s in kg_summaries):
+        # Already formatted by _transform_rag_output — use as-is
+        logger.info(f"[answer_generator] Mongo display already in kg_summaries, skipping rebuild")
+    elif state.get("mongo_results") and state.get("final_answer"):
+        # Fallback: use pre-formatted final_answer
+        context_parts.append("## Cơ Sở Dữ Liệu Người Dân\n" + state["final_answer"])
+        logger.info(f"[answer_generator] Using state.final_answer for mongo context")
 
     # Add abbreviation search results to context
     abbreviation_results = state.get("abbreviation_results", [])
@@ -819,13 +890,51 @@ async def answer_generator(state: "AgentState") -> dict:
             + context_text
             + "\n=== END CONTEXT ===\n\n"
             "INSTRUCTIONS:\n"
-            "- Answer using ONLY the retrieved sources above.\n"
+            "- Answer based ONLY on the retrieved sources above. "
+            "If the retrieved context is empty or says 'no results', say so — do NOT fill in details from your own knowledge.\n"
+            "- You have NO access to external databases, phone records, or personal information "
+            "about any individual except what appears in the 'RETRIEVED CONTEXT' section above.\n"
             "- Cite sources using their unique IDs in brackets, e.g. [a3z9] or [b2m7].\n"
             "- Knowledge Graph / memory facts: cite as [MEM-{id}] (e.g. [MEM-1]).\n"
             "- If the sources do not contain enough information to answer fully, "
-            "provide as much detail as possible and clearly state what is missing.\n"
-            "- Avoid saying 'information not found' if you can provide a partial answer.\n"
+            "be honest about it. Provide what you can, clearly note what is missing, "
+            "and suggest what the user might do next.\n"
+            "- If NO sources are relevant or available, say so politely. "
+            "Do NOT pretend to know. Suggest what the user could try instead "
+            "(e.g., rephrasing the question, checking if documents on this topic exist, "
+            "uploading relevant documents).\n"
             "- TABLE DATA: 'Key, Year = Value' pairs are table cells.\n"
+            "- DATABASE RECORDS: If the context includes 'Cơ Sở Dữ Liệu Người Dân', "
+            "ONLY report the information that appears EXPLICITLY in those records. "
+            "Do NOT infer, guess, or fabricate related phone numbers, names, IDs, "
+            "or any other personal information not present in the records. "
+            "If a record does not contain a field (e.g., no address, no birthdate), "
+            "simply state that the information is not available — do not fill in with assumptions.\n"
+            "- PHONE NUMBER SEARCH STRICT RULE:\n"
+            "  You have NO knowledge of any specific Vietnamese individual's phone number, "
+            "name, CCCD, or BHXH beyond what appears EXPLICITLY in the retrieved database records above.\n"
+            "  When a phone search returns NO records:\n"
+            "    ✅ CORRECT: 'Không tìm thấy người nào có số điện thoại này trong cơ sở dữ liệu.'\n"
+            "    ❌ WRONG: Mentioning ANY other phone number (e.g., 0949755968, 0339755968) "
+            "or ANY person's name (e.g., Huỳnh Minh Khải) — even if you think you 'recognize' it. "
+            "You do NOT have real-time access to Vietnamese phone records. "
+            "Any name or number NOT in the retrieved context is a hallucination.\n"
+            "  When a phone search returns records:\n"
+            "    ✅ CORRECT: Report ONLY the fields that appear verbatim in the records. "
+            "If a phone number is not in the records, do not mention it — even if you believe you know who it belongs to.\n"
+            "  FIREWALL RULE: The moment you write a sentence containing a phone number or name "
+            "that does NOT appear in the 'Cơ Sở Dữ Liệu Người Dân' section above, "
+            "you are hallucinating. Stop immediately and revise.\n"
+            "- SPARSE RECORDS (e.g. UID/Facebook records with only phone + ID, no name): "
+            "If a record has no person's name attached, do NOT mention it as a result. "
+            "Skip it entirely. Only include records where a person's name is present.\n"
+            "- PARENT/GUARDIAN PHONE NUMBERS: If the only phone number in a record "
+            "belongs to a parent or guardian (e.g., mother's phone in vaccination records), "
+            "do NOT report it as the person's own phone number. "
+            "You may mention it briefly as 'phone of parent/guardian' only if directly relevant.\n"
+            "- Keep your tone friendly and helpful, not robotic or overly formal.\n"
+            "- End with a brief 1-2 line suggestion for what to explore next, "
+            "if appropriate (start with 'Gợi ý:' or 'Suggestion:').\n"
         )
         # Append to last user message
         if llm_messages and llm_messages[-1].role == "user":
@@ -1171,6 +1280,7 @@ def _transform_rag_input(state: "AgentState") -> dict:
         "image_parts": [],
         "kg_summaries": [],
         "abbreviation_results": [],
+        "mongo_results": [],
         "final_answer": None,
     }
 
@@ -1181,16 +1291,17 @@ def _transform_rag_output(rag_result: dict, state: "AgentState") -> dict:
 
     Extracts: sources, images, image_parts, kg_summaries,
               abbreviation_results, tool_called, iterations.
-    Does NOT set final_answer — that's left to answer_generator.
+    Sets final_answer from rag_result so answer_generator can use it directly for mongo intents.
     """
     sources = rag_result.get("sources", []) or []
     images = rag_result.get("images", []) or []
     image_parts = rag_result.get("image_parts", []) or []
     kg_summaries = rag_result.get("kg_summaries", []) or []
     abbreviation_results = rag_result.get("abbreviation_results", []) or []
+    mongo_results = rag_result.get("mongo_results", []) or []
 
     # Inject the final_answer from RAG node into kg_summaries so answer_generator
-    # can use it as context (for list_docs, summarize, kg_query, search_doc_num)
+    # can use it as context (for list_docs, summarize, kg_query, search_doc_num, mongo)
     # For search_documents, the context is already in sources, but final_answer
     # might contain extra formatting or KG summaries that are useful.
     final_answer_from_rag = rag_result.get("final_answer") or ""
@@ -1211,6 +1322,8 @@ def _transform_rag_output(rag_result: dict, state: "AgentState") -> dict:
         "image_parts": image_parts,
         "kg_summaries": kg_summaries,
         "abbreviation_results": abbreviation_results,
+        "mongo_results": mongo_results,
+        "final_answer": final_answer_from_rag,  # Set for mongo intents so answer_generator can use it
         "tool_called": True,
         "iterations": state.get("iterations", 0) + 1,  # Increment properly
     }
@@ -1251,6 +1364,10 @@ async def agent_rag_executor(state: "AgentState") -> dict:
         "kg_query": "Đang truy vấn đồ thị tri thức...",
         "search_doc_num": "Đang tra cứu số văn bản...",
         "search_abbr": "Đang tra cứu viết tắt...",
+        "mongo_search_cccd": "Đang tra cứu CCCD trong cơ sở dữ liệu...",
+        "mongo_search_name": "Đang tìm kiếm người theo tên...",
+        "mongo_search_bhxh": "Đang tra cứu BHXH trong cơ sở dữ liệu...",
+        "mongo_search_phone": "Đang tìm kiếm người theo số điện thoại...",
     }
     await push_event(
         state,
@@ -1260,6 +1377,43 @@ async def agent_rag_executor(state: "AgentState") -> dict:
             "detail": tool_status_map.get(intent, "Đang xử lý yêu cầu..."),
         },
     )
+
+    # ── FABRICATED QUERY GUARD ─────────────────────────────────────────────
+    # For mongo searches, validate that rewritten_query actually appears in the
+    # ORIGINAL user message. If LLM fabricated a phone/CCCD/BHXH number during
+    # its reasoning, reject it here BEFORE wasting a subgraph call.
+    original_query = state.get("original_query", "")
+    mongo_intents = (
+        "mongo_search_cccd",
+        "mongo_search_bhxh",
+        "mongo_search_phone",
+        "mongo_search_name",
+    )
+    if intent in mongo_intents and query and original_query:
+        # Check if the query value actually exists verbatim in the original question
+        if query.strip() not in original_query.strip():
+            logger.warning(
+                f"[agent_rag_executor] FABRICATED query detected: {query!r} "
+                f"not in original: {original_query!r} — skipping subgraph"
+            )
+            await push_event(
+                state,
+                "status",
+                {
+                    "step": "searching",
+                    "detail": "Phát hiện truy vấn không hợp lệ — bỏ qua",
+                },
+            )
+            return {
+                "sources": [],
+                "images": [],
+                "image_parts": [],
+                "kg_summaries": [],
+                "abbreviation_results": [],
+                "mongo_results": [],
+                "tool_called": True,
+                "iterations": state.get("iterations", 0) + 1,
+            }
 
     # ── Transform: AgentState → AgentRagState ────────────────────────────
     rag_input = _transform_rag_input(state)

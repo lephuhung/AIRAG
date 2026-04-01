@@ -8,9 +8,10 @@ from app.models.user import User
 from app.models.tenant import Tenant, TenantUser
 from app.models.invite_token import InviteToken
 from app.models.user_memory import UserMemory
+from app.models.exchange_summary import ExchangeSummary
 
 __all__ = [
     "KnowledgeBase", "DocumentType", "Document", "DocumentImage", "DocumentTable",
     "ChatSession", "ChatMessage", "User", "Tenant", "TenantUser", "InviteToken",
-    "UserMemory", "Abbreviation",
+    "UserMemory", "Abbreviation", "ExchangeSummary",
 ]

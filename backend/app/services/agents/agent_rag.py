@@ -6,9 +6,12 @@ RAG functionality for document search, knowledge graph queries, and document ope
 """
 
 from typing import Literal
+import logging
 from langgraph.graph import StateGraph, END
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage  # noqa: F401
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 
 class AgentRagState(BaseModel):
@@ -22,6 +25,7 @@ class AgentRagState(BaseModel):
     image_parts: list = []
     kg_summaries: list = []
     abbreviation_results: list = []
+    mongo_results: list = []
     final_answer: str | None = None
 
 
@@ -34,6 +38,7 @@ def route_by_intent(
     "kg_query",
     "search_doc_num",
     "search_abbr",
+    "mongo_search_people",
 ]:
     """Route to the appropriate tool based on intent from supervisor."""
     intent = state.intent
@@ -45,6 +50,10 @@ def route_by_intent(
         "kg_query": "kg_query",
         "search_doc_num": "search_doc_num",
         "search_abbr": "search_abbr",
+        "mongo_search_cccd": "mongo_search_people",
+        "mongo_search_name": "mongo_search_people",
+        "mongo_search_bhxh": "mongo_search_people",
+        "mongo_search_phone": "mongo_search_people",
     }
 
     return intent_to_node.get(intent, "search_documents")
@@ -488,6 +497,65 @@ async def search_abbr_node(state: AgentRagState) -> AgentRagState:
     return state
 
 
+async def mongo_search_people_node(state: AgentRagState) -> AgentRagState:
+    """
+    Search MongoDB people collection by CCCD, name, BHXH, or phone.
+    Dispatches to the appropriate mongo_people_service function based on intent.
+    Stores structured person records in mongo_results and a readable display
+    in final_answer.
+    """
+    from app.services.mongo_people_service import (
+        search_by_cccd,
+        search_by_name,
+        search_by_bhxh,
+        search_by_phone,
+    )
+
+    intent = state.intent or ""
+    query = (state.rewritten_query or "").strip()
+    logger.warning(
+        f"[mongo_search_people_node] intent={intent}, rewritten_query={query!r}"
+    )
+
+    try:
+        if intent == "mongo_search_cccd":
+            result = await search_by_cccd(query)
+            logger.warning(f"[mongo_search_people_node] cccd result: found={result.get('found')}, persons={len(result.get('persons', []))}")
+            state.mongo_results = result.get("persons", [])
+            state.final_answer = result.get("display", "")
+
+        elif intent == "mongo_search_name":
+            result = await search_by_name(query, limit=10)
+            logger.warning(f"[mongo_search_people_node] name result: found={result.get('found')}, persons={len(result.get('persons', []))}")
+            state.mongo_results = result.get("persons", [])
+            state.final_answer = result.get("display", "")
+
+        elif intent == "mongo_search_bhxh":
+            result = await search_by_bhxh(query)
+            logger.warning(f"[mongo_search_people_node] bhxh result: found={result.get('found')}, persons={len(result.get('persons', []))}")
+            state.mongo_results = result.get("persons", [])
+            state.final_answer = result.get("display", "")
+
+        elif intent == "mongo_search_phone":
+            result = await search_by_phone(query, limit=10)
+            logger.warning(
+                f"[mongo_search_people_node] phone result: found={result.get('found')}, "
+                f"persons={len(result.get('persons', []))}"
+            )
+            state.mongo_results = result.get("persons", [])
+            state.final_answer = result.get("display", "")
+
+        else:
+            state.final_answer = f"Không xác định được loại tìm kiếm mongo: {intent}"
+
+    except Exception as e:
+        logger.error(f"[mongo_search_people_node] EXCEPTION: {e}", exc_info=True)
+        state.final_answer = f"Lỗi tìm kiếm cơ sở dữ liệu người: {str(e)}"
+        state.mongo_results = []
+
+    return state
+
+
 def create_agent_rag():
     """Create and compile the RAG agent graph."""
     from langgraph.graph import START
@@ -500,6 +568,7 @@ def create_agent_rag():
     graph.add_node("kg_query", kg_query_node)
     graph.add_node("search_doc_num", search_doc_num_node)
     graph.add_node("search_abbr", search_abbr_node)
+    graph.add_node("mongo_search_people", mongo_search_people_node)
 
     graph.add_conditional_edges(
         START,
@@ -511,6 +580,7 @@ def create_agent_rag():
             "kg_query": "kg_query",
             "search_doc_num": "search_doc_num",
             "search_abbr": "search_abbr",
+            "mongo_search_people": "mongo_search_people",
         },
     )
 
@@ -520,5 +590,6 @@ def create_agent_rag():
     graph.add_edge("kg_query", END)
     graph.add_edge("search_doc_num", END)
     graph.add_edge("search_abbr", END)
+    graph.add_edge("mongo_search_people", END)
 
     return graph.compile()

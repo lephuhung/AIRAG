@@ -171,6 +171,7 @@ class ChatRequest(BaseModel):
     """Request for the chat endpoint."""
     message: str = Field(..., min_length=1, max_length=5000)
     history: list[ChatMessageSchema] = []
+    session_id: str | None = Field(default=None, description="Session ID for conversation context. If provided, exchange summaries will be used instead of history[]")
     document_ids: list[int] | None = None
     enable_thinking: bool = False
     force_search: bool = False  # Pre-search before LLM call; injects sources as context directly

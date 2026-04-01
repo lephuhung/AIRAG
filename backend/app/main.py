@@ -94,6 +94,32 @@ async def lifespan(app: FastAPI):
             await conn.execute(text(
                 "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS potential_abbreviations JSON"
             ))
+            # Exchange summaries for per-Q&A conversation context
+            await conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS chat_exchange_summaries (
+                    id SERIAL PRIMARY KEY,
+                    session_id VARCHAR(36) NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                    exchange_index INTEGER NOT NULL,
+                    user_message_id VARCHAR(50) NOT NULL,
+                    assistant_message_id VARCHAR(50),
+                    topic_label VARCHAR(255) NOT NULL,
+                    key_entities JSON,
+                    summary TEXT NOT NULL,
+                    cited_sources JSON,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_chat_exchange_summaries_session_id ON chat_exchange_summaries(session_id)"
+            ))
+            await conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_chat_exchange_summaries_exchange_index ON chat_exchange_summaries(exchange_index)"
+            ))
+            # Add cited_sources column if not exists (table may already exist from previous run)
+            await conn.execute(text(
+                "ALTER TABLE chat_exchange_summaries ADD COLUMN IF NOT EXISTS cited_sources JSON"
+            ))
+
             # Worker pipeline sub-task flags
             await conn.execute(text(
                 "ALTER TABLE documents ADD COLUMN IF NOT EXISTS embed_done BOOLEAN DEFAULT FALSE"
@@ -347,9 +373,26 @@ async def lifespan(app: FastAPI):
     except Exception as _graphiti_err:
         logger.warning(f"Graphiti memory init failed (non-fatal): {_graphiti_err}")
 
+    # ── MongoDB Connection Warmup ─────────────────────────────────────────
+    # Pre-establish MongoDB TCP connection so the first search request is instant.
+    # Non-fatal: if MongoDB is unreachable, falls back to lazy connect on first use.
+    try:
+        from app.services.mongo_client import get_mongo_client
+        _mongo_client = get_mongo_client()
+        # Force TCP handshake + auth now (pymongo connects lazily on first op)
+        _mongo_client.admin.command("ping")
+        logger.info("[mongo] Connection warmup OK")
+    except Exception as _mongo_err:
+        logger.warning(f"MongoDB warmup failed (non-fatal): {_mongo_err}")
+
     yield
     logger.info("Shutting down...")
     await engine.dispose()
+    try:
+        from app.services.mongo_client import close_mongo_client
+        close_mongo_client()
+    except Exception:
+        pass
 
 
 app = FastAPI(

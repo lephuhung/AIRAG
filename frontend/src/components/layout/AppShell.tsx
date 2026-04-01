@@ -53,7 +53,7 @@ export function AppShell() {
     if (isNarrow && !isCollapsed) {
       setIsCollapsed(true);
     }
-  }, [location.pathname, isNarrow, isCollapsed]);
+  }, [location.pathname, isNarrow]);
 
   useEffect(() => {
     document.documentElement.style.setProperty(
