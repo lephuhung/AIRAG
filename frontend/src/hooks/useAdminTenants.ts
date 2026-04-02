@@ -9,7 +9,7 @@ export function useAdminTenants() {
   });
 }
 
-export function useTenant(tenantId: number | null) {
+export function useTenant(tenantId: string | null) {
   return useQuery({
     queryKey: ["tenant", tenantId],
     queryFn: () => (tenantId ? api.get<Tenant>(`/tenants/${tenantId}`) : null),
@@ -36,7 +36,7 @@ export function useUpdateTenant() {
       tenantId,
       data,
     }: {
-      tenantId: number;
+      tenantId: string;
       data: { name?: string; slug?: string; domain?: string; is_active?: boolean };
     }) => api.put<Tenant>(`/tenants/${tenantId}`, data),
     onSuccess: () => {
@@ -48,7 +48,7 @@ export function useUpdateTenant() {
 export function useDeactivateTenant() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (tenantId: number) => api.delete(`/tenants/${tenantId}`),
+    mutationFn: (tenantId: string) => api.delete(`/tenants/${tenantId}`),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["admin-tenants"] });
       queryClient.invalidateQueries({ queryKey: ["admin-stats"] });

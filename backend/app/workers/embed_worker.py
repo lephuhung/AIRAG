@@ -121,10 +121,12 @@ async def handle_embed(payload: dict) -> None:
                 f"doc_{msg.document_id}_chunk_{c['chunk_index']}"
                 for c in chunks_data
             ]
-            img_url_prefix = f"/static/doc-images/kb_{msg.workspace_id}/images"
+            ws_id = str(msg.workspace_id)
+            img_url_prefix = f"/static/doc-images/kb_{ws_id}/images"
             metadatas = [
                 {
-                    "document_id":     msg.document_id,
+                    "document_id":     str(msg.document_id),
+                    "workspace_id":   ws_id,
                     "chunk_index":     c["chunk_index"],
                     "source":          c["source_file"],
                     "file_type":       document.file_type,

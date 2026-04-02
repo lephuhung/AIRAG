@@ -43,7 +43,7 @@ export function useDocuments(workspaceId: string | undefined) {
 // ---------------------------------------------------------------------------
 // Query hook — get a single document by ID
 // ---------------------------------------------------------------------------
-export function useDocument(documentId: number | string | undefined) {
+export function useDocument(documentId: string | undefined) {
   return useQuery({
     queryKey: ["documents", "single", String(documentId)],
     queryFn: () => api.get<Document>(`/documents/${documentId}`),
@@ -59,7 +59,7 @@ export function useDeleteDocument(workspaceId: string | undefined) {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (docId: number) => api.delete(`/documents/${docId}`),
+    mutationFn: (docId: string) => api.delete(`/documents/${docId}`),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["documents", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["rag-stats", workspaceId] });
@@ -74,7 +74,7 @@ export function useProcessDocument(workspaceId: string | undefined) {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (docId: number) => api.post(`/rag/process/${docId}`),
+    mutationFn: (docId: string) => api.post(`/rag/process/${docId}`),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["documents", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["rag-stats", workspaceId] });
@@ -90,7 +90,7 @@ export function useReindexDocument(workspaceId: string | undefined) {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (docId: number) => api.post(`/rag/reindex/${docId}`),
+    mutationFn: (docId: string) => api.post(`/rag/reindex/${docId}`),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["documents", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["rag-stats", workspaceId] });
@@ -104,7 +104,7 @@ export function useUpdateDocument(workspaceId: string | undefined) {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: ({ docId, data }: { docId: number; data: Partial<Document> }) =>
+    mutationFn: ({ docId, data }: { docId: string; data: Partial<Document> }) =>
       api.patch(`/documents/${docId}`, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["documents", workspaceId] });

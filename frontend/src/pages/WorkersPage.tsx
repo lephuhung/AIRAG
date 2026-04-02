@@ -211,6 +211,15 @@ export function WorkersPage() {
     onError: (err: Error) => toast.error(err.message),
   });
 
+  const restartAllWorkers = useMutation({
+    mutationFn: () => api.post("/workers/restart-all"),
+    onSuccess: () => {
+      invalidateAll();
+      toast.success(t("workers.restart_all_success"));
+    },
+    onError: (err: Error) => toast.error(t("workers.restart_all_failed")),
+  });
+
   // ── Pipeline mutations ──
   const retryAll = useMutation({
     mutationFn: () => api.post<{ retried_count: number }>("/workers/retry-failed"),
@@ -337,6 +346,17 @@ export function WorkersPage() {
             >
               <Zap className={cn("w-3.5 h-3.5", startWorker.isPending && "animate-spin")} />
               {t("workers.start_all")}
+            </Button>
+
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 gap-1.5 text-xs border-primary/20 text-primary hover:bg-primary/5"
+              onClick={() => restartAllWorkers.mutate()}
+              disabled={restartAllWorkers.isPending}
+            >
+              <RefreshCw className={cn("w-3.5 h-3.5", restartAllWorkers.isPending && "animate-spin")} />
+              {t("workers.restart_all")}
             </Button>
 
             <div className="h-6 w-px bg-border mx-1" />

@@ -259,7 +259,8 @@ async def publish(exchange_name: str, routing_key: str, payload: dict) -> None:
         exchange = await channel.declare_exchange(
             exchange_name, ExchangeType.DIRECT, durable=True
         )
-        body = json.dumps(payload).encode()
+        # Use default=str to handle UUID serialization
+        body = json.dumps(payload, default=str).encode()
         await exchange.publish(
             Message(body, delivery_mode=DeliveryMode.PERSISTENT),
             routing_key=routing_key,

@@ -10,7 +10,7 @@ interface EditDocumentDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   document: Document | null;
-  onSave: (documentId: number, data: Partial<Document>) => Promise<void>;
+  onSave: (documentId: string, data: Partial<Document>) => Promise<void>;
 }
 
 export const EditDocumentDialog: React.FC<EditDocumentDialogProps> = ({

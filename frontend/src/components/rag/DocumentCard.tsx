@@ -1,18 +1,10 @@
-import { memo, useState, useEffect } from "react";
+import { memo, useState, useEffect, useRef } from "react";
 import { motion } from "framer-motion";
 import { useTranslation } from "@/hooks/useTranslation";
 import {
-  FileText,
-  FileType,
-  Presentation,
-  FileCode,
-  Hash,
   Trash2,
   CheckCircle2,
-  XCircle,
   Loader2,
-  Clock,
-  File,
   Layers,
   ImageIcon,
   Network,
@@ -20,53 +12,9 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { getFileConfig } from "@/components/rag/document-utils";
 import type { Document, DocumentStatus } from "@/types";
 
-// ---------------------------------------------------------------------------
-// File-type icon mapping
-// ---------------------------------------------------------------------------
-export const FILE_TYPE_CONFIG: Record<string, { icon: typeof FileText; color: string }> = {
-  pdf:  { icon: FileText, color: "text-red-400" },
-  docx: { icon: FileType, color: "text-blue-400" },
-  pptx: { icon: Presentation, color: "text-orange-400" },
-  txt:  { icon: FileCode, color: "text-muted-foreground" },
-  md:   { icon: Hash, color: "text-purple-400" },
-};
-
-export function getFileConfig(fileType: string) {
-  const ext = fileType.replace(".", "").toLowerCase();
-  return FILE_TYPE_CONFIG[ext] ?? { icon: File, color: "text-muted-foreground" };
-}
-
-// ---------------------------------------------------------------------------
-// Status badge
-// ---------------------------------------------------------------------------
-export const STATUS_CONFIG: Record<DocumentStatus, { labelKey: string; className: string; icon: typeof CheckCircle2 }> = {
-  pending:      { labelKey: "files.status.pending",      className: "bg-muted text-muted-foreground",         icon: Clock },
-  parsing:      { labelKey: "files.status.parsing",      className: "bg-blue-400/15 text-blue-400",           icon: Loader2 },
-  ocring:       { labelKey: "files.status.ocring",       className: "bg-indigo-400/15 text-indigo-400",       icon: Loader2 },
-  chunking:     { labelKey: "files.status.chunking",     className: "bg-cyan-400/15 text-cyan-400",           icon: Loader2 },
-  embedding:    { labelKey: "files.status.embedding",    className: "bg-amber-400/15 text-amber-400",         icon: Loader2 },
-  building_kg:  { labelKey: "files.status.building_kg",  className: "bg-violet-400/15 text-violet-400",       icon: Loader2 },
-  indexed:      { labelKey: "files.status.indexed",      className: "bg-primary/15 text-primary",             icon: CheckCircle2 },
-  failed:       { labelKey: "files.status.failed",       className: "bg-destructive/15 text-destructive",     icon: XCircle },
-};
-
-function StatusBadge({ status }: { status: DocumentStatus }) {
-  const { t } = useTranslation();
-  const config = STATUS_CONFIG[status] ?? STATUS_CONFIG.pending;
-  const Icon = config.icon;
-  const isAnimated = status === "parsing" || status === "ocring" || status === "chunking" || status === "embedding" || status === "building_kg";
-
-  if (status === "indexed") return null;
-
-  return (
-    <span className={cn("inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium rounded-full border shadow-sm", config.className)}>
-      <Icon className={cn("w-3 h-3", isAnimated && "animate-spin")} />
-      {t(config.labelKey)}
-    </span>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Sub-task progress pills (shown when status = chunking | embedding)
@@ -75,9 +23,10 @@ interface SubTaskProgressProps {
   embed_done?: boolean;
   captions_done?: boolean;
   kg_done?: boolean;
+  isNarrow?: boolean;
 }
 
-function SubTaskProgress({ embed_done, captions_done, kg_done }: SubTaskProgressProps) {
+function SubTaskProgress({ embed_done, captions_done, kg_done, isNarrow }: SubTaskProgressProps) {
   const { t } = useTranslation();
   const tasks = [
     { done: embed_done,    label: t("files.tasks.embed"),    Icon: Layers },
@@ -86,23 +35,24 @@ function SubTaskProgress({ embed_done, captions_done, kg_done }: SubTaskProgress
   ];
 
   return (
-    <div className="flex items-center gap-1.5 mt-1.5">
+    <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
       {tasks.map(({ done, label, Icon }) => (
         <span
           key={label}
+          title={label}
           className={cn(
-            "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium border",
+            "inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium border h-5 transition-all duration-200",
             done
               ? "bg-green-500/10 text-green-400 border-green-500/20"
               : "bg-amber-400/10 text-amber-400/70 border-amber-400/20",
           )}
         >
           {done
-            ? <CheckCircle2 className="w-2.5 h-2.5" />
-            : <Loader2 className="w-2.5 h-2.5 animate-spin" />
+            ? <CheckCircle2 className="w-2.5 h-2.5 flex-shrink-0" />
+            : <Loader2 className="w-2.5 h-2.5 animate-spin flex-shrink-0" />
           }
-          <Icon className="w-2.5 h-2.5" />
-          {label}
+          <Icon className="w-2.5 h-2.5 flex-shrink-0" />
+          {!isNarrow && <span className="truncate max-w-[80px]">{label}</span>}
         </span>
       ))}
     </div>
@@ -139,12 +89,13 @@ function MetadataChips({ doc }: { doc: Document }) {
 interface DocumentCardProps {
   doc: Document;
   selected?: boolean;
-  onToggleSelect?: (id: number) => void;
-  onDelete: (id: number) => void;
-  onProcess: (id: number) => void;
+  onToggleSelect?: (id: string) => void;
+  onDelete: (id: string) => void;
+  onProcess: (id: string) => void;
   onClick?: (doc: Document) => void;
   showSubTasks?: boolean;
   isProcessing?: boolean;
+  className?: string;
 }
 
 const ACTIVE_STATUSES: DocumentStatus[] = ["parsing", "ocring", "chunking", "embedding", "building_kg"];
@@ -158,6 +109,7 @@ export const DocumentCard = memo(({
   onClick,
   showSubTasks: forceShowSubTasks,
   isProcessing,
+  className,
 }: DocumentCardProps) => {
   const { t } = useTranslation();
   const fileConfig = getFileConfig(doc.file_type);
@@ -168,6 +120,20 @@ export const DocumentCard = memo(({
 
   const isActive = ACTIVE_STATUSES.includes(doc.status);
   const shouldShowSubTasks = forceShowSubTasks ?? (doc.status === "chunking" || doc.status === "embedding");
+
+  // Detection for narrow layout
+  const [isNarrow, setIsNarrow] = useState(false);
+  const cardRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!cardRef.current) return;
+    const observer = new ResizeObserver((entries) => {
+      const { width } = entries[0].contentRect;
+      setIsNarrow(width < 250);
+    });
+    observer.observe(cardRef.current);
+    return () => observer.disconnect();
+  }, []);
 
   // Flash animation when user just clicked "Analyze"
   const [justTriggered, setJustTriggered] = useState(false);
@@ -186,6 +152,7 @@ export const DocumentCard = memo(({
 
   return (
     <motion.div
+      ref={cardRef}
       layout
       initial={{ opacity: 0, y: 8 }}
       animate={{
@@ -203,6 +170,7 @@ export const DocumentCard = memo(({
         selected && "border-primary ring-1 ring-primary/30 shadow-sm",
         doc.status === "indexed" || doc.status === "building_kg" ? "cursor-pointer" : "cursor-default",
         justTriggered && "ring-2 ring-blue-400/60",
+        className
       )}
       onClick={() => onClick?.(doc)}
     >
@@ -244,10 +212,9 @@ export const DocumentCard = memo(({
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2">
               <p className="font-medium text-sm truncate">{doc.original_filename}</p>
-              <StatusBadge status={doc.status} />
             </div>
-            <div className="flex items-center gap-2 mt-0.5">
-              <span className="text-xs text-muted-foreground">{sizeStr}</span>
+            <div className="flex items-center gap-1.5 mt-0.5">
+              <span className="text-[10px] text-muted-foreground font-medium">{sizeStr}</span>
               {doc.parser_version && (
                 <span className="text-xs text-muted-foreground/60">{doc.parser_version}</span>
               )}
@@ -284,7 +251,10 @@ export const DocumentCard = memo(({
         </div>
 
         {/* Status specific messages */}
-        <div className="flex flex-col gap-1 pl-13">
+        <div className={cn(
+          "flex flex-col gap-1 transition-all duration-200",
+          isActive ? "pl-11 sm:pl-13" : "pl-11"
+        )}>
           {doc.status === "parsing" && (
             <span className="text-xs text-blue-400/80 font-medium animate-pulse">
               {t("files.msg.parsing")}
@@ -318,6 +288,7 @@ export const DocumentCard = memo(({
               embed_done={doc.embed_done}
               captions_done={doc.captions_done}
               kg_done={doc.kg_done}
+              isNarrow={isNarrow}
             />
           )}
           

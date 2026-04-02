@@ -398,6 +398,50 @@ async def restart_workers(worker_type: str, user: User = Depends(require_superad
     }
 
 
+@router.post("/restart-all")
+async def restart_all_workers(user: User = Depends(require_superadmin)):
+    """
+    Restart all managed workers of all types.
+    """
+    restarted = {}
+    async with _workers_lock:
+        for wtype in _VALID_WORKER_TYPES:
+            old_workers = _workers.get(wtype, [])
+            alive_count = len([w for w in old_workers if w.is_alive])
+            if alive_count == 0:
+                continue
+
+            # Stop all existing
+            for w in old_workers:
+                if w.is_alive:
+                    try:
+                        w.process.send_signal(signal.SIGTERM)
+                        try:
+                            await asyncio.wait_for(w.process.wait(), timeout=3.0)
+                        except asyncio.TimeoutError:
+                            w.process.kill()
+                    except Exception:
+                        pass
+
+            # Start new ones
+            _workers[wtype] = []
+            started_pids = []
+            for _ in range(alive_count):
+                worker = await _spawn_worker(wtype)
+                _workers[wtype].append(worker)
+                started_pids.append(worker.pid)
+            
+            restarted[wtype] = {
+                "stopped_count": alive_count,
+                "started_pids": started_pids,
+            }
+
+    return {
+        "status": "ok",
+        "restarted": restarted,
+    }
+
+
 @router.delete("/managed/{worker_type}")
 async def remove_dead_workers(worker_type: str, user: User = Depends(require_superadmin)):
     """Remove dead/exited worker entries from the managed list."""

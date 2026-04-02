@@ -35,7 +35,7 @@ export function usePurgeQueue() {
 export function useRetryFailed() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (workspaceId?: number) =>
+    mutationFn: (workspaceId?: string) =>
       api.post<{ retried_count: number }>(
         `/workers/retry-failed${workspaceId ? `?workspace_id=${workspaceId}` : ""}`
       ),
@@ -50,7 +50,7 @@ export function useRetryFailed() {
 export function useRetryDocument() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (documentId: number) =>
+    mutationFn: (documentId: string) =>
       api.post(`/workers/retry-failed/${documentId}`),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["worker-overview"] });

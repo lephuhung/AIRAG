@@ -43,14 +43,14 @@ export function KnowledgeBasesPage() {
   const [showNewWorkspace, setShowNewWorkspace] = useState(false);
   const [newWorkspaceName, setNewWorkspaceName] = useState("");
   const [newVisibility, setNewVisibility] = useState<VisibilityOption>("personal");
-  const [selectedTenantId, setSelectedTenantId] = useState<number | null>(null);
-  const [deleteConfirm, setDeleteConfirm] = useState<number | null>(null);
-  const [openMenu, setOpenMenu] = useState<number | null>(null);
+  const [selectedTenantId, setSelectedTenantId] = useState<string | null>(null);
+  const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+  const [openMenu, setOpenMenu] = useState<string | null>(null);
 
   const [editWorkspace, setEditWorkspace] = useState<KnowledgeBase | null>(null);
   const [editWorkspaceName, setEditWorkspaceName] = useState("");
   const [editVisibility, setEditVisibility] = useState<VisibilityOption>("personal");
-  const [editTenantId, setEditTenantId] = useState<number | null>(null);
+  const [editTenantId, setEditTenantId] = useState<string | null>(null);
 
   useEffect(() => {
     if (editWorkspace) {
@@ -115,7 +115,7 @@ export function KnowledgeBasesPage() {
     }
   };
 
-  const handleDeleteWorkspace = async (id: number) => {
+  const handleDeleteWorkspace = async (id: string) => {
     try {
       await deleteWorkspace.mutateAsync(id);
       toast.success(t("kb.delete_success"));
@@ -351,7 +351,7 @@ export function KnowledgeBasesPage() {
                       <div className="relative">
                         <select
                           value={selectedTenantId ?? ""}
-                          onChange={(e) => setSelectedTenantId(e.target.value ? Number(e.target.value) : null)}
+                          onChange={(e) => setSelectedTenantId(e.target.value || null)}
                           className={cn(
                             "w-full appearance-none rounded-lg border bg-background px-3 py-2 pr-8 text-sm",
                             "focus:outline-none focus:ring-1 focus:ring-ring",
@@ -444,7 +444,7 @@ export function KnowledgeBasesPage() {
                       <div className="relative">
                         <select
                           value={editTenantId ?? ""}
-                          onChange={(e) => setEditTenantId(e.target.value ? Number(e.target.value) : null)}
+                          onChange={(e) => setEditTenantId(e.target.value || null)}
                           className={cn(
                             "w-full appearance-none rounded-lg border bg-background px-3 py-2 pr-8 text-sm",
                             "focus:outline-none focus:ring-1 focus:ring-ring",

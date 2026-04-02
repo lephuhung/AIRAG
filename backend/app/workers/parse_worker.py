@@ -262,14 +262,14 @@ async def handle_parse(payload: dict) -> None:
                 EmbedMessage(
                     document_id=msg.document_id,
                     workspace_id=msg.workspace_id,
-                ).model_dump(),
+                ).model_dump(mode="json"),
             )
             await mq.publish(
                 mq.EXCHANGE_CAPTION, "caption",
                 CaptionMessage(
                     document_id=msg.document_id,
                     workspace_id=msg.workspace_id,
-                ).model_dump(),
+                ).model_dump(mode="json"),
             )
             await mq.publish(
                 mq.EXCHANGE_KG, str(msg.workspace_id),
@@ -277,7 +277,7 @@ async def handle_parse(payload: dict) -> None:
                     document_id=msg.document_id,
                     workspace_id=msg.workspace_id,
                     markdown=parsed.markdown,
-                ).model_dump(),
+                ).model_dump(mode="json"),
             )
             logger.info(
                 f"[parse_worker] doc={msg.document_id} dispatched "

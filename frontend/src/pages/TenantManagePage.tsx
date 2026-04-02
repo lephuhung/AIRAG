@@ -57,19 +57,19 @@ export function TenantManagePage() {
   const createInvite = useCreateInvite();
   const revokeInvite = useRevokeInvite();
 
-  const tid = Number(tenantId);
-  const { data: activeInvites } = useTenantInvites(showInviteDialog ? tid : null);
+  const { data: activeInvites } = useTenantInvites(showInviteDialog ? tenantId ?? null : null);
 
   useEffect(() => {
-    if (!tid) return;
+    if (!tenantId) return;
     loadData();
-  }, [tid]);
+  }, [tenantId]);
 
   const loadData = async () => {
+    if (!tenantId) return;
     try {
       const [tenantData, memberList] = await Promise.all([
-        api.get<Tenant>(`/tenants/${tid}`),
-        api.get<TenantUser[]>(`/tenants/${tid}/users`),
+        api.get<Tenant>(`/tenants/${tenantId}`),
+        api.get<TenantUser[]>(`/tenants/${tenantId}/users`),
       ]);
       setTenant(tenantData);
       setMembers(memberList);
@@ -82,7 +82,7 @@ export function TenantManagePage() {
 
   const handleApprove = async (userId: number) => {
     try {
-      await api.post(`/tenants/${tid}/users/${userId}/approve`);
+      await api.post(`/tenants/${tenantId}/users/${userId}/approve`);
       toast.success(t("admin.tenants.manage.approve_success"));
       loadData();
     } catch (err: any) {
@@ -92,7 +92,7 @@ export function TenantManagePage() {
 
   const handleReject = async (userId: number) => {
     try {
-      await api.post(`/tenants/${tid}/users/${userId}/reject`);
+      await api.post(`/tenants/${tenantId}/users/${userId}/reject`);
       toast.success(t("admin.tenants.manage.reject_success"));
       loadData();
     } catch (err: any) {
@@ -102,7 +102,7 @@ export function TenantManagePage() {
 
   const handleRemove = async (userId: number) => {
     try {
-      await api.delete(`/tenants/${tid}/users/${userId}`);
+      await api.delete(`/tenants/${tenantId}/users/${userId}`);
       toast.success(t("admin.tenants.manage.remove_success"));
       loadData();
     } catch (err: any) {
@@ -113,7 +113,7 @@ export function TenantManagePage() {
   const handleToggleRole = async (userId: number, currentRole: string) => {
     const newRole = currentRole === "admin" ? "member" : "admin";
     try {
-      await api.put(`/tenants/${tid}/users/${userId}/role`, { role: newRole });
+      await api.put(`/tenants/${tenantId}/users/${userId}/role`, { role: newRole });
       toast.success(t("admin.tenants.manage.role_changed", { role: newRole }));
       loadData();
     } catch (err: any) {
@@ -124,7 +124,7 @@ export function TenantManagePage() {
   const handleCreateInvite = async () => {
     try {
       const result = await createInvite.mutateAsync({
-        tenantId: tid,
+        tenantId: tenantId ?? "",
         data: {
           email: inviteForm.email.trim() || undefined,
           role: inviteForm.role,
@@ -142,7 +142,7 @@ export function TenantManagePage() {
 
   const handleRevokeInvite = async (inviteId: number) => {
     try {
-      await revokeInvite.mutateAsync({ tenantId: tid, inviteId });
+      await revokeInvite.mutateAsync({ tenantId: tenantId ?? "", inviteId });
       toast.success(t("admin.tenants.toast.invite_revoked"));
     } catch (err: any) {
       toast.error(err.message || t("admin.tenants.toast.invite_revoke_failed"));
@@ -180,7 +180,7 @@ export function TenantManagePage() {
             <div className="flex items-center gap-2">
               <Building2 className="w-5 h-5 text-amber-500" />
               <h2 className="text-lg font-semibold">
-                {tenant?.name || `Tenant #${tid}`}
+                {tenant?.name || `Tenant ${tenantId ?? ""}`}
               </h2>
             </div>
           </div>

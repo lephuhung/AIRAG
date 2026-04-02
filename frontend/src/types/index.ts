@@ -603,3 +603,11 @@ export interface AbbreviationListResponse {
   page: number;
   per_page: number;
 }
+
+export interface UploadingFile {
+  id: string;
+  name: string;
+  size: number;
+  progress: number;
+  error?: string;
+}

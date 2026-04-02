@@ -199,7 +199,7 @@ class ApiClient {
    *   3. POST /documents/upload/{wsId}/confirm  → DocumentUploadResponse
    */
   async uploadFileDirect<T>(
-    workspaceId: number,
+    workspaceId: string | number,
     file: File,
     onProgress?: (percent: number) => void,
   ): Promise<T> {

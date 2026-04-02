@@ -5,7 +5,7 @@ import type { AdminUserListResponse, AdminUserDetail, AdminStats } from "@/types
 export function useAdminUsers(
   search?: string,
   isActive?: boolean | null,
-  tenantId?: number | null,
+  tenantId?: string | null,
   page: number = 1,
   perPage: number = 20,
 ) {
@@ -22,7 +22,7 @@ export function useAdminUsers(
   });
 }
 
-export function useAdminUserDetail(userId: number) {
+export function useAdminUserDetail(userId: string) {
   return useQuery({
     queryKey: ["admin-user", userId],
     queryFn: () => api.get<AdminUserDetail>(`/admin/users/${userId}`),
@@ -44,7 +44,7 @@ export function useUpdateUser() {
       userId,
       data,
     }: {
-      userId: number;
+      userId: string;
       data: { is_active?: boolean; is_superadmin?: boolean; full_name?: string };
     }) => api.put<AdminUserDetail>(`/admin/users/${userId}`, data),
     onSuccess: () => {
@@ -57,7 +57,7 @@ export function useUpdateUser() {
 export function useDeleteUser() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (userId: number) => api.delete(`/admin/users/${userId}`),
+    mutationFn: (userId: string) => api.delete(`/admin/users/${userId}`),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["admin-users"] });
       queryClient.invalidateQueries({ queryKey: ["admin-stats"] });
@@ -68,7 +68,7 @@ export function useDeleteUser() {
 export function useResetUserPassword() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ userId, newPassword }: { userId: number; newPassword: string }) =>
+    mutationFn: ({ userId, newPassword }: { userId: string; newPassword: string }) =>
       api.post<AdminUserDetail>(`/admin/users/${userId}/reset-password`, {
         new_password: newPassword,
       }),
@@ -86,8 +86,8 @@ export function useUpdateTenantMemberRole() {
       userId,
       role,
     }: {
-      tenantId: number;
-      userId: number;
+      tenantId: string;
+      userId: string;
       role: "admin" | "member";
     }) => api.put<any>(`/tenants/${tenantId}/users/${userId}/role`, { role }),
     onSuccess: () => {

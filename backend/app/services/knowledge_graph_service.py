@@ -432,7 +432,7 @@ class KnowledgeGraphService:
                             MATCH (n:`{label}`) WHERE n.document_id = $doc_id
                             DETACH DELETE n
                             """,
-                            doc_id=document_id,
+                            doc_id=str(document_id),
                         )
                         summary = await result.consume()
                         logger.info(

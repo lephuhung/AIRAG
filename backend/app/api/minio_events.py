@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import re
 import urllib.parse
+import uuid
 
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy import select
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/minio", tags=["minio-events"])
 
 # Key format: kb_{workspace_id}/doc_{document_id}.{ext}
-_KEY_RE = re.compile(r"^kb_(\d+)/doc_(\d+)\.\w+$")
+_KEY_RE = re.compile(r"^kb_([0-9a-f-]+)/doc_([0-9a-f-]+)\.\w+$")
 
 
 @router.post("/events")
@@ -79,8 +80,8 @@ async def handle_minio_event(
             )
             continue
 
-        workspace_id = int(match.group(1))
-        document_id = int(match.group(2))
+        workspace_id = uuid.UUID(match.group(1))
+        document_id = uuid.UUID(match.group(2))
 
         result = await db.execute(select(Document).where(Document.id == document_id))
         document = result.scalar_one_or_none()

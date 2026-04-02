@@ -14,7 +14,7 @@ export function useWorkspaces() {
   });
 }
 
-export function useWorkspace(workspaceId: number | null) {
+export function useWorkspace(workspaceId: string | null) {
   return useQuery({
     queryKey: ["workspaces", workspaceId],
     queryFn: () => api.get<KnowledgeBase>(`/workspaces/${workspaceId}`),
@@ -45,7 +45,7 @@ export function useUpdateWorkspace() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: ({ id, data }: { id: number; data: UpdateWorkspace }) =>
+    mutationFn: ({ id, data }: { id: string; data: UpdateWorkspace }) =>
       api.put<KnowledgeBase>(`/workspaces/${id}`, data),
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: ["workspaces"] });
@@ -58,7 +58,7 @@ export function useDeleteWorkspace() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (id: number) => api.delete(`/workspaces/${id}`),
+    mutationFn: (id: string) => api.delete(`/workspaces/${id}`),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["workspaces"] });
     },

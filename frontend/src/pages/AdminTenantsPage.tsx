@@ -76,7 +76,7 @@ export function AdminTenantsPage() {
   const [showDialog, setShowDialog] = useState(false);
   const [editingTenant, setEditingTenant] = useState<Tenant | null>(null);
   const [form, setForm] = useState<TenantFormData>(emptyForm);
-  const [selectedWorkspaceIds, setSelectedWorkspaceIds] = useState<number[]>([]);
+  const [selectedWorkspaceIds, setSelectedWorkspaceIds] = useState<string[]>([]);
   const [confirmDeactivate, setConfirmDeactivate] = useState<Tenant | null>(null);
 
   // Invite dialog state
@@ -195,7 +195,7 @@ export function AdminTenantsPage() {
     }
   };
 
-  const handleRevokeInvite = async (inviteId: number) => {
+  const handleRevokeInvite = async (inviteId: string) => {
     if (!inviteTenant) return;
     try {
       await revokeInvite.mutateAsync({

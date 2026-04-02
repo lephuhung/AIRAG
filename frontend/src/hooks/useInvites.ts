@@ -9,7 +9,7 @@ export function useCreateInvite() {
       tenantId,
       data,
     }: {
-      tenantId: number;
+      tenantId: string;
       data: {
         email?: string | null;
         role?: string;
@@ -25,7 +25,7 @@ export function useCreateInvite() {
   });
 }
 
-export function useTenantInvites(tenantId: number | null) {
+export function useTenantInvites(tenantId: string | null) {
   return useQuery({
     queryKey: ["tenant-invites", tenantId],
     queryFn: () => api.get<InviteLink[]>(`/tenants/${tenantId}/invites`),
@@ -40,8 +40,8 @@ export function useRevokeInvite() {
       tenantId,
       inviteId,
     }: {
-      tenantId: number;
-      inviteId: number;
+      tenantId: string;
+      inviteId: string;
     }) => api.delete(`/tenants/${tenantId}/invites/${inviteId}`),
     onSuccess: (_data, variables) => {
       queryClient.invalidateQueries({

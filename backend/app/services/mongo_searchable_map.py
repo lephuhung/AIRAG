@@ -135,8 +135,8 @@ SEARCHABLE_COLLECTION_MAP: dict[str, dict] = {
             "vnvc": {
                 # mobile: Số điện thoại trong hồ sơ tiêm VNVC
                 "fields": ["mobile"],
-                # TODO: Xác nhận display_fields cho vnvc (có hoTen, ngaySinh không?)
-                "display_fields": ["HO_TEN", "NGAY_SINH", "TEN_ME", "DIEN_THOAI_ME", "GIOI_TINH", "PID"],
+                # Actual field names: fullName (name), fullNam (birth date), mobile, diaChi (address)
+                "display_fields": ["fullName", "fullNam", "mobile", "diaChi", "TEN_ME", "gioi_tinh"],
             },
         },
     },
@@ -174,10 +174,9 @@ SEARCHABLE_COLLECTION_MAP: dict[str, dict] = {
             #     "fields": ["<ten_field_ten>"],
             #     "display_fields": [],
             # },
-            # TODO: vnvc có trường tên không? (ngoài mobile)
             "vnvc": {
                 "fields": ["fullName"],
-                "display_fields": ["mobile", "fullNam", "diaChi"],
+                "display_fields": ["fullName", "mobile", "fullNam", "diaChi", "TEN_ME"],
             },
         },
     },

@@ -1,5 +1,5 @@
 import { useTranslation } from "@/hooks/useTranslation";
-import { useMemo, useCallback, useEffect, useRef } from "react";
+import { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import { useParams } from "react-router-dom";
 import { toast } from "sonner";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -8,7 +8,7 @@ import { VisualPanel } from "@/components/rag/VisualPanel";
 import { useWorkspaceStore } from "@/stores/workspaceStore";
 import { useWorkspace, useUpdateWorkspace } from "@/hooks/useWorkspaces";
 import { api } from "@/lib/api";
-import type { Document, RAGStats, DocumentStatus } from "@/types";
+import type { Document, RAGStats, DocumentStatus, UploadingFile } from "@/types";
 
 const PROCESSING_STATUSES = new Set<DocumentStatus>([
   "parsing",
@@ -27,11 +27,13 @@ export function WorkspacePage() {
   const { t } = useTranslation();
   const { workspaceId } = useParams<{ workspaceId: string }>();
   const queryClient = useQueryClient();
-  const wsId = workspaceId ? Number(workspaceId) : null;
 
   // -- Workspace data --
-  const { data: workspace } = useWorkspace(wsId);
+  const { data: workspace } = useWorkspace(workspaceId ?? null);
   const updateWorkspace = useUpdateWorkspace();
+
+  // -- Uploading files state --
+  const [uploadingFiles, setUploadingFiles] = useState<Record<string, UploadingFile>>({});
 
   // -- Store --
   const { selectedDoc, selectDoc, reset: resetStore } = useWorkspaceStore();
@@ -93,8 +95,37 @@ export function WorkspacePage() {
   // Mutations
   // -----------------------------------------------------------------------
   const uploadDoc = useMutation({
-    mutationFn: (file: File) =>
-      api.uploadFileDirect<Document>(Number(workspaceId), file),
+    mutationFn: async (file: File) => {
+      if (!workspaceId) throw new Error("Invalid workspace ID");
+
+      const fileId = `${file.name}-${file.size}-${Date.now()}`;
+      setUploadingFiles((prev: Record<string, UploadingFile>) => ({
+        ...prev,
+        [fileId]: { id: fileId, name: file.name, size: file.size, progress: 0 }
+      }));
+
+      try {
+        return await api.uploadFileDirect<Document>(
+          workspaceId,
+          file,
+          (progress) => {
+            setUploadingFiles((prev: Record<string, UploadingFile>) => {
+              if (!prev[fileId]) return prev;
+              return {
+                ...prev,
+                [fileId]: { ...prev[fileId], progress }
+              };
+            });
+          }
+        );
+      } finally {
+        setUploadingFiles((prev: Record<string, UploadingFile>) => {
+          const next = { ...prev };
+          delete next[fileId];
+          return next;
+        });
+      }
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["documents", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["rag-stats", workspaceId] });
@@ -116,7 +147,7 @@ export function WorkspacePage() {
   });
 
   const deleteDoc = useMutation({
-    mutationFn: (docId: number) => api.delete(`/documents/${docId}`),
+    mutationFn: (docId: string) => api.delete(`/documents/${docId}`),
     onSuccess: (_, docId) => {
       queryClient.invalidateQueries({ queryKey: ["documents", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["rag-stats", workspaceId] });
@@ -128,7 +159,7 @@ export function WorkspacePage() {
   });
 
   const processDoc = useMutation({
-    mutationFn: (docId: number) => api.post(`/rag/process/${docId}`),
+    mutationFn: (docId: string) => api.post(`/rag/process/${docId}`),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["documents", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["rag-stats", workspaceId] });
@@ -158,10 +189,10 @@ export function WorkspacePage() {
 
   const handleUpdateWorkspace = useCallback(
     async (data: { name: string; description?: string }) => {
-      if (!wsId) return;
-      await updateWorkspace.mutateAsync({ id: wsId, data });
+      if (!workspaceId) return;
+      await updateWorkspace.mutateAsync({ id: workspaceId, data });
     },
-    [wsId, updateWorkspace]
+    [workspaceId, updateWorkspace]
   );
 
   // -----------------------------------------------------------------------
@@ -178,6 +209,7 @@ export function WorkspacePage() {
         selectedDocId={selectedDoc?.id ?? null}
         onSelectDoc={handleSelectDoc}
         onUpload={(f) => uploadDoc.mutate(f)}
+        uploadingFiles={Object.values(uploadingFiles)}
         isUploading={uploadDoc.isPending}
         onDelete={(id) => deleteDoc.mutate(id)}
         onProcess={(id) => processDoc.mutate(id)}

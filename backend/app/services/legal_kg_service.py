@@ -432,6 +432,7 @@ class LegalKGService:
         """
         driver = await self._get_driver()
         label = self._label
+        doc_id_str = str(document_id)
         try:
             async with driver.session() as session:
                 # Delete relationships first, then nodes with matching document_id
@@ -440,7 +441,7 @@ class LegalKGService:
                     MATCH (n:`{label}`) WHERE n.document_id = $doc_id
                     DETACH DELETE n
                     """,
-                    doc_id=document_id,
+                    doc_id=doc_id_str,
                 )
                 summary = await result.consume()
                 logger.info(
@@ -564,7 +565,7 @@ class LegalKGService:
                             n.document_id = $doc_id,
                             n.created_at = datetime()
                         """,
-                        doc_id=document_id,
+                        doc_id=str(document_id),
                         display_name=doc_name,
                         description=description,
                         entity_id=new_entity_id,
@@ -594,6 +595,9 @@ class LegalKGService:
         if not markdown_content.strip():
             logger.warning(f"LegalKG: empty content for workspace {self.workspace_id}, skipping")
             return
+
+        # Convert UUID to string for Neo4j (Neo4j doesn't support UUID objects)
+        doc_id_str = str(document_id) if document_id else None
 
         # Step 1: Document metadata
         doc_meta = parse_document_meta(markdown_content)
@@ -735,7 +739,7 @@ class LegalKGService:
         async with driver.session() as session:
             # Store Document node and get its internal Neo4j <id>
             neo4j_node_id = await self._upsert_document_root(
-                session, doc_name, doc_meta.get("so_hieu", ""), document_id
+                session, doc_name, doc_meta.get("so_hieu", ""), doc_id_str
             )
             logger.info(f"LegalKG: created root Document node with Neo4j id={neo4j_node_id}")
 
@@ -743,57 +747,57 @@ class LegalKGService:
             loc_name = ""
             if loc:
                 loc_name = loc if "tỉnh" in loc.lower() or "thành phố" in loc.lower() else f"Tỉnh {loc}"
-                await self._upsert_node(session, loc_name, "Location", "", document_id)
+                await self._upsert_node(session, loc_name, "Location", "", doc_id_str)
                 await self._upsert_relation(
-                    session, doc_name, "BAN_HANH_TAI", loc_name, "Phạm vi địa lý", document_id,
+                    session, doc_name, "BAN_HANH_TAI", loc_name, "Phạm vi địa lý", doc_id_str,
                     source_type="Document", target_type="Location",
                 )
-                
+
             if parent_org and issue_org:
                 combined_issue_org = f"{issue_org} {parent_org}"
-                await self._upsert_node(session, combined_issue_org, "Organization", "", document_id)
-                await self._upsert_node(session, parent_org, "Organization", "", document_id)
-                
+                await self._upsert_node(session, combined_issue_org, "Organization", "", doc_id_str)
+                await self._upsert_node(session, parent_org, "Organization", "", doc_id_str)
+
                 await self._upsert_relation(
-                    session, doc_name, "BAN_HANH_BOI", combined_issue_org, "", document_id,
+                    session, doc_name, "BAN_HANH_BOI", combined_issue_org, "", doc_id_str,
                     source_type="Document", target_type="Organization",
                 )
                 await self._upsert_relation(
-                    session, combined_issue_org, "TRUC_THUOC", parent_org, "", document_id,
+                    session, combined_issue_org, "TRUC_THUOC", parent_org, "", doc_id_str,
                     source_type="Organization", target_type="Organization",
                 )
-                
+
                 if loc_name:
                     await self._upsert_relation(
-                        session, parent_org, "THUOC_TINH", loc_name, "", document_id,
+                        session, parent_org, "THUOC_TINH", loc_name, "", doc_id_str,
                         source_type="Organization", target_type="Location",
                     )
             elif issue_org:
-                await self._upsert_node(session, issue_org, "Organization", "", document_id)
+                await self._upsert_node(session, issue_org, "Organization", "", doc_id_str)
                 await self._upsert_relation(
-                    session, doc_name, "BAN_HANH_BOI", issue_org, "", document_id,
+                    session, doc_name, "BAN_HANH_BOI", issue_org, "", doc_id_str,
                     source_type="Document", target_type="Organization",
                 )
             elif parent_org:
                 # Only parent org, no issuing org (e.g., Quốc Hội)
-                await self._upsert_node(session, parent_org, "Organization", "", document_id)
+                await self._upsert_node(session, parent_org, "Organization", "", doc_id_str)
                 await self._upsert_relation(
-                    session, doc_name, "BAN_HANH_BOI", parent_org, "", document_id,
+                    session, doc_name, "BAN_HANH_BOI", parent_org, "", doc_id_str,
                     source_type="Document", target_type="Organization",
                 )
                 if loc_name:
                     await self._upsert_relation(
-                        session, parent_org, "THUOC_TINH", loc_name, "", document_id,
+                        session, parent_org, "THUOC_TINH", loc_name, "", doc_id_str,
                         source_type="Organization", target_type="Location",
                     )
 
 
             # Store CAN_CU relations from preamble
             for ref_doc in can_cu_list:
-                await self._upsert_node(session, ref_doc, "Document", ref_doc, document_id)
+                await self._upsert_node(session, ref_doc, "Document", ref_doc, doc_id_str)
                 await self._upsert_relation(
                     session, doc_name, "CAN_CU", ref_doc,
-                    f"Căn cứ pháp lý: {ref_doc}", document_id,
+                    f"Căn cứ pháp lý: {ref_doc}", doc_id_str,
                     source_type="Document", target_type="Document",
                 )
 
@@ -833,7 +837,7 @@ class LegalKGService:
                     continue
                 await self._upsert_node(
                     session, canonical, ent.get("type", "Organization"),
-                    ent.get("representative_description", ""), document_id,
+                    ent.get("representative_description", ""), doc_id_str,
                 )
 
             # Step 5.6: Store article relations using resolved entity lookup
@@ -841,7 +845,7 @@ class LegalKGService:
                 if isinstance(result, Exception) or not result:
                     continue
                 await self._store_relations_from_extraction(
-                    session, result, doc_name, document_id,
+                    session, result, doc_name, doc_id_str,
                     canonical_lookup, merged_map, skipped_entities, entity_type_map,
                 )
 
@@ -859,7 +863,7 @@ class LegalKGService:
         )
 
         # Save kg_root_entity_id (Neo4j internal <id>) back to Document table for future metadata updates
-        if document_id and neo4j_node_id:
+        if doc_id_str and neo4j_node_id:
             try:
                 from app.core.database import async_session_maker
                 from sqlalchemy import text
@@ -869,9 +873,9 @@ class LegalKGService:
                         {"node_id": neo4j_node_id, "doc_id": document_id}
                     )
                     await _db.commit()
-                logger.info(f"LegalKG: saved kg_root_entity_id='{neo4j_node_id}' for doc_id={document_id}")
+                logger.info(f"LegalKG: saved kg_root_entity_id='{neo4j_node_id}' for doc_id={doc_id_str}")
             except Exception as _e:
-                logger.warning(f"LegalKG: failed to save kg_root_entity_id for doc_id={document_id}: {_e}")
+                logger.warning(f"LegalKG: failed to save kg_root_entity_id for doc_id={doc_id_str}: {_e}")
 
     def _format_doc_meta(self, meta: dict) -> str:
         parts = []
@@ -1292,7 +1296,7 @@ class LegalKGService:
         session,
         doc_name: str,
         description: str = "",
-        document_id: Optional[uuid.UUID] = None,
+        document_id: Optional[str] = None,
     ) -> str:
         """
         Create or update the root Document node and return its Neo4j internal <id>.
@@ -1317,7 +1321,7 @@ class LegalKGService:
             entity_id=canonical_id,
             display_name=display_name,
             description=description,
-            document_id=document_id,
+            document_id=str(document_id) if document_id else None,
         )
         record = await result.single()
         if record:
@@ -1330,7 +1334,7 @@ class LegalKGService:
         entity_id: str,
         entity_type: str,
         description: str = "",
-        document_id: Optional[uuid.UUID] = None,
+        document_id: Optional[str] = None,
     ) -> None:
         if not entity_id or not entity_id.strip():
             return
@@ -1357,7 +1361,7 @@ class LegalKGService:
             entity_type=entity_type,
             display_name=display_name,
             description=description,
-            document_id=document_id,
+            document_id=str(document_id) if document_id else None,
         )
         return canonical_id  # caller may need canonical id for relation lookup
 
@@ -1368,7 +1372,7 @@ class LegalKGService:
         relation_type: str,
         target: str,
         description: str = "",
-        document_id: Optional[uuid.UUID] = None,
+        document_id: Optional[str] = None,
         article_ref: str = "",
         extra_props: Optional[dict] = None,
         source_type: str = "Organization",
@@ -1382,10 +1386,10 @@ class LegalKGService:
         target_canonical = normalize_entity_id(target, target_type)
         # Build extra properties SET clause
         extra_props = extra_props or {}
-        prop_sets = []
+        prop_sets: list[str] = []
         params: dict[str, Any] = {
             "src": source_canonical, "tgt": target_canonical,
-            "desc": description, "doc_id": document_id, "art_ref": article_ref,
+            "desc": description, "doc_id": str(document_id) if document_id else None, "art_ref": article_ref,
         }
         for k, v in extra_props.items():
             safe_key = re.sub(r"\W", "_", k)
@@ -1411,7 +1415,7 @@ class LegalKGService:
         session,
         data: dict,
         doc_name: str,
-        document_id: Optional[uuid.UUID],
+        document_id: Optional[str],
     ) -> None:
         """Upsert all entities and relations from one article's extraction result."""
         entity_map: dict[str, str] = {}  # canonical_id → entity_type
@@ -1468,7 +1472,7 @@ class LegalKGService:
             
             desc = str(rel.get("description", "")).strip()
             art_ref = rel.get("article_ref", "")
-            doc_id = rel.get("document_id", document_id)
+            doc_id = str(rel.get("document_id")) if rel.get("document_id") else document_id
             person_props: dict = rel.get("person_props", {})
 
             if not source_raw or not target_raw or not relation_type:
@@ -1533,7 +1537,7 @@ class LegalKGService:
         session,
         data: dict,
         doc_name: str,
-        document_id: Optional[uuid.UUID],
+        document_id: Optional[str],
         canonical_lookup: dict[str, str],
         merged_map: dict[str, str],
         skipped_entities: set[str],
@@ -1559,7 +1563,7 @@ class LegalKGService:
 
             desc = str(rel.get("description", "")).strip()
             art_ref = rel.get("article_ref", "")
-            doc_id = rel.get("document_id", document_id)
+            doc_id = str(rel.get("document_id")) if rel.get("document_id") else document_id
             person_props: dict = rel.get("person_props", {})
 
             if not source_raw or not target_raw or not relation_type:

@@ -9,7 +9,7 @@ import type { RAGQueryMode, Document } from "@/types";
 // SearchBar
 // ---------------------------------------------------------------------------
 interface SearchBarProps {
-  onSearch: (query: string, mode: RAGQueryMode, topK: number, documentIds?: number[]) => void;
+  onSearch: (query: string, mode: RAGQueryMode, topK: number, documentIds?: string[]) => void;
   isSearching?: boolean;
   documents?: Document[];
 }
@@ -20,7 +20,7 @@ export const SearchBar = memo(function SearchBar({ onSearch, isSearching, docume
   const [mode, setMode] = useState<RAGQueryMode>("hybrid");
   const [topK, setTopK] = useState(5);
   const [showFilters, setShowFilters] = useState(false);
-  const [selectedDocs, setSelectedDocs] = useState<number[]>([]);
+  const [selectedDocs, setSelectedDocs] = useState<string[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const MODES = useMemo(() => [
@@ -47,7 +47,7 @@ export const SearchBar = memo(function SearchBar({ onSearch, isSearching, docume
     onSearch(query.trim(), mode, topK, selectedDocs.length > 0 ? selectedDocs : undefined);
   }, [query, mode, topK, selectedDocs, isSearching, onSearch]);
 
-  const toggleDoc = useCallback((id: number) => {
+  const toggleDoc = useCallback((id: string) => {
     setSelectedDocs((prev) => prev.includes(id) ? prev.filter((d) => d !== id) : [...prev, id]);
   }, []);
 

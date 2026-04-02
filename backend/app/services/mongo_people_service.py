@@ -232,7 +232,7 @@ def _merge_results(
         display_fields = cfg.get("display_fields", [])
         # Use per-schema display_fields for this document
         person_display = _build_display_text(doc, display_fields, schema)
-        lines.append(f"\n--- Kết quả {i} ---")
+        lines.append(f"{'─'*30}\n📋 Kết quả {i}\n{'─'*30}")
         lines.append(person_display)
 
     return all_persons, "\n".join(lines), schemas_with_results

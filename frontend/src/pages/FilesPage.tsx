@@ -79,7 +79,7 @@ function sortDocs(docs: Document[], key: SortKey): Document[] {
 function WorkspaceSelector({
   onSelect,
 }: {
-  onSelect: (wsId: number) => void;
+  onSelect: (wsId: string) => void;
 }) {
   const { t } = useTranslation();
   const { data: workspaces, isLoading } = useWorkspaces();
@@ -210,10 +210,9 @@ export function FilesPage() {
   }, [urlWorkspaceId]);
 
   const workspaceId = selectedWsId;
-  const wsId = workspaceId ? Number(workspaceId) : null;
 
   // Data
-  const { data: workspace } = useWorkspace(wsId);
+  const { data: workspace } = useWorkspace(workspaceId ?? null);
   const { data: documents, isLoading: docsLoading } = useDocuments(workspaceId);
   const { data: ragStats } = useQuery({
     queryKey: ["rag-stats", workspaceId],
@@ -298,8 +297,8 @@ export function FilesPage() {
   }, []);
 
   // Workspace selection handler
-  const handleSelectWorkspace = useCallback((wsIdNum: number) => {
-    setSelectedWsId(String(wsIdNum));
+  const handleSelectWorkspace = useCallback((wsId: string) => {
+    setSelectedWsId(wsId);
     // Reset filters when switching workspace
     setSearchQuery("");
     setFilterTab("all");

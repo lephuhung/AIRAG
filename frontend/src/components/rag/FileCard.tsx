@@ -23,7 +23,7 @@ import { cn } from "@/lib/utils";
 import {
   STATUS_CONFIG,
   getFileConfig,
-} from "@/components/rag/DocumentCard";
+} from "@/components/rag/document-utils";
 import { formatFileSize, formatDate } from "@/lib/format";
 import type { Document, DocumentStatus } from "@/types";
 
@@ -107,9 +107,9 @@ function SubTaskProgress({
 // ---------------------------------------------------------------------------
 interface FileCardProps {
   doc: Document;
-  onDelete: (docId: number) => void;
-  onReindex: (docId: number) => void;
-  onProcess: (docId: number) => void;
+  onDelete: (docId: string) => void;
+  onReindex: (docId: string) => void;
+  onProcess: (docId: string) => void;
   onDownload: (doc: Document) => void;
   onPreview: (doc: Document) => void;
   onClickEdit?: (doc: Document) => void;

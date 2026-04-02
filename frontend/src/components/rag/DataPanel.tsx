@@ -18,10 +18,11 @@ import { UploadZone } from "./UploadZone";
 import { StatsBar } from "./StatsBar";
 import { DocumentFilters, type FilterStatus } from "./DocumentFilters";
 import { DocumentCard } from "./DocumentCard";
+import { UploadingCard } from "./UploadingCard";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import type { Document, RAGStats, DocumentStatus } from "@/types";
+import type { Document, RAGStats, DocumentStatus, UploadingFile } from "@/types";
 
 const PROCESSING_STATUSES = new Set<DocumentStatus>([
   "parsing",
@@ -33,16 +34,17 @@ const PROCESSING_STATUSES = new Set<DocumentStatus>([
 const PROCESSABLE_STATUSES = new Set<DocumentStatus>(["pending", "failed"]);
 
 interface DataPanelProps {
-  workspace: { id: number; name: string; description?: string | null } | undefined;
+  workspace: { id: string; name: string; description?: string | null } | undefined;
   documents: Document[] | undefined;
   docsLoading: boolean;
   ragStats: RAGStats | undefined;
-  selectedDocId: number | null;
+  selectedDocId: string | null;
   onSelectDoc: (doc: Document) => void;
   onUpload: (file: File) => void;
+  uploadingFiles?: UploadingFile[];
   isUploading: boolean;
-  onDelete: (id: number) => void;
-  onProcess: (id: number) => void;
+  onDelete: (id: string) => void;
+  onProcess: (id: string) => void;
   isProcessing: boolean;
   onUpdateWorkspace: (data: { name: string; description?: string }) => Promise<void>;
 }
@@ -55,6 +57,7 @@ export const DataPanel = memo(function DataPanel({
   selectedDocId,
   onSelectDoc,
   onUpload,
+  uploadingFiles,
   isUploading,
   onDelete,
   onProcess,
@@ -63,7 +66,7 @@ export const DataPanel = memo(function DataPanel({
 }: DataPanelProps) {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const [deleteDocConfirm, setDeleteDocConfirm] = useState<number | null>(null);
+  const [deleteDocConfirm, setDeleteDocConfirm] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<FilterStatus>("all");
   const [isEditingName, setIsEditingName] = useState(false);
@@ -288,6 +291,11 @@ export const DataPanel = memo(function DataPanel({
 
             <div className="flex-1 overflow-y-auto px-3 py-2 grid grid-cols-2 gap-2 auto-rows-min">
               <AnimatePresence mode="popLayout">
+                {uploadingFiles?.map((file) => (
+                  <div key={file.id} className="col-span-2">
+                    <UploadingCard file={file} />
+                  </div>
+                ))}
                 {filteredDocs.map((doc) => (
                   <DocumentCard
                     key={doc.id}
@@ -297,6 +305,9 @@ export const DataPanel = memo(function DataPanel({
                     onProcess={onProcess}
                     isProcessing={isProcessing}
                     onClick={onSelectDoc}
+                    className={cn(
+                      PROCESSING_STATUSES.has(doc.status) && "col-span-2 shadow-md border-blue-400/30"
+                    )}
                   />
                 ))}
               </AnimatePresence>

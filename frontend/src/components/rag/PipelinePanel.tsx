@@ -209,8 +209,8 @@ function ActiveDocuments({
   retryingId,
 }: {
   documents: PipelineDocument[];
-  onRetry: (id: number) => void;
-  retryingId: number | null;
+  onRetry: (id: string) => void;
+  retryingId: string | null;
 }) {
   const { t } = useTranslation();
   if (documents.length === 0) {
@@ -298,11 +298,11 @@ export const PipelinePanel = memo(function PipelinePanel({
   const retryFailed = useRetryFailed();
   const retryDocument = useRetryDocument();
 
-  const [retryingDocId, setRetryingDocId] = useState<number | null>(null);
+  const [retryingDocId, setRetryingDocId] = useState<string | null>(null);
   const [purgeTarget, setPurgeTarget] = useState<string | null>(null);
 
   const handleRetryDoc = useCallback(
-    (docId: number) => {
+    (docId: string) => {
       setRetryingDocId(docId);
       retryDocument.mutate(docId, {
         onSettled: () => setRetryingDocId(null),
@@ -312,7 +312,7 @@ export const PipelinePanel = memo(function PipelinePanel({
   );
 
   const handleRetryAll = useCallback(() => {
-    retryFailed.mutate(Number(workspaceId));
+    retryFailed.mutate(workspaceId);
   }, [retryFailed, workspaceId]);
 
   const handlePurge = useCallback(

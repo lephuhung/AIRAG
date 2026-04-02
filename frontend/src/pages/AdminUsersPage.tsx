@@ -39,7 +39,7 @@ export function AdminUsersPage() {
   const [search, setSearch] = useState("");
   const [debouncedSearch, setDebouncedSearch] = useState("");
   const [filterStatus, setFilterStatus] = useState<FilterStatus>("all");
-  const [filterTenant, setFilterTenant] = useState<number | "all">("all");
+  const [filterTenant, setFilterTenant] = useState<string | "all">("all");
   const [page, setPage] = useState(1);
   const perPage = 20;
 
@@ -118,7 +118,7 @@ export function AdminUsersPage() {
     }
   };
 
-  const handleToggleTenantRole = async (userId: number, tenantId: number, currentRole: string) => {
+  const handleToggleTenantRole = async (userId: string, tenantId: string, currentRole: string) => {
     if (isSelf(userId)) {
       toast.error(t("admin.users.toast.self_role_error"));
       return;
@@ -156,7 +156,7 @@ export function AdminUsersPage() {
     }
   };
 
-  const isSelf = (userId: number) => userId === currentUser?.id;
+  const isSelf = (userId: string) => userId === currentUser?.id;
 
   return (
     <div className="h-full overflow-y-auto">
@@ -213,7 +213,7 @@ export function AdminUsersPage() {
               value={filterTenant}
               onChange={(e) => {
                 const val = e.target.value;
-                setFilterTenant(val === "all" ? "all" : Number(val));
+                setFilterTenant(val === "all" ? "all" : val);
                 setPage(1);
               }}
               className="px-3 py-1.5 text-xs font-medium rounded-lg border bg-card text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/30 min-w-[140px]"

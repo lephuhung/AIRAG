@@ -5,13 +5,15 @@ High-level helpers called by the FastAPI upload endpoint.
 """
 from __future__ import annotations
 
+import uuid
+
 from app.queue import connection as mq
 from app.queue.messages import ParseMessage
 
 
 async def publish_parse_task(
-    document_id: int,
-    workspace_id: int,
+    document_id: uuid.UUID,
+    workspace_id: uuid.UUID,
     minio_key: str,
     original_filename: str,
 ) -> None:
@@ -24,5 +26,5 @@ async def publish_parse_task(
             workspace_id=workspace_id,
             minio_key=minio_key,
             original_filename=original_filename,
-        ).model_dump(),
+        ).model_dump(mode="json"),
     )
