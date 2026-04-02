@@ -1,6 +1,8 @@
 """
 Knowledge Base (Workspace) CRUD API endpoints — with auth.
 """
+import uuid
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_
@@ -188,7 +190,7 @@ async def list_workspace_summaries(
 
 @router.get("/{workspace_id}", response_model=WorkspaceResponse)
 async def get_workspace(
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -199,7 +201,7 @@ async def get_workspace(
 
 @router.put("/{workspace_id}", response_model=WorkspaceResponse)
 async def update_workspace(
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     body: WorkspaceUpdate,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
@@ -252,7 +254,7 @@ async def update_workspace(
 
 @router.delete("/{workspace_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_workspace(
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):

@@ -6,6 +6,7 @@ SuperAdmin-only endpoints for global user management and system stats.
 from __future__ import annotations
 
 import logging
+import uuid
 
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy import select, func, or_, desc
@@ -206,7 +207,7 @@ async def get_admin_stats(
 async def list_users(
     search: str | None = Query(None, description="Search by name or email"),
     is_active: bool | None = Query(None, description="Filter by active status"),
-    tenant_id: int | None = Query(None, description="Filter by tenant ID"),
+    tenant_id: uuid.UUID | None = Query(None, description="Filter by tenant ID"),
     page: int = Query(1, ge=1),
     per_page: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
@@ -255,7 +256,7 @@ async def list_users(
 
 @router.get("/users/{user_id}", response_model=AdminUserDetail)
 async def get_user(
-    user_id: int,
+    user_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_superadmin),
 ):
@@ -270,7 +271,7 @@ async def get_user(
 
 @router.put("/users/{user_id}", response_model=AdminUserDetail)
 async def update_user(
-    user_id: int,
+    user_id: uuid.UUID,
     body: AdminUserUpdate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_superadmin),
@@ -299,7 +300,7 @@ async def update_user(
 
 @router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_user(
-    user_id: int,
+    user_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_superadmin),
 ):
@@ -319,7 +320,7 @@ async def delete_user(
 
 @router.post("/users/{user_id}/reset-password", response_model=AdminUserDetail)
 async def reset_user_password(
-    user_id: int,
+    user_id: uuid.UUID,
     body: AdminPasswordResetRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_superadmin),

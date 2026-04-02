@@ -19,6 +19,7 @@ Endpoints:
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -41,7 +42,7 @@ router = APIRouter(prefix="/document-types", tags=["document-types"])
 # ---------------------------------------------------------------------------
 
 class DocumentTypeResponse(BaseModel):
-    id: int
+    id: uuid.UUID
     slug: str
     name: str
     description: str | None
@@ -64,7 +65,7 @@ class DocumentTypeUpdate(BaseModel):
 
 class SystemPromptResponse(BaseModel):
     document_type_slug: str
-    workspace_id: int | None
+    workspace_id: uuid.UUID | None
     system_prompt: str
     kg_system_prompt: str | None
     is_default: bool  # True nếu chưa có bản ghi riêng → dùng DEFAULT_SYSTEM_PROMPT
@@ -92,7 +93,7 @@ async def _get_type_by_slug(slug: str, db: AsyncSession) -> DocumentType:
     return doc_type
 
 
-async def _get_workspace(ws_id: int, db: AsyncSession) -> KnowledgeBase:
+async def _get_workspace(ws_id: uuid.UUID, db: AsyncSession) -> KnowledgeBase:
     result = await db.execute(select(KnowledgeBase).where(KnowledgeBase.id == ws_id))
     kb = result.scalar_one_or_none()
     if not kb:
@@ -200,7 +201,7 @@ async def deactivate_document_type(slug: str, db: AsyncSession = Depends(get_db)
 
 async def _resolve_system_prompt(
     doc_type: DocumentType,
-    workspace_id: int | None,
+    workspace_id: uuid.UUID | None,
     db: AsyncSession,
 ) -> tuple[str, bool]:
     """
@@ -307,7 +308,7 @@ async def set_global_system_prompt(
 @router.get("/{slug}/prompt/{workspace_id}", response_model=SystemPromptResponse)
 async def get_workspace_system_prompt(
     slug: str,
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -362,7 +363,7 @@ async def get_workspace_system_prompt(
 @router.put("/{slug}/prompt/{workspace_id}", response_model=SystemPromptResponse)
 async def set_workspace_system_prompt(
     slug: str,
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     body: SystemPromptSet,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_superadmin),
@@ -404,7 +405,7 @@ async def set_workspace_system_prompt(
 @router.delete("/{slug}/prompt/{workspace_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_workspace_system_prompt(
     slug: str,
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_superadmin),
 ):

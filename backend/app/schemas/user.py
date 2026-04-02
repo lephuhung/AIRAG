@@ -1,12 +1,13 @@
 """
 User schemas.
 """
+import uuid
 from datetime import datetime
 from pydantic import BaseModel
 
 
 class UserResponse(BaseModel):
-    id: int
+    id: uuid.UUID
     email: str
     full_name: str
     is_active: bool
@@ -20,7 +21,7 @@ class UserResponse(BaseModel):
 
 class UserBrief(BaseModel):
     """Compact user info for embedding in other responses."""
-    id: int
+    id: uuid.UUID
     email: str
     full_name: str
 

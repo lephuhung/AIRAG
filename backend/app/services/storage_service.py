@@ -8,6 +8,7 @@ Uploads bucket:  hrag-uploads   (key: kb_{workspace_id}/doc_{document_id}.{ext})
 from __future__ import annotations
 
 import logging
+import uuid
 from io import BytesIO
 
 import aioboto3
@@ -40,11 +41,11 @@ class StorageService:
         )
 
     @staticmethod
-    def _make_key(workspace_id: int, document_id: int) -> str:
+    def _make_key(workspace_id: uuid.UUID, document_id: uuid.UUID) -> str:
         return f"kb_{workspace_id}/doc_{document_id}.md"
 
     @staticmethod
-    def _make_upload_key(workspace_id: int, document_id: int, ext: str) -> str:
+    def _make_upload_key(workspace_id: uuid.UUID, document_id: uuid.UUID, ext: str) -> str:
         """Return the upload key for a raw file. ext must include leading dot."""
         # Ensure ext has a leading dot
         if ext and not ext.startswith("."):
@@ -83,8 +84,8 @@ class StorageService:
 
     async def upload_markdown(
         self,
-        workspace_id: int,
-        document_id: int,
+        workspace_id: uuid.UUID,
+        document_id: uuid.UUID,
         content: str,
     ) -> str:
         """Upload markdown text to MinIO. Returns the object key."""

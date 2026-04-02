@@ -1,4 +1,5 @@
 from typing import List
+import uuid
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,7 +54,7 @@ async def list_abbreviations(
 
 @router.get("/{abbreviation_id}", response_model=AbbreviationResponse)
 async def get_abbreviation(
-    abbreviation_id: int,
+    abbreviation_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
 ):
@@ -66,7 +67,7 @@ async def get_abbreviation(
 
 @router.patch("/{abbreviation_id}", response_model=AbbreviationResponse)
 async def update_abbreviation(
-    abbreviation_id: int,
+    abbreviation_id: uuid.UUID,
     request: AbbreviationUpdate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
@@ -96,7 +97,7 @@ async def update_abbreviation(
 
 @router.delete("/{abbreviation_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_abbreviation(
-    abbreviation_id: int,
+    abbreviation_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user)
 ):

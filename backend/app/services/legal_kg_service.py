@@ -27,6 +27,7 @@ import asyncio
 import json
 import logging
 import re
+import uuid
 from datetime import datetime
 from typing import Any, Optional
 
@@ -392,7 +393,7 @@ class LegalKGService:
     Requires Neo4j backend (HRAG_KG_GRAPH_BACKEND=neo4j or the factory selects this).
     """
 
-    def __init__(self, workspace_id: int):
+    def __init__(self, workspace_id: uuid.UUID):
         self.workspace_id = workspace_id
         self._label = f"kb_{workspace_id}"
         self._driver = None
@@ -424,7 +425,7 @@ class LegalKGService:
     # Document deletion
     # ------------------------------------------------------------------
 
-    async def delete_document(self, document_id: int) -> None:
+    async def delete_document(self, document_id: uuid.UUID) -> None:
         """
         Delete all Neo4j nodes and relationships for a specific document.
         Called before reprocessing a document to prevent KG duplicates/orphans.
@@ -457,7 +458,7 @@ class LegalKGService:
 
     async def update_document_metadata(
         self,
-        document_id: int,
+        document_id: uuid.UUID,
         doc_number: str | None = None,
         doc_title: str | None = None,
         signer_name: str | None = None,
@@ -581,7 +582,7 @@ class LegalKGService:
     # Ingestion pipeline
     # ------------------------------------------------------------------
 
-    async def ingest(self, markdown_content: str, document_id: Optional[int] = None) -> None:
+    async def ingest(self, markdown_content: str, document_id: Optional[uuid.UUID] = None) -> None:
         """
         Full LegalKG ingestion pipeline:
           1. Parse document metadata
@@ -914,7 +915,7 @@ class LegalKGService:
         doc_meta_str: str,
         doc_name: str,
         is_personnel: bool,
-        document_id: Optional[int],
+        document_id: Optional[uuid.UUID],
         custom_system_prompt: str | None = None,
         doc_title: str = "",
         doc_num: str = "",
@@ -1291,7 +1292,7 @@ class LegalKGService:
         session,
         doc_name: str,
         description: str = "",
-        document_id: Optional[int] = None,
+        document_id: Optional[uuid.UUID] = None,
     ) -> str:
         """
         Create or update the root Document node and return its Neo4j internal <id>.
@@ -1329,7 +1330,7 @@ class LegalKGService:
         entity_id: str,
         entity_type: str,
         description: str = "",
-        document_id: Optional[int] = None,
+        document_id: Optional[uuid.UUID] = None,
     ) -> None:
         if not entity_id or not entity_id.strip():
             return
@@ -1367,7 +1368,7 @@ class LegalKGService:
         relation_type: str,
         target: str,
         description: str = "",
-        document_id: Optional[int] = None,
+        document_id: Optional[uuid.UUID] = None,
         article_ref: str = "",
         extra_props: Optional[dict] = None,
         source_type: str = "Organization",
@@ -1410,7 +1411,7 @@ class LegalKGService:
         session,
         data: dict,
         doc_name: str,
-        document_id: Optional[int],
+        document_id: Optional[uuid.UUID],
     ) -> None:
         """Upsert all entities and relations from one article's extraction result."""
         entity_map: dict[str, str] = {}  # canonical_id → entity_type
@@ -1532,7 +1533,7 @@ class LegalKGService:
         session,
         data: dict,
         doc_name: str,
-        document_id: Optional[int],
+        document_id: Optional[uuid.UUID],
         canonical_lookup: dict[str, str],
         merged_map: dict[str, str],
         skipped_entities: set[str],

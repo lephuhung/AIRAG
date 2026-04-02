@@ -373,6 +373,10 @@
     "search_files": "Tìm kiếm tài liệu...",
     "select_workspace": "Chọn một kho tri thức để xem tài liệu",
     "search_ws": "Tìm kiếm kho tri thức...",
+    "no_ws_match": "Không tìm thấy kho tri thức nào phù hợp",
+    "no_ws_yet": "Chưa có kho tri thức nào",
+    "search_ws_hint": "Hãy thử thay đổi từ khóa tìm kiếm.",
+    "create_ws_hint": "Tạo kho tri thức để bắt đầu quản lý tài liệu.",
     "upload_hint": "Tải tài liệu lên từ kho tri thức để bắt đầu.",
     "no_files_match": "Không tìm thấy tệp tin phù hợp",
     "adjust_search_hint": "Hãy thử thay đổi từ khóa hoặc bộ lọc.",
@@ -438,7 +442,6 @@
   "workers": {
     "title": "Tiến trình xử lý",
     "title_short": "Tiến trình",
-    "status": "Trạng thái",
     "subtitle": "Quản lý các công nhân xử lý, theo dõi hàng đợi và kiểm tra luồng xử lý tài liệu",
     "desc": "Quản lý các công nhân xử lý, theo dõi hàng đợi và kiểm tra luồng xử lý tài liệu",
     "start_all": "Khởi động tất cả tiến trình",

@@ -219,7 +219,7 @@ export function AdminDocumentTypesPage() {
         ) : filtered.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-20 text-muted-foreground">
             <FileText className="w-10 h-10 mb-3 opacity-30" />
-            <p className="text-sm">{t("admin.no_doc_types")}</p>
+            <p className="text-sm">{t("admin.doc_types.no_types")}</p>
           </div>
         ) : (
           <div className="border rounded-xl overflow-hidden divide-y">

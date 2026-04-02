@@ -5,7 +5,7 @@ Main service that orchestrates document processing, indexing, and retrieval.
 from __future__ import annotations
 
 import logging
-import uuid
+import uuid as uuid_lib
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
@@ -47,7 +47,7 @@ class RAGService:
     def __init__(
         self,
         db: AsyncSession,
-        workspace_id: int,
+        workspace_id: uuid_lib.UUID,
         chunk_size: int = 500,
         chunk_overlap: int = 50
     ):
@@ -66,7 +66,7 @@ class RAGService:
         self.embedder = get_embedding_service()
         self.vector_store = get_vector_store(workspace_id)
 
-    async def process_document(self, document_id: int, file_path: str) -> int:
+    async def process_document(self, document_id: uuid_lib.UUID, file_path: str) -> int:
         """
         Process a document: load, chunk, embed, and store.
 
@@ -126,7 +126,7 @@ class RAGService:
             ids = [f"doc_{document_id}_chunk_{i}" for i in range(len(chunks))]
             metadatas = [
                 {
-                    "document_id": document_id,
+                    "document_id": str(document_id),
                     "chunk_index": c.chunk_index,
                     "char_start": c.char_start,
                     "char_end": c.char_end,
@@ -160,7 +160,7 @@ class RAGService:
             await self.db.commit()
             raise
 
-    async def delete_document(self, document_id: int) -> None:
+    async def delete_document(self, document_id: uuid_lib.UUID) -> None:
         """
         Delete a document's chunks from the vector store.
 
@@ -174,7 +174,7 @@ class RAGService:
         self,
         question: str,
         top_k: int = 5,
-        document_ids: list[int] | None = None
+        document_ids: list[uuid_lib.UUID] | None = None
     ) -> RAGQueryResult:
         """
         Query the vector store for relevant chunks.
@@ -193,7 +193,7 @@ class RAGService:
         # Build filter
         where = None
         if document_ids:
-            where = {"document_id": {"$in": document_ids}}
+            where = {"document_id": {"$in": [str(doc_id) for doc_id in document_ids]}}
 
         # Query vector store
         results = self.vector_store.query(
@@ -239,7 +239,7 @@ class RAGService:
 # that import get_kg_service from rag_service continue to work.
 _kg_service_cache: dict = {}
 
-async def get_kg_service(workspace_id: int):
+async def get_kg_service(workspace_id: uuid_lib.UUID):
     """Get KG service for a workspace — cached, routed via HRAG_KG_MODE."""
     from app.services.knowledge_graph_service import get_kg_service as _factory
     if workspace_id not in _kg_service_cache:
@@ -249,9 +249,9 @@ async def get_kg_service(workspace_id: int):
 
 # --- RAG Service Factory ---
 # Module-level cache: workspace_id → HRAGService
-_hrag_service_cache: dict[int, "HRAGService"] = {}
+_hrag_service_cache: dict[uuid_lib.UUID, "HRAGService"] = {}
 
-def get_rag_service(db: AsyncSession, workspace_id: int) -> "RAGService | HRAGService":
+def get_rag_service(db: AsyncSession, workspace_id: uuid_lib.UUID) -> "RAGService | HRAGService":
     """Factory function: routes to HRAGService or legacy RAGService based on config."""
     from app.core.config import settings
 

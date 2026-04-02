@@ -7,9 +7,11 @@ document_type_system_prompts — system prompt riêng cho từng loại văn b�
 """
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -23,7 +25,9 @@ class DocumentType(Base):
     """
     __tablename__ = "document_types"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
     slug: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -60,13 +64,15 @@ class DocumentTypeSystemPrompt(Base):
         ),
     )
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    document_type_id: Mapped[int] = mapped_column(
-        ForeignKey("document_types.id", ondelete="CASCADE"), nullable=False
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    document_type_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("document_types.id", ondelete="CASCADE"), nullable=False
     )
     # NULL = global default; non-NULL = workspace-specific override
-    workspace_id: Mapped[int | None] = mapped_column(
-        ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=True
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=True
     )
     system_prompt: Mapped[str] = mapped_column(Text, nullable=False)
     # Custom KG extraction prompt for this document type (NULL = use default LEGAL_KG_SYSTEM_PROMPT)

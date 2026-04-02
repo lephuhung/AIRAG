@@ -1,6 +1,7 @@
 """
 Invite token request/response schemas.
 """
+import uuid
 from datetime import datetime
 
 from pydantic import BaseModel, Field
@@ -14,9 +15,9 @@ class InviteCreateRequest(BaseModel):
 
 
 class InviteResponse(BaseModel):
-    id: int
+    id: uuid.UUID
     token: str
-    tenant_id: int
+    tenant_id: uuid.UUID
     email: str | None
     role: str
     max_uses: int | None

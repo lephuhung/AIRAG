@@ -325,7 +325,7 @@ async def sse_with_heartbeat(
 # Tool executor — retrieval via HRAG
 # ---------------------------------------------------------------------------
 
-async def _get_accessible_workspaces(db: AsyncSession, user: User) -> list[int]:
+async def _get_accessible_workspaces(db: AsyncSession, user: User) -> list[uuid.UUID]:
     """Get all knowledge base IDs the user has access to."""
     if user.is_superadmin:
         result = await db.execute(select(KnowledgeBase.id))
@@ -348,7 +348,7 @@ async def _get_accessible_workspaces(db: AsyncSession, user: User) -> list[int]:
 
 
 async def _execute_search_documents(
-    workspace_ids: list[int],
+    workspace_ids: list[uuid.UUID],
     query: str,
     top_k: int,
     db: AsyncSession,
@@ -553,7 +553,7 @@ async def _execute_search_documents(
 MAX_MEMORIES_PER_USER = 200
 
 async def _save_memory(
-    user_id: int,
+    user_id: uuid.UUID,
     content: str,
     category: str,
     importance: int,
@@ -595,7 +595,7 @@ async def _save_memory(
 
 
 async def _search_memories(
-    user_id: int,
+    user_id: uuid.UUID,
     query: str,
     db: AsyncSession,
     top_k: int = 5,
@@ -704,7 +704,7 @@ async def _extract_facts_with_llm(message: str) -> list[dict]:
 
 
 async def _auto_save_memory(
-    user_id: int,
+    user_id: uuid.UUID,
     message: str,
     session_id: Optional[str],
     db: AsyncSession,
@@ -738,7 +738,7 @@ async def _auto_save_memory(
 # ---------------------------------------------------------------------------
 
 async def agent_chat_stream(
-    workspace_ids: list[int],
+    workspace_ids: list[uuid.UUID],
     message: str,
     history: list[dict],
     enable_thinking: bool,
@@ -1254,7 +1254,7 @@ async def agent_chat_stream(
 # ---------------------------------------------------------------------------
 
 async def chat_stream_endpoint(
-    workspace_ids: list[int],
+    workspace_ids: list[uuid.UUID],
     request: ChatRequest,
     db: AsyncSession,
     user: User,

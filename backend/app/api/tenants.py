@@ -41,7 +41,7 @@ router = APIRouter(prefix="/tenants", tags=["tenants"])
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
-async def _get_tenant(tenant_id: int, db: AsyncSession) -> Tenant:
+async def _get_tenant(tenant_id: uuid.UUID, db: AsyncSession) -> Tenant:
     result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
     tenant = result.scalar_one_or_none()
     if tenant is None:
@@ -49,7 +49,7 @@ async def _get_tenant(tenant_id: int, db: AsyncSession) -> Tenant:
     return tenant
 
 
-async def _require_tenant_admin(tenant_id: int, user: User, db: AsyncSession) -> TenantUser:
+async def _require_tenant_admin(tenant_id: uuid.UUID, user: User, db: AsyncSession) -> TenantUser:
     """Check user is admin of the given tenant."""
     if user.is_superadmin:
         # Superadmin has implicit admin access to all tenants
@@ -214,7 +214,7 @@ async def get_my_tenants(
 
 @router.get("/{tenant_id}", response_model=TenantResponse)
 async def get_tenant(
-    tenant_id: int,
+    tenant_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -249,7 +249,7 @@ async def get_tenant(
 
 @router.put("/{tenant_id}", response_model=TenantResponse)
 async def update_tenant(
-    tenant_id: int,
+    tenant_id: uuid.UUID,
     body: TenantUpdate,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_superadmin),
@@ -279,7 +279,7 @@ async def update_tenant(
 
 @router.delete("/{tenant_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def deactivate_tenant(
-    tenant_id: int,
+    tenant_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_superadmin),
 ):
@@ -291,8 +291,8 @@ async def deactivate_tenant(
 
 @router.post("/{tenant_id}/set-admin/{user_id}", response_model=TenantUserResponse)
 async def set_tenant_admin(
-    tenant_id: int,
-    user_id: int,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_superadmin),
 ):
@@ -339,7 +339,7 @@ async def set_tenant_admin(
 
 @router.get("/{tenant_id}/users", response_model=list[TenantUserResponse])
 async def list_tenant_users(
-    tenant_id: int,
+    tenant_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -358,8 +358,8 @@ async def list_tenant_users(
 
 @router.post("/{tenant_id}/users/{user_id}/approve", response_model=TenantUserResponse)
 async def approve_user(
-    tenant_id: int,
-    user_id: int,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -393,8 +393,8 @@ async def approve_user(
 
 @router.post("/{tenant_id}/users/{user_id}/reject", status_code=status.HTTP_204_NO_CONTENT)
 async def reject_user(
-    tenant_id: int,
-    user_id: int,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -418,8 +418,8 @@ async def reject_user(
 
 @router.delete("/{tenant_id}/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def remove_tenant_user(
-    tenant_id: int,
-    user_id: int,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -443,8 +443,8 @@ async def remove_tenant_user(
 
 @router.put("/{tenant_id}/users/{user_id}/role", response_model=TenantUserResponse)
 async def update_user_role(
-    tenant_id: int,
-    user_id: int,
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
     body: RoleUpdateRequest,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
@@ -503,7 +503,7 @@ def _build_invite_response(invite: InviteToken, request: Request) -> InviteRespo
 
 @router.post("/{tenant_id}/invites", response_model=InviteResponse, status_code=status.HTTP_201_CREATED)
 async def create_invite(
-    tenant_id: int,
+    tenant_id: uuid.UUID,
     body: InviteCreateRequest,
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -538,7 +538,7 @@ async def create_invite(
 
 @router.get("/{tenant_id}/invites", response_model=list[InviteResponse])
 async def list_invites(
-    tenant_id: int,
+    tenant_id: uuid.UUID,
     request: Request,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
@@ -561,8 +561,8 @@ async def list_invites(
 
 @router.delete("/{tenant_id}/invites/{invite_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def revoke_invite(
-    tenant_id: int,
-    invite_id: int,
+    tenant_id: uuid.UUID,
+    invite_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):

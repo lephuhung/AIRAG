@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import re
+import uuid
 from datetime import datetime, timezone
 from typing import Any
 
@@ -195,7 +196,7 @@ async def initialize_graphiti() -> None:
 
 
 async def search_user_memory(
-    user_id: int,
+    user_id: uuid.UUID,
     query: str,
     top_k: int = 5,
 ) -> str:
@@ -327,7 +328,7 @@ async def _llm_extract_facts(text: str) -> str:
 
 
 async def add_conversation_episode(
-    user_id: int,
+    user_id: uuid.UUID,
     user_message: str,
     assistant_message: str,
     session_id: str | None = None,

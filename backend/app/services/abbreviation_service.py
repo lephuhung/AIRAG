@@ -1,5 +1,6 @@
 import re
 import logging
+import uuid
 from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete
@@ -12,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 class AbbreviationService:
     @staticmethod
-    async def create(db: AsyncSession, obj_in: AbbreviationCreate, user_id: int, is_active: bool = False) -> Abbreviation:
+    async def create(db: AsyncSession, obj_in: AbbreviationCreate, user_id: uuid.UUID, is_active: bool = False) -> Abbreviation:
         db_obj = Abbreviation(
             short_form=obj_in.short_form,
             full_form=obj_in.full_form,
@@ -62,7 +63,7 @@ class AbbreviationService:
         return list(result.scalars().all())
 
     @staticmethod
-    async def get(db: AsyncSession, id: int) -> Optional[Abbreviation]:
+    async def get(db: AsyncSession, id: uuid.UUID) -> Optional[Abbreviation]:
         result = await db.execute(select(Abbreviation).where(Abbreviation.id == id))
         return result.scalar_one_or_none()
 
@@ -76,7 +77,7 @@ class AbbreviationService:
         return db_obj
 
     @staticmethod
-    async def delete(db: AsyncSession, id: int) -> None:
+    async def delete(db: AsyncSession, id: uuid.UUID) -> None:
         await db.execute(delete(Abbreviation).where(Abbreviation.id == id))
         await db.commit()
 

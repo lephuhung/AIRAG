@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 def _inject_images_from_db(
     markdown: str,
     images: list[DocumentImage],
-    workspace_id: int,
+    workspace_id: uuid.UUID,
 ) -> str:
     """Replace remaining <!-- image --> placeholders with real image markdown.
 
@@ -73,7 +73,7 @@ def _mime_for_ext(ext: str) -> str:
 
 @router.get("/workspace/{workspace_id}", response_model=list[DocumentResponse])
 async def list_documents(
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -86,7 +86,7 @@ async def list_documents(
     return result.scalars().all()
 
 
-async def process_document_background(document_id: int, file_path: str, workspace_id: int):
+async def process_document_background(document_id: uuid.UUID, file_path: str, workspace_id: uuid.UUID):
     """Legacy fallback: process document inline when RabbitMQ is unavailable."""
     from app.core.database import async_session_maker
     from app.services.rag_service import get_rag_service
@@ -102,7 +102,7 @@ async def process_document_background(document_id: int, file_path: str, workspac
 
 @router.post("/upload/{workspace_id}", response_model=DocumentUploadResponse)
 async def upload_document(
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
@@ -209,18 +209,18 @@ class PresignRequest(BaseModel):
 
 
 class PresignResponse(BaseModel):
-    document_id: int
+    document_id: uuid.UUID
     upload_url: str          # Presigned PUT URL pointing directly to MinIO
     minio_key: str           # Object key — needed for /confirm call
 
 
 class ConfirmRequest(BaseModel):
-    document_id: int
+    document_id: uuid.UUID
 
 
 @router.post("/upload/{workspace_id}/presign", response_model=PresignResponse)
 async def presign_upload(
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     body: PresignRequest,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
@@ -295,7 +295,7 @@ async def presign_upload(
 
 @router.post("/upload/{workspace_id}/confirm", response_model=DocumentUploadResponse)
 async def confirm_upload(
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     body: ConfirmRequest,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
@@ -371,7 +371,7 @@ async def confirm_upload(
 
 @router.get("/{document_id}", response_model=DocumentResponse)
 async def get_document(
-    document_id: int,
+    document_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -387,7 +387,7 @@ async def get_document(
 
 @router.get("/{document_id}/markdown")
 async def get_document_markdown(
-    document_id: int,
+    document_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -433,7 +433,7 @@ async def get_document_markdown(
 
 @router.get("/{document_id}/images", response_model=list[DocumentImageResponse])
 async def get_document_images(
-    document_id: int,
+    document_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -467,7 +467,7 @@ async def get_document_images(
 
 @router.get("/{document_id}/download")
 async def download_document(
-    document_id: int,
+    document_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -511,7 +511,7 @@ async def download_document(
 
 @router.patch("/{document_id}", response_model=DocumentResponse)
 async def update_document(
-    document_id: int,
+    document_id: uuid.UUID,
     body: DocumentUpdate,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
@@ -574,7 +574,7 @@ async def update_document(
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_document(
-    document_id: int,
+    document_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):

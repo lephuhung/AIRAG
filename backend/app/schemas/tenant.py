@@ -1,6 +1,7 @@
 """
 Tenant schemas.
 """
+import uuid
 from datetime import datetime
 from pydantic import BaseModel, Field
 
@@ -19,7 +20,7 @@ class TenantUpdate(BaseModel):
 
 
 class TenantResponse(BaseModel):
-    id: int
+    id: uuid.UUID
     name: str
     slug: str
     domain: str | None
@@ -33,9 +34,9 @@ class TenantResponse(BaseModel):
 
 
 class TenantUserResponse(BaseModel):
-    id: int
-    tenant_id: int
-    user_id: int
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    user_id: uuid.UUID
     role: str
     is_approved: bool
     created_at: datetime

@@ -1,6 +1,8 @@
 """
 RAG API endpoints for document querying and retrieval.
 """
+import uuid
+
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -83,7 +85,7 @@ from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
 
 
 async def verify_workspace_access(
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     db: AsyncSession,
     user: User | None = None,
 ) -> KnowledgeBase:
@@ -97,7 +99,7 @@ _user_dep = Depends(get_current_active_user)
 
 @router.post("/query/{workspace_id}", response_model=RAGQueryResponse)
 async def query_documents(
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     request: RAGQueryRequest,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
@@ -203,7 +205,7 @@ async def query_documents(
 
 @router.post("/process/{document_id}", response_model=DocumentProcessResponse)
 async def process_document(
-    document_id: int,
+    document_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -342,7 +344,7 @@ async def process_batch(
 
 @router.post("/reindex/{document_id}", response_model=DocumentProcessResponse)
 async def reindex_document(
-    document_id: int,
+    document_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -421,7 +423,7 @@ async def reindex_document(
 
 @router.post("/reindex-workspace/{workspace_id}")
 async def reindex_workspace(
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
@@ -455,7 +457,7 @@ async def reindex_workspace(
     except Exception as e:
         logger.warning(f"Failed to delete old collection: {e}")
 
-    async def _reindex_all(doc_ids: list[int], ws_id: int):
+    async def _reindex_all(doc_ids: list[uuid.UUID], ws_id: uuid.UUID):
         """Background task: reindex each document sequentially via RabbitMQ."""
         from app.core.database import AsyncSessionLocal
         from app.queue.publisher import publish_parse_task as _publish
@@ -513,7 +515,7 @@ async def reindex_workspace(
 
 @router.get("/stats/{workspace_id}", response_model=ProjectRAGStatsResponse)
 async def get_workspace_rag_stats(
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -568,7 +570,7 @@ async def get_workspace_rag_stats(
 
 @router.get("/chunks/{document_id}")
 async def get_document_chunks(
-    document_id: int,
+    document_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -625,7 +627,7 @@ from app.services.rag_service import get_kg_service as _get_kg_service
 
 @router.get("/entities/{workspace_id}", response_model=list[KGEntityResponse])
 async def get_kg_entities(
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     search: str | None = None,
     entity_type: str | None = None,
     limit: int = 200,
@@ -648,7 +650,7 @@ async def get_kg_entities(
 
 @router.get("/relationships/{workspace_id}", response_model=list[KGRelationshipResponse])
 async def get_kg_relationships(
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     entity: str | None = None,
     limit: int = 500,
     db: AsyncSession = Depends(get_db),
@@ -667,7 +669,7 @@ async def get_kg_relationships(
 
 @router.get("/graph/{workspace_id}", response_model=KGGraphResponse)
 async def get_kg_graph(
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     center: str | None = None,
     max_depth: int = 3,
     max_nodes: int = 150,
@@ -693,7 +695,7 @@ async def get_kg_graph(
 
 @router.get("/analytics/{workspace_id}", response_model=ProjectAnalyticsResponse)
 async def get_workspace_analytics(
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -820,7 +822,7 @@ async def get_llm_capabilities(
 
 @router.post("/debug-chat/{workspace_id}", response_model=DebugChatResponse)
 async def debug_chat(
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     request: ChatRequest,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),

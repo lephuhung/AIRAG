@@ -49,7 +49,7 @@ router = APIRouter(prefix="/rag/chat", tags=["chat_langgraph"])
 # Helpers (reused from chat_agent.py)
 # ---------------------------------------------------------------------------
 
-async def _get_accessible_workspaces_lg(db: AsyncSession, user: User) -> list[int]:
+async def _get_accessible_workspaces_lg(db: AsyncSession, user: User) -> list[uuid.UUID]:
     """Mirror of _get_accessible_workspaces from chat_agent.py."""
     if user.is_superadmin:
         result = await db.execute(select(KnowledgeBase.id))
@@ -73,8 +73,8 @@ async def _get_accessible_workspaces_lg(db: AsyncSession, user: User) -> list[in
 
 
 async def _resolve_system_prompt(
-    workspace_ids: list[int],
-    primary_id: int,
+    workspace_ids: list[uuid.UUID],
+    primary_id: uuid.UUID,
     db: AsyncSession,
     kb: KnowledgeBase,
 ) -> str:
@@ -134,7 +134,7 @@ def _format_sse(event: str, data: dict) -> str:
 # ---------------------------------------------------------------------------
 
 async def langgraph_chat_stream(
-    workspace_ids: list[int],
+    workspace_ids: list[uuid.UUID],
     request: ChatRequest,
     db: AsyncSession,
     user: User,
@@ -331,7 +331,7 @@ async def chat_stream_langgraph(
 
 @router.post("/agent-lg/{workspace_id}/stream")
 async def chat_stream_langgraph_workspace(
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     request: ChatRequest,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),

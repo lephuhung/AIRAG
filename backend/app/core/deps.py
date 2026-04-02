@@ -3,6 +3,8 @@ FastAPI dependency injection — database session + authentication.
 """
 from __future__ import annotations
 
+import uuid
+
 from fastapi import Depends
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError
@@ -48,7 +50,12 @@ async def get_current_user(
     if user_id is None:
         raise UnauthorizedError("Invalid token payload")
 
-    result = await db.execute(select(User).where(User.id == int(user_id)))
+    try:
+        user_uuid = uuid.UUID(user_id)
+    except (ValueError, AttributeError):
+        raise UnauthorizedError("Invalid token payload")
+
+    result = await db.execute(select(User).where(User.id == user_uuid))
     user = result.scalar_one_or_none()
 
     if user is None:
@@ -76,7 +83,7 @@ async def require_superadmin(
 
 
 async def verify_workspace_access(
-    workspace_id: int,
+    workspace_id: uuid.UUID,
     user=None,
     db: AsyncSession = None,
 ):

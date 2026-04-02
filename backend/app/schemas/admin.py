@@ -1,6 +1,7 @@
 """
 Admin schemas — used by superadmin user/tenant management endpoints.
 """
+import uuid
 from datetime import datetime
 from pydantic import BaseModel, Field
 
@@ -18,7 +19,7 @@ class AdminPasswordResetRequest(BaseModel):
 
 
 class AdminUserDetail(BaseModel):
-    id: int
+    id: uuid.UUID
     email: str
     full_name: str
     is_active: bool
@@ -52,19 +53,19 @@ class DocumentStatusBreakdown(BaseModel):
     count: int
 
 class TopWorkspace(BaseModel):
-    id: int
+    id: uuid.UUID
     name: str
     total_size: int
     doc_count: int
 
 class FailedDocument(BaseModel):
-    id: int
+    id: uuid.UUID
     filename: str
     workspace_name: str
     error_message: str | None
 
 class PendingApproval(BaseModel):
-    user_id: int
+    user_id: uuid.UUID
     email: str
     tenant_name: str
     role: str

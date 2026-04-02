@@ -1,6 +1,6 @@
 // ── Auth Types ──
 export interface User {
-  id: number;
+  id: string;
   email: string;
   full_name: string;
   is_active: boolean;
@@ -18,7 +18,7 @@ export interface AuthTokens {
 }
 
 export interface Tenant {
-  id: number;
+  id: string;
   name: string;
   slug: string;
   domain: string | null;
@@ -30,9 +30,9 @@ export interface Tenant {
 }
 
 export interface TenantUser {
-  id: number;
-  tenant_id: number;
-  user_id: number;
+  id: string;
+  tenant_id: string;
+  user_id: string;
   role: string;
   is_approved: boolean;
   created_at: string;
@@ -69,21 +69,21 @@ export interface DocumentStatusBreakdown {
 }
 
 export interface TopWorkspace {
-  id: number;
+  id: string;
   name: string;
   total_size: number;
   doc_count: number;
 }
 
 export interface FailedDocument {
-  id: number;
+  id: string;
   filename: string;
   workspace_name: string;
   error_message: string | null;
 }
 
 export interface PendingApproval {
-  user_id: number;
+  user_id: string;
   email: string;
   tenant_name: string;
   role: string;
@@ -107,7 +107,7 @@ export interface AdminStats {
 
 // Knowledge Base (Document Workspace)
 export interface KnowledgeBase {
-  id: number;
+  id: string;
   name: string;
   description: string | null;
   system_prompt: string | null;
@@ -116,40 +116,40 @@ export interface KnowledgeBase {
   created_at: string;
   updated_at: string;
   visibility: "public" | "tenant" | "personal";
-  owner_id: number | null;
-  tenant_id: number | null;
+  owner_id: string | null;
+  tenant_id: string | null;
 }
 
 export interface CreateWorkspace {
   name: string;
   description?: string;
   visibility?: "public" | "tenant" | "personal";
-  tenant_id?: number | null;
+  tenant_id?: string | null;
 }
 
 export interface UpdateWorkspace {
   name?: string;
   description?: string;
   system_prompt?: string | null;
-  tenant_id?: number | null;
+  tenant_id?: string | null;
   visibility?: "public" | "tenant" | "personal";
 }
 
 export interface WorkspaceSummary {
-  id: number;
+  id: string;
   name: string;
   document_count: number;
 }
 
 export interface DocumentTypeInfo {
-  id: number;
+  id: string;
   slug: string;
   name: string;
 }
 
 export interface Document {
-  id: number;
-  workspace_id: number;
+  id: string;
+  workspace_id: string;
   filename: string;
   original_filename: string;
   file_type: string;
@@ -180,7 +180,7 @@ export interface Document {
     location?: string;
   }> | null;
   // Document type classification (auto-detected by pipeline)
-  document_type_id?: number | null;
+  document_type_id?: string | null;
   document_type?: DocumentTypeInfo | null;
   // Official document reference number
   document_number?: string | null;
@@ -213,13 +213,13 @@ export type RAGQueryMode = "hybrid" | "vector_only" | "naive" | "local" | "globa
 export interface RAGQueryRequest {
   question: string;
   top_k?: number;
-  document_ids?: number[];
+  document_ids?: string[];
   mode?: RAGQueryMode;
 }
 
 export interface Citation {
   source_file: string;
-  document_id: number | null;
+  document_id: string | null;
   page_no: number | null;
   heading_path: string[];
   formatted: string;
@@ -227,7 +227,7 @@ export interface Citation {
 
 export interface DocumentImage {
   image_id: string;
-  document_id: number;
+  document_id: string;
   page_no: number;
   caption: string;
   width: number;
@@ -254,7 +254,7 @@ export interface RAGQueryResponse {
 }
 
 export interface RAGStats {
-  workspace_id: number;
+  workspace_id: string;
   total_documents: number;
   indexed_documents: number;
   total_chunks: number;
@@ -307,7 +307,7 @@ export interface KGAnalytics {
 }
 
 export interface DocumentBreakdown {
-  document_id: number;
+  document_id: string;
   filename: string;
   chunk_count: number;
   image_count: number;
@@ -333,7 +333,7 @@ export interface ChatSession {
 export interface ChatImageRef {
   ref_id?: string;  // 4-char alphanumeric ID, e.g. "p4f2"
   image_id: string;
-  document_id: number;
+  document_id: string;
   page_no: number;
   caption: string;
   url: string;
@@ -359,7 +359,7 @@ export interface ChatSourceChunk {
   index: number | string;  // number for legacy, string for new [a3x9] format
   chunk_id: string;
   content: string;
-  document_id: number;
+  document_id: string;
   page_no: number;
   heading_path: string[];
   score: number;
@@ -377,7 +377,7 @@ export interface ChatResponseData {
 }
 
 export interface PersistedChatMessage {
-  id: number;
+  id: string;
   message_id: string;
   role: "user" | "assistant";
   content: string;
@@ -464,9 +464,9 @@ export interface WorkerOverview {
 }
 
 export interface PipelineDocument {
-  id: number;
+  id: string;
   filename: string;
-  workspace_id: number;
+  workspace_id: string;
   status: DocumentStatus;
   embed_done: boolean;
   captions_done: boolean;
@@ -534,7 +534,7 @@ export interface DeadLetterMessage {
 
 // ── Document Type Admin Types ──
 export interface DocumentTypeDetail {
-  id: number;
+  id: string;
   slug: string;
   name: string;
   description: string | null;
@@ -543,7 +543,7 @@ export interface DocumentTypeDetail {
 
 export interface DocumentTypeSystemPromptResponse {
   document_type_slug: string;
-  workspace_id: number | null;
+  workspace_id: string | null;
   system_prompt: string;
   kg_system_prompt: string | null;
   is_default: boolean;
@@ -559,9 +559,9 @@ export interface InviteValidation {
 }
 
 export interface InviteLink {
-  id: number;
+  id: string;
   token: string;
-  tenant_id: number;
+  tenant_id: string;
   email: string | null;
   role: string;
   max_uses: number | null;
@@ -574,11 +574,11 @@ export interface InviteLink {
 
 // ── Abbreviation Types ──
 export interface Abbreviation {
-  id: number;
+  id: string;
   short_form: string;
   full_form: string;
   description: string | null;
-  user_id: number;
+  user_id: string;
   is_active: boolean;
   created_at: string;
   updated_at: string;

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, File, UploadFile, status
@@ -172,7 +173,12 @@ async def refresh_token(
     if user_id is None:
         raise UnauthorizedError("Invalid token payload")
 
-    result = await db.execute(select(User).where(User.id == int(user_id)))
+    try:
+        user_uuid = uuid.UUID(user_id)
+    except (ValueError, AttributeError):
+        raise UnauthorizedError("Invalid token payload")
+
+    result = await db.execute(select(User).where(User.id == user_uuid))
     user = result.scalar_one_or_none()
 
     if user is None or not user.is_active:

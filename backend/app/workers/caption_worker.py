@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from pathlib import Path
 
 from sqlalchemy import select
@@ -261,8 +262,8 @@ async def _caption_tables_concurrent(tables: list[ExtractedTable]) -> None:
 
 
 async def _reenrich_embeddings(
-    document_id: int,
-    workspace_id: int,
+    document_id: uuid.UUID,
+    workspace_id: uuid.UUID,
     db_images: list[DocumentImage],
     db_tables: list[DocumentTable],
     document: Document,

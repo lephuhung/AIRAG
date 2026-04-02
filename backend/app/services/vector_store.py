@@ -5,6 +5,7 @@ Handles ChromaDB operations for storing and retrieving document embeddings.
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Sequence, Optional, TYPE_CHECKING
 import chromadb
 from chromadb.config import Settings as ChromaSettings
@@ -48,7 +49,7 @@ class VectorStore:
 
     COLLECTION_PREFIX = "kb_"
 
-    def __init__(self, workspace_id: int):
+    def __init__(self, workspace_id: uuid.UUID):
         self.workspace_id = workspace_id
         self.collection_name = f"{self.COLLECTION_PREFIX}{workspace_id}"
         self._collection = None
@@ -164,11 +165,11 @@ class VectorStore:
             "distances": results["distances"][0] if results.get("distances") else []
         }
 
-    def delete_by_document_id(self, document_id: int) -> None:
+    def delete_by_document_id(self, document_id: uuid.UUID) -> None:
         """Delete all chunks belonging to a specific document."""
         try:
             self.collection.delete(
-                where={"document_id": document_id}
+                where={"document_id": str(document_id)}
             )
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             logger.error(
@@ -224,6 +225,6 @@ class VectorStore:
         )
 
 
-def get_vector_store(workspace_id: int) -> VectorStore:
+def get_vector_store(workspace_id: uuid.UUID) -> VectorStore:
     """Factory function to create a VectorStore for a knowledge base."""
     return VectorStore(workspace_id)

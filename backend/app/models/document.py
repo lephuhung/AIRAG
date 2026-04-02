@@ -1,7 +1,10 @@
-from sqlalchemy import String, ForeignKey, DateTime, Integer, Text, Enum, JSON
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+import uuid
 from datetime import datetime
 import enum
+
+from sqlalchemy import String, ForeignKey, DateTime, Integer, Text, Enum, JSON
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
 
@@ -20,8 +23,12 @@ class DocumentStatus(str, enum.Enum):
 class Document(Base):
     __tablename__ = "documents"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    workspace_id: Mapped[int] = mapped_column(ForeignKey("knowledge_bases.id", ondelete="CASCADE"))
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("knowledge_bases.id", ondelete="CASCADE")
+    )
     filename: Mapped[str] = mapped_column(String(255))
     original_filename: Mapped[str] = mapped_column(String(255))
     file_type: Mapped[str] = mapped_column(String(50))
@@ -61,8 +68,8 @@ class Document(Base):
     digital_signatures: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     # Document type classification (auto-detected by classifier)
-    document_type_id: Mapped[int | None] = mapped_column(
-        ForeignKey("document_types.id", ondelete="SET NULL"), nullable=True
+    document_type_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("document_types.id", ondelete="SET NULL"), nullable=True
     )
     # Official document reference number extracted by classifier (e.g. "13/2023/NĐ-CP")
     document_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
@@ -74,7 +81,7 @@ class Document(Base):
     issuing_agency: Mapped[str | None] = mapped_column(String(255), nullable=True)
     parent_agency: Mapped[str | None] = mapped_column(String(255), nullable=True)
     published_date: Mapped[str | None] = mapped_column(String(100), nullable=True)
-    
+
     # Manual signer name override
     signer_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
@@ -82,8 +89,8 @@ class Document(Base):
     kg_root_entity_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     # User who uploaded this document
-    uploaded_by: Mapped[int | None] = mapped_column(
-        ForeignKey("users.id"), nullable=True
+    uploaded_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
 
     # Relationships
@@ -102,8 +109,12 @@ class Document(Base):
 class DocumentImage(Base):
     __tablename__ = "document_images"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id", ondelete="CASCADE")
+    )
     image_id: Mapped[str] = mapped_column(String(100), unique=True)  # UUID
     page_no: Mapped[int] = mapped_column(Integer, default=0)
     file_path: Mapped[str] = mapped_column(String(500))
@@ -120,8 +131,12 @@ class DocumentImage(Base):
 class DocumentTable(Base):
     __tablename__ = "document_tables"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"))
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id", ondelete="CASCADE")
+    )
     table_id: Mapped[str] = mapped_column(String(100), unique=True)
     page_no: Mapped[int] = mapped_column(Integer, default=0)
     content_markdown: Mapped[str] = mapped_column(Text, default="")

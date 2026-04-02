@@ -1,7 +1,9 @@
 """
 RAG-related Pydantic schemas for request/response validation.
 """
+import uuid
 from typing import Literal
+
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -9,7 +11,7 @@ class RAGQueryRequest(BaseModel):
     """Request schema for RAG query endpoint."""
     question: str = Field(..., min_length=1, max_length=1000, description="The question to query")
     top_k: int = Field(default=5, ge=1, le=20, description="Number of chunks to retrieve")
-    document_ids: list[int] | None = Field(default=None, description="Filter to specific document IDs")
+    document_ids: list[uuid.UUID] | None = Field(default=None, description="Filter to specific document IDs")
     mode: str = Field(
         default="hybrid",
         description="Search mode: hybrid (default), vector_only, naive, local, global"
@@ -19,7 +21,7 @@ class RAGQueryRequest(BaseModel):
 class CitationResponse(BaseModel):
     """A source citation."""
     source_file: str
-    document_id: int
+    document_id: uuid.UUID
     page_no: int = 0
     heading_path: list[str] = []
     formatted: str = ""
@@ -39,7 +41,7 @@ class RetrievedChunkResponse(BaseModel):
 class DocumentImageResponse(BaseModel):
     """Response schema for a document image."""
     image_id: str
-    document_id: int
+    document_id: uuid.UUID
     page_no: int
     caption: str = ""
     width: int = 0
@@ -60,12 +62,12 @@ class RAGQueryResponse(BaseModel):
 
 class DocumentProcessRequest(BaseModel):
     """Request schema for document processing."""
-    document_id: int
+    document_id: uuid.UUID
 
 
 class DocumentProcessResponse(BaseModel):
     """Response schema for document processing."""
-    document_id: int
+    document_id: uuid.UUID
     status: str
     chunk_count: int
     message: str
@@ -73,12 +75,12 @@ class DocumentProcessResponse(BaseModel):
 
 class BatchProcessRequest(BaseModel):
     """Request schema for batch document processing."""
-    document_ids: list[int] = Field(..., min_length=1, description="List of document IDs to process")
+    document_ids: list[uuid.UUID] = Field(..., min_length=1, description="List of document IDs to process")
 
 
 class ProjectRAGStatsResponse(BaseModel):
     """Response schema for workspace RAG statistics."""
-    workspace_id: int
+    workspace_id: uuid.UUID
     total_documents: int
     indexed_documents: int
     total_chunks: int
@@ -141,7 +143,7 @@ class KGAnalyticsResponse(BaseModel):
 
 class DocumentBreakdownItem(BaseModel):
     """Per-document breakdown for analytics."""
-    document_id: int
+    document_id: uuid.UUID
     filename: str
     chunk_count: int = 0
     image_count: int = 0
@@ -172,7 +174,7 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=5000)
     history: list[ChatMessageSchema] = []
     session_id: str | None = Field(default=None, description="Session ID for conversation context. If provided, exchange summaries will be used instead of history[]")
-    document_ids: list[int] | None = None
+    document_ids: list[uuid.UUID] | None = None
     enable_thinking: bool = False
     force_search: bool = False  # Pre-search before LLM call; injects sources as context directly
 
@@ -187,7 +189,7 @@ class ChatSourceChunk(BaseModel):
     def coerce_index_to_str(cls, v):
         return str(v) if not isinstance(v, str) else v
     content: str
-    document_id: int
+    document_id: uuid.UUID
     page_no: int = 0
     heading_path: list[str] = []
     score: float = 0.0
@@ -198,7 +200,7 @@ class ChatImageRef(BaseModel):
     """An image referenced in the chat answer."""
     ref_id: str | None = None  # 4-char alphanumeric ID, e.g. "p4f2"
     image_id: str
-    document_id: int
+    document_id: uuid.UUID
     page_no: int = 0
     caption: str = ""
     url: str = ""
@@ -219,7 +221,7 @@ class ChatResponse(BaseModel):
 
 class PersistedChatMessage(BaseModel):
     """A persisted chat message from the database."""
-    id: int
+    id: uuid.UUID
     message_id: str
     role: str
     content: str
@@ -273,7 +275,7 @@ class LLMCapabilitiesResponse(BaseModel):
 class DebugRetrievedSource(BaseModel):
     """A retrieved source for debug inspection."""
     index: str  # 4-char alphanumeric ID (was: int)
-    document_id: int
+    document_id: uuid.UUID
 
     @field_validator("index", mode="before")
     @classmethod
@@ -291,7 +293,7 @@ class DebugChatResponse(BaseModel):
     """Full debug response — retrieval + LLM answer for quality inspection."""
     # Query
     question: str
-    workspace_id: int
+    workspace_id: uuid.UUID
 
     # Retrieval
     retrieved_sources: list[DebugRetrievedSource] = []

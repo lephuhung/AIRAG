@@ -1,6 +1,9 @@
-from pydantic import BaseModel
+import uuid
 from datetime import datetime
 from typing import Any
+
+from pydantic import BaseModel
+
 from app.models.document import DocumentStatus
 
 
@@ -12,19 +15,19 @@ class DocumentBase(BaseModel):
 
 
 class DocumentCreate(DocumentBase):
-    workspace_id: int
+    workspace_id: uuid.UUID
 
 
 class DocumentTypeInfo(BaseModel):
-    id: int
+    id: uuid.UUID
     slug: str
     name: str
     model_config = {"from_attributes": True}
 
 
 class DocumentResponse(DocumentBase):
-    id: int
-    workspace_id: int
+    id: uuid.UUID
+    workspace_id: uuid.UUID
     status: DocumentStatus
     chunk_count: int
     error_message: str | None
@@ -39,7 +42,7 @@ class DocumentResponse(DocumentBase):
     # Digital signature metadata (None if not a native PDF or no signatures found)
     digital_signatures: list[dict[str, Any]] | None = None
     # Document type classification
-    document_type_id: int | None = None
+    document_type_id: uuid.UUID | None = None
     document_type: DocumentTypeInfo | None = None
     # Official document reference number
     document_number: str | None = None
@@ -68,7 +71,7 @@ class DocumentUpdate(BaseModel):
 
 
 class DocumentUploadResponse(BaseModel):
-    id: int
+    id: uuid.UUID
     filename: str
     status: DocumentStatus
     message: str

@@ -15,6 +15,7 @@ import os
 import signal
 import sys
 import time
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -616,7 +617,7 @@ async def purge_queue(queue_name: str, user: User = Depends(require_superadmin))
 
 @router.post("/retry-failed")
 async def retry_all_failed(
-    workspace_id: int | None = None,
+    workspace_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_superadmin),
 ):
@@ -650,7 +651,7 @@ async def retry_all_failed(
 
 @router.post("/retry-failed/{document_id}")
 async def retry_single_failed(
-    document_id: int,
+    document_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_superadmin),
 ):
@@ -682,7 +683,7 @@ async def retry_single_failed(
 
 @router.get("/pipeline")
 async def get_pipeline(
-    workspace_id: int | None = None,
+    workspace_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_superadmin),
 ):

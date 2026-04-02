@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from typing import Optional
 
 from sqlalchemy import select
@@ -46,7 +47,7 @@ class DeepRetriever:
 
     def __init__(
         self,
-        workspace_id: int,
+        workspace_id: uuid.UUID,
         kg_service: Optional[KnowledgeGraphService],
         vector_store: VectorStore,
         embedder: EmbeddingService,
@@ -65,7 +66,7 @@ class DeepRetriever:
         question: str,
         mode: str = "hybrid",
         top_k: int = 5,
-        document_ids: Optional[list[int]] = None,
+        document_ids: Optional[list[uuid.UUID]] = None,
         include_images: bool = True,
     ) -> DeepRetrievalResult:
         """
@@ -145,7 +146,7 @@ class DeepRetriever:
         image_refs = []
         table_refs = []
         if include_images and self.db and chunks:
-            page_nos = {(c.document_id, c.page_no) for c in chunks if c.page_no > 0}
+            page_nos = {(str(c.document_id), c.page_no) for c in chunks if c.page_no > 0}
             if page_nos:
                 image_refs, table_refs = await asyncio.gather(
                     self._find_related_images(page_nos),
@@ -190,7 +191,7 @@ class DeepRetriever:
         self,
         question: str,
         top_n: int,
-        document_ids: Optional[list[int]],
+        document_ids: Optional[list[uuid.UUID]],
     ) -> list[dict]:
         """
         BM25 lexical search (synchronous, CPU-bound — run in thread).
@@ -305,14 +306,14 @@ class DeepRetriever:
         self,
         question: str,
         top_k: int,
-        document_ids: Optional[list[int]],
+        document_ids: Optional[list[uuid.UUID]],
     ) -> tuple[list[EnrichedChunk], list[Citation]]:
         """Synchronous vector search via ChromaDB (over-fetch stage)."""
         query_embedding = self.embedder.embed_query(question)
 
         where = None
         if document_ids:
-            where = {"document_id": {"$in": document_ids}}
+            where = {"document_id": {"$in": [str(doc_id) for doc_id in document_ids]}}
 
         results = self.vector_store.query(
             query_embedding=query_embedding,
@@ -417,7 +418,7 @@ class DeepRetriever:
 
     async def _find_related_images(
         self,
-        page_refs: set[tuple[int, int]],  # (document_id, page_no)
+        page_refs: set[tuple[uuid.UUID, int]],  # (document_id, page_no)
     ) -> list[ExtractedImage]:
         """Find images on the exact same pages as retrieved chunks."""
         if not self.db:
@@ -455,7 +456,7 @@ class DeepRetriever:
 
     async def _find_related_tables(
         self,
-        page_refs: set[tuple[int, int]],
+        page_refs: set[tuple[uuid.UUID, int]],
     ) -> list[ExtractedTable]:
         """Find tables on the exact same pages as retrieved chunks."""
         if not self.db:

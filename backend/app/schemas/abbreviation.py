@@ -1,5 +1,7 @@
-from pydantic import BaseModel, Field
+import uuid
 from datetime import datetime
+
+from pydantic import BaseModel, Field
 
 
 class AbbreviationBase(BaseModel):
@@ -20,8 +22,8 @@ class AbbreviationUpdate(BaseModel):
 
 
 class AbbreviationResponse(AbbreviationBase):
-    id: int
-    user_id: int
+    id: uuid.UUID
+    user_id: uuid.UUID
     is_active: bool
     created_at: datetime
     updated_at: datetime

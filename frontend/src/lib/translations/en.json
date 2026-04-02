@@ -344,6 +344,10 @@
     "title": "Files",
     "select_workspace": "Select a workspace to view documents",
     "search_ws": "Search workspaces...",
+    "no_ws_match": "No matching workspaces found",
+    "no_ws_yet": "No workspaces yet",
+    "search_ws_hint": "Try adjusting your search terms.",
+    "create_ws_hint": "Create a workspace to start managing documents.",
     "upload_hint": "Upload documents from the workspace to get started.",
     "no_files_match": "No matching files found",
     "adjust_search_hint": "Try adjusting your keywords or filters.",
@@ -408,7 +412,6 @@
   "workers": {
     "title": "Worker Processes",
     "title_short": "Processes",
-    "status": "Status",
     "subtitle": "Manage workers, monitor queues, and inspect the processing pipeline",
     "desc": "Manage workers, monitor queues, and inspect the processing pipeline",
     "start_all": "Start All Workers",

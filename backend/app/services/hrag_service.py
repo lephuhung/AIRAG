@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -45,7 +46,7 @@ class HRAGService:
       - query_deep()  — full async hybrid retrieval (KG + vector + images)
     """
 
-    def __init__(self, db: AsyncSession, workspace_id: int):
+    def __init__(self, db: AsyncSession, workspace_id: uuid.UUID):
         self.db = db
         self.workspace_id = workspace_id
 
@@ -73,7 +74,7 @@ class HRAGService:
     # Document Processing
     # ------------------------------------------------------------------
 
-    async def process_document(self, document_id: int, file_path: str) -> int:
+    async def process_document(self, document_id: uuid.UUID, file_path: str) -> int:
         """
         Process a document through the full HRAG pipeline.
 
@@ -201,7 +202,7 @@ class HRAGService:
 
                 metadatas = [
                     {
-                        "document_id": document_id,
+                        "document_id": str(document_id),
                         "chunk_index": c.chunk_index,
                         "source": c.source_file,
                         "file_type": document.file_type,
@@ -274,7 +275,7 @@ class HRAGService:
         self,
         question: str,
         top_k: int = 5,
-        document_ids: Optional[list[int]] = None,
+        document_ids: Optional[list[uuid.UUID]] = None,
     ) -> RAGQueryResult:
         """
         Backward-compatible sync query (vector-only).
@@ -284,7 +285,7 @@ class HRAGService:
 
         where = None
         if document_ids:
-            where = {"document_id": {"$in": document_ids}}
+            where = {"document_id": {"$in": [str(doc_id) for doc_id in document_ids]}}
 
         results = self.vector_store.query(
             query_embedding=query_embedding,
@@ -329,7 +330,7 @@ class HRAGService:
         self,
         question: str,
         top_k: int = 5,
-        document_ids: Optional[list[int]] = None,
+        document_ids: Optional[list[uuid.UUID]] = None,
         mode: str = "hybrid",
         include_images: bool = True,
     ) -> DeepRetrievalResult:
@@ -348,7 +349,7 @@ class HRAGService:
     # Management
     # ------------------------------------------------------------------
 
-    async def delete_document(self, document_id: int) -> None:
+    async def delete_document(self, document_id: uuid.UUID) -> None:
         """Delete a document's data from vector store and KG."""
         # Delete from ChromaDB
         self.vector_store.delete_by_document_id(document_id)

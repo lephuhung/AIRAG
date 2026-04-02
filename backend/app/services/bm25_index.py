@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -56,7 +57,7 @@ class _IndexState:
 
 
 # Module-level cache: workspace_id → _IndexState
-_index_cache: dict[int, _IndexState] = {}
+_index_cache: dict[uuid.UUID, _IndexState] = {}
 _cache_lock = threading.Lock()
 
 
@@ -124,7 +125,7 @@ def bm25_search(
     vector_store: VectorStore,
     query: str,
     top_n: int,
-    document_ids: list[int] | None = None,
+    document_ids: list[uuid.UUID] | None = None,
 ) -> list[dict]:
     """
     Run BM25 search and return top-N results as a list of dicts:
@@ -155,7 +156,7 @@ def bm25_search(
         if score <= 0:
             continue
         meta = state.metadatas[idx] if idx < len(state.metadatas) else {}
-        if document_ids and meta.get("document_id") not in document_ids:
+        if document_ids and meta.get("document_id") not in [str(doc_id) for doc_id in document_ids]:
             continue
         scored.append((idx, score))
 
@@ -176,7 +177,7 @@ def bm25_search(
     return results
 
 
-def invalidate_cache(workspace_id: int) -> None:
+def invalidate_cache(workspace_id: uuid.UUID) -> None:
     """
     Force the next query to rebuild the BM25 index for this workspace.
     Call after adding/deleting documents if you need immediate consistency

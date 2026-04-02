@@ -30,6 +30,7 @@ import asyncio
 import logging
 import os
 import shutil
+import uuid
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional
@@ -70,7 +71,7 @@ class KnowledgeGraphService:
       - "neo4j": shared Neo4j instance with per-workspace node labels
     """
 
-    def __init__(self, workspace_id: int):
+    def __init__(self, workspace_id: uuid.UUID):
         self.workspace_id = workspace_id
         self.working_dir = str(
             settings.BASE_DIR / "data" / "lightrag" / f"kb_{workspace_id}"
@@ -262,7 +263,7 @@ class KnowledgeGraphService:
         )
         return self._rag
 
-    async def ingest(self, markdown_content: str, document_id: Optional[int] = None) -> None:
+    async def ingest(self, markdown_content: str, document_id: Optional[uuid.UUID] = None) -> None:
         """
         Ingest markdown content into the knowledge graph.
         LightRAG extracts entities and relationships automatically.
@@ -403,7 +404,7 @@ class KnowledgeGraphService:
         self._rag = None
         self._initialized = False
 
-    async def delete_document(self, document_id: int) -> None:
+    async def delete_document(self, document_id: uuid.UUID) -> None:
         """
         Delete KG data for a specific document.
 
@@ -1072,7 +1073,7 @@ class KnowledgeGraphService:
 # ---------------------------------------------------------------------------
 
 
-def get_kg_service(workspace_id: int):
+def get_kg_service(workspace_id: uuid.UUID):
     """
     Factory: returns the appropriate KG service based on HRAG_KG_MODE config.
 
