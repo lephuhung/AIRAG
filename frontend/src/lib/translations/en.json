@@ -11,6 +11,7 @@
     "system_logs": "System Logs",
     "admin": {
       "dashboard": "Dashboard",
+      "slug": "Slug",
       "users": "Users",
       "tenants": "Tenants",
       "document_types": "Document Types",
@@ -39,6 +40,7 @@
   },
   "common": {
     "admin": "Admin",
+    "auto_refresh_15s": "Auto-refresh every 15s",
     "language": "Language",
     "english": "English",
     "vietnamese": "Vietnamese",

@@ -11,6 +11,7 @@
     "system_logs": "Nhật ký hệ thống",
     "admin": {
       "dashboard": "Thống kê",
+      "slug": "Mã định danh",
       "users": "Người dùng",
       "tenants": "Tổ chức",
       "document_types": "Loại tài liệu",
@@ -39,6 +40,7 @@
   },
   "common": {
     "admin": "Quản trị",
+    "auto_refresh_15s": "Tự động cập nhật mỗi 15 giây",
     "language": "Ngôn ngữ",
     "english": "Tiếng Anh",
     "vietnamese": "Tiếng Việt",
@@ -486,6 +488,31 @@
     "failed_with_count": "Thất bại ({{count}})",
     "retry_all_with_count": "Thử lại tất cả ({{count}})",
     "management": "Quản lý tiến trình",
+    "labels": {
+      "pid": "PID",
+      "in": "Vào",
+      "out": "Ra",
+      "per_second": "/s",
+      "version": "Phiên bản",
+      "cluster": "Cụm",
+      "error": "Lỗi",
+      "unknown": "Lỗi không xác định"
+    },
+    "types": {
+      "parse": "Phân tích",
+      "embed": "Nhúng",
+      "caption": "Mô tả",
+      "kg": "Biểu đồ"
+    },
+    "errors": {
+      "unknown": "Lỗi không xác định"
+    },
+    "health_status": {
+      "healthy": "Khỏe mạnh",
+      "degraded": "Suy giảm",
+      "unhealthy": "Không ổn định",
+      "warning": "Cảnh báo"
+    },
     "consumers": "{{count}} consumer",
     "consumers_plural": "{{count}} consumers",
     "consumers_label": "Người thực thi",
@@ -497,6 +524,14 @@
     "restart_success": "Đã khởi động lại tiến trình {{type}}",
     "retry_all_success": "Đang thử lại {{count}} tài liệu lỗi",
     "retry_all_failed": "Thử lại tài liệu thất bại",
+    "queue_purged": "Đã làm trống hàng đợi {{name}}",
+    "queue_purge_failed": "Làm trống hàng đợi thất bại",
+    "queue_deleted": "Đã xóa hàng đợi {{name}}",
+    "queue_delete_failed": "Xóa hàng đợi thất bại",
+    "dlq_purged": "Đã làm trống hàng đợi lỗi (DLQ)",
+    "dlq_purge_failed": "Làm trống DLQ thất bại",
+    "dlq_retry_success": "Đã thử lại {{count}} tin nhắn từ DLQ",
+    "dlq_retry_failed": "Thử lại tin nhắn từ DLQ thất bại",
     "retry_single_success": "Tài liệu đã được đưa vào hàng đợi thử lại",
     "retry_single_failed": "Thử lại tài liệu thất bại",
     "purge_queue_success": "Đã làm trống hàng đợi {{name}}",
@@ -525,6 +560,7 @@
     "stop_workers_title": "Dừng tiến trình",
     "stop_workers_msg": "Dừng tất cả tiến trình {{type}}? Các nhiệm vụ đang thực hiện sẽ bị gián đoạn.",
     "health_details": "Chi tiết sức khỏe hệ thống",
+    "llm_service": "Dịch vụ LLM",
     "version": "Phiên bản",
     "cluster": "Cụm",
     "in_progress": "Đang thực hiện",
@@ -535,16 +571,32 @@
       "hours_minutes": "{{h}} giờ {{m}} phút"
     },
     "status": {
-      "pending": "Đang chờ",
-      "parsing": "Đang trích xuất",
-      "ocring": "Đang OCR",
-      "chunking": "Đang cắt nhỏ",
-      "embedding": "Đang chuyển đổi số",
-      "building_kg": "Đang xây biểu đồ",
+      "pending": "Chờ xử lý",
+      "parsing": "Trích xuất văn bản",
+      "ocring": "Quét chữ (OCR)",
+      "chunking": "Cắt đoạn tri thức",
+      "embedding": "Chuyển số (Embedding)",
+      "building_kg": "Xây biểu đồ (KG)",
       "indexed": "Đã chỉ mục",
       "failed": "Thất bại"
     },
+    "status_desc": {
+      "pending": "Đang chờ trong hàng đợi để bắt đầu xử lý.",
+      "parsing": "Đang phân tích cấu trúc tệp và trích nội dung.",
+      "ocring": "Đang nhận dạng chữ từ hình ảnh hoặc tệp quét.",
+      "chunking": "Đang chia nhỏ văn bản thành các đoạn tri thức.",
+      "embedding": "Đang chuyển văn bản thành vectơ không gian.",
+      "building_kg": "Đang trích xuất thực thể và quan hệ biểu đồ.",
+      "indexed": "Đã xử lý xong và sẵn sàng để trả lời câu hỏi.",
+      "failed": "Xử lý gặp lỗi, cần kiểm tra hoặc xử lý lại."
+    },
     "health": {
+      "rabbitmq": "RabbitMQ",
+      "pipeline": "Luồng xử lý (Pipeline)",
+      "dlq": "Hàng đợi lỗi (DLQ)",
+      "ocr_service": "Dịch vụ OCR",
+      "qwen_memory": "Bộ nhớ Qwen",
+      "main_llm": "Mô hình ngôn ngữ (Qwen)",
       "in_progress": "Đang xử lý: {{count}}",
       "failed": "Thất bại: {{count}}",
       "messages": "Tin nhắn: {{count}}",

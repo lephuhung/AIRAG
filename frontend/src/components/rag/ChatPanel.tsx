@@ -356,34 +356,45 @@ function preprocessMarkdown(text: string): string {
   let inCodeFence = false;
 
   for (const line of lines) {
+    let processedLine = line;
     const trimmed = line.trim();
 
-    if (trimmed.startsWith("```")) {
+    // Fix: Headers lacking a space (e.g. "##Title" -> "## Title")
+    if (/^#{1,6}[^#\s]/.test(processedLine)) {
+      processedLine = processedLine.replace(/^(#{1,6})([^#\s])/, "$1 $2");
+    }
+
+    if (processedLine.trim().startsWith("```")) {
       inCodeFence = !inCodeFence;
     }
 
-    const isTable = (trimmed.startsWith("|") && trimmed.endsWith("|")) ||
-      /^\|[\s:|-]+\|$/.test(trimmed);
+    const isTable = (processedLine.trim().startsWith("|") && processedLine.trim().endsWith("|")) ||
+      /^\|[\s:|-]+\|$/.test(processedLine.trim());
 
-    // Insert blank line when transitioning from table row to non-table content
-    if (prevWasTable && !isTable && trimmed !== "") {
+    // Insert blank line before a table if needed
+    if (isTable && !prevWasTable && result.length > 0 && result[result.length - 1].trim() !== "") {
+      result.push("");
+    }
+
+    // Insert blank line after a table if current line is not a table
+    if (prevWasTable && !isTable && processedLine.trim() !== "") {
       result.push("");
     }
 
     // Convert single-line display math $$content$$ to multi-line format
     if (
       !inCodeFence &&
-      trimmed.startsWith("$$") &&
-      trimmed.endsWith("$$") &&
-      trimmed.length > 4 &&
-      trimmed !== "$$"
+      processedLine.trim().startsWith("$$") &&
+      processedLine.trim().endsWith("$$") &&
+      processedLine.trim().length > 4 &&
+      processedLine.trim() !== "$$"
     ) {
-      const mathContent = trimmed.slice(2, -2);
+      const mathContent = processedLine.trim().slice(2, -2);
       result.push("$$");
       result.push(mathContent);
       result.push("$$");
     } else {
-      result.push(line);
+      result.push(processedLine);
     }
 
     prevWasTable = isTable;
@@ -797,39 +808,42 @@ function ImageRefsPanel({ images }: { images: ChatImageRef[] }) {
 // ---------------------------------------------------------------------------
 // Thinking panel — collapsible violet-themed thinking process display
 // ---------------------------------------------------------------------------
-function ThinkingPanel({ thinking }: { thinking: string }) {
+function PremiumThinking({ thinking, isStreaming }: { thinking: string, isStreaming?: boolean }) {
   const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(isStreaming || false);
 
   if (!thinking) return null;
 
   return (
-    <div className="mt-1.5 mb-1 rounded-md border border-violet-500/20 bg-violet-500/5 overflow-hidden">
+    <div className="mb-3 group">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-1.5 px-2.5 py-1.5 text-[10px] font-medium text-violet-400 hover:text-violet-300 [[data-theme='light']_&]:text-violet-600 [[data-theme='light']_&]:hover:text-violet-700 transition-colors"
+        className={cn(
+          "flex items-center gap-2 px-3 py-1.5 rounded-full text-[13px] font-medium transition-all duration-300",
+          "bg-violet-500/5 hover:bg-violet-500/10 border border-violet-500/10 hover:border-violet-500/20",
+          "text-violet-600/80 hover:text-violet-600 shadow-sm",
+          expanded && "bg-violet-500/8 border-violet-500/20 text-violet-600"
+        )}
       >
-        <Brain className="w-3 h-3" />
-        {t("chat.thinking_process")}
-        <ChevronDown
-          className={cn(
-            "w-3 h-3 ml-auto transition-transform",
-            expanded && "rotate-180"
-          )}
-        />
+        <Sparkles className={cn("w-3.5 h-3.5 transition-transform duration-500 text-violet-500", isStreaming && "animate-pulse")} />
+        <span>{t("chat.thinking_process") || "Hiện tiến trình tư duy"}</span>
+        <ChevronDown className={cn("w-3.5 h-3.5 transition-transform duration-300", expanded && "rotate-180")} />
       </button>
+
       <AnimatePresence>
         {expanded && (
           <motion.div
-            initial={{ height: 0 }}
-            animate={{ height: "auto" }}
-            exit={{ height: 0 }}
+            initial={{ height: 0, opacity: 0, y: -4 }}
+            animate={{ height: "auto", opacity: 1, y: 0 }}
+            exit={{ height: 0, opacity: 0, y: -4 }}
+            transition={{ duration: 0.3, ease: "easeOut" }}
             className="overflow-hidden"
           >
-            <div className="px-2.5 pb-2 border-t border-violet-500/10">
-              <pre className="text-[11px] text-violet-300/90 [[data-theme='light']_&]:text-violet-700/90 whitespace-pre-wrap leading-relaxed mt-1.5 max-h-[300px] overflow-y-auto">
+            <div className="mt-2 ml-3 pl-4 border-l-2 border-violet-500/30">
+              <div className="text-[14px] leading-relaxed text-slate-600/90 whitespace-pre-wrap font-chat italic py-1">
                 {thinking}
-              </pre>
+                {isStreaming && <span className="inline-block w-1.5 h-4 bg-violet-400/50 animate-pulse ml-1 align-middle" />}
+              </div>
             </div>
           </motion.div>
         )}
@@ -837,6 +851,7 @@ function ThinkingPanel({ thinking }: { thinking: string }) {
     </div>
   );
 }
+
 
 // ---------------------------------------------------------------------------
 // Copy message actions — plain text or raw markdown (without citations)
@@ -1213,6 +1228,13 @@ const MessageBubble = memo(function MessageBubble({
           <TypingIndicator status="analyzing" />
         )}
 
+        {!isUser && (
+          <PremiumThinking 
+            thinking={message.thinking || message.agentSteps?.find(s => s.thinkingText)?.thinkingText || ""} 
+            isStreaming={message.isStreaming}
+          />
+        )}
+
         {isUser ? (
           <p className="text-[15.5px] leading-relaxed whitespace-pre-wrap font-chat">
             {message.content}
@@ -1240,8 +1262,6 @@ const MessageBubble = memo(function MessageBubble({
               />
               <span className="streaming-cursor" />
             </div>
-          ) : message.thinking ? (
-            <InlineThinkingPreview text={message.thinking} />
           ) : null
         ) : (
           <div className={proseClasses}>
@@ -1272,11 +1292,6 @@ const MessageBubble = memo(function MessageBubble({
           <AssistantMessageFooter message={message} />
         )}
 
-        {/* ThinkingPanel — only when no ThinkingTimeline with thinking log (avoid duplication) */}
-        {!isUser && message.thinking && !message.isStreaming &&
-          !message.agentSteps?.some((s) => s.thinkingText) && (
-            <ThinkingPanel thinking={message.thinking} />
-          )}
 
         {!isUser && !message.isStreaming && message.imageRefs && message.imageRefs.length > 0 && (
           <ImageRefsPanel images={message.imageRefs} />
@@ -1326,46 +1341,6 @@ const MessageBubble = memo(function MessageBubble({
 // Inline thinking preview — shown in message body while model is thinking
 // ---------------------------------------------------------------------------
 
-function InlineThinkingPreview({ text }: { text: string }) {
-  const { t } = useTranslation();
-  const containerRef = useRef<HTMLDivElement>(null);
-  const isUserScrolledRef = useRef(false);
-
-  const handleScroll = useCallback(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    const isAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 20;
-    isUserScrolledRef.current = !isAtBottom;
-  }, []);
-
-  useEffect(() => {
-    if (containerRef.current && !isUserScrolledRef.current) {
-      containerRef.current.scrollTop = containerRef.current.scrollHeight;
-    }
-  }, [text]);
-
-  return (
-    <div className="mt-1">
-      <div className="flex items-center gap-1.5 mb-1.5">
-        <Brain className="w-3.5 h-3.5 text-violet-400 animate-pulse" />
-        <span className="text-xs font-medium text-violet-400">{t("chat.thinking")}</span>
-      </div>
-      <div
-        ref={containerRef}
-        onScroll={handleScroll}
-        className={cn(
-          "text-xs leading-relaxed text-muted-foreground/70 italic",
-          "max-h-[200px] overflow-y-auto scrollbar-none",
-          "border-l-2 border-violet-500/30 pl-3",
-          "whitespace-pre-wrap break-words",
-        )}
-      >
-        {text}
-        <span className="animate-pulse text-violet-400 ml-0.5">|</span>
-      </div>
-    </div>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Typing indicator
@@ -1574,7 +1549,10 @@ export const ChatPanel = memo(function ChatPanel({
   const { t } = useTranslation();
   const { user } = useAuthStore();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [input, setInput] = useState("");
+  const [input, setInput] = useState(() => {
+    if (!sessionId) return "";
+    return localStorage.getItem(`hrag-draft-${sessionId}`) || "";
+  });
   const [enableThinking, setEnableThinking] = useState(true);
   const [thinkingDefaultSynced, setThinkingDefaultSynced] = useState(false);
 
@@ -1583,8 +1561,20 @@ export const ChatPanel = memo(function ChatPanel({
   // Reset session state when switching chats/starting a new chat
   useEffect(() => {
     setMessages([]);
-    setInput("");
+    const savedDraft = sessionId ? localStorage.getItem(`hrag-draft-${sessionId}`) : "";
+    setInput(savedDraft || "");
   }, [sessionId]);
+
+  // Persist draft to localStorage
+  useEffect(() => {
+    if (sessionId) {
+      if (input.trim()) {
+        localStorage.setItem(`hrag-draft-${sessionId}`, input);
+      } else {
+        localStorage.removeItem(`hrag-draft-${sessionId}`);
+      }
+    }
+  }, [sessionId, input]);
 
   // Abbreviation modal state
   const [isAbbModalOpen, setIsAbbModalOpen] = useState(false);

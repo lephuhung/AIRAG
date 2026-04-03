@@ -34,6 +34,7 @@ export function useAdminStats() {
   return useQuery({
     queryKey: ["admin-stats"],
     queryFn: () => api.get<AdminStats>("/admin/stats"),
+    refetchInterval: 15000,
   });
 }
 

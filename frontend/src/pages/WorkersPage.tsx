@@ -49,14 +49,14 @@ const PIPELINE_STATUS: Record<
   string,
   { labelKey: string; color: string; bgColor: string; icon: typeof Clock }
 > = {
-  pending:     { labelKey: "files.tabs.pending",      color: "text-muted-foreground", bgColor: "bg-muted",                icon: Clock },
-  parsing:     { labelKey: "files.tabs.processing",   color: "text-blue-400",        bgColor: "bg-blue-400/15",          icon: Loader2 },
-  ocring:      { labelKey: "files.tabs.processing",   color: "text-indigo-400",      bgColor: "bg-indigo-400/15",        icon: Loader2 },
-  chunking:    { labelKey: "files.tabs.processing",   color: "text-cyan-400",        bgColor: "bg-cyan-400/15",          icon: Loader2 },
-  embedding:   { labelKey: "files.tabs.processing",   color: "text-amber-400",       bgColor: "bg-amber-400/15",         icon: Loader2 },
-  building_kg: { labelKey: "files.tabs.processing",   color: "text-violet-400",      bgColor: "bg-violet-400/15",        icon: Loader2 },
-  indexed:     { labelKey: "files.tabs.indexed",      color: "text-primary",         bgColor: "bg-primary/15",           icon: CheckCircle2 },
-  failed:      { labelKey: "files.tabs.failed",       color: "text-destructive",     bgColor: "bg-destructive/15",       icon: XCircle },
+  pending:     { labelKey: "workers.status.pending",     color: "text-muted-foreground", bgColor: "bg-muted",                icon: Clock },
+  parsing:     { labelKey: "workers.status.parsing",     color: "text-blue-400",        bgColor: "bg-blue-400/15",          icon: Loader2 },
+  ocring:      { labelKey: "workers.status.ocring",      color: "text-indigo-400",      bgColor: "bg-indigo-400/15",        icon: Loader2 },
+  chunking:    { labelKey: "workers.status.chunking",    color: "text-cyan-400",        bgColor: "bg-cyan-400/15",          icon: Loader2 },
+  embedding:   { labelKey: "workers.status.embedding",   color: "text-amber-400",       bgColor: "bg-amber-400/15",         icon: Loader2 },
+  building_kg: { labelKey: "workers.status.building_kg", color: "text-violet-400",      bgColor: "bg-violet-400/15",        icon: Loader2 },
+  indexed:     { labelKey: "workers.status.indexed",     color: "text-primary",         bgColor: "bg-primary/15",           icon: CheckCircle2 },
+  failed:      { labelKey: "workers.status.failed",      color: "text-destructive",     bgColor: "bg-destructive/15",       icon: XCircle },
 };
 
 const PROCESSING_KEYS = ["parsing", "ocring", "chunking", "embedding", "building_kg"] as const;
@@ -188,7 +188,10 @@ export function WorkersPage() {
       api.post("/workers/start", params),
     onSuccess: (_, params) => {
       invalidateAll();
-      toast.success(t("workers.start_success", { count: params.count || 1, type: params.worker_type }));
+      toast.success(t("workers.start_success", { 
+        count: params.count || 1, 
+        type: t(`workers.types.${params.worker_type}`) || params.worker_type 
+      }));
     },
     onError: (err: Error) => toast.error(err.message),
   });
@@ -197,7 +200,7 @@ export function WorkersPage() {
     mutationFn: (workerType: string) => api.post(`/workers/stop/${workerType}`),
     onSuccess: (_, wt) => {
       invalidateAll();
-      toast.success(t("workers.stop_success", { type: wt }));
+      toast.success(t("workers.stop_success", { type: t(`workers.types.${wt}`) || wt }));
     },
     onError: (err: Error) => toast.error(err.message),
   });
@@ -206,7 +209,7 @@ export function WorkersPage() {
     mutationFn: (workerType: string) => api.post(`/workers/restart/${workerType}`),
     onSuccess: (_, wt) => {
       invalidateAll();
-      toast.success(t("workers.restart_success", { type: wt }));
+      toast.success(t("workers.restart_success", { type: t(`workers.types.${wt}`) || wt }));
     },
     onError: (err: Error) => toast.error(err.message),
   });
@@ -303,12 +306,7 @@ export function WorkersPage() {
     "text-destructive bg-destructive/10 border-destructive/20";
 
   const getHealthStatusLabel = (status: string) => {
-    switch (status) {
-      case "healthy": return t("workers.healthy");
-      case "degraded": return t("workers.degraded");
-      case "unhealthy": return t("workers.unhealthy");
-      default: return t("common.unknown");
-    }
+    return t(`workers.health_status.${status}`) || status;
   };
 
   return (
@@ -419,7 +417,7 @@ export function WorkersPage() {
               )}
               {health?.checks?.rabbitmq?.version && (
                 <span className="text-[10px] text-muted-foreground">
-                  v{health.checks.rabbitmq.version}
+                  {t("workers.labels.version")}: {health.checks.rabbitmq.version}
                 </span>
               )}
               {dlqCount > 0 && (
@@ -456,8 +454,8 @@ export function WorkersPage() {
                             "w-2.5 h-2.5 rounded-full",
                             isRunning ? "bg-green-400 animate-pulse" : "bg-muted-foreground/30",
                           )} />
-                          <span className={cn("text-sm font-semibold capitalize", WORKER_COLORS[wtype])}>
-                            {wtype}
+                          <span className={cn("text-sm font-semibold", WORKER_COLORS[wtype])}>
+                            {t(`workers.types.${wtype}`) || wtype}
                           </span>
                         </div>
                         <span className="text-xs text-muted-foreground">
@@ -470,7 +468,7 @@ export function WorkersPage() {
                         <div className="space-y-1">
                           {aliveList.map((w) => (
                             <div key={w.pid} className="flex items-center justify-between text-[11px] text-muted-foreground">
-                              <span>PID {w.pid}</span>
+                              <span>{t("workers.labels.pid")} {w.pid}</span>
                               <span>{formatUptime(w.uptime_seconds)}</span>
                             </div>
                           ))}
@@ -550,6 +548,49 @@ export function WorkersPage() {
 
             </Section>
 
+            {/* ── LLM Services ── */}
+            {health && (
+              <Section title={t("workers.llm_service")} icon={Cpu} defaultOpen={true}>
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                  {/* OCR Service */}
+                  {health.checks.llm_services?.ocr && (
+                    <HealthCard
+                      title={t("workers.health.ocr_service")}
+                      status={health.checks.llm_services.ocr.status}
+                      details={[
+                        health.checks.llm_services.ocr.model ? `${t("workers.labels.version")}: ${health.checks.llm_services.ocr.model}` : null,
+                        health.checks.llm_services.ocr.error ? `${t("workers.labels.error")}: ${health.checks.llm_services.ocr.error}` : null,
+                      ].filter(Boolean) as string[]}
+                    />
+                  )}
+
+                  {/* Qwen Memory */}
+                  {health.checks.llm_services?.memory && (
+                    <HealthCard
+                      title={t("workers.health.qwen_memory")}
+                      status={health.checks.llm_services.memory.status}
+                      details={[
+                        health.checks.llm_services.memory.model ? `${t("workers.labels.version")}: ${health.checks.llm_services.memory.model}` : null,
+                        health.checks.llm_services.memory.error ? `${t("workers.labels.error")}: ${health.checks.llm_services.memory.error}` : null,
+                      ].filter(Boolean) as string[]}
+                    />
+                  )}
+
+                  {/* Main LLM */}
+                  {health.checks.llm_services?.main_llm && (
+                    <HealthCard
+                      title={t("workers.health.main_llm")}
+                      status={health.checks.llm_services.main_llm.status}
+                      details={[
+                        health.checks.llm_services.main_llm.model ? `${t("workers.labels.version")}: ${health.checks.llm_services.main_llm.model}` : null,
+                        health.checks.llm_services.main_llm.error ? `${t("workers.labels.error")}: ${health.checks.llm_services.main_llm.error}` : null,
+                      ].filter(Boolean) as string[]}
+                    />
+                  )}
+                </div>
+              </Section>
+            )}
+
             {/* ── Pipeline Summary Cards ── */}
             <Section title={t("workers.pipeline_summary")} icon={Layers}>
               <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-8 gap-3">
@@ -562,18 +603,24 @@ export function WorkersPage() {
                       <div
                         key={key}
                         className={cn(
-                          "rounded-xl border bg-card p-3 flex flex-col items-center gap-1.5 transition-all",
+                          "rounded-xl border bg-card p-3 flex flex-col items-center gap-1.5 transition-all hover:shadow-md hover:border-primary/20 group",
                           count > 0 && key === "failed" && "border-destructive/30",
                           isAnimated && "border-blue-400/30",
                         )}
+                        title={t(`workers.status_desc.${key}`)}
                       >
-                        <div className={cn("w-8 h-8 rounded-lg flex items-center justify-center", config.bgColor)}>
+                        <div className={cn("w-8 h-8 rounded-lg flex items-center justify-center transition-transform group-hover:scale-110", config.bgColor)}>
                           <Icon className={cn("w-4 h-4", config.color, isAnimated && "animate-spin")} />
                         </div>
                         <span className="text-lg font-bold tabular-nums">{count}</span>
-                        <span className="text-[10px] text-muted-foreground font-medium uppercase tracking-wider">
-                          {t(config.labelKey)}
-                        </span>
+                        <div className="flex flex-col items-center gap-0.5 text-center">
+                          <span className="text-[10px] text-muted-foreground font-semibold uppercase tracking-wider">
+                            {t(config.labelKey)}
+                          </span>
+                          <span className="text-[9px] text-muted-foreground/60 leading-tight line-clamp-1 max-w-[80px]">
+                            {t(`workers.status_desc.${key}`)}
+                          </span>
+                        </div>
                       </div>
                     );
                   })}
@@ -638,8 +685,8 @@ export function WorkersPage() {
                       </div>
                       {(q.message_rate_in > 0 || q.message_rate_out > 0) && (
                         <div className="flex items-center justify-between text-[11px] text-muted-foreground pt-1 border-t border-border/50">
-                          <span>In: {q.message_rate_in.toFixed(1)}/s</span>
-                          <span>Out: {q.message_rate_out.toFixed(1)}/s</span>
+                          <span>{t("workers.labels.in")}: {q.message_rate_in.toFixed(1)}{t("workers.labels.per_second")}</span>
+                          <span>{t("workers.labels.out")}: {q.message_rate_out.toFixed(1)}{t("workers.labels.per_second")}</span>
                         </div>
                       )}
                     </div>
@@ -810,7 +857,7 @@ export function WorkersPage() {
                           </td>
                           <td className="px-4 py-2.5">
                             <span className="text-xs text-destructive/80 truncate max-w-[300px] block" title={doc.error_message ?? ""}>
-                              {doc.error_message || "Unknown error"}
+                              {doc.error_message || t("workers.errors.unknown")}
                             </span>
                           </td>
                           <td className="px-4 py-2.5 text-xs text-muted-foreground">
@@ -842,18 +889,18 @@ export function WorkersPage() {
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
                   {/* RabbitMQ */}
                   <HealthCard
-                    title="RabbitMQ"
+                    title={t("workers.health.rabbitmq")}
                     status={health.checks.rabbitmq.status}
                     details={[
-                      health.checks.rabbitmq.version ? `Version: ${health.checks.rabbitmq.version}` : null,
-                      health.checks.rabbitmq.cluster ? `Cluster: ${health.checks.rabbitmq.cluster}` : null,
-                      health.checks.rabbitmq.error ? `Error: ${health.checks.rabbitmq.error}` : null,
+                      health.checks.rabbitmq.version ? `${t("workers.labels.version")}: ${health.checks.rabbitmq.version}` : null,
+                      health.checks.rabbitmq.cluster ? `${t("workers.labels.cluster")}: ${health.checks.rabbitmq.cluster}` : null,
+                      health.checks.rabbitmq.error ? `${t("workers.labels.error")}: ${health.checks.rabbitmq.error}` : null,
                     ].filter(Boolean) as string[]}
                   />
 
                   {/* Pipeline */}
                   <HealthCard
-                    title="Pipeline"
+                    title={t("workers.health.pipeline")}
                     status={health.checks.pipeline.status}
                     details={[
                       t("workers.health.in_progress", { count: health.checks.pipeline.documents_in_progress }),
@@ -863,7 +910,7 @@ export function WorkersPage() {
 
                   {/* Dead Letter Queue */}
                   <HealthCard
-                    title="Dead Letter Queue"
+                    title={t("workers.health.dlq")}
                     status={health.checks.dead_letter_queue.status}
                     details={[
                       t("workers.health.messages", { count: health.checks.dead_letter_queue.messages }),
@@ -978,6 +1025,7 @@ function HealthCard({
   status: string;
   details: string[];
 }) {
+  const { t } = useTranslation();
   const statusColor =
     status === "healthy" ? "text-green-400" :
     status === "warning" ? "text-amber-400" :
@@ -992,8 +1040,8 @@ function HealthCard({
     <div className="rounded-xl border bg-card p-3 space-y-2">
       <div className="flex items-center justify-between">
         <span className="text-xs font-medium truncate">{title}</span>
-        <span className={cn("text-[10px] font-medium px-1.5 py-0.5 rounded-full capitalize", statusBg, statusColor)}>
-          {status}
+        <span className={cn("text-[10px] font-medium px-1.5 py-0.5 rounded-full", statusBg, statusColor)}>
+          {t(`workers.health_status.${status}`) || status}
         </span>
       </div>
       <div className="space-y-0.5">
@@ -1015,6 +1063,7 @@ function SubTaskPill({
   done: boolean;
   label: string;
 }) {
+  const { t } = useTranslation();
   return (
     <span
       className={cn(
@@ -1023,7 +1072,7 @@ function SubTaskPill({
           ? "bg-green-500/10 text-green-400 border-green-500/20"
           : "bg-muted/50 text-muted-foreground/50 border-border/50",
       )}
-      title={`${label === "E" ? "Embed" : label === "C" ? "Captions" : "KG"}: ${done ? "Done" : "Pending"}`}
+      title={`${label === "E" ? t("workers.types.embed") : label === "C" ? t("workers.types.caption") : t("workers.types.kg")}: ${done ? t("common.completed") : t("pipeline.stats.ready")}`}
     >
       {done ? <CheckCircle2 className="w-2.5 h-2.5" /> : <Clock className="w-2.5 h-2.5" />}
       {label}

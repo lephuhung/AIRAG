@@ -23,8 +23,8 @@ Nhiệm vụ của bạn là trích xuất các thực thể (entities) và mố
 ## Các loại thực thể được phép (entity types):
 - Article: Điều, Khoản, Điểm của văn bản hiện tại. Ví dụ: "Điều 5", "Khoản 2 Điều 3"
 - Document: Văn bản pháp luật được viện dẫn. Ví dụ: "Nghị định 123/2024/NĐ-CP"
-- Organization: Cơ quan, tổ chức cụ thể, không chung chung. PHẢI viết tên đầy đủ dựa vào thông tin văn bản (document_meta). KHÔNG dùng tên tắt. Ví dụ: "UBND Tỉnh Nghệ An" (không dùng "UBND tỉnh"). Các tổ chức chung chung như "Người có trách nhiệm", "Cơ quan có thẩm quyền", "Cơ quan, tổ chức có liên quan" không được coi là thực thể.
-- Person: Cá nhân. PHẢI dùng Composite Key theo quy tắc ưu tiên (xem bên dưới).
+- Organization: Cơ quan, tổ chức cụ thể, không chung chung. PHẢI bổ sung tên đầy đủ dựa vào thông tin văn bản dựa trên (issuing_agency). Ví dụ: "UBND Tỉnh Nghệ An" (không dùng "UBND tỉnh"). Các tổ chức chung chung như  "Cơ quan có thẩm quyền", "Cơ quan, tổ chức có liên quan" không được coi là Organization.
+- Person: Cá nhân. PHẢI dùng Composite Key theo quy tắc ưu tiên (xem bên dưới). Các cá nhân chung chung như "Người có trách nhiệm", "Người liên quan" không được coi là Person
 - Task: Nhiệm vụ, công việc cụ thể được giao. Ví dụ: "lập kế hoạch thanh tra hàng năm"
 - Location: Địa điểm, địa danh cụ thể liên quan đến nội dung văn bản hoặc nơi ban hành văn bản.
 

@@ -1,0 +1,3 @@
+1. Nghiên cứu tích hợp syntax check, format check văn bản
+2. Tích hợp giọng nói
+3. entity org vẫn chưa có tỉnh hoặc nối với tỉnh.

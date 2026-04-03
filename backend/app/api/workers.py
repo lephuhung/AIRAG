@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import httpx
 import signal
 import sys
 import time
@@ -139,6 +140,52 @@ def _extract_queue_info(q: dict[str, Any]) -> dict[str, Any]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Health Check Helpers
+# ══════════════════════════════════════════════════════════════════════════════
+ 
+async def _check_openai_health(url: str | None, model: str | None, api_key: str | None = None) -> dict[str, Any]:
+    """Check health of an OpenAI-compatible API endpoint."""
+    if not url:
+        return {"status": "unhealthy", "error": "URL not configured"}
+    
+    try:
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+            
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            # We check the /models endpoint to confirm the server is up and knows about the model
+            # Note: We strip /v1 if present to reach /v1/models correctly if base_url includes it
+            base = url.rstrip("/")
+            models_url = f"{base}/models"
+            
+            resp = await client.get(models_url, headers=headers)
+            if resp.status_code != 200:
+                return {"status": "unhealthy", "error": f"HTTP {resp.status_code}", "url": url}
+            
+            data = resp.json()
+            models = [m.get("id") for m in data.get("data", [])]
+            
+            if model and model not in models:
+                # If model is not in list, it might still be ok if it's a dynamic endpoint,
+                # but usually it's a sign of a mismatch. We'll mark as warning.
+                return {
+                    "status": "warning", 
+                    "error": f"Model '{model}' not found in active list", 
+                    "available_models": models[:5],
+                    "url": url
+                }
+                
+            return {
+                "status": "healthy",
+                "model": model,
+                "url": url
+            }
+    except Exception as exc:
+        return {"status": "unhealthy", "error": str(exc), "url": url}
+ 
+ 
+# ══════════════════════════════════════════════════════════════════════════════
 # Health Check
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -260,6 +307,30 @@ async def workers_health(db: AsyncSession = Depends(get_db), user: User = Depend
         "status": "warning" if failed > 0 else "healthy",
         "documents_in_progress": in_progress,
         "documents_failed": failed,
+    }
+
+    # ── AI Services Health ────────────────────────────────────────────────
+    llm_tasks = [
+        _check_openai_health(
+            os.getenv("HUNYUAN_OCR_API_URL"), 
+            os.getenv("HUNYUAN_OCR_MODEL")
+        ),
+        _check_openai_health(
+            os.getenv("MEMORY_AGENT_BASE_URL") or os.getenv("LEGAL_KG_LLM_BASE_URL"),
+            os.getenv("MEMORY_AGENT_MODEL") or os.getenv("LEGAL_KG_LLM_MODEL")
+        ),
+        _check_openai_health(
+            os.getenv("OPENAI_COMPATIBLE_BASE_URL"),
+            os.getenv("OPENAI_COMPATIBLE_MODEL"),
+            os.getenv("OPENAI_COMPATIBLE_API_KEY")
+        ),
+    ]
+    llm_results = await asyncio.gather(*llm_tasks)
+    
+    health["checks"]["llm_services"] = {
+        "ocr": llm_results[0],
+        "memory": llm_results[1],
+        "main_llm": llm_results[2],
     }
 
     return health

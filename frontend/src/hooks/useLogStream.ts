@@ -39,13 +39,13 @@ export function useLogStream(): LogStreamState {
   useEffect(() => {
     return () => {
       abortRef.current?.abort();
-      readerRef.current?.cancel();
+      readerRef.current?.cancel().catch(() => {});
     };
   }, []);
 
   const stop = useCallback(() => {
     abortRef.current?.abort();
-    readerRef.current?.cancel();
+    readerRef.current?.cancel().catch(() => {});
     abortRef.current = null;
     readerRef.current = null;
     setIsStreaming(false);
@@ -75,7 +75,7 @@ export function useLogStream(): LogStreamState {
       },
       signal: abortRef.current.signal,
     })
-      .then((response) => {
+      .then(async (response) => {
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
@@ -142,7 +142,7 @@ export function useLogStream(): LogStreamState {
             processChunk(value);
             read();
           }).catch((err) => {
-            if ((err as Error)?.name === "AbortError") return;
+            if ((err as Error)?.name === "AbortError" || (err as Error)?.message?.includes("aborted")) return;
             setError(`Stream read error: ${err}`);
             setIsStreaming(false);
           });
@@ -151,7 +151,7 @@ export function useLogStream(): LogStreamState {
         read();
       })
       .catch((err) => {
-        if ((err as Error)?.name === "AbortError") return;
+        if ((err as Error)?.name === "AbortError" || (err as Error)?.message?.includes("aborted")) return;
         setError(`Connection error: ${err}`);
         setIsStreaming(false);
       });

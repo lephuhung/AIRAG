@@ -1,6 +1,6 @@
 import { useAdminStats } from "@/hooks/useAdminUsers";
 import { useTranslation } from "@/hooks/useTranslation";
-import { Users, Building2, Database, FileText, Activity, AlertCircle, Clock } from "lucide-react";
+import { Users, Building2, Database, FileText, Activity, AlertCircle, Clock, RefreshCw } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   LineChart,
@@ -20,7 +20,7 @@ import {
 import dayjs from "dayjs";
 
 export function AdminDashboardPage() {
-  const { data: stats, isLoading } = useAdminStats();
+  const { data: stats, isLoading, isFetching } = useAdminStats();
   const { t } = useTranslation();
 
   if (isLoading) {
@@ -40,10 +40,20 @@ export function AdminDashboardPage() {
           <div className="w-10 h-10 rounded-xl bg-primary/10 flex items-center justify-center shadow-inner">
             <Activity className="w-5 h-5 text-primary" />
           </div>
-          <div>
-            <h1 className="text-2xl font-bold tracking-tight">{t("admin.dashboard.title")}</h1>
+          <div className="flex-1">
+            <div className="flex items-center gap-3">
+              <h1 className="text-2xl font-bold tracking-tight">{t("admin.dashboard.title")}</h1>
+              <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-primary/5 border border-primary/10 text-[10px] font-medium text-primary">
+                <div className={cn("w-1.5 h-1.5 rounded-full bg-primary", !isFetching && "animate-pulse")} />
+                {isFetching ? (
+                  <RefreshCw className="w-2.5 h-2.5 animate-spin" />
+                ) : (
+                   "LIVE"
+                )}
+              </div>
+            </div>
             <p className="text-sm text-muted-foreground">
-              {t("admin.dashboard.subtitle")}
+              {t("admin.dashboard.subtitle")} • {t("common.auto_refresh_15s")}
             </p>
           </div>
         </div>
@@ -157,104 +167,58 @@ export function AdminDashboardPage() {
           </div>
 
           {/* Top Workspaces */}
-          <div className="bg-card border rounded-2xl p-6 shadow-sm">
+          <div className="bg-card border rounded-2xl p-6 shadow-sm lg:col-span-2">
             <h2 className="text-lg font-semibold tracking-tight mb-4">{t("admin.dashboard.top_workspaces")}</h2>
-            <div className="h-72">
+            <div className="h-96">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={stats.top_workspaces} layout="vertical" margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
-                  <CartesianGrid strokeDasharray="3 3" horizontal={true} vertical={false} opacity={0.3} />
-                  <XAxis type="number" tickFormatter={(val) => `${(val / (1024 * 1024)).toFixed(1)} MB`} fontSize={12} />
-                  <YAxis dataKey="name" type="category" width={150} fontSize={12} tick={{ fill: 'currentColor' }} />
+                <LineChart data={stats.top_workspaces} margin={{ top: 5, right: 30, left: 10, bottom: 20 }}>
+                  <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
+                  <XAxis dataKey="name" fontSize={12} tickMargin={10} angle={-15} textAnchor="end" />
+                  <YAxis tickFormatter={(val) => `${(val / (1024 * 1024)).toFixed(0)}MB`} fontSize={12} />
                   <Tooltip 
-                    formatter={(value: any) => [value, t("admin.dashboard.total_size")] as [any, any]}
+                    formatter={(value: any) => [`${(Number(value) / (1024 * 1024)).toFixed(1)} MB`, t("admin.dashboard.total_size")] as [any, any]}
                     contentStyle={{ borderRadius: '8px', border: '1px solid #e2e8f0', fontSize: '14px' }}
                   />
-                  <Bar dataKey="total_size" fill="#8b5cf6" radius={[0, 4, 4, 0]} maxBarSize={40}>
-                    {stats.top_workspaces.map((_entry, index) => (
-                      <Cell key={`cell-${index}`} fill={["#8b5cf6", "#ec4899", "#f43f5e", "#f97316", "#eab308"][index % 5]} />
-                    ))}
-                  </Bar>
-                </BarChart>
+                  <Line 
+                    type="monotone" 
+                    dataKey="total_size" 
+                    stroke="#8b5cf6" 
+                    strokeWidth={3} 
+                    dot={{ r: 4, fill: "#8b5cf6" }} 
+                    activeDot={{ r: 7 }} 
+                  />
+                </LineChart>
               </ResponsiveContainer>
             </div>
           </div>
 
           {/* Document Types */}
-          <div className="bg-card border rounded-2xl p-6 shadow-sm">
+          <div className="bg-card border rounded-2xl p-6 shadow-sm lg:col-span-2">
             <h2 className="text-lg font-semibold tracking-tight mb-4">{t("admin.dashboard.type_breakdown")}</h2>
-            <div className="h-72">
+            <div className="h-96">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={stats.document_type_breakdown} margin={{ top: 5, right: 30, left: 10, bottom: 5 }}>
-                  <CartesianGrid strokeDasharray="3 3" vertical={false} opacity={0.3} />
+                <LineChart data={stats.document_type_breakdown} margin={{ top: 5, right: 30, left: 10, bottom: 20 }}>
+                  <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
                   <XAxis dataKey="name" fontSize={12} tickMargin={10} />
                   <YAxis fontSize={12} allowDecimals={false} />
                   <Tooltip 
                     formatter={(value: any) => [value, t("admin.dashboard.count")] as [any, any]}
                     contentStyle={{ borderRadius: '8px', border: '1px solid #e2e8f0', fontSize: '14px' }}
                   />
-                  <Bar dataKey="count" fill="#10b981" radius={[4, 4, 0, 0]} maxBarSize={40}>
-                    {stats.document_type_breakdown.map((_entry, index) => (
-                      <Cell key={`cell-${index}`} fill={["#3b82f6", "#10b981", "#8b5cf6", "#f59e0b", "#ec4899", "#14b8a6", "#6366f1"][index % 7]} />
-                    ))}
-                  </Bar>
-                </BarChart>
+                  <Line 
+                    type="monotone" 
+                    dataKey="count" 
+                    stroke="#10b981" 
+                    strokeWidth={3} 
+                    dot={{ r: 4, fill: "#10b981" }} 
+                    activeDot={{ r: 7 }} 
+                  />
+                </LineChart>
               </ResponsiveContainer>
             </div>
           </div>
         </div>
 
-        {/* Actionable Tables */}
-        <div className="mt-8 grid grid-cols-1 lg:grid-cols-2 gap-6 pb-12">
-          
-          {/* Failed Documents Alert */}
-          <div className="bg-card border-red-500/30 border-2 rounded-2xl overflow-hidden shadow-sm">
-            <div className="bg-red-500/10 px-4 py-3 border-b flex items-center gap-2">
-              <AlertCircle className="w-5 h-5 text-red-500" />
-              <h2 className="text-sm font-bold text-red-600">{t("admin.dashboard.failed_docs_title")}</h2>
-            </div>
-            <div className="p-0">
-              {stats.recent_failed_docs.length === 0 ? (
-                <p className="text-sm text-muted-foreground p-6 text-center">{t("admin.dashboard.failed_docs_healthy")}</p>
-              ) : (
-                <ul className="divide-y">
-                  {stats.recent_failed_docs.map(doc => (
-                    <li key={doc.id} className="p-4 hover:bg-muted/30 transition-colors">
-                      <p className="text-sm font-semibold truncate" title={doc.filename}>{doc.filename}</p>
-                      <p className="text-xs text-muted-foreground mt-1">{t("admin.dashboard.workspace")}: {doc.workspace_name}</p>
-                      <p className="text-xs text-red-500/80 mt-2 bg-red-500/10 p-2 rounded truncate" title={doc.error_message || ""}>
-                        {doc.error_message || t("workers.unknown")}
-                      </p>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          </div>
-
-          {/* Pending Approvals */}
-          <div className="bg-card border-amber-500/30 border-2 rounded-2xl overflow-hidden shadow-sm">
-            <div className="bg-amber-500/10 px-4 py-3 border-b flex items-center gap-2">
-              <Clock className="w-5 h-5 text-amber-500" />
-              <h2 className="text-sm font-bold text-amber-600">{t("admin.dashboard.pending_approvals_title")}</h2>
-            </div>
-            <div className="p-0">
-              {stats.pending_approvals.length === 0 ? (
-                <p className="text-sm text-muted-foreground p-6 text-center">{t("admin.dashboard.no_pending_users")}</p>
-              ) : (
-                <ul className="divide-y">
-                  {stats.pending_approvals.map(user => (
-                    <li key={user.user_id} className="p-4 flex items-center justify-between hover:bg-muted/30 transition-colors">
-                      <div className="overflow-hidden">
-                        <p className="text-sm font-semibold truncate" title={user.email}>{user.email}</p>
-                        <p className="text-xs text-muted-foreground mt-1 truncate">Tenant: {user.tenant_name} • {t("common.role")}: {user.role}</p>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          </div>
-        </div>
 
       </div>
     </div>

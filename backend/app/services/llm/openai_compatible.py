@@ -110,14 +110,12 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         oai_msgs = _to_openai_messages(messages, system_prompt)
         try:
             client = self._sync_client()
-            # Qwen3 vLLM: control thinking via extra_body
-            extra_body = {"enable_thinking": think} if not think else {}
             response = client.chat.completions.create(
                 model=self._model,
                 messages=oai_msgs,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                extra_body=extra_body or None,
+                extra_body={"chat_template_kwargs": {"enable_thinking": think}},
             )
             content = response.choices[0].message.content or ""
             content = self._strip_think(content)
@@ -138,14 +136,12 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         oai_msgs = _to_openai_messages(messages, system_prompt)
         try:
             client = self._async_client()
-            # Qwen3 vLLM: control thinking via extra_body
-            extra_body = {"enable_thinking": think} if not think else {}
             response = await client.chat.completions.create(
                 model=self._model,
                 messages=oai_msgs,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                extra_body=extra_body or None,
+                extra_body={"chat_template_kwargs": {"enable_thinking": think}},
             )
             content = response.choices[0].message.content or ""
             content = self._strip_think(content)
@@ -174,9 +170,8 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         )
         if tools:
             kwargs["tools"] = tools
-        # Qwen3 vLLM: disable thinking by default unless caller explicitly requests it
-        if not think:
-            kwargs["extra_body"] = {"enable_thinking": False}
+        # Qwen3.5 vLLM: use chat_template_kwargs to control thinking
+        kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": think}}
 
         try:
             client = self._async_client()
@@ -216,6 +211,13 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                     continue
 
                 content = delta.content or ""
+                # vLLM streams reasoning via delta.reasoning (Qwen3.5 thinking mode)
+                reasoning = getattr(delta, "reasoning", None) or ""
+
+                # Yield reasoning chunks first (before content in same delta)
+                if reasoning:
+                    yield StreamChunk(type="thinking", text=reasoning)
+
                 if not content:
                     continue
 
@@ -234,7 +236,8 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                         yield StreamChunk(type="thinking", text=think_buffer)
                         think_buffer = ""
                         in_think = False
-                        content = after_end
+                        # Terminator often followed by \n\n, strip it
+                        content = after_end.lstrip("\n ")
                     else:
                         think_buffer += content
                         yield StreamChunk(type="thinking", text=content)
@@ -247,12 +250,19 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                     if "</think>" in rest:
                         think_part, after = rest.split("</think>", 1)
                         yield StreamChunk(type="thinking", text=think_part)
-                        content = after
+                        content = after.lstrip("\n ")
                     else:
                         think_buffer = rest
                         in_think = True
                         yield StreamChunk(type="thinking", text=rest)
                         continue
+                elif "</think>" in content:
+                    # Model starts thinking without <think> tag but we found the end marker
+                    before, after = content.split("</think>", 1)
+                    if before:
+                        yield StreamChunk(type="thinking", text=before)
+                    content = after.lstrip("\n ")
+
 
                 # Handle <tool_call>...</tool_call> XML tags (Qwen-style)
                 if in_tool_call:

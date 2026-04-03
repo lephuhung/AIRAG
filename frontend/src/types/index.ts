@@ -509,6 +509,26 @@ export interface WorkerHealthCheck {
       documents_in_progress: number;
       documents_failed: number;
     };
+    llm_services: {
+      ocr: {
+        status: string;
+        model?: string;
+        error?: string;
+        url?: string;
+      };
+      memory: {
+        status: string;
+        model?: string;
+        error?: string;
+        url?: string;
+      };
+      main_llm: {
+        status: string;
+        model?: string;
+        error?: string;
+        url?: string;
+      };
+    };
   };
 }
 

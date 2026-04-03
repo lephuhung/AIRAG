@@ -170,14 +170,42 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
   }, []);
 
   const onToken = useCallback((text: string) => {
-    bufferRef.current += text;
-    if (!rafRef.current) {
-      rafRef.current = requestAnimationFrame(() => {
-        const chunk = bufferRef.current;
-        bufferRef.current = "";
-        rafRef.current = undefined;
-        setStreamingContent((prev) => prev + chunk);
-      });
+    // Check for delimiter to separate thinking from answer (safety net for leaked tags)
+    const fullText = bufferRef.current + text;
+    const delimiter = "</think>\n\n";
+    const delimIndex = fullText.indexOf(delimiter);
+
+    if (delimIndex !== -1) {
+      // Transition point found in the middle of a token stream!
+      const thinkingPart = fullText.slice(0, delimIndex);
+      const answerPart = fullText.slice(delimIndex + delimiter.length);
+
+      if (thinkingPart) onThinkingToken(thinkingPart);
+      
+      // Flush answer chunk
+      bufferRef.current = answerPart;
+      if (answerPart && !rafRef.current) {
+        rafRef.current = requestAnimationFrame(() => {
+          const chunk = bufferRef.current;
+          bufferRef.current = "";
+          rafRef.current = undefined;
+          setStreamingContent((prev) => prev + chunk);
+        });
+      }
+    } else {
+      // No delimiter found. 
+      // If the text starts with "<think" but hasn't finished, we might want to treat it as thinking.
+      // But for now, we'll assume that if it's sent as a 'token' event, it's answer content 
+      // UNLESS it's very clearly thinking (which we'd detect above).
+      bufferRef.current += text;
+      if (!rafRef.current) {
+        rafRef.current = requestAnimationFrame(() => {
+          const chunk = bufferRef.current;
+          bufferRef.current = "";
+          rafRef.current = undefined;
+          setStreamingContent((prev) => prev + chunk);
+        });
+      }
     }
   }, []);
 
@@ -425,13 +453,13 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
                     break;
 
                   case "complete": {
+                    // Strip  markers from streamed answer (defensive — in case backend didn't strip)
+                    const cleanAnswer = (streamingContent || data.answer || "").replace(/<\/think>\s*/g, "").trim();
                     // Flush remaining buffer
-                    if (bufferRef.current) {
-                      bufferRef.current = "";
-                      if (rafRef.current) {
-                        cancelAnimationFrame(rafRef.current);
-                        rafRef.current = undefined;
-                      }
+                    bufferRef.current = "";
+                    if (rafRef.current) {
+                      cancelAnimationFrame(rafRef.current);
+                      rafRef.current = undefined;
                     }
                     // Flush accumulated thinking into localSteps so finalMessage.agentSteps has thinkingText
                     if (thinkingAccumulator) {
@@ -466,7 +494,7 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
                     finalMessage = {
                       id: localAiMessageId || crypto.randomUUID(),
                       role: "assistant",
-                      content: data.answer || "",
+                      content: cleanAnswer,
                       sources: localSources, // use accumulated sources, backend complete event omits them
                       relatedEntities: data.related_entities || [],
                       imageRefs: localImages,

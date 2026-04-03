@@ -160,7 +160,7 @@ async def stream_agent_to_sse(
                 yield _sse("token", {"text": text})
 
             elif ev_type == "thinking":
-                yield _sse("thinking", {"text": item[1]})
+                yield _sse("thinking", item[1])
 
             elif ev_type == "potential_abbreviations":
                 all_potentials = item[1]

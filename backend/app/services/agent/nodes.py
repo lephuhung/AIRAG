@@ -25,12 +25,34 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from app.services.agent.state import AgentState
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------------
+
+def strip_thinking_tags(text: str) -> str:
+    """
+    Remove <think>...</think> or <thought>...</thought> tags and their content
+    from a string. Acts as a safety net if the provider fails to strip them.
+    Case-insensitive.
+    """
+    if not text:
+        return ""
+    # Strip both <think> and <thought> tags and their contents
+    # Case-insensitive, dotall for multiline thinking. 
+    # Use \s* at start and end to catch associated newlines.
+    cleaned = re.sub(r"\s*<(think|thought)>[\s\S]*?<\/\1>\s*", "\n", text, flags=re.IGNORECASE)
+    # Also catch unclosed tags at the end of the string
+    cleaned = re.sub(r"\s*<(think|thought)>[\s\S]*$", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
 
 # ---------------------------------------------------------------------------
 # Intent classifier system prompt — for Qwen3-4B
@@ -777,17 +799,17 @@ async def answer_generator(state: "AgentState") -> dict:
             "Nhiệm vụ: Đọc dữ liệu hồ sơ người dân bên dưới và trình bày lại "
             "NGẮN GỌN, SẠCH SẼ, DỄ ĐỌC bằng TIẾNG VIỆT.\n\n"
             "QUY TẮC BẮT BUỘC:\n"
-            "1. LIỆT KÊ ĐỦ VÀ ĐÚNG TẤT CẢ các kết quả có trong dữ liệu. "
-            "Nếu có 4 người → phải trình bày đủ 4 người. Không được bỏ bớt.\n"
-            "2. Mỗi người = 1 block riêng, có tiêu đề tên.\n"
-            "3. Chỉ dùng thông tin CÓ TRONG dữ liệu. Không bịa, không thêm, không suy đoán.\n"
-            "4. Bỏ qua các trường không có giá trị (để trống/null).\n"
-            "5. Dùng gạch đầu dòng (•) cho các trường có dữ liệu.\n"
-            "6. KHÔNG dùng ký hiệu [xxx] hay ObjectId trong câu trả lời.\n"
+            "1. Mỗi hồ sơ = 1 KHỐI riêng biệt, bắt đầu bởi 1., 2., 3., ...\n"
+            "2. Mỗi khối cách nhau bằng MỘT DÒNG TRỐNG.\n"
+            "3. Dòng đầu là tiêu đề (in đậm).\n"
+            "4. Mỗi thông tin nằm trên 1 dòng riêng, có dấu ';'.\n"
+            "5. KHÔNG viết nhiều thông tin trên cùng một dòng.\n"
+            "6. KHÔNG dùng ký hiệu [xxx] hay ObjectId trong câu trả lời..\n"
+            "7. Bỏ qua field rỗng/null.\n"
         )
         format_user = (
             f"Dữ liệu truy vấn:\n{mongo_context}\n\n"
-            "Hãy trình bày lại đẹp hơn cho người dùng."
+            "Hãy trình bày lại dữ liệu dễ đọc cho người dùng."
         )
 
         mongo_messages = [_LLMMsg(role="system", content=format_system)]
@@ -993,7 +1015,7 @@ async def answer_generator(state: "AgentState") -> dict:
             answer_parts.append(error_msg)
             await push_event(state, "token", error_msg)
 
-    final_answer = "".join(answer_parts)
+    final_answer = strip_thinking_tags("".join(answer_parts))
 
     # Nếu không tìm thấy tài liệu và có từ viết tắt tiềm năng -> gợi ý thêm
     is_not_found = "không tìm thấy tài liệu phù hợp câu hỏi" in [s.lower() for s in kg_summaries]
@@ -1095,7 +1117,7 @@ async def direct_answer(state: "AgentState") -> dict:
             answer_parts.append(greeting)
             await push_event(state, "token", greeting)
 
-    return {"final_answer": "".join(answer_parts)}
+    return {"final_answer": strip_thinking_tags("".join(answer_parts))}
 
 
 # ---------------------------------------------------------------------------
