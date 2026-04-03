@@ -53,14 +53,9 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle, isNarrow }: 
   const [workspacesExpanded, setWorkspacesExpanded] = useState(true);
   const [deleteConfirmId, setDeleteConfirmId] = useState<string | null>(null);
 
-  const handleNewSession = async (e: React.MouseEvent) => {
+  const handleNewSession = (e: React.MouseEvent) => {
     e.stopPropagation();
-    try {
-      const newSession = await createSession.mutateAsync({ title: t("nav.new_chat") });
-      navigate(`/chat/${newSession.id}`);
-    } catch (error) {
-      toast.error(t("chat.create_failed"));
-    }
+    navigate("/chat");
   };
 
   const handleDeleteSession = (e: React.MouseEvent, id: string) => {
@@ -134,7 +129,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle, isNarrow }: 
           disabled={createSession.isPending}
           className={cn(
             "w-full flex items-center justify-between px-2.5 py-2 rounded-lg text-sm transition-colors group",
-            isChatPage && !location.pathname.match(/\/chat\/\d+/)
+            location.pathname === "/chat"
               ? "bg-primary/10 text-primary font-medium"
               : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
             createSession.isPending && "opacity-70 cursor-not-allowed"

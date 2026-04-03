@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo, memo, createContext, useContext, Children, isValidElement, type ReactNode } from "react";
 import { createPortal } from "react-dom";
+import { useNavigate } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { motion, AnimatePresence } from "framer-motion";
 import ReactMarkdown from "react-markdown";
@@ -84,6 +85,7 @@ import { useDocument } from "@/hooks/useDocuments";
 import { useChatHistory } from "@/hooks/useChatHistory";
 import { useRAGChatStream } from "@/hooks/useRAGChatStream";
 import { useTranslation } from "@/hooks/useTranslation";
+import { useCreateChatSession } from "@/hooks/useChatSessions";
 import { useCreateAbbreviation } from "@/hooks/useAbbreviations";
 import { AbbreviationModal } from "@/components/rag/AbbreviationModal";
 import { StreamingMarkdown } from "@/components/rag/MemoizedMarkdown";
@@ -808,9 +810,20 @@ function ImageRefsPanel({ images }: { images: ChatImageRef[] }) {
 // ---------------------------------------------------------------------------
 // Thinking panel — collapsible violet-themed thinking process display
 // ---------------------------------------------------------------------------
-function PremiumThinking({ thinking, isStreaming }: { thinking: string, isStreaming?: boolean }) {
+function PremiumThinking({ thinking, isStreaming, hasContent }: { thinking: string; isStreaming?: boolean; hasContent?: boolean }) {
   const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(isStreaming || false);
+  const [expanded, setExpanded] = useState(isStreaming && !hasContent);
+
+  // Auto-collapse when reasoning is done and answer starts
+  useEffect(() => {
+    if (isStreaming) {
+      if (thinking && !hasContent) {
+        setExpanded(true);
+      } else if (hasContent) {
+        setExpanded(false);
+      }
+    }
+  }, [isStreaming, !!thinking, hasContent]);
 
   if (!thinking) return null;
 
@@ -1232,6 +1245,7 @@ const MessageBubble = memo(function MessageBubble({
           <PremiumThinking 
             thinking={message.thinking || message.agentSteps?.find(s => s.thinkingText)?.thinkingText || ""} 
             isStreaming={message.isStreaming}
+            hasContent={!!message.content}
           />
         )}
 
@@ -1547,32 +1561,39 @@ export const ChatPanel = memo(function ChatPanel({
   sessionTitle,
 }: ChatPanelProps) {
   const { t } = useTranslation();
+  const navigate = useNavigate();
+  const createSession = useCreateChatSession();
   const { user } = useAuthStore();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState(() => {
-    if (!sessionId) return "";
+    if (!sessionId) return localStorage.getItem("hrag-draft-new") || "";
     return localStorage.getItem(`hrag-draft-${sessionId}`) || "";
   });
   const [enableThinking, setEnableThinking] = useState(true);
   const [thinkingDefaultSynced, setThinkingDefaultSynced] = useState(false);
+  const skipResetRef = useRef(false);
 
   const [forceSearch, setForceSearch] = useState(false);
 
   // Reset session state when switching chats/starting a new chat
   useEffect(() => {
+    if (skipResetRef.current) {
+      skipResetRef.current = false;
+      return;
+    }
     setMessages([]);
-    const savedDraft = sessionId ? localStorage.getItem(`hrag-draft-${sessionId}`) : "";
-    setInput(savedDraft || "");
+    const key = sessionId ? `hrag-draft-${sessionId}` : "hrag-draft-new";
+    const savedDraft = localStorage.getItem(key) || "";
+    setInput(savedDraft);
   }, [sessionId]);
 
   // Persist draft to localStorage
   useEffect(() => {
-    if (sessionId) {
-      if (input.trim()) {
-        localStorage.setItem(`hrag-draft-${sessionId}`, input);
-      } else {
-        localStorage.removeItem(`hrag-draft-${sessionId}`);
-      }
+    const key = sessionId ? `hrag-draft-${sessionId}` : "hrag-draft-new";
+    if (input.trim()) {
+      localStorage.setItem(key, input);
+    } else {
+      localStorage.removeItem(key);
     }
   }, [sessionId, input]);
 
@@ -1906,7 +1927,8 @@ export const ChatPanel = memo(function ChatPanel({
         m.imageRefs === newImages &&
         m.thinking === newThinking &&
         m.agentSteps === newSteps &&
-        m.potential_abbreviations === newPotentials
+        m.potential_abbreviations === newPotentials &&
+        m.isStreaming === stream.isStreaming
       ) {
         return prev; // no change → skip setMessages re-render
       }
@@ -1920,6 +1942,7 @@ export const ChatPanel = memo(function ChatPanel({
         thinking: newThinking,
         agentSteps: newSteps,
         potential_abbreviations: newPotentials,
+        isStreaming: stream.isStreaming,
       };
       return updated;
     });
@@ -1929,6 +1952,19 @@ export const ChatPanel = memo(function ChatPanel({
     async (text?: string) => {
       const msg = (text || input).trim();
       if (!msg || stream.isStreaming) return;
+
+      let effectiveSessionId = sessionId;
+      if (!effectiveSessionId) {
+        try {
+          const newSession = await createSession.mutateAsync({ title: msg.slice(0, 30) || t("nav.new_chat") });
+          effectiveSessionId = newSession.id;
+          skipResetRef.current = true;
+          navigate(`/chat/${newSession.id}`, { replace: true });
+        } catch (err: any) {
+          toast.error(t("chat.create_failed"));
+          return;
+        }
+      }
 
       const userMsg: ChatMessage = {
         id: crypto.randomUUID(),
@@ -1964,6 +2000,7 @@ export const ChatPanel = memo(function ChatPanel({
         history,
         thinkingSupported && enableThinking,
         forceSearch,
+        effectiveSessionId || undefined
       );
 
       // Finalize the streaming message (prefer finalMsg.agentSteps — directly from SSE loop,
@@ -2013,7 +2050,7 @@ export const ChatPanel = memo(function ChatPanel({
       }
       streamingMsgIdRef.current = null;
     },
-    [input, messages, stream, thinkingSupported, enableThinking, forceSearch, scrollUserMsgToTop],
+    [input, messages, stream, thinkingSupported, enableThinking, forceSearch, scrollUserMsgToTop, sessionId, navigate, createSession, t],
   );
 
   const handleKeyDown = (e: React.KeyboardEvent) => {

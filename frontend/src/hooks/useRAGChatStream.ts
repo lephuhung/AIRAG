@@ -47,6 +47,7 @@ export interface RAGStreamResult {
     history: { role: string; content: string }[],
     enableThinking: boolean,
     forceSearch?: boolean,
+    overrideSessionId?: string,
   ) => Promise<ChatMessage | null>;
   /** Cancel ongoing stream */
   cancel: () => void;
@@ -245,6 +246,7 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
       history: { role: string; content: string }[],
       enableThinking: boolean,
       forceSearch: boolean = false,
+      overrideSessionId?: string,
     ): Promise<ChatMessage | null> => {
       // Reset state for new message
       setStreamingContent("");
@@ -282,7 +284,8 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
       abortRef.current = new AbortController();
 
       try {
-        if (!sessionId) throw new Error("No active chat session.");
+        const sid = overrideSessionId || sessionId;
+        if (!sid) throw new Error("No active chat session.");
         const token = useAuthStore.getState().token;
         const headers: Record<string, string> = {
           "Content-Type": "application/json",
@@ -292,7 +295,7 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
         }
 
         const response = await fetch(
-          `${BASE_URL}/rag/chat/sessions/${sessionId}/stream`,
+          `${BASE_URL}/rag/chat/sessions/${sid}/stream`,
           {
             method: "POST",
             headers,
