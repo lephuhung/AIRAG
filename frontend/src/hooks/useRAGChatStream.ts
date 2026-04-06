@@ -48,6 +48,7 @@ export interface RAGStreamResult {
     enableThinking: boolean,
     forceSearch?: boolean,
     overrideSessionId?: string,
+    documentIds?: string[],
   ) => Promise<ChatMessage | null>;
   /** Cancel ongoing stream */
   cancel: () => void;
@@ -247,6 +248,7 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
       enableThinking: boolean,
       forceSearch: boolean = false,
       overrideSessionId?: string,
+      documentIds?: string[],
     ): Promise<ChatMessage | null> => {
       // Reset state for new message
       setStreamingContent("");
@@ -304,6 +306,7 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
               history,
               enable_thinking: enableThinking,
               force_search: forceSearch,
+              document_ids: documentIds,
             }),
             signal: abortRef.current.signal,
           },

@@ -82,7 +82,9 @@ async def search_documents_node(state: AgentRagState) -> AgentRagState:
             return state
         last_message = messages[-1]
         query = (
-            last_message.content if hasattr(last_message, "content") else str(last_message)
+            last_message.content
+            if hasattr(last_message, "content")
+            else str(last_message)
         )
 
     workspace_ids = state.workspace_ids
@@ -95,6 +97,7 @@ async def search_documents_node(state: AgentRagState) -> AgentRagState:
                 # Fallback: load all workspaces
                 from sqlalchemy import select
                 from app.models.knowledge_base import KnowledgeBase as Workspace
+
                 result = await db.execute(select(Workspace))
                 workspaces = result.scalars().all()
                 workspace_ids = [ws.id for ws in workspaces]
@@ -115,6 +118,7 @@ async def search_documents_node(state: AgentRagState) -> AgentRagState:
                 top_k=8,
                 db=db,
                 existing_ids=set(),
+                document_ids=list(state.document_ids) if state.document_ids else None,
             )
 
             state.sources = [s.model_dump() for s in sources]
@@ -196,7 +200,9 @@ async def summarize_document_node(state: AgentRagState) -> AgentRagState:
     if not query and state.messages:
         last_message = state.messages[-1]
         query = (
-            last_message.content if hasattr(last_message, "content") else str(last_message)
+            last_message.content
+            if hasattr(last_message, "content")
+            else str(last_message)
         )
 
     if not query:
@@ -210,7 +216,11 @@ async def summarize_document_node(state: AgentRagState) -> AgentRagState:
         doc_id_match = re.search(r"\b(\d+)\b", query, re.IGNORECASE)
         if not doc_id_match and state.messages:
             last_message = state.messages[-1]
-            raw_msg = last_message.content if hasattr(last_message, "content") else str(last_message)
+            raw_msg = (
+                last_message.content
+                if hasattr(last_message, "content")
+                else str(last_message)
+            )
             doc_id_match = re.search(
                 r"(?:doc|document|tài liệu)[^\d]*(\d+)", raw_msg, re.IGNORECASE
             )
@@ -337,11 +347,15 @@ async def search_doc_num_node(state: AgentRagState) -> AgentRagState:
             return state
         last_message = messages[-1]
         query = (
-            last_message.content if hasattr(last_message, "content") else str(last_message)
+            last_message.content
+            if hasattr(last_message, "content")
+            else str(last_message)
         )
 
     # 1. Regex to extract the pure document number, ignoring chatty words
-    doc_num_match = re.search(r"([a-zA-Z0-9ĐẮẰẶẤẦẨẪẬẮẶẪẨẦ_]+/[A-Za-z0-9ĐẮẰẶẤẦẨẪẬẮẶẪẨẦ_\-]+)", query)
+    doc_num_match = re.search(
+        r"([a-zA-Z0-9ĐẮẰẶẤẦẨẪẬẮẶẪẨẦ_]+/[A-Za-z0-9ĐẮẰẶẤẦẨẪẬẮẶẪẨẦ_\-]+)", query
+    )
     search_term = doc_num_match.group(1) if doc_num_match else query.strip()
 
     try:
@@ -380,36 +394,51 @@ async def search_doc_num_node(state: AgentRagState) -> AgentRagState:
             if not docs:
                 # 4. Fallback: No metadata match -> Vector Search Fallback
                 import logging
+
                 logger = logging.getLogger(__name__)
-                logger.info(f"[search_doc_num_node] Không tìm thấy metadata cho '{search_term}'. Chuyển sang tìm kiếm vector.")
-                state.rewritten_query = search_term  # Optional: constrain vector search to pure term
+                logger.info(
+                    f"[search_doc_num_node] Không tìm thấy metadata cho '{search_term}'. Chuyển sang tìm kiếm vector."
+                )
+                state.rewritten_query = (
+                    search_term  # Optional: constrain vector search to pure term
+                )
                 return await search_documents_node(state)
             else:
                 # 3. Found document -> Inject S3 Markdown Content directly into state for LLM
                 from app.services.storage_service import get_storage_service
+
                 doc = docs[0]
                 doc_title = doc.document_number or doc.original_filename
-                
+
                 content_text = ""
                 if doc.markdown_s3_key:
                     try:
                         storage = get_storage_service()
-                        markdown_text = await storage.download_markdown(doc.markdown_s3_key)
-                        
+                        markdown_text = await storage.download_markdown(
+                            doc.markdown_s3_key
+                        )
+
                         MAX_CHARS = 16000
                         content_text = markdown_text[:MAX_CHARS]
                         if len(markdown_text) > MAX_CHARS:
                             content_text += "\n\n[... nội dung đã được cắt bớt ...]"
                     except Exception as e:
                         import logging
+
                         logger = logging.getLogger(__name__)
-                        logger.error(f"[search_doc_num_node] Lỗi tải markdown từ S3 cho '{doc_title}': {e}")
-                        content_text = f"Không thể tải chi tiết nội dung từ hệ thống lưu trữ: {e}"
+                        logger.error(
+                            f"[search_doc_num_node] Lỗi tải markdown từ S3 cho '{doc_title}': {e}"
+                        )
+                        content_text = (
+                            f"Không thể tải chi tiết nội dung từ hệ thống lưu trữ: {e}"
+                        )
                 else:
-                    content_text = "Tài liệu này chưa được trích xuất nội dung chữ Markdown."
+                    content_text = (
+                        "Tài liệu này chưa được trích xuất nội dung chữ Markdown."
+                    )
 
                 state.final_answer = f"Tài liệu tìm thấy: {doc_title}\n\nNội dung chi tiết:\n{content_text}"
-            
+
             break
     except Exception as e:
         state.final_answer = f"Lỗi: {str(e)}"
@@ -437,9 +466,13 @@ async def search_abbr_node(state: AgentRagState) -> AgentRagState:
             return state
         last_message = messages[-1]
         raw_query = (
-            last_message.content if hasattr(last_message, "content") else str(last_message)
+            last_message.content
+            if hasattr(last_message, "content")
+            else str(last_message)
         )
-        abbr_match = re.search(r"(?:abbr|viết tắt của)[:\s]+(\w+)", raw_query, re.IGNORECASE)
+        abbr_match = re.search(
+            r"(?:abbr|viết tắt của)[:\s]+(\w+)", raw_query, re.IGNORECASE
+        )
         if abbr_match:
             search_term = abbr_match.group(1)
         else:
@@ -520,19 +553,25 @@ async def mongo_search_people_node(state: AgentRagState) -> AgentRagState:
     try:
         if intent == "mongo_search_cccd":
             result = await search_by_cccd(query)
-            logger.warning(f"[mongo_search_people_node] cccd result: found={result.get('found')}, persons={len(result.get('persons', []))}")
+            logger.warning(
+                f"[mongo_search_people_node] cccd result: found={result.get('found')}, persons={len(result.get('persons', []))}"
+            )
             state.mongo_results = result.get("persons", [])
             state.final_answer = result.get("display", "")
 
         elif intent == "mongo_search_name":
             result = await search_by_name(query, limit=10)
-            logger.warning(f"[mongo_search_people_node] name result: found={result.get('found')}, persons={len(result.get('persons', []))}")
+            logger.warning(
+                f"[mongo_search_people_node] name result: found={result.get('found')}, persons={len(result.get('persons', []))}"
+            )
             state.mongo_results = result.get("persons", [])
             state.final_answer = result.get("display", "")
 
         elif intent == "mongo_search_bhxh":
             result = await search_by_bhxh(query)
-            logger.warning(f"[mongo_search_people_node] bhxh result: found={result.get('found')}, persons={len(result.get('persons', []))}")
+            logger.warning(
+                f"[mongo_search_people_node] bhxh result: found={result.get('found')}, persons={len(result.get('persons', []))}"
+            )
             state.mongo_results = result.get("persons", [])
             state.final_answer = result.get("display", "")
 

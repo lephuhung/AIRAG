@@ -1,6 +1,7 @@
 """
 ChatSession model — groups chat messages into distinct conversation sessions across workspaces.
 """
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -23,7 +24,10 @@ class ChatSession(Base):
 
     # User who owns this chat session
     user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -36,11 +40,17 @@ class ChatSession(Base):
         "ChatMessage",
         back_populates="session",
         cascade="all, delete-orphan",
-        order_by="ChatMessage.created_at"
+        order_by="ChatMessage.created_at",
     )
     exchange_summaries: Mapped[list["ExchangeSummary"]] = relationship(
         "ExchangeSummary",
         back_populates="session",
         cascade="all, delete-orphan",
-        order_by="ExchangeSummary.exchange_index"
+        order_by="ExchangeSummary.exchange_index",
+    )
+    chat_files: Mapped[list["ChatFile"]] = relationship(
+        "ChatFile",
+        back_populates="session",
+        cascade="all, delete-orphan",
+        order_by="ChatFile.created_at",
     )

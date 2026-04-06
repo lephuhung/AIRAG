@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { useTranslation } from "@/hooks/useTranslation";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
-import { useWorkspaces, useCreateWorkspace, useDeleteWorkspace, useUpdateWorkspace } from "@/hooks/useWorkspaces";
+import { useWorkspaces, useCreateWorkspace, useDeleteWorkspace, useUpdateWorkspace, useSetDefaultWorkspace } from "@/hooks/useWorkspaces";
 import { useMyTenants } from "@/hooks/useMyTenants";
 import { useAdminTenants } from "@/hooks/useAdminTenants";
 import { useAuthStore } from "@/stores/authStore";
@@ -21,6 +21,7 @@ import {
   User,
   ChevronDown,
   Edit,
+  Star,
 } from "lucide-react";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { cn } from "@/lib/utils";
@@ -40,6 +41,7 @@ export function KnowledgeBasesPage() {
   const createWorkspace = useCreateWorkspace();
   const deleteWorkspace = useDeleteWorkspace();
   const updateWorkspace = useUpdateWorkspace();
+  const setDefaultWorkspace = useSetDefaultWorkspace();
   const [showNewWorkspace, setShowNewWorkspace] = useState(false);
   const [newWorkspaceName, setNewWorkspaceName] = useState("");
   const [newVisibility, setNewVisibility] = useState<VisibilityOption>("personal");
@@ -158,7 +160,15 @@ export function KnowledgeBasesPage() {
               <Database className="w-4 h-4 text-blue-500" />
             </div>
             <div className="min-w-0">
-              <h3 className="font-medium text-sm truncate">{ws.name}</h3>
+              <div className="flex items-center gap-1.5">
+                <h3 className="font-medium text-sm truncate">{ws.name}</h3>
+                {ws.is_default && (
+                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
+                    <Star className="w-2.5 h-2.5 fill-amber-500" />
+                    {t("kb.default")}
+                  </span>
+                )}
+              </div>
               {ws.description && (
                 <p className="text-xs text-muted-foreground truncate mt-0.5">
                   {ws.description}
@@ -177,7 +187,7 @@ export function KnowledgeBasesPage() {
               <MoreHorizontal className="w-4 h-4" />
             </button>
             {openMenu === ws.id && (
-              <div className="absolute right-0 top-8 z-20 bg-card border rounded-lg shadow-lg py-1 w-32">
+              <div className="absolute right-0 top-8 z-20 bg-card border rounded-lg shadow-lg py-1 w-40">
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
@@ -189,6 +199,24 @@ export function KnowledgeBasesPage() {
                   <Edit className="w-3.5 h-3.5" />
                   {t("common.edit")}
                 </button>
+                {ws.visibility === "personal" && !ws.is_default && (
+                  <button
+                    onClick={async (e) => {
+                      e.stopPropagation();
+                      setOpenMenu(null);
+                      try {
+                        await setDefaultWorkspace.mutateAsync(ws.id);
+                        toast.success(t("kb.set_default_success"));
+                      } catch {
+                        toast.error(t("kb.set_default_failed"));
+                      }
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-1.5 text-sm hover:bg-muted transition-colors"
+                  >
+                    <Star className="w-3.5 h-3.5" />
+                    {t("kb.set_default")}
+                  </button>
+                )}
                 <button
                   onClick={(e) => {
                     e.stopPropagation();

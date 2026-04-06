@@ -4,6 +4,7 @@ import {
   Presentation, 
   FileCode, 
   Hash, 
+  FileDigit,
   File,
   Clock,
   Loader2,
@@ -12,17 +13,21 @@ import {
 } from "lucide-react";
 import type { DocumentStatus } from "@/types";
 
-export const FILE_TYPE_CONFIG: Record<string, { icon: any; color: string }> = {
-  pdf:  { icon: FileText, color: "text-red-400" },
-  docx: { icon: FileType, color: "text-blue-400" },
-  pptx: { icon: Presentation, color: "text-orange-400" },
-  txt:  { icon: FileCode, color: "text-muted-foreground" },
-  md:   { icon: Hash, color: "text-purple-400" },
+export const FILE_TYPE_CONFIG: Record<string, { icon: any; color: string; bgColor: string }> = {
+  pdf:  { icon: FileText, color: "text-red-500", bgColor: "bg-red-500/10" },
+  docx: { icon: FileType, color: "text-blue-500", bgColor: "bg-blue-500/10" },
+  doc:  { icon: FileType, color: "text-blue-500", bgColor: "bg-blue-500/10" },
+  pptx: { icon: Presentation, color: "text-orange-500", bgColor: "bg-orange-500/10" },
+  ppt:  { icon: Presentation, color: "text-orange-500", bgColor: "bg-orange-500/10" },
+  txt:  { icon: FileCode, color: "text-zinc-500", bgColor: "bg-zinc-500/10" },
+  md:   { icon: Hash, color: "text-indigo-500", bgColor: "bg-indigo-500/10" },
+  xlsx: { icon: FileDigit, color: "text-emerald-500", bgColor: "bg-emerald-500/10" },
+  xls:  { icon: FileDigit, color: "text-emerald-500", bgColor: "bg-emerald-500/10" },
 };
 
 export function getFileConfig(fileType: string) {
   const ext = fileType.replace(".", "").toLowerCase();
-  return FILE_TYPE_CONFIG[ext] ?? { icon: File, color: "text-muted-foreground" };
+  return FILE_TYPE_CONFIG[ext] ?? { icon: File, color: "text-muted-foreground", bgColor: "bg-muted/15" };
 }
 
 export const STATUS_CONFIG: Record<DocumentStatus, { labelKey: string; className: string; icon: any }> = {

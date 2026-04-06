@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 # Utilities
 # ---------------------------------------------------------------------------
 
+
 def strip_thinking_tags(text: str) -> str:
     """
     Remove <think>...</think> or <thought>...</thought> tags and their content
@@ -47,12 +48,15 @@ def strip_thinking_tags(text: str) -> str:
     if not text:
         return ""
     # Strip both <think> and <thought> tags and their contents
-    # Case-insensitive, dotall for multiline thinking. 
+    # Case-insensitive, dotall for multiline thinking.
     # Use \s* at start and end to catch associated newlines.
-    cleaned = re.sub(r"\s*<(think|thought)>[\s\S]*?<\/\1>\s*", "\n", text, flags=re.IGNORECASE)
+    cleaned = re.sub(
+        r"\s*<(think|thought)>[\s\S]*?<\/\1>\s*", "\n", text, flags=re.IGNORECASE
+    )
     # Also catch unclosed tags at the end of the string
     cleaned = re.sub(r"\s*<(think|thought)>[\s\S]*$", "", cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
+
 
 # ---------------------------------------------------------------------------
 # Intent classifier system prompt — for Qwen3-4B
@@ -108,6 +112,8 @@ User: "doanh thu 2024 là bao nhiêu?" → {"intent": "search", "rewritten_query
 User: "an ninh mạng là gì?" → {"intent": "search", "rewritten_query": "định nghĩa an ninh mạng khái niệm", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "có tài liệu gì trong hệ thống?" → {"intent": "list_docs", "rewritten_query": "danh sách tài liệu", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "tóm tắt tài liệu ID 5" → {"intent": "summarize", "rewritten_query": "tóm tắt tài liệu 5", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "tóm tắt @quyche2024.pdf" → {"intent": "summarize", "rewritten_query": "tóm tắt @quyche2024.pdf", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "summarize @report.pdf" → {"intent": "summarize", "rewritten_query": "summarize @report.pdf", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "tìm văn bản số 60/QĐ-UBND giúp tôi" → {"intent": "search_doc_num", "rewritten_query": "60/QĐ-UBND", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "BMNN là gì?" → {"intent": "search_abbr", "rewritten_query": "BMNN", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "tìm người có CCCD 079203012345" → {"intent": "mongo_search_cccd", "rewritten_query": "079203012345", "needs_tool": true, "write_action": "", "text_input": ""}
@@ -172,7 +178,13 @@ def _parse_classifier_output(raw: str) -> dict:
         logger.warning(
             f"[classifier] Failed to parse JSON: {raw[:100]!r}, defaulting to search"
         )
-        return {"intent": "search", "rewritten_query": "", "needs_tool": True, "write_action": "", "text_input": ""}
+        return {
+            "intent": "search",
+            "rewritten_query": "",
+            "needs_tool": True,
+            "write_action": "",
+            "text_input": "",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -380,7 +392,10 @@ async def abbr_expander(state: "AgentState") -> dict:
     # Tìm tất cả token viết hoa liên tiếp có khả năng là viết tắt (2+ ký tự)
     # Loại trừ các token dính với dấu / hoặc - (như trong số hiệu văn bản 172/GM-UBND)
     import re
-    abbr_candidates = re.findall(r"(?<!/)(?<!-)\b[A-ZĐẮẰẶẤẦẨẪẬẮẶẪẨẦ]{2,}\b(?!/)(?!-)", user_message)
+
+    abbr_candidates = re.findall(
+        r"(?<!/)(?<!-)\b[A-ZĐẮẰẶẤẦẨẪẬẮẶẪẨẦ]{2,}\b(?!/)(?!-)", user_message
+    )
     if not abbr_candidates:
         return {}
 
@@ -423,10 +438,13 @@ async def abbr_expander(state: "AgentState") -> dict:
             await push_event(
                 state,
                 "status",
-                {"step": "searching", "detail": f"Mở rộng viết tắt: {expanded_message}"},
+                {
+                    "step": "searching",
+                    "detail": f"Mở rộng viết tắt: {expanded_message}",
+                },
             )
             updates["rewritten_query"] = expanded_message
-        
+
         if potential_abbreviations:
             updates["potential_abbreviations"] = potential_abbreviations
             await push_event(state, "potential_abbreviations", potential_abbreviations)
@@ -501,6 +519,7 @@ async def tool_executor(state: "AgentState") -> dict:
                 workspace_ids=workspace_ids,
                 existing_citation_ids=existing_ids,
                 db=db,
+                document_ids=state.get("document_ids"),
             )
             result_update["sources"] = tool_result["sources"]
             result_update["images"] = tool_result["images"]
@@ -516,38 +535,70 @@ async def tool_executor(state: "AgentState") -> dict:
             result_update["kg_summaries"] = [tool_result["text"]]
 
         elif intent == "summarize":
-            # Extract document ID from query if present, else use first doc
-            import re
+            # Check if document_ids is provided from @docname mentions or attached files
+            doc_ids_from_state = state.get("document_ids") or []
 
-            doc_id_match = re.search(
-                r"\b(?:id\s*[:=]?\s*)?(\d+)\b", query, re.IGNORECASE
-            )
-            doc_id = int(doc_id_match.group(1)) if doc_id_match else 0
-
-            if doc_id:
-                tool_result = await _tools.summarize_document(
-                    document_id=doc_id,
+            if doc_ids_from_state:
+                # Use get_documents_content to fetch raw markdown for the referenced docs
+                logger.info(
+                    f"[tool_executor] summarize with document_ids={doc_ids_from_state}"
+                )
+                tool_result = await _tools.get_documents_content(
+                    document_ids=doc_ids_from_state,
                     db=db,
                 )
-                result_update["kg_summaries"] = [tool_result["text"]]
+                # Combine all document contents into kg_summaries
+                doc_texts = []
+                for doc in tool_result.get("documents", []):
+                    if doc.get("content"):
+                        doc_texts.append(
+                            f"# {doc.get('filename', 'Document')}\n\n{doc.get('content')}"
+                        )
+                    elif doc.get("error"):
+                        doc_texts.append(
+                            f"# {doc.get('filename', 'Document')}\n\nLỗi: {doc.get('error')}"
+                        )
+
+                if doc_texts:
+                    result_update["kg_summaries"] = ["\n\n---\n\n".join(doc_texts)]
+                else:
+                    result_update["kg_summaries"] = [
+                        "Không tìm thấy nội dung tài liệu."
+                    ]
             else:
-                # Fallback to search if no doc ID found
-                logger.warning(
-                    "[tool_executor] summarize intent but no doc_id found — falling back to search"
-                )
-                from app.core.config import settings
+                # Fallback: extract document ID from query if present
+                import re
 
-                tool_result = await _tools.search_documents(
-                    query=query,
-                    top_k=settings.HRAG_RERANKER_TOP_K,
-                    workspace_ids=workspace_ids,
-                    existing_citation_ids=existing_ids,
-                    db=db,
+                doc_id_match = re.search(
+                    r"\b(?:id\s*[:=]?\s*)?(\d+)\b", query, re.IGNORECASE
                 )
-                result_update["sources"] = tool_result["sources"]
-                result_update["images"] = tool_result["images"]
-                result_update["image_parts"] = tool_result["image_parts"]
-                result_update["kg_summaries"] = tool_result["kg_summaries"]
+                doc_id = int(doc_id_match.group(1)) if doc_id_match else 0
+
+                if doc_id:
+                    tool_result = await _tools.summarize_document(
+                        document_id=doc_id,
+                        db=db,
+                    )
+                    result_update["kg_summaries"] = [tool_result["text"]]
+                else:
+                    # Fallback to search if no doc ID found
+                    logger.warning(
+                        "[tool_executor] summarize intent but no doc_id found — falling back to search"
+                    )
+                    from app.core.config import settings
+
+                    tool_result = await _tools.search_documents(
+                        query=query,
+                        top_k=settings.HRAG_RERANKER_TOP_K,
+                        workspace_ids=workspace_ids,
+                        existing_citation_ids=existing_ids,
+                        db=db,
+                        document_ids=state.get("document_ids"),
+                    )
+                    result_update["sources"] = tool_result["sources"]
+                    result_update["images"] = tool_result["images"]
+                    result_update["image_parts"] = tool_result["image_parts"]
+                    result_update["kg_summaries"] = tool_result["kg_summaries"]
 
         elif intent == "kg_query":
             tool_result = await _tools.query_knowledge_graph(
@@ -559,9 +610,12 @@ async def tool_executor(state: "AgentState") -> dict:
 
         elif intent == "search_doc_num":
             import re
+
             # Fallback: exact document number pattern extraction in case LLM outputs extra words
             # e.g., "thông tin về văn bản số 60/QĐ-UBND" -> "60/QĐ-UBND"
-            doc_num_match = re.search(r"([a-zA-Z0-9ĐẮẰẶẤẦẨẪẬẮẶẪẨẦ_]+/[A-Za-z0-9ĐẮẰẶẤẦẨẪẬẮẶẪẨẦ_\-]+)", query)
+            doc_num_match = re.search(
+                r"([a-zA-Z0-9ĐẮẰẶẤẦẨẪẬẮẶẪẨẦ_]+/[A-Za-z0-9ĐẮẰẶẤẦẨẪẬẮẶẪẨẦ_\-]+)", query
+            )
             clean_query = doc_num_match.group(1) if doc_num_match else query
 
             tool_result = await _tools.search_documents_number(
@@ -572,7 +626,7 @@ async def tool_executor(state: "AgentState") -> dict:
             docs = tool_result.get("documents", [])
             result_update["doc_numbers"] = docs
             result_update["tool_status"] = tool_result.get("status", "completed")
-            
+
             # Fetch markdown content for the matched document(s) so LLM can read it
             if docs:
                 # We take the best matched document
@@ -582,16 +636,20 @@ async def tool_executor(state: "AgentState") -> dict:
                 from sqlalchemy import select
                 from app.models.document import Document
                 from app.services.storage_service import get_storage_service
-                
-                result = await db.execute(select(Document).where(Document.id == target_doc_id))
+
+                result = await db.execute(
+                    select(Document).where(Document.id == target_doc_id)
+                )
                 doc = result.scalar_one_or_none()
-                
+
                 summary_text = ""
                 if doc and doc.markdown_s3_key:
                     try:
                         storage = get_storage_service()
-                        markdown_text = await storage.download_markdown(doc.markdown_s3_key)
-                        
+                        markdown_text = await storage.download_markdown(
+                            doc.markdown_s3_key
+                        )
+
                         MAX_CHARS = 16000
                         summary_text = markdown_text[:MAX_CHARS]
                         if len(markdown_text) > MAX_CHARS:
@@ -601,10 +659,10 @@ async def tool_executor(state: "AgentState") -> dict:
                         summary_text = "Lỗi hệ thống khi tải nội dung văn bản."
                 else:
                     summary_text = "Tài liệu này chưa có nội dung markdown hoặc chưa được lập chỉ mục."
-                
+
                 if "kg_summaries" not in result_update:
                     result_update["kg_summaries"] = []
-                    
+
                 result_update["kg_summaries"].append(
                     f"Nội dung chi tiết của văn bản {doc_num}:\n{summary_text}"
                 )
@@ -612,26 +670,34 @@ async def tool_executor(state: "AgentState") -> dict:
                 # Metadata match failed. The document number might only exist within the file contents.
                 # Fallback to full-text vector search to retrieve the document chunks!
                 from app.core.config import settings
-                logger.info(f"[search_doc_num] Không tìm thấy metadata cho '{clean_query.strip()}'. Chuyển sang tìm kiếm vector.")
-                
+
+                logger.info(
+                    f"[search_doc_num] Không tìm thấy metadata cho '{clean_query.strip()}'. Chuyển sang tìm kiếm vector."
+                )
+
                 fallback_result = await _tools.search_documents(
                     query=clean_query.strip(),
                     top_k=settings.HRAG_RERANKER_TOP_K,
                     workspace_ids=workspace_ids,
                     existing_citation_ids=existing_ids,
                     db=db,
+                    document_ids=state.get("document_ids"),
                 )
-                
+
                 result_update["sources"] = fallback_result.get("sources", [])
                 result_update["images"] = fallback_result.get("images", [])
                 result_update["image_parts"] = fallback_result.get("image_parts", [])
-                
+
                 if "kg_summaries" not in result_update:
                     result_update["kg_summaries"] = []
-                result_update["kg_summaries"].extend(fallback_result.get("kg_summaries", []))
-                
+                result_update["kg_summaries"].extend(
+                    fallback_result.get("kg_summaries", [])
+                )
+
                 if not result_update["sources"] and not result_update["kg_summaries"]:
-                    result_update["kg_summaries"].append(f"Sau khi quét toàn bộ dữ liệu, không tìm thấy văn bản nào có số: {clean_query}")
+                    result_update["kg_summaries"].append(
+                        f"Sau khi quét toàn bộ dữ liệu, không tìm thấy văn bản nào có số: {clean_query}"
+                    )
 
         elif intent == "search_abbr":
             logger.info(
@@ -708,6 +774,7 @@ async def tool_executor(state: "AgentState") -> dict:
                 workspace_ids=workspace_ids,
                 existing_citation_ids=existing_ids,
                 db=db,
+                document_ids=state.get("document_ids"),
             )
             if search_query != query:
                 logger.info(
@@ -789,10 +856,17 @@ async def answer_generator(state: "AgentState") -> dict:
     logger.info(f"[answer_generator] abbreviation_results={abbreviation_results!r}")
 
     # ── MongoDB people search: use LLM to format nicely (but include ALL results) ──
-    mongo_intents = {"mongo_search_cccd", "mongo_search_name", "mongo_search_bhxh", "mongo_search_phone"}
+    mongo_intents = {
+        "mongo_search_cccd",
+        "mongo_search_name",
+        "mongo_search_bhxh",
+        "mongo_search_phone",
+    }
     if intent in mongo_intents and state.get("final_answer"):
         mongo_context = state["final_answer"]
-        logger.info(f"[answer_generator] Mongo search — formatting via LLM ({len(mongo_context)} chars)")
+        logger.info(
+            f"[answer_generator] Mongo search — formatting via LLM ({len(mongo_context)} chars)"
+        )
 
         format_system = (
             "Bạn là một trợ lý truy vấn cơ sở dữ liệu.\n"
@@ -817,14 +891,18 @@ async def answer_generator(state: "AgentState") -> dict:
 
         try:
             mongo_answer_parts: list[str] = []
-            async for chunk in provider.astream(messages=mongo_messages, temperature=0.1, max_tokens=4096):
+            async for chunk in provider.astream(
+                messages=mongo_messages, temperature=0.1, max_tokens=4096
+            ):
                 if chunk.type == "text" and chunk.text:
                     await push_event(state, "token", chunk.text)
                     mongo_answer_parts.append(chunk.text)
             final = "".join(mongo_answer_parts)
             return {"final_answer": final}
         except Exception as e:
-            logger.error(f"[answer_generator] Mongo LLM format failed: {e} — falling back to raw")
+            logger.error(
+                f"[answer_generator] Mongo LLM format failed: {e} — falling back to raw"
+            )
             await push_event(state, "token", mongo_context)
             return {"final_answer": mongo_context}
 
@@ -847,9 +925,13 @@ async def answer_generator(state: "AgentState") -> dict:
     # Add MongoDB people search results to context
     # Use kg_summaries (already has formatted mongo display from _transform_rag_output)
     # or state.final_answer — do NOT rebuild from raw mongo_results fields
-    if kg_summaries and any("Cơ Sở Dữ Liệu" in s or "PRE-FORMATTED" in s for s in kg_summaries):
+    if kg_summaries and any(
+        "Cơ Sở Dữ Liệu" in s or "PRE-FORMATTED" in s for s in kg_summaries
+    ):
         # Already formatted by _transform_rag_output — use as-is
-        logger.info(f"[answer_generator] Mongo display already in kg_summaries, skipping rebuild")
+        logger.info(
+            f"[answer_generator] Mongo display already in kg_summaries, skipping rebuild"
+        )
     elif state.get("mongo_results") and state.get("final_answer"):
         # Fallback: use pre-formatted final_answer
         context_parts.append("## Cơ Sở Dữ Liệu Người Dân\n" + state["final_answer"])
@@ -1018,13 +1100,17 @@ async def answer_generator(state: "AgentState") -> dict:
     final_answer = strip_thinking_tags("".join(answer_parts))
 
     # Nếu không tìm thấy tài liệu và có từ viết tắt tiềm năng -> gợi ý thêm
-    is_not_found = "không tìm thấy tài liệu phù hợp câu hỏi" in [s.lower() for s in kg_summaries]
+    is_not_found = "không tìm thấy tài liệu phù hợp câu hỏi" in [
+        s.lower() for s in kg_summaries
+    ]
     if is_not_found and potential_abbreviations:
         suggestion = "\n\nBạn có muốn thêm giải thích cho các từ viết tắt này không?"
         final_answer += suggestion
         await push_event(state, "token", suggestion)
         await push_event(state, "potential_abbreviations", potential_abbreviations)
-        logger.info(f"[answer_generator] Pushed potential_abbreviations: {potential_abbreviations}")
+        logger.info(
+            f"[answer_generator] Pushed potential_abbreviations: {potential_abbreviations}"
+        )
 
     return {"final_answer": final_answer}
 
@@ -1133,6 +1219,7 @@ def _get_write_subgraph():
     global _write_subgraph
     if _write_subgraph is None:
         from app.services.agents.agent_write import create_agent_write
+
         _write_subgraph = create_agent_write()
         logger.info("[write_executor] agent_write subgraph compiled and cached")
     return _write_subgraph
@@ -1179,7 +1266,7 @@ def _transform_input(state: "AgentState") -> dict:
         }.get(intent, "summarize")
 
     return {
-        "messages": [],            # write subgraph doesn't need chat history
+        "messages": [],  # write subgraph doesn't need chat history
         "user_id": state.get("user_id"),
         "workspace_ids": state.get("workspace_ids", []),
         "text_input": text_input,
@@ -1227,9 +1314,12 @@ async def write_executor(state: "AgentState") -> dict:
         "write_grammar_check": "grammar_check",
     }.get(intent, "summarize")
 
+    doc_ids = state.get("document_ids") or []
+    text_input = state.get("text_input", "")
+
     logger.info(
         f"[write_executor] intent={intent!r} write_action={write_action!r} "
-        f"text_input={str(state.get('text_input', ''))[:80]!r}"
+        f"text_input={str(text_input)[:80]!r} doc_ids={doc_ids!r}"
     )
 
     await push_event(
@@ -1237,6 +1327,42 @@ async def write_executor(state: "AgentState") -> dict:
         "status",
         {"step": "processing", "detail": "Đang xử lý văn bản..."},
     )
+
+    # ── Fetch referenced doc content via @docname mentions ─────────────────
+    # When user references @docname but intent_classifier couldn't extract text
+    # (write_summarize / write_suggest_edits / write_grammar_check with attached docs)
+    if doc_ids and not text_input:
+        logger.info(
+            f"[write_executor] Fetching content for {len(doc_ids)} referenced docs"
+        )
+        try:
+            from app.services.agent import tools as _tools
+            from app.services.agent.streaming import get_current_db
+
+            db = get_current_db()
+            tool_result = await _tools.get_documents_content(
+                document_ids=doc_ids,
+                db=db,
+            )
+            doc_texts = []
+            for doc in tool_result.get("documents", []):
+                if doc.get("content"):
+                    doc_texts.append(
+                        f"# {doc.get('filename', 'Document')}\n\n{doc.get('content')}"
+                    )
+                elif doc.get("error"):
+                    doc_texts.append(
+                        f"# {doc.get('filename', 'Document')}\n\nLỗi: {doc.get('error')}"
+                    )
+            if doc_texts:
+                combined = "\n\n---\n\n".join(doc_texts)
+                state["kg_summaries"] = [combined]
+                logger.info(
+                    f"[write_executor] Fetched {len(doc_texts)} docs, "
+                    f"total content {len(combined)} chars"
+                )
+        except Exception as e:
+            logger.warning(f"[write_executor] Failed to fetch doc content: {e}")
 
     # ── Transform: AgentState → AgentWriteState ──────────────────────────
     write_input = _transform_input(state)
@@ -1278,6 +1404,7 @@ def _get_rag_subgraph():
     global _rag_subgraph
     if _rag_subgraph is None:
         from app.services.agents.agent_rag import create_agent_rag
+
         _rag_subgraph = create_agent_rag()
         logger.info("[agent_rag_executor] agent_rag subgraph compiled and cached")
     return _rag_subgraph
@@ -1334,7 +1461,9 @@ def _transform_rag_output(rag_result: dict, state: "AgentState") -> dict:
             # Check if final_answer_from_rag is just a concatenation of sources
             # to avoid extreme redundancy. If it's short or seems processed, keep it.
             if len(final_answer_from_rag) > 100:
-                kg_summaries = [f"### PRE-FORMATTED RAG CONTEXT:\n{final_answer_from_rag}"] + list(kg_summaries)
+                kg_summaries = [
+                    f"### PRE-FORMATTED RAG CONTEXT:\n{final_answer_from_rag}"
+                ] + list(kg_summaries)
         else:
             kg_summaries = [final_answer_from_rag] + list(kg_summaries)
 
@@ -1450,10 +1579,16 @@ async def agent_rag_executor(state: "AgentState") -> dict:
             f"final_answer_len={len(str(rag_output.get('final_answer', '')))}"
         )
     except Exception as e:
-        logger.error(f"[agent_rag_executor] subgraph invocation failed: {e}", exc_info=True)
+        logger.error(
+            f"[agent_rag_executor] subgraph invocation failed: {e}", exc_info=True
+        )
         rag_output = {
-            "sources": [], "images": [], "image_parts": [],
-            "kg_summaries": [], "abbreviation_results": [], "final_answer": None,
+            "sources": [],
+            "images": [],
+            "image_parts": [],
+            "kg_summaries": [],
+            "abbreviation_results": [],
+            "final_answer": None,
         }
 
     # ── Transform: AgentRagState → AgentState partial update ─────────────
@@ -1480,4 +1615,3 @@ async def agent_rag_executor(state: "AgentState") -> dict:
         await push_event(state, "images", images)
 
     return partial
-

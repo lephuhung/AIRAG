@@ -18,6 +18,7 @@ Available tools:
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -34,6 +35,7 @@ TOOL_REGISTRY: dict[str, str] = {
     "search_documents": "search the knowledge base for relevant document sections",
     "list_documents": "list all documents available in the current workspace",
     "summarize_document": "get a comprehensive summary of a specific document",
+    "get_documents_content": "fetch raw markdown content from multiple documents by their UUIDs for detailed reading/summarization/editing",
     "query_knowledge_graph": "query the knowledge graph for entity relationships",
     "search_documents_number": "search for documents by their official document number (văn bản số)",
     "search_abbreviation": "search for the meaning of an abbreviation or acronym",
@@ -54,9 +56,10 @@ TOOL_REGISTRY: dict[str, str] = {
 async def search_documents(
     query: str,
     top_k: int,
-    workspace_ids: list[int],
+    workspace_ids: list[uuid.UUID],
     existing_citation_ids: set,
     db: "AsyncSession",
+    document_ids: Optional[list[uuid.UUID]] = None,
 ) -> dict:
     """
     Hybrid search across workspaces via HRAG pipeline.
@@ -78,6 +81,7 @@ async def search_documents(
         top_k=top_k,
         db=db,
         existing_ids=existing_citation_ids,
+        document_ids=document_ids,
     )
     return {
         "context_text": context_text,
@@ -257,6 +261,142 @@ async def summarize_document(
             "text": "Không thể tóm tắt tài liệu. Vui lòng thử lại.",
             "document_name": "",
             "document_id": document_id,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Tool 3b: get_documents_content
+# ---------------------------------------------------------------------------
+
+
+async def get_documents_content(
+    document_ids: list[uuid.UUID],
+    db: "AsyncSession",
+) -> dict:
+    """
+    Fetch raw markdown content from multiple documents by their UUIDs.
+
+    This is useful when the user references documents by name (@docname)
+    or by attached document IDs, and the agent needs the full content
+    for tasks like summarization, grammar checking, or editing suggestions.
+
+    Args:
+        document_ids: List of document UUIDs to fetch
+        db: Database session
+
+    Returns:
+        dict with keys:
+            - documents: list of {id, filename, content, error}
+            - total_count: int
+            - errors: list of error messages if any documents failed
+    """
+    from sqlalchemy import select
+    from app.models.document import Document, DocumentStatus
+    from app.services.storage_service import get_storage_service
+
+    MAX_CHARS_PER_DOC = 48000  # ~12k tokens, leave room for prompt
+
+    results = []
+    errors = []
+
+    if not document_ids:
+        return {
+            "documents": [],
+            "total_count": 0,
+            "errors": [],
+        }
+
+    try:
+        # Fetch all documents in one query
+        result = await db.execute(select(Document).where(Document.id.in_(document_ids)))
+        docs = result.scalars().all()
+
+        # Create a map for quick lookup
+        doc_map = {doc.id: doc for doc in docs}
+
+        storage = get_storage_service()
+
+        for doc_id in document_ids:
+            doc = doc_map.get(doc_id)
+
+            if not doc:
+                errors.append(f"Không tìm thấy tài liệu {doc_id}")
+                results.append(
+                    {
+                        "id": str(doc_id),
+                        "filename": "Unknown",
+                        "content": None,
+                        "error": f"Không tìm thấy tài liệu",
+                    }
+                )
+                continue
+
+            if doc.status != DocumentStatus.INDEXED:
+                errors.append(
+                    f"Tài liệu '{doc.original_filename}' chưa được lập chỉ mục"
+                )
+                results.append(
+                    {
+                        "id": str(doc_id),
+                        "filename": doc.original_filename,
+                        "content": None,
+                        "error": f"Tài liệu chưa được lập chỉ mục (status: {doc.status.value if hasattr(doc.status, 'value') else doc.status})",
+                    }
+                )
+                continue
+
+            if not doc.markdown_s3_key:
+                errors.append(f"Tài liệu '{doc.original_filename}' không có nội dung")
+                results.append(
+                    {
+                        "id": str(doc_id),
+                        "filename": doc.original_filename,
+                        "content": None,
+                        "error": "Không có nội dung markdown",
+                    }
+                )
+                continue
+
+            try:
+                markdown_text = await storage.download_markdown(doc.markdown_s3_key)
+
+                # Truncate if too long
+                truncated = markdown_text[:MAX_CHARS_PER_DOC]
+                if len(markdown_text) > MAX_CHARS_PER_DOC:
+                    truncated += f"\n\n[... nội dung đã được cắt bớt ({len(markdown_text)} → {MAX_CHARS_PER_DOC} ký tự) ...]"
+
+                results.append(
+                    {
+                        "id": str(doc_id),
+                        "filename": doc.original_filename,
+                        "content": truncated,
+                        "error": None,
+                    }
+                )
+
+            except Exception as e:
+                errors.append(f"Lỗi tải '{doc.original_filename}': {e}")
+                results.append(
+                    {
+                        "id": str(doc_id),
+                        "filename": doc.original_filename,
+                        "content": None,
+                        "error": str(e),
+                    }
+                )
+
+        return {
+            "documents": results,
+            "total_count": len(results),
+            "errors": errors,
+        }
+
+    except Exception as e:
+        logger.error(f"[tool:get_documents_content] Failed: {e}")
+        return {
+            "documents": [],
+            "total_count": 0,
+            "errors": [f"Lỗi hệ thống: {e}"],
         }
 
 
@@ -469,6 +609,7 @@ async def search_people_by_cccd(cccd: str) -> dict:
         dict with keys: found, person, display
     """
     from app.services.mongo_people_service import search_by_cccd as _svc
+
     try:
         return await _svc(cccd)
     except Exception as e:
@@ -485,6 +626,7 @@ async def search_people_by_name(name: str, limit: int = 10) -> dict:
         dict with keys: found, count, persons, display
     """
     from app.services.mongo_people_service import search_by_name as _svc
+
     try:
         return await _svc(name, limit=limit)
     except Exception as e:
@@ -506,6 +648,7 @@ async def search_people_by_bhxh(so_bhxh: str) -> dict:
         dict with keys: found, person, display
     """
     from app.services.mongo_people_service import search_by_bhxh as _svc
+
     try:
         return await _svc(so_bhxh)
     except Exception as e:
@@ -522,6 +665,7 @@ async def search_people_by_phone(phone: str, limit: int = 10) -> dict:
         dict with keys: found, count, persons, display
     """
     from app.services.mongo_people_service import search_by_phone as _svc
+
     try:
         return await _svc(phone, limit=limit)
     except Exception as e:

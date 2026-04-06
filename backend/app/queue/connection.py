@@ -24,6 +24,7 @@ instead of being held in worker memory via asyncio.sleep().
 After MAX_RETRIES the message is routed to a dead-letter queue for manual
 inspection.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -42,33 +43,31 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 # ── Exchange / queue names ──────────────────────────────────────────────────
-EXCHANGE_PARSE   = "hrag.parse"
-EXCHANGE_EMBED   = "hrag.embed"
+EXCHANGE_PARSE = "hrag.parse"
+EXCHANGE_EMBED = "hrag.embed"
 EXCHANGE_CAPTION = "hrag.caption"
-EXCHANGE_KG      = "hrag.kg"
+EXCHANGE_KG = "hrag.kg"
 
-QUEUE_PARSE   = "hrag.parse"
-QUEUE_EMBED   = "hrag.embed"
+QUEUE_PARSE = "hrag.parse"
+QUEUE_EMBED = "hrag.embed"
 QUEUE_CAPTION = "hrag.caption"
 # KG queues are named hrag.kg.<workspace_id> and created on-demand
 QUEUE_KG_PREFIX = "hrag.kg"
 
 # ── Dead-letter exchange for failed messages ────────────────────────────────
 DLX_EXCHANGE = "hrag.dlx"
-DLQ_QUEUE    = "hrag.dead-letter"
+DLQ_QUEUE = "hrag.dead-letter"
 
 # ── Retry settings ──────────────────────────────────────────────────────────
-MAX_RETRIES   = 3              # Total attempts = MAX_RETRIES + 1 (first try + retries)
-RETRY_DELAYS  = [5, 15, 60]   # Seconds — mapped to per-message TTL
+MAX_RETRIES = 3  # Total attempts = MAX_RETRIES + 1 (first try + retries)
+RETRY_DELAYS = [5, 15, 60]  # Seconds — mapped to per-message TTL
 
 # Retry exchange: delay queues dead-letter back to this exchange which
 # fans out to the original exchange via x-dead-letter-exchange on each
 # delay queue.  We use a single HEADERS exchange so that we can route
 # each message back to its original exchange/routing_key using headers.
 RETRY_EXCHANGE = "hrag.retry"
-_RETRY_QUEUE_NAMES = [
-    f"hrag.retry.{d}s" for d in RETRY_DELAYS
-]
+_RETRY_QUEUE_NAMES = [f"hrag.retry.{d}s" for d in RETRY_DELAYS]
 
 
 # ── Singleton connection ────────────────────────────────────────────────────
@@ -88,6 +87,7 @@ async def get_connection() -> AbstractRobustConnection:
             _connection = await aio_pika.connect_robust(
                 settings.RABBITMQ_URL,
                 reconnect_interval=reconnect_interval,
+                heartbeat=120,
             )
             logger.info("RabbitMQ connected")
     return _connection
@@ -127,7 +127,9 @@ async def _ensure_retry_queues(channel: aio_pika.Channel) -> None:
     """
     # Retry exchange — messages land here after TTL expires
     await channel.declare_exchange(
-        RETRY_EXCHANGE, ExchangeType.DIRECT, durable=True,
+        RETRY_EXCHANGE,
+        ExchangeType.DIRECT,
+        durable=True,
     )
 
     for delay_sec, q_name in zip(RETRY_DELAYS, _RETRY_QUEUE_NAMES):
@@ -136,8 +138,8 @@ async def _ensure_retry_queues(channel: aio_pika.Channel) -> None:
                 q_name,
                 durable=True,
                 arguments={
-                    "x-message-ttl": delay_sec * 1000,          # ms
-                    "x-dead-letter-exchange": RETRY_EXCHANGE,   # after TTL → retry exchange
+                    "x-message-ttl": delay_sec * 1000,  # ms
+                    "x-dead-letter-exchange": RETRY_EXCHANGE,  # after TTL → retry exchange
                 },
             )
             # Bind so publisher can publish directly by queue name
@@ -185,7 +187,7 @@ async def _publish_to_retry_queue(
             body,
             delivery_mode=DeliveryMode.PERSISTENT,
             headers=headers,
-            expiration=jittered_ms,   # per-message TTL override (ms)
+            expiration=jittered_ms,  # per-message TTL override (ms)
         ),
         routing_key=q_name,
     )
@@ -198,7 +200,9 @@ async def _start_retry_consumer(channel: aio_pika.Channel) -> None:
     delay queues and re-publish them to their original exchange/routing_key.
     """
     retry_exchange = await channel.declare_exchange(
-        RETRY_EXCHANGE, ExchangeType.DIRECT, durable=True,
+        RETRY_EXCHANGE,
+        ExchangeType.DIRECT,
+        durable=True,
     )
 
     # We need a queue bound to the retry exchange to catch expired messages.
@@ -207,11 +211,13 @@ async def _start_retry_consumer(channel: aio_pika.Channel) -> None:
     retry_requeue_name = "hrag.retry.requeue"
     try:
         retry_queue = await channel.declare_queue(
-            retry_requeue_name, durable=True,
+            retry_requeue_name,
+            durable=True,
         )
     except Exception:
         retry_queue = await channel.declare_queue(
-            retry_requeue_name, durable=True,
+            retry_requeue_name,
+            durable=True,
         )
 
     # Bind to all known delay queue names as routing keys
@@ -235,7 +241,9 @@ async def _start_retry_consumer(channel: aio_pika.Channel) -> None:
 
                 # Re-publish to original exchange
                 exchange = await channel.declare_exchange(
-                    orig_exchange, ExchangeType.DIRECT, durable=True,
+                    orig_exchange,
+                    ExchangeType.DIRECT,
+                    durable=True,
                 )
                 await exchange.publish(
                     Message(
@@ -304,16 +312,16 @@ async def consume(
         exchange_name, ExchangeType.DIRECT, durable=True
     )
 
-    # Try to declare queue with DLX arguments.
-    # If the queue already exists without DLX (from an older version),
-    # RabbitMQ returns PRECONDITION_FAILED which closes the channel.
-    # In that case, open a new channel and declare without DLX args.
+    queue_declaration_failed = False
+
     try:
         queue = await channel.declare_queue(
             queue_name,
             durable=True,
             arguments={
                 "x-dead-letter-exchange": DLX_EXCHANGE,
+                "x-max-length": 10000,
+                "x-overflow": "reject-publish",
             },
         )
     except Exception:
@@ -322,9 +330,12 @@ async def consume(
             f"Using existing queue (DLX will not apply until queue is recreated). "
             f"To fix: delete the queue in RabbitMQ management UI and restart."
         )
-        # The channel was likely closed by the error — open a fresh one
+        queue_declaration_failed = True
+
+    if queue_declaration_failed:
         channel = await conn.channel()
         await channel.set_qos(prefetch_count=prefetch_count)
+        await _ensure_dlx(channel)
         await _ensure_retry_queues(channel)
         exchange = await channel.declare_exchange(
             exchange_name, ExchangeType.DIRECT, durable=True
@@ -333,53 +344,122 @@ async def consume(
 
     await queue.bind(exchange, routing_key=routing_key)
 
-    # Start the retry re-publisher in background
-    asyncio.create_task(_start_retry_consumer(channel))
+    retry_channel = await conn.channel()
+    asyncio.create_task(_start_retry_consumer(retry_channel))
 
     logger.info(f"Consuming {exchange_name}/{routing_key} → {queue_name}")
 
-    async with queue.iterator() as messages:
-        async for message in messages:
-            async with message.process(requeue=False):
-                # Read retry count from headers
-                headers = message.headers or {}
-                retry_count = int(headers.get("x-retry-count", 0))
+    restart_count = 0
+    while True:
+        try:
+            logger.info(
+                f"queue_iterator starting",
+                extra={"queue_name": queue_name},
+            )
+            async with queue.iterator() as messages:
+                async for message in messages:
+                    async with message.process(requeue=False):
+                        headers = message.headers or {}
+                        retry_count = int(headers.get("x-retry-count", 0))
+                        document_id = "unknown"
+                        minio_key = "unknown"
 
-                start_time = time.monotonic()
-                try:
-                    payload = json.loads(message.body)
-                    await handler(payload)
-                    # Track success
-                    elapsed = time.monotonic() - start_time
-                    worker_metrics.record_success(queue_name, elapsed)
-                except Exception as e:
-                    elapsed = time.monotonic() - start_time
-                    worker_metrics.record_failure(queue_name, elapsed)
-
-                    if retry_count < MAX_RETRIES:
-                        logger.warning(
-                            f"Handler error on {queue_name} "
-                            f"(attempt {retry_count + 1}/{MAX_RETRIES + 1}): {e}"
-                        )
-                        # Publish to delay queue (crash-safe — message persisted on broker)
+                        start_time = time.monotonic()
                         try:
-                            await _publish_to_retry_queue(
-                                channel, exchange_name, routing_key,
-                                message.body, retry_count,
+                            payload = json.loads(message.body)
+                            document_id = str(payload.get("document_id", "unknown"))
+                            minio_key = payload.get("minio_key", "unknown")
+
+                            async with asyncio.timeout(30):
+                                await handler(payload)
+
+                            elapsed = time.monotonic() - start_time
+                            worker_metrics.record_success(queue_name, elapsed)
+                        except asyncio.TimeoutError:
+                            elapsed = time.monotonic() - start_time
+                            worker_metrics.record_failure(queue_name, elapsed)
+                            logger.warning(
+                                "parse_worker handler timed out",
+                                extra={
+                                    "queue_name": queue_name,
+                                    "document_id": document_id,
+                                    "minio_key": minio_key,
+                                    "retry_count": retry_count,
+                                },
                             )
-                        except Exception as retry_err:
-                            logger.error(
-                                f"Failed to publish retry for {queue_name}: {retry_err}"
-                            )
-                        # Don't re-raise — message is ack'd, retry is queued on broker
-                    else:
-                        logger.error(
-                            f"Handler error on {queue_name} after "
-                            f"{MAX_RETRIES + 1} attempts: {e}",
-                            exc_info=True,
-                        )
-                        # Let the message go to DLX (nack without requeue)
-                        raise
+                            await message.ack()
+                        except Exception as e:
+                            elapsed = time.monotonic() - start_time
+                            worker_metrics.record_failure(queue_name, elapsed)
+                            if retry_count < MAX_RETRIES:
+                                logger.warning(
+                                    f"Handler error on {queue_name} "
+                                    f"(attempt {retry_count + 1}/{MAX_RETRIES + 1}): {e}",
+                                    extra={
+                                        "queue_name": queue_name,
+                                        "document_id": document_id,
+                                        "minio_key": minio_key,
+                                        "retry_count": retry_count,
+                                        "error": str(e),
+                                        "error_type": type(e).__name__,
+                                    },
+                                )
+                                try:
+                                    await _publish_to_retry_queue(
+                                        channel,
+                                        exchange_name,
+                                        routing_key,
+                                        message.body,
+                                        retry_count,
+                                    )
+                                except Exception as retry_err:
+                                    logger.error(
+                                        f"Failed to publish retry for {queue_name}: {retry_err}",
+                                        extra={
+                                            "queue_name": queue_name,
+                                            "document_id": document_id,
+                                            "minio_key": minio_key,
+                                            "retry_count": retry_count,
+                                            "error": str(retry_err),
+                                        },
+                                    )
+                                await message.ack()
+                            else:
+                                logger.error(
+                                    f"Handler error on {queue_name} after "
+                                    f"{MAX_RETRIES + 1} attempts: {e}",
+                                    extra={
+                                        "queue_name": queue_name,
+                                        "document_id": document_id,
+                                        "minio_key": minio_key,
+                                        "retry_count": retry_count,
+                                        "error": str(e),
+                                        "error_type": type(e).__name__,
+                                    },
+                                )
+                                await message.ack()
+            logger.warning(
+                f"queue_iterator exhausted unexpectedly — reconnecting",
+                extra={"queue_name": queue_name},
+            )
+        except Exception as it_error:
+            restart_count += 1
+            logger.error(
+                f"queue_iterator error",
+                extra={
+                    "queue_name": queue_name,
+                    "error": str(it_error),
+                    "error_type": type(it_error).__name__,
+                    "restart_count": restart_count,
+                },
+            )
+            if restart_count >= 10:
+                logger.critical(
+                    f"queue_iterator max restarts reached, abandoning",
+                    extra={"queue_name": queue_name, "restart_count": restart_count},
+                )
+                break
+            await asyncio.sleep(5)
 
 
 async def consume_kg(workspace_id: int, handler: MessageHandler) -> None:
@@ -390,6 +470,9 @@ async def consume_kg(workspace_id: int, handler: MessageHandler) -> None:
     queue_name = f"hrag.kg.{workspace_id}"
     routing_key = str(workspace_id)
     await consume(
-        EXCHANGE_KG, queue_name, routing_key,
-        handler, prefetch_count=settings.WORKER_PREFETCH_KG,
+        EXCHANGE_KG,
+        queue_name,
+        routing_key,
+        handler,
+        prefetch_count=settings.WORKER_PREFETCH_KG,
     )

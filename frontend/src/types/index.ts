@@ -118,6 +118,7 @@ export interface KnowledgeBase {
   visibility: "public" | "tenant" | "personal";
   owner_id: string | null;
   tenant_id: string | null;
+  is_default?: boolean;
 }
 
 export interface CreateWorkspace {
@@ -345,6 +346,8 @@ export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
+  documentIds?: string[];
+  attachedDocs?: AttachedDoc[];
   sources?: ChatSourceChunk[];
   relatedEntities?: string[];
   imageRefs?: ChatImageRef[];
@@ -353,6 +356,7 @@ export interface ChatMessage {
   isStreaming?: boolean;
   agentSteps?: AgentStep[];
   potential_abbreviations?: string[];
+  formatProgress?: FormatUploadProgress;
 }
 
 export interface ChatSourceChunk {
@@ -376,11 +380,22 @@ export interface ChatResponseData {
   potential_abbreviations?: string[];
 }
 
+export interface AttachedDoc {
+  id: string;
+  filename: string;
+  original_filename: string;
+  file_type: string;
+  status: string;
+  document_number?: string | null;
+}
+
 export interface PersistedChatMessage {
   id: string;
   message_id: string;
   role: "user" | "assistant";
   content: string;
+  document_ids?: string[] | null;
+  attached_docs?: AttachedDoc[] | null;
   sources?: ChatSourceChunk[] | null;
   related_entities?: string[] | null;
   image_refs?: ChatImageRef[] | null;
@@ -396,6 +411,10 @@ export interface ChatHistoryResponse {
   total: number;
 }
 
+export interface SessionDocumentsResponse {
+  documents: AttachedDoc[];
+}
+
 export interface LLMCapabilities {
   provider: string;
   model: string;
@@ -407,6 +426,15 @@ export interface LLMCapabilities {
 // SSE Streaming Types
 // * useRAGChatStream — SSE streaming hook for HRAG chat.
 export type ChatStreamStatus = "idle" | "analyzing" | "retrieving" | "generating" | "error";
+
+// Format Upload Progress Types
+export type FormatUploadStep = "idle" | "uploading" | "extracting" | "analyzing" | "complete" | "error";
+
+export interface FormatUploadProgress {
+  step: FormatUploadStep;
+  message: string;
+  issues_count?: number;
+}
 
 // Agent Step Types (ThinkingTimeline)
 export type AgentStepType =

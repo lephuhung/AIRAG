@@ -7,7 +7,16 @@ import uuid
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Body
+from fastapi import (
+    APIRouter,
+    Depends,
+    Header,
+    HTTPException,
+    status,
+    UploadFile,
+    File,
+    Body,
+)
 from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,7 +28,11 @@ from app.core.exceptions import NotFoundError
 from app.models.knowledge_base import KnowledgeBase
 from app.models.document import Document, DocumentImage, DocumentStatus
 from app.models.user import User
-from app.schemas.document import DocumentResponse, DocumentUploadResponse, DocumentUpdate
+from app.schemas.document import (
+    DocumentResponse,
+    DocumentUploadResponse,
+    DocumentUpdate,
+)
 from app.schemas.rag import DocumentImageResponse
 
 logger = logging.getLogger(__name__)
@@ -49,20 +62,22 @@ def _inject_images_from_db(
 
     return re.sub(r"<!--\s*image\s*-->", _replacer, markdown)
 
+
 router = APIRouter(prefix="/documents", tags=["documents"])
 
 UPLOAD_DIR = settings.BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".docx", ".pptx"}
+ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".docx", ".doc", ".pptx"}
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
 # MIME type mapping for common extensions
 _EXT_TO_MIME: dict[str, str] = {
-    ".pdf":  "application/pdf",
-    ".txt":  "text/plain",
-    ".md":   "text/markdown",
+    ".pdf": "application/pdf",
+    ".txt": "text/plain",
+    ".md": "text/markdown",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 
@@ -81,12 +96,16 @@ async def list_documents(
     await verify_workspace_access(workspace_id, user, db)
 
     result = await db.execute(
-        select(Document).where(Document.workspace_id == workspace_id).order_by(Document.created_at.desc())
+        select(Document)
+        .where(Document.workspace_id == workspace_id)
+        .order_by(Document.created_at.desc())
     )
     return result.scalars().all()
 
 
-async def process_document_background(document_id: uuid.UUID, file_path: str, workspace_id: uuid.UUID):
+async def process_document_background(
+    document_id: uuid.UUID, file_path: str, workspace_id: uuid.UUID
+):
     """Legacy fallback: process document inline when RabbitMQ is unavailable."""
     from app.core.database import async_session_maker
     from app.services.rag_service import get_rag_service
@@ -95,7 +114,9 @@ async def process_document_background(document_id: uuid.UUID, file_path: str, wo
         try:
             rag_service = get_rag_service(db, workspace_id)
             await rag_service.process_document(document_id, file_path)
-            logger.info(f"Document {document_id} processed successfully (fallback mode)")
+            logger.info(
+                f"Document {document_id} processed successfully (fallback mode)"
+            )
         except Exception as e:
             logger.error(f"Failed to process document {document_id}: {e}")
 
@@ -104,24 +125,32 @@ async def process_document_background(document_id: uuid.UUID, file_path: str, wo
 async def upload_document(
     workspace_id: uuid.UUID,
     file: UploadFile = File(...),
+    x_chat_upload: bool = Header(default=False, alias="X-Chat-Upload"),
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
-    """Upload a document to a knowledge base and store the raw file in MinIO."""
+    """Upload a document to a knowledge base and store the raw file in MinIO.
+
+    Header X-Chat-Upload: set to true when uploading from chat context.
+    This causes the file to be processed in parse-only mode (skip KG/caption
+    workers) for faster chat attachment.
+    """
     await verify_workspace_access(workspace_id, user, db)
 
     ext = Path(file.filename).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"File type {ext} not allowed. Allowed: {ALLOWED_EXTENSIONS}"
+            detail=f"File type {ext} not allowed. Allowed: {ALLOWED_EXTENSIONS}",
         )
 
     try:
         content = await file.read()
     except (ConnectionResetError, OSError) as exc:
         # Client disconnected mid-upload (Broken pipe / Connection reset)
-        logger.warning(f"Client disconnected during file upload for workspace {workspace_id}: {exc}")
+        logger.warning(
+            f"Client disconnected during file upload for workspace {workspace_id}: {exc}"
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Upload interrupted — client disconnected. Please retry.",
@@ -130,11 +159,12 @@ async def upload_document(
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"File too large. Max size: {MAX_FILE_SIZE // 1024 // 1024}MB"
+            detail=f"File too large. Max size: {MAX_FILE_SIZE // 1024 // 1024}MB",
         )
 
     # Sanitize original filename: keep alphanumeric, dots, dashes, underscores
     import re as _re
+
     safe_stem = _re.sub(r"[^\w\-.]", "_", Path(file.filename).stem)
     filename = f"{safe_stem}{ext}"
 
@@ -154,8 +184,11 @@ async def upload_document(
 
     # Upload raw file to MinIO hrag-uploads bucket
     from app.services.storage_service import get_storage_service
+
     storage = get_storage_service()
-    upload_key = storage._make_upload_key(workspace_id, document.id, ext)
+    upload_key = storage._make_upload_key(
+        workspace_id, document.id, ext, is_chat_upload=x_chat_upload
+    )
     try:
         await storage.upload_file(
             key=upload_key,
@@ -166,19 +199,28 @@ async def upload_document(
         await db.commit()
     except Exception as e:
         logger.error(f"Failed to upload file to MinIO for doc {document.id}: {e}")
-        # Still continue — document is in DB, will need manual requeue
+        # Rollback document status to failed
+        document.status = "failed"
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to upload file to storage: {str(e)}",
+        )
 
     # Publish parse task (immediate if webhook disabled, else MinIO event fires)
     if not settings.MINIO_WEBHOOK_ENABLED:
         try:
             from app.queue.publisher import publish_parse_task
+
             await publish_parse_task(
                 document_id=document.id,
                 workspace_id=workspace_id,
                 minio_key=upload_key,
                 original_filename=file.filename,
             )
-            logger.info(f"Document {document.id} queued for processing (direct publish)")
+            logger.info(
+                f"Document {document.id} queued for processing (direct publish)"
+            )
         except Exception as e:
             logger.error(
                 f"Failed to publish parse task for doc {document.id}: {e}. "
@@ -194,13 +236,14 @@ async def upload_document(
         id=document.id,
         filename=document.original_filename,
         status=document.status,
-        message="Document uploaded and queued for processing."
+        message="Document uploaded and queued for processing.",
     )
 
 
 # ---------------------------------------------------------------------------
 # Presigned-upload flow (frontend uploads directly to MinIO)
 # ---------------------------------------------------------------------------
+
 
 class PresignRequest(BaseModel):
     filename: str
@@ -210,8 +253,8 @@ class PresignRequest(BaseModel):
 
 class PresignResponse(BaseModel):
     document_id: uuid.UUID
-    upload_url: str          # Presigned PUT URL pointing directly to MinIO
-    minio_key: str           # Object key — needed for /confirm call
+    upload_url: str  # Presigned PUT URL pointing directly to MinIO
+    minio_key: str  # Object key — needed for /confirm call
 
 
 class ConfirmRequest(BaseModel):
@@ -247,6 +290,7 @@ async def presign_upload(
         )
 
     import re as _re
+
     safe_stem = _re.sub(r"[^\w\-.]", "_", Path(body.filename).stem)
     filename = f"{safe_stem}{ext}"
 
@@ -264,6 +308,7 @@ async def presign_upload(
     await db.refresh(document)
 
     from app.services.storage_service import get_storage_service
+
     storage = get_storage_service()
     upload_key = storage._make_upload_key(workspace_id, document.id, ext)
 
@@ -327,6 +372,7 @@ async def confirm_upload(
 
     # Verify the file actually landed in MinIO before queuing
     from app.services.storage_service import get_storage_service
+
     storage = get_storage_service()
     if document.upload_s3_key:
         try:
@@ -343,13 +389,16 @@ async def confirm_upload(
     if not settings.MINIO_WEBHOOK_ENABLED:
         try:
             from app.queue.publisher import publish_parse_task
+
             await publish_parse_task(
                 document_id=document.id,
                 workspace_id=workspace_id,
                 minio_key=document.upload_s3_key or "",
                 original_filename=document.original_filename,
             )
-            logger.info(f"Document {document.id} queued for processing (presign confirm)")
+            logger.info(
+                f"Document {document.id} queued for processing (presign confirm)"
+            )
         except Exception as e:
             logger.error(
                 f"Failed to publish parse task for doc {document.id}: {e}. "
@@ -401,17 +450,20 @@ async def get_document_markdown(
     if not document.markdown_s3_key:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="No markdown content available. Document may not have been processed with HRAG."
+            detail="No markdown content available. Document may not have been processed with HRAG.",
         )
 
     from app.services.storage_service import get_storage_service
+
     try:
-        markdown = await get_storage_service().download_markdown(document.markdown_s3_key)
+        markdown = await get_storage_service().download_markdown(
+            document.markdown_s3_key
+        )
     except Exception as e:
         logger.error(f"Failed to fetch markdown from MinIO for doc {document_id}: {e}")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Markdown storage is temporarily unavailable."
+            detail="Markdown storage is temporarily unavailable.",
         )
 
     # Safety net: if image placeholders remain, inject real references on-the-fly
@@ -485,6 +537,7 @@ async def download_document(
         )
 
     from app.services.storage_service import get_storage_service
+
     storage = get_storage_service()
 
     try:
@@ -530,7 +583,7 @@ async def update_document(
     workspace = workspace_result.scalar_one_or_none()
     if workspace is None:
         raise NotFoundError("KnowledgeBase", document.workspace_id)
-    
+
     await verify_workspace_access(workspace.id, user, db)
 
     # Update fields
@@ -549,12 +602,17 @@ async def update_document(
     await db.refresh(document)
 
     # Update LegalKG (Neo4j) if document was indexed
-    logger.info(f"update_document: doc_id={document_id}, status={document.status}, workspace_id={document.workspace_id}, kg_root_entity_id={document.kg_root_entity_id}")
+    logger.info(
+        f"update_document: doc_id={document_id}, status={document.status}, workspace_id={document.workspace_id}, kg_root_entity_id={document.kg_root_entity_id}"
+    )
     if document.status == DocumentStatus.INDEXED:
         try:
             from app.services.legal_kg_service import LegalKGService
+
             kg_service = LegalKGService(document.workspace_id)
-            logger.info(f"Calling LegalKG update_document_metadata for doc_id={document_id}")
+            logger.info(
+                f"Calling LegalKG update_document_metadata for doc_id={document_id}"
+            )
             await kg_service.update_document_metadata(
                 document_id=document.id,
                 doc_number=document.document_number,
@@ -567,7 +625,9 @@ async def update_document(
         except Exception as e:
             logger.warning(f"Failed to update LegalKG metadata: {e}")
     else:
-        logger.info(f"Skipping LegalKG update - document status is {document.status}, not INDEXED")
+        logger.info(
+            f"Skipping LegalKG update - document status is {document.status}, not INDEXED"
+        )
 
     return document
 
@@ -588,6 +648,7 @@ async def delete_document(
     if document.status == DocumentStatus.INDEXED:
         try:
             from app.services.rag_service import get_rag_service
+
             rag_service = get_rag_service(db, document.workspace_id)
             await rag_service.delete_document(document_id)
         except Exception as e:
@@ -596,6 +657,7 @@ async def delete_document(
         # Also delete from LegalKG (Neo4j) if KG was built
         try:
             from app.services.legal_kg_service import LegalKGService
+
             kg_service = LegalKGService(document.workspace_id)
             await kg_service.delete_document(document_id)
         except Exception as e:
@@ -607,6 +669,7 @@ async def delete_document(
         os.remove(file_path)
 
     from app.services.storage_service import get_storage_service
+
     storage = get_storage_service()
 
     # Delete raw upload from MinIO
@@ -614,14 +677,18 @@ async def delete_document(
         try:
             await storage.delete_file(document.upload_s3_key)
         except Exception as e:
-            logger.warning(f"Failed to delete upload MinIO object for doc {document_id}: {e}")
+            logger.warning(
+                f"Failed to delete upload MinIO object for doc {document_id}: {e}"
+            )
 
     # Delete markdown object from MinIO
     if document.markdown_s3_key:
         try:
             await storage.delete_markdown(document.markdown_s3_key)
         except Exception as e:
-            logger.warning(f"Failed to delete markdown MinIO object for doc {document_id}: {e}")
+            logger.warning(
+                f"Failed to delete markdown MinIO object for doc {document_id}: {e}"
+            )
 
     await db.delete(document)
     await db.commit()

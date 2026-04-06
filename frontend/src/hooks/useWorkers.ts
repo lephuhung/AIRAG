@@ -59,3 +59,18 @@ export function useRetryDocument() {
     },
   });
 }
+
+export function useCancelPipeline(options?: { onSuccess?: () => void; onError?: (err: Error) => void }) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (documentId: string) =>
+      api.post(`/workers/pipeline/${documentId}/cancel`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["worker-overview"] });
+      queryClient.invalidateQueries({ queryKey: ["worker-pipeline"] });
+      queryClient.invalidateQueries({ queryKey: ["documents"] });
+      options?.onSuccess?.();
+    },
+    onError: options?.onError,
+  });
+}

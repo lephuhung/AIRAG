@@ -5,6 +5,7 @@ and raw uploaded files.
 Markdown bucket: hrag-markdown  (key: kb_{workspace_id}/doc_{document_id}.md)
 Uploads bucket:  hrag-uploads   (key: kb_{workspace_id}/doc_{document_id}.{ext})
 """
+
 from __future__ import annotations
 
 import logging
@@ -45,11 +46,22 @@ class StorageService:
         return f"kb_{workspace_id}/doc_{document_id}.md"
 
     @staticmethod
-    def _make_upload_key(workspace_id: uuid.UUID, document_id: uuid.UUID, ext: str) -> str:
-        """Return the upload key for a raw file. ext must include leading dot."""
-        # Ensure ext has a leading dot
+    def _make_upload_key(
+        workspace_id: uuid.UUID,
+        document_id: uuid.UUID,
+        ext: str,
+        is_chat_upload: bool = False,
+    ) -> str:
+        """Return the upload key for a raw file. ext must include leading dot.
+
+        Args:
+            is_chat_upload: If True, uses chat_file_ prefix so parse_worker
+            skips KG/caption workers (parse-only mode for faster chat attachment).
+        """
         if ext and not ext.startswith("."):
             ext = f".{ext}"
+        if is_chat_upload:
+            return f"kb_{workspace_id}/chat_file_{document_id}{ext}"
         return f"kb_{workspace_id}/doc_{document_id}{ext}"
 
     async def ensure_bucket(self) -> None:
@@ -72,7 +84,9 @@ class StorageService:
         async with self._client() as s3:
             try:
                 await s3.head_bucket(Bucket=self._bucket_uploads)
-                logger.debug(f"[storage] bucket '{self._bucket_uploads}' already exists")
+                logger.debug(
+                    f"[storage] bucket '{self._bucket_uploads}' already exists"
+                )
             except ClientError as e:
                 code = e.response["Error"]["Code"]
                 if code in ("404", "NoSuchBucket"):
@@ -200,9 +214,11 @@ class StorageService:
         public = settings.MINIO_PUBLIC_ENDPOINT.rstrip("/")
         internal = settings.MINIO_ENDPOINT.rstrip("/")
         if public and public != internal and url.startswith(internal):
-            url = public + url[len(internal):]
+            url = public + url[len(internal) :]
 
-        logger.debug(f"[storage] generated presigned PUT URL for {key} (expires_in={expires_in}s)")
+        logger.debug(
+            f"[storage] generated presigned PUT URL for {key} (expires_in={expires_in}s)"
+        )
         return url
 
     async def object_exists(self, key: str) -> bool:
@@ -228,7 +244,9 @@ class StorageService:
             ext = f".{ext}"
         return f"avatars/user_{user_id}{ext}"
 
-    async def upload_avatar(self, user_id: int, data: bytes, content_type: str, ext: str) -> str:
+    async def upload_avatar(
+        self, user_id: int, data: bytes, content_type: str, ext: str
+    ) -> str:
         """Upload avatar image to MinIO. Returns a public URL (presigned GET, 1 year).
 
         Stores under ``hrag-uploads`` at key ``avatars/user_{id}.{ext}``.
@@ -254,7 +272,7 @@ class StorageService:
         public = settings.MINIO_PUBLIC_ENDPOINT.rstrip("/")
         internal = settings.MINIO_ENDPOINT.rstrip("/")
         if public and public != internal and url.startswith(internal):
-            url = public + url[len(internal):]
+            url = public + url[len(internal) :]
 
         logger.debug(f"[storage] uploaded avatar for user {user_id} at key={key}")
         return url

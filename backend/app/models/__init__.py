@@ -8,9 +8,23 @@ from app.models.user import User
 from app.models.tenant import Tenant, TenantUser
 from app.models.invite_token import InviteToken
 from app.models.exchange_summary import ExchangeSummary
+from app.models.chat_file import ChatFile
+from app.models.format_metadata import FormatMetadata
 
 __all__ = [
-    "KnowledgeBase", "DocumentType", "Document", "DocumentImage", "DocumentTable",
-    "ChatSession", "ChatMessage", "User", "Tenant", "TenantUser", "InviteToken",
-    "Abbreviation", "ExchangeSummary",
+    "KnowledgeBase",
+    "DocumentType",
+    "Document",
+    "DocumentImage",
+    "DocumentTable",
+    "ChatSession",
+    "ChatMessage",
+    "User",
+    "Tenant",
+    "TenantUser",
+    "InviteToken",
+    "Abbreviation",
+    "ExchangeSummary",
+    "ChatFile",
+    "FormatMetadata",
 ]

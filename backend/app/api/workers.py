@@ -7,6 +7,7 @@ health checks, worker process management, and dead-letter queue inspection.
 Proxies RabbitMQ Management HTTP API + queries DB for pipeline status.
 Worker processes are managed as background asyncio subprocesses.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -29,7 +30,9 @@ from app.models.document import Document, DocumentStatus
 from app.models.user import User
 from app.services.rabbitmq_management import get_rabbitmq_management
 from app.queue.connection import (
-    publish, EXCHANGE_PARSE, DLQ_QUEUE,
+    publish,
+    EXCHANGE_PARSE,
+    DLQ_QUEUE,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,7 +91,9 @@ async def _spawn_worker(worker_type: str) -> _ManagedWorker:
     env["WORKER_TYPE"] = worker_type
 
     process = await asyncio.create_subprocess_exec(
-        sys.executable, "-m", "app.workers.runner",
+        sys.executable,
+        "-m",
+        "app.workers.runner",
         env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
@@ -128,12 +133,10 @@ def _extract_queue_info(q: dict[str, Any]) -> dict[str, Any]:
         "messages_unacked": q.get("messages_unacknowledged", 0),
         "consumers": q.get("consumers", 0),
         "message_rate_in": (
-            msg_stats.get("publish_details", {}).get("rate", 0)
-            if msg_stats else 0
+            msg_stats.get("publish_details", {}).get("rate", 0) if msg_stats else 0
         ),
         "message_rate_out": (
-            msg_stats.get("deliver_get_details", {}).get("rate", 0)
-            if msg_stats else 0
+            msg_stats.get("deliver_get_details", {}).get("rate", 0) if msg_stats else 0
         ),
         "has_dlx": bool(args.get("x-dead-letter-exchange")),
     }
@@ -142,56 +145,61 @@ def _extract_queue_info(q: dict[str, Any]) -> dict[str, Any]:
 # ══════════════════════════════════════════════════════════════════════════════
 # Health Check Helpers
 # ══════════════════════════════════════════════════════════════════════════════
- 
-async def _check_openai_health(url: str | None, model: str | None, api_key: str | None = None) -> dict[str, Any]:
+
+
+async def _check_openai_health(
+    url: str | None, model: str | None, api_key: str | None = None
+) -> dict[str, Any]:
     """Check health of an OpenAI-compatible API endpoint."""
     if not url:
         return {"status": "unhealthy", "error": "URL not configured"}
-    
+
     try:
         headers = {}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-            
+
         async with httpx.AsyncClient(timeout=3.0) as client:
             # We check the /models endpoint to confirm the server is up and knows about the model
             # Note: We strip /v1 if present to reach /v1/models correctly if base_url includes it
             base = url.rstrip("/")
             models_url = f"{base}/models"
-            
+
             resp = await client.get(models_url, headers=headers)
             if resp.status_code != 200:
-                return {"status": "unhealthy", "error": f"HTTP {resp.status_code}", "url": url}
-            
+                return {
+                    "status": "unhealthy",
+                    "error": f"HTTP {resp.status_code}",
+                    "url": url,
+                }
+
             data = resp.json()
             models = [m.get("id") for m in data.get("data", [])]
-            
+
             if model and model not in models:
                 # If model is not in list, it might still be ok if it's a dynamic endpoint,
                 # but usually it's a sign of a mismatch. We'll mark as warning.
                 return {
-                    "status": "warning", 
-                    "error": f"Model '{model}' not found in active list", 
+                    "status": "warning",
+                    "error": f"Model '{model}' not found in active list",
                     "available_models": models[:5],
-                    "url": url
+                    "url": url,
                 }
-                
-            return {
-                "status": "healthy",
-                "model": model,
-                "url": url
-            }
+
+            return {"status": "healthy", "model": model, "url": url}
     except Exception as exc:
         return {"status": "unhealthy", "error": str(exc), "url": url}
- 
- 
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Health Check
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 @router.get("/health")
-async def workers_health(db: AsyncSession = Depends(get_db), user: User = Depends(require_superadmin)):
+async def workers_health(
+    db: AsyncSession = Depends(get_db), user: User = Depends(require_superadmin)
+):
     """
     Comprehensive health check for the worker system.
     Returns status of RabbitMQ, each queue, active consumers, managed workers,
@@ -290,16 +298,12 @@ async def workers_health(db: AsyncSession = Depends(get_db), user: User = Depend
         DocumentStatus.BUILDING_KG,
     ]
     result = await db.execute(
-        select(func.count(Document.id)).where(
-            Document.status.in_(_stuck_statuses)
-        )
+        select(func.count(Document.id)).where(Document.status.in_(_stuck_statuses))
     )
     in_progress = result.scalar() or 0
 
     result2 = await db.execute(
-        select(func.count(Document.id)).where(
-            Document.status == DocumentStatus.FAILED
-        )
+        select(func.count(Document.id)).where(Document.status == DocumentStatus.FAILED)
     )
     failed = result2.scalar() or 0
 
@@ -312,21 +316,20 @@ async def workers_health(db: AsyncSession = Depends(get_db), user: User = Depend
     # ── AI Services Health ────────────────────────────────────────────────
     llm_tasks = [
         _check_openai_health(
-            os.getenv("HUNYUAN_OCR_API_URL"), 
-            os.getenv("HUNYUAN_OCR_MODEL")
+            os.getenv("HUNYUAN_OCR_API_URL"), os.getenv("HUNYUAN_OCR_MODEL")
         ),
         _check_openai_health(
             os.getenv("MEMORY_AGENT_BASE_URL") or os.getenv("LEGAL_KG_LLM_BASE_URL"),
-            os.getenv("MEMORY_AGENT_MODEL") or os.getenv("LEGAL_KG_LLM_MODEL")
+            os.getenv("MEMORY_AGENT_MODEL") or os.getenv("LEGAL_KG_LLM_MODEL"),
         ),
         _check_openai_health(
             os.getenv("OPENAI_COMPATIBLE_BASE_URL"),
             os.getenv("OPENAI_COMPATIBLE_MODEL"),
-            os.getenv("OPENAI_COMPATIBLE_API_KEY")
+            os.getenv("OPENAI_COMPATIBLE_API_KEY"),
         ),
     ]
     llm_results = await asyncio.gather(*llm_tasks)
-    
+
     health["checks"]["llm_services"] = {
         "ocr": llm_results[0],
         "memory": llm_results[1],
@@ -358,7 +361,9 @@ async def list_managed_workers(user: User = Depends(require_superadmin)):
 
 
 @router.post("/start")
-async def start_worker(req: WorkerStartRequest, user: User = Depends(require_superadmin)):
+async def start_worker(
+    req: WorkerStartRequest, user: User = Depends(require_superadmin)
+):
     """
     Start one or more worker processes of the given type.
     Workers run as subprocesses managed by this API server.
@@ -386,7 +391,9 @@ async def start_worker(req: WorkerStartRequest, user: User = Depends(require_sup
 
 
 @router.post("/stop/{worker_type}")
-async def stop_workers(worker_type: str, pid: int | None = None, user: User = Depends(require_superadmin)):
+async def stop_workers(
+    worker_type: str, pid: int | None = None, user: User = Depends(require_superadmin)
+):
     """
     Stop managed workers of the given type.
     If pid is specified, only that worker is stopped.
@@ -421,7 +428,8 @@ async def stop_workers(worker_type: str, pid: int | None = None, user: User = De
     if not stopped:
         raise HTTPException(
             status_code=404,
-            detail=f"No running workers of type '{wtype}'" + (f" with PID={pid}" if pid else ""),
+            detail=f"No running workers of type '{wtype}'"
+            + (f" with PID={pid}" if pid else ""),
         )
 
     return {"status": "ok", "stopped": stopped}
@@ -501,7 +509,7 @@ async def restart_all_workers(user: User = Depends(require_superadmin)):
                 worker = await _spawn_worker(wtype)
                 _workers[wtype].append(worker)
                 started_pids.append(worker.pid)
-            
+
             restarted[wtype] = {
                 "stopped_count": alive_count,
                 "started_pids": started_pids,
@@ -514,7 +522,9 @@ async def restart_all_workers(user: User = Depends(require_superadmin)):
 
 
 @router.delete("/managed/{worker_type}")
-async def remove_dead_workers(worker_type: str, user: User = Depends(require_superadmin)):
+async def remove_dead_workers(
+    worker_type: str, user: User = Depends(require_superadmin)
+):
     """Remove dead/exited worker entries from the managed list."""
     wtype = worker_type.lower()
     async with _workers_lock:
@@ -531,7 +541,9 @@ async def remove_dead_workers(worker_type: str, user: User = Depends(require_sup
 
 
 @router.get("/dead-letter")
-async def get_dead_letter_messages(count: int = 20, user: User = Depends(require_superadmin)):
+async def get_dead_letter_messages(
+    count: int = 20, user: User = Depends(require_superadmin)
+):
     """
     Peek at messages in the dead-letter queue.
     Messages are NOT consumed — they remain in the queue.
@@ -569,13 +581,16 @@ async def purge_dead_letter(user: User = Depends(require_superadmin)):
 
 
 @router.post("/dead-letter/retry")
-async def retry_dead_letter_messages(count: int = 100, user: User = Depends(require_superadmin)):
+async def retry_dead_letter_messages(
+    count: int = 100, user: User = Depends(require_superadmin)
+):
     """
     Move messages from dead-letter queue back to their original queues.
     Reads messages from DLQ and republishes them to the original exchange.
     """
     try:
         import json
+
         mgmt = get_rabbitmq_management()
         # Get messages with ack (consume them)
         messages = await mgmt.get_messages(
@@ -594,7 +609,9 @@ async def retry_dead_letter_messages(count: int = 100, user: User = Depends(requ
                 x_death = headers.get("x-death", [])
                 if x_death and isinstance(x_death, list):
                     original_exchange = x_death[0].get("exchange", "")
-                    original_routing_key = x_death[0].get("routing-keys", [routing_key])[0]
+                    original_routing_key = x_death[0].get(
+                        "routing-keys", [routing_key]
+                    )[0]
                 else:
                     # Fallback: infer from routing key
                     original_exchange = f"hrag.{routing_key}" if routing_key else ""
@@ -637,7 +654,9 @@ async def delete_queue(queue_name: str, user: User = Depends(require_superadmin)
 
 
 @router.get("/overview")
-async def get_overview(db: AsyncSession = Depends(get_db), user: User = Depends(require_superadmin)):
+async def get_overview(
+    db: AsyncSession = Depends(get_db), user: User = Depends(require_superadmin)
+):
     """
     Combined RabbitMQ stats + DB document pipeline counts.
     Gracefully handles RabbitMQ being unreachable.
@@ -754,11 +773,15 @@ async def retry_all_failed(
         await db.commit()
 
         # Republish parse task
-        await publish(EXCHANGE_PARSE, "parse", {
-            "document_id": doc.id,
-            "workspace_id": doc.workspace_id,
-            "minio_key": doc.filename,
-        })
+        await publish(
+            EXCHANGE_PARSE,
+            "parse",
+            {
+                "document_id": doc.id,
+                "workspace_id": doc.workspace_id,
+                "minio_key": doc.filename,
+            },
+        )
         count += 1
 
     return {"status": "ok", "retried_count": count}
@@ -771,9 +794,7 @@ async def retry_single_failed(
     user: User = Depends(require_superadmin),
 ):
     """Reset a single FAILED document to PENDING and republish ParseMessage."""
-    result = await db.execute(
-        select(Document).where(Document.id == document_id)
-    )
+    result = await db.execute(select(Document).where(Document.id == document_id))
     doc = result.scalar_one_or_none()
     if doc is None:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -787,12 +808,64 @@ async def retry_single_failed(
     doc.kg_done = False
     await db.commit()
 
-    await publish(EXCHANGE_PARSE, "parse", {
-        "document_id": doc.id,
-        "workspace_id": doc.workspace_id,
-        "minio_key": doc.filename,
-    })
+    await publish(
+        EXCHANGE_PARSE,
+        "parse",
+        {
+            "document_id": doc.id,
+            "workspace_id": doc.workspace_id,
+            "minio_key": doc.filename,
+        },
+    )
 
+    return {"status": "ok", "document_id": document_id}
+
+
+@router.post("/pipeline/{document_id}/cancel")
+async def cancel_pipeline_document(
+    document_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_superadmin),
+):
+    """
+    Cancel an in-progress document by marking it as FAILED and cleaning up
+    all associated pipeline data (ChromaDB vectors, KG nodes, MinIO objects).
+    """
+    result = await db.execute(select(Document).where(Document.id == document_id))
+    doc = result.scalar_one_or_none()
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    active_statuses = [
+        DocumentStatus.PENDING,
+        DocumentStatus.PARSING,
+        DocumentStatus.OCRING,
+        DocumentStatus.CHUNKING,
+        DocumentStatus.EMBEDDING,
+        DocumentStatus.BUILDING_KG,
+    ]
+    if doc.status not in active_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot cancel document in '{doc.status}' status",
+        )
+
+    doc.status = DocumentStatus.FAILED
+    doc.error_message = "Cancelled by user"
+    doc.embed_done = False
+    doc.captions_done = False
+    doc.kg_done = False
+    await db.commit()
+
+    try:
+        from app.services.rag_service import get_rag_service
+
+        rag_service = get_rag_service(db, doc.workspace_id)
+        await rag_service.delete_document(document_id)
+    except Exception as exc:
+        logger.warning(f"Cleanup failed for cancelled doc {document_id}: {exc}")
+
+    logger.info(f"Cancelled pipeline document {document_id}")
     return {"status": "ok", "document_id": document_id}
 
 

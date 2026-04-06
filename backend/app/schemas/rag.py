@@ -1,6 +1,7 @@
 """
 RAG-related Pydantic schemas for request/response validation.
 """
+
 import uuid
 from typing import Literal
 
@@ -9,17 +10,25 @@ from pydantic import BaseModel, Field, field_validator
 
 class RAGQueryRequest(BaseModel):
     """Request schema for RAG query endpoint."""
-    question: str = Field(..., min_length=1, max_length=1000, description="The question to query")
-    top_k: int = Field(default=5, ge=1, le=20, description="Number of chunks to retrieve")
-    document_ids: list[uuid.UUID] | None = Field(default=None, description="Filter to specific document IDs")
+
+    question: str = Field(
+        ..., min_length=1, max_length=1000, description="The question to query"
+    )
+    top_k: int = Field(
+        default=5, ge=1, le=20, description="Number of chunks to retrieve"
+    )
+    document_ids: list[uuid.UUID] | None = Field(
+        default=None, description="Filter to specific document IDs"
+    )
     mode: str = Field(
         default="hybrid",
-        description="Search mode: hybrid (default), vector_only, naive, local, global"
+        description="Search mode: hybrid (default), vector_only, naive, local, global",
     )
 
 
 class CitationResponse(BaseModel):
     """A source citation."""
+
     source_file: str
     document_id: uuid.UUID
     page_no: int = 0
@@ -29,6 +38,7 @@ class CitationResponse(BaseModel):
 
 class RetrievedChunkResponse(BaseModel):
     """Response schema for a single retrieved chunk."""
+
     content: str
     chunk_id: str
     score: float
@@ -40,6 +50,7 @@ class RetrievedChunkResponse(BaseModel):
 
 class DocumentImageResponse(BaseModel):
     """Response schema for a document image."""
+
     image_id: str
     document_id: uuid.UUID
     page_no: int
@@ -49,8 +60,22 @@ class DocumentImageResponse(BaseModel):
     url: str = ""
 
 
+class DocumentBrief(BaseModel):
+    """Minimal document metadata for chat message attachments."""
+
+    id: uuid.UUID
+    filename: str
+    original_filename: str
+    file_type: str
+    status: str
+    document_number: str | None = None
+
+    model_config = {"from_attributes": True}
+
+
 class RAGQueryResponse(BaseModel):
     """Response schema for RAG query."""
+
     query: str
     chunks: list[RetrievedChunkResponse]
     context: str
@@ -62,11 +87,13 @@ class RAGQueryResponse(BaseModel):
 
 class DocumentProcessRequest(BaseModel):
     """Request schema for document processing."""
+
     document_id: uuid.UUID
 
 
 class DocumentProcessResponse(BaseModel):
     """Response schema for document processing."""
+
     document_id: uuid.UUID
     status: str
     chunk_count: int
@@ -75,11 +102,15 @@ class DocumentProcessResponse(BaseModel):
 
 class BatchProcessRequest(BaseModel):
     """Request schema for batch document processing."""
-    document_ids: list[uuid.UUID] = Field(..., min_length=1, description="List of document IDs to process")
+
+    document_ids: list[uuid.UUID] = Field(
+        ..., min_length=1, description="List of document IDs to process"
+    )
 
 
 class ProjectRAGStatsResponse(BaseModel):
     """Response schema for workspace RAG statistics."""
+
     workspace_id: uuid.UUID
     total_documents: int
     indexed_documents: int
@@ -92,8 +123,10 @@ class ProjectRAGStatsResponse(BaseModel):
 # Knowledge Graph schemas
 # ---------------------------------------------------------------------------
 
+
 class KGEntityResponse(BaseModel):
     """A knowledge graph entity (node)."""
+
     name: str
     entity_type: str = "Unknown"
     description: str = ""
@@ -102,6 +135,7 @@ class KGEntityResponse(BaseModel):
 
 class KGRelationshipResponse(BaseModel):
     """A knowledge graph relationship (edge)."""
+
     source: str
     target: str
     description: str = ""
@@ -111,6 +145,7 @@ class KGRelationshipResponse(BaseModel):
 
 class KGGraphNodeResponse(BaseModel):
     """Node in the graph visualization payload."""
+
     id: str
     label: str
     entity_type: str = "Unknown"
@@ -119,6 +154,7 @@ class KGGraphNodeResponse(BaseModel):
 
 class KGGraphEdgeResponse(BaseModel):
     """Edge in the graph visualization payload."""
+
     source: str
     target: str
     label: str = ""
@@ -127,6 +163,7 @@ class KGGraphEdgeResponse(BaseModel):
 
 class KGGraphResponse(BaseModel):
     """Full graph export for frontend visualization."""
+
     nodes: list[KGGraphNodeResponse] = []
     edges: list[KGGraphEdgeResponse] = []
     is_truncated: bool = False
@@ -134,6 +171,7 @@ class KGGraphResponse(BaseModel):
 
 class KGAnalyticsResponse(BaseModel):
     """Knowledge Graph analytics summary."""
+
     entity_count: int = 0
     relationship_count: int = 0
     entity_types: dict[str, int] = {}  # type → count
@@ -143,6 +181,7 @@ class KGAnalyticsResponse(BaseModel):
 
 class DocumentBreakdownItem(BaseModel):
     """Per-document breakdown for analytics."""
+
     document_id: uuid.UUID
     filename: str
     chunk_count: int = 0
@@ -154,6 +193,7 @@ class DocumentBreakdownItem(BaseModel):
 
 class ProjectAnalyticsResponse(BaseModel):
     """Extended project analytics."""
+
     stats: ProjectRAGStatsResponse
     kg_analytics: KGAnalyticsResponse | None = None
     document_breakdown: list[DocumentBreakdownItem] = []
@@ -163,24 +203,33 @@ class ProjectAnalyticsResponse(BaseModel):
 # Chat schemas
 # ---------------------------------------------------------------------------
 
+
 class ChatMessageSchema(BaseModel):
     """A single chat message in conversation history."""
+
     role: str = Field(..., description="user or assistant")
     content: str
 
 
 class ChatRequest(BaseModel):
     """Request for the chat endpoint."""
+
     message: str = Field(..., min_length=1, max_length=5000)
     history: list[ChatMessageSchema] = []
-    session_id: str | None = Field(default=None, description="Session ID for conversation context. If provided, exchange summaries will be used instead of history[]")
+    session_id: str | None = Field(
+        default=None,
+        description="Session ID for conversation context. If provided, exchange summaries will be used instead of history[]",
+    )
     document_ids: list[uuid.UUID] | None = None
     enable_thinking: bool = False
-    force_search: bool = False  # Pre-search before LLM call; injects sources as context directly
+    force_search: bool = (
+        False  # Pre-search before LLM call; injects sources as context directly
+    )
 
 
 class ChatSourceChunk(BaseModel):
     """A source chunk referenced in the chat answer."""
+
     index: str  # 4-char alphanumeric ID, e.g. "id12" (was: int)
     chunk_id: str
 
@@ -188,6 +237,7 @@ class ChatSourceChunk(BaseModel):
     @classmethod
     def coerce_index_to_str(cls, v):
         return str(v) if not isinstance(v, str) else v
+
     content: str
     document_id: uuid.UUID
     page_no: int = 0
@@ -198,6 +248,7 @@ class ChatSourceChunk(BaseModel):
 
 class ChatImageRef(BaseModel):
     """An image referenced in the chat answer."""
+
     ref_id: str | None = None  # 4-char alphanumeric ID, e.g. "p4f2"
     image_id: str
     document_id: uuid.UUID
@@ -210,6 +261,7 @@ class ChatImageRef(BaseModel):
 
 class ChatResponse(BaseModel):
     """Response from the chat endpoint."""
+
     answer: str
     sources: list[ChatSourceChunk] = []
     related_entities: list[str] = []
@@ -221,10 +273,13 @@ class ChatResponse(BaseModel):
 
 class PersistedChatMessage(BaseModel):
     """A persisted chat message from the database."""
+
     id: uuid.UUID
     message_id: str
     role: str
     content: str
+    document_ids: list[uuid.UUID] | None = None
+    attached_docs: list[DocumentBrief] | None = None
     sources: list[ChatSourceChunk] | None = None
     related_entities: list[str] | None = None
     image_refs: list[ChatImageRef] | None = None
@@ -238,13 +293,21 @@ class PersistedChatMessage(BaseModel):
 
 class ChatHistoryResponse(BaseModel):
     """Response for GET chat history."""
+
     session_id: str
     messages: list[PersistedChatMessage]
     total: int
 
 
+class SessionDocumentsResponse(BaseModel):
+    """Response for GET session documents (for @mention autocomplete)."""
+
+    documents: list[DocumentBrief]
+
+
 class RateSourceRequest(BaseModel):
     """Request to rate a source citation."""
+
     message_id: str = Field(..., description="The message_id containing the source")
     source_index: str = Field(..., description="Source citation ID, e.g. 'id12'")
     rating: Literal["relevant", "partial", "not_relevant"] = Field(
@@ -254,6 +317,7 @@ class RateSourceRequest(BaseModel):
 
 class RateSourceResponse(BaseModel):
     """Response after rating a source."""
+
     success: bool
     message_id: str
     ratings: dict[str, str]
@@ -261,6 +325,7 @@ class RateSourceResponse(BaseModel):
 
 class LLMCapabilitiesResponse(BaseModel):
     """Response for LLM capabilities check."""
+
     provider: str
     model: str
     supports_thinking: bool
@@ -272,8 +337,10 @@ class LLMCapabilitiesResponse(BaseModel):
 # Debug / QA schemas
 # ---------------------------------------------------------------------------
 
+
 class DebugRetrievedSource(BaseModel):
     """A retrieved source for debug inspection."""
+
     index: str  # 4-char alphanumeric ID (was: int)
     document_id: uuid.UUID
 
@@ -281,6 +348,7 @@ class DebugRetrievedSource(BaseModel):
     @classmethod
     def coerce_index_to_str(cls, v):
         return str(v) if not isinstance(v, str) else v
+
     page_no: int
     heading_path: list[str] = []
     source_file: str = ""
@@ -291,6 +359,7 @@ class DebugRetrievedSource(BaseModel):
 
 class DebugChatResponse(BaseModel):
     """Full debug response — retrieval + LLM answer for quality inspection."""
+
     # Query
     question: str
     workspace_id: uuid.UUID

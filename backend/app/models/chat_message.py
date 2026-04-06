@@ -1,6 +1,7 @@
 """
 ChatMessage model — persists chat history per session to PostgreSQL.
 """
+
 from __future__ import annotations
 
 import uuid
@@ -28,6 +29,9 @@ class ChatMessage(Base):
     role: Mapped[str] = mapped_column(String(20), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
 
+    # Document attachments (list of document IDs)
+    document_ids: Mapped[list | None] = mapped_column(JSON, nullable=True)
+
     # Rich metadata (JSON columns — nullable for user messages)
     sources: Mapped[list | None] = mapped_column(JSON, nullable=True)
     related_entities: Mapped[list | None] = mapped_column(JSON, nullable=True)
@@ -45,4 +49,6 @@ class ChatMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     # Relationship to ChatSession
-    session: Mapped["ChatSession"] = relationship("ChatSession", back_populates="messages")
+    session: Mapped["ChatSession"] = relationship(
+        "ChatSession", back_populates="messages"
+    )

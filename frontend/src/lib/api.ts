@@ -171,13 +171,20 @@ class ApiClient {
     URL.revokeObjectURL(url);
   }
 
-  async uploadFile<T>(path: string, file: File): Promise<T> {
+  async uploadFile<T>(
+    path: string,
+    file: File,
+    extraHeaders?: Record<string, string>,
+  ): Promise<T> {
     const formData = new FormData();
     formData.append("file", file);
 
     const response = await fetch(`${BASE_URL}${path}`, {
       method: "POST",
-      headers: getAuthHeaders(),
+      headers: {
+        ...getAuthHeaders(),
+        ...extraHeaders,
+      },
       body: formData,
     });
 

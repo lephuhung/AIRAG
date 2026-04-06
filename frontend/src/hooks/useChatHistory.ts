@@ -1,6 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
-import type { ChatHistoryResponse } from "@/types";
+import type { ChatHistoryResponse, SessionDocumentsResponse } from "@/types";
 
 export function useChatHistory(sessionId: string | null) {
   return useQuery({
@@ -27,5 +27,15 @@ export function useClearChatHistory(sessionId: string | null) {
         },
       );
     },
+  });
+}
+
+export function useSessionDocuments(sessionId: string | null) {
+  return useQuery({
+    queryKey: ["session-documents", sessionId],
+    queryFn: () =>
+      api.get<SessionDocumentsResponse>(`/rag/chat/sessions/${sessionId}/documents`),
+    enabled: !!sessionId,
+    staleTime: 30000, // Cache for 30 seconds
   });
 }

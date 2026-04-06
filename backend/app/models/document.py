@@ -10,14 +10,14 @@ from app.core.database import Base
 
 
 class DocumentStatus(str, enum.Enum):
-    PENDING      = "pending"        # uploaded, waiting for worker
-    PARSING      = "parsing"        # Docling on native PDF/DOCX/PPTX
-    OCRING       = "ocring"         # OCR on scanned PDFs
-    CHUNKING     = "chunking"       # parse done, sub-tasks dispatched
-    EMBEDDING    = "embedding"      # embed_worker running
-    BUILDING_KG  = "building_kg"    # embed+captions done, KG still running
-    INDEXED      = "indexed"        # all done
-    FAILED       = "failed"
+    PENDING = "pending"  # uploaded, waiting for worker
+    PARSING = "parsing"  # Docling on native PDF/DOCX/PPTX
+    OCRING = "ocring"  # OCR on scanned PDFs
+    CHUNKING = "chunking"  # parse done, sub-tasks dispatched
+    EMBEDDING = "embedding"  # embed_worker running
+    BUILDING_KG = "building_kg"  # embed+captions done, KG still running
+    INDEXED = "indexed"  # all done
+    FAILED = "failed"
 
 
 class Document(Base):
@@ -34,7 +34,9 @@ class Document(Base):
     file_type: Mapped[str] = mapped_column(String(50))
     file_size: Mapped[int] = mapped_column(Integer)
     status: Mapped[DocumentStatus] = mapped_column(
-        Enum(DocumentStatus, values_callable=lambda enum_cls: [m.value for m in enum_cls]),
+        Enum(
+            DocumentStatus, values_callable=lambda enum_cls: [m.value for m in enum_cls]
+        ),
         default=DocumentStatus.PENDING,
     )
     chunk_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -50,13 +52,15 @@ class Document(Base):
     page_count: Mapped[int] = mapped_column(Integer, default=0)
     image_count: Mapped[int] = mapped_column(Integer, default=0)
     table_count: Mapped[int] = mapped_column(Integer, default=0)
-    parser_version: Mapped[str | None] = mapped_column(String(50), nullable=True)  # "docling" | "legacy"
+    parser_version: Mapped[str | None] = mapped_column(
+        String(50), nullable=True
+    )  # "docling" | "legacy"
     processing_time_ms: Mapped[int] = mapped_column(Integer, default=0)
 
     # Sub-task completion flags (set independently by each worker)
-    embed_done:    Mapped[bool] = mapped_column(default=False)
+    embed_done: Mapped[bool] = mapped_column(default=False)
     captions_done: Mapped[bool] = mapped_column(default=False)
-    kg_done:       Mapped[bool] = mapped_column(default=False)
+    kg_done: Mapped[bool] = mapped_column(default=False)
 
     # Raw chunks JSON stored by parse_worker, consumed by embed_worker
     # Cleared after embed_worker finishes to save space
@@ -69,7 +73,9 @@ class Document(Base):
 
     # Document type classification (auto-detected by classifier)
     document_type_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("document_types.id", ondelete="SET NULL"), nullable=True
+        UUID(as_uuid=True),
+        ForeignKey("document_types.id", ondelete="SET NULL"),
+        nullable=True,
     )
     # Official document reference number extracted by classifier (e.g. "13/2023/NĐ-CP")
     document_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
@@ -92,6 +98,9 @@ class Document(Base):
     uploaded_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
+
+    # True = uploaded via chat → skip embed/caption/kg workers after parse
+    is_chat_upload: Mapped[bool] = mapped_column(default=False)
 
     # Relationships
     workspace: Mapped["KnowledgeBase"] = relationship(back_populates="documents")

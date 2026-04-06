@@ -12,6 +12,7 @@ Responsibilities:
        CaptionMessage → hrag.caption
        KGMessage      → hrag.kg  (routing_key = workspace_id)
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -23,6 +24,7 @@ from pathlib import Path
 from sqlalchemy import delete, select
 
 from app.core.database import async_session_maker
+from app.core.config import settings
 from app.models.document_type import DocumentType as _DocumentType  # noqa: F401 — ensures SQLAlchemy mapper resolves "DocumentType" relationship
 from app.models.document import Document, DocumentImage, DocumentStatus, DocumentTable
 from app.queue import connection as mq
@@ -39,11 +41,16 @@ async def handle_parse(payload: dict) -> None:
     start = time.time()
 
     async with async_session_maker() as db:
-        result = await db.execute(select(Document).where(Document.id == msg.document_id))
+        result = await db.execute(
+            select(Document).where(Document.id == msg.document_id)
+        )
         document = result.scalar_one_or_none()
         if document is None:
             logger.error(f"[parse_worker] doc={msg.document_id} not found — skipping")
             return
+
+        document.is_chat_upload = msg.is_chat_upload
+        await db.commit()
 
         tmp_path: Path | None = None
         try:
@@ -77,6 +84,7 @@ async def handle_parse(payload: dict) -> None:
             if ext == ".pdf":
                 try:
                     from app.services.ocr_service import get_ocr_service
+
                     ocr_svc = get_ocr_service()
                     is_scanned = await asyncio.to_thread(
                         ocr_svc.is_scanned_pdf, str(tmp_path)
@@ -91,7 +99,10 @@ async def handle_parse(payload: dict) -> None:
             if ext == ".pdf" and not is_scanned:
                 try:
                     from app.services.ocr_service import get_ocr_service as _get_ocr  # noqa: F811
-                    from app.services.digital_signature_service import extract_digital_signatures
+                    from app.services.digital_signature_service import (
+                        extract_digital_signatures,
+                    )
+
                     sigs = await asyncio.to_thread(
                         extract_digital_signatures, str(tmp_path)
                     )
@@ -123,9 +134,9 @@ async def handle_parse(payload: dict) -> None:
                 content=parsed.markdown,
             )
             document.markdown_s3_key = s3_key
-            document.page_count       = parsed.page_count
-            document.table_count      = parsed.tables_count
-            document.parser_version   = (
+            document.page_count = parsed.page_count
+            document.table_count = parsed.tables_count
+            document.parser_version = (
                 "docling"
                 if DeepDocumentParser.is_docling_supported(str(tmp_path))
                 else "legacy"
@@ -136,35 +147,44 @@ async def handle_parse(payload: dict) -> None:
             try:
                 from app.services.document_type_classifier import classify_with_llm
                 from app.models.document_type import DocumentType as _DT
-                
+
                 # If PDF, attempt 1st page OCR for perfect header extraction
                 text_for_llm = parsed.markdown
                 if str(tmp_path).lower().endswith(".pdf"):
                     try:
                         import fitz
                         from app.services.ocr_service import get_ocr_service
-                        logger.info(f"[parse_worker] doc={msg.document_id} extracting page 1 for reliable header OCR")
+
+                        logger.info(
+                            f"[parse_worker] doc={msg.document_id} extracting page 1 for reliable header OCR"
+                        )
                         doc_fitz = fitz.open(str(tmp_path))
                         if doc_fitz.page_count > 0:
-                            page_pixmap = doc_fitz[0].get_pixmap(matrix=fitz.Matrix(150/72, 150/72), alpha=False)
+                            page_pixmap = doc_fitz[0].get_pixmap(
+                                matrix=fitz.Matrix(150 / 72, 150 / 72), alpha=False
+                            )
                             img_bytes = page_pixmap.tobytes("png")
                             doc_fitz.close()
-                            
+
                             ocr_svc = get_ocr_service()
                             if ocr_svc._local:
                                 page_texts = await ocr_svc._ocr_pages_local([img_bytes])
                             else:
                                 page_texts = await ocr_svc._ocr_pages_api([img_bytes])
-                                
+
                             if page_texts and page_texts[0].strip():
                                 text_for_llm = page_texts[0]
-                                logger.info(f"[parse_worker] doc={msg.document_id} page 1 OCR successful ({len(text_for_llm)} chars)")
+                                logger.info(
+                                    f"[parse_worker] doc={msg.document_id} page 1 OCR successful ({len(text_for_llm)} chars)"
+                                )
                     except Exception as e_pdf:
-                        logger.warning(f"[parse_worker] doc={msg.document_id} page 1 OCR failed, fallback to markdown: {e_pdf}")
+                        logger.warning(
+                            f"[parse_worker] doc={msg.document_id} page 1 OCR failed, fallback to markdown: {e_pdf}"
+                        )
 
                 meta_res = await classify_with_llm(text_for_llm) if text_for_llm else {}
                 slug = meta_res.get("slug")
-                
+
                 if slug:
                     dt_result = await db.execute(
                         select(_DT).where(_DT.slug == slug, _DT.is_active.is_(True))
@@ -172,7 +192,7 @@ async def handle_parse(payload: dict) -> None:
                     dt = dt_result.scalar_one_or_none()
                     if dt:
                         document.document_type_id = dt.id
-                        
+
                 # Update all rich fields
                 document.document_number = meta_res.get("document_number")
                 document.document_title = meta_res.get("document_title")
@@ -182,7 +202,9 @@ async def handle_parse(payload: dict) -> None:
                 document.published_date = meta_res.get("published_date")
 
                 await db.commit()
-                logger.info(f"[parse_worker] doc={msg.document_id} metadata classified: {meta_res}")
+                logger.info(
+                    f"[parse_worker] doc={msg.document_id} metadata classified: {meta_res}"
+                )
             except Exception as _cls_err:
                 logger.warning(
                     f"[parse_worker] doc={msg.document_id} "
@@ -191,39 +213,47 @@ async def handle_parse(payload: dict) -> None:
 
             # ── Persist images (no captions yet) ───────────────────────────
             await db.execute(
-                delete(DocumentImage).where(DocumentImage.document_id == msg.document_id)
+                delete(DocumentImage).where(
+                    DocumentImage.document_id == msg.document_id
+                )
             )
             await db.commit()
             for img in parsed.images:
-                db.add(DocumentImage(
-                    document_id=msg.document_id,
-                    image_id=img.image_id,
-                    page_no=img.page_no,
-                    file_path=img.file_path,
-                    caption=img.caption,   # empty at this point
-                    width=img.width,
-                    height=img.height,
-                    mime_type=img.mime_type,
-                ))
+                db.add(
+                    DocumentImage(
+                        document_id=msg.document_id,
+                        image_id=img.image_id,
+                        page_no=img.page_no,
+                        file_path=img.file_path,
+                        caption=img.caption,  # empty at this point
+                        width=img.width,
+                        height=img.height,
+                        mime_type=img.mime_type,
+                    )
+                )
             if parsed.images:
                 document.image_count = len(parsed.images)
                 await db.commit()
 
             # ── Persist tables (no captions yet) ───────────────────────────
             await db.execute(
-                delete(DocumentTable).where(DocumentTable.document_id == msg.document_id)
+                delete(DocumentTable).where(
+                    DocumentTable.document_id == msg.document_id
+                )
             )
             await db.commit()
             for tbl in parsed.tables:
-                db.add(DocumentTable(
-                    document_id=msg.document_id,
-                    table_id=tbl.table_id,
-                    page_no=tbl.page_no,
-                    content_markdown=tbl.content_markdown,
-                    caption="",   # empty at this point
-                    num_rows=tbl.num_rows,
-                    num_cols=tbl.num_cols,
-                ))
+                db.add(
+                    DocumentTable(
+                        document_id=msg.document_id,
+                        table_id=tbl.table_id,
+                        page_no=tbl.page_no,
+                        content_markdown=tbl.content_markdown,
+                        caption="",  # empty at this point
+                        num_rows=tbl.num_rows,
+                        num_cols=tbl.num_cols,
+                    )
+                )
             if parsed.tables:
                 await db.commit()
 
@@ -231,21 +261,24 @@ async def handle_parse(payload: dict) -> None:
             # Attach chunk data into a JSON column for the embed worker
             # so we don't need to re-parse the file
             import json
-            document.raw_chunks_json = json.dumps([
-                {
-                    "content":         c.content,
-                    "chunk_index":     c.chunk_index,
-                    "source_file":     c.source_file,
-                    "page_no":         c.page_no,
-                    "heading_path":    c.heading_path,
-                    "image_refs":      c.image_refs,
-                    "table_refs":      c.table_refs,
-                    "has_table":       c.has_table,
-                    "has_code":        c.has_code,
-                    "document_number": document.document_number or "",
-                }
-                for c in parsed.chunks
-            ])
+
+            document.raw_chunks_json = json.dumps(
+                [
+                    {
+                        "content": c.content,
+                        "chunk_index": c.chunk_index,
+                        "source_file": c.source_file,
+                        "page_no": c.page_no,
+                        "heading_path": c.heading_path,
+                        "image_refs": c.image_refs,
+                        "table_refs": c.table_refs,
+                        "has_table": c.has_table,
+                        "has_code": c.has_code,
+                        "document_number": document.document_number or "",
+                    }
+                    for c in parsed.chunks
+                ]
+            )
             document.status = DocumentStatus.CHUNKING
             elapsed_ms = int((time.time() - start) * 1000)
             document.processing_time_ms = elapsed_ms
@@ -256,36 +289,55 @@ async def handle_parse(payload: dict) -> None:
                 f"{parsed.tables_count} tables"
             )
 
-            # ── Dispatch 3 independent sub-tasks ───────────────────────────
-            await mq.publish(
-                mq.EXCHANGE_EMBED, "embed",
-                EmbedMessage(
-                    document_id=msg.document_id,
-                    workspace_id=msg.workspace_id,
-                ).model_dump(mode="json"),
+            # ── Dispatch sub-tasks OR mark INDEXED (parse-only / chat-upload mode) ─────
+            parse_only = (
+                settings.HRAG_PARSE_ONLY_MODE
+                or settings.NEXUSRAG_PARSE_ONLY_MODE
+                or msg.is_chat_upload
             )
-            await mq.publish(
-                mq.EXCHANGE_CAPTION, "caption",
-                CaptionMessage(
-                    document_id=msg.document_id,
-                    workspace_id=msg.workspace_id,
-                ).model_dump(mode="json"),
-            )
-            await mq.publish(
-                mq.EXCHANGE_KG, str(msg.workspace_id),
-                KGMessage(
-                    document_id=msg.document_id,
-                    workspace_id=msg.workspace_id,
-                    markdown=parsed.markdown,
-                ).model_dump(mode="json"),
-            )
-            logger.info(
-                f"[parse_worker] doc={msg.document_id} dispatched "
-                f"embed + caption + kg messages"
-            )
+            if parse_only:
+                document.status = DocumentStatus.INDEXED
+                await db.commit()
+                mode = "chat-upload" if msg.is_chat_upload else "parse-only"
+                logger.info(
+                    f"[parse_worker] doc={msg.document_id} {mode} — "
+                    f"marked INDEXED in {int((time.time() - start) * 1000)}ms"
+                )
+            else:
+                await mq.publish(
+                    mq.EXCHANGE_EMBED,
+                    "embed",
+                    EmbedMessage(
+                        document_id=msg.document_id,
+                        workspace_id=msg.workspace_id,
+                    ).model_dump(mode="json"),
+                )
+                await mq.publish(
+                    mq.EXCHANGE_CAPTION,
+                    "caption",
+                    CaptionMessage(
+                        document_id=msg.document_id,
+                        workspace_id=msg.workspace_id,
+                    ).model_dump(mode="json"),
+                )
+                await mq.publish(
+                    mq.EXCHANGE_KG,
+                    str(msg.workspace_id),
+                    KGMessage(
+                        document_id=msg.document_id,
+                        workspace_id=msg.workspace_id,
+                        markdown=parsed.markdown,
+                    ).model_dump(mode="json"),
+                )
+                logger.info(
+                    f"[parse_worker] doc={msg.document_id} dispatched "
+                    f"embed + caption + kg messages"
+                )
 
         except Exception as e:
-            logger.error(f"[parse_worker] doc={msg.document_id} FAILED: {e}", exc_info=True)
+            logger.error(
+                f"[parse_worker] doc={msg.document_id} FAILED: {e}", exc_info=True
+            )
             document.status = DocumentStatus.FAILED
             document.error_message = str(e)[:500]
             await db.commit()

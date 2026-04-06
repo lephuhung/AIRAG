@@ -1,6 +1,7 @@
 """
 HRAG — standalone Knowledge Base + RAG application.
 """
+
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -17,14 +18,16 @@ from app.core.database import engine, Base
 
 # Ensure all models are imported so Base.metadata knows about them
 import app.models.knowledge_base  # noqa: F401
-import app.models.document        # noqa: F401
-import app.models.document_type   # noqa: F401
-import app.models.chat_session    # noqa: F401
-import app.models.chat_message    # noqa: F401
-import app.models.user            # noqa: F401
-import app.models.tenant          # noqa: F401
-import app.models.invite_token    # noqa: F401
-import app.models.abbreviation    # noqa: F401
+import app.models.document  # noqa: F401
+import app.models.document_type  # noqa: F401
+import app.models.chat_session  # noqa: F401
+import app.models.chat_message  # noqa: F401
+import app.models.user  # noqa: F401
+import app.models.tenant  # noqa: F401
+import app.models.invite_token  # noqa: F401
+import app.models.abbreviation  # noqa: F401
+import app.models.chat_file  # noqa: F401
+import app.models.format_metadata  # noqa: F401
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("neo4j.notifications").setLevel(logging.WARNING)
@@ -37,16 +40,20 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     logger.info("Starting HRAG API...")
     import os
+
     auto_create = os.environ.get("AUTO_CREATE_TABLES", "true").lower() == "true"
     if auto_create:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
             # Auto-migrate: add new columns if missing
             await conn.execute(
-                text("ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS system_prompt TEXT")
+                text(
+                    "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS system_prompt TEXT"
+                )
             )
             # Create chat_sessions table if not exists
-            await conn.execute(text("""
+            await conn.execute(
+                text("""
                 CREATE TABLE IF NOT EXISTS chat_sessions (
                     id VARCHAR(36) PRIMARY KEY,
                     title VARCHAR(255) NOT NULL DEFAULT 'New Chat',
@@ -54,13 +61,17 @@ async def lifespan(app: FastAPI):
                     created_at TIMESTAMP DEFAULT NOW(),
                     updated_at TIMESTAMP DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS ix_chat_sessions_user_id ON chat_sessions(user_id)"
-            ))
+            """)
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_chat_sessions_user_id ON chat_sessions(user_id)"
+                )
+            )
 
             # Ensure chat_messages table + indexes exist (idempotent)
-            await conn.execute(text("""
+            await conn.execute(
+                text("""
                 CREATE TABLE IF NOT EXISTS chat_messages (
                     id SERIAL PRIMARY KEY,
                     message_id VARCHAR(50) NOT NULL,
@@ -72,30 +83,48 @@ async def lifespan(app: FastAPI):
                     thinking TEXT,
                     created_at TIMESTAMP DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text(
-                "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS session_id VARCHAR(36) REFERENCES chat_sessions(id) ON DELETE CASCADE"
-            ))
-            await conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS ix_chat_messages_session_id ON chat_messages(session_id)"
-            ))
-            await conn.execute(text(
-                "ALTER TABLE chat_messages DROP COLUMN IF EXISTS workspace_id"
-            ))
-            await conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS ix_chat_messages_message_id ON chat_messages(message_id)"
-            ))
-            await conn.execute(text(
-                "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS ratings JSON"
-            ))
-            await conn.execute(text(
-                "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS agent_steps JSON"
-            ))
-            await conn.execute(text(
-                "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS potential_abbreviations JSON"
-            ))
+            """)
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS session_id VARCHAR(36) REFERENCES chat_sessions(id) ON DELETE CASCADE"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_chat_messages_session_id ON chat_messages(session_id)"
+                )
+            )
+            await conn.execute(
+                text("ALTER TABLE chat_messages DROP COLUMN IF EXISTS workspace_id")
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_chat_messages_message_id ON chat_messages(message_id)"
+                )
+            )
+            await conn.execute(
+                text("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS ratings JSON")
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS agent_steps JSON"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS potential_abbreviations JSON"
+                )
+            )
+            # Add document_ids column for file attachments
+            await conn.execute(
+                text(
+                    "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS document_ids JSON"
+                )
+            )
             # Exchange summaries for per-Q&A conversation context
-            await conn.execute(text("""
+            await conn.execute(
+                text("""
                 CREATE TABLE IF NOT EXISTS chat_exchange_summaries (
                     id SERIAL PRIMARY KEY,
                     session_id VARCHAR(36) NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
@@ -108,107 +137,170 @@ async def lifespan(app: FastAPI):
                     cited_sources JSON,
                     created_at TIMESTAMP DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS ix_chat_exchange_summaries_session_id ON chat_exchange_summaries(session_id)"
-            ))
-            await conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS ix_chat_exchange_summaries_exchange_index ON chat_exchange_summaries(exchange_index)"
-            ))
+            """)
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_chat_exchange_summaries_session_id ON chat_exchange_summaries(session_id)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_chat_exchange_summaries_exchange_index ON chat_exchange_summaries(exchange_index)"
+                )
+            )
             # Add cited_sources column if not exists (table may already exist from previous run)
-            await conn.execute(text(
-                "ALTER TABLE chat_exchange_summaries ADD COLUMN IF NOT EXISTS cited_sources JSON"
-            ))
+            await conn.execute(
+                text(
+                    "ALTER TABLE chat_exchange_summaries ADD COLUMN IF NOT EXISTS cited_sources JSON"
+                )
+            )
 
             # Worker pipeline sub-task flags
-            await conn.execute(text(
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS embed_done BOOLEAN DEFAULT FALSE"
-            ))
-            await conn.execute(text(
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS captions_done BOOLEAN DEFAULT FALSE"
-            ))
-            await conn.execute(text(
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS kg_done BOOLEAN DEFAULT FALSE"
-            ))
-            await conn.execute(text(
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS raw_chunks_json TEXT"
-            ))
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS embed_done BOOLEAN DEFAULT FALSE"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS captions_done BOOLEAN DEFAULT FALSE"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS kg_done BOOLEAN DEFAULT FALSE"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS raw_chunks_json TEXT"
+                )
+            )
             # MinIO migration: swap markdown_content column for markdown_s3_key
-            await conn.execute(text(
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS markdown_s3_key VARCHAR(500)"
-            ))
-            await conn.execute(text(
-                "ALTER TABLE documents DROP COLUMN IF EXISTS markdown_content"
-            ))
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS markdown_s3_key VARCHAR(500)"
+                )
+            )
+            await conn.execute(
+                text("ALTER TABLE documents DROP COLUMN IF EXISTS markdown_content")
+            )
             # MinIO uploads: store the raw file S3 key
-            await conn.execute(text(
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS upload_s3_key VARCHAR(500)"
-            ))
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS upload_s3_key VARCHAR(500)"
+                )
+            )
             # Digital signature metadata (native PDF only, JSON array)
-            await conn.execute(text(
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS digital_signatures JSON"
-            ))
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS digital_signatures JSON"
+                )
+            )
             # Document type classification
-            await conn.execute(text(
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_type_id INTEGER "
-                "REFERENCES document_types(id) ON DELETE SET NULL"
-            ))
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_type_id INTEGER "
+                    "REFERENCES document_types(id) ON DELETE SET NULL"
+                )
+            )
             # Official document reference number (e.g. "13/2023/NĐ-CP")
-            await conn.execute(text(
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_number VARCHAR(100)"
-            ))
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_number VARCHAR(100)"
+                )
+            )
             # Document title/subject extracted from header (e.g. "Luật Bảo vệ Bí mật nhà nước")
-            await conn.execute(text(
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_title VARCHAR(500)"
-            ))
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_title VARCHAR(500)"
+                )
+            )
             # Manual signer name override
-            await conn.execute(text(
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS signer_name VARCHAR(255)"
-            ))
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS signer_name VARCHAR(255)"
+                )
+            )
             # Root Document node entity_id in Neo4j KG (used for metadata updates)
-            await conn.execute(text(
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS kg_root_entity_id VARCHAR(500)"
-            ))
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS kg_root_entity_id VARCHAR(500)"
+                )
+            )
             # Rich Header Metadata extracted by LLM from Page 1 OCR
-            await conn.execute(text(
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS location VARCHAR(255)"
-            ))
-            await conn.execute(text(
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS issuing_agency VARCHAR(255)"
-            ))
-            await conn.execute(text(
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS parent_agency VARCHAR(255)"
-            ))
-            await conn.execute(text(
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS published_date VARCHAR(100)"
-            ))
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS location VARCHAR(255)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS issuing_agency VARCHAR(255)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS parent_agency VARCHAR(255)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS published_date VARCHAR(100)"
+                )
+            )
             # ── Auth & multi-tenant columns ────────────────────────────────────
             # knowledge_bases: visibility, owner_id, tenant_id
-            await conn.execute(text(
-                "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS visibility VARCHAR(20) DEFAULT 'personal'"
-            ))
-            await conn.execute(text(
-                "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS owner_id INTEGER REFERENCES users(id)"
-            ))
-            await conn.execute(text(
-                "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS tenant_id INTEGER REFERENCES tenants(id)"
-            ))
+            await conn.execute(
+                text(
+                    "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS visibility VARCHAR(20) DEFAULT 'personal'"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS owner_id INTEGER REFERENCES users(id)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS tenant_id INTEGER REFERENCES tenants(id)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS is_default BOOLEAN DEFAULT FALSE"
+                )
+            )
             # documents: uploaded_by
-            await conn.execute(text(
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS uploaded_by INTEGER REFERENCES users(id)"
-            ))
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS uploaded_by INTEGER REFERENCES users(id)"
+                )
+            )
+            # documents: is_chat_upload
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS is_chat_upload BOOLEAN DEFAULT FALSE"
+                )
+            )
             # chat_messages: user_id
-            await conn.execute(text(
-                "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id)"
-            ))
+            await conn.execute(
+                text(
+                    "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id)"
+                )
+            )
 
             # document_type_system_prompts: kg_system_prompt
-            await conn.execute(text(
-                "ALTER TABLE document_type_system_prompts ADD COLUMN IF NOT EXISTS kg_system_prompt TEXT"
-            ))
+            await conn.execute(
+                text(
+                    "ALTER TABLE document_type_system_prompts ADD COLUMN IF NOT EXISTS kg_system_prompt TEXT"
+                )
+            )
 
             # --- Abbreviations Table (Explicit for clarity or metadata sync) ---
-            await conn.execute(text("""
+            await conn.execute(
+                text("""
                 CREATE TABLE IF NOT EXISTS abbreviations (
                     id SERIAL PRIMARY KEY,
                     short_form VARCHAR(50) NOT NULL,
@@ -219,23 +311,35 @@ async def lifespan(app: FastAPI):
                     created_at TIMESTAMP DEFAULT NOW(),
                     updated_at TIMESTAMP DEFAULT NOW()
                 )
-            """))
-            await conn.execute(text(
-                "CREATE INDEX IF NOT EXISTS ix_abbreviations_short_form ON abbreviations(short_form)"
-            ))
+            """)
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_abbreviations_short_form ON abbreviations(short_form)"
+                )
+            )
             # Ensure ALL lowercase enum values exist in PostgreSQL.
             # On a fresh DB, create_all() + values_callable creates them lowercase.
             # On an existing DB from before values_callable, create_all() made them
             # UPPERCASE — so we add lowercase variants and migrate data below.
             for _new_val in (
-                'pending', 'parsing', 'ocring', 'chunking',
-                'embedding', 'building_kg', 'indexed', 'failed',
+                "pending",
+                "parsing",
+                "ocring",
+                "chunking",
+                "embedding",
+                "building_kg",
+                "indexed",
+                "failed",
             ):
-                await conn.execute(text(
-                    f"ALTER TYPE documentstatus ADD VALUE IF NOT EXISTS '{_new_val}'"
-                ))
+                await conn.execute(
+                    text(
+                        f"ALTER TYPE documentstatus ADD VALUE IF NOT EXISTS '{_new_val}'"
+                    )
+                )
             # Migrate UPPERCASE enum values → lowercase (safe if already lowercase)
-            await conn.execute(text("""
+            await conn.execute(
+                text("""
                 DO $$
                 BEGIN
                     IF EXISTS (
@@ -265,11 +369,103 @@ async def lifespan(app: FastAPI):
                     -- ignore: enum may not have legacy values
                     NULL;
                 END $$;
-            """))
+            """)
+            )
+            # --- chat_files table (docx/audio files attached to chat sessions) ---
+            await conn.execute(
+                text("""
+                CREATE TABLE IF NOT EXISTS chat_files (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    session_id UUID NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    workspace_id UUID NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+                    file_name VARCHAR(255) NOT NULL,
+                    original_filename VARCHAR(255) NOT NULL,
+                    file_type VARCHAR(50) NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    minio_original_key VARCHAR(500),
+                    minio_markdown_key VARCHAR(500),
+                    markdown_content TEXT,
+                    report TEXT,
+                    issues_count INTEGER,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_chat_files_session_id ON chat_files(session_id)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_chat_files_user_id ON chat_files(user_id)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_chat_files_workspace_id ON chat_files(workspace_id)"
+                )
+            )
+            # --- format_metadata table (extracted docx formatting info) ---
+            await conn.execute(
+                text("""
+                CREATE TABLE IF NOT EXISTS format_metadata (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    chat_file_id UUID NOT NULL REFERENCES chat_files(id) ON DELETE CASCADE,
+                    format_data JSONB,
+                    created_at TIMESTAMP DEFAULT NOW()
+                )
+            """)
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_format_metadata_chat_file_id ON format_metadata(chat_file_id)"
+                )
+            )
+            # Trigger to auto-delete MinIO objects when chat_files row is deleted
+            # Inserts into chat_files_cleanup for background worker to process
+            await conn.execute(
+                text("""
+                CREATE TABLE IF NOT EXISTS chat_files_cleanup (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    minio_original_key VARCHAR(500),
+                    minio_markdown_key VARCHAR(500),
+                    created_at TIMESTAMP DEFAULT NOW(),
+                    processed BOOLEAN DEFAULT FALSE
+                )
+            """)
+            )
+            await conn.execute(
+                text("""
+                CREATE OR REPLACE FUNCTION chat_files_delete_cleanup()
+                RETURNS TRIGGER AS $$
+                BEGIN
+                    INSERT INTO chat_files_cleanup (minio_original_key, minio_markdown_key)
+                    VALUES (OLD.minio_original_key, OLD.minio_markdown_key);
+                    RETURN OLD;
+                END;
+                $$ LANGUAGE plpgsql;
+            """)
+            )
+            await conn.execute(
+                text("""
+                DROP TRIGGER IF EXISTS chat_files_cleanup_trigger ON chat_files;
+            """)
+            )
+            await conn.execute(
+                text("""
+                CREATE TRIGGER chat_files_cleanup_trigger
+                AFTER DELETE ON chat_files
+                FOR EACH ROW
+                EXECUTE FUNCTION chat_files_delete_cleanup();
+            """)
+            )
         logger.info("Database tables created/verified")
 
         # Ensure MinIO buckets exist
         from app.services.storage_service import get_storage_service
+
         try:
             storage = get_storage_service()
             await storage.ensure_bucket()
@@ -298,7 +494,9 @@ async def lifespan(app: FastAPI):
 
             async with async_session_maker() as _admin_db:
                 exists = await _admin_db.execute(
-                    _select(UserModel).where(UserModel.email == settings.FIRST_SUPERADMIN_EMAIL)
+                    _select(UserModel).where(
+                        UserModel.email == settings.FIRST_SUPERADMIN_EMAIL
+                    )
                 )
                 existing_admin = exists.scalar_one_or_none()
                 if existing_admin is None:
@@ -311,14 +509,18 @@ async def lifespan(app: FastAPI):
                     )
                     _admin_db.add(admin)
                     await _admin_db.commit()
-                    logger.info(f"SuperAdmin user created: {settings.FIRST_SUPERADMIN_EMAIL}")
+                    logger.info(
+                        f"SuperAdmin user created: {settings.FIRST_SUPERADMIN_EMAIL}"
+                    )
                 else:
                     # Ensure superadmin is always active and has superadmin flag
                     if not existing_admin.is_active or not existing_admin.is_superadmin:
                         existing_admin.is_active = True
                         existing_admin.is_superadmin = True
                         await _admin_db.commit()
-                        logger.info(f"SuperAdmin user re-activated: {settings.FIRST_SUPERADMIN_EMAIL}")
+                        logger.info(
+                            f"SuperAdmin user re-activated: {settings.FIRST_SUPERADMIN_EMAIL}"
+                        )
                     else:
                         logger.info("SuperAdmin user already exists and is active")
         except Exception as _admin_err:
@@ -329,13 +531,17 @@ async def lifespan(app: FastAPI):
             from app.core.database import async_session_maker
 
             async with async_session_maker() as _migrate_db:
-                result = await _migrate_db.execute(text(
-                    "UPDATE knowledge_bases SET visibility = 'public' "
-                    "WHERE owner_id IS NULL AND visibility = 'personal'"
-                ))
+                result = await _migrate_db.execute(
+                    text(
+                        "UPDATE knowledge_bases SET visibility = 'public' "
+                        "WHERE owner_id IS NULL AND visibility = 'personal'"
+                    )
+                )
                 if result.rowcount > 0:
                     await _migrate_db.commit()
-                    logger.info(f"Migrated {result.rowcount} legacy workspaces to visibility='public'")
+                    logger.info(
+                        f"Migrated {result.rowcount} legacy workspaces to visibility='public'"
+                    )
                 else:
                     await _migrate_db.commit()
         except Exception as _mig_err:
@@ -344,9 +550,11 @@ async def lifespan(app: FastAPI):
         # ── Add avatar_url column to users (idempotent) ───────────────────────
         try:
             async with engine.begin() as _col_conn:
-                await _col_conn.execute(text(
-                    "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(1024)"
-                ))
+                await _col_conn.execute(
+                    text(
+                        "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url VARCHAR(1024)"
+                    )
+                )
             logger.info("users.avatar_url column ensured")
         except Exception as _col_err:
             logger.warning(f"avatar_url migration failed (non-fatal): {_col_err}")
@@ -357,6 +565,7 @@ async def lifespan(app: FastAPI):
     if settings.HRAG_EAGER_MODEL_LOADING:
         logger.info("Eager loading HRAG models...")
         from app.services.models.loader import preload_models
+
         # Pre-load embedder and reranker (and optionally local OCR)
         # to ensure the first request is fast.
         preload_models()
@@ -369,6 +578,7 @@ async def lifespan(app: FastAPI):
     # Non-fatal: if Neo4j is unavailable, memory falls back to empty context.
     try:
         from app.services.graphiti_client import initialize_graphiti
+
         await initialize_graphiti()
     except Exception as _graphiti_err:
         logger.warning(f"Graphiti memory init failed (non-fatal): {_graphiti_err}")
@@ -378,6 +588,7 @@ async def lifespan(app: FastAPI):
     # Non-fatal: if MongoDB is unreachable, falls back to lazy connect on first use.
     try:
         from app.services.mongo_client import get_mongo_client
+
         _mongo_client = get_mongo_client()
         # Force TCP handshake + auth now (pymongo connects lazily on first op)
         _mongo_client.admin.command("ping")
@@ -390,6 +601,7 @@ async def lifespan(app: FastAPI):
     await engine.dispose()
     try:
         from app.services.mongo_client import close_mongo_client
+
         close_mongo_client()
     except Exception:
         pass
@@ -426,7 +638,9 @@ async def global_exception_handler(request: Request, exc: Exception):
             f"{request.method} {request.url.path}"
         )
         # Can't send a response — the pipe is gone. Return a minimal 499.
-        return JSONResponse(status_code=499, content={"detail": "Client closed request"})
+        return JSONResponse(
+            status_code=499, content={"detail": "Client closed request"}
+        )
     logger.error(f"Unhandled exception: {exc}", exc_info=True)
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
@@ -449,7 +663,19 @@ app.include_router(api_router, prefix="/api/v1")
 # Static files — document images extracted by HRAG (Docling)
 _docling_data = Path(__file__).resolve().parent.parent / "data" / "docling"
 _docling_data.mkdir(parents=True, exist_ok=True)
-app.mount("/static/doc-images", StaticFiles(directory=str(_docling_data)), name="static_doc_images")
+app.mount(
+    "/static/doc-images",
+    StaticFiles(directory=str(_docling_data)),
+    name="static_doc_images",
+)
 
 # Import models so SQLAlchemy registers them
-from app.models import knowledge_base, document, chat_session, chat_message, user, tenant, invite_token  # noqa: E402, F401
+from app.models import (
+    knowledge_base,
+    document,
+    chat_session,
+    chat_message,
+    user,
+    tenant,
+    invite_token,
+)  # noqa: E402, F401

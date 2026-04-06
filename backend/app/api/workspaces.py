@@ -1,6 +1,7 @@
 """
 Knowledge Base (Workspace) CRUD API endpoints — with auth.
 """
+
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -8,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_
 
 from app.core.deps import get_db, get_current_active_user, verify_workspace_access
-from app.core.exceptions import NotFoundError, ForbiddenError
+from app.core.exceptions import NotFoundError, ForbiddenError, BadRequestError
 from app.models.knowledge_base import KnowledgeBase
 from app.models.document import Document, DocumentStatus
 from app.models.user import User
@@ -46,6 +47,7 @@ async def _enrich_response(db: AsyncSession, kb: KnowledgeBase) -> WorkspaceResp
         visibility=kb.visibility or "personal",
         owner_id=kb.owner_id,
         tenant_id=kb.tenant_id,
+        is_default=kb.is_default,
     )
 
 
@@ -82,8 +84,8 @@ async def list_workspaces(
         ]
         if user_tenant_ids:
             conditions.append(
-                (KnowledgeBase.visibility == "tenant") &
-                KnowledgeBase.tenant_id.in_(user_tenant_ids)
+                (KnowledgeBase.visibility == "tenant")
+                & KnowledgeBase.tenant_id.in_(user_tenant_ids)
             )
 
         result = await db.execute(
@@ -113,11 +115,14 @@ async def create_workspace(
 
     # Validate: tenant visibility requires a tenant_id
     if (body.visibility or "personal") == "tenant" and body.tenant_id is None:
-        raise HTTPException(status_code=400, detail="tenant_id is required when visibility is 'tenant'")
+        raise HTTPException(
+            status_code=400, detail="tenant_id is required when visibility is 'tenant'"
+        )
 
     # Validate tenant_id if provided
     if body.tenant_id is not None:
         from app.models.tenant import Tenant
+
         t_result = await db.execute(select(Tenant).where(Tenant.id == body.tenant_id))
         if t_result.scalar_one_or_none() is None:
             raise HTTPException(status_code=400, detail="Tenant not found")
@@ -147,9 +152,7 @@ async def list_workspace_summaries(
     """Compact list for dropdown selectors."""
     # Reuse same filter logic as list_workspaces
     if user.is_superadmin:
-        result = await db.execute(
-            select(KnowledgeBase).order_by(KnowledgeBase.name)
-        )
+        result = await db.execute(select(KnowledgeBase).order_by(KnowledgeBase.name))
     else:
         tenant_result = await db.execute(
             select(TenantUser.tenant_id).where(
@@ -166,14 +169,12 @@ async def list_workspace_summaries(
         ]
         if user_tenant_ids:
             conditions.append(
-                (KnowledgeBase.visibility == "tenant") &
-                KnowledgeBase.tenant_id.in_(user_tenant_ids)
+                (KnowledgeBase.visibility == "tenant")
+                & KnowledgeBase.tenant_id.in_(user_tenant_ids)
             )
 
         result = await db.execute(
-            select(KnowledgeBase)
-            .where(or_(*conditions))
-            .order_by(KnowledgeBase.name)
+            select(KnowledgeBase).where(or_(*conditions)).order_by(KnowledgeBase.name)
         )
 
     kbs = result.scalars().all()
@@ -182,9 +183,9 @@ async def list_workspace_summaries(
         cnt = await db.execute(
             select(func.count(Document.id)).where(Document.workspace_id == kb.id)
         )
-        summaries.append(WorkspaceSummary(
-            id=kb.id, name=kb.name, document_count=cnt.scalar() or 0
-        ))
+        summaries.append(
+            WorkspaceSummary(id=kb.id, name=kb.name, document_count=cnt.scalar() or 0)
+        )
     return summaries
 
 
@@ -222,7 +223,9 @@ async def update_workspace(
                 )
             )
             if tu_result.scalar_one_or_none() is None:
-                raise ForbiddenError("Only the owner or tenant admin can edit this workspace")
+                raise ForbiddenError(
+                    "Only the owner or tenant admin can edit this workspace"
+                )
         else:
             raise ForbiddenError("Only the owner can edit this workspace")
 
@@ -237,10 +240,15 @@ async def update_workspace(
     # Superadmin-only: reassign tenant_id / visibility
     if body.tenant_id is not None or body.visibility is not None:
         if not user.is_superadmin:
-            raise ForbiddenError("Only superadmin can change workspace tenant or visibility")
+            raise ForbiddenError(
+                "Only superadmin can change workspace tenant or visibility"
+            )
         if body.tenant_id is not None:
             from app.models.tenant import Tenant
-            t_result = await db.execute(select(Tenant).where(Tenant.id == body.tenant_id))
+
+            t_result = await db.execute(
+                select(Tenant).where(Tenant.id == body.tenant_id)
+            )
             if t_result.scalar_one_or_none() is None:
                 raise HTTPException(status_code=400, detail="Tenant not found")
             kb.tenant_id = body.tenant_id
@@ -273,13 +281,16 @@ async def delete_workspace(
                 )
             )
             if tu_result.scalar_one_or_none() is None:
-                raise ForbiddenError("Only the owner or tenant admin can delete this workspace")
+                raise ForbiddenError(
+                    "Only the owner or tenant admin can delete this workspace"
+                )
         else:
             raise ForbiddenError("Only the owner can delete this workspace")
 
     # Clean up vector store and KG data
     try:
         from app.services.vector_store import get_vector_store
+
         vs = get_vector_store(workspace_id)
         vs.delete_collection()
     except Exception:
@@ -287,6 +298,7 @@ async def delete_workspace(
 
     try:
         from app.services.knowledge_graph_service import KnowledgeGraphService
+
         kg = KnowledgeGraphService(workspace_id)
         await kg.delete_project_data()
     except Exception:
@@ -295,9 +307,54 @@ async def delete_workspace(
     # Clean up image files
     import shutil
     from app.core.config import settings
+
     images_dir = settings.BASE_DIR / "data" / "docling" / f"kb_{workspace_id}"
     if images_dir.exists():
         shutil.rmtree(images_dir, ignore_errors=True)
 
     await db.delete(kb)
     await db.commit()
+
+
+@router.post("/{workspace_id}/set-default", response_model=WorkspaceResponse)
+async def set_default_workspace(
+    workspace_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
+    """Set a personal workspace as the user's default.
+
+    Only the owner can set their personal workspace as default.
+    Setting a new default will unset the previous default.
+    """
+    kb = await verify_workspace_access(workspace_id, user, db)
+
+    # Only personal workspaces can be set as default
+    if kb.visibility != "personal":
+        raise BadRequestError("Only personal workspaces can be set as default")
+
+    # Only owner can set default
+    if kb.owner_id is None or kb.owner_id != user.id:
+        raise ForbiddenError("Only the owner can set workspace as default")
+
+    # Unset any existing default for this user
+    await db.execute(
+        select(KnowledgeBase).where(
+            KnowledgeBase.owner_id == user.id,
+            KnowledgeBase.is_default.is_(True),
+        )
+    )
+    existing_defaults = await db.execute(
+        select(KnowledgeBase).where(
+            KnowledgeBase.owner_id == user.id,
+            KnowledgeBase.is_default.is_(True),
+        )
+    )
+    for old_default in existing_defaults.scalars().all():
+        old_default.is_default = False
+
+    # Set new default
+    kb.is_default = True
+    await db.commit()
+    await db.refresh(kb)
+    return await _enrich_response(db, kb)

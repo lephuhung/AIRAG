@@ -14,7 +14,9 @@ class Settings(BaseSettings):
     BASE_DIR: Path = Path(__file__).resolve().parent.parent.parent
 
     # Infrastructure
-    DATABASE_URL: str = Field(default="postgresql+asyncpg://postgres:postgres@localhost:5433/hrag")
+    DATABASE_URL: str = Field(
+        default="postgresql+asyncpg://postgres:postgres@localhost:5433/hrag"
+    )
     CHROMA_HOST: str = Field(default="localhost")
     CHROMA_PORT: int = Field(default=8002)
     RABBITMQ_URL: str = Field(default="amqp://guest:guest@localhost:5672/")
@@ -63,7 +65,9 @@ class Settings(BaseSettings):
 
     # LegalKG Extraction LLM — model for KG entity/relation extraction
     # Can use same provider as LLM_PROVIDER but specify different URL + model
-    LEGAL_KG_LLM_PROVIDER: str = Field(default="openai_compatible")  # gemini | ollama | openai_compatible
+    LEGAL_KG_LLM_PROVIDER: str = Field(
+        default="openai_compatible"
+    )  # gemini | ollama | openai_compatible
     LEGAL_KG_LLM_BASE_URL: str = Field(default="http://127.0.0.1:8000/v1")
     LEGAL_KG_LLM_MODEL: str = Field(default="Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8")
     LEGAL_KG_LLM_API_KEY: str = Field(default="sk-nexusrag")
@@ -76,6 +80,19 @@ class Settings(BaseSettings):
     HRAG_ENABLE_TABLE_CAPTIONING: bool = Field(default=True)
     HRAG_ENABLE_FORMULA_ENRICHMENT: bool = Field(default=False)
 
+    # Aliases for NEXUSRAG_* prefix (same values, read from .env)
+    NEXUSRAG_ENABLED: bool = Field(default=True)
+    NEXUSRAG_ENABLE_KG: bool = Field(default=True)
+    NEXUSRAG_ENABLE_IMAGE_EXTRACTION: bool = Field(default=True)
+    NEXUSRAG_ENABLE_IMAGE_CAPTIONING: bool = Field(default=True)
+    NEXUSRAG_ENABLE_TABLE_CAPTIONING: bool = Field(default=True)
+    NEXUSRAG_ENABLE_FORMULA_ENRICHMENT: bool = Field(default=False)
+
+    # Parse-only mode: skip embed/caption/kg workers, mark as INDEXED immediately after parse.
+    # Use when you only need markdown storage (no RAG retrieval, no KG, no captioning).
+    HRAG_PARSE_ONLY_MODE: bool = Field(default=False)
+    NEXUSRAG_PARSE_ONLY_MODE: bool = Field(default=False)
+
     # Chunking
     HRAG_CHUNK_MAX_TOKENS: int = Field(default=512)
 
@@ -83,24 +100,39 @@ class Settings(BaseSettings):
     # Reduces retrieval failure rate by ~35-49% at the cost of extra LLM calls during indexing.
     # Uses the memory agent (Qwen3-4B) — no extra model needed.
     HRAG_ENABLE_CONTEXTUAL_EMBEDDINGS: bool = Field(default=False)
-    HRAG_CONTEXTUAL_MAX_TOKENS: int = Field(default=120)   # max tokens for generated context sentence
-    HRAG_CONTEXTUAL_CONCURRENCY: int = Field(default=8)    # parallel LLM calls per document
+    HRAG_CONTEXTUAL_MAX_TOKENS: int = Field(
+        default=120
+    )  # max tokens for generated context sentence
+    HRAG_CONTEXTUAL_CONCURRENCY: int = Field(
+        default=8
+    )  # parallel LLM calls per document
 
     # BM25 hybrid search (lexical search merged with vector via Reciprocal Rank Fusion)
     # Reduces retrieval failure rate by an additional ~14% on top of contextual embeddings.
     # No extra model needed — pure BM25 over in-memory corpus (per workspace, lazy-built).
     HRAG_ENABLE_BM25: bool = Field(default=True)
-    HRAG_BM25_PREFETCH: int = Field(default=20)   # top-N BM25 candidates before RRF merge
-    HRAG_RRF_K: int = Field(default=60)           # RRF constant (higher = smoother, 60 is standard)
+    HRAG_BM25_PREFETCH: int = Field(
+        default=20
+    )  # top-N BM25 candidates before RRF merge
+    HRAG_RRF_K: int = Field(
+        default=60
+    )  # RRF constant (higher = smoother, 60 is standard)
 
     # Knowledge Graph
     HRAG_KG_LANGUAGE: str = Field(default="Vietnamese")
-    HRAG_KG_ENTITY_TYPES: list[str] = Field(default=[
-        "Article", "Person", "Organization", "Task"
-    ])
-    HRAG_KG_RELATION_TYPES: list[str] = Field(default=[
-        "CAN_CU", "VIEN_DAN", "SUA_DOI", "CHU_TRI", "PHOI_HOP", "CHIU_TRACH_NHIEM"
-    ])
+    HRAG_KG_ENTITY_TYPES: list[str] = Field(
+        default=["Article", "Person", "Organization", "Task"]
+    )
+    HRAG_KG_RELATION_TYPES: list[str] = Field(
+        default=[
+            "CAN_CU",
+            "VIEN_DAN",
+            "SUA_DOI",
+            "CHU_TRI",
+            "PHOI_HOP",
+            "CHIU_TRACH_NHIEM",
+        ]
+    )
     # KG pipeline mode:
     #   "legal"    → LegalKGService (Vietnamese admin/legal docs, purpose-built)
     #   "lightrag" → original LightRAG generic pipeline (backward compat)
@@ -158,7 +190,9 @@ class Settings(BaseSettings):
     WORKER_PREFETCH_EMBED: int = Field(default=2)
     WORKER_PREFETCH_CAPTION: int = Field(default=1)
     WORKER_PREFETCH_KG: int = Field(default=1)
-    WORKER_KG_POLL_INTERVAL: int = Field(default=30)  # seconds — how often to scan for new workspaces
+    WORKER_KG_POLL_INTERVAL: int = Field(
+        default=30
+    )  # seconds — how often to scan for new workspaces
 
     # ── LangGraph Agent ──────────────────────────────────────────────────────
     # Choose the chat agent backend:
@@ -201,7 +235,9 @@ class Settings(BaseSettings):
     MONGO_AUTH_SOURCE: str = Field(default="admin")
 
     # CORS
-    CORS_ORIGINS: list[str] = Field(default=["http://localhost:5174", "http://localhost:3000"])
+    CORS_ORIGINS: list[str] = Field(
+        default=["http://localhost:5174", "http://localhost:3000"]
+    )
 
     # Authentication (JWT)
     JWT_SECRET_KEY: str = Field(default="change-me-in-production-use-a-real-secret-key")

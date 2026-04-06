@@ -3,6 +3,7 @@ import { useTranslation } from "@/hooks/useTranslation";
 import { useNavigate } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { useCancelPipeline } from "@/hooks/useWorkers";
 import {
   Activity,
   CheckCircle2,
@@ -260,6 +261,14 @@ export function WorkersPage() {
     onError: () => toast.error(t("workers.queue_delete_failed")),
   });
 
+  const cancelDoc = useCancelPipeline({
+    onSuccess: () => {
+      invalidateAll();
+      toast.success(t("workers.cancel_success"));
+    },
+    onError: () => toast.error(t("workers.cancel_failed")),
+  });
+
   // ── DLQ mutations ──
   const purgeDlq = useMutation({
     mutationFn: () => api.post("/workers/dead-letter/purge"),
@@ -284,6 +293,7 @@ export function WorkersPage() {
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
   const [retryAllConfirm, setRetryAllConfirm] = useState(false);
   const [stopConfirm, setStopConfirm] = useState<string | null>(null);
+  const [cancelConfirmDoc, setCancelConfirmDoc] = useState<string | null>(null);
 
   // ── Computed ──
   const pipeline = overview?.pipeline_summary;
@@ -775,10 +785,11 @@ export function WorkersPage() {
                     <thead>
                       <tr className="border-b bg-muted/30">
                         <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.file")}</th>
-                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.status")}</th>
+                        <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">{t("common.status")}</th>
                         <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.sub_tasks")}</th>
                         <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.time")}</th>
                         <th className="text-left px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.updated")}</th>
+                        <th className="text-right px-4 py-2 text-xs font-medium text-muted-foreground">{t("workers.actions")}</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -816,6 +827,18 @@ export function WorkersPage() {
                             </td>
                             <td className="px-4 py-2.5 text-xs text-muted-foreground">
                               {doc.updated_at ? formatRelativeDate(doc.updated_at) : "—"}
+                            </td>
+                            <td className="px-4 py-2.5 text-right">
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 text-xs gap-1 text-destructive hover:text-destructive"
+                                onClick={() => setCancelConfirmDoc(String(doc.id))}
+                                disabled={cancelDoc.isPending}
+                              >
+                                <XCircle className="w-3 h-3" />
+                                {t("common.cancel")}
+                              </Button>
                             </td>
                           </tr>
                         );
@@ -1007,6 +1030,21 @@ export function WorkersPage() {
         title={t("workers.stop_workers_title")}
         message={t("workers.stop_workers_msg", { type: stopConfirm })}
         confirmLabel={t("common.stop")}
+        variant="danger"
+      />
+
+      <ConfirmDialog
+        open={cancelConfirmDoc !== null}
+        onConfirm={() => {
+          if (cancelConfirmDoc) {
+            cancelDoc.mutate(cancelConfirmDoc);
+            setCancelConfirmDoc(null);
+          }
+        }}
+        onCancel={() => setCancelConfirmDoc(null)}
+        title={t("workers.cancel_title")}
+        message={t("workers.cancel_msg")}
+        confirmLabel={t("common.cancel")}
         variant="danger"
       />
     </div>

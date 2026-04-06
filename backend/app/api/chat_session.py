@@ -1,6 +1,7 @@
 """
 REST API for Chat Sessions.
 """
+
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
@@ -10,7 +11,13 @@ from app.models.user import User
 from app.models.chat_session import ChatSession
 from app.models.chat_message import ChatMessage
 from app.models.knowledge_base import KnowledgeBase
-from app.schemas.rag import ChatHistoryResponse, PersistedChatMessage
+from app.models.document import Document
+from app.schemas.rag import (
+    ChatHistoryResponse,
+    PersistedChatMessage,
+    DocumentBrief,
+    SessionDocumentsResponse,
+)
 import logging
 import uuid
 from datetime import datetime
@@ -18,6 +25,7 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/rag/chat/sessions", tags=["chat_session"])
+
 
 @router.get("")
 async def list_chat_sessions(
@@ -41,10 +49,13 @@ async def list_chat_sessions(
         for s in sessions
     ]
 
+
 from pydantic import BaseModel
+
 
 class CreateSessionRequest(BaseModel):
     title: str = "New Chat"
+
 
 @router.post("")
 async def create_chat_session(
@@ -53,10 +64,7 @@ async def create_chat_session(
     user: User = Depends(get_current_active_user),
 ):
     """Create a new chat session."""
-    session = ChatSession(
-        title=request.title,
-        user_id=user.id
-    )
+    session = ChatSession(title=request.title, user_id=user.id)
     db.add(session)
     await db.commit()
     await db.refresh(session)
@@ -67,6 +75,7 @@ async def create_chat_session(
         "updated_at": session.updated_at,
     }
 
+
 @router.delete("/{session_id}")
 async def delete_chat_session(
     session_id: str,
@@ -75,7 +84,9 @@ async def delete_chat_session(
 ):
     """Delete a chat session and all its messages."""
     result = await db.execute(
-        select(ChatSession).where(ChatSession.id == session_id, ChatSession.user_id == user.id)
+        select(ChatSession).where(
+            ChatSession.id == session_id, ChatSession.user_id == user.id
+        )
     )
     session = result.scalar_one_or_none()
     if not session:
@@ -85,6 +96,7 @@ async def delete_chat_session(
     await db.commit()
     return {"status": "deleted"}
 
+
 @router.get("/{session_id}/history", response_model=ChatHistoryResponse)
 async def get_session_history(
     session_id: str,
@@ -93,7 +105,9 @@ async def get_session_history(
 ):
     """Get the message history for a chat session."""
     result = await db.execute(
-        select(ChatSession).where(ChatSession.id == session_id, ChatSession.user_id == user.id)
+        select(ChatSession).where(
+            ChatSession.id == session_id, ChatSession.user_id == user.id
+        )
     )
     session = result.scalar_one_or_none()
     if not session:
@@ -106,6 +120,31 @@ async def get_session_history(
     )
     msgs = msg_result.scalars().all()
 
+    # Convert stored string document_ids back to UUID list
+    def _parse_doc_ids(doc_ids_json):
+        if not doc_ids_json:
+            return None
+        try:
+            return [uuid.UUID(str(d)) for d in doc_ids_json]
+        except (ValueError, TypeError):
+            return None
+
+    # Collect all document IDs from messages
+    all_doc_ids: list[uuid.UUID] = []
+    for m in msgs:
+        parsed = _parse_doc_ids(m.document_ids)
+        if parsed:
+            all_doc_ids.extend(parsed)
+
+    # Fetch document metadata in bulk
+    doc_metadata_map: dict[uuid.UUID, Document] = {}
+    if all_doc_ids:
+        doc_result = await db.execute(
+            select(Document).where(Document.id.in_(all_doc_ids))
+        )
+        for doc in doc_result.scalars().all():
+            doc_metadata_map[doc.id] = doc
+
     return ChatHistoryResponse(
         session_id=session_id,
         total=len(msgs),
@@ -115,6 +154,13 @@ async def get_session_history(
                 message_id=m.message_id,
                 role=m.role,
                 content=m.content,
+                document_ids=_parse_doc_ids(m.document_ids),
+                attached_docs=[
+                    DocumentBrief.model_validate(doc_metadata_map[doc_id])
+                    for doc_id in (_parse_doc_ids(m.document_ids) or [])
+                    if doc_id in doc_metadata_map
+                ]
+                or None,
                 sources=m.sources,
                 related_entities=m.related_entities,
                 image_refs=m.image_refs,
@@ -128,6 +174,54 @@ async def get_session_history(
         ],
     )
 
+
+@router.get("/{session_id}/documents", response_model=SessionDocumentsResponse)
+async def get_session_documents(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
+    """Get all documents attached to any message in a chat session (for @mention autocomplete)."""
+    result = await db.execute(
+        select(ChatSession).where(
+            ChatSession.id == session_id, ChatSession.user_id == user.id
+        )
+    )
+    session = result.scalar_one_or_none()
+    if not session:
+        raise HTTPException(status_code=404, detail="Chat session not found")
+
+    msg_result = await db.execute(
+        select(ChatMessage).where(ChatMessage.session_id == session_id)
+    )
+    msgs = msg_result.scalars().all()
+
+    def _parse_doc_ids(doc_ids_json):
+        if not doc_ids_json:
+            return None
+        try:
+            return [uuid.UUID(str(d)) for d in doc_ids_json]
+        except (ValueError, TypeError):
+            return None
+
+    all_doc_ids: list[uuid.UUID] = []
+    for m in msgs:
+        parsed = _parse_doc_ids(m.document_ids)
+        if parsed:
+            all_doc_ids.extend(parsed)
+
+    doc_metadata_map: dict[uuid.UUID, Document] = {}
+    if all_doc_ids:
+        doc_result = await db.execute(
+            select(Document).where(Document.id.in_(all_doc_ids))
+        )
+        for doc in doc_result.scalars().all():
+            doc_metadata_map[doc.id] = doc
+
+    documents = [DocumentBrief.model_validate(doc) for doc in doc_metadata_map.values()]
+    return SessionDocumentsResponse(documents=documents)
+
+
 @router.delete("/{session_id}/history")
 async def clear_session_history(
     session_id: str,
@@ -136,7 +230,9 @@ async def clear_session_history(
 ):
     """Clear all messages from a chat session."""
     result = await db.execute(
-        select(ChatSession).where(ChatSession.id == session_id, ChatSession.user_id == user.id)
+        select(ChatSession).where(
+            ChatSession.id == session_id, ChatSession.user_id == user.id
+        )
     )
     session = result.scalar_one_or_none()
     if not session:
@@ -146,9 +242,11 @@ async def clear_session_history(
     await db.commit()
     return {"status": "cleared"}
 
+
 from fastapi.responses import StreamingResponse
 from app.schemas.rag import ChatRequest
 from app.api.chat_agent import agent_chat_stream, _get_accessible_workspaces
+
 
 @router.post("/{session_id}/stream")
 async def chat_stream_session(
@@ -166,22 +264,30 @@ async def chat_stream_session(
     from app.core.config import settings
 
     result = await db.execute(
-        select(ChatSession).where(ChatSession.id == session_id, ChatSession.user_id == user.id)
+        select(ChatSession).where(
+            ChatSession.id == session_id, ChatSession.user_id == user.id
+        )
     )
     session = result.scalar_one_or_none()
     if not session:
         raise HTTPException(status_code=404, detail="Chat session not found")
 
     import uuid
+
     user_msg_id = f"msg_{uuid.uuid4().hex[:8]}"
 
     # Save user message
+    # Convert UUIDs to strings for JSON serialization
+    doc_ids_json = (
+        [str(d) for d in request.document_ids] if request.document_ids else None
+    )
     user_msg = ChatMessage(
         session_id=session_id,
         message_id=user_msg_id,
         role="user",
         content=request.message,
         user_id=user.id,
+        document_ids=doc_ids_json,
     )
     db.add(user_msg)
     await db.commit()
@@ -191,12 +297,18 @@ async def chat_stream_session(
 
     # Get system prompt
     from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
+
     system_prompt_to_use = DEFAULT_SYSTEM_PROMPT + HARD_SYSTEM_PROMPT
 
     # Build conversation context from exchange summaries (if session has history)
-    from app.services.conversation_summary_service import get_conversation_summary_service
+    from app.services.conversation_summary_service import (
+        get_conversation_summary_service,
+    )
+
     summary_svc = get_conversation_summary_service()
-    conversation_context = await summary_svc.get_context_for_session(db, session_id, limit=10)
+    conversation_context = await summary_svc.get_context_for_session(
+        db, session_id, limit=10
+    )
     if conversation_context:
         system_prompt_to_use += (
             "\n\n=== CONVERSATION HISTORY (from previous exchanges) ===\n"
@@ -223,9 +335,12 @@ async def chat_stream_session(
     ):
         try:
             from app.core.database import async_session_maker
+
             async with async_session_maker() as bg_db:
                 # Re-fetch session to ensure it exists in this session
-                res = await bg_db.execute(select(ChatSession).where(ChatSession.id == session_id))
+                res = await bg_db.execute(
+                    select(ChatSession).where(ChatSession.id == session_id)
+                )
                 bg_session = res.scalar_one_or_none()
                 if not bg_session:
                     return
@@ -237,15 +352,17 @@ async def chat_stream_session(
                     if step_copy.get("status") == "active":
                         step_copy["status"] = "completed"
                     processed_steps.append(step_copy)
-                
+
                 if not any(s.get("step") == "done" for s in processed_steps):
-                    processed_steps.append({
-                        "id": f"step_done_{uuid.uuid4().hex[:6]}",
-                        "step": "done",
-                        "status": "completed",
-                        "detail": "Hoàn thành",
-                        "timestamp": int(datetime.utcnow().timestamp() * 1000)
-                    })
+                    processed_steps.append(
+                        {
+                            "id": f"step_done_{uuid.uuid4().hex[:6]}",
+                            "step": "done",
+                            "status": "completed",
+                            "detail": "Hoàn thành",
+                            "timestamp": int(datetime.utcnow().timestamp() * 1000),
+                        }
+                    )
 
                 # Save assistant message
                 ai_msg = ChatMessage(
@@ -264,14 +381,19 @@ async def chat_stream_session(
                 # Update session title if still default
                 DEFAULT_TITLES = ["New Chat", "New chat", "Chat mới", "Kho tri thức"]
                 if bg_session.title in DEFAULT_TITLES or not bg_session.title:
-                    bg_session.title = user_message[:50] + ("..." if len(user_message) > 50 else "")
+                    bg_session.title = user_message[:50] + (
+                        "..." if len(user_message) > 50 else ""
+                    )
 
                 await bg_db.commit()
-                logger.info(f"[session/{session_id}] Post-stream updates completed in background")
+                logger.info(
+                    f"[session/{session_id}] Post-stream updates completed in background"
+                )
 
                 # Graphiti save
                 if user.id and user_message and text:
                     from app.services.graphiti_client import add_conversation_episode
+
                     await add_conversation_episode(
                         user_id=user.id,
                         user_message=user_message,
@@ -281,7 +403,10 @@ async def chat_stream_session(
 
                 # Generate exchange summary for conversation context
                 try:
-                    from app.services.conversation_summary_service import get_conversation_summary_service
+                    from app.services.conversation_summary_service import (
+                        get_conversation_summary_service,
+                    )
+
                     summary_svc = get_conversation_summary_service()
                     await summary_svc.save_exchange_summary(
                         db=bg_db,
@@ -292,11 +417,18 @@ async def chat_stream_session(
                         assistant_message=text,
                         cited_sources=sources,
                     )
-                    logger.info(f"[session/{session_id}] Exchange summary saved for msg {user_msg_id}")
+                    logger.info(
+                        f"[session/{session_id}] Exchange summary saved for msg {user_msg_id}"
+                    )
                 except Exception as e:
-                    logger.warning(f"[session/{session_id}] Failed to save exchange summary: {e}")
+                    logger.warning(
+                        f"[session/{session_id}] Failed to save exchange summary: {e}"
+                    )
         except Exception as e:
-            logger.error(f"[session/{session_id}] Background persistence failed: {e}", exc_info=True)
+            logger.error(
+                f"[session/{session_id}] Background persistence failed: {e}",
+                exc_info=True,
+            )
 
     # ── Route: LangGraph agent ──────────────────────────────────────────────
     use_langgraph = settings.NEXUSRAG_AGENT_BACKEND.lower() == "langgraph"
@@ -305,7 +437,10 @@ async def chat_stream_session(
         logger.info(f"[session/{session_id}] Routing to LangGraph agent backend")
 
         async def _event_generator_lg():
-            yield format_sse_event("status", {"step": "starting", "detail": "Initializing LangGraph agent..."})
+            yield format_sse_event(
+                "status",
+                {"step": "starting", "detail": "Initializing LangGraph agent..."},
+            )
             yield format_sse_event("user_id", {"id": user_msg_id})
             yield format_sse_event("ai_message_id", {"message_id": ai_msg_id})
 
@@ -318,13 +453,18 @@ async def chat_stream_session(
 
             try:
                 from app.services.agent.graph import get_agent_graph
-                from app.services.agent.streaming import stream_agent_to_sse, build_initial_state
+                from app.services.agent.streaming import (
+                    stream_agent_to_sse,
+                    build_initial_state,
+                )
                 import json as _json
 
                 history = []
                 for m in request.history:
                     role = m.role if hasattr(m, "role") else m.get("role", "user")
-                    content = m.content if hasattr(m, "content") else m.get("content", "")
+                    content = (
+                        m.content if hasattr(m, "content") else m.get("content", "")
+                    )
                     history.append({"role": role, "content": content})
 
                 initial_state = build_initial_state(
@@ -336,6 +476,7 @@ async def chat_stream_session(
                     db=db,
                     user_id=user.id,
                     session_id=session_id,
+                    document_ids=request.document_ids,
                 )
 
                 graph = get_agent_graph()
@@ -346,7 +487,9 @@ async def chat_stream_session(
                         if sse_str.startswith("event:"):
                             lines = sse_str.strip().split("\n")
                             ev_type = lines[0].replace("event: ", "").strip()
-                            data_line = next((l for l in lines if l.startswith("data:")), None)
+                            data_line = next(
+                                (l for l in lines if l.startswith("data:")), None
+                            )
                             if data_line:
                                 ev_data = _json.loads(data_line[5:].strip())
                                 if ev_type == "token":
@@ -356,14 +499,18 @@ async def chat_stream_session(
                                 elif ev_type == "sources":
                                     final_sources = ev_data.get("sources", [])
                                 elif ev_type == "images":
-                                    final_images = ev_data.get("image_refs", ev_data.get("images", []))
+                                    final_images = ev_data.get(
+                                        "image_refs", ev_data.get("images", [])
+                                    )
                                 elif ev_type == "status":
                                     final_steps.append(ev_data)
                                 elif ev_type == "complete":
                                     if "answer" in ev_data:
                                         accumulated_text = ev_data["answer"]
                                 elif ev_type == "potential_abbreviations":
-                                    final_potential_abbreviations = ev_data.get("abbreviations", [])
+                                    final_potential_abbreviations = ev_data.get(
+                                        "abbreviations", []
+                                    )
                     except Exception:
                         pass
 
@@ -397,7 +544,9 @@ async def chat_stream_session(
     logger.info(f"[session/{session_id}] Routing to legacy agent backend")
 
     async def _event_generator():
-        yield format_sse_event("status", {"step": "starting", "detail": "Initializing agent..."})
+        yield format_sse_event(
+            "status", {"step": "starting", "detail": "Initializing agent..."}
+        )
         yield format_sse_event("user_id", {"id": user_msg_id})
         yield format_sse_event("ai_message_id", {"message_id": ai_msg_id})
 
@@ -420,6 +569,7 @@ async def chat_stream_session(
                 force_search=request.force_search,
                 user_id=user.id,
                 session_id=session_id,
+                document_ids=request.document_ids,
             ):
                 if sse_item["event"] == "token":
                     accumulated_text += sse_item["data"]["text"]
@@ -448,7 +598,7 @@ async def chat_stream_session(
                 sources=final_sources,
                 images=final_images,
                 steps=final_steps,
-                potentials=[], # Legacy agent doesn't send abbreviations
+                potentials=[],  # Legacy agent doesn't send abbreviations
                 user_message=request.message,
                 user_msg_id=user_msg_id,
                 ai_msg_id=ai_msg_id,
@@ -459,11 +609,12 @@ async def chat_stream_session(
             yield format_sse_event("error", {"message": str(e)})
 
     return StreamingResponse(
-        sse_with_heartbeat(_event_generator()),
-        media_type="text/event-stream"
+        sse_with_heartbeat(_event_generator()), media_type="text/event-stream"
     )
 
+
 from app.schemas.rag import RateSourceRequest
+
 
 @router.post("/{session_id}/rate")
 async def rate_source(
@@ -475,7 +626,9 @@ async def rate_source(
     """Rate a source citation in a chat message."""
     # First verify the session belongs to user
     result = await db.execute(
-        select(ChatSession).where(ChatSession.id == session_id, ChatSession.user_id == user.id)
+        select(ChatSession).where(
+            ChatSession.id == session_id, ChatSession.user_id == user.id
+        )
     )
     if not result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="Chat session not found")
@@ -496,8 +649,9 @@ async def rate_source(
     current_ratings = row.ratings or {}
     current_ratings[body.source_index] = body.rating
     row.ratings = current_ratings
-    
+
     from sqlalchemy.orm.attributes import flag_modified
+
     flag_modified(row, "ratings")
     await db.commit()
 

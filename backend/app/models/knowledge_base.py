@@ -23,15 +23,26 @@ class KnowledgeBase(Base):
     )
 
     # Multi-tenant fields
-    visibility: Mapped[str] = mapped_column(String(20), default="personal")  # 'public' | 'tenant' | 'personal'
+    visibility: Mapped[str] = mapped_column(
+        String(20), default="personal"
+    )  # 'public' | 'tenant' | 'personal'
     owner_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=True
     )
+    is_default: Mapped[bool] = mapped_column(
+        default=False
+    )  # user's default personal workspace
 
     # Relationships
     documents: Mapped[list["Document"]] = relationship(
         back_populates="workspace", cascade="all, delete-orphan"
+    )
+    chat_files: Mapped[list["ChatFile"]] = relationship(
+        "ChatFile",
+        back_populates="workspace",
+        cascade="all, delete-orphan",
+        order_by="ChatFile.created_at",
     )

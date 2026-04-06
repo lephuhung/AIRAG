@@ -126,7 +126,10 @@
     "indexed": "Đã lập chỉ mục",
     "completed": "Hoàn thành",
     "processed": "Đã xử lý",
-    "milliseconds": "mili giây"
+    "milliseconds": "mili giây",
+    "retry": "Thử lại",
+    "navigate": "Di chuyển",
+    "select": "Chọn"
   },
   "entities": {
     "title": "Thực thể",
@@ -227,7 +230,27 @@
     "view_source": "Xem nguồn: {{name}} (trang {{page}})",
     "copy_code": "Sao chép mã",
     "memory_citation": "Trích dẫn từ trí nhớ",
-    "add_abbreviation": "Thêm từ viết tắt ({{abbr}})"
+    "add_abbreviation": "Thêm từ viết tắt ({{abbr}})",
+    "format_check_title": "Kết quả kiểm tra định dạng Word",
+    "format_check_button": "Kiểm tra Word",
+    "format_check_loading": "Đang kiểm tra định dạng Word...",
+    "format_check_error": "Lỗi kiểm tra định dạng Word",
+    "audio_tool_button": "Ghi âm",
+    "audio_feature_coming": "Tính năng ghi âm đang được phát triển",
+    "status_uploading": "Đang tải lên...",
+    "status_parsing": "Đang xử lý...",
+    "status_indexed": "Sẵn sàng",
+    "status_failed": "Lỗi",
+    "wait_for_files": "Vui lòng đợi tệp tin được xử lý xong",
+    "upload_failed": "Tải lên thất bại",
+    "no_workspace": "Không tìm thấy không gian làm việc hợp lệ",
+    "mention_category_docs": "Tài liệu đề xuất",
+    "no_docs_found": "Không tìm thấy tài liệu nào phù hợp",
+    "tool_upload": "Tải lên tệp tin",
+    "tool_word": "Kiểm tra định dạng Word",
+    "tool_audio": "Ghi âm cuộc hội thoại",
+    "tool_force_search": "Bắt buộc tìm kiếm (Bật/Tắt)",
+    "tools_button": "Công cụ"
   },
   "rag": {
     "timeline": {
@@ -603,7 +626,11 @@
       "consumers": "Người tiêu thụ: {{count}}",
       "ready": "Sẵn sàng: {{count}}",
       "dlx": "DLX: {{status}}"
-    }
+    },
+    "cancel_title": "Hủy xử lý tài liệu",
+    "cancel_msg": "Bạn có chắc chắn muốn hủy xử lý tài liệu này? Nó sẽ được đánh dấu là thất bại và các dữ liệu đã lập chỉ mục sẽ được làm sạch.",
+    "cancel_success": "Đã hủy xử lý tài liệu",
+    "cancel_failed": "Hủy xử lý tài liệu thất bại"
   },
   "admin": {
     "dashboard": {

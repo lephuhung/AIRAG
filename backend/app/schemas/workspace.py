@@ -1,6 +1,7 @@
 """
 Knowledge Base (Workspace) schemas for request/response validation.
 """
+
 import uuid
 from datetime import datetime
 from pydantic import BaseModel, Field
@@ -9,7 +10,9 @@ from pydantic import BaseModel, Field
 class WorkspaceCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     description: str | None = None
-    visibility: str | None = Field(default="personal", pattern="^(public|tenant|personal)$")
+    visibility: str | None = Field(
+        default="personal", pattern="^(public|tenant|personal)$"
+    )
     tenant_id: uuid.UUID | None = None
 
 
@@ -34,12 +37,14 @@ class WorkspaceResponse(BaseModel):
     visibility: str = "personal"
     owner_id: uuid.UUID | None = None
     tenant_id: uuid.UUID | None = None
+    is_default: bool = False
 
     model_config = {"from_attributes": True}
 
 
 class WorkspaceSummary(BaseModel):
     """Compact summary for dropdown selectors."""
+
     id: uuid.UUID
     name: str
     document_count: int = 0

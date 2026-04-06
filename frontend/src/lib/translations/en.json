@@ -121,7 +121,10 @@
     "building_kg": "Building KG",
     "completed": "Completed",
     "processed": "Processed",
-    "milliseconds": "ms"
+    "milliseconds": "ms",
+    "retry": "Retry",
+    "navigate": "Navigate",
+    "select": "Select"
   },
   "entities": {
     "title": "Entities",
@@ -222,7 +225,21 @@
     "view_source": "View source: {{name}} (page {{page}})",
     "copy_code": "Copy code",
     "memory_citation": "Memory citation",
-    "add_abbreviation": "Add abbreviation ({{abbr}})"
+    "add_abbreviation": "Add abbreviation ({{abbr}})",
+    "status_uploading": "Uploading...",
+    "status_parsing": "Parsing...",
+    "status_indexed": "Ready",
+    "status_failed": "Failed",
+    "wait_for_files": "Please wait for files to be indexed",
+    "upload_failed": "Upload failed",
+    "no_workspace": "No valid workspace found",
+    "mention_category_docs": "Suggested Documents",
+    "no_docs_found": "No matching documents found",
+    "tool_upload": "Upload file",
+    "tool_word": "Word format check",
+    "tool_audio": "Record audio",
+    "tool_force_search": "Force Search (On/Off)",
+    "tools_button": "Tools"
   },
   "rag": {
     "timeline": {
@@ -328,6 +345,10 @@
     "delete_failed": "Failed to delete knowledge base",
     "delete_confirm_title": "Delete Knowledge Base",
     "delete_confirm_msg": "Are you sure? All documents, indexed data, and knowledge graph data will be permanently removed.",
+    "set_default": "Set as default",
+    "set_default_success": "Default workspace updated",
+    "set_default_failed": "Failed to set default workspace",
+    "default": "Default",
     "empty_title": "Create your first knowledge base",
     "empty_desc1": "Knowledge bases store your documents and enable AI-powered search across them.",
     "empty_desc2": "Link them to any project as a data source.",
@@ -495,6 +516,10 @@
     "retry_all_msg": "This will reset {{count}} failed documents and re-queue them for processing. Continue?",
     "stop_workers_title": "Stop Workers",
     "stop_workers_msg": "Stop all managed {{type}} workers? In-progress tasks will be interrupted.",
+    "cancel_title": "Cancel Document",
+    "cancel_msg": "Are you sure you want to cancel this document? It will be marked as failed and its indexed data will be cleaned up.",
+    "cancel_success": "Document cancelled",
+    "cancel_failed": "Failed to cancel document",
     "health_details": "System Health Details",
     "version": "Version",
     "cluster": "Cluster",

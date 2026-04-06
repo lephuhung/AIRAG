@@ -64,3 +64,15 @@ export function useDeleteWorkspace() {
     },
   });
 }
+
+export function useSetDefaultWorkspace() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (id: string) =>
+      api.post<KnowledgeBase>(`/workspaces/${id}/set-default`),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+    },
+  });
+}

@@ -1,6 +1,7 @@
 """
 Auth API — register, login, refresh, profile.
 """
+
 from __future__ import annotations
 
 import logging
@@ -13,7 +14,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import get_db, get_current_user, get_current_active_user
-from app.core.exceptions import BadRequestError, ConflictError, ForbiddenError, UnauthorizedError
+from app.core.exceptions import (
+    BadRequestError,
+    ConflictError,
+    ForbiddenError,
+    UnauthorizedError,
+)
 from app.core.security import (
     hash_password,
     verify_password,
@@ -24,6 +30,7 @@ from app.core.security import (
 from app.models.user import User
 from app.models.tenant import Tenant, TenantUser
 from app.models.invite_token import InviteToken
+from app.models.knowledge_base import KnowledgeBase
 from app.schemas.auth import (
     RegisterRequest,
     LoginRequest,
@@ -40,7 +47,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
-@router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED
+)
 async def register(
     body: RegisterRequest,
     db: AsyncSession = Depends(get_db),
@@ -70,14 +79,20 @@ async def register(
             raise BadRequestError("Invite link has reached its maximum number of uses")
 
         if invite.email and invite.email.lower() != body.email.lower().strip():
-            raise BadRequestError("This invite link is restricted to a different email address")
+            raise BadRequestError(
+                "This invite link is restricted to a different email address"
+            )
 
         # Verify the tenant is still active
         result = await db.execute(
-            select(Tenant).where(Tenant.id == invite.tenant_id, Tenant.is_active.is_(True))
+            select(Tenant).where(
+                Tenant.id == invite.tenant_id, Tenant.is_active.is_(True)
+            )
         )
         if result.scalar_one_or_none() is None:
-            raise BadRequestError("The organization for this invite is no longer active")
+            raise BadRequestError(
+                "The organization for this invite is no longer active"
+            )
 
     # ── Create user ────────────────────────────────────────────────────
     user = User(
@@ -89,6 +104,19 @@ async def register(
     db.add(user)
     await db.commit()
     await db.refresh(user)
+
+    # ── Auto-create personal workspace for the new user ───────────────
+    personal_kb = KnowledgeBase(
+        name=f"{user.full_name}'s Workspace",
+        owner_id=user.id,
+        visibility="personal",
+        is_default=True,
+    )
+    db.add(personal_kb)
+    await db.commit()
+    logger.info(
+        f"Auto-created personal workspace for user {user.email} (kb_id={personal_kb.id})"
+    )
 
     # ── Invite: auto-approve tenant membership + increment use_count ──
     if invite:
@@ -108,7 +136,9 @@ async def register(
     elif body.tenant_slug:
         # Standard flow: create pending membership
         result = await db.execute(
-            select(Tenant).where(Tenant.slug == body.tenant_slug, Tenant.is_active.is_(True))
+            select(Tenant).where(
+                Tenant.slug == body.tenant_slug, Tenant.is_active.is_(True)
+            )
         )
         tenant = result.scalar_one_or_none()
         if tenant:
@@ -120,11 +150,17 @@ async def register(
             )
             db.add(tenant_user)
             await db.commit()
-            logger.info(f"User {user.email} registered with pending membership to tenant '{body.tenant_slug}'")
+            logger.info(
+                f"User {user.email} registered with pending membership to tenant '{body.tenant_slug}'"
+            )
         else:
-            logger.warning(f"Tenant slug '{body.tenant_slug}' not found during registration")
+            logger.warning(
+                f"Tenant slug '{body.tenant_slug}' not found during registration"
+            )
 
-    logger.info(f"User registered: {user.email} (id={user.id}, active={user.is_active})")
+    logger.info(
+        f"User registered: {user.email} (id={user.id}, active={user.is_active})"
+    )
     return user
 
 
@@ -141,7 +177,9 @@ async def login(
         raise UnauthorizedError("Invalid email or password")
 
     if not user.is_active:
-        raise ForbiddenError("Account not yet approved. Please wait for admin approval.")
+        raise ForbiddenError(
+            "Account not yet approved. Please wait for admin approval."
+        )
 
     access_token = create_access_token(user.id)
     refresh_token = create_refresh_token(user.id)
@@ -253,7 +291,9 @@ async def upload_avatar(
         "image/gif": ".gif",
         "image/webp": ".webp",
     }
-    ext = _ext_map.get(file.content_type, os.path.splitext(file.filename or "")[1] or ".jpg")
+    ext = _ext_map.get(
+        file.content_type, os.path.splitext(file.filename or "")[1] or ".jpg"
+    )
 
     storage = get_storage_service()
     avatar_url = await storage.upload_avatar(user.id, data, file.content_type, ext)

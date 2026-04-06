@@ -15,6 +15,7 @@ SSE Event Types:
   - complete:       {"answer": str, "sources": [...], ...}
   - error:          {"message": str}
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -104,40 +105,44 @@ def _generate_citation_id(existing: set[str]) -> str:
 # Tool definitions
 # ---------------------------------------------------------------------------
 
+
 # Gemini native function calling
 def _get_gemini_tool():
     """Lazily create Gemini Tool to avoid import at module level."""
     from google.genai import types
-    return types.Tool(function_declarations=[
-        types.FunctionDeclaration(
-            name="search_documents",
-            description=(
-                "Search the knowledge base for relevant document sections. "
-                "Use this tool when the user asks about document content, data, or facts. "
-                "IMPORTANT: Rewrite the user's question as a detailed, specific search query "
-                "to get better retrieval results. "
-                "Do NOT use this tool for greetings, chitchat, or non-document questions."
-            ),
-            parameters={
-                "type": "OBJECT",
-                "properties": {
-                    "query": {
-                        "type": "STRING",
-                        "description": (
-                            "A rewritten, detailed search query based on the user's question. "
-                            "Examples: 'revenue?' → 'total revenue figures and financial performance metrics'. "
-                            "'AI là gì?' → 'định nghĩa trí tuệ nhân tạo, lịch sử và ứng dụng'"
-                        ),
+
+    return types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name="search_documents",
+                description=(
+                    "Search the knowledge base for relevant document sections. "
+                    "Use this tool when the user asks about document content, data, or facts. "
+                    "IMPORTANT: Rewrite the user's question as a detailed, specific search query "
+                    "to get better retrieval results. "
+                    "Do NOT use this tool for greetings, chitchat, or non-document questions."
+                ),
+                parameters={
+                    "type": "OBJECT",
+                    "properties": {
+                        "query": {
+                            "type": "STRING",
+                            "description": (
+                                "A rewritten, detailed search query based on the user's question. "
+                                "Examples: 'revenue?' → 'total revenue figures and financial performance metrics'. "
+                                "'AI là gì?' → 'định nghĩa trí tuệ nhân tạo, lịch sử và ứng dụng'"
+                            ),
+                        },
+                        "top_k": {
+                            "type": "INTEGER",
+                            "description": "Number of relevant chunks to retrieve (default: 5, max: 10)",
+                        },
                     },
-                    "top_k": {
-                        "type": "INTEGER",
-                        "description": "Number of relevant chunks to retrieve (default: 5, max: 10)",
-                    },
+                    "required": ["query"],
                 },
-                "required": ["query"],
-            },
-        ),
-    ])
+            ),
+        ]
+    )
 
 
 # OpenAI-compatible native function calling (JSON schema format)
@@ -215,7 +220,7 @@ Call it by outputting EXACTLY:
 
 OLLAMA_TOOL_REMINDER = (
     "\n\n[SYSTEM REMINDER] If this is a question or request, you MUST call search_documents FIRST. "
-    "Output ONLY: <tool_call>{\"name\": \"search_documents\", \"arguments\": {\"query\": \"...\"}}</tool_call> "
+    'Output ONLY: <tool_call>{"name": "search_documents", "arguments": {"query": "..."}}</tool_call> '
     "Exception: simple greetings, thanks, or farewells do NOT require a tool call — respond directly. "
     "For everything else, searching is MANDATORY. "
     "When answering from search results, use the provided source IDs for citations (e.g., [id12]).\n"
@@ -266,14 +271,13 @@ You have access to the `search_documents` tool.
 - If you are unsure whether a search is needed, PERFORM THE SEARCH.
 """
 
-NATIVE_TOOL_REMINDER = (
-    "\n\n[SYSTEM REMINDER] You MUST call the `search_documents` tool before answering this query. "
-)
+NATIVE_TOOL_REMINDER = "\n\n[SYSTEM REMINDER] You MUST call the `search_documents` tool before answering this query. "
 
 
 # ---------------------------------------------------------------------------
 # SSE Helpers (ported from PageIndex backend/app/api/v1/chat.py)
 # ---------------------------------------------------------------------------
+
 
 def format_sse_event(event: str, data: dict) -> str:
     """Format data as an SSE event string."""
@@ -325,6 +329,7 @@ async def sse_with_heartbeat(
 # Tool executor — retrieval via HRAG
 # ---------------------------------------------------------------------------
 
+
 async def _get_accessible_workspaces(db: AsyncSession, user: User) -> list[uuid.UUID]:
     """Get all knowledge base IDs the user has access to."""
     if user.is_superadmin:
@@ -332,19 +337,70 @@ async def _get_accessible_workspaces(db: AsyncSession, user: User) -> list[uuid.
         return list(result.scalars().all())
 
     # Get user's tenants
-    tenant_result = await db.execute(select(TenantUser.tenant_id).where(TenantUser.user_id == user.id))
+    tenant_result = await db.execute(
+        select(TenantUser.tenant_id).where(TenantUser.user_id == user.id)
+    )
     user_tenant_ids = list(tenant_result.scalars().all())
 
     from sqlalchemy import or_
+
     query = select(KnowledgeBase.id).where(
         or_(
             KnowledgeBase.visibility == "public",
             KnowledgeBase.owner_id == user.id,
-            KnowledgeBase.tenant_id.in_(user_tenant_ids) if user_tenant_ids else False
+            KnowledgeBase.tenant_id.in_(user_tenant_ids) if user_tenant_ids else False,
         )
     )
     result = await db.execute(query)
     return list(result.scalars().all())
+
+
+MAX_DIRECT_DOC_CHARS = 48000  # ~12k tokens per doc
+
+
+async def _fetch_direct_document_content(
+    document_ids: list[uuid.UUID],
+    db: AsyncSession,
+) -> list[tuple]:
+    """Fetch markdown content directly from MinIO for specific document UUIDs.
+
+    This is used for chat-uploaded documents that are parsed but not indexed
+    in ChromaDB (no embed pipeline). Returns list of (content, doc) tuples.
+    """
+    from sqlalchemy import select
+    from app.models.document import Document
+    from app.services.storage_service import get_storage_service
+
+    if not document_ids:
+        return []
+
+    storage = get_storage_service()
+    result = await db.execute(select(Document).where(Document.id.in_(document_ids)))
+    docs = result.scalars().all()
+    doc_map = {doc.id: doc for doc in docs}
+
+    contents = []
+    for doc_id in document_ids:
+        doc = doc_map.get(doc_id)
+        if not doc:
+            logger.warning(f"[direct_doc] Document {doc_id} not found")
+            continue
+        if not doc.markdown_s3_key:
+            logger.warning(f"[direct_doc] Document {doc_id} has no markdown_s3_key")
+            continue
+        try:
+            md = await storage.download_markdown(doc.markdown_s3_key)
+            truncated = md[:MAX_DIRECT_DOC_CHARS]
+            if len(md) > MAX_DIRECT_DOC_CHARS:
+                truncated += f"\n\n[... nội dung đã được cắt bớt ({len(md)} → {MAX_DIRECT_DOC_CHARS} ký tự) ...]"
+            contents.append((truncated, doc))
+            logger.info(f"[direct_doc] Loaded {len(truncated)} chars from doc {doc_id}")
+        except Exception as e:
+            logger.warning(
+                f"[direct_doc] Failed to download markdown for doc {doc_id}: {e}"
+            )
+
+    return contents
 
 
 async def _execute_search_documents(
@@ -353,8 +409,12 @@ async def _execute_search_documents(
     top_k: int,
     db: AsyncSession,
     existing_ids: set[str],
+    document_ids: Optional[list[uuid.UUID]] = None,
 ) -> tuple[str, list[ChatSourceChunk], list[ChatImageRef], list[dict], list[str]]:
     """Execute document search across multiple workspaces and return best chunks.
+
+    When document_ids is provided, fetches content directly from MinIO (for
+    chat-uploaded documents that bypassed the ChromaDB embed pipeline).
 
     Returns:
         (context_text, sources, image_refs, image_parts_for_vision, kg_summaries)
@@ -362,20 +422,45 @@ async def _execute_search_documents(
     from app.services.rag_service import get_rag_service
     from app.services.hrag_service import HRAGService
     from pathlib import Path as _P
-    
+
     all_chunks = []
     all_kg_summaries = []
-    
+
     # Get workspace titles for better labeling
     from app.models.knowledge_base import KnowledgeBase
-    ws_result = await db.execute(select(KnowledgeBase).where(KnowledgeBase.id.in_(workspace_ids)))
+
+    ws_result = await db.execute(
+        select(KnowledgeBase).where(KnowledgeBase.id.in_(workspace_ids))
+    )
     ws_map = {ws.id: ws.name for ws in ws_result.scalars().all()}
-    
+
+    # ── Direct document fetch (for chat-uploaded files with markdown in MinIO) ──
+    if document_ids:
+        direct_contents = await _fetch_direct_document_content(document_ids, db)
+        for idx, (content, doc) in enumerate(direct_contents):
+            from types import SimpleNamespace
+
+            chunk = SimpleNamespace(
+                content=content,
+                document_id=doc.id,
+                chunk_index=0,
+                page_no=0,
+                heading_path=[],
+                source_file=doc.original_filename or "document",
+                image_refs=[],
+                score=1.0,  # High score to prioritize over vector results
+            )
+            all_chunks.append((1.0, chunk, None, doc.workspace_id))
+            logger.info(
+                f"[RAG] Direct doc content loaded: doc={doc.id}, chars={len(content)}"
+            )
+
     for workspace_id in workspace_ids:
-        logger.info(f"[RAG] External Search: query='{query}' on workspace {workspace_id}")
+        logger.info(
+            f"[RAG] External Search: query='{query}' on workspace {workspace_id}"
+        )
         rag_service = get_rag_service(db, workspace_id)
-        ws_name = ws_map.get(workspace_id, f"KB {workspace_id}")
-        
+
         chunks = []
         citations = []
         if isinstance(rag_service, HRAGService):
@@ -383,43 +468,57 @@ async def _execute_search_documents(
                 result = await rag_service.query_deep(
                     question=query,
                     top_k=min(top_k, 10),
+                    document_ids=document_ids,
                     mode="hybrid",
                     include_images=False,
                 )
                 chunks = result.chunks
                 citations = result.citations
                 if result.knowledge_graph_summary:
-                    all_kg_summaries.append(f"### Knowledge Graph Insights\n{result.knowledge_graph_summary}")
+                    all_kg_summaries.append(
+                        f"### Knowledge Graph Insights\n{result.knowledge_graph_summary}"
+                    )
             except Exception as e:
                 logger.warning(f"Search failed for workspace {workspace_id}: {e}")
         else:
             from types import SimpleNamespace
+
             try:
                 legacy = rag_service.query(question=query, top_k=min(top_k, 10))
                 for i, c in enumerate(legacy.chunks):
-                    chunks.append(SimpleNamespace(
-                        content=c.content,
-                        document_id=int(c.metadata.get("document_id", 0)),
-                        chunk_index=i,
-                        page_no=int(c.metadata.get("page_no", 0)),
-                        heading_path=str(c.metadata.get("heading_path", "")).split(" > ") if c.metadata.get("heading_path") else [],
-                        source_file=str(c.metadata.get("source", "")),
-                        image_refs=[],
-                        score=c.score
-                    ))
+                    chunks.append(
+                        SimpleNamespace(
+                            content=c.content,
+                            document_id=int(c.metadata.get("document_id", 0)),
+                            chunk_index=i,
+                            page_no=int(c.metadata.get("page_no", 0)),
+                            heading_path=str(c.metadata.get("heading_path", "")).split(
+                                " > "
+                            )
+                            if c.metadata.get("heading_path")
+                            else [],
+                            source_file=str(c.metadata.get("source", "")),
+                            image_refs=[],
+                            score=c.score,
+                        )
+                    )
             except Exception as e:
-                logger.warning(f"Legacy search failed for workspace {workspace_id}: {e}")
-                
+                logger.warning(
+                    f"Legacy search failed for workspace {workspace_id}: {e}"
+                )
+
         # Pack chunks with their citation for sorting
         for i, chunk in enumerate(chunks):
             citation = citations[i] if i < len(citations) else None
             score = getattr(chunk, "score", 0.0)
             all_chunks.append((score, chunk, citation, workspace_id))
-            
+
     # Sort all aggregated chunks by score descending
     all_chunks.sort(key=lambda x: x[0], reverse=True)
-    logger.info(f"[RAG] Found total {len(all_chunks)} potential chunks across {len(workspace_ids)} workspaces")
-    
+    logger.info(
+        f"[RAG] Found total {len(all_chunks)} potential chunks across {len(workspace_ids)} workspaces"
+    )
+
     # Take top_k
     best_chunks = all_chunks[:top_k]
 
@@ -429,31 +528,37 @@ async def _execute_search_documents(
     chunk_image_ids: list[str] = []
     seen_image_ids: set[str] = set()
     source_pages = set()
-    
+
     for score, chunk, citation, workspace_id in best_chunks:
         cid = _generate_citation_id(existing_ids)
         existing_ids.add(cid)
-        sources.append(ChatSourceChunk(
-            index=cid,
-            chunk_id=f"doc_{chunk.document_id}_chunk_{chunk.chunk_index}",
-            content=chunk.content,
-            document_id=chunk.document_id,
-            page_no=chunk.page_no,
-            heading_path=chunk.heading_path,
-            score=score,
-            source_type="vector",
-        ))
-        logger.info(f"[RAG] Selected Chunk [{cid}] (KB {workspace_id}) score={score:.3f}: {chunk.content[:60]}...")
-        
+        sources.append(
+            ChatSourceChunk(
+                index=cid,
+                chunk_id=f"doc_{chunk.document_id}_chunk_{chunk.chunk_index}",
+                content=chunk.content,
+                document_id=chunk.document_id,
+                page_no=chunk.page_no,
+                heading_path=chunk.heading_path,
+                score=score,
+                source_type="vector",
+            )
+        )
+        logger.info(
+            f"[RAG] Selected Chunk [{cid}] (KB {workspace_id}) score={score:.3f}: {chunk.content[:60]}..."
+        )
+
         # Collect images to fetch
         for iid in getattr(chunk, "image_refs", []) or []:
             if iid and iid not in seen_image_ids:
                 seen_image_ids.add(iid)
                 chunk_image_ids.append(iid)
-                
+
         if getattr(chunk, "page_no", 0) > 0:
-            source_pages.add((getattr(chunk, "document_id", 0), getattr(chunk, "page_no", 0)))
-        
+            source_pages.add(
+                (getattr(chunk, "document_id", 0), getattr(chunk, "page_no", 0))
+            )
+
         meta_parts = []
         if citation:
             meta_parts.append(citation.source_file)
@@ -470,7 +575,7 @@ async def _execute_search_documents(
         context += "## Knowledge Graph Entities & Relationships\n"
         context += "\n\n".join(all_kg_summaries)
         context += "\n\n---\n\n"
-        
+
     context += "## Document Chunks\n"
     context += "\n\n---\n\n".join(context_parts)
 
@@ -483,6 +588,7 @@ async def _execute_search_documents(
 
     if not resolved_images and source_pages:
         from sqlalchemy import or_, and_
+
         page_filters = [
             and_(
                 DocumentImage.document_id == doc_id,
@@ -490,9 +596,7 @@ async def _execute_search_documents(
             )
             for doc_id, page_no in source_pages
         ]
-        img_result = await db.execute(
-            select(DocumentImage).where(or_(*page_filters))
-        )
+        img_result = await db.execute(select(DocumentImage).where(or_(*page_filters)))
         resolved_images = list(img_result.scalars().all())
         seen = set()
         deduped = []
@@ -511,18 +615,26 @@ async def _execute_search_documents(
         existing_ids.add(img_ref_id)
         # Figure out which workspace this image belongs to in order to construct the correct URL
         # For simplicity we query the document's workspace_id
-        workspace_id = img.document.workspace_id if hasattr(img, "document") and img.document else workspace_ids[0] if workspace_ids else 0
+        workspace_id = (
+            img.document.workspace_id
+            if hasattr(img, "document") and img.document
+            else workspace_ids[0]
+            if workspace_ids
+            else 0
+        )
         img_url = f"/static/doc-images/kb_{workspace_id}/images/{img.image_id}.png"
-        chat_image_refs.append(ChatImageRef(
-            ref_id=img_ref_id,
-            image_id=img.image_id,
-            document_id=img.document_id,
-            page_no=img.page_no,
-            caption=img.caption or "",
-            url=img_url,
-            width=img.width,
-            height=img.height,
-        ))
+        chat_image_refs.append(
+            ChatImageRef(
+                ref_id=img_ref_id,
+                image_id=img.image_id,
+                document_id=img.document_id,
+                page_no=img.page_no,
+                caption=img.caption or "",
+                url=img_url,
+                width=img.width,
+                height=img.height,
+            )
+        )
         cap = f'"{img.caption}"' if img.caption else "no caption"
         image_context_parts.append(f"- [IMG-{img_ref_id}] Page {img.page_no}: {cap}")
 
@@ -531,12 +643,14 @@ async def _execute_search_documents(
             try:
                 img_bytes = img_path.read_bytes()
                 mime = img.mime_type or "image/png"
-                image_parts.append({
-                    "inline_data": {"mime_type": mime, "data": img_bytes},
-                    "page_no": img.page_no,
-                    "caption": img.caption or "",
-                    "img_ref_id": img_ref_id,
-                })
+                image_parts.append(
+                    {
+                        "inline_data": {"mime_type": mime, "data": img_bytes},
+                        "page_no": img.page_no,
+                        "caption": img.caption or "",
+                        "img_ref_id": img_ref_id,
+                    }
+                )
             except Exception as e:
                 logger.warning(f"Failed to read image {img.image_id}: {e}")
 
@@ -552,6 +666,7 @@ async def _execute_search_documents(
 
 MAX_MEMORIES_PER_USER = 200
 
+
 async def _save_memory(
     user_id: uuid.UUID,
     content: str,
@@ -566,17 +681,25 @@ async def _save_memory(
 
     # Check limit
     count_result = await db.execute(
-        select(func.count()).select_from(UserMemory).where(UserMemory.user_id == user_id)
+        select(func.count())
+        .select_from(UserMemory)
+        .where(UserMemory.user_id == user_id)
     )
     count = count_result.scalar() or 0
     if count >= MAX_MEMORIES_PER_USER:
-        return f"Memory limit reached ({MAX_MEMORIES_PER_USER}). Cannot save new memory."
+        return (
+            f"Memory limit reached ({MAX_MEMORIES_PER_USER}). Cannot save new memory."
+        )
 
     # Generate embedding
     try:
         emb_provider = get_embedding_provider()
         embedding = await emb_provider.embed([content])
-        emb_list = embedding[0].tolist() if hasattr(embedding[0], 'tolist') else list(embedding[0])
+        emb_list = (
+            embedding[0].tolist()
+            if hasattr(embedding[0], "tolist")
+            else list(embedding[0])
+        )
     except Exception as e:
         logger.warning(f"Failed to generate memory embedding: {e}")
         emb_list = None
@@ -608,7 +731,11 @@ async def _search_memories(
     try:
         emb_provider = get_embedding_provider()
         query_embedding = await emb_provider.embed([query])
-        query_vec = query_embedding[0].tolist() if hasattr(query_embedding[0], 'tolist') else list(query_embedding[0])
+        query_vec = (
+            query_embedding[0].tolist()
+            if hasattr(query_embedding[0], "tolist")
+            else list(query_embedding[0])
+        )
     except Exception as e:
         logger.warning(f"Failed to generate query embedding for memory search: {e}")
         # Fallback: text search
@@ -626,14 +753,18 @@ async def _search_memories(
     # pgvector cosine distance search. We combine distance with importance.
     try:
         from pgvector.sqlalchemy import Vector
+
         # Higher importance and lower distance is better.
         # We order by (distance / importance) to favor important matches even if slightly less similar.
         result = await db.execute(
             select(UserMemory)
             .where(UserMemory.user_id == user_id)
             .where(UserMemory.embedding.isnot(None))
-            .order_by(UserMemory.embedding.cosine_distance(query_vec) * (10.0 / (UserMemory.importance + 1)))
-            .limit(top_k + 5) # Retrieve more to be sure
+            .order_by(
+                UserMemory.embedding.cosine_distance(query_vec)
+                * (10.0 / (UserMemory.importance + 1))
+            )
+            .limit(top_k + 5)  # Retrieve more to be sure
         )
         memories = list(result.scalars().all())
     except Exception as e:
@@ -647,20 +778,25 @@ async def _search_memories(
         memories = result.scalars().all()
 
     if not memories:
-        logger.info(f"[MEMORY] No memories found for user_id={user_id} and query='{query}'.")
+        logger.info(
+            f"[MEMORY] No memories found for user_id={user_id} and query='{query}'."
+        )
         return "No relevant memories found."
-    
+
     # Format and log memories
     context_parts = []
     for i, m in enumerate(memories):
-        context_parts.append(f"• [MEM-{i+1}] [{m.category}] {m.content}")
+        context_parts.append(f"• [MEM-{i + 1}] [{m.category}] {m.content}")
     context = "\n".join(context_parts)
-    logger.info(f"[MEMORY] Found {len(memories)} relevant snippets for user_id={user_id}. Content preview: {context[:200]}...")
+    logger.info(
+        f"[MEMORY] Found {len(memories)} relevant snippets for user_id={user_id}. Content preview: {context[:200]}..."
+    )
     return context
 
 
 # ---------------------------------------------------------------------------
 # Memory Extraction Agent
+
 
 async def _extract_facts_with_llm(message: str) -> list[dict]:
     """Use the Memory Agent (small LLM) to extract structured facts from user message."""
@@ -737,6 +873,7 @@ async def _auto_save_memory(
 # Agent loop — semi-agentic streaming
 # ---------------------------------------------------------------------------
 
+
 async def agent_chat_stream(
     workspace_ids: list[uuid.UUID],
     message: str,
@@ -747,6 +884,7 @@ async def agent_chat_stream(
     force_search: bool = False,
     user_id: Optional[int] = None,
     session_id: Optional[str] = None,
+    document_ids: Optional[list[uuid.UUID]] = None,
 ) -> AsyncGenerator[dict, None]:
     """Semi-agentic chat loop with streaming.
 
@@ -789,32 +927,91 @@ async def agent_chat_stream(
     #       (these should be acknowledged from memory, not trigger a KB search)
     greeting_detected = False
     import string
+
     low_msg = message.lower().strip(string.punctuation + " ")
     _GREETING_TOKENS = {
         # Greetings
-        "hi", "hello", "hey", "greetings", "howdy",
-        "xin chào", "chào", "chào bạn", "alo",
+        "hi",
+        "hello",
+        "hey",
+        "greetings",
+        "howdy",
+        "xin chào",
+        "chào",
+        "chào bạn",
+        "alo",
         # Acknowledgements / thanks
-        "cảm ơn", "cảm ơn bạn", "cảm ơn nhiều", "cảm ơn nha",
-        "thanks", "thank you", "thx", "ty",
-        "ok", "okay", "oke", "okie", "got it", "understood", "sure",
-        "được", "được rồi", "rồi", "vâng", "dạ", "ừ", "ừm",
-        "tuyệt", "tuyệt vời", "hay quá", "tốt", "tốt lắm",
-        "great", "nice", "cool", "awesome", "perfect",
+        "cảm ơn",
+        "cảm ơn bạn",
+        "cảm ơn nhiều",
+        "cảm ơn nha",
+        "thanks",
+        "thank you",
+        "thx",
+        "ty",
+        "ok",
+        "okay",
+        "oke",
+        "okie",
+        "got it",
+        "understood",
+        "sure",
+        "được",
+        "được rồi",
+        "rồi",
+        "vâng",
+        "dạ",
+        "ừ",
+        "ừm",
+        "tuyệt",
+        "tuyệt vời",
+        "hay quá",
+        "tốt",
+        "tốt lắm",
+        "great",
+        "nice",
+        "cool",
+        "awesome",
+        "perfect",
         # Farewells
-        "bye", "goodbye", "tạm biệt", "bái bai", "hẹn gặp lại",
+        "bye",
+        "goodbye",
+        "tạm biệt",
+        "bái bai",
+        "hẹn gặp lại",
     }
     # Personal-statement prefixes — user is sharing info about themselves,
     # not asking about documents. No KB search needed; just acknowledge.
     _PERSONAL_PREFIXES = (
-        "tôi tên", "tên tôi", "tôi là ", "mình là ", "tôi làm việc",
-        "tôi ở ", "tôi sống", "tôi dùng ", "tôi đang dùng", "tôi thích ",
-        "tôi không thích", "tôi muốn bạn", "hãy gọi tôi", "call me ",
-        "my name is", "i am ", "i'm ", "i work at", "i live in",
-        "i use ", "i like ", "i don't like", "i prefer ",
-        "always call me", "please call me",
+        "tôi tên",
+        "tên tôi",
+        "tôi là ",
+        "mình là ",
+        "tôi làm việc",
+        "tôi ở ",
+        "tôi sống",
+        "tôi dùng ",
+        "tôi đang dùng",
+        "tôi thích ",
+        "tôi không thích",
+        "tôi muốn bạn",
+        "hãy gọi tôi",
+        "call me ",
+        "my name is",
+        "i am ",
+        "i'm ",
+        "i work at",
+        "i live in",
+        "i use ",
+        "i like ",
+        "i don't like",
+        "i prefer ",
+        "always call me",
+        "please call me",
     )
-    if low_msg in _GREETING_TOKENS or any(low_msg.startswith(p) for p in _PERSONAL_PREFIXES):
+    if low_msg in _GREETING_TOKENS or any(
+        low_msg.startswith(p) for p in _PERSONAL_PREFIXES
+    ):
         greeting_detected = True
 
     # Tool / prompt setup
@@ -826,33 +1023,55 @@ async def agent_chat_stream(
         try:
             memory_context = await _search_memories(user_id, message, db, top_k=5)
             # Add memory context if available
-            if memory_context and "No relevant memories" not in memory_context and "No memories found" not in memory_context:
-                logger.info(f"Auto-recall injected {len(memory_context)} chars of memory context for user {user_id}")
+            if (
+                memory_context
+                and "No relevant memories" not in memory_context
+                and "No memories found" not in memory_context
+            ):
+                logger.info(
+                    f"Auto-recall injected {len(memory_context)} chars of memory context for user {user_id}"
+                )
                 # Move User Context to a separate system block or make it VERY prominent
-                messages.insert(0, LLMMessage(
-                    role="system",
-                    content=(
-                        f"AUTHENTICATED USER PROFILE (PERSONAL HISTORY):\n{memory_context}\n\n"
-                        "Rules for using this profile:\n"
-                        "1. If the user asks about themselves (name, job, device, preferences, etc.), "
-                        "answer DIRECTLY from this profile. Do NOT search documents. Do NOT mix in document content.\n"
-                        "2. When citing a fact from this profile, add the 🧠 icon after the claim. "
-                        "Do NOT use numeric tags like [MEM-1] or [1].\n"
-                        "3. For all other questions (about documents, data, topics), IGNORE this profile "
-                        "and answer from document sources only. Do NOT volunteer personal facts unprompted.\n"
-                        "4. NEVER blend personal facts with document answers in the same sentence."
+                messages.insert(
+                    0,
+                    LLMMessage(
+                        role="system",
+                        content=(
+                            f"AUTHENTICATED USER PROFILE (PERSONAL HISTORY):\n{memory_context}\n\n"
+                            "Rules for using this profile:\n"
+                            "1. If the user asks about themselves (name, job, device, preferences, etc.), "
+                            "answer DIRECTLY from this profile. Do NOT search documents. Do NOT mix in document content.\n"
+                            "2. When citing a fact from this profile, add the 🧠 icon after the claim. "
+                            "Do NOT use numeric tags like [MEM-1] or [1].\n"
+                            "3. For all other questions (about documents, data, topics), IGNORE this profile "
+                            "and answer from document sources only. Do NOT volunteer personal facts unprompted.\n"
+                            "4. NEVER blend personal facts with document answers in the same sentence."
+                        ),
                     ),
-                ))
+                )
         except Exception as e:
             logger.warning(f"Auto-recall failed for user {user_id}: {e}")
 
     if force_search:
         # ── Force-search mode: pre-search before LLM call ──────────────────
         # Retrieve sources immediately, inject as context. No tool calling needed.
-        yield {"event": "status", "data": {"step": "retrieving", "detail": f"Searching: {message[:80]}..."}}
+        yield {
+            "event": "status",
+            "data": {"step": "retrieving", "detail": f"Searching: {message[:80]}..."},
+        }
 
-        context, sources, images, img_parts, kg_summaries = await _execute_search_documents(
-            workspace_ids, message, 8, db, existing_ids,
+        (
+            context,
+            sources,
+            images,
+            img_parts,
+            kg_summaries,
+        ) = await _execute_search_documents(
+            workspace_ids,
+            message,
+            8,
+            db,
+            existing_ids,
         )
         all_sources.extend(sources)
         all_images.extend(images)
@@ -860,9 +1079,15 @@ async def agent_chat_stream(
         all_kg_summaries_collected.extend(kg_summaries)
 
         if sources:
-            yield {"event": "sources", "data": {"sources": [s.model_dump() for s in sources]}}
+            yield {
+                "event": "sources",
+                "data": {"sources": [s.model_dump() for s in sources]},
+            }
         if images:
-            yield {"event": "images", "data": {"image_refs": [i.model_dump() for i in images]}}
+            yield {
+                "event": "images",
+                "data": {"image_refs": [i.model_dump() for i in images]},
+            }
 
         if sources:
             tool_result_parts = [
@@ -876,7 +1101,7 @@ async def agent_chat_stream(
                 "- TABLE DATA: Sources may contain table data as 'Key, Year = Value' pairs. "
                 "Example: 'ROE, 2023 = 12,8%' means ROE was 12.8% in 2023.\n"
                 "- If no source contains relevant information, say: "
-                "\"Tài liệu không chứa thông tin này.\"\n",
+                '"Tài liệu không chứa thông tin này."\n',
             ]
             tool_result_content = "\n".join(tool_result_parts)
 
@@ -884,17 +1109,21 @@ async def agent_chat_stream(
             if img_parts:
                 for img_data in img_parts:
                     tool_result_content += f"\n[IMG-{img_data['img_ref_id']}] (page {img_data['page_no']}):"
-                    user_images_fs.append(LLMImagePart(
-                        data=img_data["inline_data"]["data"],
-                        mime_type=img_data["inline_data"]["mime_type"],
-                    ))
+                    user_images_fs.append(
+                        LLMImagePart(
+                            data=img_data["inline_data"]["data"],
+                            mime_type=img_data["inline_data"]["mime_type"],
+                        )
+                    )
 
             tool_result_content += f"\n\nNow answer the question: {message}"
-            messages.append(LLMMessage(
-                role="user",
-                content=tool_result_content,
-                images=user_images_fs,
-            ))
+            messages.append(
+                LLMMessage(
+                    role="user",
+                    content=tool_result_content,
+                    images=user_images_fs,
+                )
+            )
         # tools remain None — model answers directly with provided context
     elif is_gemini:
         if not greeting_detected:
@@ -926,18 +1155,26 @@ async def agent_chat_stream(
             content=messages[-1].content + OLLAMA_TOOL_REMINDER,
         )
 
-    yield {"event": "status", "data": {"step": "analyzing", "detail": "Analyzing your question..."}}
+    yield {
+        "event": "status",
+        "data": {"step": "analyzing", "detail": "Analyzing your question..."},
+    }
 
     accumulated_text = ""
     thinking_text = ""
 
-    logger.info(f"--- AGENT CHAT START (provider={provider_name}, user_id={user_id}, workspaces={workspace_ids}) ---")
+    logger.info(
+        f"--- AGENT CHAT START (provider={provider_name}, user_id={user_id}, "
+        f"thinking={enable_thinking}, force_search={force_search}, "
+        f"workspaces={workspace_ids}) ---"
+    )
     logger.info(f"User Question: {message}")
-    logger.info(f"System Prompt Length: {len(effective_system_prompt)}")
 
     for iteration in range(MAX_AGENT_ITERATIONS):
         iteration_idx = iteration + 1
-        logger.info(f"[AGENT] Iteration {iteration_idx}/{MAX_AGENT_ITERATIONS} (tools_available={tools is not None})")
+        logger.info(
+            f"[AGENT] Iteration {iteration_idx}/{MAX_AGENT_ITERATIONS} (tools_available={tools is not None})"
+        )
         iteration_text = ""
         function_calls: list[dict] = []
         tokens_yielded = False
@@ -978,28 +1215,45 @@ async def agent_chat_stream(
                 query = fc_args.get("query", message)
                 top_k = int(fc_args.get("top_k", 8))
 
-                yield {"event": "status", "data": {
-                    "step": "retrieving",
-                    "detail": f"Searching: {query[:80]}..."
-                }}
+                yield {
+                    "event": "status",
+                    "data": {
+                        "step": "retrieving",
+                        "detail": f"Searching: {query[:80]}...",
+                    },
+                }
 
-                context, sources, images, img_parts, kg_summaries = await _execute_search_documents(
-                    workspace_ids, query, top_k, db, existing_ids,
+                (
+                    context,
+                    sources,
+                    images,
+                    img_parts,
+                    kg_summaries,
+                ) = await _execute_search_documents(
+                    workspace_ids,
+                    query,
+                    top_k,
+                    db,
+                    existing_ids,
                 )
-                logger.info(f"Search found {len(sources)} chunks and {len(kg_summaries)} KG summaries")
+                logger.info(
+                    f"Search found {len(sources)} chunks and {len(kg_summaries)} KG summaries"
+                )
                 all_sources.extend(sources)
                 all_images.extend(images)
                 all_image_parts.extend(img_parts)
                 all_kg_summaries_collected.extend(kg_summaries)
 
                 if sources:
-                    yield {"event": "sources", "data": {
-                        "sources": [s.model_dump() for s in sources]
-                    }}
+                    yield {
+                        "event": "sources",
+                        "data": {"sources": [s.model_dump() for s in sources]},
+                    }
                 if images:
-                    yield {"event": "images", "data": {
-                        "image_refs": [i.model_dump() for i in images]
-                    }}
+                    yield {
+                        "event": "images",
+                        "data": {"image_refs": [i.model_dump() for i in images]},
+                    }
 
                 # Build tool result as user message with sources
                 tool_result_parts = [
@@ -1014,7 +1268,7 @@ async def agent_chat_stream(
                     "Example: 'ROE, 2023 = 12,8%' means ROE was 12.8% in 2023.\n"
                     "- If no source contains relevant information, check if your User Context has the answer.\n"
                     "- If neither sources nor User Context have the answer, say: "
-                    "\"Tài liệu không chứa thông tin này.\"\n",
+                    '"Tài liệu không chứa thông tin này."\n',
                 ]
                 tool_result_content = "\n".join(tool_result_parts)
 
@@ -1023,10 +1277,12 @@ async def agent_chat_stream(
                 if img_parts:
                     for img_data in img_parts:
                         tool_result_content += f"\n[IMG-{img_data['img_ref_id']}] (page {img_data['page_no']}):"
-                        user_images.append(LLMImagePart(
-                            data=img_data["inline_data"]["data"],
-                            mime_type=img_data["inline_data"]["mime_type"],
-                        ))
+                        user_images.append(
+                            LLMImagePart(
+                                data=img_data["inline_data"]["data"],
+                                mime_type=img_data["inline_data"]["mime_type"],
+                            )
+                        )
 
                 tool_result_content += f"\n\nNow answer the question: {message}"
 
@@ -1039,31 +1295,39 @@ async def agent_chat_stream(
                     raw_content = getattr(provider, "last_response_content", None)
                     if raw_content:
                         # Preserve the model's raw response (with thought_signature)
-                        messages.append(LLMMessage(
-                            role="assistant",
-                            content="",
-                            _raw_provider_content=raw_content,
-                        ))
+                        messages.append(
+                            LLMMessage(
+                                role="assistant",
+                                content="",
+                                _raw_provider_content=raw_content,
+                            )
+                        )
                     else:
-                        messages.append(LLMMessage(
-                            role="assistant",
-                            content=f"[Called search_documents(query=\"{query}\")]",
-                        ))
+                        messages.append(
+                            LLMMessage(
+                                role="assistant",
+                                content=f'[Called search_documents(query="{query}")]',
+                            )
+                        )
 
                     # Build native FunctionResponse with sources context
-                    func_resp_parts = [_gtypes.Part.from_function_response(
-                        name="search_documents",
-                        response={"result": tool_result_content},
-                    )]
+                    func_resp_parts = [
+                        _gtypes.Part.from_function_response(
+                            name="search_documents",
+                            response={"result": tool_result_content},
+                        )
+                    ]
                     func_resp_content = _gtypes.Content(
                         role="user",
                         parts=func_resp_parts,
                     )
-                    messages.append(LLMMessage(
-                        role="user",
-                        content="",
-                        _raw_provider_content=func_resp_content,
-                    ))
+                    messages.append(
+                        LLMMessage(
+                            role="user",
+                            content="",
+                            _raw_provider_content=func_resp_content,
+                        )
+                    )
 
                     # Send images as a separate user message for vision
                     if img_parts:
@@ -1071,15 +1335,19 @@ async def agent_chat_stream(
                         img_text = "Referenced document images:\n"
                         for img_data in img_parts:
                             img_text += f"[IMG-{img_data['img_ref_id']}] (page {img_data['page_no']})\n"
-                            img_llm_parts.append(LLMImagePart(
-                                data=img_data["inline_data"]["data"],
-                                mime_type=img_data["inline_data"]["mime_type"],
-                            ))
-                        messages.append(LLMMessage(
-                            role="user",
-                            content=img_text,
-                            images=img_llm_parts,
-                        ))
+                            img_llm_parts.append(
+                                LLMImagePart(
+                                    data=img_data["inline_data"]["data"],
+                                    mime_type=img_data["inline_data"]["mime_type"],
+                                )
+                            )
+                        messages.append(
+                            LLMMessage(
+                                role="user",
+                                content=img_text,
+                                images=img_llm_parts,
+                            )
+                        )
 
                     # Remove tool-calling instructions since search is done;
                     # keep tools so thinking + tool awareness still works.
@@ -1089,23 +1357,27 @@ async def agent_chat_stream(
                     # to maintain proper user/assistant alternation
                     # (prevents two consecutive user messages which confuses
                     # small models like qwen3.5).
-                    messages.append(LLMMessage(
-                        role="assistant",
-                        content=f"[Called search_documents(query=\"{query}\")]",
-                    ))
-                    messages.append(LLMMessage(
-                        role="user",
-                        content=tool_result_content,
-                        images=user_images,
-                    ))
+                    messages.append(
+                        LLMMessage(
+                            role="assistant",
+                            content=f'[Called search_documents(query="{query}")]',
+                        )
+                    )
+                    messages.append(
+                        LLMMessage(
+                            role="user",
+                            content=tool_result_content,
+                            images=user_images,
+                        )
+                    )
                     # Remove tool prompt from system prompt so the model
                     # answers with sources instead of calling the tool again.
                     effective_system_prompt = system_prompt
 
-                yield {"event": "status", "data": {
-                    "step": "generating",
-                    "detail": "Generating answer..."
-                }}
+                yield {
+                    "event": "status",
+                    "data": {"step": "generating", "detail": "Generating answer..."},
+                }
             else:
                 # Unknown tool — treat accumulated text as answer
                 logger.warning(f"Unknown tool call: {fc_name}")
@@ -1122,13 +1394,23 @@ async def agent_chat_stream(
         logger.warning(
             "Ollama produced no text and no tool call — fallback to auto-search"
         )
-        yield {"event": "status", "data": {
-            "step": "retrieving",
-            "detail": f"Searching: {message[:80]}..."
-        }}
+        yield {
+            "event": "status",
+            "data": {"step": "retrieving", "detail": f"Searching: {message[:80]}..."},
+        }
 
-        context, sources, images, img_parts, kg_summaries = await _execute_search_documents(
-            workspace_ids, message, 8, db, existing_ids,
+        (
+            context,
+            sources,
+            images,
+            img_parts,
+            kg_summaries,
+        ) = await _execute_search_documents(
+            workspace_ids,
+            message,
+            8,
+            db,
+            existing_ids,
         )
         all_kg_summaries_collected.extend(kg_summaries)
         all_sources.extend(sources)
@@ -1136,13 +1418,15 @@ async def agent_chat_stream(
         all_image_parts.extend(img_parts)
 
         if sources:
-            yield {"event": "sources", "data": {
-                "sources": [s.model_dump() for s in sources]
-            }}
+            yield {
+                "event": "sources",
+                "data": {"sources": [s.model_dump() for s in sources]},
+            }
         if images:
-            yield {"event": "images", "data": {
-                "image_refs": [i.model_dump() for i in images]
-            }}
+            yield {
+                "event": "images",
+                "data": {"image_refs": [i.model_dump() for i in images]},
+            }
 
         if sources:
             fallback_parts = [
@@ -1154,7 +1438,7 @@ async def agent_chat_stream(
                 "- Read EVERY source above carefully.\n"
                 "- If no source contains relevant information, check if your User Context has the answer.\n"
                 "- If neither sources nor User Context have the answer, say: "
-                "\"Tài liệu không chứa thông tin này.\"\n",
+                '"Tài liệu không chứa thông tin này."\n',
             ]
             fallback_content = "\n".join(fallback_parts)
             fallback_content += f"\n\nNow answer the question: {message}"
@@ -1163,9 +1447,10 @@ async def agent_chat_stream(
             fallback_msgs = messages.copy()
             fallback_msgs.append(LLMMessage(role="user", content=fallback_content))
 
-            yield {"event": "status", "data": {
-                "step": "generating", "detail": "Generating answer..."
-            }}
+            yield {
+                "event": "status",
+                "data": {"step": "generating", "detail": "Generating answer..."},
+            }
 
             async for chunk in provider.astream(
                 fallback_msgs,
@@ -1186,6 +1471,7 @@ async def agent_chat_stream(
     related_entities: list[str] = []
     try:
         from app.services.rag_service import get_kg_service
+
         # Use first workspace for KG summary extraction (best effort)
         target_kg_id = workspace_ids[0] if workspace_ids else None
         if target_kg_id:
@@ -1194,13 +1480,13 @@ async def agent_chat_stream(
             entity_names = {e["name"].lower(): e["name"] for e in entities}
         else:
             entity_names = {}
-        
+
         # Search in generated answer
         text_lower = accumulated_text.lower()
         for lower_name, original_name in entity_names.items():
             if len(lower_name) >= 3 and lower_name in text_lower:
                 related_entities.append(original_name)
-        
+
         # Also search in KG summaries from search results (ensure graph shows relevant context)
         if all_kg_summaries_collected:
             summary_text_lower = "\n".join(all_kg_summaries_collected).lower()
@@ -1213,21 +1499,25 @@ async def agent_chat_stream(
 
     # Strip artifacts
     if accumulated_text:
-        accumulated_text = re.sub(r'<unused\d+>:?\s*', '', accumulated_text).strip()
+        accumulated_text = re.sub(r"<unused\d+>:?\s*", "", accumulated_text).strip()
 
-    yield {"event": "complete", "data": {
-        "answer": accumulated_text or "Unable to generate a response.",
-        "sources": [s.model_dump() for s in all_sources],
-        "image_refs": [i.model_dump() for i in all_images],
-        "thinking": thinking_text or None,
-        "related_entities": related_entities[:30],
-    }}
+    yield {
+        "event": "complete",
+        "data": {
+            "answer": accumulated_text or "Unable to generate a response.",
+            "sources": [s.model_dump() for s in all_sources],
+            "image_refs": [i.model_dump() for i in all_images],
+            "thinking": thinking_text or None,
+            "related_entities": related_entities[:30],
+        },
+    }
 
     # ── Auto-save: persist conversation episode to Graphiti knowledge graph ──
     if user_id and message and accumulated_text:
         try:
             from app.services.graphiti_client import add_conversation_episode
             import asyncio
+
             uid = user_id
             sid = session_id
             msg = message
@@ -1252,6 +1542,7 @@ async def agent_chat_stream(
 # ---------------------------------------------------------------------------
 # SSE Streaming endpoint
 # ---------------------------------------------------------------------------
+
 
 async def chat_stream_endpoint(
     workspace_ids: list[uuid.UUID],
@@ -1281,6 +1572,7 @@ async def chat_stream_endpoint(
 
     # Build system prompt — use document-type-specific prompt if applicable
     from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
+
     base_prompt = kb.system_prompt or DEFAULT_SYSTEM_PROMPT
 
     # Check if there are documents in this workspace with a dominant document type,
@@ -1288,7 +1580,10 @@ async def chat_stream_endpoint(
     try:
         from sqlalchemy import select as _sel, func as _func
         from app.models.document import Document as _Doc, DocumentStatus as _DS
-        from app.models.document_type import DocumentType as _DT, DocumentTypeSystemPrompt as _DTSP
+        from app.models.document_type import (
+            DocumentType as _DT,
+            DocumentTypeSystemPrompt as _DTSP,
+        )
 
         # Find most common document_type_id in INDEXED documents of these workspaces
         dominant_type_result = await db.execute(
@@ -1326,7 +1621,9 @@ async def chat_stream_endpoint(
                 if global_prompt:
                     base_prompt = global_prompt.system_prompt
     except Exception as _sp_err:
-        logger.debug(f"Document-type system prompt resolution failed (non-fatal): {_sp_err}")
+        logger.debug(
+            f"Document-type system prompt resolution failed (non-fatal): {_sp_err}"
+        )
 
     system_prompt = base_prompt + HARD_SYSTEM_PROMPT
 
@@ -1336,6 +1633,7 @@ async def chat_stream_endpoint(
     # Persist user message immediately
     try:
         from app.models.chat_message import ChatMessage as ChatMessageModel
+
         user_row = ChatMessageModel(
             workspace_id=primary_id,
             message_id=str(uuid.uuid4()),
@@ -1386,30 +1684,36 @@ async def chat_stream_endpoint(
                     # When generating starts, insert sources_found first (correct order)
                     if step_name == "generating" and streaming_sources:
                         step_counter += 1
-                        badges = list(dict.fromkeys(
-                            s.get("index", "") for s in streaming_sources[:6]
-                        ))
-                        collected_steps.append({
-                            "id": f"step-{step_counter}",
-                            "step": "sources_found",
-                            "detail": f"Found {len(streaming_sources)} source{'s' if len(streaming_sources) != 1 else ''}",
-                            "status": "completed",
-                            "timestamp": 0,
-                            "sourceCount": len(streaming_sources),
-                            "imageCount": len(streaming_images),
-                            "sourceBadges": badges,
-                        })
+                        badges = list(
+                            dict.fromkeys(
+                                s.get("index", "") for s in streaming_sources[:6]
+                            )
+                        )
+                        collected_steps.append(
+                            {
+                                "id": f"step-{step_counter}",
+                                "step": "sources_found",
+                                "detail": f"Found {len(streaming_sources)} source{'s' if len(streaming_sources) != 1 else ''}",
+                                "status": "completed",
+                                "timestamp": 0,
+                                "sourceCount": len(streaming_sources),
+                                "imageCount": len(streaming_images),
+                                "sourceBadges": badges,
+                            }
+                        )
                         streaming_sources.clear()
                         streaming_images.clear()
 
                     step_counter += 1
-                    collected_steps.append({
-                        "id": f"step-{step_counter}",
-                        "step": step_name,
-                        "detail": event_data.get("detail", ""),
-                        "status": "completed",
-                        "timestamp": 0,
-                    })
+                    collected_steps.append(
+                        {
+                            "id": f"step-{step_counter}",
+                            "step": step_name,
+                            "detail": event_data.get("detail", ""),
+                            "status": "completed",
+                            "timestamp": 0,
+                        }
+                    )
 
                 # Track sources/images as they arrive
                 elif event_type == "sources":
@@ -1423,7 +1727,9 @@ async def chat_stream_endpoint(
                     thinking_fragment = event_data.get("text", "")
                     for s in collected_steps:
                         if s["step"] == "analyzing":
-                            s["thinkingText"] = (s.get("thinkingText") or "") + thinking_fragment
+                            s["thinkingText"] = (
+                                s.get("thinkingText") or ""
+                            ) + thinking_fragment
                             break
 
                 elif event_type == "complete":
@@ -1434,31 +1740,39 @@ async def chat_stream_endpoint(
                     final_entities = event_data.get("related_entities", [])
 
                     # Fallback: if sources arrived but generating step was never emitted
-                    if streaming_sources and not any(s["step"] == "sources_found" for s in collected_steps):
+                    if streaming_sources and not any(
+                        s["step"] == "sources_found" for s in collected_steps
+                    ):
                         step_counter += 1
-                        badges = list(dict.fromkeys(
-                            s.get("index", "") for s in streaming_sources[:6]
-                        ))
-                        collected_steps.append({
-                            "id": f"step-{step_counter}",
-                            "step": "sources_found",
-                            "detail": f"Found {len(streaming_sources)} source{'s' if len(streaming_sources) != 1 else ''}",
-                            "status": "completed",
-                            "timestamp": 0,
-                            "sourceCount": len(streaming_sources),
-                            "imageCount": len(streaming_images),
-                            "sourceBadges": badges,
-                        })
+                        badges = list(
+                            dict.fromkeys(
+                                s.get("index", "") for s in streaming_sources[:6]
+                            )
+                        )
+                        collected_steps.append(
+                            {
+                                "id": f"step-{step_counter}",
+                                "step": "sources_found",
+                                "detail": f"Found {len(streaming_sources)} source{'s' if len(streaming_sources) != 1 else ''}",
+                                "status": "completed",
+                                "timestamp": 0,
+                                "sourceCount": len(streaming_sources),
+                                "imageCount": len(streaming_images),
+                                "sourceBadges": badges,
+                            }
+                        )
 
                     # Done step
                     step_counter += 1
-                    collected_steps.append({
-                        "id": f"step-{step_counter}",
-                        "step": "done",
-                        "detail": "Done",
-                        "status": "completed",
-                        "timestamp": 0,
-                    })
+                    collected_steps.append(
+                        {
+                            "id": f"step-{step_counter}",
+                            "step": "done",
+                            "detail": "Done",
+                            "status": "completed",
+                            "timestamp": 0,
+                        }
+                    )
 
                 yield format_sse_event(event_type, event_data)
 
@@ -1471,17 +1785,20 @@ async def chat_stream_endpoint(
             if final_answer and not session_id:
                 try:
                     from app.models.chat_message import ChatMessage as ChatMessageModel
+
                     # Note: for multi-workspace search, we associate with the first workspace
                     # or leave NULL if no workspaces.
                     target_workspace_id = workspace_ids[0] if workspace_ids else None
-                    
+
                     assistant_row = ChatMessageModel(
                         workspace_id=target_workspace_id,
                         message_id=str(uuid.uuid4()),
                         role="assistant",
                         content=final_answer,
                         sources=final_sources if final_sources else None,
-                        related_entities=final_entities[:30] if final_entities else None,
+                        related_entities=final_entities[:30]
+                        if final_entities
+                        else None,
                         image_refs=final_images if final_images else None,
                         thinking=final_thinking,
                         agent_steps=collected_steps if collected_steps else None,
