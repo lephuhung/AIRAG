@@ -211,27 +211,39 @@ async def summarize_document_node(state: AgentRagState) -> AgentRagState:
 
     try:
         import re
+        import uuid as uuid_lib
 
-        # Thử trích document ID từ rewritten_query trước, rồi messages
-        doc_id_match = re.search(r"\b(\d+)\b", query, re.IGNORECASE)
-        if not doc_id_match and state.messages:
-            last_message = state.messages[-1]
-            raw_msg = (
-                last_message.content
-                if hasattr(last_message, "content")
-                else str(last_message)
-            )
-            doc_id_match = re.search(
-                r"(?:doc|document|tài liệu)[^\d]*(\d+)", raw_msg, re.IGNORECASE
-            )
+        # Prefer document_ids from state (attached files), fallback to regex extraction
+        document_ids_from_state = getattr(state, "document_ids", None) or []
 
-        if doc_id_match:
-            document_id = int(doc_id_match.group(1))
+        if document_ids_from_state:
+            # Use first attached document ID
+            document_id = (
+                document_ids_from_state[0]
+                if isinstance(document_ids_from_state[0], uuid_lib.UUID)
+                else uuid_lib.UUID(str(document_ids_from_state[0]))
+            )
         else:
-            state.final_answer = (
-                "Vui lòng chỉ định ID tài liệu (ví dụ: 'tóm tắt tài liệu 5')."
-            )
-            return state
+            # Fallback: extract numeric ID from query (for legacy numeric ID usage)
+            doc_id_match = re.search(r"\b(\d+)\b", query, re.IGNORECASE)
+            if not doc_id_match and state.messages:
+                last_message = state.messages[-1]
+                raw_msg = (
+                    last_message.content
+                    if hasattr(last_message, "content")
+                    else str(last_message)
+                )
+                doc_id_match = re.search(
+                    r"(?:doc|document|tài liệu)[^\d]*(\d+)", raw_msg, re.IGNORECASE
+                )
+
+            if doc_id_match:
+                document_id = int(doc_id_match.group(1))
+            else:
+                state.final_answer = (
+                    "Vui lòng đính kèm file hoặc chỉ định ID tài liệu (ví dụ: 'tóm tắt tài liệu 5')."
+                )
+                return state
 
         from sqlalchemy import select
         from app.models.document import Document, DocumentStatus
@@ -247,9 +259,15 @@ async def summarize_document_node(state: AgentRagState) -> AgentRagState:
                 state.final_answer = f"Không tìm thấy tài liệu với ID {document_id}."
                 return state
 
-            if doc.status != DocumentStatus.INDEXED:
+            # Allow PARSING/CHUNKING/EMBEDDING (chat-uploaded files have markdown in MinIO)
+            if doc.status not in (
+                DocumentStatus.INDEXED,
+                DocumentStatus.CHUNKING,
+                DocumentStatus.EMBEDDING,
+                DocumentStatus.PARSING,
+            ):
                 state.final_answer = (
-                    f"Tài liệu '{doc.original_filename}' chưa được lập chỉ mục."
+                    f"Tài liệu '{doc.original_filename}' chưa được xử lý xong."
                 )
                 return state
 

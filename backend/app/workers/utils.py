@@ -20,9 +20,13 @@ async def check_and_finalize(document: Document, db: AsyncSession) -> None:
     """
     Transition document status based on sub-task completion:
 
-      - embed_done + captions_done + kg_done → INDEXED
+      - is_chat_upload + embed_done → INDEXED (chat temp files: parse → embed only)
+      - embed_done + captions_done + kg_done → INDEXED (full pipeline)
       - embed_done + captions_done (kg still running) → BUILDING_KG
       - otherwise → no change (still EMBEDDING or CHUNKING)
+
+    Chat-upload documents skip KG and caption workers, so only embed_done
+    is needed before marking INDEXED.
 
     Opens a *separate* session so it always reads the latest committed values
     from the other workers (avoids stale snapshot from the caller's long-lived
@@ -39,6 +43,18 @@ async def check_and_finalize(document: Document, db: AsyncSession) -> None:
         )
         fresh = result.scalar_one_or_none()
         if fresh is None:
+            return
+
+        # Chat-upload documents: skip KG and caption workers, so only embed_done is needed
+        if fresh.is_chat_upload:
+            if fresh.embed_done:
+                if fresh.status != DocumentStatus.INDEXED:
+                    fresh.status = DocumentStatus.INDEXED
+                    await fresh_db.commit()
+                    logger.info(
+                        f"[finalize] doc={fresh.id} → INDEXED "
+                        f"(chat-upload: embed✓)"
+                    )
             return
 
         if fresh.embed_done and fresh.captions_done:

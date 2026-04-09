@@ -63,8 +63,10 @@ class AgentState(TypedDict):
     mongo_results: list[dict]  # person records from MongoDB people collection
 
     # ── Write agent ───────────────────────────────────────────────────────
-    write_action: str   # "summarize" | "suggest_edits" | "grammar_check" | "extract_key_points"
+    write_action: str   # "summarize" | "suggest_edits" | "grammar_check" | "extract_key_points" | "format_check"
     text_input: str     # raw text to process (extracted from message or provided directly)
+    format_data: dict | None  # extracted format metadata for format_check
+    file_name: str | None     # filename for format_check report
     # potential_abbreviations: list[str]  # candidates that look like abbreviations but not in DB
 
 
@@ -82,6 +84,7 @@ VALID_INTENTS = {
     "write_summarize",
     "write_suggest_edits",
     "write_grammar_check",
+    "write_format_check",
     # mongo people search intents
     "mongo_search_cccd",
     "mongo_search_name",
@@ -113,6 +116,8 @@ DEFAULT_STATE: dict = {
     "citation_map": {},
     "write_action": "",
     "text_input": "",
+    "format_data": None,
+    "file_name": None,
     "abbreviation_results": [],
     "expanded_query": "",
     "mongo_results": [],

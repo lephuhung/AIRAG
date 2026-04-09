@@ -82,7 +82,7 @@ async def delete_chat_session(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
-    """Delete a chat session and all its messages."""
+    """Delete a chat session, all its messages, chat files, and MinIO objects."""
     result = await db.execute(
         select(ChatSession).where(
             ChatSession.id == session_id, ChatSession.user_id == user.id
@@ -92,6 +92,31 @@ async def delete_chat_session(
     if not session:
         raise HTTPException(status_code=404, detail="Chat session not found")
 
+    # Delete associated MinIO objects for all chat files in this session
+    from app.models.chat_file import ChatFile
+    from app.services.storage_service import get_storage_service
+
+    chat_files_result = await db.execute(
+        select(ChatFile).where(ChatFile.session_id == session_id)
+    )
+    chat_files = chat_files_result.scalars().all()
+
+    storage = get_storage_service()
+    for chat_file in chat_files:
+        # Delete original file from MinIO
+        if chat_file.minio_original_key:
+            try:
+                await storage.delete_file(chat_file.minio_original_key)
+            except Exception as e:
+                logger.warning(f"[session/{session_id}] Failed to delete MinIO file {chat_file.minio_original_key}: {e}")
+        # Delete markdown file from MinIO
+        if chat_file.minio_markdown_key:
+            try:
+                await storage.delete_markdown(chat_file.minio_markdown_key)
+            except Exception as e:
+                logger.warning(f"[session/{session_id}] Failed to delete MinIO markdown {chat_file.minio_markdown_key}: {e}")
+
+    # Delete the session (cascade deletes ChatMessage, ChatFile, ExchangeSummary rows)
     await db.delete(session)
     await db.commit()
     return {"status": "deleted"}

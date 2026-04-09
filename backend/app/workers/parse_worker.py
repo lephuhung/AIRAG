@@ -293,17 +293,31 @@ async def handle_parse(payload: dict) -> None:
             parse_only = (
                 settings.HRAG_PARSE_ONLY_MODE
                 or settings.NEXUSRAG_PARSE_ONLY_MODE
-                or msg.is_chat_upload
             )
             if parse_only:
+                # Full parse-only mode (settings flag): skip embed + caption + KG → INDEXED
                 document.status = DocumentStatus.INDEXED
                 await db.commit()
-                mode = "chat-upload" if msg.is_chat_upload else "parse-only"
                 logger.info(
-                    f"[parse_worker] doc={msg.document_id} {mode} — "
+                    f"[parse_worker] doc={msg.document_id} parse-only — "
                     f"marked INDEXED in {int((time.time() - start) * 1000)}ms"
                 )
+            elif msg.is_chat_upload:
+                # Chat-upload: parse → embed → INDEXED (skip KG and caption for speed)
+                await mq.publish(
+                    mq.EXCHANGE_EMBED,
+                    "embed",
+                    EmbedMessage(
+                        document_id=msg.document_id,
+                        workspace_id=msg.workspace_id,
+                    ).model_dump(mode="json"),
+                )
+                logger.info(
+                    f"[parse_worker] doc={msg.document_id} chat-upload — "
+                    f"dispatched embed (skip caption+kg) in {int((time.time() - start) * 1000)}ms"
+                )
             else:
+                # Full pipeline: embed + caption + KG
                 await mq.publish(
                     mq.EXCHANGE_EMBED,
                     "embed",

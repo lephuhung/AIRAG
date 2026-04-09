@@ -59,6 +59,12 @@ def inches_to_cm(inches: float) -> float:
     return inches * 2.54
 
 
+def extract_docx_format_sync(file_path: str) -> dict[str, Any]:
+    """Synchronous wrapper for extract_docx_format — runs CPU-bound docx parsing in thread pool."""
+    import asyncio
+    return asyncio.run(extract_docx_format(file_path))
+
+
 async def extract_docx_format(file_path: str) -> dict[str, Any]:
     """
     Extract comprehensive formatting information from a .docx file.
@@ -131,21 +137,43 @@ async def extract_docx_format(file_path: str) -> dict[str, Any]:
 
             line_spacing_samples.append(spacing_info)
 
-        # Font analysis
+        # Font analysis - first check rPrDefault for document-wide defaults
+        default_font = None
+        default_font_size = None
+
+        try:
+            import zipfile
+            with zipfile.ZipFile(file_path, 'r') as z:
+                with z.open('word/styles.xml') as f:
+                    styles_xml = f.read().decode('utf-8')
+                    # Extract default font from rPrDefault
+                    import re
+                    rpr_match = re.search(r'<w:rPrDefault>.*?<w:rFonts[^>]*w:ascii="([^"]*)"', styles_xml, re.DOTALL)
+                    if rpr_match:
+                        default_font = rpr_match.group(1)
+                    # Extract default font size
+                    sz_match = re.search(r'<w:sz w:val="(\d+)"', styles_xml)
+                    if sz_match:
+                        default_font_size = int(sz_match.group(1)) / 2  # Convert half-points to pt
+        except Exception as e:
+            logger.warning(f"[extract_docx_format] Could not read styles.xml defaults: {e}")
+
+        # Now analyze runs (may inherit defaults if not explicitly set)
         font_samples = []
         for i, para in enumerate(doc.paragraphs[:30]):
             for run in para.runs:
                 if run.text.strip():
                     font_info = {
                         "paragraph_index": i,
-                        "font_name": run.font.name,
-                        "font_size": run.font.size.pt if run.font.size else None,
+                        "font_name": run.font.name or default_font,
+                        "font_size": run.font.size.pt if run.font.size else default_font_size,
                         "bold": run.font.bold,
                         "italic": run.font.italic,
                         "underline": run.font.underline,
                         "text_preview": run.text[:50] + "..."
                         if len(run.text) > 50
                         else run.text,
+                        "is_default": run.font.name is None,  # True if using document default
                     }
                     font_samples.append(font_info)
                     if len(font_samples) >= 50:

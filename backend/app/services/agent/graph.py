@@ -56,7 +56,7 @@ def _route_by_intent(state: AgentState) -> str:
         logger.debug(f"[router] intent={intent!r} → direct_answer")
         return "direct_answer"
 
-    if intent in ("write_summarize", "write_suggest_edits", "write_grammar_check"):
+    if intent in ("write_summarize", "write_suggest_edits", "write_grammar_check", "write_format_check"):
         logger.debug(f"[router] intent={intent!r} → write_executor")
         return "write_executor"
 

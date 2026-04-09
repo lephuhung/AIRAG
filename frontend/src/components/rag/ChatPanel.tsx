@@ -1226,8 +1226,9 @@ function AddAbbreviationButton({
 // ---------------------------------------------------------------------------
 // File attachment badge for inline display in message bubbles
 // ---------------------------------------------------------------------------
-function FileAttachmentBadge({ doc }: { doc: { id: string; filename: string; file_type?: string; status: string } }) {
+function FileAttachmentBadge({ doc }: { doc: { id: string; filename: string; original_filename?: string; file_type?: string; status: string } }) {
   const { t } = useTranslation();
+  const displayName = doc.original_filename || doc.filename;
   const fileConfig = getFileConfig(doc.file_type || doc.filename?.split(".").pop() || "");
   const FileIcon = fileConfig.icon;
   const statusConfig = STATUS_CONFIG[doc.status as DocumentStatus] ?? STATUS_CONFIG.pending;
@@ -1237,8 +1238,8 @@ function FileAttachmentBadge({ doc }: { doc: { id: string; filename: string; fil
   return (
     <div className="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg bg-muted/60 border border-border/50 text-xs">
       <FileIcon className={cn("w-3.5 h-3.5 shrink-0", fileConfig.color)} />
-      <span className="truncate max-w-[120px] font-medium text-foreground/80" title={doc.filename}>
-        {doc.filename}
+      <span className="truncate max-w-[120px] font-medium text-foreground/80" title={displayName}>
+        {displayName}
       </span>
       {doc.status !== "indexed" && (
         <span className={cn(
@@ -1391,7 +1392,7 @@ function DocumentMentionDropdown({
                         "text-[12px] font-medium truncate tracking-tight transition-colors duration-150",
                         isHighlighted ? "text-foreground" : "text-muted-foreground/80 group-hover:text-foreground"
                       )}>
-                        {doc.filename}
+                        {doc.original_filename || doc.filename}
                       </span>
                       {doc.document_number && (
                         <span className={cn(
@@ -1436,7 +1437,8 @@ function DocumentMentionDropdown({
 // ---------------------------------------------------------------------------
 // Referenced document badge (shown in input area)
 // ---------------------------------------------------------------------------
-function ReferencedDocBadge({ doc, onRemove }: { doc: { id: string; filename: string }; onRemove: () => void }) {
+function ReferencedDocBadge({ doc, onRemove }: { doc: { id: string; filename: string; original_filename?: string }; onRemove: () => void }) {
+  const displayName = doc.original_filename || doc.filename;
   const fileConfig = getFileConfig(doc.filename.split(".").pop() || "");
   const FileIcon = fileConfig.icon;
 
@@ -1451,7 +1453,7 @@ function ReferencedDocBadge({ doc, onRemove }: { doc: { id: string; filename: st
         <FileIcon className={cn("w-3.5 h-3.5", fileConfig.color)} />
       </div>
       <span className="text-[12px] font-bold text-foreground tracking-tight truncate max-w-[150px]">
-        {doc.filename}
+        {displayName}
       </span>
       <button
         type="button"
@@ -1949,7 +1951,7 @@ function SuggestionChips({ onSelect }: { onSelect: (text: string) => void }) {
 interface AttachedFile {
   id: string; // Document database ID
   file: File;
-  status: "uploading" | "parsing" | "indexed" | "failed";
+  status: "uploading" | "parsing" | "ready" | "indexed" | "failed";
   progress: number;
   docMetadata?: Document;
 }
@@ -1998,11 +2000,11 @@ function ChatInputArea({
   onPlus?: () => void;
   onMic?: () => void;
   t: any;
-  referencedDocs?: { id: string; filename: string }[];
+  referencedDocs?: { id: string; filename: string; original_filename?: string }[];
   onRemoveReferencedDoc?: (docId: string) => void;
   showMentionDropdown?: boolean;
   filteredMentionDocs?: { id: string; filename: string; original_filename?: string; document_number?: string | null }[];
-  onSelectMentionDoc?: (doc: { id: string; filename: string }) => void;
+  onSelectMentionDoc?: (doc: { id: string; filename: string; original_filename?: string }) => void;
   onCloseMentionDropdown?: () => void;
   onInputChange?: (text: string, cursorPos: number) => void;
   mentionSelectedIndex?: number;
@@ -2036,13 +2038,15 @@ function ChatInputArea({
                     <span className={cn(
                       "text-[9px] font-bold uppercase tracking-wider",
                       file.status === "indexed" ? "text-emerald-500" :
-                        file.status === "failed" ? "text-destructive" :
-                          "text-muted-foreground/60"
+                        file.status === "ready" ? "text-amber-500" :
+                          file.status === "failed" ? "text-destructive" :
+                            "text-muted-foreground/60"
                     )}>
                       {file.status === "indexed" ? t("chat.status_indexed") || "Sẵn sàng" :
-                        file.status === "parsing" ? t("chat.status_parsing") || "Đang xử lý..." :
-                          file.status === "uploading" ? t("chat.status_uploading") || "Đang tải lên..." :
-                            t("chat.status_failed") || "Lỗi"}
+                        file.status === "ready" ? t("chat.status_ready") || "Sẵn sàng truy vấn" :
+                          file.status === "parsing" ? t("chat.status_parsing") || "Đang xử lý..." :
+                            file.status === "uploading" ? t("chat.status_uploading") || "Đang tải lên..." :
+                              t("chat.status_failed") || "Lỗi"}
                     </span>
                   </div>
                   <button
@@ -2204,7 +2208,7 @@ export const ChatPanel = memo(function ChatPanel({
   const [enableThinking, setEnableThinking] = useState(true);
   const [thinkingDefaultSynced, setThinkingDefaultSynced] = useState(false);
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
-  const [referencedDocs, setReferencedDocs] = useState<{ id: string; filename: string }[]>([]);
+  const [referencedDocs, setReferencedDocs] = useState<{ id: string; filename: string; original_filename?: string }[]>([]);
   const [docMetadataMap, setDocMetadataMap] = useState<Map<string, Document>>(new Map());
   const skipResetRef = useRef(false);
 
@@ -2243,15 +2247,25 @@ export const ChatPanel = memo(function ChatPanel({
     const workspaceDocsList = workspaceDocs || [];
 
     // Map locally attached files so they immediately appear in mentions
+    // Use docMetadata.original_filename if available (from API response after upload)
     const attachedDocsInfo = attachedFiles
       .map((af) => ({
         id: af.id,
         filename: af.file.name,
-        original_filename: af.file.name,
+        original_filename: af.docMetadata?.original_filename || af.file.name,
         file_type: af.file.name.split('.').pop(),
       }));
 
-    const allDocs = [...attachedDocsInfo, ...sessionDocs];
+    // Map workspace docs - they have original_filename from the API
+    const workspaceDocsInfo = workspaceDocsList.map((doc: any) => ({
+      id: doc.id,
+      filename: doc.filename || doc.original_filename || "Untitled",
+      original_filename: doc.original_filename || doc.filename,
+      file_type: doc.file_type || (doc.filename?.split('.')?.pop()),
+      document_number: doc.document_number
+    }));
+
+    const allDocs = [...attachedDocsInfo, ...sessionDocs, ...workspaceDocsInfo];
     if (allDocs.length === 0) return [];
     // Deduplicate by ID
     const uniqueDocs = Array.from(new Map(allDocs.map(d => [d.id, d])).values());
@@ -2305,7 +2319,7 @@ export const ChatPanel = memo(function ChatPanel({
     setMentionSearch(match[1]);
     setShowMentionDropdown(true);
   }, []);  // Helper: insert selected doc into input
-  const insertMentionDoc = useCallback((doc: { id: string; filename: string }) => {
+  const insertMentionDoc = useCallback((doc: { id: string; filename: string; original_filename?: string }) => {
     const textBeforeCursor = input.slice(0, inputRef.current?.selectionStart || 0);
     const atIndex = textBeforeCursor.lastIndexOf('@');
     if (atIndex === -1) return;
@@ -2321,7 +2335,7 @@ export const ChatPanel = memo(function ChatPanel({
 
     // Add to referenced docs
     if (!referencedDocs.find(d => d.id === doc.id)) {
-      setReferencedDocs(prev => [...prev, { id: doc.id, filename: doc.filename }]);
+      setReferencedDocs(prev => [...prev, { id: doc.id, filename: doc.filename, original_filename: doc.original_filename }]);
     }
   }, [input, referencedDocs]);
 
@@ -2461,6 +2475,13 @@ export const ChatPanel = memo(function ChatPanel({
           ));
           return;
         }
+        // Parse done → embedding in background. Allow chat immediately.
+        if (docData.status === "chunking" || docData.status === "embedding") {
+          setAttachedFiles(prev => prev.map(f =>
+            f.id === docId ? { ...f, status: "ready", progress: 70, docMetadata: docData } : f
+          ));
+          return;
+        }
         if (docData.status === "failed") {
           setAttachedFiles(prev => prev.map(f =>
             f.id === docId ? { ...f, status: "failed" } : f
@@ -2477,12 +2498,14 @@ export const ChatPanel = memo(function ChatPanel({
           ));
           toast.error(t("chat.upload_failed"));
         }
-      } catch (err) {
+      } catch (err: any) {
+        // If document not found (404) or other error, stop polling
         console.error("Polling failed:", err);
         setAttachedFiles(prev => prev.map(f =>
           f.id === docId ? { ...f, status: "failed" } : f
         ));
-        toast.error(t("chat.upload_failed"));
+        // Don't continue polling on error - stop here
+        return;
       }
     };
 
@@ -2519,6 +2542,9 @@ export const ChatPanel = memo(function ChatPanel({
           f.id === tempId ? { ...f, id: docId, status: "parsing", progress: 40, docMetadata: response } : f
         ));
 
+        // Invalidate workspace docs so mention dropdown gets updated list
+        queryClient.invalidateQueries({ queryKey: ["documents", currentWorkspaceId] });
+
         pollDocumentStatus(docId);
       } catch (err) {
         toast.error(t("chat.upload_failed"));
@@ -2527,7 +2553,7 @@ export const ChatPanel = memo(function ChatPanel({
         ));
       }
     },
-    [currentWorkspaceId, pollDocumentStatus, t]
+    [currentWorkspaceId, pollDocumentStatus, queryClient, t]
   );
 
   const removeAttachment = useCallback((id: string) => {
@@ -2814,7 +2840,7 @@ export const ChatPanel = memo(function ChatPanel({
   const handleSend = useCallback(
     async (text?: string) => {
       const msg = (text || input).trim();
-      const isStillProcessing = attachedFiles.some(f => f.status === "uploading" || f.status === "parsing");
+      const isStillProcessing = attachedFiles.some(f => f.status === "uploading");
       if (isStillProcessing) {
         toast.info(t("chat.wait_for_files"));
         return;
@@ -2848,15 +2874,17 @@ export const ChatPanel = memo(function ChatPanel({
       }
 
       // Only send @ mentioned docs + newly attached files (not all session docs)
+      // "ready" files (parse done, embed in background) are also included — backend
+      // fetches markdown directly from MinIO so content is available immediately.
       const documentIds = [
         ...referencedDocs.map(d => d.id),
-        ...attachedFiles.filter(f => f.status === "indexed").map(f => f.id),
+        ...attachedFiles.filter(f => f.status === "indexed" || f.status === "ready").map(f => f.id),
       ];
       setAttachedFiles([]);
       // setReferencedDocs([]); // Keep mentions for subsequent questions as requested
 
       const attachedDocs = attachedFiles
-        .filter(f => f.status === "indexed" && f.docMetadata)
+        .filter(f => (f.status === "indexed" || f.status === "ready") && f.docMetadata)
         .map(f => f.docMetadata as Document);
 
       const userMsg: ChatMessage = {

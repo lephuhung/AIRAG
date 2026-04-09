@@ -27,6 +27,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Helpers (sync, run in thread pool to avoid blocking event loop)
+# ---------------------------------------------------------------------------
+
+def _write_file_sync(path: str, data: bytes) -> None:
+    """Synchronous file write — must run in asyncio.to_thread()"""
+    with open(path, "wb") as f:
+        f.write(data)
+
+
 # ---------------------------------------------------------------------------
 # Tool registry — maps tool name → callable
 # ---------------------------------------------------------------------------
@@ -198,9 +209,16 @@ async def summarize_document(
                 "document_id": document_id,
             }
 
-        if doc.status != DocumentStatus.INDEXED:
+        # Allow chat-upload files (PARSE_DONE or beyond) even if not yet INDEXED,
+        # as long as markdown content exists in MinIO
+        if doc.status not in (
+            DocumentStatus.INDEXED,
+            DocumentStatus.CHUNKING,
+            DocumentStatus.EMBEDDING,
+            DocumentStatus.PARSING,
+        ):
             return {
-                "text": f"Tài liệu '{doc.original_filename}' chưa được lập chỉ mục.",
+                "text": f"Tài liệu '{doc.original_filename}' chưa được xử lý xong.",
                 "document_name": doc.original_filename,
                 "document_id": document_id,
             }
@@ -331,16 +349,23 @@ async def get_documents_content(
                 )
                 continue
 
-            if doc.status != DocumentStatus.INDEXED:
+            # Allow chat-upload files (PARSE_DONE or beyond) even if not yet INDEXED,
+            # as long as markdown content exists in MinIO
+            if doc.status not in (
+                DocumentStatus.INDEXED,
+                DocumentStatus.CHUNKING,
+                DocumentStatus.EMBEDDING,
+                DocumentStatus.PARSING,
+            ):
                 errors.append(
-                    f"Tài liệu '{doc.original_filename}' chưa được lập chỉ mục"
+                    f"Tài liệu '{doc.original_filename}' chưa được xử lý xong"
                 )
                 results.append(
                     {
                         "id": str(doc_id),
                         "filename": doc.original_filename,
                         "content": None,
-                        "error": f"Tài liệu chưa được lập chỉ mục (status: {doc.status.value if hasattr(doc.status, 'value') else doc.status})",
+                        "error": f"Tài liệu chưa được xử lý xong (status: {doc.status.value if hasattr(doc.status, 'value') else doc.status}). Vui lòng đợi một chút và thử lại.",
                     }
                 )
                 continue
@@ -393,6 +418,156 @@ async def get_documents_content(
 
     except Exception as e:
         logger.error(f"[tool:get_documents_content] Failed: {e}")
+        return {
+            "documents": [],
+            "total_count": 0,
+            "errors": [f"Lỗi hệ thống: {e}"],
+        }
+
+
+# ---------------------------------------------------------------------------
+# Tool 3c: get_document_format
+# ---------------------------------------------------------------------------
+
+
+async def get_document_format(
+    document_ids: list[uuid.UUID],
+    db: "AsyncSession",
+) -> dict:
+    """
+    Extract and return format metadata for Word (.docx) documents.
+
+    Downloads the original docx file from MinIO and extracts formatting
+    information including margins, fonts, line spacing, etc.
+    Used when user asks to check document formatting.
+
+    Args:
+        document_ids: List of document UUIDs to extract format from
+        db: Database session
+
+    Returns:
+        dict with keys:
+            - documents: list of {id, filename, file_type, format_data, error}
+            - total_count: int
+            - errors: list of error messages if any documents failed
+    """
+    import tempfile
+    import os
+
+    from sqlalchemy import select
+    from app.models.document import Document, DocumentStatus
+    from app.services.storage_service import get_storage_service
+    from app.services.agents.docx_formatter_tools import extract_docx_format, extract_docx_format_sync
+
+    results = []
+    errors = []
+
+    if not document_ids:
+        return {
+            "documents": [],
+            "total_count": 0,
+            "errors": [],
+        }
+
+    try:
+        # Fetch all documents in one query
+        result = await db.execute(select(Document).where(Document.id.in_(document_ids)))
+        docs = result.scalars().all()
+        doc_map = {doc.id: doc for doc in docs}
+
+        storage = get_storage_service()
+
+        for doc_id in document_ids:
+            doc = doc_map.get(doc_id)
+
+            if not doc:
+                errors.append(f"Không tìm thấy tài liệu {doc_id}")
+                results.append({
+                    "id": str(doc_id),
+                    "filename": "Unknown",
+                    "file_type": None,
+                    "format_data": None,
+                    "error": "Không tìm thấy tài liệu",
+                })
+                continue
+
+            # Only process Word documents
+            file_type = doc.file_type.lower() if doc.file_type else ""
+            if file_type not in ("docx", "word", ".docx"):
+                results.append({
+                    "id": str(doc_id),
+                    "filename": doc.original_filename,
+                    "file_type": file_type,
+                    "format_data": None,
+                    "error": f"Không phải file Word (.docx). Loại file: {file_type or 'unknown'}",
+                })
+                continue
+
+            if not doc.upload_s3_key:
+                results.append({
+                    "id": str(doc_id),
+                    "filename": doc.original_filename,
+                    "file_type": file_type,
+                    "format_data": None,
+                    "error": "Không tìm thấy file gốc trong MinIO",
+                })
+                continue
+
+            try:
+                # Download docx from MinIO to temp file
+                tmp_dir = tempfile.gettempdir()
+                tmp_path = os.path.join(tmp_dir, f"format_check_{doc_id}.docx")
+
+                file_data = await storage.download_file(doc.upload_s3_key)
+                # Use asyncio.to_thread to avoid blocking the event loop
+                import asyncio
+                await asyncio.to_thread(_write_file_sync, tmp_path, file_data)
+
+                # Extract format metadata in thread pool (CPU-bound docx parsing)
+                format_data = await asyncio.to_thread(extract_docx_format_sync, tmp_path)
+
+                # Clean up temp file
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+                if format_data.get("error"):
+                    results.append({
+                        "id": str(doc_id),
+                        "filename": doc.original_filename,
+                        "file_type": file_type,
+                        "format_data": None,
+                        "error": format_data["error"],
+                    })
+                else:
+                    results.append({
+                        "id": str(doc_id),
+                        "filename": doc.original_filename,
+                        "file_type": file_type,
+                        "format_data": format_data,
+                        "error": None,
+                    })
+
+            except Exception as e:
+                logger.error(f"[tool:get_document_format] Failed for doc {doc_id}: {e}")
+                errors.append(f"Lỗi xử lý '{doc.original_filename}': {e}")
+                results.append({
+                    "id": str(doc_id),
+                    "filename": doc.original_filename,
+                    "file_type": file_type,
+                    "format_data": None,
+                    "error": str(e),
+                })
+
+        return {
+            "documents": results,
+            "total_count": len(results),
+            "errors": errors,
+        }
+
+    except Exception as e:
+        logger.error(f"[tool:get_document_format] Failed: {e}")
         return {
             "documents": [],
             "total_count": 0,

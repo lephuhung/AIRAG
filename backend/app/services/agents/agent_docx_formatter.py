@@ -197,8 +197,7 @@ async def generate_report_node(
         font_samples = extracted.get("font_samples", [])
 
         # Build prompt
-        prompt = f"""Bạn là chuyên gia kiểm tra định dạng văn bản hành chính Việt Nam.
-Hãy phân tích thông tin định dạng sau và đưa ra báo cáo kiểm tra chi tiết.
+        prompt = f"""Phân tích thông tin định dạng sau và đưa ra báo cáo kiểm tra chi tiết.
 
 ## TÊN TỆP: {file_name}
 

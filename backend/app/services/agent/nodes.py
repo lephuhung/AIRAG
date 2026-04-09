@@ -80,6 +80,7 @@ Intent categories:
 - "write_summarize"     : user provides a TEXT PASSAGE and wants it summarized or key points extracted
 - "write_suggest_edits" : user provides a TEXT PASSAGE and wants editing/improvement suggestions
 - "write_grammar_check" : user provides a TEXT PASSAGE and wants grammar/style checking
+- "write_format_check"  : user wants to CHECK or EVALUATE the FORMATTING of an attached Word document (margins, fonts, line spacing, etc.) — user mentions "định dạng", "kiểm tra định dạng", "format", "căn lề", "cỡ chữ", "trình bày"
 - "mongo_search_cccd"  : user asks to look up a person by their CCCD (Căn cước công dân) number. The query contains a national ID number (12 digits).
 - "mongo_search_name"  : user asks to find/search for a person by their name.
 - "mongo_search_bhxh"  : user asks to look up a person by their BHXH (Bảo hiểm xã hội) number.
@@ -97,6 +98,7 @@ Rules:
 - For "write_summarize": write_action = "summarize" (or "extract_key_points" if user asks for key points)
 - For "write_suggest_edits": write_action = "suggest_edits"
 - For "write_grammar_check": write_action = "grammar_check"
+- For "write_format_check": write_action = "format_check", set needs_tool to false
 - For "mongo_search_cccd": rewritten_query = the CCCD number itself (digits only, 9-12 digits)
 - For "mongo_search_name": rewritten_query = the person's name or partial name
 - For "mongo_search_bhxh": rewritten_query = the BHXH number
@@ -125,6 +127,9 @@ User: "tìm người qua số BHXH 001234567890" → {"intent": "mongo_search_bh
 User: "tóm tắt đoạn văn sau: [đoạn văn dài]" → {"intent": "write_summarize", "rewritten_query": "", "needs_tool": false, "write_action": "summarize", "text_input": "[đoạn văn dài]"}
 User: "kiểm tra ngữ pháp: Hôm nay tôi đi học." → {"intent": "write_grammar_check", "rewritten_query": "", "needs_tool": false, "write_action": "grammar_check", "text_input": "Hôm nay tôi đi học."}
 User: "đề xuất chỉnh sửa văn bản này: [nội dung]" → {"intent": "write_suggest_edits", "rewritten_query": "", "needs_tool": false, "write_action": "suggest_edits", "text_input": "[nội dung]"}
+User: "kiểm tra định dạng file đính kèm" → {"intent": "write_format_check", "rewritten_query": "", "needs_tool": false, "write_action": "format_check", "text_input": ""}
+User: "đánh giá thể thức văn bản Word này" → {"intent": "write_format_check", "rewritten_query": "", "needs_tool": false, "write_action": "format_check", "text_input": ""}
+User: "check format of attached document" → {"intent": "write_format_check", "rewritten_query": "", "needs_tool": false, "write_action": "format_check", "text_input": ""}
 """
 
 _VALID_INTENTS = {
@@ -139,6 +144,7 @@ _VALID_INTENTS = {
     "write_summarize",
     "write_suggest_edits",
     "write_grammar_check",
+    "write_format_check",
     # mongo people search intents
     "mongo_search_cccd",
     "mongo_search_name",
@@ -347,6 +353,7 @@ async def intent_classifier(state: "AgentState") -> dict:
             "write_summarize": "Tóm tắt văn bản",
             "write_suggest_edits": "Đề xuất chỉnh sửa",
             "write_grammar_check": "Kiểm tra ngữ pháp",
+            "write_format_check": "Kiểm tra định dạng",
         }
         intent_label = intent_labels.get(result["intent"], "Tìm kiếm")
         await push_event(
@@ -915,7 +922,7 @@ async def answer_generator(state: "AgentState") -> dict:
             "IMPORTANT: Do NOT add any citation markers like [id1], [mem1], [1] etc. when using memory facts.\n\n"
         ) + effective_system
 
-    # Build context string
+    # Build context string — always inject instructions (even when no sources)
     context_parts = []
     if kg_summaries:
         context_parts.append(
@@ -984,70 +991,68 @@ async def answer_generator(state: "AgentState") -> dict:
             content = getattr(msg, "content", "")
         llm_messages.append(_LLMMsg(role=role, content=content))
 
-    # Inject context as the last "user" turn supplement
-    if context_parts:
-        context_text = "\n\n".join(context_parts)
-        query_msg = f"Question: {rewritten_query}" if rewritten_query else ""
-        inject = (
-            "\n\n=== RETRIEVED CONTEXT ===\n"
-            + (f"{query_msg}\n\n" if query_msg else "")
-            + context_text
-            + "\n=== END CONTEXT ===\n\n"
-            "INSTRUCTIONS:\n"
-            "- Answer based ONLY on the retrieved sources above. "
-            "If the retrieved context is empty or says 'no results', say so — do NOT fill in details from your own knowledge.\n"
-            "- You have NO access to external databases, phone records, or personal information "
-            "about any individual except what appears in the 'RETRIEVED CONTEXT' section above.\n"
-            "- Cite sources using their unique IDs in brackets, e.g. [a3z9] or [b2m7].\n"
-            "- Knowledge Graph / memory facts: cite as [MEM-{id}] (e.g. [MEM-1]).\n"
-            "- If the sources do not contain enough information to answer fully, "
-            "be honest about it. Provide what you can, clearly note what is missing, "
-            "and suggest what the user might do next.\n"
-            "- If NO sources are relevant or available, say so politely. "
-            "Do NOT pretend to know. Suggest what the user could try instead "
-            "(e.g., rephrasing the question, checking if documents on this topic exist, "
-            "uploading relevant documents).\n"
-            "- TABLE DATA: 'Key, Year = Value' pairs are table cells.\n"
-            "- DATABASE RECORDS: If the context includes 'Cơ Sở Dữ Liệu Người Dân', "
-            "ONLY report the information that appears EXPLICITLY in those records. "
-            "Do NOT infer, guess, or fabricate related phone numbers, names, IDs, "
-            "or any other personal information not present in the records. "
-            "If a record does not contain a field (e.g., no address, no birthdate), "
-            "simply state that the information is not available — do not fill in with assumptions.\n"
-            "- PHONE NUMBER SEARCH STRICT RULE:\n"
-            "  You have NO knowledge of any specific Vietnamese individual's phone number, "
-            "name, CCCD, or BHXH beyond what appears EXPLICITLY in the retrieved database records above.\n"
-            "  When a phone search returns NO records:\n"
-            "    ✅ CORRECT: 'Không tìm thấy người nào có số điện thoại này trong cơ sở dữ liệu.'\n"
-            "    ❌ WRONG: Mentioning ANY other phone number (e.g., 0949755968, 0339755968) "
-            "or ANY person's name (e.g., Huỳnh Minh Khải) — even if you think you 'recognize' it. "
-            "You do NOT have real-time access to Vietnamese phone records. "
-            "Any name or number NOT in the retrieved context is a hallucination.\n"
-            "  When a phone search returns records:\n"
-            "    ✅ CORRECT: Report ONLY the fields that appear verbatim in the records. "
-            "If a phone number is not in the records, do not mention it — even if you believe you know who it belongs to.\n"
-            "  FIREWALL RULE: The moment you write a sentence containing a phone number or name "
-            "that does NOT appear in the 'Cơ Sở Dữ Liệu Người Dân' section above, "
-            "you are hallucinating. Stop immediately and revise.\n"
-            "- SPARSE RECORDS (e.g. UID/Facebook records with only phone + ID, no name): "
-            "If a record has no person's name attached, do NOT mention it as a result. "
-            "Skip it entirely. Only include records where a person's name is present.\n"
-            "- PARENT/GUARDIAN PHONE NUMBERS: If the only phone number in a record "
-            "belongs to a parent or guardian (e.g., mother's phone in vaccination records), "
-            "do NOT report it as the person's own phone number. "
-            "You may mention it briefly as 'phone of parent/guardian' only if directly relevant.\n"
-            "- Keep your tone friendly and helpful, not robotic or overly formal.\n"
-            "- End with a brief 1-2 line suggestion for what to explore next, "
-            "if appropriate (start with 'Gợi ý:' or 'Suggestion:').\n"
+    # Always inject instructions so LLM never fabricates when context is empty
+    context_text = "\n\n".join(context_parts) if context_parts else "(no retrieved context)"
+    query_msg = f"Question: {rewritten_query}" if rewritten_query else ""
+    inject = (
+        "\n\n=== RETRIEVED CONTEXT ===\n"
+        + (f"{query_msg}\n\n" if query_msg else "")
+        + context_text
+        + "\n=== END CONTEXT ===\n\n"
+        "INSTRUCTIONS:\n"
+        "- Answer based ONLY on the retrieved sources above. "
+        "If the retrieved context is empty or says 'no results', say so — do NOT fill in details from your own knowledge.\n"
+        "- You have NO access to external databases, phone records, or personal information "
+        "about any individual except what appears in the 'RETRIEVED CONTEXT' section above.\n"
+        "- Cite sources using their unique IDs in brackets, e.g. [a3z9] or [b2m7].\n"
+        "- Knowledge Graph / memory facts: cite as [MEM-{id}] (e.g. [MEM-1]).\n"
+        "- If the sources do not contain enough information to answer fully, "
+        "be honest about it. Provide what you can, clearly note what is missing, "
+        "and suggest what the user might do next.\n"
+        "- If NO sources are relevant or available (context shows 'no results' or is empty), "
+        "respond that you cannot find relevant information and ASK the user to provide more details "
+        "or clarify their question. Do NOT list or introduce documents in the system.\n"
+        "- TABLE DATA: 'Key, Year = Value' pairs are table cells.\n"
+        "- DATABASE RECORDS: If the context includes 'Cơ Sở Dữ Liệu Người Dân', "
+        "ONLY report the information that appears EXPLICITLY in those records. "
+        "Do NOT infer, guess, or fabricate related phone numbers, names, IDs, "
+        "or any other personal information not present in the records. "
+        "If a record does not contain a field (e.g., no address, no birthdate), "
+        "simply state that the information is not available — do not fill in with assumptions.\n"
+        "- PHONE NUMBER SEARCH STRICT RULE:\n"
+        "  You have NO knowledge of any specific Vietnamese individual's phone number, "
+        "name, CCCD, or BHXH beyond what appears EXPLICITLY in the retrieved database records above.\n"
+        "  When a phone search returns NO records:\n"
+        "    ✅ CORRECT: 'Không tìm thấy người nào có số điện thoại này trong cơ sở dữ liệu.'\n"
+        "    ❌ WRONG: Mentioning ANY other phone number (e.g., 0949755968, 0339755968) "
+        "or ANY person's name (e.g., Huỳnh Minh Khải) — even if you think you 'recognize' it. "
+        "You do NOT have real-time access to Vietnamese phone records. "
+        "Any name or number NOT in the retrieved context is a hallucination.\n"
+        "  When a phone search returns records:\n"
+        "    ✅ CORRECT: Report ONLY the fields that appear verbatim in the records. "
+        "If a phone number is not in the records, do not mention it — even if you believe you know who it belongs to.\n"
+        "  FIREWALL RULE: The moment you write a sentence containing a phone number or name "
+        "that does NOT appear in the 'Cơ Sở Dữ Liệu Người Dân' section above, "
+        "you are hallucinating. Stop immediately and revise.\n"
+        "- SPARSE RECORDS (e.g. UID/Facebook records with only phone + ID, no name): "
+        "If a record has no person's name attached, do NOT mention it as a result. "
+        "Skip it entirely. Only include records where a person's name is present.\n"
+        "- PARENT/GUARDIAN PHONE NUMBERS: If the only phone number in a record "
+        "belongs to a parent or guardian (e.g., mother's phone in vaccination records), "
+        "do NOT report it as the person's own phone number. "
+        "You may mention it briefly as 'phone of parent/guardian' only if directly relevant.\n"
+        "- Keep your tone friendly and helpful, not robotic or overly formal.\n"
+        "- End with a brief 1-2 line suggestion for what to explore next, "
+        "if appropriate (start with 'Gợi ý:' or 'Suggestion:').\n"
+    )
+    # Always append instructions (no `if context_parts:` guard)
+    if llm_messages and llm_messages[-1].role == "user":
+        llm_messages[-1] = _LLMMsg(
+            role="user",
+            content=llm_messages[-1].content + inject,
         )
-        # Append to last user message
-        if llm_messages and llm_messages[-1].role == "user":
-            llm_messages[-1] = _LLMMsg(
-                role="user",
-                content=llm_messages[-1].content + inject,
-            )
-        else:
-            llm_messages.append(_LLMMsg(role="user", content=inject))
+    else:
+        llm_messages.append(_LLMMsg(role="user", content=inject))
 
     from app.core.config import settings
 
@@ -1135,7 +1140,6 @@ async def direct_answer(state: "AgentState") -> dict:
     messages = state.get("messages", [])
     system_prompt = state.get("system_prompt", "")
     user_memory = state.get("user_memory_context", "")
-    enable_thinking = state.get("enable_thinking", False)
 
     await push_event(
         state, "status", {"step": "generating", "detail": "Đang trả lời..."}
@@ -1173,7 +1177,7 @@ async def direct_answer(state: "AgentState") -> dict:
             temperature=0.5,
             max_tokens=512,
             system_prompt=effective_system,
-            think=enable_thinking,
+            think=False,  # Disable thinking for greetings — fast, direct response
         ):
             if chunk.text:
                 answer_parts.append(chunk.text)
@@ -1188,7 +1192,7 @@ async def direct_answer(state: "AgentState") -> dict:
                 temperature=0.5,
                 max_tokens=512,
                 system_prompt=effective_system,
-                think=enable_thinking,
+                think=False,  # Disable thinking for greetings — fast, direct response
             )
             fallback = (
                 result
@@ -1241,9 +1245,11 @@ def _transform_input(state: "AgentState") -> dict:
     write_action = state.get("write_action", "")
     text_input = state.get("text_input", "")
 
-    # Khi intent = "summarize": RAG subgraph đã fetch raw doc content vào kg_summaries
+    # Khi intent = "summarize" HOẶC write intents với attached docs:
+    # RAG subgraph đã fetch raw doc content vào kg_summaries
     # → dùng kg_summaries[0] làm text_input cho write agent
-    if not text_input and intent == "summarize":
+    write_intents_with_kg = {"summarize", "write_summarize", "write_suggest_edits", "write_grammar_check"}
+    if not text_input and intent in write_intents_with_kg:
         kg_summaries = state.get("kg_summaries", [])
         if kg_summaries:
             text_input = kg_summaries[0]
@@ -1262,10 +1268,11 @@ def _transform_input(state: "AgentState") -> dict:
             "write_summarize": "summarize",
             "write_suggest_edits": "suggest_edits",
             "write_grammar_check": "grammar_check",
+            "write_format_check": "format_check",
             "summarize": "summarize",  # RAG-triggered summarize intent
         }.get(intent, "summarize")
 
-    return {
+    result = {
         "messages": [],  # write subgraph doesn't need chat history
         "user_id": state.get("user_id"),
         "workspace_ids": state.get("workspace_ids", []),
@@ -1274,6 +1281,13 @@ def _transform_input(state: "AgentState") -> dict:
         "result": "",
         "error": None,
     }
+
+    # Pass format_data for format_check action
+    if write_action == "format_check":
+        result["format_data"] = state.get("format_data")
+        result["file_name"] = state.get("file_name", "tài liệu")
+
+    return result
 
 
 def _transform_output(write_result: dict) -> dict:
@@ -1298,11 +1312,11 @@ async def write_executor(state: "AgentState") -> dict:
         AgentState
           ↓  _transform_input()
         AgentWriteState  ──▶  agent_write subgraph
-          (route_write_action → summarize/suggest_edits/grammar → answer node)
+          (route_write_action → summarize/suggest_edits/grammar/format → answer node)
           ↓  _transform_output()
         AgentState partial update  { final_answer: str }
 
-    Handles intents: write_summarize, write_suggest_edits, write_grammar_check.
+    Handles intents: write_summarize, write_suggest_edits, write_grammar_check, write_format_check.
     Streams the result as tokens into SSE after subgraph completes.
     """
     from app.services.agent.streaming import push_event
@@ -1312,6 +1326,7 @@ async def write_executor(state: "AgentState") -> dict:
         "write_summarize": "summarize",
         "write_suggest_edits": "suggest_edits",
         "write_grammar_check": "grammar_check",
+        "write_format_check": "format_check",
     }.get(intent, "summarize")
 
     doc_ids = state.get("document_ids") or []
@@ -1328,10 +1343,85 @@ async def write_executor(state: "AgentState") -> dict:
         {"step": "processing", "detail": "Đang xử lý văn bản..."},
     )
 
+    # ── Guard: check for missing required data ───────────────────────────
+    write_action_labels = {
+        "summarize": "tóm tắt",
+        "suggest_edits": "đề xuất chỉnh sửa",
+        "grammar_check": "kiểm tra ngữ pháp",
+        "format_check": "kiểm tra định dạng",
+    }
+    action_label = write_action_labels.get(write_action, write_action)
+
+    if write_action == "format_check":
+        # Format check REQUIRES a docx file attachment
+        if not doc_ids:
+            msg = (
+                "Bạn chưa đính kèm file nào để kiểm tra định dạng.\n\n"
+                "Vui lòng đính kèm một file Word (.docx) rồi hỏi lại, ví dụ:\n"
+                "• \"Kiểm tra định dạng file đính kèm\"\n"
+                "• \"Đánh giá thể thức văn bản này\""
+            )
+            for i in range(0, len(msg), 80):
+                await push_event(state, "token", msg[i:i+80])
+            return {"final_answer": msg}
+
+        # Fetch format metadata
+        logger.info(
+            f"[write_executor] format_check: fetching format metadata for {len(doc_ids)} docs"
+        )
+        try:
+            from app.services.agent import tools as _tools
+            from app.services.agent.streaming import get_current_db
+
+            db = get_current_db()
+            tool_result = await _tools.get_document_format(
+                document_ids=doc_ids,
+                db=db,
+            )
+            docs_with_format = tool_result.get("documents", [])
+            if docs_with_format:
+                first_doc = docs_with_format[0]
+                if first_doc.get("format_data"):
+                    state["format_data"] = first_doc["format_data"]
+                    state["file_name"] = first_doc.get("filename", "tài liệu")
+                    logger.info(
+                        f"[write_executor] format_check: extracted format for {first_doc.get('filename')}"
+                    )
+                elif first_doc.get("error"):
+                    err = first_doc.get("error", "")
+                    if "không phải file Word" in err.lower():
+                        msg = (
+                            f"File \"{first_doc.get('filename', 'của bạn')}\" không phải định dạng Word (.docx).\n\n"
+                            "Hiện tại tôi chỉ hỗ trợ kiểm tra định dạng cho file Word (.docx).\n"
+                            "Vui lòng đính kèm một file Word và thử lại."
+                        )
+                    else:
+                        msg = (
+                            f"Không thể đọc file \"{first_doc.get('filename', 'của bạn')}\": {err}\n\n"
+                            "Vui lòng thử đính kèm file khác hoặc kiểm tra lại file gốc."
+                        )
+                    for i in range(0, len(msg), 80):
+                        await push_event(state, "token", msg[i:i+80])
+                    return {"final_answer": msg}
+        except Exception as e:
+            logger.warning(f"[write_executor] Failed to fetch format metadata: {e}")
+
+    elif not doc_ids and not text_input:
+        # Text-based write actions require either attached docs OR inline text
+        msg = (
+            f"Bạn chưa cung cấp văn bản để {action_label}.\n\n"
+            "Vui lòng làm một trong các cách sau:\n"
+            "• Dán nội dung văn bản trực tiếp vào tin nhắn\n"
+            "• Đính kèm file tài liệu và hỏi lại (ví dụ: \"Tóm tắt file đính kèm\")"
+        )
+        for i in range(0, len(msg), 80):
+            await push_event(state, "token", msg[i:i+80])
+        return {"final_answer": msg}
+
     # ── Fetch referenced doc content via @docname mentions ─────────────────
     # When user references @docname but intent_classifier couldn't extract text
     # (write_summarize / write_suggest_edits / write_grammar_check with attached docs)
-    if doc_ids and not text_input:
+    elif doc_ids and not text_input:
         logger.info(
             f"[write_executor] Fetching content for {len(doc_ids)} referenced docs"
         )
@@ -1345,15 +1435,14 @@ async def write_executor(state: "AgentState") -> dict:
                 db=db,
             )
             doc_texts = []
+            fetch_errors = []
             for doc in tool_result.get("documents", []):
                 if doc.get("content"):
                     doc_texts.append(
                         f"# {doc.get('filename', 'Document')}\n\n{doc.get('content')}"
                     )
                 elif doc.get("error"):
-                    doc_texts.append(
-                        f"# {doc.get('filename', 'Document')}\n\nLỗi: {doc.get('error')}"
-                    )
+                    fetch_errors.append(f"• {doc.get('filename', 'Document')}: {doc.get('error')}")
             if doc_texts:
                 combined = "\n\n---\n\n".join(doc_texts)
                 state["kg_summaries"] = [combined]
@@ -1361,11 +1450,26 @@ async def write_executor(state: "AgentState") -> dict:
                     f"[write_executor] Fetched {len(doc_texts)} docs, "
                     f"total content {len(combined)} chars"
                 )
+            if fetch_errors and not doc_texts:
+                # All docs failed to fetch
+                err_msg = (
+                    "Không thể đọc được các file đính kèm:\n"
+                    + "\n".join(fetch_errors)
+                    + "\n\nVui lòng kiểm tra lại file hoặc thử đính kèm file khác."
+                )
+                for i in range(0, len(err_msg), 80):
+                    await push_event(state, "token", err_msg[i:i+80])
+                return {"final_answer": err_msg}
         except Exception as e:
             logger.warning(f"[write_executor] Failed to fetch doc content: {e}")
 
     # ── Transform: AgentState → AgentWriteState ──────────────────────────
     write_input = _transform_input(state)
+
+    # ── Inject format_data for format_check ───────────────────────────────
+    if write_action == "format_check":
+        write_input["format_data"] = state.get("format_data")
+        write_input["file_name"] = state.get("file_name", "tài liệu")
 
     # ── Invoke child graph ────────────────────────────────────────────────
     try:
@@ -1379,14 +1483,9 @@ async def write_executor(state: "AgentState") -> dict:
         write_output = {"result": "", "error": str(e)}
 
     # ── Transform: AgentWriteState → AgentState partial update ───────────
+    # Note: tokens are already streamed in real-time via push_event() inside
+    # the tool nodes (summarize_text_node, suggest_edits_node, etc.)
     partial = _transform_output(write_output)
-    result_text = partial.get("final_answer", "")
-
-    # ── Stream result as tokens (~80 chars per chunk for smooth UX) ───────
-    if result_text:
-        chunk_size = 80
-        for i in range(0, len(result_text), chunk_size):
-            await push_event(state, "token", result_text[i : i + chunk_size])
 
     return partial
 
