@@ -20,10 +20,11 @@ class ChatMessage(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    session_id: Mapped[uuid.UUID] = mapped_column(
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("chat_sessions.id", ondelete="CASCADE"),
         index=True,
+        nullable=True,
     )
     message_id: Mapped[str] = mapped_column(String(50), index=True)
     role: Mapped[str] = mapped_column(String(20), nullable=False)

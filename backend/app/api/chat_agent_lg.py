@@ -137,7 +137,9 @@ async def langgraph_chat_stream(
     workspace_ids: list[uuid.UUID],
     request: ChatRequest,
     db: AsyncSession,
-    user: User,
+    user_id: uuid.UUID,
+    user_email: str,
+    user_is_superadmin: bool,
     session_id: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """
@@ -182,7 +184,7 @@ async def langgraph_chat_stream(
             message_id=str(uuid.uuid4()),
             role="user",
             content=message,
-            user_id=user.id,
+            user_id=user_id,
             session_id=session_id,
         )
         db.add(user_row)
@@ -199,7 +201,7 @@ async def langgraph_chat_stream(
         system_prompt=system_prompt,
         enable_thinking=getattr(request, "enable_thinking", False),
         db=db,
-        user_id=user.id,
+        user_id=user_id,
         session_id=session_id,
         document_ids=getattr(request, "document_ids", None),
     )
@@ -248,7 +250,7 @@ async def langgraph_chat_stream(
             message_id=str(uuid.uuid4()),
             role="assistant",
             content=final_answer,
-            user_id=user.id,
+            user_id=user_id,
             session_id=session_id,
             sources=_json.dumps(final_sources, default=str) if final_sources else None,
             agent_steps=_json.dumps(collected_steps) if collected_steps else None,
@@ -261,12 +263,12 @@ async def langgraph_chat_stream(
 
     # Background: save conversation episode to Graphiti knowledge graph
     # Graphiti will extract entities and temporal facts from the turn automatically.
-    if user.id and request.message and final_answer:
+    if user_id and request.message and final_answer:
         try:
             from app.services.graphiti_client import add_conversation_episode
             import asyncio
 
-            uid = user.id
+            uid = user_id
             sid = session_id
             msg = request.message
             ans = final_answer
@@ -314,8 +316,15 @@ async def chat_stream_langgraph(
     if hasattr(request, "workspace_ids") and request.workspace_ids:
         workspace_ids = request.workspace_ids
 
+    # Capture user.id early — accessing it inside the streaming generator causes
+    # SQLAlchemy greenlet errors (lazy loading fails in async context)
+    user_id = user.id
+    user_email = user.email
+    user_is_superadmin = user.is_superadmin
+    session_id = None  # Non-session endpoint, no session tracking
+
     async def _gen():
-        async for chunk in langgraph_chat_stream(workspace_ids, request, db, user):
+        async for chunk in langgraph_chat_stream(workspace_ids, request, db, user_id, user_email, user_is_superadmin, session_id):
             yield chunk
 
     return StreamingResponse(
@@ -352,8 +361,13 @@ async def chat_stream_langgraph_workspace(
     if workspace_id not in accessible:
         raise HTTPException(status_code=403, detail="Access denied to this workspace")
 
+    user_id = user.id
+    user_email = user.email
+    user_is_superadmin = user.is_superadmin
+    session_id = None
+
     async def _gen():
-        async for chunk in langgraph_chat_stream([workspace_id], request, db, user):
+        async for chunk in langgraph_chat_stream([workspace_id], request, db, user_id, user_email, user_is_superadmin, session_id):
             yield chunk
 
     return StreamingResponse(

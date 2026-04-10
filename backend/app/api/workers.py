@@ -779,7 +779,9 @@ async def retry_all_failed(
             {
                 "document_id": doc.id,
                 "workspace_id": doc.workspace_id,
-                "minio_key": doc.filename,
+                "minio_key": doc.upload_s3_key or doc.filename,
+                "original_filename": doc.original_filename or doc.filename,
+                "is_chat_upload": doc.is_chat_upload,
             },
         )
         count += 1
@@ -814,7 +816,9 @@ async def retry_single_failed(
         {
             "document_id": doc.id,
             "workspace_id": doc.workspace_id,
-            "minio_key": doc.filename,
+            "minio_key": doc.upload_s3_key or doc.filename,
+            "original_filename": doc.original_filename or doc.filename,
+            "is_chat_upload": doc.is_chat_upload,
         },
     )
 
@@ -867,6 +871,68 @@ async def cancel_pipeline_document(
 
     logger.info(f"Cancelled pipeline document {document_id}")
     return {"status": "ok", "document_id": document_id}
+
+
+@router.post("/retry-stuck")
+async def retry_stuck_documents(
+    workspace_id: uuid.UUID | None = None,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_superadmin),
+):
+    """
+    Reset documents stuck in intermediate states (ocring, parsing, chunking,
+    embedding, building_kg) back to PENDING and republish ParseMessage so
+    workers can reprocess them. Does NOT touch PENDING, INDEXED, or FAILED docs.
+    """
+    _stuck_statuses = [
+        DocumentStatus.PARSING,
+        DocumentStatus.OCRING,
+        DocumentStatus.CHUNKING,
+        DocumentStatus.EMBEDDING,
+        DocumentStatus.BUILDING_KG,
+    ]
+
+    query = select(Document).where(Document.status.in_(_stuck_statuses))
+    if workspace_id is not None:
+        query = query.where(Document.workspace_id == workspace_id)
+
+    result = await db.execute(query)
+    stuck_docs = result.scalars().all()
+
+    retried = 0
+    for doc in stuck_docs:
+        doc.status = DocumentStatus.PENDING
+        doc.error_message = f"stuck_retry: was {doc.status.value}, reset at {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        doc.embed_done = False
+        doc.captions_done = False
+        doc.kg_done = False
+        await db.commit()
+
+        await publish(
+            EXCHANGE_PARSE,
+            "parse",
+            {
+                "document_id": doc.id,
+                "workspace_id": doc.workspace_id,
+                "minio_key": doc.upload_s3_key or doc.filename,
+                "original_filename": doc.original_filename or doc.filename,
+                "is_chat_upload": doc.is_chat_upload,
+            },
+        )
+        retried += 1
+
+    return {
+        "status": "ok",
+        "retried_count": retried,
+        "documents": [
+            {
+                "id": str(doc.id),
+                "filename": doc.original_filename or doc.filename,
+                "previous_status": doc.status.value if hasattr(doc.status, "value") else doc.status,
+            }
+            for doc in stuck_docs
+        ],
+    }
 
 
 @router.get("/pipeline")

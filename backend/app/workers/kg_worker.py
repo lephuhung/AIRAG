@@ -11,16 +11,16 @@ Key design decisions:
   - Semaphore + exponential-backoff retry in _kg_llm_complete for rate limits.
   - KG failure does NOT fail the document — it stays BUILDING_KG
     and captions_done/embed_done are unaffected.
+  - Idempotent: checks kg_done at start to skip already-processed documents
+    (handles redelivered messages after crash-before-ack).
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from sqlalchemy import select
 
 from app.core.database import async_session_maker
-from app.models.document_type import DocumentType as _DocumentType  # noqa: F401
 from app.models.document import Document
 from app.queue.messages import KGMessage
 from app.services.knowledge_graph_service import get_kg_service
@@ -41,6 +41,12 @@ async def handle_kg(payload: dict) -> None:
         document = result.scalar_one_or_none()
         if document is None:
             logger.error(f"[kg_worker] doc={msg.document_id} not found")
+            return
+
+        # Idempotency: if kg_done=True the message was already processed
+        # (e.g. redelivered after a crash-before-ack). Skip silently.
+        if document.kg_done:
+            logger.info(f"[kg_worker] doc={msg.document_id} already has kg_done=True — skipping")
             return
 
         if not msg.markdown.strip():

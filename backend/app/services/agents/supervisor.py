@@ -21,7 +21,7 @@ Classify the user's message into one of these intents:
 3. **search**: General document search queries looking for information
 4. **list_docs**: Requests to list available documents in the workspace
 5. **summarize**: Requests to summarize a specific document or topic
-6. **kg_query**: Questions about entities, relationships, or concepts that might be in a knowledge graph
+6. **kg_query**: ONLY for questions that explicitly ask about relationships between documents, entities, or organizational structure in a knowledge graph (e.g., "Văn bản nào ban hành Bộ Công Thương?", "Điều 5 thuộc văn bản nào?", "Những văn bản nào căn cứ vào Luật này?", "UBND Hà Tĩnh có những văn bản nào?"). DO NOT use for general questions about concepts, definitions, or topics — use "search" for those.
 7. **search_doc_num**: Looking for specific document by number or ID (e.g., "document 5", "doc #23")
 8. **search_abbr**: Looking up abbreviations or acronyms
 

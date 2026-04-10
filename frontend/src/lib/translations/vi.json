@@ -510,6 +510,11 @@
     "processing_with_count": "Đang xử lý ({{count}})",
     "failed_with_count": "Thất bại ({{count}})",
     "retry_all_with_count": "Thử lại tất cả ({{count}})",
+    "clear_stuck": "Xả đợi OCR",
+    "clear_stuck_desc": "Đặt lại tất cả tài liệu đang kẹt ở trạng thái ocring/parsing/chunking về pending",
+    "clear_stuck_success": "Đã đặt lại {{count}} tài liệu bị kẹt",
+    "clear_stuck_failed": "Không thể xả đợi OCR",
+    "stuck_count": "{{count}} kẹt",
     "management": "Quản lý tiến trình",
     "labels": {
       "pid": "PID",

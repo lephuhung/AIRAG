@@ -116,6 +116,54 @@ async def delete_chat_session(
             except Exception as e:
                 logger.warning(f"[session/{session_id}] Failed to delete MinIO markdown {chat_file.minio_markdown_key}: {e}")
 
+    # Delete chat-uploaded documents (is_chat_upload=True) attached to session messages
+    from app.models.chat_message import ChatMessage
+    msg_result = await db.execute(
+        select(ChatMessage.document_ids).where(ChatMessage.session_id == session_id)
+    )
+    all_doc_ids: list[uuid.UUID] = []
+    for row in msg_result.scalars().all():
+        if row:
+            for doc_id_str in row:
+                try:
+                    all_doc_ids.append(uuid.UUID(str(doc_id_str)))
+                except (ValueError, TypeError):
+                    pass
+
+    if all_doc_ids:
+        chat_upload_docs_result = await db.execute(
+            select(Document).where(
+                Document.id.in_(all_doc_ids),
+                Document.is_chat_upload == True
+            )
+        )
+        chat_upload_docs = chat_upload_docs_result.scalars().all()
+
+        for doc in chat_upload_docs:
+            # Delete from ChromaDB vector store
+            try:
+                from app.services.rag_service import get_rag_service
+                rag_svc = get_rag_service(db, doc.workspace_id)
+                await rag_svc.delete_document(doc.id)
+            except Exception as e:
+                logger.warning(f"[session/{session_id}] Failed to delete ChromaDB chunks for doc {doc.id}: {e}")
+            # Delete raw file from MinIO
+            if doc.upload_s3_key:
+                try:
+                    await storage.delete_file(doc.upload_s3_key)
+                except Exception as e:
+                    logger.warning(f"[session/{session_id}] Failed to delete MinIO file {doc.upload_s3_key}: {e}")
+            # Delete markdown from MinIO
+            if doc.markdown_s3_key:
+                try:
+                    await storage.delete_markdown(doc.markdown_s3_key)
+                except Exception as e:
+                    logger.warning(f"[session/{session_id}] Failed to delete MinIO markdown {doc.markdown_s3_key}: {e}")
+            # Delete DB record
+            await db.delete(doc)
+        if chat_upload_docs:
+            logger.info(f"[session/{session_id}] Deleted {len(chat_upload_docs)} chat-upload documents")
+
     # Delete the session (cascade deletes ChatMessage, ChatFile, ExchangeSummary rows)
     await db.delete(session)
     await db.commit()

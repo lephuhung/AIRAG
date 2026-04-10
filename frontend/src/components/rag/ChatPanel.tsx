@@ -2866,7 +2866,8 @@ export const ChatPanel = memo(function ChatPanel({
           }
 
           skipResetRef.current = true;
-          navigate(`/chat/${newSession.id}`, { replace: true });
+          // Update URL in background (no redirect) so chat is bookmarkable
+          window.history.replaceState({}, "", `/chat/${newSession.id}`);
         } catch (err: any) {
           toast.error(t("chat.create_failed"));
           return;
@@ -2874,17 +2875,17 @@ export const ChatPanel = memo(function ChatPanel({
       }
 
       // Only send @ mentioned docs + newly attached files (not all session docs)
-      // "ready" files (parse done, embed in background) are also included — backend
-      // fetches markdown directly from MinIO so content is available immediately.
+      // "parsing", "ready" files (parse done, embed in background) are also included —
+      // backend fetches markdown directly from MinIO so content is available immediately.
       const documentIds = [
         ...referencedDocs.map(d => d.id),
-        ...attachedFiles.filter(f => f.status === "indexed" || f.status === "ready").map(f => f.id),
+        ...attachedFiles.filter(f => f.status === "indexed" || f.status === "ready" || f.status === "parsing").map(f => f.id),
       ];
       setAttachedFiles([]);
       // setReferencedDocs([]); // Keep mentions for subsequent questions as requested
 
       const attachedDocs = attachedFiles
-        .filter(f => (f.status === "indexed" || f.status === "ready") && f.docMetadata)
+        .filter(f => (f.status === "indexed" || f.status === "ready" || f.status === "parsing") && f.docMetadata)
         .map(f => f.docMetadata as Document);
 
       const userMsg: ChatMessage = {

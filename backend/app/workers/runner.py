@@ -63,7 +63,7 @@ async def _run_kg_worker() -> None:
     On startup, scans the DB for all existing workspaces and starts
     a consumer per workspace.  A background polling loop runs every
     WORKER_KG_POLL_INTERVAL seconds to discover new workspaces and
-    create additional consumers on-the-fly — no restart required.
+    restart dead consumers for existing ones — no restart required.
     """
     from app.workers.kg_worker import handle_kg
 
@@ -76,22 +76,42 @@ async def _run_kg_worker() -> None:
     from sqlalchemy import select
 
     active_workspaces: set[int] = set()
-    tasks: list[asyncio.Task] = []
+    consumer_tasks: dict[int, asyncio.Task] = {}  # workspace_id -> consumer task
+
+    async def _start_consumer_for(wid: int) -> None:
+        """Start (or restart) a consumer for a single workspace, cancelling any existing task."""
+        if wid in consumer_tasks:
+            consumer_tasks[wid].cancel()
+            try:
+                await consumer_tasks[wid]
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(f"[kg_runner] Previous consumer for workspace {wid} exited with: {e}")
+
+        active_workspaces.add(wid)
+        task = asyncio.create_task(
+            mq.consume_kg(wid, handle_kg),
+            name=f"kg-consumer-ws-{wid}",
+        )
+        consumer_tasks[wid] = task
+        logger.info(f"[kg_runner] Started (or restarted) consumer for workspace {wid}")
 
     async def _start_consumers_for(workspace_ids: list[int]) -> None:
         """Start consumers for workspaces not already tracked."""
         for wid in workspace_ids:
             if wid not in active_workspaces:
-                active_workspaces.add(wid)
-                task = asyncio.create_task(
-                    mq.consume_kg(wid, handle_kg),
-                    name=f"kg-consumer-ws-{wid}",
-                )
-                tasks.append(task)
-                logger.info(f"[kg_runner] Started consumer for workspace {wid}")
+                await _start_consumer_for(wid)
 
-    async def _poll_new_workspaces() -> None:
-        """Periodically scan DB for new workspaces and start consumers."""
+    async def _poll_workspaces() -> None:
+        """
+        Periodically:
+          1. Discover new workspaces and start consumers.
+          2. Check RabbitMQ queue consumer counts; restart consumers
+             that have died (consumer count dropped to 0).
+        """
+        import aiohttp
+
         poll_interval = settings.WORKER_KG_POLL_INTERVAL
         while True:
             await asyncio.sleep(poll_interval)
@@ -99,10 +119,46 @@ async def _run_kg_worker() -> None:
                 async with async_session_maker() as db:
                     result = await db.execute(select(KnowledgeBase.id))
                     current_ids = [row[0] for row in result.all()]
+
+                # Start consumers for new workspaces
                 new_ids = [wid for wid in current_ids if wid not in active_workspaces]
                 if new_ids:
                     logger.info(f"[kg_runner] New workspaces detected: {new_ids}")
                     await _start_consumers_for(new_ids)
+
+                # Check consumer health via RabbitMQ Management API
+                import httpx
+                for wid in list(active_workspaces):
+                    queue_name = f"hrag.kg.{wid}"
+                    try:
+                        async with httpx.AsyncClient(timeout=5.0) as session:
+                            url = (
+                                f"{settings.RABBITMQ_MANAGEMENT_URL}/api/queues/"
+                                f"%2f/{queue_name}"
+                            )
+                            resp = await session.get(
+                                url,
+                                auth=httpx.Auth(
+                                    settings.RABBITMQ_MANAGEMENT_USER,
+                                    settings.RABBITMQ_MANAGEMENT_PASSWORD,
+                                ),
+                            )
+                            if resp.status_code == 200:
+                                q_info = resp.json()
+                                consumer_count = q_info.get("consumers", 0)
+                                if consumer_count == 0:
+                                    logger.warning(
+                                        f"[kg_runner] Workspace {wid} queue has 0 consumers — restarting"
+                                    )
+                                    await _start_consumer_for(wid)
+                            elif resp.status_code == 404:
+                                # Queue gone — workspace deleted; remove from active set
+                                logger.info(f"[kg_runner] Workspace {wid} queue not found — removing")
+                                active_workspaces.discard(wid)
+                                consumer_tasks.pop(wid, None)
+                    except Exception as poll_err:
+                        logger.debug(f"[kg_runner] Queue health check failed for {queue_name}: {poll_err}")
+
             except Exception as e:
                 logger.warning(f"[kg_runner] Workspace poll failed: {e}")
 
@@ -114,11 +170,10 @@ async def _run_kg_worker() -> None:
     logger.info(f"[kg_runner] Starting consumers for workspaces: {workspace_ids}")
     await _start_consumers_for(workspace_ids)
 
-    # ── Start background poller for new workspaces ─────────────────────────
+    # ── Start background poller for new workspaces and dead-consumer detection
     poller = asyncio.create_task(
-        _poll_new_workspaces(), name="kg-workspace-poller"
+        _poll_workspaces(), name="kg-workspace-poller"
     )
-    tasks.append(poller)
 
     if not workspace_ids:
         logger.info(
@@ -126,8 +181,9 @@ async def _run_kg_worker() -> None:
             f"{settings.WORKER_KG_POLL_INTERVAL}s for new ones"
         )
 
-    # Wait for all tasks (they run indefinitely)
-    await asyncio.gather(*tasks)
+    # Wait for all consumer tasks + poller (they run indefinitely)
+    all_tasks = list(consumer_tasks.values()) + [poller]
+    await asyncio.gather(*all_tasks)
 
 
 _WORKER_MAP = {

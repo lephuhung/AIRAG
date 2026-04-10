@@ -11,6 +11,7 @@ from app.core.deps import get_db, get_current_active_user
 from app.core.deps import verify_workspace_access as _verify_workspace_access
 from app.core.exceptions import NotFoundError
 from app.models.knowledge_base import KnowledgeBase
+from app.models.tenant import TenantUser
 from app.models.document import Document, DocumentImage, DocumentStatus
 from app.models.user import User
 import logging
@@ -833,25 +834,62 @@ async def debug_chat(
     """
     kb = await verify_workspace_access(workspace_id, db, user)
 
-    rag_service = get_rag_service(db, workspace_id)
+    # Get all accessible workspaces (same logic as chat endpoint)
+    if user.is_superadmin:
+        ws_result = await db.execute(select(KnowledgeBase.id))
+        all_workspace_ids = list(ws_result.scalars().all())
+    else:
+        tenant_result = await db.execute(
+            select(TenantUser.tenant_id).where(TenantUser.user_id == user.id)
+        )
+        user_tenant_ids = list(tenant_result.scalars().all())
+        from sqlalchemy import or_
+        ws_query = select(KnowledgeBase.id).where(
+            or_(
+                KnowledgeBase.visibility == "public",
+                KnowledgeBase.owner_id == user.id,
+                KnowledgeBase.tenant_id.in_(user_tenant_ids) if user_tenant_ids else False,
+            )
+        )
+        ws_result = await db.execute(ws_query)
+        all_workspace_ids = list(ws_result.scalars().all())
 
-    # -- 1. Retrieve --
+    # -- 1. Retrieve across all accessible workspaces --
     chunks = []
     citations = []
     kg_summary = ""
 
     from app.services.hrag_service import HRAGService
-    if isinstance(rag_service, HRAGService):
-        result = await rag_service.query_deep(
-            question=request.message,
-            top_k=8,
-            document_ids=request.document_ids,
-            mode="hybrid",
-            include_images=False,
-        )
-        chunks = result.chunks
-        citations = result.citations
-        kg_summary = result.knowledge_graph_summary
+    for ws_id in all_workspace_ids:
+        rag_service = get_rag_service(db, ws_id)
+        if isinstance(rag_service, HRAGService):
+            result = await rag_service.query_deep(
+                question=request.message,
+                top_k=8,
+                document_ids=request.document_ids,
+                mode="hybrid",
+                include_images=False,
+            )
+            chunks.extend(result.chunks)
+            citations.extend(result.citations)
+            if result.knowledge_graph_summary:
+                kg_summary += result.knowledge_graph_summary + "\n\n"
+
+    # Deduplicate chunks by document_id + chunk_id
+    seen = set()
+    unique_chunks = []
+    unique_citations = []
+    for i, chunk in enumerate(chunks):
+        key = (str(chunk.document_id), chunk.chunk_hash if hasattr(chunk, 'chunk_hash') else i)
+        if key not in seen:
+            seen.add(key)
+            unique_chunks.append(chunk)
+            if i < len(citations):
+                unique_citations.append(citations[i])
+
+    chunks = unique_chunks[:8]
+    citations = unique_citations[:8]
+    kg_summary = kg_summary.strip() or ""
 
     # -- 2. Build sources + context (same logic as chat endpoint) --
     debug_used_ids: set[str] = set()

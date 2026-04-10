@@ -193,6 +193,13 @@ class Settings(BaseSettings):
     WORKER_KG_POLL_INTERVAL: int = Field(
         default=30
     )  # seconds — how often to scan for new workspaces
+    # Timeout per message handler (seconds). Parse workers need higher timeout
+    # for large scanned PDFs with OCR (120s recommended). Other workers use
+    # shorter timeouts since they do not perform LLM inference on large files.
+    WORKER_PARSE_TIMEOUT: int = Field(default=120)
+    WORKER_EMBED_TIMEOUT: int = Field(default=60)
+    WORKER_CAPTION_TIMEOUT: int = Field(default=60)
+    WORKER_KG_TIMEOUT: int = Field(default=120)
 
     # ── LangGraph Agent ──────────────────────────────────────────────────────
     # Choose the chat agent backend:

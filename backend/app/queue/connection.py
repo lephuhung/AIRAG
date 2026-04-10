@@ -32,6 +32,7 @@ import json
 import logging
 import random
 import time
+import uuid
 from typing import Awaitable, Callable
 
 import aio_pika
@@ -280,6 +281,19 @@ async def publish(exchange_name: str, routing_key: str, payload: dict) -> None:
 MessageHandler = Callable[[dict], Awaitable[None]]
 
 
+def _get_timeout_for_queue(queue_name: str) -> int:
+    """Determine handler timeout based on queue type."""
+    if "parse" in queue_name:
+        return settings.WORKER_PARSE_TIMEOUT
+    if "embed" in queue_name:
+        return settings.WORKER_EMBED_TIMEOUT
+    if "caption" in queue_name:
+        return settings.WORKER_CAPTION_TIMEOUT
+    if "kg" in queue_name:
+        return settings.WORKER_KG_TIMEOUT
+    return 60  # default
+
+
 async def consume(
     exchange_name: str,
     queue_name: str,
@@ -299,6 +313,8 @@ async def consume(
     it in the background.
     """
     from app.workers.metrics import worker_metrics
+
+    handler_timeout = _get_timeout_for_queue(queue_name)
 
     conn = await get_connection()
     channel = await conn.channel()
@@ -370,7 +386,7 @@ async def consume(
                             document_id = str(payload.get("document_id", "unknown"))
                             minio_key = payload.get("minio_key", "unknown")
 
-                            async with asyncio.timeout(30):
+                            async with asyncio.timeout(handler_timeout):
                                 await handler(payload)
 
                             elapsed = time.monotonic() - start_time
@@ -379,14 +395,67 @@ async def consume(
                             elapsed = time.monotonic() - start_time
                             worker_metrics.record_failure(queue_name, elapsed)
                             logger.warning(
-                                "parse_worker handler timed out",
+                                f"{queue_name} handler timed out after {handler_timeout}s",
                                 extra={
                                     "queue_name": queue_name,
                                     "document_id": document_id,
                                     "minio_key": minio_key,
                                     "retry_count": retry_count,
+                                    "timeout": handler_timeout,
                                 },
                             )
+                            # Timeout: rollback document status to PENDING and requeue for retry
+                            # Only do this for parse queue (other queues don't have status to rollback)
+                            if "parse" in queue_name and document_id != "unknown":
+                                try:
+                                    from app.core.database import async_session_maker
+                                    from sqlalchemy import select
+                                    from app.models.document import Document, DocumentStatus
+
+                                    async with async_session_maker() as rollback_db:
+                                        result = await rollback_db.execute(
+                                            select(Document).where(
+                                                Document.id == uuid.UUID(document_id)
+                                            )
+                                        )
+                                        doc = result.scalar_one_or_none()
+                                        if doc and doc.status not in (
+                                            DocumentStatus.PENDING,
+                                            DocumentStatus.INDEXED,
+                                            DocumentStatus.FAILED,
+                                        ):
+                                            doc.status = DocumentStatus.PENDING
+                                            doc.error_message = f"timeout_retry: handler timed out after {elapsed:.1f}s"
+                                            await rollback_db.commit()
+                                            logger.info(
+                                                f"[timeout_rollback] doc={document_id} "
+                                                f"status reverted to PENDING"
+                                            )
+                                except Exception as rollback_err:
+                                    logger.warning(
+                                        f"[timeout_rollback] failed for doc={document_id}: {rollback_err}"
+                                    )
+                            # Requeue the message for retry (with existing retry count, no new retry)
+                            if retry_count < MAX_RETRIES:
+                                try:
+                                    await _publish_to_retry_queue(
+                                        channel,
+                                        exchange_name,
+                                        routing_key,
+                                        message.body,
+                                        retry_count,
+                                    )
+                                except Exception as retry_err:
+                                    logger.error(
+                                        f"Failed to publish retry for {queue_name}: {retry_err}",
+                                        extra={
+                                            "queue_name": queue_name,
+                                            "document_id": document_id,
+                                            "minio_key": minio_key,
+                                            "retry_count": retry_count,
+                                            "error": str(retry_err),
+                                        },
+                                    )
                             await message.ack()
                         except Exception as e:
                             elapsed = time.monotonic() - start_time

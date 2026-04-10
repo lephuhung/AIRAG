@@ -79,24 +79,8 @@ async def handle_parse(payload: dict) -> None:
                 tmp.write(file_bytes)
                 tmp_path = Path(tmp.name)
 
-            # ── Check if scanned PDF → switch to OCRING ─────────────────────
-            is_scanned = False
-            if ext == ".pdf":
-                try:
-                    from app.services.ocr_service import get_ocr_service
-
-                    ocr_svc = get_ocr_service()
-                    is_scanned = await asyncio.to_thread(
-                        ocr_svc.is_scanned_pdf, str(tmp_path)
-                    )
-                    if is_scanned:
-                        document.status = DocumentStatus.OCRING
-                        await db.commit()
-                except Exception:
-                    pass  # fall back to PARSING
-
             # ── Extract digital signatures (native PDF only) ────────────────
-            if ext == ".pdf" and not is_scanned:
+            if ext == ".pdf":
                 try:
                     from app.services.ocr_service import get_ocr_service as _get_ocr  # noqa: F811
                     from app.services.digital_signature_service import (

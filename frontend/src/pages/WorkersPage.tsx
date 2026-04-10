@@ -234,6 +234,15 @@ export function WorkersPage() {
     onError: () => toast.error(t("workers.retry_all_failed")),
   });
 
+  const clearStuck = useMutation({
+    mutationFn: () => api.post<{ retried_count: number }>("/workers/retry-stuck"),
+    onSuccess: (data) => {
+      invalidateAll();
+      toast.success(t("workers.clear_stuck_success", { count: (data as any)?.retried_count ?? 0 }));
+    },
+    onError: () => toast.error(t("workers.clear_stuck_failed")),
+  });
+
   const retrySingle = useMutation({
     mutationFn: (docId: number) => api.post(`/workers/retry-failed/${docId}`),
     onSuccess: () => {
@@ -395,6 +404,24 @@ export function WorkersPage() {
                     <RotateCcw className="w-3.5 h-3.5" />
                   )}
                   {t("workers.retry_all_with_count", { count: failedCount })}
+                </Button>
+              )}
+
+              {pipeline?.ocring != null && pipeline?.ocring > 0 && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 gap-1.5 text-xs border-indigo-400/30 text-indigo-400 hover:bg-indigo-400/10"
+                  onClick={() => clearStuck.mutate()}
+                  disabled={clearStuck.isPending}
+                  title={t("workers.clear_stuck_desc")}
+                >
+                  {clearStuck.isPending ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Layers className="w-3.5 h-3.5" />
+                  )}
+                  {t("workers.clear_stuck")}
                 </Button>
               )}
             </div>
