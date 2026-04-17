@@ -252,7 +252,7 @@ services:
       NEO4J_URI: bolt://neo4j:7687
       WORKER_TYPE: parse
       AUTO_CREATE_TABLES: "false"
-      CUDA_VISIBLE_DEVICES: "1"
+      CUDA_VISIBLE_DEVICES: "0"
       HRAG_EAGER_MODEL_LOADING: "false"
       NEXUSRAG_DOCLING_DEVICE: cuda
       WORKER_DRAIN_TIMEOUT: "30"
@@ -314,7 +314,7 @@ services:
       MINIO_WEBHOOK_ENABLED: "false"
       WORKER_TYPE: embed
       AUTO_CREATE_TABLES: "false"
-      CUDA_VISIBLE_DEVICES: "1"
+      CUDA_VISIBLE_DEVICES: "0"
       HRAG_EAGER_MODEL_LOADING: "false"
       NEXUSRAG_EMBEDDING_DEVICE: cuda
       WORKER_DRAIN_TIMEOUT: "30"
@@ -380,7 +380,7 @@ services:
       MINIO_WEBHOOK_ENABLED: "false"
       WORKER_TYPE: caption
       AUTO_CREATE_TABLES: "false"
-      CUDA_VISIBLE_DEVICES: "1"
+      CUDA_VISIBLE_DEVICES: "0"
       WORKER_DRAIN_TIMEOUT: "30"
       WORKER_HEALTH_PORT: "8081"
     volumes:
@@ -430,7 +430,7 @@ services:
       NEO4J_URI: bolt://neo4j:7687
       WORKER_TYPE: kg
       AUTO_CREATE_TABLES: "false"
-      CUDA_VISIBLE_DEVICES: "1"
+      CUDA_VISIBLE_DEVICES: "0"
       WORKER_DRAIN_TIMEOUT: "30"
       WORKER_HEALTH_PORT: "8081"
       LEGAL_KG_LLM_BASE_URL: http://vllm-memory:8088/v1
@@ -484,7 +484,7 @@ services:
   #     MINIO_ENDPOINT: http://minio:9000
   #     MINIO_WEBHOOK_ENABLED: "false"
   #     NEO4J_URI: bolt://neo4j:7687
-  #     CUDA_VISIBLE_DEVICES: "1"
+  #     CUDA_VISIBLE_DEVICES: "0"
   #   volumes:
   #     - hrag_uploads:/app/backend/uploads
   #     - hrag_data:/app/backend/data

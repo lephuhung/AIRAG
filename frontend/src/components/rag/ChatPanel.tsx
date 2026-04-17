@@ -826,15 +826,27 @@ function PremiumThinking({
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(isStreaming && !hasContent);
   const [showFull, setShowFull] = useState(false);
+  const userToggledRef = useRef(false);
+
+  // Track user manual toggle
+  const handleToggle = useCallback(() => {
+    userToggledRef.current = true;
+    setExpanded(prev => !prev);
+  }, []);
 
   // Auto-collapse when reasoning is done and answer starts
   useEffect(() => {
-    if (isStreaming) {
-      if (thinking && !hasContent) {
-        setExpanded(true);
-      } else if (hasContent) {
-        setExpanded(false);
-      }
+    // Auto-expand when thinking arrives during streaming
+    if (isStreaming && thinking && !hasContent && !userToggledRef.current) {
+      setExpanded(true);
+    }
+    // Auto-collapse when content arrives (answer starts) — regardless of isStreaming
+    if (hasContent && !userToggledRef.current) {
+      setExpanded(false);
+    }
+    // Reset user-toggled flag when streaming ends (new message cycle)
+    if (!isStreaming && thinking === "") {
+      userToggledRef.current = false;
     }
   }, [isStreaming, !!thinking, hasContent]);
 
@@ -870,7 +882,7 @@ function PremiumThinking({
   return (
     <div className="mb-3 group">
       <button
-        onClick={() => setExpanded(!expanded)}
+        onClick={handleToggle}
         className={cn(
           "flex items-center gap-2 px-3 py-1.5 rounded-full text-[13px] font-medium transition-all duration-300",
           "bg-violet-500/5 hover:bg-violet-500/10 border border-violet-500/10 hover:border-violet-500/20",

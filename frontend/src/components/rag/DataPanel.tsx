@@ -2,7 +2,7 @@ import { useState, useMemo, useCallback, memo } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { useTranslation } from "@/hooks/useTranslation";
-import { AnimatePresence } from "framer-motion";
+import { AnimatePresence, motion } from "framer-motion";
 import {
   FileText,
   Sparkles,
@@ -290,11 +290,11 @@ export const DataPanel = memo(function DataPanel({
             </div>
 
             <div className="flex-1 overflow-y-auto px-3 py-2 grid grid-cols-2 gap-2 auto-rows-min">
-              <AnimatePresence mode="popLayout">
+              <AnimatePresence mode="sync">
                 {uploadingFiles?.map((file) => (
-                  <div key={file.id} className="col-span-2">
+                  <motion.div key={file.id} layout className="col-span-2">
                     <UploadingCard file={file} />
-                  </div>
+                  </motion.div>
                 ))}
                 {filteredDocs.map((doc) => (
                   <DocumentCard

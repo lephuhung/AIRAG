@@ -91,14 +91,15 @@ export function WorkspacePage() {
 
   const hasDeepragDocs = (ragStats?.hrag_documents ?? 0) > 0;
 
-  // -----------------------------------------------------------------------
-  // Mutations
-  // -----------------------------------------------------------------------
+  // Ref to track current upload fileId for onError cleanup
+  const currentUploadFileIdRef = useRef<string | null>(null);
+
   const uploadDoc = useMutation({
     mutationFn: async (file: File) => {
       if (!workspaceId) throw new Error("Invalid workspace ID");
 
       const fileId = `${file.name}-${file.size}-${Date.now()}`;
+      currentUploadFileIdRef.current = fileId;
       setUploadingFiles((prev: Record<string, UploadingFile>) => ({
         ...prev,
         [fileId]: { id: fileId, name: file.name, size: file.size, progress: 0 }
@@ -118,21 +119,33 @@ export function WorkspacePage() {
             });
           }
         );
-      } finally {
-        setUploadingFiles((prev: Record<string, UploadingFile>) => {
+      } catch (err) {
+        throw err; // Re-throw so onError fires
+      }
+    },
+    onSuccess: () => {
+      const fileId = currentUploadFileIdRef.current;
+      if (fileId) {
+        setUploadingFiles((prev) => {
           const next = { ...prev };
           delete next[fileId];
           return next;
         });
       }
-    },
-    onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["documents", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["rag-stats", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["workspaces"] });
       toast.success(t("workspace.upload_success"));
     },
     onError: (err: Error) => {
+      const fileId = currentUploadFileIdRef.current;
+      if (fileId) {
+        setUploadingFiles((prev) => {
+          const next = { ...prev };
+          delete next[fileId];
+          return next;
+        });
+      }
       const msg = err.message || "";
       if (msg.includes("MinIO PUT failed") || msg.includes("Network error")) {
         toast.error(t("workspace.upload_failed_network"), {

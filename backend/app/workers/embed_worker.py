@@ -186,8 +186,18 @@ async def handle_embed(payload: dict) -> None:
             # worker (KG) can use the freed blocks.  This is a best-effort
             # hint — PyTorch may still hold the CUDA context until process exit.
             try:
-                import torch
-                if torch.cuda.is_available():
+                import os, torch
+                cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+                device_count = torch.cuda.device_count()
+                is_available = torch.cuda.is_available()
+                logger.debug(
+                    f"[embed_worker] CUDA state: CUDA_VISIBLE_DEVICES={cuda_visible!r}, "
+                    f"device_count={device_count}, is_available={is_available}"
+                )
+                if is_available and device_count > 0:
                     torch.cuda.empty_cache()
-            except Exception:
-                pass
+                    logger.debug(f"[embed_worker] GPU cache cleared")
+                else:
+                    logger.debug(f"[embed_worker] No CUDA GPU available for cache clear — skipping")
+            except Exception as e:
+                logger.debug(f"[embed_worker] GPU cache clear failed (non-fatal): {e}")

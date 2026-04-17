@@ -474,7 +474,11 @@ async def consume(
                                             )
                                         )
                                         doc = result.scalar_one_or_none()
-                                        if doc:
+                                        if doc and doc.status not in (
+                                            DocumentStatus.PENDING,
+                                            DocumentStatus.INDEXED,
+                                            DocumentStatus.FAILED,
+                                        ):
                                             doc.kg_done = False
                                             doc.status = DocumentStatus.BUILDING_KG
                                             doc.error_message = f"timeout_retry: KG handler timed out after {elapsed:.1f}s — will retry"
@@ -486,34 +490,6 @@ async def consume(
                                 except Exception as rollback_err:
                                     logger.warning(
                                         f"[timeout_rollback] KG failed for doc={document_id}: {rollback_err}"
-                                    )
-                                try:
-                                    from app.core.database import async_session_maker
-                                    from sqlalchemy import select
-                                    from app.models.document import Document, DocumentStatus
-
-                                    async with async_session_maker() as rollback_db:
-                                        result = await rollback_db.execute(
-                                            select(Document).where(
-                                                Document.id == uuid.UUID(document_id)
-                                            )
-                                        )
-                                        doc = result.scalar_one_or_none()
-                                        if doc and doc.status not in (
-                                            DocumentStatus.PENDING,
-                                            DocumentStatus.INDEXED,
-                                            DocumentStatus.FAILED,
-                                        ):
-                                            doc.status = DocumentStatus.PENDING
-                                            doc.error_message = f"timeout_retry: handler timed out after {elapsed:.1f}s"
-                                            await rollback_db.commit()
-                                            logger.info(
-                                                f"[timeout_rollback] doc={document_id} "
-                                                f"status reverted to PENDING"
-                                            )
-                                except Exception as rollback_err:
-                                    logger.warning(
-                                        f"[timeout_rollback] failed for doc={document_id}: {rollback_err}"
                                     )
                             # Requeue the message for retry (with existing retry count, no new retry)
                             if retry_count < MAX_RETRIES:
@@ -543,12 +519,30 @@ async def consume(
                             except Exception as ack_err:
                                 logger.warning(f"[{queue_name}] message.ack() failed: {ack_err} — ignoring")
                         except Exception as e:
+                            import os
+                            cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "NOT_SET")
                             elapsed = time.monotonic() - start_time
                             worker_metrics.record_failure(queue_name, elapsed)
+                            is_cuda = "No CUDA GPUs are available" in str(e) or "cuda" in str(e).lower()
+                            log_fn = logger.error if is_cuda else logger.warning
+                            log_fn(
+                                f"Handler error on {queue_name} "
+                                f"(attempt {retry_count + 1}/{MAX_RETRIES + 1}): {e}",
+                                extra={
+                                    "queue_name": queue_name,
+                                    "document_id": document_id,
+                                    "minio_key": minio_key,
+                                    "retry_count": retry_count,
+                                    "error": str(e),
+                                    "error_type": type(e).__name__,
+                                    "is_cuda_error": is_cuda,
+                                    "cuda_visible_devices": cuda_visible,
+                                },
+                            )
                             if retry_count < MAX_RETRIES:
-                                logger.warning(
-                                    f"Handler error on {queue_name} "
-                                    f"(attempt {retry_count + 1}/{MAX_RETRIES + 1}): {e}",
+                                log_fn(
+                                    f"[{queue_name}] Scheduling retry {retry_count + 1}/{MAX_RETRIES + 1} "
+                                    f"for {queue_name}/{queue_name}",
                                     extra={
                                         "queue_name": queue_name,
                                         "document_id": document_id,
@@ -556,6 +550,8 @@ async def consume(
                                         "retry_count": retry_count,
                                         "error": str(e),
                                         "error_type": type(e).__name__,
+                                        "is_cuda_error": is_cuda,
+                                        "cuda_visible_devices": cuda_visible,
                                     },
                                 )
                                 try:
@@ -590,6 +586,8 @@ async def consume(
                                         "retry_count": retry_count,
                                         "error": str(e),
                                         "error_type": type(e).__name__,
+                                        "is_cuda_error": is_cuda,
+                                        "cuda_visible_devices": cuda_visible,
                                     },
                                 )
                                 try:

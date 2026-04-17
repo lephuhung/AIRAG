@@ -45,6 +45,10 @@ async def check_and_finalize(document: Document, db: AsyncSession) -> None:
         if fresh is None:
             return
 
+        # FAILED is a terminal state — only admin retry can clear it
+        if fresh.status == DocumentStatus.FAILED:
+            return
+
         # Chat-upload documents: skip KG and caption workers, so only embed_done is needed
         if fresh.is_chat_upload:
             if fresh.embed_done:
