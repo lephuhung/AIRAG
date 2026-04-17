@@ -87,6 +87,13 @@ async def _run_kg_worker() -> None:
     # Ensure all SQLAlchemy models are registered before querying
     import app.models  # noqa: F401 — registers DocumentType and all relationships
 
+    # Mark DB as connected (models import verifies DB connection works)
+    try:
+        from app.workers.health_server import update_worker_state
+        update_worker_state(db=True)
+    except Exception:
+        pass
+
     # Fetch all existing workspace IDs
     from app.core.database import async_session_maker
     from app.models.knowledge_base import KnowledgeBase
@@ -248,8 +255,19 @@ async def main() -> None:
 
         health_port = int(os.getenv("WORKER_HEALTH_PORT", "8081"))
         health_task = asyncio.create_task(_run_health_server(health_port))
-        # NOTE: ready=True is set by mq.consume() after RabbitMQ connection is established
+        # NOTE: ready=True and rabbitmq=True are set by mq.consume() after connections are established
         logger.info(f"Health server started on port {health_port}")
+    except Exception as e:
+        logger.warning(f"Health server failed to start (non-fatal): {e}")
+
+    # ── Verify DB connection and mark as ready ─────────────────────────────
+    try:
+        import app.models  # noqa: F401 — verifies DB connection
+        from app.workers.health_server import update_worker_state
+        update_worker_state(db=True)
+        logger.info("Database connection verified")
+    except Exception as db_err:
+        logger.warning(f"Database connection check failed (non-fatal): {db_err}")
     except Exception as e:
         logger.warning(f"Health server failed to start (non-fatal): {e}")
 
