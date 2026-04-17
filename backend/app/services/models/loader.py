@@ -33,6 +33,8 @@ def preload_models() -> None:
     emb = get_embedding_service()
     _ = emb.model  # triggers lazy load
     logger.info(f"[preload] Embedding model ready ({emb.model_name})")
+    # Warmup: encode dummy texts to initialize CUDA kernels
+    emb.warmup()
 
     # 2. Reranker model (cross-encoder)
     from app.services.reranker import get_reranker_service
@@ -40,9 +42,11 @@ def preload_models() -> None:
     rr = get_reranker_service()
     _ = rr.model  # triggers lazy load
     logger.info(f"[preload] Reranker model ready ({rr.model_name})")
+    # Warmup: score dummy pairs to initialize CUDA kernels
+    rr.warmup()
 
     elapsed = time.time() - t0
-    logger.info(f"[preload] Retrieval models loaded in {elapsed:.1f}s")
+    logger.info(f"[preload] Retrieval models loaded + warmed up in {elapsed:.1f}s")
 
     # 3. Memory Agent (Qwen via vLLM API — used by chat_agent for memory extraction)
     from app.core.config import settings

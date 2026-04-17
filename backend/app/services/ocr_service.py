@@ -240,8 +240,8 @@ class HunyuanOCRService:
         return self._client
 
     async def _ocr_pages_api(self, page_images: list[bytes]) -> list[str]:
-        """OCR all pages via remote vLLM API, up to 4 pages concurrently."""
-        semaphore = asyncio.Semaphore(4)
+        """OCR all pages via remote vLLM API, up to 16 pages concurrently."""
+        semaphore = asyncio.Semaphore(16)
 
         async def ocr_one(idx: int, img_bytes: bytes) -> tuple[int, str]:
             async with semaphore:
@@ -279,7 +279,7 @@ class HunyuanOCRService:
                 }
             ],
             "temperature": 0.0,
-            "max_tokens": 8192,
+            "max_tokens": 16384,
         }
 
         client = await self._get_client()

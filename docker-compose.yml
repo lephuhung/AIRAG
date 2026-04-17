@@ -76,7 +76,7 @@ services:
       - "7474:7474"   # Browser UI → http://localhost:7474
       - "7687:7687"   # Bolt protocol
     environment:
-      NEO4J_AUTH: neo4j/hrag123
+      NEO4J_AUTH: neo4j/hrag1234
       NEO4J_PLUGINS: '["apoc"]'
       NEO4J_dbms_security_procedures_unrestricted: apoc.*
       NEO4J_dbms_memory_heap_initial__size: 512m
@@ -115,7 +115,7 @@ services:
       MINIO_ENDPOINT: http://minio:9000
       MINIO_WEBHOOK_ENABLED: "true"
       NEO4J_URI: bolt://neo4j:7687
-      CUDA_VISIBLE_DEVICES: "1"
+      CUDA_VISIBLE_DEVICES: "0"
     volumes:
       - hrag_uploads:/app/backend/uploads
       - hrag_data:/app/backend/data
@@ -126,7 +126,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ["1"]
+              device_ids: ["0"]
               capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
@@ -167,7 +167,87 @@ services:
       "
     restart: on-failure
 
-  # ── Parse workers (CPU/IO — Docling + OCR, zero LLM) ────────────────────
+  # ── vllm-ocr (HunyuanOCR for scanned PDF OCR) ────────────────────────────
+  # Port: 8001, GPU 1, ~19.2GB VRAM (0.4 × 48GB)
+  vllm-ocr:
+    image: vllm/vllm-openai:latest
+    container_name: hrag-vllm-ocr
+    ports:
+      - "8001:8001"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "1"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    command:
+      - tencent/HunyuanOCR
+      - --port
+      - "8001"
+      - --max-model-len
+      - "16384"
+      - --gpu-memory-utilization
+      - "0.4"
+      - --trust-remote-code
+      - --served-model-name
+      - hunyuan-ocr
+      - --host
+      - 0.0.0.0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    restart: always
+
+  # ── vllm-memory (Qwen3-4B for document classification) ─────────────────────
+  # Port: 8088, GPU 1, ~9.6GB VRAM (0.2 × 48GB)
+  vllm-memory:
+    image: vllm/vllm-openai:latest
+    container_name: hrag-vllm-memory
+    ports:
+      - "8088:8088"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "1"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    command:
+      - Qwen/Qwen3-4B-Instruct-2507-FP8
+      - --port
+      - "8088"
+      - --max-model-len
+      - "17000"
+      - --gpu-memory-utilization
+      - "0.25"
+      - --trust-remote-code
+      - --served-model-name
+      - qwen-memory
+      - --host
+      - 0.0.0.0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+    restart: always
+
+  # ── Parse workers (GPU-accelerated Docling, lazy load) ────────────────────
+  # Docling layout + OCR → ~4-6GB VRAM when loaded
+  # HRAG_EAGER_MODEL_LOADING=false prevents VRAM spike at startup
   worker-parse:
     build:
       context: .
@@ -177,9 +257,9 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-      chromadb:
-        condition: service_started
       minio:
+        condition: service_healthy
+      vllm-memory:
         condition: service_healthy
     env_file: .env
     environment:
@@ -188,24 +268,45 @@ services:
       CHROMA_PORT: 8000
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       MINIO_ENDPOINT: http://minio:9000
+      MINIO_WEBHOOK_ENABLED: "true"
+      NEO4J_URI: bolt://neo4j:7687
       WORKER_TYPE: parse
       AUTO_CREATE_TABLES: "false"
-      CUDA_VISIBLE_DEVICES: "1"
+      CUDA_VISIBLE_DEVICES: "0"
+      HRAG_EAGER_MODEL_LOADING: "false"
+      NEXUSRAG_DOCLING_DEVICE: cuda
+      WORKER_DRAIN_TIMEOUT: "30"
+      WORKER_HEALTH_PORT: "8081"
+      HUNYUAN_OCR_API_URL: http://vllm-ocr:8001/v1
+      MEMORY_AGENT_BASE_URL: http://vllm-memory:8088/v1
     volumes:
       - hrag_uploads:/app/backend/uploads
       - hrag_data:/app/backend/data
     deploy:
-      replicas: 8
+      replicas: 2
       resources:
         reservations:
           devices:
             - driver: nvidia
               device_ids: ["1"]
               capabilities: [gpu]
+    stop_grace_period: 60s
     command: ["python", "-m", "app.workers.runner"]
-    restart: unless-stopped
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
-  # ── Embed workers (bge-m3 embedding → ChromaDB) ─────────────────────────
+  # ── Embed workers (BGE-m3 on GPU 1) ────────────────────────────────────────
+  # BGE-m3 embedding model → ~1-2GB VRAM, lazy load
   worker-embed:
     build:
       context: .
@@ -224,24 +325,42 @@ services:
       CHROMA_PORT: 8000
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       MINIO_ENDPOINT: http://minio:9000
+      MINIO_WEBHOOK_ENABLED: "true"
       WORKER_TYPE: embed
       AUTO_CREATE_TABLES: "false"
-      CUDA_VISIBLE_DEVICES: "1"
+      CUDA_VISIBLE_DEVICES: "0"
+      HRAG_EAGER_MODEL_LOADING: "false"
+      NEXUSRAG_EMBEDDING_DEVICE: cuda
+      WORKER_DRAIN_TIMEOUT: "30"
+      WORKER_HEALTH_PORT: "8081"
     volumes:
       - hrag_uploads:/app/backend/uploads
       - hrag_data:/app/backend/data
     deploy:
-      replicas: 4
+      replicas: 2
       resources:
         reservations:
           devices:
             - driver: nvidia
               device_ids: ["1"]
               capabilities: [gpu]
+    stop_grace_period: 60s
     command: ["python", "-m", "app.workers.runner"]
-    restart: unless-stopped
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
-  # ── Caption workers (Vision + Text LLM — images & tables) ───────────────
+  # ── Caption workers (HTTP calls to vLLM, no GPU model) ────────────────────
+  # Caption worker calls LLM via HTTP — GPU not used by this worker process
   worker-caption:
     build:
       context: .
@@ -262,27 +381,39 @@ services:
       CHROMA_PORT: 8000
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       MINIO_ENDPOINT: http://minio:9000
+      MINIO_WEBHOOK_ENABLED: "true"
       WORKER_TYPE: caption
       AUTO_CREATE_TABLES: "false"
-      CUDA_VISIBLE_DEVICES: "1"
+      CUDA_VISIBLE_DEVICES: "0"
+      WORKER_DRAIN_TIMEOUT: "30"
+      WORKER_HEALTH_PORT: "8081"
     volumes:
       - hrag_uploads:/app/backend/uploads
       - hrag_data:/app/backend/data
     deploy:
-      replicas: 4
+      replicas: 1
       resources:
         reservations:
           devices:
             - driver: nvidia
               device_ids: ["1"]
               capabilities: [gpu]
+    stop_grace_period: 60s
     command: ["python", "-m", "app.workers.runner"]
-    restart: unless-stopped
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
-  # ── KG workers (LightRAG entity extraction) ──────────────────────────────
-  # Scale = number of parallel workspaces you want to process simultaneously.
-  # Each worker handles ALL documents for specific workspaces sequentially
-  # (enforced by routing_key=workspace_id + prefetch_count=1).
+  # ── KG workers (LightRAG, CPU-bound, GPU for consistency) ─────────────────
   worker-kg:
     build:
       context: .
@@ -301,19 +432,33 @@ services:
       NEO4J_URI: bolt://neo4j:7687
       WORKER_TYPE: kg
       AUTO_CREATE_TABLES: "false"
-      CUDA_VISIBLE_DEVICES: "1"
+      CUDA_VISIBLE_DEVICES: "0"
+      WORKER_DRAIN_TIMEOUT: "30"
+      WORKER_HEALTH_PORT: "8081"
     volumes:
       - hrag_data:/app/backend/data
     deploy:
-      replicas: 4
+      replicas: 1
       resources:
         reservations:
           devices:
             - driver: nvidia
               device_ids: ["1"]
               capabilities: [gpu]
+    stop_grace_period: 60s
     command: ["python", "-m", "app.workers.runner"]
-    restart: unless-stopped
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
   frontend:
     build:

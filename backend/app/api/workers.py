@@ -195,6 +195,54 @@ async def _check_openai_health(
 # Health Check
 # ══════════════════════════════════════════════════════════════════════════════
 
+# Worker health server ports (per container, mapped to host)
+# These map from host port → worker health server (container port 8081)
+_WORKER_HEALTH_PORTS: dict[str, list[int]] = {
+    "parse":   [8082],   # worker-parse-1 on 8082, add more for replicas
+    "embed":   [8083],
+    "caption": [8084],
+    "kg":      [8085],
+}
+
+
+async def _check_worker_containers() -> dict[str, Any]:
+    """Check health of worker containers via their built-in health servers."""
+    import httpx
+
+    results: dict[str, Any] = {}
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        for worker_type, ports in _WORKER_HEALTH_PORTS.items():
+            worker_results = []
+            for port in ports:
+                try:
+                    resp = await client.get(f"http://localhost:{port}/health")
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        worker_results.append({
+                            "port": port,
+                            "status": "healthy",
+                            "worker_type": data.get("worker_type", worker_type),
+                            "uptime_seconds": data.get("uptime_seconds", 0),
+                        })
+                    else:
+                        worker_results.append({
+                            "port": port,
+                            "status": "unreachable",
+                            "code": resp.status_code,
+                        })
+                except Exception as exc:
+                    worker_results.append({
+                        "port": port,
+                        "status": "offline",
+                        "error": str(exc)[:100],
+                    })
+            results[worker_type] = {
+                "instances": worker_results,
+                "healthy_count": len([r for r in worker_results if r.get("status") == "healthy"]),
+                "total": len(worker_results),
+            }
+    return results
+
 
 @router.get("/health")
 async def workers_health(
@@ -203,7 +251,7 @@ async def workers_health(
     """
     Comprehensive health check for the worker system.
     Returns status of RabbitMQ, each queue, active consumers, managed workers,
-    and pipeline status summary.
+    worker containers (via health servers), and pipeline status summary.
     """
     health: dict[str, Any] = {
         "status": "healthy",
@@ -225,6 +273,27 @@ async def workers_health(
         health["checks"]["rabbitmq"] = {
             "status": "unhealthy",
             "error": str(exc),
+        }
+
+    # ── Worker containers ──────────────────────────────────────────────
+    try:
+        container_health = await _check_worker_containers()
+        container_status = "healthy"
+        for wtype, info in container_health.items():
+            if info["healthy_count"] == 0:
+                container_status = "unhealthy"
+            elif info["healthy_count"] < info["total"]:
+                container_status = "degraded"
+        health["checks"]["worker_containers"] = {
+            "status": container_status,
+            "workers": container_health,
+        }
+        if container_status == "unhealthy":
+            health["status"] = "degraded"
+    except Exception as exc:
+        health["checks"]["worker_containers"] = {
+            "status": "unknown",
+            "error": str(exc)[:200],
         }
 
     # ── Queue health ──────────────────────────────────────────────────────
@@ -706,17 +775,29 @@ async def get_overview(
         "failed": status_counts.get(DocumentStatus.FAILED, 0),
     }
 
-    # Include managed workers info
+    # Include managed workers info (workers started from this API server)
     managed_workers: dict[str, int] = {}
     async with _workers_lock:
         for wtype, workers in _workers.items():
             managed_workers[wtype] = len([w for w in workers if w.is_alive])
+
+    # Include container worker counts (workers running as Docker containers)
+    # For KG, active_workers shows consumers per workspace queue, not container count
+    # KG uses per-workspace queues so 1 container consuming from multiple queues
+    try:
+        container_health = await _check_worker_containers()
+        container_workers: dict[str, int] = {
+            wtype: info["healthy_count"] for wtype, info in container_health.items()
+        }
+    except Exception:
+        container_workers = {}
 
     return {
         "queues": queues_data,
         "pipeline_summary": pipeline_summary,
         "active_workers": active_workers,
         "managed_workers": managed_workers,
+        "container_workers": container_workers,
         "rabbitmq_connected": rabbitmq_connected,
     }
 

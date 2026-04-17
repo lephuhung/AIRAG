@@ -74,6 +74,7 @@ _RETRY_QUEUE_NAMES = [f"hrag.retry.{d}s" for d in RETRY_DELAYS]
 # ── Singleton connection ────────────────────────────────────────────────────
 _connection: AbstractRobustConnection | None = None
 _lock = asyncio.Lock()
+_retry_consumer_started: bool = False
 
 
 async def get_connection() -> AbstractRobustConnection:
@@ -91,6 +92,13 @@ async def get_connection() -> AbstractRobustConnection:
                 heartbeat=120,
             )
             logger.info("RabbitMQ connected")
+            # Update health server state so /ready returns true
+            # Both rabbitmq and ready must be True for /ready to return 200
+            try:
+                from app.workers.health_server import update_worker_state
+                update_worker_state(rabbitmq=True, ready=True)
+            except Exception:
+                pass  # non-fatal if health server not yet initialized
     return _connection
 
 
@@ -99,6 +107,11 @@ async def close_connection() -> None:
     if _connection and not _connection.is_closed:
         await _connection.close()
         _connection = None
+        try:
+            from app.workers.health_server import update_worker_state
+            update_worker_state(rabbitmq=False, ready=False)
+        except Exception:
+            pass  # non-fatal
 
 
 # ── DLX / DLQ setup ──────────────────────────────────────────────────────────
@@ -114,19 +127,25 @@ async def _ensure_dlx(channel: aio_pika.Channel) -> None:
 # ── Retry infrastructure ───────────────────────────────────────────────────
 async def _ensure_retry_queues(channel: aio_pika.Channel) -> None:
     """
-    Create the retry exchange and per-delay queues (idempotent).
+    Create per-delay queues (idempotent).
 
-    Each delay queue has a TTL matching its delay.  When a message's TTL
-    expires it is dead-lettered to the *retry exchange* (DIRECT) which
-    re-routes it back to the original exchange using the
-    ``x-original-routing-key`` header stored on the message.
+    Each delay queue has a TTL matching its delay. When a message's TTL
+    expires it is dead-lettered directly back to the original KG exchange
+    (EXCHANGE_KG) using the original routing key preserved in the message
+    headers. This bypasses the need for a separate retry consumer.
 
     Flow:
-        handler fail → publish to hrag.retry.Xs (with TTL = X s)
-            → TTL expires → DLX to hrag.retry (DIRECT)
-            → route back to original exchange/routing_key
+        handler fail → publish to hrag.retry.Xs (with TTL = X s, x-original-routing-key header)
+            → TTL expires → DLX to hrag.kg (EXCHANGE_KG) with original routing key
+            → routes back to hrag.kg.{workspace_id} queue automatically
     """
-    # Retry exchange — messages land here after TTL expires
+    # Declare the KG exchange (used as DLX so messages return to right queue on retry)
+    await channel.declare_exchange(
+        EXCHANGE_KG,
+        ExchangeType.DIRECT,
+        durable=True,
+    )
+    # Keep RETRY_EXCHANGE for the retry requeue consumer path (MAX_RETRIES exhausted)
     await channel.declare_exchange(
         RETRY_EXCHANGE,
         ExchangeType.DIRECT,
@@ -140,7 +159,9 @@ async def _ensure_retry_queues(channel: aio_pika.Channel) -> None:
                 durable=True,
                 arguments={
                     "x-message-ttl": delay_sec * 1000,  # ms
-                    "x-dead-letter-exchange": RETRY_EXCHANGE,  # after TTL → retry exchange
+                    # DLX directly to EXCHANGE_KG so expired message routes back
+                    # to hrag.kg.{workspace_id} using the original routing key
+                    "x-dead-letter-exchange": EXCHANGE_KG,
                 },
             )
             # Bind so publisher can publish directly by queue name
@@ -360,8 +381,12 @@ async def consume(
 
     await queue.bind(exchange, routing_key=routing_key)
 
-    retry_channel = await conn.channel()
-    asyncio.create_task(_start_retry_consumer(retry_channel))
+    # Start retry consumer only once globally (not per queue)
+    global _retry_consumer_started
+    if not _retry_consumer_started:
+        _retry_consumer_started = True
+        retry_channel = await conn.channel()
+        asyncio.create_task(_start_retry_consumer(retry_channel))
 
     logger.info(f"Consuming {exchange_name}/{routing_key} → {queue_name}")
 
@@ -435,6 +460,61 @@ async def consume(
                                     logger.warning(
                                         f"[timeout_rollback] failed for doc={document_id}: {rollback_err}"
                                     )
+                            # For KG worker: reset kg_done=False so retry can process again
+                            if "kg" in queue_name and document_id != "unknown":
+                                try:
+                                    from app.core.database import async_session_maker
+                                    from sqlalchemy import select
+                                    from app.models.document import Document, DocumentStatus
+
+                                    async with async_session_maker() as rollback_db:
+                                        result = await rollback_db.execute(
+                                            select(Document).where(
+                                                Document.id == uuid.UUID(document_id)
+                                            )
+                                        )
+                                        doc = result.scalar_one_or_none()
+                                        if doc:
+                                            doc.kg_done = False
+                                            doc.status = DocumentStatus.BUILDING_KG
+                                            doc.error_message = f"timeout_retry: KG handler timed out after {elapsed:.1f}s — will retry"
+                                            await rollback_db.commit()
+                                            logger.info(
+                                                f"[timeout_rollback] doc={document_id} "
+                                                f"kg_done reset to False for retry"
+                                            )
+                                except Exception as rollback_err:
+                                    logger.warning(
+                                        f"[timeout_rollback] KG failed for doc={document_id}: {rollback_err}"
+                                    )
+                                try:
+                                    from app.core.database import async_session_maker
+                                    from sqlalchemy import select
+                                    from app.models.document import Document, DocumentStatus
+
+                                    async with async_session_maker() as rollback_db:
+                                        result = await rollback_db.execute(
+                                            select(Document).where(
+                                                Document.id == uuid.UUID(document_id)
+                                            )
+                                        )
+                                        doc = result.scalar_one_or_none()
+                                        if doc and doc.status not in (
+                                            DocumentStatus.PENDING,
+                                            DocumentStatus.INDEXED,
+                                            DocumentStatus.FAILED,
+                                        ):
+                                            doc.status = DocumentStatus.PENDING
+                                            doc.error_message = f"timeout_retry: handler timed out after {elapsed:.1f}s"
+                                            await rollback_db.commit()
+                                            logger.info(
+                                                f"[timeout_rollback] doc={document_id} "
+                                                f"status reverted to PENDING"
+                                            )
+                                except Exception as rollback_err:
+                                    logger.warning(
+                                        f"[timeout_rollback] failed for doc={document_id}: {rollback_err}"
+                                    )
                             # Requeue the message for retry (with existing retry count, no new retry)
                             if retry_count < MAX_RETRIES:
                                 try:
@@ -456,7 +536,12 @@ async def consume(
                                             "error": str(retry_err),
                                         },
                                     )
-                            await message.ack()
+                            # Ack the message; wrap in try-except because the channel may be
+                            # in a broken state after CancelledError from asyncio.timeout.
+                            try:
+                                await message.ack()
+                            except Exception as ack_err:
+                                logger.warning(f"[{queue_name}] message.ack() failed: {ack_err} — ignoring")
                         except Exception as e:
                             elapsed = time.monotonic() - start_time
                             worker_metrics.record_failure(queue_name, elapsed)
@@ -494,9 +579,10 @@ async def consume(
                                     )
                                 await message.ack()
                             else:
+                                # MAX_RETRIES exhausted — send to DLQ, not discard
                                 logger.error(
-                                    f"Handler error on {queue_name} after "
-                                    f"{MAX_RETRIES + 1} attempts: {e}",
+                                    f"[{queue_name}] Max retries {MAX_RETRIES} reached — "
+                                    f"sending to DLQ",
                                     extra={
                                         "queue_name": queue_name,
                                         "document_id": document_id,
@@ -506,7 +592,12 @@ async def consume(
                                         "error_type": type(e).__name__,
                                     },
                                 )
-                                await message.ack()
+                                try:
+                                    await message.reject(requeue=False)  # trigger x-dead-letter-exchange → DLQ
+                                    logger.info(f"[{queue_name}] Message sent to DLQ")
+                                except Exception as dlq_err:
+                                    logger.error(f"[{queue_name}] Failed to send to DLQ: {dlq_err}")
+                                    await message.ack()  # fallback: ack to prevent infinite loop
             logger.warning(
                 f"queue_iterator exhausted unexpectedly — reconnecting",
                 extra={"queue_name": queue_name},

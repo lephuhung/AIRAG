@@ -89,6 +89,27 @@ class EmbeddingService:
         """Generate embedding for a search query."""
         return self.embed_text(query)
 
+    def warmup(self, texts: list[str] | None = None) -> None:
+        """
+        Pre-warm the model by encoding dummy/real texts to initialize CUDA kernels
+        and verify the model produces valid embeddings.
+
+        Args:
+            texts: Optional list of texts to encode. If None, uses 5 generic
+                   dummy strings. Providing real texts (e.g., common queries)
+                   gives better warmup quality.
+        """
+        warmup_texts = texts or [
+            "Vietnamese administrative document query",
+            "Legal regulation search",
+            "Policy keyword lookup",
+            "Document classification request",
+            "Entity extraction query",
+        ]
+        logger.info(f"[embedder] Warmup: encoding {len(warmup_texts)} texts")
+        self.embed_texts(warmup_texts)
+        logger.info(f"[embedder] Warmup complete for {self.model_name}")
+
 
 # Default service instance (singleton)
 _default_service: Optional[EmbeddingService] = None

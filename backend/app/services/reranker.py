@@ -98,6 +98,20 @@ class RerankerService:
 
         return results
 
+    def warmup(self) -> None:
+        """
+        Pre-warm the cross-encoder by scoring dummy (query, doc) pairs to
+        initialize CUDA kernels and verify the model produces valid scores.
+        """
+        dummy_pairs = [
+            ("Vietnamese law query", "legal document content here"),
+            ("administrative procedure", "procedure steps for government"),
+            ("policy regulation", "regulation text with articles"),
+        ]
+        logger.info(f"[reranker] Warmup: scoring {len(dummy_pairs)} pairs")
+        self.model.predict(dummy_pairs)
+        logger.info(f"[reranker] Warmup complete for {self.model_name}")
+
 
 # Singleton instance
 _default_service: Optional[RerankerService] = None

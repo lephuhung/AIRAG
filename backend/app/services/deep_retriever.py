@@ -12,11 +12,20 @@ Pipeline:
   4. Merge vector + BM25 via Reciprocal Rank Fusion (RRF)
   5. Cross-encoder rerank → precision filter to top-K (HRAG_RERANKER_TOP_K)
   6. Merge with citations + optional image references
+
+Retrieval caching:
+  - Results are cached in-memory for 5 minutes (TTL) keyed by
+    (workspace_id + query_hash + top_k + mode + document_ids).
+  - Cache is invalidated automatically when BM25 index is rebuilt
+    (BM25 index already tracks doc_count staleness).
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import threading
+import time
 import uuid
 from typing import Optional
 
@@ -38,6 +47,55 @@ from app.services.models.parsed_document import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ── Retrieval result cache ────────────────────────────────────────────────────
+_RETRIEVAL_CACHE: dict[str, tuple[DeepRetrievalResult, float]] = {}
+_CACHE_LOCK = threading.Lock()
+_RETRIEVAL_CACHE_TTL = 300.0  # 5 minutes
+
+
+def _retrieval_cache_key(
+    workspace_id: uuid.UUID,
+    question: str,
+    top_k: int,
+    mode: str,
+    document_ids: Optional[list[uuid.UUID]],
+) -> str:
+    """Build a cache key from retrieval parameters."""
+    doc_ids_str = "|".join(sorted(str(d) for d in (document_ids or [])))
+    raw = f"{workspace_id}:{question}:{top_k}:{mode}:{doc_ids_str}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:40]
+
+
+def _get_cached_result(cache_key: str) -> Optional[DeepRetrievalResult]:
+    """Return cached result if fresh, else None."""
+    with _CACHE_LOCK:
+        cached = _RETRIEVAL_CACHE.get(cache_key)
+    if cached is None:
+        return None
+    result, cached_at = cached
+    if time.time() - cached_at > _RETRIEVAL_CACHE_TTL:
+        with _CACHE_LOCK:
+            _RETRIEVAL_CACHE.pop(cache_key, None)
+        return None
+    logger.info(f"[retrieval_cache] HIT key={cache_key[:8]}…")
+    return result
+
+
+def _set_cached_result(cache_key: str, result: DeepRetrievalResult) -> None:
+    """Store result in cache with current timestamp."""
+    with _CACHE_LOCK:
+        _RETRIEVAL_CACHE[cache_key] = (result, time.time())
+    logger.info(f"[retrieval_cache] SET key={cache_key[:8]}… ({len(result.chunks)} chunks)")
+
+
+def invalidate_retrieval_cache(workspace_id: uuid.UUID) -> None:
+    """Remove all cache entries for a workspace (call after document changes)."""
+    with _CACHE_LOCK:
+        keys_to_remove = [k for k in _RETRIEVAL_CACHE if k.startswith(str(workspace_id))]
+        for k in keys_to_remove:
+            _RETRIEVAL_CACHE.pop(k, None)
+    logger.debug(f"[retrieval_cache] Invalidated {len(keys_to_remove)} entries for workspace {workspace_id}")
 
 
 class DeepRetriever:
@@ -90,6 +148,12 @@ class DeepRetriever:
         Returns:
             DeepRetrievalResult with chunks, citations, context, and optional images
         """
+        # ── Retrieval result cache ───────────────────────────────────────────
+        cache_key = _retrieval_cache_key(self.workspace_id, question, top_k, mode, document_ids)
+        cached = _get_cached_result(cache_key)
+        if cached is not None:
+            return cached
+
         # Run KG and vector search in parallel
         kg_task = None
         if self.kg_service and mode != "vector_only":
@@ -156,7 +220,7 @@ class DeepRetriever:
         # Assemble context
         context = self._assemble_context(chunks, citations, kg_summary, image_refs, table_refs)
 
-        return DeepRetrievalResult(
+        result = DeepRetrievalResult(
             chunks=chunks,
             citations=citations,
             context=context,
@@ -166,6 +230,9 @@ class DeepRetriever:
             image_refs=image_refs,
             table_refs=table_refs,
         )
+        # Cache the result for 5 minutes
+        _set_cached_result(cache_key, result)
+        return result
 
     async def _kg_query(self, question: str, mode: str) -> str:
         """Get raw KG context (entities + relationships) relevant to the question.

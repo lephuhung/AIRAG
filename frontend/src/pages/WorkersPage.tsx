@@ -470,11 +470,13 @@ export function WorkersPage() {
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
                 {WORKER_TYPES.map((wtype) => {
                   const rmqConsumers = overview?.active_workers?.[wtype] ?? 0;
+                  const containerCount = overview?.container_workers?.[wtype] ?? 0;
                   const managedCount = overview?.managed_workers?.[wtype] ?? 0;
                   const managedList = managedWorkers[wtype] ?? [];
                   const aliveList = managedList.filter((w) => w.alive);
-                  const totalConsumers = rmqConsumers;
-                  const isRunning = totalConsumers > 0 || aliveList.length > 0;
+                  // Prefer container count for Docker workers; fall back to consumer count for non-container workers
+                  const workerCount = containerCount > 0 ? containerCount : (rmqConsumers > 0 ? rmqConsumers : managedCount);
+                  const isRunning = workerCount > 0 || aliveList.length > 0;
 
                   return (
                     <div
@@ -496,7 +498,7 @@ export function WorkersPage() {
                           </span>
                         </div>
                         <span className="text-xs text-muted-foreground">
-                          {t("workers.consumers", { count: totalConsumers })}
+                          {t("workers.containers", { count: workerCount })}
                         </span>
                       </div>
 

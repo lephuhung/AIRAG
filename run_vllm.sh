@@ -23,7 +23,7 @@ echo "Cleaning up existing vLLM processes on GPU 1..."
 # Kill by ports
 fuser -k 8001/tcp || true
 fuser -k 8002/tcp || true
-fuser -k 8082/tcp || true
+fuser -k 8088/tcp || true
 
 # Aggressive kill for any vllm-related processes (excluding this script)
 echo "Killing any remaining vllm or EngineCore python processes..."
@@ -48,16 +48,17 @@ echo "[1/2] Starting HunyuanOCR on port 8001..."
 nohup "$VIRTUAL_ENV/bin/python3" -m vllm.entrypoints.openai.api_server \
     --model tencent/HunyuanOCR \
     --port 8001 \
+    --max-model-len 16384 \
     --gpu-memory-utilization 0.4 \
     --trust-remote-code \
     --served-model-name hunyuan-ocr > ./logs/ocr_vllm.log 2>&1 &
 
 # 2. Start Qwen3-4B-Instruct-2507-FP8 (Memory Agent Model)
-# Port: 8082, GPU Memory: 0.15 (approx 7.3 GB)
-echo "[2/2] Starting Qwen3-4B-Instruct-2507-FP8 on port 8082..."
+# Port: 8088, GPU Memory: 0.15 (approx 7.3 GB)
+echo "[2/2] Starting Qwen3-4B-Instruct-2507-FP8 on port 8088..."
 nohup "$VIRTUAL_ENV/bin/python3" -m vllm.entrypoints.openai.api_server \
     --model Qwen/Qwen3-4B-Instruct-2507-FP8 \
-    --port 8082 \
+    --port 8088 \
     --max-model-len 17000 \
     --gpu-memory-utilization 0.2 \
     --trust-remote-code \
@@ -66,7 +67,7 @@ nohup "$VIRTUAL_ENV/bin/python3" -m vllm.entrypoints.openai.api_server \
 echo "----------------------------------------------------------"
 echo "Both models are starting in the background."
 echo "OCR (HunyuanOCR): http://localhost:8001/v1"
-echo "LLM (Qwen3.5):    http://localhost:8082/v1"
+echo "LLM (Qwen3.5):    http://localhost:8088/v1"
 echo "----------------------------------------------------------"
 echo "Check logs for progress:"
 echo "  tail -f ocr_vllm.log"

@@ -1,7 +1,11 @@
-# HRAG — Dev services only (PostgreSQL + ChromaDB + RabbitMQ)
+# NexusRAG — Dev/Production services with Workers
 # Usage: docker compose -f docker-compose.services.yml up -d
 
 services:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # INFRASTRUCTURE
+  # ═══════════════════════════════════════════════════════════════════════════
+
   postgres:
     image: pgvector/pgvector:pg15
     container_name: nexusrag-postgres
@@ -18,6 +22,9 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    labels:
+      com.nexusrag.service: postgres
+      com.nexusrag.stack: nexusrag
 
   chromadb:
     image: chromadb/chroma:latest
@@ -25,10 +32,13 @@ services:
     ports:
       - "8002:8000"
     volumes:
-      - nexusrag_chroma_data:/chroma/chroma
+      - nexusrag_chroma_data:/data
     environment:
       - IS_PERSISTENT=TRUE
       - ANONYMIZED_TELEMETRY=FALSE
+    labels:
+      com.nexusrag.service: chromadb
+      com.nexusrag.stack: nexusrag
 
   rabbitmq:
     image: rabbitmq:3-management-alpine
@@ -47,6 +57,9 @@ services:
       timeout: 5s
       retries: 10
       start_period: 20s
+    labels:
+      com.nexusrag.service: rabbitmq
+      com.nexusrag.stack: nexusrag
 
   minio:
     image: minio/minio:latest
@@ -58,11 +71,8 @@ services:
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-      # Webhook notification target (used in production / full docker-compose.yml)
-      # Not active here since there's no backend container in this services-only compose.
-      # Use MINIO_WEBHOOK_ENABLED=false in .env for local dev (direct publish after upload).
       MINIO_NOTIFY_WEBHOOK_ENABLE_NEXUSRAG: "on"
-      MINIO_NOTIFY_WEBHOOK_ENDPOINT_NEXUSRAG: "http://host.docker.internal:8080/api/v1/minio/events"
+      MINIO_NOTIFY_WEBHOOK_ENDPOINT_NEXUSRAG: http://host.docker.internal:8080/api/v1/minio/events
     volumes:
       - nexusrag_minio_data:/data
     healthcheck:
@@ -70,6 +80,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    labels:
+      com.nexusrag.service: minio
+      com.nexusrag.stack: nexusrag
 
   neo4j:
     image: neo4j:5-community
@@ -91,6 +104,451 @@ services:
       timeout: 5s
       retries: 10
       start_period: 30s
+    labels:
+      com.nexusrag.service: neo4j
+      com.nexusrag.stack: nexusrag
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # VLLM SERVICES — GPU 1 (same as workers, 48GB VRAM total)
+  # HunyuanOCR: ~19.2GB (0.4), Qwen3-4B: ~9.6GB (0.2) → ~28.8GB used
+  # Remaining ~19GB for workers (parse ~4-6GB, embed ~1-2GB)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # ── HunyuanOCR (OCR Model) ────────────────────────────────────────────────
+  # Port: 8001, GPU 1, ~19.2GB VRAM (0.4 × 48GB)
+  # OpenAI-compatible API → workers call via Docker network
+  vllm-ocr:
+    build:
+      context: .
+      dockerfile: Dockerfile.vllm
+    container_name: nexusrag-vllm-ocr
+    ports:
+      - "8001:8001"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "1"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    command:
+      - tencent/HunyuanOCR
+      - --port
+      - "8001"
+      - --max-model-len
+      - "16384"
+      - --gpu-memory-utilization
+      - "0.4"
+      - --trust-remote-code
+      - --served-model-name
+      - hunyuan-ocr
+      - --host
+      - 0.0.0.0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      com.nexusrag.service: vllm-ocr
+      com.nexusrag.stack: nexusrag
+
+  # ── Qwen3-4B-Instruct (Memory/KG Model) ──────────────────────────────────
+  # Port: 8088, GPU 1, ~9.6GB VRAM (0.2 × 48GB)
+  # OpenAI-compatible API → workers call via Docker network
+  vllm-memory:
+    build:
+      context: .
+      dockerfile: Dockerfile.vllm
+    container_name: nexusrag-vllm-memory
+    ports:
+      - "8088:8088"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "1"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    command:
+      - Qwen/Qwen3-4B-Instruct-2507-FP8
+      - --port
+      - "8088"
+      - --max-model-len
+      - "25000"
+      - --gpu-memory-utilization
+      - "0.3"
+      - --trust-remote-code
+      - --served-model-name
+      - qwen-memory
+      - --host
+      - 0.0.0.0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      com.nexusrag.service: vllm-memory
+      com.nexusrag.stack: nexusrag
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # WORKERS — All use GPU 1 (same as vLLM services, 48GB VRAM total)
+  # vLLM uses ~28.8GB, workers have ~19GB available (parse ~4-6GB, embed ~1-2GB)
+  # Caption/KG workers don't load GPU models (HTTP calls / CPU-bound)
+  # All workers include: graceful drain (WORKER_DRAIN_TIMEOUT=30s),
+  # stop_grace_period=60s (Docker waits 60s before SIGKILL on stop)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # ── Parse workers ─────────────────────────────────────────────────────────
+  # Docling (layout + OCR) → ~4-6GB VRAM when loaded
+  # Lazy load (HRAG_EAGER_MODEL_LOADING=false) to avoid VRAM spike at startup
+  # Health server on port 8081, exposed to host on port 8082
+  worker-parse:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      vllm-ocr:
+        condition: service_healthy
+      vllm-memory:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/nexusrag
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_WEBHOOK_ENABLED: "false"
+      NEO4J_URI: bolt://neo4j:7687
+      WORKER_TYPE: parse
+      AUTO_CREATE_TABLES: "false"
+      CUDA_VISIBLE_DEVICES: "1"
+      HRAG_EAGER_MODEL_LOADING: "false"
+      NEXUSRAG_DOCLING_DEVICE: cuda
+      WORKER_DRAIN_TIMEOUT: "30"
+      WORKER_HEALTH_PORT: "8081"
+      HUNYUAN_OCR_API_URL: http://vllm-ocr:8001/v1
+      MEMORY_AGENT_BASE_URL: http://vllm-memory:8088/v1
+    volumes:
+      - nexusrag_uploads:/app/backend/uploads
+      - nexusrag_data:/app/backend/data
+    deploy:
+      replicas: 1
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    stop_grace_period: 60s
+    command: ["python", "-m", "app.workers.runner"]
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    ports:
+      - "8082:8081"
+    labels:
+      com.nexusrag.service: worker-parse
+      com.nexusrag.stack: nexusrag
+
+  # ── Embed workers ───────────────────────────────────────────────────────────
+  # BGE-m3 embedding model → ~1-2GB VRAM
+  # Health server on port 8081
+  worker-embed:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      chromadb:
+        condition: service_started
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/nexusrag
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_WEBHOOK_ENABLED: "false"
+      WORKER_TYPE: embed
+      AUTO_CREATE_TABLES: "false"
+      CUDA_VISIBLE_DEVICES: "1"
+      HRAG_EAGER_MODEL_LOADING: "false"
+      NEXUSRAG_EMBEDDING_DEVICE: cuda
+      WORKER_DRAIN_TIMEOUT: "30"
+      WORKER_HEALTH_PORT: "8081"
+      MEMORY_AGENT_BASE_URL: http://vllm-memory:8088/v1
+      WORKER_EMBED_TIMEOUT: "300"
+      HRAG_CONTEXTUAL_CONCURRENCY: "16"
+    volumes:
+      - nexusrag_uploads:/app/backend/uploads
+      - nexusrag_data:/app/backend/data
+    deploy:
+      replicas: 1
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
+    stop_grace_period: 60s
+    command: ["python", "-m", "app.workers.runner"]
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    ports:
+      - "8083:8081"
+    labels:
+      com.nexusrag.service: worker-embed
+      com.nexusrag.stack: nexusrag
+
+  # ── Caption workers ─────────────────────────────────────────────────────────
+  # Vision LLM captions via HTTP calls to vLLM (no GPU model loaded in worker)
+  # Workers call LLM provider via HTTP — GPU not used by caption worker process
+  # Health server on port 8081
+  worker-caption:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      chromadb:
+        condition: service_started
+      minio:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/nexusrag
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_WEBHOOK_ENABLED: "false"
+      WORKER_TYPE: caption
+      AUTO_CREATE_TABLES: "false"
+      CUDA_VISIBLE_DEVICES: "1"
+      WORKER_DRAIN_TIMEOUT: "30"
+      WORKER_HEALTH_PORT: "8081"
+    volumes:
+      - nexusrag_uploads:/app/backend/uploads
+      - nexusrag_data:/app/backend/data
+    stop_grace_period: 60s
+    command: ["python", "-m", "app.workers.runner"]
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    ports:
+      - "8084:8081"
+    labels:
+      com.nexusrag.service: worker-caption
+      com.nexusrag.stack: nexusrag
+
+  # ── KG workers ─────────────────────────────────────────────────────────────
+  # LightRAG file-based KG extraction (CPU-bound, no GPU model)
+  # GPU assigned for consistency but not used
+  # Health server on port 8081
+  worker-kg:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      vllm-memory:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/nexusrag
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      NEO4J_URI: bolt://neo4j:7687
+      WORKER_TYPE: kg
+      AUTO_CREATE_TABLES: "false"
+      CUDA_VISIBLE_DEVICES: "1"
+      WORKER_DRAIN_TIMEOUT: "30"
+      WORKER_HEALTH_PORT: "8081"
+      LEGAL_KG_LLM_BASE_URL: http://vllm-memory:8088/v1
+    volumes:
+      - nexusrag_data:/app/backend/data
+    stop_grace_period: 60s
+    command: ["python", "-m", "app.workers.runner"]
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    ports:
+      - "8085:8081"
+    labels:
+      com.nexusrag.service: worker-kg
+      com.nexusrag.stack: nexusrag
+
+  # ── Backend API server ─────────────────────────────────────────────────────
+  # Optional: include backend if you want full stack in docker
+  # Comment out if running backend locally (./run_bk.sh)
+  # backend:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.backend
+  #   container_name: nexusrag-backend
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #     rabbitmq:
+  #       condition: service_healthy
+  #     chromadb:
+  #       condition: service_started
+  #     minio:
+  #       condition: service_healthy
+  #     neo4j:
+  #       condition: service_healthy
+  #   env_file: .env
+  #   environment:
+  #     DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/nexusrag
+  #     CHROMA_HOST: chromadb
+  #     CHROMA_PORT: 8000
+  #     RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+  #     MINIO_ENDPOINT: http://minio:9000
+  #     MINIO_WEBHOOK_ENABLED: "false"
+  #     NEO4J_URI: bolt://neo4j:7687
+  #     CUDA_VISIBLE_DEVICES: "1"
+  #   volumes:
+  #     - nexusrag_uploads:/app/backend/uploads
+  #     - nexusrag_data:/app/backend/data
+  #   ports:
+  #     - "8080:8080"
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             device_ids: ["1"]
+  #             capabilities: [gpu]
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 10
+  #     start_period: 30s
+  #   restart: unless-stopped
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # OBSERVABILITY — Loki + Grafana + Promtail
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # ── Loki (all-in-one, ephemeral storage for dev) ───────────────────────
+  loki:
+    image: grafana/loki:3.2.0
+    container_name: nexusrag-loki
+    ports:
+      - "3100:3100"
+    volumes:
+      - nexusrag_loki_data:/var/loki
+    restart: unless-stopped
+
+  # ── Promtail (reads Docker container logs) ──────────────────────────────
+  promtail:
+    image: grafana/promtail:3.2.0
+    container_name: nexusrag-promtail
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - ./infra/promtail:/etc/promtail:ro
+      - nexusrag_promtail_positions:/tmp/promtail
+    command: -config.file=/etc/promtail/config.yml
+    restart: unless-stopped
+    depends_on:
+      loki:
+        condition: service_started
+
+  # ── Grafana (port 3000) ────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: nexusrag-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - nexusrag_grafana_data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+    restart: unless-stopped
+    depends_on:
+      - loki
 
 volumes:
   nexusrag_postgres_data:
@@ -98,3 +556,8 @@ volumes:
   nexusrag_rabbitmq_data:
   nexusrag_minio_data:
   nexusrag_neo4j_data:
+  nexusrag_uploads:
+  nexusrag_data:
+  nexusrag_loki_data:
+  nexusrag_grafana_data:
+  nexusrag_promtail_positions:

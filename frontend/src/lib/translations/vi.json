@@ -543,6 +543,7 @@
     },
     "consumers": "{{count}} consumer",
     "consumers_plural": "{{count}} consumers",
+    "containers": "{{count}}",
     "consumers_label": "Người thực thi",
     "start_success": "Đã chạy {{count}} tiến trình {{type}}",
     "restart_all": "Khởi động lại tất cả",

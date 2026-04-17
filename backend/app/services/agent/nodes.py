@@ -152,6 +152,19 @@ _VALID_INTENTS = {
     "mongo_search_phone",
 }
 
+# Intent classification cache — keyed by hash(message), TTL 60s
+# Skips the memory-agent LLM call for repeated/folded queries within a session.
+import hashlib as _hashlib
+import time as _time
+
+_INTENT_CACHE: dict[str, tuple[dict, float]] = {}
+_CACHE_TTL = 60.0  # seconds
+
+
+def _get_cache_key(message: str) -> str:
+    """Fast cache key: SHA256 truncated to 32 chars."""
+    return _hashlib.sha256(message.encode()).hexdigest()[:32]
+
 
 def _parse_classifier_output(raw: str) -> dict:
     """Parse Qwen3-4B classifier JSON output with safe fallback."""
@@ -315,6 +328,25 @@ async def intent_classifier(state: "AgentState") -> dict:
     if not user_message:
         return {"intent": "search", "rewritten_query": ""}
 
+    # ── Intent classification cache (TTL 60s) ───────────────────────────────
+    cache_key = _get_cache_key(user_message)
+    now = _time.time()
+    cached = _INTENT_CACHE.get(cache_key)
+    if cached is not None:
+        result_dict, cached_at = cached
+        if now - cached_at < _CACHE_TTL:
+            logger.info(f"[intent_classifier] Cache hit for key={cache_key[:8]}…")
+            return {
+                "intent": result_dict["intent"],
+                "rewritten_query": result_dict.get("rewritten_query") or user_message,
+                "original_query": user_message,
+                "write_action": result_dict.get("write_action", ""),
+                "text_input": result_dict.get("text_input", ""),
+            }
+        else:
+            # Expired — remove stale entry
+            _INTENT_CACHE.pop(cache_key, None)
+
     try:
         from app.services.llm import get_memory_agent
         from app.services.llm.types import LLMMessage as _LLMMsg
@@ -364,6 +396,9 @@ async def intent_classifier(state: "AgentState") -> dict:
                 "detail": f"Phân loại: {intent_label}",
             },
         )
+
+        # Cache result for 60s (keyed on exact user message)
+        _INTENT_CACHE[cache_key] = (result, now)
 
         return {
             "intent": result["intent"],

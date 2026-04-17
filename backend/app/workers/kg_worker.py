@@ -16,6 +16,7 @@ Key design decisions:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from sqlalchemy import select
@@ -74,6 +75,21 @@ async def handle_kg(payload: dict) -> None:
             logger.info(f"[kg_worker] doc={msg.document_id} KG ingest done")
             await check_and_finalize(document, db)
 
+        except asyncio.TimeoutError:
+            # asyncio.TimeoutError does NOT inherit from Exception — it bypasses
+            # the except block below. We need to call check_and_finalize() here
+            # so the document transitions out of BUILDING_KG even on timeout.
+            # The timeout handler in connection.py will requeue for retry.
+            logger.warning(f"[kg_worker] doc={msg.document_id} KG ingest timed out")
+            document.kg_done = True
+            document.error_message = "kg_timeout: handler timed out — will retry"
+            try:
+                await db.commit()
+            except asyncio.TimeoutError:
+                # db.commit() timed out too — force rollback so check_and_finalize can still run
+                await db.rollback()
+            # Always call check_and_finalize even on commit timeout
+            await check_and_finalize(document, db)
         except Exception as e:
             logger.error(
                 f"[kg_worker] doc={msg.document_id} KG ingest FAILED: {e}",

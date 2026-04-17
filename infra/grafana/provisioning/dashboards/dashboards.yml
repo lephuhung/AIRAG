@@ -1,0 +1,9 @@
+apiVersion: 1
+
+providers:
+  - name: 'NexusRAG'
+    orgId: 1
+    folder: 'NexusRAG'
+    type: file
+    options:
+      path: /etc/grafana/provisioning/dashboards

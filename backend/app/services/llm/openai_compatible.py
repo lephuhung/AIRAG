@@ -16,8 +16,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from typing import AsyncGenerator, Optional
 
+import httpx
 import numpy as np
 
 from app.services.llm.base import EmbeddingProvider, LLMProvider
@@ -27,6 +29,22 @@ logger = logging.getLogger(__name__)
 
 # Strip <think>...</think> blocks
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+
+
+# Connection pool limits (shared singleton, thread-safe)
+_HTTPX_LIMITS = None
+_HTTPX_LOCK = threading.Lock()
+
+
+def _get_httpx_limits():
+    """Get or create shared httpx connection pool limits."""
+    global _HTTPX_LIMITS
+    if _HTTPX_LIMITS is None:
+        with _HTTPX_LOCK:
+            if _HTTPX_LIMITS is None:
+                import httpx
+                _HTTPX_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20, keepalive_expiry=120.0)
+    return _HTTPX_LIMITS
 
 
 def _to_openai_messages(
@@ -66,14 +84,30 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._api_key = api_key
+        self._sync_client_instance: Optional[object] = None
+        self._async_client_instance: Optional[object] = None
 
     def _sync_client(self):
-        from openai import OpenAI
-        return OpenAI(api_key=self._api_key, base_url=self._base_url)
+        if self._sync_client_instance is None:
+            from openai import OpenAI
+            limits = _get_httpx_limits()
+            self._sync_client_instance = OpenAI(
+                api_key=self._api_key,
+                base_url=self._base_url,
+                http_client=httpx.Client(limits=limits),
+            )
+        return self._sync_client_instance
 
     def _async_client(self):
-        from openai import AsyncOpenAI
-        return AsyncOpenAI(api_key=self._api_key, base_url=self._base_url)
+        if self._async_client_instance is None:
+            from openai import AsyncOpenAI
+            limits = _get_httpx_limits()
+            self._async_client_instance = AsyncOpenAI(
+                api_key=self._api_key,
+                base_url=self._base_url,
+                http_client=httpx.AsyncClient(limits=limits),
+            )
+        return self._async_client_instance
 
     @staticmethod
     def _strip_think(text: str) -> str:
@@ -399,10 +433,33 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
         self._model = model
         self._api_key = api_key
         self._dimension = dimension
+        self._sync_client: Optional[object] = None
+        self._async_client: Optional[object] = None
+
+    def _get_sync_client(self):
+        if self._sync_client is None:
+            from openai import OpenAI
+            limits = _get_httpx_limits()
+            self._sync_client = OpenAI(
+                api_key=self._api_key,
+                base_url=self._base_url,
+                http_client=httpx.Client(limits=limits),
+            )
+        return self._sync_client
+
+    def _get_async_client(self):
+        if self._async_client is None:
+            from openai import AsyncOpenAI
+            limits = _get_httpx_limits()
+            self._async_client = AsyncOpenAI(
+                api_key=self._api_key,
+                base_url=self._base_url,
+                http_client=httpx.AsyncClient(limits=limits),
+            )
+        return self._async_client
 
     def embed_sync(self, texts: list[str]) -> np.ndarray:
-        from openai import OpenAI
-        client = OpenAI(api_key=self._api_key, base_url=self._base_url)
+        client = self._get_sync_client()
         clean = [t.strip() or "[empty]" for t in texts]
         try:
             response = client.embeddings.create(model=self._model, input=clean)
@@ -416,8 +473,7 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
             return np.zeros((len(texts), self._dimension), dtype=np.float32)
 
     async def embed(self, texts: list[str]) -> np.ndarray:
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=self._api_key, base_url=self._base_url)
+        client = self._get_async_client()
         clean = [t.strip() or "[empty]" for t in texts]
         try:
             response = await client.embeddings.create(model=self._model, input=clean)

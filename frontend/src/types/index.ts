@@ -488,6 +488,7 @@ export interface WorkerOverview {
   pipeline_summary: PipelineSummary;
   active_workers: Record<string, number>;
   managed_workers: Record<string, number>;
+  container_workers: Record<string, number>;
   rabbitmq_connected: boolean;
 }
 
@@ -514,6 +515,21 @@ export interface WorkerHealthCheck {
       cluster?: string;
       error?: string;
       queue_totals?: Record<string, number>;
+    };
+    worker_containers: {
+      status: string;
+      workers: Record<string, {
+        instances: Array<{
+          port: number;
+          status: "healthy" | "unreachable" | "offline";
+          worker_type?: string;
+          uptime_seconds?: number;
+          error?: string;
+          code?: number;
+        }>;
+        healthy_count: number;
+        total: number;
+      }>;
     };
     queues: Record<string, {
       status: string;

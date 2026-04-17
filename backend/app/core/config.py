@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     OLLAMA_MODEL: str = Field(default="gemma3:12b")
     OLLAMA_ENABLE_THINKING: bool = Field(default=False)
     MEMORY_AGENT_MODEL: str = Field(default="qwen-memory")
-    MEMORY_AGENT_BASE_URL: str = Field(default="http://localhost:8082/v1")
+    MEMORY_AGENT_BASE_URL: str = Field(default="http://localhost:8088/v1")
     MEMORY_AGENT_API_KEY: str = Field(default="sk-nexusrag")
     MEMORY_AGENT_LOCAL: bool = Field(default=False)
     MEMORY_AGENT_GPU_UTILIZATION: float = Field(default=0.15)
@@ -191,8 +191,8 @@ class Settings(BaseSettings):
     WORKER_PREFETCH_CAPTION: int = Field(default=1)
     WORKER_PREFETCH_KG: int = Field(default=1)
     WORKER_KG_POLL_INTERVAL: int = Field(
-        default=30
-    )  # seconds — how often to scan for new workspaces
+        default=60
+    )  # seconds — how often to scan for new workspaces (adaptive: 300s when idle)
     # Timeout per message handler (seconds). Parse workers need higher timeout
     # for large scanned PDFs with OCR (120s recommended). Other workers use
     # shorter timeouts since they do not perform LLM inference on large files.
@@ -227,7 +227,7 @@ class Settings(BaseSettings):
     # NEO4J_PASSWORD above) for graph storage.
     # LLM used by Graphiti for entity/fact extraction from conversations.
     # Defaults to the memory agent (Qwen3-4B) — no extra model needed.
-    GRAPHITI_LLM_BASE_URL: str = Field(default="http://localhost:8082/v1")
+    GRAPHITI_LLM_BASE_URL: str = Field(default="http://localhost:8088/v1")
     GRAPHITI_LLM_MODEL: str = Field(default="qwen-memory")
     GRAPHITI_LLM_API_KEY: str = Field(default="sk-nexusrag")
     # Embedding dimension — must match HRAG_EMBEDDING_MODEL (BAAI/bge-m3 = 1024).

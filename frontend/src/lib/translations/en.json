@@ -486,6 +486,7 @@
     "management": "Worker Management",
     "consumers": "{{count}} consumer",
     "consumers_plural": "{{count}} consumers",
+    "containers": "{{count}}",
     "start_success": "Started {{count}} {{type}} workers",
     "restart_all": "Restart All",
     "restart_all_success": "All system workers have been restarted",

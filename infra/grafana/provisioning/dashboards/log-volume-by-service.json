@@ -1,0 +1,61 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "sum by (service) (rate({stack=\"nexusrag\"} | logproto.LineCounter[])[5m]))",
+          "legendFormat": "{{service}}"
+        }
+      ],
+      "title": "Log Volume by Service (bytes/s)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "topk(5, sum by (service) (rate({stack=\"nexusrag\"} |= \"ERROR\" | logproto.LineCounter[])[5m])))",
+          "legendFormat": "{{service}} errors/s"
+        }
+      ],
+      "title": "Top 5 Services by Error Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "datasource": { "type": "loki", "uid": "loki" },
+          "expr": "sum by (service) (rate({stack=\"nexusrag\"} | logproto.LineCounter[])[1h]))",
+          "legendFormat": "{{service}} logs/hr"
+        }
+      ],
+      "title": "Log Throughput by Service",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["nexusrag", "loki"],
+  "templating": {
+    "list": []
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "title": "NexusRAG - Log Volume",
+  "uid": "nexusrag-log-volume",
+  "version": 1
+}
