@@ -201,6 +201,13 @@ class DeepRetriever:
                 raw_chunks, raw_citations, bm25_results
             )
 
+        # Post-RRF recency boost: favor newer documents when relevance is similar
+        # This boosts both vector and BM25 results based on published_date
+        if settings.HRAG_RECENTNESS_BOOST > 0:
+            raw_chunks, raw_citations = self._apply_recency_boost(
+                raw_chunks, raw_citations
+            )
+
         # Rerank: cross-encoder scoring for precision
         chunks, citations = await asyncio.to_thread(
             self._rerank_chunks, question, raw_chunks, raw_citations, top_k
@@ -368,6 +375,80 @@ class DeepRetriever:
             )
 
         return merged_chunks, merged_citations
+
+    def _apply_recency_boost(
+        self,
+        chunks: list[EnrichedChunk],
+        citations: list[Citation],
+    ) -> tuple[list[EnrichedChunk], list[Citation]]:
+        """
+        Apply recency boost to chunks based on published_date metadata.
+        Boost factor = HRAG_RECENTNESS_BOOST * exp(-days_since / decay_days)
+        Newer documents get higher boost.
+        """
+        import math
+        from datetime import datetime
+
+        def parse_vietnamese_date(date_str: str):
+            """Parse Vietnamese date formats: '15/01/2026', '01/2026', '2026'."""
+            if not date_str:
+                return None
+            date_str = date_str.strip()
+            for fmt in ("%d/%m/%Y", "%d-%m-%Y"):
+                try:
+                    return datetime.strptime(date_str, fmt)
+                except ValueError:
+                    pass
+            for fmt in ("%m/%Y", "%m-%Y"):
+                try:
+                    return datetime.strptime(date_str, fmt)
+                except ValueError:
+                    pass
+            try:
+                return datetime(int(date_str[:4]), 1, 1)
+            except (ValueError, IndexError):
+                return None
+
+        def compute_boost(date_str: str) -> float:
+            if not date_str:
+                return 0.0
+            pub_date = parse_vietnamese_date(date_str)
+            if pub_date is None:
+                return 0.0
+            try:
+                now = datetime.now()
+                days_since = (now - pub_date).days
+                if days_since < 0:
+                    days_since = 0
+                boost = math.exp(-days_since / settings.HRAG_RECENTNESS_DECAY_DAYS)
+                return boost
+            except Exception:
+                return 0.0
+
+        boosted_chunks = []
+        boosted_citations = []
+        boost_factor = settings.HRAG_RECENTNESS_BOOST
+
+        for chunk, citation in zip(chunks, citations):
+            # Get published_date from vector store metadata
+            try:
+                results = self.vector_store.collection.get(
+                    ids=[f"doc_{chunk.document_id}_chunk_{chunk.chunk_index}"],
+                    include=["metadatas"]
+                )
+                meta = results.get("metadatas", [{}])[0] if results.get("metadatas") else {}
+                date_str = meta.get("published_date", "") if meta else ""
+            except Exception:
+                date_str = ""
+
+            recency_boost = compute_boost(date_str)
+            # Initialize score if not set, then apply boost
+            base_score = chunk.score if chunk.score else 0.5  # default score if not set
+            chunk.score = base_score * (1 + boost_factor * recency_boost)
+            boosted_chunks.append(chunk)
+            boosted_citations.append(citation)
+
+        return boosted_chunks, boosted_citations
 
     def _vector_query(
         self,

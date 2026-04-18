@@ -216,6 +216,8 @@ class HRAGService:
                         "image_urls": "|".join(
                             _img_url_map.get(iid, "") for iid in c.image_refs
                         ) if c.image_refs else "",
+                        # Recency boost: published date for date-aware scoring
+                        "published_date": document.published_date or "",
                     }
                     for c in parsed.chunks
                 ]

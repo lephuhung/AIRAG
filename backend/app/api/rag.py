@@ -113,6 +113,10 @@ async def query_documents(
     # Expand abbreviations in the query question
     request.question = await AbbreviationService.expand_ab_in_text(db, request.question)
 
+    # Expand common Vietnamese legal terms for better retrieval
+    from app.services.query_expander import expand_legal_terms
+    request.question = expand_legal_terms(request.question)
+
     # Try deep query if available
     from app.services.hrag_service import HRAGService
     if isinstance(rag_service, HRAGService) and request.mode != "vector_only":

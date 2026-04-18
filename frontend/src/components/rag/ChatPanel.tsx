@@ -2951,15 +2951,15 @@ export const ChatPanel = memo(function ChatPanel({
           prev.map((m) =>
             m.id === assistantId
               ? {
-                ...finalMsg,
-                id: finalMsg.id, // Use the official server-assigned ID from finalMsg
-                isStreaming: false,
-                agentSteps: finalMsg.agentSteps?.length
-                  ? finalMsg.agentSteps
-                  : agentStepsRef.current.length > 0
-                    ? agentStepsRef.current
-                    : m.agentSteps,
-              }
+                  ...finalMsg,
+                  id: finalMsg.id,
+                  isStreaming: false,
+                  agentSteps: finalMsg.agentSteps?.length
+                    ? finalMsg.agentSteps
+                    : agentStepsRef.current.length > 0
+                      ? agentStepsRef.current
+                      : m.agentSteps,
+                }
               : m,
           ),
         );

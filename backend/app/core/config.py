@@ -117,6 +117,12 @@ class Settings(BaseSettings):
     HRAG_RRF_K: int = Field(
         default=60
     )  # RRF constant (higher = smoother, 60 is standard)
+    # BM25 parameters tuned for Vietnamese legal text (long sentences, sparse keywords)
+    HRAG_BM25_K1: float = Field(default=2.0)  # higher = more weight to term frequency variation
+    HRAG_BM25_B: float = Field(default=0.5)  # lower = less penalty for document length
+    # Recency boost: prefer newer documents based on published_date
+    HRAG_RECENTNESS_BOOST: float = Field(default=0.3)  # 0=disabled, 1=full weight
+    HRAG_RECENTNESS_DECAY_DAYS: int = Field(default=365)  # half-life in days
 
     # Knowledge Graph
     HRAG_KG_LANGUAGE: str = Field(default="Vietnamese")

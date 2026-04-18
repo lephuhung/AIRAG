@@ -24,10 +24,12 @@ Performance:
 from __future__ import annotations
 
 import logging
+import math
 import re
 import threading
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -38,6 +40,54 @@ logger = logging.getLogger(__name__)
 # Simple tokeniser: lowercase + split on non-word chars
 # Works well for Vietnamese (space-segmented) and Latin text.
 _TOKEN_RE = re.compile(r"[^\w]+", re.UNICODE)
+
+
+def _parse_vietnamese_date(date_str: str) -> datetime | None:
+    """Parse Vietnamese date formats: '15/01/2026', '01/2026', '2026'."""
+    if not date_str:
+        return None
+    date_str = date_str.strip()
+    # Try full date: DD/MM/YYYY
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            pass
+    # Try month/year: MM/YYYY
+    for fmt in ("%m/%Y", "%m-%Y"):
+        try:
+            return datetime.strptime(date_str, fmt)
+        except ValueError:
+            pass
+    # Try year only: YYYY
+    try:
+        return datetime(int(date_str[:4]), 1, 1)
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def _compute_recency_boost(date_str: str, decay_days: int = 365) -> float:
+    """
+    Compute recency boost factor based on published_date.
+    Returns exp(-days_since / decay_days), scaled to [0, 1].
+    Newer documents get higher boost (closer to 1.0).
+    """
+    if not date_str:
+        return 0.0  # No date = no boost
+    pub_date = _parse_vietnamese_date(date_str)
+    if pub_date is None:
+        return 0.0
+    try:
+        now = datetime.now()
+        days_since = (now - pub_date).days
+        if days_since < 0:
+            days_since = 0  # Future dates get max boost
+        # exponential decay: boost = exp(-days / decay_days)
+        boost = math.exp(-days_since / decay_days)
+        return boost
+    except Exception:
+        return 0.0
 
 
 def _tokenize(text: str) -> list[str]:
@@ -67,6 +117,7 @@ def _build_index(vector_store: VectorStore) -> _IndexState:
     This is a synchronous, CPU-bound call — run inside asyncio.to_thread().
     """
     from rank_bm25 import BM25Okapi
+    from app.core.config import settings
 
     logger.info(f"[bm25] Building BM25 index for collection '{vector_store.collection_name}'")
 
@@ -83,10 +134,11 @@ def _build_index(vector_store: VectorStore) -> _IndexState:
     else:
         corpus_tokenized = [_tokenize(doc) for doc in documents]
 
-    bm25 = BM25Okapi(corpus_tokenized)
+    # Tuned BM25 parameters for Vietnamese legal text
+    bm25 = BM25Okapi(corpus_tokenized, k1=settings.HRAG_BM25_K1, b=settings.HRAG_BM25_B)
     doc_count = len(ids)
 
-    logger.info(f"[bm25] Index built: {doc_count} chunks")
+    logger.info(f"[bm25] Index built: {doc_count} chunks (k1={settings.HRAG_BM25_K1}, b={settings.HRAG_BM25_B})")
     return _IndexState(
         bm25=bm25,
         ids=ids,
@@ -150,7 +202,12 @@ def bm25_search(
 
     scores = state.bm25.get_scores(tokens)
 
-    # Pair scores with indices, apply optional document_id filter
+    # Apply recency boost to BM25 scores
+    from app.core.config import settings
+    boost_factor = settings.HRAG_RECENTNESS_BOOST
+    decay_days = settings.HRAG_RECENTNESS_DECAY_DAYS
+
+    # Pair scores with indices, apply optional document_id filter and recency boost
     scored = []
     for idx, score in enumerate(scores):
         if score <= 0:
@@ -158,6 +215,11 @@ def bm25_search(
         meta = state.metadatas[idx] if idx < len(state.metadatas) else {}
         if document_ids and meta.get("document_id") not in [str(doc_id) for doc_id in document_ids]:
             continue
+        # Apply recency boost: newer docs get higher scores
+        if boost_factor > 0:
+            date_str = meta.get("published_date", "")
+            recency_boost = _compute_recency_boost(date_str, decay_days)
+            score = score * (1 + boost_factor * recency_boost)
         scored.append((idx, score))
 
     # Sort by score descending, take top_n
