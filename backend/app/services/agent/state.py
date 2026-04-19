@@ -35,9 +35,9 @@ class AgentState(TypedDict):
     image_parts: Annotated[list, lambda a, b: a + b]  # raw bytes for vision LLM
     kg_summaries: Annotated[list, lambda a, b: a + b]  # KG insight strings
 
-    # Shared citation ID registry — plain set, nodes mutate in-place
-    # (LangGraph copies state per node, so we use a dict wrapper trick)
-    existing_citation_ids: set
+    # Shared citation ID registry — dict wrapper (set-like, survives LangGraph immutability)
+    # Keys are citation_id strings, values are True — avoids the set-mutation issue
+    existing_citation_ids: dict
 
     # ── Agent control ─────────────────────────────────────────────────────────
     intent: str  # "greeting" | "search" | "list_docs" | "summarize" | "kg_query"
@@ -105,7 +105,7 @@ DEFAULT_STATE: dict = {
     "images": [],
     "image_parts": [],
     "kg_summaries": [],
-    "existing_citation_ids": set(),
+    "existing_citation_ids": {},
     "intent": "search",
     "rewritten_query": "",
     "original_query": "",

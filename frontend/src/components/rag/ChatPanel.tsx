@@ -174,23 +174,23 @@ function CitationLink({
   const label = `${docName}-P.${source.page_no || "?"}`;
 
   return (
-    <span className="inline-flex gap-0.5 mx-0.5 align-middle">
+    <div className="inline-flex gap-0.5 mx-0.5 align-middle">
       <button
         onClick={handleContentClick}
+        aria-label={t("chat.view_source", { name: doc?.original_filename || "unknown", page: source.page_no })}
         className="inline-flex items-center gap-0.5 h-[18px] px-1.5 text-[10px] font-medium rounded-full bg-primary/12 text-primary hover:bg-primary/20 transition-colors whitespace-nowrap"
-        title={t("chat.view_source", { name: doc?.original_filename || "unknown", page: source.page_no })}
       >
         <FileText className="w-2.5 h-2.5 flex-shrink-0" />
         <span>{label}</span>
       </button>
       <button
         onClick={handleKGClick}
+        aria-label={t("chat.highlight_kg")}
         className="inline-flex items-center justify-center w-[18px] h-[18px] text-[10px] font-bold rounded-full bg-purple-400/15 text-purple-500 dark:text-purple-400 hover:bg-purple-400/25 transition-colors"
-        title={t("chat.highlight_kg")}
       >
         <Brain className="w-2.5 h-2.5" />
       </button>
-    </span>
+    </div>
   );
 }
 
@@ -462,11 +462,11 @@ function CodeBlock({
       )}
       <button
         onClick={handleCopy}
+        aria-label={t("chat.copy_code")}
         className={cn(
           "absolute top-2 left-2 p-1 rounded-md text-muted-foreground/50 hover:text-muted-foreground transition-all opacity-0 group-hover:opacity-100 z-10",
           isDark ? "bg-white/5 hover:bg-white/10" : "bg-black/5 hover:bg-black/10"
         )}
-        title={t("chat.copy_code")}
       >
         {copied ? (
           <ClipboardCheck className="w-3 h-3 text-emerald-500" />
@@ -1087,7 +1087,7 @@ function AssistantMessageFooter({
                 ? "text-emerald-500 bg-emerald-500/5"
                 : "text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted/60",
             )}
-            title={t("chat.copy_text")}
+            aria-label={t("chat.copy_text")}
           >
             {copiedMode === "text" ? (
               <ClipboardCheck className="w-3.5 h-3.5" />
@@ -1103,7 +1103,7 @@ function AssistantMessageFooter({
                 ? "text-emerald-500 bg-emerald-500/5"
                 : "text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted/60",
             )}
-            title={t("chat.copy_markdown")}
+            aria-label={t("chat.copy_markdown")}
           >
             {copiedMode === "markdown" ? (
               <ClipboardCheck className="w-3.5 h-3.5" />
@@ -2158,6 +2158,7 @@ function ChatInputArea({
                 <button
                   type="button"
                   onClick={() => onCancel()}
+                  aria-label={t("chat.cancel") || "Stop"}
                   className="w-10 h-10 rounded-full flex items-center justify-center bg-destructive/10 text-destructive hover:bg-destructive/15 transition-all shadow-sm ring-1 ring-destructive/20 cursor-pointer"
                 >
                   <Square className="w-3.5 h-3.5 fill-current" />
@@ -2174,6 +2175,7 @@ function ChatInputArea({
                 <button
                   type="button"
                   onClick={onMic}
+                  aria-label={t("chat.voice")}
                   className="w-10 h-10 rounded-full flex items-center justify-center text-muted-foreground/60 hover:text-primary hover:bg-primary/5 transition-all cursor-default"
                   title={t("chat.voice")}
                 >
@@ -2663,9 +2665,15 @@ export const ChatPanel = memo(function ChatPanel({
       const serverId = stream.aiMessageId;
       const localId = streamingMsgIdRef.current;
       if (serverId !== localId) {
-        setMessages((prev) =>
-          prev.map((m) => (m.id === localId ? { ...m, id: serverId } : m))
-        );
+        setMessages((prev) => {
+          // Find and update the message by LOCAL id, then update ref to server id
+          const idx = prev.findIndex((m) => m.id === localId);
+          if (idx === -1) return prev;
+          const updated = [...prev];
+          updated[idx] = { ...updated[idx], id: serverId };
+          return updated;
+        });
+        // Update ref to server ID so sync effect can find it
         streamingMsgIdRef.current = serverId;
       }
     }
@@ -2951,18 +2959,20 @@ export const ChatPanel = memo(function ChatPanel({
           prev.map((m) =>
             m.id === assistantId
               ? {
-                  ...finalMsg,
-                  id: finalMsg.id,
-                  isStreaming: false,
-                  agentSteps: finalMsg.agentSteps?.length
-                    ? finalMsg.agentSteps
-                    : agentStepsRef.current.length > 0
-                      ? agentStepsRef.current
-                      : m.agentSteps,
-                }
+                ...finalMsg,
+                id: finalMsg.id,
+                isStreaming: false, // Ensure streaming is false when finalizing
+                agentSteps: finalMsg.agentSteps?.length
+                  ? finalMsg.agentSteps
+                  : agentStepsRef.current.length > 0
+                    ? agentStepsRef.current
+                    : m.agentSteps,
+              }
               : m,
           ),
         );
+        // Only clear streaming ref AFTER setMessages completes and isStreaming is false
+        // This prevents race condition where sync effect could update wrong message
       } else if (stream.error) {
         toast.error(t("chat.failed", { error: stream.error }));
         setMessages((prev) =>
@@ -2976,6 +2986,7 @@ export const ChatPanel = memo(function ChatPanel({
               : m,
           ),
         );
+        streamingMsgIdRef.current = null;
       } else {
         // Cancelled — keep partial content
         setMessages((prev) =>
@@ -2983,8 +2994,8 @@ export const ChatPanel = memo(function ChatPanel({
             m.id === assistantId ? { ...m, isStreaming: false } : m,
           ),
         );
+        streamingMsgIdRef.current = null;
       }
-      streamingMsgIdRef.current = null;
     },
     [input, messages, stream, thinkingSupported, enableThinking, forceSearch, scrollUserMsgToTop, sessionId, navigate, createSession, t, attachedFiles],
   );
@@ -2992,9 +3003,12 @@ export const ChatPanel = memo(function ChatPanel({
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (showMentionDropdown) {
       if (e.key === "Escape") {
-        e.preventDefault();
-        setShowMentionDropdown(false);
-        setMentionSearch("");
+        if (showMentionDropdown) {
+          setShowMentionDropdown(false);
+          setMentionSearch("");
+        } else if (input.trim()) {
+          setInput("");
+        }
         return;
       }
       if (e.key === "ArrowDown") {

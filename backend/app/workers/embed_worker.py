@@ -15,6 +15,7 @@ Responsibilities:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -37,10 +38,20 @@ async def handle_embed(payload: dict) -> None:
     logger.info(f"[embed_worker] doc={msg.document_id}")
 
     async with async_session_maker() as db:
-        result = await db.execute(select(Document).where(Document.id == msg.document_id))
+        result = await db.execute(
+            select(Document)
+            .where(Document.id == msg.document_id)
+            .with_for_update()
+        )
         document = result.scalar_one_or_none()
         if document is None:
             logger.error(f"[embed_worker] doc={msg.document_id} not found")
+            return
+
+        # Idempotency: if embed_done=True the message was already processed
+        # (e.g. redelivered after a crash-before-ack). Skip silently.
+        if document.embed_done:
+            logger.info(f"[embed_worker] doc={msg.document_id} already has embed_done=True — skipping")
             return
 
         try:
@@ -115,7 +126,7 @@ async def handle_embed(payload: dict) -> None:
             embedder     = get_embedding_service()
             vector_store = get_vector_store(msg.workspace_id)
 
-            embeddings = embedder.embed_texts(embed_texts)
+            embeddings = await asyncio.to_thread(embedder.embed_texts, embed_texts)
 
             ids = [
                 f"doc_{msg.document_id}_chunk_{c['chunk_index']}"

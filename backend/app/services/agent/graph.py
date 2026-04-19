@@ -6,7 +6,7 @@ Builds and compiles the NexusRAG chat StateGraph.
 
 Graph topology:
     START
-      → abbr_expander              ← NEW: expand abbreviations immediately
+      → abbr_expander
       → memory_recall
       → intent_classifier
       → [direct_answer | write_executor | agent_rag_executor]
@@ -27,7 +27,7 @@ import logging
 
 from langgraph.graph import StateGraph, START, END
 
-from app.services.agent.state import AgentState, VALID_INTENTS
+from app.services.agent.state import AgentState
 from app.services.agent.nodes import (
     memory_recall,
     intent_classifier,

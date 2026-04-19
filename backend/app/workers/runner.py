@@ -102,6 +102,12 @@ async def _run_kg_worker() -> None:
     active_workspaces: set[int] = set()
     consumer_tasks: dict[int, asyncio.Task] = {}  # workspace_id -> consumer task
 
+    # Circuit breaker for polling failures
+    _circuit_open: bool = False
+    _circuit_failures: int = 0
+    _CIRCUIT_THRESHOLD: int = 3
+    _CIRCUIT_EXTENDED_INTERVAL: int = 120
+
     async def _start_consumer_for(wid: int) -> None:
         """Start (or restart) a consumer for a single workspace, cancelling any existing task."""
         if wid in consumer_tasks:
@@ -144,7 +150,10 @@ async def _run_kg_worker() -> None:
         slow_poll = 300  # 5 min when no workspaces
 
         while True:
-            poll_interval = fast_poll if active_workspaces else slow_poll
+            if _circuit_open:
+                poll_interval = _CIRCUIT_EXTENDED_INTERVAL
+            else:
+                poll_interval = fast_poll if active_workspaces else slow_poll
             await asyncio.sleep(poll_interval)
             try:
                 async with async_session_maker() as db:
@@ -201,7 +210,20 @@ async def _run_kg_worker() -> None:
                     except Exception as poll_err:
                         logger.debug(f"[kg_runner] Queue health check failed for {queue_name}: {poll_err}")
 
+                # Reset circuit breaker on successful poll
+                if _circuit_open and _circuit_failures > 0:
+                    logger.info(f"[kg_runner] Circuit breaker CLOSED — restored normal polling")
+                    _circuit_open = False
+                    _circuit_failures = 0
+
             except Exception as e:
+                _circuit_failures += 1
+                if _circuit_failures >= _CIRCUIT_THRESHOLD:
+                    _circuit_open = True
+                    logger.warning(
+                        f"[kg_runner] Circuit breaker OPEN — polling every "
+                        f"{_CIRCUIT_EXTENDED_INTERVAL}s (consecutive failures: {_circuit_failures})"
+                    )
                 logger.warning(f"[kg_runner] Workspace poll failed: {e}")
 
     # ── Initial startup: consume all existing workspaces ───────────────────

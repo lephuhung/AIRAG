@@ -46,10 +46,20 @@ async def handle_caption(payload: dict) -> None:
     logger.info(f"[caption_worker] doc={msg.document_id}")
 
     async with async_session_maker() as db:
-        result = await db.execute(select(Document).where(Document.id == msg.document_id))
+        result = await db.execute(
+            select(Document)
+            .where(Document.id == msg.document_id)
+            .with_for_update()
+        )
         document = result.scalar_one_or_none()
         if document is None:
             logger.error(f"[caption_worker] doc={msg.document_id} not found")
+            return
+
+        # Idempotency: if captions_done=True the message was already processed
+        # (e.g. redelivered after a crash-before-ack). Skip silently.
+        if document.captions_done:
+            logger.info(f"[caption_worker] doc={msg.document_id} already has captions_done=True — skipping")
             return
 
         has_images  = settings.HRAG_ENABLE_IMAGE_CAPTIONING
@@ -316,7 +326,7 @@ async def _reenrich_embeddings(
 
     ids   = list(updated_texts.keys())
     texts = list(updated_texts.values())
-    new_embeddings = embedder.embed_texts(texts)
+    new_embeddings = await asyncio.to_thread(embedder.embed_texts, texts)
 
     # ChromaDB upsert — update existing vectors with enriched text
     vector_store.update_documents(ids=ids, embeddings=new_embeddings, documents=texts)

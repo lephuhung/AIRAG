@@ -161,7 +161,7 @@ async def _ensure_retry_queues(channel: aio_pika.Channel) -> None:
                     "x-message-ttl": delay_sec * 1000,  # ms
                     # DLX directly to EXCHANGE_KG so expired message routes back
                     # to hrag.kg.{workspace_id} using the original routing key
-                    "x-dead-letter-exchange": EXCHANGE_KG,
+                    "x-dead-letter-exchange": RETRY_EXCHANGE,
                 },
             )
             # Bind so publisher can publish directly by queue name
