@@ -55,6 +55,7 @@ TOOL_REGISTRY: dict[str, str] = {
     "search_people_by_name": "search for persons by their full name or partial name",
     "search_people_by_bhxh": "search for a person by their BHXH (Bảo hiểm xã hội) number",
     "search_people_by_phone": "search for persons by their phone number",
+    "search_people_advanced": "search for persons using combinations of exact/partial information like Name + Date of birth + Address/Hometown",
 }
 
 
@@ -850,4 +851,21 @@ async def search_people_by_phone(phone: str, limit: int = 10) -> dict:
             "count": 0,
             "persons": [],
             "display": f"Lỗi tìm kiếm SĐT: {e}",
+        }
+
+async def search_people_advanced(criteria: dict, limit: int = 10) -> dict:
+    """
+    Search for persons by multiple criteria (Name + DoB + Address + etc).
+    """
+    from app.services.mongo_people_service import search_by_advanced as _svc
+
+    try:
+        return await _svc(criteria, limit=limit)
+    except Exception as e:
+        logger.error(f"[tool:search_people_advanced] Failed: {e}")
+        return {
+            "found": False,
+            "count": 0,
+            "persons": [],
+            "display": f"Lỗi tìm kiếm phức tạp: {e}",
         }

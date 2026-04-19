@@ -149,7 +149,7 @@ async def langgraph_chat_stream(
     Produces identical SSE output — frontend needs no changes.
     """
     from app.core.config import settings
-    from app.services.agent.graph import get_agent_graph
+    from app.services.agents.supervisor import get_supervisor_graph
     from app.services.agent.streaming import stream_agent_to_sse, build_initial_state
 
     primary_id = workspace_ids[0] if workspace_ids else None
@@ -213,7 +213,7 @@ async def langgraph_chat_stream(
     collected_steps: list[dict] = []
     step_counter = 0
 
-    graph = get_agent_graph()
+    graph = get_supervisor_graph()
 
     async for sse_str in stream_agent_to_sse(graph, initial_state):
         yield sse_str

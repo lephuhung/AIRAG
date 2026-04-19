@@ -525,7 +525,7 @@ async def chat_stream_session(
             final_potential_abbreviations: list = []
 
             try:
-                from app.services.agent.graph import get_agent_graph
+                from app.services.agents.supervisor import get_supervisor_graph as get_agent_graph
                 from app.services.agent.streaming import (
                     stream_agent_to_sse,
                     build_initial_state,

@@ -371,6 +371,115 @@ async def _search_multi(
 
 
 # ============================================================================
+# Advanced (Multi-field) search functions
+# ============================================================================
+
+def _query_single_schema_advanced_sync(
+    collection_name: str,
+    collection,
+    query_fields_dict: dict[str, str],
+    criteria: dict[str, str],
+) -> tuple[str, list[dict]]:
+    """
+    Perform a multi-field (AND) query on a single schema synchronously.
+    """
+    try:
+        and_conditions = []
+        for key, value in criteria.items():
+            if not value:
+                continue
+            mapped_field = query_fields_dict.get(key)
+            if not mapped_field:
+                continue
+            
+            if key == "phone":
+                norm = _normalize_phone(value)
+                and_conditions.append({mapped_field: norm})
+            elif key == "name":
+                # Tìm kiếm CHÍNH XÁC tên (không phân biệt hoa thường)
+                # Dùng ^ và $ để khớp toàn bộ chuỗi, tránh Nguyễn Văn A khớp Nguyễn Văn Anh
+                and_conditions.append({mapped_field: {"$regex": f"^{re.escape(value)}$", "$options": "i"}})
+            else:
+                # Các trường khác (dob, address) vẫn dùng regex 'chứa' 
+                # vì người dùng có thể chỉ nhập năm sinh hoặc một phần địa chỉ
+                and_conditions.append({mapped_field: {"$regex": re.escape(value), "$options": "i"}})
+        
+        if not and_conditions:
+            return collection_name, []
+            
+        and_query = {"$and": and_conditions}
+        cursor = collection.find(and_query).limit(10)
+        docs = cursor.to_list(length=10)
+        return collection_name, docs
+
+    except Exception as e:
+        logger.warning(f"[_query_single_schema_advanced] ❌ {collection_name}: {e}")
+        return collection_name, []
+
+async def _search_multi_advanced(criteria: dict[str, str]) -> dict:
+    lookup_type = "advanced"
+    if lookup_type not in SEARCHABLE_COLLECTION_MAP:
+        return {
+            "found": False,
+            "persons": [],
+            "display": f"Không hỗ trợ lookup type: {lookup_type}",
+            "lookup_type": lookup_type,
+        }
+
+    schema_map = SEARCHABLE_COLLECTION_MAP[lookup_type]["collections"]
+    db = get_mongo_db()
+
+    tasks = []
+    for schema_name, cfg in schema_map.items():
+        query_fields_dict = cfg.get("fields", {})
+        if not query_fields_dict:
+            continue
+        
+        # Check if schema supports at least one criteria field
+        supported_keys = [k for k in criteria.keys() if k in query_fields_dict and criteria[k]]
+        if not supported_keys:
+            continue
+            
+        collection = db[schema_name]
+        logger.warning(
+            f"[_search_multi_advanced] 📡 {schema_name} — criteria={criteria}"
+        )
+        task = asyncio.to_thread(
+            _query_single_schema_advanced_sync,
+            schema_name,
+            collection,
+            query_fields_dict,
+            criteria,
+        )
+        tasks.append(task)
+
+    if not tasks:
+        return {
+            "found": False,
+            "persons": [],
+            "display": "Không có collection nào hỗ trợ các trường tìm kiếm này.",
+            "lookup_type": lookup_type,
+        }
+
+    results_list = await asyncio.gather(*tasks)
+
+    results_by_schema: dict[str, list[dict]] = {}
+    for schema_name, docs in results_list:
+        results_by_schema[schema_name] = docs
+        if docs:
+            logger.warning(f"[_search_multi_advanced] ✅ {schema_name} → {len(docs)} docs")
+
+    persons, display, schemas = _merge_results(results_by_schema, lookup_type)
+    if schemas:
+        display = enrich_display_with_schema(display, schemas)
+    return {
+        "found": bool(persons),
+        "persons": persons,
+        "display": display,
+        "lookup_type": lookup_type,
+    }
+
+# ============================================================================
 # Public API — 1 function per intent
 # ============================================================================
 
@@ -448,4 +557,23 @@ async def search_by_phone(phone: str, limit: int = 10) -> dict:
     result = await _search_multi("phone", phone_digits, match_mode="phone")
     logger.warning(f"[search_by_phone] ✅ RETURNED — found={result['found']}, count={len(result['persons'])}")
     result["persons"] = result["persons"][:limit]
+    return result
+
+async def search_by_advanced(criteria: dict[str, str], limit: int = 10) -> dict:
+    """
+    Search for persons using multiple criteria (e.g. name + dob + address).
+    Returns mapping combined from all cross schemas.
+    """
+    # Clean criteria
+    clean_criteria = {k: str(v).strip() for k, v in criteria.items() if v and str(v).strip()}
+    if not clean_criteria:
+        return {"found": False, "persons": [], "display": "Không có tiêu chí tìm kiếm hợp lệ."}
+
+    logger.info(f"[search_by_advanced] Searching: {clean_criteria}")
+    result = await _search_multi_advanced(clean_criteria)
+    result["persons"] = result["persons"][:limit]
+    
+    if not result["found"]:
+        return {"found": False, "persons": [], "display": f"Không tìm thấy người khớp với thông tin: {clean_criteria}"}
+        
     return result

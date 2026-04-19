@@ -180,6 +180,39 @@ SEARCHABLE_COLLECTION_MAP: dict[str, dict] = {
             },
         },
     },
+
+    # --------------------------------------------------------------------------
+    # Advanced lookup — tìm theo tổ hợp (Tên + DOB + Địa chỉ/Quê quán)
+    # --------------------------------------------------------------------------
+    "advanced": {
+        "description": "Tìm theo tổ hợp thông tin",
+        "collections": {
+            "bhxh": {
+                "fields": {"name": "hoTen", "dob": "ngaySinhHienThi", "address": "diaChi", "phone": "soDienThoai"},
+                "display_fields": ["hoTen", "maSoBhxh", "soTheBhyt", "soCmnd", "soDienThoai", "ngaySinhHienThi", "diaChi", "coSoKCB"],
+            },
+            "lg": {
+                "fields": {"name": "TenHoiVien", "dob": "NgaySinh", "address": "DiaChi", "phone": "SoDienThoai"},
+                "display_fields": ["TenHoiVien", "SoDinhDanh", "SoDienThoai", "NgaySinh", "DiaChi"],
+            },
+            "vacxin": {
+                "fields": {"name": "HO_TEN", "dob": "NGAY_SINH", "phone": "DIEN_THOAI_ME"},
+                "display_fields": ["HO_TEN", "MA_DOI_TUONG", "NGAY_SINH", "DIEN_THOAI_ME", "TEN_ME"],
+            },
+            "evn": {
+                "fields": {"name": "tenKhachHang", "address": "diaChiCapDien", "phone": "phone"},
+                "display_fields": ["tenKhachHang", "cmnd", "phone", "diaChiCapDien", "ngayDangKy"],
+            },
+            "cv19": {
+                "fields": {"name": "ho_ten", "dob": "namsinh", "address": "dia_chi", "phone": "so_dien_thoai"},
+                "display_fields": ["ho_ten", "so_dien_thoai", "namsinh", "gioi_tinh", "dia_chi"],
+            },
+            "vnvc": {
+                "fields": {"name": "fullName", "dob": "fullNam", "address": "diaChi", "phone": "mobile"},
+                "display_fields": ["fullName", "mobile", "fullNam", "diaChi", "TEN_ME"],
+            },
+        },
+    },
 }
 
 
@@ -192,6 +225,7 @@ INTENT_TO_LOOKUP_TYPE: dict[str, str] = {
     "mongo_search_bhxh":  "bhxh",
     "mongo_search_phone": "phone",
     "mongo_search_name":  "name",
+    "mongo_search_advanced": "advanced",
 }
 
 

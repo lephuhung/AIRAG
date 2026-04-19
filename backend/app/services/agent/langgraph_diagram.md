@@ -1,88 +1,90 @@
 # LangGraph Agent Diagram
 
-This document shows the LangGraph workflow for the NexusRAG agent.
+This document shows the LangGraph supervisor-based multi-agent workflow for NexusRAG.
 
 ## Overview
 
-The agent uses a state-driven graph architecture with memory recall, intent classification, tool execution, and answer generation.
+The agent uses a **Supervisor-Worker** architecture: a single LLM call classifies intent and
+routes to the appropriate worker agent. Each worker handles its domain, then all routes converge
+at `answer_generator` for final answer generation and SSE streaming.
 
 ## Flow Diagram
 
 ```mermaid
 flowchart TD
-    START([START]) --> memory_recall
-    memory_recall --> intent_classifier
-    
-    intent_classifier -->|greeting| direct_answer
-    intent_classifier -->|personal| direct_answer
-    intent_classifier -->|search| tool_executor
-    intent_classifier -->|list_docs| tool_executor
-    intent_classifier -->|summarize| tool_executor
-    intent_classifier -->|kg_query| tool_executor
-    intent_classifier -->|search_doc_num| tool_executor
-    intent_classifier -->|search_abbr| tool_executor
-    
-    direct_answer --> END([END])
-    
-    tool_executor --> check_iteration{Iteration < 5?}
-    check_iteration -->|Yes| answer_generator
-    check_iteration -->|No| max_iteration[Max Iteration Reached]
-    max_iteration --> END
-    
-    answer_generator --> END
+    START([START]) --> supervisor["🧠 Supervisor\nclassify intent + route\n(LLM call, temp=0)"]
 
-    subgraph "Intent Classification"
-        intent_classifier(Intent Classifier)
-    end
-    
-    subgraph "Tool Execution"
-        tool_executor(Tool Executor)
-    end
-    
-    subgraph "Memory"
-        memory_recall(Memory Recall)
+    supervisor -->|"next_agent='rag'"| rag["📄 RAG Agent\ntool registry dispatch"]
+    supervisor -->|"next_agent='write'"| write["✍️ Write Agent\nsummarize / edit / format"]
+    supervisor -->|"next_agent='people'"| people["👤 People Agent\nMongoDB search"]
+    supervisor -->|"next_agent='direct'"| direct["💬 Direct Answer\ngreeting / personal"]
+    supervisor -->|"next_agent=finish\nor None"| END([END])
+
+    rag --> ag["📦 Answer Generator\n(nodes.py)"]
+    write --> ag
+    people --> ag
+    direct --> ag
+
+    ag --> END
+
+    subgraph "Worker Agents"
+        rag
+        write
+        people
+        direct
     end
 ```
 
 ## Node Descriptions
 
-| Node | Description |
-|------|-------------|
-| **memory_recall** | Loads user memories from Graphiti (temporal knowledge graph) |
-| **intent_classifier** | Classifies intent using Qwen3-4B and rewrites query |
-| **tool_executor** | Dispatches to appropriate tool based on intent |
-| **answer_generator** | Main LLM generates answer with retrieved context |
-| **direct_answer** | Answers greetings/chitchat directly without retrieval |
+| Node | File | Description |
+|------|------|-------------|
+| **supervisor** | `agents/supervisor.py` | LLM-based router: classify intent + pick next agent in one call |
+| **rag** | `agents/rag_agent.py` | Tool registry for document search, KG, abbreviations, doc numbers |
+| **write** | `agents/write_agent.py` | Text processing: summarize, suggest edits, grammar/format check |
+| **people** | `agents/people_agent.py` | MongoDB people search: CCCD, name, BHXH, phone |
+| **direct** | `agents/supervisor.py` | Direct LLM answer for greetings and personal questions |
+| **answer_generator** | `agent/nodes.py` | Main LLM generates final answer with retrieved context + sources |
 
 ## Intent Routing
 
-| Intent | Route |
-|--------|-------|
-| `greeting` | → direct_answer |
-| `personal` | → direct_answer |
-| `search` | → tool_executor |
-| `list_docs` | → tool_executor |
-| `summarize` | → tool_executor |
-| `kg_query` | → tool_executor |
-| `search_doc_num` | → tool_executor |
-| `search_abbr` | → tool_executor |
+| Intent | Agent | Description |
+|--------|-------|-------------|
+| `greeting` | direct | Greetings, thanks, farewells |
+| `personal` | direct | Questions about the user themselves |
+| `search` | rag | Document content search (hybrid RAG) |
+| `list_docs` | rag | List available documents in workspace |
+| `summarize` | rag | Fetch and summarize a specific document |
+| `kg_query` | rag | Knowledge graph entity/relationship lookup |
+| `search_doc_num` | rag | Search by official document number |
+| `search_abbr` | rag | Abbreviation/acronym lookup |
+| `mongo_search_cccd` | people | Search person by CCCD number |
+| `mongo_search_name` | people | Search person by name |
+| `mongo_search_bhxh` | people | Search person by BHXH number |
+| `mongo_search_phone` | people | Search person by phone number |
+| `write_summarize` | write | Summarize a provided text passage |
+| `write_suggest_edits` | write | Suggest editing improvements |
+| `write_grammar_check` | write | Grammar and style check |
+| `write_format_check` | write | Word document format check (30/2020/NĐ-CP) |
 
-## Available Tools
+## SSE Event Flow
 
-| Tool | Purpose |
-|------|---------|
-| `search_documents` | Semantic search across document chunks |
-| `list_documents` | List documents in workspace |
-| `summarize_document` | Generate document summary |
-| `query_knowledge_graph` | Query extracted entities/relationships |
-| `search_documents_number` | Search by document number/reference |
-| `search_abbreviation` | Search abbreviation definitions |
+```
+stream_agent_to_sse()
+  ├── supervisor_node  → (no event)
+  ├── worker node      → status, sources, images events
+  └── answer_generator → status, token × N, complete events
+```
 
-## Iteration Loop
+## Streaming Architecture
 
-After `tool_executor`, there's a check to ensure the graph doesn't exceed 5 iterations:
+Nodes communicate with the SSE layer via `ContextVar` (not LangGraph state keys, which are
+filtered by TypedDict). See `agent/streaming.py` for details.
 
-1. `tool_executor` executes the tool
-2. Check if iteration count < 5
-3. If yes → proceed to `answer_generator`
-4. If no → terminate with max iteration reached message
+```
+stream_agent_to_sse
+  ├── set _event_queue_ctx  (ContextVar — bypasses LangGraph state filtering)
+  ├── asyncio.create_task(graph.ainvoke)  ← inherits context
+  │     nodes call push_event() → ContextVar.get() → queue.put()
+  └── drain queue → yield SSE strings
+```
