@@ -714,6 +714,7 @@ async def search_abbreviation(
     from sqlalchemy import select
     from app.models.abbreviation import Abbreviation
 
+    logger.info(f"[tool:search_abbreviation] searching abbreviation={abbreviation!r}, workspace_ids={workspace_ids}, db={type(db).__name__}")
     try:
         result = await db.execute(
             select(Abbreviation)
@@ -724,6 +725,7 @@ async def search_abbreviation(
             .limit(10)
         )
         abbreviations = result.scalars().all()
+        logger.info(f"[tool:search_abbreviation] found {len(abbreviations)} results for '{abbreviation}'")
 
         if not abbreviations:
             return {

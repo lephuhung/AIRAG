@@ -132,7 +132,17 @@ _INTENT_TO_AGENT_FALLBACK: dict[str, str] = {
 # =============================================================================
 
 def _extract_user_message(state: SupervisorState) -> str:
-    """Extract the last user message from state.messages."""
+    """Extract the last user message from state.messages.
+
+    On abbreviation loop-back, prefer expanded_query so supervisor
+    re-classifies using the full form (e.g., "an ninh mạng") instead of
+    the original abbreviation (e.g., "ANM").
+    """
+    # expanded_query is set by rag_agent when abbreviation is found
+    expanded = state.get("expanded_query", "")
+    if expanded:
+        return expanded
+
     messages = state.get("messages", [])
     for msg in reversed(messages):
         if isinstance(msg, dict):
@@ -233,11 +243,15 @@ async def supervisor_node(state: SupervisorState) -> dict:
     try:
         from app.services.llm.types import LLMMessage as _LLMMsg
 
+        # On loop-back from abbreviation expansion, use expanded_query for re-classification
+        expanded = state.get("expanded_query", "")
+        query_for_classifier = expanded if expanded else user_message
+
         classifier = get_memory_agent()
         response_text = ""
 
         async for chunk in classifier.astream(
-            [_LLMMsg(role="user", content=user_message)],
+            [_LLMMsg(role="user", content=query_for_classifier)],
             system_prompt=_SUPERVISOR_PROMPT.format(max_iterations=max_iter),
             temperature=0.0,
             max_tokens=256,
@@ -257,6 +271,8 @@ async def supervisor_node(state: SupervisorState) -> dict:
             "original_query": user_message,
             "rewritten_query": user_message,  # needed by tool functions
             "iterations": iterations + 1,
+            # Reset loop flag on each supervisor entry
+            "should_loop_back": False,
         }
 
     except Exception as e:
@@ -383,6 +399,17 @@ def route_from_supervisor(state: SupervisorState) -> str:
     return next_agent
 
 
+def route_from_rag(state: SupervisorState) -> str:
+    """Route after rag agent completes.
+
+    If abbreviation was found and expanded, loop back to supervisor
+    to re-classify with the full form. Otherwise go to answer_generator.
+    """
+    if state.get("should_loop_back"):
+        return "supervisor"
+    return "answer_generator"
+
+
 # shouldContinue_from_supervisor removed — was dead code (never called).
 
 
@@ -426,7 +453,9 @@ def create_supervisor_graph():
     )
 
     # After rag/write/people/direct agents complete, go to answer_generator
-    graph.add_edge("rag", "answer_generator")
+    # (rag uses conditional routing to support abbreviation loop-back)
+    graph.add_conditional_edges("rag", route_from_rag, {"supervisor": "supervisor", "answer_generator": "answer_generator"})
+    graph.add_edge("write", "answer_generator")
     graph.add_edge("write", "answer_generator")
     graph.add_edge("people", "answer_generator")
     graph.add_edge("direct", "answer_generator")

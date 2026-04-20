@@ -135,6 +135,7 @@ class SupervisorState(TypedDict, total=False):
     user_memory_context: str
     potential_abbreviations: list[str]
     expanded_query: str
+    should_loop_back: bool  # True when abbreviation was found → re-classify with full form
 
 
 # =============================================================================

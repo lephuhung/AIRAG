@@ -70,9 +70,27 @@ def _map_doc_num_result(result: dict) -> dict:
 
 def _map_abbr_result(result: dict) -> dict:
     """Map search_abbreviation result to SupervisorState."""
+    results = result.get("results", [])
+    # When only 1 result, search_abbreviation returns no "results" key
+    # but includes full_form + description directly
+    if not results and result.get("found"):
+        short = result.get("abbreviation", "")
+        full = result.get("full_form", "")
+        desc = result.get("description", "")
+        if short and full:
+            results = [{"short_form": short, "full_form": full, "description": desc}]
+
+    # If abbreviation was found and expanded, loop back to supervisor
+    # to re-classify with the full form (e.g., "an ninh mạng" instead of "ANM")
+    should_loop = bool(results)
+
     return {
-        "abbreviation_results": result.get("results", []),
+        "abbreviation_results": results,
         "kg_summaries": [result.get("text", "")],
+        "should_loop_back": should_loop,
+        # Set expanded_query so supervisor re-classifies with full form
+        "expanded_query": results[0].get("full_form", "") if results else "",
+        "rewritten_query": results[0].get("full_form", "") if results else "",
     }
 
 
@@ -122,6 +140,7 @@ async def _tool_list_docs(state: SupervisorState) -> dict:
 async def _tool_summarize(state: SupervisorState) -> dict:
     """Fetch document content for summarization."""
     from app.services.agent.tools import summarize_document
+    from app.services.agent.streaming import get_current_db
 
     document_ids = state.get("document_ids") or []
     if not document_ids:
@@ -129,41 +148,60 @@ async def _tool_summarize(state: SupervisorState) -> dict:
 
     return await summarize_document(
         document_id=document_ids[0],
-        db=None,
+        db=get_current_db(),
     )
 
 
 async def _tool_kg_query(state: SupervisorState) -> dict:
     """Query knowledge graph for entity relationships."""
     from app.services.agent.tools import query_knowledge_graph
+    from app.services.agent.streaming import get_current_db
 
     rewritten_query = state.get("rewritten_query", "")
     return await query_knowledge_graph(
         entity=rewritten_query,
         workspace_ids=state.get("workspace_ids", []),
-        db=None,
+        db=get_current_db(),
     )
 
 
 async def _tool_search_doc_num(state: SupervisorState) -> dict:
     """Search documents by official document number."""
     from app.services.agent.tools import search_documents_number
+    from app.services.agent.streaming import get_current_db
 
     return await search_documents_number(
         query=state.get("rewritten_query", ""),
         workspace_ids=state.get("workspace_ids", []),
-        db=None,
+        db=get_current_db(),
     )
 
 
 async def _tool_search_abbr(state: SupervisorState) -> dict:
     """Search abbreviation meaning."""
     from app.services.agent.tools import search_abbreviation
+    from app.services.agent.streaming import get_current_db
+
+    raw_query = state.get("rewritten_query", "")
+    workspace_ids = state.get("workspace_ids", [])
+    db = get_current_db()
+
+    # Extract abbreviation from query patterns:
+    # - "khái niệm ANM là gì" → "ANM"
+    # - "'ANM'" or '"ANM"' → "ANM"
+    # - "ANM nghĩa là gì" → "ANM"
+    import re
+    abbreviation_match = re.search(r'\b([A-Z]{2,})\b', raw_query)  # uppercase acronyms
+    if not abbreviation_match:
+        abbreviation_match = re.search(r'[\'"]([^\'"]+)[\'"]', raw_query)  # quoted
+    abbreviation = abbreviation_match.group(1) if abbreviation_match else raw_query
+
+    logger.info(f"[_tool_search_abbr] abbreviation={abbreviation!r}, workspace_ids={workspace_ids}, db={type(db).__name__}")
 
     return await search_abbreviation(
-        abbreviation=state.get("rewritten_query", ""),
-        workspace_ids=state.get("workspace_ids", []),
-        db=None,
+        abbreviation=abbreviation,
+        workspace_ids=workspace_ids,
+        db=db,
     )
 
 
