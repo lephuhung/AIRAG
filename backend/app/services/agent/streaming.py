@@ -96,6 +96,7 @@ async def stream_agent_to_sse(
     all_sources: list = []
     all_images: list = []
     all_potentials: list = []
+    all_people_data: list = []
 
     # ── Background task: chạy toàn bộ LangGraph pipeline ───────────────────
     async def _run_graph():
@@ -135,6 +136,7 @@ async def stream_agent_to_sse(
                     "sources": all_sources,
                     "images": all_images,
                     "potential_abbreviations": all_potentials,
+                    "people_data": all_people_data,
                 })
                 logger.info(
                     f"[stream] Complete: {len(final_answer)} chars, "
@@ -169,6 +171,11 @@ async def stream_agent_to_sse(
             elif ev_type == "error":
                 yield _sse("error", {"message": item[1]})
                 break
+
+            elif ev_type == "people_data":
+                all_people_data = item[1]
+                yield _sse("people_data", {"people": all_people_data})
+                logger.info(f"[stream] Emitted {len(all_people_data)} people records")
 
     finally:
         # Reset contextvars

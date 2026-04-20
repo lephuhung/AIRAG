@@ -104,6 +104,7 @@ import type {
   AgentStepType,
   Document,
   DocumentStatus,
+  PeopleRecord,
 } from "@/types";
 
 // Context to provide sessionId and debugMode to nested components
@@ -497,6 +498,154 @@ function CodeBlock({
       >
         {code}
       </SyntaxHighlighter>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// People Card — structured display for MongoDB people search results
+// ---------------------------------------------------------------------------
+
+/** Field display config: maps schema-agnostic keys to display labels and icon */
+const FIELD_CONFIG: Record<string, { label: string; icon: ReactNode }> = {
+  hoTen: { label: "Họ tên", icon: <User className="w-3 h-3" /> },
+  HO_TEN: { label: "Họ tên", icon: <User className="w-3 h-3" /> },
+  TenHoiVien: { label: "Họ tên", icon: <User className="w-3 h-3" /> },
+  ho_ten: { label: "Họ tên", icon: <User className="w-3 h-3" /> },
+  maSoBhxh: { label: "Mã BHXH", icon: <DatabaseZap className="w-3 h-3" /> },
+  soTheBhyt: { label: "Số thẻ BHYT", icon: <FileText className="w-3 h-3" /> },
+  ngaySinhHienThi: { label: "Ngày sinh", icon: <BookOpen className="w-3 h-3" /> },
+  NGAY_SINH: { label: "Ngày sinh", icon: <BookOpen className="w-3 h-3" /> },
+  NgaySinh: { label: "Ngày sinh", icon: <BookOpen className="w-3 h-3" /> },
+  soCmnd: { label: "Số CMND", icon: <FileSearch className="w-3 h-3" /> },
+  cmnd: { label: "Số CMND", icon: <FileSearch className="w-3 h-3" /> },
+  SoDinhDanh: { label: "Số định danh", icon: <FileSearch className="w-3 h-3" /> },
+  MA_DOI_TUONG: { label: "Mã định danh", icon: <FileSearch className="w-3 h-3" /> },
+  dienThoai: { label: "Điện thoại", icon: <Mic className="w-3 h-3" /> },
+  SoDienThoai: { label: "Điện thoại", icon: <Mic className="w-3 h-3" /> },
+  DIEN_THOAI_ME: { label: "Điện thoại mẹ", icon: <Mic className="w-3 h-3" /> },
+  diaChi: { label: "Địa chỉ", icon: <LayoutGrid className="w-3 h-3" /> },
+  DiaChi: { label: "Địa chỉ", icon: <LayoutGrid className="w-3 h-3" /> },
+  coSoKCB: { label: "CS KCB", icon: <Settings2 className="w-3 h-3" /> },
+  trangThaiThe: { label: "Trạng thái", icon: <Zap className="w-3 h-3" /> },
+  tyLeBhyt: { label: "Tỷ lệ BHYT", icon: <Sparkles className="w-3 h-3" /> },
+  tuNgay: { label: "Từ ngày", icon: <BookOpen className="w-3 h-3" /> },
+  denNgay: { label: "Đến ngày", icon: <BookOpen className="w-3 h-3" /> },
+  TenHangHoiVien: { label: "Hạng hội viên", icon: <GraduationCap className="w-3 h-3" /> },
+  SoTheHoiVien: { label: "Số thẻ hội viên", icon: <FileText className="w-3 h-3" /> },
+  TEN_ME: { label: "Tên mẹ", icon: <User className="w-3 h-3" /> },
+  GIOI_TINH: { label: "Giới tính", icon: <User className="w-3 h-3" /> },
+  PID: { label: "PID", icon: <FileSearch className="w-3 h-3" /> },
+};
+
+/** Fields to exclude from display */
+const SKIP_FIELDS = new Set(["_id", "_source_schema", "lookup_type", "found", "persons", "display"]);
+
+/** Get name field from a people record (tries multiple possible field names) */
+function getNameField(record: Record<string, unknown>): string {
+  for (const key of ["hoTen", "HO_TEN", "TenHoiVien", "ho_ten"]) {
+    if (record[key] && typeof record[key] === "string") {
+      return record[key] as string;
+    }
+  }
+  return "(Không có tên)";
+}
+
+/** Schema display name mapping */
+const SCHEMA_LABELS: Record<string, string> = {
+  bhxh: "BHXH",
+  lg: "LG Hội viên",
+  vacxin: "Tiêm chủng",
+  evn: "Điện lực",
+};
+
+function PeopleCard({ people }: { people: PeopleRecord[] }) {
+  const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
+
+  if (!people || people.length === 0) return null;
+
+  const handleCopyCard = (person: PeopleRecord, idx: number) => {
+    const name = getNameField(person);
+    const schema = SCHEMA_LABELS[person._source_schema || ""] || person._source_schema || "Unknown";
+    const lines = [`Người: ${name} (${schema})`];
+    for (const [key, val] of Object.entries(person)) {
+      if (SKIP_FIELDS.has(key)) continue;
+      const config = FIELD_CONFIG[key];
+      if (val !== undefined && val !== null && val !== "") {
+        lines.push(`  ${config?.label || key}: ${val}`);
+      }
+    }
+    navigator.clipboard.writeText(lines.join("\n")).then(() => {
+      setCopiedIdx(idx);
+      setTimeout(() => setCopiedIdx(null), 2000);
+    });
+  };
+
+  return (
+    <div className="my-3 space-y-2">
+      {people.map((person, idx) => {
+        const name = getNameField(person);
+        const schema = SCHEMA_LABELS[person._source_schema || ""] || person._source_schema;
+        const displayFields = Object.entries(person)
+          .filter(([k, v]) => !SKIP_FIELDS.has(k) && v !== undefined && v !== null && v !== "")
+          .sort(([a], [b]) => {
+            const order = Object.keys(FIELD_CONFIG);
+            return order.indexOf(a) - order.indexOf(b);
+          });
+
+        return (
+          <div
+            key={idx}
+            className="relative rounded-lg border bg-muted/20 p-3 hover:bg-muted/30 transition-colors"
+          >
+            {/* Copy button — top right corner */}
+            <button
+              onClick={() => handleCopyCard(person, idx)}
+              className={cn(
+                "absolute top-2 right-2 p-1.5 rounded-md text-xs transition-all",
+                copiedIdx === idx
+                  ? "bg-emerald-500/10 text-emerald-600"
+                  : "bg-muted/50 hover:bg-muted text-muted-foreground hover:text-foreground"
+              )}
+              title="Copy"
+            >
+              {copiedIdx === idx ? (
+                <ClipboardCheck className="w-3.5 h-3.5" />
+              ) : (
+                <Copy className="w-3.5 h-3.5" />
+              )}
+            </button>
+
+            {/* Header: name + schema badge */}
+            <div className="flex items-center gap-2 mb-2 pr-8">
+              <div className="w-7 h-7 rounded-full bg-primary/10 flex items-center justify-center text-primary text-xs font-semibold">
+                {name.charAt(0).toUpperCase()}
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="font-medium text-sm truncate">{name}</p>
+                {schema && (
+                  <p className="text-[10px] text-muted-foreground uppercase tracking-wide">{schema}</p>
+                )}
+              </div>
+            </div>
+
+            {/* Fields grid */}
+            <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[12.5px]">
+              {displayFields.map(([key, val]) => {
+                const config = FIELD_CONFIG[key];
+                if (!config) return null;
+                return (
+                  <div key={key} className="flex items-start gap-1.5 text-muted-foreground">
+                    <span className="mt-0.5 text-primary/60">{config.icon}</span>
+                    <span className="text-[11px]">{config.label}:</span>
+                    <span className="text-[11px] font-medium text-foreground/80 truncate">{String(val)}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -1760,7 +1909,7 @@ const MessageBubble = memo(function MessageBubble({
               <span className="streaming-cursor" />
             </div>
           ) : null
-        ) : (
+        ) : message.peopleData && message.peopleData.length > 0 ? null : (
           <div className={proseClasses}>
             <MarkdownWithCitations
               content={message.content}
@@ -1769,6 +1918,11 @@ const MessageBubble = memo(function MessageBubble({
               imageRefs={message.imageRefs}
             />
           </div>
+        )}
+
+        {/* People Card — structured display for people search results */}
+        {!isUser && !message.isStreaming && message.peopleData && message.peopleData.length > 0 && (
+          <PeopleCard people={message.peopleData} />
         )}
 
         {/* Potential Abbreviation Suggestion Buttons */}
@@ -2619,6 +2773,7 @@ export const ChatPanel = memo(function ChatPanel({
           thinking: m.thinking ?? undefined,
           timestamp: m.created_at,
           potential_abbreviations: m.potential_abbreviations ?? undefined,
+          peopleData: m.people_data ?? undefined,
           agentSteps: stepsMap.get(m.message_id) ?? (m.agent_steps?.length
             ? (m.agent_steps as any[]).map((s, i) => ({
               id: s.id || `hist-${m.message_id}-${i}`,
@@ -2829,6 +2984,11 @@ export const ChatPanel = memo(function ChatPanel({
       const newThinking = stream.thinkingText || m.thinking;
       const newSteps = stream.agentSteps.length > 0 ? stream.agentSteps : m.agentSteps;
       const newPotentials = stream.potentialAbbreviations.length > 0 ? stream.potentialAbbreviations : m.potential_abbreviations;
+      // Only use pendingPeople during active streaming; after complete fires, peopleData is already set
+      // Don't update peopleData if pendingPeople is empty (might be from sendMessage reset before complete)
+      const newPeople = stream.pendingPeople.length > 0
+        ? stream.pendingPeople
+        : (stream.isStreaming ? m.peopleData : (m.peopleData ?? stream.pendingPeople));
 
       if (
         m.content === newContent &&
@@ -2837,6 +2997,7 @@ export const ChatPanel = memo(function ChatPanel({
         m.thinking === newThinking &&
         m.agentSteps === newSteps &&
         m.potential_abbreviations === newPotentials &&
+        m.peopleData === newPeople &&
         m.isStreaming === stream.isStreaming
       ) {
         return prev;
@@ -2851,11 +3012,12 @@ export const ChatPanel = memo(function ChatPanel({
         thinking: newThinking,
         agentSteps: newSteps,
         potential_abbreviations: newPotentials,
+        peopleData: newPeople,
         isStreaming: stream.isStreaming,
       };
       return updated;
     });
-  }, [stream.streamingContent, stream.pendingSources, stream.pendingImages, stream.thinkingText, stream.isStreaming, stream.agentSteps]);
+  }, [stream.streamingContent, stream.pendingSources, stream.pendingImages, stream.thinkingText, stream.isStreaming, stream.agentSteps, stream.pendingPeople, stream.streamCompleteTick]);
 
   const handleSend = useCallback(
     async (text?: string) => {

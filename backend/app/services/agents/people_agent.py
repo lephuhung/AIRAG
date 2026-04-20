@@ -174,6 +174,11 @@ async def people_agent_node(state: SupervisorState) -> dict:
         if sources:
             await push_event(state, "sources", sources)
 
+        # Emit people_data for structured display in frontend
+        people_data = updates.get("mongo_results", [])
+        if people_data:
+            await push_event(state, "people_data", people_data)
+
         # Add iteration count
         updates["iterations"] = state.get("iterations", 0) + 1
 

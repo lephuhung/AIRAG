@@ -14,12 +14,50 @@ Each operation is a prompt-based LLM call.
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from app.services.agents.models import SupervisorState
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# Static Standards Path
+# =============================================================================
+
+STANDARD_30_PATH = os.path.join(
+    os.path.dirname(__file__), "../../docs/30-ND.md"
+)
+
+
+FALLBACK_STANDARD = """\
+30/2020/NĐ-CP QUY ĐỊNH VỀ THỂ THỨC VĂN BẢN:
+
+1. CĂN LỀ: Trên 2cm, Dưới 2cm, Trái 3cm, Phải 2cm
+2. CỠ CHỮ: 13pt cho nội dung, 14pt cho tiêu đề
+3. FONT: Times New Roman, Arial
+4. KHOẢNG CÁCH DÒNG: 1.5 dòng
+"""
+
+
+def _load_30_standard_from_file() -> str:
+    """Load 30/2020/NĐ-CP standards directly from static file."""
+    try:
+        with open(STANDARD_30_PATH, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception as e:
+        logger.warning(f"[_load_30_standard_from_file] Failed to read {STANDARD_30_PATH}: {e}")
+        return FALLBACK_STANDARD
+
+
+async def _get_30_2020_standard(state: SupervisorState) -> str:
+    """
+    Load 30/2020/NĐ-CP standards from static file.
+    No RAG dependency - works even when documents are not indexed.
+    """
+    return _load_30_standard_from_file()
+
 
 # =============================================================================
 # Write Prompts
@@ -62,17 +100,27 @@ Phân tích thông tin định dạng sau và đưa ra báo cáo kiểm tra chi 
 
 ## THÔNG TIN ĐỊNH DẠNG ĐÃ TRÍCH XUẤT:
 
-### 1. Căn lề (cm):
+### 1. Khổ giấy:
+- Chiều rộng: {page_width} cm
+- Chiều cao: {page_height} cm
+
+### 2. Căn lề (cm):
 - Trên (top): {top} cm
 - Dưới (bottom): {bottom} cm
 - Trái (left): {left} cm
 - Phải (right): {right} cm
 
-### 2. Cỡ chữ: {font_sizes}
-### 3. Font chữ: {fonts}
-### 4. Khoảng cách dòng: {line_spacing}
-### 5. Số đoạn văn: {paragraph_count}
-### 6. Số bảng: {table_count}
+### 3. Cỡ chữ:
+{font_sizes}
+
+### 4. Font chữ:
+{fonts}
+
+### 5. Khoảng cách dòng:
+{line_spacing}
+
+### 6. Số đoạn văn: {paragraph_count}
+### 7. Số bảng: {table_count}
 
 ## TIÊU CHUẨN VĂN BẢN (30/2020/NĐ-CP):
 {standard_content}
@@ -85,108 +133,6 @@ Phân tích thông tin định dạng sau và đưa ra báo cáo kiểm tra chi 
 5. Trích dẫn điều khoản cụ thể từ 30/2020/NĐ-CP cho mỗi vấn đề
 
 Trả lời bằng tiếng Việt, rõ ràng và có cấu trúc.
-"""
-
-
-# =============================================================================
-# RAG-based Format Evaluation (Option A + B)
-# =============================================================================
-
-RAG_FORMAT_EVALUATION_PROMPT = """\
-Dựa trên thông tin thể thức văn bản sau, hãy đánh giá và so sánh với tiêu chuẩn 30/2020/NĐ-CP.
-
-## THÔNG TIN THỂ THỨC VĂN BẢN CẦN ĐÁNH GIÁ:
-{format_summary}
-
-## YÊU CẦU:
-1. Tra cứu các quy định về thể thức trong 30/2020/NĐ-CP liên quan đến:
-   - Căn lề (margins)
-   - Cỡ chữ và font chữ
-   - Khoảng cách dòng
-   - Cấu trúc văn bản (tiêu đề, đề mục, đoạn văn)
-2. So sánh văn bản cần đánh giá với tiêu chuẩn
-3. Chỉ ra các điểm sai hoặc không phù hợp
-4. Đề xuất cách sửa cụ thể
-
-Trả lời bằng tiếng Việt, có cấu trúc rõ ràng.
-"""
-
-
-async def _get_30_2020_standard(state: SupervisorState) -> str:
-    """
-    Call RAG to get relevant standards from 30/2020/NĐ-CP for format evaluation.
-
-    This implements the pattern: Write Agent -> RAG Agent -> Evaluate
-    (Option B: direct edge for format_check flow)
-    """
-    from app.services.hrag_service import NexusRAGService
-    from app.services.agent.streaming import get_current_db
-
-    workspace_ids = state.get("workspace_ids", [])
-    if not workspace_ids:
-        return ""
-
-    try:
-        db = get_current_db()
-        rag_service = NexusRAGService()
-
-        # Query to get relevant sections from 30/2020/NĐ-CP about format standards
-        query = (
-            "thể thức văn bản hành chính 30/2020/NĐ-CP căn lề cỡ chữ khoảng cách dòng "
-            "cấu trúc tiêu đề đề mục quy định trình bày"
-        )
-
-        # Use the same deep retrieval as the main RAG pipeline
-        result = await rag_service.query_deep(
-            query=query,
-            workspace_ids=workspace_ids,
-            top_k=3,
-            rerank=True,
-            db=db,
-        )
-
-        # Extract relevant text from sources
-        standard_parts = []
-        for src in result.get("sources", []):
-            content = src.get("content", "")
-            if content:
-                standard_parts.append(content)
-
-        if standard_parts:
-            standard_content = "\n\n---\n\n".join(standard_parts[:3])  # Limit to top 3
-            logger.info(f"[_get_30_2020_standard] Retrieved {len(standard_parts)} standard sections")
-            return standard_content
-
-        # Fallback: return generic 30/2020/NĐ-CP standards if RAG returns nothing
-        return _get_generic_30_2020_standards()
-
-    except Exception as e:
-        logger.warning(f"[_get_30_2020_standard] RAG call failed: {e}, using generic standards")
-        return _get_generic_30_2020_standards()
-
-
-def _get_generic_30_2020_standards() -> str:
-    """Fallback generic standards from 30/2020/NĐ-CP when RAG is unavailable."""
-    return """\
-30/2020/NĐ-CP QUY ĐỊNH VỀ THỂ THỨC VĂN BẢN:
-
-1. CĂN LỀ (theo Điều 12):
-   - Trang giấy A4: Trên 2cm, Dưới 2cm, Trái 3cm, Phải 2cm
-   - Văn bản khổ A5: Trên 2cm, Dưới 2cm, Trái 2.5cm, Phải 2cm
-
-2. CỠ CHỮ VÀ FONT (theo Điều 11):
-   - Khuyến khích dùng font Times New Roman, Arial, Courier
-   - Cỡ chữ: 13pt hoặc 14pt cho văn bản thông thường
-   - Tiêu đề có thể dùng 16pt-20pt
-
-3. KHOẢNG CÁCH DÒNG (theo Điều 13):
-   - Dùng cách 1 dòng rưỡi (1.5 line spacing) cho văn bản thông thường
-   - Có thể dùng cách đơn (single spacing) cho phụ lục, trích dẫn
-
-4. CẤU TRÚC VĂN BẢN:
-   - Tiêu đề văn bản: IN HOA, không gạch chân, căn giữa
-   - Đề mục: số thứ tự La Mã, chữ cái, số Ả Rập
-   - Danh sách: dùng dấu gạch đầu dòng (-) hoặc số thứ tự
 """
 
 
@@ -301,34 +247,57 @@ async def _handle_format_check(state: SupervisorState) -> dict:
 
     # Extract format info
     margins = format_data.get("margins", {})
+    page_size = format_data.get("page_size", {})
     font_samples = format_data.get("font_samples", [])
-
-    # Build font info
-    font_sizes = format_data.get("font_sizes", [])
-    unique_fonts = set(f.get("font_name") for f in font_samples if f.get("font_name"))
-
-    from collections import Counter
-    size_counts = Counter(font_sizes)
-    most_common_sizes = size_counts.most_common(3)
-
     line_spacing_data = format_data.get("line_spacing", [])
-    has_line_spacing = any(ls.get("line_spacing_value") for ls in line_spacing_data)
 
-    # Step 1: Get standard from RAG (Option B - direct edge pattern)
-    logger.info("[_handle_format_check] Calling RAG for 30/2020/NĐ-CP standards...")
+    # Build font sizes info
+    from collections import Counter
+    raw_font_sizes = [f.get("font_size") for f in font_samples if f.get("font_size")]
+    size_counts = Counter(raw_font_sizes)
+    most_common_sizes = size_counts.most_common(5)
+
+    # Build font list - deduplicate and limit
+    unique_fonts = []
+    seen = set()
+    for f in font_samples:
+        name = f.get("font_name")
+        if name and name not in seen:
+            seen.add(name)
+            unique_fonts.append(name)
+
+    # Analyze line spacing
+    spacing_types = {}
+    for ls in line_spacing_data:
+        ls_type = ls.get("line_spacing_type")
+        ls_val = ls.get("line_spacing_value")
+        if ls_type and ls_val is not None:
+            key = f"{ls_type}_{ls_val}"
+            spacing_types[key] = spacing_types.get(key, 0) + 1
+
+    if spacing_types:
+        most_common_spacing = max(spacing_types, key=spacing_types.get)
+        line_spacing_display = f"{most_common_spacing} (gặp {max(spacing_types.values())} lần)"
+    else:
+        line_spacing_display = "Không trích xuất được"
+
+    # Step 1: Get standard from file (no RAG dependency)
+    logger.info("[_handle_format_check] Loading 30/2020/NĐ-CP standards from file...")
     standard_content = await _get_30_2020_standard(state)
     logger.info(f"[_handle_format_check] Got standard content: {len(standard_content)} chars")
 
     # Step 2: Build comprehensive evaluation prompt with standard
     prompt = FORMAT_CHECK_PROMPT.format(
         file_name=file_name,
+        page_width=page_size.get("width", "N/A"),
+        page_height=page_size.get("height", "N/A"),
         top=margins.get("top", "N/A"),
         bottom=margins.get("bottom", "N/A"),
         left=margins.get("left", "N/A"),
         right=margins.get("right", "N/A"),
-        font_sizes=", ".join([f"{s}pt ({c} lần)" for s, c in most_common_sizes]) if most_common_sizes else "Không trích xuất được",
-        fonts=", ".join(list(unique_fonts)[:5]) if unique_fonts else "Không trích xuất được",
-        line_spacing="Có" if has_line_spacing else "Không trích xuất được (mặc định nên dùng 1.5 lines)",
+        font_sizes="\n".join([f"- {s}pt ({c} lần)" for s, c in most_common_sizes]) if most_common_sizes else "- Không trích xuất được",
+        fonts=", ".join(unique_fonts[:5]) if unique_fonts else "Không trích xuất được",
+        line_spacing=line_spacing_display,
         paragraph_count=format_data.get("paragraph_count", 0),
         table_count=format_data.get("table_count", 0),
         standard_content=standard_content,

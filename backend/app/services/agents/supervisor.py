@@ -24,7 +24,6 @@ from langgraph.graph import StateGraph, START, END
 from app.services.agents.models import (
     SupervisorState,
     AgentType,
-    INTENT_TO_AGENT,
 )
 
 if TYPE_CHECKING:
@@ -356,9 +355,32 @@ async def answer_generator_node(state: SupervisorState) -> dict:
 
     Uses merge pattern over DEFAULT_STATE to avoid manual field-by-field copy.
     This stays in sync automatically when new fields are added to either state.
+
+    For write intents (summarize/suggest_edits/grammar_check/format_check),
+    the write agent already produces a final_answer — skip LLM generation
+    and use the write agent's output directly.
     """
     from app.services.agent.nodes import answer_generator as _orig_ag
     from app.services.agent.state import DEFAULT_STATE
+
+    # Check if write agent already produced final_answer — if so, use it directly
+    write_intents = {
+        "write_summarize",
+        "write_suggest_edits",
+        "write_grammar_check",
+        "write_format_check",
+    }
+    intent = state.get("intent", "")
+    existing_final = state.get("final_answer", "")
+    if intent in write_intents and existing_final:
+        logger.info(
+            f"[answer_generator_node] Write intent={intent!r} — using existing final_answer "
+            f"({len(existing_final)} chars), skipping LLM generation"
+        )
+        return {
+            "final_answer": existing_final,
+            "next_agent": AgentType.FINISH,
+        }
 
     # Merge SupervisorState over DEFAULT_STATE — keys present in state win.
     # We iterate state.items() to handle TypedDict gracefully.
@@ -511,6 +533,98 @@ async def _rag_agent_wrapper(state: SupervisorState) -> dict:
 async def _write_agent_wrapper(state: SupervisorState) -> dict:
     """Wrapper that imports and calls write_agent_node."""
     from app.services.agents.write_agent import write_agent_node
+
+    intent = state.get("intent", "")
+
+    # Map intent → write_action (supervisor graph doesn't set this)
+    _intent_to_action = {
+        "write_summarize": "summarize",
+        "write_suggest_edits": "suggest_edits",
+        "write_grammar_check": "grammar_check",
+        "write_format_check": "format_check",
+    }
+    if intent in _intent_to_action and not state.get("write_action"):
+        state["write_action"] = _intent_to_action[intent]
+
+    # Fetch format metadata for format_check intent before calling write_agent_node
+    if intent == "write_format_check":
+        doc_ids = state.get("document_ids") or []
+        if doc_ids:
+            try:
+                from app.services.agent.streaming import get_current_db
+                from app.services.agent import tools as _agent_tools
+
+                db = get_current_db()
+                tool_result = await _agent_tools.get_document_format(
+                    document_ids=doc_ids,
+                    db=db,
+                )
+                docs_with_format = tool_result.get("documents", [])
+                if docs_with_format:
+                    first_doc = docs_with_format[0]
+                    if first_doc.get("format_data"):
+                        state["format_data"] = first_doc["format_data"]
+                        state["file_name"] = first_doc.get("filename", "tài liệu")
+                        logger.info(
+                            f"[_write_agent_wrapper] format_check: injected format_data for {first_doc.get('filename')}"
+                        )
+                    elif first_doc.get("error"):
+                        err = first_doc.get("error", "")
+                        logger.warning(f"[_write_agent_wrapper] format_check error: {err}")
+                else:
+                    logger.warning(f"[_write_agent_wrapper] format_check: no docs with format returned")
+            except Exception as e:
+                logger.warning(f"[_write_agent_wrapper] Failed to fetch format metadata: {e}")
+
+    # For text-processing intents, ensure text_input is populated.
+    # The supervisor graph does NOT extract text_input (unlike the old intent_classifier).
+    # Priority: state.text_input → document content (if doc attached) → user message fallback
+    text_processing_intents = {"write_summarize", "write_suggest_edits", "write_grammar_check"}
+    if intent in text_processing_intents and not state.get("text_input"):
+        doc_ids = state.get("document_ids") or []
+        if doc_ids:
+            # User attached a file — fetch its markdown content
+            try:
+                from app.services.agent.streaming import get_current_db
+                from app.services.agent import tools as _agent_tools
+
+                db = get_current_db()
+                content_result = await _agent_tools.get_documents_content(
+                    document_ids=doc_ids,
+                    db=db,
+                )
+                docs = content_result.get("documents", [])
+                combined = "\n\n---\n\n".join(
+                    f"**{d['filename']}**\n\n{d['content']}"
+                    for d in docs
+                    if d.get("content")
+                )
+                if combined:
+                    state["text_input"] = combined
+                    logger.info(
+                        f"[_write_agent_wrapper] Injected doc content as text_input "
+                        f"({len(combined)} chars) for intent={intent!r}"
+                    )
+            except Exception as e:
+                logger.warning(f"[_write_agent_wrapper] Failed to fetch doc content: {e}")
+        else:
+            # No docs attached — extract text from the user message itself.
+            # Strip common command prefixes like "tóm tắt:", "summarize:", etc.
+            import re
+            user_msg = state.get("original_query") or state.get("rewritten_query", "")
+            cleaned = re.sub(
+                r"^(tóm tắt|summarize|kiểm tra ngữ pháp|grammar check|"
+                r"đề xuất chỉnh sửa|suggest edits)[:\s]+",
+                "",
+                user_msg,
+                flags=re.IGNORECASE,
+            ).strip()
+            if cleaned:
+                state["text_input"] = cleaned
+                logger.info(
+                    f"[_write_agent_wrapper] Extracted text_input from message "
+                    f"({len(cleaned)} chars) for intent={intent!r}"
+                )
 
     return await write_agent_node(state)
 

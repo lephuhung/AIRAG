@@ -357,6 +357,17 @@ export interface ChatMessage {
   agentSteps?: AgentStep[];
   potential_abbreviations?: string[];
   formatProgress?: FormatUploadProgress;
+  peopleData?: PeopleRecord[];
+}
+
+/**
+ * People record from MongoDB people search.
+ * Fields vary by schema (bhxh, lg, vacxin, evn, etc.)
+ * Common fields: ho_ten/hoTen/HO_TEN (name), _source_schema
+ */
+export interface PeopleRecord {
+  [key: string]: unknown;
+  _source_schema?: string;
 }
 
 export interface ChatSourceChunk {
@@ -402,6 +413,7 @@ export interface PersistedChatMessage {
   thinking?: string | null;
   agent_steps?: AgentStep[] | null;
   potential_abbreviations?: string[] | null;
+  people_data?: PeopleRecord[] | null;
   created_at: string;
 }
 

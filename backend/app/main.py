@@ -122,6 +122,12 @@ async def lifespan(app: FastAPI):
                     "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS document_ids JSON"
                 )
             )
+            # Add people_data column for MongoDB people search results
+            await conn.execute(
+                text(
+                    "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS people_data JSON"
+                )
+            )
             # Exchange summaries for per-Q&A conversation context
             await conn.execute(
                 text("""

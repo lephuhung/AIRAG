@@ -286,6 +286,7 @@ class PersistedChatMessage(BaseModel):
     thinking: str | None = None
     agent_steps: list | None = None
     potential_abbreviations: list[str] | None = None
+    people_data: list[dict] | None = None
     created_at: str  # ISO format
 
     model_config = {"from_attributes": True}

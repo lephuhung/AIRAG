@@ -241,6 +241,7 @@ async def get_session_history(
                 ratings=m.ratings,
                 agent_steps=m.agent_steps,
                 potential_abbreviations=m.potential_abbreviations,
+                people_data=m.people_data,
                 created_at=m.created_at.isoformat() if m.created_at else "",
             )
             for m in msgs
@@ -402,6 +403,7 @@ async def chat_stream_session(
         images: list,
         steps: list,
         potentials: list,
+        people_data: list,
         user_message: str,
         user_msg_id: str,
         ai_msg_id: str,
@@ -448,6 +450,7 @@ async def chat_stream_session(
                     thinking=thinking or None,
                     agent_steps=processed_steps,
                     potential_abbreviations=potentials or None,
+                    people_data=people_data or None,
                 )
                 bg_db.add(ai_msg)
 
@@ -523,6 +526,7 @@ async def chat_stream_session(
             final_images: list = []
             final_steps: list = []
             final_potential_abbreviations: list = []
+            final_people_data: list = []
 
             try:
                 from app.services.agents.supervisor import get_supervisor_graph as get_agent_graph
@@ -584,6 +588,8 @@ async def chat_stream_session(
                                     final_potential_abbreviations = ev_data.get(
                                         "abbreviations", []
                                     )
+                                elif ev_type == "people_data":
+                                    final_people_data = ev_data.get("people", [])
                     except Exception:
                         pass
 
@@ -598,6 +604,7 @@ async def chat_stream_session(
                     images=final_images,
                     steps=final_steps,
                     potentials=final_potential_abbreviations,
+                    people_data=final_people_data,
                     user_message=request.message,
                     user_msg_id=user_msg_id,
                     ai_msg_id=ai_msg_id,
@@ -629,6 +636,7 @@ async def chat_stream_session(
         final_images = []
         final_entities = []
         final_steps = []
+        final_people_data = []
 
         try:
             # Re-fetch DB session if needed, but we pass the request scoped db
@@ -654,6 +662,8 @@ async def chat_stream_session(
                     final_images = sse_item["data"]["image_refs"]
                 elif sse_item["event"] == "status":
                     final_steps.append(sse_item["data"])
+                elif sse_item["event"] == "people_data":
+                    final_people_data = sse_item["data"].get("people", [])
                 elif sse_item["event"] == "complete":
                     if "related_entities" in sse_item["data"]:
                         final_entities = sse_item["data"]["related_entities"]
@@ -672,6 +682,7 @@ async def chat_stream_session(
                 images=final_images,
                 steps=final_steps,
                 potentials=[],  # Legacy agent doesn't send abbreviations
+                people_data=final_people_data,
                 user_message=request.message,
                 user_msg_id=user_msg_id,
                 ai_msg_id=ai_msg_id,

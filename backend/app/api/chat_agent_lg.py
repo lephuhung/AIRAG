@@ -210,6 +210,7 @@ async def langgraph_chat_stream(
     final_answer = ""
     final_sources: list[dict] = []
     final_images: list[dict] = []
+    final_people_data: list[dict] = []
     collected_steps: list[dict] = []
     step_counter = 0
 
@@ -230,6 +231,8 @@ async def langgraph_chat_stream(
                         final_answer = ev_data.get("answer", "")
                         final_sources = ev_data.get("sources", [])
                         final_images = ev_data.get("images", [])
+                    elif ev_type == "people_data":
+                        final_people_data = ev_data.get("people", [])
                     elif ev_type == "status":
                         step_counter += 1
                         collected_steps.append({
@@ -254,6 +257,7 @@ async def langgraph_chat_stream(
             session_id=session_id,
             sources=_json.dumps(final_sources, default=str) if final_sources else None,
             agent_steps=_json.dumps(collected_steps) if collected_steps else None,
+            people_data=_json.dumps(final_people_data) if final_people_data else None,
         )
         db.add(assistant_row)
         await db.commit()

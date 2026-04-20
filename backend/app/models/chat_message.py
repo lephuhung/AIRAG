@@ -41,6 +41,7 @@ class ChatMessage(Base):
     ratings: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     agent_steps: Mapped[list | None] = mapped_column(JSON, nullable=True)
     potential_abbreviations: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    people_data: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
     # User who sent/received this message
     user_id: Mapped[uuid.UUID | None] = mapped_column(

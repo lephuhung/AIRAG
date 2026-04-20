@@ -14,6 +14,7 @@ import type {
   ChatMessage,
   AgentStep,
   AgentStepType,
+  PeopleRecord,
 } from "@/types";
 
 const BASE_URL = import.meta.env.VITE_API_URL || "/api/v1";
@@ -29,6 +30,10 @@ export interface RAGStreamResult {
   pendingSources: ChatSourceChunk[];
   /** Image refs received from retrieval */
   pendingImages: ChatImageRef[];
+  /** People records from MongoDB people search */
+  pendingPeople: PeopleRecord[];
+  /** Tick to force ChatPanel useEffect re-run after streaming complete */
+  streamCompleteTick: number;
   /** Error message if any */
   error: string | null;
   /** Whether currently streaming */
@@ -105,6 +110,9 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
   const [potentialAbbreviations, setPotentialAbbreviations] = useState<string[]>([]);
   const [aiMessageId, setAiMessageId] = useState<string | null>(null);
   const [userMessageId, setUserMessageId] = useState<string | null>(null);
+  const [pendingPeople, setPendingPeople] = useState<PeopleRecord[]>([]);
+  // Tick to force ChatPanel useEffect to re-run after complete
+  const [streamCompleteTick, setStreamCompleteTick] = useState(0);
 
   const abortRef = useRef<AbortController | null>(null);
   const bufferRef = useRef("");
@@ -116,6 +124,9 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
 
   // Track start time for total duration
   const streamStartRef = useRef(0);
+
+  // Persist people data across resets (for final message after streaming completes)
+  const peopleDataRef = useRef<PeopleRecord[]>([]);
 
   // Cleanup on unmount
   useEffect(() => {
@@ -138,6 +149,7 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
     setPotentialAbbreviations([]);
     setAiMessageId(null);
     setUserMessageId(null);
+    // Keep pendingPeople - it persists across streaming sessions for card display
     bufferRef.current = "";
     thinkingBufferRef.current = "";
     if (rafRef.current) {
@@ -262,6 +274,7 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
       setPotentialAbbreviations([]);
       setAiMessageId(null);
       setUserMessageId(null);
+      setPendingPeople([]);
       bufferRef.current = "";
       thinkingBufferRef.current = "";
       streamStartRef.current = Date.now();
@@ -271,6 +284,7 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
       let localSteps: AgentStep[] = [];
       let localSources: ChatSourceChunk[] = [];
       let localImages: ChatImageRef[] = [];
+      let localPeople: PeopleRecord[] = [];
       let localAiMessageId: string | null = null;
       let localUserMessageId: string | null = null;
       // Accumulate all thinking text in this scope so it can be flushed into
@@ -440,6 +454,20 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
                     break;
                   }
 
+                  case "people_data": {
+                    const people = (data.people || []) as PeopleRecord[];
+                    localPeople = people;
+                    peopleDataRef.current = people;
+                    setPendingPeople([...people]);
+
+                    // Add people_found step
+                    syncUpdateSteps((prev) => [
+                      ...completeActiveStep(prev),
+                      createStep("sources_found", `Found ${people.length} people record${people.length > 1 ? "s" : ""}`, "completed"),
+                    ]);
+                    break;
+                  }
+
                   case "token":
                     onToken(data.text || "");
                     break;
@@ -504,16 +532,19 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
                       sources: localSources, // use accumulated sources, backend complete event omits them
                       relatedEntities: data.related_entities || [],
                       imageRefs: localImages,
+                      peopleData: localPeople,
                       thinking: data.thinking || null,
                       agentSteps: localSteps, // include synced steps directly in finalMessage
                       potential_abbreviations: data.potential_abbreviations || potentialAbbreviations,
                       timestamp: new Date().toISOString(),
                     };
 
-                    // Immediately clear loading UI state on backend 'complete' event, 
+                    // Immediately clear loading UI state on backend 'complete' event,
                     // without waiting for the underlying HTTP connection to close.
                     setStatus("idle");
                     setIsStreaming(false);
+                    // Force ChatPanel useEffect to re-run with final peopleData
+                    setStreamCompleteTick((t) => t + 1);
 
                     break;
                   }
@@ -560,6 +591,8 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
     thinkingText,
     pendingSources,
     pendingImages,
+    pendingPeople,
+    streamCompleteTick,
     error,
     isStreaming,
     agentSteps,
