@@ -2,9 +2,15 @@ import { translate } from "@/hooks/useTranslation";
 import { useI18nStore } from "@/stores/i18nStore";
 import dayjs from "dayjs";
 import relativeTime from "dayjs/plugin/relativeTime";
+import timezone from "dayjs/plugin/timezone";
+import utc from "dayjs/plugin/utc";
 import "dayjs/locale/vi";
 
 dayjs.extend(relativeTime);
+dayjs.extend(utc);
+dayjs.extend(timezone);
+
+const VIETNAM_TZ = "Asia/Ho_Chi_Minh";
 
 /**
  * Shared formatting utilities.
@@ -15,14 +21,14 @@ dayjs.extend(relativeTime);
  */
 export function formatRelativeDate(dateStr: string): string {
   const lang = useI18nStore.getState().language;
-  return dayjs(dateStr).locale(lang).fromNow();
+  return dayjs(dateStr).tz(VIETNAM_TZ).locale(lang).fromNow();
 }
 
 /**
  * Format a date string as a fixed date (DD/MM/YYYY).
  */
 export function formatDate(dateStr: string): string {
-  return dayjs(dateStr).format("DD/MM/YYYY");
+  return dayjs(dateStr).tz(VIETNAM_TZ).format("DD/MM/YYYY");
 }
 
 /**

@@ -124,7 +124,7 @@
     "chunking": "Đang cắt nhỏ",
     "embedding": "Đang nhúng",
     "building_kg": "Xây dựng KG",
-    "indexed": "Đã lập chỉ mục",
+    "indexed": "Đã Index",
     "completed": "Hoàn thành",
     "processed": "Đã xử lý",
     "milliseconds": "mili giây",
@@ -366,7 +366,7 @@
     "no_public": "Không có kho tri thức công khai",
     "no_personal": "Chưa có kho tri thức cá nhân",
     "docs_count": "{{count}} tài liệu",
-    "indexed_count": "Đã lập chỉ mục {{count}}",
+    "indexed_count": "Đã Index: {{count}}",
     "kb_count": "{{count}} kho tri thức",
     "kb_count_plural": "{{count}} kho tri thức"
   },
@@ -422,7 +422,7 @@
       "chunking": "Đang cắt nhỏ",
       "embedding": "Đang nhúng",
       "building_kg": "Xây dựng KG",
-      "indexed": "Đã lập chỉ mục",
+      "indexed": "Đã Index",
       "failed": "Thất bại"
     },
     "msg": {
@@ -872,7 +872,7 @@
   },
   "stats": {
     "total_docs": "Tổng tài liệu",
-    "indexed": "Đã lập chỉ mục",
+    "indexed": "Đã index",
     "chunks": "Mảnh dữ liệu",
     "images": "Hình ảnh",
     "processing_msg": "Đang xử lý {{count}} tài liệu..."

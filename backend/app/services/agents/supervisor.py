@@ -130,6 +130,81 @@ _INTENT_TO_AGENT_FALLBACK: dict[str, str] = {
 # Helper Functions
 # =============================================================================
 
+
+async def _expand_abbreviations_in_message(message: str) -> tuple[str, bool]:
+    """
+    Expand all uppercase abbreviations (2+ chars) found in the message.
+
+    Returns (expanded_message, was_modified).
+    Uses abbreviation DB to look up full forms.
+    Supports both uppercase (BMNN) and lowercase (ntn, bmnn) abbreviations.
+    """
+    import re
+
+    # Find all uppercase sequences (2+ chars) that could be abbreviations
+    abbr_matches = re.findall(r'\b([A-Z]{2,})\b', message)
+    # Also find lowercase sequences (2+ chars) that could be abbreviations
+    lowercase_matches = re.findall(r'\b([a-z]{2,})\b', message)
+    abbr_matches = abbr_matches + lowercase_matches
+
+    if not abbr_matches:
+        return message, False
+
+    # Remove duplicates while preserving order
+    unique_abbrs = list(dict.fromkeys(abbr_matches))
+
+    try:
+        from app.services.agent.streaming import get_current_db
+        from sqlalchemy import select
+        from app.models.abbreviation import Abbreviation
+
+        db = get_current_db()
+        if db is None:
+            return message, False
+
+        expanded_message = message
+        any_expanded = False
+        multi_meaning_abbrs = []
+
+        for abbr in unique_abbrs:
+            result = await db.execute(
+                select(Abbreviation)
+                .where(
+                    Abbreviation.short_form.ilike(abbr),
+                    Abbreviation.is_active == True,
+                )
+            )
+            all_matches = result.scalars().all()
+
+            if len(all_matches) == 0:
+                # No match in DB - keep original, will prompt user to add
+                logger.debug(f"[abbr_expand] No DB entry for: {abbr}")
+                continue
+
+            if len(all_matches) == 1:
+                # Single meaning - safe to expand
+                abbr_obj = all_matches[0]
+                import re as re_module
+                pattern = re_module.compile(r'\b' + re_module.escape(abbr) + r'\b', re.IGNORECASE)
+                new_message = pattern.sub(abbr_obj.full_form, expanded_message)
+                if new_message != expanded_message:
+                    logger.info(f"[abbr_expand] {abbr} → {abbr_obj.full_form}")
+                    expanded_message = new_message
+                    any_expanded = True
+            else:
+                # Multiple meanings - keep original, let LLM decide from context
+                # Record for potential user prompt
+                multi_meaning_abbrs.append(abbr)
+                short_forms = [f"{m.short_form}={m.full_form}" for m in all_matches]
+                logger.info(f"[abbr_expand] Multiple meanings for {abbr}: {' | '.join(short_forms)}")
+
+        return expanded_message, any_expanded
+
+    except Exception as e:
+        logger.warning(f"[abbr_expand] Failed to expand abbreviations: {e}")
+        return message, False
+
+
 def _extract_user_message(state: SupervisorState) -> str:
     """Extract the last user message from state.messages.
 
@@ -218,8 +293,9 @@ async def supervisor_node(state: SupervisorState) -> dict:
 
     This is the core supervisor logic:
     1. Extract user message
-    2. Call LLM with supervisor prompt
-    3. Parse response and update state
+    2. Expand abbreviations in message
+    3. Call LLM with supervisor prompt
+    4. Parse response and update state
     """
     from app.services.llm import get_memory_agent
 
@@ -245,6 +321,16 @@ async def supervisor_node(state: SupervisorState) -> dict:
         # On loop-back from abbreviation expansion, use expanded_query for re-classification
         expanded = state.get("expanded_query", "")
         query_for_classifier = expanded if expanded else user_message
+        was_modified = False
+        expanded_message = expanded
+
+        # Expand abbreviations in message before classification
+        # This ensures BMNN -> "Bộ môn nghiệp vụ" BEFORE intent classification
+        if not expanded:
+            expanded_message, was_modified = await _expand_abbreviations_in_message(user_message)
+            if was_modified:
+                logger.info(f"[supervisor] Abbreviations expanded: {user_message!r} -> {expanded_message!r}")
+                query_for_classifier = expanded_message
 
         classifier = get_memory_agent()
         response_text = ""
@@ -264,7 +350,8 @@ async def supervisor_node(state: SupervisorState) -> dict:
             f"intent={decision['intent']!r}, reasoning={decision.get('reasoning', '')!r}"
         )
 
-        return {
+        # Build return dict
+        result = {
             "next_agent": decision["next_agent"],
             "intent": decision["intent"],
             "original_query": user_message,
@@ -273,6 +360,13 @@ async def supervisor_node(state: SupervisorState) -> dict:
             # Reset loop flag on each supervisor entry
             "should_loop_back": False,
         }
+
+        # If abbreviations were expanded, include expanded_query for downstream nodes
+        if was_modified:
+            result["expanded_query"] = expanded_message
+            result["rewritten_query"] = expanded_message
+
+        return result
 
     except Exception as e:
         logger.error(f"[supervisor] LLM call failed: {e}")

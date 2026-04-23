@@ -84,13 +84,18 @@ def _map_abbr_result(result: dict) -> dict:
     # to re-classify with the full form (e.g., "an ninh mạng" instead of "ANM")
     should_loop = bool(results)
 
+    # Use the combined expanded_query from result if available (for multi-abbr case),
+    # otherwise fall back to first result's full_form
+    expanded_query = result.get("expanded_query", "")
+    if not expanded_query and results:
+        expanded_query = results[0].get("full_form", "")
+
     return {
         "abbreviation_results": results,
         "kg_summaries": [result.get("text", "")],
         "should_loop_back": should_loop,
-        # Set expanded_query so supervisor re-classifies with full form
-        "expanded_query": results[0].get("full_form", "") if results else "",
-        "rewritten_query": results[0].get("full_form", "") if results else "",
+        "expanded_query": expanded_query,
+        "rewritten_query": expanded_query,
     }
 
 
@@ -178,31 +183,144 @@ async def _tool_search_doc_num(state: SupervisorState) -> dict:
 
 
 async def _tool_search_abbr(state: SupervisorState) -> dict:
-    """Search abbreviation meaning."""
-    from app.services.agent.tools import search_abbreviation
+    """Search abbreviation meaning - handles multiple abbreviations in one query."""
+    from sqlalchemy import select
     from app.services.agent.streaming import get_current_db
+    from app.models.abbreviation import Abbreviation
 
     raw_query = state.get("rewritten_query", "")
-    workspace_ids = state.get("workspace_ids", [])
     db = get_current_db()
 
-    # Extract abbreviation from query patterns:
-    # - "khái niệm ANM là gì" → "ANM"
-    # - "'ANM'" or '"ANM"' → "ANM"
-    # - "ANM nghĩa là gì" → "ANM"
+    # Extract ALL abbreviations from query (not just the first one)
+    # Handles queries with multiple abbreviations like "BMNN TTGT ntn"
     import re
-    abbreviation_match = re.search(r'\b([A-Z]{2,})\b', raw_query)  # uppercase acronyms
-    if not abbreviation_match:
-        abbreviation_match = re.search(r'[\'"]([^\'"]+)[\'"]', raw_query)  # quoted
-    abbreviation = abbreviation_match.group(1) if abbreviation_match else raw_query
 
-    logger.info(f"[_tool_search_abbr] abbreviation={abbreviation!r}, workspace_ids={workspace_ids}, db={type(db).__name__}")
+    # Find all uppercase sequences (2+ chars) that are abbreviations
+    all_abbr_matches = re.findall(r'\b([A-Z]{2,})\b', raw_query)
+    # Also check for quoted abbreviations
+    quoted_matches = re.findall(r'[\'"]([^\'"]+)[\'"]', raw_query)
+    all_abbreviations = all_abbr_matches + [m for m in quoted_matches if len(m) >= 2]
 
-    return await search_abbreviation(
-        abbreviation=abbreviation,
-        workspace_ids=workspace_ids,
-        db=db,
-    )
+    logger.info(f"[_tool_search_abbr] found abbreviations={all_abbreviations!r}, raw_query={raw_query!r}")
+
+    # If no abbreviations found, search with the original query
+    if not all_abbreviations:
+        abbreviation = raw_query
+        logger.info(f"[_tool_search_abbr] no abbr found, searching raw_query={abbreviation!r}")
+        result = await db.execute(
+            select(Abbreviation)
+            .where(
+                Abbreviation.short_form.ilike(f"%{abbreviation}%"),
+                Abbreviation.is_active == True,
+            )
+            .limit(10)
+        )
+        abbreviations = result.scalars().all()
+        return _build_abbr_response(abbreviations, abbreviation)
+
+    # Search for ALL abbreviations found
+    if len(all_abbreviations) == 1:
+        # Single abbreviation - use existing logic for backward compatibility
+        abbreviation = all_abbreviations[0]
+        result = await db.execute(
+            select(Abbreviation)
+            .where(
+                Abbreviation.short_form.ilike(f"%{abbreviation}%"),
+                Abbreviation.is_active == True,
+            )
+            .limit(10)
+        )
+        abbreviations = result.scalars().all()
+        return _build_abbr_response(abbreviations, abbreviation)
+
+    # Multiple abbreviations - search for each and combine
+    all_results = []
+    expanded_parts = []
+    not_found = []
+
+    for abbreviation in all_abbreviations:
+        result = await db.execute(
+            select(Abbreviation)
+            .where(
+                Abbreviation.short_form.ilike(f"%{abbreviation}%"),
+                Abbreviation.is_active == True,
+            )
+            .limit(10)
+        )
+        abbreviations = result.scalars().all()
+        if abbreviations:
+            for ab in abbreviations:
+                all_results.append({
+                    "short_form": ab.short_form,
+                    "full_form": ab.full_form,
+                    "description": ab.description,
+                })
+                if ab.full_form not in expanded_parts:
+                    expanded_parts.append(ab.full_form)
+        else:
+            not_found.append(abbreviation)
+
+    # Build expanded query with ALL expanded forms
+    expanded_query = " ".join(expanded_parts) if expanded_parts else ""
+
+    # Build text response
+    lines = [f"Tìm thấy **{len(all_results)} kết quả** cho các từ viết tắt:"]
+    for i, ab in enumerate(all_results, 1):
+        lines.append(f"{i}. **{ab['short_form']}** = {ab['full_form']}")
+        if ab.get('description'):
+            lines.append(f"   Mô tả: {ab['description']}")
+
+    if not_found:
+        lines.append(f"\nKhông tìm thấy: {', '.join(not_found)}")
+
+    text = "\n".join(lines)
+    should_loop = bool(all_results)
+
+    logger.info(f"[_tool_search_abbr] multi-abbr: found={len(all_results)}, expanded_query={expanded_query!r}")
+
+    return {
+        "text": text,
+        "results": all_results,
+        "found": should_loop,
+        "expanded_query": expanded_query,
+        "abbreviation": "|".join(all_abbreviations),
+    }
+
+
+def _build_abbr_response(abbreviations, original_abbr):
+    """Helper to build abbreviation response."""
+    if not abbreviations:
+        return {
+            "text": f"Không tìm thấy nghĩa của '{original_abbr}'. "
+                    f"Bạn có thể cho biết '{original_abbr}' là viết tắt của gì không?",
+            "abbreviation": original_abbr,
+            "found": False,
+        }
+
+    if len(abbreviations) == 1:
+        ab = abbreviations[0]
+        return {
+            "text": f"**{ab.short_form}** = {ab.full_form}\n"
+                    f"{f'Mô tả: {ab.description}' if ab.description else ''}",
+            "abbreviation": ab.short_form,
+            "full_form": ab.full_form,
+            "description": ab.description,
+            "found": True,
+        }
+
+    lines = [f"Tìm thấy **{len(abbreviations)} kết quả** cho '{original_abbr}':"]
+    for i, ab in enumerate(abbreviations, 1):
+        lines.append(f"{i}. **{ab.short_form}** = {ab.full_form}")
+
+    return {
+        "text": "\n".join(lines),
+        "abbreviation": original_abbr,
+        "found": True,
+        "results": [
+            {"short_form": ab.short_form, "full_form": ab.full_form, "description": ab.description}
+            for ab in abbreviations
+        ],
+    }
 
 
 # =============================================================================

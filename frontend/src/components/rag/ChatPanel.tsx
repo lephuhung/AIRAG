@@ -67,7 +67,7 @@ const truncateName = (name: string, maxLength = 25) => {
   return name.slice(0, maxLength - 8) + "..." + name.slice(-5);
 };
 
-export const formatMentionName = (name: string) => {
+const formatMentionName = (name: string) => {
   let clean = name.replace(/\.[^/.]+$/, "");
   return truncateName(clean, 30);
 };
