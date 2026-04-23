@@ -308,28 +308,25 @@ async def _search_multi(
     lookup_type: str,
     value: str,
     match_mode: str = "exact",  # "exact" | "regex" | "phone"
-) -> dict:
+):
     """
     Generic multi-schema search using SEARCHABLE_COLLECTION_MAP.
-
     Optimizations:
-      - All schema queries run in PARALLEL via asyncio.gather()
-      - Exact match uses equality (can use index) not regex
-      - Phone: exact match only — suffix fallback removed (false positive risk)
-      - Limit 10 docs per collection
+      - Runs parallel queries across schemas.
+      - Yields partial results as soon as each schema finishes.
     """
     if lookup_type not in SEARCHABLE_COLLECTION_MAP:
-        return {
+        yield {
             "found": False,
             "persons": [],
             "display": f"Không hỗ trợ lookup type: {lookup_type}",
             "lookup_type": lookup_type,
         }
+        return
 
     schema_map = SEARCHABLE_COLLECTION_MAP[lookup_type]["collections"]
     db = get_mongo_db()
 
-    # Build list of asyncio.to_thread tasks — one per schema, all run in parallel
     tasks = []
     for schema_name, cfg in schema_map.items():
         query_fields = cfg.get("fields", [])
@@ -350,24 +347,31 @@ async def _search_multi(
         )
         tasks.append(task)
 
-    # Wait for all schema queries to complete in parallel
-    results_list = await asyncio.gather(*tasks)
-
-    results_by_schema: dict[str, list[dict]] = {}
-    for schema_name, docs in results_list:
-        results_by_schema[schema_name] = docs
+    found_any = False
+    for coro in asyncio.as_completed(tasks):
+        schema_name, docs = await coro
         if docs:
+            found_any = True
             logger.warning(f"[_search_multi] ✅ {schema_name} → {len(docs)} docs")
+            results_by_schema = {schema_name: docs}
+            persons, display, schemas = _merge_results(results_by_schema, lookup_type)
+            if schemas:
+                display = enrich_display_with_schema(display, schemas)
+            
+            yield {
+                "found": True,
+                "persons": persons,
+                "display": display,
+                "lookup_type": lookup_type,
+            }
 
-    persons, display, schemas = _merge_results(results_by_schema, lookup_type)
-    if schemas:
-        display = enrich_display_with_schema(display, schemas)
-    return {
-        "found": bool(persons),
-        "persons": persons,
-        "display": display,
-        "lookup_type": lookup_type,
-    }
+    if not found_any:
+        yield {
+            "found": False,
+            "persons": [],
+            "display": f"Không tìm thấy người nào.",
+            "lookup_type": lookup_type,
+        }
 
 
 # ============================================================================
@@ -416,15 +420,16 @@ def _query_single_schema_advanced_sync(
         logger.warning(f"[_query_single_schema_advanced] ❌ {collection_name}: {e}")
         return collection_name, []
 
-async def _search_multi_advanced(criteria: dict[str, str]) -> dict:
+async def _search_multi_advanced(criteria: dict[str, str]):
     lookup_type = "advanced"
     if lookup_type not in SEARCHABLE_COLLECTION_MAP:
-        return {
+        yield {
             "found": False,
             "persons": [],
             "display": f"Không hỗ trợ lookup type: {lookup_type}",
             "lookup_type": lookup_type,
         }
+        return
 
     schema_map = SEARCHABLE_COLLECTION_MAP[lookup_type]["collections"]
     db = get_mongo_db()
@@ -454,126 +459,141 @@ async def _search_multi_advanced(criteria: dict[str, str]) -> dict:
         tasks.append(task)
 
     if not tasks:
-        return {
+        yield {
             "found": False,
             "persons": [],
             "display": "Không có collection nào hỗ trợ các trường tìm kiếm này.",
             "lookup_type": lookup_type,
         }
+        return
 
-    results_list = await asyncio.gather(*tasks)
-
-    results_by_schema: dict[str, list[dict]] = {}
-    for schema_name, docs in results_list:
-        results_by_schema[schema_name] = docs
+    found_any = False
+    for coro in asyncio.as_completed(tasks):
+        schema_name, docs = await coro
         if docs:
+            found_any = True
             logger.warning(f"[_search_multi_advanced] ✅ {schema_name} → {len(docs)} docs")
+            results_by_schema = {schema_name: docs}
+            persons, display, schemas = _merge_results(results_by_schema, lookup_type)
+            if schemas:
+                display = enrich_display_with_schema(display, schemas)
+                
+            yield {
+                "found": True,
+                "persons": persons,
+                "display": display,
+                "lookup_type": lookup_type,
+            }
 
-    persons, display, schemas = _merge_results(results_by_schema, lookup_type)
-    if schemas:
-        display = enrich_display_with_schema(display, schemas)
-    return {
-        "found": bool(persons),
-        "persons": persons,
-        "display": display,
-        "lookup_type": lookup_type,
-    }
+    if not found_any:
+        yield {
+            "found": False,
+            "persons": [],
+            "display": f"Không tìm thấy người nào.",
+            "lookup_type": lookup_type,
+        }
 
 # ============================================================================
 # Public API — 1 function per intent
 # ============================================================================
 
 
-async def search_by_cccd(cccd: str) -> dict:
+async def search_by_cccd(cccd: str):
     """
     Search for a person by CCCD/CMND across all schemas.
-    CCCD must be exactly 9 or 12 digits (Vietnamese national ID format).
-
-    Returns: {"found": bool, "persons": list[dict], "display": str}
+    Yields partial results.
     """
-    cccd_digits = re.sub(r"\D", "", cccd)  # strip non-digits
+    cccd_digits = re.sub(r"\D", "", cccd)
     if not cccd_digits or len(cccd_digits) not in (9, 12):
-        return {"found": False, "persons": [], "display": "Số CCCD không hợp lệ (cần 9 hoặc 12 chữ số)."}
+        yield {"found": False, "persons": [], "display": "Số CCCD không hợp lệ (cần 9 hoặc 12 chữ số)."}
+        return
 
     logger.info(f"[search_by_cccd] Searching CCCD: {cccd_digits}")
-    result = await _search_multi("cccd", cccd_digits, match_mode="exact")
+    
+    found_any = False
+    async for result in _search_multi("cccd", cccd_digits, match_mode="exact"):
+        if result["found"]:
+            found_any = True
+        yield result
+        
+    if not found_any:
+        yield {"found": False, "persons": [], "display": f"Không tìm thấy người có CCCD: {cccd_digits}"}
 
-    if not result["found"]:
-        return {"found": False, "persons": [], "display": f"Không tìm thấy người có CCCD: {cccd_digits}"}
 
-    return result
-
-
-async def search_by_name(name: str, limit: int = 10) -> dict:
+async def search_by_name(name: str, limit: int = 10):
     """
-    Search for persons by name (partial, case-insensitive regex).
-
-    Returns: {"found": bool, "persons": list[dict], "display": str}
+    Search for persons by name. Yields partial results.
     """
     if not name or len(name) < 2:
-        return {"found": False, "persons": [], "display": "Tên tìm kiếm quá ngắn."}
+        yield {"found": False, "persons": [], "display": "Tên tìm kiếm quá ngắn."}
+        return
 
     logger.info(f"[search_by_name] Searching name: {name}")
-    result = await _search_multi("name", name, match_mode="regex")
-    result["persons"] = result["persons"][:limit]
-    return result
+    found_any = False
+    async for result in _search_multi("name", name, match_mode="regex"):
+        if result["found"]:
+            found_any = True
+        result["persons"] = result["persons"][:limit]
+        yield result
 
 
-async def search_by_bhxh(so_bhxh: str) -> dict:
+async def search_by_bhxh(so_bhxh: str):
     """
-    Search for a person by BHXH number across all schemas.
-    BHXH number must be digits only, at least 5 digits.
-
-    Returns: {"found": bool, "persons": list[dict], "display": str}
+    Search for a person by BHXH number. Yields partial results.
     """
-    bhxh_digits = re.sub(r"\D", "", so_bhxh)  # strip non-digits
+    bhxh_digits = re.sub(r"\D", "", so_bhxh)
     if not bhxh_digits or len(bhxh_digits) < 5:
-        return {"found": False, "persons": [], "display": "Số BHXH không hợp lệ (cần ít nhất 5 chữ số)."}
+        yield {"found": False, "persons": [], "display": "Số BHXH không hợp lệ (cần ít nhất 5 chữ số)."}
+        return
 
     logger.info(f"[search_by_bhxh] Searching BHXH: {bhxh_digits}")
-    result = await _search_multi("bhxh", bhxh_digits, match_mode="exact")
+    found_any = False
+    async for result in _search_multi("bhxh", bhxh_digits, match_mode="exact"):
+        if result["found"]:
+            found_any = True
+        yield result
 
-    if not result["found"]:
-        return {"found": False, "persons": [], "display": f"Không tìm thấy người có số BHXH: {bhxh_digits}"}
-
-    return result
+    if not found_any:
+        yield {"found": False, "persons": [], "display": f"Không tìm thấy người có số BHXH: {bhxh_digits}"}
 
 
-async def search_by_phone(phone: str, limit: int = 10) -> dict:
+async def search_by_phone(phone: str, limit: int = 10):
     """
-    Search for persons by phone number across all schemas.
-    Phone number must be exactly 10 digits starting with a valid prefix.
-    Uses EXACT match only — suffix/partial matching was removed because
-    it generated false positives (matching any string ending in the same digits).
-
-    Returns: {"found": bool, "persons": list[dict], "display": str}
+    Search for persons by phone number. Yields partial results.
     """
-    phone_digits = re.sub(r"\D", "", phone)  # strip non-digits
+    phone_digits = re.sub(r"\D", "", phone)
     if len(phone_digits) != 10:
-        return {"found": False, "persons": [], "display": "Số điện thoại không hợp lệ (cần đúng 10 chữ số)."}
+        yield {"found": False, "persons": [], "display": "Số điện thoại không hợp lệ (cần đúng 10 chữ số)."}
+        return
 
     logger.info(f"[search_by_phone] Searching phone: {phone_digits}")
-    logger.warning(f"[search_by_phone] 🔍 REAL MongoDB QUERY — phone={phone_digits!r}")
-    result = await _search_multi("phone", phone_digits, match_mode="phone")
-    logger.warning(f"[search_by_phone] ✅ RETURNED — found={result['found']}, count={len(result['persons'])}")
-    result["persons"] = result["persons"][:limit]
-    return result
+    found_any = False
+    async for result in _search_multi("phone", phone_digits, match_mode="phone"):
+        if result["found"]:
+            found_any = True
+        result["persons"] = result["persons"][:limit]
+        yield result
 
-async def search_by_advanced(criteria: dict[str, str], limit: int = 10) -> dict:
+    if not found_any:
+        yield {"found": False, "persons": [], "display": f"Không tìm thấy người có số điện thoại: {phone_digits}"}
+
+
+async def search_by_advanced(criteria: dict[str, str], limit: int = 10):
     """
-    Search for persons using multiple criteria (e.g. name + dob + address).
-    Returns mapping combined from all cross schemas.
+    Search for persons using multiple criteria. Yields partial results.
     """
-    # Clean criteria
     clean_criteria = {k: str(v).strip() for k, v in criteria.items() if v and str(v).strip()}
     if not clean_criteria:
-        return {"found": False, "persons": [], "display": "Không có tiêu chí tìm kiếm hợp lệ."}
+        yield {"found": False, "persons": [], "display": "Không có tiêu chí tìm kiếm hợp lệ."}
+        return
 
     logger.info(f"[search_by_advanced] Searching: {clean_criteria}")
-    result = await _search_multi_advanced(clean_criteria)
-    result["persons"] = result["persons"][:limit]
-    
-    if not result["found"]:
-        return {"found": False, "persons": [], "display": f"Không tìm thấy người khớp với thông tin: {clean_criteria}"}
+    found_any = False
+    async for result in _search_multi_advanced(clean_criteria):
+        if result["found"]:
+            found_any = True
+        result["persons"] = result["persons"][:limit]
+        yield result
         
-    return result
+    if not found_any:
+        yield {"found": False, "persons": [], "display": f"Không tìm thấy người khớp với thông tin: {clean_criteria}"}

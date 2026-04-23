@@ -679,14 +679,27 @@ async def answer_generator(state: "AgentState") -> dict:
         context_parts.append("## Document Chunks\n" + "\n\n---\n\n".join(chunk_parts))
 
     # Build llm messages — convert from state messages
+    # IMPORTANT: Truncate old assistant messages to prevent topic contamination.
+    # User messages are kept intact (needed for context: "tài liệu này", "văn bản này").
+    # Old assistant responses are truncated because they can contain long answers
+    # about a DIFFERENT topic (e.g. "an ninh mạng") that biases the LLM
+    # when answering a new question (e.g. "bí mật nhà nước").
+    _HISTORY_ASSISTANT_TRUNCATE = 150  # chars — enough to indicate topic, not flood tokens
+    recent_messages = (messages or [])[-10:]
     llm_messages: list[_LLMMsg] = []
-    for msg in (messages or [])[-10:]:
+    for i, msg in enumerate(recent_messages):
         if isinstance(msg, dict):
             role = msg.get("role", "user")
             content = msg.get("content", "")
         else:
             role = _get_msg_role(msg) or "user"
             content = getattr(msg, "content", "")
+
+        # Truncate old assistant messages (all except the very last message)
+        is_last_message = (i == len(recent_messages) - 1)
+        if not is_last_message and role == "assistant" and len(content) > _HISTORY_ASSISTANT_TRUNCATE:
+            content = content[:_HISTORY_ASSISTANT_TRUNCATE] + "… [lược bỏ]"
+
         llm_messages.append(_LLMMsg(role=role, content=content))
 
     # Always inject instructions so LLM never fabricates when context is empty
@@ -698,6 +711,10 @@ async def answer_generator(state: "AgentState") -> dict:
         + context_text
         + "\n=== END CONTEXT ===\n\n"
         "INSTRUCTIONS:\n"
+        "- CRITICAL: Answer the CURRENT question based ONLY on the RETRIEVED CONTEXT above. "
+        "Previous conversation messages are provided only for reference continuity (e.g. 'tài liệu này'). "
+        "Do NOT reuse, blend, or repeat information from previous assistant answers. "
+        "Each question must be answered independently from the retrieved sources.\n"
         "- Answer based ONLY on the retrieved sources above. "
         "If the retrieved context is empty or says 'no results', say so — do NOT fill in details from your own knowledge.\n"
         "- You have NO access to external databases, phone records, or personal information "

@@ -461,8 +461,11 @@ def _format_memory_context(edges: list) -> str:
             # Strip the "Người dùng ID=<N>" internal anchor and replace with "Bạn"
             # so facts read naturally: "Bạn công tác tại..." instead of "Người dùng ID=3 công tác tại..."
             # Uses a regex to match any numeric ID variant.
-            cleaned = re.sub(r"Người dùng ID=\d+\s*", "Bạn ", str(fact)).strip()
-            cleaned = re.sub(r"người dùng ID=\d+\s*", "Bạn ", cleaned).strip()
+            # Strip the "Người dùng ID=<UUID>" internal anchor and replace with "Bạn"
+            # so facts read naturally: "Bạn công tác tại..." instead of "Người dùng ID=<UUID> công tác tại..."
+            # Uses [^\s]+ to match the full UUID (which contains hex chars and hyphens, not just \d+)
+            cleaned = re.sub(r"Người dùng ID=[^\s]+\s*", "Bạn ", str(fact)).strip()
+            cleaned = re.sub(r"người dùng ID=[^\s]+\s*", "Bạn ", cleaned).strip()
             if cleaned:
                 cleaned = cleaned[0].upper() + cleaned[1:]
             if cleaned:

@@ -9,6 +9,20 @@ export function useChatSessions() {
   });
 }
 
+export function useUpdateSessionTitle() {
+  const queryClient = useQueryClient();
+
+  return (sessionId: string, title: string) => {
+    queryClient.setQueryData<ChatSession[]>(
+      ["chat-sessions"],
+      (old) =>
+        old?.map((s) =>
+          String(s.id) === sessionId ? { ...s, title } : s,
+        ),
+    );
+  };
+}
+
 export function useCreateChatSession() {
   const queryClient = useQueryClient();
 

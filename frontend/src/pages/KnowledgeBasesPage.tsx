@@ -163,7 +163,7 @@ export function KnowledgeBasesPage() {
               <div className="flex items-center gap-1.5">
                 <h3 className="font-medium text-sm truncate">{ws.name}</h3>
                 {ws.is_default && (
-                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400">
+                  <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 whitespace-nowrap">
                     <Star className="w-2.5 h-2.5 fill-amber-500" />
                     {t("kb.default")}
                   </span>
@@ -232,18 +232,18 @@ export function KnowledgeBasesPage() {
             )}
           </div>
         </div>
-        <div className="flex items-center gap-3 mt-3 text-xs text-muted-foreground">
-          <span className="flex items-center gap-1">
+        <div className="flex items-center flex-wrap gap-x-3 gap-y-1 mt-3 text-xs text-muted-foreground">
+          <span className="flex items-center gap-1 whitespace-nowrap">
             <FileText className="w-3 h-3" />
             {t("kb.docs_count", { count: ws.document_count })}
           </span>
-          <span className="flex items-center gap-1 text-green-500">
+          <span className="flex items-center gap-1 text-green-500 whitespace-nowrap">
             {t("kb.indexed_count", { count: ws.indexed_count })}
           </span>
           {ws.updated_at && (
             <>
               <span className="text-border">|</span>
-              <span>{formatDate(ws.updated_at)}</span>
+              <span className="whitespace-nowrap">{formatDate(ws.updated_at)}</span>
             </>
           )}
         </div>

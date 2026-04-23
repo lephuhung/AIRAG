@@ -41,35 +41,39 @@ def _map_mongo_result(result: dict) -> dict:
 # Tool Functions
 # =============================================================================
 
-async def _tool_mongo_cccd(state: SupervisorState) -> dict:
+async def _tool_mongo_cccd(state: SupervisorState):
     """Search MongoDB people by CCCD."""
     from app.services.agent.tools import search_people_by_cccd
 
-    return await search_people_by_cccd(state.get("rewritten_query", ""))
+    async for res in search_people_by_cccd(state.get("rewritten_query", "")):
+        yield res
 
 
-async def _tool_mongo_name(state: SupervisorState) -> dict:
+async def _tool_mongo_name(state: SupervisorState):
     """Search MongoDB people by name."""
     from app.services.agent.tools import search_people_by_name
 
-    return await search_people_by_name(state.get("rewritten_query", ""), limit=10)
+    async for res in search_people_by_name(state.get("rewritten_query", ""), limit=10):
+        yield res
 
 
-async def _tool_mongo_bhxh(state: SupervisorState) -> dict:
+async def _tool_mongo_bhxh(state: SupervisorState):
     """Search MongoDB people by BHXH."""
     from app.services.agent.tools import search_people_by_bhxh
 
-    return await search_people_by_bhxh(state.get("rewritten_query", ""))
+    async for res in search_people_by_bhxh(state.get("rewritten_query", "")):
+        yield res
 
 
-async def _tool_mongo_phone(state: SupervisorState) -> dict:
+async def _tool_mongo_phone(state: SupervisorState):
     """Search MongoDB people by phone."""
     from app.services.agent.tools import search_people_by_phone
 
-    return await search_people_by_phone(state.get("rewritten_query", ""), limit=10)
+    async for res in search_people_by_phone(state.get("rewritten_query", ""), limit=10):
+        yield res
 
 
-async def _tool_mongo_advanced(state: SupervisorState) -> dict:
+async def _tool_mongo_advanced(state: SupervisorState):
     """Search MongoDB people using multiple criteria extracted via LLM."""
     from app.services.agent.tools import search_people_advanced
     from app.services.llm import get_llm_provider
@@ -119,7 +123,8 @@ async def _tool_mongo_advanced(state: SupervisorState) -> dict:
         criteria = {"name": user_query, "dob": "", "address": "", "phone": ""}
 
     logger.info(f"[_tool_mongo_advanced] Extracted criteria: {criteria}")
-    return await search_people_advanced(criteria, limit=10)
+    async for res in search_people_advanced(criteria, limit=10):
+        yield res
 
 
 # =============================================================================
@@ -166,27 +171,40 @@ async def people_agent_node(state: SupervisorState) -> dict:
     tool_fn, mapper = PEOPLE_TOOL_REGISTRY[intent]
 
     try:
-        result = await tool_fn(state)
-        updates = mapper(result)
+        all_persons = []
+        all_summaries = []
+        
+        async for partial_result in tool_fn(state):
+            updates = mapper(partial_result)
+            
+            # Emit sources if present
+            sources = updates.get("sources", [])
+            if sources:
+                await push_event(state, "sources", sources)
 
-        # Emit sources if present
-        sources = updates.get("sources", [])
-        if sources:
-            await push_event(state, "sources", sources)
-
-        # Emit people_data for structured display in frontend
-        people_data = updates.get("mongo_results", [])
-        if people_data:
-            await push_event(state, "people_data", people_data)
-
-        # Add iteration count
-        updates["iterations"] = state.get("iterations", 0) + 1
+            # Accumulate new persons
+            new_persons = updates.get("mongo_results", [])
+            if new_persons:
+                all_persons.extend(new_persons)
+                # Emit accumulated people_data for structured display in frontend
+                await push_event(state, "people_data", all_persons)
+                
+            new_summaries = updates.get("kg_summaries", [])
+            if new_summaries:
+                all_summaries.extend(new_summaries)
 
         logger.info(
-            f"[people_agent] completed: mongo_results={len(updates.get('mongo_results', []))}"
+            f"[people_agent] completed: mongo_results={len(all_persons)}"
         )
 
-        return updates
+        final_display = "\n".join(all_summaries) if all_summaries else "Không tìm thấy dữ liệu."
+        
+        return {
+            "mongo_results": all_persons,
+            "kg_summaries": all_summaries,
+            "final_answer": final_display,
+            "iterations": state.get("iterations", 0) + 1,
+        }
 
     except Exception as e:
         logger.error(f"[people_agent] tool {intent} failed: {e}", exc_info=True)

@@ -778,26 +778,24 @@ async def search_abbreviation(
 # ---------------------------------------------------------------------------
 
 
-async def search_people_by_cccd(cccd: str) -> dict:
+async def search_people_by_cccd(cccd: str):
     """
     Search for a person by CCCD (Căn cước công dân) number.
-    Exact match on the cccd field.
-
-    Returns:
-        dict with keys: found, person, display
+    Exact match on the cccd field. Yields partial results.
     """
     from app.services.mongo_people_service import search_by_cccd as _svc
 
     try:
-        return await _svc(cccd)
+        async for res in _svc(cccd):
+            yield res
     except Exception as e:
         logger.error(f"[tool:search_people_by_cccd] Failed: {e}")
-        return {"found": False, "person": None, "display": f"Lỗi tìm kiếm CCCD: {e}"}
+        yield {"found": False, "persons": [], "display": f"Lỗi tìm kiếm CCCD: {e}"}
 
 
-async def search_people_by_name(name: str, limit: int = 10) -> dict:
+async def search_people_by_name(name: str, limit: int = 10):
     """
-    Search for persons by name (ho_ten).
+    Search for persons by name (ho_ten). Yields partial results.
     Case-insensitive partial regex match.
 
     Returns:
@@ -806,10 +804,11 @@ async def search_people_by_name(name: str, limit: int = 10) -> dict:
     from app.services.mongo_people_service import search_by_name as _svc
 
     try:
-        return await _svc(name, limit=limit)
+        async for res in _svc(name, limit=limit):
+            yield res
     except Exception as e:
         logger.error(f"[tool:search_people_by_name] Failed: {e}")
-        return {
+        yield {
             "found": False,
             "count": 0,
             "persons": [],
@@ -817,10 +816,10 @@ async def search_people_by_name(name: str, limit: int = 10) -> dict:
         }
 
 
-async def search_people_by_bhxh(so_bhxh: str) -> dict:
+async def search_people_by_bhxh(so_bhxh: str):
     """
     Search for a person by BHXH (Bảo hiểm xã hội) number.
-    Exact or loose regex match.
+    Exact or loose regex match. Yields partial results.
 
     Returns:
         dict with keys: found, person, display
@@ -828,16 +827,17 @@ async def search_people_by_bhxh(so_bhxh: str) -> dict:
     from app.services.mongo_people_service import search_by_bhxh as _svc
 
     try:
-        return await _svc(so_bhxh)
+        async for res in _svc(so_bhxh):
+            yield res
     except Exception as e:
         logger.error(f"[tool:search_people_by_bhxh] Failed: {e}")
-        return {"found": False, "person": None, "display": f"Lỗi tìm kiếm BHXH: {e}"}
+        yield {"found": False, "person": None, "display": f"Lỗi tìm kiếm BHXH: {e}"}
 
 
-async def search_people_by_phone(phone: str, limit: int = 10) -> dict:
+async def search_people_by_phone(phone: str, limit: int = 10):
     """
     Search for persons by phone number (so_dien_thoai).
-    Exact, ends-with, or contains match.
+    Exact, ends-with, or contains match. Yields partial results.
 
     Returns:
         dict with keys: found, count, persons, display
@@ -845,27 +845,30 @@ async def search_people_by_phone(phone: str, limit: int = 10) -> dict:
     from app.services.mongo_people_service import search_by_phone as _svc
 
     try:
-        return await _svc(phone, limit=limit)
+        async for res in _svc(phone, limit=limit):
+            yield res
     except Exception as e:
         logger.error(f"[tool:search_people_by_phone] Failed: {e}")
-        return {
+        yield {
             "found": False,
             "count": 0,
             "persons": [],
             "display": f"Lỗi tìm kiếm SĐT: {e}",
         }
 
-async def search_people_advanced(criteria: dict, limit: int = 10) -> dict:
+async def search_people_advanced(criteria: dict, limit: int = 10):
     """
     Search for persons by multiple criteria (Name + DoB + Address + etc).
+    Yields partial results.
     """
     from app.services.mongo_people_service import search_by_advanced as _svc
 
     try:
-        return await _svc(criteria, limit=limit)
+        async for res in _svc(criteria, limit=limit):
+            yield res
     except Exception as e:
         logger.error(f"[tool:search_people_advanced] Failed: {e}")
-        return {
+        yield {
             "found": False,
             "count": 0,
             "persons": [],

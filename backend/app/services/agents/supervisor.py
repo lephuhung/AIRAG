@@ -452,6 +452,7 @@ def create_supervisor_graph():
 
     # Nodes
     graph.add_node("supervisor", supervisor_node)
+    graph.add_node("memory_recall", _memory_recall_wrapper)
     graph.add_node("rag", _rag_agent_wrapper)
     graph.add_node("write", _write_agent_wrapper)
     graph.add_node("people", _people_agent_wrapper)
@@ -466,18 +467,33 @@ def create_supervisor_graph():
         "supervisor",
         route_from_supervisor,
         {
+            AgentType.RAG: "memory_recall",
+            AgentType.WRITE: "memory_recall",
+            AgentType.DIRECT: "memory_recall",
+            AgentType.PEOPLE: "memory_recall",
+            END: END,  # handle finish case
+        },
+    )
+
+    # memory_recall loads personal context, then routes to the target agent
+    def route_from_memory(state: SupervisorState) -> str:
+        return state.get("next_agent", AgentType.FINISH)
+
+    graph.add_conditional_edges(
+        "memory_recall",
+        route_from_memory,
+        {
             AgentType.RAG: "rag",
             AgentType.WRITE: "write",
             AgentType.DIRECT: "direct",
             AgentType.PEOPLE: "people",
-            END: END,  # handle finish case
+            AgentType.FINISH: END,
         },
     )
 
     # After rag/write/people/direct agents complete, go to answer_generator
     # (rag uses conditional routing to support abbreviation loop-back)
     graph.add_conditional_edges("rag", route_from_rag, {"supervisor": "supervisor", "answer_generator": "answer_generator"})
-    graph.add_edge("write", "answer_generator")
     graph.add_edge("write", "answer_generator")
     graph.add_edge("people", "answer_generator")
     graph.add_edge("direct", "answer_generator")
@@ -522,6 +538,41 @@ def reset_supervisor_graph():
 # =============================================================================
 # Agent Wrappers (imported from new agent files)
 # =============================================================================
+
+async def _memory_recall_wrapper(state: SupervisorState) -> dict:
+    """
+    Load user memories from Graphiti into SupervisorState.user_memory_context.
+    Called before direct/write/rag so every agent has access to personal memory.
+    """
+    import uuid as _uuid
+
+    user_id = state.get("user_id")
+    if not user_id:
+        return {}
+
+    user_message = state.get("rewritten_query") or state.get("original_query", "")
+    if not user_message:
+        return {}
+
+    try:
+        from app.services.graphiti_client import search_user_memory
+
+        # user_id in state may be int or UUID depending on how it was passed
+        uid = user_id
+        if isinstance(uid, int):
+            uid = _uuid.UUID(int=uid)
+        elif isinstance(uid, str):
+            uid = _uuid.UUID(uid)
+
+        memory = await search_user_memory(uid, user_message, top_k=5)
+        if memory:
+            logger.info(f"[memory_recall_wrapper] Graphiti injected {len(memory)} chars")
+            return {"user_memory_context": memory}
+    except Exception as e:
+        logger.warning(f"[memory_recall_wrapper] failed: {e}")
+
+    return {}
+
 
 async def _rag_agent_wrapper(state: SupervisorState) -> dict:
     """Wrapper that imports and calls rag_agent_node."""

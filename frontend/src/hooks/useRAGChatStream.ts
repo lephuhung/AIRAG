@@ -46,6 +46,8 @@ export interface RAGStreamResult {
   aiMessageId: string | null;
   /** Server-assigned ID for the user message that started this stream */
   userMessageId: string | null;
+  /** Callback invoked when backend updates session title via topic_label (SSE event) */
+  onSessionTitleUpdated?: (title: string) => void;
   /** Send a message — returns the finalized ChatMessage on complete */
   sendMessage: (
     message: string,
@@ -98,7 +100,10 @@ function markActiveError(steps: AgentStep[]): AgentStep[] {
 // Hook
 // ---------------------------------------------------------------------------
 
-export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
+export function useRAGChatStream(
+  sessionId: string | null,
+  onSessionTitleUpdated?: (title: string) => void,
+): RAGStreamResult {
   const [status, setStatus] = useState<ChatStreamStatus>("idle");
   const [streamingContent, setStreamingContent] = useState("");
   const [thinkingText, setThinkingText] = useState("");
@@ -376,6 +381,15 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
                         ...prev,
                         createStep("analyzing", detail || "Analyzing your question..."),
                       ]);
+                    } else if (step === "searching") {
+                      setStatus("retrieving");
+                      syncUpdateSteps((prev) => [
+                        ...completeActiveStep(prev),
+                        createStep("understood", "Understood query", "completed"),
+                        createStep("retrieving", detail || "Searching documents..."),
+                      ]);
+                    } else if (step === "retrieved") {
+                      setStatus("retrieving");
                     } else if (step === "retrieving") {
                       setStatus("retrieving");
                       syncUpdateSteps((prev) => [
@@ -551,6 +565,12 @@ export function useRAGChatStream(sessionId: string | null): RAGStreamResult {
 
 
 
+
+                  case "session_title_updated":
+                    if (data.Title && onSessionTitleUpdated) {
+                      onSessionTitleUpdated(data.Title);
+                    }
+                    break;
 
                   case "error":
                     setError(data.message || "Unknown error");

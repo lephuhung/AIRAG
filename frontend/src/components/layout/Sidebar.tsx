@@ -82,7 +82,6 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle, isNarrow }: 
   const urlWorkspaceId = location.pathname.match(/\/knowledge-bases\/(\d+)/)?.[1];
   const isHome = location.pathname === "/";
   const isFilesPage = location.pathname === "/files" || location.pathname.endsWith("/files");
-  const isChatPage = location.pathname === "/chat" || location.pathname.startsWith("/chat/");
   const isWorkersPage = location.pathname === "/workers";
   const isSystemLogsPage = location.pathname === "/system-logs";
   const isAdminUsersPage = location.pathname === "/admin/users";
@@ -103,7 +102,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle, isNarrow }: 
       {/* Logo / Header */}
       <div className="flex items-center justify-between px-3 h-12 border-b border-border flex-shrink-0">
         <div className="flex items-center gap-2.5 overflow-hidden">
-          <img src={logo} alt="Logo" className="w-7 h-7 object-contain flex-shrink-0" />
+          <img src={logo} alt="Logo" className="w-8 h-8 object-contain flex-shrink-0" />
           {!collapsed && (
             <span className="font-bold text-primary text-base truncate whitespace-nowrap">
               {t("app.name")}

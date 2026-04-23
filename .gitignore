@@ -21,3 +21,4 @@ documents/
 .claude/
 *.log
 qwen_vllm.log
+.gitnexus

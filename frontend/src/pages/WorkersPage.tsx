@@ -244,12 +244,21 @@ export function WorkersPage() {
   });
 
   const retrySingle = useMutation({
-    mutationFn: (docId: number) => api.post(`/workers/retry-failed/${docId}`),
+    mutationFn: (docId: string) => api.post(`/workers/retry-failed/${docId}`),
     onSuccess: () => {
       invalidateAll();
       toast.success(t("workers.retry_single_success"));
     },
     onError: () => toast.error(t("workers.retry_single_failed")),
+  });
+
+  const deleteFailedDoc = useMutation({
+    mutationFn: (docId: string) => api.delete(`/documents/${docId}`),
+    onSuccess: () => {
+      invalidateAll();
+      toast.success(t("workers.delete_doc_success"));
+    },
+    onError: () => toast.error(t("workers.delete_doc_failed")),
   });
 
   const purgeQueue = useMutation({
@@ -303,6 +312,7 @@ export function WorkersPage() {
   const [retryAllConfirm, setRetryAllConfirm] = useState(false);
   const [stopConfirm, setStopConfirm] = useState<string | null>(null);
   const [cancelConfirmDoc, setCancelConfirmDoc] = useState<string | null>(null);
+  const [deleteFailedDocId, setDeleteFailedDocId] = useState<string | null>(null);
 
   // ── Computed ──
   const pipeline = overview?.pipeline_summary;
@@ -316,6 +326,9 @@ export function WorkersPage() {
   const dlqCount = dlqData?.count ?? 0;
   const dlqMessages = dlqData?.messages ?? [];
   const managedWorkers = managedData?.workers ?? {};
+
+  // True when all workers run as Docker containers (no subprocess management needed)
+  const isContainerMode = Object.values(overview?.container_workers ?? {}).some((c) => c > 0);
 
   // Health status color
   const healthStatus = health?.status ?? "unknown";
@@ -350,33 +363,37 @@ export function WorkersPage() {
             </p>
           </div>
           <div className="flex items-center gap-3">
-            <Button
-              variant="default"
-              size="sm"
-              className="h-8 gap-1.5 text-xs shadow-sm shadow-primary/20"
-              onClick={() => {
-                WORKER_TYPES.forEach((wt) =>
-                  startWorker.mutate({ worker_type: wt, count: 1 })
-                );
-              }}
-              disabled={startWorker.isPending}
-            >
-              <Zap className={cn("w-3.5 h-3.5", startWorker.isPending && "animate-spin")} />
-              {t("workers.start_all")}
-            </Button>
+            {!isContainerMode && (
+              <>
+                <Button
+                  variant="default"
+                  size="sm"
+                  className="h-8 gap-1.5 text-xs shadow-sm shadow-primary/20"
+                  onClick={() => {
+                    WORKER_TYPES.forEach((wt) =>
+                      startWorker.mutate({ worker_type: wt, count: 1 })
+                    );
+                  }}
+                  disabled={startWorker.isPending}
+                >
+                  <Zap className={cn("w-3.5 h-3.5", startWorker.isPending && "animate-spin")} />
+                  {t("workers.start_all")}
+                </Button>
 
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-8 gap-1.5 text-xs border-primary/20 text-primary hover:bg-primary/5"
-              onClick={() => restartAllWorkers.mutate()}
-              disabled={restartAllWorkers.isPending}
-            >
-              <RefreshCw className={cn("w-3.5 h-3.5", restartAllWorkers.isPending && "animate-spin")} />
-              {t("workers.restart_all")}
-            </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-8 gap-1.5 text-xs border-primary/20 text-primary hover:bg-primary/5"
+                  onClick={() => restartAllWorkers.mutate()}
+                  disabled={restartAllWorkers.isPending}
+                >
+                  <RefreshCw className={cn("w-3.5 h-3.5", restartAllWorkers.isPending && "animate-spin")} />
+                  {t("workers.restart_all")}
+                </Button>
 
-            <div className="h-6 w-px bg-border mx-1" />
+                <div className="h-6 w-px bg-border mx-1" />
+              </>
+            )}
 
             <div className="flex items-center gap-2">
               {/* Health badge */}
@@ -467,7 +484,7 @@ export function WorkersPage() {
 
             {/* ── Worker Management ── */}
             <Section title={t("workers.management")} icon={Cpu} defaultOpen={true}>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3">
                 {WORKER_TYPES.map((wtype) => {
                   const rmqConsumers = overview?.active_workers?.[wtype] ?? 0;
                   const containerCount = overview?.container_workers?.[wtype] ?? 0;
@@ -482,157 +499,243 @@ export function WorkersPage() {
                     <div
                       key={wtype}
                       className={cn(
-                        "rounded-xl border bg-card p-4 space-y-3",
+                        "rounded-xl border bg-card p-4 space-y-3 flex flex-col justify-between",
                         isRunning && "border-green-500/20",
                       )}
                     >
-                      {/* Header */}
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-2">
-                          <div className={cn(
-                            "w-2.5 h-2.5 rounded-full",
-                            isRunning ? "bg-green-400 animate-pulse" : "bg-muted-foreground/30",
-                          )} />
-                          <span className={cn("text-sm font-semibold", WORKER_COLORS[wtype])}>
-                            {t(`workers.types.${wtype}`) || wtype}
+                      <div>
+                        {/* Header */}
+                        <div className="flex items-center justify-between mb-2">
+                          <div className="flex items-center gap-2">
+                            <div className={cn(
+                              "w-2.5 h-2.5 rounded-full flex-shrink-0",
+                              isRunning ? "bg-green-400 animate-pulse" : "bg-muted-foreground/30",
+                            )} />
+                            <span className={cn("text-sm font-semibold truncate", WORKER_COLORS[wtype])}>
+                              {t(`workers.types.${wtype}`) || wtype}
+                            </span>
+                          </div>
+                          <span className="text-xs font-bold tabular-nums text-muted-foreground ml-2">
+                            {workerCount}
                           </span>
                         </div>
-                        <span className="text-xs text-muted-foreground">
-                          {t("workers.containers", { count: workerCount })}
-                        </span>
-                      </div>
 
-                      {/* Managed worker details */}
-                      {aliveList.length > 0 && (
-                        <div className="space-y-1">
-                          {aliveList.map((w) => (
-                            <div key={w.pid} className="flex items-center justify-between text-[11px] text-muted-foreground">
-                              <span>{t("workers.labels.pid")} {w.pid}</span>
-                              <span>{formatUptime(w.uptime_seconds)}</span>
-                            </div>
-                          ))}
-                        </div>
-                      )}
+                        {/* Managed worker details */}
+                        {aliveList.length > 0 && (
+                          <div className="space-y-1 mb-2">
+                            {aliveList.slice(0, 2).map((w) => (
+                              <div key={w.pid} className="flex items-center justify-between text-[11px] text-muted-foreground">
+                                <span>{t("workers.labels.pid")} {w.pid}</span>
+                                <span>{formatUptime(w.uptime_seconds)}</span>
+                              </div>
+                            ))}
+                            {aliveList.length > 2 && (
+                              <div className="text-[10px] text-muted-foreground/50 text-center">
+                                +{aliveList.length - 2} {t("common.show_more")}
+                              </div>
+                            )}
+                          </div>
+                        )}
 
-                      {managedCount > 0 && aliveList.length === 0 && (
-                        <p className="text-[11px] text-muted-foreground/50">
-                          {t("workers.managed_external", { count: managedCount })}
-                        </p>
-                      )}
-
-                      {/* Actions */}
-                      <div className="flex items-center gap-1.5 pt-1 border-t border-border/50">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-7 text-xs gap-1 flex-1"
-                          onClick={() => startWorker.mutate({ worker_type: wtype, count: 1 })}
-                          disabled={startWorker.isPending}
-                        >
-                          <Play className="w-3 h-3" />
-                          {t("common.start")}
-                        </Button>
-                        {isRunning && (
-                          <>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-7 text-xs gap-1 flex-1"
-                              onClick={() => restartWorker.mutate(wtype)}
-                              disabled={restartWorker.isPending}
-                            >
-                              <RefreshCw className={cn("w-3 h-3", restartWorker.isPending && "animate-spin")} />
-                              {t("common.restart")}
-                            </Button>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-7 text-xs gap-1 text-destructive hover:text-destructive"
-                              onClick={() => setStopConfirm(wtype)}
-                              disabled={stopWorker.isPending}
-                            >
-                              <Square className="w-3 h-3" />
-                            </Button>
-                          </>
+                        {managedCount > 0 && aliveList.length === 0 && (
+                          <p className="text-[11px] text-muted-foreground/50 mb-2">
+                            {t("workers.managed_external", { count: managedCount })}
+                          </p>
                         )}
                       </div>
+
+                      {/* Container-managed workers — read-only, no start/stop/restart */}
+                      {containerCount > 0 ? (
+                        <div className="pt-2 border-t border-border/50 text-center">
+                          <span className="text-[10px] text-muted-foreground/60">
+                            {t("workers.container_mode")}
+                          </span>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-1.5 pt-2 border-t border-border/50">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 text-[11px] gap-1 flex-1 px-1"
+                            onClick={() => startWorker.mutate({ worker_type: wtype, count: 1 })}
+                            disabled={startWorker.isPending}
+                          >
+                            <Play className="w-3 h-3" />
+                            {t("common.start")}
+                          </Button>
+                          {isRunning && (
+                            <>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 text-[11px] gap-1 flex-1 px-1"
+                                onClick={() => restartWorker.mutate(wtype)}
+                                disabled={restartWorker.isPending}
+                              >
+                                <RefreshCw className={cn("w-3 h-3", restartWorker.isPending && "animate-spin")} />
+                                {t("common.restart")}
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-7 w-7 text-destructive hover:text-destructive flex-shrink-0"
+                                onClick={() => setStopConfirm(wtype)}
+                                disabled={stopWorker.isPending}
+                              >
+                                <Square className="w-3 h-3" />
+                              </Button>
+                            </>
+                          )}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
-              </div>
 
-              {/* DLQ status card — informational only, cannot be started */}
-              <div className="mt-3 rounded-xl border bg-card p-4 flex items-center justify-between gap-4">
-                <div className="flex items-center gap-3">
-                  <div className={cn(
-                    "w-2.5 h-2.5 rounded-full flex-shrink-0",
-                    dlqCount > 0 ? "bg-amber-400" : "bg-muted-foreground/30",
-                  )} />
+                {/* DLQ status card — integrated into the grid */}
+                <div className={cn(
+                  "rounded-xl border bg-card p-4 flex flex-col justify-between transition-colors",
+                  dlqCount > 0 ? "border-amber-500/20 bg-amber-500/5 shadow-sm" : "border-border",
+                )}>
                   <div>
-                    <span className="text-sm font-semibold text-muted-foreground">hrag.dead-letter</span>
-                    <p className="text-[11px] text-muted-foreground/60 mt-0.5">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <div className={cn(
+                          "w-2.5 h-2.5 rounded-full flex-shrink-0",
+                          dlqCount > 0 ? "bg-amber-400" : "bg-muted-foreground/30",
+                        )} />
+                        <span className="text-sm font-semibold text-muted-foreground truncate" title="hrag.dead-letter">
+                          Dead Letter
+                        </span>
+                      </div>
+                      <span className={cn(
+                        "text-xs font-bold tabular-nums ml-2",
+                        dlqCount > 0 ? "text-amber-500" : "text-muted-foreground"
+                      )}>
+                        {dlqCount}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-muted-foreground/60 line-clamp-2 leading-relaxed" title={t("workers.dlq_desc")}>
                       {t("workers.dlq_desc")}
                     </p>
                   </div>
-                </div>
-                {dlqCount > 0 ? (
-                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20 flex-shrink-0">
-                    <Skull className="w-3 h-3" />
-                    {t(dlqCount === 1 ? 'workers.dlq_msg' : 'workers.dlq_msg_plural', { count: dlqCount })}
-                  </span>
-                ) : (
-                  <span className="text-xs text-muted-foreground/50 flex-shrink-0">{t("common.empty")}</span>
-                )}
-              </div>
 
+                  {dlqCount > 0 ? (
+                    <div className="mt-3 pt-2 border-t border-amber-500/10">
+                      <Button
+                        variant="link"
+                        size="sm"
+                        className="h-auto p-0 text-[11px] text-amber-500 hover:text-amber-600 font-medium"
+                        onClick={() => {
+                          const el = document.getElementById('dlq-section');
+                          if (el) el.scrollIntoView({ behavior: 'smooth' });
+                        }}
+                      >
+                        {t("common.show_more")}
+                      </Button>
+                    </div>
+                  ) : (
+                    <div className="mt-3 pt-2 border-t border-border/30 text-center">
+                      <span className="text-[10px] text-muted-foreground/40 italic">
+                        {t("common.empty")}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              </div>
             </Section>
+
 
             {/* ── LLM Services ── */}
             {health && (
               <Section title={t("workers.llm_service")} icon={Cpu} defaultOpen={true}>
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                  {/* OCR Service */}
-                  {health.checks.llm_services?.ocr && (
-                    <HealthCard
-                      title={t("workers.health.ocr_service")}
-                      status={health.checks.llm_services.ocr.status}
-                      details={[
-                        health.checks.llm_services.ocr.model ? `${t("workers.labels.version")}: ${health.checks.llm_services.ocr.model}` : null,
-                        health.checks.llm_services.ocr.error ? `${t("workers.labels.error")}: ${health.checks.llm_services.ocr.error}` : null,
-                      ].filter(Boolean) as string[]}
-                    />
-                  )}
+                <div className="rounded-xl border bg-card overflow-hidden">
+                  <div className="flex flex-col md:flex-row md:divide-x divide-border/50">
+                    {/* OCR Service */}
+                    {health.checks.llm_services?.ocr && (
+                      <div className="flex-1 p-3 flex items-center justify-between gap-3 min-w-0">
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <div className={cn(
+                            "w-2 h-2 rounded-full flex-shrink-0",
+                            health.checks.llm_services.ocr.status === "healthy" ? "bg-green-400" :
+                            health.checks.llm_services.ocr.status === "warning" ? "bg-amber-400" : "bg-destructive"
+                          )} title={health.checks.llm_services.ocr.status} />
+                          <div className="flex flex-col min-w-0">
+                            <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground/70 leading-none mb-1">
+                              {t("workers.health.ocr_service")}
+                            </span>
+                            <span className="text-xs font-semibold truncate" title={health.checks.llm_services.ocr.model}>
+                              {health.checks.llm_services.ocr.model || "—"}
+                            </span>
+                          </div>
+                        </div>
+                        {health.checks.llm_services.ocr.error && (
+                          <span className="text-[10px] text-destructive font-medium truncate max-w-[100px]" title={health.checks.llm_services.ocr.error}>
+                            {health.checks.llm_services.ocr.error}
+                          </span>
+                        )}
+                      </div>
+                    )}
 
-                  {/* Qwen Memory */}
-                  {health.checks.llm_services?.memory && (
-                    <HealthCard
-                      title={t("workers.health.qwen_memory")}
-                      status={health.checks.llm_services.memory.status}
-                      details={[
-                        health.checks.llm_services.memory.model ? `${t("workers.labels.version")}: ${health.checks.llm_services.memory.model}` : null,
-                        health.checks.llm_services.memory.error ? `${t("workers.labels.error")}: ${health.checks.llm_services.memory.error}` : null,
-                      ].filter(Boolean) as string[]}
-                    />
-                  )}
+                    {/* Qwen Memory */}
+                    {health.checks.llm_services?.memory && (
+                      <div className="flex-1 p-3 flex items-center justify-between gap-3 min-w-0">
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <div className={cn(
+                            "w-2 h-2 rounded-full flex-shrink-0",
+                            health.checks.llm_services.memory.status === "healthy" ? "bg-green-400" :
+                            health.checks.llm_services.memory.status === "warning" ? "bg-amber-400" : "bg-destructive"
+                          )} title={health.checks.llm_services.memory.status} />
+                          <div className="flex flex-col min-w-0">
+                            <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground/70 leading-none mb-1">
+                              {t("workers.health.qwen_memory")}
+                            </span>
+                            <span className="text-xs font-semibold truncate" title={health.checks.llm_services.memory.model}>
+                              {health.checks.llm_services.memory.model || "—"}
+                            </span>
+                          </div>
+                        </div>
+                        {health.checks.llm_services.memory.error && (
+                          <span className="text-[10px] text-destructive font-medium truncate max-w-[100px]" title={health.checks.llm_services.memory.error}>
+                            {health.checks.llm_services.memory.error}
+                          </span>
+                        )}
+                      </div>
+                    )}
 
-                  {/* Main LLM */}
-                  {health.checks.llm_services?.main_llm && (
-                    <HealthCard
-                      title={t("workers.health.main_llm")}
-                      status={health.checks.llm_services.main_llm.status}
-                      details={[
-                        health.checks.llm_services.main_llm.model ? `${t("workers.labels.version")}: ${health.checks.llm_services.main_llm.model}` : null,
-                        health.checks.llm_services.main_llm.error ? `${t("workers.labels.error")}: ${health.checks.llm_services.main_llm.error}` : null,
-                      ].filter(Boolean) as string[]}
-                    />
-                  )}
+                    {/* Main LLM */}
+                    {health.checks.llm_services?.main_llm && (
+                      <div className="flex-1 p-3 flex items-center justify-between gap-3 min-w-0">
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <div className={cn(
+                            "w-2 h-2 rounded-full flex-shrink-0",
+                            health.checks.llm_services.main_llm.status === "healthy" ? "bg-green-400" :
+                            health.checks.llm_services.main_llm.status === "warning" ? "bg-amber-400" : "bg-destructive"
+                          )} title={health.checks.llm_services.main_llm.status} />
+                          <div className="flex flex-col min-w-0">
+                            <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground/70 leading-none mb-1">
+                              {t("workers.health.main_llm")}
+                            </span>
+                            <span className="text-xs font-semibold truncate" title={health.checks.llm_services.main_llm.model}>
+                              {health.checks.llm_services.main_llm.model || "—"}
+                            </span>
+                          </div>
+                        </div>
+                        {health.checks.llm_services.main_llm.error && (
+                          <span className="text-[10px] text-destructive font-medium truncate max-w-[100px]" title={health.checks.llm_services.main_llm.error}>
+                            {health.checks.llm_services.main_llm.error}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </div>
                 </div>
               </Section>
             )}
 
             {/* ── Pipeline Summary Cards ── */}
             <Section title={t("workers.pipeline_summary")} icon={Layers}>
-              <div className="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-8 gap-3">
+              <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 gap-2.5">
                 {pipeline &&
                   Object.entries(pipeline).map(([key, count]) => {
                     const config = PIPELINE_STATUS[key] ?? PIPELINE_STATUS.pending;
@@ -642,22 +745,19 @@ export function WorkersPage() {
                       <div
                         key={key}
                         className={cn(
-                          "rounded-xl border bg-card p-3 flex flex-col items-center gap-1.5 transition-all hover:shadow-md hover:border-primary/20 group",
-                          count > 0 && key === "failed" && "border-destructive/30",
-                          isAnimated && "border-blue-400/30",
+                          "rounded-xl border bg-card p-2.5 flex flex-col items-center gap-1.5 transition-all hover:shadow-sm hover:border-primary/20 group relative overflow-hidden",
+                          count > 0 && key === "failed" && "border-destructive/30 bg-destructive/5",
+                          isAnimated && "border-blue-400/30 bg-blue-400/5",
                         )}
                         title={t(`workers.status_desc.${key}`)}
                       >
-                        <div className={cn("w-8 h-8 rounded-lg flex items-center justify-center transition-transform group-hover:scale-110", config.bgColor)}>
-                          <Icon className={cn("w-4 h-4", config.color, isAnimated && "animate-spin")} />
+                        <div className={cn("w-7 h-7 rounded-lg flex items-center justify-center transition-transform group-hover:scale-110", config.bgColor)}>
+                          <Icon className={cn("w-3.5 h-3.5", config.color, isAnimated && "animate-spin")} />
                         </div>
-                        <span className="text-lg font-bold tabular-nums">{count}</span>
-                        <div className="flex flex-col items-center gap-0.5 text-center">
-                          <span className="text-[10px] text-muted-foreground font-semibold uppercase tracking-wider">
+                        <span className="text-base font-bold tabular-nums leading-none">{count}</span>
+                        <div className="flex flex-col items-center gap-0.5 text-center w-full">
+                          <span className="text-[9px] text-muted-foreground font-bold uppercase tracking-tighter truncate w-full">
                             {t(config.labelKey)}
-                          </span>
-                          <span className="text-[9px] text-muted-foreground/60 leading-tight line-clamp-1 max-w-[80px]">
-                            {t(`workers.status_desc.${key}`)}
                           </span>
                         </div>
                       </div>
@@ -665,6 +765,7 @@ export function WorkersPage() {
                   })}
               </div>
             </Section>
+
 
             {/* ── Queue Details ── */}
             {overview && overview.queues.length > 0 && (() => {
@@ -736,7 +837,8 @@ export function WorkersPage() {
             })()}
 
             {/* ── Dead Letter Queue ── */}
-            {dlqCount > 0 && (
+            <div id="dlq-section">
+              {dlqCount > 0 && (
               <Section
                 title={t("workers.dead_letter_queue")}
                 icon={MailWarning}
@@ -805,6 +907,7 @@ export function WorkersPage() {
                 </div>
               </Section>
             )}
+          </div>
 
             {/* ── Active Documents (Processing) ── */}
             {!pipelineLoading && activeDocs.length > 0 && (
@@ -916,16 +1019,27 @@ export function WorkersPage() {
                             {doc.updated_at ? formatRelativeDate(doc.updated_at) : "—"}
                           </td>
                           <td className="px-4 py-2.5 text-right">
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-7 text-xs gap-1"
-                              onClick={() => retrySingle.mutate(doc.id)}
-                              disabled={retrySingle.isPending}
-                            >
-                              <RefreshCw className={cn("w-3 h-3", retrySingle.isPending && "animate-spin")} />
-                              {t("common.retry")}
-                            </Button>
+                            <div className="flex items-center justify-end gap-1">
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 text-xs gap-1"
+                                onClick={() => retrySingle.mutate(doc.id)}
+                                disabled={retrySingle.isPending}
+                              >
+                                <RefreshCw className={cn("w-3 h-3", retrySingle.isPending && "animate-spin")} />
+                                {t("common.retry")}
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 text-xs gap-1 text-destructive hover:text-destructive"
+                                onClick={() => setDeleteFailedDocId(String(doc.id))}
+                                disabled={deleteFailedDoc.isPending}
+                              >
+                                <Trash2 className="w-3 h-3" />
+                              </Button>
+                            </div>
                           </td>
                         </tr>
                       ))}
@@ -1074,6 +1188,21 @@ export function WorkersPage() {
         title={t("workers.cancel_title")}
         message={t("workers.cancel_msg")}
         confirmLabel={t("common.cancel")}
+        variant="danger"
+      />
+
+      <ConfirmDialog
+        open={deleteFailedDocId !== null}
+        onConfirm={() => {
+          if (deleteFailedDocId) {
+            deleteFailedDoc.mutate(deleteFailedDocId);
+            setDeleteFailedDocId(null);
+          }
+        }}
+        onCancel={() => setDeleteFailedDocId(null)}
+        title={t("workers.delete_doc_title")}
+        message={t("workers.delete_doc_msg")}
+        confirmLabel={t("common.delete")}
         variant="danger"
       />
     </div>

@@ -62,6 +62,16 @@ import { useWorkspaceStore } from "@/stores/workspaceStore";
 import { useAuthStore } from "@/stores/authStore";
 import { useThemeStore } from "@/stores/useThemeStore";
 
+const truncateName = (name: string, maxLength = 25) => {
+  if (name.length <= maxLength) return name;
+  return name.slice(0, maxLength - 8) + "..." + name.slice(-5);
+};
+
+export const formatMentionName = (name: string) => {
+  let clean = name.replace(/\.[^/.]+$/, "");
+  return truncateName(clean, 30);
+};
+
 SyntaxHighlighter.registerLanguage("python", python);
 SyntaxHighlighter.registerLanguage("javascript", javascript);
 SyntaxHighlighter.registerLanguage("js", javascript);
@@ -88,11 +98,11 @@ import { useDocument, useDocuments } from "@/hooks/useDocuments";
 import { useChatHistory, useSessionDocuments } from "@/hooks/useChatHistory";
 import { useRAGChatStream } from "@/hooks/useRAGChatStream";
 import { useTranslation } from "@/hooks/useTranslation";
-import { useCreateChatSession } from "@/hooks/useChatSessions";
+import { useCreateChatSession, useUpdateSessionTitle } from "@/hooks/useChatSessions";
 import { useCreateAbbreviation } from "@/hooks/useAbbreviations";
 import { AbbreviationModal } from "@/components/rag/AbbreviationModal";
 import { StreamingMarkdown } from "@/components/rag/MemoizedMarkdown";
-import { STEP_CONFIG } from "@/components/rag/ThinkingTimeline";
+import { STEP_CONFIG, ThinkingTimeline } from "@/components/rag/ThinkingTimeline";
 import { STATUS_CONFIG, getFileConfig } from "@/components/rag/document-utils";
 import type {
   ChatMessage,
@@ -559,7 +569,7 @@ const SCHEMA_LABELS: Record<string, string> = {
   evn: "Điện lực",
 };
 
-function PeopleCard({ people }: { people: PeopleRecord[] }) {
+function PeopleCard({ people, isLoadingMore }: { people: PeopleRecord[], isLoadingMore?: boolean }) {
   const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
 
   if (!people || people.length === 0) return null;
@@ -567,14 +577,21 @@ function PeopleCard({ people }: { people: PeopleRecord[] }) {
   const handleCopyCard = (person: PeopleRecord, idx: number) => {
     const name = getNameField(person);
     const schema = SCHEMA_LABELS[person._source_schema || ""] || person._source_schema || "Unknown";
-    const lines = [`Người: ${name} (${schema})`];
-    for (const [key, val] of Object.entries(person)) {
-      if (SKIP_FIELDS.has(key)) continue;
+    const lines = [`Thông tin: ${name}`, `Nguồn dữ liệu: ${schema}`, ""];
+
+    const displayFields = Object.entries(person)
+      .filter(([k, v]) => !SKIP_FIELDS.has(k) && v !== undefined && v !== null && v !== "")
+      .sort(([a], [b]) => {
+        const order = Object.keys(FIELD_CONFIG);
+        return order.indexOf(a) - order.indexOf(b);
+      });
+
+    for (const [key, val] of displayFields) {
       const config = FIELD_CONFIG[key];
-      if (val !== undefined && val !== null && val !== "") {
-        lines.push(`  ${config?.label || key}: ${val}`);
-      }
+      const label = config?.label || key;
+      lines.push(`- ${label}: ${val}`);
     }
+
     navigator.clipboard.writeText(lines.join("\n")).then(() => {
       setCopiedIdx(idx);
       setTimeout(() => setCopiedIdx(null), 2000);
@@ -646,6 +663,13 @@ function PeopleCard({ people }: { people: PeopleRecord[] }) {
           </div>
         );
       })}
+      
+      {isLoadingMore && (
+        <div className="flex items-center justify-center gap-2 p-3 text-muted-foreground bg-muted/10 rounded-lg border border-dashed">
+          <Loader2 className="w-4 h-4 animate-spin" />
+          <span className="text-xs font-medium">Đang tìm kiếm thêm cơ sở dữ liệu...</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -946,11 +970,11 @@ function ImageRefsPanel({ images }: { images: ChatImageRef[] }) {
             initial={{ height: 0 }}
             animate={{ height: "auto" }}
             exit={{ height: 0 }}
-            className="overflow-hidden"
+            className="overflow-hidden border-t"
           >
-            <div className="p-2 grid gap-2" style={{ gridTemplateColumns: images.length === 1 ? "1fr" : "repeat(auto-fit, minmax(140px, 1fr))" }}>
-              {images.map((img) => (
-                <ImageRefCard key={img.image_id} img={img} />
+            <div className="p-2 flex flex-wrap gap-2">
+              {images.map((img, i) => (
+                <ImageRefCard key={i} img={img} />
               ))}
             </div>
           </motion.div>
@@ -963,110 +987,154 @@ function ImageRefsPanel({ images }: { images: ChatImageRef[] }) {
 // ---------------------------------------------------------------------------
 // Thinking panel — collapsible violet-themed thinking process display
 // ---------------------------------------------------------------------------
-function PremiumThinking({
+const PremiumThinking = memo(({
   thinking,
+  agentSteps,
   isStreaming,
   hasContent
 }: {
   thinking: string;
+  agentSteps?: AgentStep[];
   isStreaming?: boolean;
   hasContent?: boolean
-}) {
+}) => {
   const { t } = useTranslation();
-  const [expanded, setExpanded] = useState(isStreaming && !hasContent);
+  
+  // Show if there's thinking text, agent steps, or we are currently streaming the beginning of a message
+  const hasReasoning = (agentSteps && agentSteps.length > 0) || !!thinking || (isStreaming && !hasContent);
+  
+  // Find active/done steps
+  const activeStep = useMemo(() => agentSteps?.find((s) => s.status === "active"), [agentSteps]);
+  const doneStep = useMemo(() => agentSteps?.find((s) => s.step === "done" && s.status === "completed"), [agentSteps]);
+  
+  // Dynamic Label Logic
+  const labelText = useMemo(() => {
+    if (!!thinking && isStreaming && !hasContent) {
+      return t("chat.thinking_process") || "Quá trình suy luận";
+    }
+    if (hasContent && isStreaming) {
+      return t("rag.status.generating") || "Đang tạo câu trả lời...";
+    }
+    if (isStreaming && !hasContent) {
+      if (activeStep) {
+        const config = STEP_CONFIG[activeStep.step];
+        return activeStep.detail || (config ? t(config.labelKey) : "Đang xử lý...");
+      }
+      if (doneStep && !thinking) {
+        return t("rag.timeline.done") || "Đã xong bước chuẩn bị";
+      }
+      return t("chat.analyzing_question") || "Đang phân tích câu hỏi...";
+    }
+    return t("chat.thinking_process") || "Quá trình suy luận";
+  }, [activeStep, doneStep, thinking, isStreaming, hasContent, t]);
+
+  const [expanded, setExpanded] = useState(false);
   const [showFull, setShowFull] = useState(false);
   const userToggledRef = useRef(false);
 
-  // Track user manual toggle
   const handleToggle = useCallback(() => {
     userToggledRef.current = true;
     setExpanded(prev => !prev);
   }, []);
 
-  // Auto-collapse when reasoning is done and answer starts
-  useEffect(() => {
-    // Auto-expand when thinking arrives during streaming
-    if (isStreaming && thinking && !hasContent && !userToggledRef.current) {
-      setExpanded(true);
-    }
-    // Auto-collapse when content arrives (answer starts) — regardless of isStreaming
-    if (hasContent && !userToggledRef.current) {
-      setExpanded(false);
-    }
-    // Reset user-toggled flag when streaming ends (new message cycle)
-    if (!isStreaming && thinking === "") {
-      userToggledRef.current = false;
-    }
-  }, [isStreaming, !!thinking, hasContent]);
-
+  // Simplified Truncation - much faster than split/join for long strings
   const { displayThinking, isTruncated } = useMemo(() => {
-    if (!thinking || showFull) return { displayThinking: thinking, isTruncated: false };
-
-    const tokens = thinking.split(/(\s+)/);
-    let wordCount = 0;
-    let truncatedIndex = -1;
-
-    for (let i = 0; i < tokens.length; i++) {
-      if (/\S/.test(tokens[i])) {
-        wordCount++;
-        if (wordCount > 200) {
-          truncatedIndex = i;
+    if (showFull || thinking.length < 1000) {
+      return { displayThinking: thinking, isTruncated: false };
+    }
+    
+    // Quick approximation of 200 words using character count (~1000 chars)
+    // or finding the 200th space
+    let count = 0;
+    let index = -1;
+    for (let i = 0; i < thinking.length; i++) {
+      if (thinking[i] === ' ') {
+        count++;
+        if (count >= 200) {
+          index = i;
           break;
         }
       }
     }
-
-    if (truncatedIndex === -1) {
-      return { displayThinking: thinking, isTruncated: false };
-    }
-
+    
+    if (index === -1) return { displayThinking: thinking, isTruncated: false };
     return {
-      displayThinking: tokens.slice(0, truncatedIndex).join("").trim() + "...",
+      displayThinking: thinking.slice(0, index) + "...",
       isTruncated: true
     };
   }, [thinking, showFull]);
 
-  if (!thinking) return null;
+  // Auto-expand/collapse logic
+  useEffect(() => {
+    if (userToggledRef.current) return;
+    
+    // Auto-expand only when thinking starts and no final content yet
+    if (isStreaming && !!thinking && thinking.length > 5 && !hasContent && !expanded) {
+      setExpanded(true);
+    }
+    
+    // Auto-collapse when content starts appearing to focus on the answer
+    if (isStreaming && hasContent && expanded) {
+      setExpanded(false);
+    }
+  }, [thinking, isStreaming, hasContent, expanded]);
+
+  if (!hasReasoning) return null;
 
   return (
     <div className="mb-3 group">
       <button
         onClick={handleToggle}
         className={cn(
-          "flex items-center gap-2 px-3 py-1.5 rounded-full text-[13px] font-medium transition-all duration-300",
-          "bg-violet-500/5 hover:bg-violet-500/10 border border-violet-500/10 hover:border-violet-500/20",
-          "text-violet-600/80 hover:text-violet-600 shadow-sm",
-          expanded && "bg-violet-500/8 border-violet-500/20 text-violet-600"
+          "flex items-center gap-2 px-2 py-1.5 rounded-md text-[13.5px] font-bold transition-all duration-200",
+          "bg-transparent border-none outline-none select-none",
+          "text-slate-700 hover:text-violet-700 hover:bg-violet-600/15",
+          expanded && "text-violet-700 bg-violet-600/20"
         )}
       >
-        <Sparkles className={cn("w-3.5 h-3.5 transition-transform duration-500 text-violet-500", isStreaming && "animate-pulse")} />
-        <span>{t("chat.thinking_process") || "Hiện tiến trình tư duy"}</span>
-        <ChevronDown className={cn("w-3.5 h-3.5 transition-transform duration-300", expanded && "rotate-180")} />
+        <AnimatePresence mode="popLayout" initial={false}>
+          <motion.div
+            key={labelText}
+            initial={{ opacity: 0, y: 3 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -3 }}
+            transition={{ duration: 0.18, ease: "easeOut" }}
+            className="flex items-center gap-2"
+          >
+            <Sparkles className={cn("w-3.5 h-3.5", isStreaming ? "animate-pulse text-violet-500" : "text-violet-400")} />
+            <span>{labelText}</span>
+            <ChevronDown className={cn("w-3.5 h-3.5 transition-transform duration-300", expanded && "rotate-180")} />
+          </motion.div>
+        </AnimatePresence>
       </button>
 
       <AnimatePresence>
         {expanded && (
           <motion.div
-            initial={{ height: 0, opacity: 0, y: -4 }}
-            animate={{ height: "auto", opacity: 1, y: 0 }}
-            exit={{ height: 0, opacity: 0, y: -4 }}
-            transition={{ duration: 0.3, ease: "easeOut" }}
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.3, ease: "easeInOut" }}
             className="overflow-hidden"
           >
-            <div className="mt-2 ml-3 pl-4 border-l-2 border-violet-500/30">
-              <div className="text-[14px] leading-relaxed text-slate-600/90 whitespace-pre-wrap font-chat italic py-1">
-                {displayThinking}
-                {isStreaming && !isTruncated && (
-                  <span className="inline-block w-1.5 h-4 bg-violet-400/50 animate-pulse ml-1 align-middle" />
-                )}
-              </div>
-              {isTruncated && !showFull && (
-                <button
-                  onClick={() => setShowFull(true)}
-                  className="mt-1 text-xs text-violet-500 hover:text-violet-600 font-medium transition-colors"
-                >
-                  {t("common.show_more") || "Xem thêm"}
-                </button>
+            <div className="mt-2 pl-3 border-l-2 border-violet-100/50 space-y-3">
+              {!!thinking && (
+                <div className="text-[13.5px] text-slate-600 leading-relaxed font-normal">
+                  <div className="prose prose-sm max-w-none prose-slate prose-p:leading-relaxed prose-pre:bg-slate-50">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                      {displayThinking}
+                    </ReactMarkdown>
+                  </div>
+                  
+                  {isTruncated && (
+                    <button
+                      onClick={() => setShowFull(true)}
+                      className="mt-2 text-violet-600 hover:text-violet-700 font-medium text-[12px] underline-offset-4 hover:underline"
+                    >
+                      {t("common.show_more")}
+                    </button>
+                  )}
+                </div>
               )}
             </div>
           </motion.div>
@@ -1074,7 +1142,7 @@ function PremiumThinking({
       </AnimatePresence>
     </div>
   );
-}
+});
 
 
 // ---------------------------------------------------------------------------
@@ -1440,6 +1508,7 @@ function DocumentMentionDropdown({
     const updatePosition = () => {
       if (anchorRef?.current) {
         const rect = anchorRef.current.getBoundingClientRect();
+        // Mention dropdown stays above the textarea as it is tied to the cursor/typing experience
         setCoords({
           bottom: window.innerHeight - rect.top + 6,
           left: rect.left,
@@ -1646,6 +1715,7 @@ function ToolsDropdown({
   useEffect(() => {
     if (isOpen && anchorRef.current) {
       const rect = anchorRef.current.getBoundingClientRect();
+      
       setCoords({
         bottom: window.innerHeight - rect.top + 8,
         left: rect.left,
@@ -1655,7 +1725,6 @@ function ToolsDropdown({
   }, [isOpen]);
 
   const menuItems = [
-    { id: 'upload', icon: Plus, label: t("chat.tool_upload"), onClick: onPlus },
     { id: 'word', icon: FileText, label: t("chat.tool_word"), onClick: onPlus },
     { id: 'audio', icon: Mic, label: t("chat.tool_audio"), onClick: onMic },
   ];
@@ -1693,26 +1762,29 @@ function ToolsDropdown({
               left: coords.left,
               zIndex: 9999
             }}
-            className="w-56 bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 rounded-2xl shadow-2xl overflow-hidden"
+            className="w-64 bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 rounded-2xl shadow-xl overflow-hidden p-1.5"
           >
-            <div className="py-1 px-1 flex flex-col gap-0.5">
-              {menuItems.map((item) => {
+            <div className="flex flex-col gap-0.5">
+              {menuItems.map((item, idx) => {
                 const Icon = item.icon;
+                const isFirst = idx === 0;
                 return (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={() => {
-                      item.onClick?.();
-                      setIsOpen(false);
-                    }}
-                    className="flex items-center gap-2.5 px-2.5 py-2 rounded-xl transition-all text-left group hover:bg-zinc-100 dark:hover:bg-zinc-900 text-foreground/70 hover:text-foreground"
-                  >
-                    <div className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0 border bg-zinc-50 dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 group-hover:border-zinc-300 group-hover:bg-white dark:group-hover:bg-zinc-800 transition-colors">
-                      <Icon className="w-3.5 h-3.5" />
-                    </div>
-                    <span className="text-[12.5px] font-semibold tracking-tight">{item.label}</span>
-                  </button>
+                  <div key={item.id}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        item.onClick?.();
+                        setIsOpen(false);
+                      }}
+                      className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all text-left group hover:bg-zinc-100 dark:hover:bg-zinc-900 text-foreground/80 hover:text-foreground"
+                    >
+                      <Icon className="w-4 h-4 shrink-0 text-foreground/60 group-hover:text-foreground transition-colors" />
+                      <span className="text-[13.5px] font-medium tracking-tight flex-1">{item.label}</span>
+                    </button>
+                    {isFirst && (
+                      <div className="h-[1px] bg-zinc-100 dark:bg-zinc-800 my-1 mx-1" />
+                    )}
+                  </div>
                 );
               })}
             </div>
@@ -1740,9 +1812,21 @@ function SearchTooltipWrapper({
   useEffect(() => {
     if (isHovered && anchorRef.current) {
       const rect = anchorRef.current.getBoundingClientRect();
+      const container = anchorRef.current.closest('[data-chat-input-container]');
+      const containerRect = container?.getBoundingClientRect();
+      const menuWidth = 200; // estimated tooltip width
+      
+      let left = rect.left + rect.width / 2;
+      if (containerRect && containerRect.left > menuWidth + 20) {
+        // If we want to move it to the margin too? 
+        // No, tooltips are better centered over the button.
+        // But for consistency with the user's request to not cover content, 
+        // let's at least make sure it doesn't cover too much.
+      }
+
       setCoords({
         bottom: window.innerHeight - rect.top + 8,
-        left: rect.left + rect.width / 2
+        left: left
       });
     }
   }, [isHovered]);
@@ -1831,19 +1915,12 @@ const MessageBubble = memo(function MessageBubble({
 
   return (
     <motion.div
-      initial={{ opacity: 0, y: 8 }}
+      initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
+      transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
       className={cn("flex gap-2", isUser ? "justify-end" : "justify-start")}
     >
       {/* Assistant: Bot icon with glow ring during streaming */}
-      {!isUser && (
-        <div className="relative w-6 h-6 flex-shrink-0 mt-1">
-          {message.isStreaming && <div className="icon-glow-ring" />}
-          <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center overflow-hidden border border-primary/20">
-            <img src="/logo.png" alt="HRAG" className="w-4 h-4 object-contain shadow-sm" />
-          </div>
-        </div>
-      )}
 
       <div
         className={cn(
@@ -1852,41 +1929,90 @@ const MessageBubble = memo(function MessageBubble({
             : "max-w-[90%] min-w-0 py-1"
         )}
       >
-        {/* ThinkingTimeline — single instance, never unmounts between streaming→completed */}
-        {/* Typing indicator — only when streaming with no steps and no content yet */}
-        {!isUser && message.isStreaming && !message.content && !message.agentSteps?.length && (
-          message.formatProgress ? (
-            <FormatUploadProgress step={message.formatProgress.step} message={message.formatProgress.message} />
-          ) : (
-            <TypingIndicator status="analyzing" />
-          )
-        )}
-
+        {/* Modern Unified Reasoning Orchestrator */}
         {!isUser && (
-          <PremiumThinking
-            thinking={message.thinking || message.agentSteps?.find(s => s.thinkingText)?.thinkingText || ""}
-            isStreaming={message.isStreaming}
-            hasContent={!!message.content}
-          />
+          <div className="flex flex-col gap-2">
+            <PremiumThinking
+              thinking={message.thinking || message.agentSteps?.find(s => s.thinkingText)?.thinkingText || ""}
+              agentSteps={message.agentSteps}
+              isStreaming={message.isStreaming}
+              hasContent={!!message.content}
+            />
+          </div>
         )}
 
         {isUser ? (
-          <>
-            <p className="text-[15.5px] leading-relaxed whitespace-pre-wrap font-chat">
-              {message.content}
-            </p>
-            {message.documentIds && message.documentIds.length > 0 && (
-              <div className="flex flex-wrap gap-1.5 mt-2">
-                {message.documentIds.map(docId => {
-                  const doc = (docMetadataMap && docMetadataMap.get(docId)) || message.attachedDocs?.find(d => d.id === docId);
-                  if (!doc) return null;
-                  return <FileAttachmentBadge key={docId} doc={doc} />;
-                })}
-              </div>
-            )}
-          </>
+          (() => {
+            const allAvailableDocs = message.documentIds?.map(id => (docMetadataMap && docMetadataMap.get(id)) || message.attachedDocs?.find(d => d.id === id)).filter(Boolean) as any[] || [];
+            const mentionedDocIds = new Set<string>();
+            let elements: React.ReactNode[] = [message.content];
+
+            if (allAvailableDocs.length > 0) {
+              for (const doc of allAvailableDocs) {
+                const truncatedDisplayName = formatMentionName(doc.original_filename || doc.filename);
+                const docIdTag = `<document_id=${doc.id}>`;
+                const escapeRegExp = (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                
+                const regexStr = `(?:${escapeRegExp(docIdTag)}|@${escapeRegExp(truncatedDisplayName)})`;
+                const mentionRegex = new RegExp(`(${regexStr})`, 'g');
+                
+                let foundMatch = false;
+                
+                const newElements: React.ReactNode[] = [];
+                elements.forEach((el, index) => {
+                  if (typeof el === 'string') {
+                    const parts = el.split(mentionRegex);
+                    
+                    parts.forEach((part, i) => {
+                      if (part === docIdTag || part === `@${truncatedDisplayName}`) {
+                        foundMatch = true;
+                        const ext = (doc.file_type || doc.filename?.split(".").pop() || "").toLowerCase();
+                        let Icon = FileText;
+                        let iconColor = "text-blue-500/80";
+                        if (ext === 'pdf') { iconColor = "text-red-500/80"; }
+                        else if (['doc', 'docx'].includes(ext)) { iconColor = "text-blue-600/80"; }
+                        else if (['xls', 'xlsx'].includes(ext)) { iconColor = "text-green-600/80"; }
+                        else if (['jpg', 'jpeg', 'png', 'svg'].includes(ext)) { Icon = ImageIcon; iconColor = "text-purple-500/80"; }
+                        else if (['ts', 'tsx', 'js', 'jsx'].includes(ext)) { Icon = FileCode; iconColor = "text-amber-500/80"; }
+
+                        newElements.push(
+                          <span key={`${index}-${i}-mention`} className="inline-flex items-center gap-1 mx-1 px-2 rounded-lg bg-primary/10 border border-primary/20 text-[14px]">
+                            <Icon className={cn("w-3.5 h-3.5", iconColor)} />
+                            <span className="text-foreground" style={{ WebkitTextStroke: "0.2px currentColor" }}>{truncatedDisplayName}</span>
+                          </span>
+                        );
+                      } else if (part) {
+                        newElements.push(part);
+                      }
+                    });
+                  } else {
+                    newElements.push(el);
+                  }
+                });
+                elements = newElements;
+                if (foundMatch) mentionedDocIds.add(doc.id);
+              }
+            }
+
+            const remainingDocs = allAvailableDocs.filter(d => !mentionedDocIds.has(d.id));
+
+            return (
+              <>
+                <p className="text-[15.5px] leading-relaxed whitespace-pre-wrap font-chat">
+                  {elements}
+                </p>
+                {remainingDocs.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 mt-2">
+                    {remainingDocs.map(doc => (
+                      <FileAttachmentBadge key={doc.id} doc={doc} />
+                    ))}
+                  </div>
+                )}
+              </>
+            );
+          })()
         ) : message.isStreaming ? (
-          message.content ? (
+          message.peopleData && message.peopleData.length > 0 ? null : message.content ? (
             <div
               className={cn(proseClasses, "relative")}
               style={{
@@ -1921,8 +2047,8 @@ const MessageBubble = memo(function MessageBubble({
         )}
 
         {/* People Card — structured display for people search results */}
-        {!isUser && !message.isStreaming && message.peopleData && message.peopleData.length > 0 && (
-          <PeopleCard people={message.peopleData} />
+        {!isUser && message.peopleData && message.peopleData.length > 0 && (
+          <PeopleCard people={message.peopleData} isLoadingMore={message.isStreaming} />
         )}
 
         {/* Potential Abbreviation Suggestion Buttons */}
@@ -2175,9 +2301,55 @@ function ChatInputArea({
   onInputChange?: (text: string, cursorPos: number) => void;
   mentionSelectedIndex?: number;
 }) {
+  const highlightRef = useRef<HTMLDivElement>(null);
+
+  const renderHighlightedMentions = () => {
+    if (!referencedDocs || referencedDocs.length === 0) return input;
+    
+    // Use formatted names for matching
+    const formattedNames = referencedDocs.map(d => formatMentionName(d.original_filename || d.filename)).sort((a, b) => b.length - a.length);
+    if (formattedNames.length === 0) return input;
+
+    const escapeRegExp = (string: string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`(@(?:${formattedNames.map(escapeRegExp).join('|')}))`, 'g');
+    const parts = input.split(regex);
+
+    return parts.map((part, i) => {
+        if (part.startsWith('@') && formattedNames.includes(part.slice(1))) {
+            const displayName = part.slice(1);
+            const doc = referencedDocs.find(d => formatMentionName(d.original_filename || d.filename) === displayName);
+            const ext = doc ? (doc.original_filename || doc.filename).split('.').pop()?.toLowerCase() : 'pdf';
+            
+            let Icon = FileText;
+            let iconColor = "text-blue-500/80";
+            if (ext === 'pdf') { iconColor = "text-red-500/80"; }
+            else if (['doc', 'docx'].includes(ext!)) { iconColor = "text-blue-600/80"; }
+            else if (['xls', 'xlsx'].includes(ext!)) { iconColor = "text-green-600/80"; }
+            else if (['jpg', 'jpeg', 'png', 'svg'].includes(ext!)) { Icon = ImageIcon; iconColor = "text-purple-500/80"; }
+            else if (['ts', 'tsx', 'js', 'jsx'].includes(ext!)) { Icon = FileCode; iconColor = "text-amber-500/80"; }
+
+            return (
+                <span key={i} className="relative inline">
+                    <span className="relative z-10 text-transparent inline-block">@</span>
+                    <span className="absolute z-10 left-[0px] top-[50%] -translate-y-[45%] flex items-center justify-center pointer-events-none">
+                        <Icon className={cn("w-[13.5px] h-[13.5px]", iconColor)} />
+                    </span>
+                    <span className="relative z-10 text-foreground" style={{ WebkitTextStroke: "0.2px currentColor" }}>
+                        {displayName}
+                    </span>
+                </span>
+            );
+        }
+        return <span key={i} className="relative z-20 text-foreground/90">{part}</span>;
+    });
+  };
+
   return (
     <div className="relative w-full">
-      <div className="relative flex flex-col bg-background/80 backdrop-blur-3xl border border-border/60 rounded-[22px] shadow-[0_8px_30px_rgb(0,0,0,0.06)] transition-all duration-300 focus-within:shadow-primary/8 focus-within:border-primary/20 overflow-hidden ring-1 ring-black/5 dark:ring-white/5">
+      <div 
+        data-chat-input-container="true"
+        className="relative flex flex-col bg-background/80 backdrop-blur-3xl border border-border/60 rounded-[22px] shadow-[0_8px_30px_rgb(0,0,0,0.06)] transition-all duration-300 focus-within:shadow-primary/8 focus-within:border-primary/20 overflow-hidden ring-1 ring-black/5 dark:ring-white/5"
+      >
         {/* Attached Files Preview */}
         {attachedFiles.length > 0 && (
           <div className="flex flex-wrap gap-2 px-4 pt-3.5 pb-2">
@@ -2228,47 +2400,52 @@ function ChatInputArea({
           </div>
         )}
 
-        {/* Referenced Documents Badges */}
-        {referencedDocs && referencedDocs.length > 0 && (
-          <div className="flex flex-wrap gap-2 px-4 py-2">
-            <AnimatePresence>
-              {referencedDocs.map((doc) => (
-                <ReferencedDocBadge
-                  key={doc.id}
-                  doc={doc}
-                  onRemove={() => onRemoveReferencedDoc?.(doc.id)}
-                />
-              ))}
-            </AnimatePresence>
-          </div>
-        )}
+
 
         {/* Input Text Area */}
-        <div className="px-4 pt-3.5 pb-1">
-          <textarea
-            ref={inputRef}
-            value={input}
-            onChange={(e) => {
-              setInput(e.target.value);
-              if (onInputChange) {
-                onInputChange(e.target.value, e.target.selectionStart || 0);
-              }
-            }}
-            onKeyDown={handleKeyDown}
-            placeholder={t("chat.input_placeholder") || "Hỏi tôi bất cứ điều gì, hoặc gõ @ để nhắc đến tài liệu..."}
-            rows={1}
-            className={cn(
-              "w-full resize-none bg-transparent px-0 py-1 text-[15.5px] placeholder:text-muted-foreground/45 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50",
-              "max-h-[200px] min-h-[38px]",
-              "font-chat leading-relaxed tracking-tight text-foreground/90 selection:bg-primary/20"
-            )}
-            style={{ height: "auto" }}
-            onInput={(e) => {
-              const target = e.target as HTMLTextAreaElement;
-              target.style.height = "auto";
-              target.style.height = Math.min(target.scrollHeight, 200) + "px";
-            }}
-          />
+        <div className="px-2.5 pt-3.5 pb-1">
+          <div className="relative w-full">
+             <div 
+               ref={highlightRef}
+               aria-hidden="true"
+               className="absolute inset-0 px-1.5 py-1 pointer-events-none whitespace-pre-wrap break-words overflow-hidden text-[15.5px] font-chat leading-relaxed tracking-tight text-foreground/90"
+               style={{ wordBreak: 'break-word' }}
+            >
+              {renderHighlightedMentions()}
+              {input.endsWith('\n') ? <br/> : null}
+            </div>
+            <textarea
+              ref={inputRef}
+              value={input}
+              onChange={(e) => {
+                setInput(e.target.value);
+                if (onInputChange) {
+                  onInputChange(e.target.value, e.target.selectionStart || 0);
+                }
+              }}
+              onScroll={(e) => {
+                if (highlightRef.current) {
+                  highlightRef.current.scrollTop = e.currentTarget.scrollTop;
+                  highlightRef.current.scrollLeft = e.currentTarget.scrollLeft;
+                }
+              }}
+              onKeyDown={handleKeyDown}
+              placeholder={t("chat.input_placeholder") || "Hỏi tôi bất cứ điều gì, hoặc gõ @ để nhắc đến tài liệu..."}
+              rows={1}
+              className={cn(
+                "relative z-10 w-full resize-none bg-transparent px-1.5 py-1 text-[15.5px] placeholder:text-muted-foreground/45 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50",
+                "max-h-[200px] min-h-[38px]",
+                "font-chat leading-relaxed tracking-tight text-transparent selection:bg-primary/20 selection:text-transparent",
+                "caret-foreground"
+              )}
+              style={{ height: "auto" }}
+              onInput={(e) => {
+                const target = e.target as HTMLTextAreaElement;
+                target.style.height = "auto";
+                target.style.height = Math.min(target.scrollHeight, 200) + "px";
+              }}
+            />
+          </div>
         </div>
 
         {/* Toolbar Row */}
@@ -2278,6 +2455,8 @@ function ChatInputArea({
             <ToolsDropdown
               onPlus={onPlus}
               onMic={onMic}
+              forceSearch={forceSearch}
+              onToggleSearch={onToggleSearch}
             />
 
             {/* Force Search Toggle — Compact with Portal Tooltip */}
@@ -2492,14 +2671,25 @@ export const ChatPanel = memo(function ChatPanel({
     const atIndex = textBeforeCursor.lastIndexOf('@');
     if (atIndex === -1) return;
 
-    // Remove the @query part completely from text
+    // Replace the @query part with the formatted document name
     const textBeforeAt = input.slice(0, atIndex);
     const textAfterMention = input.slice(inputRef.current?.selectionStart || 0);
-    const newInput = `${textBeforeAt}${textAfterMention}`;
+
+    const displayName = formatMentionName(doc.original_filename || doc.filename);
+    const newInput = `${textBeforeAt}@${displayName} ${textAfterMention}`;
 
     setInput(newInput);
     setShowMentionDropdown(false);
     setMentionSearch("");
+
+    // Set cursor position after the inserted mention
+    setTimeout(() => {
+      if (inputRef.current) {
+        const newCursorPos = textBeforeAt.length + displayName.length + 2; // +1 for @, +1 for space
+        inputRef.current.setSelectionRange(newCursorPos, newCursorPos);
+        inputRef.current.focus();
+      }
+    }, 0);
 
     // Add to referenced docs
     if (!referencedDocs.find(d => d.id === doc.id)) {
@@ -2687,6 +2877,11 @@ export const ChatPanel = memo(function ChatPanel({
         return;
       }
 
+      if (file.name.toLowerCase().endsWith(".doc")) {
+        toast.error("Format .doc is not supported. Please convert to .docx before uploading.");
+        return;
+      }
+
       const tempId = crypto.randomUUID();
       const newAttachedFile: AttachedFile = {
         id: tempId,
@@ -2805,7 +3000,19 @@ export const ChatPanel = memo(function ChatPanel({
   }, [historyData]);
 
   // SSE streaming chat
-  const stream = useRAGChatStream(sessionId);
+  const updateSessionTitle = useUpdateSessionTitle();
+  const stream = useRAGChatStream(
+    sessionId,
+    useCallback(
+      (newTitle: string) => {
+        if (sessionId) {
+          updateSessionTitle(sessionId, newTitle);
+        }
+        queryClient.invalidateQueries({ queryKey: ["chat-sessions"] });
+      },
+      [sessionId, updateSessionTitle, queryClient],
+    ),
+  );
   const streamingMsgIdRef = useRef<string | null>(null);
   const agentStepsRef = useRef<AgentStep[]>([]);
   useEffect(() => {
@@ -3059,21 +3266,35 @@ export const ChatPanel = memo(function ChatPanel({
       // Only send @ mentioned docs + newly attached files (not all session docs)
       // "parsing", "ready" files (parse done, embed in background) are also included —
       // backend fetches markdown directly from MinIO so content is available immediately.
+      // Filter mentions to only include docs still present in user text
+      const validMentions = referencedDocs.filter(doc => {
+        const displayName = formatMentionName(doc.original_filename || doc.filename);
+        return msg.includes(`@${displayName}`);
+      });
+
+      setReferencedDocs(validMentions); // Clean up unused mentions
+
       const documentIds = [
-        ...referencedDocs.map(d => d.id),
+        ...validMentions.map(d => d.id),
         ...attachedFiles.filter(f => f.status === "indexed" || f.status === "ready" || f.status === "parsing").map(f => f.id),
       ];
       setAttachedFiles([]);
-      // setReferencedDocs([]); // Keep mentions for subsequent questions as requested
 
       const attachedDocs = attachedFiles
         .filter(f => (f.status === "indexed" || f.status === "ready" || f.status === "parsing") && f.docMetadata)
         .map(f => f.docMetadata as Document);
 
+      let msgToBackend = msg;
+      validMentions.forEach(doc => {
+         const truncatedName = formatMentionName(doc.original_filename || doc.filename);
+         const escapedTruncated = truncatedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+         msgToBackend = msgToBackend.replace(new RegExp(`@${escapedTruncated}`, 'g'), `<document_id=${doc.id}>`);
+      });
+
       const userMsg: ChatMessage = {
         id: crypto.randomUUID(),
         role: "user",
-        content: msg,
+        content: msgToBackend,
         timestamp: new Date().toISOString(),
         documentIds: documentIds.length > 0 ? documentIds : undefined,
         attachedDocs: attachedDocs.length > 0 ? attachedDocs : undefined,
@@ -3101,7 +3322,7 @@ export const ChatPanel = memo(function ChatPanel({
       }));
 
       const finalMsg = await stream.sendMessage(
-        msg,
+        msgToBackend,
         history,
         thinkingSupported && enableThinking,
         forceSearch,
@@ -3189,6 +3410,36 @@ export const ChatPanel = memo(function ChatPanel({
         return;
       }
     }
+
+    if (e.key === "Backspace" && inputRef.current && !showMentionDropdown) {
+      const cursor = inputRef.current.selectionStart;
+      if (cursor === inputRef.current.selectionEnd) {
+        const textBefore = input.slice(0, cursor);
+
+        for (const doc of referencedDocs) {
+          const displayName = formatMentionName(doc.original_filename || doc.filename);
+          const exactMatch1 = textBefore.endsWith(`@${displayName} `) ? `@${displayName} ` : "";
+          const exactMatch2 = textBefore.endsWith(`@${displayName}`) ? `@${displayName}` : "";
+          const matchStr = exactMatch1 || exactMatch2;
+          
+          if (matchStr) {
+            e.preventDefault();
+            const newInput = textBefore.slice(0, -matchStr.length) + input.slice(cursor);
+            setInput(newInput);
+            
+            // Allow state to update, then fix cursor
+            setTimeout(() => {
+              if (inputRef.current) {
+                const newPos = cursor - matchStr.length;
+                inputRef.current.setSelectionRange(newPos, newPos);
+              }
+            }, 0);
+            return;
+          }
+        }
+      }
+    }
+
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -3241,8 +3492,8 @@ export const ChatPanel = memo(function ChatPanel({
             {/* Header */}
             <div className="flex-shrink-0 flex items-center justify-between px-4 py-3 bg-background/50 backdrop-blur-md">
               <div className="flex items-center gap-2.5">
-                <div className="w-8 h-8 rounded-xl flex items-center justify-center bg-primary/10 border border-primary/15 overflow-hidden shadow-sm">
-                  <img src="/logo.png" alt="HRAG" className="w-5 h-5 object-contain" />
+                <div className="w-8 h-8 rounded-xl flex items-center justify-center bg-background border overflow-hidden shadow-sm">
+                  <img src="/logo.png" alt="AIRAG" className="w-5 h-5 object-contain" />
                 </div>
                 <h2 className="text-[14px] font-bold tracking-tight text-foreground line-clamp-1">
                   {sessionTitle || (sessionId ? `${t("chat.session", { id: sessionId })}` : t("chat.select_session"))}
@@ -3315,9 +3566,10 @@ export const ChatPanel = memo(function ChatPanel({
                       <motion.div
                         key={msg.id}
                         data-message-id={msg.id}
-                        initial={{ opacity: 0, y: 10 }}
+                        initial={{ opacity: 0, y: 16 }}
                         animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, transition: { duration: 0.1 } }}
+                        exit={{ opacity: 0, y: -8, transition: { duration: 0.15 } }}
+                        transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
                       >
                         <MessageBubble
                           message={msg}
@@ -3387,7 +3639,7 @@ export const ChatPanel = memo(function ChatPanel({
       <input
         ref={docxInputRef}
         type="file"
-        accept=".pdf,.doc,.docx,.txt,.md,.pptx"
+        accept=".pdf,.docx,.txt,.md,.pptx"
         onChange={(e) => {
           const file = e.target.files?.[0];
           if (file) handleFileSelect(file);

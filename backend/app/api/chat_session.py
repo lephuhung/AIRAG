@@ -395,8 +395,13 @@ async def chat_stream_session(
     # Send AI message id immediately
     ai_msg_id = f"msg_{uuid.uuid4().hex[:8]}"
 
-    # Helper to perform post-stream updates without blocking connection close
-    async def _perform_post_stream_updates(
+    DEFAULT_TITLES = ["New Chat", "New chat", "Chat mới", "Kho tri thức"]
+
+    # Full background task: save message, generate summary, update title
+    async def _background_persist_and_emit(
+        session_id: str,
+        user_id: str,
+        user_message: str,
         text: str,
         thinking: str,
         sources: list,
@@ -404,23 +409,22 @@ async def chat_stream_session(
         steps: list,
         potentials: list,
         people_data: list,
-        user_message: str,
         user_msg_id: str,
         ai_msg_id: str,
     ):
-        try:
-            from app.core.database import async_session_maker
+        """Run entirely in background: save message + exchange summary, update title."""
+        from app.core.database import async_session_maker
 
-            async with async_session_maker() as bg_db:
-                # Re-fetch session to ensure it exists in this session
-                res = await bg_db.execute(
+        try:
+            async with async_session_maker() as db:
+                res = await db.execute(
                     select(ChatSession).where(ChatSession.id == session_id)
                 )
                 bg_session = res.scalar_one_or_none()
                 if not bg_session:
                     return
 
-                # Ensure all agent steps are marked as completed and add a final "done" step
+                # Process steps
                 processed_steps = []
                 for step in steps:
                     step_copy = step.copy()
@@ -429,15 +433,13 @@ async def chat_stream_session(
                     processed_steps.append(step_copy)
 
                 if not any(s.get("step") == "done" for s in processed_steps):
-                    processed_steps.append(
-                        {
-                            "id": f"step_done_{uuid.uuid4().hex[:6]}",
-                            "step": "done",
-                            "status": "completed",
-                            "detail": "Hoàn thành",
-                            "timestamp": int(datetime.utcnow().timestamp() * 1000),
-                        }
-                    )
+                    processed_steps.append({
+                        "id": f"step_done_{uuid.uuid4().hex[:6]}",
+                        "step": "done",
+                        "status": "completed",
+                        "detail": "Hoàn thành",
+                        "timestamp": int(datetime.utcnow().timestamp() * 1000),
+                    })
 
                 # Save assistant message
                 ai_msg = ChatMessage(
@@ -452,40 +454,30 @@ async def chat_stream_session(
                     potential_abbreviations=potentials or None,
                     people_data=people_data or None,
                 )
-                bg_db.add(ai_msg)
+                db.add(ai_msg)
 
-                # Update session title if still default
-                DEFAULT_TITLES = ["New Chat", "New chat", "Chat mới", "Kho tri thức"]
-                if bg_session.title in DEFAULT_TITLES or not bg_session.title:
-                    bg_session.title = user_message[:50] + (
-                        "..." if len(user_message) > 50 else ""
-                    )
-
-                await bg_db.commit()
-                logger.info(
-                    f"[session/{session_id}] Post-stream updates completed in background"
+                # Determine if title was auto-set
+                frontend_auto_title = user_message[:30] if len(user_message) > 30 else user_message
+                title_was_auto_set = (
+                    bg_session.title in DEFAULT_TITLES
+                    or not bg_session.title
+                    or bg_session.title == frontend_auto_title
                 )
 
-                # Graphiti save
-                if user.id and user_message and text:
-                    from app.services.graphiti_client import add_conversation_episode
+                # Set interim title from message
+                if title_was_auto_set:
+                    bg_session.title = user_message[:50] + ("..." if len(user_message) > 50 else "")
 
-                    await add_conversation_episode(
-                        user_id=user.id,
-                        user_message=user_message,
-                        assistant_message=text,
-                        session_id=session_id,
-                    )
+                await db.commit()
 
-                # Generate exchange summary for conversation context
-                try:
-                    from app.services.conversation_summary_service import (
-                        get_conversation_summary_service,
-                    )
-
-                    summary_svc = get_conversation_summary_service()
-                    await summary_svc.save_exchange_summary(
-                        db=bg_db,
+            # Generate exchange summary outside the session scope (LLM call may be slow)
+            topic_label = None
+            try:
+                from app.services.conversation_summary_service import get_conversation_summary_service
+                summary_svc = get_conversation_summary_service()
+                async with async_session_maker() as db:
+                    summary_result = await summary_svc.save_exchange_summary(
+                        db=db,
                         session_id=session_id,
                         user_message_id=user_msg_id,
                         assistant_message_id=ai_msg_id,
@@ -493,18 +485,38 @@ async def chat_stream_session(
                         assistant_message=text,
                         cited_sources=sources,
                     )
-                    logger.info(
-                        f"[session/{session_id}] Exchange summary saved for msg {user_msg_id}"
+
+                    if summary_result is not None and summary_result.exchange_index == 1:
+                        topic_label = summary_result.topic_label
+                        logger.info(f"[session/{session_id}] topic_label: {topic_label}")
+
+                        # Re-fetch session to update title
+                        res = await db.execute(
+                            select(ChatSession).where(ChatSession.id == session_id)
+                        )
+                        bg_session = res.scalar_one_or_none()
+                        if bg_session and topic_label and title_was_auto_set:
+                            bg_session.title = topic_label
+                            await db.commit()
+                            logger.info(f"[session/{session_id}] Title updated to topic_label: {topic_label}")
+            except Exception as e:
+                logger.warning(f"[session/{session_id}] Failed to save exchange summary: {e}", exc_info=True)
+
+            # Graphiti save (separate session)
+            try:
+                from app.services.graphiti_client import add_conversation_episode
+                if user_id and user_message and text:
+                    await add_conversation_episode(
+                        user_id=user_id,
+                        user_message=user_message,
+                        assistant_message=text,
+                        session_id=session_id,
                     )
-                except Exception as e:
-                    logger.warning(
-                        f"[session/{session_id}] Failed to save exchange summary: {e}"
-                    )
+            except Exception as e:
+                logger.error(f"[session/{session_id}] Graphiti save failed: {e}", exc_info=True)
+
         except Exception as e:
-            logger.error(
-                f"[session/{session_id}] Background persistence failed: {e}",
-                exc_info=True,
-            )
+            logger.error(f"[session/{session_id}] Background persistence failed: {e}", exc_info=True)
 
     # ── Route: LangGraph agent ──────────────────────────────────────────────
     use_langgraph = settings.NEXUSRAG_AGENT_BACKEND.lower() == "langgraph"
@@ -595,9 +607,12 @@ async def chat_stream_session(
 
                     yield sse_str
 
-                # Schedule persistence in background so stream can close immediately
+                # All persistence in background — stream closes immediately
                 background_tasks.add_task(
-                    _perform_post_stream_updates,
+                    _background_persist_and_emit,
+                    session_id=session_id,
+                    user_id=str(user.id),
+                    user_message=request.message,
                     text=accumulated_text,
                     thinking=accumulated_thinking,
                     sources=final_sources,
@@ -605,7 +620,6 @@ async def chat_stream_session(
                     steps=final_steps,
                     potentials=final_potential_abbreviations,
                     people_data=final_people_data,
-                    user_message=request.message,
                     user_msg_id=user_msg_id,
                     ai_msg_id=ai_msg_id,
                 )
@@ -673,17 +687,19 @@ async def chat_stream_session(
 
                 yield format_sse_event(sse_item["event"], sse_item["data"])
 
-            # Schedule persistence in background for legacy agent too
+            # All persistence in background — stream closes immediately
             background_tasks.add_task(
-                _perform_post_stream_updates,
+                _background_persist_and_emit,
+                session_id=session_id,
+                user_id=str(user.id),
+                user_message=request.message,
                 text=accumulated_text,
                 thinking=accumulated_thinking,
                 sources=final_sources,
                 images=final_images,
                 steps=final_steps,
-                potentials=[],  # Legacy agent doesn't send abbreviations
+                potentials=[],
                 people_data=final_people_data,
-                user_message=request.message,
                 user_msg_id=user_msg_id,
                 ai_msg_id=ai_msg_id,
             )

@@ -1,12 +1,3 @@
-/**
- * ThinkingTimeline — Vertical timeline showing agent processing steps.
- *
- * Two modes:
- * - "live" — during streaming: always expanded, active step has spinner
- * - "embedded" — after complete: collapsed summary, click to expand
- */
-
-import { useState, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Brain,
@@ -16,8 +7,7 @@ import {
   PenLine,
   CheckCircle2,
   AlertCircle,
-  Loader2,
-  ChevronDown,
+  Sparkles,
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -25,22 +15,67 @@ import { useTranslation } from "@/hooks/useTranslation";
 import type { AgentStep, AgentStepType } from "@/types";
 
 // ---------------------------------------------------------------------------
-// Step Configuration
+// Step Configuration with Premium Colors
 // ---------------------------------------------------------------------------
 
 interface StepConfig {
   icon: LucideIcon;
   labelKey: string;
+  color: string;
+  bg: string;
+  glow: string;
 }
 
 export const STEP_CONFIG: Record<AgentStepType, StepConfig> = {
-  analyzing: { icon: Brain, labelKey: "rag.timeline.analyzing" },
-  understood: { icon: Lightbulb, labelKey: "rag.timeline.understood" },
-  retrieving: { icon: Search, labelKey: "rag.timeline.retrieving" },
-  sources_found: { icon: Database, labelKey: "rag.timeline.sources_found" },
-  generating: { icon: PenLine, labelKey: "rag.timeline.generating" },
-  done: { icon: CheckCircle2, labelKey: "rag.timeline.done" },
-  error: { icon: AlertCircle, labelKey: "rag.timeline.error" },
+  analyzing: { 
+    icon: Brain, 
+    labelKey: "rag.timeline.analyzing", 
+    color: "text-indigo-500", 
+    bg: "bg-indigo-500/10",
+    glow: "shadow-[0_0_15px_-3px_rgba(99,102,241,0.4)]"
+  },
+  understood: { 
+    icon: Lightbulb, 
+    labelKey: "rag.timeline.understood", 
+    color: "text-amber-500", 
+    bg: "bg-amber-500/10",
+    glow: "shadow-[0_0_15px_-3px_rgba(245,158,11,0.4)]"
+  },
+  retrieving: { 
+    icon: Search, 
+    labelKey: "rag.timeline.retrieving", 
+    color: "text-blue-500", 
+    bg: "bg-blue-500/10",
+    glow: "shadow-[0_0_15px_-3px_rgba(59,130,246,0.4)]"
+  },
+  sources_found: { 
+    icon: Database, 
+    labelKey: "rag.timeline.sources_found", 
+    color: "text-emerald-500", 
+    bg: "bg-emerald-500/10",
+    glow: "shadow-[0_0_15px_-3px_rgba(16,185,129,0.4)]"
+  },
+  generating: { 
+    icon: PenLine, 
+    labelKey: "rag.timeline.generating", 
+    color: "text-fuchsia-500", 
+    bg: "bg-fuchsia-500/10",
+    glow: "shadow-[0_0_15px_-3px_rgba(217,70,239,0.4)]"
+  },
+  done: { 
+    icon: CheckCircle2, 
+    labelKey: "rag.timeline.done", 
+    color: "text-emerald-500", 
+    bg: "bg-emerald-500/10",
+    glow: "shadow-[0_0_15px_-3px_rgba(16,185,129,0.4)]"
+  },
+  error: { 
+    icon: AlertCircle, 
+    labelKey: "rag.timeline.error", 
+    color: "text-destructive", 
+    bg: "bg-destructive/10",
+    glow: "shadow-[0_0_15px_-3px_rgba(239,68,68,0.4)]"
+  },
 };
 
 function formatMs(ms: number): string {
@@ -51,393 +86,185 @@ function formatMs(ms: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// LiveTimer — updates every 100ms for active steps
+// PremiumStepIndicator — shows active step with pulsing aura
 // ---------------------------------------------------------------------------
 
-function LiveTimer({ startTimestamp }: { startTimestamp: number }) {
-  const [elapsed, setElapsed] = useState(0);
-
-  useEffect(() => {
-    const iv = setInterval(() => setElapsed(Date.now() - startTimestamp), 100);
-    return () => clearInterval(iv);
-  }, [startTimestamp]);
-
-  return (
-    <span className="text-[11px] font-mono tabular-nums text-primary/80">
-      {formatMs(elapsed)}
-    </span>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// ThinkingLogSection — collapsible full thinking log (embedded mode, post-stream)
-// ---------------------------------------------------------------------------
-
-function ThinkingLogSection({ text }: { text: string }) {
-  const [expanded, setExpanded] = useState(false);
-
-  return (
-    <div className="mt-1.5">
-      <button
-        onClick={() => setExpanded((p) => !p)}
-        className="flex items-center gap-1 text-[11px] text-muted-foreground/70 hover:text-muted-foreground transition-colors"
-      >
-        <Brain className="w-2.5 h-2.5" />
-        <span>{expanded ? "Hide" : "Show"} thinking log</span>
-        <ChevronDown
-          className={cn(
-            "w-2.5 h-2.5 transition-transform",
-            expanded && "rotate-180",
-          )}
-        />
-      </button>
-      <AnimatePresence>
-        {expanded && (
-          <motion.div
-            initial={{ height: 0, opacity: 0 }}
-            animate={{ height: "auto", opacity: 1 }}
-            exit={{ height: 0, opacity: 0 }}
-            transition={{ duration: 0.2 }}
-            className="overflow-hidden"
-          >
-            <div
-              className={cn(
-                "mt-1 ml-1 text-[11px] leading-relaxed text-muted-foreground/80 italic",
-                "max-h-[200px] overflow-y-auto scrollbar-none",
-                "border-l border-border/40 pl-2",
-                "whitespace-pre-wrap break-words",
-              )}
-            >
-              {text}
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// StepNode — single step in the timeline
-// ---------------------------------------------------------------------------
-
-interface StepNodeProps {
-  step: AgentStep;
-  isLast: boolean;
-  isLive: boolean;
-}
-
-function StepNode({ step, isLast, isLive }: StepNodeProps) {
+function PremiumStepIndicator({ step }: { step: AgentStep }) {
   const { t } = useTranslation();
   const config = STEP_CONFIG[step.step] || STEP_CONFIG.analyzing;
   const Icon = config.icon;
-  const isActive = isLive && step.status === "active";
-  const isError = step.status === "error";
-  const isCompleted = step.status === "completed" || (!isLive && !isError);
+  const isActive = step.status === "active";
 
   return (
     <motion.div
-      initial={{ opacity: 0, x: -6 }}
-      animate={{ opacity: 1, x: 0 }}
-      transition={{ duration: 0.2, ease: "easeOut" }}
-      className="flex gap-2 relative"
+      initial={{ opacity: 0, scale: 0.95, y: 10 }}
+      animate={{ opacity: 1, scale: 1, y: 0 }}
+      exit={{ opacity: 0, scale: 0.95, y: -10 }}
+      className="flex items-center gap-3 py-1"
     >
-      {/* Vertical line connector */}
-      {!isLast && (
+      <div className="relative">
+        {/* Animated Rings for Active State */}
+        {isActive && (
+          <>
+            <motion.div
+              className={cn("absolute inset-0 rounded-xl", config.bg)}
+              animate={{ scale: [1, 1.4, 1], opacity: [0.3, 0, 0.3] }}
+              transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
+            />
+            <motion.div
+              className={cn("absolute inset-0 rounded-xl", config.bg)}
+              animate={{ scale: [1, 1.8, 1], opacity: [0.2, 0, 0.2] }}
+              transition={{ duration: 2, repeat: Infinity, ease: "easeInOut", delay: 0.5 }}
+            />
+          </>
+        )}
+
+        {/* Icon Container */}
         <div
           className={cn(
-            "absolute left-[9px] top-[20px] w-px bottom-0",
-            isActive ? "bg-primary/20" : "bg-border/50",
+            "relative w-9 h-9 rounded-xl flex items-center justify-center transition-all duration-500",
+            config.bg,
+            config.glow,
+            "backdrop-blur-md border border-white/10 dark:border-white/5"
           )}
-        />
-      )}
-
-      {/* Icon node */}
-      <div className="relative flex-shrink-0 z-10">
-        {isActive ? (
-          <div className="w-[18px] h-[18px] rounded-full bg-primary/15 flex items-center justify-center ring-1 ring-primary/30">
-            <Loader2 className="w-2.5 h-2.5 animate-spin text-primary" />
-          </div>
-        ) : isError ? (
-          <div className="w-[18px] h-[18px] rounded-full bg-destructive/15 flex items-center justify-center">
-            <AlertCircle className="w-2.5 h-2.5 text-destructive" />
-          </div>
-        ) : step.step === "done" ? (
-          <div className="w-[18px] h-[18px] rounded-full bg-emerald-500/15 flex items-center justify-center">
-            <CheckCircle2 className="w-2.5 h-2.5 text-emerald-500" />
-          </div>
-        ) : (
-          <div className="w-[18px] h-[18px] rounded-full bg-muted flex items-center justify-center">
-            <Icon className="w-2.5 h-2.5 text-muted-foreground/80" />
-          </div>
-        )}
+        >
+          {isActive ? (
+            <motion.div
+              animate={{ rotate: 360 }}
+              transition={{ duration: 4, repeat: Infinity, ease: "linear" }}
+              className="absolute inset-0 rounded-xl border border-dashed border-current opacity-20"
+              style={{ color: "inherit" }}
+            />
+          ) : null}
+          <Icon className={cn("w-5 h-5", config.color)} />
+        </div>
       </div>
 
-      {/* Content */}
-      <div className="flex-1 min-w-0 pb-2.5">
-        <div className="flex items-center gap-1.5 min-h-[18px]">
-          <span
-            className={cn(
-              "text-xs leading-tight",
-              isActive && "text-foreground font-medium",
-              isCompleted && step.step !== "done" && "text-muted-foreground",
-              step.step === "done" && "text-emerald-500 font-medium",
-              isError && "text-destructive font-medium",
-            )}
-          >
+      <div className="flex flex-col">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold tracking-tight text-foreground/90">
             {step.detail || t(config.labelKey)}
           </span>
-
-          <span className="ml-auto flex-shrink-0">
-            {isActive && isLive ? (
-              <LiveTimer startTimestamp={step.timestamp} />
-            ) : step.durationMs != null && step.durationMs > 0 ? (
-              <span className="text-[11px] font-mono tabular-nums text-muted-foreground/70">
-                {formatMs(step.durationMs)}
-              </span>
-            ) : null}
-          </span>
-        </div>
-
-        {/* Source badges for sources_found step */}
-        {step.sourceBadges && step.sourceBadges.length > 0 && (
-          <div className="flex flex-wrap gap-1 mt-1">
-            {step.sourceBadges.map((badge, i) => (
-              <span
-                key={`${badge}-${i}`}
-                className="inline-flex items-center px-1 py-0.5 text-[10px] font-mono font-bold rounded bg-primary/10 text-primary/80"
+          <AnimatePresence>
+            {isActive && (
+              <motion.div 
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                className="flex items-center gap-1"
               >
-                {badge}
-              </span>
-            ))}
-          </div>
-        )}
-
-        {/* Thinking text: during active streaming, the inline preview in MessageBubble
-            handles display. After completion, show collapsible log here. */}
-        {step.step === "analyzing" && step.thinkingText && !isActive && (
-          <ThinkingLogSection text={step.thinkingText} />
-        )}
+                <span className="flex gap-1">
+                  {[0, 1, 2].map((i) => (
+                    <motion.span
+                      key={i}
+                      className="w-1 h-1 rounded-full bg-primary/40"
+                      animate={{ opacity: [0.3, 1, 0.3] }}
+                      transition={{ duration: 1, repeat: Infinity, delay: i * 0.2 }}
+                    />
+                  ))}
+                </span>
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
+        <span className="text-[11px] text-muted-foreground/60 font-medium">
+          {isActive ? "Đang xử lý..." : "Đã hoàn tất"}
+        </span>
       </div>
     </motion.div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// TimelineSummary — collapsed 1-line summary for embedded mode
-// ---------------------------------------------------------------------------
-
-function buildSummary(steps: AgentStep[], isLive: boolean, t: any): string {
-  const doneStep = steps.find((s) => s.step === "done");
-
-  let durationPart = "";
-
-  if (doneStep?.durationMs != null) {
-    durationPart = formatMs(doneStep.durationMs);
-  } else if (doneStep) {
-    // Extract duration from detail if available
-    const match = doneStep.detail.match(/[\d.]+[sm]/);
-    if (match) {
-      durationPart = match[0];
-    } else if (steps.length > 0) {
-      // Fallback: total time from start to done
-      durationPart = formatMs(doneStep.timestamp - steps[0].timestamp);
-    }
-  }
-
-  // Fallback if no done step or duration yet
-  if (!durationPart && steps.length > 0 && !isLive) {
-    durationPart = formatMs(steps[steps.length - 1].timestamp - steps[0].timestamp);
-  }
-
-  const activeStep = steps.find((s) => s.status === "active");
-
-  if (durationPart) {
-    return `${t("common.completed")} - ${durationPart}`;
-  }
-
-  if (isLive && activeStep) {
-    const cfg = STEP_CONFIG[activeStep.step] || STEP_CONFIG.analyzing;
-    return `${t(cfg.labelKey)}...`;
-  }
-
-  return t("common.processed");
-}
-
-// ---------------------------------------------------------------------------
-// ThinkingTimeline — main export
+// Main ThinkingTimeline component
 // ---------------------------------------------------------------------------
 
 interface ThinkingTimelineProps {
   steps: AgentStep[];
-  mode: "live" | "embedded";
   className?: string;
-  /** When true, auto-collapse the timeline (used when answer starts streaming). */
   autoCollapse?: boolean;
-  /** When true, the expanded view is constrained to max-w-xs to avoid breaking inline layouts. */
-  inline?: boolean;
-  /** When provided, the parent controls the expanded state instead of internal state. */
-  expanded?: boolean;
-  /** Callback when expanded state changes (used with controlled `expanded` prop). */
-  onExpandedChange?: (expanded: boolean) => void;
 }
 
 export function ThinkingTimeline({
   steps,
-  mode,
   className,
-  autoCollapse = false,
-  inline = false,
-  expanded: controlledExpanded,
-  onExpandedChange,
 }: ThinkingTimelineProps) {
-  // Controlled: parent manages state; otherwise use internal
-  const [internalExpanded, setInternalExpanded] = useState(mode === "live");
-  const expanded = controlledExpanded !== undefined ? controlledExpanded : internalExpanded;
-  const setExpanded = onExpandedChange ?? setInternalExpanded;
-
-  const hasAutoCollapsedRef = useRef(false);
-  const prevModeRef = useRef(mode);
-
-  // Live mode without autoCollapse → expanded
-  // When autoCollapse kicks in → collapse once
-  // When mode transitions live→embedded → stay collapsed
-  useEffect(() => {
-    if (autoCollapse && !hasAutoCollapsedRef.current) {
-      hasAutoCollapsedRef.current = true;
-      setExpanded(false);
-    }
-  }, [autoCollapse]);
-
-  // When mode changes from live→embedded (streaming finished),
-  // keep current collapsed state — do NOT re-expand
-  useEffect(() => {
-    prevModeRef.current = mode;
-  }, [mode]);
-
   const { t } = useTranslation();
   if (steps.length === 0) return null;
 
-  // Collapsed summary — styled like ThinkingPanel header for visibility
-  const isStillActive = mode === "live" && steps.some((s) => s.status === "active");
-  if (!expanded) {
-    return (
-      <div className={cn("w-fit max-w-full rounded-md border border-border/60 bg-background overflow-hidden", className)}>
-        <button
-          onClick={() => setExpanded(true)}
-          className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-primary/80 hover:text-primary transition-colors whitespace-nowrap"
-        >
-          {isStillActive ? (
-            <Loader2 className="w-3 h-3 animate-spin text-primary/80 flex-shrink-0" />
-          ) : (
-            <CheckCircle2 className="w-3 h-3 text-emerald-500/80 flex-shrink-0" />
-          )}
-          <span className="text-left">{buildSummary(steps, mode === "live", t)}</span>
-          <ChevronDown className="w-3 h-3 flex-shrink-0" />
-        </button>
-      </div>
-    );
-  }
+  const activeStep = steps.find((s) => s.status === "active");
+  const lastCompletedStep = [...steps].reverse().find((s) => s.status === "completed" && s.step !== "done");
+  const doneStep = steps.find((s) => s.step === "done" && s.status === "completed");
 
-  // Expanded — wrap in styled container for embedded mode
-  const isEmbedded = mode === "embedded" || autoCollapse;
+  const displayStep = activeStep || doneStep || lastCompletedStep;
+
+  if (!displayStep) return null;
 
   return (
-    <div
-      className={cn(
-        "relative",
-        isEmbedded && cn(
-          inline
-            ? "max-w-xs rounded-md border border-border/60 bg-background overflow-hidden"
-            : "w-fit max-w-2xl rounded-md border border-border/60 bg-background overflow-hidden",
-        ),
-        className,
-      )}
-    >
-      {/* Header / collapse button for embedded mode */}
-      {isEmbedded && (
-        <button
-          onClick={() => setExpanded(false)}
-          className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-primary/80 hover:text-primary transition-colors border-b border-border/40 whitespace-nowrap"
+    <div className={cn("py-2", className)}>
+      <AnimatePresence mode="wait">
+        <motion.div
+          key={displayStep.id}
+          initial={{ opacity: 0, y: 5 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: -5 }}
+          className="inline-flex flex-col"
         >
-          <CheckCircle2 className="w-3 h-3 text-emerald-500/80 flex-shrink-0" />
-          <span className="text-left">{buildSummary(steps, mode === "live", t)}</span>
-          <ChevronDown className="w-3 h-3 flex-shrink-0 rotate-180" />
-        </button>
-      )}
+          {/* Header Label - Optional, very subtle */}
+          <div className="flex items-center gap-1.5 mb-2 px-1">
+            <Sparkles className="w-3 h-3 text-primary/50" />
+            <span className="text-[10px] font-bold uppercase tracking-[0.1em] text-muted-foreground/40">
+              {t("rag.timeline.analyzing") || "Processing Engine"}
+            </span>
+          </div>
 
-      {/* Horizontal Timeline Track */}
-      <div className={cn(isEmbedded && "px-3 py-2.5")}>
-        <div className="flex items-start gap-0 relative">
-          {/* Horizontal connecting line */}
-          <div className="absolute top-[9px] left-0 right-0 h-px bg-border/50" />
+          {/* The Active/Display Step */}
+          <div className={cn(
+            "relative group rounded-2xl transition-all duration-500",
+            "bg-gradient-to-br from-muted/40 to-muted/10",
+            "border border-white/10 dark:border-white/5",
+            "p-3 pr-6 shadow-sm hover:shadow-md",
+            "backdrop-blur-xl"
+          )}>
+            <PremiumStepIndicator step={displayStep} />
+            
+            {/* Minimal Progress Bar at bottom */}
+            {activeStep && (
+              <div className="absolute bottom-0 left-0 right-0 h-[2px] overflow-hidden rounded-b-2xl">
+                <motion.div 
+                  className="h-full bg-gradient-to-r from-primary/20 via-primary to-primary/20"
+                  animate={{ x: ["-100%", "100%"] }}
+                  transition={{ duration: 2, repeat: Infinity, ease: "linear" }}
+                  style={{ width: "50%" }}
+                />
+              </div>
+            )}
+          </div>
 
-          <AnimatePresence mode="popLayout">
-            {steps.map((step, i) => {
-              const config = STEP_CONFIG[step.step] || STEP_CONFIG.analyzing;
-              const Icon = config.icon;
-              const isActive = mode === "live" && step.status === "active";
-              const isError = step.status === "error";
-              return (
-                <motion.div
-                  key={step.id || i}
-                  initial={{ opacity: 0, scale: 0.8 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  transition={{ duration: 0.2, delay: i * 0.05 }}
-                  className="flex-1 flex flex-col items-center gap-1 relative z-10"
-                >
-                  {/* Dot */}
-                  <div
-                    className={cn(
-                      "w-[18px] h-[18px] rounded-full flex items-center justify-center flex-shrink-0",
-                      isActive && "bg-primary/15 ring-1 ring-primary/30",
-                      isError && "bg-destructive/15",
-                      step.step === "done" && "bg-emerald-500/15",
-                      !isActive && !isError && step.step !== "done" && "bg-muted",
-                    )}
-                  >
-                    {isActive ? (
-                      <Loader2 className="w-2.5 h-2.5 animate-spin text-primary" />
-                    ) : (
-                      <Icon className={cn(
-                        "w-2.5 h-2.5",
-                        isError && "text-destructive",
-                        step.step === "done" && "text-emerald-500",
-                        !isActive && !isError && step.step !== "done" && "text-muted-foreground/80",
-                      )} />
-                    )}
-                  </div>
-
-                  {/* Label */}
-                  <span className={cn(
-                    "text-[10px] text-center leading-tight whitespace-nowrap",
-                    isActive && "text-foreground font-medium",
-                    step.step === "done" && "text-emerald-500",
-                    isError && "text-destructive",
-                    !isActive && !isError && step.step !== "done" && "text-muted-foreground/80",
-                  )}>
-                    {step.detail || t(config.labelKey)}
-                  </span>
-
-                  {/* Duration */}
-                  {step.durationMs != null && step.durationMs > 0 && (
-                    <span className="text-[10px] font-mono tabular-nums text-muted-foreground/60">
-                      {formatMs(step.durationMs)}
-                    </span>
-                  )}
-
-                  {/* Thinking indicator for analyzing step */}
-                  {step.step === "analyzing" && step.thinkingText && !isActive && (
-                    <div className="mt-0.5">
-                      <ThinkingLogSection text={step.thinkingText} />
-                    </div>
-                  )}
-                </motion.div>
-              );
-            })}
-          </AnimatePresence>
-        </div>
-      </div>
+          {/* Mini History Dots - Show progress through steps */}
+          <div className="flex items-center gap-1.5 mt-3 px-3">
+            {steps.filter(s => s.step !== 'done').map((s) => (
+              <div 
+                key={s.id}
+                className={cn(
+                  "h-1 rounded-full transition-all duration-500",
+                  s.status === 'completed' ? "w-4 bg-primary/30" : 
+                  s.status === 'active' ? "w-8 bg-primary shadow-[0_0_8px_rgba(var(--primary),0.5)]" : 
+                  "w-2 bg-muted-foreground/20"
+                )}
+              />
+            ))}
+            {doneStep && (
+              <motion.span 
+                initial={{ opacity: 0, scale: 0.5 }}
+                animate={{ opacity: 1, scale: 1 }}
+                className="text-[10px] font-mono text-emerald-500 font-bold ml-2"
+              >
+                {formatMs(doneStep.durationMs || 0)}
+              </motion.span>
+            )}
+          </div>
+        </motion.div>
+      </AnimatePresence>
     </div>
   );
 }

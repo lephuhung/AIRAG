@@ -82,6 +82,7 @@
     "active": "Hoạt động",
     "inactive": "Ngừng hoạt động",
     "pending": "Chờ duyệt",
+    "pending_count": "{{count}} chờ duyệt",
     "pages": "trang",
     "chunks": "đoạn",
     "images": "hình ảnh",
@@ -185,6 +186,7 @@
     "chat": "Trò chuyện",
     "thinking": "Đang suy nghĩ...",
     "thinking_process": "Quá trình suy luận",
+    "analyzing_question": "Đang phân tích câu hỏi...",
     "copy_text": "Sao chép văn bản",
     "copy_markdown": "Sao chép Markdown",
     "copied": "Đã sao chép!",
@@ -240,6 +242,7 @@
     "status_uploading": "Đang tải lên...",
     "status_parsing": "Đang xử lý...",
     "status_indexed": "Sẵn sàng",
+    "status_ready": "Sẵn sàng truy vấn",
     "status_failed": "Lỗi",
     "wait_for_files": "Vui lòng đợi tệp tin được xử lý xong",
     "upload_failed": "Tải lên thất bại",
@@ -247,7 +250,7 @@
     "mention_category_docs": "Tài liệu đề xuất",
     "no_docs_found": "Không tìm thấy tài liệu nào phù hợp",
     "tool_upload": "Tải lên tệp tin",
-    "tool_word": "Kiểm tra định dạng Word",
+    "tool_word": "Tải tài liệu lên",
     "tool_audio": "Ghi âm cuộc hội thoại",
     "tool_force_search": "Bắt buộc tìm kiếm (Bật/Tắt)",
     "tools_button": "Công cụ"
@@ -358,6 +361,7 @@
     "section_legacy": "Chia sẻ (Cũ)",
     "section_public": "Kho tri thức công khai",
     "section_org": "Tổ chức",
+    "default": "Mặc định",
     "section_personal": "Kho tri thức cá nhân",
     "no_public": "Không có kho tri thức công khai",
     "no_personal": "Chưa có kho tri thức cá nhân",
@@ -526,12 +530,6 @@
       "error": "Lỗi",
       "unknown": "Lỗi không xác định"
     },
-    "types": {
-      "parse": "Phân tích",
-      "embed": "Nhúng",
-      "caption": "Mô tả",
-      "kg": "Biểu đồ"
-    },
     "errors": {
       "unknown": "Lỗi không xác định"
     },
@@ -544,6 +542,7 @@
     "consumers": "{{count}} consumer",
     "consumers_plural": "{{count}} consumers",
     "containers": "{{count}}",
+    "container_mode": "Quản lý bằng Container",
     "consumers_label": "Người thực thi",
     "start_success": "Đã chạy {{count}} tiến trình {{type}}",
     "restart_all": "Khởi động lại tất cả",
@@ -553,6 +552,12 @@
     "restart_success": "Đã khởi động lại tiến trình {{type}}",
     "retry_all_success": "Đang thử lại {{count}} tài liệu lỗi",
     "retry_all_failed": "Thử lại tài liệu thất bại",
+    "retry_single_success": "Tài liệu đã được đưa vào hàng đợi để thử lại",
+    "retry_single_failed": "Thử lại tài liệu thất bại",
+    "delete_doc_success": "Đã xóa tài liệu",
+    "delete_doc_failed": "Xóa tài liệu thất bại",
+    "delete_doc_title": "Xóa tài liệu",
+    "delete_doc_msg": "Thao tác này sẽ xóa vĩnh viễn tài liệu và tất cả dữ liệu đã được lập chỉ mục. Tiếp tục?",
     "queue_purged": "Đã làm trống hàng đợi {{name}}",
     "queue_purge_failed": "Làm trống hàng đợi thất bại",
     "queue_deleted": "Đã xóa hàng đợi {{name}}",
@@ -561,8 +566,6 @@
     "dlq_purge_failed": "Làm trống DLQ thất bại",
     "dlq_retry_success": "Đã thử lại {{count}} tin nhắn từ DLQ",
     "dlq_retry_failed": "Thử lại tin nhắn từ DLQ thất bại",
-    "retry_single_success": "Tài liệu đã được đưa vào hàng đợi thử lại",
-    "retry_single_failed": "Thử lại tài liệu thất bại",
     "purge_queue_success": "Đã làm trống hàng đợi {{name}}",
     "purge_queue_failed": "Làm trống hàng đợi thất bại",
     "delete_queue_success": "Đã xóa hàng đợi {{name}}",
@@ -608,6 +611,12 @@
       "building_kg": "Xây biểu đồ (KG)",
       "indexed": "Đã chỉ mục",
       "failed": "Thất bại"
+    },
+    "types": {
+      "parse": "Phân tích",
+      "embed": "Nhúng",
+      "caption": "Chú thích",
+      "kg": "Đồ thị"
     },
     "status_desc": {
       "pending": "Đang chờ trong hàng đợi để bắt đầu xử lý.",

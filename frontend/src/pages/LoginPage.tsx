@@ -5,7 +5,7 @@ import { useAuthStore } from "@/stores/authStore";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent } from "@/components/ui/card";
-import { Database, LogIn } from "lucide-react";
+import { LogIn } from "lucide-react";
 import { useTranslation } from "@/hooks/useTranslation";
 
 export function LoginPage() {
@@ -33,12 +33,16 @@ export function LoginPage() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-background px-4">
-      <Card className="w-full max-w-sm shadow-xl">
+    <div className="min-h-screen flex items-center justify-center bg-background relative overflow-hidden px-4">
+      {/* Background decoration */}
+      <div className="absolute top-[-20%] left-[-10%] w-[50%] h-[50%] rounded-full bg-primary/20 blur-[120px] pointer-events-none animate-pulse duration-1000" />
+      <div className="absolute bottom-[-20%] right-[-10%] w-[50%] h-[50%] rounded-full bg-blue-500/20 blur-[120px] pointer-events-none animate-pulse duration-1000 delay-500" />
+      
+      <Card className="w-full max-w-sm shadow-2xl border-primary/10 relative z-10 bg-card/80 backdrop-blur-xl">
         <CardContent className="pt-8 pb-6">
           <div className="flex flex-col items-center mb-6">
-            <div className="w-14 h-14 rounded-2xl bg-primary/10 flex items-center justify-center mb-3">
-              <Database className="w-7 h-7 text-primary" />
+            <div className="w-16 h-16 flex items-center justify-center mb-3">
+              <img src="/logo.png" alt="AIRAG Logo" className="w-full h-full object-contain" />
             </div>
             <h1 className="text-xl font-bold">{t("app.name")}</h1>
             <p className="text-sm text-muted-foreground mt-1">{t("auth.login_title")}</p>

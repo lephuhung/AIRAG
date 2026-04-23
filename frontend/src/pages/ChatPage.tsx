@@ -54,8 +54,8 @@ export function ChatPage() {
           layout
           initial={false}
           className={cn(
-            "flex-1 h-full min-w-[320px] relative z-10",
-            selectedDoc ? "w-1/3" : "w-full max-w-2xl lg:max-w-3xl xl:max-w-4xl mx-auto"
+            "h-full min-w-[320px] relative z-10 shrink-0",
+            selectedDoc ? "w-1/2 max-w-4xl mx-auto" : "flex-1 w-full max-w-2xl lg:max-w-3xl xl:max-w-4xl mx-auto"
           )}
           transition={{ 
             type: "spring", 
@@ -83,7 +83,7 @@ export function ChatPage() {
                 damping: 38,
                 mass: 0.8
               }}
-              className="w-2/3 h-full border-l bg-background flex flex-col z-20 shadow-2xl relative"
+              className="w-1/2 h-full border-l bg-background flex flex-col z-20 shadow-2xl relative"
             >
               <div className="absolute inset-y-0 -left-6 w-6 bg-gradient-to-r from-transparent to-black/[0.03] pointer-events-none" />
               
