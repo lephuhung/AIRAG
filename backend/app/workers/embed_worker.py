@@ -126,16 +126,21 @@ async def handle_embed(payload: dict) -> None:
             embedder     = get_embedding_service()
             vector_store = get_vector_store(msg.workspace_id)
 
+            # embed_texts may filter empty/whitespace texts → track which ones survived
+            valid_indices = [i for i, t in enumerate(embed_texts) if t.strip()]
             embeddings = await asyncio.to_thread(embedder.embed_texts, embed_texts)
 
-            ids = [
-                f"doc_{msg.document_id}_chunk_{c['chunk_index']}"
-                for c in chunks_data
-            ]
+            # ids, metadatas, documents must be aligned with the embeddings list
             ws_id = str(msg.workspace_id)
             img_url_prefix = f"/static/doc-images/kb_{ws_id}/images"
-            metadatas = [
-                {
+            ids = []
+            documents = []
+            metadatas = []
+            for i in valid_indices:
+                c = chunks_data[i]
+                ids.append(f"doc_{msg.document_id}_chunk_{c['chunk_index']}")
+                documents.append(c["content"])
+                metadatas.append({
                     "document_id":     str(msg.document_id),
                     "workspace_id":   ws_id,
                     "chunk_index":     c["chunk_index"],
@@ -151,15 +156,13 @@ async def handle_embed(payload: dict) -> None:
                         f"{img_url_prefix}/{iid}.png" for iid in c["image_refs"]
                     ) if c["image_refs"] else "",
                     "document_number": c.get("document_number", ""),
-                }
-                for c in chunks_data
-            ]
+                })
 
             try:
                 vector_store.add_documents(
                     ids=ids,
                     embeddings=embeddings,
-                    documents=[c["content"] for c in chunks_data],   # store original for display
+                    documents=documents,
                     metadatas=metadatas,
                 )
                 logger.info(

@@ -261,6 +261,7 @@ async def handle_parse(payload: dict) -> None:
                         "document_number": document.document_number or "",
                     }
                     for c in parsed.chunks
+                    if c.content and c.content.strip()  # filter empty/whitespace chunks
                 ]
             )
             document.status = DocumentStatus.CHUNKING
@@ -269,8 +270,8 @@ async def handle_parse(payload: dict) -> None:
             await db.commit()
             logger.info(
                 f"[parse_worker] doc={msg.document_id} parsed in {elapsed_ms}ms "
-                f"— {len(parsed.chunks)} chunks, {len(parsed.images)} images, "
-                f"{parsed.tables_count} tables"
+                f"— {len(parsed.chunks)} chunks (filtered {sum(1 for c in parsed.chunks if not (c.content and c.content.strip()))} empty), "
+                f"{len(parsed.images)} images, {parsed.tables_count} tables"
             )
 
             # ── Dispatch sub-tasks OR mark INDEXED (parse-only / chat-upload mode) ─────

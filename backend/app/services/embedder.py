@@ -83,7 +83,14 @@ class EmbeddingService:
             normalize_embeddings=True,
             batch_size=32,
         )
-        return embeddings.tolist()
+        result = embeddings.tolist()
+        if len(result) != len(texts):
+            logger.warning(
+                f"[embedder] Filtered {len(texts) - len(result)} empty/whitespace texts "
+                f"({len(texts)} input → {len(result)} embeddings). "
+                f"This WILL cause ChromaDB length mismatch in embed_worker."
+            )
+        return result
 
     def embed_query(self, query: str) -> list[float]:
         """Generate embedding for a search query."""
