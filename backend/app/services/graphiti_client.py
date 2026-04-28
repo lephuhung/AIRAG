@@ -46,6 +46,10 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# Memory formatting budget — max characters injected into system prompt
+# ~1000 chars ≈ 250 tokens (conservative, leaves room for main prompt)
+_MEMORY_CONTEXT_MAX_CHARS = 1000
+
 # ---------------------------------------------------------------------------
 # Singleton state
 # ---------------------------------------------------------------------------
@@ -226,7 +230,7 @@ async def search_user_memory(
         logger.warning(f"[graphiti] search failed for user {user_id}: {exc}")
         return ""
 
-    return _format_memory_context(edges)
+    return _format_memory_context(edges, query=query)
 
 
 # ---------------------------------------------------------------------------
@@ -434,10 +438,15 @@ async def add_conversation_episode(
 # ---------------------------------------------------------------------------
 
 
-def _format_memory_context(edges: list) -> str:
+def _format_memory_context(edges: list, query: str = "", budget: int = _MEMORY_CONTEXT_MAX_CHARS) -> str:
     """
     Convert a list of Graphiti EntityEdge objects into a human-readable
-    string for the LLM system prompt.
+    string for the LLM system prompt, truncated to budget chars.
+
+    Keyword relevance filtering:
+        Each fact is scored by case-insensitive word overlap with the query.
+        Facts are sorted by descending score and included until budget is exhausted.
+        Facts below zero overlap score are skipped unless no facts qualify.
 
     The internal NXUser_<hash> entity tag is stripped from each fact before
     formatting so the LLM / user never sees it.
@@ -453,26 +462,49 @@ def _format_memory_context(edges: list) -> str:
     if not edges:
         return ""
 
-    facts: list[str] = []
+    # Tokenize query into keywords for relevance scoring
+    query_keywords = set(re.findall(r"\b\w{2,}\b", query.lower())) if query else set()
+
+    facts: list[tuple[int, str]] = []  # (relevance_score, fact_str)
     for edge in edges:
-        # EntityEdge has a .fact attribute (str) with the extracted fact text
         fact = getattr(edge, "fact", None) or getattr(edge, "name", None)
-        if fact and str(fact).strip():
-            # Strip the "Người dùng ID=<N>" internal anchor and replace with "Bạn"
-            # so facts read naturally: "Bạn công tác tại..." instead of "Người dùng ID=3 công tác tại..."
-            # Uses a regex to match any numeric ID variant.
-            # Strip the "Người dùng ID=<UUID>" internal anchor and replace with "Bạn"
-            # so facts read naturally: "Bạn công tác tại..." instead of "Người dùng ID=<UUID> công tác tại..."
-            # Uses [^\s]+ to match the full UUID (which contains hex chars and hyphens, not just \d+)
-            cleaned = re.sub(r"Người dùng ID=[^\s]+\s*", "Bạn ", str(fact)).strip()
-            cleaned = re.sub(r"người dùng ID=[^\s]+\s*", "Bạn ", cleaned).strip()
-            if cleaned:
-                cleaned = cleaned[0].upper() + cleaned[1:]
-            if cleaned:
-                facts.append(cleaned)
+        if not fact or not str(fact).strip():
+            continue
+
+        cleaned = str(fact).strip()
+        # Strip internal anchor (Người dùng ID=<UUID>) → "Bạn"
+        cleaned = re.sub(r"Người dùng ID=[^\s]+\s*", "Bạn ", cleaned).strip()
+        cleaned = re.sub(r"người dùng ID=[^\s]+\s*", "Bạn ", cleaned).strip()
+        if not cleaned:
+            continue
+        # Capitalize first letter
+        cleaned = cleaned[0].upper() + cleaned[1:]
+
+        # Relevance score: count keyword overlaps between fact and query
+        fact_keywords = set(re.findall(r"\b\w{2,}\b", cleaned.lower()))
+        score = len(query_keywords & fact_keywords) if query_keywords else 0
+
+        facts.append((score, cleaned))
 
     if not facts:
         return ""
 
-    lines = ["[Memory]"] + [f"- {f}" for f in facts]
+    # Sort by descending relevance score
+    facts.sort(key=lambda x: x[0], reverse=True)
+
+    # Build output within budget
+    lines: list[str] = ["[Memory]"]
+    total_len = len("\n".join(lines))  # includes "[Memory]\n"
+
+    for score, fact in facts:
+        # Skip facts with zero relevance unless nothing else qualifies
+        if score == 0 and total_len > 0:
+            continue
+        line = f"- {fact}"
+        line_len = len(line) + 1  # +1 for newline
+        if total_len + line_len > budget:
+            break
+        lines.append(line)
+        total_len += line_len
+
     return "\n".join(lines)

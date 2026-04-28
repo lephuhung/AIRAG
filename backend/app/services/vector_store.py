@@ -202,6 +202,22 @@ class VectorStore:
             include=["documents", "metadatas"]
         )
 
+    def get_by_metadata(self, where: dict) -> dict:
+        """Get documents matching metadata filter without semantic search."""
+        try:
+            results = self.collection.get(
+                where=where,
+                include=["documents", "metadatas"]
+            )
+            return {
+                "ids": results.get("ids", []),
+                "documents": results.get("documents", []),
+                "metadatas": results.get("metadatas", [])
+            }
+        except Exception as e:
+            logger.error(f"[vector_store] get_by_metadata failed: {e}")
+            return {"ids": [], "documents": [], "metadatas": []}
+
     def update_documents(
         self,
         ids: Sequence[str],

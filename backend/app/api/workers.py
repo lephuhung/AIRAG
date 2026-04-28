@@ -195,13 +195,16 @@ async def _check_openai_health(
 # Health Check
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Worker health server ports (per container, mapped to host)
-# These map from host port → worker health server (container port 8081)
-_WORKER_HEALTH_PORTS: dict[str, list[int]] = {
-    "parse":   [8082],   # worker-parse-1 on 8082, add more for replicas
-    "embed":   [8083],
-    "caption": [8084],
-    "kg":      [8085],
+# Worker health server ports (per container, via docker network)
+# Access via docker service name: http://worker-{type}:8081/health
+# For replicas, list all container names - health check requires ALL to be healthy
+# Note: Docker DNS aliases for replicas are NOT auto-generated. Use actual container names
+# which follow the pattern: {project}-{service}-{replica_number}
+_WORKER_HEALTH_PORTS: dict[str, list[str]] = {
+    "parse":   ["airag-worker-parse-1", "airag-worker-parse-2"],
+    "embed":   ["airag-worker-embed-1", "airag-worker-embed-2"],
+    "caption": ["airag-worker-caption-1"],
+    "kg":      ["airag-worker-kg-1"],
 }
 
 
@@ -211,28 +214,28 @@ async def _check_worker_containers() -> dict[str, Any]:
 
     results: dict[str, Any] = {}
     async with httpx.AsyncClient(timeout=5.0) as client:
-        for worker_type, ports in _WORKER_HEALTH_PORTS.items():
+        for worker_type, containers in _WORKER_HEALTH_PORTS.items():
             worker_results = []
-            for port in ports:
+            for container in containers:
                 try:
-                    resp = await client.get(f"http://localhost:{port}/health")
+                    resp = await client.get(f"http://{container}:8081/health")
                     if resp.status_code == 200:
                         data = resp.json()
                         worker_results.append({
-                            "port": port,
+                            "container": container,
                             "status": "healthy",
                             "worker_type": data.get("worker_type", worker_type),
                             "uptime_seconds": data.get("uptime_seconds", 0),
                         })
                     else:
                         worker_results.append({
-                            "port": port,
+                            "container": container,
                             "status": "unreachable",
                             "code": resp.status_code,
                         })
                 except Exception as exc:
                     worker_results.append({
-                        "port": port,
+                        "container": container,
                         "status": "offline",
                         "error": str(exc)[:100],
                     })

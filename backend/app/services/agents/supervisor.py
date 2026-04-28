@@ -38,7 +38,8 @@ logger = logging.getLogger(__name__)
 _SUPERVISOR_PROMPT = """\
 You are a supervisor for a Vietnamese document Q&A system.
 
-Given the user's message, classify the intent and decide which agent should handAvailable agents:
+Given the user's message, classify the intent and decide which agent should handle.
+Available agents:
 - "rag": For document search, KG queries, listing/summarizing documents
 - "write": For text summarization, editing suggestions, grammar/format checking
 - "people": For searching persons by CCCD, name, BHXH, or phone number
@@ -54,7 +55,9 @@ Intent categories (use EXACTLY these names in your JSON output):
 - "kg_query": Questions about entity relationships, organizational structure, knowledge graph
 - "search_doc_num": User asks about document numbers (văn bản số), reference numbers, official IDs
 - "search_abbr": User asks about SHORT abbreviations/acronyms (e.g., "BMNN", "TTGT")
-- "write_summarize": User provides a TEXT PASSAGE and wants it summarized
+- "resolve_doc": User references a specific document by name/type/year without providing ID (e.g., "Luật An ninh mạng 2025", "Nghị định 60/2019", "Điều 27 luật này"). The system must resolve the reference to a document UUID before searching. Key phrases: "Luật X", "Nghị định X", "Thông tư X", "Điều X của luật", "văn bản số X", "tìm/tra cứu văn bản".
+- "search_section": User asks to search, summarize, or compare a SPECIFIC section, chapter, or article (e.g., "Chương 3", "Điều 27") of a document.
+- "write_summarize": User provides a TEXT PASSAGE (in the message itself) and wants it summarized. Does NOT mention a law/regulation name or document reference.
 - "write_suggest_edits": User provides a TEXT PASSAGE and wants editing/improvement suggestions
 - "write_grammar_check": User provides a TEXT PASSAGE and wants grammar/style checking
 - "write_format_check": User wants to check Word document formatting (margins, fonts, line spacing)
@@ -66,7 +69,7 @@ Intent categories (use EXACTLY these names in your JSON output):
 
 Intent → Agent routing guide (MUST follow exactly):
 - greeting, personal → "direct"
-- search, list_docs, summarize, kg_query, search_doc_num, search_abbr → "rag"
+- search, list_docs, summarize, kg_query, search_doc_num, search_abbr, resolve_doc, search_section → "rag"
 - write_summarize, write_suggest_edits, write_grammar_check, write_format_check → "write"
 - mongo_search_cccd, mongo_search_name, mongo_search_bhxh, mongo_search_phone, mongo_search_advanced → "people"
 
@@ -76,7 +79,11 @@ Examples:
   - phone search → intent "mongo_search_phone", next_agent "people"
   - CCCD search  → intent "mongo_search_cccd",  next_agent "people"
   - dob and name search → intent "mongo_search_advanced", next_agent "people"
-  - doc search   → intent "search",             next_agent "rag"
+  - generic search → intent "search",             next_agent "rag"
+  - "Tóm tắt điều 27 Luật An ninh mạng 2025" → intent "resolve_doc", next_agent "rag" (NOT write_summarize!)
+  - "Tóm tắt văn bản số 60/2019" → intent "resolve_doc", next_agent "rag"
+  - "tìm Nghị định 60/2019" → intent "resolve_doc", next_agent "rag"
+  - "tóm tắt đoạn văn sau: [nội dung]" → intent "write_summarize", next_agent "write"
 
 Rules:
 1. First turn: classify intent from user message → route to appropriate agent
@@ -115,6 +122,8 @@ _INTENT_TO_AGENT_FALLBACK: dict[str, str] = {
     "kg_query": "rag",
     "search_doc_num": "rag",
     "search_abbr": "rag",
+    "resolve_doc": "rag",
+    "search_section": "rag",
     "write_summarize": "write",
     "write_suggest_edits": "write",
     "write_grammar_check": "write",
@@ -162,19 +171,29 @@ async def _expand_abbreviations_in_message(message: str) -> tuple[str, bool]:
         if db is None:
             return message, False
 
+        # Use a single query for all abbreviations
+        from sqlalchemy import func
+        result = await db.execute(
+            select(Abbreviation)
+            .where(
+                func.lower(Abbreviation.short_form).in_([a.lower() for a in unique_abbrs]),
+                Abbreviation.is_active == True,
+            )
+        )
+        all_abbrs_db = result.scalars().all()
+        
+        # Group by lowercase short_form
+        from collections import defaultdict
+        abbr_map = defaultdict(list)
+        for abbr_obj in all_abbrs_db:
+            abbr_map[abbr_obj.short_form.lower()].append(abbr_obj)
+
         expanded_message = message
         any_expanded = False
         multi_meaning_abbrs = []
 
         for abbr in unique_abbrs:
-            result = await db.execute(
-                select(Abbreviation)
-                .where(
-                    Abbreviation.short_form.ilike(abbr),
-                    Abbreviation.is_active == True,
-                )
-            )
-            all_matches = result.scalars().all()
+            all_matches = abbr_map.get(abbr.lower(), [])
 
             if len(all_matches) == 0:
                 # No match in DB - keep original, will prompt user to add
@@ -311,6 +330,28 @@ async def supervisor_node(state: SupervisorState) -> dict:
     from app.core.config import settings
     max_iter = getattr(settings, "NEXUSRAG_LG_MAX_ITERATIONS", 5)
     iterations = state.get("iterations", 0)
+
+    # Special case: search_section loop back from rag — don't count against iterations
+    # This happens when route_from_rag routes back to supervisor for search_section
+    pending_section = state.get("section_reference")
+    is_search_section_pending = (
+        state.get("intent") == "search_section" and pending_section
+    )
+    if is_search_section_pending and iterations >= 1:
+        # Still going — this is the supervisor re-entering from rag's route_from_rag
+        # Just route directly to rag without incrementing iteration counter
+        logger.info(f"[supervisor] search_section loop — re-routing to rag (iter={iterations})")
+        return {
+            "next_agent": AgentType.RAG,
+            "intent": "search_section",
+            "original_query": user_message,
+            "rewritten_query": user_message,
+            "iterations": iterations,  # Don't increment
+            "should_loop_back": False,
+            "section_reference": pending_section,
+            "document_ids": state.get("document_ids") or [],
+        }
+
     if iterations >= max_iter:
         logger.warning(f"[supervisor] Max iterations ({max_iter}) reached, forcing finish")
         return {"next_agent": AgentType.FINISH, "intent": state.get("intent", "search")}
@@ -346,11 +387,32 @@ async def supervisor_node(state: SupervisorState) -> dict:
 
         decision = _parse_supervisor_response(response_text)
         logger.info(
-            f"[supervisor] decision: next_agent={decision['next_agent']!r}, "
-            f"intent={decision['intent']!r}, reasoning={decision.get('reasoning', '')!r}"
+            f"[LANGGRAPH_ROUTE] user_message={user_message!r} -> "
+            f"next_agent={decision['next_agent']!r}, intent={decision['intent']!r}, "
+            f"reasoning={decision.get('reasoning', '')!r}"
         )
 
         # Build return dict
+        # Check if we're looping back with accumulated results - don't reset should_loop_back
+        # This happens when rag_agent resolved documents and we need to go to answer_generator
+        existing_should_loop = state.get("should_loop_back", False)
+        had_results = bool(state.get("kg_summaries") or state.get("sources"))
+
+        # If we have accumulated results from a previous rag loop, go to answer_generator
+        if existing_should_loop and had_results:
+            logger.info(f"[supervisor] Looping back with {len(state.get('kg_summaries', []))} kg_summaries, going to answer_generator")
+            # Preserve document_ids from rag_agent result - needed for summarize in answer_generator
+            preserved_doc_ids = state.get("document_ids") or state.get("resolved_document_ids") or []
+            return {
+                "next_agent": AgentType.ANSWER_GENERATOR,
+                "intent": "summarize",  # Force summarize to trigger content fetch in answer_generator
+                "original_query": user_message,
+                "rewritten_query": state.get("rewritten_query", user_message),
+                "iterations": iterations + 1,
+                "should_loop_back": False,
+                "document_ids": preserved_doc_ids,
+            }
+
         result = {
             "next_agent": decision["next_agent"],
             "intent": decision["intent"],
@@ -360,6 +422,33 @@ async def supervisor_node(state: SupervisorState) -> dict:
             # Reset loop flag on each supervisor entry
             "should_loop_back": False,
         }
+
+        # Smart thinking decision: RAG tasks don't need thinking (just retrieval),
+        # but complex synthesis with many sources or personal tasks benefit from it
+        thinking_intents = {"greeting", "personal", "write_suggest_edits", "write_grammar_check"}
+        rag_intents = {"search", "list_docs", "summarize", "kg_query", "search_doc_num", "resolve_doc", "search_section", "search_abbr"}
+        intent = decision["intent"]
+
+        # Check if user has personal memory from Graphiti - needs thinking to incorporate
+        user_memory_context = state.get("user_memory_context", "")
+        has_memory = bool(user_memory_context and "No relevant memories" not in user_memory_context)
+
+        if intent in thinking_intents:
+            result["enable_thinking"] = True
+        elif has_memory:
+            # Personal memory found - needs thinking to incorporate facts correctly
+            result["enable_thinking"] = True
+            logger.info(f"[supervisor] Thinking enabled for {intent} with personal memory")
+        elif intent in rag_intents:
+            # RAG tasks: check source count - many results benefit from thinking to synthesize
+            source_count = len(state.get("sources", [])) + len(state.get("kg_summaries", []))
+            if source_count >= 5:
+                result["enable_thinking"] = True  # Complex synthesis needed
+                logger.info(f"[supervisor] Thinking enabled for {intent} with {source_count} sources")
+            else:
+                result["enable_thinking"] = False  # Simple retrieval
+        else:
+            result["enable_thinking"] = False
 
         # If abbreviations were expanded, include expanded_query for downstream nodes
         if was_modified:
@@ -383,6 +472,7 @@ async def direct_answer_node(state: SupervisorState) -> dict:
 
     Emits token events via push_event for SSE streaming compatibility.
     """
+    logger.info(f"[LANGGRAPH_NODE] Entering direct_answer_node, intent={state.get('intent')!r}")
     from app.services.llm import get_llm_provider
     from app.services.llm.types import LLMMessage
     from app.services.agent.streaming import push_event
@@ -402,15 +492,22 @@ async def direct_answer_node(state: SupervisorState) -> dict:
             role, content = msg.get("role", "user"), msg.get("content", "")
         else:
             role, content = getattr(msg, "role", "user"), getattr(msg, "content", "")
+            
+        # Truncate content if it's an assistant message to save context window
+        if role == "assistant" and len(content) > 500:
+            content = content[:500] + "...\n[Nội dung đã được rút gọn]"
+            
         llm_messages.append(LLMMessage(role=role, content=content))
 
     # Inject memory if available
     effective_system = system_prompt
     if user_memory and "No relevant memories" not in user_memory:
         effective_system = (
-            f"USER MEMORY:\n{user_memory}\n\n"
-            "Use this info when relevant. Cite memory facts as [MEM-1], [MEM-2], etc.\n"
-            "Do NOT include the header 'USER MEMORY' in your response.\n\n"
+            f"{user_memory}\n\n"
+            "IMPORTANT: Do NOT copy these facts directly. When using a memory fact, "
+            "paraphrase it in your own words and cite it as [MEM-1], [MEM-2], etc. "
+            "For example: 'The user works at Công an tỉnh Hà Tĩnh [MEM-1]' instead of copying the fact verbatim. "
+            "Only include relevant memories.\n\n"
         ) + effective_system
 
     answer_parts = []
@@ -418,7 +515,7 @@ async def direct_answer_node(state: SupervisorState) -> dict:
         async for chunk in provider.astream(
             messages=llm_messages,
             temperature=0.5,
-            max_tokens=512,
+            max_tokens=2048,
             system_prompt=effective_system,
             think=False,
         ):
@@ -457,18 +554,23 @@ async def answer_generator_node(state: SupervisorState) -> dict:
     from app.services.agent.nodes import answer_generator as _orig_ag
     from app.services.agent.state import DEFAULT_STATE
 
-    # Check if write agent already produced final_answer — if so, use it directly
-    write_intents = {
+    intent = state.get("intent", "")
+    logger.info(f"[LANGGRAPH_NODE] Entering answer_generator_node, intent={intent!r}")
+
+    # Check if agent already produced final_answer and shouldn't be reformatted by answer_generator
+    skip_intents = {
         "write_summarize",
         "write_suggest_edits",
         "write_grammar_check",
         "write_format_check",
+        "greeting",
+        "personal",
     }
     intent = state.get("intent", "")
     existing_final = state.get("final_answer", "")
-    if intent in write_intents and existing_final:
+    if intent in skip_intents and existing_final:
         logger.info(
-            f"[answer_generator_node] Write intent={intent!r} — using existing final_answer "
+            f"[answer_generator_node] Skip intent={intent!r} — using existing final_answer "
             f"({len(existing_final)} chars), skipping LLM generation"
         )
         return {
@@ -510,8 +612,30 @@ def route_from_supervisor(state: SupervisorState) -> str:
     meaning we're done and should END.
     """
     next_agent = state.get("next_agent")
+    intent = state.get("intent", "")
+
     if next_agent is None or next_agent == AgentType.FINISH:
         return END
+
+    # Bypass memory_recall for intents that don't need personal memory context:
+    # - greeting/personal: direct_answer_node handles its own minimal memory use
+    # - write_format_check/grammar_check/suggest_edits: user provides inline text,
+    #   write agent processes it without needing user's past conversation facts
+    # - write_summarize: user provides TEXT PASSAGE in the message itself (per
+    #   intent definition: "User provides a TEXT PASSAGE and wants it summarized")
+    if intent in (
+        "greeting",
+        "personal",
+        "write_format_check",
+        "write_grammar_check",
+        "write_suggest_edits",
+        "write_summarize",
+    ):
+        if next_agent == AgentType.WRITE:
+            return "bypass_memory_to_write"
+        if next_agent == AgentType.DIRECT:
+            return "direct"  # bypass memory_recall, go straight to direct node
+
     return next_agent
 
 
@@ -520,9 +644,26 @@ def route_from_rag(state: SupervisorState) -> str:
 
     If abbreviation was found and expanded, loop back to supervisor
     to re-classify with the full form. Otherwise go to answer_generator.
+
+    For search_section intent, we check section_reference:
+    - If section_reference is still in state → search_section tool NOT yet executed
+      (supervisor set it but tool hasn't run yet) → route back to supervisor
+      (supervisor will re-route to rag with same intent, and rag will execute tool)
+    - If section_reference is None/empty → tool already ran, kg_summaries has content
+      → go to answer_generator
     """
-    if state.get("should_loop_back"):
+    pending_section = state.get("section_reference")
+    intent = state.get("intent")
+    loop = state.get("should_loop_back")
+    logger.info(f"[route_from_rag] intent={intent!r}, section_reference={pending_section!r}, should_loop_back={loop}")
+    if loop:
         return "supervisor"
+    if intent == "search_section":
+        if pending_section:
+            # section_reference still present → tool not yet executed
+            # Loop back to supervisor so it re-routes to rag
+            return "supervisor"
+        return "answer_generator"
     return "answer_generator"
 
 
@@ -565,6 +706,8 @@ def create_supervisor_graph():
             AgentType.WRITE: "memory_recall",
             AgentType.DIRECT: "memory_recall",
             AgentType.PEOPLE: "memory_recall",
+            AgentType.ANSWER_GENERATOR: "answer_generator",
+            "bypass_memory_to_write": "write",
             END: END,  # handle finish case
         },
     )
@@ -662,6 +805,8 @@ async def _memory_recall_wrapper(state: SupervisorState) -> dict:
         if memory:
             logger.info(f"[memory_recall_wrapper] Graphiti injected {len(memory)} chars")
             return {"user_memory_context": memory}
+        else:
+            logger.info(f"[memory_recall_wrapper] Graphiti found no relevant memory for user_id={uid}")
     except Exception as e:
         logger.warning(f"[memory_recall_wrapper] failed: {e}")
 
@@ -678,98 +823,6 @@ async def _rag_agent_wrapper(state: SupervisorState) -> dict:
 async def _write_agent_wrapper(state: SupervisorState) -> dict:
     """Wrapper that imports and calls write_agent_node."""
     from app.services.agents.write_agent import write_agent_node
-
-    intent = state.get("intent", "")
-
-    # Map intent → write_action (supervisor graph doesn't set this)
-    _intent_to_action = {
-        "write_summarize": "summarize",
-        "write_suggest_edits": "suggest_edits",
-        "write_grammar_check": "grammar_check",
-        "write_format_check": "format_check",
-    }
-    if intent in _intent_to_action and not state.get("write_action"):
-        state["write_action"] = _intent_to_action[intent]
-
-    # Fetch format metadata for format_check intent before calling write_agent_node
-    if intent == "write_format_check":
-        doc_ids = state.get("document_ids") or []
-        if doc_ids:
-            try:
-                from app.services.agent.streaming import get_current_db
-                from app.services.agent import tools as _agent_tools
-
-                db = get_current_db()
-                tool_result = await _agent_tools.get_document_format(
-                    document_ids=doc_ids,
-                    db=db,
-                )
-                docs_with_format = tool_result.get("documents", [])
-                if docs_with_format:
-                    first_doc = docs_with_format[0]
-                    if first_doc.get("format_data"):
-                        state["format_data"] = first_doc["format_data"]
-                        state["file_name"] = first_doc.get("filename", "tài liệu")
-                        logger.info(
-                            f"[_write_agent_wrapper] format_check: injected format_data for {first_doc.get('filename')}"
-                        )
-                    elif first_doc.get("error"):
-                        err = first_doc.get("error", "")
-                        logger.warning(f"[_write_agent_wrapper] format_check error: {err}")
-                else:
-                    logger.warning(f"[_write_agent_wrapper] format_check: no docs with format returned")
-            except Exception as e:
-                logger.warning(f"[_write_agent_wrapper] Failed to fetch format metadata: {e}")
-
-    # For text-processing intents, ensure text_input is populated.
-    # The supervisor graph does NOT extract text_input (unlike the old intent_classifier).
-    # Priority: state.text_input → document content (if doc attached) → user message fallback
-    text_processing_intents = {"write_summarize", "write_suggest_edits", "write_grammar_check"}
-    if intent in text_processing_intents and not state.get("text_input"):
-        doc_ids = state.get("document_ids") or []
-        if doc_ids:
-            # User attached a file — fetch its markdown content
-            try:
-                from app.services.agent.streaming import get_current_db
-                from app.services.agent import tools as _agent_tools
-
-                db = get_current_db()
-                content_result = await _agent_tools.get_documents_content(
-                    document_ids=doc_ids,
-                    db=db,
-                )
-                docs = content_result.get("documents", [])
-                combined = "\n\n---\n\n".join(
-                    f"**{d['filename']}**\n\n{d['content']}"
-                    for d in docs
-                    if d.get("content")
-                )
-                if combined:
-                    state["text_input"] = combined
-                    logger.info(
-                        f"[_write_agent_wrapper] Injected doc content as text_input "
-                        f"({len(combined)} chars) for intent={intent!r}"
-                    )
-            except Exception as e:
-                logger.warning(f"[_write_agent_wrapper] Failed to fetch doc content: {e}")
-        else:
-            # No docs attached — extract text from the user message itself.
-            # Strip common command prefixes like "tóm tắt:", "summarize:", etc.
-            import re
-            user_msg = state.get("original_query") or state.get("rewritten_query", "")
-            cleaned = re.sub(
-                r"^(tóm tắt|summarize|kiểm tra ngữ pháp|grammar check|"
-                r"đề xuất chỉnh sửa|suggest edits)[:\s]+",
-                "",
-                user_msg,
-                flags=re.IGNORECASE,
-            ).strip()
-            if cleaned:
-                state["text_input"] = cleaned
-                logger.info(
-                    f"[_write_agent_wrapper] Extracted text_input from message "
-                    f"({len(cleaned)} chars) for intent={intent!r}"
-                )
 
     return await write_agent_node(state)
 

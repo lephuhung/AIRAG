@@ -214,7 +214,7 @@ class Settings(BaseSettings):
     NEXUSRAG_AGENT_BACKEND: str = Field(default="legacy")
 
     # Max agent iterations (loop guard for LangGraph tool_executor → answer cycle)
-    NEXUSRAG_LG_MAX_ITERATIONS: int = Field(default=3)
+    NEXUSRAG_LG_MAX_ITERATIONS: int = Field(default=6)
 
     # Classifier model: reuse the memory agent (Qwen3-4B) for intent classification.
     # Set to False to use the main LLM provider instead (slower but no extra model needed).

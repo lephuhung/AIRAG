@@ -1,9 +1,0 @@
-1. Nghiên cứu tích hợp syntax check, format check văn bản
-2. Tích hợp giọng nói
-3. entity org vẫn chưa có tỉnh hoặc nối với tỉnh.
-lph@lph-SYS-740GP-TNRT:~/.claude$ grep -i anthropic ~/.bashrc
-export ANTHROPIC_AUTH_TOKEN="sk-gw-675685c0d3574aa09e02a06b461f0231"
-export ANTHROPIC_BASE_URL="https://pikaai.xyz"
-export ANTHROPIC_DEFAULT_HAIKU_MODEL="claude-haiku-4.5"
-export ANTHROPIC_DEFAULT_SONNET_MODEL="claude-sonnet-4.6"
-export ANTHROPIC_DEFAULT_OPUS_MODEL="claude-opus-4.6"

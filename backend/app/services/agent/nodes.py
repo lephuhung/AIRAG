@@ -77,6 +77,7 @@ Intent categories:
 - "kg_query"  : user asks about entity relationships, organizational charts, knowledge graph
 - "search_doc_num" : user asks about document numbers (văn bản số), reference numbers, official document IDs
 - "search_abbr" : user asks about SHORT abbreviations, acronyms, or their meanings (e.g., "BMNN", "TTGT"). Do NOT use for general concepts or multiple words (e.g., "an ninh mạng" is "search").
+- "resolve_doc" : user references a specific document by name, type, or year without providing the document ID (e.g., "Luật An ninh mạng 2025", "Nghị định 60/2019", "Thông tư 23"). The system needs to resolve the reference to a document UUID before searching.
 - "write_summarize"     : user provides a TEXT PASSAGE and wants it summarized or key points extracted
 - "write_suggest_edits" : user provides a TEXT PASSAGE and wants editing/improvement suggestions
 - "write_grammar_check" : user provides a TEXT PASSAGE and wants grammar/style checking
@@ -103,6 +104,7 @@ Rules:
 - For "mongo_search_name": rewritten_query = the person's name or partial name
 - For "mongo_search_bhxh": rewritten_query = the BHXH number
 - For "mongo_search_phone": rewritten_query = the phone number
+- For "resolve_doc": set rewritten_query to the full document reference as-is (e.g., "Luật An ninh mạng 2025", "Nghị định 60/2019"). Preserve the full reference including type keywords, names, and years.
 - For all other intents: rewrite the query to be specific and detailed for retrieval
 - If the message contains a document ID, preserve it in the output
 - Default to "search" when uncertain
@@ -130,6 +132,9 @@ User: "đề xuất chỉnh sửa văn bản này: [nội dung]" → {"intent": 
 User: "kiểm tra định dạng file đính kèm" → {"intent": "write_format_check", "rewritten_query": "", "needs_tool": false, "write_action": "format_check", "text_input": ""}
 User: "đánh giá thể thức văn bản Word này" → {"intent": "write_format_check", "rewritten_query": "", "needs_tool": false, "write_action": "format_check", "text_input": ""}
 User: "check format of attached document" → {"intent": "write_format_check", "rewritten_query": "", "needs_tool": false, "write_action": "format_check", "text_input": ""}
+User: "Tóm tắt điều 27 Luật An ninh mạng 2025" → {"intent": "resolve_doc", "rewritten_query": "Luật An ninh mạng 2025", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "Nghị định 60/2019 là gì?" → {"intent": "resolve_doc", "rewritten_query": "Nghị định 60/2019", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "tìm Thông tư 23/2021/TT-BYT" → {"intent": "resolve_doc", "rewritten_query": "Thông tư 23/2021/TT-BYT", "needs_tool": true, "write_action": "", "text_input": ""}
 """
 
 _VALID_INTENTS = {
@@ -141,6 +146,7 @@ _VALID_INTENTS = {
     "kg_query",
     "search_doc_num",
     "search_abbr",
+    "resolve_doc",   # resolve document reference to UUID by type/title/year
     "write_summarize",
     "write_suggest_edits",
     "write_grammar_check",
@@ -261,56 +267,6 @@ def _extract_last_user_message(state: "AgentState") -> str:
     return ""
 
 
-async def memory_recall(state: "AgentState") -> dict:
-    """
-    Load relevant user memories from Graphiti (temporal knowledge graph) and
-    inject into state as a formatted string.
-
-    Graphiti stores conversation episodes in Neo4j and extracts temporal facts
-    (entities + relationships) from them. Search is hybrid: semantic + BM25 +
-    graph traversal — significantly richer than flat pgvector similarity search.
-
-    Non-blocking — if Graphiti is unavailable, the pipeline continues normally
-    with an empty memory context.
-    """
-    from app.services.agent.streaming import push_event
-
-    await push_event(
-        state,
-        "status",
-        {"step": "analyzing", "detail": "Đang tải bộ nhớ người dùng..."},
-    )
-
-    user_id = state.get("user_id")
-    if not user_id:
-        return {"user_memory_context": ""}
-
-    # ── Input: use expanded_query from abbr_expander if available, else extract original ──
-    expanded_query = state.get("rewritten_query", "")
-    user_message = ""
-
-    if expanded_query:
-        user_message = expanded_query
-        logger.debug(f"[memory_recall] Using expanded query: {user_message!r}")
-    else:
-        user_message = _extract_last_user_message(state)
-
-    if not user_message:
-        return {"user_memory_context": ""}
-
-    try:
-        from app.services.graphiti_client import search_user_memory
-
-        memory_context = await search_user_memory(user_id, user_message, top_k=5)
-        if memory_context:
-            logger.info(
-                f"[memory_recall] Graphiti injected {len(memory_context)} chars for user {user_id}"
-            )
-            return {"user_memory_context": memory_context}
-    except Exception as e:
-        logger.warning(f"[memory_recall] Graphiti search failed: {e}")
-
-    return {"user_memory_context": ""}
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +355,7 @@ async def intent_classifier(state: "AgentState") -> dict:
             "kg_query": "Truy vấn đồ thị tri thức",
             "search_abbr": "Tra cứu viết tắt",
             "search_doc_num": "Tra cứu số văn bản",
+            "resolve_doc": "Tìm văn bản theo tên",
             "write_summarize": "Tóm tắt văn bản",
             "write_suggest_edits": "Đề xuất chỉnh sửa",
             "write_grammar_check": "Kiểm tra ngữ pháp",
@@ -551,6 +508,18 @@ async def answer_generator(state: "AgentState") -> dict:
     enable_thinking = state.get("enable_thinking", False)
     potential_abbreviations = state.get("potential_abbreviations", [])
 
+    # Respect supervisor's enable_thinking decision - it uses smart logic based on source count
+    # Supervisor enables thinking when source_count >= 5 (complex synthesis needed)
+    # For simple RAG (source_count < 5), disable thinking to reduce latency
+    rag_intents = {"search", "summarize", "list_docs", "search_doc_num", "resolve_doc", "search_section", "kg_query"}
+    source_count = len(sources) + len(kg_summaries)
+    if intent in rag_intents and source_count < 5:
+        enable_thinking = False
+        logger.info(f"[answer_generator] Thinking disabled for RAG intent: {intent} ({source_count} sources)")
+    elif source_count >= 5:
+        enable_thinking = True  # Complex synthesis - keep thinking enabled
+        logger.info(f"[answer_generator] Thinking enabled for complex synthesis: {source_count} sources")
+
     # DEBUG: Log state at start of answer_generator
     logger.info(
         f"[answer_generator] START - intent={intent!r}, rewritten_query={rewritten_query!r}"
@@ -615,9 +584,11 @@ async def answer_generator(state: "AgentState") -> dict:
     effective_system = system_prompt
     if user_memory and "No relevant memories" not in user_memory:
         effective_system = (
-            f"USER MEMORY:\n{user_memory}\n\n"
-            "Use this info when relevant. Do NOT include the header 'USER MEMORY' in your response.\n"
-            "IMPORTANT: Do NOT add any citation markers like [id1], [mem1], [1] etc. when using memory facts.\n\n"
+            f"{user_memory}\n\n"
+            "IMPORTANT: Do NOT copy these facts directly. When using a memory fact, "
+            "paraphrase it in your own words and cite it as [MEM-1], [MEM-2], etc. "
+            "For example: 'The user works at Công an tỉnh Hà Tĩnh [MEM-1]' instead of copying the fact verbatim. "
+            "Only include relevant memories.\n\n"
         ) + effective_system
 
     # Build context string — always inject instructions (even when no sources)
@@ -657,6 +628,59 @@ async def answer_generator(state: "AgentState") -> dict:
         logger.info(
             f"[answer_generator] Added {len(abbreviation_results)} abbreviation results to context"
         )
+
+    # ── resolve_doc → summarize: fetch document content if not yet retrieved ──
+    doc_ids_for_summarize = state.get("document_ids") or []
+    if intent == "summarize" and doc_ids_for_summarize and not sources:
+        logger.info(f"[answer_generator] resolve_doc result pending summarize: fetching content for {len(doc_ids_for_summarize)} docs")
+        from app.services.agent import tools as _tools
+        from app.services.agent.streaming import get_current_db
+
+        db = get_current_db()
+        all_texts = []
+        for doc_id in doc_ids_for_summarize:
+            try:
+                # Use get_documents_content instead of summarize_document
+                # to get RAW markdown content (not LLM summary)
+                doc_uuid_str = str(doc_id)
+                result = await _tools.get_documents_content(
+                    document_ids=[doc_uuid_str],
+                    db=db,
+                )
+                docs = result.get("documents", [])
+                if docs and docs[0].get("content"):
+                    # Use raw markdown content instead of summary
+                    raw_content = docs[0]["content"]
+                    # Truncate if too long (keep first 50k chars to fit context)
+                    MAX_CHARS = 50000
+                    if len(raw_content) > MAX_CHARS:
+                        raw_content = raw_content[:MAX_CHARS] + "\n\n[... nội dung đã được cắt bớt ...]"
+                    all_texts.append(raw_content)
+                    logger.info(f"[answer_generator] fetched raw doc_id={doc_id}: {len(raw_content)} chars")
+                else:
+                    # Fallback to summarize if no raw content
+                    error = docs[0].get("error", "Unknown error") if docs else "No document returned"
+                    logger.warning(f"[answer_generator] No raw content for {doc_id}, error: {error}")
+                    summ_result = await _tools.summarize_document(document_id=doc_id, db=db)
+                    if summ_result.get("text"):
+                        all_texts.append(summ_result["text"])
+                        logger.info(f"[answer_generator] fallback summarize for {doc_id}: {len(summ_result['text'])} chars")
+            except Exception as e:
+                logger.warning(f"[answer_generator] get_documents_content failed for {doc_id}: {e}")
+                try:
+                    summ_result = await _tools.summarize_document(document_id=doc_id, db=db)
+                    if summ_result.get("text"):
+                        all_texts.append(summ_result["text"])
+                        logger.info(f"[answer_generator] fallback summarize for {doc_id}: {len(summ_result['text'])} chars")
+                except Exception as e2:
+                    logger.warning(f"[answer_generator] summarize_document also failed for {doc_id}: {e2}")
+
+        if all_texts:
+            context_parts.append("## Document Content (Raw Markdown)\n" + "\n\n---\n\n".join(all_texts))
+            logger.info(f"[answer_generator] Added {len(all_texts)} document texts to context")
+        else:
+            # Fallback: use the resolve_doc result message
+            logger.warning("[answer_generator] No document content fetched, using resolve_doc message")
 
     if sources:
         chunk_parts = []
@@ -719,14 +743,14 @@ async def answer_generator(state: "AgentState") -> dict:
         "If the retrieved context is empty or says 'no results', say so — do NOT fill in details from your own knowledge.\n"
         "- You have NO access to external databases, phone records, or personal information "
         "about any individual except what appears in the 'RETRIEVED CONTEXT' section above.\n"
-        "- Cite sources using their unique IDs in brackets, e.g. [a3z9] or [b2m7].\n"
-        "- Knowledge Graph / memory facts: cite as [MEM-{id}] (e.g. [MEM-1]).\n"
+        "- Cite sources using their unique IDs in brackets, e.g. [a3z9] or [b2m7]. ONLY cite sources that actually appear in the RETRIEVED CONTEXT above. Do NOT invent or hallucinate citation IDs.\n"
+        "- Memory facts: paraphrase in your own words and cite as [MEM-{id}]. Do NOT copy facts verbatim.\n"
         "- If the sources do not contain enough information to answer fully, "
         "be honest about it. Provide what you can, clearly note what is missing, "
         "and suggest what the user might do next.\n"
         "- If NO sources are relevant or available (context shows 'no results' or is empty), "
         "respond that you cannot find relevant information and ASK the user to provide more details "
-        "or clarify their question. Do NOT list or introduce documents in the system.\n"
+        "or clarify their question. Do NOT list or introduce documents in the system. Do NOT fabricate citation IDs.\n"
         "- TABLE DATA: 'Key, Year = Value' pairs are table cells.\n"
         "- DATABASE RECORDS: If the context includes 'Cơ Sở Dữ Liệu Người Dân', "
         "ONLY report the information that appears EXPLICITLY in those records. "
@@ -861,20 +885,37 @@ async def direct_answer(state: "AgentState") -> dict:
     )
 
     intent = state.get("intent", "greeting")
-    effective_system = system_prompt
+    
+    # For direct answers (greeting/personal), the massive RAG system prompt 
+    # (which forces the LLM to complain if there are no sources) is counter-productive.
+    # We build a focused system prompt that retains language rules but drops RAG rules.
+    effective_system = (
+        "You are a helpful AI assistant. "
+        "You MUST answer in the SAME language as the user's question.\n"
+        "- If the user asks in Vietnamese → answer entirely in Vietnamese.\n"
+        "- If the user asks in English → answer entirely in English.\n"
+    )
+    
     if user_memory and "No relevant memories" not in user_memory:
         if intent == "personal":
-            effective_system = (
-                f"USER MEMORY:\n{user_memory}\n\n"
-                "Answer directly about the user. Cite memory facts as [MEM-1], [MEM-2], etc.\n"
-                "Do NOT include the header 'USER MEMORY' in your response.\n\n"
-            ) + effective_system
+            effective_system += (
+                f"{user_memory}\n\n"
+                "Answer the user's question using ONLY the memory above. "
+                "Paraphrase each fact in your own words and cite as [MEM-1], [MEM-2], etc. "
+                "Do NOT copy facts verbatim. Do NOT ask the user to upload documents.\n"
+            )
         else:
-            effective_system = (
-                f"USER MEMORY:\n{user_memory}\n\n"
-                "Use this info when relevant. Cite memory facts as [MEM-1], [MEM-2], etc.\n"
-                "Do NOT include the header 'USER MEMORY' in your response.\n\n"
-            ) + effective_system
+            effective_system += (
+                f"{user_memory}\n\n"
+                "IMPORTANT: Paraphrase memory facts in your own words and cite as [MEM-1], [MEM-2], etc. Do NOT copy verbatim.\n"
+            )
+    else:
+        if intent == "personal":
+            effective_system += (
+                "\nCRITICAL INSTRUCTION:\n"
+                "The user is asking a personal question about themselves, but you do NOT have any memory of this.\n"
+                "Politely inform the user that you do not know this information because they haven't shared it with you yet."
+            )
 
     llm_messages: list[_LLMMsg] = []
     for msg in (messages or [])[-6:]:

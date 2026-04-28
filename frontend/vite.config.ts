@@ -12,19 +12,20 @@ export default defineConfig({
   },
   server: {
     port: 5174,
+    allowedHosts: ['rag.hatinh.local', 'localhost', '127.0.0.1'],
     proxy: {
       '/api': {
-        target: 'http://localhost:8080',
+        target: process.env.VITE_API_PROXY_URL || 'http://backend:8080',
         changeOrigin: true,
       },
       '/static': {
-        target: 'http://localhost:8080',
+        target: process.env.VITE_API_PROXY_URL || 'http://backend:8080',
         changeOrigin: true,
       },
       // Proxy MinIO presigned PUT requests (local dev only)
       // Frontend rewrites presigned URLs from localhost:9000 → /minio-direct/
       '/minio-direct': {
-        target: 'http://localhost:9000',
+        target: process.env.VITE_MINIO_PROXY_URL || 'http://minio:9000',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/minio-direct/, ''),
         // Large file uploads need extended timeout (default is too short)

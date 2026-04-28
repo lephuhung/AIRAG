@@ -879,6 +879,10 @@
   },
   "viewer": {
     "contents": "Nội dung",
-    "parsed_by": "Được phân tích bởi {{version}}"
+    "parsed_by": "Được phân tích bởi {{version}}",
+    "view_full": "Xem toàn bộ",
+    "view_chunk": "Xem đoạn trích",
+    "error_loading": "Lỗi khi tải tài liệu",
+    "no_content": "Không có nội dung"
   }
 }

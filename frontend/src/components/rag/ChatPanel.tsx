@@ -56,7 +56,7 @@ import cpp from "react-syntax-highlighter/dist/esm/languages/prism/cpp";
 import diff from "react-syntax-highlighter/dist/esm/languages/prism/diff";
 import markdown from "react-syntax-highlighter/dist/esm/languages/prism/markdown";
 import { toast } from "sonner";
-import { cn } from "@/lib/utils";
+import { cn, generateId } from "@/lib/utils";
 import { api, rewritePresignedUrl } from "@/lib/api";
 import { useWorkspaceStore } from "@/stores/workspaceStore";
 import { useAuthStore } from "@/stores/authStore";
@@ -185,7 +185,7 @@ function CitationLink({
   const label = `${docName}-P.${source.page_no || "?"}`;
 
   return (
-    <div className="inline-flex gap-0.5 mx-0.5 align-middle">
+    <span className="inline-flex gap-0.5 mx-0.5 align-middle">
       <button
         onClick={handleContentClick}
         aria-label={t("chat.view_source", { name: doc?.original_filename || "unknown", page: source.page_no })}
@@ -201,7 +201,7 @@ function CitationLink({
       >
         <Brain className="w-2.5 h-2.5" />
       </button>
-    </div>
+    </span>
   );
 }
 
@@ -2557,7 +2557,7 @@ export const ChatPanel = memo(function ChatPanel({
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
   const [referencedDocs, setReferencedDocs] = useState<{ id: string; filename: string; original_filename?: string }[]>([]);
   const [docMetadataMap, setDocMetadataMap] = useState<Map<string, Document>>(new Map());
-  const skipResetRef = useRef(false);
+  const skipResetRef = useRef<string | null>(null);
 
   const [forceSearch, setForceSearch] = useState(true);
 
@@ -2714,13 +2714,19 @@ export const ChatPanel = memo(function ChatPanel({
 
   // Reset session state when switching chats/starting a new chat
   useEffect(() => {
-    const isDebug = document.documentElement.classList.contains("debug-mode") || 
+    const isDebug = document.documentElement.classList.contains("debug-mode") ||
                     localStorage.getItem("hrag-debug-mode") === "true";
 
-    if (skipResetRef.current) {
-      if (isDebug) console.log(`[Persistence] Skipping reset for session: ${sessionId || "new"}`);
-      skipResetRef.current = false;
+    // Only skip reset if this session was just created (handleSend set this)
+    if (skipResetRef.current === sessionId) {
+      if (isDebug) console.log(`[Persistence] Skipping reset for NEW session: ${sessionId}`);
+      skipResetRef.current = null;
       return;
+    }
+
+    // For any other session change, clear the skip flag and reset
+    if (skipResetRef.current !== null) {
+      skipResetRef.current = null;
     }
 
     if (isDebug) console.log(`[Persistence] Session ID changed: ${sessionId || "new"}. Loading defaults...`);
@@ -2882,7 +2888,7 @@ export const ChatPanel = memo(function ChatPanel({
         return;
       }
 
-      const tempId = crypto.randomUUID();
+      const tempId = generateId();
       const newAttachedFile: AttachedFile = {
         id: tempId,
         file,
@@ -3254,7 +3260,7 @@ export const ChatPanel = memo(function ChatPanel({
             console.log(`[Persistence] Migrated "new" -> "${effectiveSessionId}"`);
           }
 
-          skipResetRef.current = true;
+          skipResetRef.current = newSession.id;
           // Update URL in background (no redirect) so chat is bookmarkable
           window.history.replaceState({}, "", `/chat/${newSession.id}`);
         } catch (err: any) {
@@ -3292,7 +3298,7 @@ export const ChatPanel = memo(function ChatPanel({
       });
 
       const userMsg: ChatMessage = {
-        id: crypto.randomUUID(),
+        id: generateId(),
         role: "user",
         content: msgToBackend,
         timestamp: new Date().toISOString(),
@@ -3300,7 +3306,7 @@ export const ChatPanel = memo(function ChatPanel({
         attachedDocs: attachedDocs.length > 0 ? attachedDocs : undefined,
       };
 
-      const assistantId = crypto.randomUUID();
+      const assistantId = generateId();
       streamingMsgIdRef.current = assistantId;
       const placeholderMsg: ChatMessage = {
         id: assistantId,

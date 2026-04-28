@@ -146,9 +146,10 @@ async def write_agent_node(state: SupervisorState) -> dict:
 
     Flow:
     1. Determine write action (summarize/suggest_edits/grammar_check/format_check)
-    2. Get text input (from state.text_input or kg_summaries)
-    3. Call appropriate LLM
-    4. Return final answer
+    2. Fetch format data or document content if missing
+    3. Get text input (from state.text_input or kg_summaries)
+    4. Call appropriate LLM
+    5. Return final answer
     """
     from app.services.llm import get_llm_provider
     from app.services.llm.types import LLMMessage
@@ -156,8 +157,63 @@ async def write_agent_node(state: SupervisorState) -> dict:
     from app.services.agents.models import AgentType
     from app.services.agent.streaming import push_event
 
-    write_action = state.get("write_action", "summarize")
+    intent = state.get("intent", "")
+    _intent_to_action = {
+        "write_summarize": "summarize",
+        "write_suggest_edits": "suggest_edits",
+        "write_grammar_check": "grammar_check",
+        "write_format_check": "format_check",
+    }
+    
+    write_action = state.get("write_action")
+    if not write_action and intent in _intent_to_action:
+        write_action = _intent_to_action[intent]
+        state["write_action"] = write_action
+    if not write_action:
+        write_action = "summarize"
+
+    # Pre-processing for format_check
+    if write_action == "format_check" and not state.get("format_data"):
+        doc_ids = state.get("document_ids") or []
+        if doc_ids:
+            try:
+                from app.services.agent.streaming import get_current_db
+                from app.services.agent import tools as _agent_tools
+                db = get_current_db()
+                tool_result = await _agent_tools.get_document_format(document_ids=doc_ids, db=db)
+                docs_with_format = tool_result.get("documents", [])
+                if docs_with_format:
+                    first_doc = docs_with_format[0]
+                    if first_doc.get("format_data"):
+                        state["format_data"] = first_doc["format_data"]
+                        state["file_name"] = first_doc.get("filename", "tài liệu")
+            except Exception as e:
+                logger.warning(f"[write_agent_node] Failed to fetch format metadata: {e}")
+
+    # Pre-processing for text intents
     text_input = state.get("text_input", "")
+    if write_action in {"summarize", "suggest_edits", "grammar_check"} and not text_input:
+        doc_ids = state.get("document_ids") or []
+        if doc_ids:
+            try:
+                from app.services.agent.streaming import get_current_db
+                from app.services.agent import tools as _agent_tools
+                db = get_current_db()
+                content_result = await _agent_tools.get_documents_content(document_ids=doc_ids, db=db)
+                docs = content_result.get("documents", [])
+                combined = "\n\n---\n\n".join(f"**{d['filename']}**\n\n{d['content']}" for d in docs if d.get("content"))
+                if combined:
+                    text_input = combined
+                    state["text_input"] = combined
+            except Exception as e:
+                logger.warning(f"[write_agent_node] Failed to fetch doc content: {e}")
+        else:
+            import re
+            user_msg = state.get("original_query") or state.get("rewritten_query", "")
+            cleaned = re.sub(r"^(tóm tắt|summarize|kiểm tra ngữ pháp|grammar check|đề xuất chỉnh sửa|suggest edits)[:\s]+", "", user_msg, flags=re.IGNORECASE).strip()
+            if cleaned:
+                text_input = cleaned
+                state["text_input"] = cleaned
 
     logger.info(f"[write_agent] action={write_action!r}, text_input_len={len(text_input)}")
 

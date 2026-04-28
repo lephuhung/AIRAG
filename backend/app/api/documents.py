@@ -418,20 +418,137 @@ async def confirm_upload(
     )
 
 
-@router.get("/{document_id}", response_model=DocumentResponse)
-async def get_document(
+@router.get("/{document_id}/chunk-context")
+async def get_chunk_context(
     document_id: uuid.UUID,
+    chunk_index: int | None = None,
+    page_no: int | None = None,
+    heading_path: str | None = None,
+    context_window: int = 2,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
-    """Get document by ID"""
+    """Get a focused markdown snippet around a specific chunk.
+
+    Instead of loading the full document markdown, this returns only the
+    target chunk and its immediate neighbors (context_window chunks before
+    and after).  Used by the frontend for lightweight source viewing.
+    """
     result = await db.execute(select(Document).where(Document.id == document_id))
     document = result.scalar_one_or_none()
 
     if document is None:
         raise NotFoundError("Document", document_id)
 
-    return document
+    if document.status not in (DocumentStatus.INDEXED, DocumentStatus.BUILDING_KG):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document is not yet indexed.",
+        )
+
+    from app.services.vector_store import get_vector_store
+
+    vector_store = get_vector_store(document.workspace_id)
+
+    # --- Determine the target chunk_index ---
+    target_index = chunk_index
+
+    if target_index is None and (heading_path or page_no is not None):
+        # Build a metadata filter to find the target chunk
+        where_filter: dict = {"document_id": str(document_id)}
+        if heading_path:
+            # Note: ChromaDB 'where' filter requires exact matches for metadata
+            where_filter = {
+                "$and": [
+                    {"document_id": str(document_id)},
+                    {"heading_path": heading_path},
+                ]
+            }
+            if page_no is not None:
+                where_filter["$and"].append({"page_no": page_no})
+        elif page_no is not None:
+            where_filter = {
+                "$and": [
+                    {"document_id": str(document_id)},
+                    {"page_no": page_no},
+                ]
+            }
+
+        try:
+            found = vector_store.get_by_metadata(where=where_filter)
+            if found["metadatas"]:
+                # Pick the chunk with the smallest chunk_index
+                indices = [
+                    m.get("chunk_index", 9999) for m in found["metadatas"]
+                    if m.get("chunk_index") is not None
+                ]
+                if indices:
+                    target_index = min(indices)
+        except Exception as e:
+            logger.warning(f"[chunk-context] metadata lookup failed: {e}")
+
+    if target_index is None:
+        target_index = 0
+
+    # --- Fetch target + neighbors ---
+    start = max(0, target_index - context_window)
+    end = min(document.chunk_count - 1 if document.chunk_count > 0 else 0, target_index + context_window)
+    if start > end:
+        start = end
+
+    chunk_ids = [
+        f"doc_{document_id}_chunk_{i}" for i in range(start, end + 1)
+    ]
+
+    try:
+        results = vector_store.get_by_ids(chunk_ids)
+    except Exception as e:
+        logger.error(f"[chunk-context] get_by_ids failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve chunks: {str(e)}",
+        )
+
+    chunks = []
+    for i in range(len(results.get("ids", []))):
+        meta = results["metadatas"][i] if results.get("metadatas") else {}
+        chunks.append({
+            "chunk_id": results["ids"][i],
+            "chunk_index": meta.get("chunk_index", start + i),
+            "content": results["documents"][i] if results.get("documents") else "",
+            "page_no": meta.get("page_no"),
+            "heading_path": meta.get("heading_path", ""),
+            "source": meta.get("source", ""),
+        })
+
+    chunks.sort(key=lambda c: c["chunk_index"])
+
+    md_parts: list[str] = []
+    last_heading = ""
+    last_page = -1
+
+    for chunk in chunks:
+        hp = chunk.get("heading_path", "")
+        pg = chunk.get("page_no")
+        if hp and hp != last_heading:
+            md_parts.append(f"\n### 📍 {hp}\n")
+            last_heading = hp
+        if pg and pg != last_page:
+            md_parts.append(f"\n---\n_Trang {pg}_\n")
+            last_page = pg
+        md_parts.append(chunk["content"])
+
+    combined_markdown = "\n\n".join(md_parts)
+
+    return {
+        "document_id": str(document_id),
+        "target_chunk_index": target_index,
+        "chunk_range": [start, end],
+        "total_chunks": document.chunk_count,
+        "chunks": chunks,
+        "markdown": combined_markdown,
+    }
+
 
 
 @router.get("/{document_id}/markdown")
@@ -481,6 +598,8 @@ async def get_document_markdown(
         content=markdown,
         media_type="text/markdown",
     )
+
+
 
 
 @router.get("/{document_id}/images", response_model=list[DocumentImageResponse])
@@ -560,6 +679,22 @@ async def download_document(
             "Content-Length": str(len(file_bytes)),
         },
     )
+
+
+@router.get("/{document_id}", response_model=DocumentResponse)
+async def get_document(
+    document_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
+    """Get document by ID"""
+    result = await db.execute(select(Document).where(Document.id == document_id))
+    document = result.scalar_one_or_none()
+
+    if document is None:
+        raise NotFoundError("Document", document_id)
+
+    return document
 
 
 @router.patch("/{document_id}", response_model=DocumentResponse)

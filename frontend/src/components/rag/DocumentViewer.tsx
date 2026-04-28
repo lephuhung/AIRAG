@@ -7,7 +7,7 @@ import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import rehypeRaw from "rehype-raw";
 import "katex/dist/katex.min.css";
-import { FileText, List, ChevronRight } from "lucide-react";
+import { FileText, List, ChevronRight, Maximize2, Minimize2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
 import type { Document, ChatSourceChunk } from "@/types";
@@ -19,6 +19,22 @@ interface Heading {
   id: string;
   text: string;
   level: number;
+}
+
+interface ChunkContextResponse {
+  document_id: string;
+  target_chunk_index: number;
+  chunk_range: [number, number];
+  total_chunks: number;
+  chunks: Array<{
+    chunk_id: string;
+    chunk_index: number;
+    content: string;
+    page_no: number | null;
+    heading_path: string;
+    source: string;
+  }>;
+  markdown: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -228,13 +244,60 @@ export const DocumentViewer = memo(function DocumentViewer({
   const [activeHeading, setActiveHeading] = useState<string | null>(null);
   const [showToc, setShowToc] = useState(true);
 
-  // ---- Fetch markdown content ----
-  const { data: markdown, isLoading, error } = useQuery({
+  // ---- View mode: chunk (lightweight) vs full (entire markdown) ----
+  // Default to chunk mode when citation highlights are present
+  const [viewMode, setViewMode] = useState<"chunk" | "full">("full");
+
+  // Determine if we should use chunk-context mode
+  const hasHighlight = highlightChunks && highlightChunks.length > 0;
+  const primaryChunk = hasHighlight ? highlightChunks[0] : null;
+
+  // When new highlights arrive, switch to chunk mode automatically
+  useEffect(() => {
+    if (hasHighlight) {
+      setViewMode("chunk");
+    }
+  }, [hasHighlight, primaryChunk?.chunk_id]);
+
+  const effectiveMode = hasHighlight ? viewMode : "full";
+
+  // ---- Fetch chunk context (lightweight) ----
+  const chunkQueryParams = useMemo(() => {
+    if (!primaryChunk) return "";
+    const params = new URLSearchParams();
+    // Use chunk_id to extract chunk_index
+    const idxMatch = primaryChunk.chunk_id?.match(/chunk_(\d+)$/);
+    if (idxMatch) {
+      params.set("chunk_index", idxMatch[1]);
+    } else if (primaryChunk.page_no) {
+      params.set("page_no", String(primaryChunk.page_no));
+    }
+    if (primaryChunk.heading_path?.length > 0) {
+      params.set("heading_path", primaryChunk.heading_path.join(" > "));
+    }
+    params.set("context_window", "3");
+    return params.toString();
+  }, [primaryChunk?.chunk_id, primaryChunk?.page_no, primaryChunk?.heading_path?.join(",")]);
+
+  const { data: chunkContext, isLoading: isChunkLoading, error: chunkError } = useQuery({
+    queryKey: ["document-chunk-context", doc.id, chunkQueryParams],
+    queryFn: () => api.get<ChunkContextResponse>(`/documents/${doc.id}/chunk-context?${chunkQueryParams}`),
+    enabled: doc.status === "indexed" && effectiveMode === "chunk" && !!chunkQueryParams,
+    staleTime: 2 * 60 * 1000,
+  });
+
+  // ---- Fetch full markdown content ----
+  const { data: fullMarkdown, isLoading: isFullLoading, error: fullError } = useQuery({
     queryKey: ["document-markdown", doc.id],
     queryFn: () => api.getText(`/documents/${doc.id}/markdown`),
-    enabled: doc.status === "indexed",
+    enabled: doc.status === "indexed" && effectiveMode === "full",
     staleTime: 5 * 60 * 1000, // cache 5 min
   });
+
+  // ---- Resolved markdown based on mode ----
+  const markdown = effectiveMode === "chunk" ? chunkContext?.markdown : fullMarkdown;
+  const isLoading = effectiveMode === "chunk" ? isChunkLoading : isFullLoading;
+  const error = effectiveMode === "chunk" ? chunkError : fullError;
 
   // ---- Extract headings for TOC ----
   const headings = useMemo(
@@ -562,8 +625,8 @@ export const DocumentViewer = memo(function DocumentViewer({
 
   return (
     <div className="flex h-full min-h-0">
-      {/* TOC sidebar */}
-      {showToc && (
+      {/* TOC sidebar — only in full mode (chunk content has partial headings, TOC is misleading) */}
+      {showToc && effectiveMode === "full" && (
         <TOCSidebar
           headings={headings}
           activeId={activeHeading}
@@ -591,11 +654,56 @@ export const DocumentViewer = memo(function DocumentViewer({
         <div className="px-6 py-4">
           {/* Document title header */}
           <div className="mb-4 pb-3 border-b">
-            <h2 className="text-lg font-semibold">{doc.original_filename}</h2>
+            <div className="flex items-center justify-between">
+              <div className="flex flex-col gap-0.5 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  {doc.document_type?.name && (
+                    <span className="text-xs font-medium px-1.5 py-0.5 rounded bg-primary/10 text-primary">
+                      {doc.document_type.name}
+                    </span>
+                  )}
+                  {doc.document_number && (
+                    <span className="text-xs font-mono text-muted-foreground">{doc.document_number}</span>
+                  )}
+                </div>
+                <h2 className="text-base font-semibold truncate">{doc.document_title || doc.original_filename}</h2>
+                <span className="text-xs text-muted-foreground/60 truncate">{doc.original_filename}</span>
+              </div>
+              {/* Chunk/Full mode toggle */}
+              {hasHighlight && (
+                <button
+                  onClick={() => setViewMode(effectiveMode === "chunk" ? "full" : "chunk")}
+                  className={cn(
+                    "flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium rounded-md transition-all",
+                    effectiveMode === "chunk"
+                      ? "bg-primary/10 text-primary hover:bg-primary/20"
+                      : "bg-muted text-muted-foreground hover:bg-muted/80"
+                  )}
+                  title={effectiveMode === "chunk" ? t("viewer.view_full") : t("viewer.view_chunk")}
+                >
+                  {effectiveMode === "chunk" ? (
+                    <><Maximize2 className="w-3 h-3" />{t("viewer.view_full")}</>
+                  ) : (
+                    <><Minimize2 className="w-3 h-3" />{t("viewer.view_chunk")}</>
+                  )}
+                </button>
+              )}
+            </div>
             <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
-              {doc.page_count && doc.page_count > 0 && <span>{doc.page_count} {t("files.metadata.pages")}</span>}
-              {doc.chunk_count > 0 && <span>{doc.chunk_count} {t("files.metadata.chunks")}</span>}
-              {doc.parser_version && <span>{t("viewer.parsed_by", { version: doc.parser_version })}</span>}
+              {effectiveMode === "chunk" && chunkContext ? (
+                <>
+                  <span className="text-primary font-medium">
+                    📍 Chunk {chunkContext.chunk_range[0]+1}–{chunkContext.chunk_range[1]+1} / {chunkContext.total_chunks}
+                  </span>
+                  {primaryChunk?.page_no && <span>Trang {primaryChunk.page_no}</span>}
+                </>
+              ) : (
+                <>
+                  {doc.page_count && doc.page_count > 0 && <span>{doc.page_count} {t("files.metadata.pages")}</span>}
+                  {doc.chunk_count > 0 && <span>{doc.chunk_count} {t("files.metadata.chunks")}</span>}
+                  {doc.parser_version && <span>{t("viewer.parsed_by", { version: doc.parser_version })}</span>}
+                </>
+              )}
             </div>
           </div>
 

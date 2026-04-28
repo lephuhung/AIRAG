@@ -888,6 +888,10 @@
   },
   "viewer": {
     "contents": "Contents",
-    "parsed_by": "Parsed by {{version}}"
+    "parsed_by": "Parsed by {{version}}",
+    "view_full": "Full document",
+    "view_chunk": "Chunk view",
+    "error_loading": "Error loading document",
+    "no_content": "No content available"
   }
 }

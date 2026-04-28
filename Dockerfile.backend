@@ -1,8 +1,14 @@
 # ============================================================
 # HRAG Backend — Multi-stage Docker build
+# Supports development (--reload, mounted code) and production (multi-stage, pre-downloaded models)
+# Usage:
+#   Production: docker build -f Dockerfile.backend --target production -t hrag-backend .
+#   Development: docker build -f Dockerfile.backend --target development -t hrag-backend-dev .
 # ============================================================
 
-# Stage 1: Install Python dependencies
+ARG TARGET=production
+
+# ── Stage: deps ─────────────────────────────────────────────
 FROM python:3.11-slim AS deps
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -18,15 +24,15 @@ COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 
-# Stage 2: Pre-download ML models (~2.5GB, cached as Docker layer)
+# ── Stage: models (production only) ──────────────────────
 FROM deps AS models
 
 COPY backend/scripts/download_models.py /tmp/download_models.py
 RUN python /tmp/download_models.py
 
 
-# Stage 3: Runtime image
-FROM python:3.11-slim AS runtime
+# ── Stage: production ─────────────────────────────────────
+FROM python:3.11-slim AS production
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
@@ -37,19 +43,45 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app/backend
 
-# Copy installed packages from deps stage
 COPY --from=deps /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=deps /usr/local/bin /usr/local/bin
-
-# Copy pre-downloaded models from models stage
 COPY --from=models /root/.cache/huggingface /root/.cache/huggingface
-
-# Copy backend source
 COPY backend/ .
 
-# Create runtime directories
 RUN mkdir -p data/docling data/lightrag uploads
 
 EXPOSE 8080
 
+# Production mode: multiple workers
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+
+
+# ── Stage: development ───────────────────────────────────
+FROM python:3.11-slim AS development
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    libgl1 \
+    libglib2.0-0 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app/backend
+
+COPY --from=deps /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=deps /usr/local/bin /usr/local/bin
+
+# Copy source code (will be volume-mounted for live reload)
+COPY backend/ .
+
+RUN mkdir -p data/docling data/lightrag uploads
+
+EXPOSE 8080
+
+# Development mode: --reload for hot reload, single worker
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--reload"]
+
+
+# ── Build stage selection ─────────────────────────────────
+# This is the actual target that docker-compose will build
+FROM ${TARGET}

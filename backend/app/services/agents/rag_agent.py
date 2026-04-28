@@ -324,6 +324,261 @@ def _build_abbr_response(abbreviations, original_abbr):
 
 
 # =============================================================================
+# Tool: resolve_doc
+# =============================================================================
+
+
+async def _tool_resolve_doc(state) -> dict:
+    """Resolve document reference (e.g., 'Luật An ninh mạng 2025') to UUID."""
+    from app.services.agent.tools import resolve_document_reference
+    from app.services.agent.streaming import get_current_db
+
+    reference = state.get("rewritten_query", "") or state.get("raw_query", "")
+    logger.info(f"[_tool_resolve_doc] reference={reference!r}, workspace_ids={state.get('workspace_ids', [])}")
+
+    if not reference:
+        return {
+            "candidates": [],
+            "total": 0,
+            "ambiguous": False,
+            "message": "Không có thông tin tìm kiếm văn bản.",
+        }
+
+    result = await resolve_document_reference(
+        reference=reference,
+        workspace_ids=state.get("workspace_ids", []),
+        db=get_current_db(),
+    )
+    logger.info(f"[_tool_resolve_doc] result: {result.get('total')} candidates, message={result.get('message', '')[:100]}")
+    return result
+
+
+def _map_resolve_doc_result(result: dict) -> dict:
+    """Map resolve_document_reference result to SupervisorState."""
+    candidates = result.get("candidates", [])
+    resolved_ids = [c["document_id"] for c in candidates]
+    section_reference = result.get("section_reference")
+    logger.info(f"[_map_resolve_doc_result] resolved_ids={resolved_ids}, section_reference={section_reference}, ambiguous={result.get('ambiguous')}")
+
+    if resolved_ids:
+        # Document(s) found — route to search_section (or summarize if no section_ref)
+        intent_to_use = "search_section" if section_reference else "summarize"
+
+        logger.info(f"[_map_resolve_doc_result] → intent={intent_to_use}, section_reference={section_reference}, document_ids={resolved_ids}")
+
+        return {
+            "kg_summaries": [result.get("message", "")],
+            "document_ids": resolved_ids,
+            "resolve_doc_ambiguous": result.get("ambiguous", False),
+            "should_loop_back": False,
+            "intent": intent_to_use,
+            "section_reference": section_reference,
+            # Flag to tell route_from_rag that search_section tool hasn't run yet
+            "_pending_search_section": True,
+        }
+    else:
+        # No match — go to answer_generator with "not found" message
+        return {
+            "kg_summaries": [result.get("message", "")],
+            "resolved_document_ids": [],
+            "document_ids": [],
+            "resolve_doc_ambiguous": False,
+            "should_loop_back": False,
+        }
+
+# =============================================================================
+# Helper: extract section content from raw markdown
+# =============================================================================
+
+
+def _extract_section_from_markdown(markdown_text: str, section_ref: str) -> str:
+    """
+    Extract a specific section (Điều X, Chương Y, etc.) from raw markdown.
+
+    Uses heuristic markers:
+    - For "Điều X": finds "## Điều X" or "## Điều X." and extracts until next heading
+    - For "Chương X": finds "## Chương X" and extracts until next Chương
+    """
+    import re
+
+    if not markdown_text or not section_ref:
+        return ""
+
+    section_ref = section_ref.strip()
+
+    # Normalize section reference for matching
+    # "Điều 5" → try to match "## Điều 5" (with optional period after number)
+    section_pattern = section_ref.replace(".", r"\.?")
+
+    # Try multiple patterns to find the section header
+    patterns = [
+        rf"(?m)^##\s*{re.escape(section_pattern)}[.\s]",  # ## Điều 5
+        rf"(?m)^##\s*{re.escape(section_pattern)}",       # ## Điều 5 (no period)
+        rf"(?m)^#\s*{re.escape(section_pattern)}[.\s]",   # # Điều 5
+        rf"(?m)^###\s*{re.escape(section_pattern)}[.\s]", # ### Điều 5
+    ]
+
+    start_pos = -1
+    for pattern in patterns:
+        match = re.search(pattern, markdown_text, re.IGNORECASE)
+        if match:
+            start_pos = match.start()
+            break
+
+    if start_pos == -1:
+        # Try looser match: look for section_ref followed by newline
+        loose_match = re.search(
+            rf"(?m)(?:^|\n)\s*{re.escape(section_ref)}[.\s]*\n",
+            markdown_text,
+            re.IGNORECASE
+        )
+        if loose_match:
+            start_pos = loose_match.end()
+
+    if start_pos == -1:
+        return ""
+
+    # Find the end of this section (next top-level heading ##)
+    # Look for next ## heading at start of line
+    end_pattern = r"(?m)^##\s+\S"
+    end_match = re.search(end_pattern, markdown_text[start_pos + 1:])
+
+    if end_match:
+        end_pos = start_pos + 1 + end_match.start()
+    else:
+        end_pos = len(markdown_text)
+
+    section_text = markdown_text[start_pos:end_pos].strip()
+
+    # Limit to a reasonable size (32k chars — enough for a long article)
+    MAX_CHARS = 32000
+    if len(section_text) > MAX_CHARS:
+        section_text = section_text[:MAX_CHARS] + (
+            f"\n\n[... nội dung đã cắt bớt (quá dài) ...]"
+        )
+
+    return section_text
+
+
+# =============================================================================
+# Tool: search_section
+# =============================================================================
+
+async def _tool_search_section(state) -> dict:
+    """Search specific section/chapter in a document.
+
+    Uses heading_path metadata search first, falls back to content-based
+    section extraction from the raw markdown (more reliable for docs without
+    proper heading_path metadata).
+    """
+    from app.services.agent.tools import search_document_section
+    from app.services.agent.streaming import get_current_db
+    from sqlalchemy import select
+    from app.models.document import Document, DocumentStatus
+    from app.services.storage_service import get_storage_service
+
+    section_reference = state.get("section_reference", "")
+    if not section_reference:
+        return {"text": "Không tìm thấy thông tin chương/điều cần tra cứu.", "sources": []}
+
+    workspace_ids = state.get("workspace_ids", [])
+    document_ids = state.get("document_ids")
+
+    # Try heading_path metadata search first
+    result = await search_document_section(
+        section_reference=section_reference,
+        workspace_ids=workspace_ids,
+        document_ids=document_ids,
+    )
+
+    if result.get("sources"):
+        logger.info(
+            f"[search_section] heading_path search found {len(result['sources'])} sources "
+            f"for '{section_reference}'"
+        )
+        return result
+
+    # heading_path search returned 0 results — fall back to content-based extraction
+    logger.info(
+        f"[search_section] heading_path search returned 0 results for "
+        f"'{section_reference}', falling back to content extraction"
+    )
+
+    if not document_ids:
+        return {
+            "text": f"Không tìm thấy tài liệu nào phù hợp với '{section_reference}'.",
+            "sources": []
+        }
+
+    try:
+        db = get_current_db()
+        doc_result = await db.execute(
+            select(Document).where(Document.id == document_ids[0])
+        )
+        doc = doc_result.scalar_one_or_none()
+
+        if not doc or not doc.markdown_s3_key:
+            return {
+                "text": f"Không tìm thấy nội dung cho '{section_reference}'.",
+                "sources": []
+            }
+
+        storage = get_storage_service()
+        markdown_text = await storage.download_markdown(doc.markdown_s3_key)
+
+        # Extract section from content using markers like "Điều X", "Chương Y", etc.
+        extracted_text = _extract_section_from_markdown(markdown_text, section_reference)
+
+        if extracted_text:
+            # Generate a short index ID for citation (e.g., "ss1")
+            import uuid as _uuid
+            short_id = str(_uuid.uuid4().hex[:4])
+            result = {
+                "text": extracted_text,
+                "sources": [{
+                    "index": short_id,
+                    "chunk_id": f"doc_{doc.id}_section_{section_reference.replace(' ', '_')}",
+                    "source": doc.original_filename,
+                    "document_id": str(doc.id),
+                    "page_no": 0,
+                    "content": extracted_text[:500],  # preview for citation
+                    "heading_path": [section_reference],  # list, not string
+                }],
+                "content_extracted": True,
+            }
+            logger.info(
+                f"[search_section] content extraction got {len(extracted_text):,} chars "
+                f"for '{section_reference}'"
+            )
+            return result
+        else:
+            # No section found in content — return a helpful message
+            return {
+                "text": f"Không tìm thấy nội dung điều/khoản '{section_reference}' trong tài liệu.",
+                "sources": []
+            }
+
+    except Exception as e:
+        logger.warning(
+            f"[search_section] content extraction failed: {e}"
+        )
+        return {
+            "text": f"Không thể truy xuất nội dung cho '{section_reference}'.",
+            "sources": []
+        }
+
+def _map_search_section(result: dict) -> dict:
+    """Map search_section result to SupervisorState."""
+    return {
+        "kg_summaries": [result.get("text", "")],
+        "sources": result.get("sources", []),
+        # Change intent so route_from_rag goes to answer_generator (not back to supervisor)
+        "intent": "summarize",
+        # Clear section_reference so route_from_rag knows tool has executed
+        "section_reference": "",
+    }
+
+# =============================================================================
 # Tool Registry
 # =============================================================================
 
@@ -334,6 +589,8 @@ RAG_TOOL_REGISTRY: dict[str, tuple[Callable, Callable]] = {
     "kg_query": (_tool_kg_query, _map_kg_result),
     "search_doc_num": (_tool_search_doc_num, _map_doc_num_result),
     "search_abbr": (_tool_search_abbr, _map_abbr_result),
+    "resolve_doc": (_tool_resolve_doc, _map_resolve_doc_result),
+    "search_section": (_tool_search_section, _map_search_section),
 }
 
 
@@ -356,10 +613,20 @@ async def rag_agent_node(state: SupervisorState) -> dict:
     from app.services.agent.streaming import push_event
 
     intent = state.get("intent", "search")
-    logger.info(f"[rag_agent] intent={intent!r}")
+    logger.info(f"[rag_agent] intent={intent!r}, rewritten_query={state.get('rewritten_query', '')[:100]!r}, document_ids={state.get('document_ids')}")
 
     # Emit status
-    await push_event(state, "status", {"step": "searching", "detail": "Đang tìm kiếm..."})
+    status_map = {
+        "search": "Đang tìm kiếm tài liệu...",
+        "list_docs": "Đang lấy danh sách...",
+        "summarize": "Đang tóm tắt...",
+        "kg_query": "Đang truy vấn đồ thị...",
+        "search_doc_num": "Đang tra cứu số văn bản...",
+        "search_abbr": "Đang tra cứu viết tắt...",
+        "resolve_doc": "Đang tìm văn bản theo tên...",
+        "search_section": "Đang trích xuất nội dung phần/chương/điều...",
+    }
+    await push_event(state, "status", {"step": "searching", "detail": status_map.get(intent, "Đang xử lý...")})
 
     if intent not in RAG_TOOL_REGISTRY:
         logger.warning(f"[rag_agent] No tool for intent {intent!r}")

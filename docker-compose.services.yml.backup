@@ -1,22 +1,36 @@
-# HRAG — Dev/Production services with Workers
-# Usage: docker compose -f docker-compose.services.yml up -d
+# HRAG — Dev/Production services with Workers + Traefik
+# Usage:
+#   Development: APP_ENV=development docker compose -f docker-compose.services.yml up -d
+#   Production: APP_ENV=production docker compose -f docker-compose.services.yml up -d
+#
+# Domains (add to /etc/hosts):
+#   127.0.0.1 service.hatinh.local  (backend)
+#   127.0.0.1 rag.hatinh.local      (frontend)
+#   127.0.0.1 minio.hatinh.local    (MinIO console)
+
+x-app-env: &app_env
+  APP_ENV: ${APP_ENV:-development}
+
+x-build-args: &build_args
+  build:
+    context: .
+    args:
+      TARGET: ${APP_ENV:-development}
 
 networks:
   hrag_network:
     driver: bridge
 
 services:
-  # ═══════════════════════════════════════════════════════════════════════════
-  # TRAEFIK REVERSE PROXY
-  # ═══════════════════════════════════════════════════════════════════════════
+  # ── Traefik Reverse Proxy ───────────────────────────────────────────
   traefik:
     image: traefik:v3.0
     container_name: hrag-traefik
     command:
       - "--configFile=/etc/traefik/traefik.yml"
     ports:
-      - "80:80"
-      - "8089:8080"
+      - "80:80"       # HTTP entrypoint
+      - "8089:8080"   # Traefik dashboard (insecure)
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./traefik.yml:/etc/traefik/traefik.yml:ro
@@ -25,16 +39,12 @@ services:
       - hrag_network
     restart: unless-stopped
     labels:
-      - "com.hrag.service=traefik"
-      - "com.hrag.stack=hrag"
-      - "traefik.enable=true"
-      - "traefik.http.routers.traefik.rule=Host(`traefik.hatinh.local`)"
-      - "traefik.http.routers.traefik.entrypoints=http"
-      - "traefik.http.services.traefik.loadbalancer.server.port=8080"
+      com.hrag.service: traefik
+      com.hrag.stack: hrag
 
-  # ═══════════════════════════════════════════════════════════════════════════
+  # ═══════════════════════════════════════════════════════════════════
   # INFRASTRUCTURE
-  # ═══════════════════════════════════════════════════════════════════════════
+  # ═══════════════════════════════════════════════════════════════════
 
   postgres:
     image: pgvector/pgvector:pg15
@@ -43,18 +53,17 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: hrag
-      APP_ENV: ${APP_ENV:-development}
     ports:
       - "5433:5432"
     volumes:
       - hrag_postgres_data:/var/lib/postgresql/data
-    networks:
-      - hrag_network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - hrag_network
     labels:
       com.hrag.service: postgres
       com.hrag.stack: hrag
@@ -80,20 +89,20 @@ services:
     container_name: hrag-rabbitmq
     ports:
       - "5672:5672"
-      - "15672:15672"   # Management UI → http://localhost:15672  (guest/guest)
+      - "15672:15672"
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
     volumes:
       - hrag_rabbitmq_data:/var/lib/rabbitmq
-    networks:
-      - hrag_network
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 20s
+    networks:
+      - hrag_network
     labels:
       com.hrag.service: rabbitmq
       com.hrag.stack: hrag
@@ -103,8 +112,8 @@ services:
     container_name: hrag-minio
     command: server /data --console-address ":9001"
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # Web console → http://localhost:9001
+      - "9000:9000"
+      - "9001:9001"
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
@@ -112,56 +121,51 @@ services:
       MINIO_NOTIFY_WEBHOOK_ENDPOINT_NEXUSRAG: http://host.docker.internal:8080/api/v1/minio/events
     volumes:
       - hrag_minio_data:/data
-    networks:
-      - hrag_network
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - hrag_network
     labels:
-      com.hrag.service: minio
-      com.hrag.stack: hrag
-      traefik.enable: "true"
-      traefik.http.routers.minio.rule: "Host(`minio.hatinh.local`)"
-      traefik.http.routers.minio.entrypoints: "http"
-      traefik.http.services.minio.loadbalancer.server.port: "9000"
+      - "traefik.enable=true"
+      - "traefik.http.routers.minio.rule=Host(`minio.hatinh.local`)"
+      - "traefik.http.routers.minio.entrypoints=http"
+      - "traefik.http.services.minio.loadbalancer.server.port=9000"
+      - "com.hrag.service=minio"
+      - "com.hrag.stack=hrag"
 
   neo4j:
     image: neo4j:5-community
     container_name: hrag-neo4j
     ports:
-      - "7474:7474"   # Browser UI → http://localhost:7474
-      - "7687:7687"   # Bolt protocol
+      - "7474:7474"
+      - "7687:7687"
     environment:
-      NEO4J_AUTH: neo4j/hrag1234
+      NEO4J_AUTH: neo4j/hrag12345
       NEO4J_PLUGINS: '["apoc"]'
       NEO4J_dbms_security_procedures_unrestricted: apoc.*
       NEO4J_dbms_memory_heap_initial__size: 512m
       NEO4J_dbms_memory_heap_max__size: 1G
     volumes:
       - hrag_neo4j_data:/data
-    networks:
-      - hrag_network
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 30s
+    networks:
+      - hrag_network
     labels:
       com.hrag.service: neo4j
       com.hrag.stack: hrag
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # VLLM SERVICES — GPU 1 (same as workers, 48GB VRAM total)
-  # HunyuanOCR: ~19.2GB (0.4), Qwen3-4B: ~9.6GB (0.2) → ~28.8GB used
-  # Remaining ~19GB for workers (parse ~4-6GB, embed ~1-2GB)
-  # ═══════════════════════════════════════════════════════════════════════════
+  # ═══════════════════════════════════════════════════════════════════
+  # VLLM SERVICES — GPU 1
+  # ═══════════════════════════════════════════════════════════════════
 
-  # ── HunyuanOCR (OCR Model) ────────────────────────────────────────────────
-  # Port: 8001, GPU 1, ~19.2GB VRAM (0.4 × 48GB)
-  # OpenAI-compatible API → workers call via Docker network
   vllm-ocr:
     build:
       context: .
@@ -193,8 +197,6 @@ services:
             - driver: nvidia
               device_ids: ["1"]
               capabilities: [gpu]
-    networks:
-      - hrag_network
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 30s
@@ -207,13 +209,12 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    networks:
+      - hrag_network
     labels:
       com.hrag.service: vllm-ocr
       com.hrag.stack: hrag
 
-  # ── Qwen3-4B-Instruct (Memory/KG Model) ──────────────────────────────────
-  # Port: 8088, GPU 1, ~9.6GB VRAM (0.2 × 48GB)
-  # OpenAI-compatible API → workers call via Docker network
   vllm-memory:
     build:
       context: .
@@ -245,8 +246,6 @@ services:
             - driver: nvidia
               device_ids: ["1"]
               capabilities: [gpu]
-    networks:
-      - hrag_network
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
       interval: 30s
@@ -259,26 +258,138 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    networks:
+      - hrag_network
     labels:
       com.hrag.service: vllm-memory
       com.hrag.stack: hrag
 
-  # ═══════════════════════════════════════════════════════════════════════════
-  # WORKERS — All use GPU 1 (same as vLLM services, 48GB VRAM total)
-  # vLLM uses ~28.8GB, workers have ~19GB available (parse ~4-6GB, embed ~1-2GB)
-  # Caption/KG workers don't load GPU models (HTTP calls / CPU-bound)
-  # All workers include: graceful drain (WORKER_DRAIN_TIMEOUT=30s),
-  # stop_grace_period=60s (Docker waits 60s before SIGKILL on stop)
-  # ═══════════════════════════════════════════════════════════════════════════
+  # ═══════════════════════════════════════════════════════════════════
+  # BACKEND & FRONTEND — Dev/Prod via APP_ENV
+  # ═══════════════════════════════════════════════════════════════════
 
-  # ── Parse workers ─────────────────────────────────────────────────────────
-  # Docling (layout + OCR) → ~4-6GB VRAM when loaded
-  # Lazy load (HRAG_EAGER_MODEL_LOADING=false) to avoid VRAM spike at startup
-  # Health server on port 8081, exposed to host on port 8082
+  # ── Backend API server ─────────────────────────────────────────────
+  backend:
+    <<: *build_args
+    <<: *app_env
+    container_name: hrag-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      chromadb:
+        condition: service_started
+      minio:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/hrag
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_WEBHOOK_ENABLED: "false"
+      NEO4J_URI: bolt://neo4j:7687
+      CUDA_VISIBLE_DEVICES: "0"
+      OPENAI_COMPATIBLE_BASE_URL: http://vllm-memory:8088/v1
+    # Development: mount source code for --reload
+    volumes:
+      - ./backend:/app/backend:rw
+      - hrag_uploads:/app/backend/uploads
+      - hrag_data:/app/backend/data
+    ports:
+      - "8080:8080"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.backend.rule=Host(`service.hatinh.local`)"
+      - "traefik.http.routers.backend.entrypoints=http"
+      - "traefik.http.services.backend.loadbalancer.server.port=8080"
+      - "com.hrag.service=backend"
+      - "com.hrag.stack=hrag"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - hrag_network
+    restart: unless-stopped
+
+  # ── Frontend ─────────────────────────────────────────────────────────
+  frontend:
+    <<: *build_args
+    <<: *app_env
+    container_name: hrag-frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    # Development: mount source for hot reload
+    volumes:
+      - ./frontend:/app:rw
+    ports:
+      - "5174:5174"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=Host(`rag.hatinh.local`)"
+      - "traefik.http.routers.frontend.entrypoints=http"
+      - "traefik.http.services.frontend.loadbalancer.server.port=5174"
+      - "com.hrag.service=frontend"
+      - "com.hrag.stack=hrag"
+    networks:
+      - hrag_network
+    restart: unless-stopped
+
+  # ── minio-init ────────────────────────────────────────────────────────
+  minio-init:
+    image: minio/mc:latest
+    container_name: hrag-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin;
+        mc mb --ignore-existing local/hrag-uploads;
+        mc mb --ignore-existing local/hrag-markdown;
+        mc event add --ignore-existing local/hrag-uploads
+          arn:minio:sqs::HRAG:webhook --event put;
+        mc anonymous set-json /dev/stdin local/hrag-uploads <<'CORS'
+        {
+          \"CORSRules\": [{
+            \"AllowedOrigins\": [\"*\"],
+            \"AllowedMethods\": [\"PUT\", \"GET\", \"HEAD\"],
+            \"AllowedHeaders\": [\"*\"],
+            \"ExposeHeaders\": [\"ETag\"],
+            \"MaxAgeSeconds\": 3000
+          }]
+        }
+        CORS
+        exit 0
+      "
+    restart: on-failure
+    networks:
+      - hrag_network
+
+  # ═══════════════════════════════════════════════════════════════════
+  # WORKERS
+  # ═══════════════════════════════════════════════════════════════════
+
   worker-parse:
-    build:
-      context: .
-      dockerfile: Dockerfile.backend
+    <<: *build_args
+    <<: *app_env
     depends_on:
       postgres:
         condition: service_healthy
@@ -308,14 +419,13 @@ services:
       WORKER_HEALTH_PORT: "8081"
       HUNYUAN_OCR_API_URL: http://vllm-ocr:8001/v1
       MEMORY_AGENT_BASE_URL: http://vllm-memory:8088/v1
+      OPENAI_COMPATIBLE_BASE_URL: http://vllm-memory:8088/v1
     volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
+      - ./backend:/app/backend:rw
       - hrag_uploads:/app/backend/uploads
       - hrag_data:/app/backend/data
-    networks:
-      - hrag_network
     deploy:
-      replicas: 2
+      replicas: 1
       resources:
         reservations:
           devices:
@@ -336,17 +446,17 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+    ports:
+      - "8082:8081"
+    networks:
+      - hrag_network
     labels:
       com.hrag.service: worker-parse
       com.hrag.stack: hrag
 
-  # ── Embed workers ───────────────────────────────────────────────────────────
-  # BGE-m3 embedding model → ~1-2GB VRAM
-  # Health server on port 8081
   worker-embed:
-    build:
-      context: .
-      dockerfile: Dockerfile.backend
+    <<: *build_args
+    <<: *app_env
     depends_on:
       postgres:
         condition: service_healthy
@@ -372,14 +482,13 @@ services:
       MEMORY_AGENT_BASE_URL: http://vllm-memory:8088/v1
       WORKER_EMBED_TIMEOUT: "300"
       HRAG_CONTEXTUAL_CONCURRENCY: "16"
+      OPENAI_COMPATIBLE_BASE_URL: http://vllm-memory:8088/v1
     volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
+      - ./backend:/app/backend:rw
       - hrag_uploads:/app/backend/uploads
       - hrag_data:/app/backend/data
-    networks:
-      - hrag_network
     deploy:
-      replicas: 2
+      replicas: 1
       resources:
         reservations:
           devices:
@@ -400,18 +509,17 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+    ports:
+      - "8083:8081"
+    networks:
+      - hrag_network
     labels:
       com.hrag.service: worker-embed
       com.hrag.stack: hrag
 
-  # ── Caption workers ─────────────────────────────────────────────────────────
-  # Vision LLM captions via HTTP calls to vLLM (no GPU model loaded in worker)
-  # Workers call LLM provider via HTTP — GPU not used by caption worker process
-  # Health server on port 8081
   worker-caption:
-    build:
-      context: .
-      dockerfile: Dockerfile.backend
+    <<: *build_args
+    <<: *app_env
     depends_on:
       postgres:
         condition: service_healthy
@@ -435,10 +543,9 @@ services:
       WORKER_DRAIN_TIMEOUT: "30"
       WORKER_HEALTH_PORT: "8081"
     volumes:
+      - ./backend:/app/backend:rw
       - hrag_uploads:/app/backend/uploads
       - hrag_data:/app/backend/data
-    networks:
-      - hrag_network
     stop_grace_period: 60s
     command: ["python", "-m", "app.workers.runner"]
     restart: always
@@ -453,18 +560,17 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+    ports:
+      - "8084:8081"
+    networks:
+      - hrag_network
     labels:
       com.hrag.service: worker-caption
       com.hrag.stack: hrag
 
-  # ── KG workers ─────────────────────────────────────────────────────────────
-  # LightRAG file-based KG extraction (CPU-bound, no GPU model)
-  # GPU assigned for consistency but not used
-  # Health server on port 8081
   worker-kg:
-    build:
-      context: .
-      dockerfile: Dockerfile.backend
+    <<: *build_args
+    <<: *app_env
     depends_on:
       postgres:
         condition: service_healthy
@@ -485,10 +591,10 @@ services:
       WORKER_DRAIN_TIMEOUT: "30"
       WORKER_HEALTH_PORT: "8081"
       LEGAL_KG_LLM_BASE_URL: http://vllm-memory:8088/v1
+      OPENAI_COMPATIBLE_BASE_URL: http://vllm-memory:8088/v1
     volumes:
+      - ./backend:/app/backend:rw
       - hrag_data:/app/backend/data
-    networks:
-      - hrag_network
     stop_grace_period: 60s
     command: ["python", "-m", "app.workers.runner"]
     restart: always
@@ -503,107 +609,18 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+    ports:
+      - "8085:8081"
+    networks:
+      - hrag_network
     labels:
       com.hrag.service: worker-kg
       com.hrag.stack: hrag
 
-  # ── Backend API server ─────────────────────────────────────────────────────
-  backend:
-    build:
-      context: .
-      dockerfile: Dockerfile.backend
-      args:
-        TARGET: ${APP_ENV:-development}
-    container_name: hrag-backend
-    depends_on:
-      postgres:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-      chromadb:
-        condition: service_started
-      minio:
-        condition: service_healthy
-      neo4j:
-        condition: service_healthy
-    env_file: .env
-    environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/hrag
-      CHROMA_HOST: chromadb
-      CHROMA_PORT: 8000
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      MINIO_ENDPOINT: http://minio:9000
-      MINIO_WEBHOOK_ENABLED: "false"
-      NEO4J_URI: bolt://neo4j:7687
-      CUDA_VISIBLE_DEVICES: "0"
-      OLLAMA_HOST: http://host.docker.internal:8000/v1
-      RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
-      HUNYUAN_OCR_API_URL: http://vllm-ocr:8001/v1
-      MEMORY_AGENT_BASE_URL: http://vllm-memory:8088/v1
-      GRAPHITI_LLM_BASE_URL: http://vllm-memory:8088/v1
-      OPENAI_COMPATIBLE_BASE_URL: http://host.docker.internal:8000/v1
-      OPENAI_COMPATIBLE_MODEL: Qwen/Qwen3.5-35B-A3B-FP8
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
-      - hrag_uploads:/app/backend/uploads
-      - hrag_data:/app/backend/data
-      - ./backend:/app/backend:rw
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["1"]
-              capabilities: [gpu]
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-    networks:
-      - hrag_network
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.backend.rule=Host(`service.hatinh.local`)"
-      - "traefik.http.routers.backend.entrypoints=http"
-      - "traefik.http.services.backend.loadbalancer.server.port=8080"
-    restart: unless-stopped
-
-  # ── Frontend ─────────────────────────────────────────────────────────
-  frontend:
-    build:
-      context: .
-      dockerfile: Dockerfile.frontend
-      args:
-        TARGET: ${APP_ENV:-development}
-    container_name: hrag-frontend
-    depends_on:
-      backend:
-        condition: service_healthy
-    volumes:
-      - ./frontend/src:/app/src:rw
-      - ./frontend/public:/app/public:ro
-      - ./frontend/vite.config.ts:/app/vite.config.ts:ro
-    environment:
-      - VITE_API_PROXY_URL=http://backend:8080
-      - VITE_MINIO_PROXY_URL=http://minio:9000
-    networks:
-      - hrag_network
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.frontend.rule=Host(`rag.hatinh.local`)"
-      - "traefik.http.routers.frontend.entrypoints=http"
-      - "traefik.http.services.frontend.loadbalancer.server.port=5174"
-    restart: unless-stopped
-
-  # ═══════════════════════════════════════════════════════════════════════════
+  # ═══════════════════════════════════════════════════════════════════
   # OBSERVABILITY — Loki + Grafana + Promtail
-  # ═══════════════════════════════════════════════════════════════════════════
+  # ═══════════════════════════════════════════════════════════════════
 
-  # ── Loki (all-in-one, ephemeral storage for dev) ───────────────────────
   loki:
     image: grafana/loki:3.2.0
     container_name: hrag-loki
@@ -611,28 +628,25 @@ services:
       - "3100:3100"
     volumes:
       - hrag_loki_data:/var/loki
+    restart: unless-stopped
     networks:
       - hrag_network
-    restart: unless-stopped
 
-  # ── Promtail (reads Docker container logs) ──────────────────────────────
   promtail:
     image: grafana/promtail:3.2.0
     container_name: hrag-promtail
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
       - ./infra/promtail:/etc/promtail:ro
       - hrag_promtail_positions:/tmp/promtail
-      - /home/docker/containers:/home/docker/containers:ro
-    command: -config.expand-env=true -config.file=/etc/promtail/config.yml
-    networks:
-      - hrag_network
+    command: -config.file=/etc/promtail/config.yml
     restart: unless-stopped
     depends_on:
       loki:
         condition: service_started
+    networks:
+      - hrag_network
 
-  # ── Grafana (port 3000) ────────────────────────────────────────────────
   grafana:
     image: grafana/grafana:11.2.0
     container_name: hrag-grafana
@@ -645,16 +659,11 @@ services:
     volumes:
       - hrag_grafana_data:/var/lib/grafana
       - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
-    networks:
-      - hrag_network
     restart: unless-stopped
     depends_on:
       - loki
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.grafana.rule=Host(`grafana.hatinh.local`)"
-      - "traefik.http.routers.grafana.entrypoints=http"
-      - "traefik.http.services.grafana.loadbalancer.server.port=3000"
+    networks:
+      - hrag_network
 
 volumes:
   hrag_postgres_data:
@@ -666,5 +675,5 @@ volumes:
   hrag_data:
   hrag_loki_data:
   hrag_grafana_data:
-  hrag_traefik_data:
   hrag_promtail_positions:
+  hrag_traefik_data:

@@ -7,6 +7,7 @@
 
 import { useState, useRef, useCallback, useEffect } from "react";
 import { useAuthStore } from "@/stores/authStore";
+import { generateId } from "@/lib/utils";
 import type {
   ChatSourceChunk,
   ChatImageRef,
@@ -73,7 +74,7 @@ function createStep(
   status: "active" | "completed" | "error" = "active",
 ): AgentStep {
   return {
-    id: crypto.randomUUID(),
+    id: generateId(),
     step,
     detail,
     status,
@@ -540,7 +541,7 @@ export function useRAGChatStream(
                     ]);
 
                     finalMessage = {
-                      id: localAiMessageId || crypto.randomUUID(),
+                      id: localAiMessageId || generateId(),
                       role: "assistant",
                       content: cleanAnswer,
                       sources: localSources, // use accumulated sources, backend complete event omits them
@@ -557,6 +558,7 @@ export function useRAGChatStream(
                     // without waiting for the underlying HTTP connection to close.
                     setStatus("idle");
                     setIsStreaming(false);
+                    setThinkingText(""); // Clear thinking state to prevent ghost thinking panel
                     // Force ChatPanel useEffect to re-run with final peopleData
                     setStreamCompleteTick((t) => t + 1);
 
@@ -585,8 +587,27 @@ export function useRAGChatStream(
           }
         }
 
+        // Stream ended — if we never got a 'complete' event (connection dropped),
+        // finalize with whatever content we have to prevent stuck UI state
+        if (!finalMessage && (streamingContent || thinkingAccumulator)) {
+          console.warn("[stream] Stream ended without 'complete' event — finalizing with buffered content");
+          finalMessage = {
+            id: localAiMessageId || generateId(),
+            role: "assistant",
+            content: (streamingContent || "").replace(/<\/think>\s*/g, "").trim(),
+            sources: localSources,
+            relatedEntities: [],
+            imageRefs: localImages,
+            peopleData: localPeople,
+            thinking: thinkingAccumulator || null,
+            agentSteps: localSteps,
+            timestamp: new Date().toISOString(),
+          };
+        }
+
         setStatus("idle");
         setIsStreaming(false);
+        setThinkingText(""); // Clear thinking state
 
         return finalMessage;
       } catch (err) {

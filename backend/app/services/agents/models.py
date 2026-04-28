@@ -25,6 +25,7 @@ class Intent:
     KG_QUERY = "kg_query"
     SEARCH_DOC_NUM = "search_doc_num"
     SEARCH_ABBR = "search_abbr"
+    SEARCH_SECTION = "search_section"
     WRITE_SUMMARIZE = "write_summarize"
     WRITE_SUGGEST_EDITS = "write_suggest_edits"
     WRITE_GRAMMAR_CHECK = "write_grammar_check"
@@ -37,7 +38,7 @@ class Intent:
 
     ALL = {
         GREETING, PERSONAL, SEARCH, LIST_DOCS, SUMMARIZE, KG_QUERY,
-        SEARCH_DOC_NUM, SEARCH_ABBR, WRITE_SUMMARIZE, WRITE_SUGGEST_EDITS,
+        SEARCH_DOC_NUM, SEARCH_ABBR, SEARCH_SECTION, WRITE_SUMMARIZE, WRITE_SUGGEST_EDITS,
         WRITE_GRAMMAR_CHECK, WRITE_FORMAT_CHECK, MONGO_SEARCH_CCCD,
         MONGO_SEARCH_NAME, MONGO_SEARCH_BHxh, MONGO_SEARCH_PHONE,
         MONGO_SEARCH_ADVANCED,
@@ -54,6 +55,7 @@ class AgentType:
     DIRECT = "direct"
     PEOPLE = "people"
     FINISH = "finish"
+    ANSWER_GENERATOR = "answer_generator"
 
 
 # =============================================================================
@@ -72,6 +74,7 @@ INTENT_TO_AGENT: dict[str, str] = {
     Intent.KG_QUERY: AgentType.RAG,
     Intent.SEARCH_DOC_NUM: AgentType.RAG,
     Intent.SEARCH_ABBR: AgentType.RAG,
+    Intent.SEARCH_SECTION: AgentType.RAG,
     Intent.MONGO_SEARCH_CCCD: AgentType.PEOPLE,
     Intent.MONGO_SEARCH_NAME: AgentType.PEOPLE,
     Intent.MONGO_SEARCH_BHxh: AgentType.PEOPLE,
@@ -114,6 +117,9 @@ class SupervisorState(TypedDict, total=False):
     kg_summaries: list
     abbreviation_results: list
     mongo_results: list
+
+    # Section search results
+    section_reference: str | None
 
     # Write agent inputs
     write_action: str

@@ -1,9 +1,15 @@
 # ============================================================
 # HRAG Frontend — Multi-stage Docker build
+# Supports development (pnpm dev, hot reload) and production (pnpm build + nginx)
+# Usage:
+#   Production: docker build -f Dockerfile.frontend --target production -t hrag-frontend .
+#   Development: docker build -f Dockerfile.frontend --target development -t hrag-frontend-dev .
 # ============================================================
 
-# Stage 1: Build the frontend
-FROM node:22-alpine AS build
+ARG TARGET=production
+
+# ── Stage: deps ─────────────────────────────────────────────
+FROM node:22-alpine AS deps
 
 RUN corepack enable
 
@@ -12,19 +18,23 @@ WORKDIR /app
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 
+
+# ── Stage: build ─────────────────────────────────────────
+FROM deps AS build
+
+WORKDIR /app
+
 COPY frontend/ .
 
-# Build-time API URL (uses nginx proxy by default)
 ARG VITE_API_URL=/api/v1
 ENV VITE_API_URL=$VITE_API_URL
 
 RUN pnpm build
 
 
-# Stage 2: Serve with nginx
-FROM nginx:alpine AS runtime
+# ── Stage: production ─────────────────────────────────────
+FROM nginx:alpine AS production
 
-# Remove default nginx config
 RUN rm /etc/nginx/conf.d/default.conf
 
 COPY nginx.conf /etc/nginx/conf.d/default.conf
@@ -33,3 +43,38 @@ COPY --from=build /app/dist /usr/share/nginx/html
 EXPOSE 80
 
 CMD ["nginx", "-g", "daemon off;"]
+
+
+# ── Stage: development ───────────────────────────────────
+FROM node:22-alpine AS development
+
+RUN corepack enable && corepack prepare pnpm@latest --activate
+
+WORKDIR /app
+
+# Copy dependencies (not mounted - stays in container)
+COPY --from=deps /app/node_modules ./node_modules
+
+# Copy source code (will be volume-mounted for hot reload)
+COPY frontend/package.json frontend/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+
+COPY frontend/src ./src
+COPY frontend/public ./public
+COPY frontend/index.html ./
+COPY frontend/vite.config.ts ./
+COPY frontend/tsconfig.json ./
+COPY frontend/tsconfig.app.json ./
+COPY frontend/tsconfig.node.json ./
+COPY frontend/postcss.config.js ./
+COPY frontend/tailwind.config.js ./
+COPY frontend/.env ./
+
+EXPOSE 5174
+
+# Development: run Vite dev server with HMR
+CMD ["pnpm", "dev", "--host", "0.0.0.0"]
+
+
+# ── Build stage selection ─────────────────────────────────
+FROM ${TARGET}

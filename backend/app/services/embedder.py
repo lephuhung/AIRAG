@@ -48,7 +48,7 @@ class EmbeddingService:
             self._model = SentenceTransformer(self.model_name, device=st_device)
             logger.info(
                 f"Embedding model loaded: {self.model_name} "
-                f"(dim={self._model.get_sentence_embedding_dimension()})"
+                f"(dim={self._model.get_embedding_dimension()})"
             )
         return self._model
 
@@ -56,7 +56,7 @@ class EmbeddingService:
     def dimension(self) -> int:
         """Return the embedding dimension size."""
         if self._model is not None:
-            return self._model.get_sentence_embedding_dimension()
+            return self._model.get_embedding_dimension()
         return self._KNOWN_DIMS.get(self.model_name, 1024)
 
     def embed_text(self, text: str) -> list[float]:
