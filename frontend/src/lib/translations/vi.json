@@ -177,6 +177,10 @@
   "chat": {
     "welcome_title": "Chào mừng đến với HRAG",
     "welcome_description": "Tạo chat mới hoặc chọn chat có sẵn để bắt đầu khám phá tri thức từ các kho dữ liệu của bạn.",
+    "ai_assistant": "Trợ lý AI",
+    "assistant_online": "Trợ lý AI đang trực tuyến",
+    "greeting": "Xin chào {{name}}!",
+    "unsupported_doc": "Định dạng .doc không được hỗ trợ. Vui lòng chuyển sang .docx trước khi tải lên.",
     "doc_source": "Nguồn tài liệu",
     "create_failed": "Không thể tạo phiên chat",
     "delete_success": "Đã xóa cuộc hội thoại",
@@ -226,6 +230,7 @@
     "suggestion_summary": "Tóm tắt các phát hiện chính",
     "suggestion_topics": "Các chủ đề chính là gì?",
     "suggestion_entities": "Liệt kê các thực thể quan trọng",
+    "suggestion_any": "Viết bất cứ thứ gì",
     "suggestion_methodology": "Giải thích phương pháp được sử dụng",
     "view_kg": "Xem trong biểu đồ tri thức",
     "highlight_kg": "Làm nổi bật trong biểu đồ tri thức",
@@ -713,7 +718,23 @@
       "new_password": "Mật khẩu mới",
       "confirm_password": "Xác nhận mật khẩu",
       "repeat_password": "Nhập lại mật khẩu mới",
-      "min_chars": "Tối thiểu 6 ký tự"
+      "min_chars": "Tối thiểu 6 ký tự",
+      "toast": {
+        "deactivated": "Đã vô hiệu hóa người dùng",
+        "activated": "Đã kích hoạt người dùng",
+        "update_failed": "Cập nhật người dùng thất bại",
+        "superadmin_removed": "Đã gỡ quyền quản trị hệ thống",
+        "superadmin_granted": "Đã cấp quyền quản trị hệ thống",
+        "deleted": "Đã xóa người dùng",
+        "delete_failed": "Xóa người dùng thất bại",
+        "self_role_error": "Bạn không thể tự thay đổi vai trò của chính mình",
+        "role_changed": "Đã thay đổi vai trò thành {{role}}",
+        "role_failed": "Thay đổi vai trò thất bại",
+        "pw_min_chars": "Mật khẩu phải có ít nhất 6 ký tự",
+        "pw_mismatch": "Mật khẩu xác nhận không khớp",
+        "pw_reset_success": "Đã đặt lại mật khẩu cho {{name}}",
+        "password_failed": "Đặt lại mật khẩu thất bại"
+      }
     },
     "tenants": {
       "title": "Quản lý tổ chức",

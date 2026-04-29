@@ -27,7 +27,7 @@ class KnowledgeBase(Base):
         String(20), default="personal"
     )  # 'public' | 'tenant' | 'personal'
     owner_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True
     )
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=True

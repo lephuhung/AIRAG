@@ -58,9 +58,12 @@ async def list_workspaces(
 ):
     """List workspaces visible to the current user."""
     if user.is_superadmin:
-        # Superadmin sees everything
+        # Superadmin only sees their OWN workspaces for app functional use (upload, chat, etc.)
+        # This ensures ChatPanel fallback logic (is_default/personal/ws[0]) works correctly
         result = await db.execute(
-            select(KnowledgeBase).order_by(KnowledgeBase.updated_at.desc())
+            select(KnowledgeBase)
+            .where(KnowledgeBase.owner_id == user.id)
+            .order_by(KnowledgeBase.updated_at.desc())
         )
     else:
         # Get user's tenant IDs

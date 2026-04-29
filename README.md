@@ -1,6 +1,4 @@
-<div align="center">
-
-# HRAG
+# NexusRAG
 
 ### Hybrid Knowledge Base with Agentic Chat, Citations & Knowledge Graph
 
@@ -9,288 +7,90 @@
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://docker.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/leducdat-profile)
 
 **Upload documents. Ask questions. Get cited answers.**
 
-HRAG combines vector search, knowledge graph, and cross-encoder reranking into one seamless RAG pipeline — powered by Gemini or local Ollama models.
+NexusRAG combines vector search, knowledge graph extraction, and LLM-powered chat into one seamless RAG pipeline — with automatic citations, agentic routing, and support for Gemini, Ollama, or any OpenAI-compatible provider.
 
-[Features](#features) · [Quick Start](#quick-start) · [Model Recommendations](#multi-provider-llm) · [Tech Stack](#tech-stack)
-
-</div>
-
----
-
-## Architecture
-
-<div align="center">
-
-![HRAG Architecture](showcase/nexusrag_architecture.jpg)
-
-</div>
-
-## Showcase
-
-<div align="center">
-
-![HRAG Demo](showcase/demo_nexus_video.gif)
-
-</div>
-
----
-
-## Beyond Traditional RAG
-
-Most RAG systems follow a simple pipeline: split text → embed → retrieve → generate. HRAG goes further at every stage:
-
-| Aspect | Traditional RAG | HRAG |
-|---|---|---|
-| **Document Parsing** | Plain text extraction, structure lost | Docling: preserves headings, page boundaries, formulas, layout |
-| **Images & Tables** | Ignored entirely | Extracted, captioned by vision LLM, embedded as searchable vectors |
-| **Chunking** | Fixed-size splits, breaks mid-sentence | Hybrid semantic + structural chunking (respects headings, tables) |
-| **Embeddings** | Single model for everything | Dual-model: BAAI/bge-m3 (1024d, search) + Gemini Embedding (3072d, KG) |
-| **Retrieval** | Vector similarity only | 3-way parallel: Vector over-fetch + KG entity lookup + Cross-encoder rerank |
-| **Knowledge** | No entity awareness | LightRAG graph: entity extraction, relationship mapping, multi-hop traversal |
-| **Context** | Raw chunks dumped to LLM | Structured assembly: KG insights → cited chunks → related images/tables |
-| **Citations** | None or manual | Auto-generated 4-char IDs with page number and heading path |
-| **Page awareness** | Lost after chunking | Preserved end-to-end: chunk → citation → document viewer navigation |
+[Features](#features) · [Quick Start](#quick-start) · [Architecture](#architecture) · [Tech Stack](#tech-stack) · [Configuration](#configuration)
 
 ---
 
 ## Features
 
-<details>
-<summary><b>Deep Document Parsing (Docling)</b></summary>
+### Deep Document Parsing
 
-HRAG uses [Docling](https://github.com/docling-project/docling) for structural document understanding — not just text extraction:
+NexusRAG uses [Docling](https://github.com/docling-project/docling) for structural document understanding:
 
 - **Structural preservation** — Heading hierarchy (`H1 > H2 > H3`), page boundaries, paragraph grouping
-- **Formula enrichment** — LaTeX math notation preserved during conversion
-- **Multi-format** — PDF, DOCX, PPTX, HTML, TXT with consistent output
-- **Hybrid chunking** — `HybridChunker(max_tokens=512, merge_peers=True)` respects semantic AND structural boundaries — never splits mid-heading or mid-table
-- **Page-aware metadata** — Every chunk carries its page number, heading path, and references to images/tables on the same page
+- **Multi-format** — PDF, DOCX, PPTX, HTML, TXT with consistent markdown output
+- **Hybrid chunking** — Semantic + structural boundaries (respects headings, tables; never splits mid-sentence)
+- **Page-aware metadata** — Every chunk carries page number, heading path, and image/table references
 
-</details>
-
-<details open>
-<summary><b>Hybrid Retrieval Pipeline</b></summary>
+### Hybrid Retrieval Pipeline
 
 | Stage | Technology | Details |
 |---|---|---|
-| **Vector Embedding** | BAAI/bge-m3 | 1024-dim multilingual bi-encoder (100+ languages) |
-| **KG Embedding** | Gemini Embedding 001 | 3072-dim for high-fidelity entity/relationship extraction |
-| **Vector Search** | ChromaDB | Cosine similarity, over-fetch top-20 candidates |
-| **Knowledge Graph** | LightRAG | Entity/relationship extraction, keyword-to-entity matching |
-| **Reranking** | BAAI/bge-reranker-v2-m3 | Cross-encoder joint scoring — encodes (query, chunk) pairs together |
-| **Generation** | Gemini / Ollama | Agentic streaming chat with function calling |
-
-**Why two embedding models?** Vector search needs speed (local bge-m3, 1024-dim). Knowledge graph extraction needs semantic richness for entity recognition (Gemini Embedding, 3072-dim). Each model is optimized for its role.
+| **Embedding** | BAAI/bge-m3 | 1024-dim multilingual bi-encoder |
+| **Vector Search** | ChromaDB | Cosine similarity, over-fetch top-20 |
+| **Knowledge Graph** | LightRAG / LegalKG | Entity/relationship extraction for Vietnamese admin docs |
+| **Reranking** | BAAI/bge-reranker-v2-m3 | Cross-encoder joint scoring |
+| **Generation** | Gemini / Ollama / OpenAI-compatible | Streaming chat with function calling |
 
 **Retrieval flow:**
-1. **Parallel retrieval** — Vector over-fetch (top-20) + KG entity lookup run simultaneously
-2. **Cross-encoder reranking** — All 20 candidates scored jointly with the query through a transformer (far more precise than cosine similarity alone)
-3. **Filtering** — Keep top-8 above relevance threshold (0.15), with fallback to top-3 if all below
-4. **Media discovery** — Find images and tables on the same pages as retrieved chunks
+1. Vector over-fetch (top-20) + KG entity lookup run in parallel
+2. Cross-encoder reranking — all candidates scored jointly with the query
+3. Keep top-8 above relevance threshold, with fallback to top-3
+4. Media discovery — find images/tables on matched pages
 
-</details>
-
-<details>
-<summary><b>Visual Document Intelligence</b></summary>
-
-Images and tables are **embedded into chunk vectors** — not stored separately. When Docling extracts an image on page 5, its LLM-generated caption is appended to the text chunks on that page before embedding. This means searching for "revenue chart" finds chunks that contain the chart description, without needing a separate image search index.
-
-**Image Pipeline**
-1. Docling extracts images from PDF/DOCX/PPTX (up to 50 per document, 2x resolution)
-2. Vision LLM (Gemini Vision or Ollama multimodal) generates captions: specific numbers, labels, trends
-3. Captions appended to page chunks: `[Image on page 5]: Graph showing 12% revenue growth YoY`
-4. Chunk is embedded → **image becomes vector-searchable** through its description
-5. During retrieval, images on matched pages are surfaced as `[IMG-p4f2]` references
-
-**Table Pipeline**
-1. Docling exports tables as structured Markdown (preserving rows, columns, dimensions)
-2. Text LLM summarizes each table: purpose, key columns, notable values (max 500 chars)
-3. Summaries appended to page chunks: `[Table on page 5 (3x4)]: Annual sales by region`
-4. Table summaries injected back into document Markdown as blockquotes for the document viewer
-
-</details>
-
-<details>
-<summary><b>Citation System</b></summary>
+### Citation System
 
 Every answer is grounded in source documents with **4-character citation IDs** (e.g., `[a3z1]`):
 
-- **Inline citations** — Clickable badges embedded directly in the answer text
-- **Source cards** — Each citation shows filename, page number, heading path, and relevance score
-- **Cross-navigation** — Click a citation to jump to the exact section in the document viewer
-- **Image references** — Visual content cited separately as `[IMG-p4f2]` with page tracking
-- **Strict grounding** — The LLM is instructed to only cite sources that directly support claims, max 3 per sentence
+- Inline clickable badges embedded in answer text
+- Source cards showing filename, page number, heading path, and relevance score
+- Cross-navigation — click a citation to jump to the exact section in the document viewer
+- Image references cited separately as `[IMG-p4f2]`
 
-</details>
-
-<details>
-<summary><b>Knowledge Graph Visualization</b></summary>
+### Knowledge Graph
 
 Interactive force-directed graph built from extracted entities and relationships:
 
-- **Entity types** — Person, Organization, Product, Location, Event, Technology, Financial Metric, Date, Regulation (configurable)
-- **Force simulation** — Repulsion + spring forces + center gravity with real-time physics
-- **Pan & zoom** — Mouse drag, scroll wheel (0.3x-3x), keyboard reset
-- **Node interaction** — Click to select, hover to highlight connected edges, drag to reposition
-- **Entity scaling** — Node radius proportional to connectivity (degree)
-- **Query modes** — Naive, Local (multi-hop), Global (summary), Hybrid (default)
-- **No extra services** — LightRAG uses file-based storage (NetworkX + NanoVectorDB), zero Docker overhead
+- **Entity types** — Person, Organization, Product, Location, Event, Regulation, etc.
+- **Pan & zoom** — Mouse drag, scroll wheel, keyboard reset
+- **Node interaction** — Click to select, hover to highlight edges, drag to reposition
+- **Query modes** — Naive, Local (multi-hop), Global, Hybrid
 
-</details>
+NexusRAG also includes **LegalKG** — a domain-specific KG extraction service tuned for Vietnamese administrative documents (Nghị quyết, Quyết định, Công văn, etc.).
 
-<details>
-<summary><b>Multi-Provider LLM</b></summary>
+### Agentic Chat
 
-Switch between cloud and local models with a single environment variable:
+A LangGraph-based chat agent with real-time SSE streaming:
 
-#### Gemini (Cloud)
+- **Agent steps** — Visual timeline: Analyzing → Retrieving → Generating → Done
+- **11 intent types** — `search`, `list_docs`, `summarize`, `kg_query`, `search_doc_num`, `search_abbr`, `write_summarize`, `write_suggest_edits`, `write_grammar_check`, `greeting`, `personal`
+- **Extended thinking** — Configurable reasoning depth (minimal → high)
+- **Chat history** — Persistent per workspace with message ratings
 
-| Model | Best For | Thinking |
+### Multi-Provider LLM
+
+Switch between cloud and local models with a single env var:
+
+| Provider | Models | Notes |
 |---|---|---|
-| `gemini-2.5-flash` | General chat, fast responses | Budget-based (auto) |
-| `gemini-3.1-flash-lite` | High throughput, cost-effective **Recommended default**| Level-based: minimal / low / medium / high |
+| **Gemini** | `gemini-2.5-flash`, `gemini-3.1-flash-lite` | Cloud — auto thinking budget |
+| **Ollama** | `qwen3.5:9b`, `gemma3:12b`, etc. | Local — native protocol |
+| **OpenAI-compatible** | vLLM, LM Studio | Self-hosted OpenAI-compatible endpoints |
 
-Extended thinking is automatically configured — Gemini 2.5 uses `thinking_budget_tokens`, Gemini 3.x uses `thinking_level`.
+### Workspace Isolation
 
-#### Ollama (Local / Self-hosted)
+Each workspace has its own:
+- ChromaDB collection
+- LightRAG KG directory
+- Chat history
+- Custom system prompt (optional override per document type)
 
-| Model | Parameters | Recommendation |
-|---|---|---|
-| `qwen3.5:9b` | 9B | Good multilingual support, solid tool calling **Recommended default** |
-| `qwen3.5:4b` | 4B | Lightweight, works on 8GB RAM. May miss some tool calls |
-| `gemma3:12b` | 12B | Best balance of quality and speed.  |
-
-> **Tip**: For Knowledge Graph extraction, larger models (12B+) produce significantly better entity/relationship quality. Smaller models (4B) may extract zero entities on complex documents.
-
-**Provider switching** — Comment/uncomment blocks in `.env`:
-
-```bash
-# Cloud (Gemini)
-LLM_PROVIDER=gemini
-GOOGLE_AI_API_KEY=your-key
-
-# Local (Ollama) — uncomment to switch
-# LLM_PROVIDER=ollama
-# OLLAMA_MODEL=gemma3:12b
-```
-
-</details>
-
-<details>
-<summary><b>Agentic Streaming Chat</b></summary>
-
-The chat system uses a semi-agentic architecture with real-time SSE streaming:
-
-- **Agent steps** — Visual timeline: Analyzing → Retrieving → Generating → Done (with live timers)
-- **Extended thinking** — Gemini/Ollama reasoning displayed in a collapsible panel
-- **Function calling** — Native (Gemini) or prompt-based (Ollama) `search_documents` tool
-- **Force-search mode** — Pre-retrieval before LLM generation for guaranteed grounded answers
-- **Heartbeat** — 15s SSE keepalive prevents TCP timeout on slow responses
-- **Fallback** — If Ollama produces empty output, auto-triggers search + retry
-- **Chat history** — Persistent per workspace with message ratings (thumbs up/down)
-
-</details>
-
-<details>
-<summary><b>UI / UX</b></summary>
-
-**Theme & Layout**
-- Dark / Light mode with smooth transition, persisted preference
-- Collapsible sidebar with workspace navigation (icon-only mode at narrow width)
-- Responsive grid layouts — mobile to desktop
-
-**Chat Interface**
-- Streaming token rendering with memoized paragraph blocks (only active block re-renders)
-- Inline citation badges with hover tooltips (source file, page, heading path, relevance %)
-- Agent step timeline with spinner animations and elapsed timers
-- Thinking panel — scrollable, auto-follow, collapsible after completion
-- Code blocks with syntax highlighting (Python, JS, SQL, etc.) and one-click copy
-
-**Document Management**
-- Drag-and-drop upload (PDF, DOCX, PPTX, TXT, MD — up to 50MB)
-- Status badges with shimmer animation during processing
-- Per-document chips: pages, chunks, images, tables, file size, processing time
-
-**Search**
-- 4 query modes: Hybrid, Vector, Local KG, Global KG
-- Adjustable result count (1-20) with slider + direct input
-- Document scope filtering (multi-select)
-- Relevance score bars with color coding (green / amber / red)
-
-**Analytics Dashboard**
-- Stat cards: documents, indexed, chunks, images, entities, relationships
-- Entity type distribution bar with animated widths
-- Top entities ranked by connectivity
-- Per-document chunk breakdown chart
-
-**Micro-interactions**
-- Framer Motion animations throughout (staggered entrances, layout transitions)
-- Loading skeletons, toast notifications, empty state illustrations
-- Keyboard shortcuts: `/` to focus search, `Enter` to send, `Escape` to cancel
-
-</details>
-
-<details>
-<summary><b>Workspace System</b></summary>
-
-- Multiple isolated knowledge bases, each with its own documents, ChromaDB collection, and KG
-- Custom system prompt per workspace (override default Q&A behavior)
-- Independent chat history with message persistence and ratings
-
-</details>
-
----
-
-## Tech Stack
-
-<details>
-<summary><b>Backend</b></summary>
-
-| Technology | Purpose |
-|---|---|
-| **FastAPI** | Async web framework with SSE streaming |
-| **SQLAlchemy 2.0** | Async ORM with PostgreSQL (asyncpg) |
-| **ChromaDB** | Vector store — cosine similarity, per-workspace collections |
-| **LightRAG** | Knowledge graph — entity extraction, multi-hop queries |
-| **Docling** | Document parsing — PDF, DOCX, PPTX, HTML with structural extraction |
-| **sentence-transformers** | BAAI/bge-m3 embeddings + BAAI/bge-reranker-v2-m3 reranking |
-| **google-genai** | Gemini API — chat, vision, function calling, extended thinking |
-| **ollama** | Local LLM — tool calling via prompt tags, multimodal support |
-
-</details>
-
-<details>
-<summary><b>Frontend</b></summary>
-
-| Technology | Purpose |
-|---|---|
-| **React 19** + **TypeScript 5.9** | UI framework with strict typing |
-| **Vite 7** | Dev server and production bundler |
-| **TailwindCSS 4** | Utility-first styling with dark / light theme |
-| **Zustand 5** | Lightweight state management |
-| **React Query 5** | Async data fetching, caching, and mutations |
-| **Framer Motion 12** | Layout animations, transitions, staggered entrances |
-| **react-markdown** + **KaTeX** | Rich markdown with LaTeX math rendering |
-| **Lucide React** | Icon library |
-
-</details>
-
-<details>
-<summary><b>Infrastructure</b></summary>
-
-| Technology | Purpose |
-|---|---|
-| **PostgreSQL 15** | Document metadata, chat history, workspace config |
-| **ChromaDB** | Vector embeddings (HTTP client, containerized) |
-| **LightRAG** | File-based KG (NetworkX + NanoVectorDB — no extra services) |
-| **Docker Compose** | Full-stack deployment (4 containers) |
-| **nginx** | Production frontend serving + API/SSE reverse proxy |
-
-</details>
+Multi-tenancy enforced via PostgreSQL `tenant` model and JWT claims.
 
 ---
 
@@ -299,24 +99,21 @@ The chat system uses a semi-agentic architecture with real-time SSE streaming:
 ### Option A: Docker (Full Stack)
 
 ```bash
-git clone https://github.com/LeDat98/HRAG.git
-cd HRAG
 cp .env.example .env
-# Edit .env — set GOOGLE_AI_API_KEY (or switch to Ollama)
+# Edit .env — set GOOGLE_AI_API_KEY (or configure Ollama)
 docker compose up -d
 ```
 
-First build takes ~5-10 minutes (downloads ML models ~2.5GB). Open http://localhost:5174
+First build takes ~5–10 minutes (~2.5GB ML models). Access at http://localhost:5174
 
 ### Option B: Local Development
 
 ```bash
-git clone https://github.com/LeDat98/HRAG.git
-cd HRAG
-./setup.sh
+./setup.sh                    # One-time setup: venv, pip deps, infra services, frontend deps
+./run_dev.sh                  # Starts backend + frontend + workers combined
 ```
 
-The script checks prerequisites, creates venv, installs deps, starts PostgreSQL + ChromaDB, and optionally downloads ML models.
+Or manually in three terminals:
 
 ```bash
 # Terminal 1 — Backend (port 8080)
@@ -324,71 +121,126 @@ The script checks prerequisites, creates venv, installs deps, starts PostgreSQL 
 
 # Terminal 2 — Frontend (port 5174)
 ./run_fe.sh
+
+# Terminal 3 — Workers (parse, embed, caption, kg)
+./run_workers.sh
 ```
 
-Open http://localhost:5174
-
-<details>
-<summary><b>System Requirements</b></summary>
-
-| Resource | Minimum | Recommended |
-|---|---|---|
-| RAM | 4 GB | 8 GB+ |
-| Disk | 5 GB | 10 GB+ |
-| Python | 3.10+ | 3.11+ |
-| Node.js | 18+ | 22 LTS |
-| Docker | 20+ | Latest |
-
-</details>
-
----
-
-<details>
-<summary><h2>Configuration</h2></summary>
-
-Copy `.env.example` and configure:
+### Frontend Only
 
 ```bash
-cp .env.example .env
+cd frontend
+pnpm install
+pnpm dev          # Dev server on port 5174
+pnpm build        # Production bundle → dist/
 ```
-
-### Required
-
-| Variable | Description |
-|---|---|
-| `GOOGLE_AI_API_KEY` | Google AI API key (required for Gemini provider) |
-
-### LLM
-
-| Variable | Default | Description |
-|---|---|---|
-| `LLM_PROVIDER` | `gemini` | `gemini` or `ollama` |
-| `LLM_MODEL_FAST` | `gemini-2.5-flash` | Model for chat and KG extraction |
-| `LLM_THINKING_LEVEL` | `medium` | Gemini 3.x thinking: `minimal` / `low` / `medium` / `high` |
-| `LLM_MAX_OUTPUT_TOKENS` | `8192` | Max output tokens (includes thinking) |
-| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server URL |
-| `OLLAMA_MODEL` | `gemma3:12b` | Ollama model name |
-
-### RAG Pipeline
-
-| Variable | Default | Description |
-|---|---|---|
-| `HRAG_EMBEDDING_MODEL` | `BAAI/bge-m3` | Embedding model (1024-dim) |
-| `HRAG_RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` | Cross-encoder reranker |
-| `HRAG_VECTOR_PREFETCH` | `20` | Candidates before reranking |
-| `HRAG_RERANKER_TOP_K` | `8` | Final results after reranking |
-| `HRAG_ENABLE_KG` | `true` | Enable knowledge graph extraction |
-| `HRAG_ENABLE_IMAGE_EXTRACTION` | `true` | Extract images from documents |
-| `HRAG_ENABLE_IMAGE_CAPTIONING` | `true` | LLM-caption images for search |
-| `HRAG_KG_LANGUAGE` | `Vietnamese` | KG extraction language |
-
-</details>
 
 ---
 
-## Roadmap
+## Architecture
 
-- [ ] **Multimodal Retrieval** — Integrate Gemini Embedding 2 (multimodal) for audio and video input retrieval — ask questions about podcasts, lectures, or video content directly
+### Document Processing Pipeline
+
+```
+Upload → parse_worker → embed_worker → caption_worker → kg_worker
+             ↓                ↓               ↓               ↓
+           MinIO          ChromaDB       MinIO (captions)  LightRAG / LegalKG
+```
+
+Workers are selected at runtime via the `WORKER_TYPE` env var.
+
+### Chat Agent (LangGraph)
+
+```
+START
+  → abbr_expander        (expand abbreviations before routing)
+  → memory_recall        (load user memories from Graphiti)
+  → intent_classifier    (classify + rewrite query via Qwen3-4B)
+  → [direct_answer]      (greeting / personal intent)
+  → [write_executor]     (write_summarize / suggest_edits / grammar_check)
+  → [agent_rag_executor] (search / list_docs / summarize / kg_query / search_doc_num / search_abbr)
+      → [write_executor] (intent=summarize: RAG fetches doc, Write summarizes)
+      → [answer_generator]
+  → END
+```
+
+Controlled by `NEXUSRAG_AGENT_BACKEND` (`legacy` | `langgraph`).
+
+### Storage
+
+| Service | Purpose |
+|---|---|
+| **PostgreSQL** | Document metadata, chunks, chat history, workspaces, users, tenants |
+| **ChromaDB** | Vector embeddings (HTTP client, containerized) |
+| **MinIO** | Raw uploads, parsed markdown, captions (S3-compatible) |
+| **LightRAG** | File-based KG (NetworkX + NanoVectorDB) |
+| **Neo4j** | Optional KG backend for LegalKGService |
+
+---
+
+## Tech Stack
+
+### Backend
+
+| Technology | Purpose |
+|---|---|
+| **FastAPI** | Async web framework with SSE streaming |
+| **SQLAlchemy 2.0** | Async ORM with PostgreSQL (asyncpg) |
+| **ChromaDB** | Vector store — per-workspace collections |
+| **LightRAG / LegalKG** | Knowledge graph extraction |
+| **Docling** | Document parsing (PDF, DOCX, PPTX) |
+| **BAAI/bge-m3** | Embeddings (1024-dim) |
+| **BAAI/bge-reranker-v2-m3** | Cross-encoder reranking |
+| **LangGraph** | Agent state machine |
+
+### Frontend
+
+| Technology | Purpose |
+|---|---|
+| **React 19** + **TypeScript** | UI framework |
+| **Vite** | Dev server and bundler |
+| **TailwindCSS** | Styling with dark/light theme |
+| **Zustand** | Client state management |
+| **React Query v5** | Server state (fetching, caching, mutations) |
+| **Framer Motion** | Animations |
+| **React Router v7** | Routing (multi-page SPA) |
+| **react-markdown** + **KaTeX** | Markdown + LaTeX rendering |
+
+### Infrastructure
+
+| Technology | Purpose |
+|---|---|
+| **PostgreSQL 15** (pgvector) | Metadata + vector storage |
+| **ChromaDB** | Vector embeddings |
+| **RabbitMQ** | Async job queue |
+| **MinIO** | Object storage |
+| **nginx** | Reverse proxy + SPA serving |
+| **Docker Compose** | Full-stack deployment |
+
+---
+
+## Configuration
+
+All configuration via `.env` (copy from `.env.example`). Two prefix families coexist:
+
+- `NEXUSRAG_*` — core pipeline settings
+- `HRAG_*` — additional features (contextual embeddings, BM25)
+
+### Key Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `LLM_PROVIDER` | `gemini` | `gemini`, `ollama`, or `openai_compatible` |
+| `GOOGLE_AI_API_KEY` | — | Required for Gemini |
+| `NEXUSRAG_AGENT_BACKEND` | `langgraph` | `legacy` or `langgraph` |
+| `NEXUSRAG_ENABLE_KG` | `true` | Toggle knowledge graph extraction |
+| `NEXUSRAG_ENABLE_IMAGE_CAPTIONING` | `true` | LLM captioning for extracted images |
+| `NEXUSRAG_VECTOR_PREFETCH` | `20` | Candidates before reranking |
+| `NEXUSRAG_RERANKER_TOP_K` | `8` | Final results after reranking |
+| `HRAG_ENABLE_CONTEXTUAL_EMBEDDINGS` | `true` | Contextual embedding enrichment |
+| `HRAG_ENABLE_BM25` | `false` | Enable BM25 alongside vector search |
+
+See `.env.example` for all ~208 configuration options.
 
 ---
 
@@ -396,50 +248,35 @@ cp .env.example .env
 
 All endpoints prefixed with `/api/v1`. Interactive docs at http://localhost:8080/docs
 
-<details>
-<summary><b>Workspaces</b></summary>
+### Core Endpoints
 
-| Method | Endpoint | Description |
+| Method | Path | Description |
 |---|---|---|
-| `GET` | `/workspaces` | List all workspaces |
-| `POST` | `/workspaces` | Create workspace |
-| `PUT` | `/workspaces/{id}` | Update workspace |
-| `DELETE` | `/workspaces/{id}` | Delete workspace + all data |
-
-</details>
-
-<details>
-<summary><b>Documents</b></summary>
-
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/documents/upload/{workspace_id}` | Upload file |
+| `GET/POST` | `/workspaces` | List / create workspaces |
+| `PUT/DELETE` | `/workspaces/{id}` | Update / delete workspace |
+| `POST` | `/documents/upload/{workspace_id}` | Upload document |
 | `GET` | `/documents/{id}/markdown` | Get parsed content |
-| `GET` | `/documents/{id}/images` | List extracted images |
 | `DELETE` | `/documents/{id}` | Delete document |
-
-</details>
-
-<details>
-<summary><b>RAG — Search, Chat, Analytics</b></summary>
-
-| Method | Endpoint | Description |
-|---|---|---|
 | `POST` | `/rag/query/{workspace_id}` | Hybrid search |
-| `POST` | `/rag/chat/{workspace_id}/stream` | Agentic streaming chat (SSE) |
+| `POST` | `/rag/chat/{workspace_id}/stream` | Streaming chat (SSE) |
 | `GET` | `/rag/chat/{workspace_id}/history` | Chat history |
-| `POST` | `/rag/process/{document_id}` | Process document |
 | `GET` | `/rag/graph/{workspace_id}` | Knowledge graph data |
-| `GET` | `/rag/analytics/{workspace_id}` | Full analytics |
+| `GET` | `/rag/analytics/{workspace_id}` | Workspace analytics |
 
-</details>
+---
+
+## Document Types
+
+NexusRAG classifies Vietnamese administrative documents into 29 types:
+
+Nghị quyết (cá biệt), Quyết định (cá biệt), Chỉ thị, Quy chế, Quy định, Thông báo, Hướng dẫn, Chương trình, Kế hoạch, Phương án, Đề án, Dự án, Báo cáo, Biên bản, Tờ trình, Hợp đồng, Công văn, Công điện, Bản ghi nhớ, Bản thỏa thuận, Giấy ủy quyền, Giấy mời, Giấy giới thiệu, Giấy nghỉ phép, Phiếu gửi, Phiếu chuyển, Phiếu báo, Thư công.
+
+Each type can have a custom system prompt and KG extraction prompt per workspace.
 
 ---
 
 <div align="center">
 
-⭐ If you find HRAG useful, please consider giving it a **star** — it helps others discover the project and motivates continued development!
-
-MIT License &copy; 2026 Le Duc Dat
+MIT License &copy; 2026
 
 </div>

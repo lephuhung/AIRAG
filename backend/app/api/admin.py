@@ -9,7 +9,7 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Query, status
-from sqlalchemy import select, func, or_, desc
+from sqlalchemy import select, update, func, or_, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta
 
@@ -20,6 +20,7 @@ from app.models.tenant import Tenant, TenantUser
 from app.models.document import Document
 from app.models.knowledge_base import KnowledgeBase
 from app.models.document_type import DocumentType
+from app.models.abbreviation import Abbreviation
 
 from app.schemas.admin import (
     AdminUserUpdate,
@@ -312,6 +313,11 @@ async def delete_user(
     user = result.scalar_one_or_none()
     if user is None:
         raise NotFoundError("User", user_id)
+
+    # Deactivate abbreviations when user is deleted (keep records, mark inactive)
+    await db.execute(
+        update(Abbreviation).where(Abbreviation.user_id == user_id).values(is_active=False)
+    )
 
     await db.delete(user)
     await db.commit()

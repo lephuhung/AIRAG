@@ -319,6 +319,12 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle, isNarrow }: 
                 >
                   {workspaces.slice(0, 20).map((ws) => {
                     const isActive = urlWorkspaceId === String(ws.id);
+                    const visibilityColor =
+                      ws.visibility === "public"
+                        ? "bg-blue-500"
+                        : ws.visibility === "tenant"
+                        ? "bg-purple-500"
+                        : "bg-green-500";
                     return (
                       <button
                         key={ws.id}
@@ -332,12 +338,16 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle, isNarrow }: 
                       >
                         <Database className="w-3.5 h-3.5 flex-shrink-0" />
                         <span className="truncate">{ws.name}</span>
-                        <span className={cn(
-                          "ml-auto text-xs font-bold px-1.5 rounded-full min-w-[20px] tabular-nums transition-colors tracking-tight",
-                          isActive
-                            ? "bg-primary/20 text-primary"
-                            : "bg-muted text-muted-foreground group-hover:bg-muted-foreground/15 group-hover:text-foreground"
-                        )}>
+                        <span
+                          className={cn(
+                            "ml-auto text-xs font-bold px-1.5 rounded-full min-w-[20px] tabular-nums transition-colors tracking-tight",
+                            isActive
+                              ? "bg-primary/20 text-primary"
+                              : cn("group-hover:bg-muted-foreground/15 group-hover:text-foreground", visibilityColor),
+                            !isActive && "text-white"
+                          )}
+                          title={ws.visibility}
+                        >
                           {ws.document_count}
                         </span>
                       </button>

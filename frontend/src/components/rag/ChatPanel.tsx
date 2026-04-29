@@ -613,49 +613,56 @@ function PeopleCard({ people, isLoadingMore }: { people: PeopleRecord[], isLoadi
         return (
           <div
             key={idx}
-            className="relative rounded-lg border bg-muted/20 p-3 hover:bg-muted/30 transition-colors"
+            className="relative rounded-xl border border-border/40 bg-zinc-50/50 dark:bg-zinc-900/40 p-4 hover:shadow-md transition-all duration-300"
           >
             {/* Copy button — top right corner */}
             <button
               onClick={() => handleCopyCard(person, idx)}
               className={cn(
-                "absolute top-2 right-2 p-1.5 rounded-md text-xs transition-all",
+                "absolute top-3 right-3 p-2 rounded-lg text-xs transition-all",
                 copiedIdx === idx
                   ? "bg-emerald-500/10 text-emerald-600"
-                  : "bg-muted/50 hover:bg-muted text-muted-foreground hover:text-foreground"
+                  : "bg-muted/30 hover:bg-muted text-muted-foreground hover:text-foreground"
               )}
               title="Copy"
             >
               {copiedIdx === idx ? (
-                <ClipboardCheck className="w-3.5 h-3.5" />
+                <ClipboardCheck className="w-4 h-4" />
               ) : (
-                <Copy className="w-3.5 h-3.5" />
+                <Copy className="w-4 h-4" />
               )}
             </button>
 
             {/* Header: name + schema badge */}
-            <div className="flex items-center gap-2 mb-2 pr-8">
-              <div className="w-7 h-7 rounded-full bg-primary/10 flex items-center justify-center text-primary text-xs font-semibold">
+            <div className="flex items-center gap-3 mb-4 pr-10">
+              <div className="w-9 h-9 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary text-sm font-bold shadow-sm">
                 {name.charAt(0).toUpperCase()}
               </div>
               <div className="flex-1 min-w-0">
-                <p className="font-medium text-sm truncate">{name}</p>
+                <p className="font-bold text-[15px] text-foreground tracking-tight truncate">{name}</p>
                 {schema && (
-                  <p className="text-[10px] text-muted-foreground uppercase tracking-wide">{schema}</p>
+                  <div className="flex items-center gap-1.5 mt-0.5">
+                    <span className="w-1.5 h-1.5 rounded-full bg-primary/60" />
+                    <p className="text-[10px] text-muted-foreground font-bold uppercase tracking-wider">{schema}</p>
+                  </div>
                 )}
               </div>
             </div>
 
             {/* Fields grid */}
-            <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[12.5px]">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2.5">
               {displayFields.map(([key, val]) => {
                 const config = FIELD_CONFIG[key];
                 if (!config) return null;
                 return (
-                  <div key={key} className="flex items-start gap-1.5 text-muted-foreground">
-                    <span className="mt-0.5 text-primary/60">{config.icon}</span>
-                    <span className="text-[11px]">{config.label}:</span>
-                    <span className="text-[11px] font-medium text-foreground/80 truncate">{String(val)}</span>
+                  <div key={key} className="flex items-center gap-2.5">
+                    <div className="flex-shrink-0 w-5 h-5 rounded-md bg-muted/40 flex items-center justify-center text-primary/70 scale-90">
+                      {config.icon}
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-[10px] text-muted-foreground font-semibold uppercase tracking-tight leading-none mb-0.5">{config.label}</p>
+                      <p className="text-[12px] font-medium text-foreground/90 truncate">{String(val)}</p>
+                    </div>
                   </div>
                 );
               })}
@@ -1896,36 +1903,41 @@ const MessageBubble = memo(function MessageBubble({
     .toUpperCase();
 
   const proseClasses = cn(
-    "prose max-w-none text-foreground/90 font-chat text-[15.5px] leading-relaxed",
-    "[&_p]:my-1.5 [&_p]:text-justify [&_ul]:my-1.5 [&_ol]:my-1.5 [&_li]:my-1 [&_li]:text-justify",
-    "[&_pre]:bg-transparent [&_pre]:border-none [&_pre]:p-0 [&_pre]:m-0",
-    "[&_code]:bg-muted/50 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-[13px] [&_code]:text-foreground/90 [&_code]:font-[400]",
-    "[&_a]:text-primary [&_a]:underline [&_a]:underline-offset-2",
-    "[&_strong]:text-foreground [&_em]:text-foreground/80",
-    "[&_h1]:text-foreground [&_h2]:text-foreground [&_h3]:text-foreground [&_h4]:text-foreground",
-    "[&_h1]:text-base [&_h1]:font-bold [&_h1]:mt-4 [&_h1]:mb-2 [&_h1]:tracking-tight",
-    "[&_h2]:text-[15px] [&_h2]:font-semibold [&_h2]:mt-3 [&_h2]:mb-1.5 [&_h2]:tracking-tight",
-    "[&_h3]:text-sm [&_h3]:font-semibold [&_h3]:mt-2.5 [&_h3]:mb-1 [&_h3]:tracking-tight",
-    "[&_blockquote]:border-l-2 [&_blockquote]:border-primary/30 [&_blockquote]:pl-3 [&_blockquote]:italic [&_blockquote]:text-foreground/60",
-    "[&_table]:text-[13px] [&_th]:px-2.5 [&_th]:py-1.5 [&_td]:px-2.5 [&_td]:py-1.5 [&_th]:text-foreground/80 [&_td]:text-foreground/80",
+    "prose max-w-none text-foreground/90 font-chat text-[15px] leading-[1.65]",
+    "[&_p]:my-2 [&_p]:text-justify [&_ul]:my-2 [&_ol]:my-2 [&_li]:my-1.5 [&_li]:text-justify",
+    "[&_pre]:bg-zinc-950/50 [&_pre]:dark:bg-black/40 [&_pre]:border [&_pre]:border-border/50 [&_pre]:rounded-xl [&_pre]:p-4 [&_pre]:my-4",
+    "[&_code]:bg-muted/60 [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded-md [&_code]:text-[13px] [&_code]:text-foreground/90 [&_code]:font-medium",
+    "[&_a]:text-primary [&_a]:underline [&_a]:underline-offset-2 [&_a]:decoration-primary/30 hover:[&_a]:decoration-primary transition-all",
+    "[&_strong]:text-foreground [&_strong]:font-bold",
+    "[&_h1]:text-foreground [&_h1]:text-lg [&_h1]:font-bold [&_h1]:mt-6 [&_h1]:mb-3 [&_h1]:tracking-tight",
+    "[&_h2]:text-foreground [&_h2]:text-base [&_h2]:font-semibold [&_h2]:mt-5 [&_h2]:mb-2.5 [&_h2]:tracking-tight",
+    "[&_h3]:text-foreground [&_h3]:text-[15px] [&_h3]:font-semibold [&_h3]:mt-4 [&_h3]:mb-2 [&_h3]:tracking-tight",
+    "[&_blockquote]:border-l-3 [&_blockquote]:border-primary/40 [&_blockquote]:bg-primary/5 [&_blockquote]:px-4 [&_blockquote]:py-1 [&_blockquote]:italic [&_blockquote]:text-foreground/70 [&_blockquote]:rounded-r-lg",
+    "[&_table]:text-[13px] [&_table]:border-collapse [&_th]:border [&_th]:border-border/60 [&_td]:border [&_td]:border-border/60 [&_th]:bg-muted/40 [&_th]:px-3 [&_th]:py-2 [&_td]:px-3 [&_td]:py-2",
     "[&_li]:text-foreground/90",
-    "[&_.katex-display]:overflow-x-auto [&_.katex-display]:py-2.5",
-    "[&_.katex]:text-[0.95em]"
+    "[&_.katex-display]:overflow-x-auto [&_.katex-display]:py-3",
+    "[&_.katex]:text-[1.05em]"
   );
 
   return (
     <motion.div
-      initial={{ opacity: 0, y: 10 }}
+      initial={{ opacity: 0, y: 12 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
-      className={cn("flex gap-2", isUser ? "justify-end" : "justify-start")}
+      transition={{ duration: 0.5, ease: [0.19, 1, 0.22, 1] }}
+      className={cn("flex gap-3", isUser ? "justify-end" : "justify-start")}
     >
-      {/* Assistant: Bot icon with glow ring during streaming */}
+      {!isUser && (
+        <div className="flex-shrink-0 mt-1">
+          <div className="w-8 h-8 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary shadow-sm">
+            <Sparkles className="w-4 h-4" />
+          </div>
+        </div>
+      )}
 
       <div
         className={cn(
           isUser
-            ? "max-w-[85%] rounded-xl px-3 py-2 bg-secondary/50"
+            ? "max-w-[85%] rounded-2xl px-4 py-3 bg-secondary/40 border border-border/40 shadow-sm"
             : "max-w-[90%] min-w-0 py-1"
         )}
       >
@@ -1998,11 +2010,11 @@ const MessageBubble = memo(function MessageBubble({
 
             return (
               <>
-                <p className="text-[15.5px] leading-relaxed whitespace-pre-wrap font-chat">
+                <p className="text-[15px] leading-[1.65] whitespace-pre-wrap font-chat text-foreground/90">
                   {elements}
                 </p>
                 {remainingDocs.length > 0 && (
-                  <div className="flex flex-wrap gap-1.5 mt-2">
+                  <div className="flex flex-wrap gap-2 mt-3">
                     {remainingDocs.map(doc => (
                       <FileAttachmentBadge key={doc.id} doc={doc} />
                     ))}
@@ -2218,7 +2230,7 @@ function SuggestionChips({ onSelect }: { onSelect: (text: string) => void }) {
     { text: t("chat.suggestion_topics"), icon: <ImageIcon className="w-3.5 h-3.5 text-orange-400" /> },
     { text: t("chat.suggestion_entities"), icon: <Music className="w-3.5 h-3.5 text-pink-400" /> },
     { text: t("chat.suggestion_methodology"), icon: <GraduationCap className="w-3.5 h-3.5 text-blue-400" /> },
-    { text: "Viết bất cứ thứ gì", icon: <Pencil className="w-3.5 h-3.5 text-gray-400" /> },
+    { text: t("chat.suggestion_any"), icon: <Pencil className="w-3.5 h-3.5 text-gray-400" /> },
   ];
 
   return (
@@ -2345,10 +2357,10 @@ function ChatInputArea({
   };
 
   return (
-    <div className="relative w-full">
+    <div className="relative w-full group">
       <div 
         data-chat-input-container="true"
-        className="relative flex flex-col bg-background/80 backdrop-blur-3xl border border-border/60 rounded-[22px] shadow-[0_8px_30px_rgb(0,0,0,0.06)] transition-all duration-300 focus-within:shadow-primary/8 focus-within:border-primary/20 overflow-hidden ring-1 ring-black/5 dark:ring-white/5"
+        className="relative flex flex-col bg-background/60 backdrop-blur-3xl border border-border/80 rounded-[28px] shadow-[0_12px_40px_rgb(0,0,0,0.08)] transition-all duration-500 focus-within:shadow-primary/10 focus-within:border-primary/30 overflow-hidden ring-1 ring-black/5 dark:ring-white/5"
       >
         {/* Attached Files Preview */}
         {attachedFiles.length > 0 && (
@@ -2884,7 +2896,7 @@ export const ChatPanel = memo(function ChatPanel({
       }
 
       if (file.name.toLowerCase().endsWith(".doc")) {
-        toast.error("Format .doc is not supported. Please convert to .docx before uploading.");
+        toast.error(t("chat.unsupported_doc"));
         return;
       }
 
@@ -3249,15 +3261,12 @@ export const ChatPanel = memo(function ChatPanel({
           const newSession = await createSession.mutateAsync({ title: msg.slice(0, 30) || t("nav.new_chat") });
           effectiveSessionId = newSession.id;
 
-          // Migrate "New Chat" draft/mentions to the new session ID
-          const draft = localStorage.getItem("hrag-draft-new");
-          if (draft) localStorage.setItem(`hrag-draft-${effectiveSessionId}`, draft);
-          
-          const mentions = localStorage.getItem("hrag-mentions-new");
-          if (mentions) localStorage.setItem(`hrag-mentions-${effectiveSessionId}`, mentions);
+          // Clear "New Chat" draft/mentions since we are sending it
+          localStorage.removeItem("hrag-draft-new");
+          localStorage.removeItem("hrag-mentions-new");
           
           if (document.documentElement.classList.contains("debug-mode")) {
-            console.log(`[Persistence] Migrated "new" -> "${effectiveSessionId}"`);
+            console.log(`[Persistence] Cleared "new" draft for session "${effectiveSessionId}"`);
           }
 
           skipResetRef.current = newSession.id;
@@ -3318,6 +3327,9 @@ export const ChatPanel = memo(function ChatPanel({
 
       setMessages((prev) => [...prev, userMsg, placeholderMsg]);
       setInput("");
+      setReferencedDocs([]); // Clear mentions draft
+      localStorage.removeItem(sessionId ? `hrag-draft-${sessionId}` : "hrag-draft-new");
+      localStorage.removeItem(sessionId ? `hrag-mentions-${sessionId}` : "hrag-mentions-new");
       // Scroll new user message to top so agent response fills the space below
       scrollUserMsgToTop(userMsg.id);
 
@@ -3496,14 +3508,20 @@ export const ChatPanel = memo(function ChatPanel({
           <div className="flex flex-col h-full bg-background border-r relative z-0 overflow-hidden">
             {/* Header */}
             {/* Header */}
-            <div className="flex-shrink-0 flex items-center justify-between px-4 py-3 bg-background/50 backdrop-blur-md">
-              <div className="flex items-center gap-2.5">
-                <div className="w-8 h-8 rounded-xl flex items-center justify-center bg-background border overflow-hidden shadow-sm">
-                  <img src="/logo.png" alt="AIRAG" className="w-5 h-5 object-contain" />
+            <div className="flex-shrink-0 flex items-center justify-between px-6 py-4 bg-background/40 backdrop-blur-xl border-b border-border/40">
+              <div className="flex items-center gap-3">
+                <div className="w-9 h-9 rounded-xl flex items-center justify-center bg-background border border-border/60 overflow-hidden shadow-sm transition-transform hover:scale-105">
+                  <img src="/logo.png" alt="AIRAG" className="w-5.5 h-5.5 object-contain" />
                 </div>
-                <h2 className="text-[14px] font-bold tracking-tight text-foreground line-clamp-1">
-                  {sessionTitle || (sessionId ? `${t("chat.session", { id: sessionId })}` : t("chat.select_session"))}
-                </h2>
+                <div>
+                  <h2 className="text-[14px] font-bold tracking-tight text-foreground line-clamp-1">
+                    {sessionTitle || (sessionId ? `${t("chat.session", { id: sessionId })}` : t("chat.select_session"))}
+                  </h2>
+                  <div className="flex items-center gap-1.5">
+                    <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                    <span className="text-[10px] text-muted-foreground font-medium uppercase tracking-wider">{t("chat.assistant_online")}</span>
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -3512,15 +3530,15 @@ export const ChatPanel = memo(function ChatPanel({
               <div className="flex-1 flex flex-col items-center justify-center px-4 overflow-y-auto pb-[10vh] scrollbar-none">
                 <div className="w-full max-w-[720px] flex flex-col items-center translate-y-[-4vh]">
                   {/* Greeting */}
-                  <div className="mb-10 text-center animate-in fade-in zoom-in-95 duration-1000 ease-out">
-                    <div className="inline-flex items-center gap-2 mb-4 px-3 py-1 rounded-full bg-primary/5 border border-primary/10 text-primary">
-                      <Sparkles className="w-3.5 h-3.5" />
-                      <span className="text-[11px] font-bold uppercase tracking-wider">Assistant</span>
+                  <div className="mb-12 text-center animate-in fade-in zoom-in-95 duration-1000 ease-out">
+                    <div className="inline-flex items-center gap-2 mb-6 px-4 py-1.5 rounded-full bg-primary/10 border border-primary/20 text-primary shadow-[0_0_15px_rgba(var(--color-primary),0.1)]">
+                      <Sparkles className="w-4 h-4" />
+                      <span className="text-[12px] font-bold uppercase tracking-[0.1em]">{t("chat.ai_assistant")}</span>
                     </div>
-                    <h1 className="text-3xl md:text-5xl font-bold tracking-tight text-foreground mb-4">
-                      Xin chào {user?.full_name || "XayDung"}!
+                    <h1 className="text-4xl md:text-6xl font-bold tracking-tight text-foreground mb-6 bg-gradient-to-b from-foreground to-foreground/60 bg-clip-text text-transparent">
+                      {t("chat.greeting", { name: user?.full_name || "XayDung" })}
                     </h1>
-                    <p className="text-lg md:text-2xl text-muted-foreground/60 font-medium">
+                    <p className="text-xl md:text-2xl text-muted-foreground/50 font-medium max-w-[600px] mx-auto leading-relaxed">
                       {t("chat.assistant_desc")}
                     </p>
                   </div>

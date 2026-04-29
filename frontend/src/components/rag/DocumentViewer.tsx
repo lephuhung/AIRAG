@@ -186,35 +186,54 @@ function extractHeadings(markdown: string): Heading[] {
 // Insert page dividers into markdown text
 // ---------------------------------------------------------------------------
 function insertPageDividers(markdown: string): string {
-  // Two source formats are handled:
-  //
-  // OCR (HunyuanOCR):  "<!-- page N -->\n\nContent\n\n---\n\n<!-- page N+1 -->"
-  //   → The --- is just a separator; page info is in the <!-- comment.
-  //   → We consume the --- that follows <!-- page N --> so it doesn't become
-  //     a spurious PageDivider with the wrong auto-incremented number.
-  //
-  // Docling:  "---\n\n## Page N" (or <!-- page N -->) in the exported markdown.
-  //   → The --- followed by a heading IS the page marker; we keep it for
-  //     the hr override to turn into a PageDivider.
+  if (!markdown) return "";
 
-  // Step 1 — OCR format: <!-- page N --> ...content... \n\n---\n\n<!-- page M -->
-  let result = markdown.replace(
-    /<!--\s*page\s+(\d+)\s*-->\s*\n+([\s\S]*?)\n+---\n+/gi,
-    (_, pageNo, content) => {
-      return `<hr data-page="${pageNo}" />\n\n${content.trim()}\n\n`;
+  let result = markdown;
+
+  // Step 1 — Standardize OCR format: <!-- page N --> followed by ---
+  // We consume the --- if it's within 50 chars of a page marker to avoid double dividers.
+  result = result.replace(
+    /<!--\s*page\s+(\d+)\s*-->(\s*)\n+---\n+/gi,
+    (_, pageNo, whitespace) => `\n<hr data-page="${pageNo}" />\n${whitespace}`
+  );
+
+  // Step 2 — Handle remaining standalone <!-- page N --> markers
+  result = result.replace(
+    /<!--\s*page\s+(\d+)\s*-->/gi,
+    (_, pageNo) => `\n<hr data-page="${pageNo}" />\n`
+  );
+
+  // Step 3 — Pre-process all horizontal rules (---) that don't have a page number.
+  // To avoid side-effects in render, we'll do a sequential pass here.
+  let pageCounter = 1;
+  const parts = result.split(/(<hr data-page="\d+" \/>)/i);
+  
+  const finalParts = parts.map(part => {
+    const pageMatch = part.match(/<hr data-page="(\d+)" \/>/i);
+    if (pageMatch) {
+      pageCounter = parseInt(pageMatch[1]);
+      return part;
+    }
+    
+    // For plain --- markers, we auto-increment from the last known page
+    return part.replace(/\n---\n/g, () => {
+      pageCounter += 1;
+      return `\n<hr data-page="${pageCounter}" />\n`;
+    });
+  });
+
+  result = finalParts.join("");
+
+  // Step 4 — De-duplicate adjacent markers (e.g. <hr ... /><hr ... />)
+  // We keep only the last one in a cluster as it's usually the most "current" page.
+  result = result.replace(
+    /(<hr data-page="\d+" \/>\s*){2,}/gi,
+    (match) => {
+      const markers = match.match(/<hr data-page="\d+" \/>/gi);
+      return markers ? markers[markers.length - 1] : match;
     }
   );
 
-  // Step 2 — Remaining <!-- page N --> without trailing --- (standalone Docling style)
-  result = result.replace(
-    /<!--\s*page\s+(\d+)\s*-->/gi,
-    (_, pageNo) => `<hr data-page="${pageNo}" />`
-  );
-
-  // Step 3 — Consume orphaned trailing --- that has no page marker after it
-  result = result.replace(/\n+---\n+$/gi, '\n\n');
-
-  // Step 4 — Docling ---\n\n## Page N pattern → left for hr override (auto-increment)
   return result;
 }
 
@@ -240,7 +259,6 @@ export const DocumentViewer = memo(function DocumentViewer({
 }: DocumentViewerProps) {
   const { t } = useTranslation();
   const contentRef = useRef<HTMLDivElement>(null);
-  const pageCounterRef = useRef(1);
   const [activeHeading, setActiveHeading] = useState<string | null>(null);
   const [showToc, setShowToc] = useState(true);
 
@@ -307,9 +325,7 @@ export const DocumentViewer = memo(function DocumentViewer({
 
   // Reset page counter whenever the document changes (not just markdown content).
   // This prevents the counter from leaking between documents when markdown is cached.
-  useEffect(() => {
-    pageCounterRef.current = 1;
-  }, [doc.id]);
+  // No side-effects needed here as page numbers are pre-assigned in processedMarkdown
 
   // ---- Process markdown (insert page dividers) ----
   const processedMarkdown = useMemo(() => {
@@ -341,11 +357,13 @@ export const DocumentViewer = memo(function DocumentViewer({
       return <h4 id={id} {...props}>{children}</h4>;
     },
     hr: (props) => {
-      // If data-page is set (from <!-- page N --> marker), parse and use it;
-      // otherwise auto-increment for Docling's ---## style markers.
+      // data-page is set during insertPageDividers (pre-processing)
       const dp = (props as Record<string, unknown>)["data-page"];
-      const pageNo =
-        dp != null ? Number(dp) : (pageCounterRef.current += 1, pageCounterRef.current);
+      const pageNo = dp != null ? Number(dp) : 0;
+      
+      if (pageNo === 0) {
+        return <hr className="my-8 border-t border-border/20" />;
+      }
       return <PageDivider pageNo={pageNo} />;
     },
     p: ({ children, node, ...props }) => {
@@ -591,13 +609,20 @@ export const DocumentViewer = memo(function DocumentViewer({
       // Strategy 2: No heading_path - find text content matching chunk.content
       // and highlight its container element
       if (chunk.content) {
-        // Get first 100 chars of chunk content for matching (avoid very long searches)
-        const searchText = chunk.content.slice(0, 100).replace(/[<>]/g, "");
-        const allElements = contentRef.current.querySelectorAll("p, div, li, td, th");
-        for (const el of allElements) {
-          if (el.textContent && el.textContent.includes(searchText.slice(0, 50))) {
-            el.classList.add("chunk-hl", "chunk-hl-sibling");
-            break;
+        // Strip markdown syntax characters before matching against DOM textContent
+        const searchText = chunk.content
+          .replace(/[#*`_~\[\]()]/g, "") // Remove common markdown chars
+          .slice(0, 100)
+          .trim();
+          
+        if (searchText.length > 5) {
+          const allElements = contentRef.current.querySelectorAll("p, div, li, td, th");
+          for (const el of allElements) {
+            // Match against a slightly shorter segment to allow for minor parsing differences
+            if (el.textContent && el.textContent.includes(searchText.slice(0, 40))) {
+              el.classList.add("chunk-hl", "chunk-hl-sibling");
+              break;
+            }
           }
         }
       }
@@ -635,7 +660,7 @@ export const DocumentViewer = memo(function DocumentViewer({
       )}
 
       {/* Main markdown content */}
-      <div ref={contentRef} className="flex-1 min-h-0 overflow-y-auto">
+      <div ref={contentRef} className="flex-1 min-h-0 overflow-y-auto scroll-smooth">
         {/* TOC toggle (for smaller screens / when TOC hidden) */}
         {headings.length > 0 && (
           <button
@@ -651,101 +676,109 @@ export const DocumentViewer = memo(function DocumentViewer({
           </button>
         )}
 
-        <div className="px-6 py-4">
-          {/* Document title header */}
-          <div className="mb-4 pb-3 border-b">
-            <div className="flex items-center justify-between">
-              <div className="flex flex-col gap-0.5 min-w-0">
-                <div className="flex items-center gap-2 flex-wrap">
-                  {doc.document_type?.name && (
-                    <span className="text-xs font-medium px-1.5 py-0.5 rounded bg-primary/10 text-primary">
-                      {doc.document_type.name}
-                    </span>
-                  )}
-                  {doc.document_number && (
-                    <span className="text-xs font-mono text-muted-foreground">{doc.document_number}</span>
-                  )}
+        {/* Centered A4-like container for better readability on wide screens */}
+        <div className="w-full h-full bg-muted/10">
+          <div className="mx-auto max-w-[850px] min-h-full bg-background px-6 py-6 sm:px-12 sm:py-12 sm:my-8 sm:shadow-xl sm:rounded-sm transition-all duration-300">
+            {/* Document title header */}
+            <div className="mb-8 pb-4 border-b">
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex flex-col gap-1 min-w-0">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {doc.document_type?.name && (
+                      <span className="text-[10px] uppercase tracking-wider font-bold px-1.5 py-0.5 rounded bg-primary/10 text-primary">
+                        {doc.document_type.name}
+                      </span>
+                    )}
+                    {doc.document_number && (
+                      <span className="text-[10px] font-mono text-muted-foreground bg-muted px-1.5 py-0.5 rounded">{doc.document_number}</span>
+                    )}
+                  </div>
+                  <h2 className="text-xl font-bold tracking-tight text-foreground mt-1 leading-snug">{doc.document_title || doc.original_filename}</h2>
+                  <span className="text-xs text-muted-foreground/60 truncate">{doc.original_filename}</span>
                 </div>
-                <h2 className="text-base font-semibold truncate">{doc.document_title || doc.original_filename}</h2>
-                <span className="text-xs text-muted-foreground/60 truncate">{doc.original_filename}</span>
+                {/* Chunk/Full mode toggle */}
+                {hasHighlight && (
+                  <button
+                    onClick={() => setViewMode(effectiveMode === "chunk" ? "full" : "chunk")}
+                    className={cn(
+                      "flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-semibold rounded-full transition-all flex-shrink-0",
+                      effectiveMode === "chunk"
+                        ? "bg-primary text-primary-foreground shadow-md hover:shadow-lg"
+                        : "bg-muted text-muted-foreground hover:bg-muted/80"
+                    )}
+                    title={effectiveMode === "chunk" ? t("viewer.view_full") : t("viewer.view_chunk")}
+                  >
+                    {effectiveMode === "chunk" ? (
+                      <><Maximize2 className="w-3.5 h-3.5" />{t("viewer.view_full")}</>
+                    ) : (
+                      <><Minimize2 className="w-3.5 h-3.5" />{t("viewer.view_chunk")}</>
+                    )}
+                  </button>
+                )}
               </div>
-              {/* Chunk/Full mode toggle */}
-              {hasHighlight && (
-                <button
-                  onClick={() => setViewMode(effectiveMode === "chunk" ? "full" : "chunk")}
-                  className={cn(
-                    "flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium rounded-md transition-all",
-                    effectiveMode === "chunk"
-                      ? "bg-primary/10 text-primary hover:bg-primary/20"
-                      : "bg-muted text-muted-foreground hover:bg-muted/80"
-                  )}
-                  title={effectiveMode === "chunk" ? t("viewer.view_full") : t("viewer.view_chunk")}
-                >
-                  {effectiveMode === "chunk" ? (
-                    <><Maximize2 className="w-3 h-3" />{t("viewer.view_full")}</>
-                  ) : (
-                    <><Minimize2 className="w-3 h-3" />{t("viewer.view_chunk")}</>
-                  )}
-                </button>
-              )}
+              <div className="flex items-center gap-3 mt-3 text-xs text-muted-foreground border-t pt-3 border-border/30">
+                {effectiveMode === "chunk" && chunkContext ? (
+                  <>
+                    <span className="text-primary font-bold bg-primary/5 px-2 py-0.5 rounded-full">
+                      📍 Chunk {chunkContext.chunk_range[0]+1}–{chunkContext.chunk_range[1]+1} / {chunkContext.total_chunks}
+                    </span>
+                    {primaryChunk?.page_no && (
+                      <span className="flex items-center gap-1">
+                         <span className="w-1 h-1 rounded-full bg-muted-foreground/30" />
+                         Trang {primaryChunk.page_no}
+                      </span>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    {doc.page_count && doc.page_count > 0 && <span className="flex items-center gap-1">{doc.page_count} {t("files.metadata.pages")}</span>}
+                    {doc.chunk_count > 0 && <span className="flex items-center gap-1"><span className="w-1 h-1 rounded-full bg-muted-foreground/30" />{doc.chunk_count} {t("files.metadata.chunks")}</span>}
+                    {doc.parser_version && <span className="flex items-center gap-1"><span className="w-1 h-1 rounded-full bg-muted-foreground/30" />{t("viewer.parsed_by", { version: doc.parser_version })}</span>}
+                  </>
+                )}
+              </div>
             </div>
-            <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
-              {effectiveMode === "chunk" && chunkContext ? (
-                <>
-                  <span className="text-primary font-medium">
-                    📍 Chunk {chunkContext.chunk_range[0]+1}–{chunkContext.chunk_range[1]+1} / {chunkContext.total_chunks}
-                  </span>
-                  {primaryChunk?.page_no && <span>Trang {primaryChunk.page_no}</span>}
-                </>
-              ) : (
-                <>
-                  {doc.page_count && doc.page_count > 0 && <span>{doc.page_count} {t("files.metadata.pages")}</span>}
-                  {doc.chunk_count > 0 && <span>{doc.chunk_count} {t("files.metadata.chunks")}</span>}
-                  {doc.parser_version && <span>{t("viewer.parsed_by", { version: doc.parser_version })}</span>}
-                </>
-              )}
-            </div>
-          </div>
 
-          {/* Rendered markdown */}
-          <article
-            className={cn(
-              "prose prose-sm max-w-none text-foreground/80",
-              // Headings — explicit foreground for light/dark theme support
-              "[&_h1]:text-xl [&_h1]:font-bold [&_h1]:mt-6 [&_h1]:mb-3 [&_h1]:scroll-mt-4 [&_h1]:text-foreground",
-              "[&_h2]:text-lg [&_h2]:font-semibold [&_h2]:mt-5 [&_h2]:mb-2 [&_h2]:scroll-mt-4 [&_h2]:text-foreground",
-              "[&_h3]:text-base [&_h3]:font-semibold [&_h3]:mt-4 [&_h3]:mb-2 [&_h3]:scroll-mt-4 [&_h3]:text-foreground",
-              "[&_h4]:text-sm [&_h4]:font-semibold [&_h4]:mt-3 [&_h4]:mb-1.5 [&_h4]:scroll-mt-4 [&_h4]:text-foreground",
-              // Body text
-              "[&_p]:text-foreground/80 [&_p]:leading-relaxed [&_p]:mb-3",
-              "[&_li]:text-foreground/80",
-              "[&_strong]:text-foreground",
-              // Tables
-              "[&_table]:w-full [&_table]:border-collapse [&_table]:text-xs",
-              "[&_th]:bg-muted/50 [&_th]:border [&_th]:border-border [&_th]:px-2 [&_th]:py-1.5 [&_th]:text-left [&_th]:font-medium [&_th]:text-foreground/80",
-              "[&_td]:border [&_td]:border-border [&_td]:px-2 [&_td]:py-1.5 [&_td]:text-foreground/80",
-              // Code
-              "[&_code]:bg-muted/50 [&_code]:px-1 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-xs [&_code]:text-foreground/90",
-              "[&_pre]:bg-muted/30 [&_pre]:rounded-lg [&_pre]:p-3 [&_pre]:overflow-x-auto [&_pre]:text-xs",
-              // Blockquotes
-              "[&_blockquote]:border-l-2 [&_blockquote]:border-primary/30 [&_blockquote]:pl-4 [&_blockquote]:italic [&_blockquote]:text-foreground/60",
-              // Images
-              "[&_img]:rounded-lg [&_img]:max-w-full [&_img]:my-3",
-              // Links
-              "[&_a]:text-primary [&_a]:underline [&_a]:underline-offset-2",
-              // KaTeX math blocks
-              "[&_.katex-display]:overflow-x-auto [&_.katex-display]:py-2",
-              "[&_.katex]:text-[0.95em]"
-            )}
-          >
-            <ReactMarkdown
-              remarkPlugins={remarkPlugins}
-              rehypePlugins={rehypePlugins}
-              components={mdComponents}
+            {/* Rendered markdown */}
+            <article
+              className={cn(
+                "prose prose-sm max-w-none text-foreground/80",
+                // Headings — explicit foreground for light/dark theme support
+                "[&_h1]:text-2xl [&_h1]:font-bold [&_h1]:mt-8 [&_h1]:mb-4 [&_h1]:scroll-mt-8 [&_h1]:text-foreground [&_h1]:tracking-tight",
+                "[&_h2]:text-xl [&_h2]:font-bold [&_h2]:mt-7 [&_h2]:mb-3 [&_h2]:scroll-mt-8 [&_h2]:text-foreground [&_h2]:tracking-tight",
+                "[&_h3]:text-lg [&_h3]:font-semibold [&_h3]:mt-6 [&_h3]:mb-2 [&_h3]:scroll-mt-8 [&_h3]:text-foreground",
+                "[&_h4]:text-base [&_h4]:font-semibold [&_h4]:mt-5 [&_h4]:mb-2 [&_h4]:scroll-mt-8 [&_h4]:text-foreground",
+                // Body text
+                "[&_p]:text-[15px] [&_p]:text-foreground/80 [&_p]:leading-[1.7] [&_p]:mb-4",
+                "[&_li]:text-[15px] [&_li]:text-foreground/80 [&_li]:leading-[1.7]",
+                "[&_strong]:text-foreground [&_strong]:font-bold",
+                // Tables
+                "[&_table]:w-full [&_table]:my-6 [&_table]:border-collapse [&_table]:text-[13px]",
+                "[&_th]:bg-muted/50 [&_th]:border [&_th]:border-border [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:font-bold [&_th]:text-foreground",
+                "[&_td]:border [&_td]:border-border [&_td]:px-3 [&_td]:py-2 [&_td]:text-foreground/80",
+                // Code
+                "[&_code]:bg-muted [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-[13px] [&_code]:text-primary [&_code]:font-mono",
+                "[&_pre]:bg-muted/40 [&_pre]:rounded-xl [&_pre]:p-4 [&_pre]:my-6 [&_pre]:overflow-x-auto [&_pre]:text-[13px] [&_pre]:border [&_pre]:border-border/50",
+                // Blockquotes
+                "[&_blockquote]:border-l-4 [&_blockquote]:border-primary/20 [&_blockquote]:pl-4 [&_blockquote]:italic [&_blockquote]:text-foreground/70 [&_blockquote]:bg-primary/5 [&_blockquote]:py-1 [&_blockquote]:rounded-r-lg",
+                // Images
+                "[&_img]:rounded-xl [&_img]:max-w-full [&_img]:my-6 [&_img]:shadow-md",
+                // Links
+                "[&_a]:text-primary [&_a]:underline [&_a]:underline-offset-4 [&_a]:decoration-primary/30 [&_a]:hover:decoration-primary [&_a]:transition-colors",
+                // KaTeX math blocks
+                "[&_.katex-display]:overflow-x-auto [&_.katex-display]:py-4",
+                "[&_.katex]:text-[1.05em]"
+              )}
             >
-              {processedMarkdown}
-            </ReactMarkdown>
-          </article>
+              <ReactMarkdown
+                remarkPlugins={remarkPlugins}
+                rehypePlugins={rehypePlugins}
+                components={mdComponents}
+              >
+                {processedMarkdown}
+              </ReactMarkdown>
+            </article>
+          </div>
         </div>
       </div>
     </div>

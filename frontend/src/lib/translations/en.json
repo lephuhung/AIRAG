@@ -177,6 +177,10 @@
   "chat": {
     "welcome_title": "Welcome to HRAG",
     "welcome_description": "Create a new chat or select an existing one to start exploring knowledge from your data repositories.",
+    "ai_assistant": "AI Assistant",
+    "assistant_online": "AI Assistant Online",
+    "greeting": "Hello {{name}}!",
+    "unsupported_doc": "Format .doc is not supported. Please convert to .docx before uploading.",
     "doc_source": "Document Source",
     "create_failed": "Failed to create chat session",
     "delete_success": "Conversation deleted",
@@ -226,6 +230,7 @@
     "suggestion_summary": "Summarize key findings",
     "suggestion_topics": "What are the main topics?",
     "suggestion_entities": "List important entities",
+    "suggestion_any": "Write anything",
     "suggestion_methodology": "Explain the methodology used",
     "view_kg": "View in Knowledge Graph",
     "highlight_kg": "Highlight in Knowledge Graph",
@@ -722,7 +727,23 @@
       "new_password": "New Password",
       "confirm_password": "Confirm Password",
       "repeat_password": "Repeat new password",
-      "min_chars": "Min 6 characters"
+      "min_chars": "Min 6 characters",
+      "toast": {
+        "deactivated": "User deactivated",
+        "activated": "User activated",
+        "update_failed": "Failed to update user",
+        "superadmin_removed": "Super Admin access removed",
+        "superadmin_granted": "Super Admin access granted",
+        "deleted": "User deleted",
+        "delete_failed": "Failed to delete user",
+        "self_role_error": "You cannot change your own role",
+        "role_changed": "Role changed to {{role}}",
+        "role_failed": "Failed to change role",
+        "pw_min_chars": "Password must be at least 6 characters",
+        "pw_mismatch": "Passwords do not match",
+        "pw_reset_success": "Password reset for {{name}}",
+        "password_failed": "Failed to reset password"
+      }
     },
     "tenants": {
       "title": "Tenant Management",

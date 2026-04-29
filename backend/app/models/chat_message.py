@@ -45,7 +45,7 @@ class ChatMessage(Base):
 
     # User who sent/received this message
     user_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True
     )
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

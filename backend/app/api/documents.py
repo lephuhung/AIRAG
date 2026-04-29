@@ -533,8 +533,9 @@ async def get_chunk_context(
         if hp and hp != last_heading:
             md_parts.append(f"\n### 📍 {hp}\n")
             last_heading = hp
-        if pg and pg != last_page:
-            md_parts.append(f"\n---\n_Trang {pg}_\n")
+        if pg is not None and pg != last_page:
+            # Use the standard format that frontend expects
+            md_parts.append(f"\n<!-- page {pg} -->\n")
             last_page = pg
         md_parts.append(chunk["content"])
 

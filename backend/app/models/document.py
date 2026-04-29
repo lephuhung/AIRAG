@@ -96,7 +96,7 @@ class Document(Base):
 
     # User who uploaded this document
     uploaded_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True
     )
 
     # True = uploaded via chat → skip embed/caption/kg workers after parse
