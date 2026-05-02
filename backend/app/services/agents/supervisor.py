@@ -75,11 +75,24 @@ Intent → Agent routing guide (MUST follow exactly):
 
 CRITICAL: `next_agent` must be ONLY one of: "rag"|"write"|"people"|"direct"|"finish".
 NEVER put an intent name in `next_agent`. Use EXACT intent names from the list above.
+
+CRITICAL ANSWERING RULE:
+- "direct" agent is ONLY for greetings and personal questions about the user.
+- ANY question about document content, law, policy, facts, definitions, explanations
+  → MUST use "search" or "resolve_doc" intent → route to "rag" agent.
+- NEVER answer from general knowledge. Always search workspace documents first.
+- If the user asks "X là gì?" where X is a topic that exists in the documents
+  (e.g., "an ninh mạng là gì?", "chế độ bảo hiểm là gì?") → "search" intent → "rag" agent.
+
 Examples:
+  - "Xin chào" → intent "greeting", next_agent "direct"
+  - "Tôi là ai?" → intent "personal", next_agent "direct"
   - phone search → intent "mongo_search_phone", next_agent "people"
   - CCCD search  → intent "mongo_search_cccd",  next_agent "people"
   - dob and name search → intent "mongo_search_advanced", next_agent "people"
   - generic search → intent "search",             next_agent "rag"
+  - "An ninh mạng là gì?" → intent "search",       next_agent "rag" (NOT direct!)
+  - "Luật An ninh mạng 2025 là gì?" → intent "search", next_agent "rag"
   - "Tóm tắt điều 27 Luật An ninh mạng 2025" → intent "resolve_doc", next_agent "rag" (NOT write_summarize!)
   - "Tóm tắt văn bản số 60/2019" → intent "resolve_doc", next_agent "rag"
   - "tìm Nghị định 60/2019" → intent "resolve_doc", next_agent "rag"
@@ -134,6 +147,74 @@ _INTENT_TO_AGENT_FALLBACK: dict[str, str] = {
     "mongo_search_phone": "people",
     "mongo_search_advanced": "people",
 }
+
+# ---------------------------------------------------------------------------
+# Keyword-based safety net: Vietnamese document queries that MUST go to RAG.
+# Small classifier models (Qwen3-4B) frequently misclassify these as "greeting"
+# or "direct".  When ANY of these patterns match the user message AND the LLM
+# chose "direct", we override to "rag" + intent="search".
+# ---------------------------------------------------------------------------
+import re as _re
+
+_MUST_RAG_PATTERNS: list[_re.Pattern] = [
+    # "X là gì" — definition questions about topics in the knowledge base
+    _re.compile(r"(?:là\s+gì|nghĩa\s+là\s+gì)", _re.IGNORECASE),
+    # Responsibility / obligation questions
+    _re.compile(r"trách\s+nhiệm", _re.IGNORECASE),
+    # Regulation / policy questions
+    _re.compile(r"quy\s+định", _re.IGNORECASE),
+    # Legal concepts
+    _re.compile(r"(?:luật|nghị\s+định|thông\s+tư|điều\s+\d|chương\s+\d)", _re.IGNORECASE),
+    # "khái niệm" — concept/definition
+    _re.compile(r"khái\s+niệm", _re.IGNORECASE),
+    # "điều kiện" — conditions
+    _re.compile(r"điều\s+kiện", _re.IGNORECASE),
+    # "nguyên tắc" — principles
+    _re.compile(r"nguyên\s+tắc", _re.IGNORECASE),
+    # "chủ quản" — manager/custodian (legal role, not a person search)
+    _re.compile(r"chủ\s+quản", _re.IGNORECASE),
+    # "hệ thống thông tin" — information system
+    _re.compile(r"hệ\s+thống\s+thông\s+tin", _re.IGNORECASE),
+    # "bảo vệ / bảo mật / an ninh / an toàn" — security topics
+    _re.compile(r"(?:bảo\s+vệ|bảo\s+mật|an\s+ninh|an\s+toàn)", _re.IGNORECASE),
+    # "tiêu hủy / lưu trữ / bảo quản" — archival / destruction
+    _re.compile(r"(?:tiêu\s+hủy|lưu\s+trữ|bảo\s+quản)", _re.IGNORECASE),
+    # "xử lý / xử phạt" — processing / penalties
+    _re.compile(r"(?:xử\s+lý|xử\s+phạt)", _re.IGNORECASE),
+    # "chế độ / chính sách" — policy / regime
+    _re.compile(r"(?:chế\s+độ|chính\s+sách)", _re.IGNORECASE),
+    # "thẩm quyền" — authority / jurisdiction
+    _re.compile(r"thẩm\s+quyền", _re.IGNORECASE),
+    # "tóm tắt" — summarize (but not write_summarize which has inline text)
+    _re.compile(r"tóm\s+tắt", _re.IGNORECASE),
+    # "so sánh" — compare
+    _re.compile(r"so\s+sánh", _re.IGNORECASE),
+    # "nội dung" — content of document
+    _re.compile(r"nội\s+dung", _re.IGNORECASE),
+    # Document number patterns
+    _re.compile(r"văn\s+bản\s+số", _re.IGNORECASE),
+    _re.compile(r"\d+/\d+/(?:NĐ|TT|QĐ|NQ)", _re.IGNORECASE),
+]
+
+# Strict greeting patterns — only override to direct if the ENTIRE message
+# matches one of these (after stripping whitespace/punctuation).  Anything
+# longer or containing topic keywords should NOT be treated as a greeting.
+_GREETING_ONLY_PATTERNS: list[_re.Pattern] = [
+    _re.compile(r"^(?:xin\s+)?chào[\s!.?]*$", _re.IGNORECASE),
+    _re.compile(r"^(?:hi|hello|hey)[\s!.?]*$", _re.IGNORECASE),
+    _re.compile(r"^cảm\s+ơn[\s!.?]*$", _re.IGNORECASE),
+    _re.compile(r"^(?:tạm\s+biệt|bye)[\s!.?]*$", _re.IGNORECASE),
+]
+
+
+def _should_force_rag(message: str) -> bool:
+    """Return True if message contains keywords that MUST be handled by RAG."""
+    return any(p.search(message) for p in _MUST_RAG_PATTERNS)
+
+
+def _is_pure_greeting(message: str) -> bool:
+    """Return True only if message is a bare greeting with no topic content."""
+    return any(p.match(message.strip()) for p in _GREETING_ONLY_PATTERNS)
 
 # =============================================================================
 # Helper Functions
@@ -251,7 +332,12 @@ def _extract_user_message(state: SupervisorState) -> str:
 
 
 def _parse_supervisor_response(raw: str) -> dict:
-    """Parse LLM JSON response with fallbacks."""
+    """Parse LLM JSON response with fallbacks.
+
+    After parsing, enforces intent→agent agreement: if the intent maps to
+    a different agent than what the LLM chose, the intent-based mapping wins.
+    This catches the most common Qwen3-4B mistake: correct intent but wrong agent.
+    """
     raw = raw.strip()
 
     # Strip markdown code fences
@@ -290,6 +376,22 @@ def _parse_supervisor_response(raw: str) -> dict:
                     f"[supervisor] Invalid next_agent '{next_agent}', defaulting to 'finish'"
                 )
                 next_agent = AgentType.FINISH
+
+        # ── Deterministic intent→agent override ──────────────────────────
+        # If the intent maps to a DIFFERENT agent than what the LLM chose,
+        # trust the intent (which is usually correct) over next_agent.
+        # This catches: intent="search" + next_agent="people" or "direct".
+        expected_agent = _INTENT_TO_AGENT_FALLBACK.get(intent)
+        if (
+            expected_agent
+            and next_agent != AgentType.FINISH
+            and expected_agent != next_agent
+        ):
+            logger.warning(
+                f"[supervisor] Intent→agent mismatch: intent={intent!r} expects "
+                f"{expected_agent!r} but LLM chose {next_agent!r} — overriding to {expected_agent!r}"
+            )
+            next_agent = expected_agent
 
         return {
             "next_agent": next_agent,
@@ -386,6 +488,24 @@ async def supervisor_node(state: SupervisorState) -> dict:
                 response_text += str(chunk.text)
 
         decision = _parse_supervisor_response(response_text)
+
+        # ── Keyword safety net ───────────────────────────────────────────
+        # If the LLM classified as greeting/direct but the message contains
+        # document-related keywords, override to rag + search.
+        if (
+            decision["next_agent"] == AgentType.DIRECT
+            and decision["intent"] in ("greeting", "personal")
+            and _should_force_rag(query_for_classifier)
+            and not _is_pure_greeting(query_for_classifier)
+        ):
+            logger.warning(
+                f"[supervisor] Keyword safety net: message contains document keywords "
+                f"but LLM chose direct/{decision['intent']} — overriding to rag/search"
+            )
+            decision["next_agent"] = AgentType.RAG
+            decision["intent"] = "search"
+            decision["reasoning"] = f"(overridden by keyword safety net) {decision.get('reasoning', '')}"
+
         logger.info(
             f"[LANGGRAPH_ROUTE] user_message={user_message!r} -> "
             f"next_agent={decision['next_agent']!r}, intent={decision['intent']!r}, "
@@ -459,8 +579,10 @@ async def supervisor_node(state: SupervisorState) -> dict:
 
     except Exception as e:
         logger.error(f"[supervisor] LLM call failed: {e}")
+        # Fail-safe: default to RAG (document search) instead of direct.
+        # Direct gives empty answers; RAG at least attempts document retrieval.
         return {
-            "next_agent": AgentType.DIRECT,
+            "next_agent": AgentType.RAG,
             "intent": state.get("intent", "search"),
             "iterations": iterations + 1,
         }

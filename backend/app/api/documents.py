@@ -224,8 +224,11 @@ async def upload_document(
         except Exception as e:
             logger.error(
                 f"Failed to publish parse task for doc {document.id}: {e}. "
-                f"Document is PENDING — manual requeue may be needed."
+                f"Rolling back document to FAILED."
             )
+            document.status = DocumentStatus.FAILED
+            document.error_message = f"Publish failed: {e}"
+            await db.commit()
     else:
         logger.info(
             f"Document {document.id} uploaded to MinIO — "
@@ -328,9 +331,9 @@ async def presign_upload(
             detail="Storage service unavailable — could not generate upload URL.",
         )
 
-    document.upload_s3_key = upload_key
-    await db.commit()
-
+    # DO NOT set upload_s3_key here — file is not uploaded yet.
+    # It will be set in confirm_upload ONLY after MinIO verifies the object exists.
+    # This prevents orphaned records when frontend fails to complete the upload.
     return PresignResponse(
         document_id=document.id,
         upload_url=presigned_url,
@@ -374,17 +377,26 @@ async def confirm_upload(
     from app.services.storage_service import get_storage_service
 
     storage = get_storage_service()
-    if document.upload_s3_key:
-        try:
-            exists = await storage.object_exists(document.upload_s3_key)
-        except Exception as e:
-            logger.error(f"MinIO object_exists check failed for doc {document.id}: {e}")
-            exists = True  # optimistic — proceed anyway
-        if not exists:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="File not found in storage. Please retry the upload.",
-            )
+    minio_key = document.upload_s3_key  # May be None if set by presign flow
+    if not minio_key:
+        # Fallback: reconstruct from document_id (presign no longer saves it prematurely)
+        minio_key = storage._make_upload_key(
+            workspace_id, document.id, Path(document.filename).suffix.lower()
+        )
+    try:
+        exists = await storage.object_exists(minio_key)
+    except Exception as e:
+        logger.error(f"MinIO object_exists check failed for doc {document.id}: {e}")
+        exists = True  # optimistic — proceed anyway
+    if not exists:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File not found in storage. Please retry the upload.",
+        )
+
+    # Now that MinIO has confirmed the file, record the key and queue the parse task
+    document.upload_s3_key = minio_key
+    await db.commit()
 
     if not settings.MINIO_WEBHOOK_ENABLED:
         try:
@@ -393,7 +405,7 @@ async def confirm_upload(
             await publish_parse_task(
                 document_id=document.id,
                 workspace_id=workspace_id,
-                minio_key=document.upload_s3_key or "",
+                minio_key=minio_key,
                 original_filename=document.original_filename,
             )
             logger.info(
@@ -402,8 +414,20 @@ async def confirm_upload(
         except Exception as e:
             logger.error(
                 f"Failed to publish parse task for doc {document.id}: {e}. "
-                "Document stays PENDING — manual requeue may be needed."
+                f"Rolling back document to FAILED."
             )
+            document.status = DocumentStatus.FAILED
+            document.error_message = f"Publish failed: {e}"
+            await db.commit()
+            # Clean up MinIO file so it doesn't become orphaned
+            try:
+                await storage.delete_file(minio_key)
+                logger.info(f"[confirm_upload] Cleaned up orphaned MinIO file: {minio_key}")
+            except Exception as del_err:
+                logger.warning(
+                    f"[confirm_upload] Failed to delete MinIO file after publish failure: "
+                    f"{del_err} (doc={document.id}, key={minio_key})"
+                )
     else:
         logger.info(
             f"Document {document.id} confirmed in MinIO — "

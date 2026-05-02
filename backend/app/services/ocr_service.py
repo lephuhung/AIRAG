@@ -279,7 +279,7 @@ class HunyuanOCRService:
                 }
             ],
             "temperature": 0.0,
-            "max_tokens": 16384,
+            "max_tokens": 8192,
         }
 
         client = await self._get_client()
@@ -366,7 +366,7 @@ class HunyuanOCRService:
         self._processor = AutoProcessor.from_pretrained(
             self._model, trust_remote_code=True
         )
-        self._sampling_params = SamplingParams(temperature=0.0, max_tokens=16384)
+        self._sampling_params = SamplingParams(temperature=0.0, max_tokens=12000)
         logger.info(f"[OCR/local] Model {self._model} loaded successfully")
         return self._llm, self._processor, self._sampling_params
 

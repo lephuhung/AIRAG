@@ -171,6 +171,7 @@ services:
       - "8001:8001"
     environment:
       NVIDIA_VISIBLE_DEVICES: "1"
+      FLASHINFER_DISABLE_VERSION_CHECK: "1"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
     command:
@@ -178,9 +179,9 @@ services:
       - --port
       - "8001"
       - --max-model-len
-      - "25384"
+      - "12000"
       - --gpu-memory-utilization
-      - "0.4"
+      - "0.2"
       - --trust-remote-code
       - --served-model-name
       - hunyuan-ocr
@@ -223,16 +224,20 @@ services:
       - "8088:8088"
     environment:
       NVIDIA_VISIBLE_DEVICES: "1"
+      HF_TOKEN: "${HF_TOKEN}"
+      FLASHINFER_DISABLE_VERSION_CHECK: "1"
+      VLLM_USE_V1: "0"
+      VLLM_DISABLE_NIXL: "1"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
     command:
-      - Qwen/Qwen3-4B-Instruct-2507-FP8
+      - google/gemma-4-E4B-it
       - --port
       - "8088"
       - --max-model-len
-      - "25000"
+      - "16384"
       - --gpu-memory-utilization
-      - "0.3"
+      - "0.4"
       - --trust-remote-code
       - --served-model-name
       - qwen-memory
@@ -536,13 +541,14 @@ services:
       MINIO_WEBHOOK_ENABLED: "false"
       NEO4J_URI: bolt://neo4j:7687
       CUDA_VISIBLE_DEVICES: "0"
+      HRAG_EAGER_MODEL_LOADING: "false"
       OLLAMA_HOST: http://host.docker.internal:8000/v1
       RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
       HUNYUAN_OCR_API_URL: http://vllm-ocr:8001/v1
       MEMORY_AGENT_BASE_URL: http://vllm-memory:8088/v1
       GRAPHITI_LLM_BASE_URL: http://vllm-memory:8088/v1
       OPENAI_COMPATIBLE_BASE_URL: http://host.docker.internal:8000/v1
-      OPENAI_COMPATIBLE_MODEL: Qwen/Qwen3.5-35B-A3B-FP8
+      OPENAI_COMPATIBLE_MODEL: Qwen/Qwen3.6-35B-A3B-FP8
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

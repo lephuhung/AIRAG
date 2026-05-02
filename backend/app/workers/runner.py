@@ -144,6 +144,7 @@ async def _run_kg_worker() -> None:
           - Task.done() detection: catches consumer crashes without HTTP polling
           - HTTP polling fallback: only checks queues with active workspaces
         """
+        nonlocal _circuit_open, _circuit_failures
         import httpx
 
         fast_poll = int(os.getenv("WORKER_KG_POLL_INTERVAL", "30"))

@@ -1,9 +1,7 @@
-# ============================================================
-# vLLM Service — Docker image for HunyuanOCR & Qwen3-4B
-# Uses official vllm/vllm-openai image + reuses host HuggingFace cache
-# ============================================================
-
 FROM vllm/vllm-openai:latest
+
+# Upgrade transformers and vllm to support newer architectures like Gemma 4
+RUN pip install --no-cache-dir --upgrade transformers vllm
 
 # Reuse HuggingFace cache from host (mount at docker-compose.yml)
 # Models will be downloaded on first run and cached at ~/.cache/huggingface

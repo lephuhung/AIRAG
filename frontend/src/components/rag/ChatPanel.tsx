@@ -1108,7 +1108,11 @@ const PremiumThinking = memo(({
             transition={{ duration: 0.18, ease: "easeOut" }}
             className="flex items-center gap-2"
           >
-            <Sparkles className={cn("w-3.5 h-3.5", isStreaming ? "animate-pulse text-violet-500" : "text-violet-400")} />
+            {isStreaming ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-violet-500" />
+            ) : (
+              <Sparkles className="w-3.5 h-3.5 text-violet-400" />
+            )}
             <span>{labelText}</span>
             <ChevronDown className={cn("w-3.5 h-3.5 transition-transform duration-300", expanded && "rotate-180")} />
           </motion.div>
@@ -1131,6 +1135,12 @@ const PremiumThinking = memo(({
                     <ReactMarkdown remarkPlugins={[remarkGfm]}>
                       {displayThinking}
                     </ReactMarkdown>
+                    {isStreaming && !hasContent && (
+                      <div className="flex items-center gap-1.5 mt-2 text-violet-500/60">
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        <span className="text-[11px] italic font-medium">Đang suy nghĩ...</span>
+                      </div>
+                    )}
                   </div>
                   
                   {isTruncated && (
@@ -3270,8 +3280,8 @@ export const ChatPanel = memo(function ChatPanel({
           }
 
           skipResetRef.current = newSession.id;
-          // Update URL in background (no redirect) so chat is bookmarkable
-          window.history.replaceState({}, "", `/chat/${newSession.id}`);
+          // Update URL so chat is bookmarkable
+          navigate(`/chat/${newSession.id}`, { replace: true });
         } catch (err: any) {
           toast.error(t("chat.create_failed"));
           return;

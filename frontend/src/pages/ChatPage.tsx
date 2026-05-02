@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useParams } from "react-router-dom";
 import { MessageSquare, X } from "lucide-react";
@@ -30,13 +30,15 @@ export function ChatPage() {
   // Reset store when switching sessions
   useEffect(() => {
     resetStore();
-  }, [currentSessionId, resetStore]);
+  }, [currentSessionId]);
 
   // -- Queries & Mutations --
   const { data: sessions } = useChatSessions();
 
-  // handleNewSession simply navigates to the empty chat route
-  const currentSession = sessions?.find(s => String(s.id) === currentSessionId);
+  const currentSession = useMemo(
+    () => sessions?.find(s => String(s.id) === currentSessionId) ?? null,
+    [sessions, currentSessionId]
+  );
   const sessionTitle = currentSession?.title;
 
   return (
@@ -66,7 +68,7 @@ export function ChatPage() {
           }}
         >
           <ChatPanel 
-            sessionId={currentSessionId || null} 
+            sessionId={currentSessionId} 
             sessionTitle={sessionTitle} 
           />
         </motion.div>
