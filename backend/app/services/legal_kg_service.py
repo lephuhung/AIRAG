@@ -34,7 +34,7 @@ from typing import Any, Optional
 from app.core.config import settings
 from app.services.llm import get_kg_llm_provider
 from app.services.llm.types import LLMMessage
-from app.services.legal_kg_prompts import (
+from app.prompts.legal_kg import (
     ENTITY_RESOLVE_SYSTEM_PROMPT,
     ENTITY_RESOLVE_USER_PROMPT,
     LEGAL_KG_SYSTEM_PROMPT,

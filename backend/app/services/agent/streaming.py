@@ -36,9 +36,32 @@ import logging
 from contextvars import ContextVar
 from typing import AsyncGenerator, Optional
 
+from langfuse import get_client
+from langfuse.langchain import CallbackHandler
+
 logger = logging.getLogger(__name__)
 
 SSE_HEARTBEAT_INTERVAL = 15  # seconds
+
+# ---------------------------------------------------------------------------
+# Langfuse client (lazy initialization)
+# ---------------------------------------------------------------------------
+
+_langfuse_handler: Optional[CallbackHandler] = None
+
+
+def get_langfuse_handler() -> Optional[CallbackHandler]:
+    """Get or create the Langfuse callback handler (lazy init)."""
+    global _langfuse_handler
+    if _langfuse_handler is None:
+        try:
+            get_client()
+            _langfuse_handler = CallbackHandler()
+            logger.info("[langfuse] CallbackHandler initialized")
+        except Exception as e:
+            logger.warning(f"[langfuse] Failed to initialize CallbackHandler: {e}")
+            return None
+    return _langfuse_handler
 
 # ---------------------------------------------------------------------------
 # Module-level ContextVars — survive LangGraph state key filtering
@@ -101,8 +124,14 @@ async def stream_agent_to_sse(
     # ── Background task: chạy toàn bộ LangGraph pipeline ───────────────────
     async def _run_graph():
         from app.core.config import settings
+        langfuse_handler = get_langfuse_handler()
+        callbacks = [langfuse_handler] if langfuse_handler else []
         try:
-            await graph.ainvoke(initial_state, debug=settings.NEXUSRAG_LG_DEBUG)
+            await graph.ainvoke(
+                initial_state,
+                config={"callbacks": callbacks},
+                debug=settings.NEXUSRAG_LG_DEBUG,
+            )
         except Exception as e:
             logger.error(f"[stream] Graph execution error: {e}", exc_info=True)
             await event_queue.put(("error", str(e)))

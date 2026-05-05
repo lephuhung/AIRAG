@@ -1571,7 +1571,7 @@ async def chat_stream_endpoint(
         )
 
     # Build system prompt — use document-type-specific prompt if applicable
-    from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
+    from app.prompts.chat import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
 
     base_prompt = kb.system_prompt or DEFAULT_SYSTEM_PROMPT
 

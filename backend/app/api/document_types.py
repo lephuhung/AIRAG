@@ -146,8 +146,8 @@ async def create_document_type(
     await db.flush()  # get doc_type.id before creating related row
 
     # Auto-seed default KG system prompt (LEGAL_KG_SYSTEM_PROMPT)
-    from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT
-    from app.services.legal_kg_prompts import LEGAL_KG_SYSTEM_PROMPT
+    from app.prompts.chat import DEFAULT_SYSTEM_PROMPT
+    from app.prompts.legal_kg import LEGAL_KG_SYSTEM_PROMPT
 
     prompt_row = DocumentTypeSystemPrompt(
         document_type_id=doc_type.id,

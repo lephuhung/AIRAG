@@ -82,7 +82,7 @@ router = APIRouter(prefix="/rag", tags=["rag"])
 UPLOAD_DIR = "uploads"
 
 # Prompt constants — see chat_prompt.py for full documentation
-from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
+from app.prompts.chat import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
 
 
 async def verify_workspace_access(

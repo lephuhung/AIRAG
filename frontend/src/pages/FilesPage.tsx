@@ -16,13 +16,13 @@ import { Input } from "@/components/ui/input";
 import { FileCard } from "@/components/rag/FileCard";
 import { EditDocumentDialog } from "@/components/rag/EditDocumentDialog";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
-import { 
-  useDocuments, 
-  useDeleteDocument, 
-  useProcessDocument, 
-  useReindexDocument, 
+import {
+  useDocuments,
+  useDeleteDocument,
+  useProcessDocument,
+  useReindexDocument,
   useUpdateDocument,
-  PROCESSING_STATUSES 
+  PROCESSING_STATUSES
 } from "@/hooks/useDocuments";
 import { useWorkspaces, useWorkspace } from "@/hooks/useWorkspaces";
 import { DocumentViewer } from "@/components/rag/DocumentViewer";
@@ -322,221 +322,204 @@ export function FilesPage() {
   return (
     <div className="h-full flex overflow-hidden relative">
       {/* Left side: Search, Filters, Grid */}
-      <motion.div 
-        layout
-        initial={false}
-        className={cn(
-          "flex-1 flex flex-col h-full min-w-0 relative z-10 transition-all duration-300 ease-in-out",
-          selectedDoc ? "hidden md:flex md:w-[35%] lg:w-[30%] xl:w-[25%]" : "w-full"
-        )}
-        transition={{ 
-          type: "spring", 
-          stiffness: 300, 
-          damping: 34,
-          mass: 0.8
-        }}
-      >
+      <div className="flex-1 flex flex-col h-full min-w-0 relative z-10 transition-all duration-300">
         {/* ── Header ── */}
-      <div className={cn(
-        "flex-shrink-0 border-b transition-all duration-300",
-        selectedDoc ? "px-4 py-3" : "px-6 py-4"
-      )}>
-        {/* Breadcrumb */}
-        <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-2">
-          <button
-            onClick={handleBackToList}
-            className="hover:text-foreground transition-colors underline-offset-4 hover:underline"
-          >
-            {t("files.title")}
-          </button>
-          <span>/</span>
-          <span className="text-foreground font-medium truncate max-w-[200px]">
-            {workspace?.name || t("common.pending")}
-          </span>
-        </div>
+        <div className={cn(
+          "flex-shrink-0 border-b transition-all duration-300",
+          selectedDoc ? "px-4 py-3" : "px-6 py-4"
+        )}>
+          {/* Breadcrumb */}
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground mb-2">
+            <button
+              onClick={handleBackToList}
+              className="hover:text-foreground transition-colors underline-offset-4 hover:underline"
+            >
+              {t("files.title")}
+            </button>
+            <span>/</span>
+            <span className="text-foreground font-medium truncate max-w-[200px]">
+              {workspace?.name || t("common.pending")}
+            </span>
+          </div>
 
-        {/* Title */}
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className={cn(
-              "font-bold flex items-center gap-2 transition-all",
-              selectedDoc ? "text-base" : "text-lg"
-            )}>
-              <FolderOpen className={cn("text-primary", selectedDoc ? "w-4 h-4" : "w-5 h-5")} />
-              {workspace?.name || t("files.title")}
-            </h1>
-            <p className="text-xs text-muted-foreground">
-              {t("kb.docs_count", { count: documents?.length ?? 0 })}
-              {ragStats && ` \u00b7 ${ragStats.total_chunks} chunks`}
-            </p>
+          {/* Title */}
+          <div className="flex items-center justify-between">
+            <div>
+              <h1 className={cn(
+                "font-bold flex items-center gap-2 transition-all",
+                selectedDoc ? "text-base" : "text-lg"
+              )}>
+                <FolderOpen className={cn("text-primary", selectedDoc ? "w-4 h-4" : "w-5 h-5")} />
+                {workspace?.name || t("files.title")}
+              </h1>
+              <p className="text-xs text-muted-foreground">
+                {t("kb.docs_count", { count: documents?.length ?? 0 })}
+                {ragStats && ` · ${ragStats.total_chunks} chunks`}
+              </p>
+            </div>
           </div>
         </div>
-      </div>
 
-      {/* ── Toolbar ── */}
-      <div className={cn(
-        "flex-shrink-0 border-b flex items-center gap-3 flex-wrap transition-all duration-300",
-        selectedDoc ? "px-4 py-2" : "px-6 py-3"
-      )}>
-        {/* Search */}
+        {/* ── Toolbar ── */}
         <div className={cn(
-          "relative flex-1 min-w-[200px] transition-all",
-          selectedDoc ? "max-w-[240px]" : "max-w-sm"
+          "flex-shrink-0 border-b flex items-center gap-3 flex-wrap transition-all duration-300",
+          selectedDoc ? "px-4 py-2" : "px-6 py-3"
         )}>
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
-          <Input
-            placeholder={t("files.search_files")}
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="pl-9 h-9"
-          />
+          {/* Search */}
+          <div className={cn(
+            "relative flex-1 min-w-[200px] transition-all",
+            selectedDoc ? "max-w-[240px]" : "max-w-sm"
+          )}>
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
+            <Input
+              placeholder={t("files.search_files")}
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="pl-9 h-9"
+            />
+          </div>
+
+          {/* Filter tabs */}
+          <div className="flex items-center gap-1 bg-muted/40 rounded-lg p-0.5">
+            {FILTER_TABS.map((tab) => {
+              const isActive = filterTab === tab.value;
+              const count = tabCounts[tab.value];
+              return (
+                <button
+                  key={tab.value}
+                  onClick={() => setFilterTab(tab.value)}
+                  className={cn(
+                    "px-3 py-1.5 text-xs font-medium rounded-md transition-colors",
+                    isActive
+                      ? "bg-card text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  {t(tab.key)}
+                  {count > 0 && (
+                    <span
+                      className={cn(
+                        "ml-1 text-[10px]",
+                        isActive ? "text-primary" : "text-muted-foreground/60",
+                      )}
+                    >
+                      {count}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Sort dropdown */}
+          <div className="relative">
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-9 gap-1.5 text-xs"
+              onClick={() => setSortMenuOpen((v) => !v)}
+            >
+              <ArrowUpDown className="w-3.5 h-3.5" />
+              {t(SORT_OPTIONS.find((o) => o.value === sortKey)?.key || "")}
+            </Button>
+            {sortMenuOpen && (
+              <>
+                <div className="fixed inset-0 z-10" onClick={() => setSortMenuOpen(false)} />
+                <div className="absolute right-0 top-10 z-20 min-w-[150px] rounded-lg border bg-popover shadow-lg py-1">
+                  {SORT_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.value}
+                      className={cn(
+                        "w-full text-left px-3 py-1.5 text-xs hover:bg-muted/50 transition-colors",
+                        sortKey === opt.value && "text-primary font-medium",
+                      )}
+                      onClick={() => {
+                        setSortKey(opt.value);
+                        setSortMenuOpen(false);
+                      }}
+                    >
+                      {t(opt.key)}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
         </div>
 
-        {/* Filter tabs */}
-        <div className="flex items-center gap-1 bg-muted/40 rounded-lg p-0.5">
-          {FILTER_TABS.map((tab) => {
-            const isActive = filterTab === tab.value;
-            const count = tabCounts[tab.value];
-            return (
-              <button
-                key={tab.value}
-                onClick={() => setFilterTab(tab.value)}
-                className={cn(
-                  "px-3 py-1.5 text-xs font-medium rounded-md transition-colors",
-                  isActive
-                    ? "bg-card text-foreground shadow-sm"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
-                {t(tab.key)}
-                {count > 0 && (
-                  <span
-                    className={cn(
-                      "ml-1 text-[10px]",
-                      isActive ? "text-primary" : "text-muted-foreground/60",
-                    )}
-                  >
-                    {count}
-                  </span>
-                )}
-              </button>
-            );
-          })}
-        </div>
-
-        {/* Sort dropdown */}
-        <div className="relative">
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-9 gap-1.5 text-xs"
-            onClick={() => setSortMenuOpen((v) => !v)}
-          >
-            <ArrowUpDown className="w-3.5 h-3.5" />
-            {t(SORT_OPTIONS.find((o) => o.value === sortKey)?.key || "")}
-          </Button>
-          {sortMenuOpen && (
-            <>
-              <div className="fixed inset-0 z-10" onClick={() => setSortMenuOpen(false)} />
-              <div className="absolute right-0 top-10 z-20 min-w-[150px] rounded-lg border bg-popover shadow-lg py-1">
-                {SORT_OPTIONS.map((opt) => (
-                  <button
-                    key={opt.value}
-                    className={cn(
-                      "w-full text-left px-3 py-1.5 text-xs hover:bg-muted/50 transition-colors",
-                      sortKey === opt.value && "text-primary font-medium",
-                    )}
-                    onClick={() => {
-                      setSortKey(opt.value);
-                      setSortMenuOpen(false);
-                    }}
-                  >
-                    {t(opt.key)}
-                  </button>
-                ))}
-              </div>
-            </>
-          )}
-        </div>
-      </div>
-
-      {/* ── Grid content ── */}
-      <div className="flex-1 overflow-y-auto px-6 py-5">
-        {docsLoading ? (
-          // Loading skeletons
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
-            {Array.from({ length: 8 }).map((_, i) => (
-              <div
-                key={i}
-                className="rounded-xl border bg-card animate-pulse"
-              >
-                <div className="px-4 pt-4 pb-3 flex items-start gap-3">
-                  <div className="w-10 h-10 rounded-lg bg-muted" />
-                  <div className="flex-1 space-y-2">
-                    <div className="h-4 bg-muted rounded w-3/4" />
-                    <div className="h-3 bg-muted rounded w-1/2" />
+        {/* ── Grid content ── */}
+        <div className="flex-1 overflow-y-auto px-6 py-5">
+          {docsLoading ? (
+            // Loading skeletons
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
+              {Array.from({ length: 8 }).map((_, i) => (
+                <div
+                  key={i}
+                  className="rounded-xl border bg-card animate-pulse"
+                >
+                  <div className="px-4 pt-4 pb-3 flex items-start gap-3">
+                    <div className="w-10 h-10 rounded-lg bg-muted" />
+                    <div className="flex-1 space-y-2">
+                      <div className="h-4 bg-muted rounded w-3/4" />
+                      <div className="h-3 bg-muted rounded w-1/2" />
+                    </div>
+                  </div>
+                  <div className="px-4 pb-3">
+                    <div className="h-5 bg-muted rounded w-20" />
+                  </div>
+                  <div className="px-4 pb-3 grid grid-cols-2 gap-2">
+                    <div className="h-3 bg-muted rounded" />
+                    <div className="h-3 bg-muted rounded" />
+                  </div>
+                  <div className="px-4 pb-3">
+                    <div className="h-3 bg-muted rounded w-2/3" />
                   </div>
                 </div>
-                <div className="px-4 pb-3">
-                  <div className="h-5 bg-muted rounded w-20" />
-                </div>
-                <div className="px-4 pb-3 grid grid-cols-2 gap-2">
-                  <div className="h-3 bg-muted rounded" />
-                  <div className="h-3 bg-muted rounded" />
-                </div>
-                <div className="px-4 pb-3">
-                  <div className="h-3 bg-muted rounded w-2/3" />
-                </div>
-              </div>
-            ))}
-          </div>
-        ) : !documents || documents.length === 0 ? (
-          // Empty state
-          <div className="flex flex-col items-center justify-center h-full text-center">
-            <FolderOpen className="w-12 h-12 text-muted-foreground/30 mb-3" />
-            <h3 className="text-sm font-medium text-muted-foreground mb-1">
-              {t("files.no_files_yet")}
-            </h3>
-            <p className="text-xs text-muted-foreground/70">
-              {t("files.upload_hint")}
-            </p>
-          </div>
-        ) : filteredDocs.length === 0 ? (
-          // No results state
-          <div className="flex flex-col items-center justify-center h-full text-center">
-            <Search className="w-10 h-10 text-muted-foreground/30 mb-3" />
-            <h3 className="text-sm font-medium text-muted-foreground mb-1">
-              {t("files.no_files_match")}
-            </h3>
-            <p className="text-xs text-muted-foreground/70">
-              {t("files.adjust_search_hint")}
-            </p>
-          </div>
-        ) : (
-          // File grid
-          <div className={cn(
-            "grid gap-5 transition-all duration-300",
-            selectedDoc 
-              ? "grid-cols-1 lg:grid-cols-2" 
-              : "grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-6"
-          )}>
-            <AnimatePresence mode="popLayout">
-              {filteredDocs.map((doc) => (
-                <FileCard
-                  key={doc.id}
-                  doc={doc}
-                  onDelete={setDeleteDocConfirm}
-                  onReindex={(id) => reindexDoc.mutate(id)}
-                  onProcess={(id) => processDoc.mutate(id)}
-                  onDownload={handleDownload}
-                  onPreview={selectDoc}
-                  onClickEdit={setEditDoc}
-                  isProcessing={processDoc.isPending}
-                />
               ))}
-            </AnimatePresence>
-          </div>
-        )}
+            </div>
+          ) : !documents || documents.length === 0 ? (
+            // Empty state
+            <div className="flex flex-col items-center justify-center h-full text-center">
+              <FolderOpen className="w-12 h-12 text-muted-foreground/30 mb-3" />
+              <h3 className="text-sm font-medium text-muted-foreground mb-1">
+                {t("files.no_files_yet")}
+              </h3>
+              <p className="text-xs text-muted-foreground/70">
+                {t("files.upload_hint")}
+              </p>
+            </div>
+          ) : filteredDocs.length === 0 ? (
+            // No results state
+            <div className="flex flex-col items-center justify-center h-full text-center">
+              <Search className="w-10 h-10 text-muted-foreground/30 mb-3" />
+              <h3 className="text-sm font-medium text-muted-foreground mb-1">
+                {t("files.no_files_match")}
+              </h3>
+              <p className="text-xs text-muted-foreground/70">
+                {t("files.adjust_search_hint")}
+              </p>
+            </div>
+          ) : (
+            // File grid
+            <div className="grid gap-5 grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-6 transition-all duration-300 w-full">
+              <AnimatePresence mode="popLayout">
+                {filteredDocs.map((doc) => (
+                  <FileCard
+                    key={doc.id}
+                    doc={doc}
+                    onDelete={setDeleteDocConfirm}
+                    onReindex={(id) => reindexDoc.mutate(id)}
+                    onProcess={(id) => processDoc.mutate(id)}
+                    onDownload={handleDownload}
+                    onPreview={selectDoc}
+                    onClickEdit={setEditDoc}
+                    isProcessing={processDoc.isPending}
+                  />
+                ))}
+              </AnimatePresence>
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Delete confirmation */}
@@ -564,26 +547,25 @@ export function FilesPage() {
           await updateDoc.mutateAsync({ docId, data });
         }}
       />
-      </motion.div>
 
       {/* Right side: Document Viewer (conditionally rendered) */}
       <AnimatePresence mode="popLayout" initial={false}>
         {selectedDoc && (
-          <motion.div 
+          <motion.div
             key={selectedDoc.id}
             initial={{ x: "100%", opacity: 0.5 }}
             animate={{ x: 0, opacity: 1 }}
             exit={{ x: "100%", opacity: 0, transition: { duration: 0.2, ease: "easeInOut" } }}
-            transition={{ 
-              type: "spring", 
-              stiffness: 350, 
+            transition={{
+              type: "spring",
+              stiffness: 350,
               damping: 38,
               mass: 0.8
             }}
-            className="w-full md:w-[65%] lg:w-[70%] xl:w-[75%] h-full border-l bg-background flex flex-col z-20 shadow-2xl relative"
+            className="w-full md:w-1/2 h-full border-l bg-background flex flex-col z-20 shadow-2xl relative"
           >
             <div className="absolute inset-y-0 -left-6 w-6 bg-gradient-to-r from-transparent to-black/[0.03] pointer-events-none" />
-            
+
             {/* Header with close button */}
             <div className="h-10 border-b flex items-center justify-between px-3 bg-muted/20 shrink-0">
               <span className="text-xs font-semibold truncate text-foreground/70">
@@ -598,7 +580,7 @@ export function FilesPage() {
                 <X className="w-4 h-4" />
               </Button>
             </div>
-            
+
             {/* The actual viewer, taking remaining height */}
             <div className="flex-1 overflow-hidden relative">
               <DocumentViewer

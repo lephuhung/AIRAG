@@ -37,7 +37,7 @@ from app.models.user import User
 from app.models.knowledge_base import KnowledgeBase
 from app.models.tenant import TenantUser
 from app.schemas.rag import ChatRequest
-from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
+from app.prompts.chat import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
 from app.services.abbreviation_service import AbbreviationService
 
 logger = logging.getLogger(__name__)

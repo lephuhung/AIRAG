@@ -155,8 +155,8 @@ async def seed_document_types(db) -> None:
     """
     from sqlalchemy import select
     from app.models.document_type import DocumentType, DocumentTypeSystemPrompt
-    from app.services.legal_kg_prompts import LEGAL_KG_SYSTEM_PROMPT
-    from app.api.chat_prompt import DEFAULT_SYSTEM_PROMPT
+    from app.prompts.legal_kg import LEGAL_KG_SYSTEM_PROMPT
+    from app.prompts.chat import DEFAULT_SYSTEM_PROMPT
 
     existing = await db.execute(select(DocumentType).where(DocumentType.slug.in_(
         d.slug for d in _DEFAULT_DOC_TYPES
