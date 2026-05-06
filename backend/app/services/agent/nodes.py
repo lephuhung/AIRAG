@@ -638,7 +638,18 @@ async def answer_generator(state: "AgentState") -> dict:
 
         db = get_current_db()
         all_texts = []
-        for doc_id in doc_ids_for_summarize:
+        
+        import random, string
+        existing_ids = {s.get("index") for s in sources if s.get("index")}
+        def _get_next_cid() -> str:
+            chars = string.ascii_lowercase + string.digits
+            while True:
+                cid = "".join(random.choices(chars, k=4))
+                if any(c.isalpha() for c in cid) and cid not in existing_ids:
+                    existing_ids.add(cid)
+                    return cid
+
+        for i, doc_id in enumerate(doc_ids_for_summarize):
             try:
                 # Use get_documents_content instead of summarize_document
                 # to get RAW markdown content (not LLM summary)
@@ -651,27 +662,71 @@ async def answer_generator(state: "AgentState") -> dict:
                 if docs and docs[0].get("content"):
                     # Use raw markdown content instead of summary
                     raw_content = docs[0]["content"]
+                    doc_filename = docs[0].get("filename", "Unknown")
                     # Truncate if too long (keep first 50k chars to fit context)
                     MAX_CHARS = 50000
                     if len(raw_content) > MAX_CHARS:
                         raw_content = raw_content[:MAX_CHARS] + "\n\n[... nội dung đã được cắt bớt ...]"
-                    all_texts.append(raw_content)
-                    logger.info(f"[answer_generator] fetched raw doc_id={doc_id}: {len(raw_content)} chars")
+                    
+                    cid = _get_next_cid()
+                    meta_line = f" ({doc_filename})"
+                    all_texts.append(f"Source [{cid}]{meta_line}:\n{raw_content}")
+                    
+                    sources.append({
+                        "index": cid,
+                        "chunk_id": f"doc_{doc_id}_full",
+                        "content": raw_content[:500], # Preview for UI
+                        "document_id": str(doc_id),
+                        "page_no": 0,
+                        "heading_path": [],
+                        "score": 1.0,
+                        "source_type": "vector",
+                        "source_file": doc_filename,
+                    })
+                    logger.info(f"[answer_generator] fetched raw doc_id={doc_id} as [{cid}]: {len(raw_content)} chars")
                 else:
                     # Fallback to summarize if no raw content
                     error = docs[0].get("error", "Unknown error") if docs else "No document returned"
                     logger.warning(f"[answer_generator] No raw content for {doc_id}, error: {error}")
                     summ_result = await _tools.summarize_document(document_id=doc_id, db=db)
                     if summ_result.get("text"):
-                        all_texts.append(summ_result["text"])
-                        logger.info(f"[answer_generator] fallback summarize for {doc_id}: {len(summ_result['text'])} chars")
+                        cid = _get_next_cid()
+                        doc_filename = summ_result.get("document_name", "Unknown")
+                        meta_line = f" ({doc_filename})"
+                        all_texts.append(f"Source [{cid}]{meta_line}:\n{summ_result['text']}")
+                        sources.append({
+                            "index": cid,
+                            "chunk_id": f"doc_{doc_id}_summary",
+                            "content": summ_result["text"][:500],
+                            "document_id": str(doc_id),
+                            "page_no": 0,
+                            "heading_path": [],
+                            "score": 1.0,
+                            "source_type": "vector",
+                            "source_file": doc_filename,
+                        })
+                        logger.info(f"[answer_generator] fallback summarize for {doc_id} as [{cid}]: {len(summ_result['text'])} chars")
             except Exception as e:
                 logger.warning(f"[answer_generator] get_documents_content failed for {doc_id}: {e}")
                 try:
                     summ_result = await _tools.summarize_document(document_id=doc_id, db=db)
                     if summ_result.get("text"):
-                        all_texts.append(summ_result["text"])
-                        logger.info(f"[answer_generator] fallback summarize for {doc_id}: {len(summ_result['text'])} chars")
+                        cid = _get_next_cid()
+                        doc_filename = summ_result.get("document_name", "Unknown")
+                        meta_line = f" ({doc_filename})"
+                        all_texts.append(f"Source [{cid}]{meta_line}:\n{summ_result['text']}")
+                        sources.append({
+                            "index": cid,
+                            "chunk_id": f"doc_{doc_id}_summary",
+                            "content": summ_result["text"][:500],
+                            "document_id": str(doc_id),
+                            "page_no": 0,
+                            "heading_path": [],
+                            "score": 1.0,
+                            "source_type": "vector",
+                            "source_file": doc_filename,
+                        })
+                        logger.info(f"[answer_generator] fallback summarize for {doc_id} as [{cid}]: {len(summ_result['text'])} chars")
                 except Exception as e2:
                     logger.warning(f"[answer_generator] summarize_document also failed for {doc_id}: {e2}")
 
@@ -681,6 +736,11 @@ async def answer_generator(state: "AgentState") -> dict:
         else:
             # Fallback: use the resolve_doc result message
             logger.warning("[answer_generator] No document content fetched, using resolve_doc message")
+            
+        # PUSH to UI so frontend knows about these dynamically added sources!
+        if sources:
+            from app.services.agent.streaming import push_event
+            await push_event(state, "sources", sources)
 
     if sources:
         chunk_parts = []

@@ -151,11 +151,11 @@ def _is_pure_greeting(message: str) -> bool:
 # =============================================================================
 
 
-async def _expand_abbreviations_in_message(message: str) -> tuple[str, bool]:
+async def _expand_abbreviations_in_message(message: str) -> tuple[str, bool, list[str]]:
     """
     Expand all uppercase abbreviations (2+ chars) found in the message.
 
-    Returns (expanded_message, was_modified).
+    Returns (expanded_message, was_modified, potential_abbreviations).
     Uses abbreviation DB to look up full forms.
     Supports both uppercase (BMNN) and lowercase (ntn, bmnn) abbreviations.
     """
@@ -168,7 +168,7 @@ async def _expand_abbreviations_in_message(message: str) -> tuple[str, bool]:
     abbr_matches = abbr_matches + lowercase_matches
 
     if not abbr_matches:
-        return message, False
+        return message, False, []
 
     # Remove duplicates while preserving order
     unique_abbrs = list(dict.fromkeys(abbr_matches))
@@ -180,7 +180,7 @@ async def _expand_abbreviations_in_message(message: str) -> tuple[str, bool]:
 
         db = get_current_db()
         if db is None:
-            return message, False
+            return message, False, []
 
         # Use a single query for all abbreviations
         from sqlalchemy import func
@@ -202,6 +202,7 @@ async def _expand_abbreviations_in_message(message: str) -> tuple[str, bool]:
         expanded_message = message
         any_expanded = False
         multi_meaning_abbrs = []
+        potential_abbreviations = []
 
         for abbr in unique_abbrs:
             all_matches = abbr_map.get(abbr.lower(), [])
@@ -209,6 +210,7 @@ async def _expand_abbreviations_in_message(message: str) -> tuple[str, bool]:
             if len(all_matches) == 0:
                 # No match in DB - keep original, will prompt user to add
                 logger.debug(f"[abbr_expand] No DB entry for: {abbr}")
+                potential_abbreviations.append(abbr)
                 continue
 
             if len(all_matches) == 1:
@@ -228,11 +230,11 @@ async def _expand_abbreviations_in_message(message: str) -> tuple[str, bool]:
                 short_forms = [f"{m.short_form}={m.full_form}" for m in all_matches]
                 logger.info(f"[abbr_expand] Multiple meanings for {abbr}: {' | '.join(short_forms)}")
 
-        return expanded_message, any_expanded
+        return expanded_message, any_expanded, potential_abbreviations
 
     except Exception as e:
         logger.warning(f"[abbr_expand] Failed to expand abbreviations: {e}")
-        return message, False
+        return message, False, []
 
 
 def _extract_user_message(state: SupervisorState) -> str:
@@ -399,11 +401,16 @@ async def supervisor_node(state: SupervisorState) -> dict:
 
         # Expand abbreviations in message before classification
         # This ensures BMNN -> "Bộ môn nghiệp vụ" BEFORE intent classification
+        potential_abbreviations = []
         if not expanded:
-            expanded_message, was_modified = await _expand_abbreviations_in_message(user_message)
+            expanded_message, was_modified, potential_abbreviations = await _expand_abbreviations_in_message(user_message)
             if was_modified:
                 logger.info(f"[supervisor] Abbreviations expanded: {user_message!r} -> {expanded_message!r}")
                 query_for_classifier = expanded_message
+
+            if potential_abbreviations:
+                from app.services.agent.streaming import push_event
+                await push_event(state, "potential_abbreviations", potential_abbreviations)
 
         classifier = get_memory_agent()
         response_text = ""
@@ -461,6 +468,7 @@ async def supervisor_node(state: SupervisorState) -> dict:
                 "iterations": iterations + 1,
                 "should_loop_back": False,
                 "document_ids": preserved_doc_ids,
+                "potential_abbreviations": potential_abbreviations,
             }
 
         result = {
@@ -471,6 +479,7 @@ async def supervisor_node(state: SupervisorState) -> dict:
             "iterations": iterations + 1,
             # Reset loop flag on each supervisor entry
             "should_loop_back": False,
+            "potential_abbreviations": potential_abbreviations,
         }
 
         # Smart thinking decision: RAG tasks don't need thinking (just retrieval),

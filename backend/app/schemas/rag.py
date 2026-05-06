@@ -244,6 +244,7 @@ class ChatSourceChunk(BaseModel):
     heading_path: list[str] = []
     score: float = 0.0
     source_type: str = "vector"  # "vector" | "kg"
+    source_file: str | None = None
 
 
 class ChatImageRef(BaseModel):

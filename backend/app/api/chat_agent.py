@@ -542,6 +542,7 @@ async def _execute_search_documents(
                 heading_path=chunk.heading_path,
                 score=score,
                 source_type="vector",
+                source_file=citation.source_file if citation else getattr(chunk, "source_file", ""),
             )
         )
         logger.info(

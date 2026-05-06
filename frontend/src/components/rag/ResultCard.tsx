@@ -123,7 +123,7 @@ export const ResultCard = memo(function ResultCard({ chunk, index, query }: Resu
                 {source}
               </span>
             )}
-            {pageNo != null && (
+            {!!pageNo && (
               <span className="text-xs text-muted-foreground/60">p.{pageNo}</span>
             )}
             {citation?.heading_path && citation.heading_path.length > 0 && (

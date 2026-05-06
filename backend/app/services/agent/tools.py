@@ -155,6 +155,7 @@ async def list_documents(
             by_ws.setdefault(doc.workspace_id, []).append(doc)
 
         lines = []
+        doc_counter = 1
         for ws_id, ws_docs in by_ws.items():
             ws_name = ws_map.get(ws_id, f"KB {ws_id}")
             lines.append(f"\n### Workspace: {ws_name}")
@@ -162,9 +163,10 @@ async def list_documents(
                 page_info = f", {doc.page_count} trang" if doc.page_count else ""
                 chunk_info = f", {doc.chunk_count} đoạn" if doc.chunk_count else ""
                 lines.append(
-                    f"{i}. **{doc.original_filename}** (ID: {doc.id})"
+                    f"{i}. **{doc.original_filename}** (DocRef: doc{doc_counter:02d})"
                     f"{page_info}{chunk_info}"
                 )
+                doc_counter += 1
 
         text = f"Tổng cộng **{len(docs)} tài liệu** đã được lập chỉ mục:\n"
         text += "\n".join(lines)
@@ -673,17 +675,28 @@ async def search_documents_number(
 
         lines = [f"Tìm thấy **{len(docs)} tài liệu** có số văn bản liên quan:"]
         doc_list = []
+        import random, string
         for i, doc in enumerate(docs, 1):
+            chars = string.ascii_lowercase + string.digits
+            while True:
+                cid = "".join(random.choices(chars, k=4))
+                if any(c.isalpha() for c in cid):
+                    break
             doc_info = {
-                "id": doc.id,
+                "id": str(doc.id),
+                "document_id": str(doc.id),
                 "filename": doc.original_filename,
+                "source_file": doc.original_filename,
                 "document_number": doc.document_number,
+                "index": cid,
+                "content": f"Tài liệu: {doc.original_filename}\nSố văn bản: {doc.document_number or 'N/A'}",
+                "chunk_id": f"doc_{doc.id}_meta",
             }
             doc_list.append(doc_info)
             lines.append(
                 f"{i}. **{doc.original_filename}**\n"
                 f"   Số văn bản: {doc.document_number or 'N/A'}\n"
-                f"   ID: {doc.id}"
+                f"   Mã trích dẫn (Citation ID): [{cid}]"
             )
 
         return {

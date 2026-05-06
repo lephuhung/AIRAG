@@ -182,7 +182,7 @@ function CitationLink({
   const docName = doc?.original_filename
     ? shortenDocName(doc.original_filename)
     : t("rag.source") + ` ${index}`;
-  const label = `${docName}-P.${source.page_no || "?"}`;
+  const label = source.page_no ? `${docName}-P.${source.page_no}` : docName;
 
   return (
     <span className="inline-flex gap-0.5 mx-0.5 align-middle">
@@ -1080,8 +1080,8 @@ const PremiumThinking = memo(({
       setExpanded(true);
     }
     
-    // Auto-collapse when content starts appearing to focus on the answer
-    if (isStreaming && hasContent && expanded) {
+    // Auto-collapse when content starts appearing or when streaming finishes to focus on the answer
+    if ((hasContent || !isStreaming) && expanded) {
       setExpanded(false);
     }
   }, [thinking, isStreaming, hasContent, expanded]);

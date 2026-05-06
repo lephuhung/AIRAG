@@ -69,7 +69,7 @@ Rules:
 Examples:
 User: "xin chào"  → {"intent": "greeting", "rewritten_query": "", "needs_tool": false, "write_action": "", "text_input": ""}
 User: "tôi đang công tác ở đâu?" → {"intent": "personal", "rewritten_query": "tôi đang công tác ở đâu?", "needs_tool": false, "write_action": "", "text_input": ""}
-User: "doanh thu 2024 là bao nhiêu?" → {"intent": "search", "rewritten_query": "doanh thu thuần tổng doanh thu năm 2024 theo quý", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "mức phạt không đội mũ bảo hiểm?" → {"intent": "search", "rewritten_query": "quy định mức phạt tiền hành vi không đội mũ bảo hiểm vi phạm giao thông", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "an ninh mạng là gì?" → {"intent": "search", "rewritten_query": "định nghĩa an ninh mạng khái niệm", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "có tài liệu gì trong hệ thống?" → {"intent": "list_docs", "rewritten_query": "danh sách tài liệu", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "tóm tắt tài liệu ID 5" → {"intent": "summarize", "rewritten_query": "tóm tắt tài liệu 5", "needs_tool": true, "write_action": "", "text_input": ""}

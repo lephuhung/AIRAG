@@ -273,9 +273,13 @@ export const DocumentViewer = memo(function DocumentViewer({
   // When new highlights arrive, switch to chunk mode automatically
   useEffect(() => {
     if (hasHighlight) {
-      setViewMode("chunk");
+      if (primaryChunk?.page_no === 0 || primaryChunk?.chunk_id?.includes("summary") || primaryChunk?.chunk_id?.includes("full")) {
+        setViewMode("full");
+      } else {
+        setViewMode("chunk");
+      }
     }
-  }, [hasHighlight, primaryChunk?.chunk_id]);
+  }, [hasHighlight, primaryChunk?.chunk_id, primaryChunk?.page_no]);
 
   const effectiveMode = hasHighlight ? viewMode : "full";
 
