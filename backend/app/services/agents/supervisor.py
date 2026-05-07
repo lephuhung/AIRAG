@@ -597,20 +597,19 @@ async def direct_answer_node(state: SupervisorState) -> dict:
 
 
 # =============================================================================
-# Answer Generator Node
+# Answer Generator Node — RAG-only
 # =============================================================================
 
 async def answer_generator_node(state: SupervisorState) -> dict:
     """
-    Generate final answer from accumulated sources/context.
+    Generate final answer from accumulated RAG sources/context.
     Wraps the answer_generator from nodes.py for supervisor graph.
 
-    Uses merge pattern over DEFAULT_STATE to avoid manual field-by-field copy.
-    This stays in sync automatically when new fields are added to either state.
+    This node is now RAG-only — write/direct agents bypass it entirely,
+    and mongo has its own formatter node. This eliminates the "God Node"
+    pattern where one node handled all intent types.
 
-    For write intents (summarize/suggest_edits/grammar_check/format_check),
-    the write agent already produces a final_answer — skip LLM generation
-    and use the write agent's output directly.
+    Uses merge pattern over DEFAULT_STATE to avoid manual field-by-field copy.
     """
     from app.services.agent.nodes import answer_generator as _orig_ag
     from app.services.agent.state import DEFAULT_STATE
@@ -618,48 +617,92 @@ async def answer_generator_node(state: SupervisorState) -> dict:
     intent = state.get("intent", "")
     logger.info(f"[LANGGRAPH_NODE] Entering answer_generator_node, intent={intent!r}")
 
-    # Check if agent already produced final_answer and shouldn't be reformatted by answer_generator
-    skip_intents = {
-        "write_summarize",
-        "write_suggest_edits",
-        "write_grammar_check",
-        "write_format_check",
-        "greeting",
-        "personal",
-    }
-    intent = state.get("intent", "")
-    existing_final = state.get("final_answer", "")
-    if intent in skip_intents and existing_final:
-        logger.info(
-            f"[answer_generator_node] Skip intent={intent!r} — using existing final_answer "
-            f"({len(existing_final)} chars), skipping LLM generation"
-        )
-        return {
-            "final_answer": existing_final,
-            "next_agent": AgentType.FINISH,
-        }
-
     # Merge SupervisorState over DEFAULT_STATE — keys present in state win.
-    # We iterate state.items() to handle TypedDict gracefully.
     agent_state = {**DEFAULT_STATE}
     for k, v in state.items():
-        # Keep None values only when the field is not in DEFAULT_STATE
-        # (i.e. don't overwrite meaningful defaults with None from SupervisorState)
         if v is not None or k not in DEFAULT_STATE:
             agent_state[k] = v
 
-    # Override control fields — always force these regardless of state values
+    # Override control fields
     agent_state["tool_called"] = True
     agent_state["existing_citation_ids"] = {}
     agent_state["citation_map"] = {}
 
-    # Call the original answer_generator with AgentState-compatible dict
     result = await _orig_ag(agent_state)
 
     return {
         "final_answer": result.get("final_answer", ""),
         "next_agent": AgentType.FINISH,
     }
+
+
+# =============================================================================
+# Mongo Formatter Node — People search only
+# =============================================================================
+
+async def mongo_formatter_node(state: SupervisorState) -> dict:
+    """
+    Format MongoDB people search results via a lightweight LLM call.
+
+    Uses a small, focused prompt (~1KB) instead of the full RAG system prompt
+    (~13KB). This saves ~80% tokens compared to routing through answer_generator.
+    """
+    from app.services.llm import get_llm_provider
+    from app.services.llm.types import LLMMessage as _LLMMsg
+    from app.services.agent.streaming import push_event
+    from app.services.agent.nodes import strip_thinking_tags
+
+    logger.info(f"[LANGGRAPH_NODE] Entering mongo_formatter_node")
+
+    existing_final = state.get("final_answer", "")
+    if not existing_final:
+        return {
+            "final_answer": "Không tìm thấy dữ liệu.",
+            "next_agent": AgentType.FINISH,
+        }
+
+    await push_event(state, "status", {"step": "generating", "detail": "Đang trình bày kết quả..."})
+
+    # Focused prompt — only mongo formatting rules
+    format_system = (
+        "Bạn là một trợ lý truy vấn cơ sở dữ liệu.\n"
+        "Nhiệm vụ: Đọc dữ liệu hồ sơ người dân bên dưới và trình bày lại "
+        "NGẮN GỌN, SẠCH SẼ, DỄ ĐỌC bằng TIẾNG VIỆT.\n\n"
+        "QUY TẮC BẮT BUỘC:\n"
+        "1. Mỗi hồ sơ = 1 KHỐI riêng biệt, bắt đầu bởi 1., 2., 3., ...\n"
+        "2. Mỗi khối cách nhau bằng MỘT DÒNG TRỐNG.\n"
+        "3. Dòng đầu là tiêu đề (in đậm).\n"
+        "4. Mỗi thông tin nằm trên 1 dòng riêng, có dấu ';'.\n"
+        "5. KHÔNG viết nhiều thông tin trên cùng một dòng.\n"
+        "6. KHÔNG dùng ký hiệu [xxx] hay ObjectId trong câu trả lời.\n"
+        "7. Bỏ qua field rỗng/null.\n"
+        "8. Nếu không có kết quả, nói rõ 'Không tìm thấy'.\n"
+    )
+    format_user = (
+        f"Dữ liệu truy vấn:\n{existing_final}\n\n"
+        "Hãy trình bày lại dữ liệu dễ đọc cho người dùng."
+    )
+
+    provider = get_llm_provider()
+    mongo_messages = [
+        _LLMMsg(role="system", content=format_system),
+        _LLMMsg(role="user", content=format_user),
+    ]
+
+    try:
+        answer_parts: list[str] = []
+        async for chunk in provider.astream(
+            messages=mongo_messages, temperature=0.1, max_tokens=4096,
+        ):
+            if chunk.type == "text" and chunk.text:
+                await push_event(state, "token", chunk.text)
+                answer_parts.append(chunk.text)
+        final = strip_thinking_tags("".join(answer_parts))
+        return {"final_answer": final, "next_agent": AgentType.FINISH}
+    except Exception as e:
+        logger.error(f"[mongo_formatter_node] LLM format failed: {e} — using raw")
+        await push_event(state, "token", existing_final)
+        return {"final_answer": existing_final, "next_agent": AgentType.FINISH}
 
 
 # =============================================================================
@@ -695,7 +738,7 @@ def route_from_supervisor(state: SupervisorState) -> str:
         if next_agent == AgentType.WRITE:
             return "bypass_memory_to_write"
         if next_agent == AgentType.DIRECT:
-            return "direct"  # bypass memory_recall, go straight to direct node
+            return "bypass_memory_to_direct"  # bypass memory_recall for greeting/personal
 
     return next_agent
 
@@ -739,8 +782,11 @@ def create_supervisor_graph():
     """
     Build and compile the supervisor-based multi-agent graph.
 
-    Flow:
-        START → supervisor → [rag | write | direct] → answer_generator → END
+    Flow (intent-specific pipelines):
+        START → supervisor → memory_recall → rag → answer_generator → END
+                                           → write → END  (already has final_answer)
+                                           → people → mongo_formatter → END
+                                           → direct → END  (already has final_answer)
                       ↑                               │
                       └───────────────────────────────┘
     """
@@ -753,7 +799,8 @@ def create_supervisor_graph():
     graph.add_node("write", _write_agent_wrapper)
     graph.add_node("people", _people_agent_wrapper)
     graph.add_node("direct", direct_answer_node)
-    graph.add_node("answer_generator", answer_generator_node)
+    graph.add_node("answer_generator", answer_generator_node)  # RAG-only
+    graph.add_node("mongo_formatter", mongo_formatter_node)    # People-only
 
     # Edges
     graph.add_edge(START, "supervisor")
@@ -769,6 +816,7 @@ def create_supervisor_graph():
             AgentType.PEOPLE: "memory_recall",
             AgentType.ANSWER_GENERATOR: "answer_generator",
             "bypass_memory_to_write": "write",
+            "bypass_memory_to_direct": "direct",  # bypass memory_recall for greeting/personal
             END: END,  # handle finish case
         },
     )
@@ -789,15 +837,19 @@ def create_supervisor_graph():
         },
     )
 
-    # After rag/write/people/direct agents complete, go to answer_generator
-    # (rag uses conditional routing to support abbreviation loop-back)
+    # Intent-specific output pipelines:
+    # - RAG → answer_generator (needs LLM to compose answer from sources)
+    # - Write → END (write_agent already produces final_answer via streaming)
+    # - People → mongo_formatter (lightweight LLM call, ~1KB prompt)
+    # - Direct → END (direct_answer_node already produces final_answer via streaming)
     graph.add_conditional_edges("rag", route_from_rag, {"supervisor": "supervisor", "answer_generator": "answer_generator"})
-    graph.add_edge("write", "answer_generator")
-    graph.add_edge("people", "answer_generator")
-    graph.add_edge("direct", "answer_generator")
+    graph.add_edge("write", END)
+    graph.add_edge("people", "mongo_formatter")
+    graph.add_edge("direct", END)
 
-    # answer_generator leads to END
+    # Terminal nodes
     graph.add_edge("answer_generator", END)
+    graph.add_edge("mongo_formatter", END)
 
     return graph.compile()
 

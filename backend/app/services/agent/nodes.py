@@ -529,56 +529,6 @@ async def answer_generator(state: "AgentState") -> dict:
     )
     logger.info(f"[answer_generator] abbreviation_results={abbreviation_results!r}")
 
-    # ── MongoDB people search: use LLM to format nicely (but include ALL results) ──
-    mongo_intents = {
-        "mongo_search_cccd",
-        "mongo_search_name",
-        "mongo_search_bhxh",
-        "mongo_search_phone",
-    }
-    if intent in mongo_intents and state.get("final_answer"):
-        mongo_context = state["final_answer"]
-        logger.info(
-            f"[answer_generator] Mongo search — formatting via LLM ({len(mongo_context)} chars)"
-        )
-
-        format_system = (
-            "Bạn là một trợ lý truy vấn cơ sở dữ liệu.\n"
-            "Nhiệm vụ: Đọc dữ liệu hồ sơ người dân bên dưới và trình bày lại "
-            "NGẮN GỌN, SẠCH SẼ, DỄ ĐỌC bằng TIẾNG VIỆT.\n\n"
-            "QUY TẮC BẮT BUỘC:\n"
-            "1. Mỗi hồ sơ = 1 KHỐI riêng biệt, bắt đầu bởi 1., 2., 3., ...\n"
-            "2. Mỗi khối cách nhau bằng MỘT DÒNG TRỐNG.\n"
-            "3. Dòng đầu là tiêu đề (in đậm).\n"
-            "4. Mỗi thông tin nằm trên 1 dòng riêng, có dấu ';'.\n"
-            "5. KHÔNG viết nhiều thông tin trên cùng một dòng.\n"
-            "6. KHÔNG dùng ký hiệu [xxx] hay ObjectId trong câu trả lời..\n"
-            "7. Bỏ qua field rỗng/null.\n"
-        )
-        format_user = (
-            f"Dữ liệu truy vấn:\n{mongo_context}\n\n"
-            "Hãy trình bày lại dữ liệu dễ đọc cho người dùng."
-        )
-
-        mongo_messages = [_LLMMsg(role="system", content=format_system)]
-        mongo_messages.append(_LLMMsg(role="user", content=format_user))
-
-        try:
-            mongo_answer_parts: list[str] = []
-            async for chunk in provider.astream(
-                messages=mongo_messages, temperature=0.1, max_tokens=4096
-            ):
-                if chunk.type == "text" and chunk.text:
-                    await push_event(state, "token", chunk.text)
-                    mongo_answer_parts.append(chunk.text)
-            final = "".join(mongo_answer_parts)
-            return {"final_answer": final}
-        except Exception as e:
-            logger.error(
-                f"[answer_generator] Mongo LLM format failed: {e} — falling back to raw"
-            )
-            await push_event(state, "token", mongo_context)
-            return {"final_answer": mongo_context}
 
     # Inject memory into system prompt if available
     effective_system = system_prompt
@@ -598,20 +548,7 @@ async def answer_generator(state: "AgentState") -> dict:
             "## Knowledge Graph / Tool Results\n" + "\n\n".join(kg_summaries)
         )
 
-    # Add MongoDB people search results to context
-    # Use kg_summaries (already has formatted mongo display from _transform_rag_output)
-    # or state.final_answer — do NOT rebuild from raw mongo_results fields
-    if kg_summaries and any(
-        "Cơ Sở Dữ Liệu" in s or "PRE-FORMATTED" in s for s in kg_summaries
-    ):
-        # Already formatted by _transform_rag_output — use as-is
-        logger.info(
-            f"[answer_generator] Mongo display already in kg_summaries, skipping rebuild"
-        )
-    elif state.get("mongo_results") and state.get("final_answer"):
-        # Fallback: use pre-formatted final_answer
-        context_parts.append("## Cơ Sở Dữ Liệu Người Dân\n" + state["final_answer"])
-        logger.info(f"[answer_generator] Using state.final_answer for mongo context")
+
 
     # Add abbreviation search results to context
     abbreviation_results = state.get("abbreviation_results", [])
@@ -787,62 +724,18 @@ async def answer_generator(state: "AgentState") -> dict:
         llm_messages.append(_LLMMsg(role=role, content=content))
 
     # Always inject instructions so LLM never fabricates when context is empty
+    # Use modular instructions based on intent — saves 30-60% tokens
+    from app.prompts.agents.answer_instructions import get_instructions_for_intent
+
     context_text = "\n\n".join(context_parts) if context_parts else "(no retrieved context)"
     query_msg = f"Question: {rewritten_query}" if rewritten_query else ""
+    intent_instructions = get_instructions_for_intent(intent)
     inject = (
         "\n\n=== RETRIEVED CONTEXT ===\n"
         + (f"{query_msg}\n\n" if query_msg else "")
         + context_text
         + "\n=== END CONTEXT ===\n\n"
-        "INSTRUCTIONS:\n"
-        "- CRITICAL: Answer the CURRENT question based ONLY on the RETRIEVED CONTEXT above. "
-        "Previous conversation messages are provided only for reference continuity (e.g. 'tài liệu này'). "
-        "Do NOT reuse, blend, or repeat information from previous assistant answers. "
-        "Each question must be answered independently from the retrieved sources.\n"
-        "- Answer based ONLY on the retrieved sources above. "
-        "If the retrieved context is empty or says 'no results', say so — do NOT fill in details from your own knowledge.\n"
-        "- You have NO access to external databases, phone records, or personal information "
-        "about any individual except what appears in the 'RETRIEVED CONTEXT' section above.\n"
-        "- Cite sources using their unique IDs in brackets, e.g. [a3z9] or [b2m7]. ONLY cite sources that actually appear in the RETRIEVED CONTEXT above. Do NOT invent or hallucinate citation IDs.\n"
-        "- Memory facts: paraphrase in your own words and cite as [MEM-{id}]. Do NOT copy facts verbatim.\n"
-        "- If the sources do not contain enough information to answer fully, "
-        "be honest about it. Provide what you can, clearly note what is missing, "
-        "and suggest what the user might do next.\n"
-        "- If NO sources are relevant or available (context shows 'no results' or is empty), "
-        "respond that you cannot find relevant information and ASK the user to provide more details "
-        "or clarify their question. Do NOT list or introduce documents in the system. Do NOT fabricate citation IDs.\n"
-        "- TABLE DATA: 'Key, Year = Value' pairs are table cells.\n"
-        "- DATABASE RECORDS: If the context includes 'Cơ Sở Dữ Liệu Người Dân', "
-        "ONLY report the information that appears EXPLICITLY in those records. "
-        "Do NOT infer, guess, or fabricate related phone numbers, names, IDs, "
-        "or any other personal information not present in the records. "
-        "If a record does not contain a field (e.g., no address, no birthdate), "
-        "simply state that the information is not available — do not fill in with assumptions.\n"
-        "- PHONE NUMBER SEARCH STRICT RULE:\n"
-        "  You have NO knowledge of any specific Vietnamese individual's phone number, "
-        "name, CCCD, or BHXH beyond what appears EXPLICITLY in the retrieved database records above.\n"
-        "  When a phone search returns NO records:\n"
-        "    ✅ CORRECT: 'Không tìm thấy người nào có số điện thoại này trong cơ sở dữ liệu.'\n"
-        "    ❌ WRONG: Mentioning ANY other phone number (e.g., 0949755968, 0339755968) "
-        "or ANY person's name (e.g., Huỳnh Minh Khải) — even if you think you 'recognize' it. "
-        "You do NOT have real-time access to Vietnamese phone records. "
-        "Any name or number NOT in the retrieved context is a hallucination.\n"
-        "  When a phone search returns records:\n"
-        "    ✅ CORRECT: Report ONLY the fields that appear verbatim in the records. "
-        "If a phone number is not in the records, do not mention it — even if you believe you know who it belongs to.\n"
-        "  FIREWALL RULE: The moment you write a sentence containing a phone number or name "
-        "that does NOT appear in the 'Cơ Sở Dữ Liệu Người Dân' section above, "
-        "you are hallucinating. Stop immediately and revise.\n"
-        "- SPARSE RECORDS (e.g. UID/Facebook records with only phone + ID, no name): "
-        "If a record has no person's name attached, do NOT mention it as a result. "
-        "Skip it entirely. Only include records where a person's name is present.\n"
-        "- PARENT/GUARDIAN PHONE NUMBERS: If the only phone number in a record "
-        "belongs to a parent or guardian (e.g., mother's phone in vaccination records), "
-        "do NOT report it as the person's own phone number. "
-        "You may mention it briefly as 'phone of parent/guardian' only if directly relevant.\n"
-        "- Keep your tone friendly and helpful, not robotic or overly formal.\n"
-        "- End with a brief 1-2 line suggestion for what to explore next, "
-        "if appropriate (start with 'Gợi ý:' or 'Suggestion:').\n"
+        + intent_instructions
     )
     # Always append instructions (no `if context_parts:` guard)
     if llm_messages and llm_messages[-1].role == "user":
