@@ -26,6 +26,7 @@ class Intent:
     SEARCH_DOC_NUM = "search_doc_num"
     SEARCH_ABBR = "search_abbr"
     SEARCH_SECTION = "search_section"
+    RESOLVE_DOC = "resolve_doc"
     WRITE_SUMMARIZE = "write_summarize"
     WRITE_SUGGEST_EDITS = "write_suggest_edits"
     WRITE_GRAMMAR_CHECK = "write_grammar_check"
@@ -38,7 +39,8 @@ class Intent:
 
     ALL = {
         GREETING, PERSONAL, SEARCH, LIST_DOCS, SUMMARIZE, KG_QUERY,
-        SEARCH_DOC_NUM, SEARCH_ABBR, SEARCH_SECTION, WRITE_SUMMARIZE, WRITE_SUGGEST_EDITS,
+        SEARCH_DOC_NUM, SEARCH_ABBR, SEARCH_SECTION, RESOLVE_DOC,
+        WRITE_SUMMARIZE, WRITE_SUGGEST_EDITS,
         WRITE_GRAMMAR_CHECK, WRITE_FORMAT_CHECK, MONGO_SEARCH_CCCD,
         MONGO_SEARCH_NAME, MONGO_SEARCH_BHxh, MONGO_SEARCH_PHONE,
         MONGO_SEARCH_ADVANCED,
@@ -56,6 +58,7 @@ class AgentType:
     PEOPLE = "people"
     FINISH = "finish"
     ANSWER_GENERATOR = "answer_generator"
+    RESOLVE_DOC = "resolve_doc"  # Phase 2: dedicated resolve_doc agent (future)
 
 
 # =============================================================================
@@ -135,6 +138,16 @@ class SupervisorState(TypedDict, total=False):
     # Output
     final_answer: str | None
 
+    # Phase 1: Smart RAG Search Routing
+    # Controls which retrieval mode is used: "vector" | "kg" | "hybrid"
+    # Set by supervisor_node based on intent, consumed by _tool_search
+    search_mode: str  # "vector" | "kg" | "hybrid"
+
+    # Phase 4: Query Clarification & Smart Abbreviation Detection
+    suspected_abbreviations: list[str]   # Từ nghi ngờ là viết tắt (từ thinking)
+    clarification_needed: bool            # True khi cần hỏi user thêm thông tin
+    clarification_message: str            # Nội dung câu hỏi clarification gửi cho user
+
     # Supervisor control fields
     next_agent: Literal["rag", "write", "people", "direct", "finish"] | None
     iterations: int
@@ -142,6 +155,20 @@ class SupervisorState(TypedDict, total=False):
     potential_abbreviations: list[str]
     expanded_query: str
     should_loop_back: bool  # True when abbreviation was found → re-classify with full form
+
+    # Phase 3: Smart Memory Recall
+    # True when supervisor detects personal reference in query (intent=personal OR keywords like "tôi", "đơn vị tôi")
+    # Controls whether memory_recall → query_enricher runs before target agent
+    needs_memory: bool
+
+    # Phase 4: Plan-Aware Supervisor
+    # task_plan: ordered list of intents the supervisor plans to execute
+    # e.g. ["resolve_doc", "search_section"] for "Tóm tắt điều 3 Luật ANM 2018"
+    # First item = current step (= intent), remaining = pending steps
+    task_plan: list[str] | None
+    # pending_intent: the user's FINAL GOAL intent, preserved while prerequisite
+    # steps execute. e.g. "summarize" while resolve_doc runs first.
+    pending_intent: str | None
 
 
 # =============================================================================

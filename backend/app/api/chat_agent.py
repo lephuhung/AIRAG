@@ -410,11 +410,23 @@ async def _execute_search_documents(
     db: AsyncSession,
     existing_ids: set[str],
     document_ids: Optional[list[uuid.UUID]] = None,
+    search_mode: str = "hybrid",  # Phase 1: "vector" | "kg" | "hybrid"
+    scoped_to_documents: bool = False,  # Phase 3: skip broad search when doc_ids known
 ) -> tuple[str, list[ChatSourceChunk], list[ChatImageRef], list[dict], list[str]]:
     """Execute document search across multiple workspaces and return best chunks.
 
     When document_ids is provided, fetches content directly from MinIO (for
     chat-uploaded documents that bypassed the ChromaDB embed pipeline).
+
+    Args:
+        search_mode: Controls retrieval strategy.
+            "vector" — skip KG search, vector only (fast)
+            "kg"     — skip vector search, KG only
+            "hybrid" — run both (default)
+        scoped_to_documents: Phase 3. When True and document_ids is non-empty,
+            skips the broad per-workspace search loop and ONLY queries the vector
+            store with the document_ids filter. Use when caller already knows which
+            documents to search (e.g. after resolve_doc, or file upload context).
 
     Returns:
         (context_text, sources, image_refs, image_parts_for_vision, kg_summaries)
@@ -422,6 +434,12 @@ async def _execute_search_documents(
     from app.services.rag_service import get_rag_service
     from app.services.hrag_service import HRAGService
     from pathlib import Path as _P
+
+    # Translate search_mode to HRAGService.query_deep mode param
+    _mode_map = {"vector": "vector", "kg": "kg", "hybrid": "hybrid"}
+    hrag_mode = _mode_map.get(search_mode, "hybrid")
+    if search_mode != "hybrid":
+        logger.info(f"[RAG] search_mode={search_mode!r} → query_deep mode={hrag_mode!r}")
 
     all_chunks = []
     all_kg_summaries = []
@@ -455,63 +473,101 @@ async def _execute_search_documents(
                 f"[RAG] Direct doc content loaded: doc={doc.id}, chars={len(content)}"
             )
 
-    for workspace_id in workspace_ids:
+    # Phase 3: UUID-scoped search — skip broad workspace loop, use document filter only
+    if scoped_to_documents and document_ids:
         logger.info(
-            f"[RAG] External Search: query='{query}' on workspace {workspace_id}"
+            f"[RAG] UUID-scoped: skipping broad workspace search, "
+            f"querying {len(document_ids)} doc(s) directly via HRAG filter"
         )
-        rag_service = get_rag_service(db, workspace_id)
-
-        chunks = []
-        citations = []
-        if isinstance(rag_service, HRAGService):
-            try:
-                result = await rag_service.query_deep(
-                    question=query,
-                    top_k=min(top_k, 10),
-                    document_ids=document_ids,
-                    mode="hybrid",
-                    include_images=False,
-                )
-                chunks = result.chunks
-                citations = result.citations
-                if result.knowledge_graph_summary:
-                    all_kg_summaries.append(
-                        f"### Knowledge Graph Insights\n{result.knowledge_graph_summary}"
+        # Use the first workspace_id to instantiate HRAGService — document_ids acts as hard filter
+        for workspace_id in workspace_ids:
+            rag_service = get_rag_service(db, workspace_id)
+            if isinstance(rag_service, HRAGService):
+                try:
+                    result = await rag_service.query_deep(
+                        question=query,
+                        top_k=min(top_k, 10),
+                        document_ids=document_ids,  # Hard filter: only these docs
+                        mode=hrag_mode,
+                        include_images=False,
                     )
-            except Exception as e:
-                logger.warning(f"Search failed for workspace {workspace_id}: {e}")
-        else:
-            from types import SimpleNamespace
-
-            try:
-                legacy = rag_service.query(question=query, top_k=min(top_k, 10))
-                for i, c in enumerate(legacy.chunks):
-                    chunks.append(
-                        SimpleNamespace(
-                            content=c.content,
-                            document_id=int(c.metadata.get("document_id", 0)),
-                            chunk_index=i,
-                            page_no=int(c.metadata.get("page_no", 0)),
-                            heading_path=str(c.metadata.get("heading_path", "")).split(
-                                " > "
-                            )
-                            if c.metadata.get("heading_path")
-                            else [],
-                            source_file=str(c.metadata.get("source", "")),
-                            image_refs=[],
-                            score=c.score,
+                    for i, chunk in enumerate(result.chunks):
+                        citation = result.citations[i] if i < len(result.citations) else None
+                        score = getattr(chunk, "score", 0.0)
+                        all_chunks.append((score, chunk, citation, workspace_id))
+                    if result.knowledge_graph_summary:
+                        all_kg_summaries.append(
+                            f"### Knowledge Graph Insights\n{result.knowledge_graph_summary}"
                         )
+                    logger.info(
+                        f"[RAG] UUID-scoped query on workspace {workspace_id}: "
+                        f"{len(result.chunks)} chunks"
                     )
-            except Exception as e:
-                logger.warning(
-                    f"Legacy search failed for workspace {workspace_id}: {e}"
-                )
+                    break  # Found results, no need to check other workspaces
+                except Exception as e:
+                    logger.warning(
+                        f"[RAG] UUID-scoped search failed on workspace {workspace_id}: {e}"
+                    )
+        # Skip the broad workspace loop below
+    else:
+        for workspace_id in workspace_ids:
+            logger.info(
+                f"[RAG] External Search: query='{query}' on workspace {workspace_id}"
+            )
+            rag_service = get_rag_service(db, workspace_id)
 
-        # Pack chunks with their citation for sorting
-        for i, chunk in enumerate(chunks):
-            citation = citations[i] if i < len(citations) else None
-            score = getattr(chunk, "score", 0.0)
-            all_chunks.append((score, chunk, citation, workspace_id))
+            chunks = []
+            citations = []
+            if isinstance(rag_service, HRAGService):
+                try:
+                    result = await rag_service.query_deep(
+                        question=query,
+                        top_k=min(top_k, 10),
+                        document_ids=document_ids,
+                        mode=hrag_mode,
+                        include_images=False,
+                    )
+
+                    chunks = result.chunks
+                    citations = result.citations
+                    if result.knowledge_graph_summary:
+                        all_kg_summaries.append(
+                            f"### Knowledge Graph Insights\n{result.knowledge_graph_summary}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Search failed for workspace {workspace_id}: {e}")
+            else:
+                from types import SimpleNamespace
+
+                try:
+                    legacy = rag_service.query(question=query, top_k=min(top_k, 10))
+                    for i, c in enumerate(legacy.chunks):
+                        chunks.append(
+                            SimpleNamespace(
+                                content=c.content,
+                                document_id=int(c.metadata.get("document_id", 0)),
+                                chunk_index=i,
+                                page_no=int(c.metadata.get("page_no", 0)),
+                                heading_path=str(c.metadata.get("heading_path", "")).split(
+                                    " > "
+                                )
+                                if c.metadata.get("heading_path")
+                                else [],
+                                source_file=str(c.metadata.get("source", "")),
+                                image_refs=[],
+                                score=c.score,
+                            )
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Legacy search failed for workspace {workspace_id}: {e}"
+                    )
+
+            # Pack chunks with their citation for sorting
+            for i, chunk in enumerate(chunks):
+                citation = citations[i] if i < len(citations) else None
+                score = getattr(chunk, "score", 0.0)
+                all_chunks.append((score, chunk, citation, workspace_id))
 
     # Sort all aggregated chunks by score descending
     all_chunks.sort(key=lambda x: x[0], reverse=True)

@@ -74,9 +74,21 @@ async def search_documents(
     existing_citation_ids: set,
     db: "AsyncSession",
     document_ids: Optional[list[uuid.UUID]] = None,
+    search_mode: str = "hybrid",  # Phase 1: "vector" | "kg" | "hybrid"
+    scoped_to_documents: bool = False,  # Phase 3: restrict search to document_ids only
 ) -> dict:
     """
     Hybrid search across workspaces via HRAG pipeline.
+
+    Args:
+        search_mode: Controls retrieval strategy.
+            "vector" — vector search only (fast, good for extraction/summarize)
+            "kg"     — knowledge graph only (good for relationship queries)
+            "hybrid" — vector + KG (default, most thorough)
+        scoped_to_documents: Phase 3. When True and document_ids is non-empty,
+            skips broad workspace search and ONLY queries the specified documents.
+            Improves precision when context is already narrowed to specific docs
+            (e.g. after resolve_doc or when user uploads a specific file).
 
     Returns:
         dict with keys: context_text, sources, images, image_parts, kg_summaries
@@ -96,6 +108,8 @@ async def search_documents(
         db=db,
         existing_ids=existing_citation_ids,
         document_ids=document_ids,
+        search_mode=search_mode,
+        scoped_to_documents=scoped_to_documents,  # Phase 3
     )
     return {
         "context_text": context_text,
@@ -1400,47 +1414,70 @@ Chỉ trả lời bằng tiếng Việt, ngắn gọn (dưới 100 từ).
 
 async def search_document_section(
     section_reference: str,
-    workspace_ids: list[int],
-    document_ids: list[int] | None = None
+    workspace_ids: list[str],
+    document_ids: list[str] | None = None
 ) -> dict:
     """
     Tìm kiếm và lấy nội dung chính xác của một phần/mục/chương/điều
     dựa vào metadata 'heading_path'.
     """
     from app.services.vector_store import get_vector_store
+    from app.services.embedder import get_embedding_service
     
     all_chunks = []
     
-    # Sử dụng $contains để lọc các chunk mà có heading_path chứa section_reference.
-    # Thường heading_path lưu dạng chuỗi JSON hoặc list flattened như "Chương 3 > Điều 27"
-    # Nên dùng $contains với substring match.
-    where_filter = {"heading_path": {"$contains": section_reference}}
-    
-    # Nâng cao: Nếu có document_ids, kết hợp thêm điều kiện $and
+    # Metadata filter: if we have document_ids, fetch all their chunks first.
+    # Python-side filtering is more robust than ChromaDB's limited metadata operators.
     if document_ids:
         if len(document_ids) == 1:
-            where_filter = {
-                "$and": [
-                    {"document_id": str(document_ids[0])},
-                    {"heading_path": {"$contains": section_reference}}
-                ]
-            }
+            where_filter = {"document_id": str(document_ids[0])}
         else:
-            where_filter = {
-                "$and": [
-                    {"document_id": {"$in": [str(d) for d in document_ids]}},
-                    {"heading_path": {"$contains": section_reference}}
-                ]
-            }
+            where_filter = {"document_id": {"$in": [str(d) for d in document_ids]}}
+    else:
+        # Fallback to broad search if no specific document is resolved
+        where_filter = None
 
     for ws_id in workspace_ids:
         try:
-            # Need to get standard UUID format or string
             vstore = get_vector_store(ws_id)
-            res = vstore.get_by_metadata(where=where_filter)
+            
+            # 1. Try structural lookup via metadata
+            res = vstore.get_by_metadata(where=where_filter) if where_filter else {"documents": [], "metadatas": []}
+            
             if res.get("documents") and res.get("metadatas"):
+                # Filter in Python for substring match in heading_path
+                ref_norm = section_reference.lower().strip().rstrip(".")
+                
                 for doc, meta in zip(res["documents"], res["metadatas"]):
-                    all_chunks.append({"content": doc, "metadata": meta})
+                    path = meta.get("heading_path", "")
+                    match = False
+                    
+                    if isinstance(path, str) and path:
+                        # Split by separator and check components
+                        components = [c.strip().lower().rstrip(".") for c in path.split(">")]
+                        if any(ref_norm in c for c in components):
+                            match = True
+                    elif isinstance(path, list):
+                        if any(ref_norm in str(c).lower().rstrip(".") for c in path):
+                            match = True
+                            
+                    if match:
+                        all_chunks.append({"content": doc, "metadata": meta})
+            
+            # 2. If metadata search found nothing, fallback to semantic search restricted to the document
+            if not all_chunks and document_ids:
+                logger.info(f"[tool:search_document_section] Metadata search failed for '{section_reference}', trying semantic fallback")
+                embedder = get_embedding_service()
+                query_emb = embedder.embed_query(section_reference)
+                
+                # Broaden the filter for semantic search
+                sem_where = where_filter
+                sem_res = vstore.query(query_embedding=query_emb, n_results=10, where=sem_where)
+                
+                if sem_res.get("documents"):
+                    for doc, meta in zip(sem_res["documents"], sem_res["metadatas"]):
+                        all_chunks.append({"content": doc, "metadata": meta})
+                        
         except Exception as e:
             logger.error(f"[tool:search_document_section] Error fetching from workspace {ws_id}: {e}")
             
@@ -1452,23 +1489,32 @@ async def search_document_section(
             
     # Sắp xếp các chunk theo thứ tự xuất hiện trong tài liệu (page_no, chunk_index)
     all_chunks.sort(key=lambda c: (
-        c["metadata"].get("document_id", ""),
+        str(c["metadata"].get("document_id", "")),
         int(c["metadata"].get("page_no", 0)),
         int(c["metadata"].get("chunk_index", 0))
     ))
             
-    # Nối text lại để Answer Generator tóm tắt
-    combined_text = "\n\n".join([c["content"] for c in all_chunks])
-    
-    # Có thể bị lặp metadata nếu nhiều chunk cùng 1 trang, ta lọc distinct theo id hoặc ref
-    sources = []
-    seen = set()
+    # Deduplicate chunks to prevent overlapping text
+    unique_chunks = []
+    seen_content = set()
     for c in all_chunks:
+        content_hash = hash(c["content"].strip())
+        if content_hash not in seen_content:
+            unique_chunks.append(c)
+            seen_content.add(content_hash)
+            
+    # Nối text lại để Answer Generator tóm tắt
+    combined_text = "\n\n".join([c["content"] for c in unique_chunks])
+    
+    # Filter distinct sources for citation
+    sources = []
+    seen_source = set()
+    for c in unique_chunks:
         meta = c["metadata"]
         key = f"{meta.get('document_id')}_{meta.get('page_no')}"
-        if key not in seen:
+        if key not in seen_source:
             sources.append(meta)
-            seen.add(key)
+            seen_source.add(key)
             
     return {
         "text": combined_text,

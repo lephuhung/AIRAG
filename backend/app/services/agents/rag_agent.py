@@ -20,10 +20,69 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Callable
 
+from langfuse import get_client
+
 if TYPE_CHECKING:
     from app.services.agents.models import SupervisorState
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Langfuse client (lazy initialization for span creation)
+# =============================================================================
+
+def _get_langfuse_client():
+    """Get or create Langfuse client for manual span instrumentation."""
+    try:
+        return get_client()
+    except Exception as e:
+        logger.warning(f"[langfuse] Failed to get client: {e}")
+        return None
+
+
+class _NullContext:
+    """Null context manager for when Langfuse is unavailable."""
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        pass
+    def update(self, **kwargs):
+        pass
+
+
+def _null_context():
+    return _NullContext()
+
+
+async def _with_langfuse_span(name: str, input_data: dict, coro):
+    """
+    Execute an async coroutine within a Langfuse observation (SDK v4).
+
+    Usage:
+        result = await _with_langfuse_span(
+            "search_documents",
+            {"query": q, "workspace_ids": [...]},
+            search_documents(...),
+        )
+    """
+    langfuse = _get_langfuse_client()
+    if not langfuse:
+        return await coro
+
+    try:
+        obs = langfuse.start_observation(
+            name=name,
+            input=input_data,
+            level="DEFAULT",
+        )
+        result = await coro
+        obs.update(output={"result": result})
+        obs.end()
+        return result
+    except Exception as e:
+        logger.warning(f"[langfuse] Span failed for {name}: {e}")
+        return await coro
 
 # =============================================================================
 # Result Mappers (must be defined before registry)
@@ -112,14 +171,57 @@ def _map_mongo_result(result: dict) -> dict:
 # =============================================================================
 
 async def _tool_search(state: SupervisorState) -> dict:
-    """Hybrid document search."""
+    """Hybrid document search — search_mode is set by supervisor based on intent.
+
+    Phase 3 (UUID-Scoped Search): When document_ids is already known
+    (from resolve_doc, file upload, or prior summarize), sets scoped_to_documents=True
+    to restrict search exclusively to those documents rather than searching the
+    entire workspace. This improves precision and avoids diluted results.
+    """
     from app.services.agent.tools import search_documents
     from app.services.agent.streaming import get_current_db
 
     workspace_ids = state.get("workspace_ids", [])
     rewritten_query = state.get("rewritten_query", "")
     document_ids = state.get("document_ids")
+    # Phase 1: use supervisor-determined search_mode (vector | kg | hybrid)
+    search_mode = state.get("search_mode", "hybrid")
 
+    # Phase 3: UUID-scoped search — when document_ids are already known,
+    # restrict search to only those documents (skip wide workspace search)
+    scoped = bool(document_ids)
+    if scoped:
+        logger.info(
+            f"[_tool_search] UUID-scoped: restricting to {len(document_ids)} document(s): "
+            f"{[str(d) for d in document_ids[:3]]}"
+        )
+
+    langfuse = _get_langfuse_client()
+    if langfuse:
+        return await _with_langfuse_span(
+            "search_documents",
+            {
+                "query": rewritten_query,
+                "workspace_ids": [str(ws) for ws in workspace_ids],
+                "document_ids": [str(d) for d in document_ids] if document_ids else None,
+                "search_mode": search_mode,
+            },
+            _search_impl(workspace_ids, rewritten_query, document_ids, search_mode, scoped),
+        )
+    else:
+        return await _search_impl(workspace_ids, rewritten_query, document_ids, search_mode, scoped)
+
+
+async def _search_impl(workspace_ids, rewritten_query, document_ids, search_mode, scoped) -> dict:
+    """Implementation of search_documents tool (no Langfuse)."""
+    from app.services.agent.tools import search_documents
+    from app.services.agent.streaming import get_current_db
+
+    if scoped:
+        logger.info(
+            f"[_tool_search] UUID-scoped: restricting to {len(document_ids)} document(s): "
+            f"{[str(d) for d in document_ids[:3]]}"
+        )
     return await search_documents(
         query=rewritten_query,
         top_k=8,
@@ -127,18 +229,31 @@ async def _tool_search(state: SupervisorState) -> dict:
         existing_citation_ids=set(),
         db=get_current_db(),
         document_ids=document_ids,
+        search_mode=search_mode,
+        scoped_to_documents=scoped,
     )
-
 
 async def _tool_list_docs(state: SupervisorState) -> dict:
     """List all indexed documents in workspace."""
+    langfuse = _get_langfuse_client()
+    if langfuse:
+        return await _with_langfuse_span(
+            "list_documents",
+            {"workspace_ids": [str(ws) for ws in state.get("workspace_ids", [])]},
+            _list_docs_impl(state),
+        )
+    else:
+        return await _list_docs_impl(state)
+
+
+async def _list_docs_impl(state: SupervisorState) -> dict:
+    """Implementation of list_documents tool (no Langfuse)."""
     from app.services.agent.tools import list_documents
     from app.services.agent.streaming import get_current_db
 
-    db = get_current_db()
     return await list_documents(
         workspace_ids=state.get("workspace_ids", []),
-        db=db,
+        db=get_current_db(),
     )
 
 
@@ -148,6 +263,25 @@ async def _tool_summarize(state: SupervisorState) -> dict:
     from app.services.agent.streaming import get_current_db
 
     document_ids = state.get("document_ids") or []
+    if not document_ids:
+        return {"text": "Vui lòng đính kèm file hoặc chỉ định ID tài liệu."}
+
+    langfuse = _get_langfuse_client()
+    if langfuse:
+        return await _with_langfuse_span(
+            "summarize_document",
+            {"document_ids": [str(d) for d in document_ids]},
+            _summarize_impl(document_ids),
+        )
+    else:
+        return await _summarize_impl(document_ids)
+
+
+async def _summarize_impl(document_ids: list) -> dict:
+    """Implementation of summarize_document tool (no Langfuse)."""
+    from app.services.agent.tools import summarize_document
+    from app.services.agent.streaming import get_current_db
+
     if not document_ids:
         return {"text": "Vui lòng đính kèm file hoặc chỉ định ID tài liệu."}
 
@@ -163,8 +297,24 @@ async def _tool_kg_query(state: SupervisorState) -> dict:
     from app.services.agent.streaming import get_current_db
 
     rewritten_query = state.get("rewritten_query", "")
+    langfuse = _get_langfuse_client()
+    if langfuse:
+        return await _with_langfuse_span(
+            "query_knowledge_graph",
+            {"entity": rewritten_query, "workspace_ids": [str(ws) for ws in state.get("workspace_ids", [])]},
+            _kg_impl(state),
+        )
+    else:
+        return await _kg_impl(state)
+
+
+async def _kg_impl(state: SupervisorState) -> dict:
+    """Implementation of query_knowledge_graph tool (no Langfuse)."""
+    from app.services.agent.tools import query_knowledge_graph
+    from app.services.agent.streaming import get_current_db
+
     return await query_knowledge_graph(
-        entity=rewritten_query,
+        entity=state.get("rewritten_query", ""),
         workspace_ids=state.get("workspace_ids", []),
         db=get_current_db(),
     )
@@ -172,6 +322,22 @@ async def _tool_kg_query(state: SupervisorState) -> dict:
 
 async def _tool_search_doc_num(state: SupervisorState) -> dict:
     """Search documents by official document number."""
+    from app.services.agent.tools import search_documents_number
+    from app.services.agent.streaming import get_current_db
+
+    langfuse = _get_langfuse_client()
+    if langfuse:
+        return await _with_langfuse_span(
+            "search_documents_number",
+            {"query": state.get("rewritten_query", ""), "workspace_ids": [str(ws) for ws in state.get("workspace_ids", [])]},
+            _search_doc_num_impl(state),
+        )
+    else:
+        return await _search_doc_num_impl(state)
+
+
+async def _search_doc_num_impl(state: SupervisorState) -> dict:
+    """Implementation of search_documents_number tool (no Langfuse)."""
     from app.services.agent.tools import search_documents_number
     from app.services.agent.streaming import get_current_db
 
@@ -191,9 +357,22 @@ async def _tool_search_abbr(state: SupervisorState) -> dict:
     raw_query = state.get("rewritten_query", "")
     db = get_current_db()
 
-    # Extract ALL abbreviations from query (not just the first one)
-    # Handles queries with multiple abbreviations like "BMNN TTGT ntn"
+    langfuse = _get_langfuse_client()
+    if langfuse:
+        return await _with_langfuse_span(
+            "search_abbreviation",
+            {"query": raw_query},
+            _execute_search_abbr(raw_query, db),
+        )
+    else:
+        return await _execute_search_abbr(raw_query, db)
+
+
+async def _execute_search_abbr(raw_query: str, db) -> dict:
+    """Execute abbreviation search logic (extracted for reuse)."""
     import re
+    from sqlalchemy import select
+    from app.models.abbreviation import Abbreviation
 
     # Find all uppercase sequences (2+ chars) that are abbreviations
     all_abbr_matches = re.findall(r'\b([A-Z]{2,})\b', raw_query)
@@ -344,6 +523,22 @@ async def _tool_resolve_doc(state) -> dict:
             "message": "Không có thông tin tìm kiếm văn bản.",
         }
 
+    langfuse = _get_langfuse_client()
+    if langfuse:
+        return await _with_langfuse_span(
+            "resolve_document_reference",
+            {"reference": reference, "workspace_ids": [str(ws) for ws in state.get("workspace_ids", [])]},
+            _resolve_doc_impl(state, reference),
+        )
+    else:
+        return await _resolve_doc_impl(state, reference)
+
+
+async def _resolve_doc_impl(state, reference: str) -> dict:
+    """Implementation of resolve_document_reference tool (no Langfuse)."""
+    from app.services.agent.tools import resolve_document_reference
+    from app.services.agent.streaming import get_current_db
+
     result = await resolve_document_reference(
         reference=reference,
         workspace_ids=state.get("workspace_ids", []),
@@ -438,15 +633,42 @@ def _extract_section_from_markdown(markdown_text: str, section_ref: str) -> str:
     if start_pos == -1:
         return ""
 
-    # Find the end of this section (next top-level heading ##)
-    # Look for next ## heading at start of line
-    end_pattern = r"(?m)^##\s+\S"
-    end_match = re.search(end_pattern, markdown_text[start_pos + 1:])
-
-    if end_match:
-        end_pos = start_pos + 1 + end_match.start()
-    else:
-        end_pos = len(markdown_text)
+    # Find the end of this section
+    # We want to continue until the next heading of the SAME or HIGHER level.
+    # If section_ref is "Điều 3", we should stop at "Điều 4", "Chương II", etc.
+    # A simple but effective heuristic: look for headings that start with 
+    # common Vietnamese legal structural words.
+    
+    # Extract only the type part from section_ref (e.g., "Điều" from "Điều 3")
+    type_match = re.match(r"^([^\d\s]+)", section_ref)
+    section_type = type_match.group(1) if type_match else ""
+    
+    # Look for next heading starting with ##
+    # We'll search one by one to find a "real" boundary
+    remaining_text = markdown_text[start_pos + 1:]
+    heading_matches = list(re.finditer(r"(?m)^#+\s+(.+)$", remaining_text))
+    
+    end_pos = len(markdown_text)
+    
+    for h_match in heading_matches:
+        h_text = h_match.group(1).strip()
+        # If the next heading is a "big" structural unit or the next of the same type
+        # (e.g., next "Điều" if we are in "Điều X", or any "Chương", "Phần", "Mục")
+        is_boundary = False
+        
+        # Stop at higher level units
+        if any(h_text.startswith(kw) for kw in ["Chương", "Phần", "Mục", "LỜI NÓI ĐẦU"]):
+            is_boundary = True
+        # Stop at next unit of same type (if type was extracted)
+        elif section_type and h_text.startswith(section_type):
+            is_boundary = True
+        # If no type, stop at any ## heading that doesn't look like a sub-item (number only)
+        elif not section_type and not re.match(r"^\d+\.", h_text):
+            is_boundary = True
+            
+        if is_boundary:
+            end_pos = start_pos + 1 + h_match.start()
+            break
 
     section_text = markdown_text[start_pos:end_pos].strip()
 
@@ -483,6 +705,25 @@ async def _tool_search_section(state) -> dict:
 
     workspace_ids = state.get("workspace_ids", [])
     document_ids = state.get("document_ids")
+
+    langfuse = _get_langfuse_client()
+    if langfuse:
+        return await _with_langfuse_span(
+            "search_document_section",
+            {"section_reference": section_reference, "workspace_ids": [str(ws) for ws in workspace_ids], "document_ids": [str(d) for d in document_ids] if document_ids else None},
+            _execute_search_section(section_reference, workspace_ids, document_ids),
+        )
+    else:
+        return await _execute_search_section(section_reference, workspace_ids, document_ids)
+
+
+async def _execute_search_section(section_reference: str, workspace_ids, document_ids) -> dict:
+    """Execute section search logic (extracted for reuse)."""
+    from app.services.agent.tools import search_document_section
+    from app.services.agent.streaming import get_current_db
+    from sqlalchemy import select
+    from app.models.document import Document
+    from app.services.storage_service import get_storage_service
 
     # Try heading_path metadata search first
     result = await search_document_section(
@@ -589,9 +830,10 @@ RAG_TOOL_REGISTRY: dict[str, tuple[Callable, Callable]] = {
     "kg_query": (_tool_kg_query, _map_kg_result),
     "search_doc_num": (_tool_search_doc_num, _map_doc_num_result),
     "search_abbr": (_tool_search_abbr, _map_abbr_result),
-    "resolve_doc": (_tool_resolve_doc, _map_resolve_doc_result),
+    # resolve_doc removed — handled by dedicated resolve_doc_agent (Phase 2)
     "search_section": (_tool_search_section, _map_search_section),
 }
+
 
 
 # =============================================================================
@@ -623,9 +865,10 @@ async def rag_agent_node(state: SupervisorState) -> dict:
         "kg_query": "Đang truy vấn đồ thị...",
         "search_doc_num": "Đang tra cứu số văn bản...",
         "search_abbr": "Đang tra cứu viết tắt...",
-        "resolve_doc": "Đang tìm văn bản theo tên...",
+        # resolve_doc removed — handled by resolve_doc_agent (Phase 2)
         "search_section": "Đang trích xuất nội dung phần/chương/điều...",
     }
+
     await push_event(state, "status", {"step": "searching", "detail": status_map.get(intent, "Đang xử lý...")})
 
     if intent not in RAG_TOOL_REGISTRY:

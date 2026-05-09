@@ -65,7 +65,7 @@ _INTENT_TO_AGENT_FALLBACK: dict[str, str] = {
     "kg_query": "rag",
     "search_doc_num": "rag",
     "search_abbr": "rag",
-    "resolve_doc": "rag",
+    "resolve_doc": "resolve_doc",  # Phase 2: dedicated agent
     "search_section": "rag",
     "write_summarize": "write",
     "write_suggest_edits": "write",
@@ -146,44 +146,130 @@ def _is_pure_greeting(message: str) -> bool:
     """Return True only if message is a bare greeting with no topic content."""
     return any(p.match(message.strip()) for p in _GREETING_ONLY_PATTERNS)
 
-# =============================================================================
-# Helper Functions
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Phase 3: Personal reference detection — for smart memory_recall routing
+# Detects queries that contain personal pronouns/references which require
+# Graphiti memory to answer correctly (e.g. "đơn vị tôi", "cơ quan tôi").
+# This pattern fires REGARDLESS of intent (even intent=search can need memory
+# when the question references the user's own identity/workplace/org).
+# ---------------------------------------------------------------------------
+_PERSONAL_REF_PATTERN = _re.compile(
+    r"\b("
+    r"tôi|của\s+tôi|cho\s+tôi"
+    r"|đơn\s+vị\s+tôi|cơ\s+quan\s+tôi|nơi\s+tôi|chỗ\s+tôi"
+    r"|chúng\s+tôi|của\s+chúng\s+tôi"
+    r"|công\s+tác\s+của\s+tôi|làm\s+việc\s+của\s+tôi"
+    r")\b",
+    _re.IGNORECASE | _re.UNICODE,
+)
 
 
-async def _expand_abbreviations_in_message(message: str) -> tuple[str, bool, list[str]]:
+def _query_needs_memory(intent: str, query: str) -> bool:
+    """Determine whether the memory_recall → query_enricher pipeline should run.
+
+    Returns True when:
+    - intent is 'personal' (user asking about themselves)
+    - OR the query contains personal reference keywords (even for RAG intents,
+      e.g. "Đơn vị tôi có cần tuân thủ quy định này không?" → intent=search
+      but still needs memory to resolve "đơn vị tôi")
     """
-    Expand all uppercase abbreviations (2+ chars) found in the message.
+    if intent == "personal":
+        return True
+    return bool(_PERSONAL_REF_PATTERN.search(query))
 
-    Returns (expanded_message, was_modified, potential_abbreviations).
-    Uses abbreviation DB to look up full forms.
-    Supports both uppercase (BMNN) and lowercase (ntn, bmnn) abbreviations.
+# =============================================================================
+# Vietnamese stop words — these are NEVER abbreviations
+_VI_STOP_WORDS: frozenset[str] = frozenset({
+    "là", "và", "của", "có", "cho", "này", "đó", "với",
+    "các", "được", "theo", "trong", "về", "từ", "đến",
+    "khi", "nào", "như", "hay", "hoặc", "nếu", "thì",
+    "sẽ", "đã", "đang", "tôi", "bạn", "anh", "chị",
+    "gì", "nào", "sao", "thế", "nên", "nhưng", "mà",
+    "ra", "vào", "lên", "xuống", "qua", "lại",
+    "mọt", "hai", "ba", "rất", "cũng", "vẫn", "chỉ",
+    "không", "phải", "biết", "thân", "hỏi",
+    # common 2-letter words that look like abbreviations
+    "bộ", "bạ", "mì", "tả", "tấ",
+})
+
+# Vietnamese vowels for heuristic detection
+_VI_VOWELS: frozenset[str] = frozenset(
+    "aeiouy"
+    "àáảãạăắằẳẵặâấầẩẫậ"
+    "èéẻẽẹêếềểễệ"
+    "ìíỉĩị"
+    "òóỏõọôốồổỗộơớờởỡợ"
+    "ùúủũụưứừửữự"
+    "ỳýỷỹỵ"
+)
+
+
+def _is_likely_abbreviation(word: str) -> bool:
+    """Heuristic: trừ word có khả năng là viết tắt nếu:
+    1. Toàn uppercase (BMNN, TTGT) → chắc chắn
+    2. Lowercase nhưng không có ngườí âm âm (bmnn, ttgt) → có thể
+    3. Không thuộc stop words tiếng Việt
+    """
+    if len(word) < 2:
+        return False
+
+    # All-uppercase: definitely abbreviation
+    if word.isupper() and word.isalpha():
+        return True
+
+    # Stop words: never abbreviation
+    if word.lower() in _VI_STOP_WORDS:
+        return False
+
+    # Pure-lowercase heuristic: low vowel ratio = likely abbreviation
+    if word.islower():
+        vowel_count = sum(1 for c in word if c in _VI_VOWELS)
+        vowel_ratio = vowel_count / len(word)
+        # < 20% vowels and 2-6 chars → likely abbreviation (bmnn=0%, ttgt=0%)
+        if len(word) <= 6 and vowel_ratio < 0.20:
+            return True
+
+    return False
+
+
+async def _expand_abbreviations_in_message(
+    message: str,
+) -> tuple[str, bool, list[str], dict[str, list]]:
+    """
+    Expand abbreviations found in message using smart heuristic detection.
+
+    Returns:
+        (expanded_message, was_modified, potential_abbreviations, multi_meaning_map)
+        - expanded_message: message with single-meaning abbreviations expanded
+        - was_modified: True if any expansion happened
+        - potential_abbreviations: words that look like abbreviations but not in DB
+        - multi_meaning_map: {abbr: [{full_form, description}, ...]} for disambiguation
     """
     import re
 
-    # Find all uppercase sequences (2+ chars) that could be abbreviations
-    abbr_matches = re.findall(r'\b([A-Z]{2,})\b', message)
-    # Also find lowercase sequences (2+ chars) that could be abbreviations
-    lowercase_matches = re.findall(r'\b([a-z]{2,})\b', message)
-    abbr_matches = abbr_matches + lowercase_matches
+    # Extract candidate tokens using smart heuristic instead of greedy regex
+    all_tokens = re.findall(r'\b([\w]{2,})\b', message)
+    candidate_abbrs = [t for t in all_tokens if _is_likely_abbreviation(t)]
 
-    if not abbr_matches:
-        return message, False, []
+    if not candidate_abbrs:
+        return message, False, [], {}
 
     # Remove duplicates while preserving order
-    unique_abbrs = list(dict.fromkeys(abbr_matches))
+    unique_abbrs = list(dict.fromkeys(candidate_abbrs))
+    logger.debug(f"[abbr_expand] Candidate abbreviations: {unique_abbrs}")
 
     try:
         from app.services.agent.streaming import get_current_db
-        from sqlalchemy import select
+        from sqlalchemy import select, func
         from app.models.abbreviation import Abbreviation
+        from collections import defaultdict
 
         db = get_current_db()
         if db is None:
-            return message, False, []
+            return message, False, [], {}
 
-        # Use a single query for all abbreviations
-        from sqlalchemy import func
+        # Single batch query for all candidates
         result = await db.execute(
             select(Abbreviation)
             .where(
@@ -192,49 +278,132 @@ async def _expand_abbreviations_in_message(message: str) -> tuple[str, bool, lis
             )
         )
         all_abbrs_db = result.scalars().all()
-        
+
         # Group by lowercase short_form
-        from collections import defaultdict
-        abbr_map = defaultdict(list)
+        abbr_map: dict[str, list] = defaultdict(list)
         for abbr_obj in all_abbrs_db:
             abbr_map[abbr_obj.short_form.lower()].append(abbr_obj)
 
         expanded_message = message
         any_expanded = False
-        multi_meaning_abbrs = []
-        potential_abbreviations = []
+        potential_abbreviations: list[str] = []
+        multi_meaning_map: dict[str, list] = {}  # abbr → [{full_form, description}, ...]
 
         for abbr in unique_abbrs:
             all_matches = abbr_map.get(abbr.lower(), [])
 
             if len(all_matches) == 0:
-                # No match in DB - keep original, will prompt user to add
-                logger.debug(f"[abbr_expand] No DB entry for: {abbr}")
+                # Not in DB — flag as potential unknown abbreviation
+                logger.debug(f"[abbr_expand] No DB entry for candidate: {abbr!r}")
                 potential_abbreviations.append(abbr)
-                continue
 
-            if len(all_matches) == 1:
-                # Single meaning - safe to expand
+            elif len(all_matches) == 1:
+                # Single meaning — safe to auto-expand
                 abbr_obj = all_matches[0]
-                import re as re_module
-                pattern = re_module.compile(r'\b' + re_module.escape(abbr) + r'\b', re.IGNORECASE)
+                pattern = re.compile(r'\b' + re.escape(abbr) + r'\b', re.IGNORECASE)
                 new_message = pattern.sub(abbr_obj.full_form, expanded_message)
                 if new_message != expanded_message:
-                    logger.info(f"[abbr_expand] {abbr} → {abbr_obj.full_form}")
+                    logger.info(f"[abbr_expand] Auto-expand: {abbr!r} → {abbr_obj.full_form!r}")
                     expanded_message = new_message
                     any_expanded = True
-            else:
-                # Multiple meanings - keep original, let LLM decide from context
-                # Record for potential user prompt
-                multi_meaning_abbrs.append(abbr)
-                short_forms = [f"{m.short_form}={m.full_form}" for m in all_matches]
-                logger.info(f"[abbr_expand] Multiple meanings for {abbr}: {' | '.join(short_forms)}")
 
-        return expanded_message, any_expanded, potential_abbreviations
+            else:
+                # Multiple meanings — store for LLM-based disambiguation
+                multi_meaning_map[abbr] = [
+                    {"full_form": m.full_form, "description": m.description or ""}
+                    for m in all_matches
+                ]
+                short_forms = [f"{m.short_form}={m.full_form}" for m in all_matches]
+                logger.info(
+                    f"[abbr_expand] Multi-meaning for {abbr!r}: {' | '.join(short_forms)}"
+                    f" — will disambiguate via LLM"
+                )
+
+        return expanded_message, any_expanded, potential_abbreviations, multi_meaning_map
 
     except Exception as e:
-        logger.warning(f"[abbr_expand] Failed to expand abbreviations: {e}")
-        return message, False, []
+        logger.warning(f"[abbr_expand] Failed: {e}")
+        return message, False, [], {}
+
+
+async def _disambiguate_multi_meaning_abbrs(
+    multi_meaning_map: dict[str, list],
+    user_message: str,
+) -> tuple[str, dict[str, str], list[str]]:
+    """LLM-based disambiguation for abbreviations with multiple meanings.
+
+    Uses memory agent (Qwen3-4B) to infer which meaning fits the context.
+
+    Returns:
+        (expanded_text_addition, chosen_map, low_confidence_abbrs)
+        - expanded_text_addition: extra text to append to query with chosen expansions
+        - chosen_map: {abbr: chosen_full_form} for high-confidence choices
+        - low_confidence_abbrs: list of abbrs where LLM couldn't decide (need user clarification)
+    """
+    if not multi_meaning_map:
+        return "", {}, []
+
+    from app.services.llm import get_memory_agent
+    from app.services.llm.types import LLMMessage as _LLMMsg
+
+    chosen_map: dict[str, str] = {}
+    low_confidence_abbrs: list[str] = []
+
+    for abbr, meanings in multi_meaning_map.items():
+        meanings_text = "\n".join(
+            f"  {i+1}. {m['full_form']}" + (f" — {m['description']}" if m.get('description') else "")
+            for i, m in enumerate(meanings)
+        )
+        prompt = (
+            f'Từ viết tắt "{abbr}" có các nghĩa sau:\n{meanings_text}\n\n'
+            f'Câu hỏi của user: "{user_message}"\n\n'
+            f'Dựa vào ngữ cảnh câu hỏi, chọn nghĩa phù hợp nhất.\n'
+            f'Nếu ngữ cảnh không đủ rõ để chọn, trả về confidence: "low".\n\n'
+            f'Output JSON: {{"chosen": "<full_form>", "confidence": "high" or "low", "reasoning": "<1 sentence>"}}'
+        )
+        try:
+            agent = get_memory_agent()
+            resp_text = ""
+            async for chunk in agent.astream(
+                [_LLMMsg(role="user", content=prompt)],
+                system_prompt="You are a Vietnamese abbreviation disambiguation assistant. Output valid JSON only.",
+                temperature=0.0,
+                max_tokens=120,
+            ):
+                if hasattr(chunk, "text") and chunk.text:
+                    resp_text += chunk.text
+
+            import json as _json
+            # Strip markdown fences if present
+            clean = resp_text.strip()
+            if "```" in clean:
+                clean = clean.split("```")[-2].strip() if clean.count("```") >= 2 else clean.replace("```json", "").replace("```", "").strip()
+            result = _json.loads(clean)
+            confidence = result.get("confidence", "low")
+            chosen = result.get("chosen", "")
+            reasoning = result.get("reasoning", "")
+
+            if confidence == "high" and chosen:
+                chosen_map[abbr] = chosen
+                logger.info(
+                    f"[disambig] {abbr!r} → {chosen!r} (high confidence): {reasoning}"
+                )
+            else:
+                low_confidence_abbrs.append(abbr)
+                logger.info(
+                    f"[disambig] {abbr!r}: low confidence, will ask user. reasoning={reasoning!r}"
+                )
+        except Exception as e:
+            logger.warning(f"[disambig] Failed for {abbr!r}: {e}")
+            low_confidence_abbrs.append(abbr)
+
+    # Build expansion text for chosen abbrs
+    expansion_parts = [f"{abbr}={full}" for abbr, full in chosen_map.items()]
+    expansion_text = "; ".join(expansion_parts) if expansion_parts else ""
+
+    return expansion_text, chosen_map, low_confidence_abbrs
+
+
 
 
 def _extract_user_message(state: SupervisorState) -> str:
@@ -266,11 +435,15 @@ def _extract_user_message(state: SupervisorState) -> str:
 def _parse_supervisor_response(raw: str) -> dict:
     """Parse LLM JSON response with fallbacks.
 
+    Extracts task_plan (Phase 4) and computes pending_intent from it.
     After parsing, enforces intent→agent agreement: if the intent maps to
     a different agent than what the LLM chose, the intent-based mapping wins.
-    This catches the most common Qwen3-4B mistake: correct intent but wrong agent.
     """
     raw = raw.strip()
+
+    # Strip thinking tags (Qwen3.x with thinking enabled)
+    import re as _re_parse
+    raw = _re_parse.sub(r'<think>.*?</think>', '', raw, flags=_re_parse.DOTALL).strip()
 
     # Strip markdown code fences
     if "```json" in raw:
@@ -284,6 +457,7 @@ def _parse_supervisor_response(raw: str) -> dict:
         data = json.loads(raw)
         next_agent = data.get("next_agent", "finish")
         intent = data.get("intent", "search")
+        task_plan = data.get("task_plan") or []
 
         # Normalize intent name (LLM sometimes uses shorthand like "search_phone")
         intent = _INTENT_NORMALIZE.get(intent, intent)
@@ -294,8 +468,6 @@ def _parse_supervisor_response(raw: str) -> dict:
             AgentType.DIRECT, AgentType.FINISH,
         }
         if next_agent not in valid_agents:
-            # LLM sometimes returns an intent name instead of an agent name.
-            # Use the fallback table to correct it before logging a warning.
             corrected = _INTENT_TO_AGENT_FALLBACK.get(next_agent)
             if corrected:
                 logger.info(
@@ -310,9 +482,6 @@ def _parse_supervisor_response(raw: str) -> dict:
                 next_agent = AgentType.FINISH
 
         # ── Deterministic intent→agent override ──────────────────────────
-        # If the intent maps to a DIFFERENT agent than what the LLM chose,
-        # trust the intent (which is usually correct) over next_agent.
-        # This catches: intent="search" + next_agent="people" or "direct".
         expected_agent = _INTENT_TO_AGENT_FALLBACK.get(intent)
         if (
             expected_agent
@@ -325,15 +494,44 @@ def _parse_supervisor_response(raw: str) -> dict:
             )
             next_agent = expected_agent
 
+        # ── Phase 4: Extract pending_intent from task_plan ───────────────
+        # task_plan = ["resolve_doc", "search_section"]
+        #   → intent = "resolve_doc" (first step)
+        #   → pending_intent = "search_section" (final goal after prerequisite)
+        pending_intent = None
+        if task_plan and len(task_plan) > 1:
+            # Validate: first step should match intent
+            if task_plan[0] != intent:
+                logger.info(
+                    f"[supervisor] task_plan[0]={task_plan[0]!r} != intent={intent!r}"
+                    f" — trusting task_plan[0]"
+                )
+                intent = task_plan[0]
+                # Re-compute next_agent for corrected intent
+                corrected = _INTENT_TO_AGENT_FALLBACK.get(intent)
+                if corrected:
+                    next_agent = corrected
+            # Last step in plan = final goal
+            pending_intent = task_plan[-1]
+            logger.info(
+                f"[supervisor] task_plan={task_plan}, "
+                f"current_step={intent!r}, pending_intent={pending_intent!r}"
+            )
+
         return {
             "next_agent": next_agent,
             "intent": intent,
+            "task_plan": task_plan,
+            "pending_intent": pending_intent,
             "reasoning": data.get("reasoning", ""),
         }
     except json.JSONDecodeError:
-        logger.warning(f"[supervisor] Failed to parse JSON: {raw[:100]!r}")
-        # Fallback: treat as search intent, finish
-        return {"next_agent": AgentType.FINISH, "intent": "search", "reasoning": "Parse failed, defaulting to finish"}
+        logger.warning(f"[supervisor] Failed to parse JSON: {raw[:200]!r}")
+        return {
+            "next_agent": AgentType.FINISH, "intent": "search",
+            "task_plan": [], "pending_intent": None,
+            "reasoning": "Parse failed, defaulting to finish",
+        }
 
 
 # =============================================================================
@@ -350,7 +548,7 @@ async def supervisor_node(state: SupervisorState) -> dict:
     3. Call LLM with supervisor prompt
     4. Parse response and update state
     """
-    from app.services.llm import get_memory_agent
+    # get_llm_provider not needed here — supervisor uses OllamaLLMProvider directly
 
     user_message = _extract_user_message(state)
     if not user_message:
@@ -400,33 +598,86 @@ async def supervisor_node(state: SupervisorState) -> dict:
         expanded_message = expanded
 
         # Expand abbreviations in message before classification
-        # This ensures BMNN -> "Bộ môn nghiệp vụ" BEFORE intent classification
+        # New: uses smart heuristic detection + returns multi_meaning_map for disambiguation
         potential_abbreviations = []
+        multi_meaning_map: dict = {}
+        clarification_needed = False
+        clarification_message = ""
         if not expanded:
-            expanded_message, was_modified, potential_abbreviations = await _expand_abbreviations_in_message(user_message)
+            expanded_message, was_modified, potential_abbreviations, multi_meaning_map = (
+                await _expand_abbreviations_in_message(user_message)
+            )
             if was_modified:
                 logger.info(f"[supervisor] Abbreviations expanded: {user_message!r} -> {expanded_message!r}")
                 query_for_classifier = expanded_message
+
+            # Handle multi-meaning abbreviations: LLM tries to disambiguate from context
+            if multi_meaning_map:
+                _, chosen_map, low_confidence_abbrs = await _disambiguate_multi_meaning_abbrs(
+                    multi_meaning_map, user_message
+                )
+                # Apply high-confidence choices to query
+                if chosen_map:
+                    import re as _re_abbr
+                    for abbr, full_form in chosen_map.items():
+                        pattern = _re_abbr.compile(r'\b' + _re_abbr.escape(abbr) + r'\b', _re_abbr.IGNORECASE)
+                        new_q = pattern.sub(full_form, query_for_classifier)
+                        if new_q != query_for_classifier:
+                            logger.info(f"[supervisor] Disambiguated: {abbr!r} → {full_form!r}")
+                            query_for_classifier = new_q
+                            expanded_message = query_for_classifier
+                            was_modified = True
+                # Prepare clarification for low-confidence ones
+                if low_confidence_abbrs:
+                    clarification_needed = True
+                    clarify_parts = []
+                    for abbr in low_confidence_abbrs:
+                        meanings = multi_meaning_map.get(abbr, [])
+                        opts = "\n".join(f"  {i+1}. {m['full_form']}" for i, m in enumerate(meanings))
+                        clarify_parts.append(f"**{abbr.upper()}** có thể là:\n{opts}")
+                    clarification_message = (
+                        "Vui lòng cho biết ý nghĩa của từ viết tắt bên dưới để tôi có thể trả lời chính xác hơn:\n\n"
+                        + "\n\n".join(clarify_parts)
+                        + "\n\nBạn muốn hỏi về nghĩa nào?"
+                    )
 
             if potential_abbreviations:
                 from app.services.agent.streaming import push_event
                 await push_event(state, "potential_abbreviations", potential_abbreviations)
 
-        classifier = get_memory_agent()
+
+        # Phase 4: Use Qwen3.6-35B for plan-aware classification
+        # We check the OLLAMA_HOST to decide whether to use native Ollama
+        # or OpenAI-compatible provider (e.g. vLLM serving the 35B model).
+        from app.core.config import settings
+        if "/v1" in settings.OLLAMA_HOST:
+            from app.services.llm.openai_compatible import OpenAICompatibleLLMProvider
+            classifier = OpenAICompatibleLLMProvider(
+                base_url=settings.OLLAMA_HOST,
+                model=settings.OLLAMA_MODEL,
+                api_key="none"
+            )
+        else:
+            from app.services.llm.ollama import OllamaLLMProvider
+            classifier = OllamaLLMProvider(
+                host=settings.OLLAMA_HOST,
+                model=settings.OLLAMA_MODEL,
+            )
         response_text = ""
 
         async for chunk in classifier.astream(
             [_LLMMsg(role="user", content=query_for_classifier)],
             system_prompt=_SUPERVISOR_PROMPT.format(max_iterations=max_iter),
             temperature=0.0,
-            max_tokens=256,
+            max_tokens=512,
+            think=False,  # Disable thinking to reduce latency for classification
         ):
             if hasattr(chunk, "text") and chunk.text:
                 response_text += str(chunk.text)
 
         decision = _parse_supervisor_response(response_text)
 
-        # ── Keyword safety net ───────────────────────────────────────────
+        # ── Keyword safety net 1: direct/greeting → rag ─────────────────────
         # If the LLM classified as greeting/direct but the message contains
         # document-related keywords, override to rag + search.
         if (
@@ -443,9 +694,39 @@ async def supervisor_node(state: SupervisorState) -> dict:
             decision["intent"] = "search"
             decision["reasoning"] = f"(overridden by keyword safety net) {decision.get('reasoning', '')}"
 
+        # ── Phase 4: Plan-aware prerequisite check ──────────────────────────
+        # If the LLM didn't generate a proper task_plan but the query references
+        # a named document and the intent requires document UUID, inject
+        # resolve_doc as prerequisite. This is a fallback — with Qwen3.6-35B
+        # the task_plan should usually be correct.
+        _REQUIRES_DOC_INTENTS = {"summarize", "search_section"}
+        task_plan = decision.get("task_plan") or []
+        if (
+            decision["intent"] in _REQUIRES_DOC_INTENTS
+            and not state.get("document_ids")
+            and (not task_plan or task_plan[0] != "resolve_doc")
+        ):
+            _NAMED_DOC_PATTERN = _re.compile(
+                r"(?:lu\u1eadt|ngh\u1ecb\s+\u0111\u1ecbnh|th\u00f4ng\s+t\u01b0|quy\u1ebft\s+\u0111\u1ecbnh|ngh\u1ecb\s+quy\u1ebft|ph\u00e1p\s+l\u1ec7nh|b\u1ed9\s+lu\u1eadt)"
+                r"\s+\S",
+                _re.IGNORECASE | _re.UNICODE,
+            )
+            if _NAMED_DOC_PATTERN.search(query_for_classifier):
+                original_intent = decision["intent"]
+                decision["pending_intent"] = original_intent
+                decision["intent"] = "resolve_doc"
+                decision["next_agent"] = AgentType.RESOLVE_DOC
+                decision["task_plan"] = ["resolve_doc", original_intent]
+                logger.info(
+                    f"[supervisor] Prerequisite check: injected resolve_doc before "
+                    f"{original_intent!r}, task_plan={decision['task_plan']}"
+                )
+
         logger.info(
             f"[LANGGRAPH_ROUTE] user_message={user_message!r} -> "
             f"next_agent={decision['next_agent']!r}, intent={decision['intent']!r}, "
+            f"task_plan={decision.get('task_plan', [])!r}, "
+            f"pending_intent={decision.get('pending_intent')!r}, "
             f"reasoning={decision.get('reasoning', '')!r}"
         )
 
@@ -480,7 +761,30 @@ async def supervisor_node(state: SupervisorState) -> dict:
             # Reset loop flag on each supervisor entry
             "should_loop_back": False,
             "potential_abbreviations": potential_abbreviations,
+            "clarification_needed": clarification_needed,
+            "clarification_message": clarification_message,
+            # Phase 4: Plan-aware fields
+            "task_plan": decision.get("task_plan") or [],
+            "pending_intent": decision.get("pending_intent"),
         }
+
+        # Phase 3: Smart memory routing — determine if memory_recall is needed
+        intent = decision["intent"]
+        needs_memory = _query_needs_memory(intent, query_for_classifier)
+        result["needs_memory"] = needs_memory
+        if needs_memory:
+            logger.info(
+                f"[supervisor] needs_memory=True for intent={intent!r}, "
+                f"query={query_for_classifier[:60]!r}"
+            )
+        else:
+            logger.debug(f"[supervisor] needs_memory=False for intent={intent!r}")
+
+        # Emit clarification event for low-confidence disambiguations
+        if clarification_needed and clarification_message:
+            from app.services.agent.streaming import push_event
+            await push_event(state, "clarification", {"message": clarification_message})
+            logger.info(f"[supervisor] Clarification needed for: {list(multi_meaning_map.keys())}")
 
         # Smart thinking decision: RAG tasks don't need thinking (just retrieval),
         # but complex synthesis with many sources or personal tasks benefit from it
@@ -508,6 +812,19 @@ async def supervisor_node(state: SupervisorState) -> dict:
                 result["enable_thinking"] = False  # Simple retrieval
         else:
             result["enable_thinking"] = False
+
+        # Determine search_mode based on intent (Phase 1: Smart RAG Routing)
+        # kg_query → kg only; search/summarize/search_doc_num → vector only; else → hybrid
+        _KG_INTENTS = {"kg_query"}
+        _VECTOR_INTENTS = {"search", "summarize", "search_doc_num", "list_docs", "search_section"}
+        if intent in _KG_INTENTS:
+            search_mode = "kg"
+        elif intent in _VECTOR_INTENTS:
+            search_mode = "vector"
+        else:
+            search_mode = "hybrid"  # resolve_doc, search_abbr, unknown
+        result["search_mode"] = search_mode
+        logger.info(f"[supervisor] search_mode={search_mode!r} for intent={intent!r}")
 
         # If abbreviations were expanded, include expanded_query for downstream nodes
         if was_modified:
@@ -712,35 +1029,54 @@ async def mongo_formatter_node(state: SupervisorState) -> dict:
 def route_from_supervisor(state: SupervisorState) -> str:
     """Route to appropriate agent based on supervisor's decision.
 
+    Phase 3: Uses needs_memory flag (set by supervisor_node via _query_needs_memory)
+    to decide whether to go through memory_recall → query_enricher first, or
+    bypass directly to the target agent.
+
     Handles the case where supervisor returns next_agent=None on loop back,
     meaning we're done and should END.
     """
     next_agent = state.get("next_agent")
     intent = state.get("intent", "")
+    needs_memory = state.get("needs_memory", False)
 
     if next_agent is None or next_agent == AgentType.FINISH:
         return END
 
-    # Bypass memory_recall for intents that don't need personal memory context:
-    # - greeting/personal: direct_answer_node handles its own minimal memory use
-    # - write_format_check/grammar_check/suggest_edits: user provides inline text,
-    #   write agent processes it without needing user's past conversation facts
-    # - write_summarize: user provides TEXT PASSAGE in the message itself (per
-    #   intent definition: "User provides a TEXT PASSAGE and wants it summarized")
-    if intent in (
-        "greeting",
-        "personal",
-        "write_format_check",
-        "write_grammar_check",
-        "write_suggest_edits",
-        "write_summarize",
+    # Phase 2: resolve_doc routes directly to its dedicated agent (no memory needed)
+    if next_agent == AgentType.RESOLVE_DOC or (
+        next_agent == AgentType.RAG and intent == "resolve_doc"
     ):
-        if next_agent == AgentType.WRITE:
-            return "bypass_memory_to_write"
-        if next_agent == AgentType.DIRECT:
-            return "bypass_memory_to_direct"  # bypass memory_recall for greeting/personal
+        return "resolve_doc_agent"
 
-    return next_agent
+    # Phase 3: Smart memory routing
+    # needs_memory=True  → memory_recall → query_enricher → target agent
+    # needs_memory=False → direct to target agent (bypass Graphiti entirely)
+    if needs_memory:
+        logger.info(
+            f"[route_from_supervisor] needs_memory=True (intent={intent!r}) "
+            f"→ memory_recall"
+        )
+        return "memory_recall"
+
+    # Direct bypass: map AgentType → node name
+    _DIRECT_MAP: dict[str, str] = {
+        AgentType.RAG: "rag",
+        AgentType.WRITE: "write",
+        AgentType.DIRECT: "direct",
+        AgentType.PEOPLE: "people",
+        AgentType.ANSWER_GENERATOR: "answer_generator",
+    }
+    target = _DIRECT_MAP.get(next_agent)
+    if target:
+        logger.info(
+            f"[route_from_supervisor] needs_memory=False (intent={intent!r}) "
+            f"→ direct to {target!r}"
+        )
+        return target
+
+    # Fallback: go through memory_recall (safe default)
+    return "memory_recall"
 
 
 def route_from_rag(state: SupervisorState) -> str:
@@ -771,6 +1107,51 @@ def route_from_rag(state: SupervisorState) -> str:
     return "answer_generator"
 
 
+def route_from_resolve_doc(state: SupervisorState) -> str:
+    """Route after resolve_doc_agent completes.
+
+    Phase 4 (Plan-Aware): Uses pending_intent from task_plan to determine
+    what to do after document resolution.
+
+    Priority:
+    1. next_agent=FINISH → END (ambiguous/not-found, already streamed answer)
+    2. intent='search_section' and section_reference → rag (search_section tool)
+    3. pending_intent='search_section' and section_reference → rag
+    4. pending_intent='summarize' → answer_generator
+    5. pending_intent='search' → rag (general search within resolved doc)
+    6. Default → answer_generator
+    """
+    next_agent = state.get("next_agent")
+    intent = state.get("intent", "")
+    section_ref = state.get("section_reference", "")
+    pending_intent = state.get("pending_intent")
+
+    if next_agent == AgentType.FINISH:
+        logger.info("[route_from_resolve_doc] next_agent=FINISH → END (not found / ambiguous)")
+        return END
+
+    # resolve_doc_agent already set intent=search_section when section_ref found
+    if intent == "search_section" and section_ref:
+        logger.info(f"[route_from_resolve_doc] has section_ref={section_ref!r} → rag")
+        return "rag"
+
+    # Phase 4: Check pending_intent from task_plan
+    if pending_intent:
+        logger.info(
+            f"[route_from_resolve_doc] pending_intent={pending_intent!r}, "
+            f"section_ref={section_ref!r}"
+        )
+        if pending_intent == "search_section" and section_ref:
+            return "rag"
+        elif pending_intent == "search":
+            return "rag"
+        elif pending_intent == "summarize":
+            return "answer_generator"
+
+    logger.info("[route_from_resolve_doc] document resolved → answer_generator")
+    return "answer_generator"
+
+
 # shouldContinue_from_supervisor removed — was dead code (never called).
 
 
@@ -782,20 +1163,30 @@ def create_supervisor_graph():
     """
     Build and compile the supervisor-based multi-agent graph.
 
-    Flow (intent-specific pipelines):
-        START → supervisor → memory_recall → rag → answer_generator → END
-                                           → write → END  (already has final_answer)
-                                           → people → mongo_formatter → END
-                                           → direct → END  (already has final_answer)
-                      ↑                               │
-                      └───────────────────────────────┘
+    Phase 3 Flow (Smart Memory):
+        START → supervisor
+                  ├── [needs_memory=True] → memory_recall → query_enricher
+                  │     ├── [personal] → direct
+                  │     ├── [search/summarize/...] → rag → answer_generator
+                  │     ├── [write] → write → END
+                  │     └── [people] → people → mongo_formatter → END
+                  │
+                  └── [needs_memory=False] → target agent (direct bypass)
+                        ├── rag → answer_generator → END
+                        ├── write → END
+                        ├── direct → END
+                        └── people → mongo_formatter → END
+
+    resolve_doc always bypasses memory (no personal context needed).
     """
     graph = StateGraph(SupervisorState)
 
     # Nodes
     graph.add_node("supervisor", supervisor_node)
     graph.add_node("memory_recall", _memory_recall_wrapper)
+    graph.add_node("query_enricher", _query_enricher_wrapper)   # Phase 3: NEW
     graph.add_node("rag", _rag_agent_wrapper)
+    graph.add_node("resolve_doc_agent", _resolve_doc_agent_wrapper)  # Phase 2
     graph.add_node("write", _write_agent_wrapper)
     graph.add_node("people", _people_agent_wrapper)
     graph.add_node("direct", direct_answer_node)
@@ -805,44 +1196,83 @@ def create_supervisor_graph():
     # Edges
     graph.add_edge(START, "supervisor")
 
-    # Conditional edges from supervisor based on next_agent
+    # Phase 3: Conditional edges from supervisor based on needs_memory flag
+    # - needs_memory=True  → "memory_recall" (→ query_enricher → target)
+    # - needs_memory=False → target node directly (bypass Graphiti)
+    # - resolve_doc always → "resolve_doc_agent"
     graph.add_conditional_edges(
         "supervisor",
         route_from_supervisor,
         {
-            AgentType.RAG: "memory_recall",
-            AgentType.WRITE: "memory_recall",
-            AgentType.DIRECT: "memory_recall",
-            AgentType.PEOPLE: "memory_recall",
-            AgentType.ANSWER_GENERATOR: "answer_generator",
-            "bypass_memory_to_write": "write",
-            "bypass_memory_to_direct": "direct",  # bypass memory_recall for greeting/personal
-            END: END,  # handle finish case
+            # Memory path (personal reference detected)
+            "memory_recall": "memory_recall",
+            # Direct bypass paths (no personal context needed)
+            "rag": "rag",
+            "write": "write",
+            "direct": "direct",
+            "people": "people",
+            # Special cases
+            "answer_generator": "answer_generator",  # loop-back with accumulated results
+            "resolve_doc_agent": "resolve_doc_agent",  # Phase 2: dedicated agent
+            END: END,
         },
     )
 
-    # memory_recall loads personal context, then routes to the target agent
-    def route_from_memory(state: SupervisorState) -> str:
-        return state.get("next_agent", AgentType.FINISH)
+    # Phase 3: memory_recall → query_enricher (always: enricher is a no-op when not needed)
+    graph.add_edge("memory_recall", "query_enricher")
 
-    graph.add_conditional_edges(
-        "memory_recall",
-        route_from_memory,
-        {
+    # Phase 3: query_enricher → target agent based on next_agent / intent
+    def route_from_enricher(state: SupervisorState) -> str:
+        """Route after query enrichment to the correct agent.
+
+        personal intent → direct (answer from memory, no RAG needed)
+        all other intents → their designated agent
+        """
+        next_agent = state.get("next_agent", AgentType.FINISH)
+        intent = state.get("intent", "")
+
+        if intent == "personal":
+            return "direct"
+
+        _MAP = {
             AgentType.RAG: "rag",
             AgentType.WRITE: "write",
             AgentType.DIRECT: "direct",
             AgentType.PEOPLE: "people",
-            AgentType.FINISH: END,
+        }
+        target = _MAP.get(next_agent, "direct")
+        logger.info(
+            f"[route_from_enricher] intent={intent!r}, next_agent={next_agent!r} → {target!r}"
+        )
+        return target
+
+    graph.add_conditional_edges(
+        "query_enricher",
+        route_from_enricher,
+        {
+            "rag": "rag",
+            "write": "write",
+            "direct": "direct",
+            "people": "people",
         },
     )
 
     # Intent-specific output pipelines:
     # - RAG → answer_generator (needs LLM to compose answer from sources)
+    # - resolve_doc_agent → answer_generator / rag (section search) / END (ambiguous)
     # - Write → END (write_agent already produces final_answer via streaming)
     # - People → mongo_formatter (lightweight LLM call, ~1KB prompt)
     # - Direct → END (direct_answer_node already produces final_answer via streaming)
     graph.add_conditional_edges("rag", route_from_rag, {"supervisor": "supervisor", "answer_generator": "answer_generator"})
+    graph.add_conditional_edges(
+        "resolve_doc_agent",
+        route_from_resolve_doc,
+        {
+            "answer_generator": "answer_generator",
+            "rag": "rag",
+            END: END,
+        },
+    )
     graph.add_edge("write", END)
     graph.add_edge("people", "mongo_formatter")
     graph.add_edge("direct", END)
@@ -926,11 +1356,99 @@ async def _memory_recall_wrapper(state: SupervisorState) -> dict:
     return {}
 
 
+async def _query_enricher_wrapper(state: SupervisorState) -> dict:
+    """Phase 3: Rewrite query by replacing personal references with concrete info from memory.
+
+    Runs after memory_recall. If memory context contains facts about the user
+    (e.g. "Bạn công tác tại Công an tỉnh Hà Tĩnh"), rewrites the query like:
+      "Đơn vị tôi có cần tuân thủ...?" → "Công an tỉnh Hà Tĩnh có cần tuân thủ...?"
+
+    This ensures RAG search uses concrete terms rather than personal pronouns,
+    yielding more accurate retrieval results for personal+RAG hybrid queries.
+    For intent=personal (no RAG needed), this is a no-op and direct_answer_node
+    uses memory from user_memory_context directly.
+    """
+    memory = state.get("user_memory_context", "")
+    query = state.get("rewritten_query", "") or state.get("original_query", "")
+    intent = state.get("intent", "")
+
+    # personal intent → direct_answer_node handles memory directly, no rewrite needed
+    if intent == "personal":
+        return {}
+
+    # Nothing to enrich if no memory or no personal reference in query
+    if not memory or not query or "No relevant memories" in memory:
+        return {}
+    if not _PERSONAL_REF_PATTERN.search(query):
+        return {}
+
+    # Extract fact lines from memory context (format: "[Memory]\n- fact\n- fact")
+    facts = [
+        line.lstrip("- ").strip()
+        for line in memory.split("\n")
+        if line.strip().startswith("-")
+    ]
+    if not facts:
+        return {}
+
+    try:
+        from app.services.llm import get_memory_agent
+        from app.services.llm.types import LLMMessage as _LLMMsg
+        import re as _re_enrich
+
+        agent = get_memory_agent()
+        facts_text = "\n".join(f"- {f}" for f in facts)
+        prompt = (
+            f"FACTS about the user:\n{facts_text}\n\n"
+            f"Rewrite the query below, replacing personal pronouns and references "
+            f"(tôi, của tôi, đơn vị tôi, cơ quan tôi, chúng tôi, etc.) with the "
+            f"CONCRETE information from the FACTS above.\n"
+            f"If no replacement is possible or needed, output the query unchanged.\n"
+            f"Output ONLY the rewritten query, nothing else.\n\n"
+            f"Query: {query}"
+        )
+
+        response = ""
+        async for chunk in agent.astream(
+            [_LLMMsg(role="user", content=prompt)],
+            temperature=0.0,
+            max_tokens=128,
+        ):
+            if hasattr(chunk, "text") and chunk.text:
+                response += chunk.text
+
+        # Strip <think>...</think> tags that Qwen3 may emit
+        response = _re_enrich.sub(
+            r"<think>.*?</think>", "", response, flags=_re_enrich.DOTALL
+        ).strip()
+
+        enriched = response.strip()
+        if enriched and enriched != query:
+            logger.info(
+                f"[query_enricher] Enriched: {query!r} → {enriched!r}"
+            )
+            return {"rewritten_query": enriched}
+        else:
+            logger.debug(f"[query_enricher] No enrichment applied for: {query!r}")
+
+    except Exception as e:
+        logger.warning(f"[query_enricher] Failed: {e}")
+
+    return {}
+
+
 async def _rag_agent_wrapper(state: SupervisorState) -> dict:
     """Wrapper that imports and calls rag_agent_node."""
     from app.services.agents.rag_agent import rag_agent_node
 
     return await rag_agent_node(state)
+
+
+async def _resolve_doc_agent_wrapper(state: SupervisorState) -> dict:
+    """Phase 2: Wrapper that imports and calls resolve_doc_agent_node."""
+    from app.services.agents.resolve_doc_agent import resolve_doc_agent_node
+
+    return await resolve_doc_agent_node(state)
 
 
 async def _write_agent_wrapper(state: SupervisorState) -> dict:

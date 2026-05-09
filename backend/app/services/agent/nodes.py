@@ -508,17 +508,33 @@ async def answer_generator(state: "AgentState") -> dict:
     enable_thinking = state.get("enable_thinking", False)
     potential_abbreviations = state.get("potential_abbreviations", [])
 
-    # Respect supervisor's enable_thinking decision - it uses smart logic based on source count
-    # Supervisor enables thinking when source_count >= 5 (complex synthesis needed)
-    # For simple RAG (source_count < 5), disable thinking to reduce latency
-    rag_intents = {"search", "summarize", "list_docs", "search_doc_num", "resolve_doc", "search_section", "kg_query"}
+    # Phase 3.6: Intent-aware thinking trigger
+    # Rules (override supervisor's blanket decision with finer-grained logic):
+    # - Complex synthesis intents (kg_query, summarize, search_section) → always think
+    # - Simple extraction (search, search_doc_num, list_docs) → think only if >= 3 sources
+    # - Abbreviation / greeting / direct → no thinking needed
+    _ALWAYS_THINK_INTENTS = {"kg_query", "summarize", "search_section"}
+    _SIMPLE_INTENTS = {"search", "search_doc_num", "list_docs", "resolve_doc"}
+    _NO_THINK_INTENTS = {"search_abbr", "greeting", "personal"}
     source_count = len(sources) + len(kg_summaries)
-    if intent in rag_intents and source_count < 5:
+
+    if intent in _ALWAYS_THINK_INTENTS:
+        enable_thinking = True
+        logger.info(f"[answer_generator] Thinking FORCED for complex intent: {intent!r}")
+    elif intent in _NO_THINK_INTENTS:
         enable_thinking = False
-        logger.info(f"[answer_generator] Thinking disabled for RAG intent: {intent} ({source_count} sources)")
-    elif source_count >= 5:
-        enable_thinking = True  # Complex synthesis - keep thinking enabled
-        logger.info(f"[answer_generator] Thinking enabled for complex synthesis: {source_count} sources")
+        logger.info(f"[answer_generator] Thinking DISABLED for simple intent: {intent!r}")
+    elif intent in _SIMPLE_INTENTS:
+        # For simple intents: think only when many sources need synthesis
+        if source_count < 3:
+            enable_thinking = False
+            logger.info(f"[answer_generator] Thinking disabled: {intent!r} with {source_count} sources")
+        else:
+            enable_thinking = True
+            logger.info(f"[answer_generator] Thinking enabled: {intent!r} with {source_count} sources")
+    else:
+        # Unknown/write intents: keep supervisor decision
+        logger.info(f"[answer_generator] Using supervisor thinking decision: {enable_thinking} for {intent!r}")
 
     # DEBUG: Log state at start of answer_generator
     logger.info(
@@ -725,11 +741,12 @@ async def answer_generator(state: "AgentState") -> dict:
 
     # Always inject instructions so LLM never fabricates when context is empty
     # Use modular instructions based on intent — saves 30-60% tokens
+    # Phase 3.6: pass enable_thinking to inject _THINKING_DIRECTIVE when active
     from app.prompts.agents.answer_instructions import get_instructions_for_intent
 
     context_text = "\n\n".join(context_parts) if context_parts else "(no retrieved context)"
     query_msg = f"Question: {rewritten_query}" if rewritten_query else ""
-    intent_instructions = get_instructions_for_intent(intent)
+    intent_instructions = get_instructions_for_intent(intent, enable_thinking=enable_thinking)
     inject = (
         "\n\n=== RETRIEVED CONTEXT ===\n"
         + (f"{query_msg}\n\n" if query_msg else "")

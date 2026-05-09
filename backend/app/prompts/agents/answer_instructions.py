@@ -111,6 +111,34 @@ _LIST_DOCS_INSTRUCTIONS = (
 
 
 # =============================================================================
+# THINKING DIRECTIVE — Only injected when extended thinking is enabled
+# Guides LLM to perform structured reasoning instead of restating sources
+# =============================================================================
+
+_THINKING_DIRECTIVE = (
+    "\n## Thinking Process (extended thinking active)\n"
+    "Trong phần thinking, bạn PHẢI thực hiện các bước suy luận sau. "
+    "KHOONG được lặp lại nội dung source — thay vào đó, hãy PHÂN TÍCH chúng:\n\n"
+    "1. **Đánh giá nguồn (Source Triage):** Nguồn nào thực sự liên quan đến câu hỏi? "
+    "Nguồn nào chỉ liên quan gián tiếp hoặc không liên quan? "
+    "Ghi nhận ID nguồn quan trọng nhất.\n\n"
+    "2. **Phát hiện mâu thuẫn/lỗ hổng:** Các nguồn có mâu thuẫn không? "
+    "Có thông tin nào bị thiếu mà câu hỏi yêu cầu? "
+    "Có nguồn nào cung cấp thông tin cũ/lỗi thời không?\n\n"
+    "3. **Lập luận & suy diễn:** Câu hỏi yêu cầu trích xuất trực tiếp hay tổng hợp? "
+    "Cần so sánh giữa các nguồn hay kết hợp thông tin? "
+    "Có thể rút ra kết luận logic nào từ nhiều nguồn?\n\n"
+    "4. **Lên kế hoạch câu trả lời:** Cấu trúc câu trả lời nên như thế nào? "
+    "(danh sách, bảng so sánh, giải thích từng bước, v.v.) "
+    "Thứ tự trình bày nào logic nhất cho user?\n\n"
+    "5. **Tự kiểm tra:** Câu trả lời có đầy đủ? Có bỏ sót phần nào của câu hỏi? "
+    "Citation có chính xác không?\n\n"
+    "⚠️ TUYỆT ĐỐI KHÔNG copy/paste nội dung source vào thinking. "
+    "Thinking phải là QUÁ TRÌNH SUY LUẬN, không phải bản tóm tắt.\n"
+)
+
+
+# =============================================================================
 # Intent → Instructions mapping
 # =============================================================================
 
@@ -128,15 +156,17 @@ _MONGO_INTENTS = {
 }
 
 
-def get_instructions_for_intent(intent: str) -> str:
+def get_instructions_for_intent(intent: str, enable_thinking: bool = False) -> str:
     """
     Return the appropriate INSTRUCTIONS string for the given intent.
 
     Composes BASE + intent-specific modules to minimize token usage
     while preserving all safety rules relevant to the intent.
+    When enable_thinking=True, appends _THINKING_DIRECTIVE to guide structured reasoning.
 
     Args:
         intent: The classified intent string (e.g. "search", "mongo_search_cccd")
+        enable_thinking: Whether extended thinking is active (injects reasoning guide)
 
     Returns:
         Composed INSTRUCTIONS string ready to inject into the prompt.
@@ -154,5 +184,10 @@ def get_instructions_for_intent(intent: str) -> str:
     else:
         # Fallback: include RAG instructions for unknown intents
         parts.append(_RAG_INSTRUCTIONS)
+
+    # Phase 3.6: Inject thinking directive only when extended thinking is enabled
+    # This guides the LLM to perform structured analysis instead of restating sources
+    if enable_thinking:
+        parts.append(_THINKING_DIRECTIVE)
 
     return "".join(parts)
