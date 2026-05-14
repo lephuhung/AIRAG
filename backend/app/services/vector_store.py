@@ -202,12 +202,13 @@ class VectorStore:
             include=["documents", "metadatas"]
         )
 
-    def get_by_metadata(self, where: dict) -> dict:
+    def get_by_metadata(self, where: dict, limit: int = 1000) -> dict:
         """Get documents matching metadata filter without semantic search."""
         try:
             results = self.collection.get(
                 where=where,
-                include=["documents", "metadatas"]
+                include=["documents", "metadatas"],
+                limit=limit
             )
             return {
                 "ids": results.get("ids", []),

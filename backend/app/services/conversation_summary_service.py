@@ -102,9 +102,13 @@ Trả lời JSON format, không giải thích thêm:
         seen = set()
         formatted = []
         for src in sources:
-            doc_id = src.get("document_id") or (src.document_id if hasattr(src, "document_id") else None)
-            page = src.get("page_no") or (src.page_no if hasattr(src, "page_no") else 0)
-            heading = src.get("heading_path") or (src.heading_path if hasattr(src, "heading_path") else [])
+            if isinstance(src, str):
+                logger.warning(f"Unexpected string in sources: {src}")
+                continue
+                
+            doc_id = src.get("document_id") if isinstance(src, dict) else (src.document_id if hasattr(src, "document_id") else None)
+            page = src.get("page_no") if isinstance(src, dict) else (src.page_no if hasattr(src, "page_no") else 0)
+            heading = src.get("heading_path") if isinstance(src, dict) else (src.heading_path if hasattr(src, "heading_path") else [])
 
             if doc_id is None:
                 continue

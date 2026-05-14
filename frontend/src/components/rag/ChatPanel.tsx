@@ -522,11 +522,15 @@ const FIELD_CONFIG: Record<string, { label: string; icon: ReactNode }> = {
   HO_TEN: { label: "Họ tên", icon: <User className="w-3 h-3" /> },
   TenHoiVien: { label: "Họ tên", icon: <User className="w-3 h-3" /> },
   ho_ten: { label: "Họ tên", icon: <User className="w-3 h-3" /> },
+  fullName: { label: "Họ tên", icon: <User className="w-3 h-3" /> },
+  tenKhachHang: { label: "Họ tên", icon: <User className="w-3 h-3" /> },
   maSoBhxh: { label: "Mã BHXH", icon: <DatabaseZap className="w-3 h-3" /> },
   soTheBhyt: { label: "Số thẻ BHYT", icon: <FileText className="w-3 h-3" /> },
   ngaySinhHienThi: { label: "Ngày sinh", icon: <BookOpen className="w-3 h-3" /> },
   NGAY_SINH: { label: "Ngày sinh", icon: <BookOpen className="w-3 h-3" /> },
   NgaySinh: { label: "Ngày sinh", icon: <BookOpen className="w-3 h-3" /> },
+  namsinh: { label: "Năm sinh", icon: <BookOpen className="w-3 h-3" /> },
+  fullNam: { label: "Năm sinh", icon: <BookOpen className="w-3 h-3" /> },
   soCmnd: { label: "Số CMND", icon: <FileSearch className="w-3 h-3" /> },
   cmnd: { label: "Số CMND", icon: <FileSearch className="w-3 h-3" /> },
   SoDinhDanh: { label: "Số định danh", icon: <FileSearch className="w-3 h-3" /> },
@@ -534,13 +538,17 @@ const FIELD_CONFIG: Record<string, { label: string; icon: ReactNode }> = {
   dienThoai: { label: "Điện thoại", icon: <Mic className="w-3 h-3" /> },
   SoDienThoai: { label: "Điện thoại", icon: <Mic className="w-3 h-3" /> },
   DIEN_THOAI_ME: { label: "Điện thoại mẹ", icon: <Mic className="w-3 h-3" /> },
+  mobile: { label: "Điện thoại", icon: <Mic className="w-3 h-3" /> },
+  so_dien_thoai: { label: "Điện thoại", icon: <Mic className="w-3 h-3" /> },
   diaChi: { label: "Địa chỉ", icon: <LayoutGrid className="w-3 h-3" /> },
   DiaChi: { label: "Địa chỉ", icon: <LayoutGrid className="w-3 h-3" /> },
+  diaChiCapDien: { label: "Địa chỉ", icon: <LayoutGrid className="w-3 h-3" /> },
   coSoKCB: { label: "CS KCB", icon: <Settings2 className="w-3 h-3" /> },
   trangThaiThe: { label: "Trạng thái", icon: <Zap className="w-3 h-3" /> },
   tyLeBhyt: { label: "Tỷ lệ BHYT", icon: <Sparkles className="w-3 h-3" /> },
   tuNgay: { label: "Từ ngày", icon: <BookOpen className="w-3 h-3" /> },
   denNgay: { label: "Đến ngày", icon: <BookOpen className="w-3 h-3" /> },
+  ngayDangKy: { label: "Ngày đăng ký", icon: <BookOpen className="w-3 h-3" /> },
   TenHangHoiVien: { label: "Hạng hội viên", icon: <GraduationCap className="w-3 h-3" /> },
   SoTheHoiVien: { label: "Số thẻ hội viên", icon: <FileText className="w-3 h-3" /> },
   TEN_ME: { label: "Tên mẹ", icon: <User className="w-3 h-3" /> },
@@ -553,7 +561,7 @@ const SKIP_FIELDS = new Set(["_id", "_source_schema", "lookup_type", "found", "p
 
 /** Get name field from a people record (tries multiple possible field names) */
 function getNameField(record: Record<string, unknown>): string {
-  for (const key of ["hoTen", "HO_TEN", "TenHoiVien", "ho_ten"]) {
+  for (const key of ["hoTen", "HO_TEN", "TenHoiVien", "ho_ten", "fullName", "tenKhachHang"]) {
     if (record[key] && typeof record[key] === "string") {
       return record[key] as string;
     }
@@ -567,6 +575,9 @@ const SCHEMA_LABELS: Record<string, string> = {
   lg: "LG Hội viên",
   vacxin: "Tiêm chủng",
   evn: "Điện lực",
+  cv19: "Covid 19",
+  uids: "UIDS",
+  vnvc: "VNVC",
 };
 
 function PeopleCard({ people, isLoadingMore }: { people: PeopleRecord[], isLoadingMore?: boolean }) {
@@ -661,7 +672,18 @@ function PeopleCard({ people, isLoadingMore }: { people: PeopleRecord[], isLoadi
                     </div>
                     <div className="min-w-0">
                       <p className="text-[10px] text-muted-foreground font-semibold uppercase tracking-tight leading-none mb-0.5">{config.label}</p>
-                      <p className="text-[12px] font-medium text-foreground/90 truncate">{String(val)}</p>
+                      {key === "uids" ? (
+                        <a
+                          href={`https://facebook.com/${val}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-[12px] font-medium text-blue-600 dark:text-blue-400 hover:underline truncate"
+                        >
+                          {String(val)}
+                        </a>
+                      ) : (
+                        <p className="text-[12px] font-medium text-foreground/90 truncate">{String(val)}</p>
+                      )}
                     </div>
                   </div>
                 );

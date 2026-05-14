@@ -281,7 +281,14 @@ NATIVE_TOOL_REMINDER = "\n\n[SYSTEM REMINDER] You MUST call the `search_document
 
 def format_sse_event(event: str, data: dict) -> str:
     """Format data as an SSE event string."""
-    json_data = json.dumps(data, default=str, ensure_ascii=False)
+    def json_serial(obj):
+        if hasattr(obj, "model_dump"):
+            return obj.model_dump()
+        if hasattr(obj, "dict"):
+            return obj.dict()
+        return str(obj)
+
+    json_data = json.dumps(data, default=json_serial, ensure_ascii=False)
     return f"event: {event}\ndata: {json_data}\n\n"
 
 

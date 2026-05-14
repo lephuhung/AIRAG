@@ -35,6 +35,18 @@ class CitationResponse(BaseModel):
     heading_path: list[str] = []
     formatted: str = ""
 
+    @field_validator("heading_path", mode="before")
+    @classmethod
+    def validate_heading_path(cls, v):
+        """Coerce string heading_path to list."""
+        if isinstance(v, str):
+            if not v:
+                return []
+            if ">" in v:
+                return [p.strip() for p in v.split(">")]
+            return [v]
+        return v or []
+
 
 class RetrievedChunkResponse(BaseModel):
     """Response schema for a single retrieved chunk."""
@@ -238,7 +250,40 @@ class ChatSourceChunk(BaseModel):
     def coerce_index_to_str(cls, v):
         return str(v) if not isinstance(v, str) else v
 
-    content: str
+    @field_validator("heading_path", mode="before")
+    @classmethod
+    def coerce_heading_path(cls, v):
+        if isinstance(v, str):
+            if not v: return []
+            return v.split(" > ")
+        return v or []
+
+    @field_validator("document_id", mode="before")
+    @classmethod
+    def coerce_document_id(cls, v):
+        if isinstance(v, str):
+            try:
+                return uuid.UUID(v)
+            except ValueError:
+                return v
+        return v
+
+    @field_validator("chunk_id", mode="before")
+    @classmethod
+    def coerce_chunk_id(cls, v, info):
+        # Handle legacy format with chunk_index or no chunk_id
+        if v is not None and v != "":
+            return v
+        # Fallback: try to construct from chunk_index if present in data
+        data = info.data if hasattr(info, 'data') else {}
+        chunk_idx = data.get("chunk_index")
+        if chunk_idx is not None:
+            return f"chunk_{chunk_idx}"
+        doc_id = data.get("document_id", "")
+        return f"chunk_{doc_id}_{chunk_idx}" if chunk_idx else "unknown"
+
+    content: str = ""
+    chunk_id: str = ""
     document_id: uuid.UUID
     page_no: int = 0
     heading_path: list[str] = []
@@ -249,6 +294,16 @@ class ChatSourceChunk(BaseModel):
 
 class ChatImageRef(BaseModel):
     """An image referenced in the chat answer."""
+
+    @field_validator("document_id", mode="before")
+    @classmethod
+    def coerce_document_id(cls, v):
+        if isinstance(v, str):
+            try:
+                return uuid.UUID(v)
+            except ValueError:
+                return v
+        return v
 
     ref_id: str | None = None  # 4-char alphanumeric ID, e.g. "p4f2"
     image_id: str
@@ -274,6 +329,56 @@ class ChatResponse(BaseModel):
 
 class PersistedChatMessage(BaseModel):
     """A persisted chat message from the database."""
+
+    @field_validator("document_ids", mode="before")
+    @classmethod
+    def coerce_doc_ids(cls, v):
+        if v is None: return None
+        if isinstance(v, str):
+            # Try to parse as JSON if it's a string
+            import json
+            try:
+                v = json.loads(v)
+            except:
+                return None
+        if isinstance(v, list):
+            out = []
+            for item in v:
+                if isinstance(item, str):
+                    try:
+                        out.append(uuid.UUID(item))
+                    except ValueError:
+                        continue
+                elif isinstance(item, uuid.UUID):
+                    out.append(item)
+            return out
+        return None
+
+    @field_validator("sources", mode="before")
+    @classmethod
+    def coerce_sources(cls, v):
+        """Handle legacy source formats from older messages."""
+        if v is None: return None
+        if not isinstance(v, list):
+            return None
+        normalized = []
+        for item in v:
+            if not isinstance(item, dict):
+                continue
+            # Normalize legacy format to ChatSourceChunk format
+            normalized_item = {
+                "index": str(item.get("index", item.get("chunk_index", "???"))),
+                "chunk_id": item.get("chunk_id") or f"chunk_{item.get('chunk_index', 'unknown')}",
+                "content": item.get("content", ""),
+                "document_id": item.get("document_id", ""),
+                "page_no": item.get("page_no", 0),
+                "heading_path": item.get("heading_path", []),
+                "score": item.get("score", 0.0),
+                "source_type": item.get("source_type", "vector"),
+                "source_file": item.get("source_file") or item.get("source"),
+            }
+            normalized.append(normalized_item)
+        return normalized if normalized else None
 
     id: uuid.UUID
     message_id: str

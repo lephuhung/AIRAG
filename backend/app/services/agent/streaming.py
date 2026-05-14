@@ -88,9 +88,18 @@ def get_current_db():
 # SSE helpers
 # ---------------------------------------------------------------------------
 
+def json_serial(obj):
+    """JSON serializer for objects not serializable by default json code."""
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump()
+    if hasattr(obj, "dict"):
+        return obj.dict()
+    return str(obj)
+
+
 def _sse(event: str, data: dict) -> str:
     """Format a dict as an SSE event string."""
-    json_data = json.dumps(data, default=str, ensure_ascii=False)
+    json_data = json.dumps(data, default=json_serial, ensure_ascii=False)
     return f"event: {event}\ndata: {json_data}\n\n"
 
 
@@ -248,15 +257,15 @@ async def push_event(state: dict, ev_type: str, ev_data) -> None:
 # ---------------------------------------------------------------------------
 
 def build_initial_state(
-    workspace_ids: list[int],
+    workspace_ids: list[uuid.UUID],
     message: str,
     history: list[dict],
     system_prompt: str,
     enable_thinking: bool,
     db,
-    user_id: Optional[int] = None,
+    user_id: Optional[uuid.UUID] = None,
     session_id: Optional[str] = None,
-    document_ids: Optional[list[int]] = None,
+    document_ids: Optional[list[uuid.UUID]] = None,
 ) -> dict:
     """
     Build the initial AgentState dict from a chat request.

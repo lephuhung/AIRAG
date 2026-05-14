@@ -9,6 +9,9 @@ from typing_extensions import TypedDict
 from langgraph.graph.message import add_messages
 
 
+import uuid
+import operator
+
 class AgentState(TypedDict):
     """
     Shared state flowing through the LangGraph graph nodes.
@@ -22,52 +25,45 @@ class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
 
     # ── Request context ───────────────────────────────────────────────────────
-    workspace_ids: list[int]
-    document_ids: Optional[list[int]]
-    user_id: Optional[int]
+    workspace_ids: list[uuid.UUID]
+    document_ids: Optional[list[uuid.UUID]]
+    user_id: Optional[uuid.UUID]
     session_id: Optional[str]
     system_prompt: str
     enable_thinking: bool
 
     # ── Retrieval accumulator (reducer: extend lists) ─────────────────────────
-    sources: Annotated[list, lambda a, b: a + b]  # ChatSourceChunk dicts
-    images: Annotated[list, lambda a, b: a + b]  # ChatImageRef dicts
-    image_parts: Annotated[list, lambda a, b: a + b]  # raw bytes for vision LLM
-    kg_summaries: Annotated[list, lambda a, b: a + b]  # KG insight strings
+    # We use list[ChatSourceChunk] if imported, but TypedDict doesn't strictly enforce.
+    # Annotated[list, operator.add] is the LangGraph way to extend lists instead of overwriting.
+    sources: Annotated[list, operator.add]  # ChatSourceChunk objects
+    images: Annotated[list, operator.add]  # ChatImageRef objects
+    image_parts: Annotated[list, operator.add]  # raw bytes for vision LLM
+    kg_summaries: Annotated[list, operator.add]  # KG insight strings
+    abbreviation_results: Annotated[list, operator.add] # List[dict]
+    mongo_results: Annotated[list, operator.add] # List[dict]
+    potential_abbreviations: Annotated[list, operator.add] # List[str]
 
     # Shared citation ID registry — dict wrapper (set-like, survives LangGraph immutability)
-    # Keys are citation_id strings, values are True — avoids the set-mutation issue
     existing_citation_ids: dict
 
     # ── Agent control ─────────────────────────────────────────────────────────
-    intent: str  # "greeting" | "search" | "list_docs" | "summarize" | "kg_query"
-    rewritten_query: str  # query after Qwen3-4B rewrite (used by tool_executor)
-    original_query: str  # original user message (for validating fabricated search values)
-    iterations: int  # loop guard — nodes increment, graph checks max
-    tool_called: bool  # True after first tool execution
+    intent: str
+    rewritten_query: str
+    original_query: str
+    iterations: int
+    tool_called: bool
+    should_loop_back: bool
+    needs_memory: bool
 
     # ── Memory ───────────────────────────────────────────────────────────────
-    user_memory_context: str  # formatted memories injected into system prompt
+    user_memory_context: str
 
     # ── Output ───────────────────────────────────────────────────────────────
     final_answer: str
-    citation_map: dict  # citation_id → {source_file, page_no, ...}
+    citation_map: dict
 
-    # ── Abbreviation search results ───────────────────────────────────────
-    abbreviation_results: list[
-        dict
-    ]  # [{"short_form": ..., "full_form": ..., "description": ...}]
-    expanded_query: str  # query expanded with abbreviation full_form for routing
-
-    # ── MongoDB people search results ────────────────────────────────────
-    mongo_results: list[dict]  # person records from MongoDB people collection
-
-    # ── Write agent ───────────────────────────────────────────────────────
-    write_action: str   # "summarize" | "suggest_edits" | "grammar_check" | "extract_key_points" | "format_check"
-    text_input: str     # raw text to process (extracted from message or provided directly)
-    format_data: dict | None  # extracted format metadata for format_check
-    file_name: str | None     # filename for format_check report
-    # potential_abbreviations: list[str]  # candidates that look like abbreviations but not in DB
+    # ── Section search results ───────────────────────────────────────
+    section_reference: str | None
 
 
 # Valid intents recognised by the classifier

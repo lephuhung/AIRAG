@@ -196,8 +196,8 @@ async def _tool_search(state: SupervisorState) -> dict:
             f"{[str(d) for d in document_ids[:3]]}"
         )
 
-    langfuse = _get_langfuse_client()
-    if langfuse:
+    existing_ids = state.get("existing_citation_ids", {})
+    if _get_langfuse_client():
         return await _with_langfuse_span(
             "search_documents",
             {
@@ -206,16 +206,19 @@ async def _tool_search(state: SupervisorState) -> dict:
                 "document_ids": [str(d) for d in document_ids] if document_ids else None,
                 "search_mode": search_mode,
             },
-            _search_impl(workspace_ids, rewritten_query, document_ids, search_mode, scoped),
+            _search_impl(workspace_ids, rewritten_query, document_ids, search_mode, scoped, existing_ids),
         )
     else:
-        return await _search_impl(workspace_ids, rewritten_query, document_ids, search_mode, scoped)
+        return await _search_impl(workspace_ids, rewritten_query, document_ids, search_mode, scoped, existing_ids)
 
 
-async def _search_impl(workspace_ids, rewritten_query, document_ids, search_mode, scoped) -> dict:
+async def _search_impl(workspace_ids, rewritten_query, document_ids, search_mode, scoped, existing_ids) -> dict:
     """Implementation of search_documents tool (no Langfuse)."""
     from app.services.agent.tools import search_documents
     from app.services.agent.streaming import get_current_db
+
+    # Convert dict keys to set for search_documents
+    ids_set = set(existing_ids.keys()) if isinstance(existing_ids, dict) else set(existing_ids)
 
     if scoped:
         logger.info(
@@ -226,7 +229,7 @@ async def _search_impl(workspace_ids, rewritten_query, document_ids, search_mode
         query=rewritten_query,
         top_k=8,
         workspace_ids=workspace_ids,
-        existing_citation_ids=set(),
+        existing_citation_ids=ids_set,
         db=get_current_db(),
         document_ids=document_ids,
         search_mode=search_mode,
@@ -774,17 +777,22 @@ async def _execute_search_section(section_reference: str, workspace_ids, documen
             # Generate a short index ID for citation (e.g., "ss1")
             import uuid as _uuid
             short_id = str(_uuid.uuid4().hex[:4])
+            from app.schemas.rag import ChatSourceChunk
+            
+            chunk_obj = ChatSourceChunk(
+                index=short_id,
+                chunk_id=f"doc_{doc.id}_section_{section_reference.replace(' ', '_')}",
+                content=extracted_text,  # Full text for LLM
+                document_id=doc.id,
+                page_no=0,
+                heading_path=[section_reference],
+                source_type="extraction",
+                source_file=doc.original_filename
+            )
+            
             result = {
                 "text": extracted_text,
-                "sources": [{
-                    "index": short_id,
-                    "chunk_id": f"doc_{doc.id}_section_{section_reference.replace(' ', '_')}",
-                    "source": doc.original_filename,
-                    "document_id": str(doc.id),
-                    "page_no": 0,
-                    "content": extracted_text[:500],  # preview for citation
-                    "heading_path": [section_reference],  # list, not string
-                }],
+                "sources": [chunk_obj],
                 "content_extracted": True,
             }
             logger.info(

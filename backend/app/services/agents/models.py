@@ -9,7 +9,10 @@ Contains:
 - INTENT_TO_AGENT mapping
 """
 
-from typing import Literal, TypedDict
+from typing import Literal, TypedDict, Annotated
+import uuid
+import operator
+from app.schemas.rag import ChatSourceChunk, ChatImageRef
 
 
 # =============================================================================
@@ -106,20 +109,20 @@ class SupervisorState(TypedDict, total=False):
     original_query: str
 
     # Workspace context
-    workspace_ids: list[int]
-    document_ids: list[int] | None
-    user_id: int | None
+    workspace_ids: list[uuid.UUID]
+    document_ids: list[uuid.UUID] | None
+    user_id: uuid.UUID | None
     session_id: str | None
     system_prompt: str
     enable_thinking: bool
 
     # Accumulated retrieval results
-    sources: list
-    images: list
-    image_parts: list
-    kg_summaries: list
-    abbreviation_results: list
-    mongo_results: list
+    sources: Annotated[list[ChatSourceChunk], operator.add]
+    images: Annotated[list[ChatImageRef], operator.add]
+    image_parts: Annotated[list, operator.add]
+    kg_summaries: Annotated[list, operator.add]
+    abbreviation_results: Annotated[list, operator.add]
+    mongo_results: Annotated[list, operator.add]
 
     # Section search results
     section_reference: str | None
@@ -144,7 +147,7 @@ class SupervisorState(TypedDict, total=False):
     search_mode: str  # "vector" | "kg" | "hybrid"
 
     # Phase 4: Query Clarification & Smart Abbreviation Detection
-    suspected_abbreviations: list[str]   # Từ nghi ngờ là viết tắt (từ thinking)
+    suspected_abbreviations: Annotated[list[str], operator.add]   # Từ nghi ngờ là viết tắt (từ thinking)
     clarification_needed: bool            # True khi cần hỏi user thêm thông tin
     clarification_message: str            # Nội dung câu hỏi clarification gửi cho user
 
@@ -152,7 +155,7 @@ class SupervisorState(TypedDict, total=False):
     next_agent: Literal["rag", "write", "people", "direct", "finish"] | None
     iterations: int
     user_memory_context: str
-    potential_abbreviations: list[str]
+    potential_abbreviations: Annotated[list[str], operator.add]
     expanded_query: str
     should_loop_back: bool  # True when abbreviation was found → re-classify with full form
 

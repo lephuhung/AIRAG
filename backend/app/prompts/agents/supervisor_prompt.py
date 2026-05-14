@@ -105,6 +105,12 @@ CRITICAL RULES
 - NEVER answer from general knowledge. Always search documents.
 - "write_summarize" = user provides TEXT IN THE MESSAGE. If they name a law → resolve_doc, NOT write_summarize.
 
+- ABBREVIATION BEFORE DOCUMENT: If the query contains an abbreviation
+  that looks like a CODE (e.g., BMNN, TTGT, BNNT) without a document type
+  keyword (Luật, Nghị định, Thông tư, Quyết định, văn bản số), use
+  "search_abbr" intent first. Only use "resolve_doc" when user explicitly
+  names a document by type, number, or year.
+
 ═══════════════════════════════════════════════════════
 EXAMPLES
 ═══════════════════════════════════════════════════════

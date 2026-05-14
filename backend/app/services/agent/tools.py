@@ -93,7 +93,7 @@ async def search_documents(
     Returns:
         dict with keys: context_text, sources, images, image_parts, kg_summaries
     """
-    from app.api.chat_agent import _execute_search_documents
+    from app.api.chat_agent import _execute_search_documents, _generate_citation_id
 
     (
         context_text,
@@ -113,8 +113,8 @@ async def search_documents(
     )
     return {
         "context_text": context_text,
-        "sources": [s.model_dump() for s in sources],
-        "images": [i.model_dump() for i in image_refs],
+        "sources": sources,
+        "images": image_refs,
         "image_parts": image_parts,
         "kg_summaries": kg_summaries,
     }
@@ -688,25 +688,31 @@ async def search_documents_number(
             }
 
         lines = [f"Tìm thấy **{len(docs)} tài liệu** có số văn bản liên quan:"]
-        doc_list = []
+        from app.schemas.rag import ChatSourceChunk
+        import uuid
         import random, string
+
+        doc_list = []
         for i, doc in enumerate(docs, 1):
             chars = string.ascii_lowercase + string.digits
             while True:
                 cid = "".join(random.choices(chars, k=4))
                 if any(c.isalpha() for c in cid):
                     break
-            doc_info = {
-                "id": str(doc.id),
-                "document_id": str(doc.id),
-                "filename": doc.original_filename,
-                "source_file": doc.original_filename,
-                "document_number": doc.document_number,
-                "index": cid,
-                "content": f"Tài liệu: {doc.original_filename}\nSố văn bản: {doc.document_number or 'N/A'}",
-                "chunk_id": f"doc_{doc.id}_meta",
-            }
-            doc_list.append(doc_info)
+            
+            chunk_obj = ChatSourceChunk(
+                index=cid,
+                chunk_id=f"doc_{doc.id}_meta",
+                content=f"Tài liệu: {doc.original_filename}\nSố văn bản: {doc.document_number or 'N/A'}",
+                document_id=doc.id,
+                page_no=0,
+                heading_path=[],
+                score=1.0, # Exact match by number
+                source_type="metadata",
+                source_file=doc.original_filename
+            )
+            doc_list.append(chunk_obj)
+            
             lines.append(
                 f"{i}. **{doc.original_filename}**\n"
                 f"   Số văn bản: {doc.document_number or 'N/A'}\n"
@@ -1423,6 +1429,8 @@ async def search_document_section(
     """
     from app.services.vector_store import get_vector_store
     from app.services.embedder import get_embedding_service
+    from app.api.chat_agent import _generate_citation_id
+    from app.schemas.rag import ChatSourceChunk
     
     all_chunks = []
     
@@ -1448,17 +1456,21 @@ async def search_document_section(
                 # Filter in Python for substring match in heading_path
                 ref_norm = section_reference.lower().strip().rstrip(".")
                 
+                # Precise matching using regex to avoid partial matches (e.g., "Điều 3" vs "Điều 30")
+                import re
+                ref_pattern = rf"(?i)\b{re.escape(ref_norm)}(?!\d)\b" # Match whole word, no digit immediately after
+                
                 for doc, meta in zip(res["documents"], res["metadatas"]):
                     path = meta.get("heading_path", "")
                     match = False
                     
                     if isinstance(path, str) and path:
                         # Split by separator and check components
-                        components = [c.strip().lower().rstrip(".") for c in path.split(">")]
-                        if any(ref_norm in c for c in components):
+                        components = [c.strip() for c in path.split(">")]
+                        if any(re.search(ref_pattern, c) for c in components):
                             match = True
                     elif isinstance(path, list):
-                        if any(ref_norm in str(c).lower().rstrip(".") for c in path):
+                        if any(re.search(ref_pattern, str(c)) for c in path):
                             match = True
                             
                     if match:
@@ -1506,16 +1518,44 @@ async def search_document_section(
     # Nối text lại để Answer Generator tóm tắt
     combined_text = "\n\n".join([c["content"] for c in unique_chunks])
     
-    # Filter distinct sources for citation
+    # Convert to ChatSourceChunk objects for consistent RAG pipeline
     sources = []
-    seen_source = set()
+    existing_ids = set()
+    
     for c in unique_chunks:
         meta = c["metadata"]
-        key = f"{meta.get('document_id')}_{meta.get('page_no')}"
-        if key not in seen_source:
-            sources.append(meta)
-            seen_source.add(key)
-            
+        doc_id_raw = meta.get("document_id")
+        
+        # Coerce document_id to UUID
+        try:
+            if isinstance(doc_id_raw, str):
+                doc_id = uuid.UUID(doc_id_raw)
+            else:
+                doc_id = doc_id_raw if isinstance(doc_id_raw, uuid.UUID) else uuid.uuid4()
+        except Exception:
+            doc_id = uuid.uuid4()
+
+        # Handle heading_path
+        h_path = meta.get("heading_path", [])
+        if isinstance(h_path, str):
+            h_path = [p.strip() for p in h_path.split(">")] if ">" in h_path else [h_path]
+        elif not h_path:
+            h_path = ["Tài liệu"]
+
+        chunk_obj = ChatSourceChunk(
+            index=_generate_citation_id(existing_ids),
+            chunk_id=str(meta.get("id") or meta.get("chunk_id") or uuid.uuid4()),
+            content=c["content"],
+            document_id=doc_id,
+            page_no=int(meta.get("page_no", 0)),
+            heading_path=h_path,
+            score=float(c.get("score", 0.0)),
+            source_type="vector",
+            source_file=str(meta.get("filename") or meta.get("original_filename") or "Tài liệu")
+        )
+        sources.append(chunk_obj)
+        existing_ids.add(chunk_obj.index)
+
     return {
         "text": combined_text,
         "sources": sources

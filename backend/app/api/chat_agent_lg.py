@@ -124,9 +124,11 @@ async def _resolve_system_prompt(
     return base_prompt + HARD_SYSTEM_PROMPT
 
 
+from app.services.agent.streaming import json_serial
+
 def _format_sse(event: str, data: dict) -> str:
     """Format as SSE string."""
-    return f"event: {event}\ndata: {json.dumps(data, default=str, ensure_ascii=False)}\n\n"
+    return f"event: {event}\ndata: {json.dumps(data, default=json_serial, ensure_ascii=False)}\n\n"
 
 
 # ---------------------------------------------------------------------------
@@ -249,15 +251,16 @@ async def langgraph_chat_stream(
     try:
         from app.models.chat_message import ChatMessage as ChatMessageModel
         import json as _json
+        from app.services.agent.streaming import json_serial
         assistant_row = ChatMessageModel(
             message_id=str(uuid.uuid4()),
             role="assistant",
             content=final_answer,
             user_id=user_id,
             session_id=session_id,
-            sources=_json.dumps(final_sources, default=str) if final_sources else None,
-            agent_steps=_json.dumps(collected_steps) if collected_steps else None,
-            people_data=_json.dumps(final_people_data) if final_people_data else None,
+            sources=_json.dumps(final_sources, default=json_serial) if final_sources else None,
+            agent_steps=_json.dumps(collected_steps, default=json_serial) if collected_steps else None,
+            people_data=_json.dumps(final_people_data, default=json_serial) if final_people_data else None,
         )
         db.add(assistant_row)
         await db.commit()

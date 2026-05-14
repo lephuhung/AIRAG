@@ -507,6 +507,9 @@ async def answer_generator(state: "AgentState") -> dict:
     messages = state.get("messages", [])
     enable_thinking = state.get("enable_thinking", False)
     potential_abbreviations = state.get("potential_abbreviations", [])
+    images = state.get("images", [])
+    new_sources = []
+    new_images = []
 
     # Phase 3.6: Intent-aware thinking trigger
     # Rules (override supervisor's blanket decision with finer-grained logic):
@@ -592,8 +595,9 @@ async def answer_generator(state: "AgentState") -> dict:
         db = get_current_db()
         all_texts = []
         
+        from app.schemas.rag import ChatSourceChunk
         import random, string
-        existing_ids = {s.get("index") for s in sources if s.get("index")}
+        existing_ids = {s.index if hasattr(s, "index") else s.get("index") for s in sources if (hasattr(s, "index") and s.index) or (isinstance(s, dict) and s.get("index"))}
         def _get_next_cid() -> str:
             chars = string.ascii_lowercase + string.digits
             while True:
@@ -625,17 +629,17 @@ async def answer_generator(state: "AgentState") -> dict:
                     meta_line = f" ({doc_filename})"
                     all_texts.append(f"Source [{cid}]{meta_line}:\n{raw_content}")
                     
-                    sources.append({
-                        "index": cid,
-                        "chunk_id": f"doc_{doc_id}_full",
-                        "content": raw_content[:500], # Preview for UI
-                        "document_id": str(doc_id),
-                        "page_no": 0,
-                        "heading_path": [],
-                        "score": 1.0,
-                        "source_type": "vector",
-                        "source_file": doc_filename,
-                    })
+                    sources.append(ChatSourceChunk(
+                        index=cid,
+                        chunk_id=f"doc_{doc_id}_full",
+                        content=raw_content[:500], # Preview for UI
+                        document_id=doc_id,
+                        page_no=0,
+                        heading_path=[],
+                        score=1.0,
+                        source_type="vector",
+                        source_file=doc_filename,
+                    ))
                     logger.info(f"[answer_generator] fetched raw doc_id={doc_id} as [{cid}]: {len(raw_content)} chars")
                 else:
                     # Fallback to summarize if no raw content
@@ -647,17 +651,17 @@ async def answer_generator(state: "AgentState") -> dict:
                         doc_filename = summ_result.get("document_name", "Unknown")
                         meta_line = f" ({doc_filename})"
                         all_texts.append(f"Source [{cid}]{meta_line}:\n{summ_result['text']}")
-                        sources.append({
-                            "index": cid,
-                            "chunk_id": f"doc_{doc_id}_summary",
-                            "content": summ_result["text"][:500],
-                            "document_id": str(doc_id),
-                            "page_no": 0,
-                            "heading_path": [],
-                            "score": 1.0,
-                            "source_type": "vector",
-                            "source_file": doc_filename,
-                        })
+                        new_sources.append(ChatSourceChunk(
+                            index=cid,
+                            chunk_id=f"doc_{doc_id}_summary",
+                            content=summ_result["text"][:500],
+                            document_id=doc_id,
+                            page_no=0,
+                            heading_path=[],
+                            score=1.0,
+                            source_type="vector",
+                            source_file=doc_filename,
+                        ))
                         logger.info(f"[answer_generator] fallback summarize for {doc_id} as [{cid}]: {len(summ_result['text'])} chars")
             except Exception as e:
                 logger.warning(f"[answer_generator] get_documents_content failed for {doc_id}: {e}")
@@ -668,17 +672,17 @@ async def answer_generator(state: "AgentState") -> dict:
                         doc_filename = summ_result.get("document_name", "Unknown")
                         meta_line = f" ({doc_filename})"
                         all_texts.append(f"Source [{cid}]{meta_line}:\n{summ_result['text']}")
-                        sources.append({
-                            "index": cid,
-                            "chunk_id": f"doc_{doc_id}_summary",
-                            "content": summ_result["text"][:500],
-                            "document_id": str(doc_id),
-                            "page_no": 0,
-                            "heading_path": [],
-                            "score": 1.0,
-                            "source_type": "vector",
-                            "source_file": doc_filename,
-                        })
+                        new_sources.append(ChatSourceChunk(
+                            index=cid,
+                            chunk_id=f"doc_{doc_id}_summary",
+                            content=summ_result["text"][:500],
+                            document_id=doc_id,
+                            page_no=0,
+                            heading_path=[],
+                            score=1.0,
+                            source_type="vector",
+                            source_file=doc_filename,
+                        ))
                         logger.info(f"[answer_generator] fallback summarize for {doc_id} as [{cid}]: {len(summ_result['text'])} chars")
                 except Exception as e2:
                     logger.warning(f"[answer_generator] summarize_document also failed for {doc_id}: {e2}")
@@ -698,11 +702,19 @@ async def answer_generator(state: "AgentState") -> dict:
     if sources:
         chunk_parts = []
         for src in sources:
-            cid = src.get("index", "??")
-            content = src.get("content", "")
-            source_file = src.get("source_file", "")
-            page_no = src.get("page_no", 0)
-            heading_path = src.get("heading_path", [])
+            if isinstance(src, dict):
+                cid = src.get("index", "??")
+                content = src.get("content", "")
+                source_file = src.get("source_file", "")
+                page_no = src.get("page_no", 0)
+                heading_path = src.get("heading_path", [])
+            else:
+                cid = getattr(src, "index", "??")
+                content = getattr(src, "content", "")
+                source_file = getattr(src, "source_file", "")
+                page_no = getattr(src, "page_no", 0)
+                heading_path = getattr(src, "heading_path", [])
+
             meta_parts = []
             if source_file:
                 meta_parts.append(source_file)
@@ -826,7 +838,12 @@ async def answer_generator(state: "AgentState") -> dict:
             f"[answer_generator] Pushed potential_abbreviations: {potential_abbreviations}"
         )
 
-    return {"final_answer": final_answer}
+    return {
+        "final_answer": final_answer,
+        "sources": new_sources,
+        "images": new_images,
+        "potential_abbreviations": potential_abbreviations,
+    }
 
 
 # ---------------------------------------------------------------------------
