@@ -77,6 +77,9 @@ User: "tóm tắt @quyche2024.pdf" → {"intent": "summarize", "rewritten_query"
 User: "summarize @report.pdf" → {"intent": "summarize", "rewritten_query": "summarize @report.pdf", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "tìm văn bản số 60/QĐ-UBND giúp tôi" → {"intent": "search_doc_num", "rewritten_query": "60/QĐ-UBND", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "BMNN là gì?" → {"intent": "search_abbr", "rewritten_query": "BMNN", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "BMNN mở rộng là gì?" → {"intent": "search_abbr", "rewritten_query": "BMNN", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "Khái niệm bí mật nhà nước" → {"intent": "search", "rewritten_query": "bí mật nhà nước là gì định nghĩa", "needs_tool": true, "write_action": "", "text_input": ""}
+User: "thế nào là bí mật nhà nước?" → {"intent": "search", "rewritten_query": "bí mật nhà nước là gì", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "tìm người có CCCD 079203012345" → {"intent": "mongo_search_cccd", "rewritten_query": "079203012345", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "tra cứu CCCD 079203012345" → {"intent": "mongo_search_cccd", "rewritten_query": "079203012345", "needs_tool": true, "write_action": "", "text_input": ""}
 User: "tìm ông Nguyễn Văn A" → {"intent": "mongo_search_name", "rewritten_query": "Nguyễn Văn A", "needs_tool": true, "write_action": "", "text_input": ""}
