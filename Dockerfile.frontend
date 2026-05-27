@@ -16,7 +16,7 @@ RUN corepack enable
 WORKDIR /app
 
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
+RUN pnpm config set strict-dep-builds false && pnpm install --frozen-lockfile
 
 
 # ── Stage: build ─────────────────────────────────────────
@@ -57,7 +57,7 @@ COPY --from=deps /app/node_modules ./node_modules
 
 # Copy source code (will be volume-mounted for hot reload)
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile
+RUN pnpm config set strict-dep-builds false && pnpm install --frozen-lockfile
 
 COPY frontend/src ./src
 COPY frontend/public ./public

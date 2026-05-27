@@ -22,12 +22,13 @@ services:
     image: docker.io/minio/mc:latest
     container_name: airag-langfuse-minio-init
     entrypoint: ["/bin/sh", "-c"]
-    command: >
-      sleep 5 &&
-      mc alias set local http://hrag-minio:9000 minioadmin minioadmin &&
-      mc mb local/langfuse --ignore-existing &&
-      mc anonymous set download local/langfuse &&
-      echo "Bucket langfuse ready"
+    command:
+      - |
+        sleep 5 &&
+        mc alias set local http://hrag-minio:9000 minioadmin minioadmin &&
+        mc mb local/langfuse --ignore-existing &&
+        mc anonymous set download local/langfuse &&
+        echo "Bucket langfuse ready"
     networks:
       - default
     restart: "no"

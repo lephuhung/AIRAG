@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     MEMORY_AGENT_CUDA_DEVICE: str = Field(default="auto")
 
     # OpenAI-compatible provider (vLLM, LM Studio, llama.cpp, etc.)
-    OPENAI_COMPATIBLE_BASE_URL: str = Field(default="http://127.0.0.1:8000/v1")
+    OPENAI_COMPATIBLE_BASE_URL: str = Field(default="http://10.10.0.240:8000/v1")
     OPENAI_COMPATIBLE_MODEL: str = Field(default="default")
     OPENAI_COMPATIBLE_API_KEY: str = Field(default="sk-nexusrag")
 
@@ -68,7 +68,7 @@ class Settings(BaseSettings):
     LEGAL_KG_LLM_PROVIDER: str = Field(
         default="openai_compatible"
     )  # gemini | ollama | openai_compatible
-    LEGAL_KG_LLM_BASE_URL: str = Field(default="http://127.0.0.1:8000/v1")
+    LEGAL_KG_LLM_BASE_URL: str = Field(default="http://10.10.0.240:8000/v1")
     LEGAL_KG_LLM_MODEL: str = Field(default="Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8")
     LEGAL_KG_LLM_API_KEY: str = Field(default="sk-nexusrag")
 

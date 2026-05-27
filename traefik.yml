@@ -16,7 +16,7 @@ providers:
   docker:
     endpoint: "unix:///var/run/docker.sock"
     exposedByDefault: false  # Only services with traefik.enable=true are exposed
-    network: hrag_network
+    network: airag_hrag_network
 
   file:
     directory: /etc/traefik/dynamic

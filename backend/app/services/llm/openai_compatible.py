@@ -2,12 +2,12 @@
 OpenAI-Compatible LLM Provider
 ================================
 Supports any endpoint implementing the OpenAI Chat Completions API:
-- vLLM  (e.g. http://127.0.0.1:8000/v1)
+- vLLM  (e.g. http://10.10.0.240:8000/v1)
 - LM Studio, llama.cpp server, LiteLLM, etc.
 
 Set in .env:
     LLM_PROVIDER=openai_compatible
-    OPENAI_COMPATIBLE_BASE_URL=http://127.0.0.1:8000/v1
+    OPENAI_COMPATIBLE_BASE_URL=http://10.10.0.240:8000/v1
     OPENAI_COMPATIBLE_MODEL=Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
     OPENAI_COMPATIBLE_API_KEY=none          # bắt buộc có giá trị, nhưng có thể là bất kỳ string nào
 """
@@ -77,7 +77,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
 
     def __init__(
         self,
-        base_url: str = "http://127.0.0.1:8000/v1",
+        base_url: str = "http://10.10.0.240:8000/v1",
         model: str = "default",
         api_key: str = "none",
     ):
@@ -424,7 +424,7 @@ class OpenAICompatibleEmbeddingProvider(EmbeddingProvider):
 
     def __init__(
         self,
-        base_url: str = "http://127.0.0.1:8000/v1",
+        base_url: str = "http://10.10.0.240:8000/v1",
         model: str = "BAAI/bge-m3",
         api_key: str = "none",
         dimension: int = 1024,
