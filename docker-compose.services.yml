@@ -321,6 +321,8 @@ services:
       - hrag_data:/app/backend/data
     networks:
       - hrag_network
+    extra_hosts:
+      - "langfuse.hatinh.local:10.10.0.241"
     deploy:
       replicas: 2
       resources:
@@ -385,6 +387,8 @@ services:
       - hrag_data:/app/backend/data
     networks:
       - hrag_network
+    extra_hosts:
+      - "langfuse.hatinh.local:10.10.0.241"
     deploy:
       replicas: 2
       resources:
@@ -446,6 +450,8 @@ services:
       - hrag_data:/app/backend/data
     networks:
       - hrag_network
+    extra_hosts:
+      - "langfuse.hatinh.local:10.10.0.241"
     stop_grace_period: 60s
     command: ["python", "-m", "app.workers.runner"]
     restart: always
@@ -496,6 +502,8 @@ services:
       - hrag_data:/app/backend/data
     networks:
       - hrag_network
+    extra_hosts:
+      - "langfuse.hatinh.local:10.10.0.241"
     stop_grace_period: 60s
     command: ["python", "-m", "app.workers.runner"]
     restart: always
@@ -548,8 +556,10 @@ services:
       HUNYUAN_OCR_API_URL: http://vllm-ocr:8001/v1
       MEMORY_AGENT_BASE_URL: http://vllm-memory:8088/v1
       GRAPHITI_LLM_BASE_URL: http://vllm-memory:8088/v1
+      LEGAL_KG_LLM_BASE_URL: http://vllm-memory:8088/v1
     extra_hosts:
       - "host.docker.internal:host-gateway"
+      - "langfuse.hatinh.local:10.10.0.241"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
       - hrag_uploads:/app/backend/uploads

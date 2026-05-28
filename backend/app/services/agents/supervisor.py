@@ -153,14 +153,21 @@ def _is_pure_greeting(message: str) -> bool:
 # Graphiti memory to answer correctly (e.g. "đơn vị tôi", "cơ quan tôi").
 # This pattern fires REGARDLESS of intent (even intent=search can need memory
 # when the question references the user's own identity/workplace/org).
+#
+# NOTE: Python's \b word boundary does NOT work correctly with Vietnamese
+# Unicode diacritics (e.g. "ô" in "tôi"). Use (?<!\w)/(?!\w) lookaround
+# anchors instead, which are Unicode-aware and work for all Vietnamese text.
 # ---------------------------------------------------------------------------
 _PERSONAL_REF_PATTERN = _re.compile(
-    r"\b("
-    r"tôi|của\s+tôi|cho\s+tôi"
+    r"(?<!\w)("
+    r"tôi"
+    r"|của\s+tôi|cho\s+tôi"
     r"|đơn\s+vị\s+tôi|cơ\s+quan\s+tôi|nơi\s+tôi|chỗ\s+tôi"
     r"|chúng\s+tôi|của\s+chúng\s+tôi"
     r"|công\s+tác\s+của\s+tôi|làm\s+việc\s+của\s+tôi"
-    r")\b",
+    r"|tôi\s+tên|tên\s+(của\s+)?tôi|tôi\s+là\s+ai"
+    r"|tôi\s+làm\s+việc|tôi\s+công\s+tác|tôi\s+đang\s+ở"
+    r")(?!\w)",
     _re.IGNORECASE | _re.UNICODE,
 )
 
@@ -538,6 +545,86 @@ def _parse_supervisor_response(raw: str) -> dict:
 # Graph Nodes
 # =============================================================================
 
+
+async def query_analyzer_node(state: SupervisorState) -> dict:
+    """Analyze user query to extract structured metadata BEFORE supervisor routing.
+
+    Runs as the FIRST node in the graph.  Output informs supervisor_node:
+    - sub_queries  : decomposed questions for multi-step execution
+    - extracted_params : doc names, sections, IDs for precise tool invocation
+    - query_complexity : determines if single-agent or multi-agent needed
+
+    For very short messages (greetings, <10 chars) we skip analysis entirely.
+    """
+    user_message = _extract_user_message(state)
+    logger.info(f"[LANGGRAPH_NODE] Entering query_analyzer_node with query: {user_message!r}")
+    if not user_message or len(user_message.strip()) < 10:
+        # Very short messages (greetings) don't need analysis
+        return {"query_complexity": "simple", "sub_queries": None, "extracted_params": None}
+
+    # Skip analysis on loop-back (already analyzed on first pass)
+    if state.get("iterations", 0) >= 1:
+        return {}
+
+    try:
+        from app.services.llm.types import LLMMessage as _LLMMsg
+        from app.prompts.agents.query_analyzer_prompt import _QUERY_ANALYZER_PROMPT
+        from app.services.llm import get_memory_agent
+
+        # Use the memory agent (Qwen-memory 9B) for complex structured extraction
+        analyzer_llm = get_memory_agent()
+
+        response_text = ""
+        async for chunk in analyzer_llm.astream(
+            [_LLMMsg(role="user", content=user_message)],
+            system_prompt=_QUERY_ANALYZER_PROMPT,
+            temperature=0.0,
+            max_tokens=512,
+            think=False,
+        ):
+            if hasattr(chunk, "text") and chunk.text:
+                response_text += str(chunk.text)
+
+        # Parse JSON response — same cleanup as supervisor
+        raw = response_text.strip()
+        import re as _re_qa
+        raw = _re_qa.sub(r'<think>.*?</think>', '', raw, flags=_re_qa.DOTALL).strip()
+        if "```json" in raw:
+            raw = raw.split("```json")[-1].split("```")[0].strip()
+        elif "```" in raw:
+            parts = raw.split("```")
+            if len(parts) >= 3:
+                raw = parts[1].strip()
+
+        parsed = json.loads(raw)
+        complexity = parsed.get("complexity", "simple")
+        sub_queries = parsed.get("sub_queries") or []
+        extracted_params = parsed.get("extracted_params") or {}
+
+        logger.info(
+            f"[query_analyzer] complexity={complexity!r}, "
+            f"sub_queries={len(sub_queries)}, "
+            f"doc_refs={extracted_params.get('document_refs', [])!r}, "
+            f"sections={extracted_params.get('sections', [])!r}, "
+            f"comparison={extracted_params.get('comparison_mode', False)}"
+        )
+
+        return {
+            "query_complexity": complexity,
+            "sub_queries": sub_queries if len(sub_queries) > 1 else None,
+            "extracted_params": extracted_params if extracted_params else None,
+            "current_step_index": 0,
+            "retry_count": 0,
+        }
+
+    except json.JSONDecodeError as e:
+        logger.warning(f"[query_analyzer] JSON parse failed: {e}, raw={response_text[:200]!r}")
+        return {"query_complexity": "simple", "sub_queries": None, "extracted_params": None}
+    except Exception as e:
+        logger.warning(f"[query_analyzer] Failed: {e}")
+        return {"query_complexity": "simple", "sub_queries": None, "extracted_params": None}
+
+
 async def supervisor_node(state: SupervisorState) -> dict:
     """
     Classify intent + decide next agent in ONE LLM call.
@@ -545,17 +632,24 @@ async def supervisor_node(state: SupervisorState) -> dict:
     This is the core supervisor logic:
     1. Extract user message
     2. Expand abbreviations in message
-    3. Call LLM with supervisor prompt
-    4. Parse response and update state
+    3. Use query_analyzer output (if available) for enhanced context
+    4. Call LLM with supervisor prompt
+    5. Parse response and update state
+    6. For multi-step queries, build proper task_plan from sub_queries
     """
     # get_llm_provider not needed here — supervisor uses OllamaLLMProvider directly
 
     user_message = _extract_user_message(state)
+    iterations = state.get("iterations", 0)
+    logger.info(
+        f"[LANGGRAPH_NODE] Entering supervisor_node, iteration={iterations}, "
+        f"current_intent={state.get('intent')!r}, pending_intent={state.get('pending_intent')!r}"
+    )
     if not user_message:
         return {
             "next_agent": AgentType.DIRECT,
             "intent": "greeting",
-            "iterations": state.get("iterations", 0) + 1,
+            "iterations": iterations + 1,
         }
 
     # Guard: max iterations
@@ -665,9 +759,40 @@ async def supervisor_node(state: SupervisorState) -> dict:
             )
         response_text = ""
 
+        # Phase 5: Build analyzer context string for supervisor prompt
+        _analyzer_context = ""
+        _qa_complexity = state.get("query_complexity", "simple")
+        _qa_sub_queries = state.get("sub_queries") or []
+        _qa_params = state.get("extracted_params") or {}
+        if _qa_complexity != "simple" and (_qa_sub_queries or _qa_params):
+            _ctx_parts = [
+                "\n═══════════════════════════════════════════════════════",
+                "PRE-ANALYZED QUERY CONTEXT (from query_analyzer)",
+                "═══════════════════════════════════════════════════════\n",
+                f"Complexity: {_qa_complexity}",
+            ]
+            if _qa_sub_queries:
+                _ctx_parts.append(f"Sub-queries ({len(_qa_sub_queries)}):")
+                for i, sq in enumerate(_qa_sub_queries):
+                    _ctx_parts.append(f"  {i+1}. [{sq.get('intent_hint', '?')}] {sq.get('query', '')}")
+            if _qa_params.get("document_refs"):
+                _ctx_parts.append(f"Document references: {_qa_params['document_refs']}")
+            if _qa_params.get("sections"):
+                _ctx_parts.append(f"Sections: {_qa_params['sections']}")
+            if _qa_params.get("comparison_mode"):
+                _ctx_parts.append("Mode: COMPARISON (user wants to compare items)")
+            _ctx_parts.append("")
+            _ctx_parts.append("Use this pre-analyzed context to inform your routing decision.")
+            _ctx_parts.append("For multi-step queries, the system will handle step progression automatically.")
+            _ctx_parts.append("")
+            _analyzer_context = "\n".join(_ctx_parts)
+
         async for chunk in classifier.astream(
             [_LLMMsg(role="user", content=query_for_classifier)],
-            system_prompt=_SUPERVISOR_PROMPT.format(max_iterations=max_iter),
+            system_prompt=_SUPERVISOR_PROMPT.format(
+                max_iterations=max_iter,
+                analyzer_context=_analyzer_context,
+            ),
             temperature=0.0,
             max_tokens=512,
             think=False,  # Disable thinking to reduce latency for classification
@@ -768,6 +893,58 @@ async def supervisor_node(state: SupervisorState) -> dict:
             "pending_intent": decision.get("pending_intent"),
         }
 
+        # ── Phase 5: Query Analyzer enhanced routing ────────────────────
+        # If query_analyzer detected a complex query, override the plan
+        complexity = state.get("query_complexity", "simple")
+        sub_queries = state.get("sub_queries") or []
+        extracted_params = state.get("extracted_params") or {}
+        current_step = state.get("current_step_index", 0)
+
+        if complexity != "simple" and sub_queries and current_step < len(sub_queries):
+            # Multi-step execution: use sub_queries to build a proper plan
+            current_sq = sub_queries[current_step]
+            sq_intent = current_sq.get("intent_hint", "search")
+            sq_query = current_sq.get("query", user_message)
+
+            # Normalize intent hint
+            sq_intent = _INTENT_NORMALIZE.get(sq_intent, sq_intent)
+
+            # Determine agent from intent
+            sq_agent = _INTENT_TO_AGENT_FALLBACK.get(sq_intent, "rag")
+
+            logger.info(
+                f"[supervisor] Phase 5: multi-step routing — "
+                f"complexity={complexity!r}, step {current_step+1}/{len(sub_queries)}, "
+                f"intent={sq_intent!r}, agent={sq_agent!r}, query={sq_query[:80]!r}"
+            )
+
+            result["intent"] = sq_intent
+            result["next_agent"] = sq_agent
+            result["rewritten_query"] = sq_query
+            result["current_step_index"] = current_step
+
+            # Build task_plan from remaining sub_queries
+            remaining_intents = [sq.get("intent_hint", "search") for sq in sub_queries[current_step:]]
+            result["task_plan"] = remaining_intents
+            if len(remaining_intents) > 1:
+                result["pending_intent"] = remaining_intents[-1]
+
+        # Pre-fill section_reference from extracted_params if available
+        if extracted_params.get("sections") and not state.get("section_reference"):
+            sections = extracted_params["sections"]
+            if current_step < len(sub_queries or []):
+                # Match section to current sub_query if possible
+                current_sq_text = (sub_queries[current_step].get("query", "") if sub_queries else "")
+                for sec in sections:
+                    if sec.lower() in current_sq_text.lower():
+                        result["section_reference"] = sec
+                        break
+                else:
+                    # Default: use first unprocessed section
+                    result["section_reference"] = sections[0] if sections else None
+            elif sections:
+                result["section_reference"] = sections[0]
+
         # Phase 3: Smart memory routing — determine if memory_recall is needed
         intent = decision["intent"]
         needs_memory = _query_needs_memory(intent, query_for_classifier)
@@ -798,8 +975,8 @@ async def supervisor_node(state: SupervisorState) -> dict:
 
         if intent in thinking_intents:
             result["enable_thinking"] = True
-        elif has_memory:
-            # Personal memory found - needs thinking to incorporate facts correctly
+        elif has_memory and intent in {"personal", "greeting"}:
+            # Only enable thinking for personal memory if intent requires synthesis (e.g. personal/greeting)
             result["enable_thinking"] = True
             logger.info(f"[supervisor] Thinking enabled for {intent} with personal memory")
         elif intent in rag_intents:
@@ -831,12 +1008,21 @@ async def supervisor_node(state: SupervisorState) -> dict:
             result["expanded_query"] = expanded_message
             result["rewritten_query"] = expanded_message
 
+        logger.info(
+            f"[LANGGRAPH_DECISION] supervisor_node decision: next_agent={result.get('next_agent')!r}, "
+            f"intent={result.get('intent')!r}, rewritten_query={result.get('rewritten_query', '')[:100]!r}, "
+            f"needs_memory={result.get('needs_memory')}, search_mode={result.get('search_mode')!r}"
+        )
         return result
 
     except Exception as e:
         logger.error(f"[supervisor] LLM call failed: {e}")
         # Fail-safe: default to RAG (document search) instead of direct.
         # Direct gives empty answers; RAG at least attempts document retrieval.
+        logger.warning(
+            f"[LANGGRAPH_DECISION] supervisor_node exception fallback: next_agent=RAG, "
+            f"intent={state.get('intent', 'search')!r}"
+        )
         return {
             "next_agent": AgentType.RAG,
             "intent": state.get("intent", "search"),
@@ -911,6 +1097,153 @@ async def direct_answer_node(state: SupervisorState) -> dict:
     final_answer = strip_thinking_tags("".join(answer_parts))
 
     return {"final_answer": final_answer, "next_agent": AgentType.FINISH}
+
+
+# =============================================================================
+# Result Evaluator Node — Phase 5
+# =============================================================================
+
+
+async def result_evaluator_node(state: SupervisorState) -> dict:
+    """Evaluate agent results and decide: go to answer, retry, or next step.
+
+    Phase 5 node that runs AFTER rag/resolve_doc agents.
+
+    Decision logic:
+    1. If more sub_queries to execute → advance step, route back to supervisor
+    2. If results empty AND retry_count < 2 → retry with fallback strategy
+    3. Otherwise → route to answer_generator
+    """
+    from app.services.agent.streaming import push_event
+
+    sources = state.get("sources", [])
+    kg_summaries = state.get("kg_summaries", [])
+    intent = state.get("intent", "")
+    retry_count = state.get("retry_count", 0)
+    sub_queries = state.get("sub_queries") or []
+    current_step = state.get("current_step_index", 0)
+    complexity = state.get("query_complexity", "simple")
+
+    has_results = bool(sources)
+    # Check kg_summaries for SUBSTANTIVE content (>50 chars, not just metadata)
+    # Short entries like "Đã xác định văn bản: **title**" are metadata from resolve_doc,
+    # not actual search results. With operator.add reducer, these accumulate and would
+    # cause false positives without this filter.
+    _MIN_SUBSTANTIVE_LEN = 50
+    substantive_kg = [
+        s for s in kg_summaries
+        if isinstance(s, str) and len(s.strip()) >= _MIN_SUBSTANTIVE_LEN
+        and not s.strip().startswith("Đã xác định văn bản:")
+    ]
+    if not has_results and substantive_kg:
+        has_results = True
+
+    logger.info(
+        f"[LANGGRAPH_NODE] Entering result_evaluator_node, intent={intent!r}, has_results={has_results}, "
+        f"sources={len(sources)}, kg_summaries={len(kg_summaries)} (substantive={len(substantive_kg)}), "
+        f"complexity={complexity!r}, step={current_step}/{len(sub_queries)}, "
+        f"retry_count={retry_count}"
+    )
+
+    # ── Check 1: More sub_queries to execute? ─────────────────────────────
+    if complexity != "simple" and sub_queries and (current_step + 1) < len(sub_queries):
+        # Accumulate current step results
+        step_result = {
+            "step_intent": intent,
+            "step_index": current_step,
+            "sources_count": len(sources),
+            "kg_summaries": kg_summaries[:3],  # Keep summaries compact
+        }
+
+        next_step = current_step + 1
+        next_sq = sub_queries[next_step]
+        next_intent = next_sq.get("intent_hint", "search")
+        next_query = next_sq.get("query", "")
+
+        logger.info(
+            f"[result_evaluator] Advancing to step {next_step+1}/{len(sub_queries)}: "
+            f"intent={next_intent!r}, query={next_query[:80]!r}"
+        )
+
+        await push_event(state, "status", {
+            "step": "searching",
+            "detail": f"Bước {next_step+1}/{len(sub_queries)}: {next_query[:60]}...",
+        })
+
+        logger.info(
+            f"[LANGGRAPH_DECISION] result_evaluator_node decision: next_agent='supervisor_loop' (advance to step {next_step+1})"
+        )
+        return {
+            "current_step_index": next_step,
+            "accumulated_results": [step_result],
+            "retry_count": 0,  # Reset retry for new step
+            # Route back to supervisor for next step
+            "next_agent": "supervisor_loop",
+        }
+
+    # ── Check 2: Results insufficient? Retry with fallback ────────────────
+    if not has_results and retry_count < 2:
+        _FALLBACK_MAP = {
+            "search": "kg_query",
+            "kg_query": "search",
+            "search_section": "search",  # Section not found → try general search
+        }
+        fallback_intent = _FALLBACK_MAP.get(intent)
+        if fallback_intent:
+            logger.info(
+                f"[result_evaluator] No results for {intent!r}, "
+                f"retrying with {fallback_intent!r} (retry {retry_count+1}/2)"
+            )
+            await push_event(state, "status", {
+                "step": "searching",
+                "detail": f"Thử phương pháp tìm kiếm khác...",
+            })
+            logger.info(
+                f"[LANGGRAPH_DECISION] result_evaluator_node decision: next_agent={_INTENT_TO_AGENT_FALLBACK.get(fallback_intent, 'rag')!r} (retry with intent {fallback_intent!r})"
+            )
+            return {
+                "intent": fallback_intent,
+                "next_agent": _INTENT_TO_AGENT_FALLBACK.get(fallback_intent, "rag"),
+                "retry_count": retry_count + 1,
+                "retry_strategy": f"fallback_{fallback_intent}",
+                "search_mode": "kg" if fallback_intent == "kg_query" else "vector",
+            }
+
+    # ── Default: sufficient or max retries → answer_generator ─────────────
+    logger.info(
+        f"[LANGGRAPH_DECISION] result_evaluator_node decision: next_agent=ANSWER_GENERATOR (sufficient results or max retries)"
+    )
+    return {
+        "next_agent": AgentType.ANSWER_GENERATOR,
+    }
+
+
+def route_from_evaluator(state: SupervisorState) -> str:
+    """Route after result evaluation.
+
+    - ANSWER_GENERATOR → answer (sufficient results or max retries)
+    - supervisor_loop  → supervisor (more sub_queries to execute)
+    - rag / other      → retry with different strategy
+    """
+    next_agent = state.get("next_agent")
+
+    if next_agent == AgentType.ANSWER_GENERATOR:
+        logger.info("[LANGGRAPH_ROUTE] result_evaluator -> answer_generator")
+        return "answer_generator"
+
+    if next_agent == "supervisor_loop":
+        logger.info("[LANGGRAPH_ROUTE] result_evaluator -> supervisor")
+        return "supervisor"
+
+    # Retry: map agent type to node name
+    _RETRY_MAP = {
+        AgentType.RAG: "rag",
+        AgentType.PEOPLE: "people",
+        AgentType.WRITE: "write",
+    }
+    target = _RETRY_MAP.get(next_agent, "rag")
+    logger.info(f"[LANGGRAPH_ROUTE] result_evaluator -> {target} (retry)")
+    return target
 
 
 # =============================================================================
@@ -1041,12 +1374,14 @@ def route_from_supervisor(state: SupervisorState) -> str:
     needs_memory = state.get("needs_memory", False)
 
     if next_agent is None or next_agent == AgentType.FINISH:
+        logger.info("[LANGGRAPH_ROUTE] supervisor -> END")
         return END
 
     # Phase 2: resolve_doc routes directly to its dedicated agent (no memory needed)
     if next_agent == AgentType.RESOLVE_DOC or (
         next_agent == AgentType.RAG and intent == "resolve_doc"
     ):
+        logger.info(f"[LANGGRAPH_ROUTE] supervisor -> resolve_doc_agent (intent={intent!r})")
         return "resolve_doc_agent"
 
     # Phase 3: Smart memory routing
@@ -1054,8 +1389,7 @@ def route_from_supervisor(state: SupervisorState) -> str:
     # needs_memory=False → direct to target agent (bypass Graphiti entirely)
     if needs_memory:
         logger.info(
-            f"[route_from_supervisor] needs_memory=True (intent={intent!r}) "
-            f"→ memory_recall"
+            f"[LANGGRAPH_ROUTE] supervisor -> memory_recall (needs_memory=True, intent={intent!r})"
         )
         return "memory_recall"
 
@@ -1070,41 +1404,47 @@ def route_from_supervisor(state: SupervisorState) -> str:
     target = _DIRECT_MAP.get(next_agent)
     if target:
         logger.info(
-            f"[route_from_supervisor] needs_memory=False (intent={intent!r}) "
-            f"→ direct to {target!r}"
+            f"[LANGGRAPH_ROUTE] supervisor -> {target} (needs_memory=False, intent={intent!r})"
         )
         return target
 
-    # Fallback: go through memory_recall (safe default)
+    logger.info(f"[LANGGRAPH_ROUTE] supervisor -> memory_recall (fallback, intent={intent!r})")
     return "memory_recall"
 
 
 def route_from_rag(state: SupervisorState) -> str:
     """Route after rag agent completes.
 
-    If abbreviation was found and expanded, loop back to supervisor
-    to re-classify with the full form. Otherwise go to answer_generator.
+    Phase 5: Routes through result_evaluator for quality checking and
+    multi-step execution. Abbreviation loop-back and search_section
+    pending cases still go directly to supervisor.
 
-    For search_section intent, we check section_reference:
-    - If section_reference is still in state → search_section tool NOT yet executed
-      (supervisor set it but tool hasn't run yet) → route back to supervisor
-      (supervisor will re-route to rag with same intent, and rag will execute tool)
-    - If section_reference is None/empty → tool already ran, kg_summaries has content
-      → go to answer_generator
+    Priority:
+    1. should_loop_back (abbreviation) → supervisor
+    2. search_section with pending section_reference → supervisor
+    3. Everything else → result_evaluator (quality check + multi-step)
     """
     pending_section = state.get("section_reference")
     intent = state.get("intent")
     loop = state.get("should_loop_back")
-    logger.info(f"[route_from_rag] intent={intent!r}, section_reference={pending_section!r}, should_loop_back={loop}")
+    logger.info(
+        f"[route_from_rag] intent={intent!r}, section_reference={pending_section!r}, "
+        f"should_loop_back={loop}, complexity={state.get('query_complexity', 'simple')!r}"
+    )
+
+    # Abbreviation loop-back takes priority
     if loop:
+        logger.info("[LANGGRAPH_ROUTE] rag -> supervisor (abbreviation loop-back)")
         return "supervisor"
-    if intent == "search_section":
-        if pending_section:
-            # section_reference still present → tool not yet executed
-            # Loop back to supervisor so it re-routes to rag
-            return "supervisor"
-        return "answer_generator"
-    return "answer_generator"
+
+    # search_section pending → supervisor re-routes to rag
+    if intent == "search_section" and pending_section:
+        logger.info("[LANGGRAPH_ROUTE] rag -> supervisor (pending search_section)")
+        return "supervisor"
+
+    # Phase 5: Route through result_evaluator for quality check + multi-step
+    logger.info("[LANGGRAPH_ROUTE] rag -> result_evaluator")
+    return "result_evaluator"
 
 
 def route_from_resolve_doc(state: SupervisorState) -> str:
@@ -1127,12 +1467,12 @@ def route_from_resolve_doc(state: SupervisorState) -> str:
     pending_intent = state.get("pending_intent")
 
     if next_agent == AgentType.FINISH:
-        logger.info("[route_from_resolve_doc] next_agent=FINISH → END (not found / ambiguous)")
+        logger.info("[LANGGRAPH_ROUTE] resolve_doc_agent -> END (not found / ambiguous)")
         return END
 
     # resolve_doc_agent already set intent=search_section when section_ref found
     if intent == "search_section" and section_ref:
-        logger.info(f"[route_from_resolve_doc] has section_ref={section_ref!r} → rag")
+        logger.info(f"[LANGGRAPH_ROUTE] resolve_doc_agent -> rag (has section_ref={section_ref!r})")
         return "rag"
 
     # Phase 4: Check pending_intent from task_plan
@@ -1142,13 +1482,16 @@ def route_from_resolve_doc(state: SupervisorState) -> str:
             f"section_ref={section_ref!r}"
         )
         if pending_intent == "search_section" and section_ref:
+            logger.info("[LANGGRAPH_ROUTE] resolve_doc_agent -> rag (pending search_section)")
             return "rag"
         elif pending_intent == "search":
+            logger.info("[LANGGRAPH_ROUTE] resolve_doc_agent -> rag (pending search)")
             return "rag"
         elif pending_intent == "summarize":
+            logger.info("[LANGGRAPH_ROUTE] resolve_doc_agent -> answer_generator (pending summarize)")
             return "answer_generator"
 
-    logger.info("[route_from_resolve_doc] document resolved → answer_generator")
+    logger.info("[LANGGRAPH_ROUTE] resolve_doc_agent -> answer_generator (resolved)")
     return "answer_generator"
 
 
@@ -1163,28 +1506,35 @@ def create_supervisor_graph():
     """
     Build and compile the supervisor-based multi-agent graph.
 
-    Phase 3 Flow (Smart Memory):
-        START → supervisor
+    Phase 5 Flow (Query Analyzer + Result Evaluator + Multi-Step):
+        START → query_analyzer → supervisor
                   ├── [needs_memory=True] → memory_recall → query_enricher
                   │     ├── [personal] → direct
-                  │     ├── [search/summarize/...] → rag → answer_generator
+                  │     ├── [search/...] → rag → result_evaluator → answer_generator
                   │     ├── [write] → write → END
                   │     └── [people] → people → mongo_formatter → END
                   │
                   └── [needs_memory=False] → target agent (direct bypass)
-                        ├── rag → answer_generator → END
+                        ├── rag → result_evaluator → answer_generator → END
                         ├── write → END
                         ├── direct → END
                         └── people → mongo_formatter → END
+
+    result_evaluator checks quality and handles:
+    - Multi-step sub_queries: advance to next step → supervisor
+    - Empty results: retry with fallback strategy → rag
+    - Sufficient results: → answer_generator
 
     resolve_doc always bypasses memory (no personal context needed).
     """
     graph = StateGraph(SupervisorState)
 
     # Nodes
+    graph.add_node("query_analyzer", query_analyzer_node)       # Phase 5: NEW
     graph.add_node("supervisor", supervisor_node)
+    graph.add_node("result_evaluator", result_evaluator_node)   # Phase 5: NEW
     graph.add_node("memory_recall", _memory_recall_wrapper)
-    graph.add_node("query_enricher", _query_enricher_wrapper)   # Phase 3: NEW
+    graph.add_node("query_enricher", _query_enricher_wrapper)   # Phase 3
     graph.add_node("rag", _rag_agent_wrapper)
     graph.add_node("resolve_doc_agent", _resolve_doc_agent_wrapper)  # Phase 2
     graph.add_node("write", _write_agent_wrapper)
@@ -1193,10 +1543,11 @@ def create_supervisor_graph():
     graph.add_node("answer_generator", answer_generator_node)  # RAG-only
     graph.add_node("mongo_formatter", mongo_formatter_node)    # People-only
 
-    # Edges
-    graph.add_edge(START, "supervisor")
+    # Edges — Phase 5: START → query_analyzer → supervisor
+    graph.add_edge(START, "query_analyzer")
+    graph.add_edge("query_analyzer", "supervisor")
 
-    # Phase 3: Conditional edges from supervisor based on needs_memory flag
+    # Conditional edges from supervisor based on needs_memory flag
     # - needs_memory=True  → "memory_recall" (→ query_enricher → target)
     # - needs_memory=False → target node directly (bypass Graphiti)
     # - resolve_doc always → "resolve_doc_agent"
@@ -1218,10 +1569,10 @@ def create_supervisor_graph():
         },
     )
 
-    # Phase 3: memory_recall → query_enricher (always: enricher is a no-op when not needed)
+    # memory_recall → query_enricher (always: enricher is a no-op when not needed)
     graph.add_edge("memory_recall", "query_enricher")
 
-    # Phase 3: query_enricher → target agent based on next_agent / intent
+    # query_enricher → target agent based on next_agent / intent
     def route_from_enricher(state: SupervisorState) -> str:
         """Route after query enrichment to the correct agent.
 
@@ -1232,6 +1583,7 @@ def create_supervisor_graph():
         intent = state.get("intent", "")
 
         if intent == "personal":
+            logger.info("[LANGGRAPH_ROUTE] query_enricher -> direct (personal intent)")
             return "direct"
 
         _MAP = {
@@ -1242,7 +1594,7 @@ def create_supervisor_graph():
         }
         target = _MAP.get(next_agent, "direct")
         logger.info(
-            f"[route_from_enricher] intent={intent!r}, next_agent={next_agent!r} → {target!r}"
+            f"[LANGGRAPH_ROUTE] query_enricher -> {target} (intent={intent!r}, next_agent={next_agent!r})"
         )
         return target
 
@@ -1258,12 +1610,23 @@ def create_supervisor_graph():
     )
 
     # Intent-specific output pipelines:
-    # - RAG → answer_generator (needs LLM to compose answer from sources)
-    # - resolve_doc_agent → answer_generator / rag (section search) / END (ambiguous)
+    # - RAG → result_evaluator (Phase 5: quality check + multi-step)
+    # - resolve_doc_agent → result_evaluator / rag (section) / END (ambiguous)
     # - Write → END (write_agent already produces final_answer via streaming)
     # - People → mongo_formatter (lightweight LLM call, ~1KB prompt)
     # - Direct → END (direct_answer_node already produces final_answer via streaming)
-    graph.add_conditional_edges("rag", route_from_rag, {"supervisor": "supervisor", "answer_generator": "answer_generator"})
+
+    # Phase 5: rag → result_evaluator (instead of direct to answer_generator)
+    graph.add_conditional_edges(
+        "rag",
+        route_from_rag,
+        {
+            "supervisor": "supervisor",
+            "result_evaluator": "result_evaluator",
+        },
+    )
+
+    # resolve_doc_agent → result_evaluator (for multi-step) / rag / END
     graph.add_conditional_edges(
         "resolve_doc_agent",
         route_from_resolve_doc,
@@ -1273,6 +1636,18 @@ def create_supervisor_graph():
             END: END,
         },
     )
+
+    # Phase 5: result_evaluator → answer_generator / rag (retry) / supervisor (next step)
+    graph.add_conditional_edges(
+        "result_evaluator",
+        route_from_evaluator,
+        {
+            "answer_generator": "answer_generator",
+            "rag": "rag",
+            "supervisor": "supervisor",
+        },
+    )
+
     graph.add_edge("write", END)
     graph.add_edge("people", "mongo_formatter")
     graph.add_edge("direct", END)
@@ -1324,6 +1699,7 @@ async def _memory_recall_wrapper(state: SupervisorState) -> dict:
     Load user memories from Graphiti into SupervisorState.user_memory_context.
     Called before direct/write/rag so every agent has access to personal memory.
     """
+    logger.info("[LANGGRAPH_NODE] Entering memory_recall_wrapper")
     import uuid as _uuid
 
     user_id = state.get("user_id")
@@ -1368,6 +1744,7 @@ async def _query_enricher_wrapper(state: SupervisorState) -> dict:
     For intent=personal (no RAG needed), this is a no-op and direct_answer_node
     uses memory from user_memory_context directly.
     """
+    logger.info("[LANGGRAPH_NODE] Entering query_enricher_wrapper")
     memory = state.get("user_memory_context", "")
     query = state.get("rewritten_query", "") or state.get("original_query", "")
     intent = state.get("intent", "")
@@ -1439,6 +1816,7 @@ async def _query_enricher_wrapper(state: SupervisorState) -> dict:
 
 async def _rag_agent_wrapper(state: SupervisorState) -> dict:
     """Wrapper that imports and calls rag_agent_node."""
+    logger.info("[LANGGRAPH_NODE] Entering rag_agent_wrapper")
     from app.services.agents.rag_agent import rag_agent_node
 
     return await rag_agent_node(state)
@@ -1446,6 +1824,7 @@ async def _rag_agent_wrapper(state: SupervisorState) -> dict:
 
 async def _resolve_doc_agent_wrapper(state: SupervisorState) -> dict:
     """Phase 2: Wrapper that imports and calls resolve_doc_agent_node."""
+    logger.info("[LANGGRAPH_NODE] Entering resolve_doc_agent_wrapper")
     from app.services.agents.resolve_doc_agent import resolve_doc_agent_node
 
     return await resolve_doc_agent_node(state)
@@ -1453,6 +1832,7 @@ async def _resolve_doc_agent_wrapper(state: SupervisorState) -> dict:
 
 async def _write_agent_wrapper(state: SupervisorState) -> dict:
     """Wrapper that imports and calls write_agent_node."""
+    logger.info("[LANGGRAPH_NODE] Entering write_agent_wrapper")
     from app.services.agents.write_agent import write_agent_node
 
     return await write_agent_node(state)
@@ -1460,6 +1840,7 @@ async def _write_agent_wrapper(state: SupervisorState) -> dict:
 
 async def _people_agent_wrapper(state: SupervisorState) -> dict:
     """Wrapper that imports and calls people_agent_node."""
+    logger.info("[LANGGRAPH_NODE] Entering people_agent_wrapper")
     from app.services.agents.people_agent import people_agent_node
 
     return await people_agent_node(state)

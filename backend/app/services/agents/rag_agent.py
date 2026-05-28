@@ -863,7 +863,7 @@ async def rag_agent_node(state: SupervisorState) -> dict:
     from app.services.agent.streaming import push_event
 
     intent = state.get("intent", "search")
-    logger.info(f"[rag_agent] intent={intent!r}, rewritten_query={state.get('rewritten_query', '')[:100]!r}, document_ids={state.get('document_ids')}")
+    logger.info(f"[LANGGRAPH_NODE] Entering rag_agent_node, intent={intent!r}, rewritten_query={state.get('rewritten_query', '')[:100]!r}, document_ids={state.get('document_ids')}")
 
     # Emit status
     status_map = {
@@ -901,7 +901,7 @@ async def rag_agent_node(state: SupervisorState) -> dict:
         updates["iterations"] = state.get("iterations", 0) + 1
 
         logger.info(
-            f"[rag_agent] completed: sources={len(sources)}, "
+            f"[LANGGRAPH_DECISION] rag_agent_node completed: sources={len(sources)}, "
             f"kg_summaries={len(updates.get('kg_summaries', []))}"
         )
 

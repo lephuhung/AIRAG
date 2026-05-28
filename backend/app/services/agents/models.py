@@ -173,6 +173,27 @@ class SupervisorState(TypedDict, total=False):
     # steps execute. e.g. "summarize" while resolve_doc runs first.
     pending_intent: str | None
 
+    # Phase 5: Query Analyzer output (set by query_analyzer_node)
+    # sub_queries: decomposed sub-questions for multi-step execution
+    # e.g. [{"query": "NĐ 13 về DLCN", "intent_hint": "resolve_doc"}, ...]
+    sub_queries: list[dict] | None
+    # extracted_params: structured params extracted from the user query
+    # e.g. {"document_refs": ["NĐ 13", "Luật ANM"], "sections": ["Điều 5"]}
+    extracted_params: dict | None
+    # query_complexity: "simple"|"multi_doc"|"multi_section"|"cross_agent"|"comparison"
+    query_complexity: str | None
+
+    # Phase 5: Multi-step execution tracking
+    # current_step_index: which step in sub_queries are we executing
+    current_step_index: int
+    # accumulated_results: results from completed sub-query steps
+    # Each entry: {"step_intent": str, "sources": [...], "kg_summaries": [...]}
+    accumulated_results: Annotated[list[dict], operator.add]
+    # retry_count: how many retries for current step (max 2)
+    retry_count: int
+    # retry_strategy: what fallback strategy is being used
+    retry_strategy: str | None
+
 
 # =============================================================================
 # Write Action Constants

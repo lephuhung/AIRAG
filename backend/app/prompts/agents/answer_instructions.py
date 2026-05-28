@@ -51,6 +51,11 @@ _RAG_INSTRUCTIONS = (
     "- Memory facts: paraphrase in your own words and cite as [MEM-{id}]. "
     "Do NOT copy facts verbatim.\n"
     "- TABLE DATA: 'Key, Year = Value' pairs are table cells.\n"
+    "- LEGAL DOCUMENTS: If sources contain conflicting rules from documents of different years, "
+    "ALWAYS prioritize the newest document (latest year/date). You MUST structure your answer to "
+    "state the current rule from the newest document first, and then explicitly mention how it "
+    "updated or changed from the older document (e.g. 'Theo văn bản mới nhất [A] thì..., "
+    "thay đổi so với quy định cũ tại [B] là...').\n"
 )
 
 # =============================================================================
@@ -116,25 +121,13 @@ _LIST_DOCS_INSTRUCTIONS = (
 # =============================================================================
 
 _THINKING_DIRECTIVE = (
-    "\n## Thinking Process (extended thinking active)\n"
-    "Trong phần thinking, bạn PHẢI thực hiện các bước suy luận sau. "
-    "KHOONG được lặp lại nội dung source — thay vào đó, hãy PHÂN TÍCH chúng:\n\n"
-    "1. **Đánh giá nguồn (Source Triage):** Nguồn nào thực sự liên quan đến câu hỏi? "
-    "Nguồn nào chỉ liên quan gián tiếp hoặc không liên quan? "
-    "Ghi nhận ID nguồn quan trọng nhất.\n\n"
-    "2. **Phát hiện mâu thuẫn/lỗ hổng:** Các nguồn có mâu thuẫn không? "
-    "Có thông tin nào bị thiếu mà câu hỏi yêu cầu? "
-    "Có nguồn nào cung cấp thông tin cũ/lỗi thời không?\n\n"
-    "3. **Lập luận & suy diễn:** Câu hỏi yêu cầu trích xuất trực tiếp hay tổng hợp? "
-    "Cần so sánh giữa các nguồn hay kết hợp thông tin? "
-    "Có thể rút ra kết luận logic nào từ nhiều nguồn?\n\n"
-    "4. **Lên kế hoạch câu trả lời:** Cấu trúc câu trả lời nên như thế nào? "
-    "(danh sách, bảng so sánh, giải thích từng bước, v.v.) "
-    "Thứ tự trình bày nào logic nhất cho user?\n\n"
-    "5. **Tự kiểm tra:** Câu trả lời có đầy đủ? Có bỏ sót phần nào của câu hỏi? "
-    "Citation có chính xác không?\n\n"
-    "⚠️ TUYỆT ĐỐI KHÔNG copy/paste nội dung source vào thinking. "
-    "Thinking phải là QUÁ TRÌNH SUY LUẬN, không phải bản tóm tắt.\n"
+    "\n## Yêu cầu cho phần suy nghĩ (Thinking)\n"
+    "Phần suy nghĩ của bạn phải cực kỳ NGẮN GỌN (tối đa 3-5 câu). "
+    "TUYỆT ĐỐI KHÔNG tóm tắt, trích dẫn hay lặp lại nội dung chi tiết. "
+    "Hãy NHANH CHÓNG kiểm tra mốc thời gian của các văn bản trong source: "
+    "nếu có sự khác biệt (ví dụ: văn bản cũ quy định 3, văn bản mới quy định 2), "
+    "hãy note lại ID của văn bản mới nhất để ưu tiên trả lời trước. "
+    "Vạch ra dàn ý nhanh (ví dụ: 'Dùng [a1] (mới nhất) để trả lời chính, dùng [b2] (cũ) để đối chiếu thay đổi').\n"
 )
 
 

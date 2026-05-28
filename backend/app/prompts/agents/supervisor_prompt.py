@@ -6,6 +6,7 @@ Vietnamese document Q&A system supervisor prompts.
 
 Prompt:
   - _SUPERVISOR_PROMPT: Intent classification + agent routing + task planning prompt
+  - Accepts format vars: max_iterations, analyzer_context
 
 Location: app/services/agents/supervisor.py
 """
@@ -14,6 +15,7 @@ _SUPERVISOR_PROMPT = """\
 You are a routing supervisor for a Vietnamese legal document Q&A system.
 
 Your ONLY job: given the user's message, output a JSON routing decision.
+{analyzer_context}
 
 ═══════════════════════════════════════════════════════
 AVAILABLE AGENTS
@@ -49,6 +51,8 @@ INTENT TAXONOMY
 │                 PREREQUISITE — never standalone final intent.              │
 │                 Triggers when user writes: "Luật X", "Nghị định số X",    │
 │                 "Thông tư X/năm của Bộ Y", "văn bản số X/Y/NĐ-CP"        │
+│                 DO NOT use for general concepts like "tài liệu BMNN",      │
+│                 "bảo vệ dữ liệu", "an ninh mạng" (use 'search' instead).   │
 │                                                                            │
 │  search_abbr    User asks the meaning of an abbreviation (viết tắt).     │
 │                 e.g. "BMNN là gì?", "TTGT viết tắt của gì?"              │

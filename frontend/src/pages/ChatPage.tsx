@@ -27,16 +27,19 @@ export function ChatPage() {
     clearScrollTarget,
   } = useWorkspaceStore();
 
-  // Reset store when switching sessions
+  // Reset store khi chuyển đổi phiên chat (session) hoặc khi rời trang (unmount)
   useEffect(() => {
     resetStore();
-  }, [currentSessionId]);
+    return () => {
+      resetStore();
+    };
+  }, [currentSessionId, resetStore]);
 
   // -- Queries & Mutations --
   const { data: sessions } = useChatSessions();
 
   const currentSession = useMemo(
-    () => sessions?.find(s => String(s.id) === currentSessionId) ?? null,
+    () => sessions?.find((s: any) => String(s.id) === currentSessionId) ?? null,
     [sessions, currentSessionId]
   );
   const sessionTitle = currentSession?.title;
@@ -57,7 +60,7 @@ export function ChatPage() {
           className={cn(
             "h-full min-w-[320px] relative z-10 shrink-0",
             selectedDoc 
-              ? "w-1/2 max-w-[850px]" 
+              ? "w-full md:w-1/2 max-w-[850px]" 
               : "flex-1 w-full max-w-2xl lg:max-w-3xl xl:max-w-4xl"
           )}
           transition={{ 
@@ -68,6 +71,7 @@ export function ChatPage() {
           }}
         >
           <ChatPanel 
+            key={currentSessionId || "new-chat"}
             sessionId={currentSessionId} 
             sessionTitle={sessionTitle} 
           />
@@ -86,18 +90,20 @@ export function ChatPage() {
                 damping: 34,
                 mass: 1
               }}
-              className="w-1/2 max-w-[950px] h-full bg-background flex flex-col z-20 shadow-[-10px_0_30px_-15px_rgba(0,0,0,0.1)] relative"
+              className="absolute md:relative right-0 inset-y-0 w-full md:w-1/2 max-w-[950px] h-full bg-background flex flex-col z-20 shadow-[-10px_0_30px_-15px_rgba(0,0,0,0.1)]"
             >
-              <div className="absolute inset-y-0 -left-px w-px bg-border/40" />
-              
-              {/* Header with close button */}
-              <div className="h-12 border-b flex items-center justify-between px-4 bg-background shrink-0">
-                <span className="text-sm font-semibold tracking-tight text-foreground/80">
-                  {t("chat.doc_source")}
+              {/* Header của viewer - Cải tiến hiển thị tên file và hỗ trợ Glassmorphism */}
+              <div className="h-12 border-b flex items-center justify-between px-4 bg-background/95 backdrop-blur sticky top-0 shrink-0 z-10">
+                <span 
+                  className="text-sm font-semibold tracking-tight text-foreground/80 truncate pr-4"
+                  title={selectedDoc.original_filename}
+                >
+                  {selectedDoc.original_filename}
                 </span>
                 <button
                   onClick={() => selectDoc(null)}
-                  className="p-2 rounded-full hover:bg-muted text-muted-foreground transition-all duration-200 hover:rotate-90 active:scale-95"
+                  className="p-2 rounded-full hover:bg-muted text-muted-foreground transition-all duration-200 hover:rotate-90 active:scale-95 flex-shrink-0"
+                  aria-label={t("common.close")}
                 >
                   <X className="w-4 h-4" />
                 </button>

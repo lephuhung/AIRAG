@@ -51,6 +51,23 @@ logger = logging.getLogger(__name__)
 _MEMORY_CONTEXT_MAX_CHARS = 1000
 
 # ---------------------------------------------------------------------------
+# Identity-query patterns (trigger full-graph fetch instead of vector search)
+# ---------------------------------------------------------------------------
+# These patterns match user questions about themselves (name, job, age, …).
+# When matched, we bypass the embedding search and read ALL facts from Neo4j
+# directly, which is far more reliable than cosine similarity for pronoun-heavy,
+# short queries like "tôi tên là gì" or "tôi làm việc ở đâu".
+_IDENTITY_PATTERNS = re.compile(
+    r"(?i)"
+    r"(tên\s*(của\s*)?tôi|tôi\s*tên|tên\s*tôi|my\s*name)"
+    r"|(tôi\s*(là|l[\xE0a]\s*ai|sinh|tuổi)|tôi\s*\w{1,4}\s*ai)"
+    r"|(tôi\s*(công\s*tác|làm\s*việc|đang\s*ở|sống|học|dùng|sử\s*dụng))"
+    r"|(thông\s*tin.*tôi|tôi.*thông\s*tin)"
+    r"|(who\s*am\s*i|what.*my\s*(name|job|role|age))"
+    r"|(nhớ.*tôi|biết.*tôi|tôi.*là\s*ai)"
+)
+
+# ---------------------------------------------------------------------------
 # Singleton state
 # ---------------------------------------------------------------------------
 
@@ -195,7 +212,49 @@ async def initialize_graphiti() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Memory search
+# Memory search — helpers
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_all_user_facts(user_id: uuid.UUID, limit: int = 20) -> list:
+    """
+    Fetch ALL RELATES_TO edges for a user directly from Neo4j via Cypher.
+
+    Returns a list of SimpleNamespace objects with a `.fact` attribute so
+    that _format_memory_context can consume them identically to Graphiti edges.
+
+    Used as fallback when vector similarity search returns no results, and as
+    the primary retrieval method for identity-type queries ("tôi tên là gì").
+    """
+    from types import SimpleNamespace
+
+    group_id = f"nexusrag_user_{user_id}"
+    cypher = (
+        "MATCH ()-[r:RELATES_TO]->() "
+        "WHERE r.group_id = $group_id AND r.fact IS NOT NULL "
+        "RETURN r.fact AS fact, r.created_at AS created_at "
+        "ORDER BY r.created_at DESC "
+        f"LIMIT {int(limit)}"
+    )
+    try:
+        client = get_graphiti_client()
+        records, _, _ = await client.driver.execute_query(
+            cypher, {"group_id": group_id}
+        )
+        results = [SimpleNamespace(fact=r["fact"]) for r in records if r["fact"]]
+        logger.info(
+            f"[graphiti] Cypher fetch returned {len(results)} facts for user {user_id}"
+        )
+        return results
+    except Exception as exc:
+        logger.warning(
+            f"[graphiti] Cypher fallback failed for user {user_id}: {exc}"
+        )
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Memory search — main entry point
 # ---------------------------------------------------------------------------
 
 
@@ -208,18 +267,49 @@ async def search_user_memory(
     Search the Graphiti knowledge graph for facts relevant to *query*,
     scoped to the given user (via group_id).
 
+    Retrieval strategy — 3 layers:
+
+    Layer 1 — Identity shortcut
+        Queries about the user themselves ("tôi tên là gì", "tôi làm việc
+        ở đâu", "who am I") bypass vector similarity entirely and fetch ALL
+        user facts from Neo4j via Cypher.  Cosine similarity is unreliable
+        for pronoun-heavy short queries with no lexical overlap to stored facts.
+
+    Layer 2 — Vector search (Graphiti)
+        Standard embedding-based search.  All returned edges are kept;
+        keyword overlap score is used only for *sorting*, never for filtering.
+        This ensures Graphiti results are never silently dropped.
+
+    Layer 3 — Cypher fallback
+        If Layer 2 returns no edges, fall back to fetching ALL user facts
+        directly from Neo4j — guaranteeing we always surface available memory.
+
     Returns a formatted multi-line string suitable for injection into the
     LLM system prompt, or an empty string if nothing is found.
-
-    client.search() returns list[EntityEdge] — each edge has a .fact str.
     """
     if not query.strip():
         return ""
 
-    client = get_graphiti_client()
-    group_id = f"nexusrag_user_{user_id}"
     logger.info(f"[graphiti] search for user_id={user_id}, query={query[:80]!r}")
 
+    # ------------------------------------------------------------------
+    # Layer 1: Identity shortcut — fetch ALL facts for self-referential queries
+    # ------------------------------------------------------------------
+    if _IDENTITY_PATTERNS.search(query):
+        logger.info(
+            f"[graphiti] identity query detected — fetching all facts for user {user_id}"
+        )
+        edges = await _fetch_all_user_facts(user_id, limit=top_k * 4)
+        if edges:
+            return _format_memory_context(edges, query=query, include_all=True)
+        logger.info(f"[graphiti] no facts found in Neo4j for user {user_id}")
+        # Falls through to vector search (graph may simply be empty for this user)
+
+    # ------------------------------------------------------------------
+    # Layer 2: Standard Graphiti vector search
+    # ------------------------------------------------------------------
+    group_id = f"nexusrag_user_{user_id}"
+    client = get_graphiti_client()
     try:
         edges: list = await client.search(
             query=query,
@@ -227,10 +317,23 @@ async def search_user_memory(
             num_results=top_k,
         )
     except Exception as exc:
-        logger.warning(f"[graphiti] search failed for user {user_id}: {exc}")
-        return ""
+        logger.warning(f"[graphiti] vector search failed for user {user_id}: {exc}")
+        edges = []
 
-    return _format_memory_context(edges, query=query)
+    if edges:
+        logger.info(
+            f"[graphiti] vector search returned {len(edges)} edges for user {user_id}"
+        )
+        return _format_memory_context(edges, query=query, include_all=False)
+
+    # ------------------------------------------------------------------
+    # Layer 3: Cypher fallback — always surface memory even on vector miss
+    # ------------------------------------------------------------------
+    logger.info(
+        f"[graphiti] vector search empty — falling back to Cypher for user {user_id}"
+    )
+    fallback_edges = await _fetch_all_user_facts(user_id, limit=top_k * 2)
+    return _format_memory_context(fallback_edges, query=query, include_all=True)
 
 
 # ---------------------------------------------------------------------------
@@ -438,18 +541,30 @@ async def add_conversation_episode(
 # ---------------------------------------------------------------------------
 
 
-def _format_memory_context(edges: list, query: str = "", budget: int = _MEMORY_CONTEXT_MAX_CHARS) -> str:
+def _format_memory_context(
+    edges: list,
+    query: str = "",
+    budget: int = _MEMORY_CONTEXT_MAX_CHARS,
+    include_all: bool = False,
+) -> str:
     """
-    Convert a list of Graphiti EntityEdge objects into a human-readable
-    string for the LLM system prompt, truncated to budget chars.
+    Convert a list of Graphiti EntityEdge objects (or SimpleNamespace with .fact)
+    into a human-readable string for the LLM system prompt, truncated to budget.
 
-    Keyword relevance filtering:
-        Each fact is scored by case-insensitive word overlap with the query.
-        Facts are sorted by descending score and included until budget is exhausted.
-        Facts below zero overlap score are skipped unless no facts qualify.
+    Args:
+        edges:       List of edge objects with a .fact attribute.
+        query:       The original search query — used for relevance scoring/sorting.
+        budget:      Maximum character budget for the output string.
+        include_all: When True, ALL edges are included regardless of keyword
+                     overlap score.  Use this for identity queries and Cypher
+                     fallback results where lexical matching is unreliable.
+                     When False (default), facts with zero keyword overlap are
+                     skipped only once at least one higher-scoring fact has been
+                     included — preventing a flood of completely unrelated facts
+                     while still surfacing all facts when none match the query.
 
-    The internal NXUser_<hash> entity tag is stripped from each fact before
-    formatting so the LLM / user never sees it.
+    The internal entity anchor ("Người dùng ID=<UUID>") is stripped from each
+    fact before formatting so the LLM / user never sees it.
 
     Output format:
         [Memory]
@@ -494,11 +609,14 @@ def _format_memory_context(edges: list, query: str = "", budget: int = _MEMORY_C
 
     # Build output within budget
     lines: list[str] = ["[Memory]"]
-    total_len = len("\n".join(lines))  # includes "[Memory]\n"
+    total_len = len("[Memory]") + 1  # +1 for trailing newline
+    included = 0
 
     for score, fact in facts:
-        # Skip facts with zero relevance unless nothing else qualifies
-        if score == 0 and total_len > 0:
+        # When include_all=False, skip zero-relevance facts only after we
+        # already have at least one higher-scoring fact in the output.
+        # When include_all=True (identity/Cypher-fallback path), never skip.
+        if not include_all and score == 0 and included > 0:
             continue
         line = f"- {fact}"
         line_len = len(line) + 1  # +1 for newline
@@ -506,5 +624,10 @@ def _format_memory_context(edges: list, query: str = "", budget: int = _MEMORY_C
             break
         lines.append(line)
         total_len += line_len
+        included += 1
+
+    # Return empty string if we only have the header with no facts
+    if included == 0:
+        return ""
 
     return "\n".join(lines)

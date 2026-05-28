@@ -536,13 +536,24 @@ async def _strategy_vector_fallback(
         seen: set[str] = set()
         candidates: list[dict] = []
         for src in sources:
-            doc_id = str(src.get("document_id", ""))
+            # Handle both dicts and Pydantic models/dataclasses
+            if hasattr(src, "model_dump"):
+                src_dict = src.model_dump()
+            elif hasattr(src, "__dict__"):
+                src_dict = src.__dict__
+            else:
+                src_dict = src if isinstance(src, dict) else {}
+                
+            doc_id = str(src_dict.get("document_id", getattr(src, "document_id", "")))
+            source_name = src_dict.get("source", getattr(src, "source", getattr(src, "source_file", "")))
+            score = float(src_dict.get("score", getattr(src, "score", 0.4)))
+            
             if doc_id and doc_id not in seen:
                 seen.add(doc_id)
                 candidates.append({
                     "document_id": doc_id,
-                    "title": src.get("source", ""),
-                    "score": float(src.get("score", 0.4)) * 0.6,  # Down-weight vs DB
+                    "title": source_name,
+                    "score": score * 0.6,  # Down-weight vs DB
                     "strategy": "vector",
                     "section_reference": None,
                 })
@@ -609,6 +620,7 @@ async def resolve_doc_agent_node(state: "SupervisorState") -> dict:
     workspace_ids = state.get("workspace_ids", [])
     db = get_current_db()
 
+    logger.info(f"[LANGGRAPH_NODE] Entering resolve_doc_agent_node, reference={reference!r}, workspace_ids={workspace_ids}")
     logger.info(f"[resolve_doc_agent] START reference={reference!r}")
     await push_event(state, "status", {
         "step": "searching",
@@ -683,12 +695,14 @@ async def resolve_doc_agent_node(state: "SupervisorState") -> dict:
             "- Cung cấp tên đầy đủ của văn bản\n"
             "- Kiểm tra xem văn bản đã được tải lên chưa"
         )
+        logger.info("[LANGGRAPH_DECISION] resolve_doc_agent decision: no candidates found")
         await push_event(state, "token", msg)
         return {
             "final_answer": msg,
             "next_agent": AgentType.FINISH,
             "sources": [],
-            "kg_summaries": [msg],
+            # NOTE: Do NOT write to kg_summaries here — status messages pollute
+            # operator.add accumulation and cause result_evaluator to see phantom results.
         }
 
     top = all_candidates[0]
@@ -717,13 +731,14 @@ async def resolve_doc_agent_node(state: "SupervisorState") -> dict:
             + "\n\nBạn muốn tra cứu văn bản nào? "
             "Vui lòng chỉ định số thứ tự hoặc cung cấp thêm thông tin."
         )
+        logger.info(f"[LANGGRAPH_DECISION] resolve_doc_agent decision: ambiguous ({len(all_candidates)} candidates)")
         await push_event(state, "clarification", {"message": clarify_msg})
         await push_event(state, "token", clarify_msg)
-        logger.info(f"[resolve_doc_agent] Ambiguous — {len(all_candidates)} candidates")
         return {
             "final_answer": clarify_msg,
             "next_agent": AgentType.FINISH,
-            "kg_summaries": [clarify_msg],
+            # NOTE: Do NOT write to kg_summaries — clarification messages are metadata,
+            # not search results. operator.add would accumulate them as phantom results.
         }
 
     # Single clear winner
@@ -742,18 +757,38 @@ def _build_resolved_state(top: dict, parsed: dict, pending_intent: str | None = 
     score = top.get("score", 0.0)
 
     logger.info(
-        f"[resolve_doc_agent] Resolved → doc_id={doc_id}, score={score:.2f}, "
+        f"[LANGGRAPH_DECISION] resolve_doc_agent Resolved → doc_id={doc_id}, score={score:.2f}, "
         f"section_ref={section_ref!r}, strategies=[{strategies_used}], "
         f"pending_intent={pending_intent!r}"
     )
 
-    resolved: dict = {
-        "document_ids": [doc_id] if doc_id else [],
-        "section_reference": section_ref,
-        "kg_summaries": [f"Đã xác định văn bản: **{title}**"],
-        "next_agent": AgentType.ANSWER_GENERATOR,
-        "should_loop_back": False,
-    }
+    # Confidence threshold: if score is very low, don't scope search to this document.
+    # This prevents false narrowing when resolve_doc picks a wrong document.
+    LOW_CONFIDENCE_THRESHOLD = 0.30
+    if score < LOW_CONFIDENCE_THRESHOLD:
+        logger.warning(
+            f"[resolve_doc_agent] Low confidence score={score:.2f} < {LOW_CONFIDENCE_THRESHOLD} "
+            f"for doc_id={doc_id}, title={title!r} — will NOT scope search to this document"
+        )
+        # Clear document_ids so rag_agent searches across all workspaces
+        resolved: dict = {
+            "document_ids": [],  # Don't scope — low confidence
+            "section_reference": section_ref,
+            # NOTE: Do NOT write to kg_summaries — status messages are metadata,
+            # not search results. operator.add would accumulate them as phantom results.
+            "next_agent": AgentType.ANSWER_GENERATOR,
+            "should_loop_back": False,
+        }
+    else:
+        resolved: dict = {
+            "document_ids": [doc_id] if doc_id else [],
+            "section_reference": section_ref,
+            # NOTE: Do NOT write to kg_summaries — "Đã xác định văn bản" is metadata,
+            # not search content. With operator.add reducer, it would accumulate and
+            # cause result_evaluator to see phantom results (has_results=True with 0 actual results).
+            "next_agent": AgentType.ANSWER_GENERATOR,
+            "should_loop_back": False,
+        }
 
     if section_ref:
         resolved["intent"] = "search_section"

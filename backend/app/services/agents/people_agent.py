@@ -159,7 +159,7 @@ async def people_agent_node(state: SupervisorState) -> dict:
     from app.services.agent.streaming import push_event
 
     intent = state.get("intent", "mongo_search_name")
-    logger.info(f"[people_agent] intent={intent!r}")
+    logger.info(f"[LANGGRAPH_NODE] Entering people_agent_node, intent={intent!r}")
 
     # Emit status
     await push_event(state, "status", {"step": "searching", "detail": "Đang tìm kiếm..."})
@@ -194,7 +194,7 @@ async def people_agent_node(state: SupervisorState) -> dict:
                 all_summaries.extend(new_summaries)
 
         logger.info(
-            f"[people_agent] completed: mongo_results={len(all_persons)}"
+            f"[LANGGRAPH_DECISION] people_agent_node completed: mongo_results={len(all_persons)}"
         )
 
         final_display = "\n".join(all_summaries) if all_summaries else "Không tìm thấy dữ liệu."

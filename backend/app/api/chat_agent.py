@@ -592,6 +592,24 @@ async def _execute_search_documents(
     seen_image_ids: set[str] = set()
     source_pages = set()
 
+    # Fetch document metadata for context
+    doc_ids_in_chunks = {chunk.document_id for _, chunk, _, _ in best_chunks}
+    doc_meta_map = {}
+    if doc_ids_in_chunks:
+        from app.models.document import Document
+        # Handle string vs UUID ids (some systems return string doc ids)
+        try:
+            valid_uuids = [uuid.UUID(str(did)) for did in doc_ids_in_chunks]
+        except ValueError:
+            valid_uuids = list(doc_ids_in_chunks)
+        doc_result = await db.execute(select(Document).where(Document.id.in_(valid_uuids)))
+        for doc in doc_result.scalars().all():
+            doc_meta_map[str(doc.id)] = {
+                "published_date": doc.published_date,
+                "document_number": doc.document_number,
+                "document_title": doc.document_title,
+            }
+
     for score, chunk, citation, workspace_id in best_chunks:
         cid = _generate_citation_id(existing_ids)
         existing_ids.add(cid)
@@ -631,6 +649,14 @@ async def _execute_search_documents(
         heading = " > ".join(chunk.heading_path) if chunk.heading_path else ""
         if heading:
             meta_parts.append(heading)
+
+        doc_meta = doc_meta_map.get(str(chunk.document_id))
+        if doc_meta:
+            if doc_meta["published_date"]:
+                meta_parts.append(f"Ngày ban hành: {doc_meta['published_date']}")
+            elif doc_meta["document_number"]:
+                meta_parts.append(f"Số hiệu: {doc_meta['document_number']}")
+
         meta_line = f" ({', '.join(meta_parts)})" if meta_parts else ""
         context_parts.append(f"Source [{cid}]{meta_line}:\n{chunk.content}")
 

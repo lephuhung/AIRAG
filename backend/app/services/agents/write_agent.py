@@ -128,6 +128,7 @@ async def write_agent_node(state: SupervisorState) -> dict:
                 text_input = cleaned
                 state["text_input"] = cleaned
 
+    logger.info(f"[LANGGRAPH_NODE] Entering write_agent_node, intent={intent!r}, action={write_action!r}")
     logger.info(f"[write_agent] action={write_action!r}, text_input_len={len(text_input)}")
 
     # Emit status so frontend shows progress immediately
