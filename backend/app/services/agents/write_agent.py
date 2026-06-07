@@ -19,6 +19,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from app.prompts.agents import write_agent_prompt
+from app.services.agent.langfuse_tracing import _get_langfuse_client
 
 if TYPE_CHECKING:
     from app.services.agents.models import SupervisorState
@@ -70,6 +71,7 @@ async def write_agent_node(state: SupervisorState) -> dict:
     from app.services.agents.models import AgentType
     from app.services.agent.streaming import push_event
 
+    langfuse = _get_langfuse_client()
     intent = state.get("intent", "")
     _intent_to_action = {
         "write_summarize": "summarize",
@@ -170,12 +172,40 @@ async def write_agent_node(state: SupervisorState) -> dict:
                 await push_event(state, "token", chunk.text)
     except Exception as e:
         logger.error(f"[write_agent] LLM call failed: {e}")
+        if langfuse:
+            try:
+                obs = langfuse.start_observation(
+                    name="write_agent",
+                    input={"intent": intent, "write_action": write_action},
+                    level="DEFAULT",
+                )
+                obs.update(output={"outcome": "error", "error": str(e)})
+                obs.end()
+            except Exception:
+                pass
         return {
             "final_answer": f"Lỗi xử lý văn bản: {e}",
             "next_agent": AgentType.FINISH,
         }
 
     final_answer = strip_thinking_tags("".join(answer_parts))
+
+    if langfuse:
+        try:
+            obs = langfuse.start_observation(
+                name="write_agent",
+                input={"intent": intent, "write_action": write_action},
+                level="DEFAULT",
+            )
+            obs.update(
+                output={
+                    "outcome": "success",
+                    "answer_length": len(final_answer),
+                }
+            )
+            obs.end()
+        except Exception as e:
+            logger.warning(f"[langfuse] write_agent span failed: {e}")
 
     return {
         "final_answer": final_answer,
@@ -199,7 +229,9 @@ async def _handle_format_check(state: SupervisorState) -> dict:
     from app.services.agent.nodes import strip_thinking_tags
     from app.services.agents.models import AgentType
     from app.services.agent.streaming import push_event
+    from app.services.agent.langfuse_tracing import _get_langfuse_client
 
+    langfuse = _get_langfuse_client()
     format_data = state.get("format_data") or {}
     file_name = state.get("file_name", "tài liệu")
 
@@ -207,6 +239,17 @@ async def _handle_format_check(state: SupervisorState) -> dict:
     await push_event(state, "status", {"step": "generating", "detail": "Đang kiểm tra định dạng..."})
 
     if not format_data:
+        if langfuse:
+            try:
+                obs = langfuse.start_observation(
+                    name="write_agent",
+                    input={"intent": state.get("intent", ""), "write_action": "format_check"},
+                    level="DEFAULT",
+                )
+                obs.update(output={"outcome": "no_format_data"})
+                obs.end()
+            except Exception as e:
+                logger.warning(f"[langfuse] write_agent format_check span failed: {e}")
         return {
             "final_answer": (
                 "Không có dữ liệu định dạng để kiểm tra.\n\n"
@@ -295,6 +338,26 @@ async def _handle_format_check(state: SupervisorState) -> dict:
         }
 
     final_answer = strip_thinking_tags("".join(answer_parts))
+
+    logger.info(f"[write_agent] _handle_format_check completed, text_len={len(final_answer)}")
+
+    if langfuse:
+        try:
+            obs = langfuse.start_observation(
+                name="write_agent",
+                input={"intent": intent, "write_action": "format_check"},
+                level="DEFAULT",
+            )
+            obs.update(
+                output={
+                    "outcome": "success",
+                    "answer_length": len(final_answer),
+                    "is_valid": "đạt" in final_answer.lower() or "phù hợp" in final_answer.lower(),
+                }
+            )
+            obs.end()
+        except Exception as e:
+            logger.warning(f"[langfuse] write_agent format_check span failed: {e}")
 
     return {
         "final_answer": final_answer,

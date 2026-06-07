@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import logging
 import re
+
+from app.services.agent.langfuse_tracing import _get_langfuse_client
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -616,6 +618,7 @@ async def resolve_doc_agent_node(state: "SupervisorState") -> dict:
     from app.services.agents.models import AgentType
     from app.services.agent.streaming import push_event, get_current_db
 
+    langfuse = _get_langfuse_client()
     reference = state.get("rewritten_query", "") or state.get("original_query", "")
     workspace_ids = state.get("workspace_ids", [])
     db = get_current_db()
@@ -638,10 +641,28 @@ async def resolve_doc_agent_node(state: "SupervisorState") -> dict:
             f"[resolve_doc_agent] EARLY EXIT — high-confidence DB hit: "
             f"doc_id={top['document_id']}, score={top['score']:.2f}"
         )
+        if langfuse:
+            try:
+                obs = langfuse.start_observation(
+                    name="resolve_doc_agent",
+                    input={"reference": reference, "workspace_ids": [str(w) for w in workspace_ids]},
+                    level="DEFAULT",
+                )
+                obs.update(
+                    output={
+                        "outcome": "early_exit_db",
+                        "document_id": top["document_id"],
+                        "title": top.get("title"),
+                        "score": top["score"],
+                        "strategy": top.get("strategy", "db_query"),
+                    }
+                )
+                obs.end()
+            except Exception as e:
+                logger.warning(f"[langfuse] resolve_doc_agent span failed: {e}")
         return _build_resolved_state(top, parsed, state.get("pending_intent"))
 
     # ── Stage 2: LLM fallback (memory agent, fast) ───────────────────────────
-    # Only invoke if regex gave low confidence AND DB gave 0 results
     llm_candidates: list[dict] = []
     if not db_candidates and parsed.get("confidence") in ("low", "medium"):
         logger.info("[resolve_doc_agent] DB gave 0 results — invoking memory agent for extraction")
@@ -651,7 +672,6 @@ async def resolve_doc_agent_node(state: "SupervisorState") -> dict:
         })
         llm_parsed = await _extract_by_llm(reference)
         if llm_parsed:
-            # Merge list fields — extend without duplicates
             for list_key in ("doc_number_candidates", "title_keywords"):
                 llm_list = llm_parsed.get(list_key) or []
                 existing = parsed.get(list_key) or []
@@ -659,11 +679,9 @@ async def resolve_doc_agent_node(state: "SupervisorState") -> dict:
                     if item not in existing:
                         existing.append(item)
                 parsed[list_key] = existing
-            # Merge scalar fields — fill gaps only
             for k, v in llm_parsed.items():
                 if k not in ("doc_number_candidates", "title_keywords") and v and not parsed.get(k):
                     parsed[k] = v
-            # Re-query DB with enriched parsed
             llm_candidates = await _query_db(parsed, workspace_ids, db)
 
     # ── Stage 3: Vector fallback (last resort) ────────────────────────────────
@@ -697,12 +715,21 @@ async def resolve_doc_agent_node(state: "SupervisorState") -> dict:
         )
         logger.info("[LANGGRAPH_DECISION] resolve_doc_agent decision: no candidates found")
         await push_event(state, "token", msg)
+        if langfuse:
+            try:
+                obs = langfuse.start_observation(
+                    name="resolve_doc_agent",
+                    input={"reference": reference, "workspace_ids": [str(w) for w in workspace_ids]},
+                    level="DEFAULT",
+                )
+                obs.update(output={"outcome": "not_found"})
+                obs.end()
+            except Exception as e:
+                logger.warning(f"[langfuse] resolve_doc_agent span failed: {e}")
         return {
             "final_answer": msg,
             "next_agent": AgentType.FINISH,
             "sources": [],
-            # NOTE: Do NOT write to kg_summaries here — status messages pollute
-            # operator.add accumulation and cause result_evaluator to see phantom results.
         }
 
     top = all_candidates[0]
@@ -734,14 +761,50 @@ async def resolve_doc_agent_node(state: "SupervisorState") -> dict:
         logger.info(f"[LANGGRAPH_DECISION] resolve_doc_agent decision: ambiguous ({len(all_candidates)} candidates)")
         await push_event(state, "clarification", {"message": clarify_msg})
         await push_event(state, "token", clarify_msg)
+        if langfuse:
+            try:
+                obs = langfuse.start_observation(
+                    name="resolve_doc_agent",
+                    input={"reference": reference, "workspace_ids": [str(w) for w in workspace_ids]},
+                    level="DEFAULT",
+                )
+                obs.update(
+                    output={
+                        "outcome": "ambiguous",
+                        "candidates_count": len(all_candidates),
+                        "top_score": top_score,
+                    }
+                )
+                obs.end()
+            except Exception as e:
+                logger.warning(f"[langfuse] resolve_doc_agent span failed: {e}")
         return {
             "final_answer": clarify_msg,
             "next_agent": AgentType.FINISH,
-            # NOTE: Do NOT write to kg_summaries — clarification messages are metadata,
-            # not search results. operator.add would accumulate them as phantom results.
         }
 
     # Single clear winner
+    strategies_used = ", ".join(top.get("strategies", [top.get("strategy", "?")]))
+    if langfuse:
+        try:
+            obs = langfuse.start_observation(
+                name="resolve_doc_agent",
+                input={"reference": reference, "workspace_ids": [str(w) for w in workspace_ids]},
+                level="DEFAULT",
+            )
+            obs.update(
+                output={
+                    "outcome": "resolved",
+                    "document_id": top.get("document_id"),
+                    "title": top.get("title"),
+                    "score": top_score,
+                    "strategies": strategies_used,
+                    "section_reference": top.get("section_reference") or parsed.get("section_reference"),
+                }
+            )
+            obs.end()
+        except Exception as e:
+            logger.warning(f"[langfuse] resolve_doc_agent span failed: {e}")
     return _build_resolved_state(top, parsed, state.get("pending_intent"))
 
 

@@ -71,7 +71,6 @@ export function ChatPage() {
           }}
         >
           <ChatPanel 
-            key={currentSessionId || "new-chat"}
             sessionId={currentSessionId} 
             sessionTitle={sessionTitle} 
           />

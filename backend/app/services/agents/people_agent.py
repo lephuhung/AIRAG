@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Callable
 
+from app.services.agent.langfuse_tracing import _get_langfuse_client
+
 if TYPE_CHECKING:
     from app.services.agents.models import SupervisorState
 
@@ -158,14 +160,26 @@ async def people_agent_node(state: SupervisorState) -> dict:
     from app.services.agents.models import AgentType
     from app.services.agent.streaming import push_event
 
+    langfuse = _get_langfuse_client()
     intent = state.get("intent", "mongo_search_name")
+    query = state.get("rewritten_query") or state.get("original_query", "")
     logger.info(f"[LANGGRAPH_NODE] Entering people_agent_node, intent={intent!r}")
 
-    # Emit status
     await push_event(state, "status", {"step": "searching", "detail": "Đang tìm kiếm..."})
 
     if intent not in PEOPLE_TOOL_REGISTRY:
-        logger.warning(f"[people_agent] No tool for intent {intent!r}")
+        logger.warning(f"[_agent] No tool for intent {intent!r}")
+        if langfuse:
+            try:
+                obs = langfuse.start_observation(
+                    name="people_agent",
+                    input={"intent": intent, "query": query},
+                    level="DEFAULT",
+                )
+                obs.update(output={"outcome": "no_tool"})
+                obs.end()
+            except Exception as e:
+                logger.warning(f"[langfuse] people_agent span failed: {e}")
         return {"next_agent": AgentType.FINISH}
 
     tool_fn, mapper = PEOPLE_TOOL_REGISTRY[intent]
@@ -173,22 +187,19 @@ async def people_agent_node(state: SupervisorState) -> dict:
     try:
         all_persons = []
         all_summaries = []
-        
+
         async for partial_result in tool_fn(state):
             updates = mapper(partial_result)
-            
-            # Emit sources if present
+
             sources = updates.get("sources", [])
             if sources:
                 await push_event(state, "sources", sources)
 
-            # Accumulate new persons
             new_persons = updates.get("mongo_results", [])
             if new_persons:
                 all_persons.extend(new_persons)
-                # Emit accumulated people_data for structured display in frontend
                 await push_event(state, "people_data", all_persons)
-                
+
             new_summaries = updates.get("kg_summaries", [])
             if new_summaries:
                 all_summaries.extend(new_summaries)
@@ -198,7 +209,24 @@ async def people_agent_node(state: SupervisorState) -> dict:
         )
 
         final_display = "\n".join(all_summaries) if all_summaries else "Không tìm thấy dữ liệu."
-        
+
+        if langfuse:
+            try:
+                obs = langfuse.start_observation(
+                    name="people_agent",
+                    input={"intent": intent, "query": query},
+                    level="DEFAULT",
+                )
+                obs.update(
+                    output={
+                        "outcome": "found" if all_persons else "no_results",
+                        "persons_count": len(all_persons),
+                    }
+                )
+                obs.end()
+            except Exception as e:
+                logger.warning(f"[langfuse] people_agent span failed: {e}")
+
         return {
             "mongo_results": all_persons,
             "kg_summaries": all_summaries,
@@ -207,7 +235,18 @@ async def people_agent_node(state: SupervisorState) -> dict:
         }
 
     except Exception as e:
-        logger.error(f"[people_agent] tool {intent} failed: {e}", exc_info=True)
+        logger.error(f"[_agent] tool {intent} failed: {e}", exc_info=True)
+        if langfuse:
+            try:
+                obs = langfuse.start_observation(
+                    name="people_agent",
+                    input={"intent": intent, "query": query},
+                    level="DEFAULT",
+                )
+                obs.update(output={"outcome": "error", "error": str(e)})
+                obs.end()
+            except Exception:
+                pass
         return {
             "kg_summaries": [f"Lỗi tìm kiếm: {str(e)}"],
             "iterations": state.get("iterations", 0) + 1,

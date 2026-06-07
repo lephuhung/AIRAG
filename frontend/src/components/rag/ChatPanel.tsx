@@ -2999,7 +2999,12 @@ export const ChatPanel = memo(function ChatPanel({
 
   // Sync DB history → local messages state when data loads.
   useEffect(() => {
-    if (historyData?.messages) {
+    if (!sessionId) {
+      setMessages([]);
+      return;
+    }
+
+    if (historyData?.messages && historyData.session_id === sessionId) {
       setMessages((prev) => {
         const stepsMap = new Map<string, AgentStep[]>();
         for (const m of prev) {

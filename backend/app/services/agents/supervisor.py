@@ -25,6 +25,9 @@ from app.services.agents.models import (
     SupervisorState,
     AgentType,
 )
+def _get_langfuse_client():
+    from app.services.agent.langfuse_tracing import _get_langfuse_client as get_client
+    return get_client()
 
 if TYPE_CHECKING:
     from app.services.llm.types import LLMMessage
@@ -78,112 +81,7 @@ _INTENT_TO_AGENT_FALLBACK: dict[str, str] = {
     "mongo_search_advanced": "people",
 }
 
-# ---------------------------------------------------------------------------
-# Keyword-based safety net: Vietnamese document queries that MUST go to RAG.
-# Small classifier models (Qwen3-4B) frequently misclassify these as "greeting"
-# or "direct".  When ANY of these patterns match the user message AND the LLM
-# chose "direct", we override to "rag" + intent="search".
-# ---------------------------------------------------------------------------
-import re as _re
 
-_MUST_RAG_PATTERNS: list[_re.Pattern] = [
-    # "X là gì" — definition questions about topics in the knowledge base
-    _re.compile(r"(?:là\s+gì|nghĩa\s+là\s+gì)", _re.IGNORECASE),
-    # Responsibility / obligation questions
-    _re.compile(r"trách\s+nhiệm", _re.IGNORECASE),
-    # Regulation / policy questions
-    _re.compile(r"quy\s+định", _re.IGNORECASE),
-    # Legal concepts
-    _re.compile(r"(?:luật|nghị\s+định|thông\s+tư|điều\s+\d|chương\s+\d)", _re.IGNORECASE),
-    # "khái niệm" — concept/definition
-    _re.compile(r"khái\s+niệm", _re.IGNORECASE),
-    # "điều kiện" — conditions
-    _re.compile(r"điều\s+kiện", _re.IGNORECASE),
-    # "nguyên tắc" — principles
-    _re.compile(r"nguyên\s+tắc", _re.IGNORECASE),
-    # "chủ quản" — manager/custodian (legal role, not a person search)
-    _re.compile(r"chủ\s+quản", _re.IGNORECASE),
-    # "hệ thống thông tin" — information system
-    _re.compile(r"hệ\s+thống\s+thông\s+tin", _re.IGNORECASE),
-    # "bảo vệ / bảo mật / an ninh / an toàn" — security topics
-    _re.compile(r"(?:bảo\s+vệ|bảo\s+mật|an\s+ninh|an\s+toàn)", _re.IGNORECASE),
-    # "tiêu hủy / lưu trữ / bảo quản" — archival / destruction
-    _re.compile(r"(?:tiêu\s+hủy|lưu\s+trữ|bảo\s+quản)", _re.IGNORECASE),
-    # "xử lý / xử phạt" — processing / penalties
-    _re.compile(r"(?:xử\s+lý|xử\s+phạt)", _re.IGNORECASE),
-    # "chế độ / chính sách" — policy / regime
-    _re.compile(r"(?:chế\s+độ|chính\s+sách)", _re.IGNORECASE),
-    # "thẩm quyền" — authority / jurisdiction
-    _re.compile(r"thẩm\s+quyền", _re.IGNORECASE),
-    # "tóm tắt" — summarize (but not write_summarize which has inline text)
-    _re.compile(r"tóm\s+tắt", _re.IGNORECASE),
-    # "so sánh" — compare
-    _re.compile(r"so\s+sánh", _re.IGNORECASE),
-    # "nội dung" — content of document
-    _re.compile(r"nội\s+dung", _re.IGNORECASE),
-    # Document number patterns
-    _re.compile(r"văn\s+bản\s+số", _re.IGNORECASE),
-    _re.compile(r"\d+/\d+/(?:NĐ|TT|QĐ|NQ)", _re.IGNORECASE),
-]
-
-# Strict greeting patterns — only override to direct if the ENTIRE message
-# matches one of these (after stripping whitespace/punctuation).  Anything
-# longer or containing topic keywords should NOT be treated as a greeting.
-_GREETING_ONLY_PATTERNS: list[_re.Pattern] = [
-    _re.compile(r"^(?:xin\s+)?chào[\s!.?]*$", _re.IGNORECASE),
-    _re.compile(r"^(?:hi|hello|hey)[\s!.?]*$", _re.IGNORECASE),
-    _re.compile(r"^cảm\s+ơn[\s!.?]*$", _re.IGNORECASE),
-    _re.compile(r"^(?:tạm\s+biệt|bye)[\s!.?]*$", _re.IGNORECASE),
-]
-
-
-def _should_force_rag(message: str) -> bool:
-    """Return True if message contains keywords that MUST be handled by RAG."""
-    return any(p.search(message) for p in _MUST_RAG_PATTERNS)
-
-
-def _is_pure_greeting(message: str) -> bool:
-    """Return True only if message is a bare greeting with no topic content."""
-    return any(p.match(message.strip()) for p in _GREETING_ONLY_PATTERNS)
-
-
-# ---------------------------------------------------------------------------
-# Phase 3: Personal reference detection — for smart memory_recall routing
-# Detects queries that contain personal pronouns/references which require
-# Graphiti memory to answer correctly (e.g. "đơn vị tôi", "cơ quan tôi").
-# This pattern fires REGARDLESS of intent (even intent=search can need memory
-# when the question references the user's own identity/workplace/org).
-#
-# NOTE: Python's \b word boundary does NOT work correctly with Vietnamese
-# Unicode diacritics (e.g. "ô" in "tôi"). Use (?<!\w)/(?!\w) lookaround
-# anchors instead, which are Unicode-aware and work for all Vietnamese text.
-# ---------------------------------------------------------------------------
-_PERSONAL_REF_PATTERN = _re.compile(
-    r"(?<!\w)("
-    r"tôi"
-    r"|của\s+tôi|cho\s+tôi"
-    r"|đơn\s+vị\s+tôi|cơ\s+quan\s+tôi|nơi\s+tôi|chỗ\s+tôi"
-    r"|chúng\s+tôi|của\s+chúng\s+tôi"
-    r"|công\s+tác\s+của\s+tôi|làm\s+việc\s+của\s+tôi"
-    r"|tôi\s+tên|tên\s+(của\s+)?tôi|tôi\s+là\s+ai"
-    r"|tôi\s+làm\s+việc|tôi\s+công\s+tác|tôi\s+đang\s+ở"
-    r")(?!\w)",
-    _re.IGNORECASE | _re.UNICODE,
-)
-
-
-def _query_needs_memory(intent: str, query: str) -> bool:
-    """Determine whether the memory_recall → query_enricher pipeline should run.
-
-    Returns True when:
-    - intent is 'personal' (user asking about themselves)
-    - OR the query contains personal reference keywords (even for RAG intents,
-      e.g. "Đơn vị tôi có cần tuân thủ quy định này không?" → intent=search
-      but still needs memory to resolve "đơn vị tôi")
-    """
-    if intent == "personal":
-        return True
-    return bool(_PERSONAL_REF_PATTERN.search(query))
 
 # =============================================================================
 # Vietnamese stop words — these are NEVER abbreviations
@@ -465,6 +363,9 @@ def _parse_supervisor_response(raw: str) -> dict:
         next_agent = data.get("next_agent", "finish")
         intent = data.get("intent", "search")
         task_plan = data.get("task_plan") or []
+        needs_memory = data.get("needs_memory", False)
+        is_legal_query = data.get("is_legal_query", False)
+        mentions_specific_doc = data.get("mentions_specific_doc", False)
 
         # Normalize intent name (LLM sometimes uses shorthand like "search_phone")
         intent = _INTENT_NORMALIZE.get(intent, intent)
@@ -530,6 +431,9 @@ def _parse_supervisor_response(raw: str) -> dict:
             "intent": intent,
             "task_plan": task_plan,
             "pending_intent": pending_intent,
+            "needs_memory": needs_memory,
+            "is_legal_query": is_legal_query,
+            "mentions_specific_doc": mentions_specific_doc,
             "reasoning": data.get("reasoning", ""),
         }
     except json.JSONDecodeError:
@@ -802,14 +706,24 @@ async def supervisor_node(state: SupervisorState) -> dict:
 
         decision = _parse_supervisor_response(response_text)
 
+        # ── Keyword safety net 0: needs_memory fallback ─────────────────────
+        # If the query explicitly contains personal pronouns, forcefully trigger
+        # memory_recall even if the LLM classification missed it (e.g. typos).
+        _PERSONAL_REF_PATTERN = _re.compile(
+            r"(?<!\w)(tôi|của\s+tôi|cho\s+tôi|đơn\s+vị\s+tôi|cơ\s+quan\s+tôi|nơi\s+tôi|chỗ\s+tôi|chúng\s+tôi|của\s+chúng\s+tôi|công\s+tác\s+của\s+tôi|làm\s+việc\s+của\s+tôi|tôi\s+tên|tên\s+(của\s+)?tôi|tôi\s+là\s+ai|tôi\s+làm\s+việc|tôi\s+công\s+tác|tôi\s+đang\s+ở)(?!\w)",
+            _re.IGNORECASE | _re.UNICODE
+        )
+        if not decision.get("needs_memory") and _PERSONAL_REF_PATTERN.search(query_for_classifier):
+            logger.info("[supervisor] Keyword safety net: forcing needs_memory=True because query contains personal keywords")
+            decision["needs_memory"] = True
+
         # ── Keyword safety net 1: direct/greeting → rag ─────────────────────
         # If the LLM classified as greeting/direct but the message contains
         # document-related keywords, override to rag + search.
         if (
             decision["next_agent"] == AgentType.DIRECT
             and decision["intent"] in ("greeting", "personal")
-            and _should_force_rag(query_for_classifier)
-            and not _is_pure_greeting(query_for_classifier)
+            and decision.get("is_legal_query", False)
         ):
             logger.warning(
                 f"[supervisor] Keyword safety net: message contains document keywords "
@@ -947,7 +861,7 @@ async def supervisor_node(state: SupervisorState) -> dict:
 
         # Phase 3: Smart memory routing — determine if memory_recall is needed
         intent = decision["intent"]
-        needs_memory = _query_needs_memory(intent, query_for_classifier)
+        needs_memory = decision.get("needs_memory", False)
         result["needs_memory"] = needs_memory
         if needs_memory:
             logger.info(
@@ -1013,6 +927,45 @@ async def supervisor_node(state: SupervisorState) -> dict:
             f"intent={result.get('intent')!r}, rewritten_query={result.get('rewritten_query', '')[:100]!r}, "
             f"needs_memory={result.get('needs_memory')}, search_mode={result.get('search_mode')!r}"
         )
+
+        # ── Langfuse: emit routing decision span ──────────────────────────────
+        langfuse = _get_langfuse_client()
+        if langfuse:
+            try:
+                decision_intent = decision.get("intent", intent)
+                keyword_override = (
+                    decision.get("reasoning", "").startswith("(overridden by keyword safety net)")
+                    if decision.get("reasoning") else False
+                )
+                obs = langfuse.start_observation(
+                    name="supervisor_routing_decision",
+                    input={
+                        "user_message": user_message,
+                        "expanded_query": expanded_message,
+                        "intent": decision_intent,
+                        "next_agent": str(decision.get("next_agent")),
+                        "needs_memory": bool(result.get("needs_memory")),
+                        "search_mode": str(result.get("search_mode")),
+                        "task_plan": result.get("task_plan") or [],
+                        "pending_intent": str(result.get("pending_intent") or ""),
+                        "query_complexity": str(state.get("query_complexity", "simple")),
+                    },
+                    level="DEBUG",
+                )
+                obs.update(
+                    output={
+                        "next_agent": str(result.get("next_agent")),
+                        "intent": str(result.get("intent")),
+                        "needs_memory": bool(result.get("needs_memory")),
+                        "keyword_override": keyword_override,
+                        "search_mode": str(result.get("search_mode")),
+                        "task_plan": result.get("task_plan") or [],
+                    }
+                )
+                obs.end()
+            except Exception as e:
+                logger.warning(f"[langfuse] supervisor_routing_decision span failed: {e}")
+
         return result
 
     except Exception as e:
@@ -1225,7 +1178,43 @@ def route_from_evaluator(state: SupervisorState) -> str:
     - supervisor_loop  → supervisor (more sub_queries to execute)
     - rag / other      → retry with different strategy
     """
+    langfuse = _get_langfuse_client()
     next_agent = state.get("next_agent")
+
+    if next_agent == AgentType.ANSWER_GENERATOR:
+        target = "answer_generator"
+    elif next_agent == "supervisor_loop":
+        target = "supervisor"
+    else:
+        _RETRY_MAP = {
+            AgentType.RAG: "rag",
+            AgentType.PEOPLE: "people",
+            AgentType.WRITE: "write",
+        }
+        target = _RETRY_MAP.get(next_agent, "rag")
+
+    if langfuse:
+        try:
+            obs = langfuse.start_observation(
+                name="route_from_evaluator",
+                input={
+                    "next_agent": str(next_agent),
+                    "intent": str(state.get("intent", "")),
+                    "query_complexity": str(state.get("query_complexity", "simple")),
+                    "current_step": int(state.get("current_step_index", 0)),
+                },
+                level="DEFAULT",
+            )
+            obs.update(
+                output={
+                    "target_node": target,
+                    "next_agent": str(next_agent),
+                    "is_retry": next_agent not in (AgentType.ANSWER_GENERATOR, "supervisor_loop"),
+                }
+            )
+            obs.end()
+        except Exception as e:
+            logger.warning(f"[langfuse] route_from_evaluator span failed: {e}")
 
     if next_agent == AgentType.ANSWER_GENERATOR:
         logger.info("[LANGGRAPH_ROUTE] result_evaluator -> answer_generator")
@@ -1235,13 +1224,6 @@ def route_from_evaluator(state: SupervisorState) -> str:
         logger.info("[LANGGRAPH_ROUTE] result_evaluator -> supervisor")
         return "supervisor"
 
-    # Retry: map agent type to node name
-    _RETRY_MAP = {
-        AgentType.RAG: "rag",
-        AgentType.PEOPLE: "people",
-        AgentType.WRITE: "write",
-    }
-    target = _RETRY_MAP.get(next_agent, "rag")
     logger.info(f"[LANGGRAPH_ROUTE] result_evaluator -> {target} (retry)")
     return target
 
@@ -1369,31 +1351,64 @@ def route_from_supervisor(state: SupervisorState) -> str:
     Handles the case where supervisor returns next_agent=None on loop back,
     meaning we're done and should END.
     """
+    langfuse = _get_langfuse_client()
     next_agent = state.get("next_agent")
     intent = state.get("intent", "")
     needs_memory = state.get("needs_memory", False)
 
     if next_agent is None or next_agent == AgentType.FINISH:
+        target = "END"
+    elif next_agent == AgentType.RESOLVE_DOC or (
+        next_agent == AgentType.RAG and intent == "resolve_doc"
+    ):
+        target = "resolve_doc_agent"
+    elif needs_memory:
+        target = "memory_recall"
+    else:
+        _DIRECT_MAP: dict[str, str] = {
+            AgentType.RAG: "rag",
+            AgentType.WRITE: "write",
+            AgentType.DIRECT: "direct",
+            AgentType.PEOPLE: "people",
+            AgentType.ANSWER_GENERATOR: "answer_generator",
+        }
+        target = _DIRECT_MAP.get(next_agent, "memory_recall")
+
+    if langfuse:
+        try:
+            obs = langfuse.start_observation(
+                name="route_from_supervisor",
+                input={
+                    "next_agent": str(next_agent),
+                    "intent": str(intent),
+                    "needs_memory": bool(needs_memory),
+                    "query_complexity": str(state.get("query_complexity", "simple")),
+                    "task_plan": state.get("task_plan") or [],
+                    "pending_intent": str(state.get("pending_intent") or ""),
+                },
+                level="DEFAULT",
+            )
+            obs.update(output={"target_node": target, "keyword_override": bool(state.get("_keyword_override"))})
+            obs.end()
+        except Exception as e:
+            logger.warning(f"[langfuse] route_from_supervisor span failed: {e}")
+
+    if next_agent is None or next_agent == AgentType.FINISH:
         logger.info("[LANGGRAPH_ROUTE] supervisor -> END")
         return END
 
-    # Phase 2: resolve_doc routes directly to its dedicated agent (no memory needed)
     if next_agent == AgentType.RESOLVE_DOC or (
         next_agent == AgentType.RAG and intent == "resolve_doc"
     ):
         logger.info(f"[LANGGRAPH_ROUTE] supervisor -> resolve_doc_agent (intent={intent!r})")
         return "resolve_doc_agent"
 
-    # Phase 3: Smart memory routing
-    # needs_memory=True  → memory_recall → query_enricher → target agent
-    # needs_memory=False → direct to target agent (bypass Graphiti entirely)
     if needs_memory:
         logger.info(
             f"[LANGGRAPH_ROUTE] supervisor -> memory_recall (needs_memory=True, intent={intent!r})"
         )
         return "memory_recall"
 
-    # Direct bypass: map AgentType → node name
     _DIRECT_MAP: dict[str, str] = {
         AgentType.RAG: "rag",
         AgentType.WRITE: "write",
@@ -1424,25 +1439,49 @@ def route_from_rag(state: SupervisorState) -> str:
     2. search_section with pending section_reference → supervisor
     3. Everything else → result_evaluator (quality check + multi-step)
     """
+    langfuse = _get_langfuse_client()
     pending_section = state.get("section_reference")
     intent = state.get("intent")
     loop = state.get("should_loop_back")
+
+    if loop:
+        target = "supervisor"
+    elif intent == "search_section" and pending_section:
+        target = "supervisor"
+    else:
+        target = "result_evaluator"
+
+    if langfuse:
+        try:
+            obs = langfuse.start_observation(
+                name="route_from_rag",
+                input={
+                    "intent": str(intent),
+                    "section_reference": str(pending_section or ""),
+                    "should_loop_back": bool(loop),
+                    "has_sources": bool(state.get("sources")),
+                    "has_kg_summaries": bool(state.get("kg_summaries")),
+                },
+                level="DEFAULT",
+            )
+            obs.update(output={"target_node": target})
+            obs.end()
+        except Exception as e:
+            logger.warning(f"[langfuse] route_from_rag span failed: {e}")
+
     logger.info(
         f"[route_from_rag] intent={intent!r}, section_reference={pending_section!r}, "
         f"should_loop_back={loop}, complexity={state.get('query_complexity', 'simple')!r}"
     )
 
-    # Abbreviation loop-back takes priority
     if loop:
         logger.info("[LANGGRAPH_ROUTE] rag -> supervisor (abbreviation loop-back)")
         return "supervisor"
 
-    # search_section pending → supervisor re-routes to rag
     if intent == "search_section" and pending_section:
         logger.info("[LANGGRAPH_ROUTE] rag -> supervisor (pending search_section)")
         return "supervisor"
 
-    # Phase 5: Route through result_evaluator for quality check + multi-step
     logger.info("[LANGGRAPH_ROUTE] rag -> result_evaluator")
     return "result_evaluator"
 
@@ -1461,21 +1500,51 @@ def route_from_resolve_doc(state: SupervisorState) -> str:
     5. pending_intent='search' → rag (general search within resolved doc)
     6. Default → answer_generator
     """
+    langfuse = _get_langfuse_client()
     next_agent = state.get("next_agent")
     intent = state.get("intent", "")
     section_ref = state.get("section_reference", "")
     pending_intent = state.get("pending_intent")
 
     if next_agent == AgentType.FINISH:
+        target = "END"
+    elif intent == "search_section" and section_ref:
+        target = "rag"
+    elif pending_intent == "search_section" and section_ref:
+        target = "rag"
+    elif pending_intent == "search":
+        target = "rag"
+    elif pending_intent == "summarize":
+        target = "answer_generator"
+    else:
+        target = "answer_generator"
+
+    if langfuse:
+        try:
+            obs = langfuse.start_observation(
+                name="route_from_resolve_doc",
+                input={
+                    "next_agent": str(next_agent),
+                    "intent": str(intent),
+                    "section_reference": str(section_ref or ""),
+                    "pending_intent": str(pending_intent or ""),
+                    "document_ids": [str(d) for d in (state.get("document_ids") or [])],
+                },
+                level="DEFAULT",
+            )
+            obs.update(output={"target_node": target})
+            obs.end()
+        except Exception as e:
+            logger.warning(f"[langfuse] route_from_resolve_doc span failed: {e}")
+
+    if next_agent == AgentType.FINISH:
         logger.info("[LANGGRAPH_ROUTE] resolve_doc_agent -> END (not found / ambiguous)")
         return END
 
-    # resolve_doc_agent already set intent=search_section when section_ref found
     if intent == "search_section" and section_ref:
         logger.info(f"[LANGGRAPH_ROUTE] resolve_doc_agent -> rag (has section_ref={section_ref!r})")
         return "rag"
 
-    # Phase 4: Check pending_intent from task_plan
     if pending_intent:
         logger.info(
             f"[route_from_resolve_doc] pending_intent={pending_intent!r}, "
@@ -1579,8 +1648,36 @@ def create_supervisor_graph():
         personal intent → direct (answer from memory, no RAG needed)
         all other intents → their designated agent
         """
+        langfuse = _get_langfuse_client()
         next_agent = state.get("next_agent", AgentType.FINISH)
         intent = state.get("intent", "")
+
+        if intent == "personal":
+            target = "direct"
+        else:
+            _MAP = {
+                AgentType.RAG: "rag",
+                AgentType.WRITE: "write",
+                AgentType.DIRECT: "direct",
+                AgentType.PEOPLE: "people",
+            }
+            target = _MAP.get(next_agent, "direct")
+
+        if langfuse:
+            try:
+                obs = langfuse.start_observation(
+                    name="route_from_enricher",
+                    input={
+                        "next_agent": str(next_agent),
+                        "intent": str(intent),
+                        "has_memory_context": bool(state.get("user_memory_context")),
+                    },
+                    level="DEFAULT",
+                )
+                obs.update(output={"target_node": target})
+                obs.end()
+            except Exception as e:
+                logger.warning(f"[langfuse] route_from_enricher span failed: {e}")
 
         if intent == "personal":
             logger.info("[LANGGRAPH_ROUTE] query_enricher -> direct (personal intent)")
@@ -1699,21 +1796,43 @@ async def _memory_recall_wrapper(state: SupervisorState) -> dict:
     Load user memories from Graphiti into SupervisorState.user_memory_context.
     Called before direct/write/rag so every agent has access to personal memory.
     """
+    langfuse = _get_langfuse_client()
     logger.info("[LANGGRAPH_NODE] Entering memory_recall_wrapper")
     import uuid as _uuid
 
     user_id = state.get("user_id")
     if not user_id:
+        if langfuse:
+            try:
+                obs = langfuse.start_observation(
+                    name="memory_recall",
+                    input={"user_id": None},
+                    level="DEFAULT",
+                )
+                obs.update(output={"outcome": "no_user_id"})
+                obs.end()
+            except Exception as e:
+                logger.warning(f"[langfuse] memory_recall span failed: {e}")
         return {}
 
     user_message = state.get("rewritten_query") or state.get("original_query", "")
     if not user_message:
+        if langfuse:
+            try:
+                obs = langfuse.start_observation(
+                    name="memory_recall",
+                    input={"user_id": str(user_id)},
+                    level="DEFAULT",
+                )
+                obs.update(output={"outcome": "no_message"})
+                obs.end()
+            except Exception as e:
+                logger.warning(f"[langfuse] memory_recall span failed: {e}")
         return {}
 
     try:
         from app.services.graphiti_client import search_user_memory
 
-        # user_id in state may be int or UUID depending on how it was passed
         uid = user_id
         if isinstance(uid, int):
             uid = _uuid.UUID(int=uid)
@@ -1721,13 +1840,41 @@ async def _memory_recall_wrapper(state: SupervisorState) -> dict:
             uid = _uuid.UUID(uid)
 
         memory = await search_user_memory(uid, user_message, top_k=5)
-        if memory:
+        if langfuse:
+            try:
+                obs = langfuse.start_observation(
+                    name="memory_recall",
+                    input={"user_id": str(uid), "query": user_message},
+                    level="DEFAULT",
+                )
+                obs.update(
+                    output={
+                        "outcome": "found" if memory and "No relevant memories" not in memory else "no_memory",
+                        "memory_chars": len(memory) if memory else 0,
+                    }
+                )
+                obs.end()
+            except Exception as e:
+                logger.warning(f"[langfuse] memory_recall span failed: {e}")
+
+        if memory and "No relevant memories" not in memory:
             logger.info(f"[memory_recall_wrapper] Graphiti injected {len(memory)} chars")
             return {"user_memory_context": memory}
         else:
             logger.info(f"[memory_recall_wrapper] Graphiti found no relevant memory for user_id={uid}")
     except Exception as e:
         logger.warning(f"[memory_recall_wrapper] failed: {e}")
+        if langfuse:
+            try:
+                obs = langfuse.start_observation(
+                    name="memory_recall",
+                    input={"user_id": str(user_id), "query": user_message},
+                    level="DEFAULT",
+                )
+                obs.update(output={"outcome": "error", "error": str(e)})
+                obs.end()
+            except Exception:
+                pass
 
     return {}
 
@@ -1745,19 +1892,41 @@ async def _query_enricher_wrapper(state: SupervisorState) -> dict:
     uses memory from user_memory_context directly.
     """
     logger.info("[LANGGRAPH_NODE] Entering query_enricher_wrapper")
+    langfuse = _get_langfuse_client()
     memory = state.get("user_memory_context", "")
     query = state.get("rewritten_query", "") or state.get("original_query", "")
     intent = state.get("intent", "")
 
     # personal intent → direct_answer_node handles memory directly, no rewrite needed
     if intent == "personal":
+        if langfuse:
+            try:
+                obs = langfuse.start_observation(
+                    name="query_enricher",
+                    input={"query": query, "intent": intent},
+                    level="DEFAULT",
+                )
+                obs.update(output={"outcome": "skipped", "reason": "personal_intent"})
+                obs.end()
+            except Exception as e:
+                logger.warning(f"[langfuse] query_enricher span failed: {e}")
         return {}
 
     # Nothing to enrich if no memory or no personal reference in query
     if not memory or not query or "No relevant memories" in memory:
+        if langfuse:
+            try:
+                obs = langfuse.start_observation(
+                    name="query_enricher",
+                    input={"query": query, "intent": intent},
+                    level="DEFAULT",
+                )
+                obs.update(output={"outcome": "skipped", "reason": "no_memory"})
+                obs.end()
+            except Exception as e:
+                logger.warning(f"[langfuse] query_enricher span failed: {e}")
         return {}
-    if not _PERSONAL_REF_PATTERN.search(query):
-        return {}
+
 
     # Extract fact lines from memory context (format: "[Memory]\n- fact\n- fact")
     facts = [
@@ -1804,12 +1973,45 @@ async def _query_enricher_wrapper(state: SupervisorState) -> dict:
             logger.info(
                 f"[query_enricher] Enriched: {query!r} → {enriched!r}"
             )
+            if langfuse:
+                try:
+                    obs = langfuse.start_observation(
+                        name="query_enricher",
+                        input={"query": query, "intent": intent},
+                        level="DEFAULT",
+                    )
+                    obs.update(output={"outcome": "enriched", "enriched_query": enriched})
+                    obs.end()
+                except Exception as e:
+                    logger.warning(f"[langfuse] query_enricher span failed: {e}")
             return {"rewritten_query": enriched}
         else:
             logger.debug(f"[query_enricher] No enrichment applied for: {query!r}")
+            if langfuse:
+                try:
+                    obs = langfuse.start_observation(
+                        name="query_enricher",
+                        input={"query": query, "intent": intent},
+                        level="DEFAULT",
+                    )
+                    obs.update(output={"outcome": "no_change"})
+                    obs.end()
+                except Exception as e:
+                    logger.warning(f"[langfuse] query_enricher span failed: {e}")
 
     except Exception as e:
         logger.warning(f"[query_enricher] Failed: {e}")
+        if langfuse:
+            try:
+                obs = langfuse.start_observation(
+                    name="query_enricher",
+                    input={"query": query, "intent": intent},
+                    level="DEFAULT",
+                )
+                obs.update(output={"outcome": "error", "error": str(e)})
+                obs.end()
+            except Exception:
+                pass
 
     return {}
 

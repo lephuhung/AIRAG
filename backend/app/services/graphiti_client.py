@@ -61,7 +61,7 @@ _IDENTITY_PATTERNS = re.compile(
     r"(?i)"
     r"(tên\s*(của\s*)?tôi|tôi\s*tên|tên\s*tôi|my\s*name)"
     r"|(tôi\s*(là|l[\xE0a]\s*ai|sinh|tuổi)|tôi\s*\w{1,4}\s*ai)"
-    r"|(tôi\s*(công\s*tác|làm\s*việc|đang\s*ở|sống|học|dùng|sử\s*dụng))"
+    r"|(tôi\s*(đang\s+|đã\s+|sẽ\s+|vừa\s+|mới\s+)?(công\s*tác|làm\s*việc|đang\s*ở|sống|học|dùng|sử\s*dụng|sư\s*dụng|xài))"
     r"|(thông\s*tin.*tôi|tôi.*thông\s*tin)"
     r"|(who\s*am\s*i|what.*my\s*(name|job|role|age))"
     r"|(nhớ.*tôi|biết.*tôi|tôi.*là\s*ai)"
@@ -230,16 +230,20 @@ async def _fetch_all_user_facts(user_id: uuid.UUID, limit: int = 20) -> list:
 
     group_id = f"nexusrag_user_{user_id}"
     cypher = (
+        "MATCH (e:Episodic) "
+        "WHERE e.group_id = $group_id AND e.content IS NOT NULL "
+        "RETURN e.content AS fact, e.created_at AS created_at "
+        "UNION "
         "MATCH ()-[r:RELATES_TO]->() "
         "WHERE r.group_id = $group_id AND r.fact IS NOT NULL "
         "RETURN r.fact AS fact, r.created_at AS created_at "
-        "ORDER BY r.created_at DESC "
+        "ORDER BY created_at DESC "
         f"LIMIT {int(limit)}"
     )
     try:
         client = get_graphiti_client()
         records, _, _ = await client.driver.execute_query(
-            cypher, {"group_id": group_id}
+            cypher, group_id=group_id
         )
         results = [SimpleNamespace(fact=r["fact"]) for r in records if r["fact"]]
         logger.info(
@@ -252,6 +256,58 @@ async def _fetch_all_user_facts(user_id: uuid.UUID, limit: int = 20) -> list:
         )
         return []
 
+
+# ---------------------------------------------------------------------------
+# LLM Identity Classifier
+# ---------------------------------------------------------------------------
+
+async def _llm_classify_identity(query: str) -> bool:
+    """
+    Use the memory-agent LLM (e.g. Gemma-9B) to determine if a query is asking
+    about the user's own identity, equipment, organization, or personal facts.
+    Returns True if it is an identity query, False otherwise.
+    Falls back to regex if the LLM call fails.
+    """
+    try:
+        from app.services.llm import get_memory_agent
+        from app.services.llm.types import LLMMessage as _LLMMsg
+        import json as _json
+
+        classifier = get_memory_agent()
+        prompt = (
+            "You are a query classifier. Your task is to determine if the user's query "
+            "is asking about their own personal information, identity, equipment, organization, "
+            "or facts related to themselves (e.g., 'tôi tên gì', 'đơn vị tôi có trách nhiệm gì', "
+            "'tôi xài máy gì', 'địa chỉ của tôi').\n"
+            "If the query is asking about the user's own information, return true.\n"
+            "If it's a general question or asking about someone else, return false.\n"
+            "Respond ONLY with valid JSON in this exact format: {\"is_identity\": true} or {\"is_identity\": false}.\n"
+            "Do not include any other text or markdown formatting.\n\n"
+            f"Query: {query}"
+        )
+        
+        response_text = ""
+        async for chunk in classifier.astream(
+            [_LLMMsg(role="user", content=prompt)],
+            temperature=0.0,
+            max_tokens=128,
+        ):
+            if chunk.text:
+                response_text += chunk.text
+                
+        # Parse JSON response
+        clean = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip()
+        m = re.search(r"\{.*\}", clean, re.DOTALL)
+        if not m:
+            logger.warning(f"[graphiti] identity-classifier returned no JSON: {response_text[:80]!r}, falling back to regex")
+            return bool(_IDENTITY_PATTERNS.search(query))
+            
+        data = _json.loads(m.group())
+        return data.get("is_identity", False)
+        
+    except Exception as e:
+        logger.warning(f"[graphiti] identity-classifier LLM failed ({e}), falling back to regex")
+        return bool(_IDENTITY_PATTERNS.search(query))
 
 # ---------------------------------------------------------------------------
 # Memory search — main entry point
@@ -295,7 +351,8 @@ async def search_user_memory(
     # ------------------------------------------------------------------
     # Layer 1: Identity shortcut — fetch ALL facts for self-referential queries
     # ------------------------------------------------------------------
-    if _IDENTITY_PATTERNS.search(query):
+    is_identity = await _llm_classify_identity(query)
+    if is_identity:
         logger.info(
             f"[graphiti] identity query detected — fetching all facts for user {user_id}"
         )

@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Callable
 
-from langfuse import get_client
+from app.services.agent.langfuse_tracing import with_langfuse_span, _get_langfuse_client
 
 if TYPE_CHECKING:
     from app.services.agents.models import SupervisorState
@@ -32,57 +32,11 @@ logger = logging.getLogger(__name__)
 # Langfuse client (lazy initialization for span creation)
 # =============================================================================
 
-def _get_langfuse_client():
-    """Get or create Langfuse client for manual span instrumentation."""
-    try:
-        return get_client()
-    except Exception as e:
-        logger.warning(f"[langfuse] Failed to get client: {e}")
-        return None
+# Re-use shared langfuse utilities from centralized module
+# (local aliases maintain compatibility with existing call sites)
+get_langfuse_client = _get_langfuse_client
+_with_langfuse_span = with_langfuse_span
 
-
-class _NullContext:
-    """Null context manager for when Langfuse is unavailable."""
-    def __enter__(self):
-        return self
-    def __exit__(self, *args):
-        pass
-    def update(self, **kwargs):
-        pass
-
-
-def _null_context():
-    return _NullContext()
-
-
-async def _with_langfuse_span(name: str, input_data: dict, coro):
-    """
-    Execute an async coroutine within a Langfuse observation (SDK v4).
-
-    Usage:
-        result = await _with_langfuse_span(
-            "search_documents",
-            {"query": q, "workspace_ids": [...]},
-            search_documents(...),
-        )
-    """
-    langfuse = _get_langfuse_client()
-    if not langfuse:
-        return await coro
-
-    try:
-        obs = langfuse.start_observation(
-            name=name,
-            input=input_data,
-            level="DEFAULT",
-        )
-        result = await coro
-        obs.update(output={"result": result})
-        obs.end()
-        return result
-    except Exception as e:
-        logger.warning(f"[langfuse] Span failed for {name}: {e}")
-        return await coro
 
 # =============================================================================
 # Result Mappers (must be defined before registry)

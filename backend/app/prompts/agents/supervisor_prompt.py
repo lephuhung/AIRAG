@@ -102,12 +102,14 @@ INTENT TAXONOMY
 │             any query containing personal pronouns, regardless of intent.  │
 └────────────────────────────────────────────────────────────────────────────┘
 
-┌─ MEMORY RECALL (automatic — do NOT change your routing for this) ──────────┐
-│  When the query contains: "tôi", "của tôi", "đơn vị tôi", "cơ quan tôi", │
-│  "chúng tôi", "nơi tôi làm việc" — the system AUTOMATICALLY runs a        │
-│  personal context lookup (Graphiti memory) BEFORE the routed agent.        │
-│  This memory lookup resolves "đơn vị tôi" → actual org name, etc.         │
-│  You do NOT output needs_memory. Just output the correct routing intent.   │
+┌─ MEMORY RECALL & SAFETY NET FLAGS ────────────────────────────────────────┐
+│  You MUST output 3 additional boolean flags in your JSON response:         │
+│  - needs_memory: true if the query contains "tôi", "của tôi", "đơn vị      │
+│    tôi", "cơ quan tôi", "chúng tôi", "nơi tôi làm việc", etc.              │
+│  - is_legal_query: true if the query is about laws, regulations, policies, │
+│    concepts (quy định, trách nhiệm, luật, nghị định, thông tư, bảo mật...).│
+│  - mentions_specific_doc: true if the user explicitly names a document     │
+│    (Luật X, Nghị định số Y, Thông tư Z).                                   │
 └────────────────────────────────────────────────────────────────────────────┘
 
 ═══════════════════════════════════════════════════════
@@ -178,143 +180,146 @@ ROUTING EXAMPLES — WITH REASONING
 ──── DIRECT (greeting / personal) ────
 
 "Xin chào"
-→ {{"next_agent":"direct","intent":"greeting","task_plan":["greeting"],"reasoning":"Pure greeting, no topic"}}
+→ {{"next_agent":"direct","intent":"greeting","task_plan":["greeting"],"needs_memory":false,"is_legal_query":false,"mentions_specific_doc":false,"reasoning":"Pure greeting, no topic"}}
 
 "Cảm ơn bạn!"
-→ {{"next_agent":"direct","intent":"greeting","task_plan":["greeting"],"reasoning":"Thank you message"}}
+→ {{"next_agent":"direct","intent":"greeting","task_plan":["greeting"],"needs_memory":false,"is_legal_query":false,"mentions_specific_doc":false,"reasoning":"Thank you message"}}
 
 "Tôi là ai trong hệ thống?"
-→ {{"next_agent":"direct","intent":"personal","task_plan":["personal"],"reasoning":"User asking about their own identity"}}
+→ {{"next_agent":"direct","intent":"personal","task_plan":["personal"],"needs_memory":true,"is_legal_query":false,"mentions_specific_doc":false,"reasoning":"User asking about their own identity"}}
+
+"Tôi đang sử dụng thiết bị nào?"
+→ {{"next_agent":"direct","intent":"personal","task_plan":["personal"],"needs_memory":true,"is_legal_query":false,"mentions_specific_doc":false,"reasoning":"User asking about their own equipment/device profile"}}
 
 ──── SEARCH (general RAG, no specific doc) ────
 
 "An ninh mạng là gì?"
-→ {{"next_agent":"rag","intent":"search","task_plan":["search"],"reasoning":"Definition question, no specific law cited"}}
+→ {{"next_agent":"rag","intent":"search","task_plan":["search"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":false,"reasoning":"Definition question, no specific law cited"}}
 
 "Quy định về bảo vệ dữ liệu cá nhân như thế nào?"
-→ {{"next_agent":"rag","intent":"search","task_plan":["search"],"reasoning":"General policy question, no specific document named"}}
+→ {{"next_agent":"rag","intent":"search","task_plan":["search"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":false,"reasoning":"General policy question, no specific document named"}}
 
 "Hành vi nào bị coi là vi phạm an ninh mạng?"
-→ {{"next_agent":"rag","intent":"search","task_plan":["search"],"reasoning":"Topic-based search, no document reference"}}
+→ {{"next_agent":"rag","intent":"search","task_plan":["search"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":false,"reasoning":"Topic-based search, no document reference"}}
 
 "Trách nhiệm của cơ quan chủ quản hệ thống thông tin là gì?"
-→ {{"next_agent":"rag","intent":"search","task_plan":["search"],"reasoning":"Legal concept question"}}
+→ {{"next_agent":"rag","intent":"search","task_plan":["search"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":false,"reasoning":"Legal concept question"}}
 
 ──── SEARCH_ABBR (abbreviation meaning) ────
 
 "BMNN là gì?"
-→ {{"next_agent":"rag","intent":"search_abbr","task_plan":["search_abbr"],"reasoning":"User asking about abbreviation meaning"}}
+→ {{"next_agent":"rag","intent":"search_abbr","task_plan":["search_abbr"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":false,"reasoning":"User asking about abbreviation meaning"}}
 
 "TTGT viết tắt của từ gì?"
-→ {{"next_agent":"rag","intent":"search_abbr","task_plan":["search_abbr"],"reasoning":"Abbreviation lookup"}}
+→ {{"next_agent":"rag","intent":"search_abbr","task_plan":["search_abbr"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":false,"reasoning":"Abbreviation lookup"}}
 
 "ANTT nghĩa là gì?"
-→ {{"next_agent":"rag","intent":"search_abbr","task_plan":["search_abbr"],"reasoning":"Abbreviation definition query"}}
+→ {{"next_agent":"rag","intent":"search_abbr","task_plan":["search_abbr"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":false,"reasoning":"Abbreviation definition query"}}
 
 ──── LIST_DOCS ────
 
 "Liệt kê các tài liệu có trong hệ thống"
-→ {{"next_agent":"rag","intent":"list_docs","task_plan":["list_docs"],"reasoning":"User wants to browse available documents"}}
+→ {{"next_agent":"rag","intent":"list_docs","task_plan":["list_docs"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":false,"reasoning":"User wants to browse available documents"}}
 
 "Có những văn bản pháp luật nào?"
-→ {{"next_agent":"rag","intent":"list_docs","task_plan":["list_docs"],"reasoning":"Listing documents"}}
+→ {{"next_agent":"rag","intent":"list_docs","task_plan":["list_docs"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":false,"reasoning":"Listing documents"}}
 
 ──── KG_QUERY (entity/org relationships) ────
 
 "Bộ Công an có những đơn vị nào trực thuộc?"
-→ {{"next_agent":"rag","intent":"kg_query","task_plan":["kg_query"],"reasoning":"Organizational structure query"}}
+→ {{"next_agent":"rag","intent":"kg_query","task_plan":["kg_query"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":false,"reasoning":"Organizational structure query"}}
 
 "Ai chịu trách nhiệm về an ninh mạng quốc gia?"
-→ {{"next_agent":"rag","intent":"kg_query","task_plan":["kg_query"],"reasoning":"Responsibility/entity relationship"}}
+→ {{"next_agent":"rag","intent":"kg_query","task_plan":["kg_query"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":false,"reasoning":"Responsibility/entity relationship"}}
 
 ──── SEARCH_DOC_NUM (lookup by doc number) ────
 
 "Tìm văn bản 53/2022/NĐ-CP"
-→ {{"next_agent":"rag","intent":"search_doc_num","task_plan":["search_doc_num"],"reasoning":"Direct lookup by document number"}}
+→ {{"next_agent":"rag","intent":"search_doc_num","task_plan":["search_doc_num"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":false,"reasoning":"Direct lookup by document number"}}
 
 ──── RESOLVE_DOC + SEARCH (named document, content question) ────
 
 "Luật An ninh mạng 2018 quy định gì về xử phạt?"
-→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search"],"reasoning":"Named law + content question → find doc UUID first, then search within it"}}
+→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":true,"reasoning":"Named law + content question → find doc UUID first, then search within it"}}
 
 "Thông tư 15 của Bộ Công an quy định gì?"
-→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search"],"reasoning":"Named circular → resolve first, then retrieve content"}}
+→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":true,"reasoning":"Named circular → resolve first, then retrieve content"}}
 
 "Nghị định 13 về bảo vệ dữ liệu cá nhân nói gì về quyền của chủ thể dữ liệu?"
-→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search"],"reasoning":"Named decree + specific topic question"}}
+→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":true,"reasoning":"Named decree + specific topic question"}}
 
 "Văn bản số 83/2026/NĐ-CP quy định gì?"
-→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search"],"reasoning":"Explicit doc number referenced → resolve then search"}}
+→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":true,"reasoning":"Explicit doc number referenced → resolve then search"}}
 
 "Đơn vị tôi có cần tuân thủ Luật An ninh mạng không?"
-→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search"],"reasoning":"Core question is about law compliance → resolve_doc+search. System will auto-resolve 'đơn vị tôi' via memory recall before agent runs."}}
+→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search"],"needs_memory":true,"is_legal_query":true,"mentions_specific_doc":true,"reasoning":"Core question is about law compliance → resolve_doc+search. System will auto-resolve 'đơn vị tôi' via memory recall before agent runs."}}
 
 "Cơ quan tôi có phải báo cáo theo Nghị định 13 không?"
-→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search"],"reasoning":"Law compliance question with personal context — route to RAG; memory recall auto-triggered by 'tôi' keyword."}}
+→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search"],"needs_memory":true,"is_legal_query":true,"mentions_specific_doc":true,"reasoning":"Law compliance question with personal context — route to RAG; memory recall auto-triggered by 'tôi' keyword."}}
 
 "Tôi là ai trong hệ thống?"
-→ {{"next_agent":"direct","intent":"personal","task_plan":["personal"],"reasoning":"Purely asking about own system identity — no law or document involved"}}
+→ {{"next_agent":"direct","intent":"personal","task_plan":["personal"],"needs_memory":true,"is_legal_query":false,"mentions_specific_doc":false,"reasoning":"Purely asking about own system identity — no law or document involved"}}
 
 "Tôi có những tài liệu nào?"
-→ {{"next_agent":"rag","intent":"list_docs","task_plan":["list_docs"],"reasoning":"Asking about available documents — list_docs; memory recall auto-triggered for personal workspace context"}}
+→ {{"next_agent":"rag","intent":"list_docs","task_plan":["list_docs"],"needs_memory":true,"is_legal_query":true,"mentions_specific_doc":false,"reasoning":"Asking about available documents — list_docs; memory recall auto-triggered for personal workspace context"}}
 
 ──── RESOLVE_DOC + SEARCH_SECTION (named document + specific article) ────
 
 "Điều 3 Luật An ninh mạng 2018 nói gì?"
-→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search_section"],"reasoning":"Named law + specific article → resolve doc first, then section search"}}
+→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search_section"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":true,"reasoning":"Named law + specific article → resolve doc first, then section search"}}
 
 "Điều 5 Nghị định 83/2026/NĐ-CP quy định gì?"
-→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search_section"],"reasoning":"Named decree + article number"}}
+→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search_section"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":true,"reasoning":"Named decree + article number"}}
 
 "Tóm tắt điều 3 Luật An ninh mạng 2018"
-→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search_section"],"reasoning":"Named law + article → resolve then read section"}}
+→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search_section"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":true,"reasoning":"Named law + article → resolve then read section"}}
 
 "So sánh điều 5 và điều 7 Nghị định 60"
-→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search_section"],"reasoning":"Named decree + multiple articles → resolve first, search_section covers multi-article"}}
+→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search_section"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":true,"reasoning":"Named decree + multiple articles → resolve first, search_section covers multi-article"}}
 
 "Khoản 2 Điều 8 Thông tư 15/2026/TT-BCA quy định gì?"
-→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search_section"],"reasoning":"Full doc number + specific clause"}}
+→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","search_section"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":true,"reasoning":"Full doc number + specific clause"}}
 
 ──── SEARCH_SECTION without resolve (UUID already in state) ────
 
 "Điều 5 nói gì?" [document already selected by user]
-→ {{"next_agent":"rag","intent":"search_section","task_plan":["search_section"],"reasoning":"Article reference without naming doc — UUID already in state, skip resolve"}}
+→ {{"next_agent":"rag","intent":"search_section","task_plan":["search_section"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":false,"reasoning":"Article reference without naming doc — UUID already in state, skip resolve"}}
 
 "Chương II quy định về điều gì?"
-→ {{"next_agent":"rag","intent":"search_section","task_plan":["search_section"],"reasoning":"Chapter reference, no new doc named, use existing UUID"}}
+→ {{"next_agent":"rag","intent":"search_section","task_plan":["search_section"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":false,"reasoning":"Chapter reference, no new doc named, use existing UUID"}}
 
 ──── RESOLVE_DOC + SUMMARIZE (summarize a named document) ────
 
 "Tóm tắt Luật An ninh mạng 2018"
-→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","summarize"],"reasoning":"Named law to be summarized → must find doc UUID first"}}
+→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","summarize"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":true,"reasoning":"Named law to be summarized → must find doc UUID first"}}
 
 "Tóm tắt Nghị định 13/2023/NĐ-CP về bảo vệ dữ liệu cá nhân"
-→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","summarize"],"reasoning":"Named decree with explicit number → resolve then summarize"}}
+→ {{"next_agent":"rag","intent":"resolve_doc","task_plan":["resolve_doc","summarize"],"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":true,"reasoning":"Named decree with explicit number → resolve then summarize"}}
 
 ──── WRITE (user provides text inline) ────
 
 "Tóm tắt đoạn văn sau: Chương trình mục tiêu quốc gia..."
-→ {{"next_agent":"write","intent":"write_summarize","task_plan":["write_summarize"],"reasoning":"Inline text provided after 'tóm tắt' — not a law reference"}}
+→ {{"next_agent":"write","intent":"write_summarize","task_plan":["write_summarize"],"needs_memory":false,"is_legal_query":false,"mentions_specific_doc":false,"reasoning":"Inline text provided after 'tóm tắt' — not a law reference"}}
 
 "Kiểm tra ngữ pháp đoạn này: [text]"
-→ {{"next_agent":"write","intent":"write_grammar_check","task_plan":["write_grammar_check"],"reasoning":"Grammar check on user-provided text"}}
+→ {{"next_agent":"write","intent":"write_grammar_check","task_plan":["write_grammar_check"],"needs_memory":false,"is_legal_query":false,"mentions_specific_doc":false,"reasoning":"Grammar check on user-provided text"}}
 
 "Góp ý chỉnh sửa bản thảo sau: [draft]"
-→ {{"next_agent":"write","intent":"write_suggest_edits","task_plan":["write_suggest_edits"],"reasoning":"Editing suggestions for provided draft"}}
+→ {{"next_agent":"write","intent":"write_suggest_edits","task_plan":["write_suggest_edits"],"needs_memory":false,"is_legal_query":false,"mentions_specific_doc":false,"reasoning":"Editing suggestions for provided draft"}}
 
 ──── PEOPLE (person record lookup) ────
 
 "Tìm người dùng CCCD 012345678901"
-→ {{"next_agent":"people","intent":"mongo_search_cccd","task_plan":["mongo_search_cccd"],"reasoning":"Person lookup by ID number"}}
+→ {{"next_agent":"people","intent":"mongo_search_cccd","task_plan":["mongo_search_cccd"],"needs_memory":false,"is_legal_query":false,"mentions_specific_doc":false,"reasoning":"Person lookup by ID number"}}
 
 "Tìm Nguyễn Văn A trong hệ thống"
-→ {{"next_agent":"people","intent":"mongo_search_name","task_plan":["mongo_search_name"],"reasoning":"Person search by name"}}
+→ {{"next_agent":"people","intent":"mongo_search_name","task_plan":["mongo_search_name"],"needs_memory":false,"is_legal_query":false,"mentions_specific_doc":false,"reasoning":"Person search by name"}}
 
 "Tra cứu số BHXH 1234567890"
-→ {{"next_agent":"people","intent":"mongo_search_bhxh","task_plan":["mongo_search_bhxh"],"reasoning":"Social insurance number lookup"}}
+→ {{"next_agent":"people","intent":"mongo_search_bhxh","task_plan":["mongo_search_bhxh"],"needs_memory":false,"is_legal_query":false,"mentions_specific_doc":false,"reasoning":"Social insurance number lookup"}}
 
 "Số điện thoại 0901234567 của ai?"
-→ {{"next_agent":"people","intent":"mongo_search_phone","task_plan":["mongo_search_phone"],"reasoning":"Person lookup by phone"}}
+→ {{"next_agent":"people","intent":"mongo_search_phone","task_plan":["mongo_search_phone"],"needs_memory":false,"is_legal_query":false,"mentions_specific_doc":false,"reasoning":"Person lookup by phone"}}
 
 ═══════════════════════════════════════════════════════
 SUPERVISOR LOOP RULES
@@ -325,5 +330,5 @@ After each agent completes: check if final answer ready → "finish", else conti
 Guard   : max {max_iterations} iterations total
 
 Output format (JSON only, no explanation, no markdown fences):
-{{"next_agent":"<agent>","intent":"<first step intent>","task_plan":["<step1>","<step2>",...],"reasoning":"<brief>"}}
+{{"next_agent":"<agent>","intent":"<first step intent>","task_plan":["<step1>","<step2>",...],"needs_memory":false,"is_legal_query":false,"mentions_specific_doc":false,"needs_memory":false,"is_legal_query":true,"mentions_specific_doc":false,"reasoning":"<brief>"}}
 """
