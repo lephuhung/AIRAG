@@ -210,7 +210,6 @@ async def write_agent_node(state: SupervisorState) -> dict:
     return {
         "final_answer": final_answer,
         "next_agent": AgentType.FINISH,
-        "iterations": state.get("iterations", 0) + 1,
     }
 
 
@@ -362,7 +361,6 @@ async def _handle_format_check(state: SupervisorState) -> dict:
     return {
         "final_answer": final_answer,
         "next_agent": AgentType.FINISH,
-        "iterations": state.get("iterations", 0) + 1,
         "format_evaluation_result": {
             "is_valid": "đạt" in final_answer.lower() or "phù hợp" in final_answer.lower(),
             "overall_status": (

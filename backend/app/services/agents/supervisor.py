@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import TYPE_CHECKING
 
 from langgraph.graph import StateGraph, START, END
@@ -24,6 +25,7 @@ from langgraph.graph import StateGraph, START, END
 from app.services.agents.models import (
     SupervisorState,
     AgentType,
+    Intent,
 )
 def _get_langfuse_client():
     from app.services.agent.langfuse_tracing import _get_langfuse_client as get_client
@@ -41,8 +43,9 @@ logger = logging.getLogger(__name__)
 from app.prompts.agents.supervisor_prompt import _SUPERVISOR_PROMPT
 
 # Intent abbreviation → canonical name (safety net for LLM shortcutting intent names)
+# P0-6: Expanded to cover more observed LLM shorthand patterns.
 _INTENT_NORMALIZE: dict[str, str] = {
-    # Common LLM shortcuts for people intents
+    # People: search_X ↔ X_search variants
     "search_phone": "mongo_search_phone",
     "search_cccd": "mongo_search_cccd",
     "search_name": "mongo_search_name",
@@ -52,35 +55,77 @@ _INTENT_NORMALIZE: dict[str, str] = {
     "name_search": "mongo_search_name",
     "bhxh_search": "mongo_search_bhxh",
     "search_advanced": "mongo_search_advanced",
-    # some LLMs drop the prefix entirely
+    "advanced_search": "mongo_search_advanced",
+    # People: LLM drops the "mongo_" prefix entirely
     "find_phone": "mongo_search_phone",
     "find_person": "mongo_search_name",
-    "advanced_search": "mongo_search_advanced",
+    "search_person": "mongo_search_name",
+    "find_by_name": "mongo_search_name",
+    "find_by_phone": "mongo_search_phone",
+    "find_by_cccd": "mongo_search_cccd",
+    # RAG: doc resolution variants
+    "query_doc": "resolve_doc",
+    "find_doc": "resolve_doc",
+    "lookup_doc": "resolve_doc",
+    "resolve_document": "resolve_doc",
+    # RAG: section variants
+    "lookup_section": "search_section",
+    "get_article": "search_section",
+    "find_article": "search_section",
+    "search_article": "search_section",
+    "get_section": "search_section",
+    # RAG: summarize variants
+    "summarize_doc": "summarize",
+    "doc_summary": "summarize",
 }
 
-# Intent → Agent routing table used as fallback inside _parse_supervisor_response
+# Intent → Agent routing table used as fallback inside _parse_supervisor_response.
+# Uses Intent.* and AgentType.* constants (P0-5) so renames stay in sync.
 _INTENT_TO_AGENT_FALLBACK: dict[str, str] = {
-    "greeting": "direct",
-    "personal": "direct",
-    "search": "rag",
-    "list_docs": "rag",
-    "summarize": "rag",
-    "kg_query": "rag",
-    "search_doc_num": "rag",
-    "search_abbr": "rag",
-    "resolve_doc": "resolve_doc",  # Phase 2: dedicated agent
-    "search_section": "rag",
-    "write_summarize": "write",
-    "write_suggest_edits": "write",
-    "write_grammar_check": "write",
-    "write_format_check": "write",
-    "mongo_search_cccd": "people",
-    "mongo_search_name": "people",
-    "mongo_search_bhxh": "people",
-    "mongo_search_phone": "people",
-    "mongo_search_advanced": "people",
+    Intent.GREETING:           AgentType.DIRECT,
+    Intent.PERSONAL:           AgentType.DIRECT,
+    Intent.SEARCH:             AgentType.RAG,
+    Intent.LIST_DOCS:          AgentType.RAG,
+    Intent.SUMMARIZE:          AgentType.RAG,
+    Intent.KG_QUERY:           AgentType.RAG,
+    Intent.SEARCH_DOC_NUM:     AgentType.RAG,
+    Intent.SEARCH_ABBR:        AgentType.RAG,
+    Intent.SEARCH_SECTION:     AgentType.RAG,
+    Intent.RESOLVE_DOC:        AgentType.RESOLVE_DOC,  # Phase 2: dedicated agent
+    Intent.WRITE_SUMMARIZE:    AgentType.WRITE,
+    Intent.WRITE_SUGGEST_EDITS: AgentType.WRITE,
+    Intent.WRITE_GRAMMAR_CHECK: AgentType.WRITE,
+    Intent.WRITE_FORMAT_CHECK:  AgentType.WRITE,
+    Intent.MONGO_SEARCH_CCCD:   AgentType.PEOPLE,
+    Intent.MONGO_SEARCH_NAME:   AgentType.PEOPLE,
+    Intent.MONGO_SEARCH_BHXH:   AgentType.PEOPLE,
+    Intent.MONGO_SEARCH_PHONE:  AgentType.PEOPLE,
+    Intent.MONGO_SEARCH_ADVANCED: AgentType.PEOPLE,
 }
 
+
+# =============================================================================
+# Module-level compiled regex patterns (P1-7: avoid recompile per call)
+# =============================================================================
+
+# Detects personal pronouns like "tôi", "đơn vị tôi", "của tôi", "chỗ tôi"…
+# Used as safety net for needs_memory — fires when LLM misses personal context.
+_PERSONAL_REF_PATTERN: re.Pattern[str] = re.compile(
+    r"(?<!\w)(tôi|của\s+tôi|cho\s+tôi|đơn\s+vị\s+tôi|cơ\s+quan\s+tôi|nơi\s+tôi|chỗ\s+tôi|chúng\s+tôi|của\s+chúng\s+tôi|công\s+tác\s+của\s+tôi|làm\s+việc\s+của\s+tôi|tôi\s+tên|tên\s+(của\s+)?tôi|tôi\s+là\s+ai|tôi\s+làm\s+việc|tôi\s+công\s+tác|tôi\s+đang\s\sở)(?!\w)",
+    re.IGNORECASE | re.UNICODE,
+)
+
+# Detects references to a NAMED legal document (used by _REQUIRES_DOC_INTENTS
+# prerequisite check). Covers both full names ("Luật An ninh mạng") and
+# abbreviated forms ("NĐ 13", "TT 15", "QĐ 53").
+# See also: resolve_doc_agent._DOC_TYPE_KEYWORDS — should be unified in P1-6.
+_NAMED_DOC_PATTERN: re.Pattern[str] = re.compile(
+    r"(?:"
+    r"luật|nghị\s+định|thông\s+tư|quyết\s+định|nghị\s+quyết|pháp\s+lệnh|bộ\s+luật"
+    r"|nđ|tt|qđ|nq|cp|ttlt"
+    r")\s+\S",
+    re.IGNORECASE | re.UNICODE,
+)
 
 
 # =============================================================================
@@ -250,28 +295,21 @@ async def _disambiguate_multi_meaning_abbrs(
 
     from app.services.llm import get_memory_agent
     from app.services.llm.types import LLMMessage as _LLMMsg
+    from app.prompts.agents.disambiguation_prompt import (
+        build_disambiguation_prompt,
+    )
 
     chosen_map: dict[str, str] = {}
     low_confidence_abbrs: list[str] = []
 
     for abbr, meanings in multi_meaning_map.items():
-        meanings_text = "\n".join(
-            f"  {i+1}. {m['full_form']}" + (f" — {m['description']}" if m.get('description') else "")
-            for i, m in enumerate(meanings)
-        )
-        prompt = (
-            f'Từ viết tắt "{abbr}" có các nghĩa sau:\n{meanings_text}\n\n'
-            f'Câu hỏi của user: "{user_message}"\n\n'
-            f'Dựa vào ngữ cảnh câu hỏi, chọn nghĩa phù hợp nhất.\n'
-            f'Nếu ngữ cảnh không đủ rõ để chọn, trả về confidence: "low".\n\n'
-            f'Output JSON: {{"chosen": "<full_form>", "confidence": "high" or "low", "reasoning": "<1 sentence>"}}'
-        )
+        sys_prompt, user_prompt = build_disambiguation_prompt(abbr, meanings, user_message)
         try:
             agent = get_memory_agent()
             resp_text = ""
             async for chunk in agent.astream(
-                [_LLMMsg(role="user", content=prompt)],
-                system_prompt="You are a Vietnamese abbreviation disambiguation assistant. Output valid JSON only.",
+                [_LLMMsg(role="user", content=user_prompt)],
+                system_prompt=sys_prompt,
                 temperature=0.0,
                 max_tokens=120,
             ):
@@ -365,7 +403,8 @@ def _parse_supervisor_response(raw: str) -> dict:
         task_plan = data.get("task_plan") or []
         needs_memory = data.get("needs_memory", False)
         is_legal_query = data.get("is_legal_query", False)
-        mentions_specific_doc = data.get("mentions_specific_doc", False)
+        # mentions_specific_doc removed (P0-3 — was dead code; never used in routing).
+        # Langfuse can derive "named doc referenced" from task_plan.includes("resolve_doc").
 
         # Normalize intent name (LLM sometimes uses shorthand like "search_phone")
         intent = _INTENT_NORMALIZE.get(intent, intent)
@@ -373,7 +412,7 @@ def _parse_supervisor_response(raw: str) -> dict:
         # Validate next_agent
         valid_agents = {
             AgentType.RAG, AgentType.WRITE, AgentType.PEOPLE,
-            AgentType.DIRECT, AgentType.FINISH,
+            AgentType.DIRECT, AgentType.FINISH, AgentType.RESOLVE_DOC,
         }
         if next_agent not in valid_agents:
             corrected = _INTENT_TO_AGENT_FALLBACK.get(next_agent)
@@ -433,7 +472,6 @@ def _parse_supervisor_response(raw: str) -> dict:
             "pending_intent": pending_intent,
             "needs_memory": needs_memory,
             "is_legal_query": is_legal_query,
-            "mentions_specific_doc": mentions_specific_doc,
             "reasoning": data.get("reasoning", ""),
         }
     except json.JSONDecodeError:
@@ -475,7 +513,7 @@ async def query_analyzer_node(state: SupervisorState) -> dict:
         from app.prompts.agents.query_analyzer_prompt import _QUERY_ANALYZER_PROMPT
         from app.services.llm import get_memory_agent
 
-        # Use the memory agent (Qwen-memory 9B) for complex structured extraction
+        # Use the memory agent (Qwen-memory 4B / Qwen3-4B) for complex structured extraction
         analyzer_llm = get_memory_agent()
 
         response_text = ""
@@ -709,10 +747,7 @@ async def supervisor_node(state: SupervisorState) -> dict:
         # ── Keyword safety net 0: needs_memory fallback ─────────────────────
         # If the query explicitly contains personal pronouns, forcefully trigger
         # memory_recall even if the LLM classification missed it (e.g. typos).
-        _PERSONAL_REF_PATTERN = _re.compile(
-            r"(?<!\w)(tôi|của\s+tôi|cho\s+tôi|đơn\s+vị\s+tôi|cơ\s+quan\s+tôi|nơi\s+tôi|chỗ\s+tôi|chúng\s+tôi|của\s+chúng\s+tôi|công\s+tác\s+của\s+tôi|làm\s+việc\s+của\s+tôi|tôi\s+tên|tên\s+(của\s+)?tôi|tôi\s+là\s+ai|tôi\s+làm\s+việc|tôi\s+công\s+tác|tôi\s+đang\s+ở)(?!\w)",
-            _re.IGNORECASE | _re.UNICODE
-        )
+        # Pattern is module-level (P1-7) — no per-call compile.
         if not decision.get("needs_memory") and _PERSONAL_REF_PATTERN.search(query_for_classifier):
             logger.info("[supervisor] Keyword safety net: forcing needs_memory=True because query contains personal keywords")
             decision["needs_memory"] = True
@@ -745,11 +780,7 @@ async def supervisor_node(state: SupervisorState) -> dict:
             and not state.get("document_ids")
             and (not task_plan or task_plan[0] != "resolve_doc")
         ):
-            _NAMED_DOC_PATTERN = _re.compile(
-                r"(?:lu\u1eadt|ngh\u1ecb\s+\u0111\u1ecbnh|th\u00f4ng\s+t\u01b0|quy\u1ebft\s+\u0111\u1ecbnh|ngh\u1ecb\s+quy\u1ebft|ph\u00e1p\s+l\u1ec7nh|b\u1ed9\s+lu\u1eadt)"
-                r"\s+\S",
-                _re.IGNORECASE | _re.UNICODE,
-            )
+            # Pattern is module-level (P1-7) \u2014 no per-call compile.
             if _NAMED_DOC_PATTERN.search(query_for_classifier):
                 original_intent = decision["intent"]
                 decision["pending_intent"] = original_intent
@@ -760,6 +791,28 @@ async def supervisor_node(state: SupervisorState) -> dict:
                     f"[supervisor] Prerequisite check: injected resolve_doc before "
                     f"{original_intent!r}, task_plan={decision['task_plan']}"
                 )
+            else:
+                # V2.1: "Ask user when uncertain" — if intent requires a doc but
+                # regex didn't match a named doc AND no document_ids in state,
+                # ask the user to specify which document they want.
+                from app.services.agents.clarification import (
+                    ask_user_clarification,
+                    should_ask_for_doc_reference,
+                )
+                if should_ask_for_doc_reference(query_for_classifier, has_named_doc_match=False):
+                    logger.info(
+                        f"[supervisor] V2.1 fallback: asking user for doc reference "
+                        f"(intent={decision['intent']!r}, no named doc matched)"
+                    )
+                    await ask_user_clarification(
+                        state,
+                        question=(
+                            "Bạn muốn tra cứu văn bản nào? "
+                            "Vui lòng cung cấp tên đầy đủ hoặc số hiệu văn bản "
+                            "(ví dụ: 'Nghị định 13/2023/NĐ-CP' hoặc 'Luật An ninh mạng 2018')."
+                        ),
+                        context={"type": "missing_doc_reference", "intent": decision["intent"]},
+                    )
 
         logger.info(
             f"[LANGGRAPH_ROUTE] user_message={user_message!r} -> "

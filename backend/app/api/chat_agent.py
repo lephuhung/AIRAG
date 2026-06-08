@@ -382,13 +382,25 @@ async def _fetch_direct_document_content(
         return []
 
     storage = get_storage_service()
-    result = await db.execute(select(Document).where(Document.id.in_(document_ids)))
+    # Normalize document_ids — may be str or UUID (passed through langgraph state)
+    normalized_ids: list[uuid.UUID] = []
+    for d in document_ids:
+        if isinstance(d, str):
+            try:
+                normalized_ids.append(uuid.UUID(d))
+            except (ValueError, TypeError):
+                continue
+        elif isinstance(d, uuid.UUID):
+            normalized_ids.append(d)
+    result = await db.execute(select(Document).where(Document.id.in_(normalized_ids)))
     docs = result.scalars().all()
-    doc_map = {doc.id: doc for doc in docs}
+    # Bug fix: key doc_map by str(uuid) so lookups work whether caller has UUID or str
+    doc_map: dict[str, Document] = {str(doc.id): doc for doc in docs}
 
     contents = []
     for doc_id in document_ids:
-        doc = doc_map.get(doc_id)
+        lookup_key = str(doc_id) if isinstance(doc_id, (str, uuid.UUID)) else doc_id
+        doc = doc_map.get(lookup_key)
         if not doc:
             logger.warning(f"[direct_doc] Document {doc_id} not found")
             continue
@@ -486,15 +498,63 @@ async def _execute_search_documents(
             f"[RAG] UUID-scoped: skipping broad workspace search, "
             f"querying {len(document_ids)} doc(s) directly via HRAG filter"
         )
-        # Use the first workspace_id to instantiate HRAGService — document_ids acts as hard filter
-        for workspace_id in workspace_ids:
-            rag_service = get_rag_service(db, workspace_id)
-            if isinstance(rag_service, HRAGService):
+        # Bug fix: previously iterated ALL workspaces and broke on the first
+        # iteration even when 0 chunks were returned — that meant a doc in
+        # workspace[1] was never reachable if workspace[0] returned 0 chunks.
+        # Now: only search the workspaces that actually contain the documents.
+        # Bug fix 2: document_ids may contain str (not UUID) when passed through
+        # langgraph state — normalize to UUIDs before comparison.
+        from app.models.document import Document
+        normalized_doc_ids: list[uuid.UUID] = []
+        for d in document_ids:
+            if isinstance(d, str):
+                try:
+                    normalized_doc_ids.append(uuid.UUID(d))
+                except (ValueError, TypeError):
+                    continue
+            elif isinstance(d, uuid.UUID):
+                normalized_doc_ids.append(d)
+        if len(normalized_doc_ids) != len(document_ids):
+            logger.warning(
+                f"[RAG] UUID-scoped: {len(document_ids) - len(normalized_doc_ids)} "
+                f"of {len(document_ids)} doc id(s) were not valid UUIDs"
+            )
+        doc_ws_result = await db.execute(
+            select(Document.workspace_id, Document.id).where(
+                Document.id.in_(normalized_doc_ids)
+            )
+        )
+        doc_ws_map: dict[uuid.UUID, set[uuid.UUID]] = {}
+        for ws_id_val, doc_id_val in doc_ws_result:
+            doc_ws_map.setdefault(ws_id_val, set()).add(doc_id_val)
+        scoped_workspaces = [ws for ws in workspace_ids if ws in doc_ws_map]
+        if not scoped_workspaces:
+            logger.warning(
+                f"[RAG] UUID-scoped: none of {len(normalized_doc_ids)} doc(s) belong to "
+                f"user's {len(workspace_ids)} accessible workspace(s) — "
+                f"doc→workspace mapping: { {str(k)[:8]: len(v) for k, v in doc_ws_map.items()} }"
+            )
+        else:
+            logger.info(
+                f"[RAG] UUID-scoped: narrowed {len(workspace_ids)} → "
+                f"{len(scoped_workspaces)} workspace(s) containing the doc(s)"
+            )
+            for workspace_id in scoped_workspaces:
+                rag_service = get_rag_service(db, workspace_id)
+                if not isinstance(rag_service, HRAGService):
+                    continue
+                # Filter document_ids to only those in this workspace
+                ws_doc_ids = [
+                    d for d in normalized_doc_ids
+                    if d in doc_ws_map.get(workspace_id, set())
+                ]
+                if not ws_doc_ids:
+                    continue
                 try:
                     result = await rag_service.query_deep(
                         question=query,
                         top_k=min(top_k, 10),
-                        document_ids=document_ids,  # Hard filter: only these docs
+                        document_ids=ws_doc_ids,  # Hard filter: only these docs in this ws
                         mode=hrag_mode,
                         include_images=False,
                     )
@@ -510,7 +570,6 @@ async def _execute_search_documents(
                         f"[RAG] UUID-scoped query on workspace {workspace_id}: "
                         f"{len(result.chunks)} chunks"
                     )
-                    break  # Found results, no need to check other workspaces
                 except Exception as e:
                     logger.warning(
                         f"[RAG] UUID-scoped search failed on workspace {workspace_id}: {e}"

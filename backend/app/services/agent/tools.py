@@ -619,8 +619,9 @@ async def query_knowledge_graph(
         try:
             kg_service = get_kg_service(workspace_id=ws_id)
             # Use naive mode for entity lookup (faster than hybrid)
+            # Bug fix: LegalKGService.query() takes `question=`, not `query=`.
             kg_result = await kg_service.query(
-                query=entity,
+                question=entity,
                 mode="naive",
             )
             if kg_result and kg_result.strip():

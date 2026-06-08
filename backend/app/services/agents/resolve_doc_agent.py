@@ -100,6 +100,123 @@ _SECTION_PATTERNS = [
 
 
 # =============================================================================
+# Similar Documents Search (fuzzy title matching)
+# =============================================================================
+
+async def _search_similar_documents(
+    reference: str,
+    workspace_ids: list,
+    db,
+) -> list[dict]:
+    """
+    When no exact match is found, search for documents with similar titles.
+    Uses keyword extraction + fuzzy ILIKE matching on document_title and original_filename.
+    Returns top 5 similar documents sorted by keyword match score.
+    """
+    try:
+        from sqlalchemy import select, or_, func
+        from app.models.document import Document, DocumentStatus
+
+        # Extract meaningful keywords from the reference query
+        text = reference.strip()
+        for pat in _ACTION_PATTERNS:
+            text = re.sub(pat, "", text, flags=re.IGNORECASE).strip()
+
+        # Remove section references
+        for spat in _SECTION_PATTERNS:
+            text = re.sub(spat, "", text, flags=re.IGNORECASE).strip()
+
+        # Extract year to use as a filter (strong signal)
+        year_match = re.search(r'\b((?:19|20)\d{2})\b', text)
+        year = year_match.group(1) if year_match else None
+        if year_match:
+            text = (text[:year_match.start()] + text[year_match.end():]).strip()
+
+        # Remove document type keywords to isolate the title part
+        for keyword, _ in _DOC_TYPE_KEYWORDS:
+            text = re.sub(re.escape(keyword), "", text, count=1, flags=re.IGNORECASE).strip()
+
+        # Extract keywords
+        keywords = [
+            t for t in text.split()
+            if len(t) > 2 and t.lower() not in _LEGAL_STOPWORDS
+        ]
+
+        if not keywords:
+            return []
+
+        # Build fuzzy query on document titles
+        query = select(Document).where(
+            Document.workspace_id.in_(workspace_ids),
+            Document.status == DocumentStatus.INDEXED,
+        )
+
+        # Build OR conditions for each keyword (ILIKE partial match)
+        keyword_conditions = []
+        for kw in keywords[:6]:  # Limit to 6 keywords to avoid over-filtering
+            kw_lower = kw.lower()
+            keyword_conditions.append(
+                or_(
+                    Document.document_title.ilike(f"%{kw_lower}%"),
+                    Document.document_title.ilike(f"%{kw}%"),  # original case too
+                    Document.original_filename.ilike(f"%{kw_lower}%"),
+                    Document.original_filename.ilike(f"%{kw}%"),
+                )
+            )
+
+        if keyword_conditions:
+            query = query.where(or_(*keyword_conditions))
+
+        # Boost by year if available
+        if year:
+            query = query.where(Document.published_date.ilike(f"%{year}%"))
+
+        query = query.limit(10)
+        result = await db.execute(query)
+        docs = result.scalars().all()
+
+        # Score by how many keywords matched
+        scored: list[dict] = []
+        for doc in docs:
+            title_lower = (doc.document_title or "").lower()
+            filename_lower = (doc.original_filename or "").lower()
+            matched = 0
+            matched_keywords = []
+            for kw in keywords:
+                kw_lower = kw.lower()
+                if kw_lower in title_lower or kw_lower in filename_lower:
+                    matched += 1
+                    matched_keywords.append(kw)
+
+            if matched > 0:
+                score = matched / len(keywords)  # Ratio of matched keywords
+                scored.append({
+                    "document_id": str(doc.id),
+                    "title": doc.document_title or doc.original_filename or "",
+                    "document_number": doc.document_number or "",
+                    "published_date": doc.published_date or "",
+                    "score": score,
+                    "matched_keywords": matched_keywords,
+                })
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        logger.info(
+            f"[resolve_doc/similar] reference={reference[:80]!r} → "
+            f"keywords={keywords!r}, year={year!r}, found {len(scored)} similar documents"
+        )
+        for s in scored[:5]:
+            logger.info(
+                f"[resolve_doc/similar]   - {s['title'][:60]!r} "
+                f"(matched: {s['matched_keywords']}, score={s['score']:.2f})"
+            )
+        return scored[:5]
+
+    except Exception as e:
+        logger.warning(f"[resolve_doc/similar] search failed: {e}")
+        return []
+
+
+# =============================================================================
 # Helpers
 # =============================================================================
 
@@ -357,14 +474,17 @@ async def _query_db(
                     ])
                 query = query.where(or_(*agency_conds))
 
-        # ── 4. Title keywords — AND each kw (Dạng B: nhớ tên) ────────────
-        # Only apply when no number candidates (avoid over-filtering)
+        # ── 4. Title keywords — OR (any keyword match, Dạng B: nhớ tên) ──
+        # Use OR so documents matching ANY keyword (not all) are returned.
+        # Use AND only when the query has very few keywords (< 3) to avoid noise.
         if title_keywords and not doc_number_candidates:
-            for kw in title_keywords[:4]:
-                query = query.where(or_(
+            keyword_conds = []
+            for kw in title_keywords[:6]:  # Increase from 4 to 6
+                keyword_conds.append(or_(
                     Document.document_title.ilike(f"%{kw}%"),
                     Document.original_filename.ilike(f"%{kw}%"),
                 ))
+            query = query.where(or_(*keyword_conds))
 
         # ── 5. Year ───────────────────────────────────────────────────────
         if year and not doc_number_candidates:
@@ -397,11 +517,11 @@ async def _query_db(
             if issuing_agency_text:
                 agency_str = f"{doc.issuing_agency or ''} {doc.parent_agency or ''}".lower()
                 if any(t.lower() in agency_str for t in issuing_agency_text.split() if len(t) > 1):
-                    score += 0.25
+                    score += 0.15
 
             # Type match
             if doc_type_slug and doc.document_type and doc.document_type.slug == doc_type_slug:
-                score += 0.20
+                score += 0.25
 
             # Year match
             if year and doc.published_date and year in str(doc.published_date):
@@ -411,7 +531,7 @@ async def _query_db(
             if title_keywords:
                 title_str = f"{doc.document_title or ''} {doc.original_filename or ''}".lower()
                 matched = sum(1 for kw in title_keywords if kw.lower() in title_str)
-                score += 0.10 * (matched / len(title_keywords))
+                score += 0.25 * (matched / len(title_keywords))
 
             score = min(score, 1.0)
             scored.append({
@@ -445,44 +565,11 @@ async def _extract_by_llm(reference: str) -> dict:
     try:
         from app.services.llm import get_memory_agent
         from app.services.llm.types import LLMMessage
+        from app.prompts.agents.resolve_doc_prompt import build_extract_prompt
         import json
 
         llm = get_memory_agent()
-        prompt = (
-            "Bạn là chuyên gia tìm kiếm văn bản pháp luật Việt Nam.\n"
-            "Trích xuất metadata để search database. Trả về JSON duy nhất.\n\n"
-            "DATABASE SCHEMA (bảng documents):\n"
-            "  document_number  : Số ký hiệu, vd: 24/2018/QH14, 15/TT-BCA\n"
-            "  document_title   : Tiêu đề, vd: Luật An ninh mạng\n"
-            "  issuing_agency   : Cơ quan, vd: Bộ Công an, Chính phủ\n"
-            "  published_date   : Năm/ngày, vd: 2018, 2026-03-20\n"
-            "  document_type    : luat|bo_luat|nghi_dinh|thong_tu|quyet_dinh|nghi_quyet|phap_lenh|chi_thi|thong_tu_lien_tich\n\n"
-            "QUY TẮC SỐ VĂN BẢN VIỆT NAM:\n"
-            "  Luật (Quốc hội)      : [số]/[năm]/QH15  vd: 24/2018/QH14, 129/2025/QH15\n"
-            "  Nghị định (CP)       : [số]/[năm]/NĐ-CP vd: 83/2026/NĐ-CP\n"
-            "  Thông tư Bộ X        : [số]/[năm]/TT-[MÃ] vd: 15/2026/TT-BCA\n"
-            "  Quyết định UBND      : [số]/[năm]/QĐ-UBND\n"
-            "  Nghị quyết HĐND      : [số]/[năm]/NQ-HĐND\n"
-            "  Thông tư liên tịch   : [số]/[năm]/TTLT-[BỘ1]-[BỘ2]\n\n"
-            "MÃ CƠ QUAN: BCA=Công an|BTC=Tài chính|BCT=Công Thương|BTP=Tư pháp\n"
-            "            BYT=Y tế|BNV=Nội vụ|BGDĐT=Giáo dục|BXD=Xây dựng\n"
-            "            BGTVT=Giao thông|NHNN=Ngân hàng NN|CP=Chính phủ|TTg=Thủ tướng\n\n"
-            f"Câu hỏi: \"{reference}\"\n\n"
-            "Trả về JSON (chỉ JSON):\n"
-            '{"doc_type_slug":"","document_number":"","doc_number_candidates":[],'
-            '"title_keywords":[],"issuing_agency_text":"","year":"","section_reference":""}\n\n'
-            "Ví dụ 1 - nhớ số: \"Thông tư 15 của Bộ Công an\"\n"
-            '{"doc_type_slug":"thong_tu","document_number":"15/TT-BCA",'
-            '"doc_number_candidates":["15/TT-BCA","15/2025/TT-BCA","15/2026/TT-BCA"],'
-            '"title_keywords":[],"issuing_agency_text":"Bộ Công an","year":"","section_reference":""}\n'
-            "Ví dụ 2 - nhớ tên: \"Luật An ninh mạng 2018\"\n"
-            '{"doc_type_slug":"luat","document_number":"24/2018/QH14",'
-            '"doc_number_candidates":["24/2018/QH14"],'
-            '"title_keywords":["an ninh","mạng"],"issuing_agency_text":"Quốc hội","year":"2018","section_reference":""}\n'
-            "Ví dụ 3 - nhớ nội dung: \"Nghị định về xử phạt vi phạm giao thông\"\n"
-            '{"doc_type_slug":"nghi_dinh","document_number":"","doc_number_candidates":[],'
-            '"title_keywords":["xử phạt","vi phạm","giao thông"],"issuing_agency_text":"Chính phủ","year":"","section_reference":""}'
-        )
+        prompt = build_extract_prompt(reference)
         resp = await llm.acomplete(
             messages=[LLMMessage(role="user", content=prompt)],
             temperature=0.0,
@@ -660,7 +747,7 @@ async def resolve_doc_agent_node(state: "SupervisorState") -> dict:
                 obs.end()
             except Exception as e:
                 logger.warning(f"[langfuse] resolve_doc_agent span failed: {e}")
-        return _build_resolved_state(top, parsed, state.get("pending_intent"))
+        return _build_resolved_state(top, db_candidates, parsed, state.get("pending_intent"))
 
     # ── Stage 2: LLM fallback (memory agent, fast) ───────────────────────────
     llm_candidates: list[dict] = []
@@ -706,14 +793,46 @@ async def resolve_doc_agent_node(state: "SupervisorState") -> dict:
     # ── Evaluate & Route ──────────────────────────────────────────────────────
 
     if not all_candidates:
-        msg = (
-            f"Không tìm thấy văn bản phù hợp với **\"{reference}\"** trong kho tài liệu.\n\n"
-            "Bạn có thể:\n"
-            "- Cung cấp số văn bản chính xác (ví dụ: 53/2022/NĐ-CP)\n"
-            "- Cung cấp tên đầy đủ của văn bản\n"
-            "- Kiểm tra xem văn bản đã được tải lên chưa"
-        )
-        logger.info("[LANGGRAPH_DECISION] resolve_doc_agent decision: no candidates found")
+        # Try to find similar documents by title fuzzy matching
+        await push_event(state, "status", {
+            "step": "searching",
+            "detail": "Đang tìm văn bản tương tự...",
+        })
+        similar_docs = await _search_similar_documents(reference, workspace_ids, db)
+
+        if similar_docs:
+            # Build suggestion message with similar documents
+            similar_lines = [
+                f"\n\nKhông tìm thấy văn bản chính xác, nhưng có văn bản có tên tương tự:"
+            ]
+            for i, doc in enumerate(similar_docs[:5], 1):
+                title = doc.get("title", "")
+                num = doc.get("document_number", "")
+                date = doc.get("published_date", "")
+                matched = ", ".join(doc.get("matched_keywords", [])[:4])
+                line = f"{i}. **{title}**"
+                if num:
+                    line += f" (Số: {num})"
+                if date:
+                    line += f" - {date}"
+                if matched:
+                    line += f"\n   Từ khóa tương tự: {matched}"
+                similar_lines.append(line)
+
+            similar_lines.append("\nBạn có đang tìm một trong các văn bản trên không?")
+            msg = "\n".join(similar_lines)
+
+            logger.info(f"[LANGGRAPH_DECISION] resolve_doc_agent: no exact match, found {len(similar_docs)} similar documents")
+        else:
+            msg = (
+                f"Không tìm thấy văn bản phù hợp với **\"{reference}\"** trong kho tài liệu.\n\n"
+                "Bạn có thể:\n"
+                "- Cung cấp số văn bản chính xác (ví dụ: 53/2022/NĐ-CP)\n"
+                "- Cung cấp tên đầy đủ của văn bản\n"
+                "- Kiểm tra xem văn bản đã được tải lên chưa"
+            )
+            logger.info("[LANGGRAPH_DECISION] resolve_doc_agent decision: no candidates found")
+
         await push_event(state, "token", msg)
         if langfuse:
             try:
@@ -805,10 +924,58 @@ async def resolve_doc_agent_node(state: "SupervisorState") -> dict:
             obs.end()
         except Exception as e:
             logger.warning(f"[langfuse] resolve_doc_agent span failed: {e}")
-    return _build_resolved_state(top, parsed, state.get("pending_intent"))
+    return _build_resolved_state(top, all_candidates, parsed, state.get("pending_intent"))
 
 
-def _build_resolved_state(top: dict, parsed: dict, pending_intent: str | None = None) -> dict:
+def _build_medium_confidence_state(top: dict, all_candidates: list, parsed: dict, pending_intent: str | None = None) -> dict:
+    """
+    Build state for medium confidence matches (score 0.30 - 0.59).
+    Shows all similar documents and asks user to confirm which one they want.
+    """
+    from app.services.agents.models import AgentType
+    from app.services.agent.streaming import push_event, get_current_db
+
+    doc_id = top.get("document_id")
+    top_score = top.get("score", 0.0)
+    section_ref = top.get("section_reference") or parsed.get("section_reference") or ""
+
+    logger.info(
+        f"[LANGGRAPH_DECISION] resolve_doc_agent MEDIUM confidence → top_score={top_score:.2f}, "
+        f"total_candidates={len(all_candidates)}"
+    )
+
+    # Show all candidates (not just top one) for user to choose
+    lines = [
+        f"Tìm thấy **{len(all_candidates)} văn bản** có thể phù hợp:"
+    ]
+    for i, c in enumerate(all_candidates[:5], 1):
+        title = c.get("title", "văn bản")
+        num = c.get("document_number", "")
+        score_val = c.get("score", 0.0)
+        label = f"{i}. **{title}**"
+        if num:
+            label += f" (Số: {num})"
+        label += f" - Độ chính xác: {score_val:.0%}"
+        lines.append(label)
+
+    lines.append("")
+    lines.append("Bạn đang tìm văn bản nào? Vui lòng chỉ định số thứ tự.")
+
+    clarify_msg = "\n".join(lines)
+
+    return {
+        "final_answer": clarify_msg,
+        "next_agent": AgentType.FINISH,
+        "sources": [],
+        # Keep all document_ids so user can choose
+        "document_ids": [c.get("document_id") for c in all_candidates[:5] if c.get("document_id")],
+        "section_reference": section_ref,
+        "resolve_doc_ambiguous": True,
+        "should_loop_back": False,
+    }
+
+
+def _build_resolved_state(top: dict, all_candidates: list, parsed: dict, pending_intent: str | None = None) -> dict:
     """Build the state update dict for a successfully resolved document."""
     from app.services.agents.models import AgentType
 
@@ -825,15 +992,16 @@ def _build_resolved_state(top: dict, parsed: dict, pending_intent: str | None = 
         f"pending_intent={pending_intent!r}"
     )
 
-    # Confidence threshold: if score is very low, don't scope search to this document.
-    # This prevents false narrowing when resolve_doc picks a wrong document.
-    LOW_CONFIDENCE_THRESHOLD = 0.30
-    if score < LOW_CONFIDENCE_THRESHOLD:
+    # Confidence thresholds for decision making
+    HIGH_CONFIDENCE_THRESHOLD = 0.60   # Accept & resolve
+    MEDIUM_CONFIDENCE_THRESHOLD = 0.30  # Ask user for confirmation
+
+    if score < MEDIUM_CONFIDENCE_THRESHOLD:
+        # LOW confidence: don't scope search to this document
         logger.warning(
-            f"[resolve_doc_agent] Low confidence score={score:.2f} < {LOW_CONFIDENCE_THRESHOLD} "
+            f"[resolve_doc_agent] Low confidence score={score:.2f} < {MEDIUM_CONFIDENCE_THRESHOLD} "
             f"for doc_id={doc_id}, title={title!r} — will NOT scope search to this document"
         )
-        # Clear document_ids so rag_agent searches across all workspaces
         resolved: dict = {
             "document_ids": [],  # Don't scope — low confidence
             "section_reference": section_ref,
@@ -842,7 +1010,8 @@ def _build_resolved_state(top: dict, parsed: dict, pending_intent: str | None = 
             "next_agent": AgentType.ANSWER_GENERATOR,
             "should_loop_back": False,
         }
-    else:
+    elif score >= HIGH_CONFIDENCE_THRESHOLD:
+        # HIGH confidence: resolve document normally
         resolved: dict = {
             "document_ids": [doc_id] if doc_id else [],
             "section_reference": section_ref,
@@ -852,11 +1021,21 @@ def _build_resolved_state(top: dict, parsed: dict, pending_intent: str | None = 
             "next_agent": AgentType.ANSWER_GENERATOR,
             "should_loop_back": False,
         }
+    else:
+        # MEDIUM confidence (0.30 - 0.59): ask user for confirmation
+        return _build_medium_confidence_state(top, all_candidates, parsed, pending_intent)
 
     if section_ref:
         resolved["intent"] = "search_section"
         resolved["next_agent"] = AgentType.RAG
         logger.info(f"[resolve_doc_agent] Has section_ref → rag/search_section")
+    elif pending_intent == "search_section" and not section_ref:
+        # section_ref is empty but pending_intent was search_section
+        # Fall back to 'search' with document_ids to find content within the resolved document
+        resolved["intent"] = "search"
+        resolved["pending_intent"] = "search"  # Clear search_section to allow routing to rag
+        resolved["next_agent"] = AgentType.RAG
+        logger.info(f"[resolve_doc_agent] search_section but no section_ref → fall back to search within doc")
     elif pending_intent:
         # Phase 4: Respect pending_intent from supervisor plan
         resolved["intent"] = pending_intent

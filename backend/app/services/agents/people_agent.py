@@ -231,7 +231,6 @@ async def people_agent_node(state: SupervisorState) -> dict:
             "mongo_results": all_persons,
             "kg_summaries": all_summaries,
             "final_answer": final_display,
-            "iterations": state.get("iterations", 0) + 1,
         }
 
     except Exception as e:
@@ -249,5 +248,4 @@ async def people_agent_node(state: SupervisorState) -> dict:
                 pass
         return {
             "kg_summaries": [f"Lỗi tìm kiếm: {str(e)}"],
-            "iterations": state.get("iterations", 0) + 1,
         }

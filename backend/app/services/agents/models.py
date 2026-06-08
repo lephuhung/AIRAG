@@ -36,7 +36,7 @@ class Intent:
     WRITE_FORMAT_CHECK = "write_format_check"
     MONGO_SEARCH_CCCD = "mongo_search_cccd"
     MONGO_SEARCH_NAME = "mongo_search_name"
-    MONGO_SEARCH_BHxh = "mongo_search_bhxh"
+    MONGO_SEARCH_BHXH = "mongo_search_bhxh"
     MONGO_SEARCH_PHONE = "mongo_search_phone"
     MONGO_SEARCH_ADVANCED = "mongo_search_advanced"
 
@@ -45,7 +45,7 @@ class Intent:
         SEARCH_DOC_NUM, SEARCH_ABBR, SEARCH_SECTION, RESOLVE_DOC,
         WRITE_SUMMARIZE, WRITE_SUGGEST_EDITS,
         WRITE_GRAMMAR_CHECK, WRITE_FORMAT_CHECK, MONGO_SEARCH_CCCD,
-        MONGO_SEARCH_NAME, MONGO_SEARCH_BHxh, MONGO_SEARCH_PHONE,
+        MONGO_SEARCH_NAME, MONGO_SEARCH_BHXH, MONGO_SEARCH_PHONE,
         MONGO_SEARCH_ADVANCED,
     }
 
@@ -83,7 +83,7 @@ INTENT_TO_AGENT: dict[str, str] = {
     Intent.SEARCH_SECTION: AgentType.RAG,
     Intent.MONGO_SEARCH_CCCD: AgentType.PEOPLE,
     Intent.MONGO_SEARCH_NAME: AgentType.PEOPLE,
-    Intent.MONGO_SEARCH_BHxh: AgentType.PEOPLE,
+    Intent.MONGO_SEARCH_BHXH: AgentType.PEOPLE,
     Intent.MONGO_SEARCH_PHONE: AgentType.PEOPLE,
     Intent.MONGO_SEARCH_ADVANCED: AgentType.PEOPLE,
     Intent.WRITE_SUMMARIZE: AgentType.WRITE,

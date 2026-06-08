@@ -851,8 +851,7 @@ async def rag_agent_node(state: SupervisorState) -> dict:
         if images:
             await push_event(state, "images", images)
 
-        # Add iteration count
-        updates["iterations"] = state.get("iterations", 0) + 1
+        # NOTE: Only supervisor increments iterations — sub-agents pass through
 
         logger.info(
             f"[LANGGRAPH_DECISION] rag_agent_node completed: sources={len(sources)}, "
@@ -865,5 +864,4 @@ async def rag_agent_node(state: SupervisorState) -> dict:
         logger.error(f"[rag_agent] tool {intent} failed: {e}", exc_info=True)
         return {
             "kg_summaries": [f"Lỗi tìm kiếm: {str(e)}"],
-            "iterations": state.get("iterations", 0) + 1,
         }

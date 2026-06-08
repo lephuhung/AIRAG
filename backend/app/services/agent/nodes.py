@@ -514,27 +514,39 @@ async def answer_generator(state: "AgentState") -> dict:
     # Phase 3.6: Intent-aware thinking trigger
     # Rules (override supervisor's blanket decision with finer-grained logic):
     # - Complex synthesis intents (kg_query, summarize, search_section) → always think
-    # - Simple extraction (search, search_doc_num, list_docs) → think only if >= 3 sources
+    # - Simple extraction intents (search, search_doc_num, list_docs, resolve_doc):
+    #     * Single / few-doc query (len(document_ids) <= 2) → no thinking
+    #       Rationale: extractive answer from a single document, no synthesis needed.
+    #       Skipping thinking removes the 5–15s "no progress" gap that broke the
+    #       streaming UX.
+    #     * Multi-doc synthesis (len(document_ids) > 2) → thinking helps
+    #       The LLM needs to compare/contrast across 3+ documents, structure themes.
     # - Abbreviation / greeting / direct → no thinking needed
     _ALWAYS_THINK_INTENTS = {"kg_query", "summarize", "search_section"}
     _SIMPLE_INTENTS = {"search", "search_doc_num", "list_docs", "resolve_doc"}
     _NO_THINK_INTENTS = {"search_abbr", "greeting", "personal"}
     source_count = len(sources) + len(kg_summaries)
+    doc_ids_count = len(state.get("document_ids") or [])
 
     if intent in _ALWAYS_THINK_INTENTS:
         enable_thinking = True
         logger.info(f"[answer_generator] Thinking FORCED for complex intent: {intent!r}")
     elif intent in _NO_THINK_INTENTS:
         enable_thinking = False
-        logger.info(f"[answer_generator] Thinking DISABLED for simple intent: {intent!r}")
+        logger.info(f"[answer_generator] Thinking DISABLED for {intent!r} (no-think intent)")
     elif intent in _SIMPLE_INTENTS:
-        # For simple intents: think only when many sources need synthesis
-        if source_count < 3:
-            enable_thinking = False
-            logger.info(f"[answer_generator] Thinking disabled: {intent!r} with {source_count} sources")
-        else:
+        if doc_ids_count > 2:
             enable_thinking = True
-            logger.info(f"[answer_generator] Thinking enabled: {intent!r} with {source_count} sources")
+            logger.info(
+                f"[answer_generator] Thinking ENABLED for {intent!r} "
+                f"(multi-doc synthesis: {doc_ids_count} docs)"
+            )
+        else:
+            enable_thinking = False
+            logger.info(
+                f"[answer_generator] Thinking DISABLED for {intent!r} "
+                f"(single/few-doc query: {doc_ids_count} docs, {source_count} sources)"
+            )
     else:
         # Unknown/write intents: keep supervisor decision
         logger.info(f"[answer_generator] Using supervisor thinking decision: {enable_thinking} for {intent!r}")

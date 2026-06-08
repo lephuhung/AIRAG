@@ -68,7 +68,7 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 UPLOAD_DIR = settings.BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".docx", ".doc", ".pptx"}
+ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".docx", ".pptx"}
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
 # MIME type mapping for common extensions
@@ -77,7 +77,6 @@ _EXT_TO_MIME: dict[str, str] = {
     ".txt": "text/plain",
     ".md": "text/markdown",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    ".doc": "application/msword",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
 }
 
