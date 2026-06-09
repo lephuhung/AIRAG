@@ -283,6 +283,8 @@ async def _disambiguate_multi_meaning_abbrs(
     """LLM-based disambiguation for abbreviations with multiple meanings.
 
     Uses memory agent (Qwen3-4B) to infer which meaning fits the context.
+    OPTIMIZED: Batches ALL abbreviations into a single LLM call instead of
+    calling the LLM once per abbreviation (saves ~1s × N sequential calls).
 
     Returns:
         (expanded_text_addition, chosen_map, low_confidence_abbrs)
@@ -296,35 +298,46 @@ async def _disambiguate_multi_meaning_abbrs(
     from app.services.llm import get_memory_agent
     from app.services.llm.types import LLMMessage as _LLMMsg
     from app.prompts.agents.disambiguation_prompt import (
-        build_disambiguation_prompt,
+        build_batch_disambiguation_prompt,
     )
 
     chosen_map: dict[str, str] = {}
     low_confidence_abbrs: list[str] = []
 
-    for abbr, meanings in multi_meaning_map.items():
-        sys_prompt, user_prompt = build_disambiguation_prompt(abbr, meanings, user_message)
-        try:
-            agent = get_memory_agent()
-            resp_text = ""
-            async for chunk in agent.astream(
-                [_LLMMsg(role="user", content=user_prompt)],
-                system_prompt=sys_prompt,
-                temperature=0.0,
-                max_tokens=120,
-            ):
-                if hasattr(chunk, "text") and chunk.text:
-                    resp_text += chunk.text
+    # Build a single prompt for ALL abbreviations at once
+    sys_prompt, user_prompt = build_batch_disambiguation_prompt(
+        multi_meaning_map, user_message
+    )
 
-            import json as _json
-            # Strip markdown fences if present
-            clean = resp_text.strip()
-            if "```" in clean:
-                clean = clean.split("```")[-2].strip() if clean.count("```") >= 2 else clean.replace("```json", "").replace("```", "").strip()
-            result = _json.loads(clean)
-            confidence = result.get("confidence", "low")
-            chosen = result.get("chosen", "")
-            reasoning = result.get("reasoning", "")
+    try:
+        agent = get_memory_agent()
+        resp_text = ""
+        async for chunk in agent.astream(
+            [_LLMMsg(role="user", content=user_prompt)],
+            system_prompt=sys_prompt,
+            temperature=0.0,
+            max_tokens=256,
+        ):
+            if hasattr(chunk, "text") and chunk.text:
+                resp_text += chunk.text
+
+        import json as _json
+        # Strip thinking tags and markdown fences
+        clean = resp_text.strip()
+        import re as _re_disamb
+        clean = _re_disamb.sub(r'<think>.*?</think>', '', clean, flags=_re_disamb.DOTALL).strip()
+        if "```" in clean:
+            clean = clean.split("```")[-2].strip() if clean.count("```") >= 2 else clean.replace("```json", "").replace("```", "").strip()
+
+        result = _json.loads(clean)
+        # Result format: {"results": [{"abbr": ..., "chosen": ..., "confidence": ..., "reasoning": ...}, ...]}
+        results_list = result.get("results", [])
+
+        for item in results_list:
+            abbr = item.get("abbr", "")
+            confidence = item.get("confidence", "low")
+            chosen = item.get("chosen", "")
+            reasoning = item.get("reasoning", "")
 
             if confidence == "high" and chosen:
                 chosen_map[abbr] = chosen
@@ -336,9 +349,11 @@ async def _disambiguate_multi_meaning_abbrs(
                 logger.info(
                     f"[disambig] {abbr!r}: low confidence, will ask user. reasoning={reasoning!r}"
                 )
-        except Exception as e:
-            logger.warning(f"[disambig] Failed for {abbr!r}: {e}")
-            low_confidence_abbrs.append(abbr)
+
+    except Exception as e:
+        logger.warning(f"[disambig] Batch disambiguation failed: {e}")
+        # Fallback: mark all as low confidence
+        low_confidence_abbrs.extend(multi_meaning_map.keys())
 
     # Build expansion text for chosen abbrs
     expansion_parts = [f"{abbr}={full}" for abbr, full in chosen_map.items()]
@@ -488,6 +503,23 @@ def _parse_supervisor_response(raw: str) -> dict:
 # =============================================================================
 
 
+# Heuristic keywords that hint at multi-step / complex queries
+_COMPLEX_QUERY_KEYWORDS: frozenset[str] = frozenset({
+    "so sánh", "khác nhau", "giống nhau", "phân biệt",
+    "liệt kê", "tất cả", "từng",
+    "và", "với", "cùng",  # conjunctions linking multiple entities
+})
+
+# Patterns that suggest a comparison or multi-doc query
+_MULTI_DOC_PATTERN: re.Pattern[str] = re.compile(
+    r"(?:"
+    r"so\s+sánh|khác\s+(?:nhau|gì|biệt)|giống\s+nhau"
+    r"|(?:luật|nghị\s+định|thông\s+tư|nđ|tt|qđ).*?(?:và|với|so\s+với).*?(?:luật|nghị\s+định|thông\s+tư|nđ|tt|qđ)"
+    r")",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
 async def query_analyzer_node(state: SupervisorState) -> dict:
     """Analyze user query to extract structured metadata BEFORE supervisor routing.
 
@@ -496,7 +528,9 @@ async def query_analyzer_node(state: SupervisorState) -> dict:
     - extracted_params : doc names, sections, IDs for precise tool invocation
     - query_complexity : determines if single-agent or multi-agent needed
 
-    For very short messages (greetings, <10 chars) we skip analysis entirely.
+    OPTIMIZATION: Uses lightweight heuristic to fast-path simple queries
+    (skips LLM call, saves ~1-2s). Only invokes LLM for queries that
+    heuristically look complex (comparisons, multi-doc references).
     """
     user_message = _extract_user_message(state)
     logger.info(f"[LANGGRAPH_NODE] Entering query_analyzer_node with query: {user_message!r}")
@@ -507,6 +541,18 @@ async def query_analyzer_node(state: SupervisorState) -> dict:
     # Skip analysis on loop-back (already analyzed on first pass)
     if state.get("iterations", 0) >= 1:
         return {}
+
+    # ── Fast-path heuristic: skip LLM for simple queries ─────────────────
+    # Only call the LLM analyzer if the query looks like it could be
+    # multi-step or comparative. This saves ~1-2s for ~80% of queries.
+    msg_lower = user_message.lower()
+    looks_complex = _MULTI_DOC_PATTERN.search(msg_lower) is not None
+
+    if not looks_complex:
+        logger.info("[query_analyzer] Fast-path: simple query (no complex heuristic match), skipping LLM")
+        return {"query_complexity": "simple", "sub_queries": None, "extracted_params": None}
+
+    logger.info("[query_analyzer] Complex heuristic matched — invoking LLM for detailed analysis")
 
     try:
         from app.services.llm.types import LLMMessage as _LLMMsg
@@ -736,7 +782,7 @@ async def supervisor_node(state: SupervisorState) -> dict:
                 analyzer_context=_analyzer_context,
             ),
             temperature=0.0,
-            max_tokens=512,
+            max_tokens=256,  # JSON output ~100-150 tokens; reduced from 512 to save latency
             think=False,  # Disable thinking to reduce latency for classification
         ):
             if hasattr(chunk, "text") and chunk.text:
@@ -930,32 +976,25 @@ async def supervisor_node(state: SupervisorState) -> dict:
             await push_event(state, "clarification", {"message": clarification_message})
             logger.info(f"[supervisor] Clarification needed for: {list(multi_meaning_map.keys())}")
 
-        # Smart thinking decision: RAG tasks don't need thinking (just retrieval),
-        # but complex synthesis with many sources or personal tasks benefit from it
-        thinking_intents = {"greeting", "personal", "write_suggest_edits", "write_grammar_check"}
-        rag_intents = {"search", "list_docs", "summarize", "kg_query", "search_doc_num", "resolve_doc", "search_section", "search_abbr"}
+        # Complexity-aware thinking decision.
+        # Thinking is ONLY enabled when:
+        #   1. query_complexity != "simple" (multi-step, comparison queries), OR
+        #   2. intent = "kg_query" (always needs reasoning for graph relationships)
+        # This replaces the old logic that checked source_count >= 5
+        # (which was dead code — sources are always empty at supervisor time).
         intent = decision["intent"]
+        complexity = state.get("query_complexity", "simple")
+        is_complex = complexity != "simple"
 
-        # Check if user has personal memory from Graphiti - needs thinking to incorporate
-        user_memory_context = state.get("user_memory_context", "")
-        has_memory = bool(user_memory_context and "No relevant memories" not in user_memory_context)
-
-        if intent in thinking_intents:
+        if intent == "kg_query":
             result["enable_thinking"] = True
-        elif has_memory and intent in {"personal", "greeting"}:
-            # Only enable thinking for personal memory if intent requires synthesis (e.g. personal/greeting)
+            logger.info(f"[supervisor] Thinking ENABLED for kg_query (always-think intent)")
+        elif is_complex:
             result["enable_thinking"] = True
-            logger.info(f"[supervisor] Thinking enabled for {intent} with personal memory")
-        elif intent in rag_intents:
-            # RAG tasks: check source count - many results benefit from thinking to synthesize
-            source_count = len(state.get("sources", [])) + len(state.get("kg_summaries", []))
-            if source_count >= 5:
-                result["enable_thinking"] = True  # Complex synthesis needed
-                logger.info(f"[supervisor] Thinking enabled for {intent} with {source_count} sources")
-            else:
-                result["enable_thinking"] = False  # Simple retrieval
+            logger.info(f"[supervisor] Thinking ENABLED for {intent!r} (complexity={complexity!r})")
         else:
             result["enable_thinking"] = False
+            logger.info(f"[supervisor] Thinking DISABLED for {intent!r} (simple query)")
 
         # Determine search_mode based on intent (Phase 1: Smart RAG Routing)
         # kg_query → kg only; search/summarize/search_doc_num → vector only; else → hybrid

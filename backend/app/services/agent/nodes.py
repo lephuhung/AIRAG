@@ -511,45 +511,40 @@ async def answer_generator(state: "AgentState") -> dict:
     new_sources = []
     new_images = []
 
-    # Phase 3.6: Intent-aware thinking trigger
-    # Rules (override supervisor's blanket decision with finer-grained logic):
-    # - Complex synthesis intents (kg_query, summarize, search_section) → always think
-    # - Simple extraction intents (search, search_doc_num, list_docs, resolve_doc):
-    #     * Single / few-doc query (len(document_ids) <= 2) → no thinking
-    #       Rationale: extractive answer from a single document, no synthesis needed.
-    #       Skipping thinking removes the 5–15s "no progress" gap that broke the
-    #       streaming UX.
-    #     * Multi-doc synthesis (len(document_ids) > 2) → thinking helps
-    #       The LLM needs to compare/contrast across 3+ documents, structure themes.
-    # - Abbreviation / greeting / direct → no thinking needed
-    _ALWAYS_THINK_INTENTS = {"kg_query", "summarize", "search_section"}
-    _SIMPLE_INTENTS = {"search", "search_doc_num", "list_docs", "resolve_doc"}
+    # Complexity-aware thinking trigger (optimized for latency).
+    #
+    # Design principle: thinking should only activate when the LLM genuinely
+    # needs step-by-step reasoning. For most RAG queries, the answer is
+    # extractive (copy-from-source), so thinking just adds 5-15s blank delay.
+    #
+    # Rules:
+    #   1. kg_query → ALWAYS think (graph relationships need multi-hop reasoning)
+    #   2. Complex queries (query_complexity != "simple") → think
+    #      This covers multi-step, comparison, and synthesis queries.
+    #   3. Everything else → NO thinking (fast extractive path)
+    _ALWAYS_THINK_INTENTS = {"kg_query"}
     _NO_THINK_INTENTS = {"search_abbr", "greeting", "personal"}
-    source_count = len(sources) + len(kg_summaries)
-    doc_ids_count = len(state.get("document_ids") or [])
+    query_complexity = state.get("query_complexity", "simple")
+    is_complex_query = query_complexity != "simple"
 
     if intent in _ALWAYS_THINK_INTENTS:
         enable_thinking = True
-        logger.info(f"[answer_generator] Thinking FORCED for complex intent: {intent!r}")
+        logger.info(f"[answer_generator] Thinking FORCED for {intent!r} (always-think intent)")
     elif intent in _NO_THINK_INTENTS:
         enable_thinking = False
         logger.info(f"[answer_generator] Thinking DISABLED for {intent!r} (no-think intent)")
-    elif intent in _SIMPLE_INTENTS:
-        if doc_ids_count > 2:
-            enable_thinking = True
-            logger.info(
-                f"[answer_generator] Thinking ENABLED for {intent!r} "
-                f"(multi-doc synthesis: {doc_ids_count} docs)"
-            )
-        else:
-            enable_thinking = False
-            logger.info(
-                f"[answer_generator] Thinking DISABLED for {intent!r} "
-                f"(single/few-doc query: {doc_ids_count} docs, {source_count} sources)"
-            )
+    elif is_complex_query:
+        enable_thinking = True
+        logger.info(
+            f"[answer_generator] Thinking ENABLED for {intent!r} "
+            f"(complex query: complexity={query_complexity!r})"
+        )
     else:
-        # Unknown/write intents: keep supervisor decision
-        logger.info(f"[answer_generator] Using supervisor thinking decision: {enable_thinking} for {intent!r}")
+        enable_thinking = False
+        logger.info(
+            f"[answer_generator] Thinking DISABLED for {intent!r} "
+            f"(simple query, fast extractive path)"
+        )
 
     # DEBUG: Log state at start of answer_generator
     logger.info(
