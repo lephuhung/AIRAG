@@ -46,10 +46,15 @@ async def handle_caption(payload: dict) -> None:
     logger.info(f"[caption_worker] doc={msg.document_id}")
 
     async with async_session_maker() as db:
+        # NOTE: no SELECT ... FOR UPDATE here. Captioning issues many (slow)
+        # vision-LLM calls; holding a row lock across them would block the
+        # embed/kg workers' final UPDATE on the same Document row until
+        # captioning finishes, serialising the "parallel" pipeline and causing
+        # spurious embed/kg timeouts. Like kg_worker, we rely on the captions_done
+        # idempotency check instead — captioning is idempotent (already-captioned
+        # images/tables are skipped) and check_and_finalize serialises promotion.
         result = await db.execute(
-            select(Document)
-            .where(Document.id == msg.document_id)
-            .with_for_update()
+            select(Document).where(Document.id == msg.document_id)
         )
         document = result.scalar_one_or_none()
         if document is None:

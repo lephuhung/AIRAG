@@ -190,9 +190,9 @@ async def _run_kg_worker() -> None:
                             )
                             resp = await session.get(
                                 url,
-                                auth=httpx.Auth(
+                                auth=httpx.BasicAuth(
                                     settings.RABBITMQ_MANAGEMENT_USER,
-                                    settings.RABBITMQ_MANAGEMENT_PASSWORD,
+                                    settings.RABBITMQ_MANAGEMENT_PASS,
                                 ),
                             )
                             if resp.status_code == 200:

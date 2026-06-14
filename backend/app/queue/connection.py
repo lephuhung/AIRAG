@@ -399,7 +399,13 @@ async def consume(
             )
             async with queue.iterator() as messages:
                 async for message in messages:
-                    async with message.process(requeue=False):
+                    # ignore_processed=True: we ack/reject manually in the
+                    # failure branches below. Without it, aio_pika's context
+                    # manager ack()s AGAIN on clean exit (it does not check
+                    # `processed` when ignore_processed is False) → raises
+                    # MessageProcessError, which kills the iterator and, after
+                    # 10 such failures, abandons the queue entirely.
+                    async with message.process(requeue=False, ignore_processed=True):
                         headers = message.headers or {}
                         retry_count = int(headers.get("x-retry-count", 0))
                         document_id = "unknown"
@@ -596,6 +602,11 @@ async def consume(
                                 except Exception as dlq_err:
                                     logger.error(f"[{queue_name}] Failed to send to DLQ: {dlq_err}")
                                     await message.ack()  # fallback: ack to prevent infinite loop
+
+                    # A message was handled without the iterator blowing up —
+                    # reset the consecutive-failure counter so the abandon guard
+                    # below only trips on 10 *consecutive* iterator failures.
+                    restart_count = 0
             logger.warning(
                 f"queue_iterator exhausted unexpectedly — reconnecting",
                 extra={"queue_name": queue_name},
