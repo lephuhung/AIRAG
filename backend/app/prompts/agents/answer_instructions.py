@@ -130,6 +130,35 @@ _THINKING_DIRECTIVE = (
     "Vạch ra dàn ý nhanh (ví dụ: 'Dùng [a1] (mới nhất) để trả lời chính, dùng [b2] (cũ) để đối chiếu thay đổi').\n"
 )
 
+# =============================================================================
+# COMPARISON — Injected when user asks "X của tôi có thể Y không?" type questions
+# =============================================================================
+
+_COMPARISON_INSTRUCTION = (
+    "\n## COMPARISON TASK — REQUIRED\n"
+    "When user asks a COMPARISON question — such as:\n"
+    "  'Thiết bị của tôi có thể dùng để Y không?'\n"
+    "  'Đơn vị tôi có đủ điều kiện Z không?'\n"
+    "  'Tôi có thể dùng X để soạn thảo tài liệu Y không?'\n"
+    "You MUST perform a COMPARISON instead of summarizing documents:\n\n"
+    "Step 1: Extract USER CONTEXT from the memory section above.\n"
+    "         Examples: device type, OS, organization, role, location.\n"
+    "         Cite memories as [MEM-1], [MEM-2], etc.\n\n"
+    "Step 2: Extract REQUIREMENTS from the retrieved documents.\n"
+    "         Examples: required OS, minimum specs, required software.\n"
+    "         Cite documents as [doc_id].\n\n"
+    "Step 3: Compare explicitly — does the user's context meet the requirements?\n"
+    "         Answer must be one of:\n"
+    "           ✅ YES — if user context meets all requirements\n"
+    "           ❌ NO — if user context fails any critical requirement\n"
+    "           ⚠️ PARTIALLY — if user context meets some but not all\n\n"
+    "Step 4: Explain WHY for each key requirement.\n\n"
+    "IMPORTANT: If NO memory about the user is available (no [MEM-] citations),\n"
+    "say 'Tôi không có thông tin về thiết bị/tổ chức của bạn trong bộ nhớ. "
+    "Vui lòng cung cấp thông tin để tôi so sánh.' Do NOT guess or assume.\n"
+    "DO NOT just summarize the documents — you MUST perform the comparison.\n"
+)
+
 
 # =============================================================================
 # Intent → Instructions mapping
@@ -149,17 +178,19 @@ _MONGO_INTENTS = {
 }
 
 
-def get_instructions_for_intent(intent: str, enable_thinking: bool = False) -> str:
+def get_instructions_for_intent(intent: str, enable_thinking: bool = False, needs_comparison: bool = False) -> str:
     """
     Return the appropriate INSTRUCTIONS string for the given intent.
 
     Composes BASE + intent-specific modules to minimize token usage
     while preserving all safety rules relevant to the intent.
     When enable_thinking=True, appends _THINKING_DIRECTIVE to guide structured reasoning.
+    When needs_comparison=True, appends _COMPARISON_INSTRUCTION to force comparison mode.
 
     Args:
         intent: The classified intent string (e.g. "search", "mongo_search_cccd")
         enable_thinking: Whether extended thinking is active (injects reasoning guide)
+        needs_comparison: Whether this is a comparison question ("X của tôi có thể Y không?")
 
     Returns:
         Composed INSTRUCTIONS string ready to inject into the prompt.
@@ -182,5 +213,9 @@ def get_instructions_for_intent(intent: str, enable_thinking: bool = False) -> s
     # This guides the LLM to perform structured analysis instead of restating sources
     if enable_thinking:
         parts.append(_THINKING_DIRECTIVE)
+
+    # Inject comparison instruction when user asks "X của tôi có thể Y không?" type question
+    if needs_comparison:
+        parts.append(_COMPARISON_INSTRUCTION)
 
     return "".join(parts)

@@ -27,6 +27,51 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _format_doc_title(doc_title: str | None, original_filename: str | None) -> str:
+    """
+    Format document title for display.
+
+    If doc_title is set and non-empty → use it.
+    Otherwise → format original_filename into readable title:
+      - Strip file extension (.pdf, .docx, etc.)
+      - Replace underscores/hyphens with spaces
+      - Title-case each word
+      - Handle common patterns like "luat117_2025" → "Luật 117/2025"
+    """
+    if doc_title and doc_title.strip():
+        return doc_title.strip()
+
+    if not original_filename:
+        return "Văn bản không tên"
+
+    # Strip extension
+    import os
+    name = os.path.splitext(original_filename)[0]
+
+    # Handle patterns like "luat117_2025", "nd13_2023", "tt15_2024"
+    # Extract number and year if present
+    num_match = re.search(r'(luat|nd|tt|nq|qd|pl|bl)[_\s]*(\d+)', name, re.IGNORECASE)
+    year_match = re.search(r'(20\d{2})', name)
+
+    if num_match and year_match:
+        doc_type = num_match.group(1).upper()
+        num = num_match.group(2)
+        year = year_match.group(1)
+        type_map = {"LUAT": "Luật", "ND": "Nghị định", "TT": "Thông tư",
+                    "NQ": "Nghị quyết", "QD": "Quyết định", "PL": "Pháp lệnh", "BL": "Bộ luật"}
+        type_str = type_map.get(doc_type, doc_type)
+        return f"{type_str} {num}/{year}"
+
+    # Fallback: replace separators with spaces, title case
+    name = re.sub(r'[_\-]+', ' ', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    if len(name) > 2:
+        name = name.title()
+
+    return name if name else "Văn bản không tên"
+
+
 # ---------------------------------------------------------------------------
 # Document type keyword → slug mapping (longest match first)
 # ---------------------------------------------------------------------------
@@ -192,7 +237,7 @@ async def _search_similar_documents(
                 score = matched / len(keywords)  # Ratio of matched keywords
                 scored.append({
                     "document_id": str(doc.id),
-                    "title": doc.document_title or doc.original_filename or "",
+                    "title": _format_doc_title(doc.document_title, doc.original_filename),
                     "document_number": doc.document_number or "",
                     "published_date": doc.published_date or "",
                     "score": score,
@@ -536,7 +581,7 @@ async def _query_db(
             score = min(score, 1.0)
             scored.append({
                 "document_id": str(doc.id),
-                "title": doc.document_title or doc.original_filename or "",
+                "title": _format_doc_title(doc.document_title, doc.original_filename),
                 "document_number": doc.document_number or "",
                 "score": score,
                 "strategy": "db_query",

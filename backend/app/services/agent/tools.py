@@ -28,6 +28,51 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _format_doc_title(doc_title: str | None, original_filename: str | None) -> str:
+    """
+    Format document title for display.
+
+    If doc_title is set and non-empty → use it.
+    Otherwise → format original_filename into readable title:
+      - Strip file extension (.pdf, .docx, etc.)
+      - Replace underscores/hyphens with spaces
+      - Title-case each word
+      - Handle common patterns like "luat117_2025" → "Luật 117/2025"
+    """
+    import re
+    import os
+
+    if doc_title and doc_title.strip():
+        return doc_title.strip()
+
+    if not original_filename:
+        return "Văn bản không tên"
+
+    # Strip extension
+    name = os.path.splitext(original_filename)[0]
+
+    # Handle patterns like "luat117_2025", "nd13_2023", "tt15_2024"
+    num_match = re.search(r'(luat|nd|tt|nq|qd|pl|bl)[_\s]*(\d+)', name, re.IGNORECASE)
+    year_match = re.search(r'(20\d{2})', name)
+
+    if num_match and year_match:
+        doc_type = num_match.group(1).upper()
+        num = num_match.group(2)
+        year = year_match.group(1)
+        type_map = {"LUAT": "Luật", "ND": "Nghị định", "TT": "Thông tư",
+                    "NQ": "Nghị quyết", "QD": "Quyết định", "PL": "Pháp lệnh", "BL": "Bộ luật"}
+        type_str = type_map.get(doc_type, doc_type)
+        return f"{type_str} {num}/{year}"
+
+    # Fallback: replace separators with spaces, title case
+    name = re.sub(r'[_\-]+', ' ', name)
+    name = re.sub(r'\s+', ' ', name).strip()
+    if len(name) > 2:
+        name = name.title()
+
+    return name if name else "Văn bản không tên"
+
+
 # ---------------------------------------------------------------------------
 # Helpers (sync, run in thread pool to avoid blocking event loop)
 # ---------------------------------------------------------------------------
@@ -176,8 +221,9 @@ async def list_documents(
             for i, doc in enumerate(ws_docs, 1):
                 page_info = f", {doc.page_count} trang" if doc.page_count else ""
                 chunk_info = f", {doc.chunk_count} đoạn" if doc.chunk_count else ""
+                doc_title = _format_doc_title(doc.document_title, doc.original_filename)
                 lines.append(
-                    f"{i}. **{doc.original_filename}** (DocRef: doc{doc_counter:02d})"
+                    f"{i}. **{doc_title}** (DocRef: doc{doc_counter:02d})"
                     f"{page_info}{chunk_info}"
                 )
                 doc_counter += 1
@@ -704,7 +750,7 @@ async def search_documents_number(
             chunk_obj = ChatSourceChunk(
                 index=cid,
                 chunk_id=f"doc_{doc.id}_meta",
-                content=f"Tài liệu: {doc.original_filename}\nSố văn bản: {doc.document_number or 'N/A'}",
+                content=f"Tài liệu: {_format_doc_title(doc.document_title, doc.original_filename)}\nSố văn bản: {doc.document_number or 'N/A'}",
                 document_id=doc.id,
                 page_no=0,
                 heading_path=[],
@@ -713,9 +759,10 @@ async def search_documents_number(
                 source_file=doc.original_filename
             )
             doc_list.append(chunk_obj)
-            
+
+            doc_title = _format_doc_title(doc.document_title, doc.original_filename)
             lines.append(
-                f"{i}. **{doc.original_filename}**\n"
+                f"{i}. **{doc_title}**\n"
                 f"   Số văn bản: {doc.document_number or 'N/A'}\n"
                 f"   Mã trích dẫn (Citation ID): [{cid}]"
             )

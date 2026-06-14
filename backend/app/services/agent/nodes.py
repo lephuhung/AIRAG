@@ -765,7 +765,8 @@ async def answer_generator(state: "AgentState") -> dict:
 
     context_text = "\n\n".join(context_parts) if context_parts else "(no retrieved context)"
     query_msg = f"Question: {rewritten_query}" if rewritten_query else ""
-    intent_instructions = get_instructions_for_intent(intent, enable_thinking=enable_thinking)
+    needs_comparison = state.get("needs_comparison", False)
+    intent_instructions = get_instructions_for_intent(intent, enable_thinking=enable_thinking, needs_comparison=needs_comparison)
     inject = (
         "\n\n=== RETRIEVED CONTEXT ===\n"
         + (f"{query_msg}\n\n" if query_msg else "")

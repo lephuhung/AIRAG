@@ -115,6 +115,18 @@ _PERSONAL_REF_PATTERN: re.Pattern[str] = re.compile(
     re.IGNORECASE | re.UNICODE,
 )
 
+# Detects comparison/capability questions: "X của tôi có thể Y không?"
+# Used by query_analyzer_node to set needs_comparison=True.
+_COMPARISON_PATTERN: re.Pattern[str] = re.compile(
+    r"(?:"
+    r"có\s+(?:thể|đủ|đáp\s+ứng|phù\s+hợp|dùng\s+để|sử\s+dụng\s+để|thực\s+hiện)"
+    r"|đủ\s+(?:điều\s+kiện|tiêu\s+chuẩn|yêu\s+cầu)"
+    r"|sử\s+dụng\s+được"
+    r"|dùng\s+để"
+    r")",
+    re.IGNORECASE | re.UNICODE,
+)
+
 # Detects references to a NAMED legal document (used by _REQUIRES_DOC_INTENTS
 # prerequisite check). Covers both full names ("Luật An ninh mạng") and
 # abbreviated forms ("NĐ 13", "TT 15", "QĐ 53").
@@ -548,9 +560,22 @@ async def query_analyzer_node(state: SupervisorState) -> dict:
     msg_lower = user_message.lower()
     looks_complex = _MULTI_DOC_PATTERN.search(msg_lower) is not None
 
-    if not looks_complex:
+    # ── Comparison detection: "X của tôi có thể Y không?" ─────────────
+    # If query has comparison pattern AND personal reference, set needs_comparison=True.
+    # This ensures answer_generator will COMPAREd user context vs. doc requirements.
+    has_comparison = _COMPARISON_PATTERN.search(msg_lower) is not None
+    has_personal = _PERSONAL_REF_PATTERN.search(user_message) is not None
+    needs_comparison = has_comparison and has_personal
+
+    if needs_comparison:
+        logger.info(
+            f"[query_analyzer] Comparison query detected: "
+            f"has_comparison={has_comparison}, has_personal={has_personal}"
+        )
+
+    if not looks_complex and not needs_comparison:
         logger.info("[query_analyzer] Fast-path: simple query (no complex heuristic match), skipping LLM")
-        return {"query_complexity": "simple", "sub_queries": None, "extracted_params": None}
+        return {"query_complexity": "simple", "sub_queries": None, "extracted_params": None, "needs_comparison": False}
 
     logger.info("[query_analyzer] Complex heuristic matched — invoking LLM for detailed analysis")
 
@@ -603,14 +628,15 @@ async def query_analyzer_node(state: SupervisorState) -> dict:
             "extracted_params": extracted_params if extracted_params else None,
             "current_step_index": 0,
             "retry_count": 0,
+            "needs_comparison": needs_comparison,
         }
 
     except json.JSONDecodeError as e:
         logger.warning(f"[query_analyzer] JSON parse failed: {e}, raw={response_text[:200]!r}")
-        return {"query_complexity": "simple", "sub_queries": None, "extracted_params": None}
+        return {"query_complexity": "simple", "sub_queries": None, "extracted_params": None, "needs_comparison": False}
     except Exception as e:
         logger.warning(f"[query_analyzer] Failed: {e}")
-        return {"query_complexity": "simple", "sub_queries": None, "extracted_params": None}
+        return {"query_complexity": "simple", "sub_queries": None, "extracted_params": None, "needs_comparison": False}
 
 
 async def supervisor_node(state: SupervisorState) -> dict:
@@ -904,6 +930,9 @@ async def supervisor_node(state: SupervisorState) -> dict:
             # Phase 4: Plan-aware fields
             "task_plan": decision.get("task_plan") or [],
             "pending_intent": decision.get("pending_intent"),
+            # Comparison flag from query_analyzer (for answer_generator comparison mode)
+            # This is passed through state from query_analyzer_node
+            "needs_comparison": state.get("needs_comparison", False),
         }
 
         # ── Phase 5: Query Analyzer enhanced routing ────────────────────
@@ -1629,14 +1658,8 @@ def route_from_resolve_doc(state: SupervisorState) -> str:
         except Exception as e:
             logger.warning(f"[langfuse] route_from_resolve_doc span failed: {e}")
 
-    if next_agent == AgentType.FINISH:
-        logger.info("[LANGGRAPH_ROUTE] resolve_doc_agent -> END (not found / ambiguous)")
-        return END
-
-    if intent == "search_section" and section_ref:
-        logger.info(f"[LANGGRAPH_ROUTE] resolve_doc_agent -> rag (has section_ref={section_ref!r})")
-        return "rag"
-
+    # If we have a pending_intent from the supervisor's task_plan, continue with it
+    # even if resolve_doc couldn't fully resolve (ambiguous case)
     if pending_intent:
         logger.info(
             f"[route_from_resolve_doc] pending_intent={pending_intent!r}, "
@@ -1651,6 +1674,14 @@ def route_from_resolve_doc(state: SupervisorState) -> str:
         elif pending_intent == "summarize":
             logger.info("[LANGGRAPH_ROUTE] resolve_doc_agent -> answer_generator (pending summarize)")
             return "answer_generator"
+
+    if next_agent == AgentType.FINISH:
+        logger.info("[LANGGRAPH_ROUTE] resolve_doc_agent -> END (not found / ambiguous)")
+        return END
+
+    if intent == "search_section" and section_ref:
+        logger.info(f"[LANGGRAPH_ROUTE] resolve_doc_agent -> rag (has section_ref={section_ref!r})")
+        return "rag"
 
     logger.info("[LANGGRAPH_ROUTE] resolve_doc_agent -> answer_generator (resolved)")
     return "answer_generator"
