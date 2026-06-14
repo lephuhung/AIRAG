@@ -114,7 +114,9 @@ SEARCHABLE_COLLECTION_MAP: dict[str, dict] = {
                 "display_fields": ["tenKhachHang", "cmnd", "diaChiCapDien", "ngayDangKy"],
             },
             "lg": {
-                "fields": ["SoDienThoai"],
+                # Collection `lg` lưu SĐT ở field `phone` (đã có index) — KHÔNG phải
+                # `SoDienThoai` (field không tồn tại → quét toàn bộ 13M docs → timeout).
+                "fields": ["phone"],
                 "display_fields": ["TenHoiVien", "SoDinhDanh"],
             },
             "vacxin": {
@@ -129,8 +131,9 @@ SEARCHABLE_COLLECTION_MAP: dict[str, dict] = {
                 "display_fields": ["ho_ten", "so_dien_thoai", "namsinh", "gioi_tinh", "dia_chi"]
             },
             "uids": {
+                # Field định danh Facebook thực tế tên là `uid` (số), không phải `uids`.
                 "fields": ["phone"],
-                "display_fields": ["uids"],
+                "display_fields": ["uid", "phone"],
             },
             "vnvc": {
                 # mobile: Số điện thoại trong hồ sơ tiêm VNVC

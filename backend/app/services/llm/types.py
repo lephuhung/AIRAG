@@ -25,9 +25,15 @@ class LLMImagePart:
 @dataclass
 class LLMMessage:
     """A single message in a conversation."""
-    role: str  # "system" | "user" | "assistant"
+    role: str  # "system" | "user" | "assistant" | "tool"
     content: str = ""
     images: list[LLMImagePart] = field(default_factory=list)
+    # Tool-calling round-trip (OpenAI function-calling format):
+    #   - assistant turn that requested tools → ``tool_calls`` is the list of
+    #     {"id","type","function":{"name","arguments"}} entries.
+    #   - tool result turn → role="tool" + ``tool_call_id`` referencing the call.
+    tool_calls: list | None = None
+    tool_call_id: str | None = None
     # Opaque provider-specific content (e.g. Gemini Content with
     # thought_signature).  When set, providers should use this directly
     # instead of building from ``content``/``images``.

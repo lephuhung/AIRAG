@@ -593,6 +593,49 @@ async def add_conversation_episode(
         logger.warning(f"[graphiti] add_episode failed for user {user_id}: {exc}")
 
 
+async def save_user_fact(user_id: uuid.UUID, fact: str) -> bool:
+    """Persist a single, caller-decided fact to the user's personal memory graph.
+
+    Unlike :func:`add_conversation_episode` — which LLM-extracts facts from a raw
+    conversation turn — this stores ``fact`` AS-IS. The caller (e.g. an agent's
+    ``save_memory`` tool) has already decided this is worth remembering, so we do
+    NOT re-filter it. Anchors to the same stable user entity used elsewhere so
+    facts accumulate on a single node instead of proliferating.
+
+    Returns True on success, False if the fact is empty or the write fails
+    (non-fatal — memory loss is preferable to blocking chat).
+    """
+    fact = (fact or "").strip()
+    if not fact:
+        return False
+
+    user_entity = f"Người dùng ID={user_id}"
+    episode_body = fact
+    for src in ("Người dùng", "người dùng", "The user", "the user"):
+        episode_body = episode_body.replace(src, user_entity)
+    # Ensure the entity anchor is present so Graphiti links the fact to the user.
+    if user_entity not in episode_body:
+        episode_body = f"{user_entity}: {episode_body}"
+
+    client = get_graphiti_client()
+    try:
+        from graphiti_core.nodes import EpisodeType
+
+        await client.add_episode(
+            name=f"user_{user_id}_memory",
+            episode_body=episode_body,
+            source=EpisodeType.text,
+            source_description="NexusRAG user fact — explicit save_memory",
+            group_id=f"nexusrag_user_{user_id}",
+            reference_time=datetime.now(tz=timezone.utc),
+        )
+        logger.info(f"[graphiti] save_user_fact stored for user {user_id}: {fact[:80]!r}")
+        return True
+    except Exception as exc:
+        logger.warning(f"[graphiti] save_user_fact failed for user {user_id}: {exc}")
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Formatting helper
 # ---------------------------------------------------------------------------

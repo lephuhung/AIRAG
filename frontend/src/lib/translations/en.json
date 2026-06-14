@@ -233,6 +233,7 @@
     "suggestion_any": "Write anything",
     "suggestion_methodology": "Explain the methodology used",
     "view_kg": "View in Knowledge Graph",
+    "scroll_to_latest": "Scroll to latest",
     "highlight_kg": "Highlight in Knowledge Graph",
     "view_source": "View source: {{name}} (page {{page}})",
     "copy_code": "Copy code",

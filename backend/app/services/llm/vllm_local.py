@@ -137,6 +137,7 @@ class LocalVLLMProvider(LLMProvider):
         system_prompt: Optional[str] = None,
         think: bool = False,
         tools: list | None = None,
+        tool_choice: str | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         """Streaming fallback for local vLLM (returns full text as one chunk)."""
         result = await self.acomplete(

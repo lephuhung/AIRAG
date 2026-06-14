@@ -74,6 +74,7 @@ class LLMProvider(ABC):
         system_prompt: Optional[str] = None,
         think: bool = False,
         tools: list | None = None,
+        tool_choice: str | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         """Async streaming generation. Yields StreamChunk objects.
 

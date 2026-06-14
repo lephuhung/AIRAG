@@ -56,7 +56,20 @@ def _to_openai_messages(
     if system_prompt:
         result.append({"role": "system", "content": system_prompt})
     for msg in messages:
-        if msg.images:
+        # Tool result turn (function-calling round-trip).
+        if msg.role == "tool":
+            result.append({
+                "role": "tool",
+                "tool_call_id": msg.tool_call_id or "",
+                "content": msg.content or "",
+            })
+        elif msg.tool_calls:
+            # Assistant turn that requested tool calls. content may be empty.
+            entry: dict = {"role": msg.role, "tool_calls": msg.tool_calls}
+            if msg.content:
+                entry["content"] = msg.content
+            result.append(entry)
+        elif msg.images:
             # Multi-modal: build content list
             content: list[dict] = [{"type": "text", "text": msg.content}]
             for img in msg.images:
@@ -193,6 +206,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         system_prompt: Optional[str] = None,
         think: bool = False,
         tools: list | None = None,
+        tool_choice: str | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         oai_msgs = _to_openai_messages(messages, system_prompt)
         kwargs: dict = dict(
@@ -204,6 +218,12 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         )
         if tools:
             kwargs["tools"] = tools
+            # Allow the model to emit several independent tool calls in one turn
+            # (executor runs them concurrently). vLLM honours this for
+            # tool-calling-capable models; harmless if the server ignores it.
+            kwargs["parallel_tool_calls"] = True
+        if tool_choice:
+            kwargs["tool_choice"] = tool_choice
         # Qwen3.5 vLLM: use chat_template_kwargs to control thinking
         kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": think}}
 
@@ -218,30 +238,34 @@ class OpenAICompatibleLLMProvider(LLMProvider):
             # Buffer for text that comes before a tool call in native OpenAI mode
             pre_tool_text = ""
 
+            # Native (OpenAI function-calling) tool calls arrive FRAGMENTED across
+            # deltas: the name is sent once, the arguments stream in pieces. They
+            # MUST be accumulated by index and parsed once at the end — parsing
+            # each fragment independently corrupts multi-token args (e.g. long
+            # Vietnamese queries). Keyed by tool-call index → {"name", "args"}.
+            native_tool_calls: dict[int, dict] = {}
+
             stream = await client.chat.completions.create(**kwargs)
             async for chunk in stream:
                 delta = chunk.choices[0].delta if chunk.choices else None
                 if delta is None:
                     continue
 
-                # Handle native tool_calls (OpenAI function calling)
+                # Handle native tool_calls (OpenAI function calling).
+                # Accumulate fragments by index here; the assembled calls are
+                # emitted after the stream completes (see flush below).
                 if delta.tool_calls:
                     if pre_tool_text.strip():
                         yield StreamChunk(type="thinking", text=pre_tool_text)
                         pre_tool_text = ""
                     for tc in delta.tool_calls:
+                        idx = tc.index if getattr(tc, "index", None) is not None else 0
+                        slot = native_tool_calls.setdefault(idx, {"name": "", "args": ""})
                         if tc.function:
-                            try:
-                                args = json.loads(tc.function.arguments or "{}")
-                            except json.JSONDecodeError:
-                                args = {}
-                            yield StreamChunk(
-                                type="function_call",
-                                function_call={
-                                    "name": tc.function.name or "",
-                                    "args": args,
-                                },
-                            )
+                            if tc.function.name:
+                                slot["name"] = tc.function.name
+                            if tc.function.arguments:
+                                slot["args"] += tc.function.arguments
                     continue
 
                 content = delta.content or ""
@@ -402,6 +426,26 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                         content = content.replace("</tool_call>", "").strip()
                     if content:
                         yield StreamChunk(type="text", text=content)
+
+            # Flush accumulated native tool calls — assemble fragmented args,
+            # then parse once. Ordered by index to preserve the model's intended
+            # call order (matters for parallel tool calls).
+            for idx in sorted(native_tool_calls):
+                slot = native_tool_calls[idx]
+                if not slot["name"]:
+                    continue
+                try:
+                    args = json.loads(slot["args"] or "{}")
+                except json.JSONDecodeError:
+                    logger.warning(
+                        f"[openai_compatible] native tool_call args parse failed "
+                        f"for {slot['name']!r}: {slot['args'][:200]!r}"
+                    )
+                    args = {}
+                yield StreamChunk(
+                    type="function_call",
+                    function_call={"name": slot["name"], "args": args},
+                )
 
             if in_tool_call and tool_buffer:
                 yield StreamChunk(type="text", text=tool_buffer)

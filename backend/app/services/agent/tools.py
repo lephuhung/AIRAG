@@ -868,14 +868,14 @@ async def search_people_by_cccd(cccd: str):
     Search for a person by CCCD (Căn cước công dân) number.
     Exact match on the cccd field. Yields partial results.
     """
-    from app.services.mongo_people_service import search_by_cccd as _svc
+    from app.services.mongo_people_service import BUSY_MESSAGE, search_by_cccd as _svc
 
     try:
         async for res in _svc(cccd):
             yield res
     except Exception as e:
         logger.error(f"[tool:search_people_by_cccd] Failed: {e}")
-        yield {"found": False, "persons": [], "display": f"Lỗi tìm kiếm CCCD: {e}"}
+        yield {"found": False, "error": "unavailable", "persons": [], "display": BUSY_MESSAGE}
 
 
 async def search_people_by_name(name: str, limit: int = 10):
@@ -886,7 +886,7 @@ async def search_people_by_name(name: str, limit: int = 10):
     Returns:
         dict with keys: found, count, persons, display
     """
-    from app.services.mongo_people_service import search_by_name as _svc
+    from app.services.mongo_people_service import BUSY_MESSAGE, search_by_name as _svc
 
     try:
         async for res in _svc(name, limit=limit):
@@ -895,9 +895,10 @@ async def search_people_by_name(name: str, limit: int = 10):
         logger.error(f"[tool:search_people_by_name] Failed: {e}")
         yield {
             "found": False,
+            "error": "unavailable",
             "count": 0,
             "persons": [],
-            "display": f"Lỗi tìm kiếm tên: {e}",
+            "display": BUSY_MESSAGE,
         }
 
 
@@ -909,14 +910,14 @@ async def search_people_by_bhxh(so_bhxh: str):
     Returns:
         dict with keys: found, person, display
     """
-    from app.services.mongo_people_service import search_by_bhxh as _svc
+    from app.services.mongo_people_service import BUSY_MESSAGE, search_by_bhxh as _svc
 
     try:
         async for res in _svc(so_bhxh):
             yield res
     except Exception as e:
         logger.error(f"[tool:search_people_by_bhxh] Failed: {e}")
-        yield {"found": False, "person": None, "display": f"Lỗi tìm kiếm BHXH: {e}"}
+        yield {"found": False, "error": "unavailable", "persons": [], "display": BUSY_MESSAGE}
 
 
 async def search_people_by_phone(phone: str, limit: int = 10):
@@ -927,7 +928,7 @@ async def search_people_by_phone(phone: str, limit: int = 10):
     Returns:
         dict with keys: found, count, persons, display
     """
-    from app.services.mongo_people_service import search_by_phone as _svc
+    from app.services.mongo_people_service import BUSY_MESSAGE, search_by_phone as _svc
 
     try:
         async for res in _svc(phone, limit=limit):
@@ -936,9 +937,10 @@ async def search_people_by_phone(phone: str, limit: int = 10):
         logger.error(f"[tool:search_people_by_phone] Failed: {e}")
         yield {
             "found": False,
+            "error": "unavailable",
             "count": 0,
             "persons": [],
-            "display": f"Lỗi tìm kiếm SĐT: {e}",
+            "display": BUSY_MESSAGE,
         }
 
 async def search_people_advanced(criteria: dict, limit: int = 10):
@@ -946,7 +948,7 @@ async def search_people_advanced(criteria: dict, limit: int = 10):
     Search for persons by multiple criteria (Name + DoB + Address + etc).
     Yields partial results.
     """
-    from app.services.mongo_people_service import search_by_advanced as _svc
+    from app.services.mongo_people_service import BUSY_MESSAGE, search_by_advanced as _svc
 
     try:
         async for res in _svc(criteria, limit=limit):
@@ -955,9 +957,10 @@ async def search_people_advanced(criteria: dict, limit: int = 10):
         logger.error(f"[tool:search_people_advanced] Failed: {e}")
         yield {
             "found": False,
+            "error": "unavailable",
             "count": 0,
             "persons": [],
-            "display": f"Lỗi tìm kiếm phức tạp: {e}",
+            "display": BUSY_MESSAGE,
         }
 
 

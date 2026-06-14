@@ -31,6 +31,12 @@ def _get_langfuse_client():
     from app.services.agent.langfuse_tracing import _get_langfuse_client as get_client
     return get_client()
 
+
+def _react_on() -> bool:
+    """Whether the RAG group is served by the ReAct executor (tool-aware planning)."""
+    from app.core.config import settings
+    return bool(getattr(settings, "NEXUSRAG_LG_RAG_REACT", False))
+
 if TYPE_CHECKING:
     from app.services.llm.types import LLMMessage
 
@@ -886,6 +892,19 @@ async def supervisor_node(state: SupervisorState) -> dict:
                         context={"type": "missing_doc_reference", "intent": decision["intent"]},
                     )
 
+        # ── Keyword safety net 2: attached file → rag ──────────────────────
+        # If the user attached a document this turn but the LLM routed to direct
+        # chat, the file would be silently ignored. Force the rag (react_executor)
+        # branch so the uploaded file is actually read/searched/checked.
+        if state.get("document_ids") and decision["next_agent"] == AgentType.DIRECT:
+            logger.warning(
+                f"[supervisor] document_ids present but next_agent=direct — "
+                f"overriding to rag so the attached file is used"
+            )
+            decision["next_agent"] = AgentType.RAG
+            if decision.get("intent") in ("greeting", "personal", "direct", "chitchat"):
+                decision["intent"] = "search"
+
         logger.info(
             f"[LANGGRAPH_ROUTE] user_message={user_message!r} -> "
             f"next_agent={decision['next_agent']!r}, intent={decision['intent']!r}, "
@@ -1459,6 +1478,185 @@ async def mongo_formatter_node(state: SupervisorState) -> dict:
 
 
 # =============================================================================
+# ReAct Executor Node — RAG group (tool-aware planning)
+# =============================================================================
+
+async def react_executor_node(state: SupervisorState) -> dict:
+    """Single tool-calling ReAct loop for the RAG group.
+
+    The LLM is given the RAG tool schemas and decides which tools to call (in
+    parallel where independent), iterating until it can answer. Replaces the
+    static ``rag → result_evaluator → answer_generator`` chain when
+    ``NEXUSRAG_LG_RAG_REACT`` is enabled. resolve_doc / section / kg / memory
+    are all just tools here — no intent taxonomy, no prerequisite plan.
+    """
+    import asyncio
+    from app.core.config import settings
+    from app.services.agent.streaming import push_event
+    from app.services.agent.nodes import strip_thinking_tags
+    from app.services.llm import get_llm_provider
+    from app.services.llm.types import LLMMessage as _LLMMsg
+    from app.services.agents.react_tools import ToolContext, RAG_TOOL_SCHEMAS, dispatch_tool
+    from app.prompts.agents.react_prompt import build_react_system_prompt
+
+    user_message = _extract_user_message(state)
+    query = state.get("rewritten_query") or state.get("original_query") or user_message
+    max_steps = getattr(settings, "NEXUSRAG_REACT_MAX_TOOL_STEPS", 6)
+    top_k = getattr(settings, "NEXUSRAG_REACT_TOP_K", 8)
+    logger.info(f"[LANGGRAPH_NODE] Entering react_executor_node, query={query!r}, max_steps={max_steps}")
+
+    ctx = ToolContext(
+        workspace_ids=state.get("workspace_ids", []) or [],
+        document_ids=state.get("document_ids"),
+        # Files attached this turn — kept separate so resolve_document_reference can
+        # re-scope document_ids without losing track of the user's uploaded file.
+        uploaded_document_ids=state.get("document_ids"),
+        user_id=state.get("user_id"),
+        session_id=state.get("session_id"),
+        existing_citation_ids={},
+        top_k=top_k,
+        state=state,
+    )
+
+    llm = get_llm_provider()
+    system_prompt = build_react_system_prompt(state.get("user_memory_context", "") or "")
+    msgs: list = [_LLMMsg(role="user", content=query)]
+    sources: list = []
+    images: list = []
+
+    # How many sources/images already pushed to the client — avoids re-sending.
+    _emitted = {"sources": 0, "images": 0}
+
+    async def _emit_artifacts() -> None:
+        """Flush newly-collected sources/images to the client.
+
+        Called BEFORE a turn that may stream the answer so the client has the
+        citation data by the time answer tokens arrive.
+        """
+        if len(sources) > _emitted["sources"]:
+            await push_event(state, "sources", sources)
+            _emitted["sources"] = len(sources)
+        if len(images) > _emitted["images"]:
+            await push_event(state, "images", images)
+            _emitted["images"] = len(images)
+
+    async def _run_turn(use_tools: bool):
+        """Run one LLM turn, streaming answer text to the client as it arrives.
+
+        Speculative streaming (mirrors the legacy agent): we emit text tokens
+        live, but only while no tool call has appeared in this turn. If the turn
+        ends up requesting tools, that streamed text was a thinking-aloud
+        preamble — we send ``token_rollback`` so the client discards it before
+        the tools run. When the turn produces no tool calls, the streamed text
+        IS the final answer (no re-generation, no fake chunking).
+        """
+        calls, text = [], ""
+        streamed = False
+        async for c in llm.astream(
+            msgs,
+            system_prompt=system_prompt,
+            tools=RAG_TOOL_SCHEMAS if use_tools else None,
+            tool_choice="auto" if use_tools else None,
+            temperature=0.1,
+            max_tokens=4096,
+            think=False,
+        ):
+            if c.type == "function_call" and c.function_call:
+                calls.append(c.function_call)
+            elif c.type == "text" and c.text:
+                text += c.text
+                if not calls:  # speculative — stop emitting once a tool call shows up
+                    await push_event(state, "token", c.text)
+                    streamed = True
+        if calls and streamed:
+            await push_event(state, "token_rollback", {})
+        return calls, text
+
+    async def _finish(answer_text: str) -> dict:
+        # Answer text was already streamed live by _run_turn — here we only
+        # finalize (clean thinking tags, emit a fallback if nothing came out).
+        await _emit_artifacts()
+        final = strip_thinking_tags(answer_text or "").strip()
+        if not final:
+            final = "Xin lỗi, tôi chưa tạo được câu trả lời từ kho văn bản."
+            await push_event(state, "token", final)
+        logger.info(
+            f"[react_executor] done: {len(sources)} sources, answer={len(final)} chars"
+        )
+        return {
+            "final_answer": final,
+            "sources": sources,
+            "images": images,
+            "document_ids": ctx.document_ids,
+            "next_agent": AgentType.FINISH,
+        }
+
+    try:
+        for step in range(max_steps):
+            await _emit_artifacts()
+            calls, text = await _run_turn(use_tools=True)
+            if not calls:
+                return await _finish(text)
+
+            # Assistant turn that requested tools — synthesise stable ids so the
+            # tool-result messages reference them on the next request.
+            tool_calls_payload = []
+            for i, fc in enumerate(calls):
+                cid = f"call_{step}_{i}"
+                fc["_id"] = cid
+                tool_calls_payload.append({
+                    "id": cid,
+                    "type": "function",
+                    "function": {
+                        "name": fc.get("name", ""),
+                        "arguments": json.dumps(fc.get("args", {}), ensure_ascii=False),
+                    },
+                })
+            msgs.append(_LLMMsg(role="assistant", content=text or "", tool_calls=tool_calls_payload))
+
+            names = ", ".join(fc.get("name", "?") for fc in calls)
+            await push_event(state, "status", {"step": "searching", "detail": f"Đang tra cứu: {names}"})
+            logger.info(f"[react_executor] step {step + 1}/{max_steps}: {len(calls)} call(s): {names}")
+
+            # Parallel tool execution — independent calls in the same turn run together.
+            results = await asyncio.gather(
+                *[dispatch_tool(fc.get("name", ""), fc.get("args", {}), ctx) for fc in calls]
+            )
+
+            stop = False
+            for fc, r in zip(calls, results):
+                sources.extend(r.get("sources", []) or [])
+                images.extend(r.get("images", []) or [])
+                msgs.append(_LLMMsg(role="tool", tool_call_id=fc["_id"], content=r.get("summary", "")))
+                if (r.get("data") or {}).get("stop"):
+                    stop = True
+
+            if stop:  # ask_user already emitted clarification → wait for the user
+                logger.info("[react_executor] ask_user → stopping loop for clarification")
+                return {
+                    "final_answer": "",
+                    "next_agent": AgentType.FINISH,
+                    "clarification_needed": True,
+                    "sources": sources,
+                    "images": images,
+                }
+
+        # Loop guard hit → force a final synthesis without tools.
+        logger.warning(f"[react_executor] max steps ({max_steps}) reached — forcing synthesis")
+        msgs.append(_LLMMsg(role="user", content=(
+            "Hãy tổng hợp câu trả lời cuối cùng từ thông tin đã thu thập ở trên. "
+            "Nếu chưa đủ căn cứ, nói rõ phần nào còn thiếu."
+        )))
+        await _emit_artifacts()
+        _, text = await _run_turn(use_tools=False)
+        return await _finish(text)
+
+    except Exception as e:
+        logger.error(f"[react_executor] loop failed: {e}", exc_info=True)
+        return await _finish("")
+
+
+# =============================================================================
 # Routing Functions
 # =============================================================================
 
@@ -1521,6 +1719,9 @@ def route_from_supervisor(state: SupervisorState) -> str:
     if next_agent == AgentType.RESOLVE_DOC or (
         next_agent == AgentType.RAG and intent == "resolve_doc"
     ):
+        if _react_on():
+            logger.info(f"[LANGGRAPH_ROUTE] supervisor -> react_executor (resolve via tools, intent={intent!r})")
+            return "react_executor"
         logger.info(f"[LANGGRAPH_ROUTE] supervisor -> resolve_doc_agent (intent={intent!r})")
         return "resolve_doc_agent"
 
@@ -1538,6 +1739,8 @@ def route_from_supervisor(state: SupervisorState) -> str:
         AgentType.ANSWER_GENERATOR: "answer_generator",
     }
     target = _DIRECT_MAP.get(next_agent)
+    if target == "rag" and _react_on():
+        target = "react_executor"
     if target:
         logger.info(
             f"[LANGGRAPH_ROUTE] supervisor -> {target} (needs_memory=False, intent={intent!r})"
@@ -1734,6 +1937,7 @@ def create_supervisor_graph():
     graph.add_node("direct", direct_answer_node)
     graph.add_node("answer_generator", answer_generator_node)  # RAG-only
     graph.add_node("mongo_formatter", mongo_formatter_node)    # People-only
+    graph.add_node("react_executor", react_executor_node)      # RAG group (flag: NEXUSRAG_LG_RAG_REACT)
 
     # Edges — Phase 5: START → query_analyzer → supervisor
     graph.add_edge(START, "query_analyzer")
@@ -1757,6 +1961,7 @@ def create_supervisor_graph():
             # Special cases
             "answer_generator": "answer_generator",  # loop-back with accumulated results
             "resolve_doc_agent": "resolve_doc_agent",  # Phase 2: dedicated agent
+            "react_executor": "react_executor",  # RAG group via tool-aware ReAct loop
             END: END,
         },
     )
@@ -1813,6 +2018,8 @@ def create_supervisor_graph():
             AgentType.PEOPLE: "people",
         }
         target = _MAP.get(next_agent, "direct")
+        if target == "rag" and _react_on():
+            target = "react_executor"
         logger.info(
             f"[LANGGRAPH_ROUTE] query_enricher -> {target} (intent={intent!r}, next_agent={next_agent!r})"
         )
@@ -1826,6 +2033,7 @@ def create_supervisor_graph():
             "write": "write",
             "direct": "direct",
             "people": "people",
+            "react_executor": "react_executor",
         },
     )
 
@@ -1875,6 +2083,7 @@ def create_supervisor_graph():
     # Terminal nodes
     graph.add_edge("answer_generator", END)
     graph.add_edge("mongo_formatter", END)
+    graph.add_edge("react_executor", END)  # RAG group (flag) — executor is terminal
 
     return graph.compile()
 

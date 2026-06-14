@@ -60,8 +60,13 @@ def get_mongo_client() -> MongoClient:
         )
         _client = MongoClient(
             uri,
-            serverSelectionTimeoutMS=5000,
-            connectTimeoutMS=5000,
+            # Fail fast when the external MongoDB (10.10.0.120) is unreachable
+            # so the agent can return a "system busy" message instead of hanging.
+            serverSelectionTimeoutMS=3000,
+            connectTimeoutMS=3000,
+            # Cao hơn QUERY_MAX_MS (5s) để per-query maxTimeMS hủy query chậm trước,
+            # tránh socket-timeout + retryReads gây nhân đôi thời gian chờ.
+            socketTimeoutMS=15000,
             maxPoolSize=50,
             waitQueueTimeoutMS=5000,
             retryWrites=True,

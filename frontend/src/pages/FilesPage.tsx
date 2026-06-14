@@ -451,7 +451,7 @@ export function FilesPage() {
         <div className="flex-1 overflow-y-auto px-6 py-5">
           {docsLoading ? (
             // Loading skeletons
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-5">
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-5">
               {Array.from({ length: 8 }).map((_, i) => (
                 <div
                   key={i}
@@ -500,8 +500,16 @@ export function FilesPage() {
               </p>
             </div>
           ) : (
-            // File grid
-            <div className="grid gap-5 grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-6 transition-all duration-300 w-full">
+            // File grid — column count adapts to whether the viewer panel is open.
+            // Tailwind breakpoints track the VIEWPORT, not this container, so when
+            // the viewer takes half the width we must drop columns manually to keep
+            // cards from being squashed.
+            <div className={cn(
+              "grid gap-5 grid-cols-1 transition-all duration-300 w-full",
+              selectedDoc
+                ? "md:grid-cols-1 lg:grid-cols-2 2xl:grid-cols-3"
+                : "md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5"
+            )}>
               <AnimatePresence mode="popLayout">
                 {filteredDocs.map((doc) => (
                   <FileCard

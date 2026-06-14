@@ -140,12 +140,12 @@ const TOCSidebar = memo(function TOCSidebar({
 function PageDivider({ pageNo }: { pageNo: number }) {
   const { t } = useTranslation();
   return (
-    <div className="flex items-center gap-3 py-4 select-none" data-page={pageNo}>
-      <div className="flex-1 border-t border-dashed border-muted-foreground/20" />
-      <span className="text-[10px] font-medium text-muted-foreground/50 uppercase tracking-wider">
+    <div className="flex items-center gap-3 py-6 select-none" data-page={pageNo}>
+      <div className="flex-1 border-t border-dashed border-border/40" />
+      <span className="text-[10px] font-semibold text-muted-foreground/70 uppercase tracking-wider px-2.5 py-1 rounded-full bg-muted/40 border border-border/40 shadow-sm">
         {t("common.page_x", { page: pageNo })}
       </span>
-      <div className="flex-1 border-t border-dashed border-muted-foreground/20" />
+      <div className="flex-1 border-t border-dashed border-border/40" />
     </div>
   );
 }
@@ -157,23 +157,22 @@ function extractHeadings(markdown: string): Heading[] {
   const headings: Heading[] = [];
   const lines = markdown.split("\n");
   const seenCounts = new Map<string, number>();
+  let inCodeFence = false;
   for (const line of lines) {
+    // Skip fenced code blocks so "# comment" lines don't become phantom TOC
+    // entries — that would also drift the dedupe counter out of sync with the DOM.
+    if (line.trim().startsWith("```")) {
+      inCodeFence = !inCodeFence;
+      continue;
+    }
+    if (inCodeFence) continue;
     const match = line.match(/^(#{1,4})\s+(.+)/);
     if (match) {
       const level = match[1].length;
       const text = match[2].replace(/[*_`#]/g, "").trim();
-      const baseId = text
-        .toLowerCase()
-        .replace(/[^a-z0-9\s-]/g, "")
-        .replace(/\s+/g, "-")
-        .slice(0, 80);
-      // Track occurrences of the BASE id (before suffix), not the final id.
-      // First occurrence: count=1 → no suffix
-      // Second occurrence: count=2 → "-1" suffix
-      // Third occurrence: count=3 → "-2" suffix
-      const count = (seenCounts.get(baseId) ?? 0) + 1;
-      seenCounts.set(baseId, count);
-      const id = count > 1 ? `${baseId}-${count - 1}` : baseId;
+      // Use the SAME slug + dedupe logic the renderer uses, so TOC ids always
+      // resolve to real DOM ids (even with duplicate heading texts).
+      const id = dedupeHeadingId(generateHeadingId(text), seenCounts);
       headings.push({ id, text, level });
     }
   }
@@ -262,30 +261,46 @@ export const DocumentViewer = memo(function DocumentViewer({
   const [activeHeading, setActiveHeading] = useState<string | null>(null);
   const [showToc, setShowToc] = useState(true);
 
+  // Per-render counter for heading-id deduplication. Reset on every render
+  // (below) so the memoized markdown components number duplicate headings in
+  // document order — matching the ids produced by extractHeadings() for the TOC.
+  const headingIdCounter = useRef<Map<string, number>>(new Map());
+
   // ---- View mode: chunk (lightweight) vs full (entire markdown) ----
-  // Default to chunk mode when citation highlights are present
+  // Citation clicks open chunk mode; opening a file from the library stays full.
   const [viewMode, setViewMode] = useState<"chunk" | "full">("full");
 
   // Determine if we should use chunk-context mode
   const hasHighlight = highlightChunks && highlightChunks.length > 0;
   const primaryChunk = hasHighlight ? highlightChunks[0] : null;
 
-  // When new highlights arrive, switch to chunk mode automatically
+  // Whether the highlighted chunk carries enough info to be located in the doc.
+  // Without a locator the chunk-context API silently falls back to chunk 0, so
+  // such citations (summary / whole-doc chunks) are shown in full view instead.
+  const hasChunkLocator = useMemo(() => {
+    if (!primaryChunk) return false;
+    if (primaryChunk.page_no === 0) return false; // summary / whole-doc chunk
+    if (primaryChunk.chunk_id?.includes("summary") || primaryChunk.chunk_id?.includes("full")) return false;
+    return (
+      /chunk_(\d+)$/.test(primaryChunk.chunk_id ?? "") ||
+      !!primaryChunk.page_no ||
+      (primaryChunk.heading_path?.length ?? 0) > 0
+    );
+  }, [primaryChunk?.chunk_id, primaryChunk?.page_no, primaryChunk?.heading_path?.length]);
+
+  // When new highlights arrive, switch to chunk mode automatically — but only
+  // when the chunk is actually locatable; otherwise fall back to the full doc.
   useEffect(() => {
     if (hasHighlight) {
-      if (primaryChunk?.page_no === 0 || primaryChunk?.chunk_id?.includes("summary") || primaryChunk?.chunk_id?.includes("full")) {
-        setViewMode("full");
-      } else {
-        setViewMode("chunk");
-      }
+      setViewMode(hasChunkLocator ? "chunk" : "full");
     }
-  }, [hasHighlight, primaryChunk?.chunk_id, primaryChunk?.page_no]);
+  }, [hasHighlight, hasChunkLocator, primaryChunk?.chunk_id, primaryChunk?.page_no]);
 
-  const effectiveMode = hasHighlight ? viewMode : "full";
+  const effectiveMode = hasHighlight && hasChunkLocator ? viewMode : "full";
 
   // ---- Fetch chunk context (lightweight) ----
   const chunkQueryParams = useMemo(() => {
-    if (!primaryChunk) return "";
+    if (!primaryChunk || !hasChunkLocator) return "";
     const params = new URLSearchParams();
     // Use chunk_id to extract chunk_index
     const idxMatch = primaryChunk.chunk_id?.match(/chunk_(\d+)$/);
@@ -299,7 +314,7 @@ export const DocumentViewer = memo(function DocumentViewer({
     }
     params.set("context_window", "3");
     return params.toString();
-  }, [primaryChunk?.chunk_id, primaryChunk?.page_no, primaryChunk?.heading_path?.join(",")]);
+  }, [primaryChunk?.chunk_id, primaryChunk?.page_no, primaryChunk?.heading_path?.join(","), hasChunkLocator]);
 
   const { data: chunkContext, isLoading: isChunkLoading, error: chunkError } = useQuery({
     queryKey: ["document-chunk-context", doc.id, chunkQueryParams],
@@ -336,28 +351,29 @@ export const DocumentViewer = memo(function DocumentViewer({
     return markdown ? insertPageDividers(markdown) : "";
   }, [markdown]);
 
+  // Reset the heading-id counter before the markdown subtree renders this pass.
+  // The h1–h4 components (memoized below) consume it in document order, so ids
+  // stay deterministic and identical across renders for the same content.
+  headingIdCounter.current = new Map();
+
   // ---- Stable ReactMarkdown components (prevents DOM recreation on re-render) ----
   // Without memoization, inline arrow functions create new references each render,
   // causing React to unmount/remount all heading elements — destroying highlight classes.
   const mdComponents = useMemo<import("react-markdown").Components>(() => ({
     h1: ({ children, ...props }) => {
-      const text = getHeadingText(children);
-      const id = generateHeadingId(text);
+      const id = dedupeHeadingId(generateHeadingId(getHeadingText(children)), headingIdCounter.current);
       return <h1 id={id} {...props}>{children}</h1>;
     },
     h2: ({ children, ...props }) => {
-      const text = getHeadingText(children);
-      const id = generateHeadingId(text);
+      const id = dedupeHeadingId(generateHeadingId(getHeadingText(children)), headingIdCounter.current);
       return <h2 id={id} {...props}>{children}</h2>;
     },
     h3: ({ children, ...props }) => {
-      const text = getHeadingText(children);
-      const id = generateHeadingId(text);
+      const id = dedupeHeadingId(generateHeadingId(getHeadingText(children)), headingIdCounter.current);
       return <h3 id={id} {...props}>{children}</h3>;
     },
     h4: ({ children, ...props }) => {
-      const text = getHeadingText(children);
-      const id = generateHeadingId(text);
+      const id = dedupeHeadingId(generateHeadingId(getHeadingText(children)), headingIdCounter.current);
       return <h4 id={id} {...props}>{children}</h4>;
     },
     hr: (props) => {
@@ -681,27 +697,28 @@ export const DocumentViewer = memo(function DocumentViewer({
         )}
 
         {/* Centered A4-like container for better readability on wide screens */}
-        <div className="w-full h-full bg-muted/10">
-          <div className="mx-auto max-w-[850px] min-h-full bg-background px-6 py-6 sm:px-12 sm:py-12 sm:my-8 sm:shadow-xl sm:rounded-sm transition-all duration-300">
+        <div className="w-full h-full bg-gradient-to-b from-muted/20 to-muted/5">
+          <div className="mx-auto max-w-[850px] min-h-full bg-background px-6 py-6 sm:px-14 sm:py-12 sm:my-8 sm:shadow-xl sm:rounded-lg sm:ring-1 sm:ring-border/40 transition-all duration-300">
             {/* Document title header */}
-            <div className="mb-8 pb-4 border-b">
+            <div className="relative mb-8 pb-5 border-b border-border/60 pl-4">
+              <span className="absolute left-0 top-1 bottom-5 w-1 rounded-full bg-gradient-to-b from-primary to-primary/30" />
               <div className="flex items-center justify-between gap-4">
                 <div className="flex flex-col gap-1 min-w-0">
                   <div className="flex items-center gap-2 flex-wrap">
                     {doc.document_type?.name && (
-                      <span className="text-[10px] uppercase tracking-wider font-bold px-1.5 py-0.5 rounded bg-primary/10 text-primary">
+                      <span className="text-[10px] uppercase tracking-wider font-bold px-2 py-0.5 rounded-full bg-primary/10 text-primary ring-1 ring-primary/20">
                         {doc.document_type.name}
                       </span>
                     )}
                     {doc.document_number && (
-                      <span className="text-[10px] font-mono text-muted-foreground bg-muted px-1.5 py-0.5 rounded">{doc.document_number}</span>
+                      <span className="text-[10px] font-mono text-muted-foreground bg-muted px-2 py-0.5 rounded-full">{doc.document_number}</span>
                     )}
                   </div>
-                  <h2 className="text-xl font-bold tracking-tight text-foreground mt-1 leading-snug">{doc.document_title || doc.original_filename}</h2>
+                  <h2 className="text-2xl font-bold tracking-tight text-foreground mt-1 leading-snug">{doc.document_title || doc.original_filename}</h2>
                   <span className="text-xs text-muted-foreground/60 truncate">{doc.original_filename}</span>
                 </div>
                 {/* Chunk/Full mode toggle */}
-                {hasHighlight && (
+                {hasHighlight && hasChunkLocator && (
                   <button
                     onClick={() => setViewMode(effectiveMode === "chunk" ? "full" : "chunk")}
                     className={cn(
@@ -720,10 +737,10 @@ export const DocumentViewer = memo(function DocumentViewer({
                   </button>
                 )}
               </div>
-              <div className="flex items-center gap-3 mt-3 text-xs text-muted-foreground border-t pt-3 border-border/30">
+              <div className="flex items-center gap-3 mt-3 text-xs text-muted-foreground pt-3">
                 {effectiveMode === "chunk" && chunkContext ? (
                   <>
-                    <span className="text-primary font-bold bg-primary/5 px-2 py-0.5 rounded-full">
+                    <span className="inline-flex items-center gap-1 text-primary font-semibold bg-primary/10 ring-1 ring-primary/20 px-2.5 py-1 rounded-full">
                       📍 Chunk {chunkContext.chunk_range[0]+1}–{chunkContext.chunk_range[1]+1} / {chunkContext.total_chunks}
                     </span>
                     {primaryChunk?.page_no && (
@@ -748,27 +765,31 @@ export const DocumentViewer = memo(function DocumentViewer({
               className={cn(
                 "prose prose-sm max-w-none text-foreground/80",
                 // Headings — explicit foreground for light/dark theme support
-                "[&_h1]:text-2xl [&_h1]:font-bold [&_h1]:mt-8 [&_h1]:mb-4 [&_h1]:scroll-mt-8 [&_h1]:text-foreground [&_h1]:tracking-tight",
-                "[&_h2]:text-xl [&_h2]:font-bold [&_h2]:mt-7 [&_h2]:mb-3 [&_h2]:scroll-mt-8 [&_h2]:text-foreground [&_h2]:tracking-tight",
+                "[&_h1]:text-2xl [&_h1]:font-bold [&_h1]:mt-8 [&_h1]:mb-4 [&_h1]:pb-2 [&_h1]:border-b [&_h1]:border-border/50 [&_h1]:scroll-mt-8 [&_h1]:text-foreground [&_h1]:tracking-tight",
+                "[&_h2]:text-xl [&_h2]:font-bold [&_h2]:mt-7 [&_h2]:mb-3 [&_h2]:pb-1.5 [&_h2]:border-b [&_h2]:border-border/30 [&_h2]:scroll-mt-8 [&_h2]:text-foreground [&_h2]:tracking-tight",
                 "[&_h3]:text-lg [&_h3]:font-semibold [&_h3]:mt-6 [&_h3]:mb-2 [&_h3]:scroll-mt-8 [&_h3]:text-foreground",
-                "[&_h4]:text-base [&_h4]:font-semibold [&_h4]:mt-5 [&_h4]:mb-2 [&_h4]:scroll-mt-8 [&_h4]:text-foreground",
+                "[&_h4]:text-base [&_h4]:font-semibold [&_h4]:mt-5 [&_h4]:mb-2 [&_h4]:scroll-mt-8 [&_h4]:text-foreground/90",
                 // Body text
-                "[&_p]:text-[15px] [&_p]:text-foreground/80 [&_p]:leading-[1.7] [&_p]:mb-4",
-                "[&_li]:text-[15px] [&_li]:text-foreground/80 [&_li]:leading-[1.7]",
+                "[&_p]:text-[15px] [&_p]:text-foreground/80 [&_p]:leading-[1.75] [&_p]:mb-4",
+                "[&_li]:text-[15px] [&_li]:text-foreground/80 [&_li]:leading-[1.75] [&_li]:my-1",
+                "[&_ul]:my-4 [&_ol]:my-4 [&_li]:marker:text-primary/50",
                 "[&_strong]:text-foreground [&_strong]:font-bold",
-                // Tables
-                "[&_table]:w-full [&_table]:my-6 [&_table]:border-collapse [&_table]:text-[13px]",
-                "[&_th]:bg-muted/50 [&_th]:border [&_th]:border-border [&_th]:px-3 [&_th]:py-2 [&_th]:text-left [&_th]:font-bold [&_th]:text-foreground",
-                "[&_td]:border [&_td]:border-border [&_td]:px-3 [&_td]:py-2 [&_td]:text-foreground/80",
+                // Tables — rounded card with hover rows
+                "[&_table]:w-full [&_table]:my-6 [&_table]:border-collapse [&_table]:text-[13px] [&_table]:rounded-lg [&_table]:overflow-hidden [&_table]:shadow-sm [&_table]:ring-1 [&_table]:ring-border",
+                "[&_th]:bg-muted/60 [&_th]:border-b [&_th]:border-border [&_th]:px-3.5 [&_th]:py-2.5 [&_th]:text-left [&_th]:font-bold [&_th]:text-foreground [&_th]:text-[11px] [&_th]:uppercase [&_th]:tracking-wide",
+                "[&_td]:border-t [&_td]:border-border/60 [&_td]:px-3.5 [&_td]:py-2 [&_td]:text-foreground/80",
+                "[&_tbody_tr]:transition-colors [&_tbody_tr:hover]:bg-muted/25",
                 // Code
                 "[&_code]:bg-muted [&_code]:px-1.5 [&_code]:py-0.5 [&_code]:rounded [&_code]:text-[13px] [&_code]:text-primary [&_code]:font-mono",
                 "[&_pre]:bg-muted/40 [&_pre]:rounded-xl [&_pre]:p-4 [&_pre]:my-6 [&_pre]:overflow-x-auto [&_pre]:text-[13px] [&_pre]:border [&_pre]:border-border/50",
                 // Blockquotes
-                "[&_blockquote]:border-l-4 [&_blockquote]:border-primary/20 [&_blockquote]:pl-4 [&_blockquote]:italic [&_blockquote]:text-foreground/70 [&_blockquote]:bg-primary/5 [&_blockquote]:py-1 [&_blockquote]:rounded-r-lg",
+                "[&_blockquote]:border-l-4 [&_blockquote]:border-primary/40 [&_blockquote]:pl-4 [&_blockquote]:pr-3 [&_blockquote]:italic [&_blockquote]:text-foreground/70 [&_blockquote]:bg-primary/5 [&_blockquote]:py-2 [&_blockquote]:my-5 [&_blockquote]:rounded-r-lg",
                 // Images
-                "[&_img]:rounded-xl [&_img]:max-w-full [&_img]:my-6 [&_img]:shadow-md",
+                "[&_img]:rounded-xl [&_img]:max-w-full [&_img]:my-6 [&_img]:shadow-md [&_img]:ring-1 [&_img]:ring-border/30",
                 // Links
                 "[&_a]:text-primary [&_a]:underline [&_a]:underline-offset-4 [&_a]:decoration-primary/30 [&_a]:hover:decoration-primary [&_a]:transition-colors",
+                // Horizontal rules
+                "[&_hr]:border-border/40",
                 // KaTeX math blocks
                 "[&_.katex-display]:overflow-x-auto [&_.katex-display]:py-4",
                 "[&_.katex]:text-[1.05em]"
@@ -807,4 +828,14 @@ function generateHeadingId(text: string): string {
     .replace(/[^a-z0-9\s-]/g, "")
     .replace(/\s+/g, "-")
     .slice(0, 80);
+}
+
+// Append an occurrence suffix to a base slug so duplicate heading texts get
+// unique, deterministic ids in document order. Shared by the TOC extractor and
+// the markdown renderer so both agree.
+//   1st occurrence → "intro"      2nd → "intro-1"      3rd → "intro-2"
+function dedupeHeadingId(base: string, counts: Map<string, number>): string {
+  const n = (counts.get(base) ?? 0) + 1;
+  counts.set(base, n);
+  return n > 1 ? `${base}-${n - 1}` : base;
 }

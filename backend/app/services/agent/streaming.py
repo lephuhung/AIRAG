@@ -25,6 +25,7 @@ SSE events (format tương thích 100% với legacy chat_agent.py):
     event: sources      {"sources": [...]}
     event: images       {"image_refs": [...]}
     event: token        {"text": str}
+    event: token_rollback {}   # discard speculative tokens streamed before a tool call
     event: complete     {"answer": str, "sources": [...], "images": [...]}
     event: error        {"message": str}
 """
@@ -198,6 +199,12 @@ async def stream_agent_to_sse(
                 text = item[1]
                 final_answer += text
                 yield _sse("token", {"text": text})
+
+            elif ev_type == "token_rollback":
+                # Speculative answer tokens turned out to precede a tool call —
+                # discard them so the final `complete` answer stays clean.
+                final_answer = ""
+                yield _sse("token_rollback", {})
 
             elif ev_type == "thinking":
                 yield _sse("thinking", item[1])

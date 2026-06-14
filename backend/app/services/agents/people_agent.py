@@ -189,6 +189,19 @@ async def people_agent_node(state: SupervisorState) -> dict:
         all_summaries = []
 
         async for partial_result in tool_fn(state):
+            # MongoDB không kết nối được → thông báo "hệ thống đang bận" và dừng,
+            # không để result_evaluator retry vào hệ thống đang lỗi.
+            if partial_result.get("error") == "unavailable":
+                busy = partial_result.get("display") or "Hệ thống tra cứu đang bận, vui lòng thử lại sau."
+                logger.warning("[people_agent_node] MongoDB unavailable — returning busy message")
+                await push_event(state, "status", {"step": "error", "detail": busy})
+                return {
+                    "mongo_results": [],
+                    "kg_summaries": [busy],
+                    "final_answer": busy,
+                    "next_agent": AgentType.FINISH,
+                }
+
             updates = mapper(partial_result)
 
             sources = updates.get("sources", [])

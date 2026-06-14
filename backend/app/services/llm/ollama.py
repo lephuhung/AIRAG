@@ -171,6 +171,7 @@ class OllamaLLMProvider(LLMProvider):
         system_prompt: Optional[str] = None,
         think: bool = False,
         tools: list | None = None,
+        tool_choice: str | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         """Streaming generation via Ollama's async stream API.
 

@@ -228,6 +228,16 @@ class Settings(BaseSettings):
     # Toggle LangGraph internal debug logging (prints node execution/state to console)
     NEXUSRAG_LG_DEBUG: bool = Field(default=False)
 
+    # ── ReAct executor for the RAG group (tool-aware planning) ───────────────
+    # When True, the supervisor routes RAG-group queries to a single tool-calling
+    # ReAct loop (react_executor_node) instead of the static intent→tool nodes.
+    # Requires a provider with reliable native tool-calling (vLLM OpenAI-compat).
+    NEXUSRAG_LG_RAG_REACT: bool = Field(default=False)
+    # Max tool-calling rounds before forcing a final synthesis (loop guard).
+    NEXUSRAG_REACT_MAX_TOOL_STEPS: int = Field(default=6)
+    # top_k passed to search tools inside the ReAct loop.
+    NEXUSRAG_REACT_TOP_K: int = Field(default=8)
+
     # ── Graphiti Memory (temporal knowledge graph, backed by Neo4j) ──────────
     # Graphiti uses the existing Neo4j instance (NEO4J_URI / NEO4J_USERNAME /
     # NEO4J_PASSWORD above) for graph storage.

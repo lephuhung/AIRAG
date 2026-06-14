@@ -568,6 +568,12 @@ async def chat_stream_session(
                     document_ids=request.document_ids,
                 )
 
+                logger.info(
+                    f"[session/{session_id}] LangGraph initial_state: "
+                    f"document_ids={[str(d) for d in (request.document_ids or [])]} "
+                    f"force_search={getattr(request, 'force_search', False)}"
+                )
+
                 graph = get_agent_graph()
 
                 async for sse_str in stream_agent_to_sse(graph, initial_state):

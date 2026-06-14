@@ -554,10 +554,12 @@ const FIELD_CONFIG: Record<string, { label: string; icon: ReactNode }> = {
   TEN_ME: { label: "Tên mẹ", icon: <User className="w-3 h-3" /> },
   GIOI_TINH: { label: "Giới tính", icon: <User className="w-3 h-3" /> },
   PID: { label: "PID", icon: <FileSearch className="w-3 h-3" /> },
+  uid: { label: "Facebook UID", icon: <Share2 className="w-3 h-3" /> },
+  uids: { label: "Facebook UID", icon: <Share2 className="w-3 h-3" /> },
 };
 
 /** Fields to exclude from display */
-const SKIP_FIELDS = new Set(["_id", "_source_schema", "lookup_type", "found", "persons", "display"]);
+const SKIP_FIELDS = new Set(["_id", "_source_schema", "_person_group", "lookup_type", "found", "persons", "display"]);
 
 /** Get name field from a people record (tries multiple possible field names) */
 function getNameField(record: Record<string, unknown>): string {
@@ -580,109 +582,181 @@ const SCHEMA_LABELS: Record<string, string> = {
   vnvc: "VNVC",
 };
 
+/** A person consolidated from one or more source records (across schemas) */
+interface MergedPerson {
+  groupKey: string;
+  name: string;
+  sources: string[];               // distinct schema keys, in first-seen order
+  fields: [string, string[]][];    // [fieldKey, distinct values], ordered by FIELD_CONFIG
+}
+
+/**
+ * Group flat people records into consolidated persons.
+ * Records sharing `_person_group` (set by the backend after cross-schema
+ * consolidation) become ONE card. Old data without `_person_group` falls back
+ * to one card per record (previous behaviour).
+ */
+function mergePeople(people: PeopleRecord[]): MergedPerson[] {
+  const fieldOrder = Object.keys(FIELD_CONFIG);
+  const groups = new Map<string, PeopleRecord[]>();
+  const order: string[] = [];
+
+  people.forEach((p, i) => {
+    const g = p._person_group;
+    const key = g !== undefined && g !== null ? `g${g}` : `i${i}`;
+    if (!groups.has(key)) {
+      groups.set(key, []);
+      order.push(key);
+    }
+    groups.get(key)!.push(p);
+  });
+
+  return order.map((key) => {
+    const recs = groups.get(key)!;
+    const sources: string[] = [];
+    const fieldMap = new Map<string, string[]>();
+    let name = "";
+
+    for (const r of recs) {
+      const schema = (r._source_schema as string) || "";
+      if (schema && !sources.includes(schema)) sources.push(schema);
+      if (name === "") {
+        const n = getNameField(r);
+        if (n !== "(Không có tên)") name = n;
+      }
+      for (const [k, v] of Object.entries(r)) {
+        if (SKIP_FIELDS.has(k) || v === undefined || v === null || v === "") continue;
+        const val = String(v).trim();
+        if (!val) continue;
+        if (!fieldMap.has(k)) fieldMap.set(k, []);
+        const arr = fieldMap.get(k)!;
+        if (!arr.includes(val)) arr.push(val);
+      }
+    }
+
+    // Fallback header khi không có tên (vd hồ sơ chỉ có UID/SĐT như uids)
+    if (!name) {
+      const phoneVal = ["soDienThoai", "SoDienThoai", "dienThoai", "mobile", "so_dien_thoai", "DIEN_THOAI_ME", "phone"]
+        .map((k) => fieldMap.get(k)?.[0])
+        .find(Boolean);
+      const uidVal = fieldMap.get("uid")?.[0] || fieldMap.get("uids")?.[0];
+      name = phoneVal || (uidVal ? `UID ${uidVal}` : "");
+    }
+
+    const fields = Array.from(fieldMap.entries())
+      .filter(([k]) => FIELD_CONFIG[k])
+      .sort(([a], [b]) => fieldOrder.indexOf(a) - fieldOrder.indexOf(b));
+
+    return { groupKey: key, name: name || "(Không có tên)", sources, fields };
+  });
+}
+
 function PeopleCard({ people, isLoadingMore }: { people: PeopleRecord[], isLoadingMore?: boolean }) {
-  const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+
+  const merged = useMemo(() => mergePeople(people), [people]);
 
   if (!people || people.length === 0) return null;
 
-  const handleCopyCard = (person: PeopleRecord, idx: number) => {
-    const name = getNameField(person);
-    const schema = SCHEMA_LABELS[person._source_schema || ""] || person._source_schema || "Unknown";
-    const lines = [`Thông tin: ${name}`, `Nguồn dữ liệu: ${schema}`, ""];
+  const schemaLabel = (s: string) => SCHEMA_LABELS[s] || s;
 
-    const displayFields = Object.entries(person)
-      .filter(([k, v]) => !SKIP_FIELDS.has(k) && v !== undefined && v !== null && v !== "")
-      .sort(([a], [b]) => {
-        const order = Object.keys(FIELD_CONFIG);
-        return order.indexOf(a) - order.indexOf(b);
-      });
-
-    for (const [key, val] of displayFields) {
-      const config = FIELD_CONFIG[key];
-      const label = config?.label || key;
-      lines.push(`- ${label}: ${val}`);
+  const handleCopyCard = (person: MergedPerson) => {
+    const sources = person.sources.map(schemaLabel).join(", ") || "Unknown";
+    const lines = [`Thông tin: ${person.name}`, `Nguồn dữ liệu: ${sources}`, ""];
+    for (const [key, vals] of person.fields) {
+      const label = FIELD_CONFIG[key]?.label || key;
+      lines.push(`- ${label}: ${vals.join(" · ")}`);
     }
-
     navigator.clipboard.writeText(lines.join("\n")).then(() => {
-      setCopiedIdx(idx);
-      setTimeout(() => setCopiedIdx(null), 2000);
+      setCopiedKey(person.groupKey);
+      setTimeout(() => setCopiedKey(null), 2000);
     });
   };
 
   return (
     <div className="my-3 space-y-2">
-      {people.map((person, idx) => {
-        const name = getNameField(person);
-        const schema = SCHEMA_LABELS[person._source_schema || ""] || person._source_schema;
-        const displayFields = Object.entries(person)
-          .filter(([k, v]) => !SKIP_FIELDS.has(k) && v !== undefined && v !== null && v !== "")
-          .sort(([a], [b]) => {
-            const order = Object.keys(FIELD_CONFIG);
-            return order.indexOf(a) - order.indexOf(b);
-          });
-
+      {merged.map((person) => {
+        const isMulti = person.sources.length > 1;
         return (
           <div
-            key={idx}
+            key={person.groupKey}
             className="relative rounded-xl border border-border/40 bg-zinc-50/50 dark:bg-zinc-900/40 p-4 hover:shadow-md transition-all duration-300"
           >
             {/* Copy button — top right corner */}
             <button
-              onClick={() => handleCopyCard(person, idx)}
+              onClick={() => handleCopyCard(person)}
               className={cn(
                 "absolute top-3 right-3 p-2 rounded-lg text-xs transition-all",
-                copiedIdx === idx
+                copiedKey === person.groupKey
                   ? "bg-emerald-500/10 text-emerald-600"
                   : "bg-muted/30 hover:bg-muted text-muted-foreground hover:text-foreground"
               )}
               title="Copy"
             >
-              {copiedIdx === idx ? (
+              {copiedKey === person.groupKey ? (
                 <ClipboardCheck className="w-4 h-4" />
               ) : (
                 <Copy className="w-4 h-4" />
               )}
             </button>
 
-            {/* Header: name + schema badge */}
+            {/* Header: name + source badge(s) */}
             <div className="flex items-center gap-3 mb-4 pr-10">
               <div className="w-9 h-9 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary text-sm font-bold shadow-sm">
-                {name.charAt(0).toUpperCase()}
+                {person.name.charAt(0).toUpperCase()}
               </div>
               <div className="flex-1 min-w-0">
-                <p className="font-bold text-[15px] text-foreground tracking-tight truncate">{name}</p>
-                {schema && (
-                  <div className="flex items-center gap-1.5 mt-0.5">
-                    <span className="w-1.5 h-1.5 rounded-full bg-primary/60" />
-                    <p className="text-[10px] text-muted-foreground font-bold uppercase tracking-wider">{schema}</p>
+                <p className="font-bold text-[15px] text-foreground tracking-tight truncate">{person.name}</p>
+                {person.sources.length > 0 && (
+                  <div className="flex items-center flex-wrap gap-1.5 mt-1">
+                    {isMulti && (
+                      <span className="inline-flex items-center gap-1 px-1.5 h-[18px] rounded-full bg-emerald-500/12 text-emerald-600 dark:text-emerald-400 text-[9px] font-bold uppercase tracking-wider">
+                        <LayoutGrid className="w-2.5 h-2.5" />
+                        {person.sources.length} nguồn
+                      </span>
+                    )}
+                    {person.sources.map((s) => (
+                      <span
+                        key={s}
+                        className="inline-flex items-center gap-1 px-1.5 h-[18px] rounded-full bg-primary/10 text-primary text-[9px] font-bold uppercase tracking-wider"
+                      >
+                        <span className="w-1.5 h-1.5 rounded-full bg-primary/60" />
+                        {schemaLabel(s)}
+                      </span>
+                    ))}
                   </div>
                 )}
               </div>
             </div>
 
-            {/* Fields grid */}
+            {/* Fields grid (merged across sources) */}
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2.5">
-              {displayFields.map(([key, val]) => {
+              {person.fields.map(([key, vals]) => {
                 const config = FIELD_CONFIG[key];
                 if (!config) return null;
                 return (
-                  <div key={key} className="flex items-center gap-2.5">
-                    <div className="flex-shrink-0 w-5 h-5 rounded-md bg-muted/40 flex items-center justify-center text-primary/70 scale-90">
+                  <div key={key} className="flex items-start gap-2.5">
+                    <div className="flex-shrink-0 w-5 h-5 mt-0.5 rounded-md bg-muted/40 flex items-center justify-center text-primary/70 scale-90">
                       {config.icon}
                     </div>
                     <div className="min-w-0">
                       <p className="text-[10px] text-muted-foreground font-semibold uppercase tracking-tight leading-none mb-0.5">{config.label}</p>
-                      {key === "uids" ? (
-                        <a
-                          href={`https://facebook.com/${val}`}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-[12px] font-medium text-blue-600 dark:text-blue-400 hover:underline truncate"
-                        >
-                          {String(val)}
-                        </a>
+                      {key === "uid" || key === "uids" ? (
+                        <div className="flex flex-col gap-0.5">
+                          {vals.map((v) => (
+                            <a
+                              key={v}
+                              href={`https://facebook.com/${v}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-[12px] font-medium text-blue-600 dark:text-blue-400 hover:underline truncate"
+                            >
+                              {v}
+                            </a>
+                          ))}
+                        </div>
                       ) : (
-                        <p className="text-[12px] font-medium text-foreground/90 truncate">{String(val)}</p>
+                        <p className="text-[12px] font-medium text-foreground/90 break-words">{vals.join(" · ")}</p>
                       )}
                     </div>
                   </div>
@@ -692,7 +766,7 @@ function PeopleCard({ people, isLoadingMore }: { people: PeopleRecord[], isLoadi
           </div>
         );
       })}
-      
+
       {isLoadingMore && (
         <div className="flex items-center justify-center gap-2 p-3 text-muted-foreground bg-muted/10 rounded-lg border border-dashed">
           <Loader2 className="w-4 h-4 animate-spin" />
@@ -2843,6 +2917,10 @@ export const ChatPanel = memo(function ChatPanel({
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const scrollAnimRef = useRef<number | undefined>(undefined);
   const spacerRef = useRef<HTMLDivElement>(null);
+  // Whether the user is following the latest content (near the bottom). When
+  // false (they scrolled up to read), we never auto-scroll and show a jump button.
+  const pinnedToBottomRef = useRef(true);
+  const [showScrollDown, setShowScrollDown] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const docxInputRef = useRef<HTMLInputElement>(null);
 
@@ -3070,6 +3148,11 @@ export const ChatPanel = memo(function ChatPanel({
   );
   const streamingMsgIdRef = useRef<string | null>(null);
   const agentStepsRef = useRef<AgentStep[]>([]);
+  // Synchronous in-flight guard. `stream.isStreaming` only flips to true AFTER
+  // the async session-creation + sendMessage call, leaving a window where rapid
+  // Enter presses each pass the isStreaming check and spawn duplicate sessions.
+  // This ref is set synchronously at the very top of handleSend to close that gap.
+  const isSendingRef = useRef(false);
   useEffect(() => {
     if (stream.agentSteps.length > 0) {
       agentStepsRef.current = stream.agentSteps;
@@ -3128,7 +3211,10 @@ export const ChatPanel = memo(function ChatPanel({
       requestAnimationFrame(() => {
         const el = scrollContainerRef.current;
         if (!el) return;
-        const target = el.scrollHeight - el.clientHeight;
+        // Exclude the streaming spacer — target the end of real content, not the
+        // empty room kept below it during streaming.
+        const spacerH = spacerRef.current?.offsetHeight ?? 0;
+        const target = Math.max(0, el.scrollHeight - spacerH - el.clientHeight);
         if (!smooth || Math.abs(target - el.scrollTop) < 10) {
           el.scrollTop = target;
           return;
@@ -3154,6 +3240,19 @@ export const ChatPanel = memo(function ChatPanel({
         scrollAnimRef.current = requestAnimationFrame(animate);
       });
     });
+  }, []);
+
+  // Recompute whether the user is near the bottom (pinned) + toggle the jump
+  // button. The streaming spacer is excluded so its empty room never counts as
+  // unread content.
+  const updateScrollState = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const spacerH = spacerRef.current?.offsetHeight ?? 0;
+    const unreadBelow = el.scrollHeight - spacerH - el.scrollTop - el.clientHeight;
+    const pinned = unreadBelow <= 80;
+    pinnedToBottomRef.current = pinned;
+    setShowScrollDown(!pinned);
   }, []);
 
   // Scroll user message to top of chat area
@@ -3213,24 +3312,21 @@ export const ChatPanel = memo(function ChatPanel({
     }
   }, [stream.isStreaming]);
 
-  const prevIsStreamingRef = useRef(false);
-  const justFinishedStreamingRef = useRef(false);
+  // Auto-scroll to the latest content ONLY when the user is already near the
+  // bottom. If they've scrolled up to read, leave their position alone — the
+  // jump button lets them catch up. This also prevents the jarring jump-to-end
+  // right after streaming finishes.
   useEffect(() => {
-    if (prevIsStreamingRef.current && !stream.isStreaming) {
-      justFinishedStreamingRef.current = true;
-    }
-    prevIsStreamingRef.current = stream.isStreaming;
-  }, [stream.isStreaming]);
-
-  useEffect(() => {
-    if (!stream.isStreaming) {
-      if (justFinishedStreamingRef.current) {
-        justFinishedStreamingRef.current = false;
-        return;
-      }
-      scrollToBottom();
-    }
+    if (stream.isStreaming) return;
+    if (pinnedToBottomRef.current) scrollToBottom();
   }, [messages, stream.isStreaming, scrollToBottom]);
+
+  // Keep the pinned-state / jump-button fresh as content grows (streaming) and
+  // as layout settles (e.g. the spacer collapsing when streaming ends).
+  useEffect(() => {
+    const id = requestAnimationFrame(updateScrollState);
+    return () => cancelAnimationFrame(id);
+  }, [messages, stream.streamingContent, stream.isStreaming, updateScrollState]);
 
   useEffect(() => {
     if (!streamingMsgIdRef.current) return;
@@ -3284,14 +3380,22 @@ export const ChatPanel = memo(function ChatPanel({
   const handleSend = useCallback(
     async (text?: string) => {
       const msg = (text || input).trim();
-      const isStillProcessing = attachedFiles.some(f => f.status === "uploading");
+      // Block send while any file is still uploading OR parsing — its markdown is not
+      // yet in MinIO, so the backend would silently drop it. "ready"/"indexed" are safe.
+      const isStillProcessing = attachedFiles.some(f => f.status === "uploading" || f.status === "parsing");
       if (isStillProcessing) {
         toast.info(t("chat.wait_for_files"));
         return;
       }
       if (!msg && attachedFiles.length === 0) return;
       if (stream.isStreaming) return;
+      // Reentrancy guard: block a second send while the first is still in its
+      // async setup (session creation → sendMessage), before isStreaming flips.
+      // Without this, mashing Enter on a fresh chat creates duplicate sessions.
+      if (isSendingRef.current) return;
+      isSendingRef.current = true;
 
+      try {
       let effectiveSessionId = sessionId;
       if (!effectiveSessionId) {
         try {
@@ -3301,7 +3405,7 @@ export const ChatPanel = memo(function ChatPanel({
           // Clear "New Chat" draft/mentions since we are sending it
           localStorage.removeItem("hrag-draft-new");
           localStorage.removeItem("hrag-mentions-new");
-          
+
           if (document.documentElement.classList.contains("debug-mode")) {
             console.log(`[Persistence] Cleared "new" draft for session "${effectiveSessionId}"`);
           }
@@ -3328,8 +3432,19 @@ export const ChatPanel = memo(function ChatPanel({
 
       const documentIds = [
         ...validMentions.map(d => d.id),
-        ...attachedFiles.filter(f => f.status === "indexed" || f.status === "ready" || f.status === "parsing").map(f => f.id),
+        // Only send files whose parse is confirmed done (markdown exists in MinIO).
+        // "parsing" is excluded: markdown_s3_key may still be NULL → backend direct-fetch
+        // skips the file and it becomes invisible to the agent (race condition fix).
+        ...attachedFiles.filter(f => f.status === "indexed" || f.status === "ready").map(f => f.id),
       ];
+      // [debug] Trace which docs/files are actually sent to the backend + their status.
+      // Enable via Ctrl+Shift+D (toggles document.documentElement "debug-mode").
+      if (document.documentElement.classList.contains("debug-mode")) {
+        console.log("[ChatPanel/handleSend] sending documentIds:", documentIds, {
+          mentions: validMentions.map(d => ({ id: d.id, name: d.original_filename || d.filename })),
+          attached: attachedFiles.map(f => ({ id: f.id, status: f.status, name: f.file?.name })),
+        });
+      }
       setAttachedFiles([]);
 
       const attachedDocs = attachedFiles
@@ -3433,6 +3548,11 @@ export const ChatPanel = memo(function ChatPanel({
           ),
         );
         streamingMsgIdRef.current = null;
+      }
+      } finally {
+        // Release the reentrancy guard once setup is done (stream.isStreaming now
+        // owns the in-flight state) or whenever an early return/throw bails out.
+        isSendingRef.current = false;
       }
     },
     [input, messages, stream, thinkingSupported, enableThinking, forceSearch, scrollUserMsgToTop, sessionId, navigate, createSession, t, attachedFiles],
@@ -3621,7 +3741,7 @@ export const ChatPanel = memo(function ChatPanel({
             ) : (
               <>
                 {/* Messages List */}
-                <div ref={scrollContainerRef} className="flex-1 min-h-0 overflow-y-auto px-3 py-3 space-y-4 relative scrollbar-none">
+                <div ref={scrollContainerRef} onScroll={updateScrollState} className="flex-1 min-h-0 overflow-y-auto px-3 py-3 space-y-4 relative scrollbar-none">
                   <AnimatePresence mode="popLayout">
                     {messages.map((msg) => (
                       <motion.div
@@ -3644,7 +3764,20 @@ export const ChatPanel = memo(function ChatPanel({
                 </div>
 
                 {/* Sticky Input Area (Fixed at bottom) */}
-                <div className="flex-shrink-0 p-4 border-t/0 pb-8 last-msg-focus-fix bg-gradient-to-t from-background via-background/80 to-transparent">
+                <div className="relative flex-shrink-0 p-4 border-t/0 pb-8 last-msg-focus-fix bg-gradient-to-t from-background via-background/80 to-transparent">
+                  {/* Jump-to-latest button — shown when the user has scrolled up
+                      and there is unread content below. */}
+                  {showScrollDown && (
+                    <button
+                      type="button"
+                      onClick={() => scrollToBottom()}
+                      aria-label={t("chat.scroll_to_latest")}
+                      title={t("chat.scroll_to_latest")}
+                      className="absolute left-1/2 -translate-x-1/2 bottom-full mb-2 z-20 flex items-center justify-center w-9 h-9 rounded-full bg-background/90 backdrop-blur border border-muted shadow-md text-muted-foreground hover:text-foreground hover:bg-muted transition-all animate-in fade-in slide-in-from-bottom-2 duration-200"
+                    >
+                      <ChevronDown className="w-5 h-5" />
+                    </button>
+                  )}
                   <div className="w-full max-w-[720px] mx-auto px-2">
                     <ChatInputArea
                       input={input}

@@ -233,6 +233,7 @@
     "suggestion_any": "Viết bất cứ thứ gì",
     "suggestion_methodology": "Giải thích phương pháp được sử dụng",
     "view_kg": "Xem trong biểu đồ tri thức",
+    "scroll_to_latest": "Cuộn xuống nội dung mới nhất",
     "highlight_kg": "Làm nổi bật trong biểu đồ tri thức",
     "view_source": "Xem nguồn: {{name}} (trang {{page}})",
     "copy_code": "Sao chép mã",
