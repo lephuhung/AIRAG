@@ -73,7 +73,7 @@ function App() {
       </BrowserRouter>
       <Toaster
         theme={theme}
-        position="bottom-right"
+        position="bottom-left"
         richColors
         toastOptions={{
           duration: 4000,

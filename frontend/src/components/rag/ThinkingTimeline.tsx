@@ -78,6 +78,83 @@ export const STEP_CONFIG: Record<AgentStepType, StepConfig> = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Step-detail humanizer
+//
+// Backend status events sometimes carry internal node / tool identifiers
+// (e.g. "memory_recall", "resolve_doc", or a react-executor dump like
+// "Đang tra cứu: resolve_document_reference, search_documents"). These must
+// never be shown verbatim to end users. We map known identifiers to friendly
+// Vietnamese phrases and collapse any other bare identifier to a generic
+// "thinking" message.
+// ---------------------------------------------------------------------------
+
+const GENERIC_THINKING = "Đang suy nghĩ...";
+
+const INTERNAL_STEP_LABELS: Record<string, string> = {
+  // Graph nodes / agents
+  memory_recall: "Đang nhớ lại ngữ cảnh",
+  query_analyzer: "Đang phân tích câu hỏi",
+  query_enricher: "Đang bổ sung ngữ cảnh",
+  supervisor: "Đang điều phối",
+  intent_classifier: "Đang phân loại yêu cầu",
+  resolve_doc: "Đang tìm văn bản",
+  resolve_doc_agent: "Đang tìm văn bản",
+  answer_generator: "Đang soạn câu trả lời",
+  result_evaluator: "Đang kiểm tra kết quả",
+  mongo_formatter: "Đang tổng hợp thông tin",
+  react_executor: "Đang tra cứu thông tin",
+  rag: "Đang tìm kiếm tài liệu",
+  rag_agent: "Đang tìm kiếm tài liệu",
+  people: "Đang tra cứu nhân sự",
+  people_agent: "Đang tra cứu nhân sự",
+  write: "Đang xử lý văn bản",
+  write_agent: "Đang xử lý văn bản",
+  direct: "Đang trả lời",
+  clarification: "Đang làm rõ yêu cầu",
+  // Tools
+  resolve_document_reference: "Đang xác định văn bản",
+  search_documents: "Đang tìm kiếm tài liệu",
+  search_document: "Đang tìm kiếm tài liệu",
+  get_document_content: "Đang đọc nội dung văn bản",
+  list_documents: "Đang liệt kê tài liệu",
+  recall_memory: "Đang nhớ lại ngữ cảnh",
+  save_memory: "Đang ghi nhớ",
+  search_people: "Đang tra cứu nhân sự",
+  search_abbreviation: "Đang tra cứu viết tắt",
+};
+
+// A bare internal identifier: snake_case (has "_") or lowerCamelCase function name.
+const IDENTIFIER_RE = /^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$|^[a-z]+[A-Z][a-zA-Z0-9]*$/;
+
+/**
+ * Convert a raw backend step `detail` into user-safe display text.
+ * Never leaks internal node / function identifiers.
+ */
+export function humanizeStepDetail(detail?: string | null, fallback?: string): string {
+  const raw = (detail ?? "").trim();
+  if (!raw) return fallback || GENERIC_THINKING;
+
+  // Whole string is a known internal identifier.
+  const exact = INTERNAL_STEP_LABELS[raw.toLowerCase()];
+  if (exact) return exact;
+
+  // Identifier tokens hidden inside the string (e.g. tool-name dumps).
+  const tokens = raw.match(/[A-Za-z_][A-Za-z0-9_]*/g) || [];
+  const idTokens = tokens.filter(
+    (tok) => IDENTIFIER_RE.test(tok) || tok.toLowerCase() in INTERNAL_STEP_LABELS
+  );
+  if (idTokens.length) {
+    const mapped = idTokens
+      .map((tok) => INTERNAL_STEP_LABELS[tok.toLowerCase()])
+      .find(Boolean);
+    return mapped || fallback || GENERIC_THINKING;
+  }
+
+  // Already human-readable text — keep as-is.
+  return raw;
+}
+
 function formatMs(ms: number): string {
   const absMs = Math.abs(ms);
   if (absMs < 1000) return `${absMs}ms`;
@@ -143,7 +220,7 @@ function PremiumStepIndicator({ step }: { step: AgentStep }) {
       <div className="flex flex-col">
         <div className="flex items-center gap-2">
           <span className="text-sm font-semibold tracking-tight text-foreground/90">
-            {step.detail || t(config.labelKey)}
+            {humanizeStepDetail(step.detail, t(config.labelKey))}
           </span>
           <AnimatePresence>
             {isActive && (

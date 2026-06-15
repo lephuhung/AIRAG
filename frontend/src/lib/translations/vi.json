@@ -8,7 +8,7 @@
     "knowledge_bases": "Kho tri thức",
     "files": "Tệp tin",
     "workers": "Tiến trình",
-    "system_logs": "Nhật ký hệ thống",
+    "system_logs": "Nhật ký hoạt động",
     "admin": {
       "dashboard": "Thống kê",
       "slug": "Mã định danh",
@@ -16,7 +16,7 @@
       "tenants": "Tổ chức",
       "document_types": "Loại tài liệu",
       "abbreviations": "Từ viết tắt",
-      "system_logs": "Nhật ký hệ thống"
+      "system_logs": "Nhật ký hoạt động"
     },
     "my_tenants": "Tổ chức của tôi",
     "your_chats": "Lịch sử chat"
@@ -37,6 +37,50 @@
     "waiting": "Đang đợi log...",
     "file": "File",
     "new": "mới"
+  },
+  "audit": {
+    "title": "Nhật ký hoạt động",
+    "subtitle": "Hành động quản trị của người dùng",
+    "search_placeholder": "Tìm theo mô tả, tên, email...",
+    "all_resources": "Tất cả đối tượng",
+    "all_actions": "Tất cả hành động",
+    "refresh": "Làm mới",
+    "col_time": "Thời gian",
+    "col_actor": "Người thực hiện",
+    "col_action": "Hành động",
+    "col_resource": "Đối tượng",
+    "col_summary": "Mô tả",
+    "col_source": "Nguồn",
+    "empty": "Chưa có hoạt động nào",
+    "total": "bản ghi",
+    "page": "Trang",
+    "prev": "Trước",
+    "next": "Sau",
+    "system": "Hệ thống",
+    "auto": "Tự động",
+    "explicit": "Chi tiết",
+    "resource": {
+      "abbreviation": "Từ viết tắt",
+      "workspace": "Workspace",
+      "document_type": "Loại tài liệu",
+      "tenant": "Tổ chức",
+      "tenant_member": "Thành viên",
+      "tenant_invite": "Lời mời",
+      "user": "Người dùng"
+    },
+    "action_label": {
+      "create": "Tạo",
+      "update": "Cập nhật",
+      "delete": "Xóa",
+      "set_default": "Đặt mặc định",
+      "set_admin": "Cấp quản trị",
+      "approve": "Phê duyệt",
+      "reject": "Từ chối",
+      "update_role": "Đổi vai trò",
+      "update_prompt": "Sửa prompt",
+      "delete_prompt": "Xóa prompt",
+      "reset_password": "Reset mật khẩu"
+    }
   },
   "common": {
     "admin": "Quản trị",
@@ -220,7 +264,7 @@
       "local": "Biểu đồ cục bộ",
       "global": "Biểu đồ tổng thể"
     },
-    "input_placeholder": "Hỏi về tài liệu của bạn...",
+    "input_placeholder": "Hỏi bất cứ điều gì, hoặc gõ @ để nhắc đến file đã tải lên...",
     "stop": "Dừng tạo văn bản",
     "input_hint": "Nhấn Enter để gửi, Shift+Enter để xuống dòng",
     "debug_on": "Chế độ gỡ lỗi: BẬT",
@@ -318,6 +362,9 @@
     "no_match": "Không tìm thấy tài liệu nào khớp với tìm kiếm của bạn.",
     "analyze_all": "Phân tích tất cả",
     "upload_success": "Tải lên thành công",
+    "upload_duplicate_public": "Tài liệu đã tồn tại",
+    "upload_duplicate_public_desc": "Nội dung giống hệt đã có trong không gian công khai \"{{workspace}}\". Hệ thống không xử lý lại — bạn có thể dùng bản đã có.",
+    "upload_duplicate_public_desc_generic": "Nội dung giống hệt đã tồn tại trong một không gian công khai khác. Hệ thống không xử lý lại — bạn có thể dùng bản đã có.",
     "upload_failed": "Tải lên thất bại",
     "upload_failed_network": "Lỗi mạng",
     "upload_failed_network_desc": "Không thể kết nối với máy chủ lưu trữ. Vui lòng kiểm tra kết nối của bạn.",
@@ -412,7 +459,9 @@
     "no_ws_yet": "Chưa có kho tri thức nào",
     "search_ws_hint": "Hãy thử thay đổi từ khóa tìm kiếm.",
     "create_ws_hint": "Tạo kho tri thức để bắt đầu quản lý tài liệu.",
-    "upload_hint": "Tải tài liệu lên từ kho tri thức để bắt đầu.",
+    "upload": "Tải lên",
+    "drop_here": "Thả tệp vào đây để tải lên",
+    "upload_hint": "Nhấn Tải lên hoặc kéo thả tệp vào đây để bắt đầu.",
     "no_files_match": "Không tìm thấy tệp tin phù hợp",
     "adjust_search_hint": "Hãy thử thay đổi từ khóa hoặc bộ lọc.",
     "delete_confirm_title": "Xóa tài liệu",

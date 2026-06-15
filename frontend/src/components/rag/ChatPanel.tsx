@@ -57,6 +57,7 @@ import diff from "react-syntax-highlighter/dist/esm/languages/prism/diff";
 import markdown from "react-syntax-highlighter/dist/esm/languages/prism/markdown";
 import { toast } from "sonner";
 import { cn, generateId } from "@/lib/utils";
+import { formatTime } from "@/lib/format";
 import { api, rewritePresignedUrl } from "@/lib/api";
 import { useWorkspaceStore } from "@/stores/workspaceStore";
 import { useAuthStore } from "@/stores/authStore";
@@ -102,14 +103,13 @@ import { useCreateChatSession, useUpdateSessionTitle } from "@/hooks/useChatSess
 import { useCreateAbbreviation } from "@/hooks/useAbbreviations";
 import { AbbreviationModal } from "@/components/rag/AbbreviationModal";
 import { StreamingMarkdown } from "@/components/rag/MemoizedMarkdown";
-import { STEP_CONFIG, ThinkingTimeline } from "@/components/rag/ThinkingTimeline";
+import { STEP_CONFIG, ThinkingTimeline, humanizeStepDetail } from "@/components/rag/ThinkingTimeline";
 import { STATUS_CONFIG, getFileConfig } from "@/components/rag/document-utils";
 import type {
   ChatMessage,
   ChatImageRef,
   ChatSourceChunk,
   ChatStreamStatus,
-  LLMCapabilities,
   AgentStep,
   AgentStepType,
   Document,
@@ -1121,7 +1121,7 @@ const PremiumThinking = memo(({
     if (isStreaming && !hasContent) {
       if (activeStep) {
         const config = STEP_CONFIG[activeStep.step];
-        return activeStep.detail || (config ? t(config.labelKey) : "Đang xử lý...");
+        return humanizeStepDetail(activeStep.detail, config ? t(config.labelKey) : "Đang xử lý...");
       }
       if (doneStep && !thinking) {
         return t("rag.timeline.done") || "Đã xong bước chuẩn bị";
@@ -2198,12 +2198,7 @@ const MessageBubble = memo(function MessageBubble({
             isUser ? "text-muted-foreground/50" : "text-muted-foreground/50"
           )}
         >
-          {new Date(message.timestamp).toLocaleTimeString("vi-VN", {
-            hour: "2-digit",
-            minute: "2-digit",
-            hour12: false,
-            timeZone: "Asia/Ho_Chi_Minh",
-          })}
+          {formatTime(message.timestamp)}
         </p>
       </div>
 
@@ -2372,9 +2367,6 @@ function ChatInputArea({
   isStreaming,
   onSend,
   onCancel,
-  thinkingSupported,
-  enableThinking,
-  onToggleThinking,
   forceSearch,
   onToggleSearch,
   attachedFiles,
@@ -2398,9 +2390,6 @@ function ChatInputArea({
   isStreaming: boolean;
   onSend: () => void;
   onCancel: () => void;
-  thinkingSupported: boolean;
-  enableThinking: boolean;
-  onToggleThinking: () => void;
   forceSearch: boolean;
   onToggleSearch: () => void;
   attachedFiles: AttachedFile[];
@@ -2586,23 +2575,6 @@ function ChatInputArea({
           </div>
 
           <div className="flex items-center gap-2">
-            {/* Thinking Toggle — Styled as a pill dropdown */}
-            {thinkingSupported && (
-              <button
-                type="button"
-                onClick={() => onToggleThinking()}
-                className={cn(
-                  "flex items-center gap-1.5 px-3 h-9 rounded-full transition-all text-xs font-semibold tracking-tight",
-                  enableThinking
-                    ? "text-violet-500 bg-violet-500/10 hover:bg-violet-500/15"
-                    : "text-muted-foreground/50 hover:text-muted-foreground hover:bg-muted/80"
-                )}
-              >
-                <span>{t("chat.think_toggle")}</span>
-                <ChevronDown className={cn("w-3.5 h-3.5 transition-transform", enableThinking && "rotate-180")} />
-              </button>
-            )}
-
             {/* Action Button (Mic / Send / Stop) */}
             <div className="ml-1">
               {isStreaming ? (
@@ -2670,8 +2642,6 @@ export const ChatPanel = memo(function ChatPanel({
     if (!sessionId) return localStorage.getItem("hrag-draft-new") || "";
     return localStorage.getItem(`hrag-draft-${sessionId}`) || "";
   });
-  const [enableThinking, setEnableThinking] = useState(true);
-  const [thinkingDefaultSynced, setThinkingDefaultSynced] = useState(false);
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
   const [referencedDocs, setReferencedDocs] = useState<{ id: string; filename: string; original_filename?: string }[]>([]);
   const [docMetadataMap, setDocMetadataMap] = useState<Map<string, Document>>(new Map());
@@ -3051,15 +3021,6 @@ export const ChatPanel = memo(function ChatPanel({
     setAttachedFiles((prev) => prev.filter((f) => f.id !== id));
   }, []);
 
-  // Check LLM capabilities (thinking support)
-  const { data: capabilities } = useQuery<LLMCapabilities>({
-    queryKey: ["llm-capabilities"],
-    queryFn: () => api.get<LLMCapabilities>("/rag/capabilities"),
-    staleTime: 5 * 60 * 1000, // Cache for 5 minutes
-    retry: 1,
-  });
-  const thinkingSupported = capabilities?.supports_thinking ?? false;
-
   // Auto-focus input for new chat sessions
   useEffect(() => {
     if (messages.length === 0 && !historyLoading && inputRef.current) {
@@ -3067,13 +3028,6 @@ export const ChatPanel = memo(function ChatPanel({
     }
   }, [messages.length, historyLoading]);
 
-  // Sync thinking toggle default from server (once per mount)
-  useEffect(() => {
-    if (capabilities && !thinkingDefaultSynced) {
-      setEnableThinking(capabilities.thinking_default);
-      setThinkingDefaultSynced(true);
-    }
-  }, [capabilities, thinkingDefaultSynced]);
 
   // Sync DB history → local messages state when data loads.
   useEffect(() => {
@@ -3494,7 +3448,7 @@ export const ChatPanel = memo(function ChatPanel({
       const finalMsg = await stream.sendMessage(
         msgToBackend,
         history,
-        thinkingSupported && enableThinking,
+        false, // thinking is decided server-side by query complexity
         forceSearch,
         effectiveSessionId || undefined,
         documentIds
@@ -3555,7 +3509,7 @@ export const ChatPanel = memo(function ChatPanel({
         isSendingRef.current = false;
       }
     },
-    [input, messages, stream, thinkingSupported, enableThinking, forceSearch, scrollUserMsgToTop, sessionId, navigate, createSession, t, attachedFiles],
+    [input, messages, stream, forceSearch, scrollUserMsgToTop, sessionId, navigate, createSession, t, attachedFiles],
   );
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -3708,9 +3662,6 @@ export const ChatPanel = memo(function ChatPanel({
                       isStreaming={stream.isStreaming}
                       onSend={handleSend}
                       onCancel={stream.cancel}
-                      thinkingSupported={thinkingSupported}
-                      enableThinking={enableThinking}
-                      onToggleThinking={() => setEnableThinking(!enableThinking)}
                       forceSearch={forceSearch}
                       onToggleSearch={() => setForceSearch(!forceSearch)}
                       attachedFiles={attachedFiles}
@@ -3785,9 +3736,6 @@ export const ChatPanel = memo(function ChatPanel({
                       isStreaming={stream.isStreaming}
                       onSend={handleSend}
                       onCancel={stream.cancel}
-                      thinkingSupported={thinkingSupported}
-                      enableThinking={enableThinking}
-                      onToggleThinking={() => setEnableThinking(!enableThinking)}
                       forceSearch={forceSearch}
                       onToggleSearch={() => setForceSearch(!forceSearch)}
                       attachedFiles={attachedFiles}

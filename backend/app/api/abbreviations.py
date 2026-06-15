@@ -12,6 +12,7 @@ from app.schemas.abbreviation import (
     AbbreviationListResponse
 )
 from app.services.abbreviation_service import AbbreviationService
+from app.services.audit_service import AuditService
 
 router = APIRouter(prefix="/abbreviations", tags=["abbreviations"])
 
@@ -27,7 +28,17 @@ async def create_abbreviation(
     If created by superadmin, it will be active by default.
     """
     is_active = current_user.is_superadmin
-    return await AbbreviationService.create(db, request, current_user.id, is_active=is_active)
+    created = await AbbreviationService.create(db, request, current_user.id, is_active=is_active)
+    await AuditService.record_for_actor(
+        current_user,
+        action="create",
+        resource_type="abbreviation",
+        resource_id=str(created.id),
+        resource_label=created.short_form,
+        summary=f'Thêm từ viết tắt "{created.short_form}" = "{created.full_form}"',
+        source="explicit",
+    )
+    return created
 
 
 @router.get("/", response_model=AbbreviationListResponse)
@@ -91,8 +102,19 @@ async def update_abbreviation(
     
     if not current_user.is_superadmin and db_obj.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not enough permissions")
-        
-    return await AbbreviationService.update(db, db_obj, request)
+
+    updated = await AbbreviationService.update(db, db_obj, request)
+    await AuditService.record_for_actor(
+        current_user,
+        action="update",
+        resource_type="abbreviation",
+        resource_id=str(updated.id),
+        resource_label=updated.short_form,
+        summary=f'Cập nhật từ viết tắt "{updated.short_form}"',
+        extra=request.model_dump(exclude_unset=True),
+        source="explicit",
+    )
+    return updated
 
 
 @router.delete("/{abbreviation_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -108,6 +130,16 @@ async def delete_abbreviation(
         
     if not current_user.is_superadmin and db_obj.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Not enough permissions")
-        
+
+    short_form = db_obj.short_form
     await AbbreviationService.delete(db, abbreviation_id)
+    await AuditService.record_for_actor(
+        current_user,
+        action="delete",
+        resource_type="abbreviation",
+        resource_id=str(abbreviation_id),
+        resource_label=short_form,
+        summary=f'Xóa từ viết tắt "{short_form}"',
+        source="explicit",
+    )
     return None

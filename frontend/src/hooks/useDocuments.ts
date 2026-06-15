@@ -4,10 +4,12 @@
  * Uses the same query keys as WorkspacePage so React Query's cache is shared —
  * navigating between WorkspacePage and FilesPage never re-fetches redundantly.
  */
+import { useState, useCallback, useMemo } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
-import type { Document, DocumentStatus } from "@/types";
+import { useTranslation } from "@/hooks/useTranslation";
+import type { Document, DocumentStatus, UploadingFile } from "@/types";
 
 // ---------------------------------------------------------------------------
 // Processing status helpers
@@ -112,4 +114,103 @@ export function useUpdateDocument(workspaceId: string | undefined) {
     },
     onError: () => toast.error("Failed to update document metadata"),
   });
+}
+
+// ---------------------------------------------------------------------------
+// Upload hook — direct-to-MinIO upload with per-file progress tracking.
+//
+// Each upload is tracked by its own `fileId` (passed through the mutation
+// variables), so concurrent uploads never clobber each other's progress or
+// completion state. `isUploading` is derived from the live set of in-flight
+// files rather than a single shared mutation flag, so it stays accurate even
+// when several files upload at once.
+// ---------------------------------------------------------------------------
+export interface UploadController {
+  upload: (file: File) => void;
+  uploadingFiles: UploadingFile[];
+  isUploading: boolean;
+}
+
+export function useUploadDocuments(workspaceId: string | undefined): UploadController {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+  const [uploadingFiles, setUploadingFiles] = useState<Record<string, UploadingFile>>({});
+
+  const removeUploading = useCallback((fileId: string) => {
+    setUploadingFiles((prev) => {
+      if (!prev[fileId]) return prev;
+      const next = { ...prev };
+      delete next[fileId];
+      return next;
+    });
+  }, []);
+
+  const mutation = useMutation({
+    mutationFn: ({ file, fileId }: { file: File; fileId: string }) => {
+      if (!workspaceId) throw new Error("Invalid workspace ID");
+      return api.uploadFileDirect<Document>(workspaceId, file, (progress) => {
+        setUploadingFiles((prev) => {
+          if (!prev[fileId]) return prev;
+          return { ...prev, [fileId]: { ...prev[fileId], progress } };
+        });
+      });
+    },
+    onSuccess: (data, { fileId }) => {
+      removeUploading(fileId);
+      queryClient.invalidateQueries({ queryKey: ["documents", workspaceId] });
+      queryClient.invalidateQueries({ queryKey: ["rag-stats", workspaceId] });
+      queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+      // Backend short-circuits when identical content already lives in another
+      // public workspace: the upload was deleted and nothing processed. Warn
+      // instead of reporting success.
+      const dup = data as unknown as {
+        duplicate?: boolean;
+        duplicate_workspace_name?: string | null;
+      };
+      if (dup?.duplicate) {
+        const ws = dup.duplicate_workspace_name;
+        toast.warning(t("workspace.upload_duplicate_public"), {
+          description: ws
+            ? t("workspace.upload_duplicate_public_desc", { workspace: ws })
+            : t("workspace.upload_duplicate_public_desc_generic"),
+          duration: 10000,
+        });
+        return;
+      }
+      toast.success(t("workspace.upload_success"));
+    },
+    onError: (err: Error, { fileId }) => {
+      removeUploading(fileId);
+      const msg = err.message || "";
+      if (msg.includes("MinIO PUT failed") || msg.includes("Network error")) {
+        toast.error(t("workspace.upload_failed_network"), {
+          description: t("workspace.upload_failed_network_desc"),
+        });
+      } else if (msg.includes("too large")) {
+        toast.error(t("workspace.file_too_large"), { description: msg });
+      } else {
+        toast.error(t("workspace.upload_failed"), { description: msg || undefined });
+      }
+    },
+  });
+
+  const upload = useCallback(
+    (file: File) => {
+      const fileId = `${file.name}-${file.size}-${Date.now()}-${Math.round(Math.random() * 1e6)}`;
+      setUploadingFiles((prev) => ({
+        ...prev,
+        [fileId]: { id: fileId, name: file.name, size: file.size, progress: 0 },
+      }));
+      mutation.mutate({ file, fileId });
+    },
+    [mutation],
+  );
+
+  const uploadingList = useMemo(() => Object.values(uploadingFiles), [uploadingFiles]);
+
+  return {
+    upload,
+    uploadingFiles: uploadingList,
+    isUploading: uploadingList.length > 0,
+  };
 }

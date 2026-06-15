@@ -4,6 +4,8 @@ import os
 import io
 import re
 import uuid
+import asyncio
+import hashlib
 import logging
 from pathlib import Path
 
@@ -36,6 +38,213 @@ from app.schemas.document import (
 from app.schemas.rag import DocumentImageResponse
 
 logger = logging.getLogger(__name__)
+
+
+async def _find_duplicate_document(
+    db: AsyncSession,
+    workspace_id: uuid.UUID,
+    content_hash: str,
+    file_size: int,
+) -> Document | None:
+    """Find an existing INDEXED document with the same content within scope.
+
+    Scope rules (visibility-aware) — pick the broadest sharing boundary that
+    still respects confidentiality, in priority order:
+    - PUBLIC target → match any INDEXED doc in any other PUBLIC workspace.
+      Public content is shared knowledge and figures are served from an
+      unauthenticated static mount, so reusing across owners is safe.
+    - Has tenant_id → match any INDEXED doc whose workspace shares that
+      tenant_id (Phase 2 behaviour).
+    - PERSONAL (no tenant) → match across the SAME owner's workspaces only, so
+      one user's parsed file is reused only by that same user, never leaked.
+    - No owner/tenant (legacy) → restrict to the SAME workspace.
+
+    A match in the same workspace is preferred (ordered first). file_size is
+    compared alongside the hash as a cheap guard against hash collisions.
+    """
+    ws = await db.get(KnowledgeBase, workspace_id)
+    tenant_id = ws.tenant_id if ws is not None else None
+    visibility = ws.visibility if ws is not None else None
+    owner_id = ws.owner_id if ws is not None else None
+
+    stmt = (
+        select(Document)
+        .join(KnowledgeBase, Document.workspace_id == KnowledgeBase.id)
+        .where(
+            Document.content_hash == content_hash,
+            Document.file_size == file_size,
+            Document.status == DocumentStatus.INDEXED,
+        )
+    )
+    if visibility == "public":
+        stmt = stmt.where(KnowledgeBase.visibility == "public")
+    elif tenant_id is not None:
+        stmt = stmt.where(KnowledgeBase.tenant_id == tenant_id)
+    elif owner_id is not None:
+        stmt = stmt.where(KnowledgeBase.owner_id == owner_id)
+    else:
+        stmt = stmt.where(Document.workspace_id == workspace_id)
+
+    # Prefer a match that already lives in the target workspace.
+    stmt = stmt.order_by(
+        (Document.workspace_id == workspace_id).desc(),
+        Document.created_at.asc(),
+    )
+    result = await db.execute(stmt)
+    return result.scalars().first()
+
+
+async def _is_public_workspace(db: AsyncSession, workspace_id: uuid.UUID) -> bool:
+    """True if the workspace is publicly visible."""
+    ws = await db.get(KnowledgeBase, workspace_id)
+    return ws is not None and ws.visibility == "public"
+
+
+async def _public_duplicate_response(
+    db: AsyncSession, dup: Document
+) -> DocumentUploadResponse:
+    """Build the warning response for a duplicate found in another PUBLIC
+    workspace. The caller is responsible for deleting the uploaded file and the
+    pending record; here we only assemble the user-facing payload pointing at the
+    existing public copy."""
+    src_ws = await db.get(KnowledgeBase, dup.workspace_id)
+    ws_name = src_ws.name if src_ws is not None else None
+    where = f' ("{ws_name}")' if ws_name else ""
+    return DocumentUploadResponse(
+        id=dup.id,
+        filename=dup.original_filename,
+        status=dup.status,
+        message=(
+            f"Tài liệu này đã tồn tại trong một không gian công khai khác{where} "
+            f"— không xử lý lại. Bạn có thể dùng trực tiếp bản đã có."
+        ),
+        duplicate=True,
+        duplicate_document_id=dup.id,
+        duplicate_workspace_id=dup.workspace_id,
+        duplicate_workspace_name=ws_name,
+    )
+
+
+def _copy_vector_chunks(
+    source_workspace_id: uuid.UUID,
+    source_document_id: uuid.UUID,
+    target_workspace_id: uuid.UUID,
+    new_document_id: uuid.UUID,
+) -> int:
+    """Copy a document's vector chunks from one workspace collection to another.
+
+    Re-keys ids to the new document and rewrites document_id / workspace_id in
+    the metadata. Image URLs in the metadata are intentionally LEFT UNCHANGED —
+    they keep pointing at the source workspace's static path, which resolves for
+    same-tenant users (the static mount is shared, unauthenticated), so figures
+    render without copying any image files.
+
+    Runs synchronously (ChromaDB client is blocking) — call via asyncio.to_thread.
+    Returns the number of chunks copied.
+    """
+    from app.services.vector_store import get_vector_store
+
+    src = get_vector_store(source_workspace_id)
+    data = src.get_document_chunks(source_document_id, include_embeddings=True)
+    ids = data["ids"]
+    if not ids:
+        return 0
+
+    embeddings = data["embeddings"]
+    documents = data["documents"]
+    metadatas = data["metadatas"]
+
+    new_ids: list[str] = []
+    new_metas: list[dict] = []
+    for meta in metadatas:
+        m = dict(meta)
+        chunk_index = m.get("chunk_index")
+        new_ids.append(f"doc_{new_document_id}_chunk_{chunk_index}")
+        m["document_id"] = str(new_document_id)
+        m["workspace_id"] = str(target_workspace_id)
+        new_metas.append(m)
+
+    tgt = get_vector_store(target_workspace_id)
+    tgt.add_documents(
+        ids=new_ids,
+        embeddings=[list(e) for e in embeddings],
+        documents=documents,
+        metadatas=new_metas,
+    )
+
+    # The BM25 index for the target workspace is built from ChromaDB and cached;
+    # force a rebuild so the freshly copied chunks become lexically searchable.
+    try:
+        from app.services.bm25_index import invalidate_cache
+
+        invalidate_cache(target_workspace_id)
+    except Exception as e:
+        logger.warning(f"[clone] BM25 invalidate failed for {target_workspace_id}: {e}")
+
+    return len(new_ids)
+
+
+async def _clone_document_to_workspace(
+    db: AsyncSession,
+    source_doc: Document,
+    new_doc: Document,
+) -> None:
+    """Populate ``new_doc`` (already created in the target workspace) by reusing
+    the parsed artifacts of ``source_doc`` instead of re-running the pipeline.
+
+    Reuses: parsed markdown (copied to the new doc's key) + vector chunks
+    (copied across collections with their existing embeddings). Skips parse,
+    embed, caption and KG entirely. The new document is marked INDEXED.
+    """
+    from app.services.storage_service import get_storage_service
+
+    storage = get_storage_service()
+
+    # 1. Copy parsed markdown to the new doc's key (best-effort).
+    if source_doc.markdown_s3_key:
+        try:
+            md = await storage.download_markdown(source_doc.markdown_s3_key)
+            new_doc.markdown_s3_key = await storage.upload_markdown(
+                new_doc.workspace_id, new_doc.id, md
+            )
+        except Exception as e:
+            logger.warning(
+                f"[clone] markdown copy failed src={source_doc.id} "
+                f"new={new_doc.id}: {e}"
+            )
+
+    # 2. Copy vector chunks (with embeddings) into the target collection.
+    chunk_count = await asyncio.to_thread(
+        _copy_vector_chunks,
+        source_doc.workspace_id,
+        source_doc.id,
+        new_doc.workspace_id,
+        new_doc.id,
+    )
+
+    # 3. Carry over parsed counts/metadata and mark the doc fully indexed.
+    new_doc.chunk_count = chunk_count or source_doc.chunk_count
+    new_doc.page_count = source_doc.page_count
+    new_doc.image_count = source_doc.image_count
+    new_doc.table_count = source_doc.table_count
+    new_doc.parser_version = source_doc.parser_version
+    new_doc.document_type_id = source_doc.document_type_id
+    new_doc.document_number = source_doc.document_number
+    new_doc.document_title = source_doc.document_title
+    new_doc.location = source_doc.location
+    new_doc.issuing_agency = source_doc.issuing_agency
+    new_doc.parent_agency = source_doc.parent_agency
+    new_doc.published_date = source_doc.published_date
+    new_doc.digital_signatures = source_doc.digital_signatures
+    new_doc.embed_done = True
+    new_doc.captions_done = True
+    new_doc.kg_done = True
+    new_doc.status = DocumentStatus.INDEXED
+    await db.commit()
+    logger.info(
+        f"[clone] new doc={new_doc.id} in ws={new_doc.workspace_id} cloned from "
+        f"src={source_doc.id} (ws={source_doc.workspace_id}), {new_doc.chunk_count} chunks"
+    )
 
 
 def _inject_images_from_db(
@@ -161,6 +370,35 @@ async def upload_document(
             detail=f"File too large. Max size: {MAX_FILE_SIZE // 1024 // 1024}MB",
         )
 
+    # Duplicate detection: hash the raw bytes and look for an existing INDEXED
+    # document with the same content in scope. A match in the SAME workspace is
+    # returned as-is (idempotent) — no re-upload, no re-processing.
+    content_hash = hashlib.sha256(content).hexdigest()
+    dup = await _find_duplicate_document(db, workspace_id, content_hash, len(content))
+    if dup is not None and dup.workspace_id == workspace_id:
+        logger.info(
+            f"[upload] duplicate of doc={dup.id} in same workspace "
+            f"{workspace_id} (hash={content_hash[:12]}) — returning existing"
+        )
+        return DocumentUploadResponse(
+            id=dup.id,
+            filename=dup.original_filename,
+            status=dup.status,
+            message="Document already exists in this knowledge base.",
+        )
+    # Cross-workspace duplicate in another PUBLIC workspace: don't duplicate the
+    # work — warn the user and stop. No MinIO object has been written yet in this
+    # flow, so there is nothing to delete.
+    if dup is not None and await _is_public_workspace(db, workspace_id):
+        logger.info(
+            f"[upload] duplicate of doc={dup.id} in another public workspace "
+            f"{dup.workspace_id} (hash={content_hash[:12]}) — warn + skip"
+        )
+        return await _public_duplicate_response(db, dup)
+    # Cross-workspace duplicate within the same tenant/owner: reuse its parsed
+    # artifacts (markdown + vector chunks) instead of re-running the pipeline.
+    reuse_source = dup if dup is not None else None
+
     # Sanitize original filename: keep alphanumeric, dots, dashes, underscores
     import re as _re
 
@@ -174,6 +412,7 @@ async def upload_document(
         original_filename=file.filename,
         file_type=ext[1:],
         file_size=len(content),
+        content_hash=content_hash,
         status=DocumentStatus.PENDING,
         uploaded_by=user.id,
     )
@@ -205,6 +444,31 @@ async def upload_document(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to upload file to storage: {str(e)}",
         )
+
+    # Cross-workspace duplicate (same tenant): clone parsed artifacts instead of
+    # queuing the parse pipeline. Raw file is still stored above so the new doc
+    # is self-contained (e.g. for future re-index).
+    if reuse_source is not None:
+        try:
+            await _clone_document_to_workspace(db, reuse_source, document)
+            return DocumentUploadResponse(
+                id=document.id,
+                filename=document.original_filename,
+                status=document.status,
+                message="Document reused from an existing copy in your tenant.",
+            )
+        except Exception as e:
+            # Clone failed — fall back to the normal parse pipeline rather than
+            # leaving the document stuck.
+            logger.warning(
+                f"[upload] clone from doc={reuse_source.id} failed for "
+                f"doc={document.id}: {e} — falling back to full parse"
+            )
+            document.status = DocumentStatus.PENDING
+            document.embed_done = False
+            document.captions_done = False
+            document.kg_done = False
+            await db.commit()
 
     # Publish parse task (immediate if webhook disabled, else MinIO event fires)
     if not settings.MINIO_WEBHOOK_ENABLED:
@@ -393,9 +657,92 @@ async def confirm_upload(
             detail="File not found in storage. Please retry the upload.",
         )
 
+    # Duplicate detection: the bytes are only on the server now (presign uploads
+    # go straight to MinIO), so hash them here. If the same content already lives
+    # in this workspace, drop the freshly uploaded object + pending record and
+    # return the existing document.
+    try:
+        raw_bytes = await storage.download_file(minio_key)
+        content_hash = hashlib.sha256(raw_bytes).hexdigest()
+    except Exception as e:
+        logger.warning(
+            f"[confirm_upload] could not hash doc={document.id} for dedup: {e} "
+            f"— proceeding without dedup"
+        )
+        content_hash = None
+
+    reuse_source: Document | None = None
+    if content_hash is not None:
+        dup = await _find_duplicate_document(
+            db, workspace_id, content_hash, document.file_size
+        )
+        if dup is not None and dup.workspace_id == workspace_id:
+            logger.info(
+                f"[confirm_upload] duplicate of doc={dup.id} in same workspace "
+                f"{workspace_id} (hash={content_hash[:12]}) — discarding upload"
+            )
+            try:
+                await storage.delete_file(minio_key)
+            except Exception as del_err:
+                logger.warning(
+                    f"[confirm_upload] failed to delete duplicate MinIO object "
+                    f"{minio_key}: {del_err}"
+                )
+            await db.delete(document)
+            await db.commit()
+            return DocumentUploadResponse(
+                id=dup.id,
+                filename=dup.original_filename,
+                status=dup.status,
+                message="Document already exists in this knowledge base.",
+            )
+        # Cross-workspace duplicate in another PUBLIC workspace: delete the
+        # freshly uploaded MinIO object + pending record, warn, and stop.
+        if dup is not None and await _is_public_workspace(db, workspace_id):
+            logger.info(
+                f"[confirm_upload] duplicate of doc={dup.id} in another public "
+                f"workspace {dup.workspace_id} (hash={content_hash[:12]}) — "
+                f"deleting upload + skip"
+            )
+            try:
+                await storage.delete_file(minio_key)
+            except Exception as del_err:
+                logger.warning(
+                    f"[confirm_upload] failed to delete duplicate MinIO object "
+                    f"{minio_key}: {del_err}"
+                )
+            resp = await _public_duplicate_response(db, dup)
+            await db.delete(document)
+            await db.commit()
+            return resp
+        document.content_hash = content_hash
+        reuse_source = dup  # cross-workspace tenant/owner match (or None)
+
     # Now that MinIO has confirmed the file, record the key and queue the parse task
     document.upload_s3_key = minio_key
     await db.commit()
+
+    # Cross-workspace duplicate (same tenant): clone parsed artifacts instead of
+    # re-running the parse pipeline.
+    if reuse_source is not None:
+        try:
+            await _clone_document_to_workspace(db, reuse_source, document)
+            return DocumentUploadResponse(
+                id=document.id,
+                filename=document.original_filename,
+                status=document.status,
+                message="Document reused from an existing copy in your tenant.",
+            )
+        except Exception as e:
+            logger.warning(
+                f"[confirm_upload] clone from doc={reuse_source.id} failed for "
+                f"doc={document.id}: {e} — falling back to full parse"
+            )
+            document.status = DocumentStatus.PENDING
+            document.embed_done = False
+            document.captions_done = False
+            document.kg_done = False
+            await db.commit()
 
     if not settings.MINIO_WEBHOOK_ENABLED:
         try:

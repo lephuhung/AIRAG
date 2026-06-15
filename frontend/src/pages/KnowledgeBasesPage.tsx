@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { cn } from "@/lib/utils";
+import { parseServerDate } from "@/lib/format";
 import type { KnowledgeBase, CreateWorkspace } from "@/types";
 
 type VisibilityOption = "personal" | "tenant" | "public";
@@ -128,14 +129,12 @@ export function KnowledgeBasesPage() {
   };
 
   const formatDate = (dateStr: string) => {
-    const date = new Date(dateStr);
-    const now = new Date();
-    const diff = now.getTime() - date.getTime();
-    const days = Math.floor(diff / (1000 * 60 * 60 * 24));
+    const date = parseServerDate(dateStr);
+    const days = parseServerDate(Date.now()).startOf("day").diff(date.startOf("day"), "day");
     if (days === 0) return t("common.today");
     if (days === 1) return t("common.yesterday");
     if (days < 7) return t("common.days_ago", { count: days });
-    return date.toLocaleDateString();
+    return date.format("DD/MM/YYYY");
   };
 
   // Split workspaces into sections

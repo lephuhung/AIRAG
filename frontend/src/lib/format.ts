@@ -17,18 +17,43 @@ const VIETNAM_TZ = "Asia/Ho_Chi_Minh";
  */
 
 /**
+ * Parse a timestamp coming from the backend into a dayjs object in Vietnam time.
+ *
+ * The backend stores and sends time in UTC. Numeric values are epoch
+ * milliseconds (unambiguous). ISO strings WITHOUT a timezone designator (no
+ * trailing "Z" or "+hh:mm") are naive-UTC: the browser would otherwise assume
+ * they are local time and the displayed value would be off by the local offset
+ * (e.g. -7h in Vietnam). We force such strings to be interpreted as UTC, then
+ * convert to GMT+7 for display.
+ */
+export function parseServerDate(value: string | number | Date): dayjs.Dayjs {
+  if (typeof value === "string") {
+    const hasTz = /(?:Z|[+-]\d{2}:?\d{2})$/.test(value.trim());
+    return (hasTz ? dayjs(value) : dayjs.utc(value)).tz(VIETNAM_TZ);
+  }
+  return dayjs(value).tz(VIETNAM_TZ);
+}
+
+/**
+ * Format a server timestamp as HH:mm (24h) in Vietnam time.
+ */
+export function formatTime(value: string | number | Date): string {
+  return parseServerDate(value).format("HH:mm");
+}
+
+/**
  * Format a date string as a human-readable relative date.
  */
 export function formatRelativeDate(dateStr: string): string {
   const lang = useI18nStore.getState().language;
-  return dayjs(dateStr).tz(VIETNAM_TZ).locale(lang).fromNow();
+  return parseServerDate(dateStr).locale(lang).fromNow();
 }
 
 /**
  * Format a date string as a fixed date (DD/MM/YYYY).
  */
 export function formatDate(dateStr: string): string {
-  return dayjs(dateStr).tz(VIETNAM_TZ).format("DD/MM/YYYY");
+  return parseServerDate(dateStr).format("DD/MM/YYYY");
 }
 
 /**

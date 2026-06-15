@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Request, status
 from sqlalchemy import select, func, case
@@ -189,7 +189,7 @@ async def validate_invite(
         tenant_name=tenant.name,
         tenant_slug=tenant.slug,
         email=invite.email,
-        expires_at=invite.expires_at.isoformat(),
+        expires_at=invite.expires_at.replace(tzinfo=timezone.utc).isoformat(),
     )
 
 

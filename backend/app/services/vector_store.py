@@ -202,6 +202,32 @@ class VectorStore:
             include=["documents", "metadatas"]
         )
 
+    def get_document_chunks(
+        self, document_id: uuid.UUID, include_embeddings: bool = True
+    ) -> dict:
+        """Return all chunks of a document, optionally with their embeddings.
+
+        Used to clone an already-indexed document into another workspace's
+        collection without re-embedding (see documents._clone_document_to_workspace).
+        """
+        include = ["documents", "metadatas"]
+        if include_embeddings:
+            include = ["documents", "metadatas", "embeddings"]
+        try:
+            res = self.collection.get(
+                where={"document_id": str(document_id)},
+                include=include,
+            )
+        except Exception as e:
+            logger.error(f"[vector_store] get_document_chunks failed: {e}")
+            return {"ids": [], "embeddings": None, "documents": [], "metadatas": []}
+        return {
+            "ids": res.get("ids", []) or [],
+            "embeddings": res.get("embeddings") if include_embeddings else None,
+            "documents": res.get("documents", []) or [],
+            "metadatas": res.get("metadatas", []) or [],
+        }
+
     def get_by_metadata(self, where: dict, limit: int = 1000) -> dict:
         """Get documents matching metadata filter without semantic search."""
         try:

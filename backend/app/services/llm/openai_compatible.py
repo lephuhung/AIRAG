@@ -99,6 +99,25 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         self._api_key = api_key
         self._sync_client_instance: Optional[object] = None
         self._async_client_instance: Optional[object] = None
+        # Token usage from the most recent call — read by the Langfuse tracing
+        # wrapper (TracedLLMProvider) to populate generation usage_details.
+        self._last_usage: Optional[dict] = None
+
+    @staticmethod
+    def _usage_dict(usage) -> Optional[dict]:
+        """Map an OpenAI usage object to Langfuse usage_details (input/output/total)."""
+        if usage is None:
+            return None
+        try:
+            raw = {
+                "input": getattr(usage, "prompt_tokens", None),
+                "output": getattr(usage, "completion_tokens", None),
+                "total": getattr(usage, "total_tokens", None),
+            }
+            cleaned = {k: v for k, v in raw.items() if isinstance(v, int)}
+            return cleaned or None
+        except Exception:
+            return None
 
     def _sync_client(self):
         if self._sync_client_instance is None:
@@ -155,6 +174,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         think: bool = False,
     ) -> str | LLMResult:
         oai_msgs = _to_openai_messages(messages, system_prompt)
+        self._last_usage = None
         try:
             client = self._sync_client()
             response = client.chat.completions.create(
@@ -164,6 +184,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                 max_tokens=max_tokens,
                 extra_body={"chat_template_kwargs": {"enable_thinking": think}},
             )
+            self._last_usage = self._usage_dict(getattr(response, "usage", None))
             content = response.choices[0].message.content or ""
             content = self._strip_think(content)
             return content
@@ -181,6 +202,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         think: bool = False,
     ) -> str | LLMResult:
         oai_msgs = _to_openai_messages(messages, system_prompt)
+        self._last_usage = None
         try:
             client = self._async_client()
             response = await client.chat.completions.create(
@@ -190,6 +212,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                 max_tokens=max_tokens,
                 extra_body={"chat_template_kwargs": {"enable_thinking": think}},
             )
+            self._last_usage = self._usage_dict(getattr(response, "usage", None))
             content = response.choices[0].message.content or ""
             content = self._strip_think(content)
             return content
@@ -209,12 +232,16 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         tool_choice: str | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         oai_msgs = _to_openai_messages(messages, system_prompt)
+        self._last_usage = None
         kwargs: dict = dict(
             model=self._model,
             messages=oai_msgs,
             temperature=temperature,
             max_tokens=max_tokens,
             stream=True,
+            # Ask the server to emit a final usage-only chunk (vLLM/OpenAI support
+            # this); captured below for Langfuse token accounting.
+            stream_options={"include_usage": True},
         )
         if tools:
             kwargs["tools"] = tools
@@ -247,6 +274,9 @@ class OpenAICompatibleLLMProvider(LLMProvider):
 
             stream = await client.chat.completions.create(**kwargs)
             async for chunk in stream:
+                # Final usage-only chunk has empty choices but carries token counts.
+                if getattr(chunk, "usage", None):
+                    self._last_usage = self._usage_dict(chunk.usage)
                 delta = chunk.choices[0].delta if chunk.choices else None
                 if delta is None:
                     continue

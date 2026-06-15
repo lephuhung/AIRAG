@@ -228,6 +228,15 @@ class Settings(BaseSettings):
     # Toggle LangGraph internal debug logging (prints node execution/state to console)
     NEXUSRAG_LG_DEBUG: bool = Field(default=False)
 
+    # ── Langfuse observability ───────────────────────────────────────────────
+    # Wrap LLM providers so every call (supervisor classifier, answer generator,
+    # direct answer, memory agent, query analyzer/enricher) emits a Langfuse
+    # "generation" observation with model, full prompt/completion, parameters,
+    # latency and (where the provider exposes it) token usage. These calls go
+    # through custom providers — NOT LangChain ChatModels — so without this the
+    # LangChain CallbackHandler cannot see any LLM I/O. Set False to disable.
+    LANGFUSE_TRACE_LLM: bool = Field(default=True)
+
     # ── ReAct executor for the RAG group (tool-aware planning) ───────────────
     # When True, the supervisor routes RAG-group queries to a single tool-calling
     # ReAct loop (react_executor_node) instead of the static intent→tool nodes.

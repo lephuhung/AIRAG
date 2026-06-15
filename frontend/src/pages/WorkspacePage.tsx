@@ -1,5 +1,5 @@
 import { useTranslation } from "@/hooks/useTranslation";
-import { useState, useMemo, useCallback, useEffect, useRef } from "react";
+import { useMemo, useCallback, useEffect, useRef } from "react";
 import { useParams } from "react-router-dom";
 import { toast } from "sonner";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -7,8 +7,9 @@ import { DataPanel } from "@/components/rag/DataPanel";
 import { VisualPanel } from "@/components/rag/VisualPanel";
 import { useWorkspaceStore } from "@/stores/workspaceStore";
 import { useWorkspace, useUpdateWorkspace } from "@/hooks/useWorkspaces";
+import { useUploadDocuments } from "@/hooks/useDocuments";
 import { api } from "@/lib/api";
-import type { Document, RAGStats, DocumentStatus, UploadingFile } from "@/types";
+import type { Document, RAGStats, DocumentStatus } from "@/types";
 
 const PROCESSING_STATUSES = new Set<DocumentStatus>([
   "parsing",
@@ -32,8 +33,8 @@ export function WorkspacePage() {
   const { data: workspace } = useWorkspace(workspaceId ?? null);
   const updateWorkspace = useUpdateWorkspace();
 
-  // -- Uploading files state --
-  const [uploadingFiles, setUploadingFiles] = useState<Record<string, UploadingFile>>({});
+  // -- Uploading (direct-to-MinIO, per-file progress) --
+  const { upload, uploadingFiles, isUploading } = useUploadDocuments(workspaceId);
 
   // -- Store --
   const { selectedDoc, selectDoc, reset: resetStore } = useWorkspaceStore();
@@ -90,74 +91,6 @@ export function WorkspacePage() {
   }, [documents, selectedDoc, selectDoc]);
 
   const hasDeepragDocs = (ragStats?.hrag_documents ?? 0) > 0;
-
-  // Ref to track current upload fileId for onError cleanup
-  const currentUploadFileIdRef = useRef<string | null>(null);
-
-  const uploadDoc = useMutation({
-    mutationFn: async (file: File) => {
-      if (!workspaceId) throw new Error("Invalid workspace ID");
-
-      const fileId = `${file.name}-${file.size}-${Date.now()}`;
-      currentUploadFileIdRef.current = fileId;
-      setUploadingFiles((prev: Record<string, UploadingFile>) => ({
-        ...prev,
-        [fileId]: { id: fileId, name: file.name, size: file.size, progress: 0 }
-      }));
-
-      try {
-        return await api.uploadFileDirect<Document>(
-          workspaceId,
-          file,
-          (progress) => {
-            setUploadingFiles((prev: Record<string, UploadingFile>) => {
-              if (!prev[fileId]) return prev;
-              return {
-                ...prev,
-                [fileId]: { ...prev[fileId], progress }
-              };
-            });
-          }
-        );
-      } catch (err) {
-        throw err; // Re-throw so onError fires
-      }
-    },
-    onSuccess: () => {
-      const fileId = currentUploadFileIdRef.current;
-      if (fileId) {
-        setUploadingFiles((prev) => {
-          const next = { ...prev };
-          delete next[fileId];
-          return next;
-        });
-      }
-      queryClient.invalidateQueries({ queryKey: ["documents", workspaceId] });
-      queryClient.invalidateQueries({ queryKey: ["rag-stats", workspaceId] });
-      queryClient.invalidateQueries({ queryKey: ["workspaces"] });
-      toast.success(t("workspace.upload_success"));
-    },
-    onError: (err: Error) => {
-      const fileId = currentUploadFileIdRef.current;
-      if (fileId) {
-        setUploadingFiles((prev) => {
-          const next = { ...prev };
-          delete next[fileId];
-          return next;
-        });
-      }
-      const msg = err.message || "";
-      if (msg.includes("MinIO PUT failed") || msg.includes("Network error")) {
-        toast.error(t("workspace.upload_failed_network"), {
-          description: t("workspace.upload_failed_network_desc"),
-        });
-      } else if (msg.includes("too large")) {
-        toast.error(t("workspace.file_too_large"), { description: msg });
-      } else {
-        toast.error(t("workspace.upload_failed"), { description: msg || undefined });
-      }
-    },
-  });
 
   const deleteDoc = useMutation({
     mutationFn: (docId: string) => api.delete(`/documents/${docId}`),
@@ -221,9 +154,9 @@ export function WorkspacePage() {
         ragStats={ragStats}
         selectedDocId={selectedDoc?.id ?? null}
         onSelectDoc={handleSelectDoc}
-        onUpload={(f) => uploadDoc.mutate(f)}
-        uploadingFiles={Object.values(uploadingFiles)}
-        isUploading={uploadDoc.isPending}
+        onUpload={upload}
+        uploadingFiles={uploadingFiles}
+        isUploading={isUploading}
         onDelete={(id) => deleteDoc.mutate(id)}
         onProcess={(id) => processDoc.mutate(id)}
         isProcessing={processDoc.isPending}

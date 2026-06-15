@@ -37,7 +37,7 @@ import logging
 from contextvars import ContextVar
 from typing import AsyncGenerator, Optional
 
-from langfuse import get_client
+from langfuse import get_client, propagate_attributes
 from langfuse.langchain import CallbackHandler
 
 logger = logging.getLogger(__name__)
@@ -83,6 +83,39 @@ def get_current_db():
     Use inside LangGraph nodes instead of state.get("_db").
     """
     return _db_ctx.get()
+
+
+def _last_user_message(messages) -> str:
+    """Extract the most recent textual message content (trace input)."""
+    for m in reversed(messages or []):
+        content = getattr(m, "content", None)
+        if isinstance(content, str) and content:
+            return content
+    return ""
+
+
+def _summarize_final_state(state) -> dict:
+    """Compact, serializable summary of the final AgentState for the trace output.
+
+    Best-effort: missing keys are simply omitted so this never raises.
+    """
+    if not isinstance(state, dict):
+        return {"completed": True}
+    summary: dict = {"completed": True}
+    for key in ("intent", "next_agent", "query_complexity", "search_mode", "iteration_count"):
+        val = state.get(key)
+        if val is not None:
+            summary[key] = val
+    for m in reversed(state.get("messages") or []):
+        content = getattr(m, "content", None)
+        role = getattr(m, "type", None) or getattr(m, "role", None)
+        if isinstance(content, str) and content and role in ("ai", "assistant", None):
+            summary["answer"] = content
+            break
+    srcs = state.get("sources")
+    if isinstance(srcs, list):
+        summary["sources_count"] = len(srcs)
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -136,18 +169,70 @@ async def stream_agent_to_sse(
         from app.core.config import settings
         langfuse_handler = get_langfuse_handler()
         callbacks = [langfuse_handler] if langfuse_handler else []
-        try:
-            await graph.ainvoke(
+
+        # Langfuse client for the root trace span (None if unavailable)
+        lf = None
+        if langfuse_handler is not None:
+            try:
+                lf = get_client()
+            except Exception:
+                lf = None
+
+        config = {"callbacks": callbacks}
+
+        async def _invoke():
+            return await graph.ainvoke(
                 initial_state,
-                config={"callbacks": callbacks},
+                config=config,
                 debug=settings.NEXUSRAG_LG_DEBUG,
             )
+
+        try:
+            if lf is not None:
+                # Root span wraps the whole run so every manual span (nodes AND
+                # conditional-edge routers) nests under ONE trace instead of
+                # spawning orphan traces. propagate_attributes stamps
+                # session/user/tags onto the trace + all child spans so it is
+                # filterable in the Langfuse UI.
+                sid = initial_state.get("session_id")
+                uid = initial_state.get("user_id")
+                wids = initial_state.get("workspace_ids") or []
+                dids = initial_state.get("document_ids") or []
+                tags = ["langgraph", f"agent_backend:{settings.NEXUSRAG_AGENT_BACKEND}"]
+                with lf.start_as_current_observation(
+                    name="langgraph_chat",
+                    as_type="span",
+                    input={
+                        "message": _last_user_message(initial_state.get("messages")),
+                        "workspace_ids": [str(w) for w in wids],
+                        "document_ids": [str(d) for d in dids],
+                    },
+                ) as root:
+                    with propagate_attributes(
+                        user_id=str(uid) if uid else None,
+                        session_id=str(sid) if sid else None,
+                        trace_name="langgraph_chat",
+                        tags=tags,
+                    ):
+                        final_state = await _invoke()
+                    try:
+                        root.update(output=_summarize_final_state(final_state))
+                    except Exception:
+                        pass
+            else:
+                await _invoke()
         except Exception as e:
             logger.error(f"[stream] Graph execution error: {e}", exc_info=True)
             await event_queue.put(("error", str(e)))
         finally:
             # Sentinel: báo hiệu pipeline đã xong
             await event_queue.put(("done", None))
+            # Ensure buffered observations are delivered to Langfuse
+            if lf is not None:
+                try:
+                    lf.flush()
+                except Exception:
+                    pass
 
     # create_task copies current context → task sees _event_queue_ctx & _db_ctx
     task = asyncio.create_task(_run_graph())

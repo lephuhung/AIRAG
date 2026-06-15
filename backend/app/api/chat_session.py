@@ -20,7 +20,7 @@ from app.schemas.rag import (
 )
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -242,7 +242,14 @@ async def get_session_history(
                 agent_steps=m.agent_steps,
                 potential_abbreviations=m.potential_abbreviations,
                 people_data=m.people_data,
-                created_at=m.created_at.isoformat() if m.created_at else "",
+                # Stored as naive UTC (datetime.utcnow). Emit an explicit UTC
+                # offset so the frontend doesn't misread it as local time
+                # (which made VN display 7h behind).
+                created_at=(
+                    m.created_at.replace(tzinfo=timezone.utc).isoformat()
+                    if m.created_at
+                    else ""
+                ),
             )
             for m in msgs
         ],

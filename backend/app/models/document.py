@@ -33,6 +33,11 @@ class Document(Base):
     original_filename: Mapped[str] = mapped_column(String(255))
     file_type: Mapped[str] = mapped_column(String(50))
     file_size: Mapped[int] = mapped_column(Integer)
+    # SHA256 hex digest of the raw file bytes — used to detect duplicate
+    # uploads within the same tenant (see app/api/documents.py dedup logic).
+    content_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True
+    )
     status: Mapped[DocumentStatus] = mapped_column(
         Enum(
             DocumentStatus, values_callable=lambda enum_cls: [m.value for m in enum_cls]

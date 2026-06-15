@@ -75,3 +75,10 @@ class DocumentUploadResponse(BaseModel):
     filename: str
     status: DocumentStatus
     message: str
+    # Set when the upload was rejected/short-circuited because identical content
+    # already exists in another PUBLIC workspace. The uploaded file is deleted and
+    # nothing is processed; the fields below point the user at the existing copy.
+    duplicate: bool = False
+    duplicate_document_id: uuid.UUID | None = None
+    duplicate_workspace_id: uuid.UUID | None = None
+    duplicate_workspace_name: str | None = None

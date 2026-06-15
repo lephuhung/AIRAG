@@ -65,8 +65,9 @@ rank-bm25>=0.2.2
 langgraph>=0.2.0
 langchain-core>=0.3.0
 
-# Langfuse tracing for LangGraph debug
-langfuse>=0.12.0
+# Langfuse tracing for LangGraph debug (SDK v3+ OTEL API: get_client,
+# start_observation, propagate_attributes, langfuse.langchain.CallbackHandler)
+langfuse>=3.0.0
 langchain>=0.3.0
 
 # Graphiti — temporal knowledge graph memory (uses Neo4j already in stack)

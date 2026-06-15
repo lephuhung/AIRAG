@@ -8,7 +8,7 @@
     "knowledge_bases": "Knowledge Bases",
     "files": "Files",
     "workers": "Workers",
-    "system_logs": "System Logs",
+    "system_logs": "Activity Log",
     "admin": {
       "dashboard": "Dashboard",
       "slug": "Slug",
@@ -16,7 +16,7 @@
       "tenants": "Tenants",
       "document_types": "Document Types",
       "abbreviations": "Abbreviations",
-      "system_logs": "System Logs"
+      "system_logs": "Activity Log"
     },
     "my_tenants": "My Tenants",
     "your_chats": "Your chats"
@@ -37,6 +37,50 @@
     "waiting": "Waiting for logs...",
     "file": "File",
     "new": "new"
+  },
+  "audit": {
+    "title": "Activity Log",
+    "subtitle": "User management actions",
+    "search_placeholder": "Search description, name, email...",
+    "all_resources": "All resources",
+    "all_actions": "All actions",
+    "refresh": "Refresh",
+    "col_time": "Time",
+    "col_actor": "Performed by",
+    "col_action": "Action",
+    "col_resource": "Resource",
+    "col_summary": "Description",
+    "col_source": "Source",
+    "empty": "No activity yet",
+    "total": "records",
+    "page": "Page",
+    "prev": "Prev",
+    "next": "Next",
+    "system": "System",
+    "auto": "Auto",
+    "explicit": "Tracked",
+    "resource": {
+      "abbreviation": "Abbreviation",
+      "workspace": "Workspace",
+      "document_type": "Document type",
+      "tenant": "Tenant",
+      "tenant_member": "Member",
+      "tenant_invite": "Invite",
+      "user": "User"
+    },
+    "action_label": {
+      "create": "Create",
+      "update": "Update",
+      "delete": "Delete",
+      "set_default": "Set default",
+      "set_admin": "Grant admin",
+      "approve": "Approve",
+      "reject": "Reject",
+      "update_role": "Change role",
+      "update_prompt": "Edit prompt",
+      "delete_prompt": "Delete prompt",
+      "reset_password": "Reset password"
+    }
   },
   "common": {
     "admin": "Admin",
@@ -220,7 +264,7 @@
       "local": "Local KG",
       "global": "Global KG"
     },
-    "input_placeholder": "Ask about your documents...",
+    "input_placeholder": "Ask anything, or type @ to mention uploaded files...",
     "stop": "Stop generating",
     "input_hint": "Press Enter to send, Shift+Enter for new line",
     "debug_on": "Debug mode: ON",
@@ -323,6 +367,9 @@
     "no_match": "No documents match your search.",
     "analyze_all": "Analyze All",
     "upload_success": "Uploaded successfully",
+    "upload_duplicate_public": "This document already exists",
+    "upload_duplicate_public_desc": "Identical content is already in the public workspace \"{{workspace}}\". Nothing was processed — you can use the existing copy.",
+    "upload_duplicate_public_desc_generic": "Identical content already exists in another public workspace. Nothing was processed — you can use the existing copy.",
     "upload_failed": "Upload failed",
     "upload_failed_network": "Network Error",
     "upload_failed_network_desc": "Could not connect to storage. Please check your connection.",
@@ -393,7 +440,9 @@
     "no_ws_yet": "No workspaces yet",
     "search_ws_hint": "Try adjusting your search terms.",
     "create_ws_hint": "Create a workspace to start managing documents.",
-    "upload_hint": "Upload documents from the workspace to get started.",
+    "upload": "Upload",
+    "drop_here": "Drop files to upload",
+    "upload_hint": "Click Upload or drag and drop files here to get started.",
     "no_files_match": "No matching files found",
     "adjust_search_hint": "Try adjusting your keywords or filters.",
     "delete_confirm_title": "Delete Document",

@@ -23,6 +23,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { cn } from "@/lib/utils";
+import { formatDate, parseServerDate } from "@/lib/format";
 import {
   useAdminTenants,
   useCreateTenant,
@@ -645,7 +646,7 @@ export function AdminTenantsPage() {
                   </h4>
                   <div className="space-y-2">
                     {activeInvites.map((inv) => {
-                      const expired = new Date(inv.expires_at) < new Date();
+                      const expired = parseServerDate(inv.expires_at).isBefore(parseServerDate(Date.now()));
                       const maxedOut =
                         inv.max_uses !== null && inv.use_count >= inv.max_uses;
                       return (
@@ -679,7 +680,7 @@ export function AdminTenantsPage() {
                                 {inv.max_uses !== null ? `/${inv.max_uses}` : ""}
                               </span>
                               <span>
-                                {t("admin.tenants.invite_dialog.expires", { date: new Date(inv.expires_at).toLocaleDateString() })}
+                                {t("admin.tenants.invite_dialog.expires", { date: formatDate(inv.expires_at) })}
                               </span>
                               {expired && (
                                 <span className="text-destructive font-medium">

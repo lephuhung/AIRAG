@@ -26,6 +26,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { formatDate, parseServerDate } from "@/lib/format";
 import type { Tenant, TenantUser } from "@/types";
 
 interface InviteFormData {
@@ -429,7 +430,7 @@ export function TenantManagePage() {
                   </h4>
                   <div className="space-y-2">
                     {activeInvites.map((inv) => {
-                      const expired = new Date(inv.expires_at) < new Date();
+                      const expired = parseServerDate(inv.expires_at).isBefore(parseServerDate(Date.now()));
                       const maxedOut =
                         inv.max_uses !== null && inv.use_count >= inv.max_uses;
                       return (
@@ -463,7 +464,7 @@ export function TenantManagePage() {
                                 {inv.max_uses !== null ? `/${inv.max_uses}` : ""}
                               </span>
                               <span>
-                                {t("admin.tenants.invite_dialog.expires", { date: new Date(inv.expires_at).toLocaleDateString() })}
+                                {t("admin.tenants.invite_dialog.expires", { date: formatDate(inv.expires_at) })}
                               </span>
                               {expired && (
                                 <span className="text-destructive font-medium">

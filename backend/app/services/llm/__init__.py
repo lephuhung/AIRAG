@@ -19,8 +19,13 @@ from app.services.llm.base import EmbeddingProvider, LLMProvider
 
 @lru_cache
 def get_llm_provider() -> LLMProvider:
-    """Create (and cache) the LLM provider configured via ``LLM_PROVIDER``."""
+    """Create (and cache) the LLM provider configured via ``LLM_PROVIDER``.
+
+    Wrapped with Langfuse generation tracing (label ``main_llm``) so every
+    answer-generator / direct-answer / evaluator LLM call is captured.
+    """
     from app.core.config import settings
+    from app.services.agent.langfuse_tracing import trace_llm
 
     provider = settings.LLM_PROVIDER.lower()
 
@@ -29,52 +34,59 @@ def get_llm_provider() -> LLMProvider:
 
         if not settings.GOOGLE_AI_API_KEY:
             raise ValueError("GOOGLE_AI_API_KEY is required when LLM_PROVIDER=gemini")
-        return GeminiLLMProvider(
+        inner = GeminiLLMProvider(
             api_key=settings.GOOGLE_AI_API_KEY,
             model=settings.LLM_MODEL_FAST,
             thinking_level=settings.LLM_THINKING_LEVEL,
         )
-
-    if provider == "ollama":
+    elif provider == "ollama":
         from app.services.llm.ollama import OllamaLLMProvider
 
-        return OllamaLLMProvider(
+        inner = OllamaLLMProvider(
             host=settings.OLLAMA_HOST,
             model=settings.OLLAMA_MODEL,
         )
-
-    if provider == "openai_compatible":
+    elif provider == "openai_compatible":
         from app.services.llm.openai_compatible import OpenAICompatibleLLMProvider
 
-        return OpenAICompatibleLLMProvider(
+        inner = OpenAICompatibleLLMProvider(
             base_url=settings.OPENAI_COMPATIBLE_BASE_URL,
             model=settings.OPENAI_COMPATIBLE_MODEL,
             api_key=settings.OPENAI_COMPATIBLE_API_KEY,
         )
+    else:
+        raise ValueError(f"Unknown LLM_PROVIDER: {provider!r}. Supported: gemini, ollama, openai_compatible")
 
-    raise ValueError(f"Unknown LLM_PROVIDER: {provider!r}. Supported: gemini, ollama, openai_compatible")
+    return trace_llm(inner, label="main_llm")
 
 
 @lru_cache
 def get_memory_agent() -> LLMProvider:
-    """Create (and cache) a dedicated LLM provider for internal agent tasks (like memory)."""
+    """Create (and cache) a dedicated LLM provider for internal agent tasks (like memory).
+
+    Wrapped with Langfuse generation tracing (label ``memory_agent``) so intent
+    classification, query analysis, enrichment and abbreviation calls are captured.
+    """
     from app.core.config import settings
+    from app.services.agent.langfuse_tracing import trace_llm
 
     if settings.MEMORY_AGENT_LOCAL:
         from app.services.llm.vllm_local import LocalVLLMProvider
-        return LocalVLLMProvider(
+        inner = LocalVLLMProvider(
             model=settings.MEMORY_AGENT_MODEL,
             gpu_memory_utilization=settings.MEMORY_AGENT_GPU_UTILIZATION,
             cuda_device=settings.MEMORY_AGENT_CUDA_DEVICE,
         )
+    else:
+        from app.services.llm.openai_compatible import OpenAICompatibleLLMProvider
+        # Memory agent using remote vLLM (OpenAI compatible)
+        inner = OpenAICompatibleLLMProvider(
+            base_url=settings.MEMORY_AGENT_BASE_URL,
+            model=settings.MEMORY_AGENT_MODEL,
+            api_key=settings.MEMORY_AGENT_API_KEY,
+        )
 
-    from app.services.llm.openai_compatible import OpenAICompatibleLLMProvider
-    # Memory agent using remote vLLM (OpenAI compatible)
-    return OpenAICompatibleLLMProvider(
-        base_url=settings.MEMORY_AGENT_BASE_URL,
-        model=settings.MEMORY_AGENT_MODEL,
-        api_key=settings.MEMORY_AGENT_API_KEY,
-    )
+    return trace_llm(inner, label="memory_agent")
 
 
 @lru_cache

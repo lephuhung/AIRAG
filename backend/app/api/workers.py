@@ -18,6 +18,7 @@ import signal
 import sys
 import time
 import uuid
+from datetime import timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -1063,7 +1064,11 @@ async def get_pipeline(
                 "kg_done": d.kg_done,
                 "processing_time_ms": d.processing_time_ms,
                 "error_message": d.error_message,
-                "updated_at": d.updated_at.isoformat() if d.updated_at else None,
+                "updated_at": (
+                    d.updated_at.replace(tzinfo=timezone.utc).isoformat()
+                    if d.updated_at
+                    else None
+                ),
             }
             for d in docs
         ]

@@ -266,6 +266,11 @@ async def _search_similar_documents(
 # =============================================================================
 
 import datetime as _dt
+from zoneinfo import ZoneInfo
+
+# Vietnam time — document numbers are issued/queried in local (GMT+7) calendar
+# years, so derive "current year" from VN time, not the container's UTC clock.
+_VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
 
 def _generate_number_candidates(
@@ -278,7 +283,7 @@ def _generate_number_candidates(
     E.g. number_raw="15", suffixes=["TT-BCA"], year=None
     → ["15/2026/TT-BCA", "15/2025/TT-BCA", "15/TT-BCA"]
     """
-    current_year = _dt.datetime.now().year
+    current_year = _dt.datetime.now(_VN_TZ).year
     candidates: list[str] = []
     for suffix in suffixes:
         if year:

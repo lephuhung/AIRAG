@@ -1,7 +1,8 @@
-import { useState, useMemo, useCallback, useEffect } from "react";
+import { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import { useTranslation } from "@/hooks/useTranslation";
 import { useParams, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
+import { toast } from "sonner";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Search,
@@ -10,10 +11,13 @@ import {
   Database,
   X,
   ChevronRight,
+  Upload,
+  FileUp,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { FileCard } from "@/components/rag/FileCard";
+import { UploadingCard } from "@/components/rag/UploadingCard";
 import { EditDocumentDialog } from "@/components/rag/EditDocumentDialog";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import {
@@ -22,6 +26,7 @@ import {
   useProcessDocument,
   useReindexDocument,
   useUpdateDocument,
+  useUploadDocuments,
   PROCESSING_STATUSES
 } from "@/hooks/useDocuments";
 import { useWorkspaces, useWorkspace } from "@/hooks/useWorkspaces";
@@ -30,6 +35,13 @@ import { useWorkspaceStore } from "@/stores/workspaceStore";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import type { Document, RAGStats } from "@/types";
+
+// ---------------------------------------------------------------------------
+// Upload constraints (kept in sync with UploadZone)
+// ---------------------------------------------------------------------------
+const ACCEPTED_TYPES = ".pdf,.txt,.docx,.md,.pptx";
+const ACCEPTED_EXTENSIONS = new Set(["pdf", "txt", "docx", "md", "pptx"]);
+const MAX_SIZE_MB = 50;
 
 // ---------------------------------------------------------------------------
 // Filter tabs
@@ -225,6 +237,7 @@ export function FilesPage() {
   const processDoc = useProcessDocument(workspaceId);
   const reindexDoc = useReindexDocument(workspaceId);
   const updateDoc = useUpdateDocument(workspaceId);
+  const { upload, uploadingFiles, isUploading } = useUploadDocuments(workspaceId);
 
   // UI state
   const [searchQuery, setSearchQuery] = useState("");
@@ -233,6 +246,38 @@ export function FilesPage() {
   const [deleteDocConfirm, setDeleteDocConfirm] = useState<number | null>(null);
   const [editDoc, setEditDoc] = useState<Document | null>(null);
   const [sortMenuOpen, setSortMenuOpen] = useState(false);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Validate + dispatch a batch of selected/dropped files
+  const handleFiles = useCallback(
+    (files: FileList | null) => {
+      if (!files) return;
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
+        if (!ACCEPTED_EXTENSIONS.has(ext)) {
+          toast.error(t("workspace.unsupported_format", { ext }));
+          continue;
+        }
+        if (file.size > MAX_SIZE_MB * 1024 * 1024) {
+          toast.error(t("workspace.file_size_error", { size: MAX_SIZE_MB }));
+          continue;
+        }
+        upload(file);
+      }
+    },
+    [upload, t],
+  );
+
+  const handleDrop = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault();
+      setIsDragOver(false);
+      handleFiles(e.dataTransfer.files);
+    },
+    [handleFiles],
+  );
 
   // -- Store (for unified preview) --
   const {
@@ -343,8 +388,8 @@ export function FilesPage() {
           </div>
 
           {/* Title */}
-          <div className="flex items-center justify-between">
-            <div>
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
               <h1 className={cn(
                 "font-bold flex items-center gap-2 transition-all",
                 selectedDoc ? "text-base" : "text-lg"
@@ -357,6 +402,28 @@ export function FilesPage() {
                 {ragStats && ` · ${ragStats.total_chunks} chunks`}
               </p>
             </div>
+
+            {/* Upload */}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept={ACCEPTED_TYPES}
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                handleFiles(e.target.files);
+                if (fileInputRef.current) fileInputRef.current.value = "";
+              }}
+            />
+            <Button
+              size="sm"
+              className="shadow-sm shadow-primary/20 flex-shrink-0"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isUploading}
+            >
+              <Upload className={cn("w-4 h-4 mr-1.5", isUploading && "animate-pulse")} />
+              {isUploading ? t("workspace.uploading") : t("files.upload")}
+            </Button>
           </div>
         </div>
 
@@ -448,7 +515,16 @@ export function FilesPage() {
         </div>
 
         {/* ── Grid content ── */}
-        <div className="flex-1 overflow-y-auto px-6 py-5">
+        <div
+          className="flex-1 overflow-y-auto px-6 py-5 relative"
+          onDrop={handleDrop}
+          onDragOver={(e) => { e.preventDefault(); if (!isDragOver) setIsDragOver(true); }}
+          onDragLeave={(e) => {
+            e.preventDefault();
+            // Only clear when leaving the container itself, not its children
+            if (e.currentTarget === e.target) setIsDragOver(false);
+          }}
+        >
           {docsLoading ? (
             // Loading skeletons
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5 gap-5">
@@ -477,7 +553,7 @@ export function FilesPage() {
                 </div>
               ))}
             </div>
-          ) : !documents || documents.length === 0 ? (
+          ) : (!documents || documents.length === 0) && uploadingFiles.length === 0 ? (
             // Empty state
             <div className="flex flex-col items-center justify-center h-full text-center">
               <FolderOpen className="w-12 h-12 text-muted-foreground/30 mb-3" />
@@ -488,7 +564,7 @@ export function FilesPage() {
                 {t("files.upload_hint")}
               </p>
             </div>
-          ) : filteredDocs.length === 0 ? (
+          ) : filteredDocs.length === 0 && uploadingFiles.length === 0 ? (
             // No results state
             <div className="flex flex-col items-center justify-center h-full text-center">
               <Search className="w-10 h-10 text-muted-foreground/30 mb-3" />
@@ -511,6 +587,11 @@ export function FilesPage() {
                 : "md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 2xl:grid-cols-5"
             )}>
               <AnimatePresence mode="popLayout">
+                {uploadingFiles.map((file) => (
+                  <motion.div key={file.id} layout>
+                    <UploadingCard file={file} />
+                  </motion.div>
+                ))}
                 {filteredDocs.map((doc) => (
                   <FileCard
                     key={doc.id}
@@ -525,6 +606,17 @@ export function FilesPage() {
                   />
                 ))}
               </AnimatePresence>
+            </div>
+          )}
+
+          {/* Drag-and-drop overlay */}
+          {isDragOver && (
+            <div className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-primary/5 backdrop-blur-[1px] border-2 border-dashed border-primary rounded-lg pointer-events-none">
+              <FileUp className="w-10 h-10 text-primary mb-2" />
+              <p className="text-sm font-medium text-primary">{t("files.drop_here")}</p>
+              <p className="text-xs text-muted-foreground mt-1">
+                PDF, DOCX, PPTX, TXT, MD (max {MAX_SIZE_MB}MB)
+              </p>
             </div>
           )}
         </div>

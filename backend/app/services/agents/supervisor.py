@@ -764,6 +764,7 @@ async def supervisor_node(state: SupervisorState) -> dict:
         # We check the OLLAMA_HOST to decide whether to use native Ollama
         # or OpenAI-compatible provider (e.g. vLLM serving the 35B model).
         from app.core.config import settings
+        from app.services.agent.langfuse_tracing import trace_llm
         if "/v1" in settings.OLLAMA_HOST:
             from app.services.llm.openai_compatible import OpenAICompatibleLLMProvider
             classifier = OpenAICompatibleLLMProvider(
@@ -777,6 +778,8 @@ async def supervisor_node(state: SupervisorState) -> dict:
                 host=settings.OLLAMA_HOST,
                 model=settings.OLLAMA_MODEL,
             )
+        # Langfuse: trace the intent-classification LLM call as a generation
+        classifier = trace_llm(classifier, label="supervisor_classifier")
         response_text = ""
 
         # Phase 5: Build analyzer context string for supervisor prompt
@@ -1615,7 +1618,9 @@ async def react_executor_node(state: SupervisorState) -> dict:
             msgs.append(_LLMMsg(role="assistant", content=text or "", tool_calls=tool_calls_payload))
 
             names = ", ".join(fc.get("name", "?") for fc in calls)
-            await push_event(state, "status", {"step": "searching", "detail": f"Đang tra cứu: {names}"})
+            # Don't leak internal tool/function names to the UI — keep the
+            # user-facing status generic. Raw names still go to the log.
+            await push_event(state, "status", {"step": "searching", "detail": "Đang tra cứu thông tin..."})
             logger.info(f"[react_executor] step {step + 1}/{max_steps}: {len(calls)} call(s): {names}")
 
             # Parallel tool execution — independent calls in the same turn run together.

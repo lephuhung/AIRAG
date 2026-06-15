@@ -290,6 +290,17 @@ async def lifespan(app: FastAPI):
                     "ALTER TABLE documents ADD COLUMN IF NOT EXISTS is_chat_upload BOOLEAN DEFAULT FALSE"
                 )
             )
+            # documents: content_hash (SHA256 hex) for duplicate-upload detection
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS content_hash VARCHAR(64)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_documents_content_hash ON documents(content_hash)"
+                )
+            )
             # chat_messages: user_id
             await conn.execute(
                 text(
@@ -632,6 +643,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Audit log — records management mutations (workspaces, tenants, users, …)
+from app.middleware.audit import AuditMiddleware  # noqa: E402
+
+app.add_middleware(AuditMiddleware)
+
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -684,4 +700,5 @@ from app.models import (
     user,
     tenant,
     invite_token,
+    audit_log,
 )  # noqa: E402, F401
