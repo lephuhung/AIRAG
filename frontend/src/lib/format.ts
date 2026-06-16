@@ -17,6 +17,29 @@ const VIETNAM_TZ = "Asia/Ho_Chi_Minh";
  */
 
 /**
+ * Clean a chat session title for display.
+ *
+ * Titles auto-generated from the first message can leak artifacts when the user
+ * attaches a file and mentions it: the raw `@FileName` mention token and the
+ * backend's `<document_id=...>` tag. This strips those plus other special
+ * characters, keeping letters/digits/spaces and basic punctuation (Vietnamese
+ * accents preserved via the Unicode `\p{L}` class).
+ */
+export function cleanChatTitle(raw?: string | null): string {
+  if (!raw) return "";
+  let s = raw;
+  // Drop document-id tags and @-mention tokens inserted by file attachments.
+  s = s.replace(/<document_id=[^>]+>/gi, " ");
+  s = s.replace(/@\S+/g, " ");
+  // Remove special characters, keep word chars, whitespace and basic punctuation.
+  s = s.replace(/[^\p{L}\p{N}\s.,!?()\-:/]/gu, " ");
+  // Collapse whitespace.
+  s = s.replace(/\s+/g, " ").trim();
+  // Capitalize the first letter.
+  return s ? s.charAt(0).toLocaleUpperCase() + s.slice(1) : s;
+}
+
+/**
  * Parse a timestamp coming from the backend into a dayjs object in Vietnam time.
  *
  * The backend stores and sends time in UTC. Numeric values are epoch

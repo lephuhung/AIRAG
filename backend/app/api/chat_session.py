@@ -418,8 +418,14 @@ async def chat_stream_session(
         people_data: list,
         user_msg_id: str,
         ai_msg_id: str,
+        precomputed_summary: dict | None = None,
     ):
-        """Run entirely in background: save message + exchange summary, update title."""
+        """Run entirely in background: save message + exchange summary, update title.
+
+        ``precomputed_summary`` carries the summary already generated inline for the
+        first exchange (to push the title via SSE), so we reuse it here instead of
+        calling the summarizer LLM a second time.
+        """
         from app.core.database import async_session_maker
 
         try:
@@ -448,20 +454,29 @@ async def chat_stream_session(
                         "timestamp": int(datetime.utcnow().timestamp() * 1000),
                     })
 
-                # Save assistant message
-                ai_msg = ChatMessage(
-                    session_id=session_id,
-                    message_id=ai_msg_id,
-                    role="assistant",
-                    content=text,
-                    sources=sources,
-                    image_refs=images,
-                    thinking=thinking or None,
-                    agent_steps=processed_steps,
-                    potential_abbreviations=potentials or None,
-                    people_data=people_data or None,
+                # Save assistant message — fallback only. Normally it was already
+                # persisted synchronously before the stream closed
+                # (_save_assistant_inline); insert here only if that didn't happen,
+                # to avoid duplicating the row.
+                exists = await db.execute(
+                    select(ChatMessage.id)
+                    .where(ChatMessage.message_id == ai_msg_id)
+                    .limit(1)
                 )
-                db.add(ai_msg)
+                if exists.scalar_one_or_none() is None:
+                    ai_msg = ChatMessage(
+                        session_id=session_id,
+                        message_id=ai_msg_id,
+                        role="assistant",
+                        content=text,
+                        sources=sources,
+                        image_refs=images,
+                        thinking=thinking or None,
+                        agent_steps=processed_steps,
+                        potential_abbreviations=potentials or None,
+                        people_data=people_data or None,
+                    )
+                    db.add(ai_msg)
 
                 # Determine if title was auto-set
                 frontend_auto_title = user_message[:30] if len(user_message) > 30 else user_message
@@ -491,6 +506,7 @@ async def chat_stream_session(
                         user_message=user_message,
                         assistant_message=text,
                         cited_sources=sources,
+                        precomputed=precomputed_summary,
                     )
 
                     if summary_result is not None and summary_result.exchange_index == 1:
@@ -524,6 +540,132 @@ async def chat_stream_session(
 
         except Exception as e:
             logger.error(f"[session/{session_id}] Background persistence failed: {e}", exc_info=True)
+
+    async def _make_first_exchange_title(assistant_text: str):
+        """Generate the topic-label title INLINE for the first exchange.
+
+        Lets the stream push ``session_title_updated`` to the client immediately
+        (no refresh needed). Returns ``(new_title, summary_dict)`` — the summary is
+        handed to the background task so the summarizer LLM runs only once.
+        Returns ``(None, None)`` when this is not the first turn or on any error.
+        """
+        from app.core.database import async_session_maker
+
+        try:
+            from app.models.exchange_summary import ExchangeSummary
+            from app.services.conversation_summary_service import (
+                get_conversation_summary_service,
+            )
+
+            async with async_session_maker() as db:
+                # Only the very first turn of a session controls the auto title.
+                # Detect it by the absence of any prior assistant message (the
+                # current turn's message is saved later, in the background task).
+                prior = await db.execute(
+                    select(ChatMessage.id)
+                    .where(
+                        ChatMessage.session_id == session_id,
+                        ChatMessage.role == "assistant",
+                    )
+                    .limit(1)
+                )
+                if prior.scalar_one_or_none() is not None:
+                    return None, None
+
+                res = await db.execute(
+                    select(ChatSession).where(ChatSession.id == session_id)
+                )
+                sess = res.scalar_one_or_none()
+                if sess is None:
+                    return None, None
+
+                summary = await get_conversation_summary_service().generate_exchange_summary(
+                    user_message=request.message,
+                    assistant_message=assistant_text or "",
+                )
+                if not summary:
+                    return None, None
+
+                topic_label = (summary.get("topic_label") or "").strip()
+                if not topic_label:
+                    return None, summary
+
+                # First turn of a freshly created session ⇒ title is auto-generated.
+                sess.title = topic_label[:255]
+                await db.commit()
+                logger.info(f"[session/{session_id}] Inline title set: {sess.title!r}")
+                return sess.title, summary
+        except Exception as e:
+            logger.warning(
+                f"[session/{session_id}] Inline title generation failed: {e}",
+                exc_info=True,
+            )
+            return None, None
+
+    async def _save_assistant_inline(
+        text: str,
+        thinking: str,
+        sources: list,
+        images: list,
+        steps: list,
+        potentials: list,
+        people_data: list,
+        ai_msg_id: str,
+    ) -> None:
+        """Persist the assistant message SYNCHRONOUSLY (own DB session) before the
+        stream closes, so the answer is durable immediately — even a hard reload
+        right after the reply still shows it. Only this fast INSERT runs inline;
+        the slow work (summary LLM, Graphiti) stays in the background task.
+
+        Idempotent: skips if a message with this id already exists, so the
+        background task's save acts purely as a fallback without duplicating.
+        """
+        from app.core.database import async_session_maker
+
+        try:
+            # Process steps: active → completed, ensure a trailing "done" marker.
+            processed_steps = []
+            for step in steps:
+                step_copy = step.copy()
+                if step_copy.get("status") == "active":
+                    step_copy["status"] = "completed"
+                processed_steps.append(step_copy)
+            if not any(s.get("step") == "done" for s in processed_steps):
+                processed_steps.append({
+                    "id": f"step_done_{uuid.uuid4().hex[:6]}",
+                    "step": "done",
+                    "status": "completed",
+                    "detail": "Hoàn thành",
+                    "timestamp": int(datetime.utcnow().timestamp() * 1000),
+                })
+
+            async with async_session_maker() as db:
+                exists = await db.execute(
+                    select(ChatMessage.id)
+                    .where(ChatMessage.message_id == ai_msg_id)
+                    .limit(1)
+                )
+                if exists.scalar_one_or_none() is not None:
+                    return
+                db.add(ChatMessage(
+                    session_id=session_id,
+                    message_id=ai_msg_id,
+                    role="assistant",
+                    content=text,
+                    sources=sources,
+                    image_refs=images,
+                    thinking=thinking or None,
+                    agent_steps=processed_steps,
+                    potential_abbreviations=potentials or None,
+                    people_data=people_data or None,
+                ))
+                await db.commit()
+        except Exception as e:
+            logger.warning(
+                f"[session/{session_id}] Inline assistant save failed "
+                f"(background will retry): {e}",
+                exc_info=True,
+            )
 
     # ── Route: LangGraph agent ──────────────────────────────────────────────
     use_langgraph = settings.NEXUSRAG_AGENT_BACKEND.lower() == "langgraph"
@@ -620,7 +762,33 @@ async def chat_stream_session(
 
                     yield sse_str
 
-                # All persistence in background — stream closes immediately
+                # Generate the title now (first exchange) and push it immediately so
+                # the client updates without a refresh; reuse the summary downstream.
+                # NOTE: run the title helper BEFORE saving the assistant message —
+                # it detects "first exchange" by the absence of a prior assistant
+                # message, which the inline save below would otherwise create.
+                new_title, precomputed_summary = await _make_first_exchange_title(
+                    accumulated_text
+                )
+                if new_title:
+                    yield format_sse_event(
+                        "session_title_updated", {"Title": new_title}
+                    )
+
+                # Persist the answer synchronously so it is durable the instant the
+                # stream closes (survives an immediate hard reload).
+                await _save_assistant_inline(
+                    text=accumulated_text,
+                    thinking=accumulated_thinking,
+                    sources=final_sources,
+                    images=final_images,
+                    steps=final_steps,
+                    potentials=final_potential_abbreviations,
+                    people_data=final_people_data,
+                    ai_msg_id=ai_msg_id,
+                )
+
+                # Remaining (slow) persistence in background — stream closes now.
                 background_tasks.add_task(
                     _background_persist_and_emit,
                     session_id=session_id,
@@ -635,6 +803,7 @@ async def chat_stream_session(
                     people_data=final_people_data,
                     user_msg_id=user_msg_id,
                     ai_msg_id=ai_msg_id,
+                    precomputed_summary=precomputed_summary,
                 )
 
             except Exception as e:
@@ -700,7 +869,30 @@ async def chat_stream_session(
 
                 yield format_sse_event(sse_item["event"], sse_item["data"])
 
-            # All persistence in background — stream closes immediately
+            # Generate the title now (first exchange) and push it immediately so the
+            # client updates without a refresh; reuse the summary downstream.
+            # Run BEFORE the inline save (first-exchange detection needs no prior
+            # assistant message to exist yet).
+            new_title, precomputed_summary = await _make_first_exchange_title(
+                accumulated_text
+            )
+            if new_title:
+                yield format_sse_event("session_title_updated", {"Title": new_title})
+
+            # Persist the answer synchronously so it is durable the instant the
+            # stream closes (survives an immediate hard reload).
+            await _save_assistant_inline(
+                text=accumulated_text,
+                thinking=accumulated_thinking,
+                sources=final_sources,
+                images=final_images,
+                steps=final_steps,
+                potentials=[],
+                people_data=final_people_data,
+                ai_msg_id=ai_msg_id,
+            )
+
+            # Remaining (slow) persistence in background — stream closes now.
             background_tasks.add_task(
                 _background_persist_and_emit,
                 session_id=session_id,
@@ -715,6 +907,7 @@ async def chat_stream_session(
                 people_data=final_people_data,
                 user_msg_id=user_msg_id,
                 ai_msg_id=ai_msg_id,
+                precomputed_summary=precomputed_summary,
             )
 
         except Exception as e:

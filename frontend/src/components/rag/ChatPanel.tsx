@@ -38,6 +38,7 @@ import {
   FileSearch,
   CornerDownLeft,
   LayoutGrid,
+  Layers,
 } from "lucide-react";
 import { PrismLight as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
@@ -57,7 +58,7 @@ import diff from "react-syntax-highlighter/dist/esm/languages/prism/diff";
 import markdown from "react-syntax-highlighter/dist/esm/languages/prism/markdown";
 import { toast } from "sonner";
 import { cn, generateId } from "@/lib/utils";
-import { formatTime } from "@/lib/format";
+import { formatTime, cleanChatTitle } from "@/lib/format";
 import { api, rewritePresignedUrl } from "@/lib/api";
 import { useWorkspaceStore } from "@/stores/workspaceStore";
 import { useAuthStore } from "@/stores/authStore";
@@ -115,6 +116,8 @@ import type {
   Document,
   DocumentStatus,
   PeopleRecord,
+  ChatHistoryResponse,
+  PersistedChatMessage,
 } from "@/types";
 
 // Context to provide sessionId and debugMode to nested components
@@ -1599,6 +1602,20 @@ function FileAttachmentBadge({ doc }: { doc: { id: string; filename: string; ori
 // ---------------------------------------------------------------------------
 // Document mention dropdown for @ autocomplete
 // ---------------------------------------------------------------------------
+type MentionDoc = {
+  id: string;
+  filename: string;
+  original_filename?: string;
+  file_type?: string;
+  document_number?: string | null;
+  document_title?: string | null;
+  document_type_name?: string | null;
+  issuing_agency?: string | null;
+  published_date?: string | null;
+  page_count?: number | null;
+  file_size?: number | null;
+};
+
 function DocumentMentionDropdown({
   docs,
   onSelect,
@@ -1606,7 +1623,7 @@ function DocumentMentionDropdown({
   selectedIndex = 0,
   anchorRef,
 }: {
-  docs: { id: string; filename: string; original_filename?: string; file_type?: string; document_number?: string | null }[];
+  docs: MentionDoc[];
   onSelect: (doc: { id: string; filename: string }) => void;
   onClose: () => void;
   selectedIndex?: number;
@@ -1698,60 +1715,81 @@ function DocumentMentionDropdown({
             </div>
           </div>
 
-          {/* List - Ultra compact */}
-          <div className="max-h-[280px] overflow-y-auto py-0.5 px-0.5 scrollbar-none flex flex-col gap-px">
+          {/* List - compact single-line rows, height-capped */}
+          <div className="max-h-[224px] overflow-y-auto py-1 px-1 scrollbar-none flex flex-col gap-px">
             {docs.map((doc, idx) => {
-              const fileConfig = getFileConfig(doc.file_type || doc.filename?.split(".").pop() || "");
+              const ext = (doc.file_type || doc.filename?.split(".").pop() || "").toLowerCase();
+              const fileConfig = getFileConfig(ext);
               const FileIcon = fileConfig.icon;
               const isHighlighted = idx === selectedIndex;
+
+              // Primary label: prefer the extracted title/subject, fall back to filename
+              const fileName = doc.original_filename || doc.filename;
+              const primary = doc.document_title || fileName;
+              // Show the filename inline only when it adds info (title differs)
+              const showFilename = !!doc.document_title && fileName !== doc.document_title;
 
               return (
                 <button
                   key={doc.id}
                   type="button"
                   onClick={() => onSelect(doc)}
+                  title={[doc.document_title, fileName, doc.issuing_agency].filter(Boolean).join(" — ")}
                   className={cn(
-                    "w-full flex items-center gap-2 px-2 py-1 rounded-md transition-all duration-150 text-left relative overflow-hidden group",
+                    "w-full flex items-center gap-2 px-2 py-1.5 rounded-lg transition-all duration-150 text-left relative group",
                     isHighlighted
-                      ? "bg-primary/[0.04] dark:bg-primary/[0.1]"
-                      : "hover:bg-zinc-50/50 dark:hover:bg-zinc-800/30"
+                      ? "bg-primary/[0.06] dark:bg-primary/[0.12] ring-1 ring-inset ring-primary/15"
+                      : "hover:bg-zinc-50 dark:hover:bg-zinc-800/40"
                   )}
                 >
+                  {/* File-type logo */}
                   <div className={cn(
-                    "w-8 h-8 rounded-lg flex items-center justify-center shrink-0 transition-all duration-150",
-                    isHighlighted
-                      ? "bg-white dark:bg-zinc-900 shadow-[0_1px_3px_rgba(0,0,0,0.1)] border border-zinc-200 dark:border-zinc-800"
-                      : "bg-zinc-100/50 dark:bg-zinc-800/40"
+                    "w-7 h-7 rounded-lg flex items-center justify-center shrink-0",
+                    fileConfig.bgColor
                   )}>
-                    <FileIcon className={cn(
-                      "w-4 h-4",
-                      fileConfig.color
-                    )} />
+                    <FileIcon className={cn("w-[15px] h-[15px]", fileConfig.color)} />
                   </div>
 
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center justify-between gap-2 overflow-hidden">
-                      <span className={cn(
-                        "text-[12px] font-medium truncate tracking-tight transition-colors duration-150",
-                        isHighlighted ? "text-foreground" : "text-muted-foreground/80 group-hover:text-foreground"
-                      )}>
-                        {doc.original_filename || doc.filename}
-                      </span>
-                      {doc.document_number && (
-                        <span className={cn(
-                          "text-[9px] font-bold font-mono tracking-tight shrink-0 px-1.5 py-0.5 rounded-md border",
-                          isHighlighted ? "bg-primary/5 border-primary/20 text-primary/60" : "bg-zinc-100 dark:bg-zinc-800/50 border-zinc-200 dark:border-zinc-800 text-zinc-400"
-                        )}>
-                          {doc.document_number}
-                        </span>
-                      )}
-                    </div>
-                  </div>
+                  {/* Title takes the left, flexes to push the rest right */}
+                  <span className={cn(
+                    "flex-1 min-w-0 text-[12.5px] font-semibold truncate tracking-tight transition-colors duration-150",
+                    isHighlighted ? "text-foreground" : "text-foreground/90 group-hover:text-foreground"
+                  )}>
+                    {primary}
+                  </span>
+
+                  {/* Right side: ref number · type · filename · pages, pinned to the right edge */}
+                  {doc.document_number && (
+                    <span className={cn(
+                      "text-[9px] font-bold font-mono tracking-tight shrink-0 px-1.5 py-0.5 rounded-md border",
+                      isHighlighted ? "bg-primary/10 border-primary/25 text-primary" : "bg-zinc-100 dark:bg-zinc-800/50 border-zinc-200 dark:border-zinc-800 text-zinc-500 dark:text-zinc-400"
+                    )}>
+                      {doc.document_number}
+                    </span>
+                  )}
+
+                  {doc.document_type_name && (
+                    <span className="inline-flex items-center gap-0.5 text-[9.5px] font-medium leading-none shrink-0 text-muted-foreground/55 max-w-[110px]">
+                      <Layers className="w-2.5 h-2.5 shrink-0 opacity-70" />
+                      <span className="truncate">{doc.document_type_name}</span>
+                    </span>
+                  )}
+
+                  {showFilename && (
+                    <span className="text-[10.5px] text-muted-foreground/60 truncate shrink-0 max-w-[35%]">
+                      {fileName}
+                    </span>
+                  )}
+
+                  {doc.page_count ? (
+                    <span className="inline-flex items-center gap-0.5 text-[9.5px] font-medium leading-none shrink-0 text-muted-foreground/55">
+                      <FileText className="w-2.5 h-2.5 shrink-0 opacity-70" />
+                      {doc.page_count} tr.
+                    </span>
+                  ) : null}
 
                   {isHighlighted && (
-                    <div className="shrink-0 ml-0.5 opacity-30">
-                      <CornerDownLeft className="w-2.5 h-2.5" />
-                    </div>
+                    <CornerDownLeft className="w-3 h-3 shrink-0 opacity-40" />
                   )}
                 </button>
               );
@@ -2402,7 +2440,7 @@ function ChatInputArea({
   referencedDocs?: { id: string; filename: string; original_filename?: string }[];
   onRemoveReferencedDoc?: (docId: string) => void;
   showMentionDropdown?: boolean;
-  filteredMentionDocs?: { id: string; filename: string; original_filename?: string; document_number?: string | null }[];
+  filteredMentionDocs?: MentionDoc[];
   onSelectMentionDoc?: (doc: { id: string; filename: string; original_filename?: string }) => void;
   onCloseMentionDropdown?: () => void;
   onInputChange?: (text: string, cursorPos: number) => void;
@@ -2681,59 +2719,60 @@ export const ChatPanel = memo(function ChatPanel({
     const sessionDocs = (sessionDocsData as any)?.documents || [];
     const workspaceDocsList = workspaceDocs || [];
 
+    // Normalize any doc source into a single enriched shape so the dropdown can
+    // surface meaningful hints (title, type, issuing agency, pages, size) and not
+    // just a bare filename.
+    const toMentionDoc = (doc: any) => ({
+      id: String(doc.id),
+      filename: doc.filename || doc.original_filename || "Untitled",
+      original_filename: doc.original_filename || doc.filename,
+      file_type: doc.file_type || (doc.filename?.split('.')?.pop()),
+      document_number: doc.document_number ?? null,
+      document_title: doc.document_title ?? null,
+      document_type_name: doc.document_type?.name ?? null,
+      issuing_agency: doc.issuing_agency ?? null,
+      published_date: doc.published_date ?? null,
+      page_count: doc.page_count ?? null,
+      file_size: doc.file_size ?? null,
+    });
+
     // Map locally attached files so they immediately appear in mentions
     // Use docMetadata.original_filename if available (from API response after upload)
-    const attachedDocsInfo = attachedFiles
-      .map((af) => ({
+    const attachedDocsInfo = attachedFiles.map((af) =>
+      toMentionDoc({
         id: af.id,
         filename: af.file.name,
         original_filename: af.docMetadata?.original_filename || af.file.name,
         file_type: af.file.name.split('.').pop(),
-      }));
+        file_size: af.file.size,
+      })
+    );
 
-    // Map workspace docs - they have original_filename from the API
-    const workspaceDocsInfo = workspaceDocsList.map((doc: any) => ({
-      id: doc.id,
-      filename: doc.filename || doc.original_filename || "Untitled",
-      original_filename: doc.original_filename || doc.filename,
-      file_type: doc.file_type || (doc.filename?.split('.')?.pop()),
-      document_number: doc.document_number
-    }));
-
-    const allDocs = [...attachedDocsInfo, ...sessionDocs, ...workspaceDocsInfo];
+    const allDocs = [
+      ...attachedDocsInfo,
+      ...sessionDocs.map(toMentionDoc),
+      ...workspaceDocsList.map(toMentionDoc),
+    ];
     if (allDocs.length === 0) return [];
-    // Deduplicate by ID
+    // Deduplicate by ID (prefer the first / richest occurrence)
     const uniqueDocs = Array.from(new Map(allDocs.map(d => [d.id, d])).values());
 
     // If no search term, show the most recent or all
     if (!mentionSearch) {
-      return uniqueDocs
-        .slice(0, 8)
-        .map(doc => ({
-          id: doc.id,
-          filename: doc.filename || doc.original_filename || "Untitled",
-          original_filename: doc.original_filename,
-          file_type: doc.file_type || (doc.filename?.split('.').pop()),
-          document_number: doc.document_number
-        }));
+      return uniqueDocs.slice(0, 8);
     }
 
-    // Filter by search term
+    // Filter by search term — match across filename, title, ref number and agency
     const search = mentionSearch.toLowerCase();
     return uniqueDocs
       .filter(doc =>
         doc.filename?.toLowerCase().includes(search) ||
         doc.original_filename?.toLowerCase().includes(search) ||
+        doc.document_title?.toLowerCase().includes(search) ||
+        doc.issuing_agency?.toLowerCase().includes(search) ||
         (doc.document_number && doc.document_number.toLowerCase().includes(search))
       )
-      .slice(0, 8)
-      .map(doc => ({
-        id: String(doc.id),
-        filename: doc.filename || doc.original_filename || "Untitled",
-        original_filename: doc.original_filename,
-        file_type: doc.file_type || (doc.filename?.split('.').pop()),
-        document_number: doc.document_number
-      }));
+      .slice(0, 8);
   }, [workspaceDocs, sessionDocsData, mentionSearch, attachedFiles]);
 
   // Sync index on search change
@@ -3353,7 +3392,7 @@ export const ChatPanel = memo(function ChatPanel({
       let effectiveSessionId = sessionId;
       if (!effectiveSessionId) {
         try {
-          const newSession = await createSession.mutateAsync({ title: msg.slice(0, 30) || t("nav.new_chat") });
+          const newSession = await createSession.mutateAsync({ title: cleanChatTitle(msg).slice(0, 30) || t("nav.new_chat") });
           effectiveSessionId = newSession.id;
 
           // Clear "New Chat" draft/mentions since we are sending it
@@ -3459,11 +3498,9 @@ export const ChatPanel = memo(function ChatPanel({
       if (finalMsg) {
         // Invalidate sessions list query to fetch generated chat title from backend
         queryClient.invalidateQueries({ queryKey: ["chat-sessions"] });
-        // Invalidate the specific chat history cache to prevent stale messages on remount
-        queryClient.invalidateQueries({ queryKey: ["chat-history", sessionId] });
 
-        setMessages((prev) =>
-          prev.map((m) =>
+        setMessages((prev) => {
+          const next = prev.map((m) =>
             m.id === assistantId
               ? {
                 ...finalMsg,
@@ -3476,8 +3513,42 @@ export const ChatPanel = memo(function ChatPanel({
                     : m.agentSteps,
               }
               : m,
-          ),
-        );
+          );
+
+          // Persistence runs in a background task on the server, so the DB may not
+          // have this answer yet. Instead of force-refetching chat-history (which
+          // would cache a pre-save, answer-less history and make the reply vanish
+          // when switching tabs), sync the cache from local state so the full
+          // exchange survives a remount without needing a reload.
+          if (effectiveSessionId) {
+            const persisted: PersistedChatMessage[] = next.map((m) => ({
+              id: m.id,
+              message_id: m.id,
+              role: m.role,
+              content: m.content,
+              document_ids: m.documentIds ?? null,
+              attached_docs: m.attachedDocs ?? null,
+              sources: m.sources ?? null,
+              related_entities: m.relatedEntities ?? null,
+              image_refs: m.imageRefs ?? null,
+              thinking: m.thinking ?? null,
+              agent_steps: m.agentSteps ?? null,
+              potential_abbreviations: m.potential_abbreviations ?? null,
+              people_data: m.peopleData ?? null,
+              created_at: m.timestamp ?? new Date().toISOString(),
+            }));
+            const cacheSessionId = effectiveSessionId;
+            queueMicrotask(() =>
+              queryClient.setQueryData<ChatHistoryResponse>(["chat-history", cacheSessionId], {
+                session_id: cacheSessionId,
+                messages: persisted,
+                total: persisted.length,
+              }),
+            );
+          }
+
+          return next;
+        });
         // Only clear streaming ref AFTER setMessages completes and isStreaming is false
         // This prevents race condition where sync effect could update wrong message
       } else if (stream.error) {
@@ -3620,18 +3691,30 @@ export const ChatPanel = memo(function ChatPanel({
             {/* Header */}
             {/* Header */}
             <div className="flex-shrink-0 flex items-center justify-between px-6 py-4 bg-background/40 backdrop-blur-xl border-b border-border/40">
-              <div className="flex items-center gap-3">
-                <div className="w-9 h-9 rounded-xl flex items-center justify-center bg-background border border-border/60 overflow-hidden shadow-sm transition-transform hover:scale-105">
+              <div className="flex items-center gap-3 flex-1 min-w-0">
+                <div className="w-9 h-9 rounded-xl flex items-center justify-center bg-background border border-border/60 overflow-hidden shadow-sm transition-transform hover:scale-105 shrink-0">
                   <img src="/logo.png" alt="AIRAG" className="w-5.5 h-5.5 object-contain" />
                 </div>
-                <div>
-                  <h2 className="text-[14px] font-bold tracking-tight text-foreground line-clamp-1">
-                    {sessionTitle || (sessionId ? `${t("chat.session", { id: sessionId })}` : t("chat.select_session"))}
-                  </h2>
-                  <div className="flex items-center gap-1.5">
-                    <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                    <span className="text-[10px] text-muted-foreground font-medium uppercase tracking-wider">{t("chat.assistant_online")}</span>
-                  </div>
+                <div className="min-w-0 flex-1 relative">
+                  {(() => {
+                    const displayTitle =
+                      cleanChatTitle(sessionTitle) ||
+                      (sessionId ? `${t("chat.session", { id: sessionId })}` : t("chat.select_session"));
+                    return (
+                      <AnimatePresence mode="wait" initial={false}>
+                        <motion.h2
+                          key={displayTitle}
+                          initial={{ opacity: 0, y: 5, filter: "blur(4px)" }}
+                          animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                          exit={{ opacity: 0, y: -5, filter: "blur(4px)" }}
+                          transition={{ duration: 0.3, ease: "easeOut" }}
+                          className="text-[14px] font-bold tracking-tight text-foreground break-words leading-snug"
+                        >
+                          {displayTitle}
+                        </motion.h2>
+                      </AnimatePresence>
+                    );
+                  })()}
                 </div>
               </div>
             </div>

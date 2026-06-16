@@ -133,8 +133,14 @@ Trả lời JSON format, không giải thích thêm:
         user_message: str,
         assistant_message: str,
         cited_sources: list | None = None,
+        precomputed: dict | None = None,
     ) -> ExchangeSummary | None:
-        """Generate and save a summary for a Q&A exchange."""
+        """Generate and save a summary for a Q&A exchange.
+
+        ``precomputed`` lets a caller pass a summary already produced elsewhere
+        (e.g. the inline title generation in the chat stream) so the LLM is not
+        invoked a second time for the same exchange.
+        """
         # Calculate next exchange_index
         result = await db.execute(
             select(func.max(ExchangeSummary.exchange_index)).where(
@@ -144,8 +150,8 @@ Trả lời JSON format, không giải thích thêm:
         max_index = result.scalar() or 0
         next_index = max_index + 1
 
-        # Generate summary
-        summary_data = await self.generate_exchange_summary(
+        # Generate summary (or reuse one already computed for this exchange)
+        summary_data = precomputed or await self.generate_exchange_summary(
             user_message=user_message,
             assistant_message=assistant_message or "",
         )
