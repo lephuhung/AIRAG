@@ -120,6 +120,16 @@ class Settings(BaseSettings):
     # BM25 parameters tuned for Vietnamese legal text (long sentences, sparse keywords)
     HRAG_BM25_K1: float = Field(default=2.0)  # higher = more weight to term frequency variation
     HRAG_BM25_B: float = Field(default=0.5)  # lower = less penalty for document length
+    # Vietnamese word segmentation for BM25 tokenisation (pyvi). When enabled,
+    # multi-syllable words ("quyết định") are kept as single tokens instead of
+    # being split per-syllable, improving lexical match precision. Requires the
+    # `pyvi` package; falls back to whitespace tokenisation if unavailable.
+    # NOTE: changing this requires a fresh BM25 index (restart worker / API, or
+    # invalidate cache) so the index and queries tokenise consistently.
+    HRAG_BM25_WORD_SEGMENT: bool = Field(default=False)
+    # Persist the in-memory BM25 index to disk so cold starts (process restart,
+    # new replica) reload instead of rebuilding the whole corpus from ChromaDB.
+    HRAG_BM25_PERSIST: bool = Field(default=True)
     # Recency boost: prefer newer documents based on published_date
     HRAG_RECENTNESS_BOOST: float = Field(default=0.3)  # 0=disabled, 1=full weight
     HRAG_RECENTNESS_DECAY_DAYS: int = Field(default=365)  # half-life in days
@@ -150,6 +160,11 @@ class Settings(BaseSettings):
     HRAG_DOCLING_IMAGES_SCALE: float = Field(default=2.0)
     HRAG_MAX_IMAGES_PER_DOC: int = Field(default=50)
     HRAG_MAX_TABLE_MARKDOWN_CHARS: int = Field(default=8000)
+    # Docling TableFormer table-structure recognition.
+    #   HRAG_DOCLING_DO_TABLE=false   → skip table structure entirely (fastest)
+    #   HRAG_DOCLING_TABLE_MODE=fast  → faster, ~15-25% less accurate than "accurate"
+    HRAG_DOCLING_DO_TABLE: bool = Field(default=True)
+    HRAG_DOCLING_TABLE_MODE: str = Field(default="accurate")  # "fast" | "accurate"
 
     # Retrieval
     HRAG_EMBEDDING_MODEL: str = Field(default="BAAI/bge-m3")
@@ -196,6 +211,7 @@ class Settings(BaseSettings):
     WORKER_PREFETCH_EMBED: int = Field(default=2)
     WORKER_PREFETCH_CAPTION: int = Field(default=1)
     WORKER_PREFETCH_KG: int = Field(default=1)
+    WORKER_PREFETCH_MEMORY: int = Field(default=4)
     WORKER_KG_POLL_INTERVAL: int = Field(
         default=60
     )  # seconds — how often to scan for new workspaces (adaptive: 300s when idle)
@@ -206,6 +222,8 @@ class Settings(BaseSettings):
     WORKER_EMBED_TIMEOUT: int = Field(default=60)
     WORKER_CAPTION_TIMEOUT: int = Field(default=60)
     WORKER_KG_TIMEOUT: int = Field(default=120)
+    # Memory worker: LLM fact-extraction (Qwen3-4B) + Graphiti Neo4j write.
+    WORKER_MEMORY_TIMEOUT: int = Field(default=90)
 
     # ── LangGraph Agent ──────────────────────────────────────────────────────
     # Choose the chat agent backend:
@@ -278,6 +296,18 @@ class Settings(BaseSettings):
     JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=7)
     FIRST_SUPERADMIN_EMAIL: str = Field(default="admin@hrag.local")
     FIRST_SUPERADMIN_PASSWORD: str = Field(default="admin123")
+
+    # ── Integrations: Telegram bot + third-party API keys ──
+    # Bot token from @BotFather. Empty disables the Telegram webhook handler.
+    TELEGRAM_BOT_TOKEN: str = Field(default="")
+    # Secret echoed by Telegram in the X-Telegram-Bot-Api-Secret-Token header;
+    # set it when registering the webhook so we can reject spoofed requests.
+    TELEGRAM_WEBHOOK_SECRET: str = Field(default="")
+    # TTL (minutes) for the one-time code that links a Telegram chat to an account.
+    TELEGRAM_LINK_CODE_TTL_MINUTES: int = Field(default=10)
+    # Bot username (without @), e.g. "MyAiragBot" — used to build the t.me deep
+    # link returned to the web UI. Optional (UI can fall back to showing the code).
+    TELEGRAM_BOT_USERNAME: str = Field(default="")
 
     model_config = {
         "env_file": str(ENV_FILE),

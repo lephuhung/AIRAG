@@ -10,6 +10,12 @@ from app.models.invite_token import InviteToken
 from app.models.exchange_summary import ExchangeSummary
 from app.models.chat_file import ChatFile
 from app.models.format_metadata import FormatMetadata
+from app.models.integration import (
+    ApiKey,
+    TelegramBotConfig,
+    TelegramLink,
+    TelegramLinkCode,
+)
 
 __all__ = [
     "KnowledgeBase",
@@ -27,4 +33,8 @@ __all__ = [
     "ExchangeSummary",
     "ChatFile",
     "FormatMetadata",
+    "ApiKey",
+    "TelegramBotConfig",
+    "TelegramLink",
+    "TelegramLinkCode",
 ]

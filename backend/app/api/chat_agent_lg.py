@@ -32,7 +32,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.deps import get_db, get_current_active_user
+from app.core.deps import get_db, get_principal
 from app.models.user import User
 from app.models.knowledge_base import KnowledgeBase
 from app.models.tenant import TenantUser
@@ -268,32 +268,44 @@ async def langgraph_chat_stream(
         logger.warning(f"[lg_endpoint] Failed to persist assistant message: {e}")
         await db.rollback()
 
-    # Background: save conversation episode to Graphiti knowledge graph
-    # Graphiti will extract entities and temporal facts from the turn automatically.
+    # Enqueue the turn for a durable Graphiti personal-memory save. The memory
+    # worker does the LLM fact-extraction + Neo4j write with RabbitMQ retry/DLQ;
+    # if the broker is unreachable we fall back to an in-process background save.
     if user_id and request.message and final_answer:
         try:
-            from app.services.graphiti_client import add_conversation_episode
-            import asyncio
+            from app.queue.publisher import publish_memory_save_task
 
-            uid = user_id
-            sid = session_id
-            msg = request.message
-            ans = final_answer
-
-            async def _bg_save():
-                try:
-                    await add_conversation_episode(
-                        user_id=uid,
-                        user_message=msg,
-                        assistant_message=ans,
-                        session_id=sid,
-                    )
-                except Exception as e:
-                    logger.warning(f"[lg_endpoint] Graphiti episode save failed: {e}")
-
-            asyncio.create_task(_bg_save())
+            await publish_memory_save_task(
+                user_id=user_id,
+                user_message=request.message,
+                assistant_message=final_answer,
+                session_id=session_id,
+            )
         except Exception as e:
-            logger.warning(f"[lg_endpoint] Graphiti save task spawn failed: {e}")
+            logger.warning(f"[lg_endpoint] Graphiti memory enqueue failed ({e}) — falling back to in-process save")
+            try:
+                from app.services.graphiti_client import add_conversation_episode
+                import asyncio
+
+                uid = user_id
+                sid = session_id
+                msg = request.message
+                ans = final_answer
+
+                async def _bg_save():
+                    try:
+                        await add_conversation_episode(
+                            user_id=uid,
+                            user_message=msg,
+                            assistant_message=ans,
+                            session_id=sid,
+                        )
+                    except Exception as e2:
+                        logger.warning(f"[lg_endpoint] Graphiti episode save failed: {e2}")
+
+                asyncio.create_task(_bg_save())
+            except Exception as e2:
+                logger.warning(f"[lg_endpoint] Graphiti save task spawn failed: {e2}")
 
 
 # ---------------------------------------------------------------------------
@@ -304,13 +316,14 @@ async def langgraph_chat_stream(
 async def chat_stream_langgraph(
     request: ChatRequest,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_active_user),
+    user: User = Depends(get_principal),
 ):
     """
     LangGraph SSE streaming chat endpoint (workspace-agnostic).
 
     Uses all workspaces the user has access to. Enabled when
-    NEXUSRAG_AGENT_BACKEND=langgraph (or called directly).
+    NEXUSRAG_AGENT_BACKEND=langgraph (or called directly). Accepts either a JWT
+    bearer token or an X-API-Key (third-party clients) via get_principal.
     """
     workspace_ids = await _get_accessible_workspaces_lg(db, user)
     if not workspace_ids:
@@ -350,7 +363,7 @@ async def chat_stream_langgraph_workspace(
     workspace_id: uuid.UUID,
     request: ChatRequest,
     db: AsyncSession = Depends(get_db),
-    user: User = Depends(get_current_active_user),
+    user: User = Depends(get_principal),
 ):
     """
     LangGraph SSE streaming chat endpoint (single workspace).

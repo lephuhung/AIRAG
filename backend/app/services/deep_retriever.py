@@ -429,18 +429,26 @@ class DeepRetriever:
         boosted_citations = []
         boost_factor = settings.HRAG_RECENTNESS_BOOST
 
-        for chunk, citation in zip(chunks, citations):
-            # Get published_date from vector store metadata
+        # Batch-fetch published_date for ALL chunks in a single ChromaDB call
+        # instead of one .get() per chunk (was N round-trips per query).
+        chunk_ids = [
+            f"doc_{chunk.document_id}_chunk_{chunk.chunk_index}" for chunk in chunks
+        ]
+        date_by_id: dict[str, str] = {}
+        if chunk_ids:
             try:
                 results = self.vector_store.collection.get(
-                    ids=[f"doc_{chunk.document_id}_chunk_{chunk.chunk_index}"],
-                    include=["metadatas"]
+                    ids=chunk_ids, include=["metadatas"]
                 )
-                meta = results.get("metadatas", [{}])[0] if results.get("metadatas") else {}
-                date_str = meta.get("published_date", "") if meta else ""
+                got_ids = results.get("ids") or []
+                got_metas = results.get("metadatas") or []
+                for cid, meta in zip(got_ids, got_metas):
+                    date_by_id[cid] = (meta or {}).get("published_date", "") or ""
             except Exception:
-                date_str = ""
+                date_by_id = {}
 
+        for chunk_id, chunk, citation in zip(chunk_ids, chunks, citations):
+            date_str = date_by_id.get(chunk_id, "")
             recency_boost = compute_boost(date_str)
             # Initialize score if not set, then apply boost
             base_score = chunk.score if chunk.score else 0.5  # default score if not set

@@ -4,15 +4,17 @@
  * Tabbed modal for editing profile (name + avatar) and changing password.
  */
 import { useState, useRef } from "react";
-import { User, Lock, Camera, Loader2, X, Eye, EyeOff } from "lucide-react";
+import { User, Lock, Camera, Loader2, X, Eye, EyeOff, KeyRound, Send } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { api, rewritePresignedUrl } from "@/lib/api";
 import { useAuthStore } from "@/stores/authStore";
+import { ApiKeysTab } from "@/components/settings/ApiKeysTab";
+import { TelegramTab } from "@/components/settings/TelegramTab";
 import type { User as UserType } from "@/types";
 
-type Tab = "profile" | "security";
+type Tab = "profile" | "security" | "api_keys" | "telegram";
 
 interface ProfileModalProps {
   onClose: () => void;
@@ -130,7 +132,7 @@ export function ProfileModal({ onClose }: ProfileModalProps) {
       />
 
       {/* Modal */}
-      <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-full max-w-md bg-card border rounded-2xl shadow-2xl">
+      <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-full max-w-lg bg-card border rounded-2xl shadow-2xl">
         {/* Header */}
         <div className="flex items-center justify-between px-5 pt-5 pb-4 border-b">
           <h2 className="text-base font-semibold">Edit Profile</h2>
@@ -156,10 +158,22 @@ export function ProfileModal({ onClose }: ProfileModalProps) {
             icon={<Lock className="w-3.5 h-3.5" />}
             label="Security"
           />
+          <TabButton
+            active={tab === "api_keys"}
+            onClick={() => setTab("api_keys")}
+            icon={<KeyRound className="w-3.5 h-3.5" />}
+            label="API Keys"
+          />
+          <TabButton
+            active={tab === "telegram"}
+            onClick={() => setTab("telegram")}
+            icon={<Send className="w-3.5 h-3.5" />}
+            label="Telegram"
+          />
         </div>
 
         {/* Content */}
-        <div className="px-5 py-5 space-y-4">
+        <div className="px-5 py-5 space-y-4 max-h-[60vh] overflow-y-auto">
           {tab === "profile" && (
             <>
               {/* Avatar */}
@@ -253,6 +267,10 @@ export function ProfileModal({ onClose }: ProfileModalProps) {
               />
             </>
           )}
+
+          {tab === "api_keys" && <ApiKeysTab />}
+
+          {tab === "telegram" && <TelegramTab />}
         </div>
 
         {/* Footer */}
@@ -314,10 +332,10 @@ function TabButton({
     <button
       onClick={onClick}
       className={cn(
-        "flex items-center gap-1.5 px-3 py-2.5 text-xs font-medium border-b-2 -mb-px transition-colors",
+        "relative flex items-center gap-1.5 px-3.5 py-2.5 text-xs border-b-2 -mb-px rounded-t-md transition-all",
         active
-          ? "border-primary text-primary relative"
-          : "border-transparent text-muted-foreground hover:text-foreground"
+          ? "border-primary text-primary font-semibold bg-primary/10"
+          : "border-transparent text-muted-foreground font-medium hover:text-foreground hover:bg-muted/60"
       )}
     >
       {icon}

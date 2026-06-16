@@ -47,3 +47,20 @@ class KGMessage(BaseModel):
     document_id: uuid.UUID
     workspace_id: uuid.UUID
     markdown: str  # full markdown from parse phase
+
+
+class MemorySaveMessage(BaseModel):
+    """
+    Dispatched by the chat endpoints after a turn completes, to persist the
+    user's message as a Graphiti personal-memory episode out-of-band.
+
+    Unlike the document pipeline messages this carries no document/workspace —
+    it is keyed on the user. The expensive LLM fact-extraction + Neo4j write are
+    done in the memory worker (handle_memory), so a transient failure is retried
+    durably by RabbitMQ instead of being lost in a fire-and-forget task.
+    """
+
+    user_id: uuid.UUID
+    user_message: str
+    assistant_message: str = ""
+    session_id: str | None = None

@@ -106,8 +106,13 @@ async def register(
     await db.refresh(user)
 
     # ── Auto-create personal workspace for the new user ───────────────
+    # Short, friendly name based on the user's given name (last token of a
+    # Vietnamese full name, e.g. "Lê Văn Hưng" → "Hưng Space"). Fall back to the
+    # email local part if no full name was provided.
+    _full = (user.full_name or "").strip()
+    _given = _full.split()[-1] if _full else user.email.split("@")[0]
     personal_kb = KnowledgeBase(
-        name=f"{user.full_name}'s Workspace",
+        name=f"{_given} Space",
         owner_id=user.id,
         visibility="personal",
         is_default=True,

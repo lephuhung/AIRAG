@@ -17,6 +17,64 @@ export interface AuthTokens {
   user: User;
 }
 
+// ── Integrations: API keys + Telegram linking ──
+export interface ApiKeyInfo {
+  id: string;
+  name: string;
+  prefix: string;
+  scopes: string[] | null;
+  revoked: boolean;
+  last_used_at: string | null;
+  created_at: string;
+}
+
+export interface ApiKeyCreated extends ApiKeyInfo {
+  /** Plaintext key — returned only once, at creation time. */
+  key: string;
+}
+
+export interface TelegramLinkInfo {
+  telegram_chat_id: string;
+  telegram_user_id: string | null;
+  telegram_username: string | null;
+  active_workspace_id: string | null;
+  created_at: string;
+}
+
+export interface TelegramLinkCode {
+  code: string;
+  expires_at: string;
+  deep_link: string | null;
+  ttl_minutes: number;
+}
+
+/** System-wide Telegram bot config (superadmin only); token is never exposed. */
+export interface TelegramConfigInfo {
+  enabled: boolean;
+  bot_username: string | null;
+  bot_id: string | null;
+  webhook_url: string | null;
+  has_token: boolean;
+  token_hint: string | null;
+  has_secret: boolean;
+  suggested_webhook_url: string | null;
+  updated_at: string | null;
+}
+
+export interface TelegramConfigUpdate {
+  bot_token?: string;
+  webhook_secret?: string;
+  bot_username?: string;
+  webhook_url?: string;
+  enabled?: boolean;
+}
+
+export interface WebhookActionResult {
+  ok: boolean;
+  detail: string;
+  config: TelegramConfigInfo | null;
+}
+
 export interface Tenant {
   id: string;
   name: string;

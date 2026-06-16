@@ -35,6 +35,32 @@ services:
       - "traefik.http.services.traefik.loadbalancer.server.port=8080"
 
   # ═══════════════════════════════════════════════════════════════════════════
+  # CLOUDFLARE TUNNEL — expose the webhook publicly (e.g. for Telegram)
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Token-based (remotely-managed) tunnel: create it in the Cloudflare Zero Trust
+  # dashboard, copy the token into CLOUDFLARE_TUNNEL_TOKEN (.env), then add a
+  # Public Hostname routing your domain → http://hrag-backend:8080 (the backend is
+  # on this same docker network, so cloudflared reaches it by container name).
+  # The Telegram webhook then becomes:
+  #   https://<your-domain>/api/v1/integrations/telegram/webhook
+  # Only starts when the token is set (profile "tunnel").
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: hrag-cloudflared
+    profiles: ["tunnel"]
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      - backend
+    networks:
+      - hrag_network
+    restart: unless-stopped
+    labels:
+      - "com.hrag.service=cloudflared"
+      - "com.hrag.stack=hrag"
+
+  # ═══════════════════════════════════════════════════════════════════════════
   # INFRASTRUCTURE
   # ═══════════════════════════════════════════════════════════════════════════
 
@@ -310,7 +336,7 @@ services:
       AUTO_CREATE_TABLES: "false"
       CUDA_VISIBLE_DEVICES: "0"
       HRAG_EAGER_MODEL_LOADING: "false"
-      NEXUSRAG_DOCLING_DEVICE: cuda
+      HRAG_DOCLING_DEVICE: cuda
       WORKER_DRAIN_TIMEOUT: "30"
       WORKER_HEALTH_PORT: "8081"
       HUNYUAN_OCR_API_URL: http://vllm-ocr:8001/v1
@@ -521,6 +547,55 @@ services:
       start_period: 20s
     labels:
       com.hrag.service: worker-kg
+      com.hrag.stack: hrag
+
+  # ── Memory worker ───────────────────────────────────────────────────────────
+  # Graphiti personal-memory: LLM fact-extraction (vllm-memory) + Neo4j write.
+  # Durable queue (hrag.memory) with RabbitMQ retry/DLQ. No GPU model loaded.
+  worker-memory:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      vllm-memory:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/hrag
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      NEO4J_URI: bolt://neo4j:7687
+      MEMORY_AGENT_BASE_URL: http://vllm-memory:8088/v1
+      GRAPHITI_LLM_BASE_URL: http://vllm-memory:8088/v1
+      WORKER_TYPE: memory
+      AUTO_CREATE_TABLES: "false"
+      WORKER_DRAIN_TIMEOUT: "30"
+      WORKER_HEALTH_PORT: "8081"
+    networks:
+      - hrag_network
+    extra_hosts:
+      - "langfuse.hatinh.local:10.10.0.241"
+    stop_grace_period: 60s
+    command: ["python", "-m", "app.workers.runner"]
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    labels:
+      com.hrag.service: worker-memory
       com.hrag.stack: hrag
 
   # ── Backend API server ─────────────────────────────────────────────────────

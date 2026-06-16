@@ -11,6 +11,7 @@ Fallback: TXT, MD (via legacy loader)
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -241,6 +242,7 @@ def _get_global_converter():
     from docling.datamodel.pipeline_options import (
         PdfPipelineOptions,
         OcrAutoOptions,
+        TableFormerMode,
     )
     from docling.datamodel.accelerator_options import (
         AcceleratorOptions,
@@ -249,7 +251,16 @@ def _get_global_converter():
     from docling.datamodel.base_models import InputFormat
     from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
 
-    device = settings.HRAG_DOCLING_DEVICE  # "auto" | "cpu" | "cuda"
+    # Map the config string to the Docling enum (raw strings are accepted by some
+    # Docling versions but not all — map explicitly so "cuda"/"cpu" are honored).
+    _DEVICE_MAP = {
+        "auto": AcceleratorDevice.AUTO,
+        "cpu": AcceleratorDevice.CPU,
+        "cuda": AcceleratorDevice.CUDA,
+    }
+    device = _DEVICE_MAP.get(
+        settings.HRAG_DOCLING_DEVICE.lower(), AcceleratorDevice.AUTO
+    )
 
     pipeline_options = PdfPipelineOptions(do_ocr=settings.HRAG_ENABLE_OCR)
     pipeline_options.generate_picture_images = settings.HRAG_ENABLE_IMAGE_EXTRACTION
@@ -258,7 +269,19 @@ def _get_global_converter():
     pipeline_options.ocr_options = OcrAutoOptions(lang=["vi", "en"])
     pipeline_options.accelerator_options = AcceleratorOptions(device=device)
 
-    logger.info(f"[Docling] Initializing DocumentConverter (device={device})")
+    # Table structure recognition (TableFormer). "accurate" is Docling's default
+    # and gives the best table fidelity; "fast" trades ~15-25% accuracy for speed.
+    pipeline_options.do_table_structure = settings.HRAG_DOCLING_DO_TABLE
+    pipeline_options.table_structure_options.mode = (
+        TableFormerMode.FAST
+        if settings.HRAG_DOCLING_TABLE_MODE.lower() == "fast"
+        else TableFormerMode.ACCURATE
+    )
+
+    logger.info(
+        f"[Docling] Initializing DocumentConverter (device={device.value}, "
+        f"table_mode={settings.HRAG_DOCLING_TABLE_MODE})"
+    )
     _DOCLING_CONVERTER = DocumentConverter(
         format_options={
             InputFormat.PDF: PdfFormatOption(
@@ -327,9 +350,16 @@ class DeepDocumentParser:
                     path, document_id, original_filename
                 )
             else:
-                result = self._parse_with_docling(path, document_id, original_filename)
+                # Docling conversion is CPU-bound and blocking — offload to a
+                # worker thread so the worker's asyncio event loop (RabbitMQ
+                # heartbeats, /health, /ready) stays responsive during long parses.
+                result = await asyncio.to_thread(
+                    self._parse_with_docling, path, document_id, original_filename
+                )
         elif suffix in _LEGACY_EXTENSIONS:
-            result = self._parse_legacy(path, document_id, original_filename)
+            result = await asyncio.to_thread(
+                self._parse_legacy, path, document_id, original_filename
+            )
         else:
             raise ValueError(
                 f"Unsupported file type: {suffix}. "

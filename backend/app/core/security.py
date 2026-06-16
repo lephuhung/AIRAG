@@ -1,6 +1,8 @@
 """
 Security utilities — JWT token creation/validation and password hashing.
 """
+import hashlib
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -8,6 +10,9 @@ from jose import jwt, JWTError
 import bcrypt
 
 from app.core.config import settings
+
+# Prefix for third-party API keys (NexusRAG Key) so they're recognisable in logs.
+API_KEY_PREFIX = "nrk_"
 
 
 def hash_password(password: str) -> str:
@@ -55,3 +60,25 @@ def decode_token(token: str) -> dict:
         return payload
     except JWTError:
         raise
+
+
+def hash_api_key(plaintext: str) -> str:
+    """Return the sha256 hex digest used to store/look up an API key."""
+    return hashlib.sha256(plaintext.encode("utf-8")).hexdigest()
+
+
+def generate_api_key() -> tuple[str, str, str]:
+    """Mint a new API key.
+
+    Returns (plaintext, key_hash, prefix). The plaintext is shown to the user
+    exactly once; only key_hash is persisted. `prefix` is a short, safe-to-store
+    fragment for display in the UI.
+    """
+    plaintext = API_KEY_PREFIX + secrets.token_urlsafe(32)
+    return plaintext, hash_api_key(plaintext), plaintext[: len(API_KEY_PREFIX) + 6]
+
+
+def generate_link_code() -> str:
+    """Short, unambiguous one-time code for linking a Telegram chat (no 0/O/1/I)."""
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(secrets.choice(alphabet) for _ in range(8))

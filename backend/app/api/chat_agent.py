@@ -1661,31 +1661,45 @@ async def agent_chat_stream(
         },
     }
 
-    # ── Auto-save: persist conversation episode to Graphiti knowledge graph ──
+    # ── Auto-save: enqueue the turn for durable Graphiti personal-memory save ──
+    # The memory worker does the LLM fact-extraction + Neo4j write with RabbitMQ
+    # retry/DLQ. If the broker is unreachable we fall back to an in-process
+    # background save so a fact is still attempted rather than dropped.
     if user_id and message and accumulated_text:
         try:
-            from app.services.graphiti_client import add_conversation_episode
-            import asyncio
+            from app.queue.publisher import publish_memory_save_task
 
-            uid = user_id
-            sid = session_id
-            msg = message
-            ans = accumulated_text
-
-            async def _bg_save():
-                try:
-                    await add_conversation_episode(
-                        user_id=uid,
-                        user_message=msg,
-                        assistant_message=ans,
-                        session_id=sid,
-                    )
-                except Exception as e:
-                    logger.warning(f"Graphiti episode save failed: {e}")
-
-            asyncio.create_task(_bg_save())
+            await publish_memory_save_task(
+                user_id=user_id,
+                user_message=message,
+                assistant_message=accumulated_text,
+                session_id=session_id,
+            )
         except Exception as e:
-            logger.warning(f"Graphiti save task spawn failed: {e}")
+            logger.warning(f"Graphiti memory enqueue failed ({e}) — falling back to in-process save")
+            try:
+                from app.services.graphiti_client import add_conversation_episode
+                import asyncio
+
+                uid = user_id
+                sid = session_id
+                msg = message
+                ans = accumulated_text
+
+                async def _bg_save():
+                    try:
+                        await add_conversation_episode(
+                            user_id=uid,
+                            user_message=msg,
+                            assistant_message=ans,
+                            session_id=sid,
+                        )
+                    except Exception as e2:
+                        logger.warning(f"Graphiti episode save failed: {e2}")
+
+                asyncio.create_task(_bg_save())
+            except Exception as e2:
+                logger.warning(f"Graphiti save task spawn failed: {e2}")
 
 
 # ---------------------------------------------------------------------------

@@ -36,6 +36,7 @@ Internal helpers
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import uuid
@@ -397,6 +398,41 @@ async def search_user_memory(
 # Episode saving
 # ---------------------------------------------------------------------------
 
+# First-person subject pronouns that, inside a personal-memory fact, refer to
+# the user.  Used as a *fallback* anchor: when the LLM fact-extractor is
+# unavailable and we store the raw user message, replacing these keeps the fact
+# linked to the user entity node instead of creating an orphan.  The lookarounds
+# are word-boundary guards (\w is Unicode-aware → safe for Vietnamese), so we
+# never corrupt a substring inside a larger word.
+_FIRST_PERSON_RE = re.compile(
+    r"(?<!\w)(tôi|Tôi|mình|Mình|tao|Tao|tớ|Tớ|I|me|My|my)(?!\w)"
+)
+
+
+def _anchor_to_user(text: str, user_id: uuid.UUID) -> str:
+    """Rewrite *text* so every reference to the speaker points at one stable
+    entity node — ``"Người dùng ID=<uuid>"``.
+
+    Two passes:
+      1. Replace the third-person placeholders the extractor LLM is instructed
+         to emit (``"Người dùng"`` / ``"the user"``).
+      2. Fallback safety net — replace first-person subject pronouns. On the
+         normal path the LLM has already converted these, so this is a no-op; on
+         the fallback path (LLM down → raw text stored) it is what keeps the fact
+         attached to the user instead of producing an unlinked node.
+
+    If no anchor ends up present (e.g. a fact with no pronoun at all), the entity
+    is prepended so Graphiti can still attribute the fact to the user.
+    """
+    user_entity = f"Người dùng ID={user_id}"
+    for src in ("Người dùng", "người dùng", "The user", "the user"):
+        text = text.replace(src, user_entity)
+    text = _FIRST_PERSON_RE.sub(user_entity, text)
+    if user_entity not in text:
+        text = f"{user_entity}: {text}"
+    return text
+
+
 _FACT_EXTRACTOR_PROMPT = """\
 You are a personal-fact extractor for a memory system.
 
@@ -438,57 +474,77 @@ User: "My name is John and I work at Google"
 """
 
 
-async def _llm_extract_facts(text: str) -> str:
+async def _llm_extract_facts(text: str, *, max_attempts: int = 2) -> str:
     """
     Use the memory-agent LLM (Qwen3-4B) to extract personal factual statements
     from a potentially mixed user message.
 
-    Returns the extracted facts string, or "" if the message contains no facts
-    about the user (pure question, generic request, etc.).
+    Returns:
+      * ``""`` when the LLM confidently reports the message holds no personal
+        fact (pure question / generic request) — caller skips the episode.
+      * the extracted third-person fact string on success.
+      * the ORIGINAL text as a fallback when the LLM call fails or returns
+        unparseable output after ``max_attempts`` tries — so we never silently
+        drop a potentially useful episode. The caller anchors this raw text via
+        :func:`_anchor_to_user` before storing.
 
-    Falls back to returning the original text if the LLM call fails, so that
-    we never silently drop a potentially useful episode.
+    The retry loop here is the *in-handler* layer; the memory worker adds a
+    second, durable RabbitMQ-level retry on top (see ``handle_memory``).
     """
-    try:
-        from app.services.llm import get_memory_agent
-        from app.services.llm.types import LLMMessage as _LLMMsg
+    import json as _json
 
-        classifier = get_memory_agent()
-        response_text = ""
-        async for chunk in classifier.astream(
-            [_LLMMsg(role="user", content=text)],
-            system_prompt=_FACT_EXTRACTOR_PROMPT,
-            temperature=0.0,
-            max_tokens=256,
-        ):
-            if chunk.text:
-                response_text += chunk.text
+    last_err: Exception | str | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            from app.services.llm import get_memory_agent
+            from app.services.llm.types import LLMMessage as _LLMMsg
 
-        # Parse JSON response
-        import json as _json
+            classifier = get_memory_agent()
+            response_text = ""
+            async for chunk in classifier.astream(
+                [_LLMMsg(role="user", content=text)],
+                system_prompt=_FACT_EXTRACTOR_PROMPT,
+                temperature=0.0,
+                max_tokens=512,  # headroom so Qwen3 <think> blocks don't truncate the JSON
+            ):
+                if chunk.text:
+                    response_text += chunk.text
 
-        # Strip potential <think>...</think> tags that Qwen3 may emit
-        clean = re.sub(
-            r"<think>.*?</think>", "", response_text, flags=re.DOTALL
-        ).strip()
-        # Extract JSON object
-        m = re.search(r"\{.*\}", clean, re.DOTALL)
-        if not m:
+            # Strip potential <think>...</think> tags that Qwen3 may emit
+            clean = re.sub(
+                r"<think>.*?</think>", "", response_text, flags=re.DOTALL
+            ).strip()
+            # Extract JSON object
+            m = re.search(r"\{.*\}", clean, re.DOTALL)
+            if not m:
+                last_err = f"no JSON in response: {response_text[:80]!r}"
+                logger.warning(
+                    f"[graphiti] fact-extractor attempt {attempt}/{max_attempts} "
+                    f"returned no JSON: {response_text[:80]!r}"
+                )
+                continue  # retry
+
+            data = _json.loads(m.group())
+            if not data.get("has_facts", False):
+                return ""  # definitive: no personal fact → skip
+            return data.get("facts", "").strip() or ""
+
+        except Exception as e:
+            last_err = e
             logger.warning(
-                f"[graphiti] fact-extractor returned no JSON: {response_text[:80]!r}"
+                f"[graphiti] fact-extractor attempt {attempt}/{max_attempts} "
+                f"failed: {e}"
             )
-            return text  # fallback: store as-is
+            if attempt < max_attempts:
+                await asyncio.sleep(0.5 * attempt)
 
-        data = _json.loads(m.group())
-        if not data.get("has_facts", False):
-            return ""
-        return data.get("facts", "").strip() or ""
-
-    except Exception as e:
-        logger.warning(
-            f"[graphiti] fact-extractor LLM failed ({e}), storing original text"
-        )
-        return text  # fallback: store as-is
+    # All attempts exhausted — fall back to storing the raw text (anchored by
+    # the caller) rather than losing the fact entirely.
+    logger.warning(
+        f"[graphiti] fact-extractor failed after {max_attempts} attempts "
+        f"({last_err}) — storing original text as fallback"
+    )
+    return text
 
 
 async def add_conversation_episode(
@@ -524,8 +580,10 @@ async def add_conversation_episode(
 
     stripped = user_message.strip()
 
-    # Too short to contain a meaningful personal fact
-    if len(stripped) < 10:
+    # Too short to contain any personal fact. Kept low (5) so short but real
+    # facts like "Tôi là An" (9 chars) are NOT dropped; greetings ("hi", "ok")
+    # fall through to the LLM gate which classifies them as has_facts=false.
+    if len(stripped) < 5:
         return
 
     # Use LLM to extract personal facts and discard questions/requests.
@@ -541,31 +599,13 @@ async def add_conversation_episode(
 
     logger.info(f"[graphiti] Extracted facts for user {user_id}: {facts_only[:100]!r}")
 
-    # Replace the generic "người dùng" / "the user" placeholder produced by the LLM
-    # with a stable, unique internal entity name that anchors all facts to a single
-    # Entity node in the graph without exposing the numeric user ID to the LLM output.
-    #
-    # The internal entity name uses a short hash of the user_id so that:
-    #   - Different users never share the same entity node (no cross-user fact leakage)
-    #   - The ID is invisible in search results shown to the LLM / user
-    #   - The entity name is still stable across sessions (same hash every time)
-    #
-    # Note: Vietnamese Unicode (ư, ờ) prevents simple (?i) regex matching, so
-    # we use explicit string replacement for the two casing variants.
-    # "Người dùng ID=<N>" is the stable internal entity anchor used for Graphiti extraction.
-    # The numeric ID ensures uniqueness across users (group_id partitions the graph but
-    # Graphiti can still merge same-named entities).  The ID is NEVER shown to users —
-    # it is stripped in _format_memory_context before the facts reach the LLM or UI.
-    # Tested: plain "Người dùng" causes wrong cross-device edges; this form works correctly.
-    user_entity = f"Người dùng ID={user_id}"
-
-    episode_text = facts_only
-    for src in ("Người dùng", "người dùng", "The user", "the user"):
-        episode_text = episode_text.replace(src, user_entity)
-
-    # The episode body IS the fact text — no outer prefix needed because the
-    # entity name is already embedded in the text itself.
-    episode_body = episode_text
+    # Anchor every reference to the speaker onto one stable entity node
+    # ("Người dùng ID=<uuid>"). This (a) prevents cross-user fact leakage, (b) is
+    # stripped before facts reach the LLM/UI (see _format_memory_context), and
+    # (c) — crucially for the fallback path where facts_only is raw text — also
+    # rewrites first-person pronouns so an un-extracted message still links to
+    # the user instead of producing an orphan node.
+    episode_body = _anchor_to_user(facts_only, user_id)
 
     client = get_graphiti_client()
     group_id = f"nexusrag_user_{user_id}"
@@ -574,23 +614,40 @@ async def add_conversation_episode(
     # same user entity in the KG instead of creating isolated per-session nodes.
     episode_name = f"user_{user_id}_memory"
 
-    try:
-        from graphiti_core.nodes import EpisodeType
+    from graphiti_core.nodes import EpisodeType
 
-        await client.add_episode(
-            name=episode_name,
-            episode_body=episode_body,
-            source=EpisodeType.text,
-            source_description="NexusRAG user message — personal memory",
-            group_id=group_id,
-            reference_time=datetime.now(tz=timezone.utc),
-        )
-        logger.info(
-            f"[graphiti] Episode saved for user {user_id} ({len(episode_body)} chars)"
-        )
-    except Exception as exc:
-        # Non-fatal — log and continue. Memory loss is preferable to blocking chat.
-        logger.warning(f"[graphiti] add_episode failed for user {user_id}: {exc}")
+    # In-handler retry for transient Neo4j / Graphiti blips. On final failure we
+    # RAISE so the memory worker's durable RabbitMQ retry (5s/15s/60s) and DLQ
+    # take over — instead of the old behaviour of silently dropping the fact.
+    max_attempts = 2
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await client.add_episode(
+                name=episode_name,
+                episode_body=episode_body,
+                source=EpisodeType.text,
+                source_description="NexusRAG user message — personal memory",
+                group_id=group_id,
+                reference_time=datetime.now(tz=timezone.utc),
+            )
+            logger.info(
+                f"[graphiti] Episode saved for user {user_id} ({len(episode_body)} chars)"
+            )
+            return
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                f"[graphiti] add_episode attempt {attempt}/{max_attempts} "
+                f"failed for user {user_id}: {exc}"
+            )
+            if attempt < max_attempts:
+                await asyncio.sleep(0.5 * attempt)
+
+    raise RuntimeError(
+        f"[graphiti] add_episode failed for user {user_id} after "
+        f"{max_attempts} attempts: {last_exc}"
+    )
 
 
 async def save_user_fact(user_id: uuid.UUID, fact: str) -> bool:
@@ -609,13 +666,7 @@ async def save_user_fact(user_id: uuid.UUID, fact: str) -> bool:
     if not fact:
         return False
 
-    user_entity = f"Người dùng ID={user_id}"
-    episode_body = fact
-    for src in ("Người dùng", "người dùng", "The user", "the user"):
-        episode_body = episode_body.replace(src, user_entity)
-    # Ensure the entity anchor is present so Graphiti links the fact to the user.
-    if user_entity not in episode_body:
-        episode_body = f"{user_entity}: {episode_body}"
+    episode_body = _anchor_to_user(fact, user_id)
 
     client = get_graphiti_client()
     try:

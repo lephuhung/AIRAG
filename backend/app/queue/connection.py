@@ -48,10 +48,12 @@ EXCHANGE_PARSE = "hrag.parse"
 EXCHANGE_EMBED = "hrag.embed"
 EXCHANGE_CAPTION = "hrag.caption"
 EXCHANGE_KG = "hrag.kg"
+EXCHANGE_MEMORY = "hrag.memory"
 
 QUEUE_PARSE = "hrag.parse"
 QUEUE_EMBED = "hrag.embed"
 QUEUE_CAPTION = "hrag.caption"
+QUEUE_MEMORY = "hrag.memory"
 # KG queues are named hrag.kg.<workspace_id> and created on-demand
 QUEUE_KG_PREFIX = "hrag.kg"
 
@@ -312,6 +314,8 @@ def _get_timeout_for_queue(queue_name: str) -> int:
         return settings.WORKER_CAPTION_TIMEOUT
     if "kg" in queue_name:
         return settings.WORKER_KG_TIMEOUT
+    if "memory" in queue_name:
+        return settings.WORKER_MEMORY_TIMEOUT
     return 60  # default
 
 

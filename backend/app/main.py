@@ -51,6 +51,17 @@ async def lifespan(app: FastAPI):
                     "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS system_prompt TEXT"
                 )
             )
+            # Telegram link: numeric telegram user id (added after initial release)
+            await conn.execute(
+                text(
+                    "ALTER TABLE IF EXISTS telegram_links ADD COLUMN IF NOT EXISTS telegram_user_id VARCHAR(64)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_telegram_links_telegram_user_id ON telegram_links(telegram_user_id)"
+                )
+            )
             # Create chat_sessions table if not exists
             await conn.execute(
                 text("""

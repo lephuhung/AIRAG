@@ -4,16 +4,17 @@ FastAPI dependency injection — database session + authentication.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
 from fastapi import Depends
-from fastapi.security import OAuth2PasswordBearer
+from fastapi.security import APIKeyHeader, OAuth2PasswordBearer
 from jose import JWTError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import AsyncSessionLocal
 from app.core.exceptions import UnauthorizedError, ForbiddenError, NotFoundError
-from app.core.security import decode_token
+from app.core.security import decode_token, hash_api_key
 
 
 async def get_db() -> AsyncSession:
@@ -26,6 +27,9 @@ async def get_db() -> AsyncSession:
 
 # OAuth2 scheme — auto_error=False so we can return 401 manually
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
+
+# API key scheme — third-party clients send their key in the X-API-Key header.
+api_key_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 async def get_current_user(
@@ -68,6 +72,56 @@ async def get_current_active_user(
     user=Depends(get_current_user),
 ):
     """Check user.is_active → return or raise 403 'Account not approved'."""
+    if not user.is_active:
+        raise ForbiddenError("Account not yet approved. Please wait for admin approval.")
+    return user
+
+
+async def _user_from_api_key(api_key: str, db: AsyncSession):
+    """Resolve and validate an API key → its (active) principal User, or raise 401."""
+    from app.models.integration import ApiKey
+    from app.models.user import User
+
+    key_hash = hash_api_key(api_key)
+    result = await db.execute(
+        select(ApiKey).where(ApiKey.key_hash == key_hash, ApiKey.revoked.is_(False))
+    )
+    api_key_row = result.scalar_one_or_none()
+    if api_key_row is None:
+        raise UnauthorizedError("Invalid or revoked API key")
+
+    result = await db.execute(select(User).where(User.id == api_key_row.user_id))
+    user = result.scalar_one_or_none()
+    if user is None:
+        raise UnauthorizedError("API key principal no longer exists")
+    if not user.is_active:
+        raise ForbiddenError("API key principal is not active")
+
+    # Best-effort usage stamp — never let it break the request.
+    try:
+        api_key_row.last_used_at = datetime.utcnow()
+        await db.commit()
+    except Exception:
+        await db.rollback()
+
+    return user
+
+
+async def get_principal(
+    api_key: str | None = Depends(api_key_scheme),
+    token: str | None = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db),
+):
+    """Authenticate via X-API-Key (third parties) OR JWT bearer (browser).
+
+    Returns the active principal User. API key takes precedence so service
+    clients can pass both headers. The returned user carries the exact same
+    workspace/tenant permissions whichever path was used.
+    """
+    if api_key:
+        return await _user_from_api_key(api_key, db)
+
+    user = await get_current_user(token=token, db=db)
     if not user.is_active:
         raise ForbiddenError("Account not yet approved. Please wait for admin approval.")
     return user

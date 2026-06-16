@@ -7,6 +7,7 @@ Entrypoint for worker containers.  Select worker type via WORKER_TYPE env var:
   WORKER_TYPE=embed    → embed worker
   WORKER_TYPE=caption  → caption worker
   WORKER_TYPE=kg       → KG worker (scale by workspace count)
+  WORKER_TYPE=memory   → Graphiti personal-memory worker
 
 Usage:
   python -m app.workers.runner
@@ -70,6 +71,14 @@ async def _run_caption_worker() -> None:
     await mq.consume(
         mq.EXCHANGE_CAPTION, mq.QUEUE_CAPTION, "caption",
         handle_caption, prefetch_count=settings.WORKER_PREFETCH_CAPTION,
+    )
+
+
+async def _run_memory_worker() -> None:
+    from app.workers.memory_worker import handle_memory
+    await mq.consume(
+        mq.EXCHANGE_MEMORY, mq.QUEUE_MEMORY, "memory",
+        handle_memory, prefetch_count=settings.WORKER_PREFETCH_MEMORY,
     )
 
 
@@ -256,6 +265,7 @@ _WORKER_MAP = {
     "embed":   _run_embed_worker,
     "caption": _run_caption_worker,
     "kg":      _run_kg_worker,
+    "memory":  _run_memory_worker,
 }
 
 

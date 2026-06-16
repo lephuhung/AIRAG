@@ -25,11 +25,13 @@ from __future__ import annotations
 
 import logging
 import math
+import pickle
 import re
 import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -90,8 +92,51 @@ def _compute_recency_boost(date_str: str, decay_days: int = 365) -> float:
         return 0.0
 
 
+# Vietnamese word segmenter (pyvi), lazily resolved once.
+#   None      → not yet probed
+#   False     → probed, unavailable (fall back to whitespace tokenisation)
+#   callable  → pyvi ViTokenizer.tokenize
+_vi_segmenter: object = None
+
+
+def _get_vi_segmenter():
+    """Lazily import pyvi's segmenter; cache the result (or False on failure)."""
+    global _vi_segmenter
+    if _vi_segmenter is None:
+        try:
+            from pyvi import ViTokenizer
+
+            _vi_segmenter = ViTokenizer.tokenize
+        except Exception:  # pragma: no cover - optional dependency
+            logger.warning(
+                "[bm25] HRAG_BM25_WORD_SEGMENT=true but pyvi is not available — "
+                "falling back to whitespace tokenisation"
+            )
+            _vi_segmenter = False
+    return _vi_segmenter
+
+
 def _tokenize(text: str) -> list[str]:
-    """Lowercase and split on non-word characters."""
+    """
+    Tokenise text for BM25.
+
+    Default: lowercase + split on non-word characters (whitespace-aware, works
+    for both Vietnamese space-segmented text and Latin script).
+
+    When HRAG_BM25_WORD_SEGMENT is enabled, run pyvi word segmentation first so
+    multi-syllable Vietnamese words are kept as single tokens (pyvi joins them
+    with '_', e.g. "quyết_định"). MUST be applied identically at index-build and
+    query time — both go through this one function, so they stay consistent.
+    """
+    from app.core.config import settings
+
+    if settings.HRAG_BM25_WORD_SEGMENT:
+        segmenter = _get_vi_segmenter()
+        if segmenter:
+            try:
+                text = segmenter(text)
+            except Exception:
+                pass  # fall through to plain tokenisation on any pyvi error
     return [t for t in _TOKEN_RE.split(text.lower()) if t]
 
 
@@ -109,6 +154,80 @@ class _IndexState:
 # Module-level cache: workspace_id → _IndexState
 _index_cache: dict[uuid.UUID, _IndexState] = {}
 _cache_lock = threading.Lock()
+
+# Bump when the on-disk format or tokenisation logic changes, to invalidate
+# stale pickles written by an older build.
+_PERSIST_VERSION = 1
+
+
+def _persist_path(workspace_id: uuid.UUID) -> Path:
+    from app.core.config import settings
+
+    return Path(settings.BASE_DIR) / "data" / "bm25" / f"{workspace_id}.pkl"
+
+
+def _save_index(workspace_id: uuid.UUID, state: _IndexState) -> None:
+    """Pickle the index to disk (best-effort; never raises)."""
+    from app.core.config import settings
+
+    if not settings.HRAG_BM25_PERSIST:
+        return
+    path = _persist_path(workspace_id)
+    payload = {
+        "version": _PERSIST_VERSION,
+        "word_segment": settings.HRAG_BM25_WORD_SEGMENT,
+        "doc_count": state.doc_count,
+        "bm25": state.bm25,
+        "ids": state.ids,
+        "metadatas": state.metadatas,
+        "documents": state.documents,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".pkl.tmp")
+        with open(tmp, "wb") as fh:
+            pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(path)  # atomic on POSIX
+        logger.info(f"[bm25] Persisted index for workspace {workspace_id} ({state.doc_count} chunks)")
+    except Exception as e:  # pragma: no cover - disk issues are non-fatal
+        logger.warning(f"[bm25] Failed to persist index for {workspace_id}: {e}")
+
+
+def _load_index(workspace_id: uuid.UUID, expected_count: int) -> _IndexState | None:
+    """
+    Load a persisted index from disk if it matches the current corpus size,
+    persist version, and tokenisation setting. Returns None on any mismatch/error.
+    """
+    from app.core.config import settings
+
+    if not settings.HRAG_BM25_PERSIST:
+        return None
+    path = _persist_path(workspace_id)
+    if not path.exists():
+        return None
+    try:
+        with open(path, "rb") as fh:
+            payload = pickle.load(fh)
+    except Exception as e:  # pragma: no cover
+        logger.warning(f"[bm25] Failed to read persisted index for {workspace_id}: {e}")
+        return None
+
+    if (
+        payload.get("version") != _PERSIST_VERSION
+        or payload.get("word_segment") != settings.HRAG_BM25_WORD_SEGMENT
+        or payload.get("doc_count") != expected_count
+    ):
+        # Stale (corpus changed, version bumped, or tokeniser toggled) → rebuild.
+        return None
+
+    logger.info(f"[bm25] Loaded persisted index for workspace {workspace_id} ({expected_count} chunks)")
+    return _IndexState(
+        bm25=payload["bm25"],
+        ids=payload["ids"],
+        metadatas=payload["metadatas"],
+        documents=payload["documents"],
+        doc_count=payload["doc_count"],
+    )
 
 
 def _build_index(vector_store: VectorStore) -> _IndexState:
@@ -164,8 +283,16 @@ def get_or_build_index(vector_store: VectorStore) -> _IndexState:
     if cached is not None and cached.doc_count == current_count:
         return cached  # fresh — reuse
 
-    # Build (or rebuild) index
+    # Try a persisted index from disk before rebuilding from ChromaDB.
+    loaded = _load_index(workspace_id, current_count)
+    if loaded is not None:
+        with _cache_lock:
+            _index_cache[workspace_id] = loaded
+        return loaded
+
+    # Build (or rebuild) index, then persist for future cold starts.
     new_state = _build_index(vector_store)
+    _save_index(workspace_id, new_state)
 
     with _cache_lock:
         _index_cache[workspace_id] = new_state
@@ -202,12 +329,13 @@ def bm25_search(
 
     scores = state.bm25.get_scores(tokens)
 
-    # Apply recency boost to BM25 scores
-    from app.core.config import settings
-    boost_factor = settings.HRAG_RECENTNESS_BOOST
-    decay_days = settings.HRAG_RECENTNESS_DECAY_DAYS
+    # NOTE: recency boost is intentionally NOT applied here. RRF merging uses the
+    # BM25 *rank* (not the raw score), and the post-merge DeepRetriever._apply_recency_boost
+    # already applies recency once to all chunks. Boosting here too would double-count
+    # recency for BM25-only hits. Keep raw BM25 scores so the rank reflects pure lexical
+    # relevance.
 
-    # Pair scores with indices, apply optional document_id filter and recency boost
+    # Pair scores with indices, apply optional document_id filter
     scored = []
     for idx, score in enumerate(scores):
         if score <= 0:
@@ -215,11 +343,6 @@ def bm25_search(
         meta = state.metadatas[idx] if idx < len(state.metadatas) else {}
         if document_ids and meta.get("document_id") not in [str(doc_id) for doc_id in document_ids]:
             continue
-        # Apply recency boost: newer docs get higher scores
-        if boost_factor > 0:
-            date_str = meta.get("published_date", "")
-            recency_boost = _compute_recency_boost(date_str, decay_days)
-            score = score * (1 + boost_factor * recency_boost)
         scored.append((idx, score))
 
     # Sort by score descending, take top_n
@@ -247,4 +370,9 @@ def invalidate_cache(workspace_id: uuid.UUID) -> None:
     """
     with _cache_lock:
         _index_cache.pop(workspace_id, None)
+    # Also drop the persisted copy so the next query rebuilds from scratch.
+    try:
+        _persist_path(workspace_id).unlink(missing_ok=True)
+    except Exception:
+        pass
     logger.debug(f"[bm25] Cache invalidated for workspace {workspace_id}")
