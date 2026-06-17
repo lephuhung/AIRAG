@@ -3,8 +3,8 @@ Telegram channel adapter.
 
 Bridges Telegram chats to the AIRAG agent. A chat must first be *linked* to a
 real AIRAG account (via a one-time code minted on the web); once linked, every
-message runs `agent_chat_stream()` AS that user, so workspace/tenant permissions
-are inherited automatically — no separate authorization logic here.
+message runs the LangGraph supervisor agent AS that user, so workspace/tenant
+permissions are inherited automatically — no separate authorization logic here.
 
 The webhook route (`app/api/integrations.py`) only validates the secret token and
 hands the raw Telegram update to `process_update()`, which it schedules in the
@@ -340,7 +340,9 @@ async def _cmd_workspace(db, chat_id: str, link, arg: str) -> None:
 # ──────────────────────────────── Q&A flow ─────────────────────────────────────
 
 async def _handle_question(db, chat_id: str, question: str, tg_user_id: str | None = None) -> None:
-    from app.api.chat_agent import _get_accessible_workspaces, agent_chat_stream
+    from app.api.chat_agent import _get_accessible_workspaces
+    from app.services.agents.supervisor import get_supervisor_graph
+    from app.services.agent.streaming import build_initial_state, stream_agent_events
     from app.models.chat_message import ChatMessage
     from app.models.user import User
     from app.prompts.chat import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
@@ -401,17 +403,19 @@ async def _handle_question(db, chat_id: str, question: str, tg_user_id: str | No
     last_edit = 0.0
 
     try:
-        async for ev in agent_chat_stream(
+        initial_state = build_initial_state(
             workspace_ids=workspace_ids,
             message=question,
             history=history,
+            system_prompt=system_prompt,
             enable_thinking=False,
             db=db,
-            system_prompt=system_prompt,
-            force_search=False,
             user_id=user.id,
             session_id=str(session.id),
-        ):
+            document_ids=None,
+        )
+        graph = get_supervisor_graph()
+        async for ev in stream_agent_events(graph, initial_state):
             etype = ev.get("event")
             data = ev.get("data") or {}
             if etype == "token":

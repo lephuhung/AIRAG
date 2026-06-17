@@ -9,9 +9,9 @@ requires zero changes.
 Route: POST /rag/chat/agent-lg/stream
        POST /rag/chat/sessions/{session_id}/stream-lg  (session-aware variant)
 
-Enabled when: NEXUSRAG_AGENT_BACKEND=langgraph  (default: legacy)
+LangGraph supervisor is the only chat agent backend.
 
-SSE Events emitted (same as legacy chat_agent.py):
+SSE Events emitted (via app/services/agent/streaming.py):
     status       → {"step": str, "detail": str}
     thinking     → {"text": str}
     sources      → {"sources": [...]}
@@ -321,8 +321,7 @@ async def chat_stream_langgraph(
     """
     LangGraph SSE streaming chat endpoint (workspace-agnostic).
 
-    Uses all workspaces the user has access to. Enabled when
-    NEXUSRAG_AGENT_BACKEND=langgraph (or called directly). Accepts either a JWT
+    Uses all workspaces the user has access to. Accepts either a JWT
     bearer token or an X-API-Key (third-party clients) via get_principal.
     """
     workspace_ids = await _get_accessible_workspaces_lg(db, user)

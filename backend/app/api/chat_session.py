@@ -326,7 +326,7 @@ async def clear_session_history(
 
 from fastapi.responses import StreamingResponse
 from app.schemas.rag import ChatRequest
-from app.api.chat_agent import agent_chat_stream, _get_accessible_workspaces
+from app.api.chat_agent import _get_accessible_workspaces
 
 
 @router.post("/{session_id}/stream")
@@ -339,11 +339,9 @@ async def chat_stream_session(
 ):
     """SSE endpoint for session chat.
 
-    Routes to LangGraph agent or legacy agent based on NEXUSRAG_AGENT_BACKEND config.
+    Runs the LangGraph supervisor agent (the only agent backend).
     Frontend URL stays the same — zero frontend changes required.
     """
-    from app.core.config import settings
-
     result = await db.execute(
         select(ChatSession).where(
             ChatSession.id == session_id, ChatSession.user_id == user.id
@@ -667,11 +665,9 @@ async def chat_stream_session(
                 exc_info=True,
             )
 
-    # ── Route: LangGraph agent ──────────────────────────────────────────────
-    use_langgraph = settings.NEXUSRAG_AGENT_BACKEND.lower() == "langgraph"
-
-    if use_langgraph:
-        logger.info(f"[session/{session_id}] Routing to LangGraph agent backend")
+    # ── Route: LangGraph agent (the only agent backend; legacy path removed) ─
+    logger.info(f"[session/{session_id}] Routing to LangGraph agent backend")
+    if True:  # block kept to preserve indentation; LangGraph is unconditional now
 
         async def _event_generator_lg():
             yield format_sse_event(
@@ -815,108 +811,6 @@ async def chat_stream_session(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-
-    # ── Route: Legacy agent (default) ──────────────────────────────────────
-    logger.info(f"[session/{session_id}] Routing to legacy agent backend")
-
-    async def _event_generator():
-        yield format_sse_event(
-            "status", {"step": "starting", "detail": "Initializing agent..."}
-        )
-        yield format_sse_event("user_id", {"id": user_msg_id})
-        yield format_sse_event("ai_message_id", {"message_id": ai_msg_id})
-
-        accumulated_text = ""
-        accumulated_thinking = ""
-        final_sources = []
-        final_images = []
-        final_entities = []
-        final_steps = []
-        final_people_data = []
-
-        try:
-            # Re-fetch DB session if needed, but we pass the request scoped db
-            async for sse_item in agent_chat_stream(
-                workspace_ids=workspace_ids,
-                message=request.message,
-                history=request.history,
-                enable_thinking=request.enable_thinking,
-                db=db,
-                system_prompt=system_prompt_to_use,
-                force_search=request.force_search,
-                user_id=user.id,
-                session_id=session_id,
-                document_ids=request.document_ids,
-            ):
-                if sse_item["event"] == "token":
-                    accumulated_text += sse_item["data"]["text"]
-                elif sse_item["event"] == "thinking":
-                    accumulated_thinking += sse_item["data"]["text"]
-                elif sse_item["event"] == "sources":
-                    final_sources = sse_item["data"]["sources"]
-                elif sse_item["event"] == "images":
-                    final_images = sse_item["data"]["image_refs"]
-                elif sse_item["event"] == "status":
-                    final_steps.append(sse_item["data"])
-                elif sse_item["event"] == "people_data":
-                    final_people_data = sse_item["data"].get("people", [])
-                elif sse_item["event"] == "complete":
-                    if "related_entities" in sse_item["data"]:
-                        final_entities = sse_item["data"]["related_entities"]
-                    # Override text if complete event has full answer
-                    if "answer" in sse_item["data"]:
-                        accumulated_text = sse_item["data"]["answer"]
-
-                yield format_sse_event(sse_item["event"], sse_item["data"])
-
-            # Generate the title now (first exchange) and push it immediately so the
-            # client updates without a refresh; reuse the summary downstream.
-            # Run BEFORE the inline save (first-exchange detection needs no prior
-            # assistant message to exist yet).
-            new_title, precomputed_summary = await _make_first_exchange_title(
-                accumulated_text
-            )
-            if new_title:
-                yield format_sse_event("session_title_updated", {"Title": new_title})
-
-            # Persist the answer synchronously so it is durable the instant the
-            # stream closes (survives an immediate hard reload).
-            await _save_assistant_inline(
-                text=accumulated_text,
-                thinking=accumulated_thinking,
-                sources=final_sources,
-                images=final_images,
-                steps=final_steps,
-                potentials=[],
-                people_data=final_people_data,
-                ai_msg_id=ai_msg_id,
-            )
-
-            # Remaining (slow) persistence in background — stream closes now.
-            background_tasks.add_task(
-                _background_persist_and_emit,
-                session_id=session_id,
-                user_id=str(user.id),
-                user_message=request.message,
-                text=accumulated_text,
-                thinking=accumulated_thinking,
-                sources=final_sources,
-                images=final_images,
-                steps=final_steps,
-                potentials=[],
-                people_data=final_people_data,
-                user_msg_id=user_msg_id,
-                ai_msg_id=ai_msg_id,
-                precomputed_summary=precomputed_summary,
-            )
-
-        except Exception as e:
-            logger.error(f"Chat stream error: {e}", exc_info=True)
-            yield format_sse_event("error", {"message": str(e)})
-
-    return StreamingResponse(
-        sse_with_heartbeat(_event_generator()), media_type="text/event-stream"
-    )
 
 
 from app.schemas.rag import RateSourceRequest

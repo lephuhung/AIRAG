@@ -141,15 +141,23 @@ def _sse(event: str, data: dict) -> str:
 # Main streaming function
 # ---------------------------------------------------------------------------
 
-async def stream_agent_to_sse(
+async def stream_agent_events(
     graph,
     initial_state: dict,
-) -> AsyncGenerator[str, None]:
+) -> AsyncGenerator[dict, None]:
     """
-    Run the LangGraph agent and yield SSE-formatted strings in real-time.
+    Run the LangGraph agent and yield events as dicts ``{"event", "data"}`` in
+    real-time. This is the transport-agnostic core used by both the SSE web
+    endpoint (``stream_agent_to_sse``) and the in-process Telegram consumer.
 
     Dùng ContextVar thay vì state dict để truyền queue và db vào nodes,
     bypass LangGraph's TypedDict key filtering.
+
+    Event shapes (giữ tương thích với consumer cũ):
+      status/thinking → data nguyên trạng; sources → {"sources"}; images →
+      {"image_refs"}; token → {"text"}; token_rollback → {}; complete →
+      {"answer","sources","images","potential_abbreviations","people_data"};
+      error → {"message"}. Heartbeat phát {"event":"heartbeat","data":{}}.
     """
     event_queue: asyncio.Queue = asyncio.Queue()
 
@@ -198,7 +206,7 @@ async def stream_agent_to_sse(
                 uid = initial_state.get("user_id")
                 wids = initial_state.get("workspace_ids") or []
                 dids = initial_state.get("document_ids") or []
-                tags = ["langgraph", f"agent_backend:{settings.NEXUSRAG_AGENT_BACKEND}"]
+                tags = ["langgraph", "agent_backend:langgraph"]
                 with lf.start_as_current_observation(
                     name="langgraph_chat",
                     as_type="span",
@@ -237,7 +245,7 @@ async def stream_agent_to_sse(
     # create_task copies current context → task sees _event_queue_ctx & _db_ctx
     task = asyncio.create_task(_run_graph())
 
-    # ── Main loop: drain queue → yield SSE ──────────────────────────────────
+    # ── Main loop: drain queue → yield dict events ──────────────────────────
     try:
         while True:
             try:
@@ -245,7 +253,7 @@ async def stream_agent_to_sse(
                     event_queue.get(), timeout=SSE_HEARTBEAT_INTERVAL
                 )
             except asyncio.TimeoutError:
-                yield ": heartbeat\n\n"
+                yield {"event": "heartbeat", "data": {}}
                 continue
 
             if not isinstance(item, tuple):
@@ -255,13 +263,13 @@ async def stream_agent_to_sse(
 
             if ev_type == "done":
                 # Pipeline xong — emit complete event
-                yield _sse("complete", {
+                yield {"event": "complete", "data": {
                     "answer": final_answer,
                     "sources": all_sources,
                     "images": all_images,
                     "potential_abbreviations": all_potentials,
                     "people_data": all_people_data,
-                })
+                }}
                 logger.info(
                     f"[stream] Complete: {len(final_answer)} chars, "
                     f"{len(all_sources)} sources, {len(all_images)} images"
@@ -269,42 +277,42 @@ async def stream_agent_to_sse(
                 break
 
             elif ev_type == "status":
-                yield _sse("status", item[1])
+                yield {"event": "status", "data": item[1]}
 
             elif ev_type == "sources":
                 all_sources = item[1]
-                yield _sse("sources", {"sources": all_sources})
+                yield {"event": "sources", "data": {"sources": all_sources}}
                 logger.info(f"[stream] Emitted {len(all_sources)} sources")
 
             elif ev_type == "images":
                 all_images = item[1]
-                yield _sse("images", {"image_refs": all_images})
+                yield {"event": "images", "data": {"image_refs": all_images}}
 
             elif ev_type == "token":
                 text = item[1]
                 final_answer += text
-                yield _sse("token", {"text": text})
+                yield {"event": "token", "data": {"text": text}}
 
             elif ev_type == "token_rollback":
                 # Speculative answer tokens turned out to precede a tool call —
                 # discard them so the final `complete` answer stays clean.
                 final_answer = ""
-                yield _sse("token_rollback", {})
+                yield {"event": "token_rollback", "data": {}}
 
             elif ev_type == "thinking":
-                yield _sse("thinking", item[1])
+                yield {"event": "thinking", "data": item[1]}
 
             elif ev_type == "potential_abbreviations":
                 all_potentials = item[1]
-                yield _sse("potential_abbreviations", {"abbreviations": all_potentials})
+                yield {"event": "potential_abbreviations", "data": {"abbreviations": all_potentials}}
 
             elif ev_type == "error":
-                yield _sse("error", {"message": item[1]})
+                yield {"event": "error", "data": {"message": item[1]}}
                 break
 
             elif ev_type == "people_data":
                 all_people_data = item[1]
-                yield _sse("people_data", {"people": all_people_data})
+                yield {"event": "people_data", "data": {"people": all_people_data}}
                 logger.info(f"[stream] Emitted {len(all_people_data)} people records")
 
     finally:
@@ -316,6 +324,21 @@ async def stream_agent_to_sse(
             await task
         except asyncio.CancelledError:
             pass
+
+
+async def stream_agent_to_sse(
+    graph,
+    initial_state: dict,
+) -> AsyncGenerator[str, None]:
+    """
+    SSE wrapper around :func:`stream_agent_events`. Yields SSE-formatted strings
+    for the web chat endpoint. Heartbeats become SSE comment lines.
+    """
+    async for ev in stream_agent_events(graph, initial_state):
+        if ev["event"] == "heartbeat":
+            yield ": heartbeat\n\n"
+        else:
+            yield _sse(ev["event"], ev["data"])
 
 
 # ---------------------------------------------------------------------------

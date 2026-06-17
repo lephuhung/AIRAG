@@ -242,10 +242,7 @@ class Settings(BaseSettings):
     WORKER_MEMORY_TIMEOUT: int = Field(default=90)
 
     # ── LangGraph Agent ──────────────────────────────────────────────────────
-    # Choose the chat agent backend:
-    #   "legacy"    — original manual agent loop in chat_agent.py (default, safe fallback)
-    #   "langgraph" — new LangGraph StateGraph agent (feature/langgraph-agent branch)
-    NEXUSRAG_AGENT_BACKEND: str = Field(default="legacy")
+    # The LangGraph supervisor is the only chat agent backend (legacy path removed).
 
     # Max agent iterations (loop guard for LangGraph tool_executor → answer cycle)
     NEXUSRAG_LG_MAX_ITERATIONS: int = Field(default=6)
