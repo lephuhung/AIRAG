@@ -1126,7 +1126,6 @@ async def update_document(
                 signer_name=document.signer_name,
                 issuing_agency=document.issuing_agency,
                 published_date=document.published_date,
-                kg_root_entity_id=document.kg_root_entity_id,
             )
         except Exception as e:
             logger.warning(f"Failed to update LegalKG metadata: {e}")

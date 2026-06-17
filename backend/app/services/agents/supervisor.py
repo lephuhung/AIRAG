@@ -408,6 +408,92 @@ def _extract_user_message(state: SupervisorState) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Follow-up query condensing (history-aware rewrite)
+# ---------------------------------------------------------------------------
+
+_CONDENSE_SYSTEM_PROMPT = """Bạn là trợ lý viết lại câu hỏi cho hệ thống tìm kiếm tài liệu.
+
+Nhiệm vụ: dựa vào LỊCH SỬ HỘI THOẠI, viết lại CÂU HỎI HIỆN TẠI thành một câu hỏi \
+ĐỘC LẬP, TỰ CHỨA ĐẦY ĐỦ NGỮ CẢNH (đối tượng, chủ đề, tên/loại văn bản... mà người \
+dùng đang ngầm nhắc tới ở các lượt trước).
+
+QUY TẮC:
+- Giữ nguyên Ý ĐỊNH của câu hỏi hiện tại, chỉ bổ sung ngữ cảnh còn thiếu từ lịch sử.
+- Nếu câu hỏi hiện tại ĐÃ tự chứa đầy đủ ngữ cảnh (hoặc đổi sang chủ đề mới), \
+trả lại NGUYÊN VĂN câu hỏi đó.
+- KHÔNG trả lời câu hỏi. KHÔNG giải thích. CHỈ trả về đúng MỘT câu hỏi đã viết lại."""
+
+
+def _get_prior_history(state: SupervisorState, max_turns: int = 6) -> list[tuple[str, str]]:
+    """Return (role, content) pairs for the conversation BEFORE the current message.
+
+    The current (last) user message is excluded. Roles are normalized to
+    'user'/'assistant'. Used to contextualize follow-up questions.
+    """
+    messages = state.get("messages", []) or []
+    pairs: list[tuple[str, str]] = []
+    for msg in messages:
+        if isinstance(msg, dict):
+            role = "user" if msg.get("role", "user") in ("human", "user") else "assistant"
+            content = msg.get("content", "")
+        else:
+            mtype = getattr(msg, "type", "") or getattr(msg, "role", "")
+            role = "user" if mtype in ("human", "user") else "assistant"
+            content = getattr(msg, "content", "")
+        if content:
+            pairs.append((role, content))
+    # Drop the last user turn (the current message) so only PRIOR context remains
+    if pairs and pairs[-1][0] == "user":
+        pairs = pairs[:-1]
+    return pairs[-max_turns:]
+
+
+async def _condense_followup_query(message: str, prior: list[tuple[str, str]]) -> str:
+    """Rewrite a follow-up question into a self-contained query using prior turns.
+
+    Uses the small memory agent (Qwen3-4B). A bare follow-up such as "thời hạn trả
+    kết quả là bao lâu?" loses the subject established earlier (e.g. a specific tax
+    document), so RAG search drifts to unrelated documents. Returns the original
+    message unchanged when there is no prior history or on any failure.
+    """
+    if not prior:
+        return message
+    try:
+        from app.services.llm import get_memory_agent
+        from app.services.llm.types import LLMMessage as _LLMMsg
+        import re as _re_condense
+
+        lines: list[str] = []
+        for role, content in prior:
+            speaker = "Người dùng" if role == "user" else "Trợ lý"
+            lines.append(f"{speaker}: {str(content)[:800]}")
+        transcript = "\n".join(lines)
+        if not transcript:
+            return message
+
+        agent = get_memory_agent()
+        user_content = (
+            f"LỊCH SỬ HỘI THOẠI:\n{transcript}\n\n"
+            f"CÂU HỎI HIỆN TẠI: {message}\n\n"
+            "Câu hỏi đã viết lại (độc lập, tự chứa ngữ cảnh):"
+        )
+        result = await agent.acomplete(
+            [_LLMMsg(role="user", content=user_content)],
+            system_prompt=_CONDENSE_SYSTEM_PROMPT,
+            temperature=0.0,
+            max_tokens=256,
+            think=False,
+        )
+        rewritten = result if isinstance(result, str) else getattr(result, "content", "")
+        rewritten = _re_condense.sub(r"<think>.*?</think>", "", rewritten or "", flags=_re_condense.DOTALL)
+        rewritten = rewritten.strip().strip('"').strip()
+        return rewritten or message
+    except Exception as e:
+        logger.warning(f"[supervisor] Follow-up condense failed, using original: {e}")
+        return message
+
+
 def _parse_supervisor_response(raw: str) -> dict:
     """Parse LLM JSON response with fallbacks.
 
@@ -759,6 +845,25 @@ async def supervisor_node(state: SupervisorState) -> dict:
                 from app.services.agent.streaming import push_event
                 await push_event(state, "potential_abbreviations", potential_abbreviations)
 
+        # ── Follow-up contextualization (first pass only) ─────────────────
+        # A bare follow-up ("thời hạn trả kết quả là bao lâu?") drops the subject
+        # established earlier (e.g. a specific tax document), so RAG search drifts
+        # to unrelated documents. Rewrite it into a self-contained query using the
+        # prior turns. Runs once (iterations==0) and never on abbreviation loop-back.
+        # was_modified=True makes it flow into expanded_query/rewritten_query below,
+        # so downstream RAG search + classification both use the contextualized query.
+        if iterations == 0 and not expanded:
+            _prior = _get_prior_history(state)
+            if _prior:
+                _contextualized = await _condense_followup_query(query_for_classifier, _prior)
+                if _contextualized and _contextualized.strip() != query_for_classifier.strip():
+                    logger.info(
+                        f"[supervisor] Follow-up contextualized: "
+                        f"{query_for_classifier!r} -> {_contextualized!r}"
+                    )
+                    query_for_classifier = _contextualized.strip()
+                    expanded_message = query_for_classifier
+                    was_modified = True
 
         # Phase 4: Use Qwen3.6-35B for plan-aware classification
         # We check the OLLAMA_HOST to decide whether to use native Ollama

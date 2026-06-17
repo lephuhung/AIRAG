@@ -174,6 +174,71 @@ def normalize_entity_id(name: str, entity_type: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Extraction windowing — avoid silently dropping the tail of long articles
+# ---------------------------------------------------------------------------
+
+# Max characters fed to the LLM per extraction call. Articles longer than this
+# are split into overlapping windows (previously the text was hard-truncated to
+# this size with `text[:3000]`, dropping everything after it).
+_ARTICLE_EXTRACT_MAX_CHARS = 3000
+
+
+def _split_text_windows(text: str, max_chars: int, overlap: int = 200) -> list[str]:
+    """
+    Split ``text`` into windows of at most ``max_chars`` characters with a small
+    overlap so entities/relations spanning a boundary are still seen by at least
+    one window. Returns ``[text]`` unchanged when it already fits.
+    """
+    text = text or ""
+    if len(text) <= max_chars:
+        return [text]
+    windows: list[str] = []
+    start, n = 0, len(text)
+    while start < n:
+        end = min(start + max_chars, n)
+        # Prefer to cut on a newline/space boundary near the window end.
+        if end < n:
+            brk = text.rfind("\n", start + max_chars - overlap, end)
+            if brk == -1:
+                brk = text.rfind(" ", start + max_chars - overlap, end)
+            if brk > start:
+                end = brk
+        windows.append(text[start:end])
+        if end >= n:
+            break
+        start = max(end - overlap, start + 1)
+    return windows
+
+
+# ---------------------------------------------------------------------------
+# Multi-document node/relation ownership (Cypher fragments)
+# ---------------------------------------------------------------------------
+# Shared entities (e.g. an Organization cited by many documents) must NOT be
+# deleted when one citing document is removed. Each node/relationship therefore
+# tracks a `document_ids` list; deletion only removes a node/rel once its last
+# owning document is gone. These helpers build the Cypher to seed/append that
+# list, migrating legacy rows that only have the singular `document_id`.
+
+
+def _doc_ids_seed(var: str) -> str:
+    """Seed expr: existing list, else [singular document_id], else []."""
+    return (
+        f"coalesce({var}.document_ids, "
+        f"CASE WHEN {var}.document_id IS NULL THEN [] ELSE [{var}.document_id] END)"
+    )
+
+
+def _doc_ids_append(var: str, id_param: str) -> str:
+    """Append ``$id_param`` to ``var.document_ids`` (idempotent, null-safe)."""
+    seed = _doc_ids_seed(var)
+    return (
+        f"CASE WHEN ${id_param} IS NULL THEN {seed} "
+        f"WHEN ${id_param} IN {seed} THEN {seed} "
+        f"ELSE {seed} + ${id_param} END"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Structural document splitter
 # ---------------------------------------------------------------------------
 
@@ -427,27 +492,57 @@ class LegalKGService:
 
     async def delete_document(self, document_id: uuid.UUID) -> None:
         """
-        Delete all Neo4j nodes and relationships for a specific document.
+        Remove this document's contribution to the workspace graph.
+
+        Nodes and relationships are SHARED across documents (e.g. an Organization
+        cited by many documents). Each carries a ``document_ids`` ownership list,
+        so we only drop a node/relationship once THIS document was its last owner;
+        otherwise we just remove this document_id from the list. This prevents the
+        old bug where deleting one document wiped shared entities used by others.
+
         Called before reprocessing a document to prevent KG duplicates/orphans.
         """
         driver = await self._get_driver()
         label = self._label
         doc_id_str = str(document_id)
+        seed_r = _doc_ids_seed("r")
+        seed_n = _doc_ids_seed("n")
         try:
             async with driver.session() as session:
-                # Delete relationships first, then nodes with matching document_id
-                result = await session.run(
+                # 1) Relationships: trim ownership, delete when no owner remains.
+                rel_res = await (await session.run(
                     f"""
-                    MATCH (n:`{label}`) WHERE n.document_id = $doc_id
+                    MATCH (:`{label}`)-[r]->(:`{label}`)
+                    WHERE $doc_id IN {seed_r}
+                    WITH r, [x IN {seed_r} WHERE x <> $doc_id] AS remaining
+                    SET r.document_ids = remaining,
+                        r.document_id = CASE WHEN size(remaining) > 0
+                                             THEN remaining[0] ELSE r.document_id END
+                    WITH r, remaining WHERE size(remaining) = 0
+                    DELETE r
+                    """,
+                    doc_id=doc_id_str,
+                )).consume()
+
+                # 2) Nodes: trim ownership, DETACH DELETE when no owner remains.
+                node_res = await (await session.run(
+                    f"""
+                    MATCH (n:`{label}`)
+                    WHERE $doc_id IN {seed_n}
+                    WITH n, [x IN {seed_n} WHERE x <> $doc_id] AS remaining
+                    SET n.document_ids = remaining,
+                        n.document_id = CASE WHEN size(remaining) > 0
+                                            THEN remaining[0] ELSE n.document_id END
+                    WITH n, remaining WHERE size(remaining) = 0
                     DETACH DELETE n
                     """,
                     doc_id=doc_id_str,
-                )
-                summary = await result.consume()
+                )).consume()
+
                 logger.info(
                     f"LegalKG delete_document({document_id}): "
-                    f"{summary.counters.nodes_deleted} nodes, "
-                    f"{summary.counters.relationships_deleted} rels deleted "
+                    f"{node_res.counters.nodes_deleted} nodes deleted, "
+                    f"{rel_res.counters.relationships_deleted} rels deleted "
                     f"for workspace {self.workspace_id}"
                 )
         except Exception as e:
@@ -465,116 +560,118 @@ class LegalKGService:
         signer_name: str | None = None,
         issuing_agency: str | None = None,
         published_date: str | None = None,
-        kg_root_entity_id: str | None = None,
     ) -> None:
         """
-        Update Document node properties in Neo4j when document metadata changes.
-        Uses entity_id directly if provided, otherwise falls back to document_id.
+        Sync the root Document node when document metadata is edited by hand.
+
+        Identity rules (see _upsert_document_root for the full model):
+          - The node is located by its stable ``document_id`` anchor (NOT by the
+            Neo4j internal <id>, which Neo4j may recycle after deletions). If no
+            anchored node exists, we log and return — we never MERGE a brand-new
+            orphan node here.
+          - ``display_name`` (front-end label) is always refreshed from the title.
+          - ``entity_id`` (canonical link key) is re-keyed to the số hiệu the
+            FIRST time a số hiệu appears (i.e. the node is still on its
+            ``doc:{uuid}`` / name fallback). If another Document node already owns
+            that số hiệu (e.g. a CAN_CU stub from another document), the two are
+            merged via APOC so links converge instead of duplicating.
         """
         logger.info(
             f"LegalKG.update_document_metadata: doc_id={document_id}, "
-            f"kg_root_entity_id='{kg_root_entity_id}', "
             f"doc_num='{doc_number}', doc_title='{doc_title}', "
             f"signer='{signer_name}', issuing_agency='{issuing_agency}', "
             f"published_date='{published_date}'"
         )
         driver = await self._get_driver()
         label = self._label
+        doc_id_str = str(document_id)
 
-        # Build new doc_name from provided metadata (same logic as ingest())
-        doc_type = ""
-        doc_num = doc_number or ""
-        year = "Không rõ năm"
+        so_hieu = (doc_number or "").strip()
+        new_entity_id = normalize_entity_id(so_hieu, "Document") if so_hieu else None
+        display_name = (doc_title or so_hieu or "").strip() or f"Tài liệu {document_id}"
 
-        if published_date:
-            import re
-            m = re.search(r'\b(20\d{2})\b', published_date)
-            if m:
-                year = m.group(1)
-
-        # Prefer doc_title if available, otherwise build from type/number
-        if doc_title:
-            doc_name = doc_title
-        elif doc_num and doc_type:
-            doc_name = f"{doc_type} {doc_num} ({year})"
-        elif doc_num:
-            doc_name = f"{doc_num} ({year})"
-        else:
-            doc_name = f"Tài liệu {document_id}"
-
-        # Compute entity_id (same normalization as _upsert_node uses)
-        new_entity_id = normalize_entity_id(doc_name, "Document")
-
-        # Build description
         desc_parts = []
         if signer_name:
             desc_parts.append(f"Người ký: {signer_name}")
         if issuing_agency:
             desc_parts.append(f"Cơ quan ban hành: {issuing_agency}")
-        description = "; ".join(desc_parts) if desc_parts else doc_name
-
-        # Use provided kg_root_entity_id (Neo4j internal <id>) or fall back to entity_id lookup
-        logger.info(f"LegalKG: Looking up node by kg_root_entity_id='{kg_root_entity_id}'")
+        description = "; ".join(desc_parts)
 
         try:
             async with driver.session() as session:
-                if kg_root_entity_id:
-                    # Direct lookup by Neo4j internal <id> - update existing node only
-                    # Extract integer id from format like "4:ab68e1b0-...:1832" or use as integer
-                    try:
-                        node_id = int(kg_root_entity_id.split(":")[-1])
-                    except (ValueError, IndexError):
-                        node_id = int(kg_root_entity_id)
+                # 1) Locate the root node by its stable document_id anchor
+                rec = await (await session.run(
+                    f"""
+                    MATCH (n:`{label}`:`Document` {{document_id: $doc_id}})
+                    RETURN n.entity_id AS eid
+                    """,
+                    doc_id=doc_id_str,
+                )).single()
+                if rec is None:
+                    logger.warning(
+                        f"LegalKG update_document_metadata({document_id}): no root "
+                        f"Document node anchored by document_id — skipping (KG may "
+                        f"not have been built for this document)."
+                    )
+                    return
+                cur_eid = rec["eid"]
 
-                    result = await session.run(
+                # 2) Re-key entity_id to số hiệu the first time it appears,
+                #    merging any pre-existing stub that already owns that số hiệu.
+                if new_entity_id and cur_eid != new_entity_id:
+                    collision = await (await session.run(
                         f"""
-                        MATCH (n:`{label}`:`Document`)
-                        WHERE id(n) = $node_id
-                        SET n.entity_id = $entity_id,
-                            n.display_name = $display_name,
-                            n.description = $description,
-                            n.updated_at = datetime()
-                        RETURN n
+                        MATCH (m:`{label}`:`Document` {{entity_id: $eid}})
+                        WHERE m.document_id IS NULL OR m.document_id <> $doc_id
+                        RETURN count(m) AS c
                         """,
-                        node_id=node_id,
-                        entity_id=new_entity_id,
-                        display_name=doc_name,
-                        description=description,
-                    )
-                    summary = await result.consume()
-                    logger.info(
-                        f"LegalKG update_document_metadata: "
-                        f"nodes_created={summary.counters.nodes_created or 0}, "
-                        f"properties_set={summary.counters.properties_set}"
-                    )
-                else:
-                    # Fallback: use MERGE with computed entity_id
-                    result = await session.run(
-                        f"""
-                        MERGE (n:`{label}`:`Document` {{entity_id: $entity_id}})
-                        ON MATCH SET
-                            n.entity_id = $entity_id,
-                            n.display_name = $display_name,
-                            n.description = $description,
-                            n.updated_at = datetime()
-                        ON CREATE SET
-                            n.entity_id = $entity_id,
-                            n.entity_type = 'Document',
-                            n.display_name = $display_name,
-                            n.description = $description,
-                            n.document_id = $doc_id,
-                            n.created_at = datetime()
-                        """,
-                        doc_id=str(document_id),
-                        display_name=doc_name,
-                        description=description,
-                        entity_id=new_entity_id,
-                    )
-                    summary = await result.consume()
-                    logger.info(
-                        f"LegalKG update_document_metadata({document_id}): "
-                        f"properties_set={summary.counters.properties_set}"
-                    )
+                        eid=new_entity_id, doc_id=doc_id_str,
+                    )).single()
+                    if collision and collision["c"] > 0:
+                        # Merge stub(s) INTO the anchored root (root listed first so
+                        # it survives); mergeRels keeps the stub's incoming links.
+                        await session.run(
+                            f"""
+                            MATCH (root:`{label}`:`Document` {{document_id: $doc_id}})
+                            MATCH (stub:`{label}`:`Document` {{entity_id: $eid}})
+                            WHERE id(stub) <> id(root)
+                            WITH root, collect(stub) AS stubs
+                            CALL apoc.refactor.mergeNodes(
+                                [root] + stubs,
+                                {{properties: 'discard', mergeRels: true}}
+                            ) YIELD node
+                            RETURN node
+                            """,
+                            doc_id=doc_id_str, eid=new_entity_id,
+                        )
+                        logger.info(
+                            f"LegalKG update_document_metadata({document_id}): "
+                            f"merged stub Document node(s) for số hiệu '{new_entity_id}'"
+                        )
+
+                # 3) Refresh the anchored root's display + canonical key + description
+                set_clauses = ["n.display_name = $display_name", "n.updated_at = datetime()"]
+                params = {"doc_id": doc_id_str, "display_name": display_name}
+                if new_entity_id:
+                    set_clauses.append("n.entity_id = $entity_id")
+                    params["entity_id"] = new_entity_id
+                if description:
+                    set_clauses.append("n.description = $description")
+                    params["description"] = description
+
+                result = await session.run(
+                    f"""
+                    MATCH (n:`{label}`:`Document` {{document_id: $doc_id}})
+                    SET {", ".join(set_clauses)}
+                    """,
+                    **params,
+                )
+                summary = await result.consume()
+                logger.info(
+                    f"LegalKG update_document_metadata({document_id}): "
+                    f"properties_set={summary.counters.properties_set}, "
+                    f"entity_id={'(re-keyed) ' + new_entity_id if new_entity_id and new_entity_id != cur_eid else '(unchanged)'}"
+                )
         except Exception as e:
             logger.error(f"LegalKG update_document_metadata({document_id}) failed: {e}", exc_info=True)
             raise
@@ -645,6 +742,16 @@ class LegalKGService:
 
             except Exception as _e:
                 logger.warning(f"LegalKG: Failed to fetch Document metadata: {_e}")
+
+        # --- Canonical identity for the root Document node ---
+        # entity_id (MERGE/link key) = số hiệu when available, so cross-document
+        # references by số hiệu merge onto the same node; falls back to the
+        # structured doc_name for scanned docs that have no số hiệu yet.
+        # display_name (front-end) prefers document_title.
+        # The stable update/delete anchor is the document_id property (set below).
+        root_so_hieu = (doc_num or doc_meta.get("so_hieu", "")).strip()
+        root_key = root_so_hieu or doc_name
+        root_display = doc_title or doc_name
 
         # --- Resolve custom KG system prompt from document_type ---
         custom_kg_prompt: str | None = None
@@ -739,7 +846,8 @@ class LegalKGService:
         async with driver.session() as session:
             # Store Document node and get its internal Neo4j <id>
             neo4j_node_id = await self._upsert_document_root(
-                session, doc_name, doc_meta.get("so_hieu", ""), doc_id_str
+                session, root_key, root_display, doc_id_str,
+                description=doc_meta.get("so_hieu", ""),
             )
             logger.info(f"LegalKG: created root Document node with Neo4j id={neo4j_node_id}")
 
@@ -749,17 +857,30 @@ class LegalKGService:
                 loc_name = loc if "tỉnh" in loc.lower() or "thành phố" in loc.lower() else f"Tỉnh {loc}"
                 await self._upsert_node(session, loc_name, "Location", "", doc_id_str)
                 await self._upsert_relation(
-                    session, doc_name, "BAN_HANH_TAI", loc_name, "Phạm vi địa lý", doc_id_str,
+                    session, root_key, "BAN_HANH_TAI", loc_name, "Phạm vi địa lý", doc_id_str,
                     source_type="Document", target_type="Location",
                 )
 
-            if parent_org and issue_org:
+            # parse_worker sometimes fills issuing_agency and parent_agency with
+            # the SAME value. Detect that (case/whitespace-insensitive, or one
+            # containing the other) so we don't build a doubled "X X" org name and
+            # a meaningless TRUC_THUOC self-loop.
+            norm_issue = normalize_entity_id(issue_org, "Organization") if issue_org else ""
+            norm_parent = normalize_entity_id(parent_org, "Organization") if parent_org else ""
+            same_org = bool(norm_issue) and bool(norm_parent) and (
+                norm_issue == norm_parent
+                or norm_parent in norm_issue
+                or norm_issue in norm_parent
+            )
+
+            if parent_org and issue_org and not same_org:
+                # Distinct issuing sub-unit under a parent org → full name + hierarchy.
                 combined_issue_org = f"{issue_org} {parent_org}"
                 await self._upsert_node(session, combined_issue_org, "Organization", "", doc_id_str)
                 await self._upsert_node(session, parent_org, "Organization", "", doc_id_str)
 
                 await self._upsert_relation(
-                    session, doc_name, "BAN_HANH_BOI", combined_issue_org, "", doc_id_str,
+                    session, root_key, "BAN_HANH_BOI", combined_issue_org, "", doc_id_str,
                     source_type="Document", target_type="Organization",
                 )
                 await self._upsert_relation(
@@ -772,22 +893,18 @@ class LegalKGService:
                         session, parent_org, "THUOC_TINH", loc_name, "", doc_id_str,
                         source_type="Organization", target_type="Location",
                     )
-            elif issue_org:
-                await self._upsert_node(session, issue_org, "Organization", "", doc_id_str)
+            elif issue_org or parent_org:
+                # Single issuing org: only one provided, or issue == parent.
+                # Prefer the more complete (longer) name.
+                org = max((o for o in (issue_org, parent_org) if o), key=len)
+                await self._upsert_node(session, org, "Organization", "", doc_id_str)
                 await self._upsert_relation(
-                    session, doc_name, "BAN_HANH_BOI", issue_org, "", doc_id_str,
-                    source_type="Document", target_type="Organization",
-                )
-            elif parent_org:
-                # Only parent org, no issuing org (e.g., Quốc Hội)
-                await self._upsert_node(session, parent_org, "Organization", "", doc_id_str)
-                await self._upsert_relation(
-                    session, doc_name, "BAN_HANH_BOI", parent_org, "", doc_id_str,
+                    session, root_key, "BAN_HANH_BOI", org, "", doc_id_str,
                     source_type="Document", target_type="Organization",
                 )
                 if loc_name:
                     await self._upsert_relation(
-                        session, parent_org, "THUOC_TINH", loc_name, "", doc_id_str,
+                        session, org, "THUOC_TINH", loc_name, "", doc_id_str,
                         source_type="Organization", target_type="Location",
                     )
 
@@ -796,7 +913,7 @@ class LegalKGService:
             for ref_doc in can_cu_list:
                 await self._upsert_node(session, ref_doc, "Document", ref_doc, doc_id_str)
                 await self._upsert_relation(
-                    session, doc_name, "CAN_CU", ref_doc,
+                    session, root_key, "CAN_CU", ref_doc,
                     f"Căn cứ pháp lý: {ref_doc}", doc_id_str,
                     source_type="Document", target_type="Document",
                 )
@@ -845,7 +962,7 @@ class LegalKGService:
                 if isinstance(result, Exception) or not result:
                     continue
                 await self._store_relations_from_extraction(
-                    session, result, doc_name, doc_id_str,
+                    session, result, root_key, doc_id_str,
                     canonical_lookup, merged_map, skipped_entities, entity_type_map,
                 )
 
@@ -926,54 +1043,77 @@ class LegalKGService:
         issuing_agency: str = "",
         published_date: str = "",
     ) -> dict:
-        """Run LLM extraction on a single article chunk."""
+        """Run LLM extraction on a single article, windowing long text."""
         text = article["text"]
         heading = article["heading"]
         article_ref = f"Điều {article['index']}"
 
-        # Choose prompt variant: custom per-document-type > personnel > general
+        # Choose prompt variant: custom per-document-type > personnel > general.
+        # custom & general share the LEGAL user template; personnel has its own.
         if custom_system_prompt:
             system_prompt = custom_system_prompt
-            user_prompt = LEGAL_KG_USER_PROMPT.format(
-                document_title=doc_title or "Không có tiêu đề",
-                document_number=doc_num or "Không có số hiệu",
-                issuing_agency=issuing_agency or "Không xác định",
-                published_date=published_date or "Không xác định",
-                article_text=text[:3000],
-            )
+            user_template = LEGAL_KG_USER_PROMPT
         elif is_personnel:
             system_prompt = PERSON_EXTRACT_SYSTEM_PROMPT
-            user_prompt = PERSON_EXTRACT_USER_PROMPT.format(
-                document_title=doc_title or "Không có tiêu đề",
-                document_number=doc_num or "Không có số hiệu",
-                issuing_agency=issuing_agency or "Không xác định",
-                published_date=published_date or "Không xác định",
-                article_text=text[:3000],
-            )
+            user_template = PERSON_EXTRACT_USER_PROMPT
         else:
             system_prompt = LEGAL_KG_SYSTEM_PROMPT
-            user_prompt = LEGAL_KG_USER_PROMPT.format(
+            user_template = LEGAL_KG_USER_PROMPT
+
+        # Long articles are split into overlapping windows so the tail is not
+        # dropped; results are merged and de-duplicated across windows.
+        windows = _split_text_windows(text, _ARTICLE_EXTRACT_MAX_CHARS)
+        if len(windows) > 1:
+            logger.info(
+                f"LegalKG: {heading} is {len(text)} chars → extracting in "
+                f"{len(windows)} windows"
+            )
+
+        merged_entities: list[dict] = []
+        merged_relations: list[dict] = []
+        seen_entities: set[tuple] = set()
+        seen_relations: set[tuple] = set()
+
+        for win in windows:
+            user_prompt = user_template.format(
                 document_title=doc_title or "Không có tiêu đề",
                 document_number=doc_num or "Không có số hiệu",
                 issuing_agency=issuing_agency or "Không xác định",
                 published_date=published_date or "Không xác định",
-                article_text=text[:3000],
+                article_text=win,
             )
+            try:
+                raw = await _call_llm(system_prompt, user_prompt)
+                data = _parse_llm_json(raw)
+            except Exception as e:
+                logger.warning(f"LegalKG LLM extraction failed for {heading}: {e}")
+                continue
 
-        try:
-            raw = await _call_llm(system_prompt, user_prompt)
-            data = _parse_llm_json(raw)
-            # Tag each entity/relation with its source article
             for e in data.get("entities", []):
-                e.setdefault("article_ref", article_ref)
-                e.setdefault("document_id", document_id)
+                key = (str(e.get("name", "")).strip().lower(), str(e.get("type", "")).strip())
+                if key in seen_entities:
+                    continue
+                seen_entities.add(key)
+                merged_entities.append(e)
             for r in data.get("relations", []):
-                r.setdefault("article_ref", article_ref)
-                r.setdefault("document_id", document_id)
-            return data
-        except Exception as e:
-            logger.warning(f"LegalKG LLM extraction failed for {heading}: {e}")
-            return {"entities": [], "relations": []}
+                key = (
+                    str(r.get("source", "")).strip().lower(),
+                    str(r.get("relation", "")).strip().upper(),
+                    str(r.get("target", "")).strip().lower(),
+                )
+                if key in seen_relations:
+                    continue
+                seen_relations.add(key)
+                merged_relations.append(r)
+
+        # Tag each entity/relation with its source article
+        for e in merged_entities:
+            e.setdefault("article_ref", article_ref)
+            e.setdefault("document_id", document_id)
+        for r in merged_relations:
+            r.setdefault("article_ref", article_ref)
+            r.setdefault("document_id", document_id)
+        return {"entities": merged_entities, "relations": merged_relations}
 
     # ------------------------------------------------------------------
     # Entity Resolution (Step 4.5 — deduplicate after LLM extraction)
@@ -1294,17 +1434,30 @@ class LegalKGService:
     async def _upsert_document_root(
         self,
         session,
-        doc_name: str,
-        description: str = "",
+        entity_name: str,
+        display_name: str = "",
         document_id: Optional[str] = None,
+        description: str = "",
     ) -> str:
         """
         Create or update the root Document node and return its Neo4j internal <id>.
-        This <id> is stored in documents.kg_root_entity_id for future metadata updates.
+
+        Identity model:
+          - entity_id   = normalized số hiệu (or structured name fallback) — the
+            canonical MERGE/link key. If a stub Document node with this entity_id
+            already exists (e.g. created as a CAN_CU target by another document),
+            this call claims it as the real root (sets display_name + document_id).
+          - document_id = stable Postgres UUID — the anchor used by
+            update_document_metadata() / delete_document() to locate this node.
+          - display_name = human-readable name (document_title preferred).
+
+        The returned Neo4j internal <id> is still persisted to
+        documents.kg_root_entity_id for backward compatibility, but is no longer
+        used to locate the node on update (which matches by document_id instead).
         """
         label = self._label
-        canonical_id = normalize_entity_id(doc_name, "Document")
-        display_name = doc_name.replace("#", "").strip()
+        canonical_id = normalize_entity_id(entity_name, "Document")
+        disp = (display_name or entity_name).replace("#", "").strip()
 
         cypher = f"""
         MERGE (n:`{label}`:`Document` {{entity_id: $entity_id}})
@@ -1312,14 +1465,21 @@ class LegalKGService:
                       n.display_name = $display_name,
                       n.description  = $description,
                       n.document_id  = $document_id,
+                      n.document_ids = CASE WHEN $document_id IS NULL THEN [] ELSE [$document_id] END,
                       n.created_at   = datetime()
-        ON MATCH SET  n.description  = CASE WHEN $description <> '' THEN $description ELSE n.description END
+        ON MATCH SET  n.entity_type  = 'Document',
+                      n.display_name = $display_name,
+                      n.document_id  = CASE WHEN $document_id IS NOT NULL
+                                            THEN $document_id ELSE n.document_id END,
+                      n.document_ids = {_doc_ids_append("n", "document_id")},
+                      n.description  = CASE WHEN $description <> '' THEN $description ELSE n.description END,
+                      n.updated_at   = datetime()
         RETURN id(n) as node_id
         """
         result = await session.run(
             cypher,
             entity_id=canonical_id,
-            display_name=display_name,
+            display_name=disp,
             description=description,
             document_id=str(document_id) if document_id else None,
         )
@@ -1352,8 +1512,10 @@ class LegalKGService:
                       n.display_name = $display_name,
                       n.description  = $description,
                       n.document_id  = $document_id,
+                      n.document_ids = CASE WHEN $document_id IS NULL THEN [] ELSE [$document_id] END,
                       n.created_at   = datetime()
-        ON MATCH SET  n.description  = CASE WHEN $description <> '' THEN $description ELSE n.description END
+        ON MATCH SET  n.description  = CASE WHEN $description <> '' THEN $description ELSE n.description END,
+                      n.document_ids = {_doc_ids_append("n", "document_id")}
         """
         await session.run(
             cypher,
@@ -1396,19 +1558,29 @@ class LegalKGService:
             prop_sets.append(f"r.{safe_key} = ${safe_key}")
             params[safe_key] = v
 
-        extra_set = ("SET " + ", ".join(prop_sets)) if prop_sets else ""
+        extra_set = (", " + ", ".join(prop_sets)) if prop_sets else ""
 
         cypher = f"""
         MATCH (a:`{label}` {{entity_id: $src}})
         MATCH (b:`{label}` {{entity_id: $tgt}})
         MERGE (a)-[r:{relation_type}]->(b)
-        SET r.description = $desc,
-            r.document_id = $doc_id,
-            r.article_ref = $art_ref,
-            r.updated_at  = datetime()
-        {extra_set}
+        ON CREATE SET r.document_ids = CASE WHEN $doc_id IS NULL THEN [] ELSE [$doc_id] END
+        ON MATCH SET  r.document_ids = {_doc_ids_append("r", "doc_id")}
+        SET r.description  = $desc,
+            r.document_id  = $doc_id,
+            r.article_ref  = $art_ref,
+            r.updated_at   = datetime(){extra_set}
+        RETURN count(r) AS c
         """
-        await session.run(cypher, **params)
+        result = await session.run(cypher, **params)
+        rec = await result.single()
+        if rec is None:
+            # One/both endpoints had no node with that entity_id — usually a
+            # type-mismatch in normalization. Log instead of dropping silently.
+            logger.warning(
+                f"LegalKG: relation {relation_type} dropped — endpoint node missing "
+                f"(src='{source_canonical}' [{source_type}], tgt='{target_canonical}' [{target_type}])"
+            )
 
     async def _store_extraction(
         self,
@@ -1536,7 +1708,7 @@ class LegalKGService:
         self,
         session,
         data: dict,
-        doc_name: str,
+        root_ref: str,
         document_id: Optional[str],
         canonical_lookup: dict[str, str],
         merged_map: dict[str, str],
@@ -1582,7 +1754,7 @@ class LegalKGService:
             # --- Resolve source ---
             # Coreference: "Luật này" / "quyết định này" → Document Root
             if source_raw.lower().endswith(" này") or source_raw.lower() == "này":
-                source_canonical = doc_name
+                source_canonical = root_ref
                 src_type = "Document"
             else:
                 # Check merged_map first (LLM-detected aliases)
@@ -1593,7 +1765,7 @@ class LegalKGService:
 
             # --- Resolve target ---
             if target_raw.lower().endswith(" này") or target_raw.lower() == "này":
-                target_canonical = doc_name
+                target_canonical = root_ref
                 tgt_type = "Document"
             else:
                 # Check merged_map first (LLM-detected aliases)
@@ -1615,6 +1787,13 @@ class LegalKGService:
                 if k in ("ngay_sinh", "ngay_hieu_luc") and v:
                     v = normalize_date(str(v))
                 flat_props[k] = v
+
+            # Ensure both endpoints exist so the relation is never silently
+            # dropped when an entity was referenced in a relation but never
+            # upserted as a standalone node (e.g. its type was resolved
+            # differently, giving a different normalized entity_id).
+            await self._upsert_node(session, source_canonical, src_type, "", doc_id)
+            await self._upsert_node(session, target_canonical, tgt_type, "", doc_id)
 
             await self._upsert_relation(
                 session, source_canonical, relation_type, target_canonical,
