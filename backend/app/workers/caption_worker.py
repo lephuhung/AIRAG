@@ -38,7 +38,7 @@ from app.workers.utils import check_and_finalize
 logger = logging.getLogger(__name__)
 
 # Max concurrent LLM calls for captioning
-_CAPTION_SEMAPHORE = asyncio.Semaphore(4)
+_CAPTION_SEMAPHORE = asyncio.Semaphore(settings.HRAG_CAPTION_CONCURRENCY)
 
 
 async def handle_caption(payload: dict) -> None:

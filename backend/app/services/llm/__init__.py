@@ -45,6 +45,7 @@ def get_llm_provider() -> LLMProvider:
         inner = OllamaLLMProvider(
             host=settings.OLLAMA_HOST,
             model=settings.OLLAMA_MODEL,
+            enable_thinking=settings.OLLAMA_ENABLE_THINKING,
         )
     elif provider == "openai_compatible":
         from app.services.llm.openai_compatible import OpenAICompatibleLLMProvider

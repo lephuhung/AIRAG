@@ -122,8 +122,8 @@ class DeepRetriever:
     async def query(
         self,
         question: str,
-        mode: str = "hybrid",
-        top_k: int = 5,
+        mode: Optional[str] = None,
+        top_k: Optional[int] = None,
         document_ids: Optional[list[uuid.UUID]] = None,
         include_images: bool = True,
     ) -> DeepRetrievalResult:
@@ -148,6 +148,12 @@ class DeepRetriever:
         Returns:
             DeepRetrievalResult with chunks, citations, context, and optional images
         """
+        # Fall back to the .env-configured defaults when the caller omits them.
+        if mode is None:
+            mode = settings.HRAG_DEFAULT_QUERY_MODE
+        if top_k is None:
+            top_k = settings.HRAG_RERANKER_TOP_K
+
         # ── Retrieval result cache ───────────────────────────────────────────
         cache_key = _retrieval_cache_key(self.workspace_id, question, top_k, mode, document_ids)
         cached = _get_cached_result(cache_key)

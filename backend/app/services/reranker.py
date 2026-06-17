@@ -77,7 +77,7 @@ class RerankerService:
         pairs = [(query, doc) for doc in documents]
 
         # Score all pairs in a single batch
-        scores = self.model.predict(pairs, batch_size=32).tolist()
+        scores = self.model.predict(pairs, batch_size=settings.HRAG_RERANKER_BATCH_SIZE).tolist()
 
         # Build results with original indices
         results = [

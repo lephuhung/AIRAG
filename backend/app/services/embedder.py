@@ -81,7 +81,7 @@ class EmbeddingService:
             valid_texts,
             convert_to_numpy=True,
             normalize_embeddings=True,
-            batch_size=32,
+            batch_size=settings.HRAG_EMBEDDING_BATCH_SIZE,
         )
         result = embeddings.tolist()
         if len(result) != len(texts):

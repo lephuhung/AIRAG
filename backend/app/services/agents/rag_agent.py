@@ -179,9 +179,11 @@ async def _search_impl(workspace_ids, rewritten_query, document_ids, search_mode
             f"[_tool_search] UUID-scoped: restricting to {len(document_ids)} document(s): "
             f"{[str(d) for d in document_ids[:3]]}"
         )
+    from app.core.config import settings
+
     return await search_documents(
         query=rewritten_query,
-        top_k=8,
+        top_k=settings.HRAG_RERANKER_TOP_K,
         workspace_ids=workspace_ids,
         existing_citation_ids=ids_set,
         db=get_current_db(),

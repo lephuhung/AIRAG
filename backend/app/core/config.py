@@ -173,6 +173,9 @@ class Settings(BaseSettings):
     HRAG_RERANKER_TOP_K: int = Field(default=8)
     HRAG_MIN_RELEVANCE_SCORE: float = Field(default=0.15)
     HRAG_DEFAULT_QUERY_MODE: str = Field(default="hybrid")
+    # Batch size for the SentenceTransformer encode() / cross-encoder predict() calls
+    HRAG_EMBEDDING_BATCH_SIZE: int = Field(default=32)
+    HRAG_RERANKER_BATCH_SIZE: int = Field(default=32)
 
     # GPU device placement
     HRAG_DOCLING_DEVICE: str = Field(default="auto")
@@ -195,6 +198,14 @@ class Settings(BaseSettings):
     HRAG_OCR_MAX_MODEL_LEN: int | None = Field(default=None)
     HUNYUAN_OCR_API_URL: str = Field(default="http://localhost:8001/v1")
     HUNYUAN_OCR_MODEL: str = Field(default="hunyuan-ocr")
+    # DPI used to rasterise PDF pages before sending to the OCR model.
+    HRAG_OCR_DPI: int = Field(default=150)
+    # Max pages OCR'd concurrently against the remote API backend.
+    HRAG_OCR_CONCURRENCY: int = Field(default=16)
+    # HTTP read timeout (seconds) for a single OCR API page request.
+    HRAG_OCR_HTTP_TIMEOUT: float = Field(default=120.0)
+    # max_tokens requested per OCR API page completion.
+    HRAG_OCR_API_MAX_TOKENS: int = Field(default=8192)
 
     # Knowledge Graph backend
     HRAG_KG_GRAPH_BACKEND: str = Field(default="networkx")
@@ -212,6 +223,11 @@ class Settings(BaseSettings):
     WORKER_PREFETCH_CAPTION: int = Field(default=1)
     WORKER_PREFETCH_KG: int = Field(default=1)
     WORKER_PREFETCH_MEMORY: int = Field(default=4)
+    # Max concurrent LLM calls inside a single worker process.
+    #   KG    — entity/relation extraction (legal_kg_service)
+    #   CAPTION — image/table captioning (caption_worker)
+    HRAG_KG_LLM_CONCURRENCY: int = Field(default=8)
+    HRAG_CAPTION_CONCURRENCY: int = Field(default=4)
     WORKER_KG_POLL_INTERVAL: int = Field(
         default=60
     )  # seconds — how often to scan for new workspaces (adaptive: 300s when idle)

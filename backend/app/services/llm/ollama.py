@@ -24,9 +24,15 @@ _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 class OllamaLLMProvider(LLMProvider):
     """Local Ollama text/multimodal generation."""
 
-    def __init__(self, host: str = "http://localhost:11434", model: str = "gemma3:12b"):
+    def __init__(
+        self,
+        host: str = "http://localhost:11434",
+        model: str = "gemma3:12b",
+        enable_thinking: bool = False,
+    ):
         self._host = host
         self._model = model
+        self._enable_thinking = enable_thinking  # global toggle (OLLAMA_ENABLE_THINKING)
         self._thinking_supported: bool | None = None  # lazy probe
 
     # ------------------------------------------------------------------
@@ -100,7 +106,7 @@ class OllamaLLMProvider(LLMProvider):
         import ollama
 
         ollama_msgs = self._to_ollama_messages(messages, system_prompt)
-        use_think = think and self.supports_thinking()
+        use_think = (think or self._enable_thinking) and self.supports_thinking()
 
         try:
             response = ollama.chat(
@@ -137,7 +143,7 @@ class OllamaLLMProvider(LLMProvider):
         import ollama
 
         ollama_msgs = self._to_ollama_messages(messages, system_prompt)
-        use_think = think and self.supports_thinking()
+        use_think = (think or self._enable_thinking) and self.supports_thinking()
 
         try:
             client = ollama.AsyncClient(host=self._host)
@@ -181,7 +187,7 @@ class OllamaLLMProvider(LLMProvider):
         import ollama
 
         ollama_msgs = self._to_ollama_messages(messages, system_prompt)
-        use_think = think and self.supports_thinking()
+        use_think = (think or self._enable_thinking) and self.supports_thinking()
 
         try:
             client = ollama.AsyncClient(host=self._host)

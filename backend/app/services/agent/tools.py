@@ -119,7 +119,7 @@ async def search_documents(
     existing_citation_ids: set,
     db: "AsyncSession",
     document_ids: Optional[list[uuid.UUID]] = None,
-    search_mode: str = "hybrid",  # Phase 1: "vector" | "kg" | "hybrid"
+    search_mode: Optional[str] = None,  # Phase 1: "vector" | "kg" | "hybrid"; None → HRAG_DEFAULT_QUERY_MODE
     scoped_to_documents: bool = False,  # Phase 3: restrict search to document_ids only
 ) -> dict:
     """
@@ -139,6 +139,10 @@ async def search_documents(
         dict with keys: context_text, sources, images, image_parts, kg_summaries
     """
     from app.api.chat_agent import _execute_search_documents, _generate_citation_id
+    from app.core.config import settings
+
+    if search_mode is None:
+        search_mode = settings.HRAG_DEFAULT_QUERY_MODE
 
     (
         context_text,

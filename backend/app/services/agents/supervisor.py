@@ -1133,6 +1133,7 @@ async def direct_answer_node(state: SupervisorState) -> dict:
     Emits token events via push_event for SSE streaming compatibility.
     """
     logger.info(f"[LANGGRAPH_NODE] Entering direct_answer_node, intent={state.get('intent')!r}")
+    from app.core.config import settings
     from app.services.llm import get_llm_provider
     from app.services.llm.types import LLMMessage
     from app.services.agent.streaming import push_event
@@ -1175,7 +1176,7 @@ async def direct_answer_node(state: SupervisorState) -> dict:
         async for chunk in provider.astream(
             messages=llm_messages,
             temperature=0.5,
-            max_tokens=2048,
+            max_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
             system_prompt=effective_system,
             think=False,
         ):
@@ -1422,6 +1423,7 @@ async def mongo_formatter_node(state: SupervisorState) -> dict:
     Uses a small, focused prompt (~1KB) instead of the full RAG system prompt
     (~13KB). This saves ~80% tokens compared to routing through answer_generator.
     """
+    from app.core.config import settings
     from app.services.llm import get_llm_provider
     from app.services.llm.types import LLMMessage as _LLMMsg
     from app.services.agent.streaming import push_event
@@ -1467,7 +1469,7 @@ async def mongo_formatter_node(state: SupervisorState) -> dict:
     try:
         answer_parts: list[str] = []
         async for chunk in provider.astream(
-            messages=mongo_messages, temperature=0.1, max_tokens=4096,
+            messages=mongo_messages, temperature=0.1, max_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
         ):
             if chunk.type == "text" and chunk.text:
                 await push_event(state, "token", chunk.text)
@@ -1561,7 +1563,7 @@ async def react_executor_node(state: SupervisorState) -> dict:
             tools=RAG_TOOL_SCHEMAS if use_tools else None,
             tool_choice="auto" if use_tools else None,
             temperature=0.1,
-            max_tokens=4096,
+            max_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
             think=False,
         ):
             if c.type == "function_call" and c.function_call:

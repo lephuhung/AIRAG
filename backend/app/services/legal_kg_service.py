@@ -49,7 +49,7 @@ from app.prompts.legal_kg import (
 logger = logging.getLogger(__name__)
 
 # Max concurrent LLM calls during extraction
-_LLM_SEMAPHORE = asyncio.Semaphore(8)
+_LLM_SEMAPHORE = asyncio.Semaphore(settings.HRAG_KG_LLM_CONCURRENCY)
 
 # ---------------------------------------------------------------------------
 # Date normalization utilities

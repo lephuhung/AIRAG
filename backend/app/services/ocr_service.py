@@ -216,11 +216,12 @@ class HunyuanOCRService:
 
     @staticmethod
     def _render_pages(doc) -> list[bytes]:
-        """Render all PDF pages to PNG bytes at 150 DPI (thread-pool safe)."""
+        """Render all PDF pages to PNG bytes at HRAG_OCR_DPI (thread-pool safe)."""
         import fitz
 
         page_images: list[bytes] = []
-        matrix = fitz.Matrix(150 / 72, 150 / 72)  # 150 DPI
+        dpi = settings.HRAG_OCR_DPI
+        matrix = fitz.Matrix(dpi / 72, dpi / 72)
 
         for page in doc:
             pixmap = page.get_pixmap(matrix=matrix, alpha=False)
@@ -235,13 +236,13 @@ class HunyuanOCRService:
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(120.0, connect=10.0),
+                timeout=httpx.Timeout(settings.HRAG_OCR_HTTP_TIMEOUT, connect=10.0),
             )
         return self._client
 
     async def _ocr_pages_api(self, page_images: list[bytes]) -> list[str]:
-        """OCR all pages via remote vLLM API, up to 16 pages concurrently."""
-        semaphore = asyncio.Semaphore(16)
+        """OCR all pages via remote vLLM API, up to HRAG_OCR_CONCURRENCY pages concurrently."""
+        semaphore = asyncio.Semaphore(settings.HRAG_OCR_CONCURRENCY)
 
         async def ocr_one(idx: int, img_bytes: bytes) -> tuple[int, str]:
             async with semaphore:
@@ -279,7 +280,7 @@ class HunyuanOCRService:
                 }
             ],
             "temperature": 0.0,
-            "max_tokens": 8192,
+            "max_tokens": settings.HRAG_OCR_API_MAX_TOKENS,
         }
 
         client = await self._get_client()
