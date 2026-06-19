@@ -161,6 +161,34 @@ def _model_params(temperature, max_tokens, think) -> dict:
     return params
 
 
+def _record_trace(inner, label, messages, system_prompt, temperature, max_tokens,
+                  think, output, usage, error=None) -> None:
+    """Best-effort capture of one LLM call into the per-run dataset collector.
+
+    No-op when tracing is off or no run is active. Independent of Langfuse —
+    runs whether or not the Langfuse client is available. The system prompt is
+    passed for its hash reference only; it is NOT stored in the messages list.
+    """
+    try:
+        from app.services.agent.trace_collector import get_collector
+
+        coll = get_collector()
+        if coll is None:
+            return
+        coll.add_llm_call(
+            label=label,
+            model=_model_name(inner),
+            params=_model_params(temperature, max_tokens, think),
+            messages=_serialize_messages(messages, None),
+            output=output,
+            usage=usage,
+            system_prompt=system_prompt,
+            error=error,
+        )
+    except Exception:  # pragma: no cover - never break the LLM call
+        pass
+
+
 class TracedLLMProvider:
     """Transparent wrapper that traces an inner LLMProvider's calls in Langfuse.
 
@@ -205,58 +233,61 @@ class TracedLLMProvider:
     def complete(self, messages, *, temperature=0.0, max_tokens=4096,
                  system_prompt=None, think=False, **kwargs):
         lf = _get_langfuse_client()
-        if not lf:
-            return self._inner.complete(
-                messages, temperature=temperature, max_tokens=max_tokens,
-                system_prompt=system_prompt, think=think, **kwargs)
-        gen = self._start_gen(lf, messages, system_prompt, temperature, max_tokens, think)
+        gen = self._start_gen(lf, messages, system_prompt, temperature, max_tokens, think) if lf else None
         try:
             result = self._inner.complete(
                 messages, temperature=temperature, max_tokens=max_tokens,
                 system_prompt=system_prompt, think=think, **kwargs)
-            gen.update(output=self._result_output(result),
-                       usage_details=self._read_usage(self._inner))
+            usage = self._read_usage(self._inner)
+            output = self._result_output(result)
+            if gen:
+                gen.update(output=output, usage_details=usage)
+            _record_trace(self._inner, self._label, messages, system_prompt,
+                          temperature, max_tokens, think, output, usage)
             return result
         except Exception as e:
-            gen.update(level="ERROR", status_message=str(e))
+            if gen:
+                gen.update(level="ERROR", status_message=str(e))
+            _record_trace(self._inner, self._label, messages, system_prompt,
+                          temperature, max_tokens, think, None, None, error=str(e))
             raise
         finally:
-            gen.end()
+            if gen:
+                gen.end()
 
     async def acomplete(self, messages, *, temperature=0.0, max_tokens=4096,
                         system_prompt=None, think=False, **kwargs):
         lf = _get_langfuse_client()
-        if not lf:
-            return await self._inner.acomplete(
-                messages, temperature=temperature, max_tokens=max_tokens,
-                system_prompt=system_prompt, think=think, **kwargs)
-        gen = self._start_gen(lf, messages, system_prompt, temperature, max_tokens, think)
+        gen = self._start_gen(lf, messages, system_prompt, temperature, max_tokens, think) if lf else None
         try:
             result = await self._inner.acomplete(
                 messages, temperature=temperature, max_tokens=max_tokens,
                 system_prompt=system_prompt, think=think, **kwargs)
-            gen.update(output=self._result_output(result),
-                       usage_details=self._read_usage(self._inner))
+            usage = self._read_usage(self._inner)
+            output = self._result_output(result)
+            if gen:
+                gen.update(output=output, usage_details=usage)
+            _record_trace(self._inner, self._label, messages, system_prompt,
+                          temperature, max_tokens, think, output, usage)
             return result
         except Exception as e:
-            gen.update(level="ERROR", status_message=str(e))
+            if gen:
+                gen.update(level="ERROR", status_message=str(e))
+            _record_trace(self._inner, self._label, messages, system_prompt,
+                          temperature, max_tokens, think, None, None, error=str(e))
             raise
         finally:
-            gen.end()
+            if gen:
+                gen.end()
 
     async def astream(self, messages, *, temperature=0.0, max_tokens=4096,
                       system_prompt=None, think=False, **kwargs):
         lf = _get_langfuse_client()
-        if not lf:
-            async for chunk in self._inner.astream(
-                messages, temperature=temperature, max_tokens=max_tokens,
-                system_prompt=system_prompt, think=think, **kwargs):
-                yield chunk
-            return
-        gen = self._start_gen(lf, messages, system_prompt, temperature, max_tokens, think)
+        gen = self._start_gen(lf, messages, system_prompt, temperature, max_tokens, think) if lf else None
         text_parts: list[str] = []
         think_parts: list[str] = []
         tool_calls: list = []
+        errored: str | None = None
         try:
             async for chunk in self._inner.astream(
                 messages, temperature=temperature, max_tokens=max_tokens,
@@ -276,12 +307,26 @@ class TracedLLMProvider:
                 output["thinking"] = "".join(think_parts)
             if tool_calls:
                 output["tool_calls"] = tool_calls
-            gen.update(output=output, usage_details=self._read_usage(self._inner))
+            if gen:
+                gen.update(output=output, usage_details=self._read_usage(self._inner))
         except Exception as e:
-            gen.update(level="ERROR", status_message=str(e))
+            errored = str(e)
+            if gen:
+                gen.update(level="ERROR", status_message=str(e))
             raise
         finally:
-            gen.end()
+            if gen:
+                gen.end()
+            # Record into the dataset collector after the stream is drained, so
+            # text/thinking/tool_calls are fully aggregated (also covers errors).
+            out: dict = {"content": "".join(text_parts)}
+            if think_parts:
+                out["thinking"] = "".join(think_parts)
+            if tool_calls:
+                out["tool_calls"] = tool_calls
+            _record_trace(self._inner, self._label, messages, system_prompt,
+                          temperature, max_tokens, think, out,
+                          self._read_usage(self._inner), error=errored)
 
 
 def trace_llm(inner, label: str = "llm"):

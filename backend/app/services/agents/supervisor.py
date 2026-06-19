@@ -1214,6 +1214,28 @@ async def supervisor_node(state: SupervisorState) -> dict:
             except Exception as e:
                 logger.warning(f"[langfuse] supervisor_routing_decision span failed: {e}")
 
+        # ── Dataset trace: record the supervisor routing decision ─────────────
+        try:
+            from app.services.agent.trace_collector import get_collector
+
+            _coll = get_collector()
+            if _coll is not None:
+                _coll.add_routing(
+                    node="supervisor",
+                    intent=str(result.get("intent")) if result.get("intent") else None,
+                    next_agent=str(result.get("next_agent")) if result.get("next_agent") else None,
+                    needs_memory=bool(result.get("needs_memory")),
+                    search_mode=str(result.get("search_mode")) if result.get("search_mode") else None,
+                    task_plan=result.get("task_plan") or [],
+                    pending_intent=str(result.get("pending_intent")) if result.get("pending_intent") else None,
+                    query_complexity=str(state.get("query_complexity", "simple")),
+                    reasoning=decision.get("reasoning") if isinstance(decision, dict) else None,
+                    user_message=user_message,
+                    expanded_query=expanded_message,
+                )
+        except Exception:
+            pass
+
         return result
 
     except Exception as e:

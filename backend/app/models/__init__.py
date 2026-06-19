@@ -17,6 +17,7 @@ from app.models.integration import (
     TelegramLinkCode,
 )
 from app.models.audit_log import AuditLog
+from app.models.agent_trace import AgentTrace
 
 __all__ = [
     "KnowledgeBase",
@@ -39,4 +40,5 @@ __all__ = [
     "TelegramLink",
     "TelegramLinkCode",
     "AuditLog",
+    "AgentTrace",
 ]

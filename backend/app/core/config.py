@@ -278,6 +278,17 @@ class Settings(BaseSettings):
     # LangChain CallbackHandler cannot see any LLM I/O. Set False to disable.
     LANGFUSE_TRACE_LLM: bool = Field(default=True)
 
+    # ── Agent trace dataset (distillation data capture) ──────────────────────
+    # When True, every agent run (web + Telegram, all via stream_agent_events)
+    # records a structured trace — routing decisions, LLM I/O (dynamic messages
+    # + completions; system prompts are NOT stored, only a hash reference since
+    # they live in app/prompts/), and tool calls + results — into the
+    # agent_traces table. PII (people-search results) is redacted before write.
+    # Used to build SFT/distillation datasets for a smaller model. Best-effort:
+    # capture failures never affect the chat response. Export via
+    # `python -m scripts.export_agent_traces`.
+    NEXUSRAG_TRACE_DATASET: bool = Field(default=True)
+
     # ── ReAct executor for the RAG group (tool-aware planning) ───────────────
     # When True, the supervisor routes RAG-group queries to a single tool-calling
     # ReAct loop (react_executor_node) instead of the static intent→tool nodes.

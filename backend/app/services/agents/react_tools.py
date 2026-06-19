@@ -673,8 +673,39 @@ async def dispatch_tool(name: str, args: dict, ctx: ToolContext) -> dict:
     if adapter is None:
         logger.warning(f"[react_tools] unknown tool requested: {name!r}")
         return tool_result(f"Lỗi: công cụ '{name}' không tồn tại.")
+
+    import time as _time
+
+    _t0 = _time.monotonic()
     try:
-        return await adapter(args or {}, ctx)
+        res = await adapter(args or {}, ctx)
+        _record_react_tool(name, args, res, int((_time.monotonic() - _t0) * 1000), None)
+        return res
     except Exception as e:  # noqa: BLE001 — surface to LLM, don't crash the loop
         logger.error(f"[react_tools] tool {name!r} failed: {e}", exc_info=True)
+        _record_react_tool(name, args, None, int((_time.monotonic() - _t0) * 1000), str(e))
         return tool_result(f"Lỗi khi chạy '{name}': {e}")
+
+
+def _record_react_tool(name: str, args: dict | None, res: dict | None,
+                       latency_ms: int, error: str | None) -> None:
+    """Best-effort capture of a ReAct tool call into the dataset collector."""
+    try:
+        from app.services.agent.trace_collector import get_collector
+
+        coll = get_collector()
+        if coll is None:
+            return
+        res = res or {}
+        coll.add_tool_call(
+            name=name,
+            args=args or {},
+            result_summary=str(res.get("summary") or "")[:4000],
+            sources_count=len(res.get("sources") or []),
+            images_count=len(res.get("images") or []),
+            data=res.get("data") or None,
+            latency_ms=latency_ms,
+            error=error,
+        )
+    except Exception:  # pragma: no cover - never break the loop
+        pass

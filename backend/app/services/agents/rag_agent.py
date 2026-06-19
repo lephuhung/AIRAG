@@ -842,6 +842,9 @@ async def rag_agent_node(state: SupervisorState) -> dict:
     tool_fn, mapper = RAG_TOOL_REGISTRY[intent]
 
     try:
+        import time as _time
+
+        _t0 = _time.monotonic()
         result = await tool_fn(state)
         updates = mapper(result)
 
@@ -852,6 +855,29 @@ async def rag_agent_node(state: SupervisorState) -> dict:
             await push_event(state, "sources", sources)
         if images:
             await push_event(state, "images", images)
+
+        # ── Dataset trace: record the (static-path) tool call ─────────────────
+        try:
+            from app.services.agent.trace_collector import get_collector
+
+            _coll = get_collector()
+            if _coll is not None:
+                _coll.add_tool_call(
+                    name=intent,
+                    args={
+                        "rewritten_query": state.get("rewritten_query", ""),
+                        "document_ids": [str(d) for d in (state.get("document_ids") or [])],
+                        "search_mode": state.get("search_mode"),
+                        "section_reference": state.get("section_reference"),
+                    },
+                    result_summary=str(result.get("text") or result.get("context_text") or "")[:4000],
+                    sources_count=len(sources),
+                    images_count=len(images),
+                    data={"kg_summaries": len(updates.get("kg_summaries", []))},
+                    latency_ms=int((_time.monotonic() - _t0) * 1000),
+                )
+        except Exception:
+            pass
 
         # NOTE: Only supervisor increments iterations — sub-agents pass through
 

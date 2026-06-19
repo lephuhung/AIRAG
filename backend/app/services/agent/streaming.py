@@ -144,6 +144,7 @@ def _sse(event: str, data: dict) -> str:
 async def stream_agent_events(
     graph,
     initial_state: dict,
+    channel: str = "web",
 ) -> AsyncGenerator[dict, None]:
     """
     Run the LangGraph agent and yield events as dicts ``{"event", "data"}`` in
@@ -161,9 +162,36 @@ async def stream_agent_events(
     """
     event_queue: asyncio.Queue = asyncio.Queue()
 
+    # ── Dataset trace collector (distillation capture) ─────────────────────────
+    # Set on a ContextVar BEFORE create_task so the background graph task and all
+    # downstream taps (supervisor routing, TracedLLMProvider, tool dispatch)
+    # inherit it. Entirely best-effort: never affects the chat response.
+    from app.services.agent.trace_collector import (
+        TraceCollector, set_collector, reset_collector, trace_enabled,
+    )
+    collector = TraceCollector(channel=channel) if trace_enabled() else None
+    collector_token = set_collector(collector) if collector is not None else None
+    if collector is not None:
+        try:
+            msgs = initial_state.get("messages") or []
+            collector.start_run(
+                original_query=_last_user_message(msgs),
+                workspace_ids=initial_state.get("workspace_ids"),
+                document_ids=initial_state.get("document_ids"),
+                user_id=initial_state.get("user_id"),
+                session_id=initial_state.get("session_id"),
+                history_len=max(0, len(msgs) - 1),
+            )
+        except Exception:
+            pass
+
     # Set contextvars BEFORE create_task — asyncio copies current context into task
     queue_token = _event_queue_ctx.set(event_queue)
     db_token = _db_ctx.set(initial_state.get("_db"))
+
+    # Trace run outcome (persisted in finally)
+    run_error: str | None = None
+    run_completed = False
 
     # Tracking cho complete event
     final_answer = ""
@@ -262,6 +290,7 @@ async def stream_agent_events(
             ev_type = item[0]
 
             if ev_type == "done":
+                run_completed = True
                 # Pipeline xong — emit complete event
                 yield {"event": "complete", "data": {
                     "answer": final_answer,
@@ -307,6 +336,7 @@ async def stream_agent_events(
                 yield {"event": "potential_abbreviations", "data": {"abbreviations": all_potentials}}
 
             elif ev_type == "error":
+                run_error = str(item[1])
                 yield {"event": "error", "data": {"message": item[1]}}
                 break
 
@@ -324,6 +354,23 @@ async def stream_agent_events(
             await task
         except asyncio.CancelledError:
             pass
+
+        # Persist the dataset trace (best-effort; never affects the response).
+        if collector is not None:
+            try:
+                collector.finish(
+                    final_answer=final_answer,
+                    success=(run_completed and run_error is None),
+                    error=run_error or (None if run_completed else "incomplete/cancelled"),
+                )
+                from app.services.agent_trace_service import AgentTraceService
+
+                await AgentTraceService.record(collector)
+            except Exception as e:  # pragma: no cover - best effort
+                logger.debug(f"[trace] persist failed: {e}")
+            finally:
+                if collector_token is not None:
+                    reset_collector(collector_token)
 
 
 async def stream_agent_to_sse(

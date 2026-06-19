@@ -424,7 +424,7 @@ async def _handle_question(db, chat_id: str, question: str, tg_user_id: str | No
             document_ids=None,
         )
         graph = get_supervisor_graph()
-        async for ev in stream_agent_events(graph, initial_state):
+        async for ev in stream_agent_events(graph, initial_state, channel="telegram"):
             etype = ev.get("event")
             data = ev.get("data") or {}
             if etype == "token":
