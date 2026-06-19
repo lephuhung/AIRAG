@@ -16,18 +16,13 @@ from sqlalchemy import text
 from app.core.config import settings
 from app.core.database import engine, Base
 
-# Ensure all models are imported so Base.metadata knows about them
-import app.models.knowledge_base  # noqa: F401
-import app.models.document  # noqa: F401
-import app.models.document_type  # noqa: F401
-import app.models.chat_session  # noqa: F401
-import app.models.chat_message  # noqa: F401
-import app.models.user  # noqa: F401
-import app.models.tenant  # noqa: F401
-import app.models.invite_token  # noqa: F401
-import app.models.abbreviation  # noqa: F401
-import app.models.chat_file  # noqa: F401
-import app.models.format_metadata  # noqa: F401
+# Import the whole models package so EVERY table is registered on
+# Base.metadata BEFORE create_all() runs in the lifespan below. app/models/
+# __init__.py imports every model module (knowledge_base, document, user,
+# integration, audit_log, exchange_summary, …); importing the package here is
+# the single source of truth and avoids relying on transitive imports from the
+# API router to register tables like audit_logs / telegram_* / api_keys.
+import app.models  # noqa: F401
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("neo4j.notifications").setLevel(logging.WARNING)
@@ -714,14 +709,6 @@ app.mount(
     name="static_doc_images",
 )
 
-# Import models so SQLAlchemy registers them
-from app.models import (
-    knowledge_base,
-    document,
-    chat_session,
-    chat_message,
-    user,
-    tenant,
-    invite_token,
-    audit_log,
-)  # noqa: E402, F401
+# NOTE: all models are already registered on Base.metadata via the
+# `import app.models` at the top of this file (before create_all). No second
+# import block is needed here.

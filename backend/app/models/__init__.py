@@ -16,6 +16,7 @@ from app.models.integration import (
     TelegramLink,
     TelegramLinkCode,
 )
+from app.models.audit_log import AuditLog
 
 __all__ = [
     "KnowledgeBase",
@@ -37,4 +38,5 @@ __all__ = [
     "TelegramBotConfig",
     "TelegramLink",
     "TelegramLinkCode",
+    "AuditLog",
 ]
