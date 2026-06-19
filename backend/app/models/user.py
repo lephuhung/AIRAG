@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import String, DateTime, Boolean
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -27,6 +27,10 @@ class User(Base):
     is_superadmin: Mapped[bool] = mapped_column(Boolean, default=False)
     avatar_url: Mapped[str | None] = mapped_column(
         String(1024), nullable=True, default=None
+    )
+    # Free-form per-user preferences (e.g. {"tts": {"voice": ..., "speed": 1.0}})
+    settings: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(

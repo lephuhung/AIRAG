@@ -43,6 +43,7 @@ async def list_chat_sessions(
         {
             "id": s.id,
             "title": s.title,
+            "source": s.source,
             "created_at": s.created_at,
             "updated_at": s.updated_at,
         }
@@ -71,6 +72,7 @@ async def create_chat_session(
     return {
         "id": session.id,
         "title": session.title,
+        "source": session.source,
         "created_at": session.created_at,
         "updated_at": session.updated_at,
     }

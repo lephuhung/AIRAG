@@ -258,6 +258,11 @@ async def update_me(
             raise BadRequestError("Current password is incorrect")
         user.password_hash = hash_password(body.new_password)
 
+    # Shallow-merge free-form preferences (e.g. {"tts": {...}}). Reassign a new
+    # dict so SQLAlchemy detects the JSONB mutation.
+    if body.settings is not None:
+        user.settings = {**(user.settings or {}), **body.settings}
+
     await db.commit()
     await db.refresh(user)
     return user

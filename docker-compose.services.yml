@@ -35,22 +35,28 @@ services:
       - "traefik.http.services.traefik.loadbalancer.server.port=8080"
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # CLOUDFLARE TUNNEL — expose the webhook publicly (e.g. for Telegram)
+  # CLOUDFLARE TUNNEL — expose the app publicly via a named tunnel
   # ═══════════════════════════════════════════════════════════════════════════
-  # Token-based (remotely-managed) tunnel: create it in the Cloudflare Zero Trust
-  # dashboard, copy the token into CLOUDFLARE_TUNNEL_TOKEN (.env), then add a
-  # Public Hostname routing your domain → http://hrag-backend:8080 (the backend is
-  # on this same docker network, so cloudflared reaches it by container name).
+  # Locally-managed (config.yml based) tunnel `zbots-tunnel`. Config + creds live
+  # in ./cloudflared, mounted at /etc/cloudflared:
+  #   - cert.pem                                   → origin cert (cloudflared login)
+  #   - config.yml                                 → tunnel name + ingress rules
+  #   - 95713781-76f3-40ca-b96f-25433b340d7d.json  → per-tunnel credentials (secret)
+  # config.yml routes Host(bot.zbots.store) → http://hrag-backend:8080 — cloudflared
+  # is on hrag_network so it reaches the backend by container name.
   # The Telegram webhook then becomes:
-  #   https://<your-domain>/api/v1/integrations/telegram/webhook
-  # Only starts when the token is set (profile "tunnel").
+  #   https://bot.zbots.store/api/v1/integrations/telegram/webhook
+  # Only starts with the "tunnel" profile so the rest of the stack can run without it:
+  #   docker compose -f docker-compose.services.yml --profile tunnel up -d
   cloudflared:
     image: cloudflare/cloudflared:latest
     container_name: hrag-cloudflared
     profiles: ["tunnel"]
-    command: tunnel --no-autoupdate run
+    command: tunnel --no-autoupdate run zbots-tunnel
     environment:
-      - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN:-}
+      - TUNNEL_ORIGIN_CERT=/etc/cloudflared/cert.pem
+    volumes:
+      - ./cloudflared:/etc/cloudflared:ro
     depends_on:
       - backend
     networks:
@@ -599,6 +605,59 @@ services:
       com.hrag.stack: hrag
 
   # ── Backend API server ─────────────────────────────────────────────────────
+  # ── OmniVoice (Text-to-Speech) ────────────────────────────────────────────
+  # Port: 8880, GPU 0 (shared, ~few GB VRAM). OpenAI-compatible /v1/audio/speech.
+  # ONE-TIME SETUP: the image is built from the upstream repo, not this one —
+  #   git clone https://github.com/maemreyo/omnivoice-server external/omnivoice-server
+  # Then `docker compose -f docker-compose.services.yml build omnivoice`.
+  # NOTE: OmniVoice is English/Chinese focused; Vietnamese quality is unverified.
+  omnivoice:
+    image: omnivoice-server:latest
+    pull_policy: never  # local build only
+    build:
+      context: ./external/omnivoice-server
+      dockerfile: Dockerfile.cuda
+    container_name: hrag-omnivoice
+    ports:
+      - "8880:8880"
+    environment:
+      OMNIVOICE_HOST: "0.0.0.0"
+      OMNIVOICE_PORT: "8880"
+      OMNIVOICE_DEVICE: "cuda"
+      OMNIVOICE_NUM_STEP: "32"
+      OMNIVOICE_MAX_CONCURRENT: "2"
+      OMNIVOICE_MODEL_ID: "k2-fsa/OmniVoice"
+      OMNIVOICE_LOG_LEVEL: "info"
+    volumes:
+      # Dedicated named volume (not the host ~/.cache, which is root-owned and
+      # un-writable by the container's uid-1000 'ubuntu' user → HF Permission denied).
+      - hrag_omnivoice_hf:/home/ubuntu/.cache/huggingface
+      - hrag_omnivoice_profiles:/home/ubuntu/app/profiles
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    networks:
+      - hrag_network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8880/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      com.hrag.service: omnivoice
+      com.hrag.stack: hrag
+
   backend:
     build:
       context: .
@@ -633,6 +692,7 @@ services:
       MEMORY_AGENT_BASE_URL: http://vllm-memory:8088/v1
       GRAPHITI_LLM_BASE_URL: http://vllm-memory:8088/v1
       LEGAL_KG_LLM_BASE_URL: http://vllm-memory:8088/v1
+      TTS_OMNIVOICE_BASE_URL: http://omnivoice:8880/v1
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "langfuse.hatinh.local:10.10.0.241"
@@ -759,3 +819,5 @@ volumes:
   hrag_grafana_data:
   hrag_traefik_data:
   hrag_promtail_positions:
+  hrag_omnivoice_profiles:
+  hrag_omnivoice_hf:

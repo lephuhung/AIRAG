@@ -17,6 +17,7 @@ import {
   useTelegramLinks,
   useUnlinkTelegram,
 } from "@/hooks/useIntegrations";
+import { copyToClipboard } from "@/lib/clipboard";
 import type { TelegramLinkCode, TelegramLinkInfo } from "@/types";
 
 export function TelegramTab() {
@@ -40,11 +41,10 @@ export function TelegramTab() {
 
   const handleCopy = async () => {
     if (!code) return;
-    try {
-      await navigator.clipboard.writeText(`/start ${code.code}`);
+    if (await copyToClipboard(`/start ${code.code}`)) {
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    } catch {
+    } else {
       toast.error("Could not copy to clipboard");
     }
   };

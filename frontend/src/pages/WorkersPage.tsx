@@ -41,6 +41,7 @@ import type {
   ManagedWorkerInfo,
   DeadLetterMessage,
   PipelineDocument,
+  QueueInfo,
 } from "@/types";
 
 // ---------------------------------------------------------------------------
@@ -71,6 +72,45 @@ const WORKER_COLORS: Record<WorkerType, string> = {
   caption: "text-amber-400",
   kg:      "text-cyan-400",
 };
+
+// ---------------------------------------------------------------------------
+// Queue grouping — turn raw RabbitMQ queue names into something readable.
+// Worker queues map to one of the 4 worker types (KG is split per-workspace,
+// so all `hrag.kg.*` collapse into a single logical "kg" group). Everything
+// else under `hrag.*` (retry / memory) is "system" infra; the DLQ is hidden
+// here because it has its own dedicated section.
+// ---------------------------------------------------------------------------
+function queueGroupOf(name: string): WorkerType | "system" | null {
+  if (name === "hrag.dead-letter") return null;
+  if (name === "hrag.parse") return "parse";
+  if (name === "hrag.embed") return "embed";
+  if (name === "hrag.caption") return "caption";
+  if (name === "hrag.kg" || name.startsWith("hrag.kg.")) return "kg";
+  return "system";
+}
+
+type QueueAgg = {
+  messages_ready: number;
+  messages_unacked: number;
+  consumers: number;
+  message_rate_in: number;
+  message_rate_out: number;
+  has_dlx: boolean;
+};
+
+function aggregateQueues(queues: QueueInfo[]): QueueAgg {
+  return queues.reduce<QueueAgg>(
+    (a, q) => ({
+      messages_ready: a.messages_ready + q.messages_ready,
+      messages_unacked: a.messages_unacked + q.messages_unacked,
+      consumers: a.consumers + q.consumers,
+      message_rate_in: a.message_rate_in + q.message_rate_in,
+      message_rate_out: a.message_rate_out + q.message_rate_out,
+      has_dlx: a.has_dlx || !!q.has_dlx,
+    }),
+    { messages_ready: 0, messages_unacked: 0, consumers: 0, message_rate_in: 0, message_rate_out: 0, has_dlx: false },
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Helper: format uptime
@@ -327,6 +367,19 @@ export function WorkersPage() {
   const dlqMessages = dlqData?.messages ?? [];
   const managedWorkers = managedData?.workers ?? {};
 
+  // Group raw queues by worker type; collect retry/memory infra separately
+  const { workerQueueGroups, systemQueues } = useMemo(() => {
+    const groups: Record<WorkerType, QueueInfo[]> = { parse: [], embed: [], caption: [], kg: [] };
+    const system: QueueInfo[] = [];
+    for (const q of overview?.queues ?? []) {
+      const g = queueGroupOf(q.name);
+      if (g === null) continue;
+      if (g === "system") system.push(q);
+      else groups[g].push(q);
+    }
+    return { workerQueueGroups: groups, systemQueues: system };
+  }, [overview?.queues]);
+
   // True when all workers run as Docker containers (no subprocess management needed)
   const isContainerMode = Object.values(overview?.container_workers ?? {}).some((c) => c > 0);
 
@@ -475,16 +528,23 @@ export function WorkersPage() {
                 </span>
               )}
               {dlqCount > 0 && (
-                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                <button
+                  onClick={() => {
+                    const el = document.getElementById('dlq-section');
+                    if (el) el.scrollIntoView({ behavior: 'smooth' });
+                  }}
+                  title={t("workers.dlq_desc")}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 hover:bg-amber-500/20 transition-colors"
+                >
                   <Skull className="w-3 h-3" />
                   {t(dlqCount === 1 ? 'workers.dlq_msg' : 'workers.dlq_msg_plural', { count: dlqCount })}
-                </span>
+                </button>
               )}
             </div>
 
             {/* ── Worker Management ── */}
             <Section title={t("workers.management")} icon={Cpu} defaultOpen={true}>
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
                 {WORKER_TYPES.map((wtype) => {
                   const rmqConsumers = overview?.active_workers?.[wtype] ?? 0;
                   const containerCount = overview?.container_workers?.[wtype] ?? 0;
@@ -591,57 +651,6 @@ export function WorkersPage() {
                     </div>
                   );
                 })}
-
-                {/* DLQ status card — integrated into the grid */}
-                <div className={cn(
-                  "rounded-xl border bg-card p-4 flex flex-col justify-between transition-colors",
-                  dlqCount > 0 ? "border-amber-500/20 bg-amber-500/5 shadow-sm" : "border-border",
-                )}>
-                  <div>
-                    <div className="flex items-center justify-between mb-2">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <div className={cn(
-                          "w-2.5 h-2.5 rounded-full flex-shrink-0",
-                          dlqCount > 0 ? "bg-amber-400" : "bg-muted-foreground/30",
-                        )} />
-                        <span className="text-sm font-semibold text-muted-foreground truncate" title="hrag.dead-letter">
-                          Dead Letter
-                        </span>
-                      </div>
-                      <span className={cn(
-                        "text-xs font-bold tabular-nums ml-2",
-                        dlqCount > 0 ? "text-amber-500" : "text-muted-foreground"
-                      )}>
-                        {dlqCount}
-                      </span>
-                    </div>
-                    <p className="text-[11px] text-muted-foreground/60 line-clamp-2 leading-relaxed" title={t("workers.dlq_desc")}>
-                      {t("workers.dlq_desc")}
-                    </p>
-                  </div>
-
-                  {dlqCount > 0 ? (
-                    <div className="mt-3 pt-2 border-t border-amber-500/10">
-                      <Button
-                        variant="link"
-                        size="sm"
-                        className="h-auto p-0 text-[11px] text-amber-500 hover:text-amber-600 font-medium"
-                        onClick={() => {
-                          const el = document.getElementById('dlq-section');
-                          if (el) el.scrollIntoView({ behavior: 'smooth' });
-                        }}
-                      >
-                        {t("common.show_more")}
-                      </Button>
-                    </div>
-                  ) : (
-                    <div className="mt-3 pt-2 border-t border-border/30 text-center">
-                      <span className="text-[10px] text-muted-foreground/40 italic">
-                        {t("common.empty")}
-                      </span>
-                    </div>
-                  )}
-                </div>
               </div>
             </Section>
 
@@ -767,71 +776,141 @@ export function WorkersPage() {
             </Section>
 
 
-            {/* ── Queue Details ── */}
-            {overview && overview.queues.length > 0 && (() => {
-              // Exclude the dead-letter queue — it's shown separately below
-              const workerQueues = overview.queues.filter(
-                (q) => q.name !== "hrag.dead-letter"
-              );
-              if (workerQueues.length === 0) return null;
+            {/* ── Queue Details (grouped by worker type) ── */}
+            {overview && (() => {
+              const activeGroups = WORKER_TYPES.filter((wt) => workerQueueGroups[wt].length > 0);
+              if (activeGroups.length === 0 && systemQueues.length === 0) return null;
               return (
-              <Section title={t("workers.queue_details")} icon={Inbox} badge={workerQueues.length}>
+              <Section title={t("workers.queue_details")} icon={Inbox} badge={activeGroups.length}>
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
-                  {workerQueues.map((q) => (
-                    <div key={q.name} className="rounded-xl border bg-card p-4 space-y-3">
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-1.5 min-w-0">
-                          <span className="text-sm font-medium truncate">{q.name}</span>
-                          {q.has_dlx && (
-                            <span className="text-[9px] px-1 py-0.5 rounded bg-green-500/10 text-green-400 border border-green-500/20 flex-shrink-0">
-                              DLX
+                  {activeGroups.map((wt) => {
+                    const queues = workerQueueGroups[wt];
+                    const agg = aggregateQueues(queues);
+                    // Only offer purge/delete when the group maps to a single concrete
+                    // queue (parse/embed/caption, or a single-workspace KG queue).
+                    const singleQueue = queues.length === 1 ? queues[0].name : null;
+                    return (
+                      <div key={wt} className="rounded-xl border bg-card p-4 space-y-3">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <Inbox className={cn("w-3.5 h-3.5 flex-shrink-0", WORKER_COLORS[wt])} />
+                            <span className={cn("text-sm font-semibold truncate", WORKER_COLORS[wt])}>
+                              {t(`workers.types.${wt}`) || wt}
                             </span>
+                            {wt === "kg" && queues.length > 1 && (
+                              <span className="text-[10px] text-muted-foreground flex-shrink-0">
+                                {t("workers.kg_queue_count", { count: queues.length })}
+                              </span>
+                            )}
+                            {agg.has_dlx && (
+                              <span
+                                className="text-[9px] px-1 py-0.5 rounded bg-green-500/10 text-green-400 border border-green-500/20 flex-shrink-0"
+                                title={t("workers.dlx_tip")}
+                              >
+                                DLX
+                              </span>
+                            )}
+                          </div>
+                          {singleQueue && (
+                            <div className="flex items-center gap-0.5 flex-shrink-0">
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-6 w-6"
+                                title={t("workers.purge_queue")}
+                                onClick={() => setPurgeConfirm(singleQueue)}
+                              >
+                                <Trash2 className="w-3 h-3 text-muted-foreground hover:text-destructive" />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-6 w-6"
+                                title={t("workers.delete_queue")}
+                                onClick={() => setDeleteConfirm(singleQueue)}
+                              >
+                                <Minus className="w-3 h-3 text-muted-foreground hover:text-destructive" />
+                              </Button>
+                            </div>
                           )}
                         </div>
-                        <div className="flex items-center gap-0.5 flex-shrink-0">
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-6 w-6"
-                            title={t("workers.purge_queue")}
-                            onClick={() => setPurgeConfirm(q.name)}
-                          >
-                            <Trash2 className="w-3 h-3 text-muted-foreground hover:text-destructive" />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-6 w-6"
-                            title={t("workers.delete_queue")}
-                            onClick={() => setDeleteConfirm(q.name)}
-                          >
-                            <Minus className="w-3 h-3 text-muted-foreground hover:text-destructive" />
-                          </Button>
+                        <div className="grid grid-cols-3 gap-2">
+                          <div className="text-center" title={t("workers.queue_tip_ready")}>
+                            <p className="text-lg font-bold tabular-nums">{agg.messages_ready}</p>
+                            <p className="text-[10px] text-muted-foreground">{t("workers.ready")}</p>
+                          </div>
+                          <div className="text-center" title={t("workers.queue_tip_processing")}>
+                            <p className="text-lg font-bold tabular-nums text-amber-400">{agg.messages_unacked}</p>
+                            <p className="text-[10px] text-muted-foreground">{t("workers.processing")}</p>
+                          </div>
+                          <div className="text-center" title={t("workers.queue_tip_consumers")}>
+                            <p className="text-lg font-bold tabular-nums text-primary">{agg.consumers}</p>
+                            <p className="text-[10px] text-muted-foreground">{t("workers.consumers_label")}</p>
+                          </div>
                         </div>
+                        {(agg.message_rate_in > 0 || agg.message_rate_out > 0) && (
+                          <div className="flex items-center justify-between text-[11px] text-muted-foreground pt-1 border-t border-border/50">
+                            <span>{t("workers.labels.in")}: {agg.message_rate_in.toFixed(1)}{t("workers.labels.per_second")}</span>
+                            <span>{t("workers.labels.out")}: {agg.message_rate_out.toFixed(1)}{t("workers.labels.per_second")}</span>
+                          </div>
+                        )}
                       </div>
-                      <div className="grid grid-cols-3 gap-2">
-                        <div className="text-center">
-                          <p className="text-lg font-bold tabular-nums">{q.messages_ready}</p>
-                          <p className="text-[10px] text-muted-foreground">{t("workers.ready")}</p>
-                        </div>
-                        <div className="text-center">
-                          <p className="text-lg font-bold tabular-nums">{q.messages_unacked}</p>
-                          <p className="text-[10px] text-muted-foreground">{t("workers.processing")}</p>
-                        </div>
-                        <div className="text-center">
-                          <p className="text-lg font-bold tabular-nums text-primary">{q.consumers}</p>
-                          <p className="text-[10px] text-muted-foreground">{t("workers.consumers_label")}</p>
-                        </div>
-                      </div>
-                      {(q.message_rate_in > 0 || q.message_rate_out > 0) && (
-                        <div className="flex items-center justify-between text-[11px] text-muted-foreground pt-1 border-t border-border/50">
-                          <span>{t("workers.labels.in")}: {q.message_rate_in.toFixed(1)}{t("workers.labels.per_second")}</span>
-                          <span>{t("workers.labels.out")}: {q.message_rate_out.toFixed(1)}{t("workers.labels.per_second")}</span>
-                        </div>
-                      )}
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
+
+                {/* System queues (retry / memory) — collapsed, advanced */}
+                {systemQueues.length > 0 && (
+                  <div className="mt-4">
+                    <Section
+                      title={t("workers.system_queues")}
+                      icon={Layers}
+                      badge={systemQueues.length}
+                      defaultOpen={false}
+                    >
+                      <p className="text-[11px] text-muted-foreground/70 mb-2">
+                        {t("workers.system_queues_desc")}
+                      </p>
+                      <div className="rounded-xl border bg-card overflow-hidden divide-y divide-border/50">
+                        {systemQueues.map((q) => (
+                          <div key={q.name} className="flex items-center justify-between gap-3 px-4 py-2.5">
+                            <span className="text-xs font-mono truncate min-w-0" title={q.name}>
+                              {q.name}
+                            </span>
+                            <div className="flex items-center gap-4 flex-shrink-0 text-xs tabular-nums text-muted-foreground">
+                              <span title={t("workers.queue_tip_ready")}>
+                                {t("workers.ready")} {q.messages_ready}
+                              </span>
+                              <span title={t("workers.queue_tip_processing")}>
+                                {t("workers.processing")} {q.messages_unacked}
+                              </span>
+                              <div className="flex items-center gap-0.5">
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-6 w-6"
+                                  title={t("workers.purge_queue")}
+                                  onClick={() => setPurgeConfirm(q.name)}
+                                >
+                                  <Trash2 className="w-3 h-3 text-muted-foreground hover:text-destructive" />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  className="h-6 w-6"
+                                  title={t("workers.delete_queue")}
+                                  onClick={() => setDeleteConfirm(q.name)}
+                                >
+                                  <Minus className="w-3 h-3 text-muted-foreground hover:text-destructive" />
+                                </Button>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </Section>
+                  </div>
+                )}
               </Section>
               );
             })()}

@@ -660,6 +660,10 @@ export const DocumentViewer = memo(function DocumentViewer({
     }
   }, []);
 
+  // Whether the TOC menu is actually on screen (full mode, toggled on, has
+  // headings). Gates the sidebar render below.
+  const tocVisible = showToc && effectiveMode === "full" && headings.length > 0;
+
   // ---- Loading / error / empty states ----
   if (doc.status !== "indexed") {
     return <ViewerEmpty />;
@@ -671,7 +675,7 @@ export const DocumentViewer = memo(function DocumentViewer({
   return (
     <div className="flex h-full min-h-0">
       {/* TOC sidebar — only in full mode (chunk content has partial headings, TOC is misleading) */}
-      {showToc && effectiveMode === "full" && (
+      {tocVisible && (
         <TOCSidebar
           headings={headings}
           activeId={activeHeading}
@@ -696,9 +700,11 @@ export const DocumentViewer = memo(function DocumentViewer({
           </button>
         )}
 
-        {/* Centered A4-like container for better readability on wide screens */}
-        <div className="w-full h-full bg-gradient-to-b from-muted/20 to-muted/5">
-          <div className="mx-auto max-w-[850px] min-h-full bg-background px-6 py-6 sm:px-14 sm:py-12 sm:my-8 sm:shadow-xl sm:rounded-lg sm:ring-1 sm:ring-border/40 transition-all duration-300">
+        {/* Document fills the full viewer width — no centered max-width column —
+            so the content expands to fill the panel (1:1) with no leftover
+            whitespace beside the TOC menu in the split-screen viewer. */}
+        <div className="w-full min-h-full bg-background">
+          <div className="w-full min-h-full px-6 py-6 sm:px-12 sm:py-10 transition-all duration-300">
             {/* Document title header */}
             <div className="relative mb-8 pb-5 border-b border-border/60 pl-4">
               <span className="absolute left-0 top-1 bottom-5 w-1 rounded-full bg-gradient-to-b from-primary to-primary/30" />

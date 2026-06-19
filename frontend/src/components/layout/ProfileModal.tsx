@@ -4,17 +4,19 @@
  * Tabbed modal for editing profile (name + avatar) and changing password.
  */
 import { useState, useRef } from "react";
-import { User, Lock, Camera, Loader2, X, Eye, EyeOff, KeyRound, Send } from "lucide-react";
+import { User, Lock, Camera, Loader2, X, Eye, EyeOff, KeyRound, Send, Volume2 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { api, rewritePresignedUrl } from "@/lib/api";
+import { useTranslation } from "@/hooks/useTranslation";
 import { useAuthStore } from "@/stores/authStore";
 import { ApiKeysTab } from "@/components/settings/ApiKeysTab";
 import { TelegramTab } from "@/components/settings/TelegramTab";
+import { TTSTab } from "@/components/settings/TTSTab";
 import type { User as UserType } from "@/types";
 
-type Tab = "profile" | "security" | "api_keys" | "telegram";
+type Tab = "profile" | "security" | "api_keys" | "telegram" | "tts";
 
 interface ProfileModalProps {
   onClose: () => void;
@@ -23,6 +25,7 @@ interface ProfileModalProps {
 export function ProfileModal({ onClose }: ProfileModalProps) {
   const user = useAuthStore((s) => s.user)!;
   const updateUser = useAuthStore((s) => s.updateUser);
+  const { t } = useTranslation();
   const [tab, setTab] = useState<Tab>("profile");
 
   // ── Profile tab state ──────────────────────────────────────────────────────
@@ -135,7 +138,7 @@ export function ProfileModal({ onClose }: ProfileModalProps) {
       <div className="fixed left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 w-full max-w-lg bg-card border rounded-2xl shadow-2xl">
         {/* Header */}
         <div className="flex items-center justify-between px-5 pt-5 pb-4 border-b">
-          <h2 className="text-base font-semibold">Edit Profile</h2>
+          <h2 className="text-base font-semibold">{t("profile.title")}</h2>
           <button
             onClick={onClose}
             className="rounded-full p-1 hover:bg-muted transition-colors"
@@ -145,30 +148,36 @@ export function ProfileModal({ onClose }: ProfileModalProps) {
         </div>
 
         {/* Tabs */}
-        <div className="flex border-b px-5">
+        <div className="flex border-b px-3 overflow-x-auto [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden">
           <TabButton
             active={tab === "profile"}
             onClick={() => setTab("profile")}
             icon={<User className="w-3.5 h-3.5" />}
-            label="Profile"
+            label={t("profile.tabs.profile")}
           />
           <TabButton
             active={tab === "security"}
             onClick={() => setTab("security")}
             icon={<Lock className="w-3.5 h-3.5" />}
-            label="Security"
+            label={t("profile.tabs.security")}
           />
           <TabButton
             active={tab === "api_keys"}
             onClick={() => setTab("api_keys")}
             icon={<KeyRound className="w-3.5 h-3.5" />}
-            label="API Keys"
+            label={t("profile.tabs.api_keys")}
           />
           <TabButton
             active={tab === "telegram"}
             onClick={() => setTab("telegram")}
             icon={<Send className="w-3.5 h-3.5" />}
-            label="Telegram"
+            label={t("profile.tabs.telegram")}
+          />
+          <TabButton
+            active={tab === "tts"}
+            onClick={() => setTab("tts")}
+            icon={<Volume2 className="w-3.5 h-3.5" />}
+            label={t("profile.tabs.tts")}
           />
         </div>
 
@@ -271,6 +280,8 @@ export function ProfileModal({ onClose }: ProfileModalProps) {
           {tab === "api_keys" && <ApiKeysTab />}
 
           {tab === "telegram" && <TelegramTab />}
+
+          {tab === "tts" && <TTSTab />}
         </div>
 
         {/* Footer */}
@@ -332,7 +343,7 @@ function TabButton({
     <button
       onClick={onClick}
       className={cn(
-        "relative flex items-center gap-1.5 px-3.5 py-2.5 text-xs border-b-2 -mb-px rounded-t-md transition-all",
+        "relative flex shrink-0 items-center gap-1.5 px-3 py-2.5 text-xs whitespace-nowrap border-b-2 -mb-px rounded-t-md transition-all",
         active
           ? "border-primary text-primary font-semibold bg-primary/10"
           : "border-transparent text-muted-foreground font-medium hover:text-foreground hover:bg-muted/60"

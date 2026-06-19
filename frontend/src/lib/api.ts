@@ -171,6 +171,35 @@ class ApiClient {
     URL.revokeObjectURL(url);
   }
 
+  /** POST text to the TTS endpoint and return the audio as a Blob for playback. */
+  async synthesizeSpeech(body: {
+    text: string;
+    voice?: string;
+    speed?: number;
+    pitch?: number;
+  }): Promise<Blob> {
+    const url = `${BASE_URL}/tts/synthesize`;
+    const options: RequestInit = {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+      body: JSON.stringify(body),
+    };
+
+    let response = await fetch(url, options);
+    if (response.status === 401) {
+      const retried = await handleUnauthorized(url, options);
+      if (retried) response = retried;
+    }
+    if (!response.ok) {
+      throw new Error(
+        response.status === 503
+          ? "Dịch vụ đọc văn bản hiện không khả dụng."
+          : `TTS Error: ${response.status}`,
+      );
+    }
+    return response.blob();
+  }
+
   async uploadFile<T>(
     path: string,
     file: File,

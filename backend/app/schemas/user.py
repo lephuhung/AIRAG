@@ -13,6 +13,7 @@ class UserResponse(BaseModel):
     is_active: bool
     is_superadmin: bool
     avatar_url: str | None = None
+    settings: dict = {}
     created_at: datetime
     updated_at: datetime
 

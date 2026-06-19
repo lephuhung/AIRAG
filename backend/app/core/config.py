@@ -58,6 +58,16 @@ class Settings(BaseSettings):
     OPENAI_COMPATIBLE_MODEL: str = Field(default="default")
     OPENAI_COMPATIBLE_API_KEY: str = Field(default="sk-nexusrag")
 
+    # TTS (Text-to-Speech) — engine-agnostic provider layer (app/services/tts/)
+    TTS_ENABLED: bool = Field(default=True)
+    TTS_PROVIDER: str = Field(default="omnivoice")  # omnivoice | <future>
+    TTS_OMNIVOICE_BASE_URL: str = Field(default="http://omnivoice:8880/v1")
+    TTS_OMNIVOICE_MODEL: str = Field(default="omnivoice")
+    TTS_OMNIVOICE_API_KEY: str = Field(default="")  # empty = no auth on the TTS server
+    TTS_DEFAULT_VOICE: str = Field(default="")  # empty → server default design prompt
+    TTS_DEFAULT_SPEED: float = Field(default=1.0)
+    TTS_MAX_CHARS: int = Field(default=4000)  # truncate over-long inputs
+
     # KG Embedding
     KG_EMBEDDING_PROVIDER: str = Field(default="local")
     KG_EMBEDDING_MODEL: str = Field(default="BAAI/bge-m3")
@@ -318,9 +328,19 @@ class Settings(BaseSettings):
     TELEGRAM_WEBHOOK_SECRET: str = Field(default="")
     # TTL (minutes) for the one-time code that links a Telegram chat to an account.
     TELEGRAM_LINK_CODE_TTL_MINUTES: int = Field(default=10)
+    # Idle window (minutes) after which a Telegram chat's active session is
+    # auto-expired and the next message starts a FRESH conversation — Telegram has
+    # no multi-session UI, so without this old turns leak into new answers. The
+    # user can still cut a session explicitly with /new. Set 0 to disable.
+    TELEGRAM_SESSION_IDLE_MINUTES: int = Field(default=30)
     # Bot username (without @), e.g. "MyAiragBot" — used to build the t.me deep
     # link returned to the web UI. Optional (UI can fall back to showing the code).
     TELEGRAM_BOT_USERNAME: str = Field(default="")
+    # Public origin the app is reachable at from the internet (the Cloudflare
+    # tunnel domain), e.g. "https://bot.zbots.store". Used to build the Telegram
+    # webhook URL instead of the internal `http://backend:8080`. Empty → fall back
+    # to the request's own base URL. No trailing slash.
+    PUBLIC_BASE_URL: str = Field(default="")
 
     model_config = {
         "env_file": str(ENV_FILE),

@@ -1,4 +1,15 @@
 // ── Auth Types ──
+export interface TTSPrefs {
+  voice?: string;
+  speed?: number;
+  pitch?: number;
+}
+
+export interface UserSettings {
+  tts?: TTSPrefs;
+  [key: string]: unknown;
+}
+
 export interface User {
   id: string;
   email: string;
@@ -6,8 +17,23 @@ export interface User {
   is_active: boolean;
   is_superadmin: boolean;
   avatar_url?: string | null;
+  settings?: UserSettings;
   created_at: string;
   updated_at: string;
+}
+
+// ── TTS ──
+export interface TTSVoice {
+  id: string;
+  label: string;
+  gender?: string;
+  language?: string;
+}
+
+export interface TTSVoicesResponse {
+  enabled: boolean;
+  provider: string;
+  voices: TTSVoice[];
 }
 
 export interface AuthTokens {
@@ -385,6 +411,8 @@ export interface ProjectAnalytics {
 export interface ChatSession {
   id: string;
   title: string;
+  /** Origin channel: "web" (default) or "telegram". */
+  source?: string;
   created_at: string;
   updated_at: string;
 }

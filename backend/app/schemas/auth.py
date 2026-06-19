@@ -38,6 +38,8 @@ class UpdateProfileRequest(BaseModel):
     # Password change: requires current_password for verification
     current_password: str | None = Field(default=None, min_length=1, max_length=128)
     new_password: str | None = Field(default=None, min_length=6, max_length=128)
+    # Free-form preferences, shallow-merged into users.settings (e.g. {"tts": {...}})
+    settings: dict | None = Field(default=None)
 
 
 # Forward ref

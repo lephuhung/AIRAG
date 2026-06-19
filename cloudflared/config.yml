@@ -1,0 +1,8 @@
+tunnel: zbots-tunnel
+credentials-file: /etc/cloudflared/95713781-76f3-40ca-b96f-25433b340d7d.json
+
+ingress:
+  # cloudflared chạy trong hrag_network nên gọi backend trực tiếp bằng tên container
+  - hostname: bot.zbots.store
+    service: http://hrag-backend:8080
+  - service: http_status:404

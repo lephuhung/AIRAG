@@ -22,6 +22,10 @@ class ChatSession(Base):
     )
     title: Mapped[str] = mapped_column(String(255), nullable=False, default="New Chat")
 
+    # Channel the session originated from: "web" (default) or "telegram". Lets the
+    # UI badge conversations created through the Telegram bot vs. the web app.
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="web")
+
     # User who owns this chat session
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),

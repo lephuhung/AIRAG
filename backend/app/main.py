@@ -57,6 +57,12 @@ async def lifespan(app: FastAPI):
                     "ALTER TABLE IF EXISTS telegram_links ADD COLUMN IF NOT EXISTS telegram_user_id VARCHAR(64)"
                 )
             )
+            # Per-user preferences (TTS voice/speed, future settings)
+            await conn.execute(
+                text(
+                    "ALTER TABLE IF EXISTS users ADD COLUMN IF NOT EXISTS settings JSONB NOT NULL DEFAULT '{}'::jsonb"
+                )
+            )
             await conn.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS ix_telegram_links_telegram_user_id ON telegram_links(telegram_user_id)"
@@ -77,6 +83,12 @@ async def lifespan(app: FastAPI):
             await conn.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS ix_chat_sessions_user_id ON chat_sessions(user_id)"
+                )
+            )
+            # Origin channel of the session: 'web' (default) or 'telegram'.
+            await conn.execute(
+                text(
+                    "ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS source VARCHAR(16) NOT NULL DEFAULT 'web'"
                 )
             )
 

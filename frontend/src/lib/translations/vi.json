@@ -237,6 +237,7 @@
     "analyzing_question": "Đang phân tích câu hỏi...",
     "copy_text": "Sao chép văn bản",
     "copy_markdown": "Sao chép Markdown",
+    "read_aloud": "Đọc to",
     "copied": "Đã sao chép!",
     "failed": "Chat thất bại: {{error}}",
     "error_fallback": "Xin lỗi, đã có lỗi xảy ra. Vui lòng thử lại.",
@@ -552,6 +553,13 @@
     "dlq_desc": "Hàng đợi tin nhắn dừng — chứa các tin nhắn thất bại sau tất cả các lần thử lại. Đây không phải là tiến trình có thể khởi chạy.",
     "pipeline_summary": "Tóm tắt luồng xử lý",
     "queue_details": "Chi tiết hàng đợi",
+    "kg_queue_count": "{{count}} hàng đợi",
+    "system_queues": "Hàng đợi hệ thống",
+    "system_queues_desc": "Hàng đợi nội bộ (thử lại, bộ nhớ) — thường không cần thao tác.",
+    "queue_tip_ready": "Số tin nhắn đang chờ worker nhận xử lý",
+    "queue_tip_processing": "Số tin nhắn worker đang xử lý (chưa xác nhận hoàn tất)",
+    "queue_tip_consumers": "Số worker đang lắng nghe hàng đợi này",
+    "dlx_tip": "Có hàng đợi tin nhắn dừng — tin lỗi được tự động chuyển tiếp",
     "purge_queue": "Xóa sạch hàng đợi",
     "delete_queue": "Xóa hàng đợi",
     "dead_letter_queue": "Hàng đợi tin nhắn dừng (DLQ)",
@@ -955,5 +963,24 @@
     "view_chunk": "Xem đoạn trích",
     "error_loading": "Lỗi khi tải tài liệu",
     "no_content": "Không có nội dung"
+  },
+  "profile": {
+    "title": "Chỉnh sửa hồ sơ",
+    "tabs": {
+      "profile": "Hồ sơ",
+      "security": "Bảo mật",
+      "api_keys": "API Keys",
+      "telegram": "Telegram",
+      "tts": "Giọng đọc"
+    }
+  },
+  "telegram_links": {
+    "tab": "Telegram",
+    "empty": "Chưa có tài khoản nào liên kết",
+    "col_user": "Người dùng",
+    "col_telegram": "Telegram",
+    "col_chat": "Chat ID",
+    "col_linked": "Liên kết lúc",
+    "total": "tài khoản liên kết"
   }
 }

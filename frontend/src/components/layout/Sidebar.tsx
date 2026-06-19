@@ -13,6 +13,7 @@ import {
   Users,
   FileText,
   MessageSquare,
+  Send,
   Plus,
   Trash2,
   Edit,
@@ -30,7 +31,7 @@ import { ThemeToggle } from "@/components/ui/theme-toggle";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
-import logo from "@/assets/logo.png";
+import { BrandLogo } from "@/components/layout/BrandLogo";
 
 interface SidebarProps {
   collapsed: boolean;
@@ -102,7 +103,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle, isNarrow }: 
       {/* Logo / Header */}
       <div className="flex items-center justify-between px-3 h-12 border-b border-border flex-shrink-0">
         <div className="flex items-center gap-2.5 overflow-hidden">
-          <img src={logo} alt="Logo" className="w-8 h-8 object-contain flex-shrink-0" />
+          <BrandLogo size={32} className="flex-shrink-0" />
           {!collapsed && (
             <span className="font-bold text-primary text-base truncate whitespace-nowrap">
               {t("app.name")}
@@ -453,10 +454,14 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle, isNarrow }: 
                         ? "bg-primary/10 text-primary font-medium"
                         : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
                     )}
-                    title={session.title}
+                    title={session.source === "telegram" ? `${session.title} · Telegram` : session.title}
                   >
                     <div className="flex items-center gap-2 overflow-hidden flex-1">
-                      <MessageSquare className={cn("w-3.5 h-3.5 flex-shrink-0", isActive ? "text-primary" : "text-muted-foreground")} />
+                      {session.source === "telegram" ? (
+                        <Send className="w-3.5 h-3.5 flex-shrink-0 text-sky-500" />
+                      ) : (
+                        <MessageSquare className={cn("w-3.5 h-3.5 flex-shrink-0", isActive ? "text-primary" : "text-muted-foreground")} />
+                      )}
                       <span className="truncate text-left font-medium">{session.title}</span>
                     </div>
                     <div
@@ -487,9 +492,13 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle, isNarrow }: 
                       ? "bg-primary/10 text-primary"
                       : "text-muted-foreground hover:bg-muted/50"
                   )}
-                  title={session.title}
+                  title={session.source === "telegram" ? `${session.title} · Telegram` : session.title}
                 >
-                  <MessageSquare className="w-3.5 h-3.5" />
+                  {session.source === "telegram" ? (
+                    <Send className="w-3.5 h-3.5 text-sky-500" />
+                  ) : (
+                    <MessageSquare className="w-3.5 h-3.5" />
+                  )}
                 </button>
               );
             })}

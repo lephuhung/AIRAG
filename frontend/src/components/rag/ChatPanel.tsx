@@ -39,6 +39,7 @@ import {
   CornerDownLeft,
   LayoutGrid,
   Layers,
+  Volume2,
 } from "lucide-react";
 import { PrismLight as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
@@ -63,6 +64,8 @@ import { api, rewritePresignedUrl } from "@/lib/api";
 import { useWorkspaceStore } from "@/stores/workspaceStore";
 import { useAuthStore } from "@/stores/authStore";
 import { useThemeStore } from "@/stores/useThemeStore";
+import { useTTSStore } from "@/hooks/useTTS";
+import { BrandLogo } from "@/components/layout/BrandLogo";
 
 const truncateName = (name: string, maxLength = 25) => {
   if (name.length <= maxLength) return name;
@@ -1299,6 +1302,10 @@ function AssistantMessageFooter({
   const { t } = useTranslation();
   const [copiedMode, setCopiedMode] = useState<"text" | "markdown" | null>(null);
   const [showSourcesPopover, setShowSourcesPopover] = useState(false);
+  const ttsActiveId = useTTSStore((s) => s.activeId);
+  const ttsStatus = useTTSStore((s) => s.status);
+  const ttsPlay = useTTSStore((s) => s.play);
+  const ttsActive = ttsActiveId === message.id;
   const [ratings, setRatings] = useState<Record<string, RelevanceRating>>({});
   const popoverRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
@@ -1442,6 +1449,25 @@ function AssistantMessageFooter({
               <ClipboardCheck className="w-3.5 h-3.5" />
             ) : (
               <FileCode className="w-3.5 h-3.5" />
+            )}
+          </button>
+          <button
+            onClick={() => ttsPlay(message.id, markdownToPlainText(message.content))}
+            className={cn(
+              "p-1 rounded-md transition-all",
+              ttsActive
+                ? "text-emerald-500 bg-emerald-500/5"
+                : "text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted/60",
+            )}
+            aria-label={t("chat.read_aloud")}
+            title={t("chat.read_aloud")}
+          >
+            {ttsActive && ttsStatus === "loading" ? (
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            ) : ttsActive && ttsStatus === "playing" ? (
+              <Square className="w-3.5 h-3.5" />
+            ) : (
+              <Volume2 className="w-3.5 h-3.5" />
             )}
           </button>
           <button className="p-1 rounded-md text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted/60 transition-all">
@@ -3725,6 +3751,14 @@ export const ChatPanel = memo(function ChatPanel({
                 <div className="w-full max-w-[720px] flex flex-col items-center translate-y-[-4vh]">
                   {/* Greeting */}
                   <div className="mb-12 text-center animate-in fade-in zoom-in-95 duration-1000 ease-out">
+                    {/* Brand logo — swap via src/lib/brand.ts */}
+                    <div className="mb-7 flex justify-center">
+                      <BrandLogo
+                        size={72}
+                        glow
+                        className="drop-shadow-[0_8px_24px_rgba(0,0,0,0.12)]"
+                      />
+                    </div>
                     <div className="inline-flex items-center gap-2 mb-6 px-4 py-1.5 rounded-full bg-primary/10 border border-primary/20 text-primary shadow-[0_0_15px_rgba(var(--color-primary),0.1)]">
                       <Sparkles className="w-4 h-4" />
                       <span className="text-[12px] font-bold uppercase tracking-[0.1em]">{t("chat.ai_assistant")}</span>

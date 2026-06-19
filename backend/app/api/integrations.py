@@ -33,6 +33,17 @@ router = APIRouter(prefix="/integrations", tags=["integrations"])
 TELEGRAM_WEBHOOK_PATH = "/api/v1/integrations/telegram/webhook"
 
 
+def _public_webhook_url(request: Request) -> str:
+    """Build the public Telegram webhook URL.
+
+    Prefers the configured public origin (`PUBLIC_BASE_URL`, i.e. the Cloudflare
+    tunnel domain) so the UI suggests a reachable HTTPS URL instead of the
+    internal `http://backend:8080`. Falls back to the request's own base URL.
+    """
+    base = (settings.PUBLIC_BASE_URL or str(request.base_url)).rstrip("/")
+    return base + TELEGRAM_WEBHOOK_PATH
+
+
 # ──────────────────────────────── Telegram ─────────────────────────────────────
 
 @router.post("/telegram/webhook")
@@ -115,6 +126,46 @@ async def list_telegram_links(
     return list(rows)
 
 
+class TelegramLinkAdminInfo(BaseModel):
+    """A linked Telegram account plus the owning user — for the admin logs view."""
+
+    telegram_chat_id: str
+    telegram_user_id: str | None = None
+    telegram_username: str | None = None
+    user_id: uuid.UUID
+    user_email: str | None = None
+    user_name: str | None = None
+    created_at: datetime
+
+
+@router.get("/telegram/links/all", response_model=list[TelegramLinkAdminInfo])
+async def list_all_telegram_links(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_superadmin),
+):
+    """List ALL Telegram links across every user (superadmin). Powers the
+    Telegram directory tab on the system-logs page."""
+    rows = (
+        await db.execute(
+            select(TelegramLink, User.email, User.full_name)
+            .join(User, User.id == TelegramLink.user_id)
+            .order_by(TelegramLink.created_at.desc())
+        )
+    ).all()
+    return [
+        TelegramLinkAdminInfo(
+            telegram_chat_id=link.telegram_chat_id,
+            telegram_user_id=link.telegram_user_id,
+            telegram_username=link.telegram_username,
+            user_id=link.user_id,
+            user_email=email,
+            user_name=name,
+            created_at=link.created_at,
+        )
+        for link, email, name in rows
+    ]
+
+
 @router.delete("/telegram/links/{chat_id}", status_code=status.HTTP_200_OK)
 async def unlink_telegram(
     chat_id: str,
@@ -162,7 +213,7 @@ class TelegramConfigUpdate(BaseModel):
 
 
 def _config_info(cfg: TelegramBotConfig | None, request: Request) -> TelegramConfigInfo:
-    suggested = str(request.base_url).rstrip("/") + TELEGRAM_WEBHOOK_PATH
+    suggested = _public_webhook_url(request)
     if cfg is None:
         return TelegramConfigInfo(suggested_webhook_url=suggested)
     token = cfg.bot_token or ""
@@ -261,7 +312,7 @@ async def register_telegram_webhook(
     if not cfg.bot_token:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Chưa cấu hình bot token.")
 
-    url = cfg.webhook_url or (str(request.base_url).rstrip("/") + TELEGRAM_WEBHOOK_PATH)
+    url = cfg.webhook_url or _public_webhook_url(request)
     if not cfg.webhook_secret:
         cfg.webhook_secret = secrets.token_urlsafe(24)
     cfg.webhook_url = url

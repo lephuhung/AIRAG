@@ -237,6 +237,7 @@
     "analyzing_question": "Analyzing question...",
     "copy_text": "Copy text",
     "copy_markdown": "Copy markdown",
+    "read_aloud": "Read aloud",
     "copied": "Copied!",
     "failed": "Chat failed: {{error}}",
     "error_fallback": "Sorry, an error occurred. Please try again.",
@@ -534,6 +535,13 @@
     "dlq_desc": "Dead-letter queue — contains messages that failed after all retries. This is not a startable process.",
     "pipeline_summary": "Pipeline Summary",
     "queue_details": "Queue Details",
+    "kg_queue_count": "{{count}} queues",
+    "system_queues": "System Queues",
+    "system_queues_desc": "Internal queues (retry, memory) — usually no action needed.",
+    "queue_tip_ready": "Messages waiting to be picked up by a worker",
+    "queue_tip_processing": "Messages currently being processed (not yet acknowledged)",
+    "queue_tip_consumers": "Number of workers consuming this queue",
+    "dlx_tip": "Has dead-letter routing — failed messages are auto-forwarded",
     "purge_queue": "Purge Queue",
     "delete_queue": "Delete Queue",
     "dead_letter_queue": "Dead Letter Queue (DLQ)",
@@ -964,5 +972,24 @@
     "view_chunk": "Chunk view",
     "error_loading": "Error loading document",
     "no_content": "No content available"
+  },
+  "profile": {
+    "title": "Edit Profile",
+    "tabs": {
+      "profile": "Profile",
+      "security": "Security",
+      "api_keys": "API Keys",
+      "telegram": "Telegram",
+      "tts": "Voice"
+    }
+  },
+  "telegram_links": {
+    "tab": "Telegram",
+    "empty": "No accounts linked yet",
+    "col_user": "User",
+    "col_telegram": "Telegram",
+    "col_chat": "Chat ID",
+    "col_linked": "Linked at",
+    "total": "linked accounts"
   }
 }
