@@ -173,6 +173,20 @@ def normalize_entity_id(name: str, entity_type: str) -> str:
     return name
 
 
+def _is_legal_doc_name(name: str) -> bool:
+    """
+    True when a raw entity name denotes a legal document — either it carries a số
+    hiệu (e.g. ``117/2025/QH15``) or it opens with a law-type prefix (``Luật``,
+    ``Nghị định``, …). Such entities MUST be typed ``Document`` regardless of how
+    the LLM / resolution pass classified them, otherwise the document fragments
+    into a parallel ``Organization`` node (the static ``_store_extraction`` path
+    already forces this; the resolution path historically did not).
+    """
+    if not name:
+        return False
+    return bool(_DOC_NUM_PATTERN.search(name) or _LEGAL_DOC_PREFIXES.search(name))
+
+
 # ---------------------------------------------------------------------------
 # Extraction windowing — avoid silently dropping the tail of long articles
 # ---------------------------------------------------------------------------
@@ -750,6 +764,14 @@ class LegalKGService:
         # display_name (front-end) prefers document_title.
         # The stable update/delete anchor is the document_id property (set below).
         root_so_hieu = (doc_num or doc_meta.get("so_hieu", "")).strip()
+        # When the metadata pass failed to surface a số hiệu, recover it from the
+        # structured doc_name (which embeds it, e.g. "Nghị định 53/2022/NĐ-CP (…)").
+        # Without this, re-ingests where số hiệu extraction differs produce two root
+        # nodes for the SAME document (số-hiệu key vs doc_name key) that never merge.
+        if not root_so_hieu:
+            _m = _DOC_NUM_PATTERN.search(doc_name)
+            if _m:
+                root_so_hieu = _m.group(0)
         root_key = root_so_hieu or doc_name
         root_display = doc_title or doc_name
 
@@ -926,7 +948,12 @@ class LegalKGService:
                 canonical = ent.get("canonical_name", "")
                 if not canonical:
                     continue
-                entity_type_map[canonical] = ent.get("type", "Organization")
+                etype = ent.get("type", "Organization")
+                # Hard-force Document for legal-doc names the LLM mis-typed as
+                # Organization/Person (e.g. "Luật 117/2025/QH15", "Nghị định …").
+                if etype != "Document" and _is_legal_doc_name(canonical):
+                    etype = "Document"
+                entity_type_map[canonical] = etype
 
             # Build canonical_lookup: any name → canonical (from merged_map + merged_from)
             canonical_lookup: dict[str, str] = {}
@@ -947,13 +974,16 @@ class LegalKGService:
                 if normalized != canonical:
                     canonical_lookup[normalized] = canonical
 
-            # Upsert resolved entities (only canonical ones, not duplicates)
+            # Upsert resolved entities (only canonical ones, not duplicates).
+            # Use the (legal-doc-corrected) type from entity_type_map, not the raw
+            # LLM type, so a mis-typed law/decree lands on a single Document node.
             for ent in resolved_entities:
                 canonical = ent.get("canonical_name", "")
                 if not canonical:
                     continue
                 await self._upsert_node(
-                    session, canonical, ent.get("type", "Organization"),
+                    session, canonical,
+                    entity_type_map.get(canonical, ent.get("type", "Organization")),
                     ent.get("representative_description", ""), doc_id_str,
                 )
 
@@ -1760,7 +1790,19 @@ class LegalKGService:
                 # Check merged_map first (LLM-detected aliases)
                 source_key = merged_map.get(source_raw, source_raw)
                 src_canonical_key = canonical_lookup.get(source_key, source_key)
-                src_type = entity_type_map.get(src_canonical_key, "Organization")
+                # Fallback type for endpoints the resolution pass never saw:
+                # legal-document references (số hiệu / "Luật|Nghị định|…" prefix /
+                # the doc root) MUST default to Document, otherwise they spawn a
+                # parallel :Organization node with the SAME entity_id (the two
+                # share normalize_org_name) and never merge with the :Document one.
+                src_is_legal = (
+                    source_raw == root_ref
+                    or _DOC_NUM_PATTERN.search(source_raw)
+                    or _LEGAL_DOC_PREFIXES.search(source_raw)
+                )
+                src_type = entity_type_map.get(
+                    src_canonical_key, "Document" if src_is_legal else "Organization"
+                )
                 source_canonical = src_canonical_key
 
             # --- Resolve target ---
@@ -1771,7 +1813,14 @@ class LegalKGService:
                 # Check merged_map first (LLM-detected aliases)
                 target_key = merged_map.get(target_raw, target_raw)
                 tgt_canonical_key = canonical_lookup.get(target_key, target_key)
-                tgt_type = entity_type_map.get(tgt_canonical_key, "Organization")
+                tgt_is_legal = (
+                    target_raw == root_ref
+                    or _DOC_NUM_PATTERN.search(target_raw)
+                    or _LEGAL_DOC_PREFIXES.search(target_raw)
+                )
+                tgt_type = entity_type_map.get(
+                    tgt_canonical_key, "Document" if tgt_is_legal else "Organization"
+                )
                 target_canonical = tgt_canonical_key
 
             # Person composite key for target
