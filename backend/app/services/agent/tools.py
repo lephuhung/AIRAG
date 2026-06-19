@@ -978,139 +978,53 @@ from app.models.document import Document, DocumentStatus
 from app.models.document_type import DocumentType
 
 
-# Vietnamese document type keywords → slug mapping
-_DOC_TYPE_KEYWORDS: dict[str, str] = {
-    "luật": "luat",
-    "nghị định": "nghi_dinh",
-    "thông tư": "thong_tu",
-    "quyết định": "quyet_dinh",
-    "nghị quyết": "nghi_quyet",
-    "pháp lệnh": "phap_lenh",
-    "công văn": "cong_van",
-    "chỉ thị": "chi_thi",
-    "báo cáo": "bao_cao",
-    "tờ trình": "to_trinh",
-    "biên bản": "bien_ban",
-    "hợp đồng": "hop_dong",
-    "kế hoạch": "ke_hoach",
-    "hướng dẫn": "huong_dan",
-    "đơn": "don_tu",
-    "thông báo": "thong_bao",
-}
+async def _suggest_low_score_match(reference: str, top_candidates: list[dict]) -> str | None:
+    """Ask the main LLM to phrase a 'did you mean …?' hint for low-score matches.
 
-
-def _parse_document_reference(reference: str) -> dict:
+    Mirrors the legacy low-score suggestion behaviour of resolve_document_reference,
+    now that extraction/query/scoring live in the shared resolver core.
     """
-    Parse a document reference string into structured components.
-    E.g. "Luật An ninh mạng 2025" → {doc_type_slug: "luat", year: "2025", title_keywords: ["An", "ninh", "mạng"]}
-    E.g. "Tóm tắt điều 27 Luật An ninh mạng 2018" → {doc_type_slug: "luat", year: "2018", title_keywords: ["An", "ninh", "mạng"]}
-    """
-    text = reference.strip()
+    if not top_candidates:
+        return None
+    try:
+        from app.services.llm import get_llm_provider
+        from app.services.llm.types import LLMMessage
 
-    # 0. Remove common action phrases at the start (NOT part of document name)
-    import re
-    action_patterns = [
-        r'^tóm\s*tắt\s*(điều\s*)?\d*\s*',   # "tóm tắt điều 27"
-        r'^tra\s*cứu\s+',                      # "tra cứu"
-        r'^tìm\s+',                           # "tìm"
-        r'^xem\s+',                           # "xem"
-        r'^liệt\s*kê\s*',                    # "liệt kê"
-        r'^tổng\s*hợp\s*',                   # "tổng hợp"
-        r'^nội\s*dung\s+',                    # "nội dung"
-    ]
-    for pattern in action_patterns:
-        text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
+        candidates_desc = "\n".join([
+            f"- {i+1}. **{c.get('document_title') or c.get('filename')}** "
+            f"(Số: {c.get('document_number') or 'N/A'}, Ngày: {c.get('published_date') or 'N/A'})"
+            for i, c in enumerate(top_candidates)
+        ])
+        suggestion_prompt = f"""Bạn là trợ lý tìm kiếm văn bản pháp luật Việt Nam.
 
-    # 1. Detect document type
-    doc_type_slug = None
-    remaining = text
-    for keyword, slug in _DOC_TYPE_KEYWORDS.items():
-        if keyword.lower() in text.lower():
-            doc_type_slug = slug
-            pattern = re.compile(re.escape(keyword), re.IGNORECASE)
-            remaining = pattern.sub("", remaining, count=1).strip()
-            break
+Người dùng hỏi: "{reference}"
 
-    # 2. Extract year (4-digit number in range 1900-2099)
-    year = None
-    year_match = re.search(r'\b(19|20)\d{2}\b', remaining)
-    if year_match:
-        year = year_match.group()
-        remaining = remaining.replace(year, "", 1).strip()
+Các văn bản gần đúng tìm thấy (điểm thấp):
+{candidates_desc}
 
-    # 3. Remove ordinal patterns like "điều 27", standalone numbers
-    remaining = re.sub(r'\bđiều\s*\d+\b', "", remaining, flags=re.IGNORECASE)
-    remaining = re.sub(r'\b\d+\b', "", remaining)
-    remaining = re.sub(r'\s+', " ", remaining).strip()
-
-    # 4. Extract title keywords (non-empty words/phrases, skip short ones)
-    title_keywords = [kw.strip() for kw in remaining.split() if kw.strip() and len(kw.strip()) > 1]
-
-    return {
-        "doc_type_slug": doc_type_slug,
-        "year": year,
-        "title_keywords": title_keywords,
-        "original": reference,
-    }
-
-
-def _score_document(doc: Document, parsed: dict) -> tuple[int, str]:
-    """
-    Score how well a document matches the parsed reference.
-    Returns (score, match_details).
-    """
-    score = 0
-    details = []
-
-    # Match: document type
-    if parsed["doc_type_slug"] and doc.document_type:
-        if doc.document_type.slug == parsed["doc_type_slug"]:
-            score += 40
-            details.append("type: ✓")
-        elif doc.document_type.slug == parsed["doc_type_slug"]:
-            score += 20
-            details.append("type: ~")
-
-    # Match: title keywords (all must appear in document_title)
-    if parsed["title_keywords"] and doc.document_title:
-        title_lower = doc.document_title.lower()
-        matched_kws = 0
-        for kw in parsed["title_keywords"]:
-            if kw.lower() in title_lower:
-                matched_kws += 1
-        if matched_kws > 0:
-            kw_ratio = matched_kws / len(parsed["title_keywords"])
-            score += int(30 * kw_ratio)
-            details.append(f"title: {matched_kws}/{len(parsed['title_keywords'])}")
-
-    # Match: year in published_date (compare 4-digit year only)
-    if parsed["year"] and doc.published_date:
-        import re
-        date_years = re.findall(r'(?:19|20)\d{2}', doc.published_date)
-        if parsed["year"] in date_years:
-            score += 20
-            details.append("year: ✓")
-
-    # Bonus: document_number contains any keyword
-    if parsed["title_keywords"] and doc.document_number:
-        doc_num_lower = doc.document_number.lower()
-        if any(kw.lower() in doc_num_lower for kw in parsed["title_keywords"]):
-            score += 10
-            details.append("doc_num: ✓")
-
-    # Build year_match display for logger
-    import re
-    date_years = re.findall(r'(?:19|20)\d{2}', doc.published_date) if doc.published_date else []
-    year_match_log = parsed["year"] in date_years if parsed["year"] else False
-
-    logger.info(f"[_score_document] doc_type={doc.document_type.slug if doc.document_type else None}, parsed_type={parsed['doc_type_slug']}, title_match={matched_kws if parsed['title_keywords'] and doc.document_title else 'N/A'}, year_match={year_match_log} (doc_date_years={date_years}, query_year={parsed['year']}) -> final_score={score}")
-    return score, ", ".join(details) if details else "no match"
+Nhiệm vụ: Viết 1-2 câu gợi ý ngắn bằng tiếng Việt, hỏi người dùng có phải đang tìm một trong các văn bản trên không.
+Nếu các văn bản không liên quan, gợi ý người dùng cung cấp thêm thông tin.
+Chỉ trả lời bằng tiếng Việt, ngắn gọn (dưới 100 từ).
+"""
+        llm = get_llm_provider()
+        resp = await llm.acomplete(
+            messages=[LLMMessage(role="user", content=suggestion_prompt)],
+            temperature=0.3,
+            max_tokens=256,
+        )
+        suggestion = resp if isinstance(resp, str) else getattr(resp, "content", str(resp))
+        logger.info(f"[resolve_document_reference] LLM suggestion for low-score: {suggestion[:100]}")
+        return suggestion
+    except Exception as e:
+        logger.warning(f"[resolve_document_reference] LLM suggestion failed: {e}")
+        return None
 
 
 async def resolve_document_reference(
     reference: str,
     workspace_ids: list[int],
     db: "AsyncSession",
+    topic: str | None = None,
 ) -> dict:
     """
     Resolve a document reference (e.g., "Luật An ninh mạng 2025") to candidate documents.
@@ -1118,336 +1032,107 @@ async def resolve_document_reference(
     Uses LLM to extract: document_number, document_title, document_type_slug, year.
     Then queries database with these structured fields.
 
+    Args:
+        topic: the FULL user question (e.g. "Nghị định 85 có bao nhiêu cấp độ hệ
+               thống thông tin"). Its subject content drives the vector fallback
+               and disambiguates same-number documents. When omitted, falls back
+               to `reference`.
+
     Returns:
         dict with keys:
             - candidates: list of matched documents with scores
             - total: count of candidates
             - ambiguous: true if multiple candidates found
             - message: human-readable summary
-            - llm_parsed: the LLM extraction result (for debugging)
+            - section_reference: Điều/Chương/Khoản reference if present
+            - suggestion: LLM 'did you mean' hint for low-score matches
     """
-    logger.info(f"[resolve_document_reference] called with reference={reference!r}, workspace_ids={workspace_ids}")
+    logger.info(f"[resolve_document_reference] called with reference={reference!r}, topic={topic!r}, workspace_ids={workspace_ids}")
     try:
-        # ── Step 1: LLM extraction ──────────────────────────────────────────────
-        from app.services.llm import get_llm_provider
-        from app.services.llm.types import LLMMessage
+        # Delegate extraction/query/scoring to the shared resolver core so the
+        # ReAct path and the LangGraph supervisor's resolve_doc_agent stay in sync.
+        from app.services.agent.doc_resolver import resolve_candidates
 
-        llm = get_llm_provider()
-        extraction_prompt = (f"""
-Bạn là hệ thống chuẩn hóa truy vấn văn bản pháp luật Việt Nam để tìm kiếm database.
+        res = await resolve_candidates(reference, workspace_ids, db, topic=topic, use_llm_fallback=True)
+        ranked = res["candidates"]
+        section_reference = res.get("section_reference")
 
-Nhiệm vụ:
-Đọc câu hỏi người dùng và trích xuất metadata phục vụ search.
+        # Map core candidates (score 0..1) → legacy candidate dicts (score 0..100)
+        candidates: list[dict] = []
+        for c in ranked[:5]:
+            candidates.append({
+                "document_id": c["document_id"],
+                "filename": c.get("title"),
+                "document_title": c.get("title"),
+                "document_number": c.get("document_number", ""),
+                "published_date": c.get("published_date", ""),
+                "score": int(round(c.get("score", 0.0) * 100)),
+                "strategies": c.get("strategies", []),
+                "workspace_id": None,
+            })
 
-NGUYÊN TẮC QUAN TRỌNG:
-
-1. Người dùng hỏi "Luật" thường nhớ tên:
-- Luật An ninh mạng
-- Luật BHXH 2025
-
-=> ưu tiên document_title
-
-2. Người dùng hỏi "Nghị định", "Thông tư", "Quyết định" thường nhớ số:
-- Nghị định 361
-- Nghị định 53/2022/NĐ-CP
-- Thông tư 23
-
-=> ưu tiên document_number
-
-3. Nếu có cả số + tên thì lấy cả hai.
-
-4. Nếu có Điều/Khoản/Chương thì đưa vào section_reference.
-
-5. Nếu hỏi văn bản hướng dẫn / về một luật khác:
-- nghị định về Luật An ninh mạng
-- thông tư hướng dẫn BHYT
-
-=> related_to = tên luật/chủ đề
-
-Loại văn bản map slug:
-Luật -> luat
-Bộ luật -> bo_luat
-Nghị định -> nghi_dinh
-Thông tư -> thong_tu
-Quyết định -> quyet_dinh
-Nghị quyết -> nghi_quyet
-Chỉ thị -> chi_thi
-
-Trả JSON:
-
-{{
-  "document_type": "",
-  "document_type_slug": "",
-  "document_number": "",
-  "document_title": "",
-  "year": "",
-  "section_reference": "",
-  "related_to": "",
-  "search_priority": []
-}}
-
-search_priority rules:
-- Luật => ["title","year"]
-- Nghị định/Thông tư => ["number","year","title"]
-- Nếu chỉ hỏi chủ đề => ["related_to"]
-
-Câu hỏi: "{reference}"
-
-JSON:
-""")
-        try:
-            llm_response = await llm.acomplete(
-                messages=[LLMMessage(role="user", content=extraction_prompt)],
-                temperature=0.1,
-                max_tokens=256,
-            )
-            llm_text = llm_response if isinstance(llm_response, str) else getattr(llm_response, "content", str(llm_response))
-            logger.info(f"[tool:resolve_document_reference] LLM extraction: {llm_text!r}")
-
-            # Parse JSON from LLM response
-            import json, re
-            # Try to extract JSON from response (handle potential code blocks)
-            json_match = re.search(r'\{[^{}]*\}', llm_text, re.DOTALL)
-            if json_match:
-                llm_parsed = json.loads(json_match.group())
+        # ── No match → similar-doc hint or generic not-found ─────────────────
+        if not candidates:
+            similar = res.get("similar", [])
+            if similar:
+                lines = [f"Không tìm thấy văn bản chính xác cho '{reference}'. Có thể bạn đang tìm:"]
+                for i, d in enumerate(similar[:5], 1):
+                    title = d.get("title", "")
+                    num = d.get("document_number", "")
+                    lines.append(f"{i}. **{title}**" + (f" (Số: {num})" if num else ""))
+                message = "\n".join(lines)
             else:
-                llm_parsed = json.loads(llm_text.strip())
-
-            doc_number = llm_parsed.get("document_number") or None
-            doc_title = llm_parsed.get("document_title") or None
-            doc_type_slug = llm_parsed.get("document_type_slug") or None
-            year = llm_parsed.get("year") or None
-            section_reference = llm_parsed.get("section_reference") or None
-            ref_doc_title = llm_parsed.get("referenced_document_title") or None
-            logger.info(f"[tool:resolve_document_reference] LLM extracted: doc_number={doc_number!r}, doc_title={doc_title!r}, doc_type_slug={doc_type_slug!r}, year={year!r}, section_reference={section_reference!r}, ref_doc_title={ref_doc_title!r}")
-
-            # Guard: clear doc_number if it looks like a title (contains common title words)
-            # Vietnamese document numbers like "361/2025/NĐ-CP" or "NĐ-CP" are VALID and must be preserved
-            title_keywords = ["về", "theo", "ban hành", "quy định", "hướng dẫn", "của", "nghị định", "thông tư", "luật", "quyết định"]
-            if doc_number and any(kw in doc_number.lower() for kw in title_keywords):
-                logger.warning(f"[tool:resolve_document_reference] doc_number={doc_number!r} looks like a title - clearing")
-                doc_number = None
-
-        except Exception as e:
-            logger.warning(f"[tool:resolve_document_reference] LLM extraction failed: {e}, falling back to regex parser")
-            parsed = _parse_document_reference(reference)
-            doc_number = None
-            doc_title = None
-            ref_doc_title = None
-            doc_type_slug = parsed["doc_type_slug"]
-            year = parsed["year"]
-            llm_parsed = {"fallback": True, "error": str(e)}
-
-        # ── Step 2: Build query from LLM-extracted fields ───────────────────────
-        query = select(Document).where(
-            Document.workspace_id.in_(workspace_ids),
-            Document.status == DocumentStatus.INDEXED,
-        )
-
-        # Filter by document_type if extracted
-        if doc_type_slug:
-            query = query.join(
-                DocumentType,
-                Document.document_type_id == DocumentType.id,
-            ).where(DocumentType.slug == doc_type_slug)
-
-        # Filter by document_number (exact or partial match)
-        if doc_number:
-            # Normalize: strip leading zeros and common prefixes for flexible matching
-            normalized_num = doc_number.strip()
-            query = query.where(
-                or_(
-                    Document.document_number == normalized_num,
-                    Document.document_number.ilike(f"%{normalized_num}%"),
-                    Document.document_number.ilike(f"%/{normalized_num}%"),
+                message = (
+                    f"Không tìm thấy văn bản nào phù hợp với '{reference}'. "
+                    f"Vui lòng cung cấp thêm thông tin (số văn bản, năm ban hành, "
+                    f"hoặc tên đầy đủ) hoặc yêu cầu liệt kê các văn bản hiện có."
                 )
-            )
-
-        # Filter by document_title keywords (all must match)
-        if doc_title:
-            title_keywords = [kw.strip() for kw in doc_title.split() if kw.strip()]
-            title_conditions = [
-                Document.document_title.ilike(f"%{kw}%")
-                for kw in title_keywords
-            ]
-            if title_conditions:
-                query = query.where(and_(*title_conditions))
-
-        # Filter by referenced_document_title (extra context, e.g. "Nghị định 53 về Luật X" → search X)
-        if ref_doc_title:
-            ref_keywords = [kw.strip() for kw in ref_doc_title.split() if kw.strip()]
-            ref_conditions = [
-                Document.document_title.ilike(f"%{kw}%")
-                for kw in ref_keywords
-            ]
-            if ref_conditions:
-                from sqlalchemy import or_ as or_cond
-                query = query.where(or_cond(*ref_conditions))
-
-        # Filter by year in published_date
-        # Only filter by year if NOT filtering by doc_number (year in "361/2025" is decree ID, not publish year)
-        if year and not doc_number:
-            query = query.where(Document.published_date.ilike(f"%{year}%"))
-
-        # Execute query
-        logger.info(f"[resolve_document_reference] executing query: doc_number={doc_number!r}, doc_title={doc_title!r}, doc_type_slug={doc_type_slug!r}, year={year!r}, ref_doc_title={ref_doc_title!r}")
-        result = await db.execute(query.order_by(Document.created_at.desc()).limit(50))
-        docs = result.scalars().all()
-        logger.info(f"[resolve_document_reference] query returned {len(docs)} documents")
-
-        # Score each document (LLM fields used directly, no regex parsing needed)
-        scored_docs = []
-        for doc in docs:
-            doc_title_val = doc.document_title or ""
-            doc_num_val = doc.document_number or ""
-            doc_date_val = doc.published_date or ""
-            doc_type_val = doc.document_type.slug if doc.document_type else "none"
-            logger.info(f"[resolve_document_reference] scoring doc: id={doc.id}, title={doc_title_val!r}, doc_num={doc_num_val!r}, date={doc_date_val!r}, type={doc_type_val}")
-            score = 0
-            details = []
-
-            # Document type match
-            if doc_type_slug and doc.document_type:
-                if doc.document_type.slug == doc_type_slug:
-                    score += 40
-                    details.append("type: ✓")
-
-            # Document number exact/partial match
-            if doc_number and doc_num_val:
-                if doc_num_val.strip() == doc_number.strip():
-                    score += 40
-                    details.append("doc_num: exact ✓")
-                elif doc_number.strip() in doc_num_val.strip():
-                    score += 25
-                    details.append("doc_num: partial ✓")
-
-            # Document title match (keyword overlap)
-            if doc_title:
-                title_lower = doc_title.lower()
-                title_val_lower = doc_title_val.lower()
-                matched = sum(1 for kw in title_lower.split() if kw in title_val_lower)
-                total = len(title_lower.split())
-                if matched > 0:
-                    score += int(30 * matched / total)
-                    details.append(f"title: {matched}/{total}")
-
-            # Year match in published_date
-            if year and doc_date_val:
-                if year in doc_date_val:
-                    score += 20
-                    details.append("year: ✓")
-
-            # Referenced document title match (extra context bonus)
-            if ref_doc_title:
-                ref_lower = ref_doc_title.lower()
-                title_val_lower = doc_title_val.lower()
-                ref_matched = sum(1 for kw in ref_lower.split() if kw in title_val_lower)
-                ref_total = len(ref_lower.split())
-                if ref_matched > 0:
-                    score += int(20 * ref_matched / ref_total)
-                    details.append(f"ref_title: {ref_matched}/{ref_total}")
-
-            logger.info(f"[resolve_document_reference]   -> score={score}, details={', '.join(details) if details else 'no match'}")
-            if score > 0:
-                doc_type_name = doc.document_type.name if doc.document_type else "Unknown"
-                scored_docs.append({
-                    "document_id": str(doc.id),
-                    "filename": doc.original_filename,
-                    "document_title": doc.document_title,
-                    "document_number": doc.document_number,
-                    "doc_type": doc_type_name,
-                    "published_date": doc.published_date,
-                    "score": score,
-                    "match_details": ", ".join(details) if details else "no match",
-                    "workspace_id": str(doc.workspace_id),
-                })
-
-        # Sort by score descending
-        scored_docs.sort(key=lambda x: x["score"], reverse=True)
-
-        # ── Step 3: Low-score fallback with LLM suggestion ──────────────────────
-        # If top candidates have low scores (< 50), use LLM to generate suggestions
-        low_score_threshold = 50
-        suggestion = None
-        if scored_docs and scored_docs[0]["score"] < low_score_threshold:
-            top_candidates = scored_docs[:3]  # Top 3 for suggestion
-            try:
-                from app.services.llm import get_llm_provider
-                from app.services.llm.types import LLMMessage
-
-                llm = get_llm_provider()
-                candidates_desc = "\n".join([
-                    f"- {i+1}. **{c['document_title'] or c['filename']}** (Số: {c['document_number'] or 'N/A'}, "
-                    f"Loại: {c['doc_type']}, Ngày: {c['published_date'] or 'N/A'})"
-                    for i, c in enumerate(top_candidates)
-                ])
-
-                suggestion_prompt = f"""Bạn là trợ lý tìm kiếm văn bản pháp luật Việt Nam.
-
-Người dùng hỏi: "{reference}"
-LLM đã trích xuất: Số văn bản="{doc_number or 'N/A'}", Loại="{doc_type_slug or 'N/A'}", Năm="{year or 'N/A'}"
-
-Các văn bản gần đúng tìm thấy (điểm thấp):
-{candidates_desc}
-
-Nhiệm vụ: Viết 1-2 câu gợi ý ngắn bằng tiếng Việt, hỏi người dùng có phải đang tìm một trong các văn bản trên không.
-Nếu các văn bản không liên quan, gợi ý người dùng cung cấp thêm thông tin.
-
-Ví dụ:
-- "Có phải bạn đang tìm **Nghị định 361/2025/NĐ-CP** ban hành ngày 09/01/2026 về 'Quy định về vị trí việc làm công chức' không?"
-- "Không tìm thấy văn bản chính xác. Bạn có đang tìm một trong các văn bản trên không?"
-
-Chỉ trả lời bằng tiếng Việt, ngắn gọn (dưới 100 từ).
-"""
-                suggestion_response = await llm.acomplete(
-                    messages=[LLMMessage(role="user", content=suggestion_prompt)],
-                    temperature=0.3,
-                    max_tokens=256,
-                )
-                suggestion = suggestion_response if isinstance(suggestion_response, str) else getattr(suggestion_response, "content", str(suggestion_response))
-                logger.info(f"[resolve_document_reference] LLM suggestion for low-score: {suggestion[:100]}")
-            except Exception as e:
-                logger.warning(f"[resolve_document_reference] LLM suggestion failed: {e}")
-
-        # Build response
-        if not scored_docs:
-            # No match found - return suggestion to list documents
             return {
                 "candidates": [],
                 "total": 0,
                 "ambiguous": False,
-                "message": (
-                    f"Không tìm thấy văn bản nào phù hợp với '{reference}'. "
-                    f"Vui lòng cung cấp thêm thông tin (số văn bản, năm ban hành, "
-                    f"hoặc tên đầy đủ) hoặc yêu cầu liệt kê các văn bản hiện có."
-                ),
-                "llm_parsed": {"doc_number": doc_number, "doc_title": doc_title, "doc_type_slug": doc_type_slug, "year": year},
+                "message": message,
                 "section_reference": section_reference,
-                "suggestion": suggestion,
+                "suggestion": None,
             }
 
-        # Take top 5 candidates
-        candidates = scored_docs[:5]
-        top_score = candidates[0]["score"]
+        top = candidates[0]
+        top_score = top["score"]  # 0..100
+        # Ambiguous ONLY when the TOP match is a strong DB hit (exact number/title)
+        # AND a second candidate is near-tied. Vector-fallback guesses ("strategy":
+        # "vector") are NOT a basis for stopping to ask the user — the ReAct agent
+        # should auto-scope the best guess and answer (matches pre-refactor
+        # behaviour, where tools.py resolve had no vector stage at all). Keying off
+        # the strategy (not the score) is robust to the reranker's score scale.
+        top_from_db = "db_query" in (top.get("strategies") or [])
+        ambiguous = (
+            len(candidates) > 1
+            and top_from_db
+            and (candidates[1]["score"] / max(top_score, 1)) >= 0.75
+        )
 
-        # If multiple candidates have same top score → ambiguous
-        ambiguous = len([c for c in candidates if c["score"] == top_score]) > 1
+        # ── Low-score LLM suggestion (ported legacy behaviour) ───────────────
+        suggestion = None
+        if top_score < 50:
+            suggestion = await _suggest_low_score_match(reference, candidates[:3])
 
-        if len(candidates) == 1:
+        # ── Human-readable message ───────────────────────────────────────────
+        # Decisive when NOT ambiguous so the agent searches within the scoped
+        # document instead of enumerating look-alikes and asking the user.
+        if not ambiguous:
             message = (
-                f"Tìm thấy văn bản: **{candidates[0]['document_title'] or candidates[0]['filename']}** "
-                f"(ID: {candidates[0]['document_id']})"
+                f"Đã xác định văn bản: **{top['document_title'] or top['filename']}** "
+                f"(ID: {top['document_id']}). Hãy tìm nội dung được hỏi TRONG văn bản này, "
+                f"không cần hỏi lại người dùng."
             )
         else:
-            msg_parts = [f"Tìm thấy **{len(candidates)} văn bản** phù hợp:"]
+            msg_parts = [f"Tìm thấy **{len(candidates)} văn bản** có thể phù hợp:"]
             for i, c in enumerate(candidates, 1):
                 title = c["document_title"] or c["filename"]
                 msg_parts.append(
-                    f"{i}. **{title}** (ID: {c['document_id']}, "
-                    f"type: {c['doc_type']}, score: {c['score']})"
+                    f"{i}. **{title}** (ID: {c['document_id']}, score: {c['score']})"
                 )
-            if ambiguous:
-                msg_parts.append("\n⚠️ Có nhiều văn bản tương tự. Agent nên chọn phù hợp nhất hoặc hỏi user.")
+            msg_parts.append("\n⚠️ Có nhiều văn bản tương tự. Hãy chọn phù hợp nhất hoặc hỏi người dùng.")
             message = "\n".join(msg_parts)
 
         return {
@@ -1455,23 +1140,20 @@ Chỉ trả lời bằng tiếng Việt, ngắn gọn (dưới 100 từ).
             "total": len(candidates),
             "ambiguous": ambiguous,
             "message": message,
-            "llm_parsed": {"doc_number": doc_number, "doc_title": doc_title, "doc_type_slug": doc_type_slug, "year": year},
             "section_reference": section_reference,
-            "suggestion": suggestion,  # LLM suggestion for low-score matches
+            "suggestion": suggestion,
         }
 
     except Exception as e:
-        logger.error(f"[tool:resolve_document_reference] Failed: {e}")
+        logger.error(f"[tool:resolve_document_reference] Failed: {e}", exc_info=True)
         return {
             "candidates": [],
             "total": 0,
             "ambiguous": False,
             "message": f"Lỗi tìm kiếm văn bản: {e}",
-            "llm_parsed": None,
             "section_reference": None,
             "suggestion": None,
         }
-
 
 async def search_document_section(
     section_reference: str,

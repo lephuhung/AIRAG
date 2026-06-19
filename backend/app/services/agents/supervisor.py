@@ -449,6 +449,29 @@ def _get_prior_history(state: SupervisorState, max_turns: int = 6) -> list[tuple
     return pairs[-max_turns:]
 
 
+# A message that already names a specific document (doc-type + number, or an
+# explicit document number) is self-contained w.r.t. its subject. Follow-up
+# condensation must NOT run on it — otherwise a small model merges a DIFFERENT
+# document from the prior turn into it (e.g. asking "Nghị định 53 ..." right after
+# "Nghị định 85 ..." leaked ND 85's subject into the ND 53 query → wrong answer).
+_DOC_REF_PATTERNS = [
+    re.compile(r'\b\d+\s*/\s*\d{2,4}\s*/\s*[\w\-]+', re.IGNORECASE),   # 53/2022/NĐ-CP
+    re.compile(r'\bsố\s+\d+', re.IGNORECASE),                          # số 361
+    re.compile(
+        r'(luật|bộ\s*luật|nghị\s*định|nghị\s*quyết|thông\s*tư(?:\s*liên\s*tịch)?|'
+        r'quyết\s*định|pháp\s*lệnh|chỉ\s*thị)\b[^\n]{0,25}?\d',
+        re.IGNORECASE,
+    ),  # "Nghị định 53", "Thông tư 15", "Luật ... 2018"
+]
+
+
+def _has_explicit_doc_reference(message: str) -> bool:
+    """True if the message itself names a specific document (type+number or an
+    explicit document number) — i.e. it does NOT need prior-turn context to know
+    which document is meant."""
+    return any(p.search(message or "") for p in _DOC_REF_PATTERNS)
+
+
 async def _condense_followup_query(message: str, prior: list[tuple[str, str]]) -> str:
     """Rewrite a follow-up question into a self-contained query using prior turns.
 
@@ -852,7 +875,12 @@ async def supervisor_node(state: SupervisorState) -> dict:
         # prior turns. Runs once (iterations==0) and never on abbreviation loop-back.
         # was_modified=True makes it flow into expanded_query/rewritten_query below,
         # so downstream RAG search + classification both use the contextualized query.
-        if iterations == 0 and not expanded:
+        if iterations == 0 and not expanded and _has_explicit_doc_reference(query_for_classifier):
+            logger.info(
+                f"[supervisor] Skip follow-up condensation — query already names a "
+                f"specific document: {query_for_classifier!r}"
+            )
+        if iterations == 0 and not expanded and not _has_explicit_doc_reference(query_for_classifier):
             _prior = _get_prior_history(state)
             if _prior:
                 _contextualized = await _condense_followup_query(query_for_classifier, _prior)

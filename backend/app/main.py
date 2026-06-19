@@ -2,6 +2,7 @@
 HRAG — standalone Knowledge Base + RAG application.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -605,7 +606,27 @@ async def lifespan(app: FastAPI):
         # to ensure the first request is fast.
         preload_models()
     else:
-        logger.info("HRAG_EAGER_MODEL_LOADING=false — models will load on first use")
+        # Lazy mode (default in Docker to avoid a VRAM spike at boot): instead of
+        # loading the embedder/reranker on the FIRST user query — where the heavy
+        # CrossEncoder init blocks the event loop for tens of seconds, causing the
+        # request to look "stuck" until the frontend cancels it — warm them in the
+        # BACKGROUND, off the event loop, right after startup completes. Startup
+        # stays fast and the VRAM spike is deferred (not simultaneous with vLLM
+        # boot, since the backend starts after infra is healthy).
+        logger.info("HRAG_EAGER_MODEL_LOADING=false — warming retrieval models in background")
+
+        async def _background_warm_models() -> None:
+            try:
+                from app.services.models.loader import preload_models
+                # Run the blocking model load/warm in a worker thread so it never
+                # stalls the event loop (request handling / health checks stay live).
+                await asyncio.to_thread(preload_models)
+                logger.info("[preload] Background retrieval-model warm-up complete")
+            except Exception as _warm_err:
+                logger.warning(f"[preload] Background warm-up failed (non-fatal): {_warm_err}")
+
+        # Keep a reference on app.state so the task isn't garbage-collected mid-run.
+        app.state._warm_models_task = asyncio.create_task(_background_warm_models())
 
     # ── Graphiti Memory Initialization ───────────────────────────────────
     # Build Neo4j indices and constraints required by Graphiti's knowledge

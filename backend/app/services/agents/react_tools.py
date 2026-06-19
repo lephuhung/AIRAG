@@ -156,10 +156,16 @@ async def _adapt_resolve_document_reference(args: dict, ctx: ToolContext) -> dic
     if not reference:
         return tool_result("Lỗi: thiếu 'reference' cho resolve_document_reference.")
 
+    # Pass the FULL user question as `topic` so resolve can use its subject content
+    # (not just the bare doc reference the LLM extracted) to find/disambiguate the
+    # right document — the question itself carries strong signal.
+    topic = (ctx.state.get("rewritten_query") or ctx.state.get("original_query") or "").strip()
+
     res = await resolve_document_reference(
         reference=reference,
         workspace_ids=ctx.workspace_ids,
         db=_db(),
+        topic=topic or None,
     )
     candidates = res.get("candidates", []) or []
     ambiguous = bool(res.get("ambiguous"))
