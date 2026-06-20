@@ -166,54 +166,56 @@ export function AdminDashboardPage() {
             </div>
           </div>
 
-          {/* Top Workspaces */}
-          <div className="bg-card border rounded-2xl p-6 shadow-sm lg:col-span-2">
+          {/* Top Workspaces — ranking by storage size → horizontal bars */}
+          <div className="bg-card border rounded-2xl p-6 shadow-sm">
             <h2 className="text-lg font-semibold tracking-tight mb-4">{t("admin.dashboard.top_workspaces")}</h2>
             <div className="h-96">
               <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={stats.top_workspaces} margin={{ top: 5, right: 30, left: 10, bottom: 20 }}>
-                  <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
-                  <XAxis dataKey="name" fontSize={12} tickMargin={10} angle={-15} textAnchor="end" />
-                  <YAxis tickFormatter={(val) => `${(val / (1024 * 1024)).toFixed(0)}MB`} fontSize={12} />
-                  <Tooltip 
+                <BarChart
+                  data={stats.top_workspaces}
+                  layout="vertical"
+                  margin={{ top: 5, right: 30, left: 10, bottom: 5 }}
+                >
+                  <CartesianGrid strokeDasharray="3 3" opacity={0.3} horizontal={false} />
+                  <XAxis
+                    type="number"
+                    tickFormatter={(val) => `${(val / (1024 * 1024)).toFixed(0)}MB`}
+                    fontSize={12}
+                  />
+                  <YAxis
+                    type="category"
+                    dataKey="name"
+                    fontSize={12}
+                    width={120}
+                    tickMargin={6}
+                  />
+                  <Tooltip
+                    cursor={{ fill: "rgba(139, 92, 246, 0.06)" }}
                     formatter={(value: any) => [`${(Number(value) / (1024 * 1024)).toFixed(1)} MB`, t("admin.dashboard.total_size")] as [any, any]}
                     contentStyle={{ borderRadius: '8px', border: '1px solid #e2e8f0', fontSize: '14px' }}
                   />
-                  <Line 
-                    type="monotone" 
-                    dataKey="total_size" 
-                    stroke="#8b5cf6" 
-                    strokeWidth={3} 
-                    dot={{ r: 4, fill: "#8b5cf6" }} 
-                    activeDot={{ r: 7 }} 
-                  />
-                </LineChart>
+                  <Bar dataKey="total_size" fill="#8b5cf6" radius={[0, 6, 6, 0]} barSize={22} />
+                </BarChart>
               </ResponsiveContainer>
             </div>
           </div>
 
-          {/* Document Types */}
-          <div className="bg-card border rounded-2xl p-6 shadow-sm lg:col-span-2">
+          {/* Document Types — counts per category → vertical bars */}
+          <div className="bg-card border rounded-2xl p-6 shadow-sm">
             <h2 className="text-lg font-semibold tracking-tight mb-4">{t("admin.dashboard.type_breakdown")}</h2>
             <div className="h-96">
               <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={stats.document_type_breakdown} margin={{ top: 5, right: 30, left: 10, bottom: 20 }}>
-                  <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
-                  <XAxis dataKey="name" fontSize={12} tickMargin={10} />
+                <BarChart data={stats.document_type_breakdown} margin={{ top: 5, right: 30, left: 10, bottom: 20 }}>
+                  <CartesianGrid strokeDasharray="3 3" opacity={0.3} vertical={false} />
+                  <XAxis dataKey="name" fontSize={12} tickMargin={10} interval={0} angle={-15} textAnchor="end" />
                   <YAxis fontSize={12} allowDecimals={false} />
-                  <Tooltip 
+                  <Tooltip
+                    cursor={{ fill: "rgba(16, 185, 129, 0.06)" }}
                     formatter={(value: any) => [value, t("admin.dashboard.count")] as [any, any]}
                     contentStyle={{ borderRadius: '8px', border: '1px solid #e2e8f0', fontSize: '14px' }}
                   />
-                  <Line 
-                    type="monotone" 
-                    dataKey="count" 
-                    stroke="#10b981" 
-                    strokeWidth={3} 
-                    dot={{ r: 4, fill: "#10b981" }} 
-                    activeDot={{ r: 7 }} 
-                  />
-                </LineChart>
+                  <Bar dataKey="count" fill="#10b981" radius={[6, 6, 0, 0]} barSize={36} />
+                </BarChart>
               </ResponsiveContainer>
             </div>
           </div>

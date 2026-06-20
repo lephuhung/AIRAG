@@ -9,8 +9,9 @@ tracks *how* facts about users change over time.
 Architecture
 ------------
 - Storage : Neo4j (already in docker-compose stack on bolt://localhost:7687)
-- LLM     : Qwen3-4B (MEMORY_AGENT_BASE_URL, OpenAI-compatible) for entity/fact extraction
-- Embedder: NexusRAGEmbedder — wraps the existing BAAI/bge-m3 EmbeddingService singleton
+- LLM     : memory agent (gemma-4-E4B served as `qwen-memory`, MEMORY_AGENT_BASE_URL, OpenAI-compatible) for entity/fact extraction
+- Embedder: NexusRAGEmbedder — wraps the existing EmbeddingService singleton
+            (model = HRAG_EMBEDDING_MODEL, currently mainguyen9/vietlegal-harrier-0.6b)
             so we don't load a second embedding model
 
 Data model
@@ -76,7 +77,7 @@ _graphiti_client: Any | None = None  # graphiti_core.Graphiti
 
 
 # ---------------------------------------------------------------------------
-# Custom Embedder — wraps NexusRAG's BAAI/bge-m3 EmbeddingService
+# Custom Embedder — wraps NexusRAG's EmbeddingService (HRAG_EMBEDDING_MODEL)
 # ---------------------------------------------------------------------------
 
 from graphiti_core.embedder.client import EmbedderClient
@@ -85,7 +86,8 @@ from graphiti_core.embedder.client import EmbedderClient
 class NexusRAGEmbedder(EmbedderClient):
     """
     Implements the graphiti_core EmbedderClient ABC using the existing
-    EmbeddingService singleton (BAAI/bge-m3, 1024-dim).
+    EmbeddingService singleton (model = HRAG_EMBEDDING_MODEL, 1024-dim;
+    must match GRAPHITI_EMBEDDING_DIM).
 
     Must subclass EmbedderClient (not just duck-type it) because Graphiti
     validates the embedder via Pydantic isinstance() check internally.
@@ -476,7 +478,7 @@ User: "My name is John and I work at Google"
 
 async def _llm_extract_facts(text: str, *, max_attempts: int = 2) -> str:
     """
-    Use the memory-agent LLM (Qwen3-4B) to extract personal factual statements
+    Use the memory-agent LLM (gemma-4-E4B, served as `qwen-memory`) to extract personal factual statements
     from a potentially mixed user message.
 
     Returns:
@@ -505,12 +507,12 @@ async def _llm_extract_facts(text: str, *, max_attempts: int = 2) -> str:
                 [_LLMMsg(role="user", content=text)],
                 system_prompt=_FACT_EXTRACTOR_PROMPT,
                 temperature=0.0,
-                max_tokens=512,  # headroom so Qwen3 <think> blocks don't truncate the JSON
+                max_tokens=512,  # headroom so reasoning <think> blocks don't truncate the JSON
             ):
                 if chunk.text:
                     response_text += chunk.text
 
-            # Strip potential <think>...</think> tags that Qwen3 may emit
+            # Strip potential <think>...</think> tags the model may emit
             clean = re.sub(
                 r"<think>.*?</think>", "", response_text, flags=re.DOTALL
             ).strip()

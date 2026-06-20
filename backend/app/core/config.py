@@ -79,7 +79,9 @@ class Settings(BaseSettings):
         default="openai_compatible"
     )  # gemini | ollama | openai_compatible
     LEGAL_KG_LLM_BASE_URL: str = Field(default="http://10.10.0.240:8000/v1")
-    LEGAL_KG_LLM_MODEL: str = Field(default="Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8")
+    # NOTE: in the deployed stack this resolves to the memory vLLM alias
+    # (gemma-4-E4B served as `qwen-memory`); .env / compose override it.
+    LEGAL_KG_LLM_MODEL: str = Field(default="qwen-memory")
     LEGAL_KG_LLM_API_KEY: str = Field(default="sk-nexusrag")
 
     # Pipeline features
@@ -108,7 +110,7 @@ class Settings(BaseSettings):
 
     # Contextual Embeddings (Anthropic-style: prepend LLM-generated context before embedding)
     # Reduces retrieval failure rate by ~35-49% at the cost of extra LLM calls during indexing.
-    # Uses the memory agent (Qwen3-4B) — no extra model needed.
+    # Uses the memory agent (gemma-4-E4B, served as `qwen-memory`) — no extra model needed.
     HRAG_ENABLE_CONTEXTUAL_EMBEDDINGS: bool = Field(default=False)
     HRAG_CONTEXTUAL_MAX_TOKENS: int = Field(
         default=120
@@ -248,7 +250,7 @@ class Settings(BaseSettings):
     WORKER_EMBED_TIMEOUT: int = Field(default=60)
     WORKER_CAPTION_TIMEOUT: int = Field(default=60)
     WORKER_KG_TIMEOUT: int = Field(default=120)
-    # Memory worker: LLM fact-extraction (Qwen3-4B) + Graphiti Neo4j write.
+    # Memory worker: LLM fact-extraction (gemma-4-E4B, served as `qwen-memory`) + Graphiti Neo4j write.
     WORKER_MEMORY_TIMEOUT: int = Field(default=90)
 
     # ── LangGraph Agent ──────────────────────────────────────────────────────
@@ -257,7 +259,7 @@ class Settings(BaseSettings):
     # Max agent iterations (loop guard for LangGraph tool_executor → answer cycle)
     NEXUSRAG_LG_MAX_ITERATIONS: int = Field(default=6)
 
-    # Classifier model: reuse the memory agent (Qwen3-4B) for intent classification.
+    # Classifier model: reuse the memory agent (gemma-4-E4B, served as `qwen-memory`) for intent classification.
     # Set to False to use the main LLM provider instead (slower but no extra model needed).
     NEXUSRAG_LG_USE_MEMORY_AGENT_AS_CLASSIFIER: bool = Field(default=True)
 
@@ -303,11 +305,12 @@ class Settings(BaseSettings):
     # Graphiti uses the existing Neo4j instance (NEO4J_URI / NEO4J_USERNAME /
     # NEO4J_PASSWORD above) for graph storage.
     # LLM used by Graphiti for entity/fact extraction from conversations.
-    # Defaults to the memory agent (Qwen3-4B) — no extra model needed.
+    # Defaults to the memory agent (gemma-4-E4B, served as `qwen-memory`) — no extra model needed.
     GRAPHITI_LLM_BASE_URL: str = Field(default="http://localhost:8088/v1")
     GRAPHITI_LLM_MODEL: str = Field(default="qwen-memory")
     GRAPHITI_LLM_API_KEY: str = Field(default="sk-nexusrag")
-    # Embedding dimension — must match HRAG_EMBEDDING_MODEL (BAAI/bge-m3 = 1024).
+    # Embedding dimension — must match HRAG_EMBEDDING_MODEL's output dim
+    # (vietlegal-harrier-0.6b = 1024). Update both together if you swap models.
     GRAPHITI_EMBEDDING_DIM: int = Field(default=1024)
 
     # MongoDB — People Search

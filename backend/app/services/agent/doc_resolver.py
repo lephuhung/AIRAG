@@ -13,7 +13,7 @@ documents — shared by BOTH agent entry points so the logic never diverges:
 
 Tiered strategy (performance-optimized, ~2-4s):
   Stage 0  Pure regex extraction (<1ms) → SQL query
-  Stage 1  Memory-agent LLM extraction (Qwen3-4B, ~1-2s) when the DB query is dry
+  Stage 1  Memory-agent LLM extraction (gemma-4-E4B, ~1-2s) when the DB query is dry
   Stage 2  Vector search fallback when DB+LLM are dry
   Stage 3  Fuzzy similar-title search when everything is dry
 
@@ -625,12 +625,12 @@ async def _query_db(
 
 
 # =============================================================================
-# Stage 2 (fallback): Memory Agent LLM Extraction (Qwen3-4B, ~1-2s)
+# Stage 2 (fallback): Memory Agent LLM Extraction (gemma-4-E4B, ~1-2s)
 # =============================================================================
 
 async def _extract_by_llm(reference: str) -> dict:
     """
-    LLM-based extraction using the FAST memory agent (Qwen3-4B).
+    LLM-based extraction using the FAST memory agent (gemma-4-E4B).
     Called when regex + DB query return 0 results.
     Enriched prompt with DB schema + VN legal numbering rules.
 
@@ -925,7 +925,7 @@ async def resolve_candidates(
 
     Tiered pipeline (~2-4s):
       1. regex extraction (0ms) → SQL query
-      2. LLM extraction (Qwen3-4B, ~1-2s) when DB returned 0 results
+      2. LLM extraction (gemma-4-E4B, ~1-2s) when DB returned 0 results
       3. Vector fallback when DB+LLM returned 0 results (searches by `topic`)
       4. Fuzzy similar-title search when everything returned 0 results
       5. Topic rerank: when `topic` (the full question) is given, boost candidates

@@ -5,7 +5,7 @@ Classify user message intent and rewrite query for better retrieval.
 
 Referenced by: backend/app/services/agent/nodes.py (intent_classifier node)
 
-This prompt is used with Qwen3-4B (via memory agent endpoint) to classify
+This prompt is used with gemma-4-E4B (via memory agent endpoint) to classify
 user messages into one of the following intents:
   - greeting, personal, search, list_docs, summarize, kg_query
   - search_doc_num, search_abbr, resolve_doc
@@ -16,7 +16,7 @@ See: prompts/agent_intent.md
 """
 
 # ---------------------------------------------------------------------------
-# Intent classifier system prompt — for Qwen3-4B
+# Intent classifier system prompt — for gemma-4-E4B
 # ---------------------------------------------------------------------------
 
 _CLASSIFIER_SYSTEM = """\

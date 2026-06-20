@@ -24,13 +24,6 @@ COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 
-# ── Stage: models (production only) ──────────────────────
-FROM deps AS models
-
-COPY backend/scripts/download_models.py /tmp/download_models.py
-RUN python /tmp/download_models.py
-
-
 # ── Stage: production ─────────────────────────────────────
 FROM python:3.11-slim AS production
 
@@ -43,9 +36,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app/backend
 
+# HuggingFace models are NOT baked into the image — they live in the shared
+# host cache mounted at /root/.cache/huggingface (see docker-compose.services.yml).
+# This keeps each image ~6.4GB smaller and avoids duplicating the model cache
+# across every backend/worker image.
 COPY --from=deps /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 COPY --from=deps /usr/local/bin /usr/local/bin
-COPY --from=models /root/.cache/huggingface /root/.cache/huggingface
 COPY backend/ .
 
 RUN mkdir -p data/docling data/lightrag uploads

@@ -3,8 +3,8 @@ Embedding Service
 =================
 Generates vector embeddings using sentence-transformers.
 
-Default model: BAAI/bge-m3 (1024-dim, multilingual, 100+ languages).
-Configurable via HRAG_EMBEDDING_MODEL in settings.
+Model is set by HRAG_EMBEDDING_MODEL (deployed: mainguyen9/vietlegal-harrier-0.6b,
+1024-dim; code default falls back to BAAI/bge-m3 if unset).
 """
 from __future__ import annotations
 

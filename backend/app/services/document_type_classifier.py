@@ -2,7 +2,7 @@
 Document Type Classifier
 ========================
 Classify Vietnamese administrative / legal documents from their markdown content
-using an LLM (Qwen3-4B via vLLM / memory agent).
+using an LLM (gemma-4-E4B, served as `qwen-memory`, via vLLM / memory agent).
 
 Return a dictionary with:
   - slug             matches DocumentType.slug in DB, or None.

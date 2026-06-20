@@ -4,7 +4,7 @@ Contextual Embedder
 Implements Anthropic's "Contextual Retrieval" technique:
   https://www.anthropic.com/engineering/contextual-retrieval
 
-For each chunk, a small LLM (Qwen3-4B via memory agent) generates a 1-2 sentence
+For each chunk, a small LLM (gemma-4-E4B, served as `qwen-memory`, via memory agent) generates a 1-2 sentence
 context that situates the chunk within the full document.  The generated context is
 prepended to the chunk content before embedding, giving the vector model richer
 signal about *where* and *why* the chunk matters.
@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 # Prompt adapted for Vietnamese administrative / legal documents.
 # The <document> block is the *same* for every chunk in one document → on
-# remote APIs this would be cached; with local Qwen3-4B the KV-cache reuse
+# remote APIs this would be cached; with the local memory model the KV-cache reuse
 # within a batch helps too, though it is not guaranteed.
 _CONTEXT_SYSTEM_PROMPT = (
     "Bạn là trợ lý hỗ trợ tìm kiếm tài liệu. "

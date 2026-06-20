@@ -1150,23 +1150,26 @@ async def delete_document(
     if document is None:
         raise NotFoundError("Document", document_id)
 
-    if document.status == DocumentStatus.INDEXED:
-        try:
-            from app.services.rag_service import get_rag_service
+    # Always clean up vector store + KG, regardless of status. Chunks/KG nodes
+    # can exist whenever the document was (partially) processed — e.g. embed_done
+    # while still BUILDING_KG, or a FAILED doc that already embedded. Gating this
+    # on status == INDEXED left orphaned chunks in ChromaDB on delete.
+    try:
+        from app.services.rag_service import get_rag_service
 
-            rag_service = get_rag_service(db, document.workspace_id)
-            await rag_service.delete_document(document_id)
-        except Exception as e:
-            logger.warning(f"Failed to delete chunks from vector store: {e}")
+        rag_service = get_rag_service(db, document.workspace_id)
+        await rag_service.delete_document(document_id)
+    except Exception as e:
+        logger.warning(f"Failed to delete chunks from vector store: {e}")
 
-        # Also delete from LegalKG (Neo4j) if KG was built
-        try:
-            from app.services.legal_kg_service import LegalKGService
+    # Also delete from LegalKG (Neo4j) if KG was built
+    try:
+        from app.services.legal_kg_service import LegalKGService
 
-            kg_service = LegalKGService(document.workspace_id)
-            await kg_service.delete_document(document_id)
-        except Exception as e:
-            logger.warning(f"Failed to delete document from LegalKG (Neo4j): {e}")
+        kg_service = LegalKGService(document.workspace_id)
+        await kg_service.delete_document(document_id)
+    except Exception as e:
+        logger.warning(f"Failed to delete document from LegalKG (Neo4j): {e}")
 
     # Delete local file if it still exists (legacy / backward compat)
     file_path = UPLOAD_DIR / document.filename

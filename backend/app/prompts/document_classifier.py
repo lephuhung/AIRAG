@@ -5,7 +5,7 @@ Classify Vietnamese administrative/legal documents from markdown content.
 
 Referenced by: backend/app/services/document_type_classifier.py
 
-The classifier uses an LLM (Qwen3-4B via vLLM / memory agent) to extract:
+The classifier uses an LLM (gemma-4-E4B via vLLM / memory agent) to extract:
   - slug (document type from database)
   - document_number (official document reference number)
   - location (Province or city of issuance)

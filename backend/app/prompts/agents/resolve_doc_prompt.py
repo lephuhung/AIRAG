@@ -6,7 +6,7 @@ System prompt for LLM-based document reference extraction when regex fails.
 
 Used by: app/services/agents/resolve_doc_agent.py :: _extract_by_llm()
 Context: Called ONLY when regex + DB query return 0 results (fallback strategy).
-The memory agent (Qwen3-4B) is used for this extraction to minimize latency.
+The memory agent (gemma-4-E4B) is used for this extraction to minimize latency.
 
 Location: app/prompts/agents/resolve_doc_prompt.py
 """

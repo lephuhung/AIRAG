@@ -188,13 +188,14 @@ services:
       com.hrag.stack: hrag
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # VLLM SERVICES — GPU 1 (same as workers, 48GB VRAM total)
-  # HunyuanOCR: ~19.2GB (0.4), Qwen3-4B: ~9.6GB (0.2) → ~28.8GB used
-  # Remaining ~19GB for workers (parse ~4-6GB, embed ~1-2GB)
+  # VLLM SERVICES — GPU 0 (same as workers, 48GB VRAM total)
+  # vllm-ocr (HunyuanOCR): ~10GB (0.2)  |  vllm-memory (gemma-4-E4B, served as
+  # `qwen-memory`): ~20GB (0.4)  → ~30GB locked upfront by the two vLLM engines.
+  # Remaining ~18GB shared by GPU workers (parse Docling + embed bge-m3 ×3).
   # ═══════════════════════════════════════════════════════════════════════════
 
   # ── HunyuanOCR (OCR Model) ────────────────────────────────────────────────
-  # Port: 8001, GPU 1, ~19.2GB VRAM (0.4 × 48GB)
+  # Port: 8001, GPU 0, ~10GB VRAM (0.2 × 48GB)
   # OpenAI-compatible API → workers call via Docker network
   vllm-ocr:
     build:
@@ -215,7 +216,7 @@ services:
       - --max-model-len
       - "12000"
       - --gpu-memory-utilization
-      - "0.2"
+      - "0.13"
       - --trust-remote-code
       - --served-model-name
       - hunyuan-ocr
@@ -246,8 +247,8 @@ services:
       com.hrag.service: vllm-ocr
       com.hrag.stack: hrag
 
-  # ── Qwen3-4B-Instruct (Memory/KG Model) ──────────────────────────────────
-  # Port: 8088, GPU 1, ~9.6GB VRAM (0.2 × 48GB)
+  # ── gemma-4-E4B-it (Memory/KG Model, served as `qwen-memory`) ─────────────
+  # Port: 8088, GPU 0, ~20GB VRAM (0.4 × 48GB)
   # OpenAI-compatible API → workers call via Docker network
   vllm-memory:
     build:
@@ -478,6 +479,7 @@ services:
       WORKER_DRAIN_TIMEOUT: "30"
       WORKER_HEALTH_PORT: "8081"
     volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
       - hrag_uploads:/app/backend/uploads
       - hrag_data:/app/backend/data
     networks:
@@ -532,6 +534,7 @@ services:
       WORKER_HEALTH_PORT: "8081"
       LEGAL_KG_LLM_BASE_URL: http://vllm-memory:8088/v1
     volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
       - hrag_data:/app/backend/data
     networks:
       - hrag_network
@@ -582,6 +585,8 @@ services:
       AUTO_CREATE_TABLES: "false"
       WORKER_DRAIN_TIMEOUT: "30"
       WORKER_HEALTH_PORT: "8081"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
     networks:
       - hrag_network
     extra_hosts:

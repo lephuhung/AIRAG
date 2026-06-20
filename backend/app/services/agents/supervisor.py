@@ -117,7 +117,7 @@ _INTENT_TO_AGENT_FALLBACK: dict[str, str] = {
 # Detects personal pronouns like "tôi", "đơn vị tôi", "của tôi", "chỗ tôi"…
 # Used as safety net for needs_memory — fires when LLM misses personal context.
 _PERSONAL_REF_PATTERN: re.Pattern[str] = re.compile(
-    r"(?<!\w)(tôi|của\s+tôi|cho\s+tôi|đơn\s+vị\s+tôi|cơ\s+quan\s+tôi|nơi\s+tôi|chỗ\s+tôi|chúng\s+tôi|của\s+chúng\s+tôi|công\s+tác\s+của\s+tôi|làm\s+việc\s+của\s+tôi|tôi\s+tên|tên\s+(của\s+)?tôi|tôi\s+là\s+ai|tôi\s+làm\s+việc|tôi\s+công\s+tác|tôi\s+đang\s\sở)(?!\w)",
+    r"(?<!\w)(tôi|của\s+tôi|cho\s+tôi|đơn\s+vị\s+tôi|cơ\s+quan\s+tôi|nơi\s+tôi|chỗ\s+tôi|chúng\s+tôi|của\s+chúng\s+tôi|công\s+tác\s+của\s+tôi|làm\s+việc\s+của\s+tôi|tôi\s+tên|tên\s+(của\s+)?tôi|tôi\s+là\s+ai|tôi\s+làm\s+việc|tôi\s+công\s+tác|tôi\s+đang\s+ở)(?!\w)",
     re.IGNORECASE | re.UNICODE,
 )
 
@@ -300,7 +300,7 @@ async def _disambiguate_multi_meaning_abbrs(
 ) -> tuple[str, dict[str, str], list[str]]:
     """LLM-based disambiguation for abbreviations with multiple meanings.
 
-    Uses memory agent (Qwen3-4B) to infer which meaning fits the context.
+    Uses memory agent (gemma-4-E4B) to infer which meaning fits the context.
     OPTIMIZED: Batches ALL abbreviations into a single LLM call instead of
     calling the LLM once per abbreviation (saves ~1s × N sequential calls).
 
@@ -344,8 +344,13 @@ async def _disambiguate_multi_meaning_abbrs(
         clean = resp_text.strip()
         import re as _re_disamb
         clean = _re_disamb.sub(r'<think>.*?</think>', '', clean, flags=_re_disamb.DOTALL).strip()
-        if "```" in clean:
-            clean = clean.split("```")[-2].strip() if clean.count("```") >= 2 else clean.replace("```json", "").replace("```", "").strip()
+        # Same robust fence-stripping as _parse_supervisor_response / query_analyzer_node
+        if "```json" in clean:
+            clean = clean.split("```json")[-1].split("```")[0].strip()
+        elif "```" in clean:
+            parts = clean.split("```")
+            if len(parts) >= 3:
+                clean = parts[1].strip()
 
         result = _json.loads(clean)
         # Result format: {"results": [{"abbr": ..., "chosen": ..., "confidence": ..., "reasoning": ...}, ...]}
@@ -475,7 +480,7 @@ def _has_explicit_doc_reference(message: str) -> bool:
 async def _condense_followup_query(message: str, prior: list[tuple[str, str]]) -> str:
     """Rewrite a follow-up question into a self-contained query using prior turns.
 
-    Uses the small memory agent (Qwen3-4B). A bare follow-up such as "thời hạn trả
+    Uses the small memory agent (gemma-4-E4B). A bare follow-up such as "thời hạn trả
     kết quả là bao lâu?" loses the subject established earlier (e.g. a specific tax
     document), so RAG search drifts to unrelated documents. Returns the original
     message unchanged when there is no prior history or on any failure.
@@ -526,7 +531,7 @@ def _parse_supervisor_response(raw: str) -> dict:
     """
     raw = raw.strip()
 
-    # Strip thinking tags (Qwen3.x with thinking enabled)
+    # Strip thinking tags (thinking-capable models with reasoning enabled)
     import re as _re_parse
     raw = _re_parse.sub(r'<think>.*?</think>', '', raw, flags=_re_parse.DOTALL).strip()
 
@@ -699,7 +704,7 @@ async def query_analyzer_node(state: SupervisorState) -> dict:
         from app.prompts.agents.query_analyzer_prompt import _QUERY_ANALYZER_PROMPT
         from app.services.llm import get_memory_agent
 
-        # Use the memory agent (Qwen-memory 4B / Qwen3-4B) for complex structured extraction
+        # Use the memory agent (gemma-4-E4B, served as `qwen-memory`) for complex structured extraction
         analyzer_llm = get_memory_agent()
 
         response_text = ""
@@ -1485,12 +1490,9 @@ def route_from_evaluator(state: SupervisorState) -> str:
     elif next_agent == "supervisor_loop":
         target = "supervisor"
     else:
-        _RETRY_MAP = {
-            AgentType.RAG: "rag",
-            AgentType.PEOPLE: "people",
-            AgentType.WRITE: "write",
-        }
-        target = _RETRY_MAP.get(next_agent, "rag")
+        # result_evaluator_node only ever sets next_agent=RAG on the retry path
+        # (every fallback intent maps to RAG), so retries always go to "rag".
+        target = "rag"
 
     if langfuse:
         try:
@@ -2457,7 +2459,7 @@ async def _query_enricher_wrapper(state: SupervisorState) -> dict:
             if hasattr(chunk, "text") and chunk.text:
                 response += chunk.text
 
-        # Strip <think>...</think> tags that Qwen3 may emit
+        # Strip <think>...</think> tags the model may emit
         response = _re_enrich.sub(
             r"<think>.*?</think>", "", response, flags=_re_enrich.DOTALL
         ).strip()

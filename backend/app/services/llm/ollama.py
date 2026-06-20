@@ -413,8 +413,9 @@ class LocalEmbeddingProvider(EmbeddingProvider):
     """
     Local sentence-transformers embedding provider for KG.
 
-    Uses the same BAAI/bge-m3 model that the vector search pipeline uses,
-    loaded locally via sentence-transformers.  No remote API required.
+    Loads the model named by KG_EMBEDDING_MODEL via sentence-transformers
+    (no remote API). When that equals HRAG_EMBEDDING_MODEL, it reuses the
+    already-loaded EmbeddingService singleton instead of loading a 2nd model.
 
     Use when KG_EMBEDDING_PROVIDER=local in .env.
     """

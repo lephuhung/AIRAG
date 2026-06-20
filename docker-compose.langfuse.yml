@@ -143,6 +143,11 @@ services:
     image: docker.io/clickhouse/clickhouse-server
     restart: always
     user: "101:101"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     environment:
       CLICKHOUSE_DB: default
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-clickhouse}

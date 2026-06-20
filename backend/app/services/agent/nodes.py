@@ -9,7 +9,7 @@ Nodes are pure async functions — LangGraph merges the returned dict into state
 
 Nodes:
     memory_recall       — load user memories from pgvector
-    intent_classifier   — Qwen3-4B: classify intent + rewrite query
+    intent_classifier   — gemma-4-E4B: classify intent + rewrite query
     agent_rag_executor  — invoke agent_rag subgraph (search/list/summarize/kg/abbr)
     answer_generator    — main LLM: generate answer with sources in context
     direct_answer       — main LLM: answer greetings/chitchat directly
@@ -59,7 +59,7 @@ def strip_thinking_tags(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Intent classifier system prompt — for Qwen3-4B
+# Intent classifier system prompt — for gemma-4-E4B
 # ---------------------------------------------------------------------------
 
 _CLASSIFIER_SYSTEM = """\
@@ -197,7 +197,7 @@ def _set_cached_intent(message: str, result: dict) -> None:
 
 
 def _parse_classifier_output(raw: str) -> dict:
-    """Parse Qwen3-4B classifier JSON output with safe fallback."""
+    """Parse gemma-4-E4B classifier JSON output with safe fallback."""
     raw = raw.strip()
 
     # Strip markdown code fences if present
@@ -276,7 +276,7 @@ def _extract_last_user_message(state: "AgentState") -> str:
 
 async def intent_classifier(state: "AgentState") -> dict:
     """
-    Use Qwen3-4B (via memory agent endpoint) to classify intent and rewrite query.
+    Use gemma-4-E4B (via memory agent endpoint) to classify intent and rewrite query.
 
     Extracts the last user message, calls the classifier, and returns:
         intent, rewritten_query updates to state.

@@ -7,7 +7,7 @@ Responsibilities:
   1. Load raw_chunks_json from DB
   2. (Optional) Contextual Embeddings: enrich each chunk with LLM-generated
      situating context before embedding (see HRAG_ENABLE_CONTEXTUAL_EMBEDDINGS)
-  3. Embed all chunks with bge-m3
+  3. Embed all chunks with the HRAG_EMBEDDING_MODEL (EmbeddingService)
   4. Store in ChromaDB
   5. Set embed_done=True  →  status = EMBEDDING (searchable now)
   6. Clear raw_chunks_json to free DB space

@@ -344,7 +344,7 @@ async def _handle_format_check(state: SupervisorState) -> dict:
         try:
             obs = langfuse.start_observation(
                 name="write_agent",
-                input={"intent": intent, "write_action": "format_check"},
+                input={"intent": state.get("intent", ""), "write_action": "format_check"},
                 level="DEFAULT",
             )
             obs.update(
