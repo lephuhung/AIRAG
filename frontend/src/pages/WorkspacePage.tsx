@@ -64,8 +64,25 @@ export function WorkspacePage() {
     enabled: !!workspaceId,
   });
 
+  // Invalidate every query that derives from the workspace's indexed content
+  // (chunk stats + the whole KG visual: graph, entities, relationships,
+  // analytics). Called when indexing finishes or a document is deleted so the
+  // diagram / counts refresh without a manual reload.
+  const invalidateDerived = useCallback(() => {
+    if (!workspaceId) return;
+    for (const key of [
+      "rag-stats",
+      "kg-graph",
+      "kg-entities",
+      "kg-relationships",
+      "project-analytics",
+    ]) {
+      queryClient.invalidateQueries({ queryKey: [key, workspaceId] });
+    }
+  }, [queryClient, workspaceId]);
+
   // -----------------------------------------------------------------------
-  // Refresh ragStats when processing finishes
+  // Refresh derived data when processing finishes
   // -----------------------------------------------------------------------
   const processingCount = useMemo(
     () => documents?.filter((d) => needsPolling([d])).length ?? 0,
@@ -75,10 +92,10 @@ export function WorkspacePage() {
   const prevProcessingRef = useRef(processingCount);
   useEffect(() => {
     if (prevProcessingRef.current > 0 && processingCount === 0) {
-      queryClient.invalidateQueries({ queryKey: ["rag-stats", workspaceId] });
+      invalidateDerived();
     }
     prevProcessingRef.current = processingCount;
-  }, [processingCount, queryClient, workspaceId]);
+  }, [processingCount, invalidateDerived]);
 
   // Keep selectedDoc in sync with latest document data
   useEffect(() => {
@@ -96,8 +113,8 @@ export function WorkspacePage() {
     mutationFn: (docId: string) => api.delete(`/documents/${docId}`),
     onSuccess: (_, docId) => {
       queryClient.invalidateQueries({ queryKey: ["documents", workspaceId] });
-      queryClient.invalidateQueries({ queryKey: ["rag-stats", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+      invalidateDerived();
       if (selectedDoc?.id === docId) selectDoc(null);
       toast.success(t("workspace.delete_success"));
     },

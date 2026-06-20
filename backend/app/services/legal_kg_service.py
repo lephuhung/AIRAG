@@ -150,8 +150,11 @@ def normalize_org_name(name: str) -> str:
     return " ".join(result)
 
 
-# Pattern for Vietnamese legal document numbers (e.g., 29/2018/QH14, 01/2023/ND-CP)
-_DOC_NUM_PATTERN = re.compile(r"\d+/\d+/[A-Z0-9-]+", re.IGNORECASE)
+# Pattern for Vietnamese legal document numbers (e.g., 29/2018/QH14, 01/2023/NĐ-CP).
+# The type suffix may contain the Vietnamese letter "Đ"/"đ" (NĐ-CP, QĐ-…), which is
+# NOT in the ASCII A-Z range — it MUST be in the class, else .group(0) truncates
+# "85/2016/NĐ-CP" to "85/2016/N" (and distinct types like NĐ-CP vs NQ-CP collide).
+_DOC_NUM_PATTERN = re.compile(r"\d+/\d+/[A-Za-z0-9Đđ-]+", re.IGNORECASE)
 
 # Keywords that indicate an entity MUST be a Document type
 _LEGAL_DOC_PREFIXES = re.compile(
@@ -159,32 +162,136 @@ _LEGAL_DOC_PREFIXES = re.compile(
     re.IGNORECASE
 )
 
+# Names opening with a structural-part keyword are Article/clause REFERENCES, not
+# documents — even when they embed a số hiệu (e.g. "Khoản 4 Điều 3 Nghị định
+# 53/2022/NĐ-CP"). They must be typed Article so the số-hiệu Document key below
+# never collapses a clause reference onto the document root.
+_ARTICLE_REF_PREFIX = re.compile(
+    r"^(Điều|Khoản|Điểm|Mục|Chương|Phần)\b",
+    re.IGNORECASE
+)
+
 
 def normalize_entity_id(name: str, entity_type: str) -> str:
     """
     Return canonical entity_id for MERGE key:
-    - Organization, Document, Article, Location → normalize_org_name (case-folded canonical)
+    - Document → the embedded số hiệu when present (so "Nghị định 53/2022/NĐ-CP
+      (Chính phủ, 2022)", "53/2022/NĐ-CP" and "53/2022/nđ-cp" all merge onto ONE
+      node); otherwise normalize_org_name of the full name.
+    - Organization, Article, Location → normalize_org_name (case-folded canonical)
     - Person → unchanged (Person uses composite key for disambiguation)
     - Task → whitespace-normalized only
     """
     name = " ".join(name.strip().split())  # strip + collapse spaces
-    if entity_type in ("Organization", "Document", "Article", "Location"):
+    if entity_type == "Document":
+        m = _DOC_NUM_PATTERN.search(name)
+        if m:
+            return normalize_org_name(m.group(0))
+        return normalize_org_name(name)
+    if entity_type in ("Organization", "Article", "Location"):
         return normalize_org_name(name)
     return name
 
 
+def _is_article_ref_name(name: str) -> bool:
+    """True when a name opens with a structural-part keyword (Điều/Khoản/…)."""
+    return bool(name and _ARTICLE_REF_PREFIX.match(name.strip()))
+
+
 def _is_legal_doc_name(name: str) -> bool:
     """
-    True when a raw entity name denotes a legal document — either it carries a số
-    hiệu (e.g. ``117/2025/QH15``) or it opens with a law-type prefix (``Luật``,
-    ``Nghị định``, …). Such entities MUST be typed ``Document`` regardless of how
-    the LLM / resolution pass classified them, otherwise the document fragments
-    into a parallel ``Organization`` node (the static ``_store_extraction`` path
-    already forces this; the resolution path historically did not).
+    True when a raw entity name denotes a legal document — it carries a số hiệu
+    (e.g. ``117/2025/QH15``) or opens with a law-type prefix (``Luật``, ``Nghị
+    định``, …) — and is NOT a clause reference. Such entities MUST be typed
+    ``Document`` regardless of how the LLM / resolution pass classified them.
+    """
+    if not name or _is_article_ref_name(name):
+        return False
+    return bool(_DOC_NUM_PATTERN.search(name) or _LEGAL_DOC_PREFIXES.search(name))
+
+
+def _force_legal_type(name: str, etype: str) -> str:
+    """
+    Override an LLM-assigned type for legal-structure names:
+      - clause references (Điều/Khoản/…) → Article
+      - laws/decrees (số hiệu or law prefix) → Document
+    Anything else keeps its original type.
+    """
+    if _is_article_ref_name(name):
+        return "Article"
+    if etype != "Document" and _is_legal_doc_name(name):
+        return "Document"
+    return etype
+
+
+def _doc_alias_base(s: str) -> str:
+    """Canonical form for doc-identity comparison: normalize + drop a trailing
+    "(issuer, year)" suffix."""
+    return re.sub(r"\s*\([^)]+\)\s*$", "", normalize_org_name(s)).strip()
+
+
+def _is_doc_root_alias(name: str, doc_name: str = "", doc_title: str = "") -> bool:
+    """
+    True when ``name`` IS the current document itself — it matches the structured
+    doc_name or the document title (EXACT match after normalization + dropping a
+    trailing "(issuer, year)" suffix). Used to fold a title/full-name reference
+    that only ever appears as a relation endpoint onto the số-hiệu Document root.
+
+    Exact match only — never substring — so a sub-part of the title such as
+    "Luật An ninh mạng" (a DIFFERENT document the decree details) is not swallowed.
     """
     if not name:
         return False
-    return bool(_DOC_NUM_PATTERN.search(name) or _LEGAL_DOC_PREFIXES.search(name))
+    n = _doc_alias_base(name)
+    if not n:
+        return False
+    return any(n == _doc_alias_base(ref) for ref in (doc_name, doc_title) if ref)
+
+
+# ---------------------------------------------------------------------------
+# Generic / junk entity guard (deterministic, model-independent)
+# ---------------------------------------------------------------------------
+# LLMs keep emitting a small, FINITE set of non-specific "organizations"
+# ("Bộ", "Cơ quan nhà nước", "các … có liên quan"), form-template placeholders
+# ("(tên đơn vị đề nghị)") and form names ("Mẫu số 02", "Tờ trình"), no matter
+# how strongly the prompt forbids them. They survive LLM resolution and get
+# re-materialised as nodes from relation endpoints. Drop them here so they never
+# become nodes. CONSERVATIVE by design — a precise stoplist + tight patterns —
+# so real (even long, comma-listed) names like "Doanh nghiệp viễn thông, doanh
+# nghiệp cung cấp dịch vụ …" are NOT dropped.
+_GENERIC_ORG_EXACT = frozenset({
+    "bộ", "các bộ", "bộ trưởng", "các bộ trưởng", "cơ quan", "các cơ quan",
+    "cơ quan ngang bộ", "cơ quan thuộc chính phủ", "cơ quan nhà nước",
+    "cơ quan, tổ chức nhà nước", "đơn vị", "các đơn vị", "doanh nghiệp",
+    "các doanh nghiệp", "tổ chức", "các tổ chức", "tổ chức chính trị",
+    "cá nhân", "tổ chức, cá nhân", "chủ quản hệ thống thông tin",
+    "thủ trưởng cơ quan ngang bộ", "thủ trưởng cơ quan thuộc chính phủ",
+})
+_GENERIC_ORG_PAT = re.compile(
+    r"(có liên quan$|^các\s+(cơ quan|tổ chức|bộ|ngành|đơn vị|doanh nghiệp|cá nhân)\b)",
+    re.IGNORECASE,
+)
+_JUNK_PLACEHOLDER_PAT = re.compile(r"\(\s*(tên|chủ quản|đơn vị|cơ quan)\b[^)]*\)", re.IGNORECASE)
+_JUNK_FORM_PAT = re.compile(r"^\s*(mẫu số|tờ trình|biểu mẫu|đơn đề nghị)\b", re.IGNORECASE)
+
+
+def _is_generic_or_junk(name: str, entity_type: str = "") -> bool:
+    """
+    True when ``name`` is a non-specific / template entity that must NOT become a
+    graph node. Placeholder & form names are junk for ANY type; the generic-org
+    stoplist/pattern only applies to Organization (or unknown) types so a clause
+    ref or document with an incidental match is never dropped.
+    """
+    n = (name or "").strip()
+    if not n:
+        return True
+    if _JUNK_PLACEHOLDER_PAT.search(n) or _JUNK_FORM_PAT.search(n):
+        return True
+    if entity_type in ("", "Organization"):
+        low = n.lower()
+        if low in _GENERIC_ORG_EXACT or _GENERIC_ORG_PAT.search(low):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -948,11 +1055,10 @@ class LegalKGService:
                 canonical = ent.get("canonical_name", "")
                 if not canonical:
                     continue
-                etype = ent.get("type", "Organization")
-                # Hard-force Document for legal-doc names the LLM mis-typed as
-                # Organization/Person (e.g. "Luật 117/2025/QH15", "Nghị định …").
-                if etype != "Document" and _is_legal_doc_name(canonical):
-                    etype = "Document"
+                # Correct legal-structure mistypes: laws/decrees → Document,
+                # clause refs (Điều/Khoản/…) → Article. Without the Article split
+                # a clause carrying a số hiệu would collapse onto the doc root.
+                etype = _force_legal_type(canonical, ent.get("type", "Organization"))
                 entity_type_map[canonical] = etype
 
             # Build canonical_lookup: any name → canonical (from merged_map + merged_from)
@@ -994,6 +1100,7 @@ class LegalKGService:
                 await self._store_relations_from_extraction(
                     session, result, root_key, doc_id_str,
                     canonical_lookup, merged_map, skipped_entities, entity_type_map,
+                    doc_name=doc_name, doc_title=doc_title,
                 )
 
         entity_count = sum(
@@ -1184,6 +1291,15 @@ class LegalKGService:
         for e in entity_entries:
             name = e["raw_name"]
             name_lower = name.lower()
+
+            # Check 0: Generic / junk entity ("Bộ", "Cơ quan nhà nước",
+            # "(tên đơn vị…)", "Mẫu số 02"…) — drop so it never becomes a node,
+            # and (via skipped_entities downstream) any relation touching it is
+            # skipped too.
+            if _is_generic_or_junk(name, e["type"]):
+                auto_dropped.add(name)
+                logger.debug(f"LegalKG: auto-dropped generic/junk '{name}'")
+                continue
 
             # Check 1: Self-reference patterns ("văn bản này", "Nghị định này", etc.)
             if self._SELF_REF_PATTERNS.match(name_lower):
@@ -1426,12 +1542,18 @@ class LegalKGService:
         - skipped_entities is empty (no drops in fallback)
         """
         seen: dict[tuple, dict] = {}
+        dropped: set[str] = set()
         for ent in raw_entities:
             name = str(ent.get("name", "")).strip()
             name = re.sub(r"^[#\*\- \t]+", "", name).strip()
             if not name:
                 continue
             etype = str(ent.get("type", "Organization")).strip()
+            # Apply the same generic/junk guard as the LLM path so the fallback
+            # doesn't silently let "Bộ"/"Cơ quan nhà nước"/placeholders through.
+            if _is_generic_or_junk(name, etype):
+                dropped.add(name)
+                continue
             key = (normalize_entity_id(name, etype), etype)
             if key not in seen:
                 seen[key] = {
@@ -1441,7 +1563,7 @@ class LegalKGService:
                     "source_articles": [ent.get("article_ref", "")],
                     "merged_from": [name],
                 }
-        return list(seen.values()), {}, set()
+        return list(seen.values()), {}, dropped
 
     def _build_canonical_lookup(self, resolved_entities: list[dict]) -> dict[str, str]:
         """
@@ -1744,6 +1866,8 @@ class LegalKGService:
         merged_map: dict[str, str],
         skipped_entities: set[str],
         entity_type_map: dict[str, str],
+        doc_name: str = "",
+        doc_title: str = "",
     ) -> None:
         """
         Upsert relations from one article's extraction result, using pre-resolved
@@ -1752,6 +1876,8 @@ class LegalKGService:
         Edge handling:
           - dropped entities (in skipped_entities): relation is SKIPPED entirely
           - merged entities (in merged_map): source/target is rerouted to canonical
+          - doc-root aliases (== doc_name / doc_title): folded onto the số-hiệu root
+          - self-loops after resolution: SKIPPED
           - canonical entities: relation upserted normally
         """
         for rel in data.get("relations", []):
@@ -1782,8 +1908,10 @@ class LegalKGService:
                 continue
 
             # --- Resolve source ---
-            # Coreference: "Luật này" / "quyết định này" → Document Root
-            if source_raw.lower().endswith(" này") or source_raw.lower() == "này":
+            # Coreference ("Luật này"…) or an explicit reference to THIS document
+            # by its title / full name → Document Root.
+            if (source_raw.lower().endswith(" này") or source_raw.lower() == "này"
+                    or _is_doc_root_alias(source_raw, doc_name, doc_title)):
                 source_canonical = root_ref
                 src_type = "Document"
             else:
@@ -1791,36 +1919,31 @@ class LegalKGService:
                 source_key = merged_map.get(source_raw, source_raw)
                 src_canonical_key = canonical_lookup.get(source_key, source_key)
                 # Fallback type for endpoints the resolution pass never saw:
-                # legal-document references (số hiệu / "Luật|Nghị định|…" prefix /
-                # the doc root) MUST default to Document, otherwise they spawn a
-                # parallel :Organization node with the SAME entity_id (the two
-                # share normalize_org_name) and never merge with the :Document one.
-                src_is_legal = (
-                    source_raw == root_ref
-                    or _DOC_NUM_PATTERN.search(source_raw)
-                    or _LEGAL_DOC_PREFIXES.search(source_raw)
+                # classify by the raw name — laws/decrees → Document, clause refs
+                # (Điều/Khoản/…) → Article, the doc root → Document — so they merge
+                # onto the right canonical node instead of spawning a parallel
+                # :Organization with the same entity_id.
+                src_default = (
+                    "Document" if source_raw == root_ref
+                    else _force_legal_type(source_raw, "Organization")
                 )
-                src_type = entity_type_map.get(
-                    src_canonical_key, "Document" if src_is_legal else "Organization"
-                )
+                src_type = entity_type_map.get(src_canonical_key, src_default)
                 source_canonical = src_canonical_key
 
             # --- Resolve target ---
-            if target_raw.lower().endswith(" này") or target_raw.lower() == "này":
+            if (target_raw.lower().endswith(" này") or target_raw.lower() == "này"
+                    or _is_doc_root_alias(target_raw, doc_name, doc_title)):
                 target_canonical = root_ref
                 tgt_type = "Document"
             else:
                 # Check merged_map first (LLM-detected aliases)
                 target_key = merged_map.get(target_raw, target_raw)
                 tgt_canonical_key = canonical_lookup.get(target_key, target_key)
-                tgt_is_legal = (
-                    target_raw == root_ref
-                    or _DOC_NUM_PATTERN.search(target_raw)
-                    or _LEGAL_DOC_PREFIXES.search(target_raw)
+                tgt_default = (
+                    "Document" if target_raw == root_ref
+                    else _force_legal_type(target_raw, "Organization")
                 )
-                tgt_type = entity_type_map.get(
-                    tgt_canonical_key, "Document" if tgt_is_legal else "Organization"
-                )
+                tgt_type = entity_type_map.get(tgt_canonical_key, tgt_default)
                 target_canonical = tgt_canonical_key
 
             # Person composite key for target
@@ -1836,6 +1959,28 @@ class LegalKGService:
                 if k in ("ngay_sinh", "ngay_hieu_luc") and v:
                     v = normalize_date(str(v))
                 flat_props[k] = v
+
+            # Skip self-loops created when both endpoints fold onto the same node
+            # (e.g. "53/2022 PART_OF <its own title>" after title→root folding).
+            if (normalize_entity_id(source_canonical, src_type)
+                    == normalize_entity_id(target_canonical, tgt_type)):
+                logger.debug(
+                    f"LegalKG: skipping self-loop {relation_type} on {source_canonical}"
+                )
+                continue
+
+            # Drop relations whose endpoint is a generic/junk entity that only
+            # ever appears here (never in the entity list, so premark/skip never
+            # saw it). Without this, the endpoint-materialising upsert below
+            # would re-create exactly the "Bộ" / "Cơ quan nhà nước" nodes the
+            # premark guard removed.
+            if (_is_generic_or_junk(source_canonical, src_type)
+                    or _is_generic_or_junk(target_canonical, tgt_type)):
+                logger.debug(
+                    f"LegalKG: skipping relation with generic/junk endpoint: "
+                    f"'{source_canonical}' / '{target_canonical}'"
+                )
+                continue
 
             # Ensure both endpoints exist so the relation is never silently
             # dropped when an entity was referenced in a relation but never

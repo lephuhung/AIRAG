@@ -25,10 +25,23 @@ Nhiệm vụ của bạn là trích xuất các thực thể (entities) và mố
 
 ## Các loại thực thể được phép (entity types):
 - Article: Điều, Khoản, Điểm của văn bản hiện tại. Ví dụ: "Điều 5", "Khoản 2 Điều 3"
-- Document: Văn bản pháp luật được viện dẫn. Ví dụ: "Nghị định 123/2024/NĐ-CP"
-- Organization: Cơ quan, tổ chức cụ thể, không chung chung. PHẢI bổ sung tên đầy đủ dựa vào thông tin văn bản dựa trên (issuing_agency). Ví dụ: "UBND Tỉnh Nghệ An" (không dùng "UBND tỉnh"). Các tổ chức chung chung như  "Cơ quan có thẩm quyền", "Cơ quan, tổ chức có liên quan" không được coi là Organization.
+- Document: Văn bản pháp luật được viện dẫn. Ví dụ: "Nghị định 123/2024/NĐ-CP".
+  • Dùng tên ĐỊNH DANH NGẮN GỌN NHẤT. Nếu có số hiệu → ưu tiên kèm số hiệu.
+  • TUYỆT ĐỐI KHÔNG thêm hậu tố ngày/tháng/năm ban hành vào tên.
+    ĐÚNG: "Luật An ninh mạng"  —  SAI: "Luật An ninh mạng ngày 12 tháng 6 năm 2018".
+- Organization: Cơ quan, tổ chức CỤ THỂ, có tên riêng định danh được. PHẢI bổ sung tên đầy đủ dựa vào (issuing_agency). Ví dụ: "UBND Tỉnh Nghệ An" (không dùng "UBND tỉnh").
+  • KHÔNG trích xuất tổ chức CHUNG CHUNG / không định danh được. BỎ QUA hoàn toàn các trường hợp:
+    - tên trống nghĩa: "Bộ", "Bộ trưởng", "Cơ quan", "Đơn vị", "Doanh nghiệp", "Tổ chức".
+    - loại cơ quan: "Cơ quan ngang Bộ", "Cơ quan thuộc Chính phủ", "Cơ quan nhà nước", "Tổ chức chính trị".
+    - nhóm/liệt kê: "các cơ quan, tổ chức, cá nhân có liên quan", "Bộ, ngành có liên quan", "các cơ quan Đảng, Nhà nước ở trung ương", "tổ chức, cá nhân có liên quan".
+    - placeholder biểu mẫu: bất cứ tên nào chứa "(tên đơn vị...)", "(tên cơ quan...)", "(chủ quản...)".
+    - tên biểu mẫu/văn bản con: "Mẫu số 02", "Tờ trình", "Đơn đề nghị".
 - Person: Cá nhân. PHẢI dùng Composite Key theo quy tắc ưu tiên (xem bên dưới). Các cá nhân chung chung như "Người có trách nhiệm", "Người liên quan" không được coi là Person
-- Task: Nhiệm vụ, công việc cụ thể được giao. Ví dụ: "lập kế hoạch thanh tra hàng năm"
+- Task: Nhiệm vụ/công việc cụ thể được giao. HÃY trích xuất MỖI nhiệm vụ chính trong điều khoản, viết dưới dạng CỤM ĐỘNG TỪ NGẮN GỌN (3–6 từ), chuẩn hóa. ĐỪNG bỏ sót nhiệm vụ.
+  • Nếu văn bản diễn đạt nhiệm vụ bằng câu dài, PHẢI RÚT GỌN về cụm động từ cốt lõi — KHÔNG sao chép nguyên câu/mệnh đề làm tên Task.
+  • Mỗi Task nên gắn với chủ thể thực hiện qua quan hệ CHU_TRI / CHIU_TRACH_NHIEM / PHOI_HOP (Task → Organization/Person).
+    ĐÚNG: "Giám sát an ninh mạng", "Thẩm định an ninh mạng", "Kiểm tra, đánh giá an ninh mạng", "Quản lý rủi ro".
+    SAI (nguyên câu, quá dài): "Có biện pháp, giải pháp để tìm và phát hiện kịp thời các điểm yếu, lỗ hổng về mặt kỹ thuật".
 - Location: Địa điểm, địa danh cụ thể liên quan đến nội dung văn bản hoặc nơi ban hành văn bản.
 
 ## Quy tắc Composite Key cho Person (theo thứ tự ưu tiên):
@@ -58,7 +71,9 @@ Nhiệm vụ của bạn là trích xuất các thực thể (entities) và mố
 2. KHÔNG được tạo ra bất kỳ loại quan hệ nào ngoài danh sách trên.
 3. KHÔNG được tạo entity type ngoài danh sách trên.
 4. XỬ LÝ TỰ THAM CHIẾU: TUYỆT ĐỐI KHÔNG trích xuất các cụm từ "quy định này", "quyết định này", "văn bản này" làm thực thể độc lập. Khi gặp câu "Điều X của quy định/quyết định này", BỎ QUA cụm từ chỉ văn bản, CHỈ lấy "Điều X" (loại Article). Nếu văn bản nói "Sở này", "cơ quan này", tìm ngữ cảnh trước đó để ghi TÊN ĐẦY ĐỦ.
-5. Nếu không trích xuất được gì, trả về: {"entities": [], "relations": []}
+5. LOẠI BỎ THỰC THỂ CHUNG CHUNG/RÁC: KHÔNG tạo entity cho tổ chức không định danh ("Bộ", "Cơ quan ngang Bộ", "Cơ quan nhà nước", "các … có liên quan"), placeholder biểu mẫu ("(tên đơn vị đề nghị)"), hay tên biểu mẫu ("Mẫu số 02", "Tờ trình"). Thà bỏ sót còn hơn tạo node rác. Nếu cần biểu diễn quan hệ tới một chủ thể chung chung, gắn quan hệ tới Article hoặc Organization định danh được trong ngữ cảnh, KHÔNG tạo node chung chung.
+6. Document KHÔNG kèm hậu tố ngày ban hành. Task: VẪN trích xuất đầy đủ các nhiệm vụ chính, nhưng tên Task PHẢI rút gọn thành cụm động từ ngắn (3–6 từ), KHÔNG phải nguyên câu.
+7. Nếu không trích xuất được gì, trả về: {"entities": [], "relations": []}
 """
 
 LEGAL_KG_USER_PROMPT = """## Thông tin văn bản (document_meta)

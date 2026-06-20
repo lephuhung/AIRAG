@@ -7,10 +7,23 @@ import type {
   WorkspaceSummary,
 } from "@/types";
 
-export function useWorkspaces() {
+export function useWorkspaces(options?: { pollWhileIndexing?: boolean }) {
   return useQuery({
     queryKey: ["workspaces"],
     queryFn: () => api.get<KnowledgeBase[]>("/workspaces"),
+    // While any workspace still has documents being indexed (indexed_count <
+    // document_count), poll so the doc/indexed counts update live and flip to
+    // "indexed" without a manual refresh. Stops once everything is indexed.
+    // (Deletes/uploads already invalidate ["workspaces"] via useDocuments.)
+    refetchInterval: options?.pollWhileIndexing
+      ? (query) => {
+          const data = query.state.data as KnowledgeBase[] | undefined;
+          const indexing = data?.some(
+            (ws) => (ws.indexed_count ?? 0) < (ws.document_count ?? 0),
+          );
+          return indexing ? 4000 : false;
+        }
+      : undefined,
   });
 }
 

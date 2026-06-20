@@ -33,7 +33,9 @@ type VisibilityOption = "personal" | "tenant" | "public";
 export function KnowledgeBasesPage() {
   const { t } = useTranslation();
   const navigate = useNavigate();
-  const { data: workspaces, isLoading } = useWorkspaces();
+  // Poll while any workspace still has documents indexing, so counts update live
+  // (file → indexed). Deletes already refresh via useDeleteDocument invalidation.
+  const { data: workspaces, isLoading } = useWorkspaces({ pollWhileIndexing: true });
   const { data: myTenants } = useMyTenants();
   const { data: allTenants } = useAdminTenants();
   const isSuperadmin = useAuthStore((s) => s.user?.is_superadmin ?? false);
