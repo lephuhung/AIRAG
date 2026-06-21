@@ -1703,17 +1703,17 @@ async def react_executor_node(state: SupervisorState) -> dict:
             _emitted["images"] = len(images)
 
     async def _run_turn(use_tools: bool):
-        """Run one LLM turn, streaming answer text to the client as it arrives.
+        """Run one LLM turn, collecting its tool calls and text.
 
-        Speculative streaming (mirrors the legacy agent): we emit text tokens
-        live, but only while no tool call has appeared in this turn. If the turn
-        ends up requesting tools, that streamed text was a thinking-aloud
-        preamble — we send ``token_rollback`` so the client discards it before
-        the tools run. When the turn produces no tool calls, the streamed text
-        IS the final answer (no re-generation, no fake chunking).
+        We deliberately do NOT stream text to the client here. On tool-calling
+        turns the model often writes a "thinking-aloud" preamble before emitting
+        the tool call; streaming that live and then retracting it (the old
+        ``token_rollback`` mechanism) made text flash on screen and vanish on
+        every step of a multi-tool loop. Instead the caller flushes text to the
+        client only on the turn that yields the final answer (see ``_finish``),
+        so nothing the user sees is ever taken back.
         """
         calls, text = [], ""
-        streamed = False
         async for c in llm.astream(
             msgs,
             system_prompt=system_prompt,
@@ -1727,21 +1727,23 @@ async def react_executor_node(state: SupervisorState) -> dict:
                 calls.append(c.function_call)
             elif c.type == "text" and c.text:
                 text += c.text
-                if not calls:  # speculative — stop emitting once a tool call shows up
-                    await push_event(state, "token", c.text)
-                    streamed = True
-        if calls and streamed:
-            await push_event(state, "token_rollback", {})
         return calls, text
 
     async def _finish(answer_text: str) -> dict:
-        # Answer text was already streamed live by _run_turn — here we only
-        # finalize (clean thinking tags, emit a fallback if nothing came out).
+        # Text was buffered (not streamed live) to avoid the speculative-stream
+        # flicker, so we finalize and push it to the client once, here — after
+        # artifacts so the client has citation data before the answer arrives.
         await _emit_artifacts()
+        from app.services.agent.nodes import sanitize_citations
         final = strip_thinking_tags(answer_text or "").strip()
+        # Drop citation markers the LLM invented (e.g. [75a75810] derived from a
+        # document UUID) that map to no real source — else they leak as raw text.
+        _valid_cids = {str(getattr(s, "index", "")) for s in sources}
+        _valid_cids.discard("")
+        final = sanitize_citations(final, _valid_cids)
         if not final:
             final = "Xin lỗi, tôi chưa tạo được câu trả lời từ kho văn bản."
-            await push_event(state, "token", final)
+        await push_event(state, "token", final)
         logger.info(
             f"[react_executor] done: {len(sources)} sources, answer={len(final)} chars"
         )
@@ -1754,11 +1756,29 @@ async def react_executor_node(state: SupervisorState) -> dict:
         }
 
     try:
+        seen_calls: set[str] = set()   # (name|args) signatures already executed
+        no_progress = 0                # consecutive tool-turns adding no new sources
         for step in range(max_steps):
             await _emit_artifacts()
             calls, text = await _run_turn(use_tools=True)
             if not calls:
                 return await _finish(text)
+
+            # Anti-loop guard: if EVERY tool call this turn repeats an earlier
+            # call verbatim, the model is spinning (e.g. re-running the same
+            # search_documents) — stop and synthesise from what we already have.
+            sigs = [
+                f"{fc.get('name', '')}|"
+                f"{json.dumps(fc.get('args', {}), sort_keys=True, ensure_ascii=False)}"
+                for fc in calls
+            ]
+            if sigs and all(s in seen_calls for s in sigs):
+                logger.warning(
+                    f"[react_executor] step {step + 1}: all {len(calls)} call(s) repeat "
+                    f"earlier ones — breaking to synthesis"
+                )
+                break
+            seen_calls.update(sigs)
 
             # Assistant turn that requested tools — synthesise stable ids so the
             # tool-result messages reference them on the next request.
@@ -1780,9 +1800,13 @@ async def react_executor_node(state: SupervisorState) -> dict:
             # Don't leak internal tool/function names to the UI — keep the
             # user-facing status generic. Raw names still go to the log.
             await push_event(state, "status", {"step": "searching", "detail": "Đang tra cứu thông tin..."})
-            logger.info(f"[react_executor] step {step + 1}/{max_steps}: {len(calls)} call(s): {names}")
+            logger.info(
+                f"[react_executor] step {step + 1}/{max_steps}: {len(calls)} call(s): {names} "
+                f"args={[fc.get('args', {}) for fc in calls]}"
+            )
 
             # Parallel tool execution — independent calls in the same turn run together.
+            sources_before = len(sources)
             results = await asyncio.gather(
                 *[dispatch_tool(fc.get("name", ""), fc.get("args", {}), ctx) for fc in calls]
             )
@@ -1805,8 +1829,25 @@ async def react_executor_node(state: SupervisorState) -> dict:
                     "images": images,
                 }
 
-        # Loop guard hit → force a final synthesis without tools.
-        logger.warning(f"[react_executor] max steps ({max_steps}) reached — forcing synthesis")
+            # No-progress guard: once we already have sources, two consecutive
+            # tool-turns that surface nothing new mean further searching is
+            # unproductive — synthesise from what we have. (resolve_doc and other
+            # source-less scoping tools don't trip this since sources_before==0.)
+            if sources_before > 0 and len(sources) == sources_before:
+                no_progress += 1
+                if no_progress >= 2:
+                    logger.warning(
+                        f"[react_executor] step {step + 1}: {no_progress} no-progress "
+                        f"turns — breaking to synthesis ({len(sources)} sources)"
+                    )
+                    break
+            else:
+                no_progress = 0
+
+        # Loop exhausted or an anti-loop guard fired → force a final synthesis.
+        logger.warning(
+            f"[react_executor] forcing synthesis ({len(sources)} sources collected)"
+        )
         msgs.append(_LLMMsg(role="user", content=(
             "Hãy tổng hợp câu trả lời cuối cùng từ thông tin đã thu thập ở trên. "
             "Nếu chưa đủ căn cứ, nói rõ phần nào còn thiếu."

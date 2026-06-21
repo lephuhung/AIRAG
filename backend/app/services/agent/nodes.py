@@ -58,6 +58,48 @@ def strip_thinking_tags(text: str) -> str:
     return cleaned.strip()
 
 
+# A citation-shaped bracket (with any leading spaces/tabs so a removed marker
+# leaves no dangling space): one or more comma-separated id tokens, e.g.
+# "[a3z9]", "[a3z9, b2m7]", "[MEM-1]", "[IMG-p4f2]". The negative lookahead
+# skips markdown links "[label](url)". Brackets containing spaces/Vietnamese
+# prose (e.g. "[Điều 5]") never match because tokens allow no inner spaces.
+_CITATION_BRACKET_RE = re.compile(
+    r"([ \t]*)\[\s*([A-Za-z0-9_\-]+(?:\s*,\s*[A-Za-z0-9_\-]+)*)\s*\](?!\()"
+)
+
+
+def sanitize_citations(text: str, valid_ids: set[str]) -> str:
+    """Strip citation markers the LLM invented so they don't leak as raw text.
+
+    Root cause this guards against: the LLM occasionally fabricates a citation
+    from the first 8 hex chars of a document UUID it saw in a tool observation
+    (e.g. ``[75a75810]``). Such a marker maps to no real source, so the frontend
+    can't resolve it and renders it verbatim. We keep ONLY tokens that map to a
+    real source ``index``, a ``[MEM-N]`` memory ref, an ``[IMG-...]`` image ref,
+    or a legacy numeric ``[1]``. A bracket left with no valid token is removed
+    together with the space that preceded it; untouched prose is never altered.
+    """
+    if not text:
+        return text
+    valid = {v.lower() for v in valid_ids}
+
+    def _keep(tok: str) -> bool:
+        t = tok.strip().lower()
+        return (
+            t in valid
+            or t.isdigit()
+            or t.startswith("mem-")
+            or t.startswith("img-")
+        )
+
+    def _repl(m: "re.Match") -> str:
+        lead, body = m.group(1), m.group(2)
+        kept = [t.strip() for t in body.split(",") if _keep(t)]
+        return f"{lead}[" + ", ".join(kept) + "]" if kept else ""
+
+    return _CITATION_BRACKET_RE.sub(_repl, text)
+
+
 # ---------------------------------------------------------------------------
 # Intent classifier system prompt — for gemma-4-E4B
 # ---------------------------------------------------------------------------
@@ -832,6 +874,15 @@ async def answer_generator(state: "AgentState") -> dict:
             await push_event(state, "token", error_msg)
 
     final_answer = strip_thinking_tags("".join(answer_parts))
+
+    # Drop any citation marker the LLM invented (e.g. [75a75810] derived from a
+    # document UUID) that maps to no real source — otherwise it leaks as raw text.
+    _valid_cids = {
+        str(getattr(s, "index", "") or (s.get("index", "") if isinstance(s, dict) else ""))
+        for s in (list(sources or []) + list(new_sources or []))
+    }
+    _valid_cids.discard("")
+    final_answer = sanitize_citations(final_answer, _valid_cids)
 
     # Nếu không tìm thấy tài liệu và có từ viết tắt tiềm năng -> gợi ý thêm
     is_not_found = "không tìm thấy tài liệu phù hợp câu hỏi" in [

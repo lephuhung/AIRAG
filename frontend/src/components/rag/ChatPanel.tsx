@@ -2945,8 +2945,14 @@ export const ChatPanel = memo(function ChatPanel({
     }
   };
 
-  // Load chat history from PostgreSQL
-  const { data: historyData, isLoading: historyLoading } = useChatHistory(sessionId);
+  // Load chat history from PostgreSQL. Polls every 10s (see useChatHistory) so
+  // messages sent on another channel (e.g. Telegram) appear here; isStreamingRef
+  // pauses that polling while a web stream is in flight.
+  const isStreamingRef = useRef(false);
+  const { data: historyData, isLoading: historyLoading } = useChatHistory(
+    sessionId,
+    { isStreamingRef },
+  );
   const queryClient = useQueryClient();
 
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -3165,6 +3171,12 @@ export const ChatPanel = memo(function ChatPanel({
       [sessionId, updateSessionTitle, queryClient],
     ),
   );
+
+  // Mirror live streaming state into the ref that gates history polling, so a
+  // background refetch never lands on top of a half-streamed turn.
+  useEffect(() => {
+    isStreamingRef.current = stream.isStreaming;
+  }, [stream.isStreaming]);
   const streamingMsgIdRef = useRef<string | null>(null);
   const agentStepsRef = useRef<AgentStep[]>([]);
   // Synchronous in-flight guard. `stream.isStreaming` only flips to true AFTER

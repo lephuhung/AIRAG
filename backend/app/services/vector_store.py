@@ -77,6 +77,45 @@ class VectorStore:
         # Force re-creation
         _ = self.collection
 
+    @staticmethod
+    def _is_stale_collection_error(exc: Exception) -> bool:
+        """True for ChromaDB's "Collection [<id>] does not exist." error.
+
+        Raised when the collection was deleted + recreated out-of-process (e.g.
+        a re-index or dimension migration in a worker) and got a new internal
+        id, while this process still holds the old id — either on the cached
+        ``self._collection`` handle or in the shared HttpClient's name→id cache.
+        """
+        msg = str(exc).lower()
+        return "does not exist" in msg and "collection" in msg
+
+    def _refresh_collection(self) -> chromadb.Collection:
+        """Drop the stale collection handle AND rebuild the shared client.
+
+        The HttpClient caches name→collection(id); a single recreated collection
+        is enough to make every op on the old handle fail. Resetting the client
+        forces the next ``get_or_create_collection`` to resolve the CURRENT id.
+        In-flight callers holding the old client reference are unaffected — the
+        old object stays valid; only the next ``get_chroma_client()`` rebuilds.
+        """
+        global _chroma_client
+        self._collection = None
+        _chroma_client = None
+        return self.collection
+
+    def _run(self, op):
+        """Execute a collection op, self-healing once from a stale-handle error."""
+        try:
+            return op(self.collection)
+        except Exception as exc:
+            if self._is_stale_collection_error(exc):
+                logger.warning(
+                    f"[vector_store] stale collection handle for "
+                    f"{self.collection_name} ({exc}) — refreshing client and retrying"
+                )
+                return op(self._refresh_collection())
+            raise
+
     def add_documents(
         self,
         ids: Sequence[str],
@@ -140,12 +179,12 @@ class VectorStore:
             include = ["documents", "metadatas", "distances"]
 
         try:
-            results = self.collection.query(
+            results = self._run(lambda col: col.query(
                 query_embeddings=[query_embedding],
                 n_results=n_results,
                 where=where,
                 include=include
-            )
+            ))
         except Exception as e:
             error_msg = str(e).lower()
             if "dimension" in error_msg:
@@ -193,14 +232,14 @@ class VectorStore:
 
     def count(self) -> int:
         """Return the number of documents in the collection."""
-        return self.collection.count()
+        return self._run(lambda col: col.count())
 
     def get_by_ids(self, ids: Sequence[str]) -> dict:
         """Get documents by their IDs."""
-        return self.collection.get(
+        return self._run(lambda col: col.get(
             ids=list(ids),
             include=["documents", "metadatas"]
-        )
+        ))
 
     def get_document_chunks(
         self, document_id: uuid.UUID, include_embeddings: bool = True
@@ -214,10 +253,10 @@ class VectorStore:
         if include_embeddings:
             include = ["documents", "metadatas", "embeddings"]
         try:
-            res = self.collection.get(
+            res = self._run(lambda col: col.get(
                 where={"document_id": str(document_id)},
                 include=include,
-            )
+            ))
         except Exception as e:
             logger.error(f"[vector_store] get_document_chunks failed: {e}")
             return {"ids": [], "embeddings": None, "documents": [], "metadatas": []}
@@ -231,11 +270,11 @@ class VectorStore:
     def get_by_metadata(self, where: dict, limit: int = 1000) -> dict:
         """Get documents matching metadata filter without semantic search."""
         try:
-            results = self.collection.get(
+            results = self._run(lambda col: col.get(
                 where=where,
                 include=["documents", "metadatas"],
                 limit=limit
-            )
+            ))
             return {
                 "ids": results.get("ids", []),
                 "documents": results.get("documents", []),

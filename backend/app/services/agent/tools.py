@@ -1120,17 +1120,24 @@ async def resolve_document_reference(
         # Decisive when NOT ambiguous so the agent searches within the scoped
         # document instead of enumerating look-alikes and asking the user.
         if not ambiguous:
+            # NOTE: Do NOT put the document UUID in this message. The LLM reads
+            # it as a tool observation and, when told to cite sources, fabricates
+            # a citation from the first 8 hex of the UUID (e.g. [75a75810]) that
+            # the frontend can't resolve and leaks as raw text. Scoping is handled
+            # programmatically via ctx.document_ids / data.resolved_document_ids.
             message = (
-                f"Đã xác định văn bản: **{top['document_title'] or top['filename']}** "
-                f"(ID: {top['document_id']}). Hãy tìm nội dung được hỏi TRONG văn bản này, "
+                f"Đã xác định văn bản: **{top['document_title'] or top['filename']}**. "
+                f"Hãy tìm nội dung được hỏi TRONG văn bản này, "
                 f"không cần hỏi lại người dùng."
             )
         else:
             msg_parts = [f"Tìm thấy **{len(candidates)} văn bản** có thể phù hợp:"]
             for i, c in enumerate(candidates, 1):
                 title = c["document_title"] or c["filename"]
+                # UUID intentionally omitted — see note above. The LLM picks by
+                # index/title; document scoping is resolved in code, not by the LLM.
                 msg_parts.append(
-                    f"{i}. **{title}** (ID: {c['document_id']}, score: {c['score']})"
+                    f"{i}. **{title}** (score: {c['score']})"
                 )
             msg_parts.append("\n⚠️ Có nhiều văn bản tương tự. Hãy chọn phù hợp nhất hoặc hỏi người dùng.")
             message = "\n".join(msg_parts)

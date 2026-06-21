@@ -6,6 +6,11 @@ export function useChatSessions() {
   return useQuery({
     queryKey: ["chat-sessions"],
     queryFn: () => api.get<ChatSession[]>("/rag/chat/sessions"),
+    // Auto-refresh so sessions started/updated on another channel (e.g. the
+    // Telegram bot) surface in the sidebar without a manual reload. The list is
+    // ordered by updated_at desc, so an active Telegram chat climbs to the top.
+    refetchInterval: 10000,
+    refetchOnWindowFocus: true,
   });
 }
 

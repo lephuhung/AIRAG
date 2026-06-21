@@ -240,18 +240,24 @@ def _build_index(vector_store: VectorStore) -> _IndexState:
 
     logger.info(f"[bm25] Building BM25 index for collection '{vector_store.collection_name}'")
 
-    # Fetch all docs from ChromaDB (no embedding needed)
-    result = vector_store.collection.get(include=["documents", "metadatas"])
+    # Fetch all docs from ChromaDB (no embedding needed). Go through _run so a
+    # stale collection handle (collection recreated out-of-process) self-heals
+    # instead of failing the whole BM25 build.
+    result = vector_store._run(lambda col: col.get(include=["documents", "metadatas"]))
 
     ids: list[str] = result.get("ids") or []
     documents: list[str] = result.get("documents") or []
     metadatas: list[dict] = result.get("metadatas") or []
 
     if not documents:
+        # Empty corpus: do NOT construct BM25Okapi — rank_bm25 divides by the
+        # corpus size (avgdl = num_doc / corpus_size) and raises ZeroDivisionError
+        # on an empty list. Return an empty state instead; the search path's
+        # `if not state.ids` guard short-circuits before touching `bm25`.
         logger.warning(f"[bm25] Collection '{vector_store.collection_name}' is empty — BM25 index will be empty")
-        corpus_tokenized = []
-    else:
-        corpus_tokenized = [_tokenize(doc) for doc in documents]
+        return _IndexState(bm25=None, ids=[], metadatas=[], documents=[], doc_count=0)
+
+    corpus_tokenized = [_tokenize(doc) for doc in documents]
 
     # Tuned BM25 parameters for Vietnamese legal text
     bm25 = BM25Okapi(corpus_tokenized, k1=settings.HRAG_BM25_K1, b=settings.HRAG_BM25_B)
