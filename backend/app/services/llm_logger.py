@@ -17,8 +17,18 @@ logger = logging.getLogger(__name__)
 
 
 class MinIOLoggerService:
-    def __init__(self):
+    def __init__(
+        self,
+        dataset_prefix: str = "relation_extraction",
+        base_meta: Optional[dict] = None,
+    ):
         self._logs: list[dict] = []
+        # Sub-folder under datasets/ where the JSONL is flushed. Lets different
+        # extraction pipelines (LightRAG vs LegalKG) keep separate datasets.
+        self._dataset_prefix = dataset_prefix
+        # Document-level tags merged into every log entry (e.g. doc_type,
+        # kg_mode, workspace_id). Per-call metadata_extra takes precedence.
+        self._base_meta = base_meta or {}
 
     def log_llm_call(
         self,
@@ -40,6 +50,8 @@ class MinIOLoggerService:
             "model_used": model,
             "timestamp": datetime.utcnow().isoformat() + "Z",
         }
+        if self._base_meta:
+            meta.update(self._base_meta)
         if metadata_extra:
             meta.update(metadata_extra)
 
@@ -60,7 +72,7 @@ class MinIOLoggerService:
         jsonl_bytes = jsonl_content.encode("utf-8")
 
         date_str = datetime.utcnow().strftime("%Y-%m-%d")
-        key = f"datasets/relation_extraction/{date_str}/ws_{workspace_id}_doc_{document_id}.jsonl"
+        key = f"datasets/{self._dataset_prefix}/{date_str}/ws_{workspace_id}_doc_{document_id}.jsonl"
 
         storage = get_storage_service()
         try:

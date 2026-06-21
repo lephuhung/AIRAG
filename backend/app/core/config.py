@@ -119,6 +119,10 @@ class Settings(BaseSettings):
         default=8
     )  # parallel LLM calls per document
 
+    # Log every KG extraction LLM call (prompt + completion) to MinIO as JSONL,
+    # for collecting fine-tuning datasets. Stored under datasets/legal_kg_extraction/.
+    HRAG_KG_LOG_EXTRACTION: bool = Field(default=True)
+
     # BM25 hybrid search (lexical search merged with vector via Reciprocal Rank Fusion)
     # Reduces retrieval failure rate by an additional ~14% on top of contextual embeddings.
     # No extra model needed — pure BM25 over in-memory corpus (per workspace, lazy-built).

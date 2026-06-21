@@ -28,11 +28,13 @@ import json
 import logging
 import re
 import uuid
+from contextvars import ContextVar
 from datetime import datetime
 from typing import Any, Optional
 
 from app.core.config import settings
 from app.services.llm import get_kg_llm_provider
+from app.services.llm_logger import MinIOLoggerService
 from app.services.llm.types import LLMMessage
 from app.prompts.legal_kg import (
     ENTITY_RESOLVE_SYSTEM_PROMPT,
@@ -50,6 +52,15 @@ logger = logging.getLogger(__name__)
 
 # Max concurrent LLM calls during extraction
 _LLM_SEMAPHORE = asyncio.Semaphore(settings.HRAG_KG_LLM_CONCURRENCY)
+
+# Per-ingest LLM logger (set by ingest() when HRAG_KG_LOG_EXTRACTION is on).
+# Module-level _call_llm reads it via this ContextVar so every extraction call
+# is captured without threading a logger through every method signature.
+# asyncio.gather child tasks inherit the context set before the gather, so the
+# per-article extraction tasks all see the same logger.
+_kg_log_ctx: ContextVar[Optional[MinIOLoggerService]] = ContextVar(
+    "_kg_log_ctx", default=None
+)
 
 # ---------------------------------------------------------------------------
 # Date normalization utilities
@@ -525,8 +536,15 @@ async def _call_llm(
     system_prompt: str,
     user_prompt: str,
     max_tokens: int = 4096,
+    log_meta: Optional[dict] = None,
 ) -> str:
-    """Call LegalKG LLM with exponential-backoff retry for rate limits."""
+    """Call LegalKG LLM with exponential-backoff retry for rate limits.
+
+    When an ingest set up an extraction logger (see _kg_log_ctx), the
+    request/response is buffered for the fine-tuning dataset. `log_meta`
+    carries per-call tags (stage, article_ref, doc_type, …) used to filter
+    the dataset later.
+    """
     provider = get_kg_llm_provider()
     messages = [
         LLMMessage(role="system", content=system_prompt),
@@ -535,7 +553,25 @@ async def _call_llm(
     for attempt in range(4):
         try:
             async with _LLM_SEMAPHORE:
-                return await provider.acomplete(messages, temperature=0.0, max_tokens=max_tokens)
+                response = await provider.acomplete(
+                    messages, temperature=0.0, max_tokens=max_tokens
+                )
+            _logger = _kg_log_ctx.get()
+            if _logger is not None:
+                model_name = (
+                    getattr(provider, "model", None)
+                    or getattr(provider, "model_name", None)
+                    or getattr(provider, "_model", None)
+                    or settings.LEGAL_KG_LLM_MODEL
+                )
+                _logger.log_llm_call(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    response=response,
+                    model=model_name,
+                    metadata_extra=log_meta,
+                )
+            return response
         except Exception as e:
             err = str(e).lower()
             is_rate = "429" in err or "rate" in err or "quota" in err or "resource_exhausted" in err
@@ -802,6 +838,45 @@ class LegalKGService:
     # ------------------------------------------------------------------
 
     async def ingest(self, markdown_content: str, document_id: Optional[uuid.UUID] = None) -> None:
+        """Public ingest entrypoint.
+
+        When HRAG_KG_LOG_EXTRACTION is on, set up the extraction-logging context
+        around the real pipeline so every KG LLM call (article extract, preamble,
+        entity resolve) is captured for the fine-tuning dataset, then flush the
+        buffered calls to MinIO under datasets/legal_kg_extraction/. The flush /
+        contextvar reset run in `finally` so a failed ingest never leaks the
+        logger into the worker's context or loses partial data.
+        """
+        if not settings.HRAG_KG_LOG_EXTRACTION:
+            await self._ingest_impl(markdown_content, document_id)
+            return
+
+        base_meta = {
+            "kg_mode": "legal",
+            "workspace_id": str(self.workspace_id),
+            "document_id": str(document_id) if document_id else None,
+        }
+        ext_logger = MinIOLoggerService(
+            dataset_prefix="legal_kg_extraction", base_meta=base_meta
+        )
+        token = _kg_log_ctx.set(ext_logger)
+        try:
+            await self._ingest_impl(
+                markdown_content, document_id, log_base_meta=base_meta
+            )
+        finally:
+            _kg_log_ctx.reset(token)
+            if document_id is not None:
+                await ext_logger.flush_to_minio(
+                    workspace_id=self.workspace_id, document_id=document_id
+                )
+
+    async def _ingest_impl(
+        self,
+        markdown_content: str,
+        document_id: Optional[uuid.UUID] = None,
+        log_base_meta: Optional[dict] = None,
+    ) -> None:
         """
         Full LegalKG ingestion pipeline:
           1. Parse document metadata
@@ -908,6 +983,16 @@ class LegalKGService:
                 logger.warning(f"LegalKG: failed to resolve custom KG prompt: {_e}")
 
         is_personnel = is_personnel_document(markdown_content)
+
+        # Enrich the dataset's document-level tags now that doc_type is known.
+        # base_meta is shared by reference with the extraction logger, so this
+        # is reflected in every buffered call for this document.
+        if log_base_meta is not None:
+            log_base_meta.update({
+                "doc_type": doc_type,
+                "doc_name": doc_name,
+                "is_personnel": is_personnel,
+            })
 
         logger.info(
             f"LegalKG ingest workspace={self.workspace_id} doc='{doc_name}' "
@@ -1160,7 +1245,10 @@ class LegalKGService:
                 preamble_text=preamble_text[:1500],
                 document_name=doc_name,
             )
-            raw = await _call_llm(PREAMBLE_SYSTEM_PROMPT, user_prompt, max_tokens=1024)
+            raw = await _call_llm(
+                PREAMBLE_SYSTEM_PROMPT, user_prompt, max_tokens=1024,
+                log_meta={"stage": "preamble"},
+            )
             data = _parse_llm_json(raw)
             return data.get("can_cu_list", [])
         except Exception as e:
@@ -1220,7 +1308,15 @@ class LegalKGService:
                 article_text=win,
             )
             try:
-                raw = await _call_llm(system_prompt, user_prompt)
+                raw = await _call_llm(
+                    system_prompt, user_prompt,
+                    log_meta={
+                        "stage": "article_extract",
+                        "article_ref": article_ref,
+                        "heading": heading,
+                        "is_personnel": is_personnel,
+                    },
+                )
                 data = _parse_llm_json(raw)
             except Exception as e:
                 logger.warning(f"LegalKG LLM extraction failed for {heading}: {e}")
@@ -1424,7 +1520,10 @@ class LegalKGService:
             )
 
             try:
-                raw = await _call_llm(ENTITY_RESOLVE_SYSTEM_PROMPT, user_prompt, max_tokens=2048)
+                raw = await _call_llm(
+                    ENTITY_RESOLVE_SYSTEM_PROMPT, user_prompt, max_tokens=2048,
+                    log_meta={"stage": "resolve"},
+                )
                 data = _parse_llm_json(raw)
 
                 conflicts = data.get("type_conflicts", [])

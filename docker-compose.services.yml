@@ -527,6 +527,7 @@ services:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
       NEO4J_URI: bolt://neo4j:7687
+      MINIO_ENDPOINT: http://minio:9000
       WORKER_TYPE: kg
       AUTO_CREATE_TABLES: "false"
       CUDA_VISIBLE_DEVICES: "0"
