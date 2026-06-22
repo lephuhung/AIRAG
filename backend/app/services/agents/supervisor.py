@@ -1643,6 +1643,12 @@ async def mongo_formatter_node(state: SupervisorState) -> dict:
 # ReAct Executor Node — RAG group (tool-aware planning)
 # =============================================================================
 
+# Chars of answer text buffered before the first live ``token`` is emitted.
+# Keeps a short tool-turn preamble from ever reaching the client (no flicker),
+# while delaying the real answer's appearance only by this tiny initial chunk.
+_STREAM_HOLDBACK_CHARS = 64
+
+
 async def react_executor_node(state: SupervisorState) -> dict:
     """Single tool-calling ReAct loop for the RAG group.
 
@@ -1702,18 +1708,25 @@ async def react_executor_node(state: SupervisorState) -> dict:
             await push_event(state, "images", images)
             _emitted["images"] = len(images)
 
-    async def _run_turn(use_tools: bool):
-        """Run one LLM turn, collecting its tool calls and text.
+    async def _run_turn(use_tools: bool, stream_text: bool = True):
+        """Run one LLM turn, streaming answer text to the client as it arrives.
 
-        We deliberately do NOT stream text to the client here. On tool-calling
-        turns the model often writes a "thinking-aloud" preamble before emitting
-        the tool call; streaming that live and then retracting it (the old
-        ``token_rollback`` mechanism) made text flash on screen and vanish on
-        every step of a multi-tool loop. Instead the caller flushes text to the
-        client only on the turn that yields the final answer (see ``_finish``),
-        so nothing the user sees is ever taken back.
+        Restores live token streaming (the previous revision buffered the whole
+        answer and emitted it in one ``token`` event, which killed the typing
+        effect). To avoid the old per-step flicker we hold the first
+        ``_STREAM_HOLDBACK_CHARS`` of text back instead of emitting immediately:
+        a tool-calling turn that writes a short "thinking-aloud" preamble before
+        its tool call stays under the threshold, so that preamble is never shown
+        and never has to be rolled back. The final-answer turn far exceeds the
+        threshold, so its text streams live after a tiny initial chunk. In the
+        rare case a long preamble was already flushed before a tool call appears,
+        we still retract it with ``token_rollback``.
+
+        Returns ``(calls, text, streamed)`` — ``streamed`` is True when answer
+        tokens reached the client (so ``_finish`` doesn't emit them again).
         """
         calls, text = [], ""
+        pending, streamed = "", False
         async for c in llm.astream(
             msgs,
             system_prompt=system_prompt,
@@ -1727,23 +1740,47 @@ async def react_executor_node(state: SupervisorState) -> dict:
                 calls.append(c.function_call)
             elif c.type == "text" and c.text:
                 text += c.text
-        return calls, text
+                # Stream only while no tool call has appeared this turn.
+                if stream_text and not calls:
+                    if streamed:
+                        await push_event(state, "token", c.text)
+                    else:
+                        pending += c.text
+                        if len(pending) >= _STREAM_HOLDBACK_CHARS:
+                            await push_event(state, "token", pending)
+                            pending, streamed = "", True
+        # A tool call showed up after we'd already flushed preamble → retract it.
+        if calls and streamed:
+            await push_event(state, "token_rollback", {})
+            streamed = False
+        return calls, text, streamed
 
-    async def _finish(answer_text: str) -> dict:
-        # Text was buffered (not streamed live) to avoid the speculative-stream
-        # flicker, so we finalize and push it to the client once, here — after
-        # artifacts so the client has citation data before the answer arrives.
+    async def _finish(answer_text: str, streamed: bool = False) -> dict:
+        # Sources/images first so the client has citation data before the answer.
         await _emit_artifacts()
         from app.services.agent.nodes import sanitize_citations
-        final = strip_thinking_tags(answer_text or "").strip()
+        shown = strip_thinking_tags(answer_text or "").strip()  # what the client streamed
         # Drop citation markers the LLM invented (e.g. [75a75810] derived from a
         # document UUID) that map to no real source — else they leak as raw text.
         _valid_cids = {str(getattr(s, "index", "")) for s in sources}
         _valid_cids.discard("")
-        final = sanitize_citations(final, _valid_cids)
+        final = sanitize_citations(shown, _valid_cids)
         if not final:
+            # Nothing usable (empty turn, error, or all-invalid citations) — if we
+            # had streamed something speculative, retract it before the fallback.
+            if streamed:
+                await push_event(state, "token_rollback", {})
             final = "Xin lỗi, tôi chưa tạo được câu trả lời từ kho văn bản."
-        await push_event(state, "token", final)
+            await push_event(state, "token", final)
+        elif not streamed:
+            # Buffered path (short answer < holdback, forced synthesis, or a
+            # rolled-back turn) — emit the whole answer in one token.
+            await push_event(state, "token", final)
+        elif final != shown:
+            # Already streamed live, but sanitisation changed the text (invented
+            # citations stripped) — correct the client's copy in one shot.
+            await push_event(state, "token_rollback", {})
+            await push_event(state, "token", final)
         logger.info(
             f"[react_executor] done: {len(sources)} sources, answer={len(final)} chars"
         )
@@ -1760,9 +1797,9 @@ async def react_executor_node(state: SupervisorState) -> dict:
         no_progress = 0                # consecutive tool-turns adding no new sources
         for step in range(max_steps):
             await _emit_artifacts()
-            calls, text = await _run_turn(use_tools=True)
+            calls, text, streamed = await _run_turn(use_tools=True)
             if not calls:
-                return await _finish(text)
+                return await _finish(text, streamed)
 
             # Anti-loop guard: if EVERY tool call this turn repeats an earlier
             # call verbatim, the model is spinning (e.g. re-running the same
@@ -1853,8 +1890,8 @@ async def react_executor_node(state: SupervisorState) -> dict:
             "Nếu chưa đủ căn cứ, nói rõ phần nào còn thiếu."
         )))
         await _emit_artifacts()
-        _, text = await _run_turn(use_tools=False)
-        return await _finish(text)
+        _, text, streamed = await _run_turn(use_tools=False)
+        return await _finish(text, streamed)
 
     except Exception as e:
         logger.error(f"[react_executor] loop failed: {e}", exc_info=True)

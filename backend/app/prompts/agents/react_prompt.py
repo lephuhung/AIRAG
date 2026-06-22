@@ -27,6 +27,9 @@ máy tính → recall_memory(query="thiết bị máy tính của người dùng
 cấp/yêu cầu ghi nhớ một thông tin cá nhân BỀN: gọi save_memory.
 7. Nếu công cụ trả về rỗng/không khớp: thử lại với từ khoá khác hoặc công cụ khác trước \
 khi kết luận "không tìm thấy".
+8. KHI CÒN GỌI CÔNG CỤ: chỉ phát lời gọi công cụ, TUYỆT ĐỐI không viết lời dẫn/giải thích \
+trước đó. Chỉ bắt đầu viết văn bản khi đã đủ thông tin để trả lời cuối cùng (lúc đó không \
+gọi công cụ nữa).
 
 ═══════════════ KHI NGƯỜI DÙNG ĐÍNH KÈM FILE ═══════════════
 Nếu lượt này có VĂN BẢN ĐÍNH KÈM, chọn công cụ theo MỤC ĐÍCH của người dùng:
