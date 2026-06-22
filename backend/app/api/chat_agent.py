@@ -588,6 +588,48 @@ async def _execute_search_documents(
     if image_context_parts:
         context += "\n\nDocument Images:\n" + "\n".join(image_context_parts)
 
+    # ── Drop orphan sources (defense-in-depth) ──────────────────────────────
+    # A chunk whose document_id no longer exists in Postgres (document deleted /
+    # re-uploaded, but its old vectors lingered in ChromaDB) renders as a source
+    # the frontend can't open ("Nguồn <index>", click does nothing). Purging
+    # ChromaDB removes these at rest; this filter guarantees none ever reach the
+    # client even if a fresh orphan slips in. KG sources (nil document_id) are
+    # kept — they are rendered as KG chips, not document links.
+    if sources:
+        from app.models.document import Document as _Doc
+        _nil = uuid.UUID(int=0)
+
+        def _coerce_uuid(v):
+            if isinstance(v, uuid.UUID):
+                return v
+            if isinstance(v, str):
+                try:
+                    return uuid.UUID(v)
+                except (ValueError, TypeError):
+                    return None
+            return None
+
+        _cand: set[uuid.UUID] = set()
+        for s in sources:
+            did = _coerce_uuid(getattr(s, "document_id", None))
+            if did is not None and did != _nil:
+                _cand.add(did)
+        if _cand:
+            _rows = await db.execute(select(_Doc.id).where(_Doc.id.in_(_cand)))
+            _alive = {r[0] for r in _rows.all()}
+            _dropped = _cand - _alive
+            if _dropped:
+                before = len(sources)
+                sources = [
+                    s for s in sources
+                    if getattr(s, "source_type", None) == "kg"
+                    or _coerce_uuid(getattr(s, "document_id", None)) in _alive
+                ]
+                logger.warning(
+                    f"[RAG] Dropped {before - len(sources)} orphan source(s) "
+                    f"(document_id not in DB): {[str(d)[:8] for d in _dropped]}"
+                )
+
     return context, sources, chat_image_refs, image_parts, all_kg_summaries
 
 

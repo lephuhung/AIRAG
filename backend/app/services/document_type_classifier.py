@@ -238,6 +238,44 @@ def _build_llm_system_prompt(doc_types: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Document-number recovery (regex fallback)
+# ---------------------------------------------------------------------------
+
+# A genuine số hiệu carries digits: "24/2018/QH14", "53/2022/NĐ-CP", labelled by
+# "Số:" / "Luật số:" near the top of the header.
+_DOCNUM_LABELLED = re.compile(
+    r"(?:^|\n)\s*(?:luật\s+số|số)\s*[:：]\s*(\d{1,4}\s*/\s*\d{2,4}\s*/\s*[\wĐ\-]+)",
+    re.IGNORECASE,
+)
+_DOCNUM_BARE = re.compile(r"(?<!\d)(\d{1,4}\s*/\s*\d{2,4}\s*/\s*[A-Za-zĐ][\wĐ\-]*)")
+
+
+def _recover_doc_number(markdown_text: str) -> str | None:
+    """Best-effort extraction of a document's own số hiệu from its header markdown.
+
+    CRITICAL: the number must be taken from the header region that comes BEFORE
+    the "Căn cứ …" preamble. Every Vietnamese law's preamble cites OTHER
+    documents ("Căn cứ … theo Nghị quyết số 203/2025/QH15;"), so scanning the
+    whole text would grab a citation's number instead of the document's own —
+    exactly the trap that mis-tagged Luật An ninh mạng. The real số hiệu always
+    sits above the preamble (next to the issuing agency), so we cut the search
+    region at the first "Căn cứ"/"Quốc hội ban hành" and look only there.
+    """
+    if not markdown_text:
+        return None
+    region = markdown_text[:1500]
+    # Truncate at the preamble — everything after is citations, not THIS doc's id.
+    _cut = re.search(r"căn\s+cứ|quốc\s+hội\s+ban\s+hành|ban\s+hành\s+luật", region, re.IGNORECASE)
+    if _cut:
+        region = region[: _cut.start()]
+    m = _DOCNUM_LABELLED.search(region)
+    if not m:
+        # Bare form only in the very top block (header), to avoid stray matches.
+        m = _DOCNUM_BARE.search(region[:500])
+    return re.sub(r"\s+", "", m.group(1)) if m else None
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -302,6 +340,26 @@ async def classify_with_llm(markdown_text: str, db=None) -> dict:
         document_number = _clean_str(parsed.get("document_number"))
         if document_number and len(document_number) > 60:
             document_number = None
+
+        # Validate document_number: a real Vietnamese legal số hiệu ALWAYS carries
+        # a digit (e.g. "24/2018/QH14", "53/2022/NĐ-CP", "361/QĐ-TTg"). Small
+        # extractor models sometimes leak the TITLE into this field (e.g.
+        # "Luật An ninh mạng"), which then breaks number-based document resolution
+        # (resolve_document_reference can't match it, falls back to vector search
+        # and picks the wrong document). Reject a digit-less value and try to
+        # recover the genuine number from the document header via regex.
+        if document_number and not any(ch.isdigit() for ch in document_number):
+            logger.info(
+                f"[classifier] Rejecting invalid document_number (no digit — likely "
+                f"the title leaked in): {document_number!r}"
+            )
+            document_number = None
+        if not document_number:
+            document_number = _recover_doc_number(markdown_text)
+            if document_number:
+                logger.info(
+                    f"[classifier] Recovered document_number via regex: {document_number!r}"
+                )
 
         # Clean document_title (truncate if too long)
         document_title = _clean_str(parsed.get("document_title"))

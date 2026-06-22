@@ -477,6 +477,40 @@ def _has_explicit_doc_reference(message: str) -> bool:
     return any(p.search(message or "") for p in _DOC_REF_PATTERNS)
 
 
+# Anaphora / continuation cues that signal a question LEANS on prior turns to be
+# understood ("nó", "này", "vừa rồi", "còn ... thì sao", "văn bản trên"…).
+_FOLLOWUP_CUES = re.compile(
+    r"(?<!\w)(nó|này|đó|đấy|ấy|kia|nêu\s+trên|ở\s+trên|trên\s+đây|theo\s+đó|"
+    r"vừa\s+(rồi|nêu|xong|đề\s+cập)|vậy(\s+còn)?|thế(\s+còn)?|còn\s+lại|tương\s+tự|"
+    r"trường\s+hợp\s+(này|đó)|văn\s+bản\s+(này|đó|trên|ấy)|điều\s+(này|đó)|"
+    r"quy\s+định\s+(này|đó)|cái\s+(này|đó|kia))(?!\w)",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def _needs_context(message: str) -> bool:
+    """Heuristic: does this question DEPEND on prior turns to be understood?
+
+    Returns True only for genuinely dependent follow-ups — those carrying
+    anaphora / continuation cues, or very short fragments that lack their own
+    subject. A self-contained question (its own clear topic, no anaphora) returns
+    False so the follow-up condenser LEAVES IT ALONE instead of injecting the
+    previous turn's document/subject into it — which is what made a standalone
+    question like "Dịch vụ giám sát an ninh mạng là gì" get rewritten to
+    "... theo Luật An ninh mạng 2018" and then resolve to the wrong document.
+    """
+    m = (message or "").strip()
+    if not m:
+        return False
+    if _FOLLOWUP_CUES.search(m):
+        return True
+    # Very short fragments ("thời hạn bao lâu?") tend to be elliptical — they rely
+    # on an implicit subject established earlier. Longer questions are assumed to
+    # carry their own subject and are left untouched.
+    word_count = len([w for w in re.split(r"\s+", m) if w])
+    return word_count <= 4
+
+
 async def _condense_followup_query(message: str, prior: list[tuple[str, str]]) -> str:
     """Rewrite a follow-up question into a self-contained query using prior turns.
 
@@ -880,12 +914,18 @@ async def supervisor_node(state: SupervisorState) -> dict:
         # prior turns. Runs once (iterations==0) and never on abbreviation loop-back.
         # was_modified=True makes it flow into expanded_query/rewritten_query below,
         # so downstream RAG search + classification both use the contextualized query.
-        if iterations == 0 and not expanded and _has_explicit_doc_reference(query_for_classifier):
+        _condense_eligible = (
+            iterations == 0
+            and not expanded
+            and not _has_explicit_doc_reference(query_for_classifier)
+            and _needs_context(query_for_classifier)
+        )
+        if iterations == 0 and not expanded and not _condense_eligible:
             logger.info(
-                f"[supervisor] Skip follow-up condensation — query already names a "
-                f"specific document: {query_for_classifier!r}"
+                f"[supervisor] Skip follow-up condensation — query is self-contained "
+                f"(explicit doc ref or no follow-up cue): {query_for_classifier!r}"
             )
-        if iterations == 0 and not expanded and not _has_explicit_doc_reference(query_for_classifier):
+        if _condense_eligible:
             _prior = _get_prior_history(state)
             if _prior:
                 _contextualized = await _condense_followup_query(query_for_classifier, _prior)
@@ -1643,12 +1683,6 @@ async def mongo_formatter_node(state: SupervisorState) -> dict:
 # ReAct Executor Node — RAG group (tool-aware planning)
 # =============================================================================
 
-# Chars of answer text buffered before the first live ``token`` is emitted.
-# Keeps a short tool-turn preamble from ever reaching the client (no flicker),
-# while delaying the real answer's appearance only by this tiny initial chunk.
-_STREAM_HOLDBACK_CHARS = 64
-
-
 async def react_executor_node(state: SupervisorState) -> dict:
     """Single tool-calling ReAct loop for the RAG group.
 
@@ -1708,25 +1742,26 @@ async def react_executor_node(state: SupervisorState) -> dict:
             await push_event(state, "images", images)
             _emitted["images"] = len(images)
 
-    async def _run_turn(use_tools: bool, stream_text: bool = True):
-        """Run one LLM turn, streaming answer text to the client as it arrives.
+    async def _run_turn(use_tools: bool):
+        """Run one LLM turn, BUFFERING its tool calls and answer text.
 
-        Restores live token streaming (the previous revision buffered the whole
-        answer and emitted it in one ``token`` event, which killed the typing
-        effect). To avoid the old per-step flicker we hold the first
-        ``_STREAM_HOLDBACK_CHARS`` of text back instead of emitting immediately:
-        a tool-calling turn that writes a short "thinking-aloud" preamble before
-        its tool call stays under the threshold, so that preamble is never shown
-        and never has to be rolled back. The final-answer turn far exceeds the
-        threshold, so its text streams live after a tiny initial chunk. In the
-        rare case a long preamble was already flushed before a tool call appears,
-        we still retract it with ``token_rollback``.
+        We deliberately do NOT stream text to the client speculatively. In
+        native tool-calling mode the model sometimes writes prose BEFORE emitting
+        a tool call, and the function-call chunks only arrive at the END of the
+        stream — so there is no reliable way to tell, mid-stream, whether the
+        text being produced is the final answer or a throw-away preamble.
+        Streaming it live and then retracting it with ``token_rollback`` is
+        exactly what made the answer flash on screen and vanish on tool steps.
+        Instead we buffer here and let ``_finish`` replay the finalised answer
+        progressively (see ``_stream_out``) — nothing is ever taken back, so
+        there is no flicker.
 
-        Returns ``(calls, text, streamed)`` — ``streamed`` is True when answer
-        tokens reached the client (so ``_finish`` doesn't emit them again).
+        Emits a one-off "composing" status the moment answer text starts arriving
+        (tool-only turns produce little/no text), so the user isn't left staring
+        at a stale "searching" status while the answer is generated.
         """
         calls, text = [], ""
-        pending, streamed = "", False
+        announced = False
         async for c in llm.astream(
             msgs,
             system_prompt=system_prompt,
@@ -1740,47 +1775,52 @@ async def react_executor_node(state: SupervisorState) -> dict:
                 calls.append(c.function_call)
             elif c.type == "text" and c.text:
                 text += c.text
-                # Stream only while no tool call has appeared this turn.
-                if stream_text and not calls:
-                    if streamed:
-                        await push_event(state, "token", c.text)
-                    else:
-                        pending += c.text
-                        if len(pending) >= _STREAM_HOLDBACK_CHARS:
-                            await push_event(state, "token", pending)
-                            pending, streamed = "", True
-        # A tool call showed up after we'd already flushed preamble → retract it.
-        if calls and streamed:
-            await push_event(state, "token_rollback", {})
-            streamed = False
-        return calls, text, streamed
+                if not announced and not calls:
+                    announced = True
+                    await push_event(state, "status", {"step": "composing", "detail": "Đang soạn câu trả lời..."})
+        return calls, text
 
-    async def _finish(answer_text: str, streamed: bool = False) -> dict:
+    async def _stream_out(text: str) -> None:
+        """Replay a finalised answer to the client as progressive ``token`` events.
+
+        No speculative streaming happened upstream, so there is nothing to roll
+        back — ``text`` is already cleaned + sanitised. We pace the replay
+        (~1.2s total, bounded event count) so it renders with a typing feel
+        instead of landing in one block, without any ``token_rollback`` flicker.
+        """
+        if not text:
+            return
+        import asyncio as _aio
+        parts = re.findall(r"\S+\s*", text) or [text]
+        max_emits = 100
+        group = max(1, (len(parts) + max_emits - 1) // max_emits)
+        n_emits = (len(parts) + group - 1) // group
+        delay = min(0.02, 1.2 / max(1, n_emits))
+        buf = ""
+        for i, p in enumerate(parts):
+            buf += p
+            if (i + 1) % group == 0:
+                await push_event(state, "token", buf)
+                buf = ""
+                await _aio.sleep(delay)
+        if buf:
+            await push_event(state, "token", buf)
+
+    async def _finish(answer_text: str) -> dict:
         # Sources/images first so the client has citation data before the answer.
         await _emit_artifacts()
         from app.services.agent.nodes import sanitize_citations
-        shown = strip_thinking_tags(answer_text or "").strip()  # what the client streamed
+        final = strip_thinking_tags(answer_text or "").strip()
         # Drop citation markers the LLM invented (e.g. [75a75810] derived from a
         # document UUID) that map to no real source — else they leak as raw text.
         _valid_cids = {str(getattr(s, "index", "")) for s in sources}
         _valid_cids.discard("")
-        final = sanitize_citations(shown, _valid_cids)
+        final = sanitize_citations(final, _valid_cids)
         if not final:
-            # Nothing usable (empty turn, error, or all-invalid citations) — if we
-            # had streamed something speculative, retract it before the fallback.
-            if streamed:
-                await push_event(state, "token_rollback", {})
             final = "Xin lỗi, tôi chưa tạo được câu trả lời từ kho văn bản."
-            await push_event(state, "token", final)
-        elif not streamed:
-            # Buffered path (short answer < holdback, forced synthesis, or a
-            # rolled-back turn) — emit the whole answer in one token.
-            await push_event(state, "token", final)
-        elif final != shown:
-            # Already streamed live, but sanitisation changed the text (invented
-            # citations stripped) — correct the client's copy in one shot.
-            await push_event(state, "token_rollback", {})
-            await push_event(state, "token", final)
+        # Replay the finalised, sanitised answer (no speculative tokens were sent,
+        # so this is the ONLY thing the client ever renders → zero flicker).
+        await _stream_out(final)
         logger.info(
             f"[react_executor] done: {len(sources)} sources, answer={len(final)} chars"
         )
@@ -1797,9 +1837,9 @@ async def react_executor_node(state: SupervisorState) -> dict:
         no_progress = 0                # consecutive tool-turns adding no new sources
         for step in range(max_steps):
             await _emit_artifacts()
-            calls, text, streamed = await _run_turn(use_tools=True)
+            calls, text = await _run_turn(use_tools=True)
             if not calls:
-                return await _finish(text, streamed)
+                return await _finish(text)
 
             # Anti-loop guard: if EVERY tool call this turn repeats an earlier
             # call verbatim, the model is spinning (e.g. re-running the same
@@ -1890,8 +1930,8 @@ async def react_executor_node(state: SupervisorState) -> dict:
             "Nếu chưa đủ căn cứ, nói rõ phần nào còn thiếu."
         )))
         await _emit_artifacts()
-        _, text, streamed = await _run_turn(use_tools=False)
-        return await _finish(text, streamed)
+        _, text = await _run_turn(use_tools=False)
+        return await _finish(text)
 
     except Exception as e:
         logger.error(f"[react_executor] loop failed: {e}", exc_info=True)
