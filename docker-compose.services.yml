@@ -352,6 +352,7 @@ services:
       - ~/.cache/huggingface:/root/.cache/huggingface
       - hrag_uploads:/app/backend/uploads
       - hrag_data:/app/backend/data
+      - ./backend:/app/backend:rw   # live source — `restart` picks up code changes, no rebuild
     networks:
       - hrag_network
     extra_hosts:
@@ -418,6 +419,7 @@ services:
       - ~/.cache/huggingface:/root/.cache/huggingface
       - hrag_uploads:/app/backend/uploads
       - hrag_data:/app/backend/data
+      - ./backend:/app/backend:rw   # live source — `restart` picks up code changes, no rebuild
     networks:
       - hrag_network
     extra_hosts:
@@ -482,6 +484,7 @@ services:
       - ~/.cache/huggingface:/root/.cache/huggingface
       - hrag_uploads:/app/backend/uploads
       - hrag_data:/app/backend/data
+      - ./backend:/app/backend:rw   # live source — `restart` picks up code changes, no rebuild
     networks:
       - hrag_network
     extra_hosts:
@@ -537,6 +540,7 @@ services:
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
       - hrag_data:/app/backend/data
+      - ./backend:/app/backend:rw   # live source — `restart` picks up code changes, no rebuild
     networks:
       - hrag_network
     extra_hosts:
@@ -588,6 +592,7 @@ services:
       WORKER_HEALTH_PORT: "8081"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
+      - ./backend:/app/backend:rw   # live source — `restart` picks up code changes, no rebuild
     networks:
       - hrag_network
     extra_hosts:
