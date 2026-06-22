@@ -1613,12 +1613,11 @@ async def answer_generator_node(state: SupervisorState) -> dict:
 # Mongo Formatter Node — People search only
 # =============================================================================
 
-async def mongo_formatter_node(state: SupervisorState) -> dict:
-    """
-    Format MongoDB people search results via a lightweight LLM call.
+async def _format_mongo_block(state: SupervisorState) -> str:
+    """Render the person-record block (Block 1) via a lightweight LLM call.
 
-    Uses a small, focused prompt (~1KB) instead of the full RAG system prompt
-    (~13KB). This saves ~80% tokens compared to routing through answer_generator.
+    Streams tokens as it goes and returns the formatted text. Falls back to the
+    raw MongoDB display if the formatting call fails.
     """
     from app.core.config import settings
     from app.services.llm import get_llm_provider
@@ -1626,16 +1625,7 @@ async def mongo_formatter_node(state: SupervisorState) -> dict:
     from app.services.agent.streaming import push_event
     from app.services.agent.nodes import strip_thinking_tags
 
-    logger.info(f"[LANGGRAPH_NODE] Entering mongo_formatter_node")
-
-    existing_final = state.get("final_answer", "")
-    if not existing_final:
-        return {
-            "final_answer": "Không tìm thấy dữ liệu.",
-            "next_agent": AgentType.FINISH,
-        }
-
-    await push_event(state, "status", {"step": "generating", "detail": "Đang trình bày kết quả..."})
+    existing_final = state.get("final_answer", "") or ""
 
     # Focused prompt — only mongo formatting rules
     format_system = (
@@ -1671,12 +1661,99 @@ async def mongo_formatter_node(state: SupervisorState) -> dict:
             if chunk.type == "text" and chunk.text:
                 await push_event(state, "token", chunk.text)
                 answer_parts.append(chunk.text)
-        final = strip_thinking_tags("".join(answer_parts))
-        return {"final_answer": final, "next_agent": AgentType.FINISH}
+        return strip_thinking_tags("".join(answer_parts))
     except Exception as e:
-        logger.error(f"[mongo_formatter_node] LLM format failed: {e} — using raw")
+        logger.error(f"[mongo_formatter_node] mongo block format failed: {e} — using raw")
         await push_event(state, "token", existing_final)
-        return {"final_answer": existing_final, "next_agent": AgentType.FINISH}
+        return existing_final
+
+
+async def _format_doc_block(state: SupervisorState) -> str:
+    """Render the related-documents block (Block 2) over the companion RAG search.
+
+    Reuses the full answer_generator (citations, source formatting, streaming)
+    but on an ISOLATED sub-state so it only sees the document sources — not the
+    MongoDB person record (which lives in kg_summaries/final_answer). Returns ""
+    when there are no document sources to render.
+    """
+    from app.services.agent.nodes import answer_generator as _orig_ag
+    from app.services.agent.state import DEFAULT_STATE
+
+    sources = state.get("sources") or []
+    if not sources:
+        return ""
+
+    # Build an isolated state: document sources + their KG, NOT the mongo block.
+    agent_state = {**DEFAULT_STATE}
+    for k, v in state.items():
+        if v is not None or k not in DEFAULT_STATE:
+            agent_state[k] = v
+    agent_state["sources"] = sources
+    agent_state["kg_summaries"] = state.get("people_doc_kg", []) or []
+    agent_state["mongo_results"] = []
+    agent_state["intent"] = "search"
+    agent_state["final_answer"] = None
+    agent_state["tool_called"] = True
+    agent_state["existing_citation_ids"] = {}
+    agent_state["citation_map"] = {}
+
+    result = await _orig_ag(agent_state)
+    return (result.get("final_answer") or "").strip()
+
+
+async def mongo_formatter_node(state: SupervisorState) -> dict:
+    """
+    Two-block formatter for the people path.
+
+    Block 1 — person record(s) from MongoDB, via a lightweight ~1KB prompt.
+    Block 2 — related documents found by the companion RAG search
+              (people_doc_search_node), rendered with citations.
+
+    Every person lookup (CCCD / phone / name / …) runs the document search too,
+    because the same identifier or name commonly appears in indexed documents.
+    The two blocks are kept visually separate per product decision.
+    """
+    from app.services.agent.streaming import push_event
+
+    logger.info(f"[LANGGRAPH_NODE] Entering mongo_formatter_node")
+
+    existing_final = state.get("final_answer", "")
+    has_docs = bool(state.get("sources"))
+
+    if not existing_final and not has_docs:
+        return {
+            "final_answer": "Không tìm thấy dữ liệu.",
+            "next_agent": AgentType.FINISH,
+        }
+
+    await push_event(state, "status", {"step": "generating", "detail": "Đang trình bày kết quả..."})
+
+    # ── Block 1: person record(s) ────────────────────────────────────────────
+    if existing_final:
+        block1 = await _format_mongo_block(state)
+    else:
+        block1 = "Không tìm thấy hồ sơ người dân phù hợp."
+        await push_event(state, "token", block1)
+
+    # ── Block 2: related documents (companion RAG search) ────────────────────
+    block2 = ""
+    if has_docs:
+        header = "\n\n---\n\n### 📄 Tài liệu liên quan\n\n"
+        await push_event(state, "token", header)
+        try:
+            block2_body = await _format_doc_block(state)
+        except Exception as e:
+            logger.error(f"[mongo_formatter_node] doc block format failed: {e}")
+            block2_body = ""
+        if block2_body:
+            block2 = header + block2_body
+        else:
+            note = "_Không tìm thấy tài liệu liên quan._"
+            await push_event(state, "token", note)
+            block2 = header + note
+
+    final = (block1 + block2).strip()
+    return {"final_answer": final, "next_agent": AgentType.FINISH}
 
 
 # =============================================================================
@@ -2216,6 +2293,7 @@ def create_supervisor_graph():
     graph.add_node("resolve_doc_agent", _resolve_doc_agent_wrapper)  # Phase 2
     graph.add_node("write", _write_agent_wrapper)
     graph.add_node("people", _people_agent_wrapper)
+    graph.add_node("people_doc_search", _people_doc_search_wrapper)  # People + RAG
     graph.add_node("direct", direct_answer_node)
     graph.add_node("answer_generator", answer_generator_node)  # RAG-only
     graph.add_node("mongo_formatter", mongo_formatter_node)    # People-only
@@ -2359,7 +2437,11 @@ def create_supervisor_graph():
     )
 
     graph.add_edge("write", END)
-    graph.add_edge("people", "mongo_formatter")
+    # People path: always run the companion document (RAG) search before
+    # formatting, so person lookups also surface documents that mention the
+    # identifier/name.  people → people_doc_search → mongo_formatter (two blocks)
+    graph.add_edge("people", "people_doc_search")
+    graph.add_edge("people_doc_search", "mongo_formatter")
     graph.add_edge("direct", END)
 
     # Terminal nodes
@@ -2660,6 +2742,14 @@ async def _people_agent_wrapper(state: SupervisorState) -> dict:
     from app.services.agents.people_agent import people_agent_node
 
     return await people_agent_node(state)
+
+
+async def _people_doc_search_wrapper(state: SupervisorState) -> dict:
+    """Wrapper that imports and calls people_doc_search_node."""
+    logger.info("[LANGGRAPH_NODE] Entering people_doc_search_wrapper")
+    from app.services.agents.people_agent import people_doc_search_node
+
+    return await people_doc_search_node(state)
 
 
 # =============================================================================

@@ -124,6 +124,12 @@ class SupervisorState(TypedDict, total=False):
     abbreviation_results: Annotated[list, operator.add]
     mongo_results: Annotated[list, operator.add]
 
+    # People path: KG summaries from the companion document search that runs
+    # alongside MongoDB people lookup. Kept SEPARATE from kg_summaries (which
+    # holds the MongoDB display block) so the two-block formatter can render the
+    # "related documents" section without mixing in the person record text.
+    people_doc_kg: list
+
     # Section search results
     section_reference: str | None
 

@@ -262,3 +262,137 @@ async def people_agent_node(state: SupervisorState) -> dict:
         return {
             "kg_summaries": [f"Lỗi tìm kiếm: {str(e)}"],
         }
+
+
+# =============================================================================
+# People Document Search Node
+# =============================================================================
+
+import re as _re
+
+# Common name keys across the various people collections (BHXH/LG/EVN/…). Used to
+# anchor document relevance on the matched person's actual name.
+_PERSON_NAME_KEYS = (
+    "hoTen", "ho_ten", "ho_va_ten", "hovaten", "HoTen", "HoVaTen",
+    "name", "full_name", "fullName", "Name",
+)
+
+
+def _digit_anchors(text: str) -> list[str]:
+    """Identifier strings (CCCD/BHXH/phone) = runs of >=6 digits, separators stripped."""
+    return _re.findall(r"\d{6,}", _re.sub(r"[\s.\-]", "", text or ""))
+
+
+def _person_name_anchors(persons: list) -> list[str]:
+    """Lowercased person names from the MongoDB records, for relevance matching."""
+    names: list[str] = []
+    for p in persons or []:
+        if not isinstance(p, dict):
+            continue
+        for k in _PERSON_NAME_KEYS:
+            v = p.get(k)
+            if isinstance(v, str) and len(v.strip()) >= 4:
+                names.append(v.strip().lower())
+                break
+    return names
+
+
+def _filter_relevant_sources(anchor_text: str, persons: list, sources: list) -> list:
+    """Keep only document chunks that actually mention the searched identifier or person.
+
+    People companion search is an identifier/name lookup, yet hybrid search always
+    returns top-k chunks. A chunk is relevant only if its text contains the searched
+    identifier (CCCD/BHXH/phone digits) or the matched person's name; otherwise the
+    "related documents" block is just filler. When no anchor can be derived (e.g. a
+    vague name query with no MongoDB hit) we fail OPEN and keep the sources, so we
+    only ever drop documents we are confident are unrelated.
+    """
+    digit_anchors = _digit_anchors(anchor_text)
+    name_anchors = _person_name_anchors(persons)
+    if not digit_anchors and not name_anchors:
+        return sources
+    kept = []
+    for s in sources:
+        content = getattr(s, "content", None)
+        if content is None and isinstance(s, dict):
+            content = s.get("content", "")
+        content = content or ""
+        norm_digits = _re.sub(r"[\s.\-]", "", content)
+        low = content.lower()
+        if any(a in norm_digits for a in digit_anchors) or any(n in low for n in name_anchors):
+            kept.append(s)
+    return kept
+
+
+async def people_doc_search_node(state: SupervisorState) -> dict:
+    """Companion document (RAG) search for the people path.
+
+    Runs AFTER people_agent_node so that EVERY person lookup (CCCD / phone /
+    name / BHXH / advanced) also surfaces documents that mention the person or
+    identifier — the MongoDB record alone is not enough, the same value (a CCCD
+    number, a phone number, a name) often appears in indexed documents too.
+
+    Reuses the RAG agent's hybrid search tool (vector + KG + BM25) with the
+    user's query as-is; BM25 reliably catches literal identifiers like a CCCD
+    number. Results land in `sources` (consumed by mongo_formatter_node for the
+    "related documents" block) and `people_doc_kg` (kept separate from the
+    MongoDB display in kg_summaries).
+
+    Best-effort: any failure here must NOT break the person record answer, so
+    it returns empty results instead of raising.
+    """
+    from app.services.agent.streaming import push_event
+
+    query = state.get("rewritten_query") or state.get("original_query", "")
+    logger.info(f"[LANGGRAPH_NODE] Entering people_doc_search_node, query={query[:100]!r}")
+
+    await push_event(state, "status", {"step": "searching", "detail": "Đang tra cứu tài liệu liên quan..."})
+
+    try:
+        from app.services.agents.rag_agent import _tool_search, _map_search_result
+
+        result = await _tool_search(state)
+        updates = _map_search_result(result)
+
+        raw_sources = updates.get("sources", []) or []
+        raw_images = updates.get("images", []) or []
+
+        # Relevance gate: hybrid search always returns top-k chunks, but for an
+        # identifier/name lookup most are noise. Drop chunks that don't actually
+        # mention the CCCD/BHXH/phone or the matched person — otherwise Block 2
+        # becomes filler text. When nothing relevant remains, sources=[] and the
+        # formatter omits the "related documents" block entirely (only people data).
+        anchor_text = f"{state.get('original_query', '')} {state.get('rewritten_query', '')}"
+        sources = _filter_relevant_sources(anchor_text, state.get("mongo_results", []), raw_sources)
+        dropped = len(raw_sources) - len(sources)
+
+        # Only keep images that belong to a document we actually kept.
+        if sources:
+            kept_doc_ids = {getattr(s, "document_id", None) for s in sources}
+            images = [im for im in raw_images if getattr(im, "document_id", None) in kept_doc_ids]
+        else:
+            images = []
+
+        if sources:
+            await push_event(state, "sources", sources)
+        if images:
+            await push_event(state, "images", images)
+
+        logger.info(
+            f"[LANGGRAPH_DECISION] people_doc_search_node completed: "
+            f"sources={len(sources)} (dropped {dropped} irrelevant), images={len(images)}"
+        )
+
+        return {
+            "sources": sources,
+            "images": images,
+            # Keep doc KG OUT of kg_summaries to avoid mixing with the mongo block.
+            # When no relevant document remains, drop the KG too so Block 2 is fully
+            # omitted (it is unused once sources is empty anyway).
+            "people_doc_kg": (updates.get("kg_summaries", []) if sources else []),
+        }
+
+    except Exception as e:
+        logger.error(f"[people_doc_search_node] document search failed: {e}", exc_info=True)
+        # Best-effort: never break the person record answer
+        return {"people_doc_kg": []}

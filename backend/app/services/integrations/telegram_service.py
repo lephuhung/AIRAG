@@ -36,8 +36,11 @@ _bot_token_var: ContextVar[str | None] = ContextVar("_tg_bot_token", default=Non
 # Telegram hard limit per message; leave headroom for the streaming "▌" cursor.
 TG_MAX_CHARS = 4096
 TG_EDIT_BUDGET = 3900
-# Don't hammer Telegram's edit endpoint while streaming tokens.
-EDIT_MIN_INTERVAL_S = 1.2
+# Streaming edit cadence. Telegram flood-limits edits to a SINGLE message to
+# roughly ~1/sec — editing faster trips 429 (retry_after) which paradoxically
+# makes the stream SLOWER. ~1s is the smooth-but-safe floor; a rejected edit is
+# simply skipped (we never block waiting on a retry).
+EDIT_MIN_INTERVAL_S = 1.0
 
 HELP_TEXT = (
     "🤖 *AIRAG Bot*\n\n"
@@ -76,7 +79,12 @@ async def raw_api(method: str, payload: dict, token: str) -> dict:
 
 
 async def _call(method: str, payload: dict, token: str | None = None) -> dict | None:
-    """Call a Telegram Bot API method. Returns the `result` dict or None on error."""
+    """Call a Telegram Bot API method. Returns the `result` dict or None on error.
+
+    Never blocks on flood control: a 429 just returns None so the streaming loop
+    skips this edit and moves on (blocking on ``retry_after`` mid-stream stalls the
+    whole answer). The next scheduled edit catches up with the accumulated text.
+    """
     tok = token or _current_token()
     if not tok:
         logger.warning("[telegram] bot token not configured — skipping %s", method)
@@ -410,6 +418,7 @@ async def _handle_question(db, chat_id: str, question: str, tg_user_id: str | No
     final_answer = ""
     final_sources: list[dict] = []
     last_edit = 0.0
+    last_preview = ""               # skip no-op edits ("message is not modified")
 
     try:
         initial_state = build_initial_state(
@@ -431,13 +440,20 @@ async def _handle_question(db, chat_id: str, question: str, tg_user_id: str | No
                 acc.append(data.get("text", ""))
                 now = time.monotonic()
                 if placeholder_id and now - last_edit >= EDIT_MIN_INTERVAL_S:
-                    last_edit = now
                     partial = "".join(acc).strip()
                     if partial:
                         # Plain text while streaming (markdown stripped) so no raw
                         # ** flickers; the final message gets full HTML formatting.
                         preview = _strip_markdown(_strip_citations(partial))
-                        await edit_message(chat_id, placeholder_id, _clip(preview + " ▌", TG_EDIT_BUDGET))
+                        if preview != last_preview:
+                            # Advance the clock on every attempt (success or 429) so a
+                            # rejected edit just waits for the next slot — no hammering,
+                            # no blocking. The accumulated text catches up next edit.
+                            last_edit = now
+                            if await edit_message(
+                                chat_id, placeholder_id, _clip(preview + " ▌", TG_EDIT_BUDGET)
+                            ):
+                                last_preview = preview
             elif etype == "sources":
                 final_sources = data.get("sources", []) or final_sources
             elif etype == "complete":
