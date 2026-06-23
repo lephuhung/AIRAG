@@ -43,6 +43,9 @@ neo4j>=5.0
 # Authentication
 python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.4
+# TOTP two-factor auth (Google Authenticator) + QR provisioning
+pyotp>=2.9.0
+qrcode[pil]>=7.4.0
 
 # Utilities
 python-dotenv>=1.0.0

@@ -18,6 +18,7 @@ export interface User {
   is_superadmin: boolean;
   avatar_url?: string | null;
   settings?: UserSettings;
+  two_factor_enabled?: boolean;
   created_at: string;
   updated_at: string;
 }

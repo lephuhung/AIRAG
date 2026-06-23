@@ -14,6 +14,7 @@ class UserResponse(BaseModel):
     is_superadmin: bool
     avatar_url: str | None = None
     settings: dict = {}
+    two_factor_enabled: bool = False
     created_at: datetime
     updated_at: datetime
 

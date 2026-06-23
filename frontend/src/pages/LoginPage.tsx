@@ -13,20 +13,30 @@ export function LoginPage() {
   const login = useAuthStore((s) => s.login);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [totpCode, setTotpCode] = useState("");
+  const [twoFactorRequired, setTwoFactorRequired] = useState(false);
   const [loading, setLoading] = useState(false);
   const { t } = useTranslation();
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!email || !password) return;
+    if (twoFactorRequired && totpCode.length !== 6) return;
 
     setLoading(true);
     try {
-      await login(email, password);
+      await login(email, password, twoFactorRequired ? totpCode : undefined);
       toast.success("Logged in successfully");
       navigate("/");
     } catch (err: any) {
-      toast.error(err.message || "Login failed");
+      if (err.message === "TWO_FACTOR_REQUIRED") {
+        // First step succeeded (email+password ok); now ask for the code.
+        setTwoFactorRequired(true);
+        toast.info("Enter the code from your authenticator app");
+      } else {
+        // A bad code re-throws here; keep the field visible to retry.
+        toast.error(err.message || "Login failed");
+      }
     } finally {
       setLoading(false);
     }
@@ -68,8 +78,31 @@ export function LoginPage() {
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 required
+                disabled={twoFactorRequired}
               />
             </div>
+            {twoFactorRequired && (
+              <div>
+                <label className="block text-sm font-medium mb-1.5">
+                  Authenticator code
+                </label>
+                <Input
+                  type="text"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  placeholder="6-digit code"
+                  value={totpCode}
+                  onChange={(e) =>
+                    setTotpCode(e.target.value.replace(/\D/g, "").slice(0, 6))
+                  }
+                  autoFocus
+                  required
+                />
+                <p className="text-xs text-muted-foreground mt-1.5">
+                  Open Google Authenticator and enter the current 6-digit code.
+                </p>
+              </div>
+            )}
             <Button type="submit" className="w-full" disabled={loading}>
               <LogIn className="w-4 h-4 mr-2" />
               {loading ? t("auth.signing_in") : t("auth.login")}

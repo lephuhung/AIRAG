@@ -594,6 +594,22 @@ async def lifespan(app: FastAPI):
             logger.info("users.avatar_url column ensured")
         except Exception as _col_err:
             logger.warning(f"avatar_url migration failed (non-fatal): {_col_err}")
+
+        # ── Add TOTP two-factor columns to users (idempotent) ─────────────────
+        try:
+            async with engine.begin() as _2fa_conn:
+                await _2fa_conn.execute(
+                    text("ALTER TABLE users ADD COLUMN IF NOT EXISTS totp_secret VARCHAR(64)")
+                )
+                await _2fa_conn.execute(
+                    text(
+                        "ALTER TABLE users ADD COLUMN IF NOT EXISTS "
+                        "totp_enabled BOOLEAN NOT NULL DEFAULT false"
+                    )
+                )
+            logger.info("users.totp_secret / totp_enabled columns ensured")
+        except Exception as _2fa_err:
+            logger.warning(f"2FA columns migration failed (non-fatal): {_2fa_err}")
     else:
         logger.info("AUTO_CREATE_TABLES=false — skipping auto-migration")
 

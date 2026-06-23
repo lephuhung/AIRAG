@@ -26,6 +26,10 @@ from app.core.security import (
     create_access_token,
     create_refresh_token,
     decode_token,
+    generate_totp_secret,
+    totp_provisioning_uri,
+    totp_qr_data_uri,
+    verify_totp,
 )
 from app.models.user import User
 from app.models.tenant import Tenant, TenantUser
@@ -38,6 +42,10 @@ from app.schemas.auth import (
     RefreshRequest,
     RefreshResponse,
     UpdateProfileRequest,
+    TwoFASetupResponse,
+    TwoFAEnableRequest,
+    TwoFADisableRequest,
+    TwoFAStatusResponse,
 )
 from app.schemas.user import UserResponse
 from app.services.storage_service import get_storage_service
@@ -186,6 +194,14 @@ async def login(
             "Account not yet approved. Please wait for admin approval."
         )
 
+    # ── Two-factor gate (TOTP / Google Authenticator) ─────────────────────
+    if user.totp_enabled:
+        if not body.totp_code:
+            # Sentinel the frontend recognises to prompt for the 6-digit code.
+            raise UnauthorizedError("TWO_FACTOR_REQUIRED")
+        if not verify_totp(user.totp_secret or "", body.totp_code):
+            raise UnauthorizedError("Invalid two-factor code")
+
     access_token = create_access_token(user.id)
     refresh_token = create_refresh_token(user.id)
 
@@ -313,3 +329,99 @@ async def upload_avatar(
     await db.refresh(user)
     logger.info(f"User {user.id} uploaded avatar ({len(data)} bytes)")
     return user
+
+
+# ── Two-Factor Auth (TOTP / Google Authenticator) ──────────────────────────
+
+
+@router.get("/2fa/status", response_model=TwoFAStatusResponse)
+async def two_fa_status(
+    user: User = Depends(get_current_active_user),
+):
+    """Whether TOTP two-factor is currently active for the user."""
+    return TwoFAStatusResponse(enabled=bool(user.totp_enabled))
+
+
+@router.post("/2fa/setup", response_model=TwoFASetupResponse)
+async def two_fa_setup(
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Begin enrollment: mint a fresh secret, persist it (pending), and return the
+    QR + manual key. 2FA is NOT active yet — the user must confirm via /2fa/enable.
+
+    Re-running this before enabling rotates the secret, which is fine. It is
+    rejected once 2FA is already enabled (disable first to re-enroll).
+    """
+    if user.totp_enabled:
+        raise BadRequestError(
+            "Two-factor is already enabled. Disable it first to re-enroll."
+        )
+
+    secret = generate_totp_secret()
+    uri = totp_provisioning_uri(secret, user.email)
+
+    user.totp_secret = secret  # stored pending verification; totp_enabled stays false
+    await db.commit()
+
+    logger.info(f"User {user.id} started 2FA enrollment")
+    return TwoFASetupResponse(
+        secret=secret,
+        otpauth_uri=uri,
+        qr_data_uri=totp_qr_data_uri(uri),
+    )
+
+
+@router.post("/2fa/enable", response_model=TwoFAStatusResponse)
+async def two_fa_enable(
+    body: TwoFAEnableRequest,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Confirm enrollment by submitting a valid code → activate 2FA."""
+    if user.totp_enabled:
+        raise BadRequestError("Two-factor is already enabled.")
+    if not user.totp_secret:
+        raise BadRequestError("Start setup first via /auth/2fa/setup.")
+    if not verify_totp(user.totp_secret, body.code):
+        raise BadRequestError("Invalid code. Check your authenticator app and try again.")
+
+    user.totp_enabled = True
+    await db.commit()
+    await db.refresh(user)
+    logger.info(f"User {user.id} enabled 2FA")
+    return TwoFAStatusResponse(enabled=True)
+
+
+@router.post("/2fa/disable", response_model=TwoFAStatusResponse)
+async def two_fa_disable(
+    body: TwoFADisableRequest,
+    user: User = Depends(get_current_active_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Turn 2FA off. Requires proof of ownership: a current TOTP code OR the
+    account password. Clears the stored secret."""
+    if not user.totp_enabled:
+        # Idempotent: already off. Also clear any dangling pending secret.
+        if user.totp_secret:
+            user.totp_secret = None
+            await db.commit()
+        return TwoFAStatusResponse(enabled=False)
+
+    verified = False
+    if body.code and verify_totp(user.totp_secret or "", body.code):
+        verified = True
+    elif body.password and verify_password(body.password, user.password_hash):
+        verified = True
+
+    if not verified:
+        raise BadRequestError(
+            "Verification failed. Provide a valid authenticator code or your password."
+        )
+
+    user.totp_enabled = False
+    user.totp_secret = None
+    await db.commit()
+    await db.refresh(user)
+    logger.info(f"User {user.id} disabled 2FA")
+    return TwoFAStatusResponse(enabled=False)

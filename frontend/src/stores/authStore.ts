@@ -17,7 +17,7 @@ interface AuthState {
   user: User | null;
   isAuthenticated: boolean;
 
-  login: (email: string, password: string) => Promise<void>;
+  login: (email: string, password: string, totpCode?: string) => Promise<void>;
   register: (data: {
     email: string;
     password: string;
@@ -85,15 +85,23 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     set({ user: updatedUser });
   },
 
-  login: async (email, password) => {
+  login: async (email, password, totpCode) => {
     const res = await fetch(`${BASE_URL}/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({
+        email,
+        password,
+        ...(totpCode ? { totp_code: totpCode } : {}),
+      }),
     });
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({ detail: "Login failed" }));
+      // Sentinel from the backend: account has 2FA on, prompt for the code.
+      if (err.detail === "TWO_FACTOR_REQUIRED") {
+        throw new Error("TWO_FACTOR_REQUIRED");
+      }
       throw new Error(err.detail || `Login error: ${res.status}`);
     }
 

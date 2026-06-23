@@ -14,6 +14,7 @@ import { useAuthStore } from "@/stores/authStore";
 import { ApiKeysTab } from "@/components/settings/ApiKeysTab";
 import { TelegramTab } from "@/components/settings/TelegramTab";
 import { TTSTab } from "@/components/settings/TTSTab";
+import { TwoFactorSection } from "@/components/settings/TwoFactorSection";
 import type { User as UserType } from "@/types";
 
 type Tab = "profile" | "security" | "api_keys" | "telegram" | "tts";
@@ -274,6 +275,9 @@ export function ProfileModal({ onClose }: ProfileModalProps) {
                 onToggleShow={() => setShowNew((v) => !v)}
                 placeholder="Repeat new password"
               />
+
+              {/* Two-factor auth (Google Authenticator) */}
+              <TwoFactorSection />
             </>
           )}
 

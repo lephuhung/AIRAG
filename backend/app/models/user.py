@@ -28,6 +28,15 @@ class User(Base):
     avatar_url: Mapped[str | None] = mapped_column(
         String(1024), nullable=True, default=None
     )
+    # ── Two-factor auth (TOTP / Google Authenticator) ──────────────────────
+    # base32 secret; populated during setup, kept even while pending verification.
+    totp_secret: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, default=None
+    )
+    # Only true after the user verifies a code → login then requires a TOTP code.
+    totp_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
     # Free-form per-user preferences (e.g. {"tts": {"voice": ..., "speed": 1.0}})
     settings: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict, server_default="{}"
@@ -36,6 +45,11 @@ class User(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )
+
+    @property
+    def two_factor_enabled(self) -> bool:
+        """Public-facing alias for `totp_enabled` (used by UserResponse)."""
+        return bool(self.totp_enabled)
 
     chat_files: Mapped[list["ChatFile"]] = relationship(
         "ChatFile",

@@ -82,3 +82,53 @@ def generate_link_code() -> str:
     """Short, unambiguous one-time code for linking a Telegram chat (no 0/O/1/I)."""
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "".join(secrets.choice(alphabet) for _ in range(8))
+
+
+# ── TOTP two-factor auth (Google Authenticator) ────────────────────────────
+# Label shown in the authenticator app next to the account.
+TOTP_ISSUER = "HRAG"
+
+
+def generate_totp_secret() -> str:
+    """Generate a fresh random base32 TOTP secret to store on the user."""
+    import pyotp
+
+    return pyotp.random_base32()
+
+
+def totp_provisioning_uri(secret: str, account_email: str) -> str:
+    """Build the otpauth:// URI that authenticator apps consume (via QR or manual)."""
+    import pyotp
+
+    return pyotp.totp.TOTP(secret).provisioning_uri(
+        name=account_email, issuer_name=TOTP_ISSUER
+    )
+
+
+def verify_totp(secret: str, code: str) -> bool:
+    """Verify a 6-digit TOTP code against the secret.
+
+    valid_window=1 tolerates ±30s of clock drift between server and phone.
+    """
+    import pyotp
+
+    if not secret or not code:
+        return False
+    try:
+        return pyotp.TOTP(secret).verify(code.strip(), valid_window=1)
+    except Exception:
+        return False
+
+
+def totp_qr_data_uri(provisioning_uri: str) -> str:
+    """Render the provisioning URI as a base64 PNG data URI for an <img> tag."""
+    import base64
+    import io
+
+    import qrcode
+
+    img = qrcode.make(provisioning_uri)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
