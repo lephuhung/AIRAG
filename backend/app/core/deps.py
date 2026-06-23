@@ -196,3 +196,33 @@ async def verify_workspace_access(
 
     # Unknown visibility — deny
     raise ForbiddenError("You don't have access to this workspace")
+
+
+async def verify_workspace_manage_access(kb, user, db: AsyncSession):
+    """Gate WRITE/DELETE on a workspace (and its documents).
+
+    Read access (membership via ``verify_workspace_access``) is NOT sufficient.
+    Allowed: superadmin; the workspace owner; a tenant admin ONLY when the
+    workspace is tenant-visible. Legacy workspaces without an owner stay open
+    (matches the historical update/delete behaviour). Returns ``kb``.
+    """
+    from app.models.tenant import TenantUser
+
+    if user.is_superadmin:
+        return kb
+    # Owner (or legacy ownerless workspace) — allowed.
+    if kb.owner_id is None or kb.owner_id == user.id:
+        return kb
+    # Someone else's workspace: only a tenant admin of a tenant-VISIBLE workspace.
+    if kb.tenant_id and (kb.visibility or "personal") == "tenant":
+        result = await db.execute(
+            select(TenantUser).where(
+                TenantUser.tenant_id == kb.tenant_id,
+                TenantUser.user_id == user.id,
+                TenantUser.role == "admin",
+                TenantUser.is_approved.is_(True),
+            )
+        )
+        if result.scalar_one_or_none() is not None:
+            return kb
+    raise ForbiddenError("Only the owner or tenant admin can manage this workspace")

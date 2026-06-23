@@ -1,6 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/lib/api";
-import type { InviteLink, InviteValidation } from "@/types";
+import type { InviteLink, InviteValidation, InviteAcceptResult } from "@/types";
 
 export function useCreateInvite() {
   const queryClient = useQueryClient();
@@ -58,5 +58,18 @@ export function useValidateInvite(token: string | null) {
     enabled: !!token,
     retry: false,
     staleTime: 60_000, // cache for 1 minute
+  });
+}
+
+/** Redeem an invite as an already-logged-in user (joins the tenant directly). */
+export function useAcceptInvite() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (token: string) =>
+      api.post<InviteAcceptResult>(`/tenants/invite/${token}/accept`),
+    onSuccess: () => {
+      // The user's tenant membership changed — refresh "my tenants".
+      queryClient.invalidateQueries({ queryKey: ["my-tenants"] });
+    },
   });
 }

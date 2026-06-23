@@ -6,7 +6,7 @@
  * linked, the bot chats with the user's exact permissions.
  */
 import { useState } from "react";
-import { Copy, Check, Loader2, Send, Trash2, ExternalLink } from "lucide-react";
+import { Copy, Check, Loader2, Send, Trash2, ExternalLink, ShieldAlert } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -26,16 +26,25 @@ export function TelegramTab() {
   const createCode = useCreateLinkCode();
   const unlink = useUnlinkTelegram();
 
+  const twoFAEnabled = useAuthStore((s) => s.user?.two_factor_enabled ?? false);
+
   const [code, setCode] = useState<TelegramLinkCode | null>(null);
+  const [totp, setTotp] = useState("");
   const [copied, setCopied] = useState(false);
   const [unlinkTarget, setUnlinkTarget] = useState<TelegramLinkInfo | null>(null);
 
   const handleGenerate = async () => {
+    if (totp.length !== 6) return;
     try {
-      const c = await createCode.mutateAsync();
+      const c = await createCode.mutateAsync(totp);
       setCode(c);
+      setTotp("");
     } catch (err: any) {
-      toast.error(err.message || "Failed to generate code");
+      if (err.message === "TWO_FACTOR_NOT_ENABLED") {
+        toast.error("Enable two-factor authentication first (Security tab)");
+      } else {
+        toast.error(err.message || "Failed to generate code");
+      }
     }
   };
 
@@ -72,15 +81,47 @@ export function TelegramTab() {
         <code className="px-1 rounded bg-muted">/start &lt;code&gt;</code>.
       </p>
 
-      {/* Generate code */}
-      <Button size="sm" onClick={handleGenerate} disabled={createCode.isPending}>
-        {createCode.isPending ? (
-          <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
-        ) : (
-          <Send className="w-3.5 h-3.5 mr-1.5" />
-        )}
-        Generate linking code
-      </Button>
+      {/* Generate code — gated behind 2FA */}
+      {!twoFAEnabled ? (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 p-3">
+          <ShieldAlert className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+          <p className="text-xs text-amber-700 dark:text-amber-400">
+            You must enable two-factor authentication before linking a Telegram
+            chat. Turn it on in the <strong>Security</strong> tab, then come back.
+          </p>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <label className="text-xs font-medium text-muted-foreground">
+            Enter your authenticator code to generate a linking code
+          </label>
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              placeholder="6-digit code"
+              value={totp}
+              onChange={(e) =>
+                setTotp(e.target.value.replace(/\D/g, "").slice(0, 6))
+              }
+              className="w-36 px-3 py-2 text-sm rounded-lg border bg-background focus:outline-none focus:ring-2 focus:ring-primary/30 tracking-widest"
+            />
+            <Button
+              size="sm"
+              onClick={handleGenerate}
+              disabled={createCode.isPending || totp.length !== 6}
+            >
+              {createCode.isPending ? (
+                <Loader2 className="w-3.5 h-3.5 mr-1.5 animate-spin" />
+              ) : (
+                <Send className="w-3.5 h-3.5 mr-1.5" />
+              )}
+              Generate linking code
+            </Button>
+          </div>
+        </div>
+      )}
 
       {code && (
         <div className="rounded-lg border border-primary/40 bg-primary/5 p-3 space-y-2">

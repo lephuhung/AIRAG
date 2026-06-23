@@ -735,6 +735,14 @@ export interface InviteLink {
   invite_url: string;
 }
 
+export interface InviteAcceptResult {
+  tenant_id: string;
+  tenant_name: string;
+  tenant_slug: string;
+  role: string;
+  already_member: boolean;
+}
+
 // ── Abbreviation Types ──
 export interface Abbreviation {
   id: string;

@@ -216,7 +216,14 @@
     "invite_validating": "Validating invite link...",
     "invite_locked_email": "Email set by invite link",
     "invite_auto_activate": "Your account will be activated automatically",
-    "invite_can_register": "You can still register normally below"
+    "invite_can_register": "You can still register normally below",
+    "invite_signed_in_as": "You are signed in as",
+    "invite_join_prompt": "Accept this invitation to join the organization.",
+    "invite_join": "Join organization",
+    "invite_joining": "Joining...",
+    "invite_use_other_account": "Use a different account",
+    "invite_joined": "Joined successfully!",
+    "invite_already_member": "You are already a member of this organization."
   },
   "chat": {
     "welcome_title": "Welcome to HRAG",

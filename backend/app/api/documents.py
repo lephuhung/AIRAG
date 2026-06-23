@@ -25,7 +25,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.core.config import settings
-from app.core.deps import get_db, get_current_active_user, verify_workspace_access
+from app.core.deps import (
+    get_db,
+    get_current_active_user,
+    verify_workspace_access,
+    verify_workspace_manage_access,
+)
 from app.core.exceptions import NotFoundError
 from app.models.knowledge_base import KnowledgeBase
 from app.models.document import Document, DocumentImage, DocumentStatus
@@ -627,6 +632,8 @@ async def confirm_upload(
     if document is None:
         raise NotFoundError("Document", body.document_id)
 
+    await verify_workspace_access(workspace_id, user, db)
+
     if document.status != DocumentStatus.PENDING:
         # Already queued / processing — idempotent response
         return DocumentUploadResponse(
@@ -810,6 +817,8 @@ async def get_chunk_context(
     if document is None:
         raise NotFoundError("Document", document_id)
 
+    await verify_workspace_access(document.workspace_id, user, db)
+
     if document.status not in (DocumentStatus.INDEXED, DocumentStatus.BUILDING_KG):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -935,6 +944,8 @@ async def get_document_markdown(
     if document is None:
         raise NotFoundError("Document", document_id)
 
+    await verify_workspace_access(document.workspace_id, user, db)
+
     if not document.markdown_s3_key:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -986,6 +997,8 @@ async def get_document_images(
     if document is None:
         raise NotFoundError("Document", document_id)
 
+    await verify_workspace_access(document.workspace_id, user, db)
+
     result = await db.execute(
         select(DocumentImage)
         .where(DocumentImage.document_id == document_id)
@@ -1019,6 +1032,8 @@ async def download_document(
 
     if document is None:
         raise NotFoundError("Document", document_id)
+
+    await verify_workspace_access(document.workspace_id, user, db)
 
     if not document.upload_s3_key:
         raise HTTPException(
@@ -1064,6 +1079,8 @@ async def get_document(
 
     if document is None:
         raise NotFoundError("Document", document_id)
+
+    await verify_workspace_access(document.workspace_id, user, db)
 
     return document
 
@@ -1149,6 +1166,10 @@ async def delete_document(
 
     if document is None:
         raise NotFoundError("Document", document_id)
+
+    # Only the owner, a tenant admin (tenant-visible), or a superadmin may delete.
+    kb = await verify_workspace_access(document.workspace_id, user, db)
+    await verify_workspace_manage_access(kb, user, db)
 
     # Always clean up vector store + KG, regardless of status. Chunks/KG nodes
     # can exist whenever the document was (partially) processed — e.g. embed_done

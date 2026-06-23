@@ -16,11 +16,13 @@ from fastapi import APIRouter, Depends, Request, status
 from sqlalchemy import select, func, case
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.deps import get_db, get_current_active_user, require_superadmin
 from app.core.exceptions import NotFoundError, ForbiddenError, ConflictError, BadRequestError
 from app.models.tenant import Tenant, TenantUser
 from app.models.user import User
 from app.models.invite_token import InviteToken
+from app.services.invite_service import consume_invite_use
 from app.schemas.tenant import (
     TenantCreate,
     TenantUpdate,
@@ -32,6 +34,7 @@ from app.schemas.invite import (
     InviteCreateRequest,
     InviteResponse,
     InviteValidationResponse,
+    InviteAcceptResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,6 +69,18 @@ async def _require_tenant_admin(tenant_id: uuid.UUID, user: User, db: AsyncSessi
     if tu is None:
         raise ForbiddenError("Tenant admin access required")
     return tu
+
+
+def _ensure_can_manage_admin_target(is_superadmin: bool, target_tu: TenantUser) -> None:
+    """Restrict tenant admins to managing non-admin members only.
+
+    Admin-role accounts (promote/demote/remove) are superadmin-only. This single
+    rule covers three guards at once: a tenant admin cannot demote/remove a peer
+    admin, cannot act on themselves (they are an admin), and cannot strand the
+    tenant with zero admins (the last admin is always an admin target).
+    """
+    if not is_superadmin and target_tu.role == "admin":
+        raise ForbiddenError("Only a superadmin can manage admin members of a tenant")
 
 
 async def _build_tenant_user_response(tu: TenantUser, db: AsyncSession) -> TenantUserResponse:
@@ -190,6 +205,100 @@ async def validate_invite(
         tenant_slug=tenant.slug,
         email=invite.email,
         expires_at=invite.expires_at.replace(tzinfo=timezone.utc).isoformat(),
+    )
+
+
+@router.post("/invite/{token}/accept", response_model=InviteAcceptResponse)
+async def accept_invite(
+    token: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
+    """Redeem an invite link as an ALREADY-AUTHENTICATED user to join the tenant.
+
+    The public registration flow (`POST /auth/register`) only handles brand-new
+    accounts. Existing users hit this endpoint instead — same invite token, but it
+    creates/approves their `TenantUser` membership directly. Idempotent: re-accepting
+    while already a member returns `already_member=True` without consuming a use.
+    """
+    result = await db.execute(
+        select(InviteToken).where(InviteToken.token == token)
+    )
+    invite = result.scalar_one_or_none()
+
+    if invite is None or not invite.is_active:
+        raise BadRequestError("Invalid or expired invite link")
+
+    if datetime.utcnow() > invite.expires_at:
+        raise BadRequestError("Invite link has expired")
+
+    if invite.max_uses is not None and invite.use_count >= invite.max_uses:
+        raise BadRequestError("Invite link has reached its maximum number of uses")
+
+    if invite.email and invite.email.lower() != (user.email or "").lower().strip():
+        raise BadRequestError("This invite link is restricted to a different email address")
+
+    tenant = await _get_tenant(invite.tenant_id, db)
+    if not tenant.is_active:
+        raise BadRequestError("The organization for this invite is no longer active")
+
+    # Already a member? Approve a pending membership, or no-op if already approved.
+    result = await db.execute(
+        select(TenantUser).where(
+            TenantUser.tenant_id == invite.tenant_id,
+            TenantUser.user_id == user.id,
+        )
+    )
+    membership = result.scalar_one_or_none()
+
+    if membership is not None:
+        if membership.is_approved:
+            # Idempotent: do not consume a use, do not downgrade an existing role.
+            return InviteAcceptResponse(
+                tenant_id=tenant.id,
+                tenant_name=tenant.name,
+                tenant_slug=tenant.slug,
+                role=membership.role,
+                already_member=True,
+            )
+        # Pending request → approve it via the invite and adopt the invite's role.
+        if not await consume_invite_use(db, invite):
+            raise BadRequestError("Invite link has reached its maximum number of uses")
+        membership.is_approved = True
+        membership.role = invite.role
+        await db.commit()
+        logger.info(
+            f"User {user.email} accepted invite (approved pending membership), "
+            f"tenant_id={invite.tenant_id}, role={invite.role}"
+        )
+        return InviteAcceptResponse(
+            tenant_id=tenant.id,
+            tenant_name=tenant.name,
+            tenant_slug=tenant.slug,
+            role=membership.role,
+            already_member=False,
+        )
+
+    if not await consume_invite_use(db, invite):
+        raise BadRequestError("Invite link has reached its maximum number of uses")
+    tenant_user = TenantUser(
+        tenant_id=invite.tenant_id,
+        user_id=user.id,
+        role=invite.role,
+        is_approved=True,
+    )
+    db.add(tenant_user)
+    await db.commit()
+    logger.info(
+        f"User {user.email} accepted invite (new membership), "
+        f"tenant_id={invite.tenant_id}, role={invite.role}"
+    )
+    return InviteAcceptResponse(
+        tenant_id=tenant.id,
+        tenant_name=tenant.name,
+        tenant_slug=tenant.slug,
+        role=invite.role,
+        already_member=False,
     )
 
 
@@ -365,7 +474,7 @@ async def approve_user(
 ):
     """Approve a pending user (Tenant Admin or SuperAdmin)."""
     await _get_tenant(tenant_id, db)
-    await _require_tenant_admin(tenant_id, user, db)
+    caller_tu = await _require_tenant_admin(tenant_id, user, db)
 
     result = await db.execute(
         select(TenantUser).where(
@@ -376,6 +485,9 @@ async def approve_user(
     tu = result.scalar_one_or_none()
     if tu is None:
         raise NotFoundError("TenantUser", f"tenant={tenant_id}, user={user_id}")
+
+    # Approving a pending admin activates an admin account → superadmin-only.
+    _ensure_can_manage_admin_target(caller_tu is None, tu)
 
     tu.is_approved = True
 
@@ -400,7 +512,7 @@ async def reject_user(
 ):
     """Reject and remove a pending user (Tenant Admin or SuperAdmin)."""
     await _get_tenant(tenant_id, db)
-    await _require_tenant_admin(tenant_id, user, db)
+    caller_tu = await _require_tenant_admin(tenant_id, user, db)
 
     result = await db.execute(
         select(TenantUser).where(
@@ -411,6 +523,8 @@ async def reject_user(
     tu = result.scalar_one_or_none()
     if tu is None:
         raise NotFoundError("TenantUser", f"tenant={tenant_id}, user={user_id}")
+
+    _ensure_can_manage_admin_target(caller_tu is None, tu)
 
     await db.delete(tu)
     await db.commit()
@@ -425,7 +539,7 @@ async def remove_tenant_user(
 ):
     """Remove a user from the tenant (Tenant Admin or SuperAdmin)."""
     await _get_tenant(tenant_id, db)
-    await _require_tenant_admin(tenant_id, user, db)
+    caller_tu = await _require_tenant_admin(tenant_id, user, db)
 
     result = await db.execute(
         select(TenantUser).where(
@@ -436,6 +550,8 @@ async def remove_tenant_user(
     tu = result.scalar_one_or_none()
     if tu is None:
         raise NotFoundError("TenantUser", f"tenant={tenant_id}, user={user_id}")
+
+    _ensure_can_manage_admin_target(caller_tu is None, tu)
 
     await db.delete(tu)
     await db.commit()
@@ -451,7 +567,13 @@ async def update_user_role(
 ):
     """Change a user's role in the tenant (Tenant Admin or SuperAdmin)."""
     await _get_tenant(tenant_id, db)
-    await _require_tenant_admin(tenant_id, user, db)
+    caller_tu = await _require_tenant_admin(tenant_id, user, db)
+    is_superadmin = caller_tu is None
+
+    # Only a superadmin may grant the admin role (prevents tenant admins from
+    # minting sibling admins / privilege escalation).
+    if not is_superadmin and body.role == "admin":
+        raise ForbiddenError("Only a superadmin can grant the admin role")
 
     result = await db.execute(
         select(TenantUser).where(
@@ -462,6 +584,10 @@ async def update_user_role(
     tu = result.scalar_one_or_none()
     if tu is None:
         raise NotFoundError("TenantUser", f"tenant={tenant_id}, user={user_id}")
+
+    # Demoting/altering an existing admin (incl. self and the last admin) is
+    # superadmin-only.
+    _ensure_can_manage_admin_target(is_superadmin, tu)
 
     tu.role = body.role
     await db.commit()
@@ -475,13 +601,20 @@ async def update_user_role(
 # ── Invite Link Management ────────────────────────────────────────────────
 
 def _build_invite_url(token: str, request: Request) -> str:
-    """Build the frontend invite URL from the token."""
-    # Use the request's origin to build the URL
-    origin = request.headers.get("origin", "")
-    if not origin:
-        # Fallback: use the request base URL but point to frontend port
-        origin = str(request.base_url).rstrip("/").replace(":8080", ":5174")
-    return f"{origin}/register?invite={token}"
+    """Build the frontend invite URL from the token.
+
+    Prefers an explicitly configured public frontend origin so the link is
+    correct behind a reverse proxy and for non-browser callers; only falls back
+    to the request Origin / dev port-swap when none is set.
+    """
+    base = (settings.FRONTEND_BASE_URL or settings.PUBLIC_BASE_URL or "").rstrip("/")
+    if not base:
+        base = request.headers.get("origin", "").rstrip("/")
+    if not base:
+        # Last resort (local dev): reuse the request base URL but point to the
+        # frontend port.
+        base = str(request.base_url).rstrip("/").replace(":8080", ":5174")
+    return f"{base}/register?invite={token}"
 
 
 def _build_invite_response(invite: InviteToken, request: Request) -> InviteResponse:
@@ -511,10 +644,14 @@ async def create_invite(
 ):
     """Create an invite link for a tenant (Tenant Admin or SuperAdmin)."""
     await _get_tenant(tenant_id, db)
-    await _require_tenant_admin(tenant_id, user, db)
+    caller_tu = await _require_tenant_admin(tenant_id, user, db)
 
     if body.role not in ("admin", "member"):
         raise BadRequestError("Role must be 'admin' or 'member'")
+
+    # An admin invite mints an admin on redemption → superadmin-only.
+    if caller_tu is not None and body.role == "admin":
+        raise ForbiddenError("Only a superadmin can create an admin invite")
 
     token = uuid.uuid4().hex
     expires_at = datetime.utcnow() + timedelta(days=body.expires_in_days)

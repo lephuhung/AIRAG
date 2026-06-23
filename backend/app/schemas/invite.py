@@ -36,3 +36,12 @@ class InviteValidationResponse(BaseModel):
     tenant_slug: str | None = None
     email: str | None = None
     expires_at: str | None = None
+
+
+class InviteAcceptResponse(BaseModel):
+    """Result of an already-authenticated user redeeming an invite link."""
+    tenant_id: uuid.UUID
+    tenant_name: str
+    tenant_slug: str
+    role: str
+    already_member: bool = False  # True if the user was already an approved member

@@ -53,8 +53,11 @@ export function useTelegramLinks() {
 
 export function useCreateLinkCode() {
   return useMutation({
-    mutationFn: () =>
-      api.post<TelegramLinkCode>("/integrations/telegram/link-code"),
+    // Requires a current 2FA code (account must have 2FA enabled).
+    mutationFn: (totpCode: string) =>
+      api.post<TelegramLinkCode>("/integrations/telegram/link-code", {
+        totp_code: totpCode,
+      }),
   });
 }
 

@@ -216,7 +216,14 @@
     "invite_validating": "Đang xác thực liên kết mời...",
     "invite_locked_email": "Email được chỉ định theo lời mời",
     "invite_auto_activate": "Tài khoản của bạn sẽ được kích hoạt tự động",
-    "invite_can_register": "Bạn vẫn có thể đăng ký bình thường bên dưới"
+    "invite_can_register": "Bạn vẫn có thể đăng ký bình thường bên dưới",
+    "invite_signed_in_as": "Bạn đang đăng nhập với",
+    "invite_join_prompt": "Chấp nhận lời mời để tham gia tổ chức.",
+    "invite_join": "Tham gia tổ chức",
+    "invite_joining": "Đang tham gia...",
+    "invite_use_other_account": "Dùng tài khoản khác",
+    "invite_joined": "Tham gia thành công!",
+    "invite_already_member": "Bạn đã là thành viên của tổ chức này."
   },
   "chat": {
     "welcome_title": "Chào mừng đến với HRAG",

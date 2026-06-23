@@ -2,11 +2,11 @@ import { useState, useEffect } from "react";
 import { useNavigate, Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import { useAuthStore } from "@/stores/authStore";
-import { useValidateInvite } from "@/hooks/useInvites";
+import { useValidateInvite, useAcceptInvite } from "@/hooks/useInvites";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent } from "@/components/ui/card";
-import { UserPlus, Building2, Loader2, AlertCircle, CheckCircle2 } from "lucide-react";
+import { UserPlus, Building2, Loader2, AlertCircle, CheckCircle2, LogIn } from "lucide-react";
 import { useTranslation } from "@/hooks/useTranslation";
 
 export function RegisterPage() {
@@ -16,6 +16,10 @@ export function RegisterPage() {
   const { t } = useTranslation();
 
   const register = useAuthStore((s) => s.register);
+  const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
+  const currentUser = useAuthStore((s) => s.user);
+  const logout = useAuthStore((s) => s.logout);
+  const acceptInvite = useAcceptInvite();
   const { data: inviteData, isLoading: inviteLoading } = useValidateInvite(inviteToken);
 
   const [form, setForm] = useState({
@@ -55,9 +59,27 @@ export function RegisterPage() {
     }
   };
 
+  const handleAccept = async () => {
+    if (!inviteToken) return;
+    try {
+      const result = await acceptInvite.mutateAsync(inviteToken);
+      toast.success(
+        result.already_member
+          ? t("auth.invite_already_member")
+          : t("auth.invite_joined"),
+      );
+      navigate("/");
+    } catch (err: any) {
+      toast.error(err.message || t("auth.invalid_invite"));
+    }
+  };
+
   const isInviteValid = !!(inviteToken && inviteData?.valid);
   const isInviteInvalid = !!(inviteToken && !inviteLoading && !inviteData?.valid);
   const emailLocked = isInviteValid && !!inviteData?.email;
+  // An already-authenticated user following an invite link joins the tenant
+  // directly instead of creating a brand-new account.
+  const showAcceptFlow = !!inviteToken && isAuthenticated;
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-background relative overflow-hidden px-4">
@@ -72,7 +94,9 @@ export function RegisterPage() {
               <img src="/logo.png" alt="AIRAG Logo" className="w-full h-full object-contain" />
             </div>
             <h1 className="text-xl font-bold">{t("app.name")}</h1>
-            <p className="text-sm text-muted-foreground mt-1">{t("auth.register_title")}</p>
+            <p className="text-sm text-muted-foreground mt-1">
+              {showAcceptFlow ? t("auth.invite_join") : t("auth.register_title")}
+            </p>
           </div>
 
           {/* Invite validation status */}
@@ -111,6 +135,42 @@ export function RegisterPage() {
             </div>
           )}
 
+          {/* Already-authenticated user: join the tenant directly */}
+          {showAcceptFlow ? (
+            <div className="space-y-4">
+              <div className="text-sm text-muted-foreground">
+                <p>
+                  {t("auth.invite_signed_in_as")}{" "}
+                  <span className="font-medium text-foreground">{currentUser?.email}</span>
+                </p>
+                {isInviteValid && (
+                  <p className="mt-1">{t("auth.invite_join_prompt")}</p>
+                )}
+              </div>
+
+              <Button
+                type="button"
+                className="w-full"
+                onClick={handleAccept}
+                disabled={
+                  acceptInvite.isPending || inviteLoading || isInviteInvalid
+                }
+              >
+                <LogIn className="w-4 h-4 mr-2" />
+                {acceptInvite.isPending
+                  ? t("auth.invite_joining")
+                  : t("auth.invite_join")}
+              </Button>
+
+              <button
+                type="button"
+                onClick={() => logout()}
+                className="w-full text-center text-sm text-muted-foreground hover:text-foreground"
+              >
+                {t("auth.invite_use_other_account")}
+              </button>
+            </div>
+          ) : (
           <form onSubmit={handleRegister} className="space-y-4">
             <div>
               <label className="block text-sm font-medium mb-1.5">{t("auth.full_name")}</label>
@@ -171,13 +231,16 @@ export function RegisterPage() {
               {loading ? t("auth.creating_account") : t("auth.create_account")}
             </Button>
           </form>
+          )}
 
-          <div className="mt-4 text-center text-sm text-muted-foreground">
-            {t("auth.have_account")}{" "}
-            <Link to="/login" className="text-primary hover:underline font-medium">
-              {t("auth.sign_in")}
-            </Link>
-          </div>
+          {!showAcceptFlow && (
+            <div className="mt-4 text-center text-sm text-muted-foreground">
+              {t("auth.have_account")}{" "}
+              <Link to="/login" className="text-primary hover:underline font-medium">
+                {t("auth.sign_in")}
+              </Link>
+            </div>
+          )}
         </CardContent>
       </Card>
     </div>

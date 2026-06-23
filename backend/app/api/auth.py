@@ -35,6 +35,7 @@ from app.models.user import User
 from app.models.tenant import Tenant, TenantUser
 from app.models.invite_token import InviteToken
 from app.models.knowledge_base import KnowledgeBase
+from app.services.invite_service import consume_invite_use
 from app.schemas.auth import (
     RegisterRequest,
     LoginRequest,
@@ -102,6 +103,15 @@ async def register(
                 "The organization for this invite is no longer active"
             )
 
+        # Atomically claim one use BEFORE creating the account, so a race that
+        # exhausts the link fails cleanly with nothing created. The claim stays
+        # uncommitted (row-locked) until the user-creation commit below; if that
+        # rolls back, the use is released too.
+        if not await consume_invite_use(db, invite):
+            raise BadRequestError(
+                "Invite link has reached its maximum number of uses"
+            )
+
     # ── Create user ────────────────────────────────────────────────────
     user = User(
         email=body.email.lower().strip(),
@@ -140,7 +150,7 @@ async def register(
             is_approved=True,
         )
         db.add(tenant_user)
-        invite.use_count += 1
+        # use_count was already claimed atomically before user creation.
         await db.commit()
         logger.info(
             f"User {user.email} registered via invite (auto-activated), "

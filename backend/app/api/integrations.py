@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.deps import get_current_active_user, get_db, require_superadmin
-from app.core.security import generate_api_key
+from app.core.security import generate_api_key, verify_totp
 from app.models.integration import ApiKey, TelegramBotConfig, TelegramLink
 from app.models.user import User
 from app.services.integrations import telegram_service
@@ -77,6 +77,12 @@ async def telegram_webhook(
     return {"ok": True}
 
 
+class LinkCodeRequest(BaseModel):
+    # Linking a Telegram chat grants it the user's full permissions, so we gate
+    # minting a code behind a fresh 2FA check (2FA must also be enabled first).
+    totp_code: str = Field(..., min_length=6, max_length=6)
+
+
 class LinkCodeResponse(BaseModel):
     code: str
     expires_at: datetime
@@ -86,10 +92,27 @@ class LinkCodeResponse(BaseModel):
 
 @router.post("/telegram/link-code", response_model=LinkCodeResponse)
 async def create_telegram_link_code(
+    body: LinkCodeRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ):
-    """Mint a one-time code the logged-in user pastes into the bot to link their chat."""
+    """Mint a one-time code the logged-in user pastes into the bot to link their chat.
+
+    Requires the account to have two-factor (TOTP) enabled AND a valid current
+    code — linking a chat hands it the user's full access, so it is a sensitive op.
+    """
+    if not current_user.totp_enabled:
+        # Sentinel the frontend recognises → tell the user to enable 2FA first.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="TWO_FACTOR_NOT_ENABLED",
+        )
+    if not verify_totp(current_user.totp_secret or "", body.totp_code):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid two-factor code",
+        )
+
     code, expires_at = await telegram_service.create_link_code(db, current_user.id)
     cfg = await telegram_service.get_bot_config(db)
     return LinkCodeResponse(

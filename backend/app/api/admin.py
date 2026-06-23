@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta
 
 from app.core.deps import get_db, require_superadmin
-from app.core.exceptions import NotFoundError, BadRequestError
+from app.core.exceptions import NotFoundError, BadRequestError, ForbiddenError
 from app.models.user import User
 from app.models.tenant import Tenant, TenantUser
 from app.models.document import Document
@@ -255,6 +255,18 @@ async def list_users(
     )
 
 
+def _guard_peer_superadmin(target: User, current_user: User) -> None:
+    """Block dangerous mutations on a *different* superadmin account.
+
+    Superadmins are peers: none may demote, deactivate, delete or reset the
+    password of another superadmin. The only API path that touches a superadmin
+    account is the holder acting on themselves. To remove a superadmin entirely,
+    operate directly on the database.
+    """
+    if target.is_superadmin and target.id != current_user.id:
+        raise ForbiddenError("Cannot modify another superadmin account")
+
+
 @router.get("/users/{user_id}", response_model=AdminUserDetail)
 async def get_user(
     user_id: uuid.UUID,
@@ -282,6 +294,9 @@ async def update_user(
     user = result.scalar_one_or_none()
     if user is None:
         raise NotFoundError("User", user_id)
+
+    # A superadmin cannot mutate a peer superadmin's account.
+    _guard_peer_superadmin(user, current_user)
 
     if body.is_active is not None:
         user.is_active = body.is_active
@@ -314,6 +329,9 @@ async def delete_user(
     if user is None:
         raise NotFoundError("User", user_id)
 
+    # A superadmin cannot delete a peer superadmin's account.
+    _guard_peer_superadmin(user, current_user)
+
     # Deactivate abbreviations when user is deleted (keep records, mark inactive)
     await db.execute(
         update(Abbreviation).where(Abbreviation.user_id == user_id).values(is_active=False)
@@ -340,6 +358,9 @@ async def reset_user_password(
     user = result.scalar_one_or_none()
     if user is None:
         raise NotFoundError("User", user_id)
+
+    # A superadmin cannot reset a peer superadmin's password.
+    _guard_peer_superadmin(user, current_user)
 
     user.password_hash = hash_password(body.new_password)
     await db.commit()

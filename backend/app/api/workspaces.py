@@ -8,7 +8,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_
 
-from app.core.deps import get_db, get_current_active_user, verify_workspace_access
+from app.core.deps import (
+    get_db,
+    get_current_active_user,
+    verify_workspace_access,
+    verify_workspace_manage_access,
+)
 from app.core.exceptions import NotFoundError, ForbiddenError, BadRequestError
 from app.models.knowledge_base import KnowledgeBase
 from app.models.document import Document, DocumentStatus
@@ -58,12 +63,15 @@ async def list_workspaces(
 ):
     """List workspaces visible to the current user."""
     if user.is_superadmin:
-        # Superadmin only sees their OWN workspaces for app functional use (upload, chat, etc.)
-        # This ensures ChatPanel fallback logic (is_default/personal/ws[0]) works correctly
+        # Superadmin sees EVERY workspace (incl. other users' personal ones).
+        # Own workspaces are sorted first so frontend fallback logic
+        # (is_default/personal/ws[0]) still lands on the superadmin's own KB.
         result = await db.execute(
             select(KnowledgeBase)
-            .where(KnowledgeBase.owner_id == user.id)
-            .order_by(KnowledgeBase.updated_at.desc())
+            .order_by(
+                (KnowledgeBase.owner_id == user.id).desc(),
+                KnowledgeBase.updated_at.desc(),
+            )
         )
     else:
         # Get user's tenant IDs
@@ -213,24 +221,8 @@ async def update_workspace(
     """Update a knowledge base name/description."""
     kb = await verify_workspace_access(workspace_id, user, db)
 
-    # Only owner, tenant admin, or superadmin can edit
-    if not user.is_superadmin and kb.owner_id is not None and kb.owner_id != user.id:
-        # Check if user is tenant admin
-        if kb.tenant_id:
-            tu_result = await db.execute(
-                select(TenantUser).where(
-                    TenantUser.tenant_id == kb.tenant_id,
-                    TenantUser.user_id == user.id,
-                    TenantUser.role == "admin",
-                    TenantUser.is_approved.is_(True),
-                )
-            )
-            if tu_result.scalar_one_or_none() is None:
-                raise ForbiddenError(
-                    "Only the owner or tenant admin can edit this workspace"
-                )
-        else:
-            raise ForbiddenError("Only the owner can edit this workspace")
+    # Only owner, tenant admin (tenant-visible), or superadmin can edit.
+    await verify_workspace_manage_access(kb, user, db)
 
     if body.name is not None:
         kb.name = body.name
@@ -272,23 +264,8 @@ async def delete_workspace(
     """Delete a knowledge base and all its documents."""
     kb = await verify_workspace_access(workspace_id, user, db)
 
-    # Only owner, tenant admin, or superadmin can delete
-    if not user.is_superadmin and kb.owner_id is not None and kb.owner_id != user.id:
-        if kb.tenant_id:
-            tu_result = await db.execute(
-                select(TenantUser).where(
-                    TenantUser.tenant_id == kb.tenant_id,
-                    TenantUser.user_id == user.id,
-                    TenantUser.role == "admin",
-                    TenantUser.is_approved.is_(True),
-                )
-            )
-            if tu_result.scalar_one_or_none() is None:
-                raise ForbiddenError(
-                    "Only the owner or tenant admin can delete this workspace"
-                )
-        else:
-            raise ForbiddenError("Only the owner can delete this workspace")
+    # Only owner, tenant admin (tenant-visible), or superadmin can delete.
+    await verify_workspace_manage_access(kb, user, db)
 
     # Clean up vector store and KG data
     try:

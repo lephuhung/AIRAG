@@ -360,6 +360,15 @@ class Settings(BaseSettings):
     # to the request's own base URL. No trailing slash.
     PUBLIC_BASE_URL: str = Field(default="")
 
+    # Public origin the *frontend* (web UI) is reachable at from a browser, e.g.
+    # "https://service.hatinh.local". Used to build invite links
+    # ({FRONTEND_BASE_URL}/register?invite=...) deterministically instead of
+    # guessing from the request's Origin header (which is absent for non-browser
+    # callers and wrong behind a reverse proxy). Empty → fall back to
+    # PUBLIC_BASE_URL, then the request Origin, then the dev :8080→:5174 swap.
+    # No trailing slash.
+    FRONTEND_BASE_URL: str = Field(default="")
+
     model_config = {
         "env_file": str(ENV_FILE),
         "env_file_encoding": "utf-8",
