@@ -511,6 +511,190 @@ def _needs_context(message: str) -> bool:
     return word_count <= 4
 
 
+# Tag the frontend embeds in a message when a workspace document is @mentioned
+# (see ChatPanel.tsx). Prior turns keep it in their stored text even after the
+# user drops the @mention on a later turn — that is what makes carry-forward work.
+_DOC_ID_TAG_RE = re.compile(r"<document_id=([^>]+)>", re.IGNORECASE)
+
+
+# Transformation / extraction requests that operate on an *implicit* source
+# document ("cho tôi bảng biểu …", "liệt kê …", "tóm tắt …", "thời hạn …"). They
+# carry no subject of their own, so when a document was just attached they almost
+# always mean "do this to THAT document".
+_DOC_TRANSFORM_CUES = re.compile(
+    r"(?<!\w)("
+    r"bảng\s*(biểu)?|lập\s*bảng|tạo\s*bảng|kẻ\s*bảng|"
+    r"liệt\s*kê|danh\s*sách|danh\s*mục|"
+    r"tóm\s*(tắt|lược|gọn)|rút\s*gọn|"
+    r"trích\s*(dẫn|xuất)?|"
+    r"thống\s*kê|"
+    r"so\s*sánh|đối\s*chiếu|"
+    r"sơ\s*đồ|biểu\s*đồ|lưu\s*đồ|"
+    r"mục\s*lục|bố\s*cục|dàn\s*ý|cấu\s*trúc|"
+    r"các\s*bước|quy\s*trình|trình\s*tự|"
+    r"thời\s*hạn|mốc\s*thời\s*gian|deadline|"
+    r"nội\s*dung|ý\s*chính|điểm\s*chính|ý\s*nghĩa|"
+    r"viết\s*lại|giải\s*thích|"
+    r"gồm\s*(những|các)?\s*gì|có\s*(những|các)?\s*gì"
+    r")(?!\w)",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+# Phrases that explicitly broaden the search back to the whole corpus — when the
+# user says these, do NOT inherit the attached document; let open RAG run.
+_CORPUS_BROADENING_CUES = re.compile(
+    r"(tất\s*cả\s*(các\s*)?(văn\s*bản|tài\s*liệu)|"
+    r"(văn\s*bản|tài\s*liệu)\s*(nào|khác)|"
+    r"toàn\s*bộ\s*(văn\s*bản|tài\s*liệu)|"
+    r"trong\s*kho|"
+    r"tìm\s*(kiếm\s*)?(các\s*)?(văn\s*bản|tài\s*liệu))",
+    re.IGNORECASE | re.UNICODE,
+)
+
+
+def _recent_attached_doc_ids(state: SupervisorState, max_turns: int = 6) -> list[str]:
+    """Most-recently attached document_id(s) found in prior USER turns.
+
+    Scans prior history (newest first) for the ``<document_id=…>`` tags the
+    frontend embeds when a file is @mentioned, and returns the ids from the most
+    recent turn that carried any. Empty list when nothing was ever attached.
+    """
+    prior = _get_prior_history(state, max_turns=max_turns)
+    for role, content in reversed(prior):
+        if role != "user":
+            continue
+        ids = [s.strip() for s in _DOC_ID_TAG_RE.findall(content or "") if s.strip()]
+        if ids:
+            return ids
+    return []
+
+
+async def _recent_session_doc_ids(session_id) -> list[str]:
+    """Most-recently attached document_id(s) for this session, read from DB.
+
+    Reads ``chat_messages.document_ids`` (newest user turn first), which is
+    populated for BOTH @mentioned workspace docs AND directly-uploaded chat files
+    — unlike the in-message ``<document_id=…>`` tag, which only the @mention path
+    emits (so the tag-scan in ``_recent_attached_doc_ids`` misses uploaded files).
+    Also survives the history window (state["messages"] is capped at 10 turns).
+    Best-effort: returns [] when there is no DB, no session, or on any error.
+    """
+    if not session_id:
+        return []
+    try:
+        from app.services.agent.streaming import get_current_db
+        from app.models.chat_message import ChatMessage
+        from sqlalchemy import select
+        import uuid as _uuid
+
+        db = get_current_db()
+        if db is None:
+            return []
+        try:
+            sid = _uuid.UUID(str(session_id))
+        except (ValueError, TypeError):
+            sid = session_id
+        rows = await db.execute(
+            select(ChatMessage.document_ids)
+            .where(ChatMessage.session_id == sid, ChatMessage.role == "user")
+            .order_by(ChatMessage.created_at.desc())
+            .limit(8)
+        )
+        for (doc_ids_json,) in rows.all():
+            ids = [str(d).strip() for d in (doc_ids_json or []) if str(d).strip()]
+            if ids:
+                return ids
+    except Exception as e:
+        logger.debug(f"[supervisor] _recent_session_doc_ids failed: {e}")
+    return []
+
+
+async def _recent_cited_doc_ids(session_id, max_docs: int = 2) -> list[str]:
+    """Document_id(s) the conversation has CONVERGED on, from the latest answer's
+    citations.
+
+    Recovers scope for a subject-dependent follow-up when the user never attached
+    a file (so ``chat_messages.document_ids`` is empty) but the previous answer
+    cited a specific document — e.g. "Nghị định 53 quy định gì" → answer cites
+    ND53 → a follow-up like "lập bảng các mức phạt" should stay on ND53.
+    Deterministic (no LLM) — unlike text condensing it cannot inject a wrong
+    document name into resolve_doc; the worst case is scoping to a doc the
+    conversation was already about.
+
+    Returns [] unless the latest assistant turn's citations converge on
+    ``≤ max_docs`` distinct documents — a broad multi-document search has no
+    single subject, so carrying its citations forward would only inject noise.
+    """
+    if not session_id:
+        return []
+    try:
+        from app.services.agent.streaming import get_current_db
+        from app.models.chat_message import ChatMessage
+        from sqlalchemy import select
+        import uuid as _uuid
+
+        db = get_current_db()
+        if db is None:
+            return []
+        try:
+            sid = _uuid.UUID(str(session_id))
+        except (ValueError, TypeError):
+            sid = session_id
+        # Latest assistant turn = the answer the follow-up is leaning on (the
+        # current turn's answer is persisted only AFTER this graph run finishes).
+        rows = await db.execute(
+            select(ChatMessage.sources)
+            .where(ChatMessage.session_id == sid, ChatMessage.role == "assistant")
+            .order_by(ChatMessage.created_at.desc())
+            .limit(1)
+        )
+        row = rows.first()
+        if not row or not row[0]:
+            return []
+        seen: list[str] = []
+        for src in row[0]:
+            if not isinstance(src, dict):
+                continue
+            did = str(src.get("document_id") or "").strip()
+            if not did or did in ("0", "None"):
+                continue
+            try:
+                _uuid.UUID(did)  # keep only real document UUIDs (skip KG/nil sources)
+            except (ValueError, TypeError):
+                continue
+            if did not in seen:
+                seen.append(did)
+            if len(seen) > max_docs:
+                return []  # drifted across >max_docs docs → no single subject
+        return seen
+    except Exception as e:
+        logger.debug(f"[supervisor] _recent_cited_doc_ids failed: {e}")
+    return []
+
+
+def _is_doc_followup_request(message: str) -> bool:
+    """Smart heuristic for the sticky-document carry-forward.
+
+    True when the current question reads as a CONTINUATION / transformation of an
+    already-attached document rather than a brand-new, self-contained topic. Used
+    only to decide whether to inherit the most-recently attached document_id when
+    the request itself carries none (the user dropped the @mention on a follow-up).
+    Conservative on purpose: a question that names a *specific* document, or that
+    explicitly broadens to the whole corpus, is left to the normal open flow.
+    """
+    m = (message or "").strip()
+    if not m:
+        return False
+    if _has_explicit_doc_reference(m):  # names a (likely different) specific doc
+        return False
+    if _CORPUS_BROADENING_CUES.search(m):  # user is widening the search on purpose
+        return False
+    # Anaphora / short ellipsis (existing heuristic) OR a transformation request
+    # over an implicit source. Either signals "continue on the attached doc".
+    return _needs_context(m) or bool(_DOC_TRANSFORM_CUES.search(m))
+
+
 async def _condense_followup_query(message: str, prior: list[tuple[str, str]]) -> str:
     """Rewrite a follow-up question into a self-contained query using prior turns.
 
@@ -819,6 +1003,37 @@ async def supervisor_node(state: SupervisorState) -> dict:
             "intent": "greeting",
             "iterations": iterations + 1,
         }
+
+    # ── Sticky attached-document scope (first pass only) ──────────────────
+    # A doc-Q&A session attaches a file via the `<document_id=…>` tag, but that
+    # tag is only present on turns where the user keeps the @mention. On a bare
+    # follow-up ("cho tôi bảng biểu về thời hạn các công việc") the tag is gone,
+    # so request.document_ids is empty, RAG drifts to the whole workspace and the
+    # agent ends up asking "which document?". When the follow-up clearly continues
+    # on / transforms the attached doc, inherit the most-recently attached
+    # document_id(s) from prior turns so scoping behaves as if it were re-mentioned.
+    # Mutating state in place lets every document_ids read in this node (routing,
+    # doc-resolution, the final return) see the inherited scope consistently.
+    if iterations == 0 and not state.get("document_ids"):
+        # Source priority, strongest signal first:
+        #  1. user-attached docs persisted on chat_messages.document_ids (covers
+        #     @mentioned docs AND uploaded chat files; survives the history window)
+        #  2. <document_id=…> tags scanned from in-state history text (fallback
+        #     when DB is unavailable / the turn isn't persisted yet)
+        #  3. docs the previous ANSWER converged on (≤2) — recovers a search-found
+        #     subject the user never attached. Deterministic, can't mis-resolve.
+        _sid = state.get("session_id")
+        _carried = (
+            await _recent_session_doc_ids(_sid)
+            or _recent_attached_doc_ids(state)
+            or await _recent_cited_doc_ids(_sid)
+        )
+        if _carried and _is_doc_followup_request(user_message):
+            state["document_ids"] = _carried
+            logger.info(
+                f"[supervisor] Sticky doc scope: inherited document_ids={_carried} "
+                f"from prior turn for follow-up {user_message!r}"
+            )
 
     # Guard: max iterations
     from app.core.config import settings
