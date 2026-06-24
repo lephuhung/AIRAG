@@ -704,6 +704,11 @@ services:
       GRAPHITI_LLM_BASE_URL: http://vllm-memory:8088/v1
       LEGAL_KG_LLM_BASE_URL: http://vllm-memory:8088/v1
       TTS_OMNIVOICE_BASE_URL: http://omnivoice:8880/v1
+      # Whisper (STT) runs on CPU: CTranslate2 4.8 needs CUDA 12 (libcublas.so.12)
+      # but this image ships CUDA 13, so GPU inference can't load. CPU+int8 is
+      # offline and reliable; switch to GPU later only with a CUDA-12 stack.
+      STT_FW_DEVICE: cpu
+      STT_FW_COMPUTE_TYPE: int8
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "langfuse.hatinh.local:10.10.0.241"

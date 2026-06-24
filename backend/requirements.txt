@@ -36,6 +36,9 @@ google-genai>=1.0.0
 ollama>=0.4.0
 openai>=1.0.0
 
+# Speech-to-text (local Whisper for the chat mic; pulls in ctranslate2 + av/PyAV)
+faster-whisper>=1.0.0
+
 # Knowledge Graph (LightRAG)
 lightrag-hku>=1.0.0
 neo4j>=5.0

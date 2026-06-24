@@ -68,6 +68,21 @@ class Settings(BaseSettings):
     TTS_DEFAULT_SPEED: float = Field(default=1.0)
     TTS_MAX_CHARS: int = Field(default=4000)  # truncate over-long inputs
 
+    # STT (Speech-to-Text) — engine-agnostic provider layer (app/services/stt/)
+    STT_ENABLED: bool = Field(default=True)
+    STT_PROVIDER: str = Field(default="faster_whisper")  # faster_whisper | openai
+    STT_LANGUAGE: str = Field(default="vi")  # forced language; "" → auto-detect
+    STT_MAX_UPLOAD_MB: int = Field(default=25)
+    # faster-whisper (local/offline, default)
+    STT_FW_MODEL: str = Field(default="large-v3")  # tiny|base|small|medium|large-v3
+    STT_FW_DEVICE: str = Field(default="auto")  # cpu|cuda|auto
+    STT_FW_COMPUTE_TYPE: str = Field(default="default")  # int8|float16|default
+    STT_FW_MODEL_DIR: str = Field(default="")  # HF cache dir; "" → library default
+    # OpenAI-compatible (vLLM /v1/audio/transcriptions) — optional
+    STT_OPENAI_BASE_URL: str = Field(default="")
+    STT_OPENAI_MODEL: str = Field(default="whisper-1")
+    STT_OPENAI_API_KEY: str = Field(default="")
+
     # KG Embedding
     KG_EMBEDDING_PROVIDER: str = Field(default="local")
     KG_EMBEDDING_MODEL: str = Field(default="BAAI/bge-m3")

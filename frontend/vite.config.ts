@@ -17,6 +17,11 @@ export default defineConfig({
       '/api': {
         target: process.env.VITE_API_PROXY_URL || 'http://backend:8080',
         changeOrigin: true,
+        // STT/transcribe can be slow on a cold Whisper model load (first call
+        // loads large-v3, ~70s). The proxy default timeout is too short and
+        // kills the request mid-flight → the browser sees a generic failure.
+        timeout: 600_000,       // 10 minutes socket timeout
+        proxyTimeout: 600_000,  // 10 minutes upstream response timeout
       },
       '/static': {
         target: process.env.VITE_API_PROXY_URL || 'http://backend:8080',

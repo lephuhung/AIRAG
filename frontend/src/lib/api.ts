@@ -200,6 +200,33 @@ class ApiClient {
     return response.blob();
   }
 
+  /** POST a recorded audio blob to the STT endpoint and return the transcript. */
+  async transcribeAudio(
+    blob: Blob,
+    filename = "recording.webm",
+  ): Promise<{ text: string; language?: string; duration?: number }> {
+    const url = `${BASE_URL}/stt/transcribe`;
+    const formData = new FormData();
+    formData.append("file", blob, filename);
+    // NOTE: do not set Content-Type — the browser adds the multipart boundary.
+    const options: RequestInit = {
+      method: "POST",
+      headers: { ...getAuthHeaders() },
+      body: formData,
+    };
+
+    let response = await fetch(url, options);
+    if (response.status === 401) {
+      const retried = await handleUnauthorized(url, options);
+      if (retried) response = retried;
+    }
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ detail: `STT Error: ${response.status}` }));
+      throw new Error(error.detail || `STT Error: ${response.status}`);
+    }
+    return response.json();
+  }
+
   async uploadFile<T>(
     path: string,
     file: File,

@@ -644,6 +644,24 @@ async def lifespan(app: FastAPI):
         # Keep a reference on app.state so the task isn't garbage-collected mid-run.
         app.state._warm_models_task = asyncio.create_task(_background_warm_models())
 
+    # ── Whisper (STT) Warm-up ─────────────────────────────────────────────
+    # The first /stt/transcribe call otherwise loads the Whisper model inline
+    # (~70s for large-v3), which can blow past proxy timeouts. Warm it in the
+    # background so the first real dictation is fast. Only faster-whisper needs
+    # this (the openai provider is remote).
+    if settings.STT_ENABLED and settings.STT_PROVIDER == "faster_whisper":
+        async def _background_warm_stt() -> None:
+            try:
+                from app.services.stt import get_stt_provider
+                provider = get_stt_provider()
+                if hasattr(provider, "warmup"):
+                    await asyncio.to_thread(provider.warmup)
+                    logger.info("[preload] Whisper (STT) warm-up complete")
+            except Exception as _stt_err:
+                logger.warning(f"[preload] STT warm-up failed (non-fatal): {_stt_err}")
+
+        app.state._warm_stt_task = asyncio.create_task(_background_warm_stt())
+
     # ── Graphiti Memory Initialization ───────────────────────────────────
     # Build Neo4j indices and constraints required by Graphiti's knowledge
     # graph memory layer.  Idempotent — safe to call on every startup.

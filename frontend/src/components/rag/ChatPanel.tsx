@@ -105,6 +105,7 @@ import { useRAGChatStream } from "@/hooks/useRAGChatStream";
 import { useTranslation } from "@/hooks/useTranslation";
 import { useCreateChatSession, useUpdateSessionTitle } from "@/hooks/useChatSessions";
 import { useCreateAbbreviation } from "@/hooks/useAbbreviations";
+import { useSTT } from "@/hooks/useSTT";
 import { AbbreviationModal } from "@/components/rag/AbbreviationModal";
 import { StreamingMarkdown } from "@/components/rag/MemoizedMarkdown";
 import { STEP_CONFIG, ThinkingTimeline, humanizeStepDetail } from "@/components/rag/ThinkingTimeline";
@@ -2439,6 +2440,8 @@ function ChatInputArea({
   handleKeyDown,
   onPlus,
   onMic,
+  micRecording,
+  micTranscribing,
   t,
   referencedDocs,
   onRemoveReferencedDoc,
@@ -2462,6 +2465,8 @@ function ChatInputArea({
   handleKeyDown: (e: React.KeyboardEvent) => void;
   onPlus?: () => void;
   onMic?: () => void;
+  micRecording?: boolean;
+  micTranscribing?: boolean;
   t: any;
   referencedDocs?: { id: string; filename: string; original_filename?: string }[];
   onRemoveReferencedDoc?: (docId: string) => void;
@@ -2650,6 +2655,26 @@ function ChatInputArea({
                 >
                   <Square className="w-3.5 h-3.5 fill-current" />
                 </button>
+              ) : (micRecording || micTranscribing) ? (
+                <button
+                  type="button"
+                  onClick={onMic}
+                  disabled={micTranscribing}
+                  aria-label={micTranscribing ? t("chat.transcribing") : t("chat.recording")}
+                  className={cn(
+                    "w-10 h-10 rounded-full flex items-center justify-center transition-all shadow-sm cursor-pointer",
+                    micTranscribing
+                      ? "bg-primary/10 text-primary ring-1 ring-primary/20"
+                      : "bg-destructive text-destructive-foreground ring-1 ring-destructive/30 animate-pulse"
+                  )}
+                  title={micTranscribing ? t("chat.transcribing") : t("chat.recording")}
+                >
+                  {micTranscribing ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Square className="w-3.5 h-3.5 fill-current" />
+                  )}
+                </button>
               ) : (input.trim() || attachedFiles.some(f => f.status === "indexed")) ? (
                 <button
                   type="button"
@@ -2663,7 +2688,7 @@ function ChatInputArea({
                   type="button"
                   onClick={onMic}
                   aria-label={t("chat.voice")}
-                  className="w-10 h-10 rounded-full flex items-center justify-center text-muted-foreground/60 hover:text-primary hover:bg-primary/5 transition-all cursor-default"
+                  className="w-10 h-10 rounded-full flex items-center justify-center text-muted-foreground/60 hover:text-primary hover:bg-primary/5 transition-all cursor-pointer"
                   title={t("chat.voice")}
                 >
                   <Mic className="w-4 h-4" />
@@ -3684,9 +3709,20 @@ export const ChatPanel = memo(function ChatPanel({
     }
   };
 
-  const handleMicClick = useCallback(() => {
-    toast.info(t("chat.audio_feature_coming") || "Tính năng đang phát triển");
-  }, [t]);
+  const handleVoiceTranscript = useCallback((text: string) => {
+    setInput((prev) => {
+      const sep = prev && !/\s$/.test(prev) ? " " : "";
+      return prev + sep + text;
+    });
+    // Re-focus the textarea so the user can review/edit before sending.
+    setTimeout(() => inputRef.current?.focus(), 0);
+  }, [setInput]);
+
+  const {
+    isRecording: isVoiceRecording,
+    isTranscribing: isVoiceTranscribing,
+    toggleRecording: handleMicClick,
+  } = useSTT({ onTranscript: handleVoiceTranscript, t });
 
   const handlePlusClick = useCallback(() => {
     docxInputRef.current?.click();
@@ -3799,6 +3835,8 @@ export const ChatPanel = memo(function ChatPanel({
                       handleKeyDown={handleKeyDown}
                       onPlus={handlePlusClick}
                       onMic={handleMicClick}
+                      micRecording={isVoiceRecording}
+                      micTranscribing={isVoiceTranscribing}
                       t={t}
                       referencedDocs={referencedDocs}
                       onRemoveReferencedDoc={removeReferencedDoc}
@@ -3873,6 +3911,8 @@ export const ChatPanel = memo(function ChatPanel({
                       handleKeyDown={handleKeyDown}
                       onPlus={handlePlusClick}
                       onMic={handleMicClick}
+                      micRecording={isVoiceRecording}
+                      micTranscribing={isVoiceTranscribing}
                       t={t}
                       referencedDocs={referencedDocs}
                       onRemoveReferencedDoc={removeReferencedDoc}
