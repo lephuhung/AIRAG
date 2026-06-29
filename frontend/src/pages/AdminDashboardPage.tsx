@@ -105,7 +105,36 @@ export function AdminDashboardPage() {
 
         {/* Advanced Metrics Area */}
         <div className="mt-8 grid grid-cols-1 lg:grid-cols-2 gap-6">
-          
+
+          {/* Q&A Activity — questions vs answers per day */}
+          <div className="bg-card border rounded-2xl p-6 shadow-sm lg:col-span-2">
+            <h2 className="text-lg font-semibold tracking-tight mb-4">{t("admin.dashboard.qa_activity_title")}</h2>
+            <div className="h-72">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={stats.messages_growth}>
+                  <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
+                  <XAxis
+                    dataKey="date"
+                    tickFormatter={(val) => dayjs(val).format("MMM DD")}
+                    fontSize={12}
+                    tickMargin={10}
+                  />
+                  <YAxis fontSize={12} allowDecimals={false} />
+                  <Tooltip
+                    labelFormatter={(label) => dayjs(label).format("MMM DD, YYYY")}
+                    contentStyle={{ borderRadius: '8px', border: '1px solid #e2e8f0', fontSize: '14px' }}
+                  />
+                  <Legend verticalAlign="top" height={28} iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
+                  {/* questions ≥ answers always; draw questions solid underneath and
+                      answers dashed on top so the blue line stays visible when the two
+                      coincide (every run answered → identical series). */}
+                  <Line type="monotone" dataKey="questions" name={t("admin.dashboard.qa_questions")} stroke="#0ea5e9" strokeWidth={3} dot={false} activeDot={{ r: 5 }} />
+                  <Line type="monotone" dataKey="answers" name={t("admin.dashboard.qa_answers")} stroke="#10b981" strokeWidth={2} strokeDasharray="6 4" dot={false} activeDot={{ r: 5 }} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
           {/* Growth Chart */}
           <div className="bg-card border rounded-2xl p-6 shadow-sm">
             <h2 className="text-lg font-semibold tracking-tight mb-4">{t("admin.dashboard.growth_title")}</h2>
@@ -136,8 +165,17 @@ export function AdminDashboardPage() {
             <div className="h-72">
               <ResponsiveContainer width="100%" height="100%">
                 <PieChart>
-                  <Tooltip contentStyle={{ borderRadius: '8px', border: '1px solid #e2e8f0', fontSize: '14px' }} />
-                  <Legend verticalAlign="bottom" height={36} iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
+                  <Tooltip
+                    formatter={(value: any, name: any) => [value, t("workers.status." + name)] as [any, any]}
+                    contentStyle={{ borderRadius: '8px', border: '1px solid #e2e8f0', fontSize: '14px' }}
+                  />
+                  <Legend
+                    verticalAlign="bottom"
+                    height={36}
+                    iconType="circle"
+                    formatter={(value) => t("workers.status." + value)}
+                    wrapperStyle={{ fontSize: '12px' }}
+                  />
                   <Pie
                     data={stats.document_status_breakdown}
                     cx="50%"
@@ -147,8 +185,29 @@ export function AdminDashboardPage() {
                     paddingAngle={2}
                     dataKey="count"
                     nameKey="status"
-                    label={({ name, percent }) => `${t("workers.status." + name)} ${((percent || 0) * 100).toFixed(0)}%`}
                     labelLine={false}
+                    label={({ cx, cy, midAngle, innerRadius, outerRadius, percent }) => {
+                      // Hide labels for tiny slices to avoid overlap; draw the rest
+                      // centered INSIDE the donut band so they never collide.
+                      if (!percent || percent < 0.06) return null;
+                      const RADIAN = Math.PI / 180;
+                      const radius = innerRadius + (outerRadius - innerRadius) * 0.5;
+                      const x = cx + radius * Math.cos(-midAngle * RADIAN);
+                      const y = cy + radius * Math.sin(-midAngle * RADIAN);
+                      return (
+                        <text
+                          x={x}
+                          y={y}
+                          fill="#fff"
+                          textAnchor="middle"
+                          dominantBaseline="central"
+                          fontSize={11}
+                          fontWeight={600}
+                        >
+                          {`${(percent * 100).toFixed(0)}%`}
+                        </text>
+                      );
+                    }}
                   >
                     {stats.document_status_breakdown.map((_entry, index) => {
                       const colors = {

@@ -46,6 +46,9 @@ scope="uploaded"); nếu rỗng (file vừa tải lên chưa lập chỉ mục) 
   rồi SO SÁNH nội dung file với căn cứ tìm được, nêu rõ chỗ khớp/lệch + trích dẫn.
 • HỎI ĐÁP xuyên CẢ file LẪN kho → gọi search_documents 2 lần: scope="uploaded" và scope="knowledge_base".
 LƯU Ý: mặc định search_documents KHI có file sẽ chỉ tìm trong file; muốn tìm toàn kho PHẢI đặt scope="knowledge_base".
+QUAN TRỌNG: nếu người dùng KHÔNG yêu cầu đối chiếu/tìm toàn kho mà nội dung họ hỏi KHÔNG có \
+trong file đính kèm → trả lời rõ "Nội dung bạn hỏi không có trong file đính kèm." KHÔNG tự ý mở \
+rộng sang toàn kho, KHÔNG suy đoán, KHÔNG lấy thông tin ngoài file.
 
 ═══════════════ GỌI SONG SONG (QUAN TRỌNG) ═══════════════
 Khi cần NHIỀU mẩu thông tin ĐỘC LẬP (không cái nào phụ thuộc kết quả của cái kia), BẮT BUỘC \

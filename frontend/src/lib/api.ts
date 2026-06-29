@@ -227,6 +227,62 @@ class ApiClient {
     return response.json();
   }
 
+  /**
+   * POST a PDF to the OCR endpoint and return the extracted text.
+   *
+   * Uses XHR (not fetch) so the caller can show real upload progress and a
+   * distinct "processing" phase once the bytes are uploaded and the server is
+   * running OCR. Refreshes the token and retries once on 401.
+   */
+  async extractPdfText(
+    file: File,
+    opts?: {
+      onUploadProgress?: (percent: number) => void;
+      onProcessing?: () => void;
+    },
+  ): Promise<{ text: string; pages?: number }> {
+    const url = `${BASE_URL}/ocr/extract`;
+
+    const send = (): Promise<{ status: number; body: string }> =>
+      new Promise((resolve, reject) => {
+        const formData = new FormData();
+        formData.append("file", file, file.name || "document.pdf");
+        const xhr = new XMLHttpRequest();
+        xhr.open("POST", url);
+        // NOTE: do not set Content-Type — the browser adds the multipart boundary.
+        for (const [k, v] of Object.entries(getAuthHeaders())) xhr.setRequestHeader(k, v);
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) opts?.onUploadProgress?.(Math.round((e.loaded / e.total) * 100));
+        };
+        // Bytes are uploaded — the server is now running OCR.
+        xhr.upload.onload = () => opts?.onProcessing?.();
+        xhr.onload = () => resolve({ status: xhr.status, body: xhr.responseText });
+        xhr.onerror = () => reject(new Error("Network error during OCR upload"));
+        xhr.send(formData);
+      });
+
+    let res = await send();
+    if (res.status === 401) {
+      const refreshed = await useAuthStore.getState().refreshAccessToken();
+      if (refreshed) {
+        res = await send();
+      } else {
+        if (window.location.pathname !== "/login") window.location.assign("/login");
+        throw new Error("Unauthorized");
+      }
+    }
+    if (res.status < 200 || res.status >= 300) {
+      let detail = `OCR Error: ${res.status}`;
+      try {
+        detail = JSON.parse(res.body).detail || detail;
+      } catch {
+        /* non-JSON error body */
+      }
+      throw new Error(detail);
+    }
+    return JSON.parse(res.body);
+  }
+
   async uploadFile<T>(
     path: string,
     file: File,

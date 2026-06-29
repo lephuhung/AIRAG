@@ -7,6 +7,7 @@
     "dashboard": "Dashboard",
     "knowledge_bases": "Knowledge Bases",
     "files": "Files",
+    "tools": "Convert Tools",
     "workers": "Workers",
     "system_logs": "Activity Log",
     "admin": {
@@ -20,6 +21,45 @@
     },
     "my_tenants": "My Tenants",
     "your_chats": "Your chats"
+  },
+  "tools": {
+    "title": "Convert Tools",
+    "subtitle": "Convert a PDF to text (OCR) or a voice recording to text (Speech-to-Text).",
+    "result": "Result",
+    "output": "Output",
+    "placeholder": "The converted text will appear here — you can also edit it.",
+    "copy": "Copy",
+    "download": "Download .txt",
+    "copy_failed": "Could not copy to clipboard",
+    "status": {
+      "uploading": "Uploading file… {{percent}}%",
+      "processing": "Processing file…",
+      "recording": "Recording…",
+      "transcribing": "Transcribing…",
+      "uploading_audio": "Uploading audio…"
+    },
+    "ocr": {
+      "title": "PDF to Text (OCR)",
+      "hint": "Upload a PDF — including scanned documents — to extract its text.",
+      "upload": "Choose a PDF file",
+      "processing": "Extracting text…",
+      "placeholder": "The extracted text will appear here.",
+      "pages": "{{count}} pages",
+      "invalid": "Please choose a PDF file",
+      "empty": "No text was found in this PDF",
+      "failed": "Could not extract text from the PDF"
+    },
+    "stt": {
+      "title": "Voice to Text (Speech-to-Text)",
+      "hint": "Record from your microphone or upload an audio file to transcribe it.",
+      "record": "Record",
+      "stop": "Stop",
+      "transcribing": "Transcribing…",
+      "upload": "Upload audio",
+      "placeholder": "The transcript will appear here — you can also edit it.",
+      "empty": "No speech was detected",
+      "failed": "Could not transcribe the audio"
+    }
   },
   "logs": {
     "streaming": "Streaming",
@@ -310,6 +350,8 @@
     "status_indexed": "Ready",
     "status_ready": "Ready to query",
     "status_failed": "Failed",
+    "asking_in": "Asking within",
+    "remove": "Remove",
     "wait_for_files": "Please wait for files to be indexed",
     "upload_failed": "Upload failed",
     "no_workspace": "No valid workspace found",
@@ -744,6 +786,9 @@
       "stat_tenants": "Tenants / Organizations",
       "stat_kb": "Knowledge Bases",
       "stat_docs": "Total Uploaded Documents",
+      "qa_activity_title": "Q&A Activity (Last 30 Days)",
+      "qa_questions": "Questions",
+      "qa_answers": "Answers",
       "growth_title": "System Growth (Last 30 Days)",
       "growth_new_users": "New Users",
       "status_breakdown": "Document Status Breakdown",

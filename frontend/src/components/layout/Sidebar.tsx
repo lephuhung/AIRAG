@@ -21,6 +21,7 @@ import {
   Loader2,
   X,
   ScrollText,
+  ScanText,
 } from "lucide-react";
 import { useWorkspaces } from "@/hooks/useWorkspaces";
 import { useMyTenants } from "@/hooks/useMyTenants";
@@ -83,6 +84,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle, isNarrow }: 
   const urlWorkspaceId = location.pathname.match(/\/knowledge-bases\/(\d+)/)?.[1];
   const isHome = location.pathname === "/";
   const isFilesPage = location.pathname === "/files" || location.pathname.endsWith("/files");
+  const isToolsPage = location.pathname === "/tools";
   const isWorkersPage = location.pathname === "/workers";
   const isSystemLogsPage = location.pathname === "/system-logs";
   const isAdminUsersPage = location.pathname === "/admin/users";
@@ -177,6 +179,20 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle, isNarrow }: 
         >
           <FolderOpen className="w-4 h-4 flex-shrink-0" />
           {!collapsed && <span className="truncate">{t("nav.files")}</span>}
+        </button>
+
+        <button
+          onClick={() => navigate("/tools")}
+          className={cn(
+            "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm transition-colors",
+            isToolsPage
+              ? "bg-primary/10 text-primary font-medium"
+              : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+          )}
+          title={collapsed ? t("nav.tools") : undefined}
+        >
+          <ScanText className="w-4 h-4 flex-shrink-0" />
+          {!collapsed && <span className="truncate">{t("nav.tools")}</span>}
         </button>
 
         {user?.is_superadmin && (

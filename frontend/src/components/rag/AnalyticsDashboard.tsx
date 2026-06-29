@@ -126,7 +126,10 @@ function DocumentBreakdownChart({ docs }: { docs: DocumentBreakdown[] }) {
             indexed: "bg-primary",
             pending: "bg-muted-foreground",
             parsing: "bg-blue-400",
-            indexing: "bg-amber-400",
+            ocring: "bg-indigo-400",
+            chunking: "bg-cyan-400",
+            embedding: "bg-amber-400",
+            building_kg: "bg-violet-400",
             failed: "bg-destructive",
           };
 

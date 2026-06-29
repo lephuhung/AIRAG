@@ -7,6 +7,7 @@
     "dashboard": "Bảng điều khiển",
     "knowledge_bases": "Kho tri thức",
     "files": "Tệp tin",
+    "tools": "Công cụ chuyển đổi",
     "workers": "Tiến trình",
     "system_logs": "Nhật ký hoạt động",
     "admin": {
@@ -20,6 +21,45 @@
     },
     "my_tenants": "Tổ chức của tôi",
     "your_chats": "Lịch sử chat"
+  },
+  "tools": {
+    "title": "Công cụ chuyển đổi",
+    "subtitle": "Chuyển PDF sang văn bản (OCR) hoặc chuyển ghi âm giọng nói sang văn bản.",
+    "result": "Kết quả",
+    "output": "Văn bản kết quả",
+    "placeholder": "Văn bản chuyển đổi sẽ hiển thị ở đây — bạn có thể chỉnh sửa.",
+    "copy": "Sao chép",
+    "download": "Tải .txt",
+    "copy_failed": "Không thể sao chép",
+    "status": {
+      "uploading": "Đang tải tệp lên… {{percent}}%",
+      "processing": "Đang xử lý tệp…",
+      "recording": "Đang ghi âm…",
+      "transcribing": "Đang chuyển đổi…",
+      "uploading_audio": "Đang tải âm thanh…"
+    },
+    "ocr": {
+      "title": "PDF sang văn bản (OCR)",
+      "hint": "Tải lên tệp PDF — kể cả tài liệu scan — để trích xuất văn bản.",
+      "upload": "Chọn tệp PDF",
+      "processing": "Đang trích xuất văn bản…",
+      "placeholder": "Văn bản trích xuất sẽ hiển thị ở đây.",
+      "pages": "{{count}} trang",
+      "invalid": "Vui lòng chọn tệp PDF",
+      "empty": "Không tìm thấy văn bản trong PDF này",
+      "failed": "Không thể trích xuất văn bản từ PDF"
+    },
+    "stt": {
+      "title": "Giọng nói sang văn bản (Speech-to-Text)",
+      "hint": "Ghi âm từ micro hoặc tải lên tệp âm thanh để chuyển thành văn bản.",
+      "record": "Ghi âm",
+      "stop": "Dừng",
+      "transcribing": "Đang chuyển đổi…",
+      "upload": "Tải tệp âm thanh",
+      "placeholder": "Văn bản chuyển đổi sẽ hiển thị ở đây — bạn có thể chỉnh sửa.",
+      "empty": "Không nhận được giọng nói",
+      "failed": "Không thể chuyển âm thanh thành văn bản"
+    }
   },
   "logs": {
     "streaming": "Đang stream",
@@ -310,6 +350,8 @@
     "status_indexed": "Sẵn sàng",
     "status_ready": "Sẵn sàng truy vấn",
     "status_failed": "Lỗi",
+    "asking_in": "Đang hỏi trong",
+    "remove": "Gỡ",
     "wait_for_files": "Vui lòng đợi tệp tin được xử lý xong",
     "upload_failed": "Tải lên thất bại",
     "no_workspace": "Không tìm thấy không gian làm việc hợp lệ",
@@ -735,6 +777,9 @@
       "stat_tenants": "Tổ chức / Đơn vị",
       "stat_kb": "Kho tri thức",
       "stat_docs": "Tổng tài liệu tải lên",
+      "qa_activity_title": "Hỏi & Đáp theo ngày (30 ngày qua)",
+      "qa_questions": "Câu hỏi",
+      "qa_answers": "Trả lời",
       "growth_title": "Tăng trưởng hệ thống (30 ngày qua)",
       "growth_new_users": "Người dùng mới",
       "status_breakdown": "Trạng thái phân bố tài liệu",

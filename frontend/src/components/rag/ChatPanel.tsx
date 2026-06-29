@@ -30,6 +30,7 @@ import {
   Zap,
   BookOpen,
   Plus,
+  Paperclip,
   Mic,
   Settings2,
   Music,
@@ -296,6 +297,20 @@ function InlineImageRef({
 // Does NOT match random bracketed text like [id1], [ref2] — those render as plain text.
 const CITATION_RE = /(\[\s*(?:(?:[a-zA-Z0-9]{2,6}|IMG-[a-zA-Z0-9]+|MEM-[a-zA-Z0-9_-]+)(?:\s*,\s*(?:[a-zA-Z0-9]{2,6}|IMG-[a-zA-Z0-9]+|MEM-[a-zA-Z0-9_-]+))*|\d+)(?:\s*,\s*(?:[a-zA-Z0-9]{2,6}|IMG-[a-zA-Z0-9]+|MEM-[a-zA-Z0-9_-]+|\d+))*\s*\])/g;
 
+// Render a plain text string, converting literal <br> / <br/> / <br /> tokens
+// (which LLMs love to emit inside markdown table cells) into real line breaks.
+// We don't enable rehype-raw — only this single, safe element is ever produced.
+function renderTextWithBreaks(text: string, keyPrefix: string): ReactNode {
+  const segments = text.split(/<br\s*\/?>/gi);
+  if (segments.length === 1) return text;
+  const out: ReactNode[] = [];
+  segments.forEach((seg, i) => {
+    if (seg) out.push(seg);
+    if (i < segments.length - 1) out.push(<br key={`${keyPrefix}-br-${i}`} />);
+  });
+  return out;
+}
+
 function injectCitations(
   children: ReactNode,
   sources: ChatSourceChunk[],
@@ -307,13 +322,13 @@ function injectCitations(
     // Process string nodes — split on citation patterns
     if (typeof child === "string") {
       const parts = child.split(CITATION_RE);
-      if (parts.length === 1) return child;
+      if (parts.length === 1) return renderTextWithBreaks(child, "t");
       const result: ReactNode[] = [];
       parts.forEach((part, i) => {
         // Check if this part is a bracket group
         const bracketMatch = part.match(/^\[(.+)\]$/);
         if (!bracketMatch) {
-          if (part) result.push(part);
+          if (part) result.push(renderTextWithBreaks(part, `p${i}`));
           return;
         }
         // Split on commas for grouped citations [a3x9, b2m7]
@@ -1874,181 +1889,35 @@ function ReferencedDocBadge({ doc, onRemove }: { doc: { id: string; filename: st
   );
 }
 
-function ToolsDropdown({
-  onPlus,
-  onMic,
-  forceSearch,
-  onToggleSearch
-}: {
-  onPlus?: () => void;
-  onMic?: () => void;
-  forceSearch: boolean;
-  onToggleSearch: () => void;
-}) {
-  const [isOpen, setIsOpen] = useState(false);
-  const [coords, setCoords] = useState({ bottom: 0, left: 0, width: 0 });
-  const anchorRef = useRef<HTMLButtonElement>(null);
+// Upload-file button for the chat toolbar. The old multi-item "Tools" dropdown
+// was collapsed to this single action — voice input already has its own
+// dedicated mic button in the action area, so file upload is the only tool left.
+function UploadButton({ onClick }: { onClick?: () => void }) {
   const { t } = useTranslation();
 
-  useEffect(() => {
-    if (isOpen && anchorRef.current) {
-      const rect = anchorRef.current.getBoundingClientRect();
-      
-      setCoords({
-        bottom: window.innerHeight - rect.top + 8,
-        left: rect.left,
-        width: rect.width
-      });
-    }
-  }, [isOpen]);
-
-  const menuItems = [
-    { id: 'word', icon: FileText, label: t("chat.tool_word"), onClick: onPlus },
-    { id: 'audio', icon: Mic, label: t("chat.tool_audio"), onClick: onMic },
-  ];
+  const label = t("chat.tool_upload") || "Tải lên tệp tin";
 
   return (
-    <div className="relative">
-      <button
-        ref={anchorRef}
-        type="button"
-        onClick={() => setIsOpen(!isOpen)}
-        className={cn(
-          "flex items-center gap-1.5 px-3 h-9 rounded-full transition-all text-[13px] font-bold tracking-tight",
-          isOpen
-            ? "text-primary bg-primary/10 shadow-sm"
-            : "text-zinc-500 hover:text-zinc-700 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:text-zinc-200 dark:hover:bg-zinc-900"
-        )}
-      >
-        <LayoutGrid className={cn("w-4 h-4", isOpen && "animate-pulse")} />
-        <span>{t("chat.tools_button") || "Công cụ"}</span>
-      </button>
-
-      {isOpen && createPortal(
-        <>
-          <div
-            className="fixed inset-0 z-[9998]"
-            onClick={() => setIsOpen(false)}
-          />
-          <motion.div
-            initial={{ opacity: 0, y: 10, scale: 0.95 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 10, scale: 0.95 }}
-            style={{
-              position: 'fixed',
-              bottom: coords.bottom,
-              left: coords.left,
-              zIndex: 9999
-            }}
-            className="w-64 bg-white dark:bg-zinc-950 border border-zinc-200 dark:border-zinc-800 rounded-2xl shadow-xl overflow-hidden p-1.5"
-          >
-            <div className="flex flex-col gap-0.5">
-              {menuItems.map((item, idx) => {
-                const Icon = item.icon;
-                const isFirst = idx === 0;
-                return (
-                  <div key={item.id}>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        item.onClick?.();
-                        setIsOpen(false);
-                      }}
-                      className="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-all text-left group hover:bg-zinc-100 dark:hover:bg-zinc-900 text-foreground/80 hover:text-foreground"
-                    >
-                      <Icon className="w-4 h-4 shrink-0 text-foreground/60 group-hover:text-foreground transition-colors" />
-                      <span className="text-[13.5px] font-medium tracking-tight flex-1">{item.label}</span>
-                    </button>
-                    {isFirst && (
-                      <div className="h-[1px] bg-zinc-100 dark:bg-zinc-800 my-1 mx-1" />
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </motion.div>
-        </>,
-        document.body
+    <button
+      type="button"
+      onClick={onClick}
+      title={label}
+      aria-label={label}
+      className={cn(
+        // Icon-only by default; the label slides open on hover so the toolbar
+        // stays compact while still being discoverable.
+        "group flex items-center justify-center h-9 px-2 hover:px-3 gap-0 hover:gap-1.5 rounded-full transition-all duration-300 text-[13px] font-bold tracking-tight",
+        "text-primary bg-primary/8 ring-1 ring-primary/15 hover:bg-primary/15"
       )}
-    </div>
-  );
-}
-
-function SearchTooltipWrapper({
-  forceSearch,
-  onToggleSearch,
-  t
-}: {
-  forceSearch: boolean;
-  onToggleSearch: () => void;
-  t: any
-}) {
-  const [isHovered, setIsHovered] = useState(false);
-  const [coords, setCoords] = useState({ bottom: 0, left: 0 });
-  const anchorRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (isHovered && anchorRef.current) {
-      const rect = anchorRef.current.getBoundingClientRect();
-      const container = anchorRef.current.closest('[data-chat-input-container]');
-      const containerRect = container?.getBoundingClientRect();
-      const menuWidth = 200; // estimated tooltip width
-      
-      let left = rect.left + rect.width / 2;
-      if (containerRect && containerRect.left > menuWidth + 20) {
-        // If we want to move it to the margin too? 
-        // No, tooltips are better centered over the button.
-        // But for consistency with the user's request to not cover content, 
-        // let's at least make sure it doesn't cover too much.
-      }
-
-      setCoords({
-        bottom: window.innerHeight - rect.top + 8,
-        left: left
-      });
-    }
-  }, [isHovered]);
-
-  return (
-    <div
-      ref={anchorRef}
-      className="relative"
-      onMouseEnter={() => setIsHovered(true)}
-      onMouseLeave={() => setIsHovered(false)}
     >
-      <button
-        type="button"
-        onClick={onToggleSearch}
-        className={cn(
-          "w-9 h-9 flex items-center justify-center rounded-full transition-all shadow-sm border",
-          forceSearch
-            ? "text-amber-600 bg-amber-500/10 border-amber-500/20 hover:bg-amber-500/15"
-            : "text-zinc-400 bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800"
-        )}
-      >
-        <Zap className={cn("w-4 h-4", forceSearch && "fill-amber-500")} />
-      </button>
-
-      {isHovered && createPortal(
-        <motion.div
-          initial={{ opacity: 0, y: 5, scale: 0.95, x: '-50%' }}
-          animate={{ opacity: 1, y: 0, scale: 1, x: '-50%' }}
-          style={{
-            position: 'fixed',
-            bottom: coords.bottom,
-            left: coords.left,
-            zIndex: 10000
-          }}
-          className="px-3 py-1.5 bg-zinc-900 text-white text-[11px] font-medium rounded-lg whitespace-nowrap shadow-xl pointer-events-none"
-        >
-          {forceSearch ? t("chat.search_on") : t("chat.search_off")}
-          <div className="absolute top-full left-1/2 -translate-x-1/2 border-x-4 border-x-transparent border-t-4 border-t-zinc-900" />
-        </motion.div>,
-        document.body
-      )}
-    </div>
+      <Paperclip className="w-4 h-4 shrink-0" />
+      <span className="max-w-0 group-hover:max-w-[160px] overflow-hidden whitespace-nowrap transition-all duration-300">
+        {label}
+      </span>
+    </button>
   );
 }
+
 
 // ---------------------------------------------------------------------------
 // Single message bubble
@@ -2432,8 +2301,6 @@ function ChatInputArea({
   isStreaming,
   onSend,
   onCancel,
-  forceSearch,
-  onToggleSearch,
   attachedFiles,
   onRemoveAttachment,
   inputRef,
@@ -2457,8 +2324,6 @@ function ChatInputArea({
   isStreaming: boolean;
   onSend: () => void;
   onCancel: () => void;
-  forceSearch: boolean;
-  onToggleSearch: () => void;
   attachedFiles: AttachedFile[];
   onRemoveAttachment: (id: string) => void;
   inputRef: React.RefObject<HTMLTextAreaElement | null>;
@@ -2526,58 +2391,6 @@ function ChatInputArea({
         data-chat-input-container="true"
         className="relative flex flex-col bg-background/60 backdrop-blur-3xl border border-border/80 rounded-[28px] shadow-[0_12px_40px_rgb(0,0,0,0.08)] transition-all duration-500 focus-within:shadow-primary/10 focus-within:border-primary/30 overflow-hidden ring-1 ring-black/5 dark:ring-white/5"
       >
-        {/* Attached Files Preview */}
-        {attachedFiles.length > 0 && (
-          <div className="flex flex-wrap gap-2 px-4 pt-3.5 pb-2">
-            <AnimatePresence>
-              {attachedFiles.map((file) => (
-                <motion.div
-                  key={file.id}
-                  initial={{ opacity: 0, scale: 0.9, y: 5 }}
-                  animate={{ opacity: 1, scale: 1, y: 0 }}
-                  exit={{ opacity: 0, scale: 0.9, y: 5 }}
-                  className="flex items-center gap-2 px-3 py-2 rounded-xl bg-white dark:bg-zinc-900 border border-border shadow-sm group relative"
-                >
-                  <div className="w-7 h-7 rounded-lg bg-primary/10 flex items-center justify-center text-primary">
-                    {file.status === "uploading" || file.status === "parsing" ? (
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    ) : (
-                      <FileText className="w-3.5 h-3.5" />
-                    )}
-                  </div>
-                  <div className="flex flex-col min-w-0 pr-4">
-                    <span className="text-[11.5px] font-semibold truncate max-w-[140px] text-foreground">
-                      {file.file.name}
-                    </span>
-                    <span className={cn(
-                      "text-[9px] font-bold uppercase tracking-wider",
-                      file.status === "indexed" ? "text-emerald-500" :
-                        file.status === "ready" ? "text-amber-500" :
-                          file.status === "failed" ? "text-destructive" :
-                            "text-muted-foreground/60"
-                    )}>
-                      {file.status === "indexed" ? t("chat.status_indexed") || "Sẵn sàng" :
-                        file.status === "ready" ? t("chat.status_ready") || "Sẵn sàng truy vấn" :
-                          file.status === "parsing" ? t("chat.status_parsing") || "Đang xử lý..." :
-                            file.status === "uploading" ? t("chat.status_uploading") || "Đang tải lên..." :
-                              t("chat.status_failed") || "Lỗi"}
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => onRemoveAttachment(file.id)}
-                    className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-zinc-200 dark:bg-zinc-800 border border-border flex items-center justify-center text-muted-foreground hover:bg-destructive hover:text-destructive-foreground transition-all opacity-0 group-hover:opacity-100 shadow-sm"
-                  >
-                    <X className="w-3 h-3" />
-                  </button>
-                </motion.div>
-              ))}
-            </AnimatePresence>
-          </div>
-        )}
-
-
-
         {/* Input Text Area */}
         <div className="px-2.5 pt-3.5 pb-1">
           <div className="relative w-full">
@@ -2625,25 +2438,89 @@ function ChatInputArea({
         </div>
 
         {/* Toolbar Row */}
-        <div className="flex items-center justify-between px-2.5 pb-2.5 pt-0.5">
-          <div className="flex items-center gap-2">
-            {/* Unified Tools Dropdown */}
-            <ToolsDropdown
-              onPlus={onPlus}
-              onMic={onMic}
-              forceSearch={forceSearch}
-              onToggleSearch={onToggleSearch}
-            />
-
-            {/* Force Search Toggle — Compact with Portal Tooltip */}
-            <SearchTooltipWrapper
-              forceSearch={forceSearch}
-              onToggleSearch={onToggleSearch}
-              t={t}
-            />
+        <div className="flex items-center gap-2 px-2.5 pb-2.5 pt-0.5">
+          <div className="flex items-center gap-2 shrink-0">
+            {/* Upload file (voice has its own mic button in the action area) */}
+            <UploadButton onClick={onPlus} />
           </div>
 
-          <div className="flex items-center gap-2">
+          {/* Active quote scope: @mentioned docs + uploaded files — compact chips
+              inline with the tools so the input box itself stays short. Horizontally
+              scrollable when there are many; persists until the user removes a chip. */}
+          {(attachedFiles.length > 0 || (referencedDocs && referencedDocs.length > 0)) && (
+            <div
+              className="flex-1 min-w-0 max-w-[60%] flex items-center gap-1.5 overflow-x-auto scrollbar-none py-0.5"
+              style={{
+                // Fade the right edge so it's obvious the strip scrolls when full,
+                // while never letting chips butt up against the Send button.
+                maskImage: "linear-gradient(to right, black calc(100% - 14px), transparent 100%)",
+                WebkitMaskImage: "linear-gradient(to right, black calc(100% - 14px), transparent 100%)",
+              }}
+            >
+              <AnimatePresence initial={false}>
+                {/* @mentioned document chips */}
+                {(referencedDocs || []).map((doc) => {
+                  const name = formatMentionName(doc.original_filename || doc.filename);
+                  return (
+                    <motion.div
+                      key={`ref-${doc.id}`}
+                      initial={{ opacity: 0, scale: 0.85 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      exit={{ opacity: 0, scale: 0.85 }}
+                      className="flex items-center gap-1.5 pl-2 pr-1 py-1 rounded-lg bg-primary/5 border border-primary/20 shrink-0"
+                      title={name}
+                    >
+                      <FileText className="w-3 h-3 text-primary shrink-0" />
+                      <span className="text-[11px] font-medium truncate max-w-[110px] text-foreground">
+                        {name}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => onRemoveReferencedDoc?.(doc.id)}
+                        aria-label={t("chat.remove") || "Gỡ"}
+                        className="w-3.5 h-3.5 rounded-full flex items-center justify-center text-muted-foreground hover:bg-destructive hover:text-destructive-foreground transition-all shrink-0"
+                      >
+                        <X className="w-2.5 h-2.5" />
+                      </button>
+                    </motion.div>
+                  );
+                })}
+                {/* uploaded file chips */}
+                {attachedFiles.map((file) => (
+                  <motion.div
+                    key={file.id}
+                    initial={{ opacity: 0, scale: 0.85 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.85 }}
+                    className="flex items-center gap-1.5 pl-2 pr-1 py-1 rounded-lg bg-white dark:bg-zinc-900 border border-border shrink-0"
+                    title={file.file.name}
+                  >
+                    {file.status === "uploading" || file.status === "parsing" ? (
+                      <Loader2 className="w-3 h-3 animate-spin text-primary shrink-0" />
+                    ) : (
+                      <FileText className={cn(
+                        "w-3 h-3 shrink-0",
+                        file.status === "failed" ? "text-destructive" : "text-primary"
+                      )} />
+                    )}
+                    <span className="text-[11px] font-medium truncate max-w-[110px] text-foreground">
+                      {file.file.name}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => onRemoveAttachment(file.id)}
+                      aria-label={t("chat.remove") || "Gỡ"}
+                      className="w-3.5 h-3.5 rounded-full flex items-center justify-center text-muted-foreground hover:bg-destructive hover:text-destructive-foreground transition-all shrink-0"
+                    >
+                      <X className="w-2.5 h-2.5" />
+                    </button>
+                  </motion.div>
+                ))}
+              </AnimatePresence>
+            </div>
+          )}
+
+          <div className="flex items-center gap-2 ml-auto shrink-0">
             {/* Action Button (Mic / Send / Stop) */}
             <div className="ml-1">
               {isStreaming ? (
@@ -2688,7 +2565,7 @@ function ChatInputArea({
                   type="button"
                   onClick={onMic}
                   aria-label={t("chat.voice")}
-                  className="w-10 h-10 rounded-full flex items-center justify-center text-muted-foreground/60 hover:text-primary hover:bg-primary/5 transition-all cursor-pointer"
+                  className="w-10 h-10 rounded-full flex items-center justify-center text-violet-500 bg-violet-500/10 ring-1 ring-violet-500/20 hover:bg-violet-500/20 hover:scale-105 active:scale-95 transition-all shadow-sm cursor-pointer"
                   title={t("chat.voice")}
                 >
                   <Mic className="w-4 h-4" />
@@ -2735,8 +2612,6 @@ export const ChatPanel = memo(function ChatPanel({
   const [referencedDocs, setReferencedDocs] = useState<{ id: string; filename: string; original_filename?: string }[]>([]);
   const [docMetadataMap, setDocMetadataMap] = useState<Map<string, Document>>(new Map());
   const skipResetRef = useRef<string | null>(null);
-
-  const [forceSearch, setForceSearch] = useState(true);
 
   // @docname mention states
   const [showMentionDropdown, setShowMentionDropdown] = useState(false);
@@ -2854,22 +2729,32 @@ export const ChatPanel = memo(function ChatPanel({
     const textAfterMention = input.slice(inputRef.current?.selectionStart || 0);
 
     const displayName = formatMentionName(doc.original_filename || doc.filename);
-    const newInput = `${textBeforeAt}@${displayName} ${textAfterMention}`;
+
+    // Only inline the @mention TEXT when it is part of an actual sentence. If the
+    // user hasn't typed anything besides the @query (empty sentence), don't litter
+    // the input — the quoted file lives only as a persistent "Đang hỏi trong" chip
+    // at the top. This avoids showing the same file in two places.
+    const restOfSentence = `${textBeforeAt}${textAfterMention}`;
+    const inlineMention = restOfSentence.trim().length > 0;
+    const newInput = inlineMention
+      ? `${textBeforeAt}@${displayName} ${textAfterMention}`
+      : ""; // drop the lone @query — scope is shown only as the top chip
 
     setInput(newInput);
     setShowMentionDropdown(false);
     setMentionSearch("");
 
-    // Set cursor position after the inserted mention
+    // Set cursor position after the inserted mention (or just refocus when inline-less)
     setTimeout(() => {
-      if (inputRef.current) {
+      if (!inputRef.current) return;
+      if (inlineMention) {
         const newCursorPos = textBeforeAt.length + displayName.length + 2; // +1 for @, +1 for space
         inputRef.current.setSelectionRange(newCursorPos, newCursorPos);
-        inputRef.current.focus();
       }
+      inputRef.current.focus();
     }, 0);
 
-    // Add to referenced docs
+    // Add to referenced docs (persistent quote scope) in both cases
     if (!referencedDocs.find(d => d.id === doc.id)) {
       setReferencedDocs(prev => [...prev, { id: doc.id, filename: doc.filename, original_filename: doc.original_filename }]);
     }
@@ -3475,40 +3360,36 @@ export const ChatPanel = memo(function ChatPanel({
         }
       }
 
-      // Only send @ mentioned docs + newly attached files (not all session docs)
-      // "parsing", "ready" files (parse done, embed in background) are also included —
-      // backend fetches markdown directly from MinIO so content is available immediately.
-      // Filter mentions to only include docs still present in user text
-      const validMentions = referencedDocs.filter(doc => {
-        const displayName = formatMentionName(doc.original_filename || doc.filename);
-        return msg.includes(`@${displayName}`);
-      });
-
-      setReferencedDocs(validMentions); // Clean up unused mentions
-
-      const documentIds = [
-        ...validMentions.map(d => d.id),
+      // Persistent quote scope: the user's active quoted docs (@mentions) AND
+      // uploaded files stay in scope on EVERY turn until they explicitly remove the
+      // chip (X) — we deliberately no longer drop a mention just because its @text
+      // isn't typed in this particular message. This is what makes a bare follow-up
+      // ("địa chỉ mail để báo cáo hằng tuần là gì") keep pointing at the quoted file
+      // instead of drifting to the whole workspace. Dedup by id.
+      const documentIds = Array.from(new Set([
+        ...referencedDocs.map(d => d.id),
         // Only send files whose parse is confirmed done (markdown exists in MinIO).
         // "parsing" is excluded: markdown_s3_key may still be NULL → backend direct-fetch
         // skips the file and it becomes invisible to the agent (race condition fix).
         ...attachedFiles.filter(f => f.status === "indexed" || f.status === "ready").map(f => f.id),
-      ];
+      ]));
       // [debug] Trace which docs/files are actually sent to the backend + their status.
       // Enable via Ctrl+Shift+D (toggles document.documentElement "debug-mode").
       if (document.documentElement.classList.contains("debug-mode")) {
         console.log("[ChatPanel/handleSend] sending documentIds:", documentIds, {
-          mentions: validMentions.map(d => ({ id: d.id, name: d.original_filename || d.filename })),
+          mentions: referencedDocs.map(d => ({ id: d.id, name: d.original_filename || d.filename })),
           attached: attachedFiles.map(f => ({ id: f.id, status: f.status, name: f.file?.name })),
         });
       }
-      setAttachedFiles([]);
 
       const attachedDocs = attachedFiles
         .filter(f => (f.status === "indexed" || f.status === "ready" || f.status === "parsing") && f.docMetadata)
         .map(f => f.docMetadata as Document);
 
       let msgToBackend = msg;
-      validMentions.forEach(doc => {
+      // Replace any @mention TEXT that is actually present in this message with the
+      // <document_id=…> tag (no-op for active scope docs the user didn't re-type).
+      referencedDocs.forEach(doc => {
          const truncatedName = formatMentionName(doc.original_filename || doc.filename);
          const escapedTruncated = truncatedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
          msgToBackend = msgToBackend.replace(new RegExp(`@${escapedTruncated}`, 'g'), `<document_id=${doc.id}>`);
@@ -3535,9 +3416,10 @@ export const ChatPanel = memo(function ChatPanel({
 
       setMessages((prev) => [...prev, userMsg, placeholderMsg]);
       setInput("");
-      setReferencedDocs([]); // Clear mentions draft
+      // Keep the active quote scope (referencedDocs + attachedFiles) across turns —
+      // it is only cleared when the user removes a chip (X) or switches/creates a
+      // chat. Only the typed draft text is cleared here.
       localStorage.removeItem(sessionId ? `hrag-draft-${sessionId}` : "hrag-draft-new");
-      localStorage.removeItem(sessionId ? `hrag-mentions-${sessionId}` : "hrag-mentions-new");
       // Scroll new user message to top so agent response fills the space below
       scrollUserMsgToTop(userMsg.id);
 
@@ -3551,7 +3433,7 @@ export const ChatPanel = memo(function ChatPanel({
         msgToBackend,
         history,
         false, // thinking is decided server-side by query complexity
-        forceSearch,
+        false, // search is no longer forced from the UI — the agent decides when to search
         effectiveSessionId || undefined,
         documentIds
       );
@@ -3643,7 +3525,7 @@ export const ChatPanel = memo(function ChatPanel({
         isSendingRef.current = false;
       }
     },
-    [input, messages, stream, forceSearch, scrollUserMsgToTop, sessionId, navigate, createSession, t, attachedFiles],
+    [input, messages, stream, scrollUserMsgToTop, sessionId, navigate, createSession, t, attachedFiles],
   );
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -3827,8 +3709,6 @@ export const ChatPanel = memo(function ChatPanel({
                       isStreaming={stream.isStreaming}
                       onSend={handleSend}
                       onCancel={stream.cancel}
-                      forceSearch={forceSearch}
-                      onToggleSearch={() => setForceSearch(!forceSearch)}
                       attachedFiles={attachedFiles}
                       onRemoveAttachment={removeAttachment}
                       inputRef={inputRef}
@@ -3903,8 +3783,6 @@ export const ChatPanel = memo(function ChatPanel({
                       isStreaming={stream.isStreaming}
                       onSend={handleSend}
                       onCancel={stream.cancel}
-                      forceSearch={forceSearch}
-                      onToggleSearch={() => setForceSearch(!forceSearch)}
                       attachedFiles={attachedFiles}
                       onRemoveAttachment={removeAttachment}
                       inputRef={inputRef}

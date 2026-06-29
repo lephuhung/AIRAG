@@ -18,6 +18,7 @@ import { AdminAbbreviationsPage } from "@/pages/AdminAbbreviationsPage";
 import { AdminDashboardPage } from "@/pages/AdminDashboardPage";
 import { ChatPage } from "@/pages/ChatPage";
 import { SystemLogsPage } from "@/pages/SystemLogsPage";
+import { ToolsPage } from "@/pages/ToolsPage";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -49,6 +50,7 @@ function AppRoutes() {
         <Route path="/knowledge-bases/:workspaceId" element={<WorkspacePage />} />
         <Route path="/knowledge-bases/:workspaceId/files" element={<FilesPage />} />
         <Route path="/files" element={<FilesPage />} />
+        <Route path="/tools" element={<ToolsPage />} />
         <Route path="/workers" element={<WorkersPage />} />
         <Route path="/admin/dashboard" element={<AdminDashboardPage />} />
         <Route path="/admin/users" element={<AdminUsersPage />} />

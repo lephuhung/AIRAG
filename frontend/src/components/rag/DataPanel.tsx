@@ -271,7 +271,7 @@ export const DataPanel = memo(function DataPanel({
             <Loader2 className="w-4 h-4 animate-spin text-muted-foreground mr-2" />
             <span className="text-xs text-muted-foreground">{t("common.loading")}</span>
           </div>
-        ) : !documents || documents.length === 0 ? (
+        ) : (!documents || documents.length === 0) && (uploadingFiles?.length ?? 0) === 0 ? (
           <div className="flex-1 flex items-center justify-center px-3">
             <p className="text-xs text-muted-foreground text-center">
               {t("workspace.no_docs")}

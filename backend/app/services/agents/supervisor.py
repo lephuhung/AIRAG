@@ -610,69 +610,6 @@ async def _recent_session_doc_ids(session_id) -> list[str]:
     return []
 
 
-async def _recent_cited_doc_ids(session_id, max_docs: int = 2) -> list[str]:
-    """Document_id(s) the conversation has CONVERGED on, from the latest answer's
-    citations.
-
-    Recovers scope for a subject-dependent follow-up when the user never attached
-    a file (so ``chat_messages.document_ids`` is empty) but the previous answer
-    cited a specific document — e.g. "Nghị định 53 quy định gì" → answer cites
-    ND53 → a follow-up like "lập bảng các mức phạt" should stay on ND53.
-    Deterministic (no LLM) — unlike text condensing it cannot inject a wrong
-    document name into resolve_doc; the worst case is scoping to a doc the
-    conversation was already about.
-
-    Returns [] unless the latest assistant turn's citations converge on
-    ``≤ max_docs`` distinct documents — a broad multi-document search has no
-    single subject, so carrying its citations forward would only inject noise.
-    """
-    if not session_id:
-        return []
-    try:
-        from app.services.agent.streaming import get_current_db
-        from app.models.chat_message import ChatMessage
-        from sqlalchemy import select
-        import uuid as _uuid
-
-        db = get_current_db()
-        if db is None:
-            return []
-        try:
-            sid = _uuid.UUID(str(session_id))
-        except (ValueError, TypeError):
-            sid = session_id
-        # Latest assistant turn = the answer the follow-up is leaning on (the
-        # current turn's answer is persisted only AFTER this graph run finishes).
-        rows = await db.execute(
-            select(ChatMessage.sources)
-            .where(ChatMessage.session_id == sid, ChatMessage.role == "assistant")
-            .order_by(ChatMessage.created_at.desc())
-            .limit(1)
-        )
-        row = rows.first()
-        if not row or not row[0]:
-            return []
-        seen: list[str] = []
-        for src in row[0]:
-            if not isinstance(src, dict):
-                continue
-            did = str(src.get("document_id") or "").strip()
-            if not did or did in ("0", "None"):
-                continue
-            try:
-                _uuid.UUID(did)  # keep only real document UUIDs (skip KG/nil sources)
-            except (ValueError, TypeError):
-                continue
-            if did not in seen:
-                seen.append(did)
-            if len(seen) > max_docs:
-                return []  # drifted across >max_docs docs → no single subject
-        return seen
-    except Exception as e:
-        logger.debug(f"[supervisor] _recent_cited_doc_ids failed: {e}")
-    return []
-
-
 def _is_doc_followup_request(message: str) -> bool:
     """Smart heuristic for the sticky-document carry-forward.
 
@@ -690,8 +627,14 @@ def _is_doc_followup_request(message: str) -> bool:
         return False
     if _CORPUS_BROADENING_CUES.search(m):  # user is widening the search on purpose
         return False
-    # Anaphora / short ellipsis (existing heuristic) OR a transformation request
-    # over an implicit source. Either signals "continue on the attached doc".
+    # Conservative safety net. The frontend is now the AUTHORITY on attached-file
+    # scope: while a quoted file is active it ships its document_id on EVERY turn
+    # (persistent chips), and clearing the chip means the user wants open search.
+    # So an empty document_ids reaching here usually means "no active scope on
+    # purpose" — we must NOT re-impose a stale doc. We only nudge back onto the
+    # last attached doc for clearly dependent follow-ups (anaphora / short ellipsis
+    # / an explicit transformation over an implicit source), which covers the case
+    # where the frontend scope was genuinely lost (hard reload, history replay).
     return _needs_context(m) or bool(_DOC_TRANSFORM_CUES.search(m))
 
 
@@ -1015,18 +958,18 @@ async def supervisor_node(state: SupervisorState) -> dict:
     # Mutating state in place lets every document_ids read in this node (routing,
     # doc-resolution, the final return) see the inherited scope consistently.
     if iterations == 0 and not state.get("document_ids"):
-        # Source priority, strongest signal first:
+        # Source priority, strongest signal first. Only USER-attached docs count —
+        # we deliberately do NOT infer scope from the previous answer's citations,
+        # because the frontend owns scope (persistent quote chips) and inferring a
+        # doc the user never attached would silently override that explicit model.
         #  1. user-attached docs persisted on chat_messages.document_ids (covers
         #     @mentioned docs AND uploaded chat files; survives the history window)
         #  2. <document_id=…> tags scanned from in-state history text (fallback
         #     when DB is unavailable / the turn isn't persisted yet)
-        #  3. docs the previous ANSWER converged on (≤2) — recovers a search-found
-        #     subject the user never attached. Deterministic, can't mis-resolve.
         _sid = state.get("session_id")
         _carried = (
             await _recent_session_doc_ids(_sid)
             or _recent_attached_doc_ids(state)
-            or await _recent_cited_doc_ids(_sid)
         )
         if _carried and _is_doc_followup_request(user_message):
             state["document_ids"] = _carried
@@ -2217,10 +2160,28 @@ async def react_executor_node(state: SupervisorState) -> dict:
         logger.warning(
             f"[react_executor] forcing synthesis ({len(sources)} sources collected)"
         )
-        msgs.append(_LLMMsg(role="user", content=(
-            "Hãy tổng hợp câu trả lời cuối cùng từ thông tin đã thu thập ở trên. "
-            "Nếu chưa đủ căn cứ, nói rõ phần nào còn thiếu."
-        )))
+        # Strict attached-file scope: if the user has a quoted/attached file active
+        # this turn and did NOT explicitly ask to broaden to the whole corpus, the
+        # answer must stay INSIDE that file — when the content isn't there, say so
+        # plainly instead of wandering the workspace or guessing from general
+        # knowledge. (The whole-corpus path stays available via the user explicitly
+        # broadening, which routes here without an attached scope.)
+        _attached_scope = bool(ctx.uploaded_document_ids or state.get("document_ids"))
+        _broadened = bool(_CORPUS_BROADENING_CUES.search(user_message or ""))
+        if _attached_scope and not _broadened:
+            synthesis_instr = (
+                "Hãy trả lời CHỈ dựa trên nội dung của FILE ĐÍNH KÈM đã thu thập ở trên. "
+                "Nếu thông tin người dùng hỏi KHÔNG có trong file đính kèm, hãy trả lời "
+                "rõ ràng: \"Nội dung bạn hỏi không có trong file đính kèm.\" — TUYỆT ĐỐI "
+                "không suy đoán, không lấy thông tin ngoài file và không mở rộng tìm kiếm "
+                "ra toàn kho văn bản."
+            )
+        else:
+            synthesis_instr = (
+                "Hãy tổng hợp câu trả lời cuối cùng từ thông tin đã thu thập ở trên. "
+                "Nếu chưa đủ căn cứ, nói rõ phần nào còn thiếu."
+            )
+        msgs.append(_LLMMsg(role="user", content=synthesis_instr))
         await _emit_artifacts()
         _, text = await _run_turn(use_tools=False)
         return await _finish(text)

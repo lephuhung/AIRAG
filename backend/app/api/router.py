@@ -23,6 +23,7 @@ from app.api.format_check import router as format_check_router
 from app.api.integrations import router as integrations_router
 from app.api.tts import router as tts_router
 from app.api.stt import router as stt_router
+from app.api.ocr import router as ocr_router
 
 api_router = APIRouter()
 api_router.include_router(auth_router)
@@ -44,3 +45,4 @@ api_router.include_router(format_check_router)
 api_router.include_router(integrations_router)
 api_router.include_router(tts_router)
 api_router.include_router(stt_router)
+api_router.include_router(ocr_router)

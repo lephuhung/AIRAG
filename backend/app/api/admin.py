@@ -9,7 +9,7 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Query, status
-from sqlalchemy import select, update, func, or_, desc
+from sqlalchemy import select, update, func, or_, desc, case
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta
 
@@ -29,6 +29,7 @@ from app.schemas.admin import (
     AdminStatsResponse,
     AdminPasswordResetRequest,
     DateCount,
+    MessageDateCount,
     DocumentStatusBreakdown,
     TopWorkspace,
     FailedDocument,
@@ -37,6 +38,7 @@ from app.schemas.admin import (
 from app.core.security import hash_password
 from app.schemas.tenant import TenantUserResponse
 from app.models.chat_session import ChatSession
+from app.models.agent_trace import AgentTrace
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +136,24 @@ async def get_admin_stats(
     )
     chat_growth = [DateCount(date=str(row[0]), count=row[1]) for row in chat_growth_res.all()]
 
+    # 2b. Q&A activity per day — durable counts from agent_traces. These rows are
+    #     FK-free (no cascade), so deleting/clearing a chat does NOT shrink the
+    #     history. "questions" = agent runs; "answers" = runs that succeeded.
+    messages_growth_res = await db.execute(
+        select(
+            func.date(AgentTrace.created_at).label("d"),
+            func.count(AgentTrace.id).label("questions"),
+            func.count(case((AgentTrace.success.is_(True), AgentTrace.id))).label("answers"),
+        )
+        .where(AgentTrace.created_at >= thirty_days_ago)
+        .group_by(func.date(AgentTrace.created_at))
+        .order_by("d")
+    )
+    messages_growth = [
+        MessageDateCount(date=str(row[0]), questions=row[1], answers=row[2])
+        for row in messages_growth_res.all()
+    ]
+
     # 3. Document Status Breakdown
     doc_status_res = await db.execute(
         select(Document.status, func.count(Document.id))
@@ -195,6 +215,7 @@ async def get_admin_stats(
         document_type_breakdown=document_type_breakdown,
         users_growth=users_growth,
         chat_growth=chat_growth,
+        messages_growth=messages_growth,
         document_status_breakdown=document_status_breakdown,
         top_workspaces=top_workspaces,
         recent_failed_docs=recent_failed_docs,

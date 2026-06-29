@@ -190,8 +190,8 @@ services:
   # ═══════════════════════════════════════════════════════════════════════════
   # VLLM SERVICES — GPU 0 (same as workers, 48GB VRAM total)
   # vllm-ocr (HunyuanOCR): ~10GB (0.2)  |  vllm-memory (gemma-4-E4B, served as
-  # `qwen-memory`): ~20GB (0.4)  → ~30GB locked upfront by the two vLLM engines.
-  # Remaining ~18GB shared by GPU workers (parse Docling + embed bge-m3 ×3).
+  # `qwen-memory`): ~29GB (0.6)  → ~39GB locked upfront by the two vLLM engines.
+  # Remaining ~9GB shared by GPU workers (parse Docling + embed bge-m3 ×3).
   # ═══════════════════════════════════════════════════════════════════════════
 
   # ── HunyuanOCR (OCR Model) ────────────────────────────────────────────────
@@ -248,7 +248,7 @@ services:
       com.hrag.stack: hrag
 
   # ── gemma-4-E4B-it (Memory/KG Model, served as `qwen-memory`) ─────────────
-  # Port: 8088, GPU 0, ~20GB VRAM (0.4 × 48GB)
+  # Port: 8088, GPU 0, ~29GB VRAM (0.6 × 48GB) — gemma-4-E4B weights ~15GB + KV cache
   # OpenAI-compatible API → workers call via Docker network
   vllm-memory:
     build:
@@ -272,7 +272,7 @@ services:
       - --max-model-len
       - "16384"
       - --gpu-memory-utilization
-      - "0.4"
+      - "0.6"
       - --trust-remote-code
       - --served-model-name
       - qwen-memory

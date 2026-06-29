@@ -48,6 +48,11 @@ class DateCount(BaseModel):
     date: str
     count: int
 
+class MessageDateCount(BaseModel):
+    date: str
+    questions: int
+    answers: int
+
 class DocumentStatusBreakdown(BaseModel):
     status: str
     count: int
@@ -82,6 +87,8 @@ class AdminStatsResponse(BaseModel):
     # New advanced metrics
     users_growth: list[DateCount] = []
     chat_growth: list[DateCount] = []
+    # Q&A activity per day (questions = agent runs, answers = successful runs)
+    messages_growth: list[MessageDateCount] = []
     document_status_breakdown: list[DocumentStatusBreakdown] = []
     top_workspaces: list[TopWorkspace] = []
     recent_failed_docs: list[FailedDocument] = []

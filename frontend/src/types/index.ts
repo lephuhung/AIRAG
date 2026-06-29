@@ -148,6 +148,12 @@ export interface DateCount {
   count: number;
 }
 
+export interface MessageDateCount {
+  date: string;
+  questions: number;
+  answers: number;
+}
+
 export interface DocumentStatusBreakdown {
   status: string;
   count: number;
@@ -184,6 +190,7 @@ export interface AdminStats {
   document_type_breakdown: DocumentTypeBreakdown[];
   users_growth: DateCount[];
   chat_growth: DateCount[];
+  messages_growth: MessageDateCount[];
   document_status_breakdown: DocumentStatusBreakdown[];
   top_workspaces: TopWorkspace[];
   recent_failed_docs: FailedDocument[];
