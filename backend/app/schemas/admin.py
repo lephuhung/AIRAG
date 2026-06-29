@@ -52,6 +52,7 @@ class MessageDateCount(BaseModel):
     date: str
     questions: int
     answers: int
+    failures: int = 0
 
 class DocumentStatusBreakdown(BaseModel):
     status: str

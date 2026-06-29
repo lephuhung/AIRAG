@@ -2,8 +2,13 @@
 # Usage: docker compose -f docker-compose.services.yml up -d
 
 networks:
+  # Shared bridge network — also joined (as external) by docker-compose.vllm.yml
+  # so workers/backend reach the vLLM engines by service name. Pinned to a fixed
+  # name so both stacks resolve to the same physical network regardless of which
+  # comes up first. Create once on a fresh host: docker network create airag_hrag_network
   hrag_network:
-    driver: bridge
+    external: true
+    name: airag_hrag_network
 
 services:
   # ═══════════════════════════════════════════════════════════════════════════
@@ -188,122 +193,6 @@ services:
       com.hrag.stack: hrag
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # VLLM SERVICES — GPU 0 (same as workers, 48GB VRAM total)
-  # vllm-ocr (HunyuanOCR): ~10GB (0.2)  |  vllm-memory (gemma-4-E4B, served as
-  # `qwen-memory`): ~29GB (0.6)  → ~39GB locked upfront by the two vLLM engines.
-  # Remaining ~9GB shared by GPU workers (parse Docling + embed bge-m3 ×3).
-  # ═══════════════════════════════════════════════════════════════════════════
-
-  # ── HunyuanOCR (OCR Model) ────────────────────────────────────────────────
-  # Port: 8001, GPU 0, ~10GB VRAM (0.2 × 48GB)
-  # OpenAI-compatible API → workers call via Docker network
-  vllm-ocr:
-    build:
-      context: .
-      dockerfile: Dockerfile.vllm
-    container_name: hrag-vllm-ocr
-    ports:
-      - "8001:8001"
-    environment:
-      NVIDIA_VISIBLE_DEVICES: "0"
-      FLASHINFER_DISABLE_VERSION_CHECK: "1"
-    volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
-    command:
-      - tencent/HunyuanOCR
-      - --port
-      - "8001"
-      - --max-model-len
-      - "12000"
-      - --gpu-memory-utilization
-      - "0.13"
-      - --trust-remote-code
-      - --served-model-name
-      - hunyuan-ocr
-      - --host
-      - 0.0.0.0
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["0"]
-              capabilities: [gpu]
-    networks:
-      - hrag_network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 30
-      start_period: 600s
-    restart: always
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-    labels:
-      com.hrag.service: vllm-ocr
-      com.hrag.stack: hrag
-
-  # ── gemma-4-E4B-it (Memory/KG Model, served as `qwen-memory`) ─────────────
-  # Port: 8088, GPU 0, ~29GB VRAM (0.6 × 48GB) — gemma-4-E4B weights ~15GB + KV cache
-  # OpenAI-compatible API → workers call via Docker network
-  vllm-memory:
-    build:
-      context: .
-      dockerfile: Dockerfile.vllm
-    container_name: hrag-vllm-memory
-    ports:
-      - "8088:8088"
-    environment:
-      NVIDIA_VISIBLE_DEVICES: "0"
-      HF_TOKEN: "${HF_TOKEN}"
-      FLASHINFER_DISABLE_VERSION_CHECK: "1"
-      VLLM_USE_V1: "0"
-      VLLM_DISABLE_NIXL: "1"
-    volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
-    command:
-      - google/gemma-4-E4B-it
-      - --port
-      - "8088"
-      - --max-model-len
-      - "16384"
-      - --gpu-memory-utilization
-      - "0.6"
-      - --trust-remote-code
-      - --served-model-name
-      - qwen-memory
-      - --host
-      - 0.0.0.0
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["0"]
-              capabilities: [gpu]
-    networks:
-      - hrag_network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 30
-      start_period: 600s
-    restart: always
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-    labels:
-      com.hrag.service: vllm-memory
-      com.hrag.stack: hrag
-
-  # ═══════════════════════════════════════════════════════════════════════════
   # WORKERS — All use GPU 1 (same as vLLM services, 48GB VRAM total)
   # vLLM uses ~28.8GB, workers have ~19GB available (parse ~4-6GB, embed ~1-2GB)
   # Caption/KG workers don't load GPU models (HTTP calls / CPU-bound)
@@ -326,10 +215,8 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
-      vllm-ocr:
-        condition: service_healthy
-      vllm-memory:
-        condition: service_healthy
+      # vllm-ocr / vllm-memory live in docker-compose.vllm.yml (separate stack) —
+      # reached at runtime via http://vllm-*:* over the shared network.
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/hrag
@@ -522,8 +409,8 @@ services:
         condition: service_healthy
       neo4j:
         condition: service_healthy
-      vllm-memory:
-        condition: service_healthy
+      # vllm-memory now lives in docker-compose.vllm.yml (separate stack) —
+      # reached at runtime via http://vllm-memory:8088 over the shared network.
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/hrag
@@ -577,8 +464,8 @@ services:
         condition: service_healthy
       neo4j:
         condition: service_healthy
-      vllm-memory:
-        condition: service_healthy
+      # vllm-memory now lives in docker-compose.vllm.yml (separate stack) —
+      # reached at runtime via http://vllm-memory:8088 over the shared network.
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/hrag

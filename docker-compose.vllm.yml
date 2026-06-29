@@ -1,0 +1,138 @@
+# HRAG — vLLM GPU engines (split out from the main services stack)
+# ─────────────────────────────────────────────────────────────────────────────
+# These two engines load large models and take ~minutes to become healthy, so
+# they live in their OWN compose file. That way `docker compose -f
+# docker-compose.services.yml up/down` no longer pulls them along — they stay up
+# while the rest of the app is cycled.
+#
+# Usage (bring the engines up ONCE, leave them running):
+#   docker compose -f docker-compose.vllm.yml up -d
+#   docker compose -f docker-compose.vllm.yml down        # only when you really mean it
+#
+# Networking: both stacks share the EXISTING bridge network `airag_hrag_network`
+# (declared external here) so workers/backend reach the engines by service name
+# (vllm-ocr:8001 / vllm-memory:8088). The network is created by the services
+# stack; on a fresh host create it once first:
+#   docker network create airag_hrag_network
+
+networks:
+  hrag_network:
+    external: true
+    name: airag_hrag_network
+
+services:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # VLLM SERVICES — GPU 0 (same as workers, 48GB VRAM total)
+  # vllm-ocr (HunyuanOCR): ~10GB (0.2)  |  vllm-memory (gemma-4-E4B, served as
+  # `qwen-memory`): ~29GB (0.6)  → ~39GB locked upfront by the two vLLM engines.
+  # Remaining ~9GB shared by GPU workers (parse Docling + embed bge-m3 ×3).
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  # ── HunyuanOCR (OCR Model) ────────────────────────────────────────────────
+  # Port: 8001, GPU 0, ~10GB VRAM (0.2 × 48GB)
+  # OpenAI-compatible API → workers call via Docker network
+  vllm-ocr:
+    build:
+      context: .
+      dockerfile: Dockerfile.vllm
+    container_name: hrag-vllm-ocr
+    ports:
+      - "8001:8001"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "0"
+      FLASHINFER_DISABLE_VERSION_CHECK: "1"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    command:
+      - tencent/HunyuanOCR
+      - --port
+      - "8001"
+      - --max-model-len
+      - "12000"
+      - --gpu-memory-utilization
+      - "0.13"
+      - --trust-remote-code
+      - --served-model-name
+      - hunyuan-ocr
+      - --host
+      - 0.0.0.0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    networks:
+      - hrag_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 30
+      start_period: 600s
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      com.hrag.service: vllm-ocr
+      com.hrag.stack: hrag
+
+  # ── gemma-4-E4B-it (Memory/KG Model, served as `qwen-memory`) ─────────────
+  # Port: 8088, GPU 0, ~29GB VRAM (0.6 × 48GB) — gemma-4-E4B weights ~15GB + KV cache
+  # OpenAI-compatible API → workers call via Docker network
+  vllm-memory:
+    build:
+      context: .
+      dockerfile: Dockerfile.vllm
+    container_name: hrag-vllm-memory
+    ports:
+      - "8088:8088"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "0"
+      HF_TOKEN: "${HF_TOKEN}"
+      FLASHINFER_DISABLE_VERSION_CHECK: "1"
+      VLLM_USE_V1: "0"
+      VLLM_DISABLE_NIXL: "1"
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    command:
+      - google/gemma-4-E4B-it
+      - --port
+      - "8088"
+      - --max-model-len
+      - "16384"
+      - --gpu-memory-utilization
+      - "0.6"
+      - --trust-remote-code
+      - --served-model-name
+      - qwen-memory
+      - --host
+      - 0.0.0.0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    networks:
+      - hrag_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 30
+      start_period: 600s
+    restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      com.hrag.service: vllm-memory
+      com.hrag.stack: hrag

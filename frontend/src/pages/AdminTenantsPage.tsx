@@ -90,7 +90,12 @@ export function AdminTenantsPage() {
   const openCreate = () => {
     setEditingTenant(null);
     setForm(emptyForm);
-    setSelectedWorkspaceIds([]);
+    // Public KBs are selected by default
+    setSelectedWorkspaceIds(
+      (allWorkspaces ?? [])
+        .filter((ws) => ws.visibility === "public")
+        .map((ws) => ws.id)
+    );
     setShowDialog(true);
   };
 
@@ -145,17 +150,24 @@ export function AdminTenantsPage() {
           slug: form.slug,
           domain: form.domain || undefined,
         });
-        // Assign selected workspaces to the new tenant
-        if (selectedWorkspaceIds.length > 0) {
+        // Assign selected workspaces to the new tenant.
+        // Public KBs are global already — keep them public, don't downgrade to "tenant".
+        const publicIds = new Set(
+          (allWorkspaces ?? [])
+            .filter((ws) => ws.visibility === "public")
+            .map((ws) => ws.id)
+        );
+        const idsToAssign = selectedWorkspaceIds.filter((id) => !publicIds.has(id));
+        if (idsToAssign.length > 0) {
           await Promise.all(
-            selectedWorkspaceIds.map((wsId) =>
+            idsToAssign.map((wsId) =>
               updateWorkspace.mutateAsync({
                 id: wsId,
                 data: { tenant_id: newTenant.id, visibility: "tenant" },
               })
             )
           );
-          toast.success(t("admin.tenants.toast.assigned", { count: selectedWorkspaceIds.length }));
+          toast.success(t("admin.tenants.toast.assigned", { count: idsToAssign.length }));
         } else {
           toast.success(t("admin.tenants.toast.created"));
         }

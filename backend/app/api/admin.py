@@ -9,7 +9,7 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, Query, status
-from sqlalchemy import select, update, func, or_, desc, case
+from sqlalchemy import select, update, func, or_, desc, case, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta
 
@@ -138,19 +138,33 @@ async def get_admin_stats(
 
     # 2b. Q&A activity per day — durable counts from agent_traces. These rows are
     #     FK-free (no cascade), so deleting/clearing a chat does NOT shrink the
-    #     history. "questions" = agent runs; "answers" = runs that succeeded.
+    #     history. "questions" = agent runs. "answers" counts only runs that
+    #     reached completion (success) AND produced non-empty answer text — a run
+    #     that finished but delivered nothing is NOT counted as answered.
+    #     "failures" = questions − answers (errors / cancelled / empty answers),
+    #     surfaced so silent "no answer delivered" cases stay visible.
+    answered_cond = and_(
+        AgentTrace.success.is_(True),
+        AgentTrace.final_answer.isnot(None),
+        func.length(func.trim(AgentTrace.final_answer)) > 0,
+    )
     messages_growth_res = await db.execute(
         select(
             func.date(AgentTrace.created_at).label("d"),
             func.count(AgentTrace.id).label("questions"),
-            func.count(case((AgentTrace.success.is_(True), AgentTrace.id))).label("answers"),
+            func.count(case((answered_cond, AgentTrace.id))).label("answers"),
         )
         .where(AgentTrace.created_at >= thirty_days_ago)
         .group_by(func.date(AgentTrace.created_at))
         .order_by("d")
     )
     messages_growth = [
-        MessageDateCount(date=str(row[0]), questions=row[1], answers=row[2])
+        MessageDateCount(
+            date=str(row[0]),
+            questions=row[1] or 0,
+            answers=row[2] or 0,
+            failures=(row[1] or 0) - (row[2] or 0),
+        )
         for row in messages_growth_res.all()
     ]
 

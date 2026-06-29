@@ -127,9 +127,11 @@ export function AdminDashboardPage() {
                   <Legend verticalAlign="top" height={28} iconType="circle" wrapperStyle={{ fontSize: '12px' }} />
                   {/* questions ≥ answers always; draw questions solid underneath and
                       answers dashed on top so the blue line stays visible when the two
-                      coincide (every run answered → identical series). */}
+                      coincide (every run answered → identical series). "failures"
+                      (questions − answers) surfaces runs the user got no answer for. */}
                   <Line type="monotone" dataKey="questions" name={t("admin.dashboard.qa_questions")} stroke="#0ea5e9" strokeWidth={3} dot={false} activeDot={{ r: 5 }} />
                   <Line type="monotone" dataKey="answers" name={t("admin.dashboard.qa_answers")} stroke="#10b981" strokeWidth={2} strokeDasharray="6 4" dot={false} activeDot={{ r: 5 }} />
+                  <Line type="monotone" dataKey="failures" name={t("admin.dashboard.qa_failures")} stroke="#ef4444" strokeWidth={2} dot={false} activeDot={{ r: 5 }} />
                 </LineChart>
               </ResponsiveContainer>
             </div>

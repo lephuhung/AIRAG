@@ -152,6 +152,7 @@ export interface MessageDateCount {
   date: string;
   questions: number;
   answers: number;
+  failures: number;
 }
 
 export interface DocumentStatusBreakdown {
