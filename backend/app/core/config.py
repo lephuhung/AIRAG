@@ -196,6 +196,20 @@ class Settings(BaseSettings):
     #   HRAG_DOCLING_TABLE_MODE=fast  → faster, ~15-25% less accurate than "accurate"
     HRAG_DOCLING_DO_TABLE: bool = Field(default=True)
     HRAG_DOCLING_TABLE_MODE: str = Field(default="accurate")  # "fast" | "accurate"
+    # Force full-page OCR (EasyOCR) for EVERY Docling PDF. Default OFF: most PDFs
+    # have a clean text layer that Docling reads correctly (incl. Vietnamese) —
+    # far faster + more accurate than OCR. Broken-text-layer Vietnamese PDFs are
+    # handled instead by HRAG_OCR_DETECT_BROKEN_VN (routed to Unlimited-OCR).
+    # Only set True for a corpus where most text layers are corrupt.
+    HRAG_DOCLING_FORCE_FULL_PAGE_OCR: bool = Field(default=False)
+    # Detect PDFs whose embedded text layer is Vietnamese but has dropped tone
+    # marks (corrupt font/encoding → "BỘ"→"B") and route them to the OCR
+    # pipeline (Unlimited-OCR reads Vietnamese reliably) instead of Docling.
+    HRAG_OCR_DETECT_BROKEN_VN: bool = Field(default=True)
+    # Min ratio of complex Vietnamese tone chars (U+1EA0–1EF9) to letters for a
+    # text layer to count as "clean Vietnamese". Below this (with VN base letters
+    # present) → treated as broken → OCR. Clean VN docs run ~5–15%.
+    HRAG_OCR_VN_TONE_MIN_RATIO: float = Field(default=0.02)
 
     # Retrieval
     HRAG_EMBEDDING_MODEL: str = Field(default="BAAI/bge-m3")
@@ -223,20 +237,36 @@ class Settings(BaseSettings):
     # CUDA_VISIBLE_DEVICES unchanged (vLLM picks the first available GPU).
     HRAG_OCR_CUDA_DEVICE: str = Field(default="auto")
     # Fraction of the selected GPU's VRAM vLLM may use for the OCR model KV cache.
-    # HunyuanOCR is a 1B model — 0.15 (~7 GB on a 47 GB card) is ample.
-    HRAG_OCR_GPU_MEMORY_UTILIZATION: float = Field(default=0.15)
+    # Unlimited-OCR is a ~3B model — 0.20 (~10 GB on a 48 GB card) is the floor.
+    HRAG_OCR_GPU_MEMORY_UTILIZATION: float = Field(default=0.20)
     # Max sequence length passed to vLLM; None = use model default.
     HRAG_OCR_MAX_MODEL_LEN: int | None = Field(default=None)
     HUNYUAN_OCR_API_URL: str = Field(default="http://localhost:8001/v1")
-    HUNYUAN_OCR_MODEL: str = Field(default="hunyuan-ocr")
+    # Served-model-name of the OCR engine (vllm-ocr serves Baidu Unlimited-OCR).
+    # Env var kept as HUNYUAN_OCR_MODEL for backward compatibility.
+    HUNYUAN_OCR_MODEL: str = Field(default="unlimited-ocr")
     # DPI used to rasterise PDF pages before sending to the OCR model.
     HRAG_OCR_DPI: int = Field(default=150)
     # Max pages OCR'd concurrently against the remote API backend.
     HRAG_OCR_CONCURRENCY: int = Field(default=16)
     # HTTP read timeout (seconds) for a single OCR API page request.
     HRAG_OCR_HTTP_TIMEOUT: float = Field(default=120.0)
-    # max_tokens requested per OCR API page completion.
-    HRAG_OCR_API_MAX_TOKENS: int = Field(default=8192)
+    # max_tokens requested per OCR API page completion. Must stay well below
+    # the OCR engine's max-model-len (12288) minus the image prompt (~1.7-3.5k
+    # tokens) — Unlimited-OCR counts prompt + completion against one context.
+    HRAG_OCR_API_MAX_TOKENS: int = Field(default=6144)
+    # Reconstruct the original administrative-document layout (centre/right
+    # alignment, 2-column Nghị-định-30 header, signature block) from the
+    # Unlimited-OCR bounding boxes and store it as layout HTML in the document
+    # markdown (rendered by DocumentViewer). Embeddings stay clean — the embed
+    # worker strips the layout markup before vectorising. Set false to fall back
+    # to flat reading-order text.
+    HRAG_OCR_PRESERVE_LAYOUT: bool = Field(default=True)
+    # Same administrative-layout reconstruction, but for the DIGITAL (Docling)
+    # path: rebuild the layout from each element's prov.bbox + semantic label
+    # instead of Docling's flat markdown export. Default OFF — Docling's markdown
+    # is well-tuned for general documents; enable for born-digital admin docs.
+    HRAG_DOCLING_PRESERVE_LAYOUT: bool = Field(default=False)
 
     # Knowledge Graph backend
     HRAG_KG_GRAPH_BACKEND: str = Field(default="networkx")

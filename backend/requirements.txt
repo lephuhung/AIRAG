@@ -21,6 +21,10 @@ sentence-transformers>=2.2.2
 
 # Document parsing (Docling)
 docling>=2.0.0
+# EasyOCR — the only bundled OCR engine that reads Vietnamese diacritics
+# correctly. Required by HRAG_DOCLING_FORCE_FULL_PAGE_OCR to fix PDFs with a
+# broken text layer; the auto-selected RapidOCR/PP-OCRv6 drops diacritics.
+easyocr>=1.7.0
 
 # DOCX formatting extraction
 python-docx>=1.1.0

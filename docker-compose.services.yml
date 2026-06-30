@@ -237,6 +237,10 @@ services:
       MEMORY_AGENT_BASE_URL: http://vllm-memory:8088/v1
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
+      # Persist OCR model caches across container recreates → fast startup
+      # (EasyOCR vi+en ~100MB, Docling layout/tableformer). Pre-downloaded on host.
+      - ~/.EasyOCR:/root/.EasyOCR
+      - ~/.cache/docling:/root/.cache/docling
       - hrag_uploads:/app/backend/uploads
       - hrag_data:/app/backend/data
       - ./backend:/app/backend:rw   # live source — `restart` picks up code changes, no rebuild
@@ -245,7 +249,7 @@ services:
     extra_hosts:
       - "langfuse.hatinh.local:10.10.0.241"
     deploy:
-      replicas: 2
+      replicas: 1
       resources:
         reservations:
           devices:
@@ -312,7 +316,7 @@ services:
     extra_hosts:
       - "langfuse.hatinh.local:10.10.0.241"
     deploy:
-      replicas: 3
+      replicas: 1
       resources:
         reservations:
           devices:

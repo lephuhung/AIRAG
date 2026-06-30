@@ -120,11 +120,9 @@ async def handle_parse(payload: dict) -> None:
             document.markdown_s3_key = s3_key
             document.page_count = parsed.page_count
             document.table_count = parsed.tables_count
-            document.parser_version = (
-                "docling"
-                if DeepDocumentParser.is_docling_supported(str(tmp_path))
-                else "legacy"
-            )
+            # Reflect the pipeline that ACTUALLY ran (ocr / docling / legacy),
+            # not merely whether the format is Docling-capable.
+            document.parser_version = parsed.parser
             await db.commit()
 
             # ── Classify document type & extract rich header ────────────────────────

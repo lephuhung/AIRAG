@@ -23,18 +23,23 @@ networks:
 services:
   # ═══════════════════════════════════════════════════════════════════════════
   # VLLM SERVICES — GPU 0 (same as workers, 48GB VRAM total)
-  # vllm-ocr (HunyuanOCR): ~10GB (0.2)  |  vllm-memory (gemma-4-E4B, served as
+  # vllm-ocr (Unlimited-OCR): ~10GB (0.2)  |  vllm-memory (gemma-4-E4B, served as
   # `qwen-memory`): ~29GB (0.6)  → ~39GB locked upfront by the two vLLM engines.
   # Remaining ~9GB shared by GPU workers (parse Docling + embed bge-m3 ×3).
   # ═══════════════════════════════════════════════════════════════════════════
 
-  # ── HunyuanOCR (OCR Model) ────────────────────────────────────────────────
-  # Port: 8001, GPU 0, ~10GB VRAM (0.2 × 48GB)
-  # OpenAI-compatible API → workers call via Docker network
+  # ── Unlimited-OCR (Baidu, OCR Model) ──────────────────────────────────────
+  # Port: 8001, GPU 0, ~10GB VRAM (0.2 × 48GB). ~3B model → needs more VRAM
+  # than the old 1B HunyuanOCR, hence gpu-memory-utilization bumped 0.13 → 0.20.
+  # OpenAI-compatible API → workers call via Docker network.
+  #
+  # Uses Baidu's OFFICIAL prebuilt vLLM image (NOT Dockerfile.vllm) — it ships
+  # the custom `unlimited_ocr` model code + NGram logits processor that the
+  # stock vllm-openai image does not have. Default tag = CUDA 13.0 (works on the
+  # Ampere RTX A6000 here); the `:unlimited-ocr-cu129` tag is only for Hopper.
+  # Serve flags follow https://recipes.vllm.ai/baidu/Unlimited-OCR verbatim.
   vllm-ocr:
-    build:
-      context: .
-      dockerfile: Dockerfile.vllm
+    image: vllm/vllm-openai:unlimited-ocr
     container_name: hrag-vllm-ocr
     ports:
       - "8001:8001"
@@ -44,16 +49,25 @@ services:
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
     command:
-      - tencent/HunyuanOCR
+      - baidu/Unlimited-OCR
       - --port
       - "8001"
       - --max-model-len
-      - "12000"
+      - "12288"
       - --gpu-memory-utilization
-      - "0.13"
+      - "0.22"
       - --trust-remote-code
+      - --logits_processors
+      - vllm.model_executor.models.unlimited_ocr:NGramPerReqLogitsProcessor
+      - --no-enable-prefix-caching
+      - --mm-processor-cache-gb
+      - "0"
+      # GPU 0 is shared with vllm-memory (0.6) + workers; only ~11 GB free.
+      # enforce-eager skips the multi-MB CUDA-graph capture so the 3B weights
+      # leave room for the KV cache within the 0.22 (~10.8 GB) budget.
+      - --enforce-eager
       - --served-model-name
-      - hunyuan-ocr
+      - unlimited-ocr
       - --host
       - 0.0.0.0
     deploy:
@@ -82,8 +96,11 @@ services:
       com.hrag.stack: hrag
 
   # ── gemma-4-E4B-it (Memory/KG Model, served as `qwen-memory`) ─────────────
-  # Port: 8088, GPU 0, ~29GB VRAM (0.6 × 48GB) — gemma-4-E4B weights ~15GB + KV cache
-  # OpenAI-compatible API → workers call via Docker network
+  # Port: 8088, GPU 0, ~22GB VRAM (0.45 × 48GB) — gemma-4-E4B weights ~15GB + KV cache
+  # OpenAI-compatible API → workers call via Docker network.
+  # Serves supervisor (intent), Graphiti memory + Legal KG — all send ≤1.2k-token
+  # chunks + ≤4k output, so max-model-len 8192 is ample. enforce-eager drops the
+  # CUDA-graph spike so the lower 0.45 budget still leaves a healthy KV cache.
   vllm-memory:
     build:
       context: .
@@ -104,9 +121,10 @@ services:
       - --port
       - "8088"
       - --max-model-len
-      - "16384"
+      - "8192"
       - --gpu-memory-utilization
-      - "0.6"
+      - "0.45"
+      - --enforce-eager
       - --trust-remote-code
       - --served-model-name
       - qwen-memory

@@ -65,6 +65,9 @@ class ParsedDocument:
     images: list[ExtractedImage] = field(default_factory=list)
     tables: list[ExtractedTable] = field(default_factory=list)
     tables_count: int = 0
+    # Which extraction path actually ran: "docling" | "ocr" | "legacy".
+    # Surfaced as Document.parser_version (NOT just the file-format capability).
+    parser: str = "docling"
 
 
 @dataclass

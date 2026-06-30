@@ -221,6 +221,29 @@ _DOCLING_EXTENSIONS = {".pdf", ".docx", ".pptx", ".html"}
 _LEGACY_EXTENSIONS = {".txt", ".md"}
 _OCR_EXTENSIONS = {".pdf"}  # Only PDFs need scanned-page detection
 
+
+def _md_table_to_html(md: str) -> str:
+    """Minimal markdown-pipe-table → HTML (fallback when Docling lacks
+    export_to_html). Returns '' if the text is not a pipe table."""
+    import html as _h
+
+    lines = [ln for ln in md.strip().splitlines() if ln.strip().startswith("|")]
+    if len(lines) < 2:
+        return ""
+
+    def cells(line: str) -> list[str]:
+        return [c.strip() for c in line.strip().strip("|").split("|")]
+
+    header = cells(lines[0])
+    body = [cells(r) for r in lines[2:]]  # lines[1] is the --- separator
+    th = "".join(f"<th>{_h.escape(c)}</th>" for c in header)
+    trs = "".join(
+        "<tr>" + "".join(f"<td>{_h.escape(c)}</td>" for c in r) + "</tr>"
+        for r in body
+    )
+    return f"<table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table>"
+
+
 # ---------------------------------------------------------------------------
 # Module-level Docling converter singleton
 # ---------------------------------------------------------------------------
@@ -266,7 +289,32 @@ def _get_global_converter():
     pipeline_options.generate_picture_images = settings.HRAG_ENABLE_IMAGE_EXTRACTION
     pipeline_options.images_scale = settings.HRAG_DOCLING_IMAGES_SCALE
     pipeline_options.do_formula_enrichment = settings.HRAG_ENABLE_FORMULA_ENRICHMENT
-    pipeline_options.ocr_options = OcrAutoOptions(lang=["vi", "en"])
+    # Vietnamese PDFs often ship a broken embedded text layer (dropped
+    # diacritics: "BỘ"→"B", "Độc lập"→"Đc lâp"). The fix is full-page OCR with
+    # an engine that actually reads Vietnamese — that is EasyOCR, NOT the
+    # auto-selected RapidOCR/PP-OCRv6 (which also drops diacritics even when
+    # forced to OCR the page). So only force full-page OCR when EasyOCR is
+    # importable; otherwise fall back to the default engine WITHOUT forcing
+    # (full-page RapidOCR would just waste GPU without fixing the text).
+    import importlib.util
+
+    _easyocr_ok = importlib.util.find_spec("easyocr") is not None
+    if settings.HRAG_DOCLING_FORCE_FULL_PAGE_OCR and _easyocr_ok:
+        from docling.datamodel.pipeline_options import EasyOcrOptions
+
+        pipeline_options.ocr_options = EasyOcrOptions(
+            lang=["vi", "en"], force_full_page_ocr=True
+        )
+        logger.info("[Docling] Vietnamese fix: EasyOCR full-page OCR enabled")
+    else:
+        pipeline_options.ocr_options = OcrAutoOptions(lang=["vi", "en"])
+        if settings.HRAG_DOCLING_FORCE_FULL_PAGE_OCR and not _easyocr_ok:
+            logger.warning(
+                "[Docling] HRAG_DOCLING_FORCE_FULL_PAGE_OCR set but 'easyocr' is "
+                "NOT installed — Vietnamese diacritics from broken text layers "
+                "will NOT be fixed. Add 'easyocr' to requirements + rebuild, or "
+                "route such PDFs through the Unlimited-OCR pipeline."
+            )
     pipeline_options.accelerator_options = AcceleratorOptions(device=device)
 
     # Table structure recognition (TableFormer). "accurate" is Docling's default
@@ -340,11 +388,13 @@ class DeepDocumentParser:
         start_time = time.time()
 
         if suffix in _DOCLING_EXTENSIONS:
-            # For PDFs: detect scanned pages and run OCR first if needed
+            # For PDFs: route to OCR when the page is scanned (no text) OR when
+            # the text layer is corrupt Vietnamese (dropped tone marks) — both
+            # are cases Docling can't extract correctly.
             if (
                 suffix in _OCR_EXTENSIONS
                 and settings.HRAG_ENABLE_OCR
-                and self._is_scanned(path)
+                and (self._is_scanned(path) or self._has_broken_vn_textlayer(path))
             ):
                 result = await self._parse_with_ocr(
                     path, document_id, original_filename
@@ -384,6 +434,53 @@ class DeepDocumentParser:
         from app.services.ocr_service import get_ocr_service
 
         return get_ocr_service().is_scanned_pdf(file_path)
+
+    # Vietnamese-specific base letters that survive a corrupt text layer
+    _VN_BASE_LETTERS = set("ăâđêôơưĂÂĐÊÔƠƯ")
+
+    @staticmethod
+    def _has_broken_vn_textlayer(file_path: Path) -> bool:
+        """Detect a PDF whose embedded text layer is Vietnamese but has dropped
+        its tone marks (corrupt font/encoding → "BỘ"→"B", "Độc lập"→"Đc lâp").
+
+        Clean Vietnamese is dense with complex tone chars (U+1EA0–1EF9: ộ ệ ấ ợ
+        …); a broken layer loses them but keeps Vietnamese base letters
+        (ă â đ ê ô ơ ư). English has neither, so it is left on the fast
+        text-layer path. Returns True → route to OCR (Unlimited-OCR).
+        """
+        if not settings.HRAG_OCR_DETECT_BROKEN_VN:
+            return False
+        try:
+            import fitz
+
+            doc = fitz.open(str(file_path))
+            parts = []
+            for i, page in enumerate(doc):
+                parts.append(page.get_text("text"))
+                if i >= 4:  # sample first 5 pages — enough to judge the layer
+                    break
+            doc.close()
+            text = "\n".join(parts)
+        except Exception as e:
+            logger.warning(f"[broken-vn] text extraction failed ({e}) — skipping")
+            return False
+
+        letters = sum(1 for c in text if c.isalpha())
+        if letters < 200:
+            return False  # too little selectable text (scanned handled elsewhere)
+
+        tone = sum(1 for c in text if "Ạ" <= c <= "ỹ")
+        base = sum(1 for c in text if c in DeepDocumentParser._VN_BASE_LETTERS)
+        tone_ratio = tone / letters
+
+        broken = base >= 5 and tone_ratio < settings.HRAG_OCR_VN_TONE_MIN_RATIO
+        if broken:
+            logger.info(
+                f"[broken-vn] {file_path.name}: tone_ratio={tone_ratio:.4f} "
+                f"(<{settings.HRAG_OCR_VN_TONE_MIN_RATIO}), vn_base={base}, "
+                f"letters={letters} → routing to OCR"
+            )
+        return broken
 
     async def _parse_with_ocr(
         self,
@@ -427,6 +524,7 @@ class DeepDocumentParser:
                 tables=[],
                 tables_count=0,
                 page_count=0,
+                parser="ocr",
             )
 
         # Write OCR text to a temp file and parse it as markdown
@@ -440,6 +538,7 @@ class DeepDocumentParser:
             result = self._parse_legacy(tmp_path, document_id, original_filename)
             # Override markdown with OCR output so the viewer shows the right content
             result.markdown = ocr_text
+            result.parser = "ocr"
         finally:
             tmp_path.unlink(missing_ok=True)
 
@@ -469,11 +568,25 @@ class DeepDocumentParser:
         # Extract tables (markdown only — captions added later by caption worker)
         tables = self._extract_tables(doc, document_id)
 
-        # Export to markdown (with page break markers if supported)
-        markdown = self._export_markdown(doc)
-
-        # Post-process: replace image placeholders with real markdown images
-        markdown = self._inject_image_references(markdown, pic_url_list)
+        # Export markdown. With layout reconstruction on, rebuild the admin
+        # layout from element provenance (images already embedded); otherwise
+        # use Docling's flat markdown export + inject image refs.
+        if settings.HRAG_DOCLING_PRESERVE_LAYOUT:
+            try:
+                markdown = self._export_layout_markdown(doc, pic_url_list)
+            except Exception as e:
+                logger.warning(
+                    f"Docling layout reconstruction failed for {document_id} "
+                    f"(falling back to markdown export): {e}",
+                    exc_info=True,
+                )
+                markdown = self._inject_image_references(
+                    self._export_markdown(doc), pic_url_list
+                )
+        else:
+            markdown = self._export_markdown(doc)
+            # Post-process: replace image placeholders with real markdown images
+            markdown = self._inject_image_references(markdown, pic_url_list)
         # Note: table captions NOT injected here — caption worker will update
         # markdown_content in DB once captions are ready
 
@@ -673,6 +786,132 @@ class DeepDocumentParser:
             md = doc.export_to_markdown()
 
         return _fix_scattered_vietnamese(md)
+
+    def _export_layout_markdown(self, doc, pic_url_list) -> str:
+        """Rebuild administrative layout HTML from Docling provenance.
+
+        Iterates the document items in reading order, normalises each element's
+        bounding box to top-left coordinates, and hands generic LayoutBlocks to
+        the shared renderer (same one the OCR path uses). Tables/pictures render
+        as real <table>/<img>; consecutive list items collapse into a <ul>.
+        """
+        from collections import defaultdict
+
+        from app.services.layout import LayoutBlock, esc as _esc, render_layout_blocks
+
+        # Page heights for bottom-left → top-left coordinate flip.
+        page_h: dict[int, float] = {}
+        for pno, page in (getattr(doc, "pages", None) or {}).items():
+            sz = getattr(page, "size", None)
+            page_h[int(pno)] = float(getattr(sz, "height", 0) or 0)
+
+        # picture item → image URL (pictures + pic_url_list share order)
+        pic_url: dict[int, str] = {}
+        for pic, pair in zip(getattr(doc, "pictures", None) or [], pic_url_list or []):
+            pic_url[id(pic)] = pair[1] if pair else ""
+
+        page_blocks: dict[int, list[LayoutBlock]] = defaultdict(list)
+        pending_list: dict[int, list] = {}  # page → [items, x1, y1, x2, y2]
+
+        def flush_list(pg: int) -> None:
+            buf = pending_list.pop(pg, None)
+            if not buf:
+                return
+            items, x1, y1, x2, y2 = buf
+            html = "<ul>" + "".join(f"<li>{it}</li>" for it in items) + "</ul>"
+            page_blocks[pg].append(
+                LayoutBlock(x1, y1, x2, y2, html, kind="list", block=True)
+            )
+
+        for item, _level in doc.iterate_items():
+            label = str(getattr(item, "label", "") or "").lower()
+            tname = type(item).__name__
+            prov = getattr(item, "prov", None)
+            if not prov:
+                continue
+            pr = prov[0]
+            pg = int(getattr(pr, "page_no", 0) or 0)
+            b = getattr(pr, "bbox", None)
+            if b is None:
+                continue
+            ph = page_h.get(pg, 0.0)
+            origin = str(getattr(b, "coord_origin", "")).upper()
+            x1, x2 = float(b.l), float(b.r)
+            t, bot = float(b.t), float(b.b)
+            if "BOTTOMLEFT" in origin and ph:
+                y1, y2 = ph - t, ph - bot
+            else:
+                y1, y2 = t, bot
+            if y1 > y2:
+                y1, y2 = y2, y1
+
+            # Tables → real HTML table
+            if label == "table" or tname == "TableItem":
+                flush_list(pg)
+                thtml = ""
+                try:
+                    thtml = item.export_to_html(doc=doc)
+                except Exception:
+                    try:
+                        thtml = _md_table_to_html(item.export_to_markdown(doc))
+                    except Exception:
+                        thtml = ""
+                if thtml:
+                    page_blocks[pg].append(
+                        LayoutBlock(x1, y1, x2, y2, thtml, kind="table", block=True)
+                    )
+                continue
+
+            # Pictures → real image (or signature/seal placeholder)
+            if label == "picture" or tname == "PictureItem":
+                flush_list(pg)
+                url = pic_url.get(id(item), "")
+                fig = (
+                    f'<figure class="ocr-figure"><img src="{url}" loading="lazy" alt=""/></figure>'
+                    if url
+                    else '<figure class="ocr-figure">(hình ảnh / chữ ký)</figure>'
+                )
+                page_blocks[pg].append(
+                    LayoutBlock(x1, y1, x2, y2, fig, kind="figure", block=True)
+                )
+                continue
+
+            text = getattr(item, "text", None)
+            if not text or not str(text).strip():
+                continue
+            text = _fix_scattered_vietnamese(str(text).strip())
+
+            # Consecutive list items collapse into one <ul>
+            if label == "list_item" or tname == "ListItem":
+                buf = pending_list.get(pg)
+                if buf is None:
+                    pending_list[pg] = [[_esc(text)], x1, y1, x2, y2]
+                else:
+                    buf[0].append(_esc(text))
+                    buf[1] = min(buf[1], x1); buf[2] = min(buf[2], y1)
+                    buf[3] = max(buf[3], x2); buf[4] = max(buf[4], y2)
+                continue
+
+            flush_list(pg)
+            if label in ("section_header", "title"):
+                kind = "title"
+            elif label in ("page_header", "page_footer"):
+                kind = "note"
+            else:
+                kind = "body"
+            page_blocks[pg].append(
+                LayoutBlock(x1, y1, x2, y2, _esc(text), kind=kind, multiline="\n" in text)
+            )
+
+        for pg in list(pending_list):
+            flush_list(pg)
+
+        out: list[str] = []
+        for pg in sorted(page_blocks):
+            html = render_layout_blocks(page_blocks[pg], pg)
+            if html.strip():
+                out.append(f"<!-- page {pg} -->\n\n{html}")
+        return "\n\n---\n\n".join(out)
 
     def _extract_images_with_urls(
         self,
@@ -1111,4 +1350,5 @@ class DeepDocumentParser:
             chunks=chunks,
             images=[],
             tables_count=0,
+            parser="legacy",
         )

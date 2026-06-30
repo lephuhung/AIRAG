@@ -7,7 +7,7 @@ import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import rehypeRaw from "rehype-raw";
 import "katex/dist/katex.min.css";
-import { FileText, List, ChevronRight, Maximize2, Minimize2 } from "lucide-react";
+import { FileText, List, ChevronRight, Maximize2, Minimize2, AlignLeft, LayoutTemplate } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
 import type { Document, ChatSourceChunk } from "@/types";
@@ -237,6 +237,28 @@ function insertPageDividers(markdown: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Strip OCR layout HTML for the plain-text view (mirrors backend
+// strip_ocr_layout): drop the alignment/2-column tags + data-bbox, keep the
+// reading-order text, and turn page markers into readable separators.
+// ---------------------------------------------------------------------------
+function stripOcrLayoutClient(md: string): string {
+  if (!md.includes("data-bbox")) return md;
+  let t = md.replace(/<!--\s*page\s+(\d+)\s*-->/gi, "\n— Trang $1 —\n");
+  t = t.replace(/<br\s*\/?>/gi, "\n");
+  t = t.replace(/<\/(div|p|figure)>/gi, "\n");
+  t = t.replace(/<(?!!--)[^>]*>/g, "");
+  t = t
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ");
+  t = t.replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n");
+  return t.trim();
+}
+
+// ---------------------------------------------------------------------------
 // DocumentViewer
 // ---------------------------------------------------------------------------
 interface DocumentViewerProps {
@@ -346,6 +368,19 @@ export const DocumentViewer = memo(function DocumentViewer({
   // This prevents the counter from leaking between documents when markdown is cached.
   // No side-effects needed here as page numbers are pre-assigned in processedMarkdown
 
+  // ---- OCR layout: detect + plain/rendered toggle ----
+  // Reconstructed administrative-layout markdown carries data-bbox attributes;
+  // only then do we offer the "văn bản thuần" toggle.
+  const hasOcrLayout = useMemo(
+    () => !!markdown && markdown.includes("data-bbox"),
+    [markdown]
+  );
+  const [plainMode, setPlainMode] = useState(false);
+  const plainText = useMemo(
+    () => (hasOcrLayout ? stripOcrLayoutClient(markdown || "") : ""),
+    [markdown, hasOcrLayout]
+  );
+
   // ---- Process markdown (insert page dividers) ----
   const processedMarkdown = useMemo(() => {
     return markdown ? insertPageDividers(markdown) : "";
@@ -355,6 +390,13 @@ export const DocumentViewer = memo(function DocumentViewer({
   // The h1–h4 components (memoized below) consume it in document order, so ids
   // stay deterministic and identical across renders for the same content.
   headingIdCounter.current = new Map();
+
+  // Signer for the OCR signature-block placeholder (Phase 2: real data).
+  // Prefers the manual override, then the first digital signature's signer.
+  const signerName = useMemo(
+    () => doc.signer_name || doc.digital_signatures?.[0]?.signer_name || "",
+    [doc.signer_name, doc.digital_signatures]
+  );
 
   // ---- Stable ReactMarkdown components (prevents DOM recreation on re-render) ----
   // Without memoization, inline arrow functions create new references each render,
@@ -422,7 +464,23 @@ export const DocumentViewer = memo(function DocumentViewer({
         )}
       </figure>
     ),
-  }), []);
+    // OCR signature/seal region (raw <figure class="ocr-figure">). When the
+    // pipeline captured a signer, render a real signature block instead of the
+    // bare placeholder.
+    figure: ({ children, ...props }) => {
+      const raw = (props as Record<string, unknown>).className;
+      const cls = Array.isArray(raw) ? raw.join(" ") : String(raw ?? "");
+      if (cls.includes("ocr-figure") && signerName) {
+        return (
+          <div className="ocr-sign-block" data-bbox={(props as Record<string, unknown>)["data-bbox"] as string}>
+            <div className="ocr-sign-label">(Đã ký)</div>
+            <div className="ocr-sign-name">{signerName}</div>
+          </div>
+        );
+      }
+      return <figure {...props}>{children}</figure>;
+    },
+  }), [signerName]);
 
   // Stable plugin arrays
   const remarkPlugins = useMemo(() => [remarkGfm, remarkMath], []);
@@ -459,37 +517,53 @@ export const DocumentViewer = memo(function DocumentViewer({
       block: "start" | "center" = "center",
       onDone?: () => void
     ) => {
-      const container = contentRef.current;
+      // Find the element's REAL scrollable ancestor (the height chain / which
+      // element actually scrolls isn't guaranteed to be contentRef), falling
+      // back to contentRef. Using offsetParent-walking broke when contentRef
+      // wasn't positioned, so measure with getBoundingClientRect instead.
+      let container: HTMLElement | null = target.parentElement;
+      while (container) {
+        const oy = getComputedStyle(container).overflowY;
+        if (
+          (oy === "auto" || oy === "scroll") &&
+          container.scrollHeight > container.clientHeight + 2
+        ) {
+          break;
+        }
+        container = container.parentElement;
+      }
+      if (!container) container = contentRef.current;
       if (!container) return;
+      const scroller = container;
 
       const calcTarget = () => {
-        // Calculate offset of target relative to scroll container
-        let offset = 0;
-        let el: HTMLElement | null = target;
-        while (el && el !== container) {
-          offset += el.offsetTop;
-          el = el.offsetParent as HTMLElement | null;
-        }
+        const cRect = scroller.getBoundingClientRect();
+        const tRect = target.getBoundingClientRect();
+        // target's offset within the scroller's scrollable content
+        const rel = tRect.top - cRect.top + scroller.scrollTop;
         const targetH = target.offsetHeight;
-        const containerH = container.clientHeight;
-        let dest =
+        const containerH = scroller.clientHeight;
+        const dest =
           block === "center"
-            ? offset - containerH / 2 + targetH / 2
-            : offset;
-        return Math.max(0, Math.min(dest, container.scrollHeight - containerH));
+            ? rel - containerH / 2 + targetH / 2
+            : rel - 16;
+        return Math.max(0, Math.min(dest, scroller.scrollHeight - containerH));
       };
 
       // Animate with rAF (cannot be cancelled by browser unlike smooth scrollIntoView)
       const animate = (dest: number) => {
-        const start = container.scrollTop;
+        const start = scroller.scrollTop;
         const dist = dest - start;
         if (Math.abs(dist) < 1) return;
-        const duration = Math.min(400, Math.abs(dist) * 0.5 + 150);
+        // Duration scales with distance so short hops still feel animated and
+        // long jumps don't whip past — clamped to a comfortable 320–900ms.
+        const duration = Math.min(900, Math.max(320, Math.abs(dist) * 0.45 + 200));
         const t0 = performance.now();
         const step = () => {
           const p = Math.min((performance.now() - t0) / duration, 1);
-          const ease = 1 - Math.pow(1 - p, 3); // easeOutCubic
-          container.scrollTop = start + dist * ease;
+          // easeInOutCubic — gentle accelerate then settle, reads as a smooth glide.
+          const ease = p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2;
+          scroller.scrollTop = start + dist * ease;
           if (p < 1) requestAnimationFrame(step);
         };
         requestAnimationFrame(step);
@@ -651,14 +725,34 @@ export const DocumentViewer = memo(function DocumentViewer({
   }, [highlightChunks, processedMarkdown]);
 
   // ---- TOC heading click ----
+  // Use the rAF scrollTo (same as citations) — native scrollIntoView gets
+  // cancelled by layout shifts inside the scroll container.
   const handleTocSelect = useCallback((id: string) => {
-    if (!contentRef.current) return;
-    const el = contentRef.current.querySelector(`#${CSS.escape(id)}`);
-    if (el) {
-      el.scrollIntoView({ behavior: "smooth", block: "start" });
-      setActiveHeading(id);
+    const root = contentRef.current;
+    if (!root) return;
+    // Resolve the target heading. The TOC slug (from extractHeadings on the raw
+    // markdown) and the rendered heading id (computed independently in the h1-h4
+    // renderers) can disagree — links/setext/dedupe drift — leaving the click
+    // dead. So fall back to POSITION: the headings array and the DOM headings
+    // are both in document order, so the Nth TOC entry is the Nth heading.
+    let el = root.querySelector(`#${CSS.escape(id)}`) as HTMLElement | null;
+    if (!el) {
+      const idx = headings.findIndex((h) => h.id === id);
+      // Scope to the markdown <article> — contentRef also holds the document
+      // title <h2>, which would otherwise offset the position lookup by one.
+      const article = root.querySelector("article");
+      if (idx >= 0 && article) {
+        el = (article.querySelectorAll("h1, h2, h3, h4")[idx] as HTMLElement) ?? null;
+      }
     }
-  }, []);
+    if (el) {
+      scrollTo(el, "start");
+      setActiveHeading(id);
+      // Brief flash so the jump target is obvious
+      el.classList.add("bg-primary/15", "transition-colors", "rounded");
+      setTimeout(() => el!.classList.remove("bg-primary/15"), 1500);
+    }
+  }, [scrollTo, headings]);
 
   // Whether the TOC menu is actually on screen (full mode, toggled on, has
   // headings). Gates the sidebar render below.
@@ -683,8 +777,12 @@ export const DocumentViewer = memo(function DocumentViewer({
         />
       )}
 
-      {/* Main markdown content */}
-      <div ref={contentRef} className="flex-1 min-h-0 overflow-y-auto scroll-smooth">
+      {/* Main markdown content.
+          NOTE: no `scroll-smooth` here — programmatic scrolling goes through the
+          rAF-based scrollTo() which animates scrollTop itself. CSS
+          `scroll-behavior: smooth` re-animates every scrollTop write per frame,
+          fighting the rAF loop so TOC/citation jumps stall. */}
+      <div ref={contentRef} className="flex-1 min-h-0 overflow-y-auto">
         {/* TOC toggle (for smaller screens / when TOC hidden) */}
         {headings.length > 0 && (
           <button
@@ -723,25 +821,47 @@ export const DocumentViewer = memo(function DocumentViewer({
                   <h2 className="text-2xl font-bold tracking-tight text-foreground mt-1 leading-snug">{doc.document_title || doc.original_filename}</h2>
                   <span className="text-xs text-muted-foreground/60 truncate">{doc.original_filename}</span>
                 </div>
-                {/* Chunk/Full mode toggle */}
-                {hasHighlight && hasChunkLocator && (
-                  <button
-                    onClick={() => setViewMode(effectiveMode === "chunk" ? "full" : "chunk")}
-                    className={cn(
-                      "flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-semibold rounded-full transition-all flex-shrink-0",
-                      effectiveMode === "chunk"
-                        ? "bg-primary text-primary-foreground shadow-md hover:shadow-lg"
-                        : "bg-muted text-muted-foreground hover:bg-muted/80"
-                    )}
-                    title={effectiveMode === "chunk" ? t("viewer.view_full") : t("viewer.view_chunk")}
-                  >
-                    {effectiveMode === "chunk" ? (
-                      <><Maximize2 className="w-3.5 h-3.5" />{t("viewer.view_full")}</>
-                    ) : (
-                      <><Minimize2 className="w-3.5 h-3.5" />{t("viewer.view_chunk")}</>
-                    )}
-                  </button>
-                )}
+                {/* View toggles */}
+                <div className="flex items-center gap-2 flex-shrink-0">
+                  {/* OCR layout: rendered ⇄ plain text */}
+                  {hasOcrLayout && effectiveMode === "full" && (
+                    <button
+                      onClick={() => setPlainMode((p) => !p)}
+                      className={cn(
+                        "flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-semibold rounded-full transition-all flex-shrink-0",
+                        plainMode
+                          ? "bg-muted text-muted-foreground hover:bg-muted/80"
+                          : "bg-primary/10 text-primary ring-1 ring-primary/20 hover:bg-primary/20"
+                      )}
+                      title={plainMode ? "Xem bản trình bày" : "Xem văn bản thuần"}
+                    >
+                      {plainMode ? (
+                        <><LayoutTemplate className="w-3.5 h-3.5" />Bản trình bày</>
+                      ) : (
+                        <><AlignLeft className="w-3.5 h-3.5" />Văn bản thuần</>
+                      )}
+                    </button>
+                  )}
+                  {/* Chunk/Full mode toggle */}
+                  {hasHighlight && hasChunkLocator && (
+                    <button
+                      onClick={() => setViewMode(effectiveMode === "chunk" ? "full" : "chunk")}
+                      className={cn(
+                        "flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-semibold rounded-full transition-all flex-shrink-0",
+                        effectiveMode === "chunk"
+                          ? "bg-primary text-primary-foreground shadow-md hover:shadow-lg"
+                          : "bg-muted text-muted-foreground hover:bg-muted/80"
+                      )}
+                      title={effectiveMode === "chunk" ? t("viewer.view_full") : t("viewer.view_chunk")}
+                    >
+                      {effectiveMode === "chunk" ? (
+                        <><Maximize2 className="w-3.5 h-3.5" />{t("viewer.view_full")}</>
+                      ) : (
+                        <><Minimize2 className="w-3.5 h-3.5" />{t("viewer.view_chunk")}</>
+                      )}
+                    </button>
+                  )}
+                </div>
               </div>
               <div className="flex items-center gap-3 mt-3 text-xs text-muted-foreground pt-3">
                 {effectiveMode === "chunk" && chunkContext ? (
@@ -798,16 +918,43 @@ export const DocumentViewer = memo(function DocumentViewer({
                 "[&_hr]:border-border/40",
                 // KaTeX math blocks
                 "[&_.katex-display]:overflow-x-auto [&_.katex-display]:py-4",
-                "[&_.katex]:text-[1.05em]"
+                "[&_.katex]:text-[1.05em]",
+                // ── OCR layout reconstruction (scanned administrative docs) ──
+                // Backend rebuilds the original văn bản hành chính layout from
+                // Unlimited-OCR bounding boxes into these classes.
+                "[&_.ocr-note]:text-right [&_.ocr-note]:!text-[12px] [&_.ocr-note]:text-muted-foreground [&_.ocr-note]:!my-0 [&_.ocr-note]:leading-tight",
+                "[&_.ocr-center]:text-center [&_.ocr-right]:text-right [&_.ocr-left]:text-left",
+                "[&_.ocr-title]:font-bold [&_.ocr-title]:uppercase [&_.ocr-title]:tracking-wide [&_.ocr-title]:!text-[16px] [&_.ocr-title]:!my-3",
+                // Two-column national heading (Nghị định 30): agency ‖ quốc hiệu
+                "[&_.ocr-header-grid]:flex [&_.ocr-header-grid]:justify-between [&_.ocr-header-grid]:items-start [&_.ocr-header-grid]:gap-6 [&_.ocr-header-grid]:my-4",
+                "[&_.ocr-header-grid>.ocr-col-left]:flex-1 [&_.ocr-header-grid>.ocr-col-left]:text-center [&_.ocr-header-grid>.ocr-col-left]:font-bold [&_.ocr-header-grid>.ocr-col-left]:uppercase [&_.ocr-header-grid>.ocr-col-left]:text-[13px]",
+                "[&_.ocr-header-grid>.ocr-col-right]:flex-1 [&_.ocr-header-grid>.ocr-col-right]:text-center [&_.ocr-header-grid>.ocr-col-right]:font-bold",
+                // Reference line: số hiệu (trái) ‖ địa danh, ngày tháng (phải)
+                "[&_.ocr-row-2col]:flex [&_.ocr-row-2col]:justify-between [&_.ocr-row-2col]:gap-6 [&_.ocr-row-2col]:my-3",
+                "[&_.ocr-row-2col>.ocr-col-left]:text-left [&_.ocr-row-2col>.ocr-col-right]:text-right [&_.ocr-row-2col>.ocr-col-right]:italic",
+                // Signature / seal block placeholder
+                "[&_.ocr-figure]:text-center [&_.ocr-figure]:!text-[12px] [&_.ocr-figure]:text-muted-foreground/60 [&_.ocr-figure]:italic [&_.ocr-figure]:my-4 [&_.ocr-figure]:border [&_.ocr-figure]:border-dashed [&_.ocr-figure]:border-border/40 [&_.ocr-figure]:rounded-lg [&_.ocr-figure]:py-3",
+                // Real signature block (when signer captured)
+                "[&_.ocr-sign-block]:ml-auto [&_.ocr-sign-block]:w-fit [&_.ocr-sign-block]:text-center [&_.ocr-sign-block]:my-5 [&_.ocr-sign-block]:mr-6",
+                "[&_.ocr-sign-label]:italic [&_.ocr-sign-label]:text-[13px] [&_.ocr-sign-label]:text-muted-foreground [&_.ocr-sign-label]:mb-8",
+                "[&_.ocr-sign-name]:font-bold [&_.ocr-sign-name]:text-foreground",
+                // Block wrapper for tables / lists / figures (Docling layout path)
+                "[&_.ocr-block]:my-3 [&_.ocr-block>figure]:mx-auto [&_.ocr-block>img]:mx-auto"
               )}
             >
-              <ReactMarkdown
-                remarkPlugins={remarkPlugins}
-                rehypePlugins={rehypePlugins}
-                components={mdComponents}
-              >
-                {processedMarkdown}
-              </ReactMarkdown>
+              {plainMode && hasOcrLayout ? (
+                <pre className="whitespace-pre-wrap break-words font-sans text-[14px] leading-[1.75] text-foreground/80 m-0">
+                  {plainText}
+                </pre>
+              ) : (
+                <ReactMarkdown
+                  remarkPlugins={remarkPlugins}
+                  rehypePlugins={rehypePlugins}
+                  components={mdComponents}
+                >
+                  {processedMarkdown}
+                </ReactMarkdown>
+              )}
             </article>
           </div>
         </div>
@@ -830,9 +977,16 @@ function getHeadingText(children: React.ReactNode): string {
 
 function generateHeadingId(text: string): string {
   return text
+    // Transliterate Vietnamese → ASCII so headings produce meaningful, stable,
+    // collision-free slugs (e.g. "CỘNG HÒA" → "cong-hoa", not "cng-ha"/empty).
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")   // strip combining diacritic marks
+    .replace(/đ/g, "d").replace(/Đ/g, "d")  // đ / Đ
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
     .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
     .slice(0, 80);
 }
 

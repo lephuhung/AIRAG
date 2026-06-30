@@ -75,6 +75,17 @@ async def handle_embed(payload: dict) -> None:
                 await check_and_finalize(document, db)
                 return
 
+            # ── Strip OCR layout markup before vectorising ──────────────────
+            # Scanned docs store administrative-layout HTML (alignment, 2-column
+            # header, data-bbox) in their markdown/chunks so DocumentViewer can
+            # render the original format. That markup is pure noise for the
+            # embeddings + citation snippets, so remove it here. No-op for
+            # non-OCR (Docling) documents — strip_ocr_layout only touches text
+            # that actually carries the layout markers.
+            from app.services.ocr_service import strip_ocr_layout
+            for c in chunks_data:
+                c["content"] = strip_ocr_layout(c["content"])
+
             # ── Contextual Embeddings (optional) ────────────────────────────
             # When enabled, each chunk is enriched with a short LLM-generated
             # sentence that situates it within the full document before embedding.
@@ -96,6 +107,10 @@ async def handle_embed(payload: dict) -> None:
                                 f"[embed_worker] doc={msg.document_id} "
                                 f"could not load markdown for contextual enrichment: {_md_err}"
                             )
+
+                    # The stored markdown may be OCR layout HTML — feed the
+                    # contextual LLM clean text, not coordinate markup.
+                    document_markdown = strip_ocr_layout(document_markdown)
 
                     if document_markdown:
                         embed_texts = await enrich_chunks_with_context(

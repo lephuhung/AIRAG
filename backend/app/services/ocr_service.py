@@ -1,8 +1,15 @@
 """
-HunyuanOCR Service
-==================
+OCR Service
+===========
 
-Handles OCR for scanned / image-based PDFs using Tencent HunyuanOCR.
+Handles OCR for scanned / image-based PDFs using Baidu Unlimited-OCR
+(served via vLLM, OpenAI-compatible API). The class is still named
+HunyuanOCRService and the HUNYUAN_OCR_* env vars are kept for backward
+compatibility — only the served model/prompt changed.
+
+NOTE: the remote API backend (HRAG_OCR_LOCAL=false) is the supported path.
+The in-process local backend needs Baidu's custom vLLM build (NGram logits
+processor) to match the served model's output and is not wired for that.
 
 Two backends (selected via HRAG_OCR_LOCAL in .env):
 
@@ -28,6 +35,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -39,18 +48,116 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # OCR prompt — identical for both local and API backends
 # ---------------------------------------------------------------------------
-# Extracts all body text as Markdown, ignores headers/footers,
-# renders tables as HTML and formulas as LaTeX, follows reading order.
-_OCR_PROMPT = (
-    "提取文档图片中正文的所有信息用markdown格式表示，"
-    "其中页眉、页脚部分忽略，"
-    "表格用html格式表达，"
-    "文档中公式用latex格式表示，"
-    "按照阅读顺序组织进行解析。"
-)
+# Baidu Unlimited-OCR expects its own task prompt that MUST begin with the
+# literal `<image>` token; "document parsing." is the single-image full-page
+# parsing task (outputs structured text in reading order). See
+# https://recipes.vllm.ai/baidu/Unlimited-OCR.
+_OCR_PROMPT = "<image>document parsing."
+
+# Per-request decoding extras required by Unlimited-OCR's NGram logits
+# processor (single-image parsing values from the official recipe). Passed as
+# vLLM's `vllm_xargs` in the chat/completions payload.
+_OCR_VLLM_XARGS = {"ngram_size": 35, "window_size": 128}
 
 # Minimum selectable characters per page to consider it non-scanned
 _MIN_CHARS_PER_PAGE = 30
+
+# Unlimited-OCR ("document parsing.", skip_special_tokens=False) wraps every
+# recognised region as:  <|det|>LABEL [x1, y1, x2, y2]<|/det|>ACTUAL TEXT
+# We keep the recognised text but drop the detection prefix (label + bbox) and
+# any other leftover special tokens (e.g. <|im_end|>) so the KB stores clean
+# reading-order text instead of coordinate markup.
+_DET_BLOCK_RE = re.compile(r"<\|det\|>.*?<\|/det\|>", re.DOTALL)
+_SPECIAL_TOK_RE = re.compile(r"<\|[^|]*?\|>")
+
+
+def _strip_ocr_markup(text: str) -> str:
+    """Remove Unlimited-OCR detection/markup tokens, keeping the text content."""
+    text = _DET_BLOCK_RE.sub("", text)
+    text = _SPECIAL_TOK_RE.sub("", text)
+    # Collapse the blank lines left where det blocks were removed.
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Layout reconstruction (administrative-document format from OCR bounding boxes)
+# ---------------------------------------------------------------------------
+# Unlimited-OCR emits one region per logical block as
+#   <|det|>LABEL [x1, y1, x2, y2]<|/det|>TEXT
+# where LABEL ∈ {header, text, title, image}.  We turn those into generic
+# LayoutBlocks and hand them to the shared renderer in app.services.layout,
+# which rebuilds the Nghị-định-30 layout (shared with the Docling path).
+# strip_ocr_layout (re-exported below) removes the markup before embedding.
+from app.services.layout import (  # noqa: E402
+    LayoutBlock,
+    esc as _esc,
+    normalize_footnotes as _normalize_footnotes,
+    render_layout_blocks,
+    strip_layout_html as strip_ocr_layout,
+)
+
+# Region grammar: label + bbox + text up to the next region (or end).
+_REGION_RE = re.compile(
+    r"<\|det\|>\s*([A-Za-z_]+)\s*\[\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\]"
+    r"\s*<\|/det\|>(.*?)(?=<\|det\|>|\Z)",
+    re.DOTALL,
+)
+
+
+@dataclass
+class _Region:
+    label: str
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    text: str
+
+
+def _parse_ocr_regions(raw: str) -> list[_Region]:
+    regions: list[_Region] = []
+    for m in _REGION_RE.finditer(raw):
+        label, x1, y1, x2, y2, text = m.groups()
+        regions.append(
+            _Region(
+                label=label.lower(),
+                x1=int(x1), y1=int(y1), x2=int(x2), y2=int(y2),
+                text=_normalize_footnotes(text.strip()),
+            )
+        )
+    return regions
+
+
+def reconstruct_ocr_layout(raw: str, page_no: int) -> str:
+    """Rebuild administrative-document layout HTML from <|det|> region markup.
+
+    Falls back to flat stripped text when no regions are detected so callers can
+    use this unconditionally.
+    """
+    regions = _parse_ocr_regions(raw)
+    if not regions:
+        return _strip_ocr_markup(raw)
+
+    blocks: list[LayoutBlock] = []
+    for r in regions:
+        multiline = "\n" in r.text
+        if r.label == "image":
+            inner = _esc(r.text) if r.text else "(hình ảnh / chữ ký)"
+            blocks.append(LayoutBlock(
+                r.x1, r.y1, r.x2, r.y2,
+                f'<figure class="ocr-figure">{inner}</figure>',
+                kind="figure", block=True, multiline=multiline,
+            ))
+            continue
+        if not r.text:
+            continue
+        kind = "note" if r.label == "header" else ("title" if r.label == "title" else "body")
+        blocks.append(LayoutBlock(
+            r.x1, r.y1, r.x2, r.y2, _esc(r.text), kind=kind, multiline=multiline,
+        ))
+
+    return render_layout_blocks(blocks, page_no)
 
 
 # ---------------------------------------------------------------------------
@@ -188,10 +295,11 @@ class HunyuanOCRService:
         )
         doc.close()
 
+        preserve_layout = settings.HRAG_OCR_PRESERVE_LAYOUT
         if self._local:
-            page_texts = await self._ocr_pages_local(page_images)
+            page_texts = await self._ocr_pages_local(page_images, preserve_layout)
         else:
-            page_texts = await self._ocr_pages_api(page_images)
+            page_texts = await self._ocr_pages_api(page_images, preserve_layout)
 
         # Add page number markers that both frontend (insertPageDividers) and
         # backend (_parse_legacy) can parse
@@ -240,13 +348,15 @@ class HunyuanOCRService:
             )
         return self._client
 
-    async def _ocr_pages_api(self, page_images: list[bytes]) -> list[str]:
+    async def _ocr_pages_api(
+        self, page_images: list[bytes], preserve_layout: bool = False
+    ) -> list[str]:
         """OCR all pages via remote vLLM API, up to HRAG_OCR_CONCURRENCY pages concurrently."""
         semaphore = asyncio.Semaphore(settings.HRAG_OCR_CONCURRENCY)
 
         async def ocr_one(idx: int, img_bytes: bytes) -> tuple[int, str]:
             async with semaphore:
-                text = await self._ocr_image_api(img_bytes, idx + 1)
+                text = await self._ocr_image_api(img_bytes, idx + 1, preserve_layout)
                 return idx, text
 
         results = await asyncio.gather(
@@ -263,8 +373,15 @@ class HunyuanOCRService:
             page_texts[idx] = _clean_repeated_substrings(text)
         return page_texts
 
-    async def _ocr_image_api(self, img_bytes: bytes, page_num: int) -> str:
-        """Send one page image to the remote vLLM API and return OCR text."""
+    async def _ocr_image_api(
+        self, img_bytes: bytes, page_num: int, preserve_layout: bool = False
+    ) -> str:
+        """Send one page image to the remote vLLM API and return OCR text.
+
+        When ``preserve_layout`` is set the raw region markup is rebuilt into
+        administrative-document layout HTML; otherwise it is flattened to plain
+        reading-order text.
+        """
         b64 = base64.b64encode(img_bytes).decode("ascii")
         data_uri = f"data:image/png;base64,{b64}"
 
@@ -281,6 +398,10 @@ class HunyuanOCRService:
             ],
             "temperature": 0.0,
             "max_tokens": settings.HRAG_OCR_API_MAX_TOKENS,
+            # Unlimited-OCR emits structural special tokens that must NOT be
+            # stripped, and needs its NGram processor args per request.
+            "skip_special_tokens": False,
+            "vllm_xargs": _OCR_VLLM_XARGS,
         }
 
         client = await self._get_client()
@@ -291,8 +412,13 @@ class HunyuanOCRService:
             )
             response.raise_for_status()
             text = response.json()["choices"][0]["message"]["content"]
+            text = (
+                reconstruct_ocr_layout(text, page_num)
+                if preserve_layout
+                else _strip_ocr_markup(text)
+            )
             logger.debug(f"[OCR/API] Page {page_num}: {len(text)} chars")
-            return text.strip()
+            return text
         except httpx.HTTPStatusError as e:
             logger.error(
                 f"[OCR/API] HTTP error on page {page_num}: "
@@ -367,11 +493,15 @@ class HunyuanOCRService:
         self._processor = AutoProcessor.from_pretrained(
             self._model, trust_remote_code=True
         )
-        self._sampling_params = SamplingParams(temperature=0.0, max_tokens=12000)
+        self._sampling_params = SamplingParams(
+            temperature=0.0, max_tokens=12000, skip_special_tokens=False
+        )
         logger.info(f"[OCR/local] Model {self._model} loaded successfully")
         return self._llm, self._processor, self._sampling_params
 
-    def _ocr_pages_local_sync(self, page_images: list[bytes]) -> list[str]:
+    def _ocr_pages_local_sync(
+        self, page_images: list[bytes], preserve_layout: bool = False
+    ) -> list[str]:
         """
         Run OCR on all pages using the local vLLM engine (synchronous).
 
@@ -414,16 +544,25 @@ class HunyuanOCRService:
 
         page_texts: list[str] = []
         for i, out in enumerate(outputs):
-            text = out.outputs[0].text.strip()
+            raw = out.outputs[0].text
+            text = (
+                reconstruct_ocr_layout(raw, i + 1)
+                if preserve_layout
+                else _strip_ocr_markup(raw)
+            )
             text = _clean_repeated_substrings(text)
             logger.debug(f"[OCR/local] Page {i + 1}: {len(text)} chars")
             page_texts.append(text)
 
         return page_texts
 
-    async def _ocr_pages_local(self, page_images: list[bytes]) -> list[str]:
+    async def _ocr_pages_local(
+        self, page_images: list[bytes], preserve_layout: bool = False
+    ) -> list[str]:
         """Async wrapper: run local vLLM OCR in a thread pool."""
-        return await asyncio.to_thread(self._ocr_pages_local_sync, page_images)
+        return await asyncio.to_thread(
+            self._ocr_pages_local_sync, page_images, preserve_layout
+        )
 
 
 # ---------------------------------------------------------------------------
