@@ -268,6 +268,14 @@ class Settings(BaseSettings):
     # is well-tuned for general documents; enable for born-digital admin docs.
     HRAG_DOCLING_PRESERVE_LAYOUT: bool = Field(default=False)
 
+    # Chunk văn bản pháp luật theo ranh giới Phần/Chương/Mục/Điều trên đường
+    # OCR/legacy (mỗi Điều là một đơn vị trọn vẹn, điều dài mới size-split)
+    # thay vì cắt phẳng 500 ký tự trộn cuối điều này với đầu điều kia.
+    # Chỉ kích hoạt khi văn bản có >=3 heading "Điều N." — công văn/tờ trình
+    # vẫn đi DocumentChunker thường.
+    HRAG_LEGAL_CHUNKING: bool = Field(default=True)
+    HRAG_LEGAL_CHUNK_MAX_CHARS: int = Field(default=1800)
+
     # Knowledge Graph backend
     HRAG_KG_GRAPH_BACKEND: str = Field(default="networkx")
     NEO4J_URI: str = Field(default="bolt://localhost:7687")

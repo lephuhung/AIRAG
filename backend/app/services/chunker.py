@@ -151,3 +151,93 @@ def chunk_text(
 
     chunker = DocumentChunker(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     return chunker.split_text(text, source)
+
+
+class LegalDocumentChunker:
+    """Chunker theo CẤU TRÚC văn bản pháp luật VN (Phần/Chương/Mục/Điều).
+
+    ``DocumentChunker`` cắt theo kích thước nên một chunk thường trộn cuối điều
+    này với đầu điều kia — retrieval theo điều/khoản trả nửa nội dung lạc đề.
+    Chunker này cắt tại RANH GIỚI heading cấu trúc trước (mỗi Điều là một đơn
+    vị trọn vẹn, giữ nguyên phần mở đầu/phụ lục), điều quá dài mới size-split
+    tiếp bằng RecursiveCharacterTextSplitter bên trong đúng điều đó.
+
+    Cùng contract ``split_text() -> list[TextChunk]`` với DocumentChunker để
+    dùng thay thế trực tiếp trong ``_parse_legacy``. ``char_start``/``char_end``
+    chính xác tuyệt đối (slice trực tiếp, không dò find()) — phép gán page_no
+    theo page marker giữ nguyên độ tin cậy.
+    """
+
+    # Dưới ngưỡng này coi như văn bản KHÔNG có cấu trúc luật (công văn, tờ
+    # trình...) → caller nên dùng DocumentChunker thường.
+    MIN_DIEU_HEADINGS = 3
+
+    def __init__(self, max_chars: int = 1800, sub_overlap: int = 150):
+        self.max_chars = max_chars
+        self._sub_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=max_chars,
+            chunk_overlap=sub_overlap,
+            length_function=len,
+            separators=["\n\n", "\n", ". ", " ", ""],
+        )
+
+    @classmethod
+    def has_legal_structure(cls, text: str) -> bool:
+        from app.services.heading_path import find_headings
+
+        dieu = [h for h in find_headings(text) if h.title.lower().startswith("điều")]
+        return len(dieu) >= cls.MIN_DIEU_HEADINGS
+
+    def split_text(
+        self,
+        text: str,
+        source: str = "",
+        extra_metadata: dict | None = None,
+    ) -> list[TextChunk]:
+        from app.services.heading_path import find_headings
+
+        if not text.strip():
+            return []
+
+        headings = find_headings(text)
+        # Ranh giới section: đầu văn bản + vị trí từng heading. Section cuối
+        # chạy tới hết văn bản. Preamble (trước heading đầu) là section riêng.
+        bounds = [0] + [h.start for h in headings if h.start > 0] + [len(text)]
+        bounds = sorted(set(bounds))
+
+        result: list[TextChunk] = []
+        for s, e in zip(bounds, bounds[1:]):
+            section = text[s:e]
+            if not section.strip():
+                continue
+            if len(section) <= self.max_chars:
+                pieces = [(section, s)]
+            else:
+                # Điều/phụ lục quá dài: size-split TRONG section — không bao
+                # giờ tràn sang điều kế tiếp. char_start của sub-chunk dò trong
+                # phạm vi section (offset cục bộ + s).
+                pieces = []
+                pos = 0
+                for sub in self._sub_splitter.split_text(section):
+                    at = section.find(sub[:50], pos)
+                    if at == -1:
+                        at = pos
+                    pieces.append((sub, s + at))
+                    pos = max(at + 1, pos + 1)
+            for content, at in pieces:
+                result.append(TextChunk(
+                    content=content,
+                    chunk_index=len(result),
+                    char_start=at,
+                    char_end=at + len(content),
+                    metadata={
+                        "source": source,
+                        "chunk_index": len(result),
+                        **(extra_metadata or {}),
+                    },
+                ))
+        # total_chunks chỉ biết sau khi duyệt xong
+        return [
+            c._replace(metadata={**c.metadata, "total_chunks": len(result)})
+            for c in result
+        ]

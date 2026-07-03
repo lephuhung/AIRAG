@@ -1294,10 +1294,9 @@ class DeepDocumentParser:
         """Fallback: parse TXT/MD with legacy loader + RecursiveCharacterTextSplitter."""
         import re
         from app.services.document_loader import load_document
-        from app.services.chunker import DocumentChunker
+        from app.services.chunker import DocumentChunker, LegalDocumentChunker
 
         loaded = load_document(str(file_path))
-        chunker = DocumentChunker(chunk_size=500, chunk_overlap=50)
         content = loaded.content
 
         # For OCR documents with page markers (<!-- page N -->), extract page numbers
@@ -1327,6 +1326,20 @@ class DeepDocumentParser:
             content = page_break_marker.join(reconstructed_parts)
         else:
             page_count = loaded.page_count or 1
+
+        # Legal documents (>=3 "Điều N." headings) chunk on structural
+        # boundaries so no chunk mixes the tail of one điều with the head of
+        # the next; everything else keeps the flat size-based splitter.
+        if settings.HRAG_LEGAL_CHUNKING and LegalDocumentChunker.has_legal_structure(content):
+            chunker = LegalDocumentChunker(
+                max_chars=settings.HRAG_LEGAL_CHUNK_MAX_CHARS
+            )
+            logger.info(
+                f"[legal-chunking] {original_filename}: legal structure detected "
+                f"— chunking on Phần/Chương/Mục/Điều boundaries"
+            )
+        else:
+            chunker = DocumentChunker(chunk_size=500, chunk_overlap=50)
 
         text_chunks = chunker.split_text(
             text=content,

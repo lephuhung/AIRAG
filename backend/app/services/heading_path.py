@@ -53,10 +53,24 @@ _MAX_DIEU_PER_CHUNK = 8
 
 
 @dataclass
-class _Heading:
+class Heading:
+    """Một heading cấu trúc tìm thấy trong text: vị trí, cấp và tiêu đề đã chuẩn hoá."""
     start: int
     level: int
     title: str
+
+
+# Giữ alias cũ cho nội bộ module
+_Heading = Heading
+
+
+def find_headings(text: str) -> list[Heading]:
+    """Public API: liệt kê heading Phần/Chương/Mục/Điều trong ``text`` theo thứ tự.
+
+    Dùng bởi ``derive_heading_paths`` (suy path per-chunk) và
+    ``LegalDocumentChunker`` (cắt chunk theo ranh giới cấu trúc).
+    """
+    return _iter_headings(text)
 
 
 def _iter_headings(text: str) -> list[_Heading]:
