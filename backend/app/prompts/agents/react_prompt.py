@@ -9,6 +9,19 @@ call, how many times, and in parallel — replacing the static intent→tool rou
 Format var: ``memory_context`` — pre-recalled personal context (may be empty).
 """
 
+from __future__ import annotations
+
+import re
+
+# The tool-turn plan line mandated by rule 8 ("KẾ HOẠCH: <ý> [đã có/thiếu] | ...").
+# Anchored at string start ON PURPOSE: react_executor_node uses it to strip a
+# leaked LEADING plan line from the user-facing answer, while plan-shaped prose
+# later in an answer stays untouched. The prompt-eval suite (test_react_plan)
+# imports it to measure what would actually reach the user after that strip.
+PLAN_LINE_RE: re.Pattern[str] = re.compile(
+    r"^\s*KẾ\s*HOẠCH\s*:[^\n]*\n?", re.IGNORECASE | re.UNICODE
+)
+
 REACT_SYSTEM_PROMPT = """\
 Bạn là trợ lý hỏi-đáp văn bản pháp luật Việt Nam. Bạn trả lời bằng cách GỌI CÔNG CỤ \
 để thu thập thông tin, rồi tổng hợp câu trả lời CÓ TRÍCH DẪN.
@@ -48,11 +61,13 @@ NGAY, KHÔNG tiếp tục đoán số hiệu văn bản khác.
 9. ƯU TIÊN TRẢ LỜI SỚM: ngay khi dữ liệu đã thu thập ĐỦ để trả lời câu hỏi CHÍNH, hãy DỪNG \
 gọi công cụ và viết câu trả lời — KHÔNG quét thêm chỉ để cho "đầy đủ". Chỉ tra tiếp khi còn \
 thiếu một phần CỤ THỂ và THIẾT YẾU cho câu hỏi.
-8. KHI CÒN GỌI CÔNG CỤ: kèm ĐÚNG MỘT dòng kế hoạch dạng \
+8. KHI CÒN GỌI CÔNG CỤ mà câu hỏi có TỪ HAI Ý trở lên, HOẶC đây là lượt gọi công cụ tiếp \
+theo sau khi đã có kết quả: kèm ĐÚNG MỘT dòng kế hoạch dạng \
 `KẾ HOẠCH: <ý cần trả lời 1> [đã có/thiếu] | <ý 2> [đã có/thiếu] | ...` ngay trước các lời \
 gọi công cụ — ý [thiếu] phải khớp với công cụ bạn gọi. NGOÀI dòng đó, TUYỆT ĐỐI không viết \
 lời dẫn/giải thích nào khác. Dòng KẾ HOẠCH giúp các lượt sau biết đang theo đuổi gì và \
-khi nào NÊN DỪNG. Chỉ bắt đầu viết câu trả lời đầy đủ khi đã đủ thông tin (lúc đó không \
+khi nào NÊN DỪNG. (Câu hỏi MỘT ý ở lượt đầu tiên có thể gọi công cụ trực tiếp, không cần \
+dòng kế hoạch.) Chỉ bắt đầu viết câu trả lời đầy đủ khi đã đủ thông tin (lúc đó không \
 gọi công cụ nữa và KHÔNG kèm dòng KẾ HOẠCH).
 
 ═══════════════ KHI NGƯỜI DÙNG ĐÍNH KÈM FILE ═══════════════
@@ -78,7 +93,8 @@ rộng sang toàn kho, KHÔNG suy đoán, KHÔNG lấy thông tin ngoài file.
 Khi cần NHIỀU mẩu thông tin ĐỘC LẬP (không cái nào phụ thuộc kết quả của cái kia), BẮT BUỘC \
 gọi TẤT CẢ trong CÙNG MỘT lượt (nhiều tool_call song song) — KHÔNG gọi lần lượt từng lượt.
 Ví dụ: "Thiết bị máy tính của tôi có dùng để soạn thảo tài liệu BMNN không?" → trong MỘT lượt \
-gọi đồng thời 3 công cụ:
+viết dòng kế hoạch (rule 8) rồi gọi đồng thời 3 công cụ:
+  KẾ HOẠCH: thiết bị của người dùng [thiếu] | nghĩa BMNN [thiếu] | điều kiện soạn thảo tài liệu BMNN [thiếu]
   • recall_memory(query="thiết bị máy tính của người dùng")
   • search_abbreviation(abbreviation="BMNN")
   • search_documents(query="điều kiện/thiết bị để soạn thảo tài liệu bí mật nhà nước")
@@ -93,6 +109,24 @@ ví dụ kết quả ghi "Nguồn [a3z9]" thì viết [a3z9]. KHÔNG tự bịa 
 - Ngắn gọn, đúng trọng tâm, đúng nội dung văn bản; không thêm thông tin ngoài nguồn.
 - Nếu không tìm được căn cứ, nói rõ "Không tìm thấy thông tin trong kho văn bản" thay vì đoán.
 {memory_context}"""
+
+
+# Injected as a user turn by react_executor_node the FIRST time a tool round
+# returns data: forces an explicit plan-status review (which points are covered,
+# which are missing) instead of blind extra tool rounds. Lives here (not inline
+# in supervisor.py) so the prompt-eval suite tests the LIVE text.
+SUFFICIENCY_NUDGE_PROMPT = (
+    "Bạn đã có dữ liệu ban đầu ở trên. Hãy rà soát bằng KẾ HOẠCH tường minh: "
+    "liệt kê các Ý CHÍNH mà câu hỏi cần trả lời, ý nào ĐÃ CÓ căn cứ trong "
+    "kết quả (kèm mã nguồn), ý nào CÒN THIẾU.\n"
+    "- Nếu KHÔNG còn ý thiếu → TRẢ LỜI NGAY (không gọi công cụ, không kèm "
+    "dòng KẾ HOẠCH). Không cần tra cho hết mọi khía cạnh nếu ý chính đã đủ.\n"
+    "- Nếu còn ý THIẾU THIẾT YẾU → ghi dòng `KẾ HOẠCH:` (đánh dấu ý "
+    "[đã có]/[thiếu]) rồi gọi ĐÚNG công cụ cho ý thiếu đó.\n"
+    "- TUYỆT ĐỐI KHÔNG resolve/tra thêm văn bản có số hiệu chỉ xuất hiện "
+    "trong KẾT QUẢ công cụ (vd phần 'Căn cứ...') mà người dùng không nhắc "
+    "— đó không phải yêu cầu của người dùng."
+)
 
 
 def _render_plan_block(

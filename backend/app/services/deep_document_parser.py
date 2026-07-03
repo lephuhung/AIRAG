@@ -755,6 +755,17 @@ class DeepDocumentParser:
                 )
             )
 
+        # Docling's meta.headings misses Vietnamese legal headings ("Điều N." is
+        # not recognised as a structural heading) — fill the gaps from the chunk
+        # text itself so section lookup by Điều/Chương keeps working.
+        from app.services.heading_path import derive_heading_paths
+
+        for c, hp in zip(chunks, derive_heading_paths([c.content for c in chunks])):
+            if hp and not c.heading_path:
+                c.heading_path = hp
+                if not c.contextualized:
+                    c.contextualized = " > ".join(hp) + ": " + c.content[:100]
+
         if images:
             assigned_count = len(assigned_images)
             logger.info(
@@ -1341,6 +1352,17 @@ class DeepDocumentParser:
                 document_id=document_id,
                 page_no=chunk_page,
             ))
+
+        # OCR/legacy path has no Docling headings — derive Phần/Chương/Mục/Điều
+        # from the markdown heading lines still present in the chunk text, else
+        # heading_path stays empty corpus-wide and structural section lookup
+        # (search_document_section) can never match.
+        from app.services.heading_path import derive_heading_paths
+
+        for c, hp in zip(chunks, derive_heading_paths([c.content for c in chunks])):
+            if hp:
+                c.heading_path = hp
+                c.contextualized = " > ".join(hp) + ": " + c.content[:100]
 
         return ParsedDocument(
             document_id=document_id,

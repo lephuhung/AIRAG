@@ -826,11 +826,9 @@ _MULTI_SECTION_PATTERN: re.Pattern[str] = re.compile(
 
 # A leaked leading plan line ("KẾ HOẠCH: <ý> [đã có] | ...") — the ReAct tool-turn
 # protocol (react_prompt rule 8) requires this line WITH tool calls; it must never
-# open the user-facing answer. Anchored at string start on purpose: plan-shaped
-# prose later in an answer is legitimate content.
-_PLAN_LINE_RE: re.Pattern[str] = re.compile(
-    r"^\s*KẾ\s*HOẠCH\s*:[^\n]*\n?", re.IGNORECASE | re.UNICODE
-)
+# open the user-facing answer. Definition lives next to the prompt that mandates
+# it so prod and the prompt-eval suite strip/measure the SAME pattern.
+from app.prompts.agents.react_prompt import PLAN_LINE_RE as _PLAN_LINE_RE
 
 # Detects a person identifier (CCCD/BHXH: 9-12 digits, or phone: 0 + 9-10 digits).
 # On its own this is a pure single-agent people lookup; combined with a SECOND
@@ -2536,18 +2534,8 @@ async def react_executor_node(state: SupervisorState) -> dict:
             # retrieved chunks ("Căn cứ Nghị định ...") — hence the explicit ban.
             if not nudged and sources_before == 0 and len(sources) > 0:
                 nudged = True
-                msgs.append(_LLMMsg(role="user", content=(
-                    "Bạn đã có dữ liệu ban đầu ở trên. Hãy rà soát bằng KẾ HOẠCH tường minh: "
-                    "liệt kê các Ý CHÍNH mà câu hỏi cần trả lời, ý nào ĐÃ CÓ căn cứ trong "
-                    "kết quả (kèm mã nguồn), ý nào CÒN THIẾU.\n"
-                    "- Nếu KHÔNG còn ý thiếu → TRẢ LỜI NGAY (không gọi công cụ, không kèm "
-                    "dòng KẾ HOẠCH). Không cần tra cho hết mọi khía cạnh nếu ý chính đã đủ.\n"
-                    "- Nếu còn ý THIẾU THIẾT YẾU → ghi dòng `KẾ HOẠCH:` (đánh dấu ý "
-                    "[đã có]/[thiếu]) rồi gọi ĐÚNG công cụ cho ý thiếu đó.\n"
-                    "- TUYỆT ĐỐI KHÔNG resolve/tra thêm văn bản có số hiệu chỉ xuất hiện "
-                    "trong KẾT QUẢ công cụ (vd phần 'Căn cứ...') mà người dùng không nhắc "
-                    "— đó không phải yêu cầu của người dùng."
-                )))
+                from app.prompts.agents.react_prompt import SUFFICIENCY_NUDGE_PROMPT
+                msgs.append(_LLMMsg(role="user", content=SUFFICIENCY_NUDGE_PROMPT))
                 logger.info(
                     f"[react_executor] step {step + 1}: sufficiency check injected "
                     f"({len(sources)} sources)"

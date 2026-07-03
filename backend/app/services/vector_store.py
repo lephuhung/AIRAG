@@ -284,6 +284,21 @@ class VectorStore:
             logger.error(f"[vector_store] get_by_metadata failed: {e}")
             return {"ids": [], "documents": [], "metadatas": []}
 
+    def update_metadatas(
+        self,
+        ids: Sequence[str],
+        metadatas: Sequence[dict],
+    ) -> None:
+        """Update ONLY the metadata of existing chunks — embeddings and text
+        untouched. Used by scripts/backfill_heading_path.py to repair the
+        heading_path field corpus-wide without re-embedding."""
+        if not ids:
+            return
+        self._run(lambda col: col.update(ids=list(ids), metadatas=list(metadatas)))
+        logger.info(
+            f"Updated metadata of {len(ids)} chunks in {self.collection_name}"
+        )
+
     def update_documents(
         self,
         ids: Sequence[str],
