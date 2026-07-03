@@ -346,9 +346,26 @@ class Settings(BaseSettings):
     # Requires a provider with reliable native tool-calling (vLLM OpenAI-compat).
     NEXUSRAG_LG_RAG_REACT: bool = Field(default=False)
     # Max tool-calling rounds before forcing a final synthesis (loop guard).
-    NEXUSRAG_REACT_MAX_TOOL_STEPS: int = Field(default=6)
+    # This is now a SAFETY NET, not the primary stop control — the sufficiency
+    # gate in react_executor_node makes the model answer as soon as it has
+    # enough data, so most queries finish in 2-3 rounds well under this cap.
+    NEXUSRAG_REACT_MAX_TOOL_STEPS: int = Field(default=4)
     # top_k passed to search tools inside the ReAct loop.
     NEXUSRAG_REACT_TOP_K: int = Field(default=8)
+    # Emit reasoning tokens (<think>) on the tool-decision turns so the model
+    # reasons about WHICH tool to call before calling it. Measured: ~3.5s/turn
+    # overhead on Qwen3.6-35B WITHOUT changing which tool gets chosen — so it is
+    # OFF by default. The real self-evaluation/reasoning value lives in the
+    # sufficiency gate + LLM-judge (which reason over the retrieved data), not in
+    # per-tool-call thinking. Flip to True to restore per-turn reasoning.
+    NEXUSRAG_REACT_THINK_TOOL_TURNS: bool = Field(default=False)
+    # LLM-as-judge gate: before finalising, an LLM scores the draft answer
+    # (grounded? covers the plan? no invented citations?) and can send the loop
+    # back to gather more. Set False to skip the judge (debug latency).
+    NEXUSRAG_REACT_JUDGE: bool = Field(default=True)
+    # How many times the judge may bounce the draft back for revision before the
+    # answer is forced out (bounds the reflect→act→reflect loop).
+    NEXUSRAG_REACT_MAX_REFLECTIONS: int = Field(default=2)
 
     # ── Graphiti Memory (temporal knowledge graph, backed by Neo4j) ──────────
     # Graphiti uses the existing Neo4j instance (NEO4J_URI / NEO4J_USERNAME /

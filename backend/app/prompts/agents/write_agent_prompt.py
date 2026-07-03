@@ -79,9 +79,16 @@ WRITE_PROMPTS = {
         "Văn bản:\n{text}"
     ),
     "grammar_check": (
-        "Hãy kiểm tra ngữ pháp và phong cách viết của văn bản sau. "
-        "Chỉ ra các lỗi ngữ pháp, chính tả, và đề xuất cách sửa. "
-        "Nếu văn bản tốt, hãy xác nhận điều đó.\n\n"
+        "Hãy kiểm tra CHÍNH TẢ và ngữ pháp của văn bản tiếng Việt sau, theo văn phong hành chính.\n\n"
+        "CÁCH LÀM (bắt buộc):\n"
+        "1. Rà TỪNG TỪ một. Đặc biệt chú ý lỗi DẤU THANH và dấu phụ tiếng Việt "
+        "(vd: 'gữi'→'gửi', 'trưỡng'→'trưởng', 'khẫn'→'khẩn', 'quy`t'→'quyết'), lỗi phụ âm "
+        "(l/n, s/x, ch/tr, d/gi/r), và từ sai chính tả khác.\n"
+        "2. LIỆT KÊ ĐẦY ĐỦ mọi lỗi tìm được, mỗi lỗi một dòng theo dạng: «từ sai» → «từ đúng» "
+        "(kèm giải thích ngắn nếu cần). KHÔNG bỏ sót; nếu có nhiều lỗi phải nêu hết.\n"
+        "3. Kiểm tra thêm ngữ pháp, cách dùng từ, dấu câu cho phù hợp văn phong hành chính.\n"
+        "4. Cuối cùng đưa ra BẢN SỬA HOÀN CHỈNH của văn bản.\n"
+        "5. Chỉ khi thực sự KHÔNG có lỗi nào mới xác nhận văn bản đã đúng.\n\n"
         "Trả lời bằng tiếng Việt.\n\n"
         "Văn bản:\n{text}"
     ),

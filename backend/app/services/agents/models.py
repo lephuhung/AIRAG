@@ -200,6 +200,13 @@ class SupervisorState(TypedDict, total=False):
     # retry_strategy: what fallback strategy is being used
     retry_strategy: str | None
 
+    # ReAct LLM-judge verdict (set by react_executor_node before finishing).
+    # Telemetry/tracing only — the react loop keeps its own in-node state; these
+    # expose the final judgement on the returned state for logging + Langfuse.
+    judge_verdict: str | None       # "pass" | "revise" | None (judge disabled/skipped)
+    judge_score: float | None       # 0..1 quality score from the judge
+    judge_feedback: str | None      # judge's critique of the last draft
+
 
 # =============================================================================
 # Write Action Constants

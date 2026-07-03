@@ -481,18 +481,18 @@ async def _adapt_recall_memory(args: dict, ctx: ToolContext) -> dict:
 
 
 async def _adapt_save_memory(args: dict, ctx: ToolContext) -> dict:
-    from app.services.graphiti_client import save_user_fact
+    from app.services.graphiti_client import save_user_fact_background
 
     fact = (args.get("fact") or "").strip()
     if not ctx.user_id:
         return tool_result("Không thể lưu: thiếu ngữ cảnh người dùng.")
     if not fact:
         return tool_result("Không thể lưu: thiếu nội dung 'fact'.")
-    ok = await save_user_fact(ctx.user_id, fact)
-    return tool_result(
-        "Đã ghi nhớ." if ok else "Lưu ghi nhớ thất bại (sẽ thử lại sau).",
-        data={"saved": ok},
-    )
+    # Fire-and-forget: the Graphiti write is slow (~30-50s of LLM extraction) and
+    # must NOT block the answer. Schedule it in the background and optimistically
+    # report success (the write is best-effort; failures are logged, not surfaced).
+    save_user_fact_background(ctx.user_id, fact)
+    return tool_result("Đã ghi nhớ.", data={"saved": True})
 
 
 async def _adapt_ask_user(args: dict, ctx: ToolContext) -> dict:
@@ -649,9 +649,12 @@ RAG_TOOL_SCHEMAS: list[dict] = [
     ),
     _fn(
         "save_memory",
-        "Ghi nhớ MỘT thông tin cá nhân BỀN của người dùng để dùng cho các lần sau (vd user "
-        "nói 'nhớ giúp tôi rằng đơn vị tôi là Công an tỉnh Hà Tĩnh'). Chỉ lưu fact bền, "
-        "KHÔNG lưu câu hỏi hay nội dung nhất thời.",
+        "Ghi nhớ MỘT thông tin cá nhân BỀN của người dùng để dùng cho các lần sau. Gọi CẢ khi "
+        "người dùng yêu cầu tường minh ('nhớ giúp tôi rằng đơn vị tôi là Công an tỉnh Hà Tĩnh') "
+        "LẪN khi họ NÊU NGẦM một dữ kiện cá nhân bền lồng trong câu hỏi — vd 'Tôi đang dùng "
+        "Macbook Pro 2021 có kết nối Internet...' → save_memory(fact='Thiết bị của người dùng: "
+        "Macbook Pro 2021, có kết nối Internet'). Lưu các fact như thiết bị, đơn vị/cơ quan, "
+        "vai trò/chức vụ. Chỉ lưu fact BỀN, KHÔNG lưu câu hỏi hay nội dung nhất thời.",
         {"fact": {"type": "string", "description": "Thông tin cần ghi nhớ, viết gọn rõ."}},
         ["fact"],
     ),

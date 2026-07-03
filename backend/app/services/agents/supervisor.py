@@ -812,6 +812,35 @@ _MULTI_DOC_PATTERN: re.Pattern[str] = re.compile(
     re.IGNORECASE | re.UNICODE,
 )
 
+# Detects 2+ section references joined by a conjunction: "Điều 5 và Điều 7",
+# "Chương II với Chương III", "Điều 3 đến Điều 5". A single nested reference
+# ("Chương II Khoản 3") has no conjunction between two section heads → won't
+# match, so it stays fast-path. Used by query_analyzer_node to invoke the LLM
+# for multi_section decomposition (the fast-path heuristic otherwise misses it).
+_MULTI_SECTION_PATTERN: re.Pattern[str] = re.compile(
+    r"(?:điều|chương|khoản|mục|điểm)\s+\S+.{0,40}?"
+    r"\b(?:và|với|so\s+với|đến|,)\b"
+    r".{0,20}?(?:điều|chương|khoản|mục|điểm)\s+\S+",
+    re.IGNORECASE | re.UNICODE,
+)
+
+# A leaked leading plan line ("KẾ HOẠCH: <ý> [đã có] | ...") — the ReAct tool-turn
+# protocol (react_prompt rule 8) requires this line WITH tool calls; it must never
+# open the user-facing answer. Anchored at string start on purpose: plan-shaped
+# prose later in an answer is legitimate content.
+_PLAN_LINE_RE: re.Pattern[str] = re.compile(
+    r"^\s*KẾ\s*HOẠCH\s*:[^\n]*\n?", re.IGNORECASE | re.UNICODE
+)
+
+# Detects a person identifier (CCCD/BHXH: 9-12 digits, or phone: 0 + 9-10 digits).
+# On its own this is a pure single-agent people lookup; combined with a SECOND
+# task (a named document or a "và" conjunction) it signals a cross_agent query
+# that the LLM analyzer must decompose. Used by query_analyzer_node.
+_PERSON_ID_PATTERN: re.Pattern[str] = re.compile(
+    r"(?<!\d)(?:0\d{9,10}|\d{9,12})(?!\d)",
+    re.UNICODE,
+)
+
 
 async def query_analyzer_node(state: SupervisorState) -> dict:
     """Analyze user query to extract structured metadata BEFORE supervisor routing.
@@ -839,7 +868,20 @@ async def query_analyzer_node(state: SupervisorState) -> dict:
     # Only call the LLM analyzer if the query looks like it could be
     # multi-step or comparative. This saves ~1-2s for ~80% of queries.
     msg_lower = user_message.lower()
-    looks_complex = _MULTI_DOC_PATTERN.search(msg_lower) is not None
+    # ── What makes a query "complex" enough to invoke the LLM analyzer ──
+    # (fast-path skips the LLM for everything else). Three shapes, each one a
+    # decomposition the fast-path would otherwise silently collapse to "simple":
+    #   1. multi_doc     : "so sánh…", "Luật X và Luật Y"
+    #   2. multi_section : "Điều 5 và Điều 7" (2+ sections joined)
+    #   3. cross_agent   : a person id (CCCD/BHXH/phone) + a 2nd task (named doc / "và")
+    looks_multi_doc = _MULTI_DOC_PATTERN.search(msg_lower) is not None
+    looks_multi_section = _MULTI_SECTION_PATTERN.search(msg_lower) is not None
+    has_person_id = _PERSON_ID_PATTERN.search(user_message) is not None
+    has_named_doc = _NAMED_DOC_PATTERN.search(msg_lower) is not None
+    looks_cross_agent = has_person_id and (
+        has_named_doc or re.search(r"\bvà\b", msg_lower) is not None
+    )
+    looks_complex = looks_multi_doc or looks_multi_section or looks_cross_agent
 
     # ── Comparison detection: "X của tôi có thể Y không?" ─────────────
     # If query has comparison pattern AND personal reference, set needs_comparison=True.
@@ -854,11 +896,22 @@ async def query_analyzer_node(state: SupervisorState) -> dict:
             f"has_comparison={has_comparison}, has_personal={has_personal}"
         )
 
-    if not looks_complex and not needs_comparison:
-        logger.info("[query_analyzer] Fast-path: simple query (no complex heuristic match), skipping LLM")
-        return {"query_complexity": "simple", "sub_queries": None, "extracted_params": None, "needs_comparison": False}
+    if not looks_complex:
+        # needs_comparison alone does NOT warrant the LLM analyzer: the regex above
+        # already set the flag, and observed runs spent ~6s only to come back with
+        # complexity='simple' / 1 sub_query (unused). Only multi_doc / multi_section /
+        # cross_agent shapes need actual LLM decomposition.
+        if needs_comparison:
+            logger.info("[query_analyzer] Fast-path: comparison flag set by regex, skipping LLM")
+        else:
+            logger.info("[query_analyzer] Fast-path: simple query (no complex heuristic match), skipping LLM")
+        return {"query_complexity": "simple", "sub_queries": None, "extracted_params": None, "needs_comparison": needs_comparison}
 
-    logger.info("[query_analyzer] Complex heuristic matched — invoking LLM for detailed analysis")
+    logger.info(
+        "[query_analyzer] Complex heuristic matched — invoking LLM "
+        f"(multi_doc={looks_multi_doc}, multi_section={looks_multi_section}, "
+        f"cross_agent={looks_cross_agent}, needs_comparison={needs_comparison})"
+    )
 
     try:
         from app.services.llm.types import LLMMessage as _LLMMsg
@@ -1501,6 +1554,16 @@ async def direct_answer_node(state: SupervisorState) -> dict:
     system_prompt = state.get("system_prompt", "")
     user_memory = state.get("user_memory_context", "")
 
+    # Deterministic "saved to memory" notice — extract personal facts from the
+    # user's message in parallel (the memory worker persists the same facts every
+    # turn). A pure question ("tôi tên gì?") yields [] → no notice.
+    import asyncio as _aio_dm
+    from app.services.graphiti_client import extract_personal_facts as _extract_facts_dm
+    _dm_user_msg = _extract_user_message(state)
+    _dm_fact_task = (
+        _aio_dm.create_task(_extract_facts_dm(_dm_user_msg)) if _dm_user_msg else None
+    )
+
     # Emit status
     await push_event(state, "status", {"step": "generating", "detail": "Đang trả lời..."})
 
@@ -1529,6 +1592,10 @@ async def direct_answer_node(state: SupervisorState) -> dict:
             "Only include relevant memories.\n\n"
         ) + effective_system
 
+    # Buffer the full answer, THEN sanitize + replay. Buffering lets us strip
+    # leaked source labels ("Source: Memory", "[Memory]") and fabricated
+    # citations before any token reaches the client, and keeps [MEM-1] markers
+    # whole (never split across token events → no flickering memory icon).
     answer_parts = []
     try:
         async for chunk in provider.astream(
@@ -1540,16 +1607,27 @@ async def direct_answer_node(state: SupervisorState) -> dict:
         ):
             if chunk.text:
                 answer_parts.append(chunk.text)
-                # Emit token for SSE streaming
-                await push_event(state, "token", chunk.text)
     except Exception as e:
         logger.error(f"[direct_answer] LLM streaming failed: {e}")
         answer_parts = ["Xin chào! Tôi có thể giúp gì cho bạn?"]
-        await push_event(state, "token", answer_parts[0])
 
-    # Import strip_thinking_tags from nodes
-    from app.services.agent.nodes import strip_thinking_tags
+    from app.services.agent.nodes import (
+        strip_thinking_tags,
+        sanitize_citations,
+        _stream_final_answer,
+        build_memory_saved_notice,
+    )
     final_answer = strip_thinking_tags("".join(answer_parts))
+    # No RAG sources on this path → empty valid set; sanitize keeps
+    # [MEM-N]/[IMG-…] and strips leaked labels + fabricated markers.
+    final_answer = sanitize_citations(final_answer, set())
+    if _dm_fact_task is not None:
+        try:
+            _dm_facts = await _dm_fact_task
+        except Exception:
+            _dm_facts = []
+        final_answer = final_answer + build_memory_saved_notice(_dm_facts)
+    await _stream_final_answer(state, final_answer)
 
     return {"final_answer": final_answer, "next_agent": AgentType.FINISH}
 
@@ -1938,6 +2016,15 @@ async def react_executor_node(state: SupervisorState) -> dict:
 
     user_message = _extract_user_message(state)
     query = state.get("rewritten_query") or state.get("original_query") or user_message
+    # Deterministic "saved to memory" notice: extract durable personal facts from
+    # the user's message IN PARALLEL with the tool loop (~0 added wall-clock). The
+    # memory worker persists the same facts every turn (add_conversation_episode),
+    # so we surface the notice from this extraction instead of relying on the model
+    # calling save_memory (which it does inconsistently). Read-only — no double save.
+    from app.services.graphiti_client import extract_personal_facts as _extract_facts
+    _auto_fact_task = (
+        asyncio.create_task(_extract_facts(user_message)) if user_message else None
+    )
     max_steps = getattr(settings, "NEXUSRAG_REACT_MAX_TOOL_STEPS", 6)
     top_k = getattr(settings, "NEXUSRAG_REACT_TOP_K", 8)
     logger.info(f"[LANGGRAPH_NODE] Entering react_executor_node, query={query!r}, max_steps={max_steps}")
@@ -1956,7 +2043,32 @@ async def react_executor_node(state: SupervisorState) -> dict:
     )
 
     llm = get_llm_provider()
-    system_prompt = build_react_system_prompt(state.get("user_memory_context", "") or "")
+    # Inject the query_analyzer plan (sub_queries) as an explicit checklist so
+    # the loop knows every sub-question it must cover; also feeds the judge.
+    _plan = state.get("sub_queries") or None
+    system_prompt = build_react_system_prompt(
+        state.get("user_memory_context", "") or "",
+        plan=_plan,
+        extracted_params=state.get("extracted_params"),
+    )
+    # Reasoning-token / judge knobs (see config.py NEXUSRAG_REACT_*).
+    think_tools = bool(getattr(settings, "NEXUSRAG_REACT_THINK_TOOL_TURNS", True))
+    judge_on = bool(getattr(settings, "NEXUSRAG_REACT_JUDGE", True))
+    max_reflections = int(getattr(settings, "NEXUSRAG_REACT_MAX_REFLECTIONS", 2))
+    # Plan lines reused by the judge to check completeness.
+    _plan_lines = [
+        (sq.get("query") or "").strip()
+        for sq in (_plan or [])
+        if isinstance(sq, dict) and (sq.get("query") or "").strip()
+    ]
+    if _plan_lines:
+        logger.info(
+            f"[react_executor] plan injected ({len(_plan_lines)} steps): {_plan_lines}"
+        )
+    logger.info(
+        f"[react_executor] think_tools={think_tools} judge={judge_on} "
+        f"max_reflections={max_reflections}"
+    )
     msgs: list = [_LLMMsg(role="user", content=query)]
     sources: list = []
     images: list = []
@@ -1977,7 +2089,7 @@ async def react_executor_node(state: SupervisorState) -> dict:
             await push_event(state, "images", images)
             _emitted["images"] = len(images)
 
-    async def _run_turn(use_tools: bool):
+    async def _run_turn(use_tools: bool, think: bool = False):
         """Run one LLM turn, BUFFERING its tool calls and answer text.
 
         We deliberately do NOT stream text to the client speculatively. In
@@ -2004,23 +2116,97 @@ async def react_executor_node(state: SupervisorState) -> dict:
             tool_choice="auto" if use_tools else None,
             temperature=0.1,
             max_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
-            think=False,
+            think=think,
         ):
             if c.type == "function_call" and c.function_call:
                 calls.append(c.function_call)
+            elif c.type == "thinking" and c.text:
+                # Surface the model's reasoning (why it picks a tool / how it
+                # synthesises) to the client, same channel as answer_generator.
+                await push_event(state, "thinking", c.text)
             elif c.type == "text" and c.text:
                 text += c.text
-                if not announced and not calls:
+                # Threshold: tool turns now legitimately open with a short
+                # `KẾ HOẠCH:` line (react_prompt rule 8) BEFORE their function
+                # calls arrive — don't flip the status to "composing" for it.
+                # Real answers blow past 200 chars almost immediately.
+                if not announced and not calls and len(text) > 200:
                     announced = True
                     await push_event(state, "status", {"step": "composing", "detail": "Đang soạn câu trả lời..."})
         return calls, text
+
+    async def _run_streaming_synthesis() -> str:
+        """Run the FINAL no-tools synthesis turn, streaming sanitised text LIVE.
+
+        Only safe on the last turn (step/reflection budget spent): nothing
+        downstream can retract streamed text — the judge, if it still runs,
+        only APPENDS a caveat, never rewrites. This cuts the buffered-draft →
+        judge → replay tail (~6-10s on observed traces) out of the perceived
+        latency: the user starts reading while the judge is still scoring.
+
+        Each chunk goes through _CitationSafeStreamer (a ``[marker]`` is never
+        split across token events) and then sanitize_citations (invented
+        markers are dropped BEFORE they render). Returns the accumulated text
+        exactly as the client saw it.
+        """
+        from app.services.agent.nodes import _CitationSafeStreamer, sanitize_citations
+
+        _valid = {str(getattr(s, "index", "")) for s in sources}
+        _valid.discard("")
+        streamer = _CitationSafeStreamer()
+        streamed = ""
+        announced = False
+
+        async def _emit(piece: str) -> None:
+            nonlocal streamed
+            if not piece:
+                return
+            clean = sanitize_citations(piece, _valid)
+            if clean:
+                await push_event(state, "token", clean)
+                streamed += clean
+
+        # Head holdback: buffer the FIRST line so a leaked leading `KẾ HOẠCH:`
+        # line (tool-turn protocol, react_prompt rule 8) is stripped BEFORE
+        # anything reaches the client — streamed text can never be retracted.
+        head = ""
+        head_done = False
+
+        async def _feed_out(piece: str, final_flush: bool = False) -> None:
+            nonlocal head, head_done
+            if head_done:
+                await _emit(piece)
+                return
+            head += piece or ""
+            _is_planish = head.lstrip().upper().startswith("KẾ HOẠCH")
+            if "\n" in head or final_flush or (len(head) > 160 and not _is_planish):
+                head_done = True
+                await _emit(_PLAN_LINE_RE.sub("", head))
+                head = ""
+
+        async for c in llm.astream(
+            msgs,
+            system_prompt=system_prompt,
+            temperature=0.1,
+            max_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
+            think=False,
+        ):
+            if c.type == "thinking" and c.text:
+                await push_event(state, "thinking", c.text)
+            elif c.type == "text" and c.text:
+                if not announced:
+                    announced = True
+                    await push_event(state, "status", {"step": "composing", "detail": "Đang soạn câu trả lời..."})
+                await _feed_out(streamer.feed(c.text))
+        await _feed_out(streamer.flush(), final_flush=True)
+        return streamed.strip()
 
     async def _stream_out(text: str) -> None:
         """Replay a finalised answer to the client as progressive ``token`` events.
 
         No speculative streaming happened upstream, so there is nothing to roll
         back — ``text`` is already cleaned + sanitised. We pace the replay
-        (~1.2s total, bounded event count) so it renders with a typing feel
+        (~0.3s total, bounded event count) so it renders with a typing feel
         instead of landing in one block, without any ``token_rollback`` flicker.
         """
         if not text:
@@ -2030,7 +2216,7 @@ async def react_executor_node(state: SupervisorState) -> dict:
         max_emits = 100
         group = max(1, (len(parts) + max_emits - 1) // max_emits)
         n_emits = (len(parts) + group - 1) // group
-        delay = min(0.02, 1.2 / max(1, n_emits))
+        delay = min(0.02, 0.3 / max(1, n_emits))
         buf = ""
         for i, p in enumerate(parts):
             buf += p
@@ -2041,11 +2227,48 @@ async def react_executor_node(state: SupervisorState) -> dict:
         if buf:
             await push_event(state, "token", buf)
 
+    # Last judge verdict, surfaced on the returned state for tracing (see below).
+    _last_verdict: dict = {}
+    # Tool rounds actually executed — used to skip the judge on trivial queries
+    # (no analyzer plan + a single search round): the ~5s judge pass adds little
+    # there, and sanitize_citations already drops invented citation markers.
+    tool_rounds = 0
+    # Personal facts persisted via save_memory this turn — appended as a notice
+    # at the end of the answer so the user knows their info was remembered.
+    saved_facts: list[str] = []
+
+    # Transparency caveat appended when the answer is finalised on a 'revise'
+    # verdict (judge unsatisfied but budget spent) — shared by the buffered
+    # (_finish) and live-streamed (forced synthesis) paths.
+    _REVISE_CAVEAT = (
+        "\n\n> ⚠️ *Lưu ý: câu trả lời có thể chưa bao quát đầy đủ và một số "
+        "trích dẫn số hiệu Điều/Khoản cần được đối chiếu lại với văn bản gốc "
+        "trước khi áp dụng.*"
+    )
+
+    async def _memory_notice() -> str:
+        """Notice about remembered personal info. Prefer facts the model explicitly
+        saved via save_memory; otherwise fall back to the deterministic parallel
+        extraction (the worker persists these regardless) so the notice appears
+        even when the model forgot to call the tool."""
+        from app.services.agent.nodes import build_memory_saved_notice
+        _notice_facts = list(saved_facts)
+        if _auto_fact_task is not None:
+            try:
+                _auto = await _auto_fact_task
+            except Exception:
+                _auto = []
+            if not _notice_facts:
+                _notice_facts = _auto
+        return build_memory_saved_notice(_notice_facts)
+
     async def _finish(answer_text: str) -> dict:
         # Sources/images first so the client has citation data before the answer.
         await _emit_artifacts()
         from app.services.agent.nodes import sanitize_citations
         final = strip_thinking_tags(answer_text or "").strip()
+        # Drop a leaked leading plan line (tool-turn protocol, react_prompt rule 8).
+        final = _PLAN_LINE_RE.sub("", final).strip()
         # Drop citation markers the LLM invented (e.g. [75a75810] derived from a
         # document UUID) that map to no real source — else they leak as raw text.
         _valid_cids = {str(getattr(s, "index", "")) for s in sources}
@@ -2053,11 +2276,20 @@ async def react_executor_node(state: SupervisorState) -> dict:
         final = sanitize_citations(final, _valid_cids)
         if not final:
             final = "Xin lỗi, tôi chưa tạo được câu trả lời từ kho văn bản."
+        # Transparency caveat: when the answer is finalised on a 'revise' verdict
+        # (the judge was NOT satisfied but the reflection/step budget is spent),
+        # warn the user instead of presenting possibly-ungrounded article/section
+        # numbers as authoritative. Only fires on 'revise' — a 'pass' (or a judge
+        # that failed and fail-opened to pass) never adds this.
+        if (_last_verdict or {}).get("verdict") == "revise":
+            final = final + _REVISE_CAVEAT
+        final = final + await _memory_notice()
         # Replay the finalised, sanitised answer (no speculative tokens were sent,
         # so this is the ONLY thing the client ever renders → zero flicker).
         await _stream_out(final)
         logger.info(
-            f"[react_executor] done: {len(sources)} sources, answer={len(final)} chars"
+            f"[react_executor] done: {len(sources)} sources, answer={len(final)} chars, "
+            f"judge={_last_verdict.get('verdict')!r} score={_last_verdict.get('score')}"
         )
         return {
             "final_answer": final,
@@ -2065,16 +2297,159 @@ async def react_executor_node(state: SupervisorState) -> dict:
             "images": images,
             "document_ids": ctx.document_ids,
             "next_agent": AgentType.FINISH,
+            "judge_verdict": _last_verdict.get("verdict"),
+            "judge_score": _last_verdict.get("score"),
+            "judge_feedback": _last_verdict.get("feedback"),
         }
+
+    def _sources_digest(limit: int = 12) -> str:
+        """Compact rendering of collected sources for the judge to check grounding."""
+        lines = []
+        for s in sources[:limit]:
+            idx = getattr(s, "index", "") or "?"
+            loc = getattr(s, "source_file", None) or " > ".join(getattr(s, "heading_path", []) or [])
+            body = (getattr(s, "content", "") or "").strip().replace("\n", " ")
+            lines.append(f"[{idx}] {loc}: {body[:300]}")
+        return "\n".join(lines)
+
+    async def _judge(draft: str) -> dict:
+        """LLM-as-judge: score the DRAFT against sources + plan. Returns verdict dict.
+
+        Fail-open: any error / unparseable output → treat as ``pass`` so the judge
+        can never block a usable answer (it only ever ADDS quality, never breaks).
+        """
+        from app.prompts.agents.judge_prompt import (
+            JUDGE_SYSTEM_PROMPT,
+            build_judge_user_prompt,
+        )
+
+        user_prompt = build_judge_user_prompt(
+            question=user_message or query,
+            draft=draft or "",
+            sources_digest=_sources_digest(),
+            plan_lines=_plan_lines,
+        )
+
+        async def _call() -> dict:
+            raw = ""
+            async for c in llm.astream(
+                [_LLMMsg(role="user", content=user_prompt)],
+                system_prompt=JUDGE_SYSTEM_PROMPT,
+                temperature=0.0,
+                # 768 (was 512): observed truncated-JSON failures ("Unterminated
+                # string") when the judge wrote long `missing` lists — the prompt
+                # now also caps list length, this is the safety margin.
+                max_tokens=768,
+                think=False,
+            ):
+                if c.type == "text" and c.text:
+                    raw += c.text
+            cleaned = strip_thinking_tags(raw or "").strip()
+            if "```json" in cleaned:
+                cleaned = cleaned.split("```json")[-1].split("```")[0].strip()
+            elif "```" in cleaned:
+                cleaned = cleaned.split("```")[1].split("```")[0].strip()
+            start, end = cleaned.find("{"), cleaned.rfind("}")
+            if start != -1 and end != -1:
+                cleaned = cleaned[start:end + 1]
+            data = json.loads(cleaned)
+            verdict = str(data.get("verdict", "pass")).lower()
+            if verdict not in ("pass", "revise"):
+                verdict = "pass"
+            return {
+                "verdict": verdict,
+                "score": data.get("score"),
+                "missing": data.get("missing") or [],
+                "feedback": str(data.get("feedback") or "").strip(),
+            }
+
+        # Best-effort Langfuse span, done inline so a tracing hiccup can NEVER
+        # break (or double-await) the judge call itself.
+        _obs = None
+        try:
+            _lf = _get_langfuse_client()
+            if _lf:
+                _obs = _lf.start_observation(
+                    name="react_judge",
+                    input={"draft_len": len(draft or ""), "sources": len(sources)},
+                    level="DEFAULT",
+                )
+        except Exception:
+            _obs = None
+        try:
+            v = await _call()
+            if _obs is not None:
+                try:
+                    _obs.update(output=v)
+                    _obs.end()
+                except Exception:
+                    pass
+            logger.info(
+                f"[react_executor] judge verdict={v.get('verdict')!r} "
+                f"score={v.get('score')} missing={v.get('missing')}"
+            )
+            return v
+        except Exception as e:
+            logger.warning(f"[react_executor] judge failed ({e}) — passing draft through")
+            return {"verdict": "pass", "score": None, "missing": [], "feedback": ""}
+
+    async def _judge_and_maybe_finish(draft: str, reflections: int) -> dict | None:
+        """Run the judge on a draft. Return a finish-dict when done, else None.
+
+        None means "keep looping" — the caller has already appended the judge's
+        critique to ``msgs`` and should continue gathering. When the judge is
+        disabled, or passes, or the reflection budget is spent, we finalise.
+        """
+        nonlocal _last_verdict
+        if not judge_on:
+            return await _finish(draft)
+        if not _plan_lines and tool_rounds <= 1:
+            logger.info(
+                f"[react_executor] skipping judge (simple query: no plan, "
+                f"{tool_rounds} tool round(s))"
+            )
+            return await _finish(draft)
+        verdict = await _judge(draft)
+        _last_verdict = verdict
+        if verdict["verdict"] == "pass" or reflections >= max_reflections:
+            return await _finish(draft)
+        # revise + budget remaining → feed critique back and loop for more tools.
+        missing = "; ".join(str(m) for m in verdict.get("missing") or [])
+        critique = (
+            "Bản nháp trên CHƯA đạt. "
+            + (f"Còn thiếu: {missing}. " if missing else "")
+            + (verdict.get("feedback") or "Hãy tra cứu thêm để bổ sung căn cứ còn thiếu.")
+            + " Hãy GỌI THÊM CÔNG CỤ để thu thập thông tin còn thiếu rồi trả lời lại; "
+            "chưa được kết luận nếu chưa đủ căn cứ."
+        )
+        msgs.append(_LLMMsg(role="user", content=critique))
+        await push_event(state, "status", {"step": "searching", "detail": "Đang rà soát và bổ sung..."})
+        return None
 
     try:
         seen_calls: set[str] = set()   # (name|args) signatures already executed
         no_progress = 0                # consecutive tool-turns adding no new sources
+        reflections = 0                # times the judge sent the draft back for more
+        nudged = False                 # sufficiency check injected after first data?
+        last_draft: str | None = None  # most recent revised-away draft (for reuse)
+        draft_source_count = -1        # sources count when last_draft was written
         for step in range(max_steps):
             await _emit_artifacts()
-            calls, text = await _run_turn(use_tools=True)
+            calls, text = await _run_turn(use_tools=True, think=think_tools)
             if not calls:
-                return await _finish(text)
+                # Model produced a DRAFT (stopped calling tools). Gate it through
+                # the judge before streaming: pass → finish; revise (with budget)
+                # → critique is appended to msgs and we loop for more tools.
+                done = await _judge_and_maybe_finish(text, reflections)
+                if done is not None:
+                    return done
+                # Judge asked for a revision. Keep this draft + the source count
+                # behind it: if the loop later ends WITHOUT gathering anything
+                # new, we reuse it instead of regenerating the same answer.
+                last_draft = text
+                draft_source_count = len(sources)
+                reflections += 1
+                continue
 
             # Anti-loop guard: if EVERY tool call this turn repeats an earlier
             # call verbatim, the model is spinning (e.g. re-running the same
@@ -2122,14 +2497,22 @@ async def react_executor_node(state: SupervisorState) -> dict:
             results = await asyncio.gather(
                 *[dispatch_tool(fc.get("name", ""), fc.get("args", {}), ctx) for fc in calls]
             )
+            tool_rounds += 1
 
             stop = False
             for fc, r in zip(calls, results):
                 sources.extend(r.get("sources", []) or [])
                 images.extend(r.get("images", []) or [])
                 msgs.append(_LLMMsg(role="tool", tool_call_id=fc["_id"], content=r.get("summary", "")))
-                if (r.get("data") or {}).get("stop"):
+                _data = r.get("data") or {}
+                if _data.get("stop"):
                     stop = True
+                # Remember facts actually persisted so we can tell the user at the
+                # end of the answer that we saved their info.
+                if fc.get("name") == "save_memory" and _data.get("saved"):
+                    _f = (fc.get("args") or {}).get("fact")
+                    if _f:
+                        saved_facts.append(str(_f).strip())
 
             if stop:  # ask_user already emitted clarification → wait for the user
                 logger.info("[react_executor] ask_user → stopping loop for clarification")
@@ -2140,6 +2523,35 @@ async def react_executor_node(state: SupervisorState) -> dict:
                     "sources": sources,
                     "images": images,
                 }
+
+            # Sufficiency gate: the FIRST time a tool round actually returns data,
+            # make the model STOP and take stock via an EXPLICIT plan-status
+            # checklist (not hidden thinking — reasoning tokens are off on tool
+            # turns and aren't fed back across turns anyway; a written plan line
+            # persists in msgs, so later turns see what is already covered).
+            # This is the dynamic early-exit — easy queries answer in 2-3 steps;
+            # only genuinely missing pieces trigger more tools. Measured before
+            # this rework: the free-form "ĐÁNH GIÁ đủ chưa?" nudge was ignored in
+            # 11/18 runs, mostly by chasing decree numbers that appeared inside
+            # retrieved chunks ("Căn cứ Nghị định ...") — hence the explicit ban.
+            if not nudged and sources_before == 0 and len(sources) > 0:
+                nudged = True
+                msgs.append(_LLMMsg(role="user", content=(
+                    "Bạn đã có dữ liệu ban đầu ở trên. Hãy rà soát bằng KẾ HOẠCH tường minh: "
+                    "liệt kê các Ý CHÍNH mà câu hỏi cần trả lời, ý nào ĐÃ CÓ căn cứ trong "
+                    "kết quả (kèm mã nguồn), ý nào CÒN THIẾU.\n"
+                    "- Nếu KHÔNG còn ý thiếu → TRẢ LỜI NGAY (không gọi công cụ, không kèm "
+                    "dòng KẾ HOẠCH). Không cần tra cho hết mọi khía cạnh nếu ý chính đã đủ.\n"
+                    "- Nếu còn ý THIẾU THIẾT YẾU → ghi dòng `KẾ HOẠCH:` (đánh dấu ý "
+                    "[đã có]/[thiếu]) rồi gọi ĐÚNG công cụ cho ý thiếu đó.\n"
+                    "- TUYỆT ĐỐI KHÔNG resolve/tra thêm văn bản có số hiệu chỉ xuất hiện "
+                    "trong KẾT QUẢ công cụ (vd phần 'Căn cứ...') mà người dùng không nhắc "
+                    "— đó không phải yêu cầu của người dùng."
+                )))
+                logger.info(
+                    f"[react_executor] step {step + 1}: sufficiency check injected "
+                    f"({len(sources)} sources)"
+                )
 
             # No-progress guard: once we already have sources, two consecutive
             # tool-turns that surface nothing new mean further searching is
@@ -2155,6 +2567,17 @@ async def react_executor_node(state: SupervisorState) -> dict:
                     break
             else:
                 no_progress = 0
+
+        # Reuse-draft shortcut: if we already have a judged draft and NO new
+        # sources were gathered since it was written, regenerating would produce
+        # the same answer — return the draft and skip a full synthesis + judge
+        # pass (saves ~10s on queries where the reflection found nothing new).
+        if last_draft is not None and len(sources) == draft_source_count:
+            logger.info(
+                f"[react_executor] reusing last draft (no new sources since draft; "
+                f"{len(sources)} sources) — skipping redundant synthesis"
+            )
+            return await _finish(last_draft)
 
         # Loop exhausted or an anti-loop guard fired → force a final synthesis.
         logger.warning(
@@ -2181,10 +2604,67 @@ async def react_executor_node(state: SupervisorState) -> dict:
                 "Hãy tổng hợp câu trả lời cuối cùng từ thông tin đã thu thập ở trên. "
                 "Nếu chưa đủ căn cứ, nói rõ phần nào còn thiếu."
             )
+        # Anti-fabrication guard: this is the LAST turn (budget spent), so the
+        # model won't get another judge round to catch invented citations. Force
+        # it to stay grounded — the recurring failure is inventing Điều/Khoản
+        # numbers not present in the sources.
+        synthesis_instr += (
+            " QUAN TRỌNG: CHỈ dùng nội dung CÓ trong nguồn đã thu thập; TUYỆT ĐỐI "
+            "không bịa hay suy diễn số hiệu Điều/Khoản/văn bản không xuất hiện trong "
+            "nguồn. Nếu không chắc mã điều khoản chính xác, hãy diễn đạt chung "
+            "(vd \"theo quy định về hành vi bị cấm\") và nêu rõ cần đối chiếu văn bản "
+            "gốc, thay vì ghi một mã cụ thể có thể sai."
+        )
+        # If the last reflection judge flagged concrete gaps, hand them to the
+        # synthesis turn so it can address them rather than repeat the mistake.
+        _prev_missing = "; ".join(str(m) for m in (_last_verdict or {}).get("missing") or [])
+        if (_last_verdict or {}).get("verdict") == "revise" and _prev_missing:
+            synthesis_instr = (
+                f"Lần đánh giá trước phát hiện vấn đề: {_prev_missing}. "
+                "Hãy ưu tiên khắc phục các vấn đề đó khi trả lời. " + synthesis_instr
+            )
         msgs.append(_LLMMsg(role="user", content=synthesis_instr))
         await _emit_artifacts()
-        _, text = await _run_turn(use_tools=False)
-        return await _finish(text)
+        # think=False on the FINAL synthesis: after a long tool loop the context
+        # is large, and reasoning here would eat the token budget and leave no
+        # room for the answer itself (observed: empty answer → canned apology).
+        # Tool-decision turns still reason; the answer turn just answers.
+        #
+        # LIVE streaming: the budget is spent, so a judge 'revise' here can only
+        # ever APPEND a caveat (never loop again / retract text) — that makes
+        # speculative streaming safe on THIS turn only. The judge then runs on
+        # the finished text while the user is already reading it.
+        final = await _run_streaming_synthesis()
+        if not final:
+            # Nothing was streamed — fall back to the buffered path so the
+            # canned-apology fallback (and its replay) still applies.
+            return await _finish("")
+        # One judge pass on the forced synthesis (same skip rule as the draft
+        # path: trivial single-round queries don't pay the ~5s judge).
+        if judge_on and (_plan_lines or tool_rounds > 1):
+            _last_verdict = await _judge(final)
+        tail = ""
+        if (_last_verdict or {}).get("verdict") == "revise":
+            tail += _REVISE_CAVEAT
+        tail += await _memory_notice()
+        if tail:
+            await push_event(state, "token", tail)
+            final += tail
+        logger.info(
+            f"[react_executor] done (live-streamed synthesis): {len(sources)} sources, "
+            f"answer={len(final)} chars, judge={_last_verdict.get('verdict')!r} "
+            f"score={_last_verdict.get('score')}"
+        )
+        return {
+            "final_answer": final,
+            "sources": sources,
+            "images": images,
+            "document_ids": ctx.document_ids,
+            "next_agent": AgentType.FINISH,
+            "judge_verdict": _last_verdict.get("verdict"),
+            "judge_score": _last_verdict.get("score"),
+            "judge_feedback": _last_verdict.get("feedback"),
+        }
 
     except Exception as e:
         logger.error(f"[react_executor] loop failed: {e}", exc_info=True)
@@ -2800,7 +3280,7 @@ async def _query_enricher_wrapper(state: SupervisorState) -> dict:
         return {}
 
 
-    # Extract fact lines from memory context (format: "[Memory]\n- fact\n- fact")
+    # Extract fact lines from memory context (format: "<header>\n- fact\n- fact")
     facts = [
         line.lstrip("- ").strip()
         for line in memory.split("\n")

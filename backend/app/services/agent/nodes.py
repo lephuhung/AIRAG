@@ -58,6 +58,47 @@ def strip_thinking_tags(text: str) -> str:
     return cleaned.strip()
 
 
+class _CitationSafeStreamer:
+    """Buffer streamed LLM text so a ``[citation]`` marker is never split across
+    two ``token`` SSE events.
+
+    The LLM emits tokens like ``[``, ``MEM``, ``-``, ``1``, ``]`` separately; if
+    each is pushed live, the client sees a half-written ``[MEM-`` and renders a
+    broken/late citation icon. We hold back text from an unclosed ``[`` until its
+    ``]`` arrives (or a short cap proves it is not a citation), so every marker
+    reaches the client whole.
+    """
+
+    _MAX_HOLD = 24  # a citation marker is short; longer dangling '[' → not one
+
+    def __init__(self) -> None:
+        self._pending = ""
+
+    def feed(self, text: str) -> str:
+        """Add streamed text; return the prefix that is safe to emit now."""
+        if not text:
+            return ""
+        self._pending += text
+        open_idx = self._pending.rfind("[")
+        if open_idx == -1:
+            out, self._pending = self._pending, ""
+            return out
+        tail = self._pending[open_idx:]
+        if "]" in tail or len(tail) > self._MAX_HOLD:
+            # marker closed, or too long to be one → nothing to hold back
+            out, self._pending = self._pending, ""
+            return out
+        # dangling '[...': emit everything before it, keep the rest buffered
+        out = self._pending[:open_idx]
+        self._pending = tail
+        return out
+
+    def flush(self) -> str:
+        """Emit whatever is still buffered (call once the stream ends)."""
+        out, self._pending = self._pending, ""
+        return out
+
+
 # A citation-shaped bracket (with any leading spaces/tabs so a removed marker
 # leaves no dangling space): one or more comma-separated id tokens, e.g.
 # "[a3z9]", "[a3z9, b2m7]", "[MEM-1]", "[IMG-p4f2]". The negative lookahead
@@ -65,6 +106,22 @@ def strip_thinking_tags(text: str) -> str:
 # prose (e.g. "[Điều 5]") never match because tokens allow no inner spaces.
 _CITATION_BRACKET_RE = re.compile(
     r"([ \t]*)\[\s*([A-Za-z0-9_\-]+(?:\s*,\s*[A-Za-z0-9_\-]+)*)\s*\](?!\()"
+)
+
+# The tool-observation prefix ("Nguồn [id]:") and the memory header sometimes
+# bleed into the model's prose as a bare source label — e.g. "Source: Memory",
+# "Nguồn: Bộ nhớ", or the label word glued to a real citation ("Nguồn [a3z9]",
+# "Source [MEM-1]"). These strip that leaked label WITHOUT touching ordinary
+# prose: the standalone form only fires on the literal Memory/Bộ nhớ token, and
+# the glued form only when the word directly precedes a "[" citation bracket
+# (so normal Vietnamese "nguồn lực", "nguồn gốc" are never matched).
+_LEAKED_MEMORY_SOURCE_RE = re.compile(
+    r"[\(\[]?(?:Source|Nguồn)\s*[:\-]\s*(?:Memory|Bộ nhớ)\s*[\)\]]?\s?",
+    re.IGNORECASE,
+)
+_LEAKED_SOURCE_LABEL_RE = re.compile(
+    r"\b(?:Source|Nguồn)\s*[:\-]?\s*(?=\[)",
+    re.IGNORECASE,
 )
 
 
@@ -75,19 +132,27 @@ def sanitize_citations(text: str, valid_ids: set[str]) -> str:
     from the first 8 hex chars of a document UUID it saw in a tool observation
     (e.g. ``[75a75810]``). Such a marker maps to no real source, so the frontend
     can't resolve it and renders it verbatim. We keep ONLY tokens that map to a
-    real source ``index``, a ``[MEM-N]`` memory ref, an ``[IMG-...]`` image ref,
-    or a legacy numeric ``[1]``. A bracket left with no valid token is removed
-    together with the space that preceded it; untouched prose is never altered.
+    real source ``index``, a ``[MEM-N]`` memory ref, or an ``[IMG-...]`` image
+    ref. A bracket left with no valid token is removed together with the space
+    that preceded it; untouched prose is never altered.
+
+    Bare numeric brackets (e.g. ``[14]``) are NOT kept unless the number is an
+    actual source index — source indices are always 4-char and always contain a
+    letter (see ``_get_next_cid``), so a purely-numeric marker is invariably the
+    LLM leaking an article/clause number ("Điều 14") into a citation bracket.
     """
     if not text:
         return text
+    # Strip leaked source labels first (order matters: the "Source: Memory"
+    # form has no bracket, so it must run before the glued-to-bracket form).
+    text = _LEAKED_MEMORY_SOURCE_RE.sub("", text)
+    text = _LEAKED_SOURCE_LABEL_RE.sub("", text)
     valid = {v.lower() for v in valid_ids}
 
     def _keep(tok: str) -> bool:
         t = tok.strip().lower()
         return (
             t in valid
-            or t.isdigit()
             or t.startswith("mem-")
             or t.startswith("img-")
         )
@@ -98,6 +163,51 @@ def sanitize_citations(text: str, valid_ids: set[str]) -> str:
         return f"{lead}[" + ", ".join(kept) + "]" if kept else ""
 
     return _CITATION_BRACKET_RE.sub(_repl, text)
+
+
+def build_memory_saved_notice(facts: list[str]) -> str:
+    """Build the '📌 saved to memory' notice appended to an answer.
+
+    Tells the user which durable personal facts were remembered this turn.
+    Returns "" when there is nothing to report (so callers can append blindly).
+    """
+    uniq = list(dict.fromkeys(f.strip() for f in (facts or []) if f and f.strip()))
+    if not uniq:
+        return ""
+    return (
+        "\n\n---\n📌 *Đã lưu vào bộ nhớ để dùng cho các lần sau:*\n"
+        + "\n".join(f"- {f}" for f in uniq)
+    )
+
+
+async def _stream_final_answer(state: dict, text: str) -> None:
+    """Replay an already-finalised, sanitised answer as paced ``token`` events.
+
+    Used by the direct-answer paths that buffer the full answer first (so they
+    can sanitize before showing anything). Nothing was streamed speculatively,
+    so this is the ONLY text the client renders — no retraction, no flicker.
+    Pacing (~1.2s total, bounded event count) gives a typing feel.
+    """
+    from app.services.agent.streaming import push_event
+
+    if not text:
+        return
+    import asyncio as _aio
+
+    parts = re.findall(r"\S+\s*", text) or [text]
+    max_emits = 100
+    group = max(1, (len(parts) + max_emits - 1) // max_emits)
+    n_emits = (len(parts) + group - 1) // group
+    delay = min(0.02, 1.2 / max(1, n_emits))
+    buf = ""
+    for i, p in enumerate(parts):
+        buf += p
+        if (i + 1) % group == 0:
+            await push_event(state, "token", buf)
+            buf = ""
+            await _aio.sleep(delay)
+    if buf:
+        await push_event(state, "token", buf)
 
 
 # ---------------------------------------------------------------------------
@@ -676,7 +786,7 @@ async def answer_generator(state: "AgentState") -> dict:
                     
                     cid = _get_next_cid()
                     meta_line = f" ({doc_filename})"
-                    all_texts.append(f"Source [{cid}]{meta_line}:\n{raw_content}")
+                    all_texts.append(f"Nguồn [{cid}]{meta_line}:\n{raw_content}")
                     
                     sources.append(ChatSourceChunk(
                         index=cid,
@@ -699,7 +809,7 @@ async def answer_generator(state: "AgentState") -> dict:
                         cid = _get_next_cid()
                         doc_filename = summ_result.get("document_name", "Unknown")
                         meta_line = f" ({doc_filename})"
-                        all_texts.append(f"Source [{cid}]{meta_line}:\n{summ_result['text']}")
+                        all_texts.append(f"Nguồn [{cid}]{meta_line}:\n{summ_result['text']}")
                         new_sources.append(ChatSourceChunk(
                             index=cid,
                             chunk_id=f"doc_{doc_id}_summary",
@@ -720,7 +830,7 @@ async def answer_generator(state: "AgentState") -> dict:
                         cid = _get_next_cid()
                         doc_filename = summ_result.get("document_name", "Unknown")
                         meta_line = f" ({doc_filename})"
-                        all_texts.append(f"Source [{cid}]{meta_line}:\n{summ_result['text']}")
+                        all_texts.append(f"Nguồn [{cid}]{meta_line}:\n{summ_result['text']}")
                         new_sources.append(ChatSourceChunk(
                             index=cid,
                             chunk_id=f"doc_{doc_id}_summary",
@@ -772,7 +882,7 @@ async def answer_generator(state: "AgentState") -> dict:
             if heading_path:
                 meta_parts.append(" > ".join(heading_path))
             meta_line = f" ({', '.join(meta_parts)})" if meta_parts else ""
-            chunk_parts.append(f"Source [{cid}]{meta_line}:\n{content}")
+            chunk_parts.append(f"Nguồn [{cid}]{meta_line}:\n{content}")
 
         context_parts.append("## Document Chunks\n" + "\n\n---\n\n".join(chunk_parts))
 
@@ -830,6 +940,7 @@ async def answer_generator(state: "AgentState") -> dict:
     # Stream tokens in real-time via astream()
     answer_parts: list[str] = []
     thinking_parts: list[str] = []
+    _citation_streamer = _CitationSafeStreamer()
 
     try:
         async for chunk in provider.astream(
@@ -844,10 +955,15 @@ async def answer_generator(state: "AgentState") -> dict:
                 thinking_parts.append(chunk.text)
                 await push_event(state, "thinking", {"text": chunk.text})
 
-            # Handle regular answer tokens
+            # Handle regular answer tokens — buffer so [citation] markers stay whole
             elif chunk.type == "text" and chunk.text:
                 answer_parts.append(chunk.text)
-                await push_event(state, "token", chunk.text)
+                safe = _citation_streamer.feed(chunk.text)
+                if safe:
+                    await push_event(state, "token", safe)
+        _tail = _citation_streamer.flush()
+        if _tail:
+            await push_event(state, "token", _tail)
 
     except Exception as e:
         logger.error(f"[answer_generator] LLM streaming failed: {e}", exc_info=True)
@@ -971,8 +1087,11 @@ async def direct_answer(state: "AgentState") -> dict:
             role, content = getattr(msg, "role", "user"), getattr(msg, "content", "")
         llm_messages.append(_LLMMsg(role=role, content=content))
 
+    # Buffer the whole answer BEFORE streaming: the personal/greeting answer is
+    # short, and buffering lets us sanitize away leaked source labels
+    # ("Source: Memory", "[Memory]") and fabricated citations before any token
+    # reaches the client — nothing is ever shown then retracted.
     answer_parts: list[str] = []
-
     try:
         async for chunk in provider.astream(
             messages=llm_messages,
@@ -983,8 +1102,6 @@ async def direct_answer(state: "AgentState") -> dict:
         ):
             if chunk.text:
                 answer_parts.append(chunk.text)
-                await push_event(state, "token", chunk.text)
-
     except Exception as e:
         logger.error(f"[direct_answer] LLM streaming failed: {e}", exc_info=True)
         # Fallback: non-streaming
@@ -1002,14 +1119,17 @@ async def direct_answer(state: "AgentState") -> dict:
                 else getattr(result, "content", str(result))
             )
             answer_parts.append(fallback)
-            await push_event(state, "token", fallback)
         except Exception as e2:
             logger.error(f"[direct_answer] Fallback also failed: {e2}")
-            greeting = "Xin chào! Tôi có thể giúp gì cho bạn?"
-            answer_parts.append(greeting)
-            await push_event(state, "token", greeting)
+            answer_parts.append("Xin chào! Tôi có thể giúp gì cho bạn?")
 
-    return {"final_answer": strip_thinking_tags("".join(answer_parts))}
+    final_answer = strip_thinking_tags("".join(answer_parts))
+    # No RAG sources on this path → empty valid set; sanitize still keeps
+    # [MEM-N]/[IMG-…]/[N] and strips leaked labels + fabricated markers.
+    final_answer = sanitize_citations(final_answer, set())
+    await _stream_final_answer(state, final_answer)
+
+    return {"final_answer": final_answer}
 
 
 # ---------------------------------------------------------------------------

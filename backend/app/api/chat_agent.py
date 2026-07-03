@@ -186,6 +186,21 @@ async def _fetch_direct_document_content(
         if not doc:
             logger.warning(f"[direct_doc] Document {doc_id} not found")
             continue
+        # ROOT-CAUSE GATE: this full-document dump exists ONLY for chat-uploaded
+        # files that are parsed but NOT embedded in ChromaDB (no chunks yet). For a
+        # doc that is already indexed (chunk_count > 0), dumping the whole markdown
+        # as a single score=1.0 "chunk_0" collapses citation granularity: one id
+        # ends up covering dozens of articles, so the model cites an internal
+        # article number (e.g. [14]) instead of a real source id, and the 48KB
+        # mega-source crowds out precise chunks. Indexed docs are already reachable
+        # via the scoped chunked query_deep search that runs alongside this — so
+        # skip the dump for them and let proper per-chunk citations win.
+        if (getattr(doc, "chunk_count", 0) or 0) > 0:
+            logger.info(
+                f"[direct_doc] Skip full-doc dump for indexed doc {doc_id} "
+                f"(chunk_count={doc.chunk_count}); using chunked vector search"
+            )
+            continue
         if not doc.markdown_s3_key:
             logger.warning(f"[direct_doc] Document {doc_id} has no markdown_s3_key")
             continue
@@ -358,64 +373,83 @@ async def _execute_search_documents(
                     )
         # Skip the broad workspace loop below
     else:
-        for workspace_id in workspace_ids:
+        # Fan out the per-workspace searches CONCURRENTLY. Each query_deep hits
+        # ChromaDB + reranker (~seconds); running the workspaces sequentially made
+        # total latency scale with workspace count. IMPORTANT: HRAGService.query_deep
+        # uses its db AsyncSession, and an AsyncSession is NOT safe to share across
+        # concurrent tasks — so each task gets its OWN session from AsyncSessionLocal.
+        from app.core.database import AsyncSessionLocal
+        import asyncio as _asyncio
+
+        async def _search_one_ws(workspace_id):
+            """Query ONE workspace on its own db session. Returns (chunks, kg)."""
             logger.info(
                 f"[RAG] External Search: query='{query}' on workspace {workspace_id}"
             )
-            rag_service = get_rag_service(db, workspace_id)
-
-            chunks = []
-            citations = []
-            if isinstance(rag_service, HRAGService):
-                try:
-                    result = await rag_service.query_deep(
-                        question=query,
-                        top_k=min(top_k, 10),
-                        document_ids=document_ids,
-                        mode=hrag_mode,
-                        include_images=False,
-                    )
-
-                    chunks = result.chunks
-                    citations = result.citations
-                    if result.knowledge_graph_summary:
-                        all_kg_summaries.append(
-                            f"### Knowledge Graph Insights\n{result.knowledge_graph_summary}"
+            packed: list = []          # (score, chunk, citation, workspace_id)
+            kg_summary: str | None = None
+            async with AsyncSessionLocal() as ws_db:
+                rag_service = get_rag_service(ws_db, workspace_id)
+                chunks = []
+                citations = []
+                if isinstance(rag_service, HRAGService):
+                    try:
+                        result = await rag_service.query_deep(
+                            question=query,
+                            top_k=min(top_k, 10),
+                            document_ids=document_ids,
+                            mode=hrag_mode,
+                            include_images=False,
                         )
-                except Exception as e:
-                    logger.warning(f"Search failed for workspace {workspace_id}: {e}")
-            else:
-                from types import SimpleNamespace
-
-                try:
-                    legacy = rag_service.query(question=query, top_k=min(top_k, 10))
-                    for i, c in enumerate(legacy.chunks):
-                        chunks.append(
-                            SimpleNamespace(
-                                content=c.content,
-                                document_id=int(c.metadata.get("document_id", 0)),
-                                chunk_index=i,
-                                page_no=int(c.metadata.get("page_no", 0)),
-                                heading_path=str(c.metadata.get("heading_path", "")).split(
-                                    " > "
-                                )
-                                if c.metadata.get("heading_path")
-                                else [],
-                                source_file=str(c.metadata.get("source", "")),
-                                image_refs=[],
-                                score=c.score,
+                        chunks = result.chunks
+                        citations = result.citations
+                        if result.knowledge_graph_summary:
+                            kg_summary = (
+                                f"### Knowledge Graph Insights\n{result.knowledge_graph_summary}"
                             )
+                    except Exception as e:
+                        logger.warning(f"Search failed for workspace {workspace_id}: {e}")
+                else:
+                    from types import SimpleNamespace
+
+                    try:
+                        legacy = rag_service.query(question=query, top_k=min(top_k, 10))
+                        for i, c in enumerate(legacy.chunks):
+                            chunks.append(
+                                SimpleNamespace(
+                                    content=c.content,
+                                    document_id=int(c.metadata.get("document_id", 0)),
+                                    chunk_index=i,
+                                    page_no=int(c.metadata.get("page_no", 0)),
+                                    heading_path=str(c.metadata.get("heading_path", "")).split(
+                                        " > "
+                                    )
+                                    if c.metadata.get("heading_path")
+                                    else [],
+                                    source_file=str(c.metadata.get("source", "")),
+                                    image_refs=[],
+                                    score=c.score,
+                                )
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"Legacy search failed for workspace {workspace_id}: {e}"
                         )
-                except Exception as e:
-                    logger.warning(
-                        f"Legacy search failed for workspace {workspace_id}: {e}"
-                    )
 
             # Pack chunks with their citation for sorting
             for i, chunk in enumerate(chunks):
                 citation = citations[i] if i < len(citations) else None
                 score = getattr(chunk, "score", 0.0)
-                all_chunks.append((score, chunk, citation, workspace_id))
+                packed.append((score, chunk, citation, workspace_id))
+            return packed, kg_summary
+
+        ws_results = await _asyncio.gather(
+            *[_search_one_ws(ws) for ws in workspace_ids]
+        )
+        for packed, kg_summary in ws_results:
+            all_chunks.extend(packed)
+            if kg_summary:
+                all_kg_summaries.append(kg_summary)
 
     # Sort all aggregated chunks by score descending
     all_chunks.sort(key=lambda x: x[0], reverse=True)
@@ -499,7 +533,7 @@ async def _execute_search_documents(
                 meta_parts.append(f"Số hiệu: {doc_meta['document_number']}")
 
         meta_line = f" ({', '.join(meta_parts)})" if meta_parts else ""
-        context_parts.append(f"Source [{cid}]{meta_line}:\n{chunk.content}")
+        context_parts.append(f"Nguồn [{cid}]{meta_line}:\n{chunk.content}")
 
     context = ""
     if all_kg_summaries:

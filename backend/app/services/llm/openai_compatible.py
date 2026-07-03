@@ -233,6 +233,16 @@ class OpenAICompatibleLLMProvider(LLMProvider):
     ) -> AsyncGenerator[StreamChunk, None]:
         oai_msgs = _to_openai_messages(messages, system_prompt)
         self._last_usage = None
+        # Qwen reasoning models DEGENERATE into verbatim repetition when thinking
+        # is driven at a near-greedy temperature — a single turn can emit 40k+
+        # chars of looping reasoning and blow the whole latency/token budget
+        # (observed on Qwen3.6 with temperature=0.1). Qwen's guidance for
+        # thinking mode is temp≈0.6 / top_p≈0.95; adding a presence_penalty
+        # collapses the repetition (measured: 8.7k→0.9k reasoning chars, 22s→2s).
+        # Apply these ONLY when thinking is on, so non-thinking calls keep the
+        # caller's deterministic sampling.
+        if think:
+            temperature = max(temperature, 0.6)
         kwargs: dict = dict(
             model=self._model,
             messages=oai_msgs,
@@ -243,6 +253,9 @@ class OpenAICompatibleLLMProvider(LLMProvider):
             # this); captured below for Langfuse token accounting.
             stream_options={"include_usage": True},
         )
+        if think:
+            kwargs["top_p"] = 0.95
+            kwargs["presence_penalty"] = 1.0
         if tools:
             kwargs["tools"] = tools
             # Allow the model to emit several independent tool calls in one turn
@@ -299,8 +312,14 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                     continue
 
                 content = delta.content or ""
-                # vLLM streams reasoning via delta.reasoning (Qwen3.5 thinking mode)
-                reasoning = getattr(delta, "reasoning", None) or ""
+                # vLLM streams reasoning via delta.reasoning (Qwen3.5 thinking mode).
+                # Some vLLM reasoning-parsers expose it as delta.reasoning_content
+                # instead — accept either so thinking is never silently dropped.
+                reasoning = (
+                    getattr(delta, "reasoning", None)
+                    or getattr(delta, "reasoning_content", None)
+                    or ""
+                )
 
                 # Yield reasoning chunks first (before content in same delta)
                 if reasoning:

@@ -922,7 +922,7 @@ async def debug_chat(
         if heading:
             meta_parts.append(heading)
         meta_line = f" ({', '.join(meta_parts)})" if meta_parts else ""
-        context_parts.append(f"Source [{cid}]{meta_line}:\n{chunk.content}")
+        context_parts.append(f"Nguồn [{cid}]{meta_line}:\n{chunk.content}")
 
     # NOTE: KG summary NOT added as citable source (can contain hallucinated data)
     context = "\n\n---\n\n".join(context_parts)

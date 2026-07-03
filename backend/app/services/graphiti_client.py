@@ -178,9 +178,25 @@ def get_graphiti_client():
         model=settings.GRAPHITI_LLM_MODEL,
         base_url=settings.GRAPHITI_LLM_BASE_URL,
     )
-    # max_tokens MUST be < vLLM --max-model-len (15312).
-    # OpenAIGenericClient default is 16384 which causes 400 Bad Request on every call.
-    llm_client = OpenAIGenericClient(config=llm_config, max_tokens=8192)
+    # max_tokens is the OUTPUT budget and MUST leave room for the INPUT within the
+    # served model's context window. qwen-memory (vllm-memory:8088) has
+    # max_model_len=8192. Setting the constructor default is NOT enough: Graphiti's
+    # internal extraction steps pass max_tokens=DEFAULT_MAX_TOKENS (16384)
+    # EXPLICITLY on some calls, overriding the constructor and 400'ing
+    # ("max_tokens=16384 cannot be greater than max_model_len=8192"). So we clamp
+    # every call in a subclass. 2048 output leaves ~6k tokens for the prompt.
+    _SAFE_MAX_OUTPUT = 2048
+
+    class _CappedOpenAIGenericClient(OpenAIGenericClient):
+        # All Graphiti extraction goes through the public generate_response();
+        # clamp there (overriding the private _generate_response is fragile — it
+        # receives max_tokens positionally and double-binds).
+        async def generate_response(self, *args, max_tokens=None, **kwargs):
+            if max_tokens is None or max_tokens > _SAFE_MAX_OUTPUT:
+                max_tokens = _SAFE_MAX_OUTPUT
+            return await super().generate_response(*args, max_tokens=max_tokens, **kwargs)
+
+    llm_client = _CappedOpenAIGenericClient(config=llm_config, max_tokens=_SAFE_MAX_OUTPUT)
     embedder = NexusRAGEmbedder()
 
     _graphiti_client = Graphiti(
@@ -439,9 +455,12 @@ _FACT_EXTRACTOR_PROMPT = """\
 You are a personal-fact extractor for a memory system.
 
 Your task: given a user message —
-1. Extract ONLY factual statements about the user themselves \
-(their name, job, location, devices, preferences, personal info, etc.).
-2. Discard questions, requests, and anything that is NOT a personal fact.
+1. Extract factual statements about the user OR the user's unit/organization —
+   their name, job/role, location, devices, preferences, personal info, AND
+   facts about their đơn vị/cơ quan (its name, size, số lượng cán bộ/chiến sỹ/
+   nhân sự, structure, function). A fact stated as CONTEXT inside a question
+   still counts — extract the declarative part and drop the question part.
+2. Discard the question/request itself and anything that is NOT such a fact.
 3. IMPORTANT: Convert ALL first-person pronouns (tôi, tao, mình, I, me, my) \
 to "người dùng" (third-person). This is required so the memory system can \
 correctly link facts to the user entity.
@@ -470,6 +489,12 @@ User: "tên tôi là Nguyễn Văn A, tôi sinh năm 1990, tôi có thể làm g
 
 User: "tên tôi là Hưng"
 → {"has_facts": true, "facts": "Người dùng có tên là Hưng"}
+
+User: "Đơn vị tôi có 40 cán bộ chiến sỹ, có thể tạo lập mạng LAN để gửi nhận tài liệu mật không?"
+→ {"has_facts": true, "facts": "Đơn vị của người dùng có 40 cán bộ chiến sỹ"}
+
+User: "Cơ quan tôi trực thuộc Bộ Công an, vậy có phải xin phép khi mua thiết bị không?"
+→ {"has_facts": true, "facts": "Cơ quan của người dùng trực thuộc Bộ Công an"}
 
 User: "My name is John and I work at Google"
 → {"has_facts": true, "facts": "The user's name is John and the user works at Google"}
@@ -547,6 +572,37 @@ async def _llm_extract_facts(text: str, *, max_attempts: int = 2) -> str:
         f"({last_err}) — storing original text as fallback"
     )
     return text
+
+
+async def extract_personal_facts(text: str) -> list[str]:
+    """Extract durable personal facts from a user message, for the "saved to
+    memory" notice shown at the end of an answer.
+
+    READ-ONLY: this does NOT write to the graph. Persistence is owned by the
+    memory worker (:func:`add_conversation_episode`, enqueued every turn), which
+    runs the SAME ``_llm_extract_facts`` gate — so what this returns matches what
+    actually gets stored. We surface the notice from here (not from the model's
+    ``save_memory`` tool call) because the model calls that tool inconsistently,
+    whereas the worker save is deterministic.
+
+    Returns ``[]`` when the message carries no personal fact (questions,
+    greetings, too-short input) — i.e. exactly the cases the worker also skips.
+    """
+    stripped = (text or "").strip()
+    # Mirror add_conversation_episode's short-circuit so the notice never claims
+    # a save for input the worker would drop.
+    if len(stripped) < 5:
+        return []
+    facts = (await _llm_extract_facts(stripped) or "").strip()
+    if not facts:
+        return []
+    # facts may be a single sentence or several separated by newlines/semicolons.
+    items = [
+        f.strip(" -•\t")
+        for f in re.split(r"[\n;]+", facts)
+        if f.strip(" -•\t")
+    ]
+    return items or [facts]
 
 
 async def add_conversation_episode(
@@ -689,6 +745,41 @@ async def save_user_fact(user_id: uuid.UUID, fact: str) -> bool:
         return False
 
 
+# Strong refs to in-flight background saves so the event loop doesn't GC them
+# mid-run (asyncio only holds weak refs to tasks).
+_bg_save_tasks: set = set()
+
+
+def save_user_fact_background(user_id: uuid.UUID, fact: str) -> None:
+    """Persist a user fact WITHOUT blocking the caller.
+
+    Graphiti ``add_episode`` runs several LLM extraction calls (~30-50s on the
+    local memory model) — awaiting it inside the chat turn stalled the answer.
+    This schedules the write on the running event loop and returns immediately;
+    the task outlives the request (best-effort — a memory write lost on shutdown
+    is preferable to a slow answer). Errors are logged, never raised.
+    """
+    fact = (fact or "").strip()
+    if not fact or not user_id:
+        return
+    import asyncio
+
+    async def _runner():
+        try:
+            await save_user_fact(user_id, fact)
+        except Exception as exc:  # save_user_fact already swallows, belt-and-suspenders
+            logger.warning(f"[graphiti] background save_user_fact crashed: {exc}")
+
+    try:
+        task = asyncio.create_task(_runner())
+    except RuntimeError:
+        # No running loop (shouldn't happen in the async request path) — skip.
+        logger.warning("[graphiti] no running loop for background save; skipped")
+        return
+    _bg_save_tasks.add(task)
+    task.add_done_callback(_bg_save_tasks.discard)
+
+
 # ---------------------------------------------------------------------------
 # Formatting helper
 # ---------------------------------------------------------------------------
@@ -720,7 +811,7 @@ def _format_memory_context(
     fact before formatting so the LLM / user never sees it.
 
     Output format:
-        [Memory]
+        Thông tin cá nhân đã biết về người dùng:
         - <fact 1>
         - <fact 2>
         ...
@@ -761,8 +852,12 @@ def _format_memory_context(
     facts.sort(key=lambda x: x[0], reverse=True)
 
     # Build output within budget
-    lines: list[str] = ["[Memory]"]
-    total_len = len("[Memory]") + 1  # +1 for trailing newline
+    # Header is deliberately NOT a "[...]" bracket: a "[Memory]" header reads to
+    # the LLM like a citation token and leaked into answers as raw "[Memory]" /
+    # "Source: Memory" text. A plain Vietnamese label carries no citation shape.
+    _header = "Thông tin cá nhân đã biết về người dùng:"
+    lines: list[str] = [_header]
+    total_len = len(_header) + 1  # +1 for trailing newline
     included = 0
 
     for score, fact in facts:
