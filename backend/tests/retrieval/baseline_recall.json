@@ -1,0 +1,411 @@
+{
+  "created_at": "2026-07-03T15:05:25.298326+00:00",
+  "dataset": "golden_retrieval.yaml",
+  "top_k": 8,
+  "mode": "hybrid",
+  "config": {
+    "HRAG_ENABLE_BM25": true,
+    "HRAG_BM25_WORD_SEGMENT": false,
+    "HRAG_RRF_K": 60,
+    "HRAG_MIN_RELEVANCE_SCORE": 0.15,
+    "HRAG_RERANKER_TOP_K": 8,
+    "HRAG_RECENTNESS_BOOST": 0.3,
+    "HRAG_ENABLE_CONTEXTUAL_EMBEDDINGS": true,
+    "HRAG_KG_MODE": "legal"
+  },
+  "aggregate": {
+    "n_cases": 27,
+    "n_positive": 25,
+    "n_with_article": 22,
+    "doc_recall_at_4": 1.0,
+    "doc_recall_at_8": 1.0,
+    "doc_mrr": 1.0,
+    "art_recall_at_4": 0.8182,
+    "art_recall_at_8": 0.8636,
+    "art_mrr": 0.6818,
+    "neg_avg_top_score": 0.3234
+  },
+  "cases": [
+    {
+      "id": "sec-85-d17",
+      "query": "Tóm tắt điều 17 của Nghị định 85/2016",
+      "tags": [
+        "section-ref",
+        "ocr"
+      ],
+      "negative": false,
+      "n_chunks": 7,
+      "top_score": 0.5727,
+      "latency_ms": 15318,
+      "doc_rank": 1,
+      "art_rank": null
+    },
+    {
+      "id": "sec-85-d20",
+      "query": "Điều 20 Nghị định 85/2016 quy định nội dung gì",
+      "tags": [
+        "section-ref",
+        "ocr"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.6548,
+      "latency_ms": 305,
+      "doc_rank": 1,
+      "art_rank": null
+    },
+    {
+      "id": "con-85-chuquan",
+      "query": "Trách nhiệm của chủ quản hệ thống thông tin là gì",
+      "tags": [
+        "concept",
+        "ocr"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.9985,
+      "latency_ms": 334,
+      "doc_rank": 1,
+      "art_rank": 1
+    },
+    {
+      "id": "con-85-hoso",
+      "query": "Hồ sơ đề xuất cấp độ gồm những thành phần gì",
+      "tags": [
+        "concept",
+        "ocr"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.9876,
+      "latency_ms": 345,
+      "doc_rank": 1,
+      "art_rank": 1
+    },
+    {
+      "id": "con-85-capdo3",
+      "query": "Tiêu chí xác định cấp độ 3 của hệ thống thông tin là gì",
+      "tags": [
+        "concept",
+        "ocr"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.9992,
+      "latency_ms": 244,
+      "doc_rank": 1,
+      "art_rank": 1
+    },
+    {
+      "id": "con-85-thamquyen",
+      "query": "Ai có thẩm quyền thẩm định và phê duyệt hồ sơ đề xuất cấp độ",
+      "tags": [
+        "concept",
+        "ocr"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.9959,
+      "latency_ms": 358,
+      "doc_rank": 1,
+      "art_rank": 1
+    },
+    {
+      "id": "sec-361-phamvi",
+      "query": "đơn vị tôi có thuộc phạm vi của Nghị định 361/2025 không",
+      "tags": [
+        "section-ref",
+        "ocr",
+        "trace"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.5684,
+      "latency_ms": 310,
+      "doc_rank": 1,
+      "art_rank": null
+    },
+    {
+      "id": "con-361-ngach",
+      "query": "Xếp ngạch công chức theo vị trí việc làm như thế nào",
+      "tags": [
+        "concept",
+        "ocr",
+        "trace"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.9982,
+      "latency_ms": 407,
+      "doc_rank": 1,
+      "art_rank": 1
+    },
+    {
+      "id": "con-361-tyle-xa",
+      "query": "Tỷ lệ công chức bố trí theo vị trí việc làm ở cấp xã là bao nhiêu",
+      "tags": [
+        "concept",
+        "ocr"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.994,
+      "latency_ms": 285,
+      "doc_rank": 1,
+      "art_rank": 1
+    },
+    {
+      "id": "con-361-gioithieu",
+      "query": "Nghị định 361 quy định về việc gì",
+      "tags": [
+        "section-ref",
+        "ocr",
+        "trace"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.4468,
+      "latency_ms": 383,
+      "doc_rank": 1,
+      "art_rank": 1
+    },
+    {
+      "id": "con-117-tieuhuy",
+      "query": "Quy định về tiêu hủy tài liệu bí mật nhà nước như thế nào?",
+      "tags": [
+        "concept",
+        "ocr",
+        "trace"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.996,
+      "latency_ms": 248,
+      "doc_rank": 1,
+      "art_rank": 2
+    },
+    {
+      "id": "con-117-giahan",
+      "query": "gia hạn thời hạn bảo vệ BMNN như thế nào",
+      "tags": [
+        "concept",
+        "ocr",
+        "trace",
+        "abbrev"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.7801,
+      "latency_ms": 483,
+      "doc_rank": 1,
+      "art_rank": 2
+    },
+    {
+      "id": "con-117-domat",
+      "query": "Bí mật nhà nước có bao nhiêu độ mật",
+      "tags": [
+        "concept",
+        "ocr",
+        "trace"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.9954,
+      "latency_ms": 212,
+      "doc_rank": 1,
+      "art_rank": 1
+    },
+    {
+      "id": "con-117-nghiemcam",
+      "query": "Các hành vi bị nghiêm cấm trong bảo vệ bí mật nhà nước",
+      "tags": [
+        "concept",
+        "ocr"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.9928,
+      "latency_ms": 530,
+      "doc_rank": 1,
+      "art_rank": 1
+    },
+    {
+      "id": "con-117-saochup",
+      "query": "Việc sao, chụp tài liệu bí mật nhà nước được quy định như thế nào",
+      "tags": [
+        "concept",
+        "ocr"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.9936,
+      "latency_ms": 257,
+      "doc_rank": 1,
+      "art_rank": 6
+    },
+    {
+      "id": "con-117-mangra",
+      "query": "Mang tài liệu bí mật nhà nước ra khỏi nơi lưu giữ cần điều kiện gì",
+      "tags": [
+        "concept",
+        "ocr"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.9972,
+      "latency_ms": 448,
+      "doc_rank": 1,
+      "art_rank": 3
+    },
+    {
+      "id": "con-116-kinhdoanh",
+      "query": "Điều kiện kinh doanh sản phẩm, dịch vụ an ninh mạng",
+      "tags": [
+        "concept",
+        "ocr",
+        "trace"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.9972,
+      "latency_ms": 347,
+      "doc_rank": 1,
+      "art_rank": 1
+    },
+    {
+      "id": "con-116-bienphap",
+      "query": "Các biện pháp bảo vệ an ninh mạng",
+      "tags": [
+        "concept",
+        "ocr",
+        "trace"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.9997,
+      "latency_ms": 465,
+      "doc_rank": 1,
+      "art_rank": 2
+    },
+    {
+      "id": "con-116-lucluong",
+      "query": "Lực lượng bảo vệ an ninh mạng gồm những lực lượng nào",
+      "tags": [
+        "concept",
+        "ocr"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.9695,
+      "latency_ms": 479,
+      "doc_rank": 1,
+      "art_rank": 1
+    },
+    {
+      "id": "con-116-tancong",
+      "query": "Phòng, chống tấn công mạng được quy định như thế nào",
+      "tags": [
+        "concept",
+        "ocr"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.9965,
+      "latency_ms": 556,
+      "doc_rank": 1,
+      "art_rank": 1
+    },
+    {
+      "id": "con-116-doanhnghiep",
+      "query": "Trách nhiệm của doanh nghiệp cung cấp dịch vụ trên không gian mạng",
+      "tags": [
+        "concept",
+        "ocr",
+        "trace"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.9998,
+      "latency_ms": 400,
+      "doc_rank": 1,
+      "art_rank": 2
+    },
+    {
+      "id": "con-116-kiemtra",
+      "query": "Kiểm tra an ninh mạng do ai thực hiện",
+      "tags": [
+        "concept",
+        "ocr",
+        "trace"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.9762,
+      "latency_ms": 451,
+      "doc_rank": 1,
+      "art_rank": 2
+    },
+    {
+      "id": "doc-3966-email",
+      "query": "địa chỉ email để báo cáo hằng tuần là gì",
+      "tags": [
+        "congvan",
+        "trace"
+      ],
+      "negative": false,
+      "n_chunks": 1,
+      "top_score": 0.4906,
+      "latency_ms": 491,
+      "doc_rank": 1
+    },
+    {
+      "id": "doc-3966-chuanhoa",
+      "query": "Việc chuẩn hóa dữ liệu thuế sử dụng đất phi nông nghiệp cần hoàn thành như thế nào",
+      "tags": [
+        "congvan",
+        "trace"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.9505,
+      "latency_ms": 463,
+      "doc_rank": 1
+    },
+    {
+      "id": "doc-2614-vuongmac",
+      "query": "Việc tiếp nhận và xử lý vướng mắc về nghĩa vụ thuế của người nộp thuế được triển khai như thế nào",
+      "tags": [
+        "congvan"
+      ],
+      "negative": false,
+      "n_chunks": 8,
+      "top_score": 0.988,
+      "latency_ms": 206,
+      "doc_rank": 1
+    },
+    {
+      "id": "neg-nd13",
+      "query": "Nghị định 13/2023 quy định gì về bảo vệ dữ liệu cá nhân?",
+      "tags": [
+        "negative",
+        "trace"
+      ],
+      "negative": true,
+      "n_chunks": 8,
+      "top_score": 0.6458,
+      "latency_ms": 424
+    },
+    {
+      "id": "neg-cakoi",
+      "query": "Quy định về nuôi cá koi trên sao Hỏa theo pháp luật Việt Nam là gì?",
+      "tags": [
+        "negative",
+        "trace"
+      ],
+      "negative": true,
+      "n_chunks": 3,
+      "top_score": 0.001,
+      "latency_ms": 419
+    }
+  ]
+}

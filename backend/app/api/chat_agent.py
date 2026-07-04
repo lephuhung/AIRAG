@@ -483,11 +483,17 @@ async def _execute_search_documents(
                 "published_date": doc.published_date,
                 "document_number": doc.document_number,
                 "document_title": doc.document_title,
+                "validity_status": doc.validity_status,
+                "superseded_by": doc.superseded_by_number,
             }
+
+    from app.services.heading_path import extract_article_nos
 
     for score, chunk, citation, workspace_id in best_chunks:
         cid = _generate_citation_id(existing_ids)
         existing_ids.add(cid)
+        _meta = doc_meta_map.get(str(chunk.document_id)) or {}
+        _art_nos = extract_article_nos(chunk.heading_path)
         sources.append(
             ChatSourceChunk(
                 index=cid,
@@ -499,6 +505,10 @@ async def _execute_search_documents(
                 score=score,
                 source_type="vector",
                 source_file=citation.source_file if citation else getattr(chunk, "source_file", ""),
+                document_number=_meta.get("document_number"),
+                article_label=", ".join(f"Điều {n}" for n in _art_nos[:3]) or None,
+                validity_status=_meta.get("validity_status"),
+                superseded_by=_meta.get("superseded_by"),
             )
         )
         logger.info(
@@ -526,14 +536,27 @@ async def _execute_search_documents(
             meta_parts.append(heading)
 
         doc_meta = doc_meta_map.get(str(chunk.document_id))
+        validity_warning = ""
         if doc_meta:
+            if doc_meta["document_number"]:
+                meta_parts.append(f"Số hiệu: {doc_meta['document_number']}")
             if doc_meta["published_date"]:
                 meta_parts.append(f"Ngày ban hành: {doc_meta['published_date']}")
-            elif doc_meta["document_number"]:
-                meta_parts.append(f"Số hiệu: {doc_meta['document_number']}")
+            if doc_meta.get("validity_status") == "superseded":
+                by = doc_meta.get("superseded_by")
+                validity_warning = (
+                    "\n⚠️ VĂN BẢN NÀY ĐÃ HẾT HIỆU LỰC"
+                    + (f" — đã được thay thế bởi {by}." if by else ".")
+                )
+            elif doc_meta.get("validity_status") == "partially_amended":
+                validity_warning = (
+                    "\n⚠️ Văn bản này đã được sửa đổi/bãi bỏ một phần bởi văn bản khác."
+                )
 
         meta_line = f" ({', '.join(meta_parts)})" if meta_parts else ""
-        context_parts.append(f"Nguồn [{cid}]{meta_line}:\n{chunk.content}")
+        context_parts.append(
+            f"Nguồn [{cid}]{meta_line}:{validity_warning}\n{chunk.content}"
+        )
 
     context = ""
     if all_kg_summaries:

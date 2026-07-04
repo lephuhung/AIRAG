@@ -60,7 +60,8 @@ export function preprocessMarkdown(text: string): string {
   return processed;
 }
 
-const CITATION_STRIP_RE = /\s*\[(?:[a-z0-9]+|IMG-[a-z0-9]+)(?:,\s*(?:[a-z0-9]+|IMG-[a-z0-9]+))*\]/g;
+// \s* sau "[": model đôi khi phát "[ a3f7]" có space — vẫn phải strip được
+const CITATION_STRIP_RE = /\s*\[\s*(?:[a-z0-9]+|IMG-[a-z0-9]+)(?:,\s*(?:[a-z0-9]+|IMG-[a-z0-9]+))*\s*\]/g;
 
 /** Remove citation references like [a3x9], [IMG-p4f2], [a3x9, b2m7] */
 export function stripCitations(md: string): string {

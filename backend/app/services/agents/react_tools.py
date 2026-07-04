@@ -238,6 +238,43 @@ async def _adapt_query_knowledge_graph(args: dict, ctx: ToolContext) -> dict:
     return tool_result(summary, sources=[chunk], data={"kg": True})
 
 
+async def _adapt_get_document_relations(args: dict, ctx: ToolContext) -> dict:
+    from app.services.agent.tools import get_document_relations
+    from app.api.chat_agent import _generate_citation_id
+    from app.schemas.rag import ChatSourceChunk
+
+    document = (args.get("document") or "").strip()
+    if not document:
+        return tool_result("Lỗi: thiếu 'document' cho get_document_relations.")
+    res = await get_document_relations(
+        document=document,
+        workspace_ids=ctx.workspace_ids,
+        db=_db(),
+        relation=args.get("relation"),
+    )
+    text = (res.get("text") or "").strip()
+    if not text or text.startswith("Không tìm thấy"):
+        return tool_result(text or "Không có kết quả.", data={"kg": True})
+
+    # Nguồn citable như query_knowledge_graph: kết quả gộp DB + KG, không gắn
+    # với một document duy nhất → nil document_id, render dạng chip "KG-…".
+    cid = _generate_citation_id(set(ctx.existing_citation_ids.keys()))
+    chunk = ChatSourceChunk(
+        index=cid,
+        chunk_id=f"kg_{cid}",
+        content=text,
+        document_id=uuid.UUID(int=0),
+        page_no=0,
+        heading_path=[],
+        score=1.0,
+        source_type="kg",
+        source_file=None,
+    )
+    ctx.remember_citations([chunk])
+    return tool_result(f"Nguồn [{cid}] (Quan hệ văn bản):\n{text}",
+                       sources=[chunk], data={"kg": True})
+
+
 async def _adapt_list_documents(args: dict, ctx: ToolContext) -> dict:
     from app.services.agent.tools import list_documents
 
@@ -517,6 +554,7 @@ TOOL_REGISTRY: dict[str, Callable[[dict, ToolContext], Awaitable[dict]]] = {
     "resolve_document_reference": _adapt_resolve_document_reference,
     "search_document_section": _adapt_search_document_section,
     "query_knowledge_graph": _adapt_query_knowledge_graph,
+    "get_document_relations": _adapt_get_document_relations,
     "list_documents": _adapt_list_documents,
     "search_abbreviation": _adapt_search_abbreviation,
     "search_documents_number": _adapt_search_documents_number,
@@ -588,6 +626,22 @@ RAG_TOOL_SCHEMAS: list[dict] = [
         "knowledge graph. vd 'Bộ Công an có những đơn vị nào'.",
         {"entity": {"type": "string", "description": "Thực thể/quan hệ cần tra."}},
         ["entity"],
+    ),
+    _fn(
+        "get_document_relations",
+        "Tra QUAN HỆ GIỮA CÁC VĂN BẢN và TRẠNG THÁI HIỆU LỰC: văn bản nào căn cứ / viện "
+        "dẫn / sửa đổi / THAY THẾ / bãi bỏ văn bản nào; văn bản còn hiệu lực hay đã bị "
+        "thay thế. Dùng khi user hỏi kiểu 'văn bản nào thay thế/sửa đổi X', 'X còn hiệu "
+        "lực không', 'X căn cứ những văn bản nào'. KHÁC query_knowledge_graph (quan hệ "
+        "tổ chức/con người) và KHÁC search_documents (tìm nội dung).",
+        {
+            "document": {"type": "string",
+                         "description": "Tên hoặc số hiệu văn bản cần tra quan hệ."},
+            "relation": {"type": "string",
+                         "enum": ["CAN_CU", "VIEN_DAN", "SUA_DOI", "THAY_THE", "BAI_BO"],
+                         "description": "Lọc một loại quan hệ (bỏ trống = tất cả)."},
+        },
+        ["document"],
     ),
     _fn(
         "list_documents",

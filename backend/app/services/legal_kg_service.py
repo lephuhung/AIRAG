@@ -2179,6 +2179,71 @@ class LegalKGService:
 
         return self._format_context(entity_info, rels)
 
+    # Quan hệ VĂN BẢN ↔ VĂN BẢN (khác quan hệ tổ chức/nhân sự)
+    DOC_RELATION_TYPES = (
+        "CAN_CU", "VIEN_DAN", "SUA_DOI", "THAY_THE", "BAI_BO", "REFERENCES"
+    )
+
+    async def get_document_relations(
+        self,
+        document_ref: str,
+        relation_types: list[str] | None = None,
+        limit: int = 30,
+    ) -> list[dict]:
+        """Traversal 1-hop các quan hệ văn bản từ node Document khớp ``document_ref``.
+
+        ``document_ref``: số hiệu ("85/2016") hoặc tên văn bản — match CONTAINS
+        (lowercase) trên entity_id, tối đa 3 node anchor.
+
+        Returns: list các dict
+            {anchor, source, target, relation, direction ('out'|'in'), description}
+        """
+        ref = (document_ref or "").strip().lower()
+        if not ref:
+            return []
+        rels = list(relation_types or self.DOC_RELATION_TYPES)
+
+        driver = await self._get_driver()
+        label = self._label
+        cypher = f"""
+        MATCH (n:`{label}`)
+        WHERE n.entity_type = 'Document' AND toLower(n.entity_id) CONTAINS $ref
+        WITH n LIMIT 3
+        MATCH (n)-[r]-(m:`{label}`)
+        WHERE type(r) IN $rels
+        RETURN DISTINCT
+            n.entity_id            AS anchor,
+            startNode(r).entity_id AS src,
+            endNode(r).entity_id   AS tgt,
+            type(r)                AS rel,
+            r.description          AS desc
+        LIMIT $limit
+        """
+        out: list[dict] = []
+        try:
+            async with driver.session() as session:
+                result = await session.run(cypher, ref=ref, rels=rels, limit=limit)
+                records = await result.data()
+            for rec in records:
+                anchor = rec.get("anchor") or ""
+                src, tgt = rec.get("src") or "", rec.get("tgt") or ""
+                if not (src and tgt):
+                    continue
+                out.append({
+                    "anchor": anchor,
+                    "source": src,
+                    "target": tgt,
+                    "relation": rec.get("rel") or "",
+                    "direction": "out" if src == anchor else "in",
+                    "description": rec.get("desc") or "",
+                })
+        except Exception as e:
+            logger.error(
+                f"LegalKG get_document_relations failed for workspace "
+                f"{self.workspace_id} ref={document_ref!r}: {e}"
+            )
+        return out
+
     def _format_context(self, entity_info: dict, rels: list[dict]) -> str:
         lines = ["=== Kết quả từ Knowledge Graph ===\n"]
         if entity_info:

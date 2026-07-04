@@ -320,6 +320,35 @@ async def lifespan(app: FastAPI):
                     "CREATE INDEX IF NOT EXISTS ix_documents_content_hash ON documents(content_hash)"
                 )
             )
+            # documents: trạng thái hiệu lực pháp lý (khác status = trạng thái xử lý).
+            # validity_events lưu các tuyên bố thay_the/bai_bo/het_hieu_luc trích từ
+            # điều khoản thi hành — dùng để cross-match khi văn bản bị ảnh hưởng
+            # được upload SAU văn bản tuyên bố.
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS validity_status VARCHAR(30) DEFAULT 'unknown'"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS superseded_by_number VARCHAR(100)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS superseded_by_document_id UUID REFERENCES documents(id) ON DELETE SET NULL"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS effective_date VARCHAR(100)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS validity_events JSON"
+                )
+            )
             # chat_messages: user_id
             await conn.execute(
                 text(

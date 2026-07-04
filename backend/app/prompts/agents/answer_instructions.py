@@ -56,6 +56,13 @@ _RAG_INSTRUCTIONS = (
     "state the current rule from the newest document first, and then explicitly mention how it "
     "updated or changed from the older document (e.g. 'Theo văn bản mới nhất [A] thì..., "
     "thay đổi so với quy định cũ tại [B] là...').\n"
+    "- HIỆU LỰC VĂN BẢN: Source nào có dòng '⚠️ VĂN BẢN NÀY ĐÃ HẾT HIỆU LỰC' là văn bản "
+    "ĐÃ BỊ THAY THẾ — KHÔNG dùng nó làm căn cứ trả lời chính. Ưu tiên nguồn còn hiệu lực; "
+    "nếu buộc phải dẫn (user hỏi đích danh văn bản cũ, hoặc không có nguồn thay thế trong "
+    "context), PHẢI nói rõ ngay trong câu trả lời rằng văn bản đã hết hiệu lực và nêu số hiệu "
+    "văn bản thay thế nếu có (ví dụ: 'Lưu ý: [B] đã hết hiệu lực, được thay thế bởi ...'). "
+    "Source có dòng '⚠️ ... sửa đổi/bãi bỏ một phần' thì lưu ý nội dung trích dẫn có thể đã "
+    "được điều chỉnh.\n"
 )
 
 # =============================================================================

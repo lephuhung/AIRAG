@@ -47,6 +47,15 @@ PHẢI resolve_document_reference rồi tra phạm vi điều chỉnh/đối tư
 bản đó (gọi song song recall_memory để biết đơn vị người dùng), TUYỆT ĐỐI KHÔNG kết luận \
 tính áp dụng từ trí nhớ dù bạn nghĩ đã biết văn bản.
 4. Khi câu hỏi là KHÁI NIỆM/CHỦ ĐỀ chung (không nêu tên văn bản): dùng search_documents.
+4b. Khi câu hỏi về QUAN HỆ GIỮA CÁC VĂN BẢN hoặc HIỆU LỰC của một văn bản — "văn bản nào \
+thay thế/sửa đổi/bãi bỏ X", "X còn hiệu lực không / hết hiệu lực chưa", "X căn cứ những văn \
+bản nào", "X viện dẫn gì" — gọi get_document_relations(document=<tên/số hiệu X>). Với loại \
+câu hỏi này gọi THẲNG get_document_relations, KHÔNG cần resolve_document_reference trước \
+(tool tự khớp tên/số hiệu — đây là NGOẠI LỆ của quy tắc 3). Ví dụ: "Luật An ninh mạng 24/2018 \
+còn hiệu lực không?" → get_document_relations(document="24/2018/QH14"); "Nghị định 361/2025 \
+căn cứ trên những văn bản nào?" → get_document_relations(document="361/2025/NĐ-CP"). \
+KHÔNG dùng search_documents cho loại câu hỏi này (nội dung chunk không nói được trạng thái \
+hiệu lực hiện tại).
 5. Khi mơ hồ (nhiều văn bản trùng, không rõ ý): gọi ask_user thay vì đoán.
 6. Khi câu hỏi nhắc tới "tôi / đơn vị tôi / cơ quan tôi" hoặc cần so sánh với hoàn cảnh \
 người dùng: gọi recall_memory với query NHẮM ĐÚNG khía cạnh được hỏi (vd hỏi về thiết bị \

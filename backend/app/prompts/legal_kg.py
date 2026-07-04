@@ -58,7 +58,9 @@ Nhiệm vụ của bạn là trích xuất các thực thể (entities) và mố
 ## Các loại quan hệ được phép (PHẢI dùng chính xác tên sau):
 - CAN_CU: Văn bản hiện tại căn cứ vào/dựa trên văn bản pháp lý khác. Source: Document → Target: Document
 - VIEN_DAN: Điều khoản viện dẫn/tham chiếu một quy định khác. Source: Article → Target: Document/Article
-- SUA_DOI: Văn bản sửa đổi, bổ sung văn bản khác. Source: Document → Target: Document
+- SUA_DOI: Văn bản sửa đổi, bổ sung văn bản khác (văn bản bị sửa VẪN còn hiệu lực). Source: Document → Target: Document
+- THAY_THE: Văn bản thay thế TOÀN BỘ văn bản khác — văn bản bị thay thế HẾT hiệu lực. Nhận diện từ điều khoản thi hành: "thay thế Nghị định số...", "Luật X số ... hết hiệu lực kể từ ngày Luật này có hiệu lực". Source: Document → Target: Document
+- BAI_BO: Văn bản bãi bỏ văn bản khác hoặc điều/khoản/điểm cụ thể của văn bản khác ("bãi bỏ Nghị định số...", "bãi bỏ khoản 3 Điều 49 của Luật..."). Source: Document → Target: Document/Article
 - CHU_TRI: Đơn vị, cơ quan, cá nhân chủ trì thực hiện. Source: Task/Article → Target: Organization/Person
 - PHOI_HOP: Đơn vị, cơ quan, cá nhân phối hợp thực hiện. Source: Task/Article → Target: Organization/Person
 - CHIU_TRACH_NHIEM: Đơn vị chịu trách nhiệm thi hành hoặc giám sát. Source: Task/Article → Target: Organization/Person

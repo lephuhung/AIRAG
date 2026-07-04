@@ -52,6 +52,11 @@ class EnrichedChunk:
     has_code: bool = False
     contextualized: str = ""  # heading_path joined for context
     score: float = 0.0
+    # Hiệu lực pháp lý của văn bản chứa chunk, tra từ DB lúc retrieval
+    # (không lưu vào metadata Chroma — trạng thái đổi khi có văn bản mới):
+    # "" | "unknown" | "effective" | "partially_amended" | "superseded"
+    validity_status: str = ""
+    superseded_by: str = ""  # số hiệu văn bản thay thế, nếu superseded
 
 
 @dataclass

@@ -164,6 +164,9 @@ class Settings(BaseSettings):
     # Recency boost: prefer newer documents based on published_date
     HRAG_RECENTNESS_BOOST: float = Field(default=0.3)  # 0=disabled, 1=full weight
     HRAG_RECENTNESS_DECAY_DAYS: int = Field(default=365)  # half-life in days
+    # Nhân điểm rerank cho chunk của văn bản ĐÃ BỊ THAY THẾ (validity_status=
+    # 'superseded') khi truy vấn không scope đích danh văn bản. 1.0 = tắt.
+    HRAG_SUPERSEDED_DEMOTE: float = Field(default=0.5)
 
     # Knowledge Graph
     HRAG_KG_LANGUAGE: str = Field(default="Vietnamese")
@@ -175,6 +178,8 @@ class Settings(BaseSettings):
             "CAN_CU",
             "VIEN_DAN",
             "SUA_DOI",
+            "THAY_THE",
+            "BAI_BO",
             "CHU_TRI",
             "PHOI_HOP",
             "CHIU_TRACH_NHIEM",

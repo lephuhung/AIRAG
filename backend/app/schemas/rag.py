@@ -290,6 +290,13 @@ class ChatSourceChunk(BaseModel):
     score: float = 0.0
     source_type: str = "vector"  # "vector" | "kg"
     source_file: str | None = None
+    # Citation cấp điều khoản: hiển thị "Điều 17 — 85/2016/NĐ-CP" thay vì tên file
+    document_number: str | None = None
+    article_label: str | None = None
+    # Hiệu lực pháp lý của văn bản nguồn (badge cảnh báo ở SourcesPanel):
+    # "effective" | "superseded" | "partially_amended" | "unknown" | None
+    validity_status: str | None = None
+    superseded_by: str | None = None
 
 
 class ChatImageRef(BaseModel):

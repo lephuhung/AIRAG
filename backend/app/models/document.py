@@ -99,6 +99,22 @@ class Document(Base):
     # Root Document node entity_id in Neo4j (used for KG metadata updates)
     kg_root_entity_id: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
+    # Trạng thái hiệu lực PHÁP LÝ (khác ``status`` = trạng thái xử lý pipeline):
+    # 'unknown' | 'effective' | 'superseded' | 'partially_amended'
+    validity_status: Mapped[str | None] = mapped_column(
+        String(30), nullable=True, default="unknown"
+    )
+    # Số hiệu văn bản thay thế/bãi bỏ văn bản này (giữ cả khi văn bản đó chưa
+    # được upload vào kho); id chỉ set khi nó có thật trong bảng documents.
+    superseded_by_number: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    superseded_by_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("documents.id", ondelete="SET NULL"), nullable=True
+    )
+    # Ngày văn bản NÀY có hiệu lực ("dd/mm/yyyy" hoặc "sign_date" = từ ngày ký)
+    effective_date: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Các tuyên bố hiệu lực trích từ điều khoản thi hành (list[ValidityEvent.as_dict])
+    validity_events: Mapped[list | None] = mapped_column(JSON, nullable=True)
+
     # User who uploaded this document
     uploaded_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True

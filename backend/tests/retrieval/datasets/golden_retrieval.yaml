@@ -1,0 +1,198 @@
+# Golden retrieval set — đo chất lượng hybrid retrieval (DeepRetriever.query)
+# trên kho thật. Queries lấy từ agent_traces (câu hỏi người dùng thật, đã dedup)
+# + biến thể tay để phủ các dạng: tham chiếu điều khoản, câu hỏi khái niệm,
+# công văn không cấu trúc, viết tắt, out-of-corpus.
+#
+# Nhãn (expect_article) được đối chiếu thủ công với danh sách "Điều N. <tiêu đề>"
+# dump từ ChromaDB ngày 2026-07-03 — sửa nhãn phải kiểm tra lại văn bản gốc.
+#
+# Schema mỗi case:
+#   id:               định danh duy nhất, tiền tố sec-/con-/doc-/neg-
+#   query:            câu hỏi (nguyên văn hoặc gần nguyên văn trace thật)
+#   expect_document:  pattern ILIKE trên documents.document_number — văn bản
+#                     chứa câu trả lời; đồng thời neo workspace cho case
+#   accept_documents: (tùy chọn) pattern các văn bản khác cũng tính là đúng
+#                     ở mức document (vd luật cũ/luật mới cùng chủ đề)
+#   expect_article:   (tùy chọn) list số Điều chứa câu trả lời — chỉ chấm
+#                     trong expect_document (không chấm accept_documents)
+#   negative:         true = câu hỏi ngoài kho; đo score/độ nhiễu, không tính recall
+#   tags:             để lọc/phân tích report, không ảnh hưởng chấm điểm
+
+defaults:
+  top_k: 8
+  mode: hybrid
+
+cases:
+  # ── Workspace: 85/2016/NĐ-CP + 361/2025/NĐ-CP ──────────────────────────────
+  - id: sec-85-d17
+    query: Tóm tắt điều 17 của Nghị định 85/2016
+    expect_document: "85/2016%"
+    expect_article: [17]
+    tags: [section-ref, ocr]
+
+  - id: sec-85-d20
+    query: Điều 20 Nghị định 85/2016 quy định nội dung gì
+    expect_document: "85/2016%"
+    expect_article: [20]
+    tags: [section-ref, ocr]
+
+  - id: con-85-chuquan
+    query: Trách nhiệm của chủ quản hệ thống thông tin là gì
+    expect_document: "85/2016%"
+    expect_article: [20]
+    tags: [concept, ocr]
+
+  - id: con-85-hoso
+    query: Hồ sơ đề xuất cấp độ gồm những thành phần gì
+    expect_document: "85/2016%"
+    expect_article: [15]
+    tags: [concept, ocr]
+
+  - id: con-85-capdo3
+    query: Tiêu chí xác định cấp độ 3 của hệ thống thông tin là gì
+    expect_document: "85/2016%"
+    expect_article: [9]
+    tags: [concept, ocr]
+
+  - id: con-85-thamquyen
+    query: Ai có thẩm quyền thẩm định và phê duyệt hồ sơ đề xuất cấp độ
+    expect_document: "85/2016%"
+    expect_article: [12, 16]
+    tags: [concept, ocr]
+
+  - id: sec-361-phamvi
+    query: đơn vị tôi có thuộc phạm vi của Nghị định 361/2025 không
+    expect_document: "361/2025%"
+    expect_article: [1, 2]
+    tags: [section-ref, ocr, trace]
+
+  - id: con-361-ngach
+    query: Xếp ngạch công chức theo vị trí việc làm như thế nào
+    expect_document: "361/2025%"
+    expect_article: [9]
+    tags: [concept, ocr, trace]
+
+  - id: con-361-tyle-xa
+    query: Tỷ lệ công chức bố trí theo vị trí việc làm ở cấp xã là bao nhiêu
+    expect_document: "361/2025%"
+    expect_article: [8]
+    tags: [concept, ocr]
+
+  - id: con-361-gioithieu
+    query: Nghị định 361 quy định về việc gì
+    expect_document: "361/2025%"
+    expect_article: [1]
+    tags: [section-ref, ocr, trace]
+
+  # ── Workspace: 116/2025/QH15 + 24/2018/QH14 + 117/2025/QH15 ────────────────
+  # Hai Luật An ninh mạng (cũ 24/2018, mới 116/2025) cùng workspace: câu hỏi
+  # khái niệm ANM chấp nhận cả hai ở mức document, nhưng Điều chỉ chấm trên
+  # luật mới (văn bản đang hiệu lực).
+  - id: con-117-tieuhuy
+    query: Quy định về tiêu hủy tài liệu bí mật nhà nước như thế nào?
+    expect_document: "117/2025%"
+    expect_article: [23]
+    tags: [concept, ocr, trace]
+
+  - id: con-117-giahan
+    query: gia hạn thời hạn bảo vệ BMNN như thế nào
+    expect_document: "117/2025%"
+    expect_article: [20]
+    tags: [concept, ocr, trace, abbrev]
+
+  - id: con-117-domat
+    query: Bí mật nhà nước có bao nhiêu độ mật
+    expect_document: "117/2025%"
+    expect_article: [8]
+    tags: [concept, ocr, trace]
+
+  - id: con-117-nghiemcam
+    query: Các hành vi bị nghiêm cấm trong bảo vệ bí mật nhà nước
+    expect_document: "117/2025%"
+    expect_article: [5]
+    tags: [concept, ocr]
+
+  - id: con-117-saochup
+    query: Việc sao, chụp tài liệu bí mật nhà nước được quy định như thế nào
+    expect_document: "117/2025%"
+    expect_article: [11]
+    tags: [concept, ocr]
+
+  - id: con-117-mangra
+    query: Mang tài liệu bí mật nhà nước ra khỏi nơi lưu giữ cần điều kiện gì
+    expect_document: "117/2025%"
+    expect_article: [14]
+    tags: [concept, ocr]
+
+  - id: con-116-kinhdoanh
+    query: Điều kiện kinh doanh sản phẩm, dịch vụ an ninh mạng
+    expect_document: "116/2025%"
+    accept_documents: ["24/2018%"]
+    expect_article: [29]
+    tags: [concept, ocr, trace]
+
+  - id: con-116-bienphap
+    query: Các biện pháp bảo vệ an ninh mạng
+    expect_document: "116/2025%"
+    accept_documents: ["24/2018%"]
+    expect_article: [5]
+    tags: [concept, ocr, trace]
+
+  - id: con-116-lucluong
+    query: Lực lượng bảo vệ an ninh mạng gồm những lực lượng nào
+    expect_document: "116/2025%"
+    accept_documents: ["24/2018%"]
+    expect_article: [30]
+    tags: [concept, ocr]
+
+  - id: con-116-tancong
+    query: Phòng, chống tấn công mạng được quy định như thế nào
+    expect_document: "116/2025%"
+    accept_documents: ["24/2018%"]
+    expect_article: [18]
+    tags: [concept, ocr]
+
+  - id: con-116-doanhnghiep
+    query: Trách nhiệm của doanh nghiệp cung cấp dịch vụ trên không gian mạng
+    expect_document: "116/2025%"
+    accept_documents: ["24/2018%"]
+    expect_article: [41]
+    tags: [concept, ocr, trace]
+
+  - id: con-116-kiemtra
+    query: Kiểm tra an ninh mạng do ai thực hiện
+    expect_document: "116/2025%"
+    accept_documents: ["24/2018%"]
+    expect_article: [12]
+    tags: [concept, ocr, trace]
+
+  # ── Công văn không cấu trúc Điều (doc-level only) ──────────────────────────
+  - id: doc-3966-email
+    query: địa chỉ email để báo cáo hằng tuần là gì
+    expect_document: "3966/CT-NVT%"
+    tags: [congvan, trace]
+
+  - id: doc-3966-chuanhoa
+    query: Việc chuẩn hóa dữ liệu thuế sử dụng đất phi nông nghiệp cần hoàn thành như thế nào
+    expect_document: "3966/CT-NVT%"
+    tags: [congvan, trace]
+
+  - id: doc-2614-vuongmac
+    query: Việc tiếp nhận và xử lý vướng mắc về nghĩa vụ thuế của người nộp thuế được triển khai như thế nào
+    expect_document: "2614/HTI%"
+    tags: [congvan]
+
+  # ── Out-of-corpus (negative): kho KHÔNG có văn bản trả lời được ────────────
+  # Không tính recall; report ghi lại top-score + số chunk lọt qua ngưỡng
+  # HRAG_MIN_RELEVANCE_SCORE để theo dõi độ nhiễu.
+  - id: neg-nd13
+    query: Nghị định 13/2023 quy định gì về bảo vệ dữ liệu cá nhân?
+    expect_document: "116/2025%"   # chỉ dùng làm neo workspace
+    negative: true
+    tags: [negative, trace]
+
+  - id: neg-cakoi
+    query: Quy định về nuôi cá koi trên sao Hỏa theo pháp luật Việt Nam là gì?
+    expect_document: "116/2025%"   # chỉ dùng làm neo workspace
+    negative: true
+    tags: [negative, trace]

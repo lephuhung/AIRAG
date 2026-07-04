@@ -24,6 +24,7 @@ from app.services.deep_document_parser import DeepDocumentParser
 from app.services.knowledge_graph_service import get_kg_service
 from app.services.deep_retriever import DeepRetriever
 from app.services.embedder import EmbeddingService, get_embedding_service
+from app.services.heading_path import extract_article_nos
 from app.services.vector_store import VectorStore, get_vector_store
 from app.services.reranker import get_reranker_service
 from app.services.rag_service import RAGQueryResult, RetrievedChunk
@@ -208,6 +209,9 @@ class HRAGService:
                         "file_type": document.file_type,
                         "page_no": c.page_no,
                         "heading_path": " > ".join(c.heading_path) if c.heading_path else "",
+                        # Số Điều dạng cấu trúc ("17|18") — tra cứu điều khoản
+                        # chính xác, không regex trên chuỗi heading_path
+                        "article_nos": "|".join(extract_article_nos(c.heading_path)),
                         "has_table": c.has_table,
                         "has_code": c.has_code,
                         # Image-aware metadata: pipe-separated IDs and URLs

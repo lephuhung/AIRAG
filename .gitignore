@@ -33,6 +33,7 @@ cloudflared/*.json
 
 # Prompt-eval run artifacts
 backend/tests/prompts/reports/
+backend/tests/retrieval/reports/
 backend/tests/prompts
 backend/scripts
 backend/tests/conftest.py

@@ -214,10 +214,29 @@ class DeepRetriever:
                 raw_chunks, raw_citations
             )
 
-        # Rerank: cross-encoder scoring for precision
-        chunks, citations = await asyncio.to_thread(
-            self._rerank_chunks, question, raw_chunks, raw_citations, top_k
+        # Hiệu lực pháp lý: tra DB (không phải metadata Chroma — trạng thái
+        # đổi khi văn bản thay thế được upload sau). Chunk của văn bản
+        # superseded bị demote, TRỪ khi caller scope đích danh document_ids
+        # (user chủ động hỏi văn bản cũ thì vẫn trả, kèm cảnh báo ở context).
+        validity_map = await self._fetch_validity_map(raw_chunks)
+        demote = (
+            not document_ids
+            and settings.HRAG_SUPERSEDED_DEMOTE < 1.0
+            and any(status == "superseded" for status, _ in validity_map.values())
         )
+
+        # Rerank: cross-encoder scoring for precision. Khi demote, lấy dư gấp
+        # đôi để chunk văn bản còn hiệu lực ngoài top_k có cơ hội thế chỗ.
+        chunks, citations = await asyncio.to_thread(
+            self._rerank_chunks, question, raw_chunks, raw_citations,
+            top_k * 2 if demote else top_k,
+        )
+        for chunk in chunks:
+            status, by = validity_map.get(str(chunk.document_id), ("", ""))
+            chunk.validity_status = status
+            chunk.superseded_by = by
+        if demote:
+            chunks, citations = self._demote_superseded(chunks, citations, top_k)
 
         # Find related images and tables
         image_refs = []
@@ -225,10 +244,11 @@ class DeepRetriever:
         if include_images and self.db and chunks:
             page_nos = {(str(c.document_id), c.page_no) for c in chunks if c.page_no > 0}
             if page_nos:
-                image_refs, table_refs = await asyncio.gather(
-                    self._find_related_images(page_nos),
-                    self._find_related_tables(page_nos),
-                )
+                # Sequential on purpose: both share self.db, and one AsyncSession
+                # must never run two statements concurrently (raises
+                # InvalidRequestError "concurrent operations are not permitted").
+                image_refs = await self._find_related_images(page_nos)
+                table_refs = await self._find_related_tables(page_nos)
 
         # Assemble context
         context = self._assemble_context(chunks, citations, kg_summary, image_refs, table_refs)
@@ -578,6 +598,55 @@ class DeepRetriever:
 
         return reranked_chunks, reranked_citations
 
+    async def _fetch_validity_map(
+        self, chunks: list[EnrichedChunk]
+    ) -> dict[str, tuple[str, str]]:
+        """document_id → (validity_status, superseded_by_number) cho các chunk.
+
+        Best-effort: không có db session hoặc query lỗi → map rỗng (mọi thứ
+        chạy tiếp như trước khi có validity).
+        """
+        if not self.db or not chunks:
+            return {}
+        doc_ids = []
+        for c in chunks:
+            try:
+                doc_ids.append(uuid.UUID(str(c.document_id)))
+            except (ValueError, AttributeError):
+                continue
+        if not doc_ids:
+            return {}
+        try:
+            result = await self.db.execute(
+                select(
+                    Document.id,
+                    Document.validity_status,
+                    Document.superseded_by_number,
+                ).where(Document.id.in_(set(doc_ids)))
+            )
+            return {
+                str(row[0]): (row[1] or "unknown", row[2] or "")
+                for row in result.all()
+            }
+        except Exception as e:
+            logger.warning(f"[deep_retriever] validity lookup failed (non-fatal): {e}")
+            return {}
+
+    @staticmethod
+    def _demote_superseded(
+        chunks: list[EnrichedChunk],
+        citations: list[Citation],
+        top_k: int,
+    ) -> tuple[list[EnrichedChunk], list[Citation]]:
+        """Nhân điểm chunk của văn bản superseded rồi sắp lại, cắt về top_k."""
+        for chunk in chunks:
+            if chunk.validity_status == "superseded":
+                chunk.score *= settings.HRAG_SUPERSEDED_DEMOTE
+        paired = sorted(
+            zip(chunks, citations), key=lambda p: p[0].score, reverse=True
+        )[:top_k]
+        return [p[0] for p in paired], [p[1] for p in paired]
+
     async def _find_related_images(
         self,
         page_refs: set[tuple[uuid.UUID, int]],  # (document_id, page_no)
@@ -675,6 +744,16 @@ class DeepRetriever:
             parts.append("## Retrieved Document Sections")
             for i, (chunk, citation) in enumerate(zip(chunks, citations)):
                 parts.append(f"### [{i + 1}] {citation.format()}")
+                if chunk.validity_status == "superseded":
+                    by = (
+                        f" — đã được thay thế bởi {chunk.superseded_by}"
+                        if chunk.superseded_by else ""
+                    )
+                    parts.append(f"⚠️ VĂN BẢN NÀY ĐÃ HẾT HIỆU LỰC{by}.")
+                elif chunk.validity_status == "partially_amended":
+                    parts.append(
+                        "⚠️ Văn bản này đã được sửa đổi/bãi bỏ một phần bởi văn bản khác."
+                    )
                 parts.append(chunk.content)
                 parts.append("")
 

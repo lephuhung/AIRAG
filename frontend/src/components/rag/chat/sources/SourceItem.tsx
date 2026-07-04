@@ -87,9 +87,33 @@ export function SourceItem({
       <div className="flex items-center gap-2 mb-1">
         <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 flex-shrink-0" />
         <span className="text-[10px] font-medium text-foreground/80">
-          {doc?.original_filename || t("rag.source")}
+          {source.article_label && source.document_number
+            ? `${source.article_label} — ${source.document_number}`
+            : source.document_number ||
+              doc?.original_filename ||
+              t("rag.source")}
         </span>
         <span className="text-[10px] text-muted-foreground">p.{source.page_no}</span>
+        {source.validity_status === "superseded" && (
+          <span
+            className="text-[9px] px-1 py-0.5 rounded font-medium bg-destructive/15 text-destructive flex-shrink-0"
+            title={
+              source.superseded_by
+                ? `Đã được thay thế bởi ${source.superseded_by}`
+                : "Văn bản đã hết hiệu lực"
+            }
+          >
+            Hết hiệu lực
+          </span>
+        )}
+        {source.validity_status === "partially_amended" && (
+          <span
+            className="text-[9px] px-1 py-0.5 rounded font-medium bg-amber-400/15 text-amber-600 dark:text-amber-400 flex-shrink-0"
+            title="Văn bản đã được sửa đổi/bãi bỏ một phần"
+          >
+            Đã sửa đổi
+          </span>
+        )}
         {source.heading_path.length > 0 && (
           <span className="text-[10px] text-muted-foreground/60 truncate">
             {source.heading_path.join(" > ")}

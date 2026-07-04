@@ -63,6 +63,30 @@ class Heading:
 # Giữ alias cũ cho nội bộ module
 _Heading = Heading
 
+# Component heading_path của một Điều: "Điều 17. Hồ sơ..." / "Điều 5a: ..."
+_DIEU_COMPONENT_RE = re.compile(r"(?i)^\s*Điều\s+(\d+[a-zA-Z]?)\b")
+
+
+def extract_article_nos(heading_path: list[str] | str | None) -> list[str]:
+    """Rút SỐ ĐIỀU từ heading_path của chunk → ["17", "18"].
+
+    Nguồn của metadata ``article_nos`` (pipe-separated) trên chunk ChromaDB —
+    cho ``search_document_section`` match chính xác "Điều 17" không cần regex
+    trên chuỗi heading_path (né luôn lỗi "Điều 3" trúng "Điều 30").
+    """
+    if isinstance(heading_path, str):
+        components = [c.strip() for c in heading_path.split(">")]
+    else:
+        components = [str(c) for c in (heading_path or [])]
+    out: list[str] = []
+    for comp in components:
+        m = _DIEU_COMPONENT_RE.match(comp)
+        if m:
+            no = m.group(1).lower()
+            if no not in out:
+                out.append(no)
+    return out
+
 
 def find_headings(text: str) -> list[Heading]:
     """Public API: liệt kê heading Phần/Chương/Mục/Điều trong ``text`` theo thứ tự.

@@ -690,6 +690,180 @@ async def query_knowledge_graph(
 
 
 # ---------------------------------------------------------------------------
+# Tool 4b: get_document_relations — quan hệ văn bản ↔ văn bản + hiệu lực
+# ---------------------------------------------------------------------------
+
+_REL_LABELS = {
+    "CAN_CU": "căn cứ",
+    "VIEN_DAN": "viện dẫn",
+    "SUA_DOI": "sửa đổi, bổ sung",
+    "THAY_THE": "thay thế",
+    "BAI_BO": "bãi bỏ",
+    "REFERENCES": "tham chiếu",
+}
+_EVENT_LABELS = {
+    "thay_the": "thay thế",
+    "bai_bo": "bãi bỏ",
+    "het_hieu_luc": "làm hết hiệu lực",
+}
+_VALIDITY_LABELS = {
+    "effective": "còn hiệu lực",
+    "superseded": "ĐÃ HẾT HIỆU LỰC",
+    "partially_amended": "đã được sửa đổi/bãi bỏ một phần",
+    "unknown": "chưa xác định hiệu lực",
+}
+
+
+async def get_document_relations(
+    document: str,
+    workspace_ids: list,
+    db: "AsyncSession",
+    relation: Optional[str] = None,
+) -> dict:
+    """
+    Tra quan hệ VĂN BẢN ↔ VĂN BẢN (căn cứ / viện dẫn / sửa đổi / thay thế /
+    bãi bỏ) và trạng thái hiệu lực, gộp từ HAI nguồn:
+
+    - bảng ``documents`` (validity_status/superseded_by/validity_events —
+      trích regex từ điều khoản thi hành, phủ cả kho hiện có);
+    - Neo4j LegalKG (edges CAN_CU/VIEN_DAN/SUA_DOI/THAY_THE/BAI_BO).
+
+    Returns: dict với key ``text`` (kết quả đã format tiếng Việt).
+    """
+    import re as _re
+
+    from sqlalchemy import or_, select
+
+    from app.models.document import Document
+    from app.services.knowledge_graph_service import get_kg_service
+
+    ref = (document or "").strip()
+    if not ref:
+        return {"text": "Lỗi: thiếu tên/số hiệu văn bản."}
+
+    # Số hiệu dạng "85/2016(/NĐ-CP)" nếu có trong ref — match DB chặt hơn title
+    num_match = _re.search(r"\d{1,4}/\d{4}(?:/[\w\-]+)?", ref)
+    number_pat = f"%{num_match.group(0)}%" if num_match else None
+
+    lines: list[str] = []
+    seen: set[tuple] = set()
+
+    # ── Nguồn 1: bảng documents ─────────────────────────────────────────────
+    matched_docs = []
+    try:
+        conds = [Document.document_title.ilike(f"%{ref}%")]
+        if number_pat:
+            conds.append(Document.document_number.ilike(number_pat))
+        else:
+            conds.append(Document.document_number.ilike(f"%{ref}%"))
+        matched_docs = (await db.execute(
+            select(Document).where(
+                Document.workspace_id.in_(workspace_ids), or_(*conds)
+            ).limit(5)
+        )).scalars().all()
+
+        for doc in matched_docs:
+            status = _VALIDITY_LABELS.get(doc.validity_status or "unknown")
+            head = f"• {doc.document_number or doc.document_title}: {status}"
+            if doc.validity_status == "superseded" and doc.superseded_by_number:
+                head += f" — được thay thế bởi {doc.superseded_by_number}"
+            if doc.effective_date:
+                head += f" (có hiệu lực từ {doc.effective_date})"
+            lines.append(head)
+            # Sự kiện full (đổi hiệu lực văn bản khác) luôn hiện; partial
+            # (sửa cụm từ/khoản lẻ) cap lại để không nhấn chìm tín hiệu chính.
+            events = sorted(
+                doc.validity_events or [],
+                key=lambda ev: ev.get("scope") != "full",
+            )
+            shown_partial = 0
+            for ev in events:
+                is_partial = ev.get("scope") == "partial"
+                if is_partial and shown_partial >= 8:
+                    continue
+                key = (doc.document_number, ev.get("kind"), ev.get("target_number"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                shown_partial += is_partial
+                kind = _EVENT_LABELS.get(ev.get("kind"), ev.get("kind"))
+                scope = " MỘT PHẦN" if is_partial else " toàn bộ"
+                lines.append(
+                    f"  - {doc.document_number} {kind}{scope}: {ev.get('target_number')}"
+                )
+            hidden = sum(1 for ev in events if ev.get("scope") == "partial") - shown_partial
+            if hidden > 0:
+                lines.append(f"  - … và {hidden} tuyên bố sửa đổi một phần khác")
+
+        # Văn bản KHÁC trong kho từng tuyên bố nhắm vào ref (chiều ngược)
+        if number_pat:
+            others = (await db.execute(
+                select(Document).where(
+                    Document.workspace_id.in_(workspace_ids),
+                    Document.validity_events.isnot(None),
+                )
+            )).scalars().all()
+            matched_ids = {d.id for d in matched_docs}
+            bare = num_match.group(0).lower()
+            for doc in others:
+                if doc.id in matched_ids:
+                    continue
+                for ev in doc.validity_events or []:
+                    target = (ev.get("target_number") or "").lower()
+                    if bare not in target:
+                        continue
+                    kind = _EVENT_LABELS.get(ev.get("kind"), ev.get("kind"))
+                    scope = " MỘT PHẦN" if ev.get("scope") == "partial" else " toàn bộ"
+                    key = (doc.document_number, ev.get("kind"), ev.get("target_number"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    lines.append(
+                        f"• {doc.document_number} {kind}{scope}: {ev.get('target_number')}"
+                        f" (trích: \"{(ev.get('quote') or '')[:120]}...\")"
+                    )
+    except Exception as e:
+        logger.warning(f"[tool:get_document_relations] DB lookup failed: {e}")
+
+    # ── Nguồn 2: Neo4j LegalKG ──────────────────────────────────────────────
+    rel_filter = None
+    if relation:
+        rel_key = relation.strip().upper()
+        if rel_key in _REL_LABELS:
+            rel_filter = [rel_key]
+    for ws_id in workspace_ids:
+        try:
+            kg_service = get_kg_service(workspace_id=ws_id)
+            if not hasattr(kg_service, "get_document_relations"):
+                continue  # lightrag mode không có traversal văn bản
+            kg_rels = await kg_service.get_document_relations(
+                ref, relation_types=rel_filter
+            )
+            for r in kg_rels:
+                key = (r["source"], r["relation"], r["target"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                label = _REL_LABELS.get(r["relation"], r["relation"])
+                desc = f" ({r['description'][:100]})" if r.get("description") else ""
+                lines.append(f"• {r['source']} —[{label}]→ {r['target']}{desc}")
+        except Exception as e:
+            logger.warning(
+                f"[tool:get_document_relations] KG lookup failed ws={ws_id}: {e}"
+            )
+
+    if not lines:
+        return {
+            "text": (
+                f"Không tìm thấy quan hệ văn bản nào cho '{ref}' trong kho. "
+                f"Kho chỉ biết quan hệ giữa các văn bản ĐÃ được upload hoặc "
+                f"được nhắc tới trong điều khoản thi hành của chúng."
+            )
+        }
+    return {"text": f"Quan hệ văn bản cho '{ref}':\n" + "\n".join(lines)}
+
+
+# ---------------------------------------------------------------------------
 # Tool 5: search_documents_number
 # ---------------------------------------------------------------------------
 
@@ -1199,16 +1373,25 @@ async def search_document_section(
             if res.get("documents") and res.get("metadatas"):
                 # Filter in Python for substring match in heading_path
                 ref_norm = section_reference.lower().strip().rstrip(".")
-                
+
                 # Precise matching using regex to avoid partial matches (e.g., "Điều 3" vs "Điều 30")
                 import re
                 ref_pattern = rf"(?i)\b{re.escape(ref_norm)}(?!\d)\b" # Match whole word, no digit immediately after
-                
+
+                # Tham chiếu có SỐ ĐIỀU ("Điều 17", "Khoản 2 Điều 8") → match
+                # chính xác trên metadata article_nos ("17|18"); chunk chưa có
+                # article_nos (chưa backfill) rơi về regex heading_path.
+                art_ref = re.search(r"(?i)\bđiều\s+(\d+[a-zA-Z]?)\b", ref_norm)
+                want_art = art_ref.group(1).lower() if art_ref else None
+
                 for doc, meta in zip(res["documents"], res["metadatas"]):
                     path = meta.get("heading_path", "")
+                    art_nos = meta.get("article_nos") or ""
                     match = False
-                    
-                    if isinstance(path, str) and path:
+
+                    if want_art and art_nos:
+                        match = want_art in art_nos.lower().split("|")
+                    elif isinstance(path, str) and path:
                         # Split by separator and check components
                         components = [c.strip() for c in path.split(">")]
                         if any(re.search(ref_pattern, c) for c in components):
@@ -1216,7 +1399,7 @@ async def search_document_section(
                     elif isinstance(path, list):
                         if any(re.search(ref_pattern, str(c)) for c in path):
                             match = True
-                            
+
                     if match:
                         all_chunks.append({"content": doc, "metadata": meta})
             
