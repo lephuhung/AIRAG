@@ -261,7 +261,7 @@ export function WorkersPage() {
       invalidateAll();
       toast.success(t("workers.restart_all_success"));
     },
-    onError: (err: Error) => toast.error(t("workers.restart_all_failed")),
+    onError: () => toast.error(t("workers.restart_all_failed")),
   });
 
   // ── Pipeline mutations ──
@@ -380,9 +380,6 @@ export function WorkersPage() {
     return { workerQueueGroups: groups, systemQueues: system };
   }, [overview?.queues]);
 
-  // True when all workers run as Docker containers (no subprocess management needed)
-  const isContainerMode = Object.values(overview?.container_workers ?? {}).some((c) => c > 0);
-
   // Health status color
   const healthStatus = health?.status ?? "unknown";
   const healthColor =
@@ -416,37 +413,34 @@ export function WorkersPage() {
             </p>
           </div>
           <div className="flex items-center gap-3">
-            {!isContainerMode && (
-              <>
-                <Button
-                  variant="default"
-                  size="sm"
-                  className="h-8 gap-1.5 text-xs shadow-sm shadow-primary/20"
-                  onClick={() => {
-                    WORKER_TYPES.forEach((wt) =>
-                      startWorker.mutate({ worker_type: wt, count: 1 })
-                    );
-                  }}
-                  disabled={startWorker.isPending}
-                >
-                  <Zap className={cn("w-3.5 h-3.5", startWorker.isPending && "animate-spin")} />
-                  {t("workers.start_all")}
-                </Button>
+            {/* Control-plane commands — work for container workers via RabbitMQ */}
+            <Button
+              variant="default"
+              size="sm"
+              className="h-8 gap-1.5 text-xs shadow-sm shadow-primary/20"
+              onClick={() => {
+                WORKER_TYPES.forEach((wt) =>
+                  startWorker.mutate({ worker_type: wt, count: 1 })
+                );
+              }}
+              disabled={startWorker.isPending}
+            >
+              <Zap className={cn("w-3.5 h-3.5", startWorker.isPending && "animate-spin")} />
+              {t("workers.resume_all")}
+            </Button>
 
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-8 gap-1.5 text-xs border-primary/20 text-primary hover:bg-primary/5"
-                  onClick={() => restartAllWorkers.mutate()}
-                  disabled={restartAllWorkers.isPending}
-                >
-                  <RefreshCw className={cn("w-3.5 h-3.5", restartAllWorkers.isPending && "animate-spin")} />
-                  {t("workers.restart_all")}
-                </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 gap-1.5 text-xs border-primary/20 text-primary hover:bg-primary/5"
+              onClick={() => restartAllWorkers.mutate()}
+              disabled={restartAllWorkers.isPending}
+            >
+              <RefreshCw className={cn("w-3.5 h-3.5", restartAllWorkers.isPending && "animate-spin")} />
+              {t("workers.restart_all")}
+            </Button>
 
-                <div className="h-6 w-px bg-border mx-1" />
-              </>
-            )}
+            <div className="h-6 w-px bg-border mx-1" />
 
             <div className="flex items-center gap-2">
               {/* Health badge */}
@@ -548,12 +542,13 @@ export function WorkersPage() {
                 {WORKER_TYPES.map((wtype) => {
                   const rmqConsumers = overview?.active_workers?.[wtype] ?? 0;
                   const containerCount = overview?.container_workers?.[wtype] ?? 0;
-                  const managedCount = overview?.managed_workers?.[wtype] ?? 0;
                   const managedList = managedWorkers[wtype] ?? [];
-                  const aliveList = managedList.filter((w) => w.alive);
-                  // Prefer container count for Docker workers; fall back to consumer count for non-container workers
-                  const workerCount = containerCount > 0 ? containerCount : (rmqConsumers > 0 ? rmqConsumers : managedCount);
+                  // Live container replicas (healthy or deliberately paused)
+                  const aliveList = managedList.filter((w) => w.status === "healthy" || w.status === "paused");
+                  // Prefer container count for Docker workers; fall back to consumer count
+                  const workerCount = containerCount > 0 ? containerCount : rmqConsumers;
                   const isRunning = workerCount > 0 || aliveList.length > 0;
+                  const isPaused = aliveList.length > 0 && aliveList.every((w) => w.paused);
 
                   return (
                     <div
@@ -569,24 +564,32 @@ export function WorkersPage() {
                           <div className="flex items-center gap-2">
                             <div className={cn(
                               "w-2.5 h-2.5 rounded-full flex-shrink-0",
+                              isPaused ? "bg-amber-400" :
                               isRunning ? "bg-green-400 animate-pulse" : "bg-muted-foreground/30",
                             )} />
                             <span className={cn("text-sm font-semibold truncate", WORKER_COLORS[wtype])}>
                               {t(`workers.types.${wtype}`) || wtype}
                             </span>
+                            {isPaused && (
+                              <span className="text-[10px] font-medium text-amber-400 bg-amber-500/10 border border-amber-500/20 rounded-full px-1.5 py-0.5">
+                                {t("workers.paused")}
+                              </span>
+                            )}
                           </div>
                           <span className="text-xs font-bold tabular-nums text-muted-foreground ml-2">
                             {workerCount}
                           </span>
                         </div>
 
-                        {/* Managed worker details */}
+                        {/* Container replica details */}
                         {aliveList.length > 0 && (
                           <div className="space-y-1 mb-2">
                             {aliveList.slice(0, 2).map((w) => (
-                              <div key={w.pid} className="flex items-center justify-between text-[11px] text-muted-foreground">
-                                <span>{t("workers.labels.pid")} {w.pid}</span>
-                                <span>{formatUptime(w.uptime_seconds)}</span>
+                              <div key={w.container} className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                                <span className={cn("truncate", w.paused && "text-amber-400/80")} title={w.container}>
+                                  {w.container}
+                                </span>
+                                <span className="flex-shrink-0">{formatUptime(w.uptime_seconds ?? 0)}</span>
                               </div>
                             ))}
                             {aliveList.length > 2 && (
@@ -596,58 +599,44 @@ export function WorkersPage() {
                             )}
                           </div>
                         )}
-
-                        {managedCount > 0 && aliveList.length === 0 && (
-                          <p className="text-[11px] text-muted-foreground/50 mb-2">
-                            {t("workers.managed_external", { count: managedCount })}
-                          </p>
-                        )}
                       </div>
 
-                      {/* Container-managed workers — read-only, no start/stop/restart */}
-                      {containerCount > 0 ? (
-                        <div className="pt-2 border-t border-border/50 text-center">
-                          <span className="text-[10px] text-muted-foreground/60">
-                            {t("workers.container_mode")}
-                          </span>
-                        </div>
-                      ) : (
-                        <div className="flex items-center gap-1.5 pt-2 border-t border-border/50">
+                      {/* Control-plane commands (pause / resume / restart via RabbitMQ) */}
+                      <div className="flex items-center gap-1.5 pt-2 border-t border-border/50">
+                        {isPaused ? (
                           <Button
                             variant="ghost"
                             size="sm"
-                            className="h-7 text-[11px] gap-1 flex-1 px-1"
+                            className="h-7 text-[11px] gap-1 flex-1 px-1 text-green-500 hover:text-green-400"
                             onClick={() => startWorker.mutate({ worker_type: wtype, count: 1 })}
                             disabled={startWorker.isPending}
                           >
                             <Play className="w-3 h-3" />
-                            {t("common.start")}
+                            {t("workers.resume")}
                           </Button>
-                          {isRunning && (
-                            <>
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                className="h-7 text-[11px] gap-1 flex-1 px-1"
-                                onClick={() => restartWorker.mutate(wtype)}
-                                disabled={restartWorker.isPending}
-                              >
-                                <RefreshCw className={cn("w-3 h-3", restartWorker.isPending && "animate-spin")} />
-                                {t("common.restart")}
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                className="h-7 w-7 text-destructive hover:text-destructive flex-shrink-0"
-                                onClick={() => setStopConfirm(wtype)}
-                                disabled={stopWorker.isPending}
-                              >
-                                <Square className="w-3 h-3" />
-                              </Button>
-                            </>
-                          )}
-                        </div>
-                      )}
+                        ) : (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 text-[11px] gap-1 flex-1 px-1"
+                            onClick={() => setStopConfirm(wtype)}
+                            disabled={stopWorker.isPending || !isRunning}
+                          >
+                            <Square className="w-3 h-3" />
+                            {t("workers.pause")}
+                          </Button>
+                        )}
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 text-[11px] gap-1 flex-1 px-1"
+                          onClick={() => restartWorker.mutate(wtype)}
+                          disabled={restartWorker.isPending || !isRunning}
+                        >
+                          <RefreshCw className={cn("w-3 h-3", restartWorker.isPending && "animate-spin")} />
+                          {t("common.restart")}
+                        </Button>
+                      </div>
                     </div>
                   );
                 })}

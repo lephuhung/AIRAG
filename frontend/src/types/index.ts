@@ -474,6 +474,12 @@ export interface ChatSourceChunk {
   heading_path: string[];
   score: number;
   source_type?: "vector" | "kg";
+  // Citation cấp điều khoản: "Điều 17" + số hiệu văn bản
+  document_number?: string | null;
+  article_label?: string | null;
+  // Hiệu lực pháp lý của văn bản nguồn
+  validity_status?: "effective" | "superseded" | "partially_amended" | "unknown" | null;
+  superseded_by?: string | null;
 }
 
 export interface ChatResponseData {
@@ -683,15 +689,17 @@ export interface WorkerHealthCheck {
   };
 }
 
-// ── Managed Worker Process ──
+// ── Worker container replica (reported by its health server) ──
+// status: healthy = consuming, paused = alive but paused via control-plane.
 export interface ManagedWorkerInfo {
-  worker_type: string;
-  pid: number | null;
-  alive: boolean;
-  started_at: number;
-  uptime_seconds: number;
-  restart_count: number;
-  return_code: number | null;
+  container: string;
+  status: "healthy" | "paused" | "unreachable" | "offline";
+  worker_type?: string;
+  paused?: boolean;
+  ready?: boolean;
+  uptime_seconds?: number;
+  code?: number;
+  error?: string;
 }
 
 // ── Dead Letter Queue ──

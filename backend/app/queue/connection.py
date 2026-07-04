@@ -105,7 +105,10 @@ async def get_connection() -> AbstractRobustConnection:
 
 
 async def close_connection() -> None:
-    global _connection
+    global _connection, _pub_channel
+    # Drop the cached publisher channel — it dies with the connection.
+    _pub_channel = None
+    _pub_exchanges.clear()
     if _connection and not _connection.is_closed:
         await _connection.close()
         _connection = None
@@ -284,20 +287,163 @@ async def _start_retry_consumer(channel: aio_pika.Channel) -> None:
 
 
 # ── Publisher helpers ───────────────────────────────────────────────────────
+# Publishing used to open a fresh channel (2 broker round-trips) per message —
+# cache one long-lived channel + declared exchanges instead.
+_pub_channel: aio_pika.abc.AbstractChannel | None = None
+_pub_exchanges: dict[str, aio_pika.abc.AbstractExchange] = {}
+_pub_lock = asyncio.Lock()
+
+
+async def _get_publish_exchange(exchange_name: str) -> aio_pika.abc.AbstractExchange:
+    """Return a declared exchange on the shared publisher channel."""
+    global _pub_channel
+    async with _pub_lock:
+        if _pub_channel is None or _pub_channel.is_closed:
+            conn = await get_connection()
+            _pub_channel = await conn.channel()
+            _pub_exchanges.clear()
+        exchange = _pub_exchanges.get(exchange_name)
+        if exchange is None:
+            exchange = await _pub_channel.declare_exchange(
+                exchange_name, ExchangeType.DIRECT, durable=True
+            )
+            _pub_exchanges[exchange_name] = exchange
+        return exchange
+
+
+async def _reset_publish_channel() -> None:
+    global _pub_channel
+    async with _pub_lock:
+        if _pub_channel is not None and not _pub_channel.is_closed:
+            try:
+                await _pub_channel.close()
+            except Exception:
+                pass
+        _pub_channel = None
+        _pub_exchanges.clear()
+
+
 async def publish(exchange_name: str, routing_key: str, payload: dict) -> None:
     """Publish a JSON message to *exchange_name* with *routing_key*."""
+    # Use default=str to handle UUID serialization
+    body = json.dumps(payload, default=str).encode()
+    message = Message(body, delivery_mode=DeliveryMode.PERSISTENT)
+    try:
+        exchange = await _get_publish_exchange(exchange_name)
+        await exchange.publish(message, routing_key=routing_key)
+    except Exception as e:
+        # Stale/broken cached channel — reset and retry once on a fresh one.
+        logger.warning(f"publish to {exchange_name}/{routing_key} failed ({e}) — retrying on fresh channel")
+        await _reset_publish_channel()
+        exchange = await _get_publish_exchange(exchange_name)
+        await exchange.publish(message, routing_key=routing_key)
+    logger.debug(f"Published to {exchange_name}/{routing_key}: {payload}")
+
+
+async def ensure_kg_queue(workspace_id) -> None:
+    """
+    Declare + bind the per-workspace KG queue BEFORE publishing to it.
+
+    The queue is normally declared by the KG worker's consumer, but its
+    workspace poller only discovers new workspaces every ~30s. A document
+    uploaded to a brand-new workspace would publish its KGMessage before the
+    queue existed — RabbitMQ silently drops unroutable messages, leaving the
+    document stuck in BUILDING_KG forever. Declaring here (idempotent, same
+    arguments as consume()) makes the message buffer until the worker binds.
+    """
+    queue_name = f"{QUEUE_KG_PREFIX}.{workspace_id}"
     conn = await get_connection()
     async with conn.channel() as channel:
         exchange = await channel.declare_exchange(
-            exchange_name, ExchangeType.DIRECT, durable=True
+            EXCHANGE_KG, ExchangeType.DIRECT, durable=True
         )
-        # Use default=str to handle UUID serialization
-        body = json.dumps(payload, default=str).encode()
+        try:
+            queue = await channel.declare_queue(
+                queue_name,
+                durable=True,
+                arguments={
+                    "x-dead-letter-exchange": DLX_EXCHANGE,
+                    "x-max-length": 10000,
+                    "x-overflow": "reject-publish",
+                },
+            )
+            await queue.bind(exchange, routing_key=str(workspace_id))
+        except Exception as e:
+            # Queue exists with different args — it is already bound by the
+            # consumer, so publishing is safe; just log and move on.
+            logger.debug(f"ensure_kg_queue({queue_name}): {e}")
+
+
+# ── Worker control-plane ────────────────────────────────────────────────────
+# Broadcast commands (pause / resume / restart / set_prefetch) to worker
+# processes. Every worker REPLICA gets its own exclusive auto-delete queue
+# bound to its worker_type AND "all", so one publish reaches all replicas.
+# This is how the admin UI manages Docker-containerised workers without
+# touching the Docker socket: "restart" makes the worker drain + exit and the
+# container's restart policy (always) brings it back up.
+CONTROL_EXCHANGE = "hrag.control"
+
+CONTROL_COMMANDS = {"pause", "resume", "restart", "set_prefetch"}
+
+
+async def publish_control(target: str, command: str, extra: dict | None = None) -> None:
+    """
+    Publish a control command to workers.
+
+    target:  a worker type ("parse"/"embed"/"caption"/"kg"/"memory") or "all".
+    command: one of CONTROL_COMMANDS.
+    extra:   optional command arguments (e.g. {"prefetch": 4}).
+    """
+    if command not in CONTROL_COMMANDS:
+        raise ValueError(f"Unknown control command: {command}")
+    payload = {"command": command, "target": target, **(extra or {})}
+    conn = await get_connection()
+    async with conn.channel() as channel:
+        exchange = await channel.declare_exchange(
+            CONTROL_EXCHANGE, ExchangeType.DIRECT, durable=True
+        )
+        # Non-persistent: control commands are ephemeral by design — a worker
+        # that is down will come back with default state anyway.
         await exchange.publish(
-            Message(body, delivery_mode=DeliveryMode.PERSISTENT),
-            routing_key=routing_key,
+            Message(json.dumps(payload).encode()),
+            routing_key=target,
         )
-        logger.debug(f"Published to {exchange_name}/{routing_key}: {payload}")
+    logger.info(f"[control] published {command} → {target}")
+
+
+async def consume_control(
+    worker_type: str, handler: Callable[[dict], Awaitable[None]]
+) -> None:
+    """
+    Consume control commands for this worker replica.
+
+    Each call creates an EXCLUSIVE auto-delete queue (one per process) bound
+    to routing keys <worker_type> and "all" — broadcast semantics. Runs
+    forever; callers wrap it in a task and restart on failure.
+    """
+    conn = await get_connection()
+    channel = await conn.channel()
+    exchange = await channel.declare_exchange(
+        CONTROL_EXCHANGE, ExchangeType.DIRECT, durable=True
+    )
+    queue = await channel.declare_queue("", exclusive=True, auto_delete=True)
+    await queue.bind(exchange, routing_key=worker_type)
+    await queue.bind(exchange, routing_key="all")
+    logger.info(f"[control] listening for commands (worker_type={worker_type})")
+
+    async with queue.iterator() as messages:
+        async for message in messages:
+            async with message.process():
+                try:
+                    payload = json.loads(message.body)
+                except Exception:
+                    logger.warning("[control] unparseable control message — ignored")
+                    continue
+                try:
+                    await handler(payload)
+                except Exception as e:
+                    # Control handler errors must never kill the listener.
+                    logger.error(f"[control] handler failed for {payload}: {e}", exc_info=True)
 
 
 # ── Consumer helper ─────────────────────────────────────────────────────────
@@ -343,6 +489,34 @@ async def consume(
 
     conn = await get_connection()
     channel = await conn.channel()
+    try:
+        await _consume_on_channel(
+            conn, channel, exchange_name, queue_name, routing_key,
+            handler, prefetch_count, handler_timeout,
+        )
+    finally:
+        # The consume loop only exits on cancellation (pause/shutdown) or
+        # abandon — close the channel so repeated pause/resume cycles from
+        # the control-plane don't leak channels on the shared connection.
+        try:
+            if not channel.is_closed:
+                await channel.close()
+        except Exception:
+            pass
+
+
+async def _consume_on_channel(
+    conn,
+    channel,
+    exchange_name: str,
+    queue_name: str,
+    routing_key: str,
+    handler: MessageHandler,
+    prefetch_count: int,
+    handler_timeout: int,
+) -> None:
+    from app.workers.metrics import worker_metrics
+
     await channel.set_qos(prefetch_count=prefetch_count)
 
     # Ensure DLX and retry queues exist
@@ -439,8 +613,11 @@ async def consume(
                                     "timeout": handler_timeout,
                                 },
                             )
+                            will_retry = retry_count < MAX_RETRIES
                             # Timeout: rollback document status to PENDING and requeue for retry
-                            # Only do this for parse queue (other queues don't have status to rollback)
+                            # Only do this for parse queue (other queues don't have status to rollback).
+                            # When retries are exhausted the message is dropped, so leave a
+                            # terminal FAILED state instead of a PENDING that never runs.
                             if "parse" in queue_name and document_id != "unknown":
                                 try:
                                     from app.core.database import async_session_maker
@@ -459,23 +636,32 @@ async def consume(
                                             DocumentStatus.INDEXED,
                                             DocumentStatus.FAILED,
                                         ):
-                                            doc.status = DocumentStatus.PENDING
-                                            doc.error_message = f"timeout_retry: handler timed out after {elapsed:.1f}s"
+                                            if will_retry:
+                                                doc.status = DocumentStatus.PENDING
+                                                doc.error_message = f"timeout_retry: handler timed out after {elapsed:.1f}s"
+                                            else:
+                                                doc.status = DocumentStatus.FAILED
+                                                doc.error_message = (
+                                                    f"timeout: handler timed out after {elapsed:.1f}s — retries exhausted"
+                                                )
                                             await rollback_db.commit()
                                             logger.info(
                                                 f"[timeout_rollback] doc={document_id} "
-                                                f"status reverted to PENDING"
+                                                f"status set to {doc.status}"
                                             )
                                 except Exception as rollback_err:
                                     logger.warning(
                                         f"[timeout_rollback] failed for doc={document_id}: {rollback_err}"
                                     )
-                            # For KG worker: reset kg_done=False so retry can process again
+                            # For KG worker: reset kg_done=False so retry can process again.
+                            # When retries are exhausted, mark kg_done=True (KG skipped) so the
+                            # document is not stuck in BUILDING_KG forever.
                             if "kg" in queue_name and document_id != "unknown":
                                 try:
                                     from app.core.database import async_session_maker
                                     from sqlalchemy import select
                                     from app.models.document import Document, DocumentStatus
+                                    from app.workers.utils import check_and_finalize
 
                                     async with async_session_maker() as rollback_db:
                                         result = await rollback_db.execute(
@@ -489,14 +675,22 @@ async def consume(
                                             DocumentStatus.INDEXED,
                                             DocumentStatus.FAILED,
                                         ):
-                                            doc.kg_done = False
-                                            doc.status = DocumentStatus.BUILDING_KG
-                                            doc.error_message = f"timeout_retry: KG handler timed out after {elapsed:.1f}s — will retry"
+                                            if will_retry:
+                                                doc.kg_done = False
+                                                doc.status = DocumentStatus.BUILDING_KG
+                                                doc.error_message = f"timeout_retry: KG handler timed out after {elapsed:.1f}s — will retry"
+                                            else:
+                                                doc.kg_done = True
+                                                doc.error_message = (
+                                                    "kg_timeout: retries exhausted — KG skipped"
+                                                )
                                             await rollback_db.commit()
                                             logger.info(
                                                 f"[timeout_rollback] doc={document_id} "
-                                                f"kg_done reset to False for retry"
+                                                f"kg_done={'reset for retry' if will_retry else 'True (KG skipped)'}"
                                             )
+                                            if not will_retry:
+                                                await check_and_finalize(doc, rollback_db)
                                 except Exception as rollback_err:
                                     logger.warning(
                                         f"[timeout_rollback] KG failed for doc={document_id}: {rollback_err}"

@@ -16,7 +16,6 @@ Key design decisions:
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 
 from sqlalchemy import select
@@ -34,7 +33,7 @@ async def handle_kg(payload: dict) -> None:
     msg = KGMessage(**payload)
     logger.info(
         f"[kg_worker] doc={msg.document_id} workspace={msg.workspace_id} "
-        f"markdown_len={len(msg.markdown)}"
+        f"markdown_s3_key={msg.markdown_s3_key or '-'}"
     )
 
     async with async_session_maker() as db:
@@ -50,54 +49,72 @@ async def handle_kg(payload: dict) -> None:
             logger.info(f"[kg_worker] doc={msg.document_id} already has kg_done=True — skipping")
             return
 
-        if not msg.markdown.strip():
-            logger.warning(f"[kg_worker] doc={msg.document_id} empty markdown — skipping KG")
-            document.kg_done = True
-            await db.commit()
-            await check_and_finalize(document, db)
-            return
-
         try:
-            kg_service = get_kg_service(workspace_id=msg.workspace_id)
-            logger.info(f"[kg_worker] doc={msg.document_id} starting KG ingest...")
-            try:
-                await kg_service.ingest(msg.markdown, document_id=msg.document_id)
-            except (BrokenPipeError, ConnectionResetError, OSError) as kg_e:
-                logger.error(
-                    f"[kg_worker] doc={msg.document_id} KG INGEST FAILED "
-                    f"({type(kg_e).__name__}): {kg_e}",
-                    exc_info=True,
+            # ── Load markdown ────────────────────────────────────────────────
+            # New messages carry only markdown_s3_key (small broker payload);
+            # the inline `markdown` field is a fallback for in-flight/DLQ
+            # messages published before the key existed.
+            markdown = msg.markdown
+            if msg.markdown_s3_key:
+                from app.services.storage_service import get_storage_service
+
+                markdown = await get_storage_service().download_markdown(
+                    msg.markdown_s3_key
                 )
-                raise  # re-raise to outer handler
+
+            # OCR-path markdown carries administrative-layout HTML (alignment
+            # divs, data-bbox). That markup is token waste + extraction noise
+            # for the KG LLM — strip it (no-op for Docling documents).
+            from app.services.ocr_service import strip_ocr_layout
+
+            markdown = strip_ocr_layout(markdown)
+
+            if not markdown.strip():
+                logger.warning(f"[kg_worker] doc={msg.document_id} empty markdown — skipping KG")
+                document.kg_done = True
+                await db.commit()
+                await check_and_finalize(document, db)
+                return
+
+            kg_service = get_kg_service(workspace_id=msg.workspace_id)
+            logger.info(
+                f"[kg_worker] doc={msg.document_id} starting KG ingest "
+                f"(markdown_len={len(markdown)})..."
+            )
+            await kg_service.ingest(markdown, document_id=msg.document_id)
 
             document.kg_done = True
+            # A successful ingest supersedes any stale KG/timeout warning left
+            # by an earlier failed attempt — don't keep scaring the UI.
+            if document.error_message and document.error_message.startswith(
+                ("kg_", "timeout_retry")
+            ):
+                document.error_message = None
             await db.commit()
             logger.info(f"[kg_worker] doc={msg.document_id} KG ingest done")
             await check_and_finalize(document, db)
 
-        except asyncio.TimeoutError:
-            # asyncio.TimeoutError does NOT inherit from Exception — it bypasses
-            # the except block below. We need to call check_and_finalize() here
-            # so the document transitions out of BUILDING_KG even on timeout.
-            # The timeout handler in connection.py will requeue for retry.
-            logger.warning(f"[kg_worker] doc={msg.document_id} KG ingest timed out")
-            document.kg_done = True
-            document.error_message = "kg_timeout: handler timed out — will retry"
-            try:
-                await db.commit()
-            except asyncio.TimeoutError:
-                # db.commit() timed out too — force rollback so check_and_finalize can still run
-                await db.rollback()
-            # Always call check_and_finalize even on commit timeout
-            await check_and_finalize(document, db)
         except Exception as e:
+            # NOTE: a handler-level timeout from connection.py arrives here as
+            # CancelledError (BaseException) and is NOT caught — connection.py
+            # then resets kg_done=False and requeues for a real retry. This
+            # block only handles failures raised by the ingest itself, which
+            # are non-fatal by design: mark done so the document can reach
+            # INDEXED, and record honestly that the KG was skipped.
+            is_timeout = isinstance(e, TimeoutError)
             logger.error(
-                f"[kg_worker] doc={msg.document_id} KG ingest FAILED: {e}",
+                f"[kg_worker] doc={msg.document_id} KG ingest FAILED "
+                f"({type(e).__name__}): {e}",
                 exc_info=True,
             )
-            # KG failure is non-fatal: mark done so document can reach INDEXED
+            # Roll back first: the session may be aborted after a DB error.
+            await db.rollback()
             document.kg_done = True
-            document.error_message = f"kg_warning: {str(e)[:400]}"
+            document.error_message = (
+                f"kg_timeout: ingest timed out — KG skipped"
+                if is_timeout
+                else f"kg_warning: {str(e)[:400]}"
+            )
             await db.commit()
             await check_and_finalize(document, db)
         finally:

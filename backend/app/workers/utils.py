@@ -49,24 +49,37 @@ async def check_and_finalize(document: Document, db: AsyncSession) -> None:
         if fresh.status == DocumentStatus.FAILED:
             return
 
+        changed = False
+
         # Chat-upload documents: skip KG and caption workers, so only embed_done is needed
         if fresh.is_chat_upload:
             if fresh.embed_done:
+                if fresh.raw_chunks_json is not None:
+                    fresh.raw_chunks_json = None
+                    changed = True
                 if fresh.status != DocumentStatus.INDEXED:
                     fresh.status = DocumentStatus.INDEXED
-                    await fresh_db.commit()
+                    changed = True
                     logger.info(
                         f"[finalize] doc={fresh.id} → INDEXED "
                         f"(chat-upload: embed✓)"
                     )
+                if changed:
+                    await fresh_db.commit()
             return
 
         if fresh.embed_done and fresh.captions_done:
+            # captions_done is set AFTER the caption re-embed ran, so no worker
+            # needs the raw chunks anymore — free the (potentially large) column.
+            # The KG worker reads markdown from MinIO, not from raw_chunks_json.
+            if fresh.raw_chunks_json is not None:
+                fresh.raw_chunks_json = None
+                changed = True
             if fresh.kg_done:
                 # All three done → INDEXED
                 if fresh.status != DocumentStatus.INDEXED:
                     fresh.status = DocumentStatus.INDEXED
-                    await fresh_db.commit()
+                    changed = True
                     logger.info(
                         f"[finalize] doc={fresh.id} → INDEXED "
                         f"(embed✓ captions✓ kg✓)"
@@ -75,8 +88,10 @@ async def check_and_finalize(document: Document, db: AsyncSession) -> None:
                 # embed+captions done, KG still running → BUILDING_KG
                 if fresh.status not in (DocumentStatus.BUILDING_KG, DocumentStatus.INDEXED):
                     fresh.status = DocumentStatus.BUILDING_KG
-                    await fresh_db.commit()
+                    changed = True
                     logger.info(
                         f"[finalize] doc={fresh.id} → BUILDING_KG "
                         f"(embed✓ captions✓ kg⟳)"
                     )
+            if changed:
+                await fresh_db.commit()

@@ -173,7 +173,7 @@ async def handle_caption(payload: dict) -> None:
             # ── Re-embed chunks enriched with captions ──────────────────────
             # Only if there were actual captions generated
             if (has_images and db_images) or (has_tables and db_tables):
-                await _reenrich_embeddings(msg.document_id, msg.workspace_id, db_images, db_tables, document)
+                await _reenrich_embeddings(msg.document_id, msg.workspace_id, db_images, db_tables)
 
             # ── Done ────────────────────────────────────────────────────────
             document.captions_done = True
@@ -186,7 +186,9 @@ async def handle_caption(payload: dict) -> None:
                 f"[caption_worker] doc={msg.document_id} FAILED: {e}", exc_info=True
             )
             # Caption failure does NOT fail the whole document —
-            # it stays EMBEDDING/BUILDING_KG if embed already done
+            # it stays EMBEDDING/BUILDING_KG if embed already done.
+            # Roll back first: the session may be aborted after a DB error.
+            await db.rollback()
             document.captions_done = True   # mark done to unblock INDEXED transition
             document.error_message = f"caption_warning: {str(e)[:400]}"
             await db.commit()
@@ -276,27 +278,67 @@ async def _caption_tables_concurrent(tables: list[ExtractedTable]) -> None:
     await asyncio.gather(*[caption_one(tbl) for tbl in tables])
 
 
+# How long to wait for the embed worker before giving up on the re-embed
+# (embedding is normally much faster than vision-LLM captioning, so this wait
+# almost never triggers in practice).
+_REENRICH_WAIT_ATTEMPTS = 18
+_REENRICH_WAIT_SECONDS = 5.0
+
+
 async def _reenrich_embeddings(
     document_id: uuid.UUID,
     workspace_id: uuid.UUID,
     db_images: list[DocumentImage],
     db_tables: list[DocumentTable],
-    document: Document,
 ) -> None:
     """
     Re-embed chunks that now have image/table caption descriptions.
     Only re-embeds chunks whose image_refs or table_refs have captions.
+
+    Reads the document FRESH from the DB (not the snapshot loaded when the
+    caption run started): the embed worker runs in parallel and writes the
+    OCR-stripped content plus the contextual sentence back into
+    raw_chunks_json. The re-embedded vector must be
+    "context + content + captions" — embedding only "content + captions"
+    would overwrite the contextual vectors and silently degrade retrieval.
+    Waiting for embed_done also guarantees the vectors we update actually
+    exist in ChromaDB.
     """
     import json as _json
 
-    if not document.raw_chunks_json:
-        # Already cleared by embed_worker — need to re-fetch from ChromaDB
-        # and update only the enriched text in-place
+    from app.core.database import async_session_maker
+
+    # ── Wait for the embed worker to finish (it also strips OCR layout) ────
+    raw: str | None = None
+    for attempt in range(_REENRICH_WAIT_ATTEMPTS):
+        async with async_session_maker() as fresh_db:
+            result = await fresh_db.execute(
+                select(Document).where(Document.id == document_id)
+            )
+            fresh = result.scalar_one_or_none()
+        if fresh is None or fresh.status == DocumentStatus.FAILED:
+            logger.warning(
+                f"[caption_worker] doc={document_id} missing or FAILED — skipping re-embed"
+            )
+            return
+        if fresh.embed_done:
+            raw = fresh.raw_chunks_json
+            break
+        await asyncio.sleep(_REENRICH_WAIT_SECONDS)
+    else:
+        logger.warning(
+            f"[caption_worker] doc={document_id} embed not done after "
+            f"{int(_REENRICH_WAIT_ATTEMPTS * _REENRICH_WAIT_SECONDS)}s — skipping re-embed"
+        )
+        return
+
+    if not raw:
+        # Cleared already (doc embedded by pre-context code) — nothing to enrich.
         logger.debug(f"[caption_worker] doc={document_id} raw_chunks_json gone — skipping re-embed")
         return
 
     try:
-        chunks_data: list[dict] = _json.loads(document.raw_chunks_json)
+        chunks_data: list[dict] = _json.loads(raw)
     except Exception:
         return
 
@@ -306,8 +348,10 @@ async def _reenrich_embeddings(
     img_captions  = {img.image_id: img.caption for img in db_images if img.caption}
     tbl_captions  = {tbl.table_id: tbl.caption  for tbl in db_tables if tbl.caption}
 
-    # Rebuild enriched texts
-    updated_texts: dict[str, str] = {}   # chunk_id → new text
+    # Rebuild enriched texts: chunk_id → (display_text, embed_text).
+    # display_text (stored in ChromaDB `documents`, shown in citations) has NO
+    # contextual sentence; embed_text (what gets vectorised) includes it.
+    updated_texts: dict[str, tuple[str, str]] = {}
     for c in chunks_data:
         extra: list[str] = []
         for iid in c.get("image_refs", []):
@@ -319,9 +363,11 @@ async def _reenrich_embeddings(
             if cap:
                 extra.append(f"[Table on page {c['page_no']}]: {cap}")
         if extra:
-            enriched = c["content"] + "\n\n" + "\n".join(extra)
+            display = c["content"] + "\n\n" + "\n".join(extra)
+            context = c.get("context") or ""
+            embed_text = f"{context}\n{display}" if context else display
             chunk_id = f"doc_{document_id}_chunk_{c['chunk_index']}"
-            updated_texts[chunk_id] = enriched
+            updated_texts[chunk_id] = (display, embed_text)
 
     if not updated_texts:
         return
@@ -329,13 +375,14 @@ async def _reenrich_embeddings(
     embedder     = get_embedding_service()
     vector_store = get_vector_store(workspace_id)
 
-    ids   = list(updated_texts.keys())
-    texts = list(updated_texts.values())
-    new_embeddings = await asyncio.to_thread(embedder.embed_texts, texts)
+    ids           = list(updated_texts.keys())
+    display_texts = [v[0] for v in updated_texts.values()]
+    embed_inputs  = [v[1] for v in updated_texts.values()]
+    new_embeddings = await asyncio.to_thread(embedder.embed_texts, embed_inputs)
 
     # ChromaDB upsert — update existing vectors with enriched text
-    vector_store.update_documents(ids=ids, embeddings=new_embeddings, documents=texts)
+    vector_store.update_documents(ids=ids, embeddings=new_embeddings, documents=display_texts)
     logger.info(
         f"[caption_worker] doc={document_id} re-embedded "
-        f"{len(ids)} chunks with captions"
+        f"{len(ids)} chunks with captions (contextual preserved)"
     )

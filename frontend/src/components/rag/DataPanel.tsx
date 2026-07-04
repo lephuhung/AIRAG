@@ -311,7 +311,7 @@ export const DataPanel = memo(function DataPanel({
                   />
                 ))}
               </AnimatePresence>
-              {filteredDocs.length === 0 && documents.length > 0 && (
+              {filteredDocs.length === 0 && (documents?.length ?? 0) > 0 && (
                 <div className="text-center py-4 text-[11px] text-muted-foreground">
                   {t("workspace.no_match")}
                 </div>

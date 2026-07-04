@@ -128,11 +128,17 @@ async def handle_parse(payload: dict) -> None:
             # ── Classify document type & extract rich header ────────────────────────
             try:
                 from app.services.document_type_classifier import classify_with_llm
+                from app.services.ocr_service import strip_ocr_layout
                 from app.models.document_type import DocumentType as _DT
 
-                # If PDF, attempt 1st page OCR for perfect header extraction
-                text_for_llm = parsed.markdown
-                if str(tmp_path).lower().endswith(".pdf"):
+                # OCR-path markdown carries administrative-layout HTML — feed the
+                # classifier clean text (no-op for Docling/native documents).
+                text_for_llm = strip_ocr_layout(parsed.markdown)
+                # If PDF parsed via Docling/legacy, re-OCR page 1 for reliable
+                # header extraction (native PDF text extraction may mangle the
+                # header layout). When the whole doc already went through the
+                # OCR pipeline the markdown IS OCR output — skip the extra call.
+                if str(tmp_path).lower().endswith(".pdf") and parsed.parser != "ocr":
                     try:
                         import fitz
                         from app.services.ocr_service import get_ocr_service
@@ -191,6 +197,18 @@ async def handle_parse(payload: dict) -> None:
                 logger.warning(
                     f"[parse_worker] doc={msg.document_id} "
                     f"document type classification failed (non-fatal): {_cls_err}"
+                )
+
+            # ── Hiệu lực pháp lý (validity) ─────────────────────────────────
+            # Sau classifier để có document_number cho cross-match 2 chiều.
+            try:
+                from app.services.validity_service import apply_validity
+
+                await apply_validity(db, document, parsed.markdown)
+            except Exception as _val_err:
+                logger.warning(
+                    f"[parse_worker] doc={msg.document_id} "
+                    f"validity extraction failed (non-fatal): {_val_err}"
                 )
 
             # ── Persist images (no captions yet) ───────────────────────────
@@ -317,13 +335,17 @@ async def handle_parse(payload: dict) -> None:
                         workspace_id=msg.workspace_id,
                     ).model_dump(mode="json"),
                 )
+                # New workspace → its KG queue may not exist yet (the kg
+                # worker's poller discovers workspaces every ~30s) and an
+                # unroutable publish is silently DROPPED. Declare first.
+                await mq.ensure_kg_queue(msg.workspace_id)
                 await mq.publish(
                     mq.EXCHANGE_KG,
                     str(msg.workspace_id),
                     KGMessage(
                         document_id=msg.document_id,
                         workspace_id=msg.workspace_id,
-                        markdown=parsed.markdown,
+                        markdown_s3_key=s3_key,
                     ).model_dump(mode="json"),
                 )
                 logger.info(
@@ -335,6 +357,9 @@ async def handle_parse(payload: dict) -> None:
             logger.error(
                 f"[parse_worker] doc={msg.document_id} FAILED: {e}", exc_info=True
             )
+            # The session may be in an aborted state if the failure came from a
+            # DB flush — roll back first so the FAILED status can be written.
+            await db.rollback()
             document.status = DocumentStatus.FAILED
             document.error_message = str(e)[:500]
             await db.commit()

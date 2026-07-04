@@ -146,15 +146,14 @@ async def _run_kg_worker() -> None:
         """
         Periodically:
           1. Discover new workspaces and start consumers.
-          2. Check consumer health; restart dead consumers.
+          2. Check consumer task health (task.done()); restart dead consumers.
+          3. Stop consumers for workspaces deleted from the DB.
 
-        Optimization:
-          - Adaptive poll interval: 60s when workspaces exist, 300s when empty
-          - Task.done() detection: catches consumer crashes without HTTP polling
-          - HTTP polling fallback: only checks queues with active workspaces
+        One DB query per cycle — no RabbitMQ Management API polling (the old
+        per-queue HTTP check could never trigger a restart anyway; task.done()
+        already covers consumer death, and DB diffing covers deletion).
         """
         nonlocal _circuit_open, _circuit_failures
-        import httpx
 
         fast_poll = int(os.getenv("WORKER_KG_POLL_INTERVAL", "30"))
         slow_poll = 300  # 5 min when no workspaces
@@ -168,7 +167,7 @@ async def _run_kg_worker() -> None:
             try:
                 async with async_session_maker() as db:
                     result = await db.execute(select(KnowledgeBase.id))
-                    current_ids = [row[0] for row in result.all()]
+                    current_ids = {row[0] for row in result.all()}
 
                 # Start consumers for new workspaces
                 new_ids = [wid for wid in current_ids if wid not in active_workspaces]
@@ -176,49 +175,24 @@ async def _run_kg_worker() -> None:
                     logger.info(f"[kg_runner] New workspaces detected: {new_ids}")
                     await _start_consumers_for(new_ids)
 
-                # Check consumer task health (catch dead tasks without HTTP)
+                # Stop consumers for workspaces deleted from the DB
+                for wid in list(active_workspaces - current_ids):
+                    logger.info(f"[kg_runner] Workspace {wid} deleted — stopping consumer")
+                    active_workspaces.discard(wid)
+                    task = consumer_tasks.pop(wid, None)
+                    if task:
+                        task.cancel()
+
+                # Check consumer task health; restart dead consumers
                 for wid in list(active_workspaces):
                     task = consumer_tasks.get(wid)
                     if task and task.done():
-                        # Consumer died — log and restart
-                        exc = task.exception()
+                        exc = None if task.cancelled() else task.exception()
                         logger.warning(
                             f"[kg_runner] Workspace {wid} consumer died"
                             f"{f': {exc}' if exc else ''} — restarting"
                         )
                         await _start_consumer_for(wid)
-                        continue
-
-                    # HTTP polling fallback: check if queue still has consumers
-                    queue_name = f"hrag.kg.{wid}"
-                    try:
-                        async with httpx.AsyncClient(timeout=5.0) as session:
-                            url = (
-                                f"{settings.RABBITMQ_MANAGEMENT_URL}/api/queues/"
-                                f"%2f/{queue_name}"
-                            )
-                            resp = await session.get(
-                                url,
-                                auth=httpx.BasicAuth(
-                                    settings.RABBITMQ_MANAGEMENT_USER,
-                                    settings.RABBITMQ_MANAGEMENT_PASS,
-                                ),
-                            )
-                            if resp.status_code == 200:
-                                q_info = resp.json()
-                                consumer_count = q_info.get("consumers", 0)
-                                if consumer_count == 0:
-                                    # Queue has 0 consumers but task still running → consumer is alive but not consuming
-                                    # This happens when consume() is in queue.iterator() waiting loop
-                                    # Only restart if task is also done
-                                    pass
-                            elif resp.status_code == 404:
-                                # Queue gone — workspace deleted; remove from active set
-                                logger.info(f"[kg_runner] Workspace {wid} queue not found — removing")
-                                active_workspaces.discard(wid)
-                                consumer_tasks.pop(wid, None)
-                    except Exception as poll_err:
-                        logger.debug(f"[kg_runner] Queue health check failed for {queue_name}: {poll_err}")
 
                 # Reset circuit breaker on successful poll
                 if _circuit_open and _circuit_failures > 0:
@@ -255,9 +229,19 @@ async def _run_kg_worker() -> None:
             f"{settings.WORKER_KG_POLL_INTERVAL}s for new ones"
         )
 
-    # Wait for all consumer tasks + poller (they run indefinitely)
-    all_tasks = list(consumer_tasks.values()) + [poller]
-    await asyncio.gather(*all_tasks)
+    # Block on the poller only: it supervises the consumer tasks (restarts
+    # dead ones, retrieves their exceptions). Gathering the consumers here
+    # would tear the whole worker down when a single consumer raised.
+    # On cancellation (control-plane pause / graceful shutdown) the child
+    # consumer tasks must die with us — they are independent tasks that would
+    # otherwise keep consuming while the worker is "paused".
+    try:
+        await poller
+    finally:
+        poller.cancel()
+        for t in consumer_tasks.values():
+            t.cancel()
+        await asyncio.gather(poller, *consumer_tasks.values(), return_exceptions=True)
 
 
 _WORKER_MAP = {
@@ -267,6 +251,127 @@ _WORKER_MAP = {
     "kg":      _run_kg_worker,
     "memory":  _run_memory_worker,
 }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Control-plane (pause / resume / restart / set_prefetch from the admin UI)
+# ══════════════════════════════════════════════════════════════════════════════
+class _WorkerController:
+    """
+    Owns the consume-loop task and reacts to hrag.control commands.
+
+    - pause:        cancel the consume task (message in flight drains; unacked
+                    messages stay queued in RabbitMQ). Container stays alive.
+    - resume:       recreate the consume task.
+    - restart:      resolve the shutdown future — main() drains and the process
+                    exits; the container's restart policy (always) revives it.
+    - set_prefetch: mutate the in-memory settings value and bounce the consume
+                    task. Reverts to the env value on next container restart.
+    """
+
+    def __init__(self, worker_type: str, stop: asyncio.Future) -> None:
+        self.worker_type = worker_type
+        self._stop = stop
+        self.paused = False
+        self.runner: asyncio.Task | None = None
+        self._lock = asyncio.Lock()
+        # Tasks we cancelled on purpose — main() must not treat their
+        # completion as a crash.
+        self._intentional: set[asyncio.Task] = set()
+
+    def start(self) -> None:
+        self.runner = asyncio.create_task(
+            _WORKER_MAP[self.worker_type](), name=f"consume-{self.worker_type}"
+        )
+
+    def was_intentional(self, task: asyncio.Task) -> bool:
+        return task in self._intentional
+
+    async def _stop_runner(self, drain_timeout: float) -> None:
+        task = self.runner
+        if task is None:
+            return
+        self._intentional.add(task)
+        task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=drain_timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
+        except Exception as e:
+            logger.warning(f"[control] consume task exited with: {e}")
+        self.runner = None
+
+    async def shutdown(self, drain_timeout: float) -> None:
+        """Graceful drain used by the SIGTERM / restart path."""
+        async with self._lock:
+            await self._stop_runner(drain_timeout)
+
+    async def handle_command(self, payload: dict) -> None:
+        from app.workers.health_server import update_worker_state
+
+        command = payload.get("command", "")
+        drain_timeout = float(os.getenv("WORKER_DRAIN_TIMEOUT", "30"))
+
+        async with self._lock:
+            if command == "pause":
+                if self.paused:
+                    logger.info("[control] pause — already paused")
+                    return
+                logger.info("[control] PAUSE — draining in-flight message, then idle")
+                await self._stop_runner(drain_timeout)
+                self.paused = True
+                update_worker_state(paused=True)
+
+            elif command == "resume":
+                if not self.paused and self.runner is not None and not self.runner.done():
+                    logger.info("[control] resume — already consuming")
+                    return
+                logger.info("[control] RESUME — restarting consume loop")
+                self.paused = False
+                update_worker_state(paused=False)
+                self.start()
+
+            elif command == "restart":
+                logger.info(
+                    "[control] RESTART — graceful shutdown; container restart "
+                    "policy will bring this worker back up"
+                )
+                if not self._stop.done():
+                    self._stop.set_result(None)
+
+            elif command == "set_prefetch":
+                try:
+                    n = int(payload.get("prefetch", 0))
+                except (TypeError, ValueError):
+                    n = 0
+                if not 1 <= n <= 64:
+                    logger.warning(f"[control] set_prefetch ignored — invalid value {payload.get('prefetch')!r}")
+                    return
+                attr = f"WORKER_PREFETCH_{self.worker_type.upper()}"
+                if not hasattr(settings, attr):
+                    logger.warning(f"[control] set_prefetch ignored — no setting {attr}")
+                    return
+                setattr(settings, attr, n)
+                logger.info(f"[control] SET_PREFETCH {attr}={n} — bouncing consume loop")
+                await self._stop_runner(drain_timeout)
+                if not self.paused:
+                    self.start()
+
+            else:
+                logger.warning(f"[control] unknown command: {payload}")
+
+
+async def _run_control_listener(worker_type: str, controller: _WorkerController) -> None:
+    """Consume hrag.control commands forever; reconnect on failure."""
+    while True:
+        try:
+            await mq.consume_control(worker_type, controller.handle_command)
+            logger.warning("[control] listener stream ended — reconnecting in 5s")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"[control] listener error: {e} — reconnecting in 5s")
+        await asyncio.sleep(5)
 
 
 async def main() -> None:
@@ -282,6 +387,7 @@ async def main() -> None:
 
     # ── Health server for liveness/readiness probes ───────────────────────
     # Runs on port 8081 alongside the worker consume loop
+    health_task: asyncio.Task | None = None
     try:
         from app.workers.health_server import update_worker_state
         update_worker_state(worker_type=worker_type)
@@ -301,8 +407,6 @@ async def main() -> None:
         logger.info("Database connection verified")
     except Exception as db_err:
         logger.warning(f"Database connection check failed (non-fatal): {db_err}")
-    except Exception as e:
-        logger.warning(f"Health server failed to start (non-fatal): {e}")
 
     # ── Eager model loading for workers ──────────────────────────────────
     if settings.HRAG_EAGER_MODEL_LOADING:
@@ -325,41 +429,73 @@ async def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, _shutdown, sig)
 
-    runner = asyncio.create_task(_WORKER_MAP[worker_type]())
+    controller = _WorkerController(worker_type, stop)
+    controller.start()
+    control_task = asyncio.create_task(
+        _run_control_listener(worker_type, controller), name="control-listener"
+    )
     stop_task = asyncio.ensure_future(stop)
 
-    done, pending = await asyncio.wait(
-        [runner, stop_task],
-        return_when=asyncio.FIRST_COMPLETED,
-    )
+    # ── Supervise: shutdown signal / control-plane restarts / crashes ──────
+    while True:
+        runner = controller.runner
+        aws = [stop_task] + ([runner] if runner is not None else [])
+        done, _ = await asyncio.wait(
+            aws,
+            return_when=asyncio.FIRST_COMPLETED,
+            # While paused there is no consume task — poll so a resume-created
+            # task gets picked up for supervision.
+            timeout=None if runner is not None else 2.0,
+        )
+        if stop_task in done:
+            break
+        if runner is not None and runner.done():
+            if controller.was_intentional(runner):
+                continue  # pause / set_prefetch bounce — controller owns it
+            # The consume loop ended WITHOUT a shutdown signal — crash or
+            # abandon. Log loudly and exit non-zero so the container restarts
+            # the worker, instead of the previous behavior: silent exit.
+            exc = None if runner.cancelled() else runner.exception()
+            if exc is not None:
+                logger.critical(f"Worker loop crashed: {exc!r}", exc_info=exc)
+            else:
+                logger.critical("Worker loop exited unexpectedly (no exception)")
+            stop_task.cancel()
+            control_task.cancel()
+            if health_task is not None:
+                health_task.cancel()
+            try:
+                from app.workers.health_server import update_worker_state
+                update_worker_state(ready=False)
+            except Exception:
+                pass
+            await mq.close_connection()
+            sys.exit(1)
 
-    if stop_task in done:
-        # SIGTERM received — graceful drain: let current message finish or timeout
-        logger.info(f"Graceful drain: waiting up to {drain_timeout}s for in-flight message...")
-        runner.cancel()
-        try:
-            await asyncio.wait_for(runner, timeout=drain_timeout)
-        except asyncio.TimeoutError:
-            logger.warning(f"Drain timeout ({drain_timeout}s) — forcing stop")
-        except asyncio.CancelledError:
-            pass  # Expected
+    # SIGTERM or control-plane restart — graceful drain: let the current
+    # message finish or time out, then exit (the container restart policy
+    # revives us on `restart`; on `docker stop` it stays down).
+    logger.info(f"Graceful drain: waiting up to {drain_timeout}s for in-flight message...")
+    control_task.cancel()
+    await controller.shutdown(drain_timeout)
 
-        # Shutdown health server
+    # Shutdown health server
+    if health_task is not None:
         health_task.cancel()
         try:
             await health_task
         except asyncio.CancelledError:
             pass
 
-        # Mark not ready before closing connections
-        try:
-            from app.workers.health_server import update_worker_state
-            update_worker_state(ready=False)
-        except Exception:
-            pass
+    # Mark not ready before closing connections
+    try:
+        from app.workers.health_server import update_worker_state
+        update_worker_state(ready=False)
+    except Exception:
+        pass
 
-        await mq.close_connection()
-        logger.info("Worker stopped cleanly")
+    await mq.close_connection()
+    logger.info("Worker stopped cleanly")
 
 
 if __name__ == "__main__":

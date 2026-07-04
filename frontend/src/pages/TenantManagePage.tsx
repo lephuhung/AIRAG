@@ -81,7 +81,7 @@ export function TenantManagePage() {
     }
   };
 
-  const handleApprove = async (userId: number) => {
+  const handleApprove = async (userId: string) => {
     try {
       await api.post(`/tenants/${tenantId}/users/${userId}/approve`);
       toast.success(t("admin.tenants.manage.approve_success"));
@@ -91,7 +91,7 @@ export function TenantManagePage() {
     }
   };
 
-  const handleReject = async (userId: number) => {
+  const handleReject = async (userId: string) => {
     try {
       await api.post(`/tenants/${tenantId}/users/${userId}/reject`);
       toast.success(t("admin.tenants.manage.reject_success"));
@@ -101,7 +101,7 @@ export function TenantManagePage() {
     }
   };
 
-  const handleRemove = async (userId: number) => {
+  const handleRemove = async (userId: string) => {
     try {
       await api.delete(`/tenants/${tenantId}/users/${userId}`);
       toast.success(t("admin.tenants.manage.remove_success"));
@@ -111,7 +111,7 @@ export function TenantManagePage() {
     }
   };
 
-  const handleToggleRole = async (userId: number, currentRole: string) => {
+  const handleToggleRole = async (userId: string, currentRole: string) => {
     const newRole = currentRole === "admin" ? "member" : "admin";
     try {
       await api.put(`/tenants/${tenantId}/users/${userId}/role`, { role: newRole });
@@ -141,7 +141,7 @@ export function TenantManagePage() {
     }
   };
 
-  const handleRevokeInvite = async (inviteId: number) => {
+  const handleRevokeInvite = async (inviteId: string) => {
     try {
       await revokeInvite.mutateAsync({ tenantId: tenantId ?? "", inviteId });
       toast.success(t("admin.tenants.toast.invite_revoked"));

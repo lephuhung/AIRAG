@@ -23,9 +23,12 @@ networks:
 services:
   # ═══════════════════════════════════════════════════════════════════════════
   # VLLM SERVICES — GPU 0 (same as workers, 48GB VRAM total)
-  # vllm-ocr (Unlimited-OCR): ~10GB (0.2)  |  vllm-memory (gemma-4-E4B, served as
-  # `qwen-memory`): ~29GB (0.6)  → ~39GB locked upfront by the two vLLM engines.
-  # Remaining ~9GB shared by GPU workers (parse Docling + embed bge-m3 ×3).
+  # Budget (2026-07-04): vllm-ocr 0.28 (~13.8GB) | vllm-memory 0.50 (~24.6GB)
+  # → ~38.4GB engines + ~7GB fixed (omnivoice TTS 2.3GB, embed bge-m3 4.8GB)
+  # ≈ 45.5GB, để ~3.5GB slack cho CUDA-graph capture + fragmentation.
+  # CUDA graphs BẬT (không enforce-eager) cho cả hai — eager từng làm decode
+  # chậm ~2× (đo 24 tok/s gemma). --max-num-seqs chặn kích thước graph capture
+  # nên spike khởi động chỉ vài trăm MB, không cần eager nữa.
   # ═══════════════════════════════════════════════════════════════════════════
 
   # ── Unlimited-OCR (Baidu, OCR Model) ──────────────────────────────────────
@@ -54,18 +57,21 @@ services:
       - "8001"
       - --max-model-len
       - "12288"
+      # 0.22 cho KV chỉ 23.7k tokens (concurrency 1.93x @12k) trong khi worker
+      # bắn HRAG_OCR_CONCURRENCY=16 trang song song → trang xếp hàng. 0.28 ≈
+      # gấp đôi KV để batch thật sự ~16 trang.
       - --gpu-memory-utilization
-      - "0.22"
+      - "0.28"
+      # Giới hạn batch = mức worker thực dùng → CUDA graph capture nhỏ, đủ chỗ
+      # bật graphs (bỏ enforce-eager) lấy lại tốc độ decode.
+      - --max-num-seqs
+      - "16"
       - --trust-remote-code
       - --logits_processors
       - vllm.model_executor.models.unlimited_ocr:NGramPerReqLogitsProcessor
       - --no-enable-prefix-caching
       - --mm-processor-cache-gb
       - "0"
-      # GPU 0 is shared with vllm-memory (0.6) + workers; only ~11 GB free.
-      # enforce-eager skips the multi-MB CUDA-graph capture so the 3B weights
-      # leave room for the KV cache within the 0.22 (~10.8 GB) budget.
-      - --enforce-eager
       - --served-model-name
       - unlimited-ocr
       - --host
@@ -96,11 +102,12 @@ services:
       com.hrag.stack: hrag
 
   # ── gemma-4-E4B-it (Memory/KG Model, served as `qwen-memory`) ─────────────
-  # Port: 8088, GPU 0, ~22GB VRAM (0.45 × 48GB) — gemma-4-E4B weights ~15GB + KV cache
+  # Port: 8088, GPU 0, ~24.6GB VRAM (0.50 × 48GB) — weights ~15GB + KV ~9GB.
   # OpenAI-compatible API → workers call via Docker network.
-  # Serves supervisor (intent), Graphiti memory + Legal KG — all send ≤1.2k-token
-  # chunks + ≤4k output, so max-model-len 8192 is ample. enforce-eager drops the
-  # CUDA-graph spike so the lower 0.45 budget still leaves a healthy KV cache.
+  # Serves supervisor (intent), Graphiti memory, Legal KG + contextual embed —
+  # peak thực tế ~24 request song song (contextual 16 + KG 8), request ≤1.2k in
+  # + ≤4k out nên max-model-len 8192 là đủ. CUDA graphs BẬT (max-num-seqs 32
+  # chặn spike capture); enforce-eager cũ làm decode chậm ~2× (24 tok/s).
   vllm-memory:
     build:
       context: .
@@ -123,8 +130,9 @@ services:
       - --max-model-len
       - "8192"
       - --gpu-memory-utilization
-      - "0.45"
-      - --enforce-eager
+      - "0.50"
+      - --max-num-seqs
+      - "32"
       - --trust-remote-code
       - --served-model-name
       - qwen-memory

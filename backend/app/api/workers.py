@@ -14,8 +14,6 @@ import asyncio
 import logging
 import os
 import httpx
-import signal
-import sys
 import time
 import uuid
 from datetime import timezone
@@ -32,6 +30,7 @@ from app.models.user import User
 from app.services.rabbitmq_management import get_rabbitmq_management
 from app.queue.connection import (
     publish,
+    publish_control,
     EXCHANGE_PARSE,
     DLQ_QUEUE,
 )
@@ -44,84 +43,52 @@ router = APIRouter(prefix="/workers", tags=["workers"])
 _QUEUE_PREFIX = "hrag."
 
 # ══════════════════════════════════════════════════════════════════════════════
-# In-process worker management
+# Worker control-plane (Docker-containerised workers)
 # ══════════════════════════════════════════════════════════════════════════════
-# Each managed worker is an asyncio subprocess (runs `python -m app.workers.runner`).
-# The API server keeps track of them so users can start/stop/restart from the UI.
+# Workers run as Docker containers (compose services worker-parse/embed/…).
+# The API cannot start/stop containers directly (no Docker socket); instead it
+# publishes commands to the hrag.control exchange (app/queue/connection.py):
+#   pause   → worker stops consuming (container stays up, queue buffers)
+#   resume  → worker consumes again
+#   restart → worker drains + exits; the container restart policy (always)
+#             brings it back up = a real restart from the UI
+# Replicas are discovered dynamically via Docker DNS on the compose service
+# name (one A record per replica) — no hardcoded container names.
 
-_VALID_WORKER_TYPES = {"parse", "embed", "caption", "kg"}
+_VALID_WORKER_TYPES = {"parse", "embed", "caption", "kg", "memory"}
 
-
-class _ManagedWorker:
-    """Track a single worker subprocess."""
-
-    def __init__(self, worker_type: str, process: asyncio.subprocess.Process):
-        self.worker_type = worker_type
-        self.process = process
-        self.started_at = time.time()
-        self.restart_count = 0
-
-    @property
-    def pid(self) -> int | None:
-        return self.process.pid
-
-    @property
-    def is_alive(self) -> bool:
-        return self.process.returncode is None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "worker_type": self.worker_type,
-            "pid": self.pid,
-            "alive": self.is_alive,
-            "started_at": self.started_at,
-            "uptime_seconds": round(time.time() - self.started_at, 1),
-            "restart_count": self.restart_count,
-            "return_code": self.process.returncode,
-        }
+# worker type → compose service name
+_WORKER_SERVICES: dict[str, str] = {
+    "parse":   "worker-parse",
+    "embed":   "worker-embed",
+    "caption": "worker-caption",
+    "kg":      "worker-kg",
+}
+_WORKER_HEALTH_PORT = 8081
 
 
-# worker_type → list of ManagedWorker (supports multiple instances per type)
-_workers: dict[str, list[_ManagedWorker]] = {}
-_workers_lock = asyncio.Lock()
+async def _resolve_worker_instances(service: str) -> list[str]:
+    """Resolve a compose service name to per-replica IPs (best-effort)."""
+    import socket
 
-
-async def _spawn_worker(worker_type: str) -> _ManagedWorker:
-    """Spawn a single worker subprocess."""
-    env = os.environ.copy()
-    env["WORKER_TYPE"] = worker_type
-
-    process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-m",
-        "app.workers.runner",
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        cwd=str(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
-    )
-
-    worker = _ManagedWorker(worker_type, process)
-    logger.info(f"Spawned worker-{worker_type} (PID={process.pid})")
-
-    # Start log streaming in background
-    asyncio.create_task(_stream_worker_logs(worker))
-
-    return worker
-
-
-async def _stream_worker_logs(worker: _ManagedWorker) -> None:
-    """Stream subprocess stdout/stderr to main logger."""
-    prefix = f"[worker-{worker.worker_type}:{worker.pid}]"
+    loop = asyncio.get_running_loop()
     try:
-        while True:
-            line = await worker.process.stdout.readline()
-            if not line:
-                break
-            logger.info(f"{prefix} {line.decode().rstrip()}")
+        infos = await loop.getaddrinfo(
+            service, _WORKER_HEALTH_PORT, type=socket.SOCK_STREAM
+        )
+    except socket.gaierror:
+        return []
+    return sorted({info[4][0] for info in infos})
+
+
+async def _instance_display_name(ip: str) -> str:
+    """Reverse-resolve a replica IP to its container name (best-effort)."""
+    loop = asyncio.get_running_loop()
+    try:
+        name, _ = await loop.getnameinfo((ip, _WORKER_HEALTH_PORT), 0)
+        return name.split(".")[0]
     except Exception:
-        pass
-    logger.info(f"{prefix} Process exited (code={worker.process.returncode})")
+        return ip
 
 
 def _extract_queue_info(q: dict[str, Any]) -> dict[str, Any]:
@@ -201,31 +168,35 @@ async def _check_openai_health(
 # For replicas, list all container names - health check requires ALL to be healthy
 # Note: Docker DNS aliases for replicas are NOT auto-generated. Use actual container names
 # which follow the pattern: {project}-{service}-{replica_number}
-_WORKER_HEALTH_PORTS: dict[str, list[str]] = {
-    "parse":   ["airag-worker-parse-1", "airag-worker-parse-2"],
-    "embed":   ["airag-worker-embed-1", "airag-worker-embed-2"],
-    "caption": ["airag-worker-caption-1"],
-    "kg":      ["airag-worker-kg-1"],
-}
-
-
 async def _check_worker_containers() -> dict[str, Any]:
-    """Check health of worker containers via their built-in health servers."""
+    """Check health of worker container replicas via their health servers.
+
+    Replicas are discovered through Docker DNS (compose service name → one A
+    record per replica), so scaling with `docker compose up --scale` is picked
+    up automatically. A paused worker still counts as a live container.
+    """
     import httpx
 
     results: dict[str, Any] = {}
     async with httpx.AsyncClient(timeout=5.0) as client:
-        for worker_type, containers in _WORKER_HEALTH_PORTS.items():
+        for worker_type, service in _WORKER_SERVICES.items():
+            ips = await _resolve_worker_instances(service)
             worker_results = []
-            for container in containers:
+            for ip in ips:
+                container = await _instance_display_name(ip)
                 try:
-                    resp = await client.get(f"http://{container}:8081/health")
+                    resp = await client.get(
+                        f"http://{ip}:{_WORKER_HEALTH_PORT}/health"
+                    )
                     if resp.status_code == 200:
                         data = resp.json()
+                        paused = bool(data.get("paused", False))
                         worker_results.append({
                             "container": container,
-                            "status": "healthy",
+                            "status": "paused" if paused else "healthy",
                             "worker_type": data.get("worker_type", worker_type),
+                            "paused": paused,
+                            "ready": bool(data.get("ready", False)),
                             "uptime_seconds": data.get("uptime_seconds", 0),
                         })
                     else:
@@ -242,7 +213,10 @@ async def _check_worker_containers() -> dict[str, Any]:
                     })
             results[worker_type] = {
                 "instances": worker_results,
-                "healthy_count": len([r for r in worker_results if r.get("status") == "healthy"]),
+                "healthy_count": len([
+                    r for r in worker_results
+                    if r.get("status") in ("healthy", "paused")
+                ]),
                 "total": len(worker_results),
             }
     return results
@@ -350,18 +324,6 @@ async def workers_health(
     if dlq_count > 0 and health["status"] == "healthy":
         health["status"] = "degraded"
 
-    # ── Managed workers (in-process) ──────────────────────────────────────
-    managed = {}
-    async with _workers_lock:
-        for wtype, workers in _workers.items():
-            alive = [w for w in workers if w.is_alive]
-            managed[wtype] = {
-                "running": len(alive),
-                "total_spawned": len(workers),
-                "pids": [w.pid for w in alive],
-            }
-    health["checks"]["managed_workers"] = managed
-
     # ── Pipeline (stuck documents) ────────────────────────────────────────
     _stuck_statuses = [
         DocumentStatus.PARSING,
@@ -413,24 +375,34 @@ async def workers_health(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Worker Process Management (start / stop / restart / list)
+# Worker Control (pause / resume / restart via the hrag.control exchange)
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 class WorkerStartRequest(BaseModel):
     worker_type: str
-    count: int = 1
+    count: int = 1  # deprecated — replica count is fixed by docker compose
+
+
+def _validate_worker_type(worker_type: str) -> str:
+    wtype = worker_type.lower()
+    if wtype not in _VALID_WORKER_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid worker_type: {wtype}. Choose from: {sorted(_VALID_WORKER_TYPES)}",
+        )
+    return wtype
 
 
 @router.get("/managed")
 async def list_managed_workers(user: User = Depends(require_superadmin)):
-    """List all managed worker processes started from this API server."""
-    result: dict[str, Any] = {}
-    async with _workers_lock:
-        for wtype, workers in _workers.items():
-            # Clean up dead workers from the list
-            result[wtype] = [w.to_dict() for w in workers]
-    return {"workers": result}
+    """Live status of worker container replicas (via their health servers)."""
+    container_health = await _check_worker_containers()
+    return {
+        "workers": {
+            wtype: info["instances"] for wtype, info in container_health.items()
+        }
+    }
 
 
 @router.post("/start")
@@ -438,174 +410,78 @@ async def start_worker(
     req: WorkerStartRequest, user: User = Depends(require_superadmin)
 ):
     """
-    Start one or more worker processes of the given type.
-    Workers run as subprocesses managed by this API server.
+    RESUME consumption for all replicas of the given worker type.
+
+    Workers run as Docker containers — the API cannot spawn new processes.
+    `count` is accepted for backward compatibility but ignored; scale replicas
+    with `docker compose up -d --scale worker-<type>=N`.
     """
-    wtype = req.worker_type.lower()
-    if wtype not in _VALID_WORKER_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid worker_type: {wtype}. Choose from: {sorted(_VALID_WORKER_TYPES)}",
-        )
-    if req.count < 1 or req.count > 8:
-        raise HTTPException(status_code=400, detail="count must be 1-8")
-
-    started = []
-    async with _workers_lock:
-        if wtype not in _workers:
-            _workers[wtype] = []
-
-        for _ in range(req.count):
-            worker = await _spawn_worker(wtype)
-            _workers[wtype].append(worker)
-            started.append({"pid": worker.pid, "worker_type": wtype})
-
-    return {"status": "ok", "started": started}
+    wtype = _validate_worker_type(req.worker_type)
+    await publish_control(wtype, "resume")
+    return {
+        "status": "ok",
+        "command": "resume",
+        "worker_type": wtype,
+        "note": "count is ignored — replica count is managed by docker compose",
+    }
 
 
 @router.post("/stop/{worker_type}")
-async def stop_workers(
-    worker_type: str, pid: int | None = None, user: User = Depends(require_superadmin)
-):
+async def stop_workers(worker_type: str, user: User = Depends(require_superadmin)):
     """
-    Stop managed workers of the given type.
-    If pid is specified, only that worker is stopped.
-    Otherwise, all workers of the type are stopped.
+    PAUSE consumption for all replicas of the given worker type.
+
+    Containers stay up (Docker healthcheck keeps passing); pending messages
+    buffer durably in RabbitMQ until resume.
     """
-    wtype = worker_type.lower()
-    if wtype not in _VALID_WORKER_TYPES:
-        raise HTTPException(status_code=400, detail=f"Invalid worker_type: {wtype}")
-
-    stopped = []
-    async with _workers_lock:
-        workers = _workers.get(wtype, [])
-        for w in workers:
-            if not w.is_alive:
-                continue
-            if pid is not None and w.pid != pid:
-                continue
-            try:
-                w.process.send_signal(signal.SIGTERM)
-                # Give it 5s to shutdown gracefully
-                try:
-                    await asyncio.wait_for(w.process.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    w.process.kill()
-                stopped.append({"pid": w.pid, "worker_type": wtype})
-            except Exception as exc:
-                logger.warning(f"Failed to stop worker PID={w.pid}: {exc}")
-
-        # Remove dead workers from list
-        _workers[wtype] = [w for w in workers if w.is_alive]
-
-    if not stopped:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No running workers of type '{wtype}'"
-            + (f" with PID={pid}" if pid else ""),
-        )
-
-    return {"status": "ok", "stopped": stopped}
+    wtype = _validate_worker_type(worker_type)
+    await publish_control(wtype, "pause")
+    return {"status": "ok", "command": "pause", "worker_type": wtype}
 
 
 @router.post("/restart/{worker_type}")
 async def restart_workers(worker_type: str, user: User = Depends(require_superadmin)):
     """
-    Restart all managed workers of the given type.
-    Stops all existing ones and starts the same count of new ones.
+    RESTART all replicas of the given worker type.
+
+    Each worker drains its in-flight message and exits; the container restart
+    policy (`always`) brings it back up with fresh state.
     """
-    wtype = worker_type.lower()
-    if wtype not in _VALID_WORKER_TYPES:
-        raise HTTPException(status_code=400, detail=f"Invalid worker_type: {wtype}")
-
-    async with _workers_lock:
-        old_workers = _workers.get(wtype, [])
-        alive_count = len([w for w in old_workers if w.is_alive])
-
-        # Stop all existing
-        for w in old_workers:
-            if w.is_alive:
-                try:
-                    w.process.send_signal(signal.SIGTERM)
-                    try:
-                        await asyncio.wait_for(w.process.wait(), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        w.process.kill()
-                except Exception:
-                    pass
-
-        # Start new ones (at least 1)
-        count = max(alive_count, 1)
-        _workers[wtype] = []
-        started = []
-        for _ in range(count):
-            worker = await _spawn_worker(wtype)
-            _workers[wtype].append(worker)
-            started.append({"pid": worker.pid, "worker_type": wtype})
-
-    return {
-        "status": "ok",
-        "stopped_count": alive_count,
-        "started": started,
-    }
+    wtype = _validate_worker_type(worker_type)
+    await publish_control(wtype, "restart")
+    return {"status": "ok", "command": "restart", "worker_type": wtype}
 
 
 @router.post("/restart-all")
 async def restart_all_workers(user: User = Depends(require_superadmin)):
+    """Restart ALL worker types (broadcast on the control exchange)."""
+    await publish_control("all", "restart")
+    return {"status": "ok", "command": "restart", "worker_type": "all"}
+
+
+class PrefetchRequest(BaseModel):
+    prefetch: int
+
+
+@router.post("/prefetch/{worker_type}")
+async def set_worker_prefetch(
+    worker_type: str, req: PrefetchRequest, user: User = Depends(require_superadmin)
+):
     """
-    Restart all managed workers of all types.
+    Tune message prefetch (concurrent handlers) at runtime.
+
+    In-memory only — reverts to the env value on the next container restart.
     """
-    restarted = {}
-    async with _workers_lock:
-        for wtype in _VALID_WORKER_TYPES:
-            old_workers = _workers.get(wtype, [])
-            alive_count = len([w for w in old_workers if w.is_alive])
-            if alive_count == 0:
-                continue
-
-            # Stop all existing
-            for w in old_workers:
-                if w.is_alive:
-                    try:
-                        w.process.send_signal(signal.SIGTERM)
-                        try:
-                            await asyncio.wait_for(w.process.wait(), timeout=3.0)
-                        except asyncio.TimeoutError:
-                            w.process.kill()
-                    except Exception:
-                        pass
-
-            # Start new ones
-            _workers[wtype] = []
-            started_pids = []
-            for _ in range(alive_count):
-                worker = await _spawn_worker(wtype)
-                _workers[wtype].append(worker)
-                started_pids.append(worker.pid)
-
-            restarted[wtype] = {
-                "stopped_count": alive_count,
-                "started_pids": started_pids,
-            }
-
+    wtype = _validate_worker_type(worker_type)
+    if not 1 <= req.prefetch <= 64:
+        raise HTTPException(status_code=400, detail="prefetch must be 1-64")
+    await publish_control(wtype, "set_prefetch", {"prefetch": req.prefetch})
     return {
         "status": "ok",
-        "restarted": restarted,
+        "command": "set_prefetch",
+        "worker_type": wtype,
+        "prefetch": req.prefetch,
     }
-
-
-@router.delete("/managed/{worker_type}")
-async def remove_dead_workers(
-    worker_type: str, user: User = Depends(require_superadmin)
-):
-    """Remove dead/exited worker entries from the managed list."""
-    wtype = worker_type.lower()
-    async with _workers_lock:
-        before = len(_workers.get(wtype, []))
-        _workers[wtype] = [w for w in _workers.get(wtype, []) if w.is_alive]
-        after = len(_workers[wtype])
-
-    return {"status": "ok", "removed": before - after, "remaining": after}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -779,11 +655,9 @@ async def get_overview(
         "failed": status_counts.get(DocumentStatus.FAILED, 0),
     }
 
-    # Include managed workers info (workers started from this API server)
+    # Legacy in-process managed workers were removed — workers run as Docker
+    # containers now. Key kept (always empty) for frontend compatibility.
     managed_workers: dict[str, int] = {}
-    async with _workers_lock:
-        for wtype, workers in _workers.items():
-            managed_workers[wtype] = len([w for w in workers if w.is_alive])
 
     # Include container worker counts (workers running as Docker containers)
     # For KG, active_workers shows consumers per workspace queue, not container count

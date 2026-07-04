@@ -1,6 +1,6 @@
 import { useAdminStats } from "@/hooks/useAdminUsers";
 import { useTranslation } from "@/hooks/useTranslation";
-import { Users, Building2, Database, FileText, Activity, AlertCircle, Clock, RefreshCw } from "lucide-react";
+import { Users, Building2, Database, FileText, Activity, RefreshCw } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   LineChart,
@@ -191,7 +191,7 @@ export function AdminDashboardPage() {
                     label={({ cx, cy, midAngle, innerRadius, outerRadius, percent }) => {
                       // Hide labels for tiny slices to avoid overlap; draw the rest
                       // centered INSIDE the donut band so they never collide.
-                      if (!percent || percent < 0.06) return null;
+                      if (!percent || percent < 0.06 || midAngle == null) return null;
                       const RADIAN = Math.PI / 180;
                       const radius = innerRadius + (outerRadius - innerRadius) * 0.5;
                       const x = cx + radius * Math.cos(-midAngle * RADIAN);

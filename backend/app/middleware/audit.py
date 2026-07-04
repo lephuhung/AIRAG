@@ -54,6 +54,12 @@ RULES: list[dict] = [
     {"m": "POST", "re": r"^/api/v1/admin/users/(?P<id>[^/]+)/reset-password$", "action": "reset_password", "type": "user"},
     {"m": "PUT", "re": r"^/api/v1/admin/users/(?P<id>[^/]+)$", "action": "update", "type": "user"},
     {"m": "DELETE", "re": r"^/api/v1/admin/users/(?P<id>[^/]+)$", "action": "delete", "type": "user"},
+    # ── Worker control-plane (superadmin) ─────────────────────────────────
+    {"m": "POST", "re": r"^/api/v1/workers/start$", "action": "resume", "type": "worker"},
+    {"m": "POST", "re": r"^/api/v1/workers/stop/(?P<id>[^/]+)$", "action": "pause", "type": "worker"},
+    {"m": "POST", "re": r"^/api/v1/workers/restart/(?P<id>[^/]+)$", "action": "restart", "type": "worker"},
+    {"m": "POST", "re": r"^/api/v1/workers/restart-all$", "action": "restart_all", "type": "worker"},
+    {"m": "POST", "re": r"^/api/v1/workers/prefetch/(?P<id>[^/]+)$", "action": "set_prefetch", "type": "worker"},
 ]
 
 for _r in RULES:
@@ -67,6 +73,7 @@ _RES_VI = {
     "tenant_member": "thành viên tổ chức",
     "tenant_invite": "lời mời tổ chức",
     "user": "người dùng",
+    "worker": "worker xử lý tài liệu",
     "abbreviation": "từ viết tắt",
 }
 _ACT_VI = {
@@ -81,6 +88,11 @@ _ACT_VI = {
     "update_prompt": "Cập nhật system prompt",
     "delete_prompt": "Xóa system prompt",
     "reset_password": "Đặt lại mật khẩu",
+    "pause": "Tạm dừng",
+    "resume": "Chạy tiếp",
+    "restart": "Khởi động lại",
+    "restart_all": "Khởi động lại tất cả",
+    "set_prefetch": "Chỉnh prefetch",
 }
 
 _LABEL_KEYS = ("name", "full_name", "title", "text", "short_form", "slug", "email")

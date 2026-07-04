@@ -46,7 +46,12 @@ class KGMessage(BaseModel):
 
     document_id: uuid.UUID
     workspace_id: uuid.UUID
-    markdown: str  # full markdown from parse phase
+    # Prefer markdown_s3_key: kg_worker downloads the markdown from MinIO so the
+    # broker message stays small (and retry copies stay cheap). The inline
+    # `markdown` field remains only for backward compatibility with in-flight /
+    # DLQ messages published before markdown_s3_key existed.
+    markdown: str = ""
+    markdown_s3_key: str | None = None
 
 
 class MemorySaveMessage(BaseModel):

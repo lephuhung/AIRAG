@@ -27,6 +27,7 @@ from app.models.document_type import DocumentType as _DocumentType  # noqa: F401
 from app.models.document import Document, DocumentStatus
 from app.queue.messages import EmbedMessage
 from app.services.embedder import get_embedding_service
+from app.services.heading_path import extract_article_nos
 from app.services.vector_store import get_vector_store
 from app.workers.utils import check_and_finalize
 
@@ -141,9 +142,13 @@ async def handle_embed(payload: dict) -> None:
             embedder     = get_embedding_service()
             vector_store = get_vector_store(msg.workspace_id)
 
-            # embed_texts may filter empty/whitespace texts → track which ones survived
+            # Pass ONLY non-empty texts to the embedder so the returned list is
+            # aligned with valid_indices by construction (the embedder silently
+            # drops empty strings, which would desync ids/embeddings otherwise).
             valid_indices = [i for i, t in enumerate(embed_texts) if t.strip()]
-            embeddings = await asyncio.to_thread(embedder.embed_texts, embed_texts)
+            embeddings = await asyncio.to_thread(
+                embedder.embed_texts, [embed_texts[i] for i in valid_indices]
+            )
 
             # ids, metadatas, documents must be aligned with the embeddings list
             ws_id = str(msg.workspace_id)
@@ -163,6 +168,8 @@ async def handle_embed(payload: dict) -> None:
                     "file_type":       document.file_type,
                     "page_no":         c["page_no"],
                     "heading_path":    " > ".join(c["heading_path"]) if c["heading_path"] else "",
+                    # Số Điều cấu trúc ("17|18") — tra cứu điều khoản chính xác
+                    "article_nos":     "|".join(extract_article_nos(c["heading_path"])),
                     "has_table":       c["has_table"],
                     "has_code":        c["has_code"],
                     "image_ids":       "|".join(c["image_refs"]) if c["image_refs"] else "",
@@ -194,9 +201,26 @@ async def handle_embed(payload: dict) -> None:
                 raise
 
             # ── Mark searchable ─────────────────────────────────────────────
-            document.embed_done      = True
-            document.chunk_count     = len(chunks_data)
-            document.raw_chunks_json = None   # free space
+            document.embed_done  = True
+            document.chunk_count = len(chunks_data)
+            if document.is_chat_upload:
+                # No caption worker runs for chat uploads — safe to free now.
+                document.raw_chunks_json = None
+            else:
+                # Keep the (OCR-stripped) chunks AND the contextual sentence for
+                # the caption worker: its re-embed must rebuild
+                # "context + content + captions", otherwise it would overwrite
+                # the contextual vectors with context-less text.
+                # check_and_finalize frees this column once embed+captions done.
+                for i, c in enumerate(chunks_data):
+                    t = embed_texts[i]
+                    base = c["content"]
+                    c["context"] = (
+                        t[: -len(base)].rstrip("\n")
+                        if base and t != base and t.endswith(base)
+                        else ""
+                    )
+                document.raw_chunks_json = json.dumps(chunks_data)
             await db.commit()
             logger.info(
                 f"[embed_worker] doc={msg.document_id} embedded "
@@ -206,6 +230,9 @@ async def handle_embed(payload: dict) -> None:
 
         except Exception as e:
             logger.error(f"[embed_worker] doc={msg.document_id} FAILED: {e}", exc_info=True)
+            # Session may be aborted if the failure came from a DB flush —
+            # roll back first so the FAILED status can be written.
+            await db.rollback()
             document.status = DocumentStatus.FAILED
             document.error_message = str(e)[:500]
             await db.commit()

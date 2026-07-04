@@ -243,7 +243,7 @@ export function FilesPage() {
   const [searchQuery, setSearchQuery] = useState("");
   const [filterTab, setFilterTab] = useState<FilterTab>("all");
   const [sortKey, setSortKey] = useState<SortKey>("newest");
-  const [deleteDocConfirm, setDeleteDocConfirm] = useState<number | null>(null);
+  const [deleteDocConfirm, setDeleteDocConfirm] = useState<string | null>(null);
   const [editDoc, setEditDoc] = useState<Document | null>(null);
   const [sortMenuOpen, setSortMenuOpen] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);

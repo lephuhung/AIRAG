@@ -44,7 +44,7 @@ export function useCreateAbbreviation() {
 export function useUpdateAbbreviation() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async ({ id, data }: { id: number; data: AbbreviationUpdate }) => {
+    mutationFn: async ({ id, data }: { id: string; data: AbbreviationUpdate }) => {
       const res = await api.patch<Abbreviation>(`/abbreviations/${id}`, data);
       return res;
     },
@@ -57,7 +57,7 @@ export function useUpdateAbbreviation() {
 export function useDeleteAbbreviation() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async (id: number) => {
+    mutationFn: async (id: string) => {
       await api.delete(`/abbreviations/${id}`);
     },
     onSuccess: () => {

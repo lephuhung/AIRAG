@@ -1,11 +1,9 @@
 import { memo, useEffect, useState } from "react";
-import { useLocation } from "react-router-dom";
 import { ChevronRight, Cpu, Languages, Menu } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
 import { UserMenu } from "@/components/layout/UserMenu";
 import { useTranslation } from "@/hooks/useTranslation";
-import logo from "@/assets/logo.png";
 
 interface ConfigStatus {
   llm_provider: string;
@@ -25,7 +23,6 @@ interface TopBarProps {
 }
 
 export const TopBar = memo(function TopBar({ actions, className, onToggle, isNarrow }: TopBarProps) {
-  const location = useLocation();
   const [config, setConfig] = useState<ConfigStatus | null>(null);
   const { t, language, setLanguage } = useTranslation();
 

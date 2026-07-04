@@ -31,15 +31,21 @@ _is_ready: bool = False
 _rabbitmq_connected: bool = False
 _db_connected: bool = False
 
+# Paused via the control-plane (admin UI). Container stays healthy —
+# /health must keep returning 200 or Docker's healthcheck would kill the
+# deliberately paused worker.
+_is_paused: bool = False
+
 
 def update_worker_state(
     worker_type: str | None = None,
     ready: bool | None = None,
     rabbitmq: bool | None = None,
     db: bool | None = None,
+    paused: bool | None = None,
 ) -> None:
     """Update worker state flags. Called by runner.py during lifecycle."""
-    global _worker_type, _is_ready, _rabbitmq_connected, _db_connected
+    global _worker_type, _is_ready, _rabbitmq_connected, _db_connected, _is_paused
     if worker_type is not None:
         _worker_type = worker_type
     if ready is not None:
@@ -48,6 +54,8 @@ def update_worker_state(
         _rabbitmq_connected = rabbitmq
     if db is not None:
         _db_connected = db
+    if paused is not None:
+        _is_paused = paused
 
 
 async def health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -61,11 +69,16 @@ async def health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         method, path, _ = request_line.decode().split()
 
         if path == "/health":
-            status = "ok"
-            code = 200
-            body = f'{{"status":"{status}","worker_type":"{_worker_type}","uptime_seconds":{time.monotonic() - _uptime_start:.1f}}}'
+            status = "paused" if _is_paused else "ok"
+            code = 200  # always 200 — a paused worker is alive, not unhealthy
+            body = (
+                f'{{"status":"{status}","worker_type":"{_worker_type}",'
+                f'"paused":{str(_is_paused).lower()},'
+                f'"ready":{str(_is_ready and _rabbitmq_connected and not _is_paused).lower()},'
+                f'"uptime_seconds":{time.monotonic() - _uptime_start:.1f}}}'
+            )
         elif path == "/ready":
-            if _is_ready and _rabbitmq_connected:
+            if _is_ready and _rabbitmq_connected and not _is_paused:
                 status = "ready"
                 code = 200
             else:
@@ -73,6 +86,7 @@ async def health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 code = 503
             body = (
                 f'{{"ready":{str(_is_ready).lower()},'
+                f'"paused":{str(_is_paused).lower()},'
                 f'"rabbitmq":{str(_rabbitmq_connected).lower()},'
                 f'"db":{str(_db_connected).lower()},'
                 f'"worker_type":"{_worker_type}"}}'
