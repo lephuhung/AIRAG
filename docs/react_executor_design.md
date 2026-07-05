@@ -235,3 +235,41 @@ Thứ tự:
 - Bộ ~20 câu đại diện: khái niệm chung, doc có tên, điều/khoản, so sánh 2 doc, viết tắt, kg, câu có "tôi/đơn vị tôi", câu mơ hồ (kỳ vọng `ask_user`), câu chứa fact cá nhân (kỳ vọng `save_memory`).
 - So nhánh cũ vs ReAct trên cùng bộ, chấm bằng Langfuse trace + đọc tay.
 ```
+
+---
+
+## 12. Ready-signal protocol & live-streaming synthesis (2026-07-04)
+
+**Vấn đề**: TTFT ≈ toàn bộ pipeline. Lượt trả lời là lượt CÓ tools bật → không thể
+stream speculative (function-call chunks chỉ đến cuối stream, text giữa chừng có
+thể là preamble trước tool call) → buffer toàn bộ answer, judge (~5s), rồi
+`_stream_out` replay trong ~0.3s. Đo trên `agent_traces`: chặng sinh answer
+buffered chiếm ~65% TTFT (6.5–8.5s trên query đơn giản 10–12.5s).
+
+**Giải pháp** — tách "quyết định xong" khỏi "soạn câu trả lời":
+
+1. **Prompt** (`react_prompt.py`, mục KHI ĐÃ ĐỦ THÔNG TIN): bước trả lời gồm HAI
+   lượt — (1) lượt báo hiệu: model trả về đúng dòng `SẴN SÀNG TRẢ LỜI` (không soạn
+   nội dung); (2) lượt soạn thảo: hệ thống yêu cầu viết câu trả lời đầy đủ.
+2. **Loop** (`react_executor_node`): lượt no-calls có text rỗng / chỉ chứa marker
+   (≤400 ký tự) / quá ngắn để là answer (≤160 ký tự sau khi strip plan line — bắt cả
+   marker gõ lỗi "SẴN SÀN TRẢ LỜI" mà Qwen lặp lại đều đặn) → `break` vào block
+   synthesis: lượt **no-tools** nên stream live an toàn tuyệt đối
+   (`_run_streaming_synthesis`, không thể có tool call lòi ra cuối). Judge chạy
+   SAU khi user đã đọc, chỉ được APPEND caveat — không bao giờ rút text.
+3. **Fallback không regress**: model không tuân thủ (xổ full answer trong lượt
+   tool) → đường cũ buffer → judge (có revise loop) → replay. `synthesis_instr`
+   phải mở đầu bằng dòng "Đây là LƯỢT SOẠN THẢO... KHÔNG trả về SẴN SÀNG TRẢ LỜI"
+   — không có nó model echo marker ở lượt soạn thảo, head-holdback strip sạch →
+   stream rỗng → rơi vào câu xin lỗi (bug gặp thật khi triển khai).
+
+**Regex** (định nghĩa cạnh prompt trong `react_prompt.py`): `READY_SIGNAL_RE`
+(detect, `SÀNG?` chịu typo) + `READY_LINE_RE` (strip marker mở đầu answer, dùng ở
+`_finish` và head-holdback của `_run_streaming_synthesis`).
+
+**Đo được** (query "Mạng LAN...", workspace Luật): TTFT 10.4s → **6.0s**; câu đa ý
+4 vòng tool: TTFT ~32s → **18.5s** (synthesis stream live thay vì buffer+judge+replay).
+Eval `react_plan` 7/7 (marker compliance 8/8 ở các case đủ dữ liệu). Bẫy wording:
+diễn đạt marker kiểu "chỉ trả về ĐÚNG MỘT dòng duy nhất / TUYỆT ĐỐI KHÔNG viết"
+làm model bỏ luôn dòng KẾ HOẠCH ở lượt tool (t1-plan-multipart 8/8 → 0/8) — phải
+dùng giọng trung tính "hai lượt: báo hiệu / soạn thảo" và giữ nguyên rule 8/9.

@@ -9,7 +9,7 @@ Luật số 35/2018/QH14" không được tính là đối tượng).
 """
 from __future__ import annotations
 
-from app.services.validity_extractor import extract_validity
+from app.services.legal.validity_extractor import extract_validity
 
 # Đệm cho điều thi hành nằm ở nửa sau văn bản (extractor chỉ quét sau 30%).
 _FILLER = "\n".join(
@@ -202,7 +202,7 @@ def test_cong_van_without_structure_returns_empty():
 # ── extract_article_nos (heading_path.py) — nguồn metadata article_nos ──────
 
 def test_extract_article_nos_variants():
-    from app.services.heading_path import extract_article_nos
+    from app.services.parsing.heading_path import extract_article_nos
 
     assert extract_article_nos(["Chương V", "Điều 25. Hiệu lực thi hành"]) == ["25"]
     # chuỗi đã join + nhiều điều + không lặp

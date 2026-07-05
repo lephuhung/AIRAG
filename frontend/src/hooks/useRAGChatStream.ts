@@ -121,6 +121,8 @@ export function useRAGChatStream(
   const [streamCompleteTick, setStreamCompleteTick] = useState(0);
 
   const abortRef = useRef<AbortController | null>(null);
+  // Session of the in-flight stream — target for the server-side cancel call.
+  const activeSessionRef = useRef<string | null>(null);
   const bufferRef = useRef("");
   const rafRef = useRef<number | undefined>(undefined);
 
@@ -134,7 +136,10 @@ export function useRAGChatStream(
   // Persist people data across resets (for final message after streaming completes)
   const peopleDataRef = useRef<PeopleRecord[]>([]);
 
-  // Cleanup on unmount
+  // Cleanup on unmount — only closes the socket. The backend run is detached
+  // from the connection: it keeps generating and persists the answer, which
+  // the remounted panel then picks up from history. Do NOT call the server
+  // cancel endpoint here; that is reserved for the explicit stop button.
   useEffect(() => {
     return () => {
       abortRef.current?.abort();
@@ -169,6 +174,17 @@ export function useRAGChatStream(
   }, []);
 
   const cancel = useCallback(() => {
+    // The run is detached server-side: closing the socket alone no longer
+    // stops generation, so ask the backend to cancel the run too (it persists
+    // whatever partial answer was generated).
+    const sid = activeSessionRef.current;
+    if (sid) {
+      const token = useAuthStore.getState().token;
+      fetch(`${BASE_URL}/rag/chat/sessions/${sid}/stream/cancel`, {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      }).catch(() => {});
+    }
     abortRef.current?.abort();
     abortRef.current = null;
     setStatus("idle");
@@ -308,6 +324,7 @@ export function useRAGChatStream(
       try {
         const sid = overrideSessionId || sessionId;
         if (!sid) throw new Error("No active chat session.");
+        activeSessionRef.current = sid;
         const token = useAuthStore.getState().token;
         const headers: Record<string, string> = {
           "Content-Type": "application/json",

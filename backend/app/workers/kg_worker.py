@@ -23,7 +23,7 @@ from sqlalchemy import select
 from app.core.database import async_session_maker
 from app.models.document import Document
 from app.queue.messages import KGMessage
-from app.services.knowledge_graph_service import get_kg_service
+from app.services.kg.knowledge_graph_service import get_kg_service
 from app.workers.utils import check_and_finalize
 
 logger = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ async def handle_kg(payload: dict) -> None:
             # OCR-path markdown carries administrative-layout HTML (alignment
             # divs, data-bbox). That markup is token waste + extraction noise
             # for the KG LLM — strip it (no-op for Docling documents).
-            from app.services.ocr_service import strip_ocr_layout
+            from app.services.parsing.ocr_service import strip_ocr_layout
 
             markdown = strip_ocr_layout(markdown)
 

@@ -16,6 +16,10 @@ pymongo>=4.10
 # Vector store
 chromadb>=0.4.22
 
+# Redis — shared cross-process state (stream-cancel pub/sub, distributed GPU
+# semaphore, retrieval cache) so the backend can run >1 worker process / replica.
+redis[hiredis]>=5.0
+
 # Embeddings & reranking
 sentence-transformers>=2.2.2
 

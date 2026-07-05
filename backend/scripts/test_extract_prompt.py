@@ -42,7 +42,7 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.core.database import async_session_maker
 from app.models.document import Document
-from app.services.legal_kg_service import _parse_llm_json, split_articles
+from app.services.kg.legal_kg_service import _parse_llm_json, split_articles
 from app.services.llm.openai_compatible import OpenAICompatibleLLMProvider
 from app.services.llm.types import LLMMessage
 from app.services.storage_service import StorageService

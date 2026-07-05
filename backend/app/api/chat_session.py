@@ -2,7 +2,7 @@
 REST API for Chat Sessions.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 
@@ -18,6 +18,7 @@ from app.schemas.rag import (
     DocumentBrief,
     SessionDocumentsResponse,
 )
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -25,6 +26,84 @@ from datetime import datetime, timezone
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/rag/chat/sessions", tags=["chat_session"])
+
+# In-flight agent runs per session. The run is detached from its SSE
+# connection (closing the socket does NOT stop generation), so the stop
+# button needs this to cancel it. The asyncio.Task objects are inherently
+# process-local (they can't be serialised to Redis), so this dict stays
+# per-process; cross-process reach is provided by the Redis pub/sub cancel
+# channel below (see _cancel_listener_loop). When REDIS_ENABLED=false this
+# behaves exactly as before — a single process holding all its own tasks.
+_ACTIVE_STREAMS: dict[str, asyncio.Task] = {}
+
+# Redis pub/sub channel every backend process subscribes to. A Stop that the
+# load balancer routes to a process which is NOT running the target session
+# publishes the session_id here; whichever process actually owns the task
+# cancels it locally. See start_cancel_listener() / cancel_stream_session().
+_STREAM_CANCEL_CHANNEL = "stream:cancel"
+_cancel_listener_task: "asyncio.Task | None" = None
+
+
+def _cancel_local_stream(session_id: str) -> bool:
+    """Cancel the in-flight run for this session IFF it lives in THIS process.
+
+    Returns True when a live task was found and cancelled here. Never touches
+    Redis — callers decide whether to broadcast to other processes.
+    """
+    task = _ACTIVE_STREAMS.get(session_id)
+    if task is not None and not task.done():
+        task.cancel()
+        return True
+    return False
+
+
+async def _cancel_listener_loop() -> None:
+    """Subscribe to the Redis cancel channel and cancel matching local runs.
+
+    Runs for the lifetime of the process (one task per process). Reconnects on
+    transient Redis errors. A no-op process — one that doesn't own the session —
+    simply finds nothing in _ACTIVE_STREAMS and ignores the message.
+    """
+    from app.core.redis_client import get_redis
+
+    while True:
+        try:
+            pubsub = get_redis().pubsub()
+            await pubsub.subscribe(_STREAM_CANCEL_CHANNEL)
+            logger.info("[stream-cancel] Subscribed to %s", _STREAM_CANCEL_CHANNEL)
+            async for message in pubsub.listen():
+                if message.get("type") != "message":
+                    continue  # skip subscribe/unsubscribe confirmations
+                session_id = message.get("data")
+                if not session_id:
+                    continue
+                if _cancel_local_stream(session_id):
+                    logger.info(
+                        "[stream-cancel] Cancelled local run for session=%s", session_id
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — keep the listener alive
+            logger.warning("[stream-cancel] listener error, retrying in 5s: %s", e)
+            await asyncio.sleep(5)
+
+
+async def start_cancel_listener() -> None:
+    """Start the cross-process cancel listener (idempotent, no-op without Redis)."""
+    global _cancel_listener_task
+    from app.core.redis_client import is_redis_enabled
+
+    if not is_redis_enabled() or _cancel_listener_task is not None:
+        return
+    _cancel_listener_task = asyncio.create_task(_cancel_listener_loop())
+
+
+async def stop_cancel_listener() -> None:
+    """Stop the cancel listener on shutdown."""
+    global _cancel_listener_task
+    if _cancel_listener_task is not None:
+        _cancel_listener_task.cancel()
+        _cancel_listener_task = None
 
 
 @router.get("")
@@ -144,7 +223,7 @@ async def delete_chat_session(
         for doc in chat_upload_docs:
             # Delete from ChromaDB vector store
             try:
-                from app.services.rag_service import get_rag_service
+                from app.services.retrieval.rag_service import get_rag_service
                 rag_svc = get_rag_service(db, doc.workspace_id)
                 await rag_svc.delete_document(doc.id)
             except Exception as e:
@@ -335,7 +414,6 @@ from app.api.chat_agent import _get_accessible_workspaces
 async def chat_stream_session(
     session_id: str,
     request: ChatRequest,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
@@ -382,7 +460,7 @@ async def chat_stream_session(
     system_prompt_to_use = DEFAULT_SYSTEM_PROMPT + HARD_SYSTEM_PROMPT
 
     # Build conversation context from exchange summaries (if session has history)
-    from app.services.conversation_summary_service import (
+    from app.services.memory.conversation_summary_service import (
         get_conversation_summary_service,
     )
 
@@ -495,7 +573,7 @@ async def chat_stream_session(
             # Generate exchange summary outside the session scope (LLM call may be slow)
             topic_label = None
             try:
-                from app.services.conversation_summary_service import get_conversation_summary_service
+                from app.services.memory.conversation_summary_service import get_conversation_summary_service
                 summary_svc = get_conversation_summary_service()
                 async with async_session_maker() as db:
                     summary_result = await summary_svc.save_exchange_summary(
@@ -527,7 +605,7 @@ async def chat_stream_session(
 
             # Graphiti save (separate session)
             try:
-                from app.services.graphiti_client import add_conversation_episode
+                from app.services.memory.graphiti_client import add_conversation_episode
                 if user_id and user_message and text:
                     await add_conversation_episode(
                         user_id=user_id,
@@ -553,7 +631,7 @@ async def chat_stream_session(
 
         try:
             from app.models.exchange_summary import ExchangeSummary
-            from app.services.conversation_summary_service import (
+            from app.services.memory.conversation_summary_service import (
                 get_conversation_summary_service,
             )
 
@@ -669,47 +747,70 @@ async def chat_stream_session(
 
     # ── Route: LangGraph agent (the only agent backend; legacy path removed) ─
     logger.info(f"[session/{session_id}] Routing to LangGraph agent backend")
-    if True:  # block kept to preserve indentation; LangGraph is unconditional now
 
-        async def _event_generator_lg():
-            yield format_sse_event(
-                "status",
-                {"step": "starting", "detail": "Initializing LangGraph agent..."},
+    # ── Detached agent run ────────────────────────────────────────────────
+    # The agent runs in its own task, NOT tied to the SSE connection: if the
+    # client disconnects mid-answer (tab switch, navigation), generation keeps
+    # going and the answer is still persisted — the returning client picks it
+    # up from history (which polls + refetches on window focus). SSE strings
+    # are relayed to the client via `relay`; None is the end-of-stream sentinel.
+    relay: asyncio.Queue = asyncio.Queue()
+
+    async def _run_and_persist():
+        from app.core.database import async_session_maker
+        from app.services.agents.supervisor import get_supervisor_graph as get_agent_graph
+        from app.services.agent.streaming import (
+            stream_agent_to_sse,
+            build_initial_state,
+        )
+        import json as _json
+
+        accumulated_text = ""
+        accumulated_thinking = ""
+        final_sources: list = []
+        final_images: list = []
+        final_steps: list = []
+        final_potential_abbreviations: list = []
+        final_people_data: list = []
+        saved = False
+
+        async def _persist(partial: bool) -> None:
+            nonlocal saved
+            if saved:
+                return
+            if partial and not accumulated_text and not accumulated_thinking:
+                return
+            await _save_assistant_inline(
+                text=accumulated_text,
+                thinking=accumulated_thinking,
+                sources=final_sources,
+                images=final_images,
+                steps=final_steps,
+                potentials=final_potential_abbreviations,
+                people_data=final_people_data,
+                ai_msg_id=ai_msg_id,
             )
-            yield format_sse_event("user_id", {"id": user_msg_id})
-            yield format_sse_event("ai_message_id", {"message_id": ai_msg_id})
+            saved = True
 
-            accumulated_text = ""
-            accumulated_thinking = ""
-            final_sources: list = []
-            final_images: list = []
-            final_steps: list = []
-            final_potential_abbreviations: list = []
-            final_people_data: list = []
-
-            try:
-                from app.services.agents.supervisor import get_supervisor_graph as get_agent_graph
-                from app.services.agent.streaming import (
-                    stream_agent_to_sse,
-                    build_initial_state,
+        try:
+            history = []
+            for m in request.history:
+                role = m.role if hasattr(m, "role") else m.get("role", "user")
+                content = (
+                    m.content if hasattr(m, "content") else m.get("content", "")
                 )
-                import json as _json
+                history.append({"role": role, "content": content})
 
-                history = []
-                for m in request.history:
-                    role = m.role if hasattr(m, "role") else m.get("role", "user")
-                    content = (
-                        m.content if hasattr(m, "content") else m.get("content", "")
-                    )
-                    history.append({"role": role, "content": content})
-
+            # Own DB session — the request-scoped one is closed when the HTTP
+            # request ends, which can be long before this task finishes.
+            async with async_session_maker() as run_db:
                 initial_state = build_initial_state(
                     workspace_ids=workspace_ids,
                     message=request.message,
                     history=history,
                     system_prompt=system_prompt_to_use,
                     enable_thinking=getattr(request, "enable_thinking", False),
-                    db=db,
+                    db=run_db,
                     user_id=user.id,
                     session_id=session_id,
                     document_ids=request.document_ids,
@@ -722,97 +823,164 @@ async def chat_stream_session(
                 )
 
                 graph = get_agent_graph()
+                agen = stream_agent_to_sse(graph, initial_state)
+                try:
+                    async for sse_str in agen:
+                        # Collect data for DB persistence while relaying
+                        try:
+                            if sse_str.startswith("event:"):
+                                lines = sse_str.strip().split("\n")
+                                ev_type = lines[0].replace("event: ", "").strip()
+                                data_line = next(
+                                    (l for l in lines if l.startswith("data:")), None
+                                )
+                                if data_line:
+                                    ev_data = _json.loads(data_line[5:].strip())
+                                    if ev_type == "token":
+                                        accumulated_text += ev_data.get("text", "")
+                                    elif ev_type == "thinking":
+                                        accumulated_thinking += ev_data.get("text", "")
+                                    elif ev_type == "sources":
+                                        final_sources = ev_data.get("sources", [])
+                                    elif ev_type == "images":
+                                        final_images = ev_data.get(
+                                            "image_refs", ev_data.get("images", [])
+                                        )
+                                    elif ev_type == "status":
+                                        final_steps.append(ev_data)
+                                    elif ev_type == "complete":
+                                        if "answer" in ev_data:
+                                            accumulated_text = ev_data["answer"]
+                                    elif ev_type == "potential_abbreviations":
+                                        final_potential_abbreviations = ev_data.get(
+                                            "abbreviations", []
+                                        )
+                                    elif ev_type == "people_data":
+                                        final_people_data = ev_data.get("people", [])
+                        except Exception:
+                            pass
 
-                async for sse_str in stream_agent_to_sse(graph, initial_state):
-                    # Collect data for DB persistence while yielding
-                    try:
-                        if sse_str.startswith("event:"):
-                            lines = sse_str.strip().split("\n")
-                            ev_type = lines[0].replace("event: ", "").strip()
-                            data_line = next(
-                                (l for l in lines if l.startswith("data:")), None
-                            )
-                            if data_line:
-                                ev_data = _json.loads(data_line[5:].strip())
-                                if ev_type == "token":
-                                    accumulated_text += ev_data.get("text", "")
-                                elif ev_type == "thinking":
-                                    accumulated_thinking += ev_data.get("text", "")
-                                elif ev_type == "sources":
-                                    final_sources = ev_data.get("sources", [])
-                                elif ev_type == "images":
-                                    final_images = ev_data.get(
-                                        "image_refs", ev_data.get("images", [])
-                                    )
-                                elif ev_type == "status":
-                                    final_steps.append(ev_data)
-                                elif ev_type == "complete":
-                                    if "answer" in ev_data:
-                                        accumulated_text = ev_data["answer"]
-                                elif ev_type == "potential_abbreviations":
-                                    final_potential_abbreviations = ev_data.get(
-                                        "abbreviations", []
-                                    )
-                                elif ev_type == "people_data":
-                                    final_people_data = ev_data.get("people", [])
-                    except Exception:
-                        pass
+                        relay.put_nowait(sse_str)
+                finally:
+                    # Deterministic close: on cancellation this throws
+                    # GeneratorExit into stream_agent_to_sse, whose finally
+                    # cancels the LangGraph task — the run stops promptly.
+                    await agen.aclose()
 
-                    yield sse_str
-
-                # Generate the title now (first exchange) and push it immediately so
-                # the client updates without a refresh; reuse the summary downstream.
-                # NOTE: run the title helper BEFORE saving the assistant message —
-                # it detects "first exchange" by the absence of a prior assistant
-                # message, which the inline save below would otherwise create.
-                new_title, precomputed_summary = await _make_first_exchange_title(
-                    accumulated_text
-                )
-                if new_title:
-                    yield format_sse_event(
-                        "session_title_updated", {"Title": new_title}
-                    )
-
-                # Persist the answer synchronously so it is durable the instant the
-                # stream closes (survives an immediate hard reload).
-                await _save_assistant_inline(
-                    text=accumulated_text,
-                    thinking=accumulated_thinking,
-                    sources=final_sources,
-                    images=final_images,
-                    steps=final_steps,
-                    potentials=final_potential_abbreviations,
-                    people_data=final_people_data,
-                    ai_msg_id=ai_msg_id,
+            # Generate the title now (first exchange) and push it immediately so
+            # the client updates without a refresh; reuse the summary downstream.
+            # NOTE: run the title helper BEFORE saving the assistant message —
+            # it detects "first exchange" by the absence of a prior assistant
+            # message, which the inline save below would otherwise create.
+            new_title, precomputed_summary = await _make_first_exchange_title(
+                accumulated_text
+            )
+            if new_title:
+                relay.put_nowait(
+                    format_sse_event("session_title_updated", {"Title": new_title})
                 )
 
-                # Remaining (slow) persistence in background — stream closes now.
-                background_tasks.add_task(
-                    _background_persist_and_emit,
-                    session_id=session_id,
-                    user_id=str(user.id),
-                    user_message=request.message,
-                    text=accumulated_text,
-                    thinking=accumulated_thinking,
-                    sources=final_sources,
-                    images=final_images,
-                    steps=final_steps,
-                    potentials=final_potential_abbreviations,
-                    people_data=final_people_data,
-                    user_msg_id=user_msg_id,
-                    ai_msg_id=ai_msg_id,
-                    precomputed_summary=precomputed_summary,
-                )
+            # Persist the answer synchronously so it is durable the instant the
+            # stream closes (survives an immediate hard reload).
+            await _persist(partial=False)
 
-            except Exception as e:
-                logger.error(f"[lg/session] LangGraph stream error: {e}", exc_info=True)
-                yield format_sse_event("error", {"message": str(e)})
+            # Slow persistence (summary LLM, Graphiti). Run it here — this task
+            # already outlives the response, and response BackgroundTasks never
+            # fire when the client disconnected mid-stream.
+            await _background_persist_and_emit(
+                session_id=session_id,
+                user_id=str(user.id),
+                user_message=request.message,
+                text=accumulated_text,
+                thinking=accumulated_thinking,
+                sources=final_sources,
+                images=final_images,
+                steps=final_steps,
+                potentials=final_potential_abbreviations,
+                people_data=final_people_data,
+                user_msg_id=user_msg_id,
+                ai_msg_id=ai_msg_id,
+                precomputed_summary=precomputed_summary,
+            )
 
-        return StreamingResponse(
-            sse_with_heartbeat(_event_generator_lg()),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        except asyncio.CancelledError:
+            # Stop button (cancel endpoint) or server shutdown — keep whatever
+            # was generated so the user still sees the partial answer.
+            try:
+                await asyncio.shield(_persist(partial=True))
+            except asyncio.CancelledError:
+                pass
+            raise
+        except Exception as e:
+            logger.error(f"[lg/session] LangGraph stream error: {e}", exc_info=True)
+            relay.put_nowait(format_sse_event("error", {"message": str(e)}))
+            await _persist(partial=True)
+        finally:
+            relay.put_nowait(None)
+            if _ACTIVE_STREAMS.get(session_id) is asyncio.current_task():
+                _ACTIVE_STREAMS.pop(session_id, None)
+
+    run_task = asyncio.create_task(_run_and_persist())
+    _ACTIVE_STREAMS[session_id] = run_task
+
+    async def _event_generator_lg():
+        yield format_sse_event(
+            "status",
+            {"step": "starting", "detail": "Initializing LangGraph agent..."},
         )
+        yield format_sse_event("user_id", {"id": user_msg_id})
+        yield format_sse_event("ai_message_id", {"message_id": ai_msg_id})
+
+        while True:
+            item = await relay.get()
+            if item is None:
+                break
+            yield item
+
+    return StreamingResponse(
+        sse_with_heartbeat(_event_generator_lg()),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/{session_id}/stream/cancel")
+async def cancel_stream_session(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_current_active_user),
+):
+    """Cancel the in-flight agent run for this session (stop button).
+
+    The run is detached from the SSE connection, so closing the socket no
+    longer stops generation — this endpoint does. The partial answer generated
+    so far is persisted by the run's CancelledError handler.
+    """
+    result = await db.execute(
+        select(ChatSession).where(
+            ChatSession.id == session_id, ChatSession.user_id == user.id
+        )
+    )
+    if result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Chat session not found")
+
+    # Fast path: the run lives in THIS process — cancel directly. Also covers
+    # the single-process deploy (REDIS_ENABLED=false) unchanged.
+    if _cancel_local_stream(session_id):
+        return {"cancelled": True}
+
+    # Not here — with >1 worker/replica the run may be on another process.
+    # Broadcast the session_id; the owning process cancels it via its listener.
+    from app.core.redis_client import is_redis_enabled, get_redis
+
+    if is_redis_enabled():
+        try:
+            await get_redis().publish(_STREAM_CANCEL_CHANNEL, session_id)
+            return {"cancelled": True, "dispatched": True}
+        except Exception as e:  # noqa: BLE001 — best-effort cross-process cancel
+            logger.warning("[stream-cancel] publish failed: %s", e)
+
+    return {"cancelled": False}
 
 
 from app.schemas.rag import RateSourceRequest

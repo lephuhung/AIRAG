@@ -21,7 +21,7 @@ Performance (per Anthropic benchmarks):
   - + reranking                   → -67%
 
 Usage:
-    from app.services.contextual_embedder import enrich_chunks_with_context
+    from app.services.embedding.contextual_embedder import enrich_chunks_with_context
 
     enriched_texts = await enrich_chunks_with_context(
         document_markdown=full_markdown,

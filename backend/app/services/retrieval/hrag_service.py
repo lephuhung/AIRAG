@@ -20,14 +20,14 @@ from sqlalchemy import select, delete
 
 from app.core.config import settings
 from app.models.document import Document, DocumentImage, DocumentTable, DocumentStatus
-from app.services.deep_document_parser import DeepDocumentParser
-from app.services.knowledge_graph_service import get_kg_service
-from app.services.deep_retriever import DeepRetriever
-from app.services.embedder import EmbeddingService, get_embedding_service
-from app.services.heading_path import extract_article_nos
-from app.services.vector_store import VectorStore, get_vector_store
-from app.services.reranker import get_reranker_service
-from app.services.rag_service import RAGQueryResult, RetrievedChunk
+from app.services.parsing.deep_document_parser import DeepDocumentParser
+from app.services.kg.knowledge_graph_service import get_kg_service
+from app.services.retrieval.deep_retriever import DeepRetriever
+from app.services.embedding.embedder import EmbeddingService, get_embedding_service
+from app.services.parsing.heading_path import extract_article_nos
+from app.services.embedding.vector_store import VectorStore, get_vector_store
+from app.services.retrieval.reranker import get_reranker_service
+from app.services.retrieval.rag_service import RAGQueryResult, RetrievedChunk
 from app.services.models.parsed_document import DeepRetrievalResult
 
 logger = logging.getLogger(__name__)

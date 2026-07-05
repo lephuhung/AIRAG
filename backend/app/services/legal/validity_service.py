@@ -26,7 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document import Document
-from app.services.validity_extractor import extract_validity
+from app.services.legal.validity_extractor import extract_validity
 
 logger = logging.getLogger(__name__)
 

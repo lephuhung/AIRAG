@@ -34,8 +34,8 @@ cloudflared/*.json
 # Prompt-eval run artifacts
 backend/tests/prompts/reports/
 backend/tests/retrieval/reports/
-backend/tests/prompts
-backend/scripts
+backend/tests/
+backend/scripts/
 backend/tests/conftest.py
 backend/requirements-dev.txt
 backend/pytest.ini
@@ -43,3 +43,4 @@ backend/scripts/compare_prompt_reports.py
 backend/scripts/export_agent_traces.py
 backend/scripts/export_agent_traces.py
 backend/scripts/export_agent_traces.py
+backend/tests/services/test_validity_extractor.py

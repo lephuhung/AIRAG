@@ -407,7 +407,7 @@ async def _adapt_summarize_long_document(args: dict, ctx: ToolContext) -> dict:
     from app.services.storage_service import get_storage_service
     from app.services.llm import get_llm_provider
     from app.services.llm.types import LLMMessage
-    from app.services.chunker import chunk_text
+    from app.services.embedding.chunker import chunk_text
 
     raw_ids = ctx.uploaded_document_ids or ctx.document_ids or []
     doc_ids: list = []
@@ -505,7 +505,7 @@ async def _adapt_summarize_long_document(args: dict, ctx: ToolContext) -> dict:
 # ──────────────────────────────────────────────────────────────────────────
 
 async def _adapt_recall_memory(args: dict, ctx: ToolContext) -> dict:
-    from app.services.graphiti_client import search_user_memory
+    from app.services.memory.graphiti_client import search_user_memory
 
     if not ctx.user_id:
         return tool_result("Không có ngữ cảnh người dùng để truy hồi.")
@@ -518,7 +518,7 @@ async def _adapt_recall_memory(args: dict, ctx: ToolContext) -> dict:
 
 
 async def _adapt_save_memory(args: dict, ctx: ToolContext) -> dict:
-    from app.services.graphiti_client import save_user_fact_background
+    from app.services.memory.graphiti_client import save_user_fact_background
 
     fact = (args.get("fact") or "").strip()
     if not ctx.user_id:

@@ -29,6 +29,9 @@ import {
   Zap,
   Minus,
   MailWarning,
+  Gauge,
+  Thermometer,
+  MemoryStick,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -42,6 +45,8 @@ import type {
   DeadLetterMessage,
   PipelineDocument,
   QueueInfo,
+  GpuOverview,
+  GpuInfo,
 } from "@/types";
 
 // ---------------------------------------------------------------------------
@@ -206,6 +211,12 @@ export function WorkersPage() {
     queryKey: ["workers-pipeline"],
     queryFn: () => api.get<{ documents: PipelineDocument[] }>("/workers/pipeline"),
     refetchInterval: 5000,
+  });
+
+  const { data: gpuData } = useQuery({
+    queryKey: ["workers-gpu"],
+    queryFn: () => api.get<GpuOverview>("/workers/gpu"),
+    refetchInterval: 3000,
   });
 
   const { data: dlqData } = useQuery({
@@ -727,6 +738,22 @@ export function WorkersPage() {
                       </div>
                     )}
                   </div>
+                </div>
+              </Section>
+            )}
+
+            {/* ── GPU / VRAM (real-time, 3s poll) ── */}
+            {gpuData?.available && gpuData.gpus.length > 0 && (
+              <Section
+                title={t("workers.gpu.title")}
+                icon={Gauge}
+                badge={gpuData.gpus.length > 1 ? gpuData.gpus.length : undefined}
+                defaultOpen={true}
+              >
+                <div className="space-y-3">
+                  {gpuData.gpus.map((gpu) => (
+                    <GpuCard key={gpu.index} gpu={gpu} />
+                  ))}
                 </div>
               </Section>
             )}
@@ -1273,6 +1300,137 @@ export function WorkersPage() {
         confirmLabel={t("common.delete")}
         variant="danger"
       />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// GpuCard — real-time VRAM / utilization / temperature for one GPU.
+// The VRAM bar is stacked: one colored segment per GPU process, a grey
+// "other" segment for memory NVML can't attribute (CUDA contexts, etc.),
+// and the remaining background = free.
+// ---------------------------------------------------------------------------
+const GPU_PROC_COLORS = [
+  "bg-blue-400",
+  "bg-violet-400",
+  "bg-amber-400",
+  "bg-cyan-400",
+  "bg-pink-400",
+  "bg-emerald-400",
+  "bg-orange-400",
+  "bg-indigo-400",
+];
+
+function GpuCard({ gpu }: { gpu: GpuInfo }) {
+  const { t } = useTranslation();
+  const pct = gpu.memory_pct;
+  const pctColor =
+    pct >= 90 ? "text-destructive" :
+    pct >= 70 ? "text-amber-400" :
+    "text-green-400";
+  const toGb = (mb: number) => (mb / 1024).toFixed(1);
+
+  const procs = gpu.processes ?? [];
+  const procSumMb = procs.reduce((s, p) => s + p.memory_mb, 0);
+  const otherMb = Math.max(0, gpu.memory_used_mb - procSumMb);
+  const widthPct = (mb: number) => (mb / gpu.memory_total_mb) * 100;
+
+  return (
+    <div className="rounded-xl border bg-card p-4 space-y-3">
+      {/* Header: GPU name + util/temp + VRAM % */}
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-2 min-w-0">
+          <MemoryStick className="w-3.5 h-3.5 text-primary flex-shrink-0" />
+          <span className="text-sm font-semibold truncate" title={gpu.name}>
+            {gpu.name}
+          </span>
+          <span className="text-[10px] text-muted-foreground flex-shrink-0">
+            #{gpu.index}
+          </span>
+        </div>
+        <div className="flex items-center gap-4 text-xs text-muted-foreground">
+          {gpu.utilization_pct != null && (
+            <span className="inline-flex items-center gap-1.5" title={t("workers.gpu.utilization")}>
+              <Gauge className="w-3 h-3" />
+              <span className="font-semibold tabular-nums text-foreground">{gpu.utilization_pct}%</span>
+            </span>
+          )}
+          {gpu.temperature_c != null && (
+            <span className="inline-flex items-center gap-1.5" title={t("workers.gpu.temperature")}>
+              <Thermometer className="w-3 h-3" />
+              <span className={cn(
+                "font-semibold tabular-nums",
+                gpu.temperature_c >= 85 ? "text-destructive" :
+                gpu.temperature_c >= 75 ? "text-amber-400" : "text-foreground",
+              )}>
+                {gpu.temperature_c}°C
+              </span>
+            </span>
+          )}
+          <span className={cn("text-sm font-bold tabular-nums", pctColor)}>
+            {pct.toFixed(1)}%
+          </span>
+        </div>
+      </div>
+
+      {/* Stacked VRAM bar — one segment per process */}
+      <div>
+        <div className="h-3 rounded-full bg-muted overflow-hidden flex">
+          {procs.map((p, i) => (
+            <div
+              key={p.pid}
+              className={cn(
+                "h-full transition-all duration-700 flex-shrink-0",
+                GPU_PROC_COLORS[i % GPU_PROC_COLORS.length],
+              )}
+              style={{ width: `${widthPct(p.memory_mb)}%` }}
+              title={`${p.label} — ${toGb(p.memory_mb)} GB (PID ${p.pid})`}
+            />
+          ))}
+          {otherMb > 0 && (
+            <div
+              className="h-full bg-muted-foreground/40 transition-all duration-700 flex-shrink-0"
+              style={{ width: `${widthPct(otherMb)}%` }}
+              title={`${t("workers.gpu.other")} — ${toGb(otherMb)} GB`}
+            />
+          )}
+        </div>
+        <div className="flex items-center justify-between mt-1.5 text-[11px] text-muted-foreground tabular-nums">
+          <span>
+            {t("workers.gpu.vram")}: {toGb(gpu.memory_used_mb)} / {toGb(gpu.memory_total_mb)} GB
+          </span>
+          <span>
+            {t("workers.gpu.free")}: {toGb(gpu.memory_total_mb - gpu.memory_used_mb)} GB
+          </span>
+        </div>
+      </div>
+
+      {/* Process legend — horizontal chips, wraps to screen width */}
+      {procs.length > 0 && (
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 pt-2 border-t border-border/50">
+          {procs.map((p, i) => (
+            <span
+              key={p.pid}
+              className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground"
+              title={`PID ${p.pid}`}
+            >
+              <span className={cn(
+                "w-2 h-2 rounded-sm flex-shrink-0",
+                GPU_PROC_COLORS[i % GPU_PROC_COLORS.length],
+              )} />
+              <span className="font-medium text-foreground">{p.label}</span>
+              <span className="tabular-nums">{toGb(p.memory_mb)} GB</span>
+            </span>
+          ))}
+          {otherMb > 256 && (
+            <span className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
+              <span className="w-2 h-2 rounded-sm flex-shrink-0 bg-muted-foreground/40" />
+              <span>{t("workers.gpu.other")}</span>
+              <span className="tabular-nums">{toGb(otherMb)} GB</span>
+            </span>
+          )}
+        </div>
+      )}
     </div>
   );
 }

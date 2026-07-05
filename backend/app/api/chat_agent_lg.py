@@ -284,7 +284,7 @@ async def langgraph_chat_stream(
         except Exception as e:
             logger.warning(f"[lg_endpoint] Graphiti memory enqueue failed ({e}) — falling back to in-process save")
             try:
-                from app.services.graphiti_client import add_conversation_episode
+                from app.services.memory.graphiti_client import add_conversation_episode
                 import asyncio
 
                 uid = user_id

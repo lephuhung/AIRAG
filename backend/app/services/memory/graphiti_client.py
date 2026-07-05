@@ -102,7 +102,7 @@ class NexusRAGEmbedder(EmbedderClient):
 
     def _get_service(self):
         if self._svc is None:
-            from app.services.embedder import EmbeddingService
+            from app.services.embedding.embedder import EmbeddingService
 
             self._svc = EmbeddingService()
         return self._svc

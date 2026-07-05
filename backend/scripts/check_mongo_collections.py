@@ -11,7 +11,7 @@ from app.core.config import settings
 
 
 async def check_collections():
-    from app.services.mongo_client import get_mongo_client
+    from app.services.people.mongo_client import get_mongo_client
 
     client = get_mongo_client()
     db = client[settings.MONGO_DATABASE]

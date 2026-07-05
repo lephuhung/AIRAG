@@ -32,8 +32,8 @@ from pymongo.errors import (
     ServerSelectionTimeoutError,
 )
 
-from app.services.mongo_client import get_mongo_db
-from app.services.mongo_searchable_map import (
+from app.services.people.mongo_client import get_mongo_db
+from app.services.people.mongo_searchable_map import (
     SEARCHABLE_COLLECTION_MAP,
     get_schema_display_name,
 )

@@ -29,21 +29,35 @@ _LEVELS = {"phần": 1, "chương": 2, "mục": 3, "điều": 4}
 _DIEU_LEVEL = 4
 
 # Một DÒNG heading trong markdown/plain-text đã parse. Khoan dung với thực tế kho:
-# prefix # không đồng nhất ("#"/"##"/"###", có khi 2 space sau #), "Chương III"
-# số La Mã tiêu đề cùng dòng HOẶC dòng sau ("## Chương V"), "Phần 1."/"PHẦN THỨ
-# NHẤT", "Mục 2". Docling chunk text không còn dấu # nên prefix là tuỳ chọn.
+# prefix # không đồng nhất ("#"/"##"/"###", có khi 2 space sau #), heading IN ĐẬM
+# ("**Điều 12.** Phạm vi" — Docling PDF số thường bold legal heading thay vì #),
+# "Chương III" số La Mã tiêu đề cùng dòng HOẶC dòng sau ("## Chương V"),
+# "Phần 1."/"PHẦN THỨ NHẤT", "Mục 2". Docling chunk text không còn dấu # nên
+# prefix là tuỳ chọn. Số La Mã bắt buộc VIẾT HOA ((?-i:...)) — nếu không, cờ (?i)
+# khiến 'c' thường trong "Mục c khoản 2..." match [IVXLCDM].
 _HEADING_RE = re.compile(
-    r"(?im)^[ \t]*(?:#{1,6}[ \t]*)?"
+    r"(?im)^[ \t]*(?:#{1,6}[ \t]*)?(?:[*_]{1,3}[ \t]*)?"
     r"(?P<kw>Phần|Chương|Mục|Điều)[ \t]+"
-    r"(?P<num>thứ[ \t]+\w+|[IVXLCDM]+\b|\d+[a-zA-Z]?)"
+    r"(?P<num>thứ[ \t]+\w+|(?-i:[IVXLCDM]+)\b|\d+[a-zA-Z]?)"
     r"(?P<rest>[^\n]*)"
 )
 
-# "Điều" chỉ được coi là heading khi sau số là "." hoặc ":" ("Điều 17. Tiêu đề")
-# — chặn dòng thân văn bản tình cờ mở đầu bằng tham chiếu ("Điều 5 và Điều 6
-# Nghị định này..."). Chương/Mục/Phần ít bị nhiễu hơn nên chấp nhận cả tiêu đề
-# ngăn cách bằng khoảng trắng lẫn dòng trống phía sau.
-_DIEU_REST_RE = re.compile(r"^[ \t]*[.:]")
+# "Điều" chỉ được coi là heading khi sau số là "." hoặc ":" ("Điều 17. Tiêu đề",
+# chấp nhận marker đậm đóng trước dấu: "**Điều 17**. ...") — chặn dòng thân văn
+# bản tình cờ mở đầu bằng tham chiếu ("Điều 5 và Điều 6 Nghị định này...").
+# "Điều N" TRẦN (OCR rơi dấu chấm) được cứu riêng trong _iter_headings bằng
+# lookahead dòng kế tiếp.
+_DIEU_REST_RE = re.compile(r"^[ \t]*[*_]{0,3}[ \t]*[.:]")
+
+# Đuôi "rest" trông như TRÍCH DẪN cấu trúc tiếp diễn ("Chương III Nghị định
+# này", "khoản 2 Điều 7") — keyword theo sau bởi SỐ. Phân biệt với tiêu đề thật
+# chứa keyword nhưng không có số ("Chương IX ĐIỀU KHOẢN THI HÀNH").
+_REF_CONT_RE = re.compile(
+    r"(?i)^(?:Phần|Chương|Mục|Điều|khoản|điểm)[ \t]+(?:thứ[ \t]+\w+|(?-i:[IVXLCDM]+)\b|\d)"
+)
+
+# Marker nhấn mạnh markdown (bold/italic) — loại khỏi title và các phép thử gate.
+_EMPH_RE = re.compile(r"[*_]+")
 
 _WS_RE = re.compile(r"\s+")
 
@@ -97,15 +111,54 @@ def find_headings(text: str) -> list[Heading]:
     return _iter_headings(text)
 
 
+def _upper_rest_ok(rest: str) -> bool:
+    """Gate cho Phần/Chương/Mục: đuôi dòng phải giống TIÊU ĐỀ, không phải trích dẫn.
+
+    Chấp nhận: rỗng ("Mục 1"), dấu câu ("Phần 1. ..."), chữ hoa ("Chương II
+    NHỮNG QUY ĐỊNH CHUNG"). Bác bỏ: chữ thường ("Chương V của Luật này..." —
+    trích dẫn bị wrap dòng) và tham chiếu cấu trúc nối tiếp ("Mục 2 Chương III
+    Nghị định này").
+    """
+    rest = _EMPH_RE.sub("", rest).strip()
+    if not rest:
+        return True
+    if rest[0] in ".:-–—":
+        return True
+    if _REF_CONT_RE.match(rest):
+        return False
+    return not rest[0].islower()
+
+
+def _dieu_rest_ok(rest: str, text: str, match_end: int) -> bool:
+    """Gate cho Điều: có [.:] sau số, HOẶC "Điều N" trần cuối dòng mà dòng kế
+    tiếp mở đầu bằng chữ hoa (tiêu đề bị OCR tách dòng / rơi dấu chấm)."""
+    if _DIEU_REST_RE.match(rest):
+        return True
+    if _EMPH_RE.sub("", rest).strip():
+        return False  # còn chữ sau số nhưng không phải [.:] → tham chiếu
+    # rest rỗng → nhìn dòng kế tiếp: "Phạm vi điều chỉnh" (hoa) = tiêu đề,
+    # "và khoản 2..." (thường) / hết text = trích dẫn wrap dòng → bỏ.
+    for line in text[match_end:].split("\n")[1:]:
+        s = _EMPH_RE.sub("", line).strip()
+        if s:
+            return s[0].isupper() and not _REF_CONT_RE.match(s)
+    return False
+
+
 def _iter_headings(text: str) -> list[_Heading]:
+    text = text or ""
     out: list[_Heading] = []
-    for m in _HEADING_RE.finditer(text or ""):
+    for m in _HEADING_RE.finditer(text):
         kw = m.group("kw").lower()
         level = _LEVELS[kw]
         rest = m.group("rest") or ""
-        if level == _DIEU_LEVEL and not _DIEU_REST_RE.match(rest):
+        if level == _DIEU_LEVEL:
+            if not _dieu_rest_ok(rest, text, m.end()):
+                continue
+        elif not _upper_rest_ok(rest):
             continue
-        title = _WS_RE.sub(" ", f"{m.group('kw')} {m.group('num')}{rest}").strip()
+        title = _EMPH_RE.sub(" ", f"{m.group('kw')} {m.group('num')}{rest}")
+        title = _WS_RE.sub(" ", title).strip()
         title = title.rstrip(" .:")  # "Chương V" trần / "Điều 17. Tiêu đề." gọn đuôi
         if title:
             out.append(_Heading(start=m.start(), level=level, title=title))

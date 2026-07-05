@@ -86,10 +86,10 @@ def _strip_ocr_markup(text: str) -> str:
 # Unlimited-OCR emits one region per logical block as
 #   <|det|>LABEL [x1, y1, x2, y2]<|/det|>TEXT
 # where LABEL ∈ {header, text, title, image}.  We turn those into generic
-# LayoutBlocks and hand them to the shared renderer in app.services.layout,
+# LayoutBlocks and hand them to the shared renderer in app.services.parsing.layout,
 # which rebuilds the Nghị-định-30 layout (shared with the Docling path).
 # strip_ocr_layout (re-exported below) removes the markup before embedding.
-from app.services.layout import (  # noqa: E402
+from app.services.parsing.layout import (  # noqa: E402
     LayoutBlock,
     esc as _esc,
     normalize_footnotes as _normalize_footnotes,

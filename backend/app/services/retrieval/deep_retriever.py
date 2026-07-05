@@ -34,10 +34,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.document import Document, DocumentImage, DocumentTable
-from app.services.embedder import EmbeddingService
-from app.services.vector_store import VectorStore
-from app.services.knowledge_graph_service import KnowledgeGraphService
-from app.services.reranker import RerankerService, get_reranker_service
+from app.services.embedding.embedder import EmbeddingService
+from app.services.embedding.vector_store import VectorStore
+from app.services.kg.knowledge_graph_service import KnowledgeGraphService
+from app.services.retrieval.reranker import RerankerService, get_reranker_service
 from app.services.models.parsed_document import (
     Citation,
     DeepRetrievalResult,
@@ -49,9 +49,15 @@ from app.services.models.parsed_document import (
 logger = logging.getLogger(__name__)
 
 # ── Retrieval result cache ────────────────────────────────────────────────────
+# In-process fallback, used when REDIS_ENABLED=false (unchanged behaviour). When
+# Redis is on, the cache is SHARED across all backend worker processes/replicas,
+# so a repeat query reuses ANY process's prior work (see _get/_set below).
 _RETRIEVAL_CACHE: dict[str, tuple[DeepRetrievalResult, float]] = {}
 _CACHE_LOCK = threading.Lock()
 _RETRIEVAL_CACHE_TTL = 300.0  # 5 minutes
+
+_REDIS_CACHE_PREFIX = "rag:cache:"        # rag:cache:{cache_key}      -> JSON result
+_REDIS_WS_INDEX_PREFIX = "rag:cache:ws:"  # rag:cache:ws:{workspace}   -> SET of cache_keys
 
 
 def _retrieval_cache_key(
@@ -67,8 +73,55 @@ def _retrieval_cache_key(
     return hashlib.sha256(raw.encode()).hexdigest()[:40]
 
 
-def _get_cached_result(cache_key: str) -> Optional[DeepRetrievalResult]:
-    """Return cached result if fresh, else None."""
+# ── (de)serialization for the shared (Redis) cache ────────────────────────────
+# DeepRetrievalResult is a plain nested-dataclass tree, so asdict()+json is a
+# safe, version-tolerant wire format (no pickle). bbox tuples round-trip via list.
+def _encode_result(result: DeepRetrievalResult) -> str:
+    import dataclasses
+    import json
+
+    return json.dumps(dataclasses.asdict(result))
+
+
+def _decode_result(raw: str) -> DeepRetrievalResult:
+    import json
+
+    d = json.loads(raw)
+    return DeepRetrievalResult(
+        chunks=[EnrichedChunk(**c) for c in d.get("chunks", [])],
+        citations=[Citation(**c) for c in d.get("citations", [])],
+        context=d.get("context", ""),
+        query=d.get("query", ""),
+        mode=d.get("mode", "hybrid"),
+        knowledge_graph_summary=d.get("knowledge_graph_summary", ""),
+        image_refs=[
+            ExtractedImage(**{**i, "bbox": tuple(i["bbox"]) if i.get("bbox") else None})
+            for i in d.get("image_refs", [])
+        ],
+        table_refs=[ExtractedTable(**t) for t in d.get("table_refs", [])],
+    )
+
+
+async def _get_cached_result(cache_key: str) -> Optional[DeepRetrievalResult]:
+    """Return cached result if fresh, else None (shared via Redis when enabled)."""
+    from app.core.redis_client import get_redis, is_redis_enabled
+
+    if is_redis_enabled():
+        try:
+            raw = await get_redis().get(_REDIS_CACHE_PREFIX + cache_key)
+        except Exception as e:  # noqa: BLE001 — cache miss on any Redis hiccup
+            logger.warning("[retrieval_cache] redis get failed: %s", e)
+            return None
+        if not raw:
+            return None
+        try:
+            result = _decode_result(raw)
+        except Exception as e:  # noqa: BLE001 — corrupt/old entry: treat as miss
+            logger.warning("[retrieval_cache] decode failed (ignoring entry): %s", e)
+            return None
+        logger.info(f"[retrieval_cache] HIT (redis) key={cache_key[:8]}…")
+        return result
+
     with _CACHE_LOCK:
         cached = _RETRIEVAL_CACHE.get(cache_key)
     if cached is None:
@@ -82,15 +135,63 @@ def _get_cached_result(cache_key: str) -> Optional[DeepRetrievalResult]:
     return result
 
 
-def _set_cached_result(cache_key: str, result: DeepRetrievalResult) -> None:
-    """Store result in cache with current timestamp."""
+async def _set_cached_result(
+    cache_key: str, result: DeepRetrievalResult, workspace_id: uuid.UUID
+) -> None:
+    """Store result with a 5-minute TTL (shared via Redis when enabled)."""
+    from app.core.redis_client import get_redis, is_redis_enabled
+
+    if is_redis_enabled():
+        try:
+            payload = _encode_result(result)
+        except Exception as e:  # noqa: BLE001 — never fail a query over caching
+            logger.warning("[retrieval_cache] encode failed (skip caching): %s", e)
+            return
+        ttl = int(_RETRIEVAL_CACHE_TTL)
+        idx = _REDIS_WS_INDEX_PREFIX + str(workspace_id)
+        try:
+            pipe = get_redis().pipeline()
+            pipe.set(_REDIS_CACHE_PREFIX + cache_key, payload, ex=ttl)
+            pipe.sadd(idx, cache_key)  # per-workspace index → real invalidation
+            pipe.expire(idx, ttl + 60)
+            await pipe.execute()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[retrieval_cache] redis set failed: %s", e)
+        else:
+            logger.info(
+                f"[retrieval_cache] SET (redis) key={cache_key[:8]}… ({len(result.chunks)} chunks)"
+            )
+        return
+
     with _CACHE_LOCK:
         _RETRIEVAL_CACHE[cache_key] = (result, time.time())
     logger.info(f"[retrieval_cache] SET key={cache_key[:8]}… ({len(result.chunks)} chunks)")
 
 
-def invalidate_retrieval_cache(workspace_id: uuid.UUID) -> None:
-    """Remove all cache entries for a workspace (call after document changes)."""
+async def invalidate_retrieval_cache(workspace_id: uuid.UUID) -> None:
+    """Remove all cache entries for a workspace (call after document changes).
+
+    The Redis path uses a per-workspace index SET so it actually clears entries.
+    (The in-process path matches by str(workspace_id) prefix — but keys are
+    sha256 hashes, so it never matched; kept verbatim for the disabled path.)
+    """
+    from app.core.redis_client import get_redis, is_redis_enabled
+
+    if is_redis_enabled():
+        try:
+            r = get_redis()
+            idx = _REDIS_WS_INDEX_PREFIX + str(workspace_id)
+            keys = await r.smembers(idx)
+            if keys:
+                await r.delete(*[_REDIS_CACHE_PREFIX + k for k in keys])
+            await r.delete(idx)
+            logger.debug(
+                f"[retrieval_cache] Invalidated {len(keys)} redis entries for workspace {workspace_id}"
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[retrieval_cache] redis invalidate failed: %s", e)
+        return
+
     with _CACHE_LOCK:
         keys_to_remove = [k for k in _RETRIEVAL_CACHE if k.startswith(str(workspace_id))]
         for k in keys_to_remove:
@@ -156,7 +257,7 @@ class DeepRetriever:
 
         # ── Retrieval result cache ───────────────────────────────────────────
         cache_key = _retrieval_cache_key(self.workspace_id, question, top_k, mode, document_ids)
-        cached = _get_cached_result(cache_key)
+        cached = await _get_cached_result(cache_key)
         if cached is not None:
             return cached
 
@@ -264,7 +365,7 @@ class DeepRetriever:
             table_refs=table_refs,
         )
         # Cache the result for 5 minutes
-        _set_cached_result(cache_key, result)
+        await _set_cached_result(cache_key, result, self.workspace_id)
         return result
 
     async def _kg_query(self, question: str, mode: str) -> str:
@@ -297,7 +398,7 @@ class DeepRetriever:
         BM25 lexical search (synchronous, CPU-bound — run in thread).
         Returns list of dicts with id, metadata, document, bm25_rank.
         """
-        from app.services.bm25_index import bm25_search
+        from app.services.retrieval.bm25_index import bm25_search
         return bm25_search(
             vector_store=self.vector_store,
             query=question,

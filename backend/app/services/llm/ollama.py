@@ -432,7 +432,7 @@ class LocalEmbeddingProvider(EmbeddingProvider):
         # reuse the globally loaded instance to avoid duplicating model RAM and loading time.
         if self._model is None and self._model_name == settings.HRAG_EMBEDDING_MODEL:
             try:
-                from app.services.embedder import get_embedding_service
+                from app.services.embedding.embedder import get_embedding_service
                 svc = get_embedding_service()
                 self._model = svc.model  # Access the cached SentenceTransformer instance
                 self._dimension = svc.dimension

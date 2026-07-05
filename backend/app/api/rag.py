@@ -48,7 +48,7 @@ from app.schemas.rag import (
 
 logger = logging.getLogger(__name__)
 import string, random
-from app.services.rag_service import get_rag_service
+from app.services.retrieval.rag_service import get_rag_service
 from app.services.abbreviation_service import AbbreviationService
 
 # In-progress statuses — documents currently in the pipeline
@@ -114,11 +114,11 @@ async def query_documents(
     request.question = await AbbreviationService.expand_ab_in_text(db, request.question)
 
     # Expand common Vietnamese legal terms for better retrieval
-    from app.services.query_expander import expand_legal_terms
+    from app.services.retrieval.query_expander import expand_legal_terms
     request.question = expand_legal_terms(request.question)
 
     # Try deep query if available
-    from app.services.hrag_service import HRAGService
+    from app.services.retrieval.hrag_service import HRAGService
     if isinstance(rag_service, HRAGService) and request.mode != "vector_only":
         result = await rag_service.query_deep(
             question=request.question,
@@ -455,7 +455,7 @@ async def reindex_workspace(
 
     # Delete old vector collection (required when embedding dimensions change)
     try:
-        from app.services.vector_store import get_vector_store
+        from app.services.embedding.vector_store import get_vector_store
         vs = get_vector_store(workspace_id)
         vs.delete_collection()
         logger.info(f"Deleted old vector collection for workspace {workspace_id}")
@@ -627,7 +627,7 @@ async def get_document_chunks(
 # ---------------------------------------------------------------------------
 
 # --- Knowledge Graph Service Factory Moved to rag_service.py ---
-from app.services.rag_service import get_kg_service as _get_kg_service
+from app.services.retrieval.rag_service import get_kg_service as _get_kg_service
 
 
 @router.get("/entities/{workspace_id}", response_model=list[KGEntityResponse])
@@ -863,7 +863,7 @@ async def debug_chat(
     citations = []
     kg_summary = ""
 
-    from app.services.hrag_service import HRAGService
+    from app.services.retrieval.hrag_service import HRAGService
     for ws_id in all_workspace_ids:
         rag_service = get_rag_service(db, ws_id)
         if isinstance(rag_service, HRAGService):

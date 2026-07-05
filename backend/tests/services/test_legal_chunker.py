@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import re
 
-from app.services.chunker import LegalDocumentChunker
-from app.services.heading_path import derive_heading_paths, find_headings
+from app.services.embedding.chunker import LegalDocumentChunker
+from app.services.parsing.heading_path import derive_heading_paths, find_headings
 
 LEGAL_MD = """QUỐC HỘI
 CỘNG HOÀ XÃ HỘI CHỦ NGHĨA VIỆT NAM

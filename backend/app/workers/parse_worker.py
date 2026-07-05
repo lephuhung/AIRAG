@@ -29,7 +29,7 @@ from app.models.document_type import DocumentType as _DocumentType  # noqa: F401
 from app.models.document import Document, DocumentImage, DocumentStatus, DocumentTable
 from app.queue import connection as mq
 from app.queue.messages import CaptionMessage, EmbedMessage, KGMessage, ParseMessage
-from app.services.deep_document_parser import DeepDocumentParser
+from app.services.parsing.deep_document_parser import DeepDocumentParser
 from app.services.storage_service import get_storage_service
 
 logger = logging.getLogger(__name__)
@@ -82,8 +82,8 @@ async def handle_parse(payload: dict) -> None:
             # ── Extract digital signatures (native PDF only) ────────────────
             if ext == ".pdf":
                 try:
-                    from app.services.ocr_service import get_ocr_service as _get_ocr  # noqa: F811
-                    from app.services.digital_signature_service import (
+                    from app.services.parsing.ocr_service import get_ocr_service as _get_ocr  # noqa: F811
+                    from app.services.parsing.digital_signature_service import (
                         extract_digital_signatures,
                     )
 
@@ -128,7 +128,7 @@ async def handle_parse(payload: dict) -> None:
             # ── Classify document type & extract rich header ────────────────────────
             try:
                 from app.services.document_type_classifier import classify_with_llm
-                from app.services.ocr_service import strip_ocr_layout
+                from app.services.parsing.ocr_service import strip_ocr_layout
                 from app.models.document_type import DocumentType as _DT
 
                 # OCR-path markdown carries administrative-layout HTML — feed the
@@ -141,7 +141,7 @@ async def handle_parse(payload: dict) -> None:
                 if str(tmp_path).lower().endswith(".pdf") and parsed.parser != "ocr":
                     try:
                         import fitz
-                        from app.services.ocr_service import get_ocr_service
+                        from app.services.parsing.ocr_service import get_ocr_service
 
                         logger.info(
                             f"[parse_worker] doc={msg.document_id} extracting page 1 for reliable header OCR"
@@ -202,7 +202,7 @@ async def handle_parse(payload: dict) -> None:
             # ── Hiệu lực pháp lý (validity) ─────────────────────────────────
             # Sau classifier để có document_number cho cross-match 2 chiều.
             try:
-                from app.services.validity_service import apply_validity
+                from app.services.legal.validity_service import apply_validity
 
                 await apply_validity(db, document, parsed.markdown)
             except Exception as _val_err:

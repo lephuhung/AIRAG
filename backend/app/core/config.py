@@ -19,6 +19,27 @@ class Settings(BaseSettings):
     )
     CHROMA_HOST: str = Field(default="localhost")
     CHROMA_PORT: int = Field(default=8002)
+
+    # ── Redis: shared cross-process state so the backend can run >1 worker ──
+    # process / replica. Gates stream-cancel pub/sub (Phase 1), the distributed
+    # GPU semaphore (Phase 2) and the shared retrieval cache (Phase 3). When
+    # REDIS_ENABLED=false (default) every caller falls back to its existing
+    # in-process behaviour and no Redis connection is opened.
+    REDIS_ENABLED: bool = Field(default=False)
+    REDIS_URL: str = Field(default="redis://localhost:6379/0")
+
+    # ── GPU search concurrency (shared-VRAM guard for the RAG fan-out) ──────
+    # Tier 1 (always on): per-process soft cap. Tier 2 (only when REDIS_ENABLED):
+    # a cluster-wide hard cap so N backend worker processes / replicas sharing
+    # the GPU can't multiply the activation-memory peak N-fold. Set GLOBAL=0 to
+    # disable the distributed tier. PERMIT_TTL self-heals leaked permits after a
+    # crash; WAIT_TIMEOUT bounds how long a search waits for a global slot before
+    # proceeding local-only (fail-open — never wedge a user query).
+    HRAG_SEARCH_GPU_CONCURRENCY: int = Field(default=2)
+    HRAG_SEARCH_GPU_GLOBAL_CONCURRENCY: int = Field(default=2)
+    HRAG_SEARCH_GPU_PERMIT_TTL: float = Field(default=120.0)
+    HRAG_SEARCH_GPU_WAIT_TIMEOUT: float = Field(default=30.0)
+
     RABBITMQ_URL: str = Field(default="amqp://guest:guest@localhost:5672/")
     RABBITMQ_MANAGEMENT_URL: str = Field(default="http://localhost:15672")
     RABBITMQ_MANAGEMENT_USER: str = Field(default="guest")
@@ -379,6 +400,20 @@ class Settings(BaseSettings):
     # How many times the judge may bounce the draft back for revision before the
     # answer is forced out (bounds the reflect→act→reflect loop).
     NEXUSRAG_REACT_MAX_REFLECTIONS: int = Field(default=2)
+    # Prior conversation turns injected into the ReAct system prompt as a digest
+    # ("HỘI THOẠI TRƯỚC ĐÓ") so the loop can resolve references the follow-up
+    # condenser missed ("văn bản này", "điều đó", elliptical follow-ups). The
+    # block is marked non-authoritative — answers still come from tools (rule
+    # 3b). Set 0 to disable (kill-switch if tool-call rate regresses).
+    NEXUSRAG_REACT_HISTORY_TURNS: int = Field(default=6)
+    # Follow-up condense gating. True (default): every first-pass turn with
+    # prior history (and no explicit doc reference in the question) goes to the
+    # memory-agent JUDGE — one call returning an explicit dependence verdict
+    # ({"phu_thuoc": ...}) plus the rewrite, applied only when dependent. False:
+    # legacy behavior — the _FOLLOWUP_CUES regex decides which turns reach the
+    # LLM (kill-switch if small-model latency/JSON reliability regresses; note
+    # the cue list over-triggers on "như thế nào" interrogatives).
+    NEXUSRAG_CONDENSE_LLM_JUDGE: bool = Field(default=True)
 
     # ── Graphiti Memory (temporal knowledge graph, backed by Neo4j) ──────────
     # Graphiti uses the existing Neo4j instance (NEO4J_URI / NEO4J_USERNAME /

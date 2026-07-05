@@ -662,7 +662,7 @@ async def query_knowledge_graph(
     Returns:
         dict with keys: text (formatted KG results)
     """
-    from app.services.knowledge_graph_service import get_kg_service
+    from app.services.kg.knowledge_graph_service import get_kg_service
 
     results = []
     for ws_id in workspace_ids:
@@ -735,7 +735,7 @@ async def get_document_relations(
     from sqlalchemy import or_, select
 
     from app.models.document import Document
-    from app.services.knowledge_graph_service import get_kg_service
+    from app.services.kg.knowledge_graph_service import get_kg_service
 
     ref = (document or "").strip()
     if not ref:
@@ -1046,7 +1046,7 @@ async def search_people_by_cccd(cccd: str):
     Search for a person by CCCD (Căn cước công dân) number.
     Exact match on the cccd field. Yields partial results.
     """
-    from app.services.mongo_people_service import BUSY_MESSAGE, search_by_cccd as _svc
+    from app.services.people.mongo_people_service import BUSY_MESSAGE, search_by_cccd as _svc
 
     try:
         async for res in _svc(cccd):
@@ -1064,7 +1064,7 @@ async def search_people_by_name(name: str, limit: int = 10):
     Returns:
         dict with keys: found, count, persons, display
     """
-    from app.services.mongo_people_service import BUSY_MESSAGE, search_by_name as _svc
+    from app.services.people.mongo_people_service import BUSY_MESSAGE, search_by_name as _svc
 
     try:
         async for res in _svc(name, limit=limit):
@@ -1088,7 +1088,7 @@ async def search_people_by_bhxh(so_bhxh: str):
     Returns:
         dict with keys: found, person, display
     """
-    from app.services.mongo_people_service import BUSY_MESSAGE, search_by_bhxh as _svc
+    from app.services.people.mongo_people_service import BUSY_MESSAGE, search_by_bhxh as _svc
 
     try:
         async for res in _svc(so_bhxh):
@@ -1106,7 +1106,7 @@ async def search_people_by_phone(phone: str, limit: int = 10):
     Returns:
         dict with keys: found, count, persons, display
     """
-    from app.services.mongo_people_service import BUSY_MESSAGE, search_by_phone as _svc
+    from app.services.people.mongo_people_service import BUSY_MESSAGE, search_by_phone as _svc
 
     try:
         async for res in _svc(phone, limit=limit):
@@ -1126,7 +1126,7 @@ async def search_people_advanced(criteria: dict, limit: int = 10):
     Search for persons by multiple criteria (Name + DoB + Address + etc).
     Yields partial results.
     """
-    from app.services.mongo_people_service import BUSY_MESSAGE, search_by_advanced as _svc
+    from app.services.people.mongo_people_service import BUSY_MESSAGE, search_by_advanced as _svc
 
     try:
         async for res in _svc(criteria, limit=limit):
@@ -1345,8 +1345,8 @@ async def search_document_section(
     Tìm kiếm và lấy nội dung chính xác của một phần/mục/chương/điều
     dựa vào metadata 'heading_path'.
     """
-    from app.services.vector_store import get_vector_store
-    from app.services.embedder import get_embedding_service
+    from app.services.embedding.vector_store import get_vector_store
+    from app.services.embedding.embedder import get_embedding_service
     from app.api.chat_agent import _generate_citation_id
     from app.schemas.rag import ChatSourceChunk
     

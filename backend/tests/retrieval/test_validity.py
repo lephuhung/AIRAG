@@ -51,7 +51,7 @@ async def _find_superseded_doc():
 
 async def test_unscoped_query_demotes_superseded_document():
     from app.core.database import async_session_maker
-    from app.services.hrag_service import HRAGService
+    from app.services.retrieval.hrag_service import HRAGService
 
     row = await _find_superseded_doc()
     if not row:
@@ -75,7 +75,7 @@ async def test_unscoped_query_demotes_superseded_document():
 
 async def test_scoped_query_returns_superseded_with_warning():
     from app.core.database import async_session_maker
-    from app.services.hrag_service import HRAGService
+    from app.services.retrieval.hrag_service import HRAGService
 
     row = await _find_superseded_doc()
     if not row:

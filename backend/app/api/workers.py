@@ -821,7 +821,7 @@ async def cancel_pipeline_document(
     await db.commit()
 
     try:
-        from app.services.rag_service import get_rag_service
+        from app.services.retrieval.rag_service import get_rag_service
 
         rag_service = get_rag_service(db, doc.workspace_id)
         await rag_service.delete_document(document_id)
@@ -947,3 +947,156 @@ async def get_pipeline(
             for d in docs
         ]
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GPU / VRAM monitoring (NVML)
+# ══════════════════════════════════════════════════════════════════════════════
+# Board-level memory/utilization/temperature from NVML is global (covers vLLM
+# engines + workers on the same GPU). The per-process breakdown requires the
+# backend container to run with `pid: "host"` (docker-compose.services.yml) —
+# in an isolated PID namespace NVML only returns the backend's own process.
+# Without pid:host the processes list is simply incomplete; everything else
+# still works.
+
+_nvml_state = {"initialized": False, "failed": False}
+
+
+def _gpu_process_label(pid: int) -> str:
+    """Best-effort friendly label for a GPU process via /proc (host PIDs)."""
+    # With pid:host our own PID matches what NVML reports — and the uvicorn
+    # --reload app child has an unhelpful `python -c "from multiprocessing…"`
+    # cmdline, so identify ourselves first.
+    if pid == os.getpid():
+        return "backend (uvicorn)"
+
+    def _argv(p: int) -> list[str]:
+        try:
+            with open(f"/proc/{p}/cmdline", "rb") as f:
+                return [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+        except OSError:
+            return []
+
+    argv = _argv(pid)
+    if not argv:
+        return f"pid {pid}"
+    joined = " ".join(argv)
+
+    # vLLM engine-core processes are renamed ("VLLM::EngineCore") — the model
+    # name lives on the parent `vllm serve <model>` command line.
+    if "vllm" in joined.lower():
+        vllm_argv = argv
+        if "serve" not in vllm_argv:
+            try:
+                with open(f"/proc/{pid}/status") as f:
+                    ppid = next(
+                        int(line.split()[1]) for line in f if line.startswith("PPid:")
+                    )
+                parent = _argv(ppid)
+                if any("vllm" in a.lower() for a in parent):
+                    vllm_argv = parent
+            except (OSError, StopIteration, ValueError):
+                pass
+        model = None
+        if "serve" in vllm_argv:
+            i = vllm_argv.index("serve")
+            if i + 1 < len(vllm_argv) and not vllm_argv[i + 1].startswith("-"):
+                model = vllm_argv[i + 1]
+        return f"vLLM · {model.rsplit('/', 1)[-1]}" if model else "vLLM"
+
+    if "app.workers.runner" in joined:
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                for kv in f.read().split(b"\0"):
+                    if kv.startswith(b"WORKER_TYPE="):
+                        return "worker-" + kv.split(b"=", 1)[1].decode(errors="replace")
+        except OSError:
+            pass
+        return "worker"
+
+    if "uvicorn" in joined and "app.main:app" in joined:
+        return "backend (uvicorn)"
+
+    exe = os.path.basename(argv[0])
+    if exe.startswith("python") and len(argv) > 1:
+        if argv[1] == "-m" and len(argv) > 2:
+            return argv[2]
+        if not argv[1].startswith("-"):
+            return os.path.basename(argv[1])
+    return exe
+
+
+def _read_gpu_stats() -> dict[str, Any]:
+    """Read per-GPU VRAM/utilization via NVML. Blocking — run in a thread."""
+    try:
+        import pynvml
+    except ImportError:
+        return {"available": False, "error": "pynvml not installed", "gpus": []}
+
+    if _nvml_state["failed"]:
+        return {"available": False, "error": "NVML unavailable", "gpus": []}
+    if not _nvml_state["initialized"]:
+        try:
+            pynvml.nvmlInit()
+            _nvml_state["initialized"] = True
+        except Exception as e:  # no NVIDIA driver / not a GPU host
+            _nvml_state["failed"] = True
+            logger.warning("NVML init failed, GPU stats disabled: %s", e)
+            return {"available": False, "error": str(e), "gpus": []}
+
+    gpus: list[dict[str, Any]] = []
+    try:
+        for i in range(pynvml.nvmlDeviceGetCount()):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            name = pynvml.nvmlDeviceGetName(handle)
+            if isinstance(name, bytes):
+                name = name.decode(errors="replace")
+            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            try:
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+            except pynvml.NVMLError:
+                util = None
+            try:
+                temp = pynvml.nvmlDeviceGetTemperature(
+                    handle, pynvml.NVML_TEMPERATURE_GPU
+                )
+            except pynvml.NVMLError:
+                temp = None
+            used_mb = mem.used // (1024 * 1024)
+            total_mb = mem.total // (1024 * 1024)
+            procs: list[dict[str, Any]] = []
+            try:
+                for p in pynvml.nvmlDeviceGetComputeRunningProcesses(handle):
+                    used = getattr(p, "usedGpuMemory", None)
+                    procs.append(
+                        {
+                            "pid": p.pid,
+                            "label": _gpu_process_label(p.pid),
+                            "memory_mb": (used // (1024 * 1024)) if used else 0,
+                        }
+                    )
+                procs.sort(key=lambda x: x["memory_mb"], reverse=True)
+            except pynvml.NVMLError:
+                pass
+            gpus.append(
+                {
+                    "index": i,
+                    "name": name,
+                    "memory_used_mb": used_mb,
+                    "memory_total_mb": total_mb,
+                    "memory_pct": round(used_mb / total_mb * 100, 1) if total_mb else 0.0,
+                    "utilization_pct": util,
+                    "temperature_c": temp,
+                    "processes": procs,
+                }
+            )
+    except Exception as e:
+        logger.warning("NVML read failed: %s", e)
+        return {"available": False, "error": str(e), "gpus": gpus}
+    return {"available": True, "gpus": gpus}
+
+
+@router.get("/gpu")
+async def get_gpu_stats(user: User = Depends(require_superadmin)):
+    """Real-time GPU VRAM / utilization / temperature for the Workers page."""
+    return await asyncio.to_thread(_read_gpu_stats)

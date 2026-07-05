@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from app.services.vector_store import VectorStore
+    from app.services.embedding.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 

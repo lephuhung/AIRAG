@@ -21,7 +21,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from app.services.heading_path import find_headings
+from app.services.parsing.heading_path import find_headings
 
 # Loại văn bản đứng trước "này" / "số N" trong các câu tuyên bố hiệu lực.
 _DOC_TYPES = (

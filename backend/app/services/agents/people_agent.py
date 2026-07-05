@@ -378,9 +378,16 @@ async def people_doc_search_node(state: SupervisorState) -> dict:
         if images:
             await push_event(state, "images", images)
 
+        # Degraded search (some workspace failed, e.g. CUDA OOM) must not be
+        # rendered as a confident "no related documents" downstream.
+        from app.api.chat_agent import last_search_failures
+
+        degraded = bool(last_search_failures.get())
+
         logger.info(
             f"[LANGGRAPH_DECISION] people_doc_search_node completed: "
-            f"sources={len(sources)} (dropped {dropped} irrelevant), images={len(images)}"
+            f"sources={len(sources)} (dropped {dropped} irrelevant), "
+            f"images={len(images)}, degraded={degraded}"
         )
 
         return {
@@ -390,6 +397,7 @@ async def people_doc_search_node(state: SupervisorState) -> dict:
             # When no relevant document remains, drop the KG too so Block 2 is fully
             # omitted (it is unused once sources is empty anyway).
             "people_doc_kg": (updates.get("kg_summaries", []) if sources else []),
+            "people_doc_search_degraded": degraded,
         }
 
     except Exception as e:

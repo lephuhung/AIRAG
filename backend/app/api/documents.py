@@ -147,7 +147,7 @@ def _copy_vector_chunks(
     Runs synchronously (ChromaDB client is blocking) — call via asyncio.to_thread.
     Returns the number of chunks copied.
     """
-    from app.services.vector_store import get_vector_store
+    from app.services.embedding.vector_store import get_vector_store
 
     src = get_vector_store(source_workspace_id)
     data = src.get_document_chunks(source_document_id, include_embeddings=True)
@@ -180,7 +180,7 @@ def _copy_vector_chunks(
     # The BM25 index for the target workspace is built from ChromaDB and cached;
     # force a rebuild so the freshly copied chunks become lexically searchable.
     try:
-        from app.services.bm25_index import invalidate_cache
+        from app.services.retrieval.bm25_index import invalidate_cache
 
         invalidate_cache(target_workspace_id)
     except Exception as e:
@@ -321,7 +321,7 @@ async def process_document_background(
 ):
     """Legacy fallback: process document inline when RabbitMQ is unavailable."""
     from app.core.database import async_session_maker
-    from app.services.rag_service import get_rag_service
+    from app.services.retrieval.rag_service import get_rag_service
 
     async with async_session_maker() as db:
         try:
@@ -825,7 +825,7 @@ async def get_chunk_context(
             detail="Document is not yet indexed.",
         )
 
-    from app.services.vector_store import get_vector_store
+    from app.services.embedding.vector_store import get_vector_store
 
     vector_store = get_vector_store(document.workspace_id)
 
@@ -1130,7 +1130,7 @@ async def update_document(
     )
     if document.status == DocumentStatus.INDEXED:
         try:
-            from app.services.legal_kg_service import LegalKGService
+            from app.services.kg.legal_kg_service import LegalKGService
 
             kg_service = LegalKGService(document.workspace_id)
             logger.info(
@@ -1176,7 +1176,7 @@ async def delete_document(
     # while still BUILDING_KG, or a FAILED doc that already embedded. Gating this
     # on status == INDEXED left orphaned chunks in ChromaDB on delete.
     try:
-        from app.services.rag_service import get_rag_service
+        from app.services.retrieval.rag_service import get_rag_service
 
         rag_service = get_rag_service(db, document.workspace_id)
         await rag_service.delete_document(document_id)
@@ -1185,7 +1185,7 @@ async def delete_document(
 
     # Also delete from LegalKG (Neo4j) if KG was built
     try:
-        from app.services.legal_kg_service import LegalKGService
+        from app.services.kg.legal_kg_service import LegalKGService
 
         kg_service = LegalKGService(document.workspace_id)
         await kg_service.delete_document(document_id)

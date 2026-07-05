@@ -24,7 +24,7 @@ import logging
 import uuid
 
 from app.queue.messages import MemorySaveMessage
-from app.services.graphiti_client import add_conversation_episode
+from app.services.memory.graphiti_client import add_conversation_episode
 
 logger = logging.getLogger(__name__)
 

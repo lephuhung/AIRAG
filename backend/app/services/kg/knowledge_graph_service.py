@@ -1085,6 +1085,6 @@ def get_kg_service(workspace_id: uuid.UUID):
     """
     mode = getattr(settings, "HRAG_KG_MODE", "lightrag").lower()
     if mode == "legal":
-        from app.services.legal_kg_service import LegalKGService
+        from app.services.kg.legal_kg_service import LegalKGService
         return LegalKGService(workspace_id=workspace_id)
     return KnowledgeGraphService(workspace_id=workspace_id)

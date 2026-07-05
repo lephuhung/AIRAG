@@ -326,8 +326,8 @@ async def rag_lookup_format_standards(
     """
     from sqlalchemy import select
     from app.models.document import Document, DocumentStatus
-    from app.services.deep_retriever import DeepRetriever
-    from app.services.vector_store import VectorStore
+    from app.services.retrieval.deep_retriever import DeepRetriever
+    from app.services.embedding.vector_store import VectorStore
     from app.core.config import settings
 
     try:

@@ -22,7 +22,7 @@ from app.core.deps import get_principal
 from app.core.exceptions import BadRequestError
 from app.models.user import User
 from app.schemas.ocr import OCRExtractResponse, OCRStatusResponse
-from app.services.ocr_service import get_ocr_service
+from app.services.parsing.ocr_service import get_ocr_service
 
 logger = logging.getLogger(__name__)
 

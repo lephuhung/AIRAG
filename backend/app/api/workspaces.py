@@ -269,7 +269,7 @@ async def delete_workspace(
 
     # Clean up vector store and KG data
     try:
-        from app.services.vector_store import get_vector_store
+        from app.services.embedding.vector_store import get_vector_store
 
         vs = get_vector_store(workspace_id)
         vs.delete_collection()
@@ -277,7 +277,7 @@ async def delete_workspace(
         pass
 
     try:
-        from app.services.knowledge_graph_service import KnowledgeGraphService
+        from app.services.kg.knowledge_graph_service import KnowledgeGraphService
 
         kg = KnowledgeGraphService(workspace_id)
         await kg.delete_project_data()

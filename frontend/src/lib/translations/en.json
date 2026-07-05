@@ -700,6 +700,14 @@
     "stop_workers_msg": "Pause all {{type}} workers? The in-flight message drains first; new messages queue up until resume.",
     "health_details": "System Health Details",
     "llm_service": "LLM Service",
+    "gpu": {
+      "title": "GPU / VRAM",
+      "vram": "VRAM",
+      "other": "Other",
+      "free": "Free",
+      "utilization": "GPU load",
+      "temperature": "Temperature"
+    },
     "version": "Version",
     "cluster": "Cluster",
     "in_progress": "In progress",

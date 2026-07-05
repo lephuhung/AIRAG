@@ -605,6 +605,30 @@ export interface WorkerOverview {
   rabbitmq_connected: boolean;
 }
 
+// ── GPU / VRAM monitoring ──
+export interface GpuProcessInfo {
+  pid: number;
+  label: string;
+  memory_mb: number;
+}
+
+export interface GpuInfo {
+  index: number;
+  name: string;
+  memory_used_mb: number;
+  memory_total_mb: number;
+  memory_pct: number;
+  utilization_pct: number | null;
+  temperature_c: number | null;
+  processes: GpuProcessInfo[];
+}
+
+export interface GpuOverview {
+  available: boolean;
+  error?: string;
+  gpus: GpuInfo[];
+}
+
 export interface PipelineDocument {
   id: string;
   filename: string;

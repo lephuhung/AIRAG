@@ -114,6 +114,27 @@ services:
       com.hrag.service: chromadb
       com.hrag.stack: hrag
 
+  # Shared cross-process state for the backend (stream-cancel pub/sub, and
+  # later the distributed GPU semaphore + retrieval cache). Ephemeral — no
+  # persistence needed; pub/sub is transient and the cache is regenerable.
+  redis:
+    image: redis:7-alpine
+    container_name: hrag-redis
+    command: ["redis-server", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6380:6379"
+    networks:
+      - hrag_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    labels:
+      com.hrag.service: redis
+      com.hrag.stack: hrag
+    restart: unless-stopped
+
   rabbitmq:
     image: rabbitmq:3-management-alpine
     container_name: hrag-rabbitmq
@@ -578,17 +599,27 @@ services:
         condition: service_healthy
       neo4j:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/hrag
       CHROMA_HOST: chromadb
       CHROMA_PORT: 8000
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
+      REDIS_URL: redis://redis:6379/0
+      # Flip to "true" (with the redis service up) to enable multi-worker /
+      # multi-replica: cross-process Stop, shared GPU limit + retrieval cache.
+      REDIS_ENABLED: ${REDIS_ENABLED:-false}
       MINIO_ENDPOINT: http://minio:9000
       MINIO_WEBHOOK_ENABLED: "false"
       NEO4J_URI: bolt://neo4j:7687
       CUDA_VISIBLE_DEVICES: "0"
       HRAG_EAGER_MODEL_LOADING: "false"
+      # Backend VRAM creeps up over days (fragmentation of embedder/reranker
+      # allocations) until tiny search-time allocs OOM — expandable segments
+      # curb the fragmentation (incident 2026-07-04: search silently degraded).
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
       RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
       HUNYUAN_OCR_API_URL: http://vllm-ocr:8001/v1
       MEMORY_AGENT_BASE_URL: http://vllm-memory:8088/v1
@@ -603,6 +634,10 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "langfuse.hatinh.local:10.10.0.241"
+    # Host PID namespace so NVML (/workers/gpu) can see GPU processes of the
+    # OTHER containers (vLLM engines, workers) — inside an isolated namespace
+    # nvmlDeviceGetComputeRunningProcesses only returns the backend's own PID.
+    pid: "host"
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
       - hrag_uploads:/app/backend/uploads

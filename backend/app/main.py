@@ -696,7 +696,7 @@ async def lifespan(app: FastAPI):
     # graph memory layer.  Idempotent — safe to call on every startup.
     # Non-fatal: if Neo4j is unavailable, memory falls back to empty context.
     try:
-        from app.services.graphiti_client import initialize_graphiti
+        from app.services.memory.graphiti_client import initialize_graphiti
 
         await initialize_graphiti()
     except Exception as _graphiti_err:
@@ -706,7 +706,7 @@ async def lifespan(app: FastAPI):
     # Pre-establish MongoDB TCP connection so the first search request is instant.
     # Non-fatal: if MongoDB is unreachable, falls back to lazy connect on first use.
     try:
-        from app.services.mongo_client import get_mongo_client
+        from app.services.people.mongo_client import get_mongo_client
 
         _mongo_client = get_mongo_client()
         # Force TCP handshake + auth now (pymongo connects lazily on first op)
@@ -715,13 +715,41 @@ async def lifespan(app: FastAPI):
     except Exception as _mongo_err:
         logger.warning(f"MongoDB warmup failed (non-fatal): {_mongo_err}")
 
+    # ── Redis warmup + cross-process stream-cancel listener ───────────────
+    # Only when REDIS_ENABLED — lets the backend run >1 worker/replica with a
+    # working Stop button (the cancel may land on a different process than the
+    # one running the agent). Non-fatal: if Redis is down we log and keep the
+    # single-process behaviour for this run.
+    if settings.REDIS_ENABLED:
+        try:
+            from app.core.redis_client import ping_redis
+            from app.api.chat_session import start_cancel_listener
+
+            if await ping_redis():
+                await start_cancel_listener()
+                logger.info("[redis] Connection OK — stream-cancel listener started")
+            else:
+                logger.warning(
+                    "[redis] Ping failed — cross-process cancel disabled this run"
+                )
+        except Exception as _redis_err:
+            logger.warning(f"Redis warmup failed (non-fatal): {_redis_err}")
+
     yield
     logger.info("Shutting down...")
     await engine.dispose()
     try:
-        from app.services.mongo_client import close_mongo_client
+        from app.services.people.mongo_client import close_mongo_client
 
         close_mongo_client()
+    except Exception:
+        pass
+    try:
+        from app.api.chat_session import stop_cancel_listener
+        from app.core.redis_client import close_redis
+
+        await stop_cancel_listener()
+        await close_redis()
     except Exception:
         pass
 

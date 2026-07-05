@@ -102,7 +102,11 @@ services:
       com.hrag.stack: hrag
 
   # ── gemma-4-E4B-it (Memory/KG Model, served as `qwen-memory`) ─────────────
-  # Port: 8088, GPU 0, ~24.6GB VRAM (0.50 × 48GB) — weights ~15GB + KV ~9GB.
+  # Port: 8088, GPU 0, ~20.8GB VRAM (0.42 × 48GB) — weights ~15GB + KV ~5GB
+  # (~156k tokens > peak thực tế ~125k: contextual 16 + KG 8, ~5.2k tokens/req).
+  # 0.50 gây CUDA OOM tổng thể: backend embedder+reranker 6.4GB + embed worker
+  # ~3GB + omnivoice 2.3GB + Docling 1.6GB → tổng resident vượt 48GB, spike
+  # encode (~0.6GB) hết chỗ. Giữ headroom steady-state ≥2GB.
   # OpenAI-compatible API → workers call via Docker network.
   # Serves supervisor (intent), Graphiti memory, Legal KG + contextual embed —
   # peak thực tế ~24 request song song (contextual 16 + KG 8), request ≤1.2k in
@@ -130,7 +134,7 @@ services:
       - --max-model-len
       - "8192"
       - --gpu-memory-utilization
-      - "0.50"
+      - "0.42"
       - --max-num-seqs
       - "32"
       - --trust-remote-code

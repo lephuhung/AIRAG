@@ -130,6 +130,11 @@ class SupervisorState(TypedDict, total=False):
     # "related documents" section without mixing in the person record text.
     people_doc_kg: list
 
+    # People path: True when the companion document search was DEGRADED (one or
+    # more workspaces failed, e.g. CUDA OOM) — the formatter must not present an
+    # empty result as a confident "no related documents".
+    people_doc_search_degraded: bool
+
     # Section search results
     section_reference: str | None
 

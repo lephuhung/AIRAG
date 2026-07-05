@@ -55,18 +55,6 @@ logger = logging.getLogger(__name__)
 # Lines that look like markdown structure (headings, tables, images, code
 # fences, horizontal rules) are left untouched.
 
-# Regex: a run of >=2 single Unicode letters (including accented), each
-# separated by exactly ONE space.  We anchor on word boundaries so we don't
-# accidentally eat real single-letter words like "I" in English prose.
-# The negative lookahead/lookbehind for \S ensures we only match isolated
-# char-space-char sequences.
-_SCATTERED_CHARS_RE = re.compile(
-    r"(?<!\S)"  # not preceded by a non-space char
-    r"(\w)"  # first char
-    r"((?:\s\w){2,})"  # 2+ more " <char>" pairs  (min 3 chars total)
-    r"(?!\S)",  # not followed by a non-space char
-)
-
 # Lines we should never touch
 _STRUCTURE_LINE_RE = re.compile(
     r"^\s*(?:"
@@ -104,9 +92,14 @@ def _fix_scattered_vietnamese(text: str, debug: bool = False) -> str:
 
     # Regex to detect Vietnamese "CÔNG BÁO" headers/footers (Furniture)
     # Examples: "4 CÔNG BÁO/Số 1133 + 1134/Ngày 22-12-2018", "CÔNG BÁO/Số 1133..."
-    # We handle potential scattered chars too: "C Ô N G  B Á O"
+    # We handle potential scattered chars too: "C Ô N G  B Á O".
+    # Anchored to END of line (after the number only a "/Ngày ..." tail may
+    # follow): a real BODY sentence like "Công báo/Số 1133 đã đăng toàn văn..."
+    # must NOT match — matching lines get DELETED, so a false positive is
+    # silent content loss.
     _CONG_BAO_FURNITURE_RE = re.compile(
-        r"^\d*\s*(?:C\s*Ô\s*N\s*G\s+B\s*Á\s*O\s*|CÔNG\s+BÁO\s*)[/\\].*?S\s*ố\s*\d+",
+        r"^\d*\s*(?:C\s*Ô\s*N\s*G\s+B\s*Á\s*O\s*|CÔNG\s+BÁO\s*)[/\\]\s*"
+        r"S\s*ố\s*[\d\s+.\-]*\d(?:\s*[/\\][^\n]*)?$",
         re.IGNORECASE,
     )
 
@@ -188,16 +181,29 @@ def _fix_scattered_vietnamese(text: str, debug: bool = False) -> str:
             if not words:
                 continue
 
-            # Rejoin consecutive single-char tokens, keep multi-char tokens separate
+            # Rejoin consecutive single-char tokens, keep multi-char tokens
+            # separate. Break the glue on a letter<->digit transition so a
+            # uniformly single-spaced heading "Đ I Ề U 5 . P h ạ m v i" becomes
+            # "ĐIỀU 5. Phạmvi" (heading still detectable downstream) instead of
+            # "ĐIỀU5.Phạmvi". Punctuation sticks to the current buffer ("5 ." →
+            # "5.").
             merged: list[str] = []
             buf: list[str] = []
+            buf_kind = ""  # 'l' letters | 'd' digits | '' unknown/punct-only
             for w in words:
                 if len(w) == 1:
+                    kind = "l" if w.isalpha() else ("d" if w.isdigit() else "")
+                    if buf and kind and buf_kind and kind != buf_kind:
+                        merged.append("".join(buf))
+                        buf = []
+                        buf_kind = ""
                     buf.append(w)
+                    buf_kind = buf_kind or kind
                 else:
                     if buf:
                         merged.append("".join(buf))
                         buf = []
+                        buf_kind = ""
                     merged.append(w)
             if buf:
                 merged.append("".join(buf))
@@ -431,7 +437,7 @@ class DeepDocumentParser:
     @staticmethod
     def _is_scanned(file_path: Path) -> bool:
         """Delegate scanned-PDF detection to HunyuanOCRService."""
-        from app.services.ocr_service import get_ocr_service
+        from app.services.parsing.ocr_service import get_ocr_service
 
         return get_ocr_service().is_scanned_pdf(file_path)
 
@@ -499,7 +505,7 @@ class DeepDocumentParser:
         """
         import tempfile
 
-        from app.services.ocr_service import get_ocr_service
+        from app.services.parsing.ocr_service import get_ocr_service
 
         logger.info(
             f"Document {document_id} ({original_filename}) identified as scanned PDF "
@@ -758,7 +764,7 @@ class DeepDocumentParser:
         # Docling's meta.headings misses Vietnamese legal headings ("Điều N." is
         # not recognised as a structural heading) — fill the gaps from the chunk
         # text itself so section lookup by Điều/Chương keeps working.
-        from app.services.heading_path import derive_heading_paths
+        from app.services.parsing.heading_path import derive_heading_paths
 
         for c, hp in zip(chunks, derive_heading_paths([c.content for c in chunks])):
             if hp and not c.heading_path:
@@ -808,7 +814,7 @@ class DeepDocumentParser:
         """
         from collections import defaultdict
 
-        from app.services.layout import LayoutBlock, esc as _esc, render_layout_blocks
+        from app.services.parsing.layout import LayoutBlock, esc as _esc, render_layout_blocks
 
         # Page heights for bottom-left → top-left coordinate flip.
         page_h: dict[int, float] = {}
@@ -1293,11 +1299,22 @@ class DeepDocumentParser:
     ) -> ParsedDocument:
         """Fallback: parse TXT/MD with legacy loader + RecursiveCharacterTextSplitter."""
         import re
-        from app.services.document_loader import load_document
-        from app.services.chunker import DocumentChunker, LegalDocumentChunker
+        from app.services.parsing.document_loader import load_document
+        from app.services.embedding.chunker import DocumentChunker, LegalDocumentChunker
+        from app.services.parsing.layout import strip_layout_html
 
         loaded = load_document(str(file_path))
         content = loaded.content
+
+        # OCR admin-layout docs wrap every line in HTML (<p class="ocr-body"
+        # data-bbox=...>Điều 5. ...</p>). The heading regexes cannot see through
+        # tags, so chunking/heading-derivation MUST run on stripped text or
+        # heading_path comes out empty for the whole document (and legal
+        # chunking never activates). The original markdown (with layout HTML,
+        # needed by the viewer) is preserved separately. strip_layout_html is a
+        # no-op when no layout markers are present and keeps <!-- page N -->.
+        raw_markdown = content
+        content = strip_layout_html(content)
 
         # For OCR documents with page markers (<!-- page N -->), extract page numbers
         # and split content preserving markers for proper page assignment
@@ -1370,7 +1387,7 @@ class DeepDocumentParser:
         # from the markdown heading lines still present in the chunk text, else
         # heading_path stays empty corpus-wide and structural section lookup
         # (search_document_section) can never match.
-        from app.services.heading_path import derive_heading_paths
+        from app.services.parsing.heading_path import derive_heading_paths
 
         for c, hp in zip(chunks, derive_heading_paths([c.content for c in chunks])):
             if hp:

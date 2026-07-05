@@ -718,6 +718,14 @@
     "stop_workers_msg": "Tạm dừng tất cả worker {{type}}? Tin nhắn đang xử lý sẽ được hoàn tất, tin nhắn mới nằm chờ trong hàng đợi cho tới khi chạy tiếp.",
     "health_details": "Chi tiết sức khỏe hệ thống",
     "llm_service": "Dịch vụ LLM",
+    "gpu": {
+      "title": "GPU / VRAM",
+      "vram": "VRAM",
+      "other": "Khác",
+      "free": "Còn trống",
+      "utilization": "Tải GPU",
+      "temperature": "Nhiệt độ"
+    },
     "version": "Phiên bản",
     "cluster": "Cụm",
     "in_progress": "Đang thực hiện",

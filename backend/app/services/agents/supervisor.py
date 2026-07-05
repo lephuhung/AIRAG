@@ -417,17 +417,32 @@ def _extract_user_message(state: SupervisorState) -> str:
 # Follow-up query condensing (history-aware rewrite)
 # ---------------------------------------------------------------------------
 
-_CONDENSE_SYSTEM_PROMPT = """Bạn là trợ lý viết lại câu hỏi cho hệ thống tìm kiếm tài liệu.
+# Judge-then-rewrite, ONE call. The verdict ("phu_thuoc") is an explicit output
+# field ON PURPOSE: the previous rewrite-only prompt carried the judgment as an
+# implicit rule ("return unchanged if self-contained") and the small model
+# ignored it — measured 3/3 wrong-document injections when the topic switched
+# (e.g. a self-contained BMNN question rewritten to "theo Nghị định 13/2023"
+# from the prior turn). Forcing the model to DECIDE before it generates is what
+# makes the decision reliable; code only applies the rewrite when phu_thuoc=true.
+_CONDENSE_SYSTEM_PROMPT = """Bạn đánh giá và viết lại câu hỏi cho hệ thống tìm kiếm tài liệu.
 
-Nhiệm vụ: dựa vào LỊCH SỬ HỘI THOẠI, viết lại CÂU HỎI HIỆN TẠI thành một câu hỏi \
-ĐỘC LẬP, TỰ CHỨA ĐẦY ĐỦ NGỮ CẢNH (đối tượng, chủ đề, tên/loại văn bản... mà người \
-dùng đang ngầm nhắc tới ở các lượt trước).
+Cho LỊCH SỬ HỘI THOẠI và CÂU HỎI HIỆN TẠI, làm HAI bước:
 
-QUY TẮC:
-- Giữ nguyên Ý ĐỊNH của câu hỏi hiện tại, chỉ bổ sung ngữ cảnh còn thiếu từ lịch sử.
-- Nếu câu hỏi hiện tại ĐÃ tự chứa đầy đủ ngữ cảnh (hoặc đổi sang chủ đề mới), \
-trả lại NGUYÊN VĂN câu hỏi đó.
-- KHÔNG trả lời câu hỏi. KHÔNG giải thích. CHỈ trả về đúng MỘT câu hỏi đã viết lại."""
+1. PHÁN QUYẾT: câu hỏi hiện tại có PHỤ THUỘC lịch sử mới hiểu được không?
+   - phu_thuoc=true CHỈ KHI thiếu lịch sử thì không hiểu trọn vẹn câu hỏi: có đại từ \
+thay thế ("nó", "này", "đó", "văn bản trên"...), tỉnh lược chủ thể ("thời hạn là bao lâu?" \
+— thời hạn của cái gì?), hoặc nối tiếp ("vậy còn...", "thế còn...").
+   - Câu hỏi đã nêu rõ chủ đề/đối tượng của riêng nó → phu_thuoc=false, KỂ CẢ khi trùng \
+chủ đề với lịch sử. Dạng "X như thế nào?", "thế nào là X?", "làm thế nào để X?" với X \
+đầy đủ → phu_thuoc=false.
+   - Câu hỏi ĐỔI sang chủ đề khác hẳn lịch sử → phu_thuoc=false.
+
+2. VIẾT LẠI (chỉ khi phu_thuoc=true): viết lại thành MỘT câu hỏi độc lập, tự chứa ngữ \
+cảnh — bổ sung đối tượng/chủ đề/văn bản người dùng đang ngầm nhắc từ lịch sử. Giữ nguyên \
+Ý ĐỊNH của câu hỏi. KHÔNG trả lời câu hỏi.
+
+Trả về DUY NHẤT một JSON, không giải thích gì thêm:
+{"phu_thuoc": true|false, "cau_viet_lai": "<câu hỏi đã viết lại>" hoặc null}"""
 
 
 def _get_prior_history(state: SupervisorState, max_turns: int = 6) -> list[tuple[str, str]]:
@@ -491,13 +506,19 @@ _FOLLOWUP_CUES = re.compile(
 def _needs_context(message: str) -> bool:
     """Heuristic: does this question DEPEND on prior turns to be understood?
 
-    Returns True only for genuinely dependent follow-ups — those carrying
-    anaphora / continuation cues, or very short fragments that lack their own
-    subject. A self-contained question (its own clear topic, no anaphora) returns
-    False so the follow-up condenser LEAVES IT ALONE instead of injecting the
-    previous turn's document/subject into it — which is what made a standalone
-    question like "Dịch vụ giám sát an ninh mạng là gì" get rewritten to
-    "... theo Luật An ninh mạng 2018" and then resolve to the wrong document.
+    True for messages carrying anaphora / continuation cues, or very short
+    fragments that lack their own subject. NO LONGER the condense gate by
+    default — the memory-agent judge in _condense_followup_query makes that
+    call (NEXUSRAG_CONDENSE_LLM_JUDGE=false falls back to this). Still used
+    directly by _is_doc_followup_request (sticky-document carry-forward),
+    which must stay a synchronous no-LLM check.
+
+    Known imprecision (why it lost the condense-gate job): the bare "thế" cue
+    also matches interrogative "như thế nào" / "thế nào là" / "làm thế nào",
+    flagging very common self-contained questions as follow-ups — measured 7/26
+    condenser runs on real traffic were that false positive. For the sticky-doc
+    safety net this over-trigger is acceptable (it only nudges scope back to an
+    attached doc, and only when the frontend sent no document_ids).
     """
     m = (message or "").strip()
     if not m:
@@ -639,19 +660,27 @@ def _is_doc_followup_request(message: str) -> bool:
 
 
 async def _condense_followup_query(message: str, prior: list[tuple[str, str]]) -> str:
-    """Rewrite a follow-up question into a self-contained query using prior turns.
+    """Judge-then-rewrite a follow-up question using prior turns (memory agent).
 
-    Uses the small memory agent (gemma-4-E4B). A bare follow-up such as "thời hạn trả
-    kết quả là bao lâu?" loses the subject established earlier (e.g. a specific tax
-    document), so RAG search drifts to unrelated documents. Returns the original
-    message unchanged when there is no prior history or on any failure.
+    ONE LLM call returns {"phu_thuoc": bool, "cau_viet_lai": str|null}: an
+    explicit dependence verdict first, the rewrite applied only when dependent.
+    A bare follow-up such as "thời hạn trả kết quả là bao lâu?" loses the
+    subject established earlier, so RAG search drifts — that case gets
+    rewritten. A self-contained question is left alone BY THE VERDICT, not by a
+    regex gate (see _CONDENSE_SYSTEM_PROMPT for why the verdict is an output
+    field). Fail-safe direction is "no rewrite": returns the original message
+    when there is no prior history, on JSON-parse failure, or on any error —
+    the ReAct history digest (NEXUSRAG_REACT_HISTORY_TURNS) is the downstream
+    safety net for missed rewrites.
     """
     if not prior:
         return message
     try:
+        import json as _json
+        import re as _re_condense
+
         from app.services.llm import get_memory_agent
         from app.services.llm.types import LLMMessage as _LLMMsg
-        import re as _re_condense
 
         lines: list[str] = []
         for role, content in prior:
@@ -665,7 +694,7 @@ async def _condense_followup_query(message: str, prior: list[tuple[str, str]]) -
         user_content = (
             f"LỊCH SỬ HỘI THOẠI:\n{transcript}\n\n"
             f"CÂU HỎI HIỆN TẠI: {message}\n\n"
-            "Câu hỏi đã viết lại (độc lập, tự chứa ngữ cảnh):"
+            "JSON:"
         )
         result = await agent.acomplete(
             [_LLMMsg(role="user", content=user_content)],
@@ -674,10 +703,23 @@ async def _condense_followup_query(message: str, prior: list[tuple[str, str]]) -
             max_tokens=256,
             think=False,
         )
-        rewritten = result if isinstance(result, str) else getattr(result, "content", "")
-        rewritten = _re_condense.sub(r"<think>.*?</think>", "", rewritten or "", flags=_re_condense.DOTALL)
-        rewritten = rewritten.strip().strip('"').strip()
-        return rewritten or message
+        raw = result if isinstance(result, str) else getattr(result, "content", "")
+        raw = _re_condense.sub(r"<think>.*?</think>", "", raw or "", flags=_re_condense.DOTALL)
+        m = _re_condense.search(r"\{.*\}", raw, _re_condense.DOTALL)
+        if not m:
+            logger.warning(
+                f"[supervisor] Follow-up judge returned no JSON, using original: {raw[:120]!r}"
+            )
+            return message
+        verdict = _json.loads(m.group(0))
+        dependent = bool(verdict.get("phu_thuoc"))
+        rewritten = str(verdict.get("cau_viet_lai") or "").strip().strip('"').strip()
+        logger.info(
+            f"[supervisor] Follow-up judge: phu_thuoc={dependent}, rewrite={rewritten[:120]!r}"
+        )
+        if dependent and rewritten:
+            return rewritten
+        return message
     except Exception as e:
         logger.warning(f"[supervisor] Follow-up condense failed, using original: {e}")
         return message
@@ -828,7 +870,11 @@ _MULTI_SECTION_PATTERN: re.Pattern[str] = re.compile(
 # protocol (react_prompt rule 8) requires this line WITH tool calls; it must never
 # open the user-facing answer. Definition lives next to the prompt that mandates
 # it so prod and the prompt-eval suite strip/measure the SAME pattern.
-from app.prompts.agents.react_prompt import PLAN_LINE_RE as _PLAN_LINE_RE
+from app.prompts.agents.react_prompt import (
+    PLAN_LINE_RE as _PLAN_LINE_RE,
+    READY_LINE_RE as _READY_LINE_RE,
+    READY_SIGNAL_RE as _READY_SIGNAL_RE,
+)
 
 # Detects a person identifier (CCCD/BHXH: 9-12 digits, or phone: 0 + 9-10 digits).
 # On its own this is a pure single-agent people lookup; combined with a SECOND
@@ -1119,20 +1165,34 @@ async def supervisor_node(state: SupervisorState) -> dict:
         # ── Follow-up contextualization (first pass only) ─────────────────
         # A bare follow-up ("thời hạn trả kết quả là bao lâu?") drops the subject
         # established earlier (e.g. a specific tax document), so RAG search drifts
-        # to unrelated documents. Rewrite it into a self-contained query using the
-        # prior turns. Runs once (iterations==0) and never on abbreviation loop-back.
-        # was_modified=True makes it flow into expanded_query/rewritten_query below,
-        # so downstream RAG search + classification both use the contextualized query.
+        # to unrelated documents. The memory-agent JUDGE decides dependence and
+        # rewrites in ONE call (_condense_followup_query) — the old regex cue
+        # gate (_FOLLOWUP_CUES) misclassified interrogative "như thế nào" as a
+        # follow-up cue and the rewrite then injected the prior turn's document
+        # into self-contained questions. Two hard pre-filters stay in code:
+        # explicit-doc-reference (incident-proven invariant — a NAMED document
+        # must never inherit another document from history) and first-pass-only
+        # (never on abbreviation loop-back). NEXUSRAG_CONDENSE_LLM_JUDGE=false
+        # restores the legacy cue gate in front of the same call (kill-switch).
+        # was_modified=True makes it flow into expanded_query/rewritten_query
+        # below, so downstream RAG search + classification both use the
+        # contextualized query.
+        from app.core.config import settings as _cfg
+        _judge_gate = bool(getattr(_cfg, "NEXUSRAG_CONDENSE_LLM_JUDGE", True))
         _condense_eligible = (
             iterations == 0
             and not expanded
             and not _has_explicit_doc_reference(query_for_classifier)
-            and _needs_context(query_for_classifier)
+            and (_judge_gate or _needs_context(query_for_classifier))
         )
         if iterations == 0 and not expanded and not _condense_eligible:
+            _skip_why = (
+                "explicit doc ref" if _judge_gate
+                else "explicit doc ref or no follow-up cue"
+            )
             logger.info(
-                f"[supervisor] Skip follow-up condensation — query is self-contained "
-                f"(explicit doc ref or no follow-up cue): {query_for_classifier!r}"
+                f"[supervisor] Skip follow-up condensation ({_skip_why}): "
+                f"{query_for_classifier!r}"
             )
         if _condense_eligible:
             _prior = _get_prior_history(state)
@@ -1556,7 +1616,7 @@ async def direct_answer_node(state: SupervisorState) -> dict:
     # user's message in parallel (the memory worker persists the same facts every
     # turn). A pure question ("tôi tên gì?") yields [] → no notice.
     import asyncio as _aio_dm
-    from app.services.graphiti_client import extract_personal_facts as _extract_facts_dm
+    from app.services.memory.graphiti_client import extract_personal_facts as _extract_facts_dm
     _dm_user_msg = _extract_user_message(state)
     _dm_fact_task = (
         _aio_dm.create_task(_extract_facts_dm(_dm_user_msg)) if _dm_user_msg else None
@@ -1953,8 +2013,10 @@ async def mongo_formatter_node(state: SupervisorState) -> dict:
 
     existing_final = state.get("final_answer", "")
     has_docs = bool(state.get("sources"))
+    has_person = bool(state.get("mongo_results"))
+    search_degraded = bool(state.get("people_doc_search_degraded"))
 
-    if not existing_final and not has_docs:
+    if not existing_final and not has_docs and not search_degraded:
         return {
             "final_answer": "Không tìm thấy dữ liệu.",
             "next_agent": AgentType.FINISH,
@@ -1963,7 +2025,14 @@ async def mongo_formatter_node(state: SupervisorState) -> dict:
     await push_event(state, "status", {"step": "generating", "detail": "Đang trình bày kết quả..."})
 
     # ── Block 1: person record(s) ────────────────────────────────────────────
-    if existing_final:
+    # Only rendered when MongoDB actually returned a person. An empty Mongo
+    # result with document hits is NOT worth a block — the documents ARE the
+    # answer, so it streams without any "không tìm thấy hồ sơ" preamble.
+    if has_person and existing_final:
+        block1 = await _format_mongo_block(state)
+    elif has_docs:
+        block1 = ""
+    elif existing_final:
         block1 = await _format_mongo_block(state)
     else:
         block1 = "Không tìm thấy hồ sơ người dân phù hợp."
@@ -1972,8 +2041,11 @@ async def mongo_formatter_node(state: SupervisorState) -> dict:
     # ── Block 2: related documents (companion RAG search) ────────────────────
     block2 = ""
     if has_docs:
-        header = "\n\n---\n\n### 📄 Tài liệu liên quan\n\n"
-        await push_event(state, "token", header)
+        # Two-block layout (separator + heading) only when a person record was
+        # rendered above; with no Block 1 the document answer stands alone.
+        header = "\n\n---\n\n### 📄 Tài liệu liên quan\n\n" if block1 else ""
+        if header:
+            await push_event(state, "token", header)
         try:
             block2_body = await _format_doc_block(state)
         except Exception as e:
@@ -1985,6 +2057,15 @@ async def mongo_formatter_node(state: SupervisorState) -> dict:
             note = "_Không tìm thấy tài liệu liên quan._"
             await push_event(state, "token", note)
             block2 = header + note
+    elif search_degraded:
+        # The companion document search was degraded (workspace failure, e.g.
+        # CUDA OOM) — an empty result here is NOT evidence of absence.
+        note = (
+            "\n\n⚠️ Một phần kho tài liệu tạm thời không truy vấn được nên chưa "
+            "thể kết luận tài liệu không có thông tin — vui lòng thử lại sau."
+        )
+        await push_event(state, "token", note)
+        block2 = note
 
     final = (block1 + block2).strip()
     return {"final_answer": final, "next_agent": AgentType.FINISH}
@@ -2019,7 +2100,7 @@ async def react_executor_node(state: SupervisorState) -> dict:
     # memory worker persists the same facts every turn (add_conversation_episode),
     # so we surface the notice from this extraction instead of relying on the model
     # calling save_memory (which it does inconsistently). Read-only — no double save.
-    from app.services.graphiti_client import extract_personal_facts as _extract_facts
+    from app.services.memory.graphiti_client import extract_personal_facts as _extract_facts
     _auto_fact_task = (
         asyncio.create_task(_extract_facts(user_message)) if user_message else None
     )
@@ -2044,11 +2125,21 @@ async def react_executor_node(state: SupervisorState) -> dict:
     # Inject the query_analyzer plan (sub_queries) as an explicit checklist so
     # the loop knows every sub-question it must cover; also feeds the judge.
     _plan = state.get("sub_queries") or None
+    # Prior-turn digest: the recovery path for follow-ups the condenser's
+    # precision-first gate skipped (long dependent questions without anaphora
+    # cues never reach _condense_followup_query, and this node otherwise sends
+    # ONLY the rewritten query — no history). The rendered block is explicitly
+    # non-authoritative so rule 3b (store = source of truth) keeps its force.
+    _hist_turns = int(getattr(settings, "NEXUSRAG_REACT_HISTORY_TURNS", 6))
+    _prior_turns = _get_prior_history(state, max_turns=_hist_turns) if _hist_turns > 0 else []
     system_prompt = build_react_system_prompt(
         state.get("user_memory_context", "") or "",
         plan=_plan,
         extracted_params=state.get("extracted_params"),
+        history=_prior_turns,
     )
+    if _prior_turns:
+        logger.info(f"[react_executor] history digest injected ({len(_prior_turns)} prior turns)")
     # Reasoning-token / judge knobs (see config.py NEXUSRAG_REACT_*).
     think_tools = bool(getattr(settings, "NEXUSRAG_REACT_THINK_TOOL_TURNS", True))
     judge_on = bool(getattr(settings, "NEXUSRAG_REACT_JUDGE", True))
@@ -2165,8 +2256,9 @@ async def react_executor_node(state: SupervisorState) -> dict:
                 streamed += clean
 
         # Head holdback: buffer the FIRST line so a leaked leading `KẾ HOẠCH:`
-        # line (tool-turn protocol, react_prompt rule 8) is stripped BEFORE
-        # anything reaches the client — streamed text can never be retracted.
+        # or echoed `SẴN SÀNG TRẢ LỜI` line (tool-turn protocol, react_prompt
+        # rule 8 / ready signal) is stripped BEFORE anything reaches the
+        # client — streamed text can never be retracted.
         head = ""
         head_done = False
 
@@ -2176,10 +2268,12 @@ async def react_executor_node(state: SupervisorState) -> dict:
                 await _emit(piece)
                 return
             head += piece or ""
-            _is_planish = head.lstrip().upper().startswith("KẾ HOẠCH")
+            _h = head.lstrip().upper()
+            # "SẴN SÀN" (not SÀNG) on purpose — covers the marker's typo'd form.
+            _is_planish = _h.startswith("KẾ HOẠCH") or _h.startswith("SẴN SÀN")
             if "\n" in head or final_flush or (len(head) > 160 and not _is_planish):
                 head_done = True
-                await _emit(_PLAN_LINE_RE.sub("", head))
+                await _emit(_READY_LINE_RE.sub("", _PLAN_LINE_RE.sub("", head)))
                 head = ""
 
         async for c in llm.astream(
@@ -2265,8 +2359,10 @@ async def react_executor_node(state: SupervisorState) -> dict:
         await _emit_artifacts()
         from app.services.agent.nodes import sanitize_citations
         final = strip_thinking_tags(answer_text or "").strip()
-        # Drop a leaked leading plan line (tool-turn protocol, react_prompt rule 8).
+        # Drop a leaked leading plan line (tool-turn protocol, react_prompt rule 8)
+        # and an echoed leading ready-signal marker.
         final = _PLAN_LINE_RE.sub("", final).strip()
+        final = _READY_LINE_RE.sub("", final).strip()
         # Drop citation markers the LLM invented (e.g. [75a75810] derived from a
         # document UUID) that map to no real source — else they leak as raw text.
         _valid_cids = {str(getattr(s, "index", "")) for s in sources}
@@ -2417,8 +2513,8 @@ async def react_executor_node(state: SupervisorState) -> dict:
             "Bản nháp trên CHƯA đạt. "
             + (f"Còn thiếu: {missing}. " if missing else "")
             + (verdict.get("feedback") or "Hãy tra cứu thêm để bổ sung căn cứ còn thiếu.")
-            + " Hãy GỌI THÊM CÔNG CỤ để thu thập thông tin còn thiếu rồi trả lời lại; "
-            "chưa được kết luận nếu chưa đủ căn cứ."
+            + " Hãy GỌI THÊM CÔNG CỤ để thu thập thông tin còn thiếu, rồi khi đã đủ "
+            "căn cứ trả về đúng dòng `SẴN SÀNG TRẢ LỜI`; chưa được kết luận nếu chưa đủ căn cứ."
         )
         msgs.append(_LLMMsg(role="user", content=critique))
         await push_event(state, "status", {"step": "searching", "detail": "Đang rà soát và bổ sung..."})
@@ -2431,13 +2527,40 @@ async def react_executor_node(state: SupervisorState) -> dict:
         nudged = False                 # sufficiency check injected after first data?
         last_draft: str | None = None  # most recent revised-away draft (for reuse)
         draft_source_count = -1        # sources count when last_draft was written
+        ready_signal = False           # model ended tool phase with `SẴN SÀNG TRẢ LỜI`
         for step in range(max_steps):
             await _emit_artifacts()
             calls, text = await _run_turn(use_tools=True, think=think_tools)
             if not calls:
-                # Model produced a DRAFT (stopped calling tools). Gate it through
-                # the judge before streaming: pass → finish; revise (with budget)
-                # → critique is appended to msgs and we loop for more tools.
+                # Ready-signal protocol (react_prompt "KHI ĐÃ ĐỦ THÔNG TIN"): a
+                # compliant model does NOT write the answer inside this
+                # tools-enabled turn — it returns the bare `SẴN SÀNG TRẢ LỜI`
+                # line and the answer is generated by the no-tools synthesis
+                # below, which streams LIVE. The bare-length branch catches
+                # typo'd/partial markers (observed: "SẴN SÀN TRẢ LỜI") and plan
+                # remnants — nothing that short is a usable answer, and the
+                # synthesis turn regenerates a proper one. The 400 cap keeps a
+                # full answer that merely CONTAINS the marker on the buffered
+                # path: that text is already paid for, replaying beats
+                # regenerating.
+                _core = _PLAN_LINE_RE.sub("", strip_thinking_tags(text or "").strip()).strip()
+                if (
+                    not _core
+                    or len(_core) <= 160
+                    or (_READY_SIGNAL_RE.search(_core) and len(_core) <= 400)
+                ):
+                    ready_signal = True
+                    if text:
+                        msgs.append(_LLMMsg(role="assistant", content=text))
+                    logger.info(
+                        f"[react_executor] step {step + 1}: ready signal "
+                        f"({len(sources)} sources) → live-streaming synthesis"
+                    )
+                    break
+                # Model wrote a full DRAFT despite the protocol (stopped calling
+                # tools). Gate it through the judge before streaming: pass →
+                # finish; revise (with budget) → critique is appended to msgs
+                # and we loop for more tools.
                 done = await _judge_and_maybe_finish(text, reflections)
                 if done is not None:
                     return done
@@ -2567,10 +2690,18 @@ async def react_executor_node(state: SupervisorState) -> dict:
             )
             return await _finish(last_draft)
 
-        # Loop exhausted or an anti-loop guard fired → force a final synthesis.
-        logger.warning(
-            f"[react_executor] forcing synthesis ({len(sources)} sources collected)"
-        )
+        # Reached either via the ready signal (normal path: the model ended the
+        # tool phase without drafting) or by exhausting the loop / an anti-loop
+        # guard — only the latter is anomalous enough to warn about.
+        if ready_signal:
+            logger.info(
+                f"[react_executor] synthesis after ready signal "
+                f"({len(sources)} sources collected)"
+            )
+        else:
+            logger.warning(
+                f"[react_executor] forcing synthesis ({len(sources)} sources collected)"
+            )
         # Strict attached-file scope: if the user has a quoted/attached file active
         # this turn and did NOT explicitly ask to broaden to the whole corpus, the
         # answer must stay INSIDE that file — when the content isn't there, say so
@@ -2602,6 +2733,15 @@ async def react_executor_node(state: SupervisorState) -> dict:
             "nguồn. Nếu không chắc mã điều khoản chính xác, hãy diễn đạt chung "
             "(vd \"theo quy định về hành vi bị cấm\") và nêu rõ cần đối chiếu văn bản "
             "gốc, thay vì ghi một mã cụ thể có thể sai."
+        )
+        # Disarm the ready-signal protocol: THIS is the drafting turn (bước 2) —
+        # without this line the model echoes `SẴN SÀNG TRẢ LỜI` here too (the
+        # transcript is saturated with protocol talk), the head-holdback strips
+        # it, and an empty stream falls through to the canned apology.
+        synthesis_instr = (
+            "Đây là LƯỢT SOẠN THẢO (bước 2 của mục KHI ĐÃ ĐỦ THÔNG TIN). KHÔNG trả "
+            "về dòng `SẴN SÀNG TRẢ LỜI`, KHÔNG viết dòng KẾ HOẠCH — hãy viết NGAY "
+            "câu trả lời đầy đủ. " + synthesis_instr
         )
         # If the last reflection judge flagged concrete gaps, hand them to the
         # synthesis turn so it can address them rather than repeat the mistake.
@@ -3171,7 +3311,7 @@ async def _memory_recall_wrapper(state: SupervisorState) -> dict:
         return {}
 
     try:
-        from app.services.graphiti_client import search_user_memory
+        from app.services.memory.graphiti_client import search_user_memory
 
         uid = user_id
         if isinstance(uid, int):

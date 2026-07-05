@@ -421,7 +421,7 @@ def split_articles(markdown: str) -> list[dict]:
     """
     # Pre-process: apply Vietnamese scattered-char fix from the parser
     # This handles Docling's per-glyph spacing issues in both headings and body
-    from app.services.deep_document_parser import _fix_scattered_vietnamese
+    from app.services.parsing.deep_document_parser import _fix_scattered_vietnamese
     markdown = _fix_scattered_vietnamese(markdown)
 
     # Pre-process: fix broken spacing "Đ i ề u" → "Điều"

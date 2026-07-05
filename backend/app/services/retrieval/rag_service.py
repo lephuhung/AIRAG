@@ -14,10 +14,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.models.document import Document, DocumentStatus
-from app.services.document_loader import load_document, LoadedDocument
-from app.services.chunker import DocumentChunker, TextChunk
-from app.services.embedder import EmbeddingService, get_embedding_service
-from app.services.vector_store import VectorStore, get_vector_store
+from app.services.parsing.document_loader import load_document, LoadedDocument
+from app.services.embedding.chunker import DocumentChunker, TextChunk
+from app.services.embedding.embedder import EmbeddingService, get_embedding_service
+from app.services.embedding.vector_store import VectorStore, get_vector_store
 
 logger = logging.getLogger(__name__)
 
@@ -241,30 +241,37 @@ _kg_service_cache: dict = {}
 
 async def get_kg_service(workspace_id: uuid_lib.UUID):
     """Get KG service for a workspace — cached, routed via HRAG_KG_MODE."""
-    from app.services.knowledge_graph_service import get_kg_service as _factory
+    from app.services.kg.knowledge_graph_service import get_kg_service as _factory
     if workspace_id not in _kg_service_cache:
         _kg_service_cache[workspace_id] = _factory(workspace_id)
     return _kg_service_cache[workspace_id]
 
 
 # --- RAG Service Factory ---
-# Module-level cache: workspace_id → HRAGService
-_hrag_service_cache: dict[uuid_lib.UUID, "HRAGService"] = {}
 
 def get_rag_service(db: AsyncSession, workspace_id: uuid_lib.UUID) -> "RAGService | HRAGService":
     """Factory function: routes to HRAGService or legacy RAGService based on config."""
     from app.core.config import settings
 
     if settings.HRAG_ENABLED:
-        from app.services.hrag_service import HRAGService
+        from app.services.retrieval.hrag_service import HRAGService
+        from app.services.kg.knowledge_graph_service import get_kg_service as _kg_factory
 
-        if workspace_id not in _hrag_service_cache:
-            _hrag_service_cache[workspace_id] = HRAGService(db=db, workspace_id=workspace_id)
-        else:
-            # Reuse cached service but refresh the DB session for this request
-            _hrag_service_cache[workspace_id].db = db
-            _hrag_service_cache[workspace_id].retriever.db = db
-
-        return _hrag_service_cache[workspace_id]
+        # Build a FRESH HRAGService per request so its db / retriever.db are
+        # request-PRIVATE. The old module-level cache reused one instance per
+        # workspace and rebound .db on every call — two concurrent requests to
+        # the SAME workspace then raced on a shared AsyncSession (which is not
+        # safe to use from multiple tasks concurrently). Everything the service
+        # wires is a process-wide singleton (embedder, reranker, Chroma client,
+        # Docling converter) so construction is cheap — EXCEPT the KG service,
+        # which lazily opens a Neo4j driver, so THAT stays cached per workspace
+        # (reuse the existing _kg_service_cache) to avoid a driver per request.
+        svc = HRAGService(db=db, workspace_id=workspace_id)
+        if svc.kg_service is not None:
+            if workspace_id not in _kg_service_cache:
+                _kg_service_cache[workspace_id] = _kg_factory(workspace_id)
+            svc.kg_service = _kg_service_cache[workspace_id]
+            svc.retriever.kg_service = _kg_service_cache[workspace_id]
+        return svc
 
     return RAGService(db=db, workspace_id=workspace_id)

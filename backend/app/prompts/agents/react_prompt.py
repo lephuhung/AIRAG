@@ -22,6 +22,25 @@ PLAN_LINE_RE: re.Pattern[str] = re.compile(
     r"^\s*KẾ\s*HOẠCH\s*:[^\n]*\n?", re.IGNORECASE | re.UNICODE
 )
 
+# Ready-signal marker (section "KHI ĐÃ ĐỦ THÔNG TIN"): a compliant model ends the
+# tool phase by returning this bare line INSTEAD of writing the answer inside a
+# tools-enabled turn. react_executor_node detects it and generates the answer in
+# a dedicated no-tools turn that streams LIVE to the client — the whole point of
+# the protocol is cutting the buffered-answer wait out of time-to-first-token.
+# `SÀNG?` — optional G ON PURPOSE: Qwen reliably typos the marker as
+# "SẴN SÀN TRẢ LỜI" (observed repeatedly in evals AND live runs), so both
+# detection and the leading-line strip must accept the typo'd form.
+READY_SIGNAL = "SẴN SÀNG TRẢ LỜI"
+READY_SIGNAL_RE: re.Pattern[str] = re.compile(
+    r"SẴN\s*SÀNG?\s*TRẢ\s*LỜI", re.IGNORECASE | re.UNICODE
+)
+# Start-anchored variant (like PLAN_LINE_RE): strips a LEADING marker line the
+# model may echo at the top of the synthesis turn / a buffered draft, without
+# touching the phrase if it appears inside answer prose.
+READY_LINE_RE: re.Pattern[str] = re.compile(
+    r"^\s*SẴN\s*SÀNG?\s*TRẢ\s*LỜI\s*[.!…:]*\s*\n?", re.IGNORECASE | re.UNICODE
+)
+
 REACT_SYSTEM_PROMPT = """\
 Bạn là trợ lý hỏi-đáp văn bản pháp luật Việt Nam. Bạn trả lời bằng cách GỌI CÔNG CỤ \
 để thu thập thông tin, rồi tổng hợp câu trả lời CÓ TRÍCH DẪN.
@@ -68,16 +87,16 @@ trong cùng lượt, song song với công cụ tra cứu). Lưu: thiết bị, 
 nếu vẫn không có văn bản/nội dung được hỏi trong kho thì KẾT LUẬN "không tìm thấy trong kho" \
 NGAY, KHÔNG tiếp tục đoán số hiệu văn bản khác.
 9. ƯU TIÊN TRẢ LỜI SỚM: ngay khi dữ liệu đã thu thập ĐỦ để trả lời câu hỏi CHÍNH, hãy DỪNG \
-gọi công cụ và viết câu trả lời — KHÔNG quét thêm chỉ để cho "đầy đủ". Chỉ tra tiếp khi còn \
-thiếu một phần CỤ THỂ và THIẾT YẾU cho câu hỏi.
+gọi công cụ và chuyển sang bước trả lời (mục KHI ĐÃ ĐỦ THÔNG TIN) — KHÔNG quét thêm chỉ để \
+cho "đầy đủ". Chỉ tra tiếp khi còn thiếu một phần CỤ THỂ và THIẾT YẾU cho câu hỏi.
 8. KHI CÒN GỌI CÔNG CỤ mà câu hỏi có TỪ HAI Ý trở lên, HOẶC đây là lượt gọi công cụ tiếp \
 theo sau khi đã có kết quả: kèm ĐÚNG MỘT dòng kế hoạch dạng \
 `KẾ HOẠCH: <ý cần trả lời 1> [đã có/thiếu] | <ý 2> [đã có/thiếu] | ...` ngay trước các lời \
 gọi công cụ — ý [thiếu] phải khớp với công cụ bạn gọi. NGOÀI dòng đó, TUYỆT ĐỐI không viết \
 lời dẫn/giải thích nào khác. Dòng KẾ HOẠCH giúp các lượt sau biết đang theo đuổi gì và \
 khi nào NÊN DỪNG. (Câu hỏi MỘT ý ở lượt đầu tiên có thể gọi công cụ trực tiếp, không cần \
-dòng kế hoạch.) Chỉ bắt đầu viết câu trả lời đầy đủ khi đã đủ thông tin (lúc đó không \
-gọi công cụ nữa và KHÔNG kèm dòng KẾ HOẠCH).
+dòng kế hoạch.) Chỉ chuyển sang bước trả lời khi đã đủ thông tin (lúc đó không gọi công cụ \
+nữa và KHÔNG kèm dòng KẾ HOẠCH — xem mục KHI ĐÃ ĐỦ THÔNG TIN).
 
 ═══════════════ KHI NGƯỜI DÙNG ĐÍNH KÈM FILE ═══════════════
 Nếu lượt này có VĂN BẢN ĐÍNH KÈM, chọn công cụ theo MỤC ĐÍCH của người dùng:
@@ -111,7 +130,13 @@ CHỈ gọi tuần tự (nhiều lượt) khi tool sau CẦN kết quả của t
 resolve_document_reference (để biết văn bản) RỒI mới search_document_section trong văn bản đó.
 
 ═══════════════ KHI ĐÃ ĐỦ THÔNG TIN ═══════════════
-Ngừng gọi công cụ và viết câu trả lời cuối bằng TIẾNG VIỆT:
+Bước trả lời gồm HAI lượt:
+1) Lượt báo hiệu: khi dữ liệu đã đủ, ngừng gọi công cụ và trả lời bằng dòng: SẴN SÀNG TRẢ LỜI \
+— chưa cần soạn nội dung ở lượt này.
+2) Lượt soạn thảo: hệ thống sẽ yêu cầu bạn viết câu trả lời đầy đủ ngay sau đó.
+(Các lượt CÒN GỌI CÔNG CỤ không thay đổi: vẫn kèm dòng KẾ HOẠCH theo quy tắc 8.)
+
+Khi soạn câu trả lời cuối cùng (lượt soạn thảo), viết bằng TIẾNG VIỆT:
 - Trích dẫn nguồn bằng cách chèn ĐÚNG mã trong ngoặc vuông xuất hiện ở kết quả công cụ — \
 ví dụ kết quả ghi "Nguồn [a3z9]" thì viết [a3z9]. KHÔNG tự bịa mã (không viết [idXX], [idKG], \
 [id12], [1]...); chỉ dùng mã CÓ THẬT trong kết quả. Ý nào không có mã nguồn kèm theo thì không gắn trích dẫn.
@@ -128,8 +153,9 @@ SUFFICIENCY_NUDGE_PROMPT = (
     "Bạn đã có dữ liệu ban đầu ở trên. Hãy rà soát bằng KẾ HOẠCH tường minh: "
     "liệt kê các Ý CHÍNH mà câu hỏi cần trả lời, ý nào ĐÃ CÓ căn cứ trong "
     "kết quả (kèm mã nguồn), ý nào CÒN THIẾU.\n"
-    "- Nếu KHÔNG còn ý thiếu → TRẢ LỜI NGAY (không gọi công cụ, không kèm "
-    "dòng KẾ HOẠCH). Không cần tra cho hết mọi khía cạnh nếu ý chính đã đủ.\n"
+    "- Nếu KHÔNG còn ý thiếu → trả về đúng dòng `SẴN SÀNG TRẢ LỜI` (không gọi "
+    "công cụ, không kèm dòng KẾ HOẠCH, KHÔNG tự viết câu trả lời). Không cần "
+    "tra cho hết mọi khía cạnh nếu ý chính đã đủ.\n"
     "- Nếu còn ý THIẾU THIẾT YẾU → ghi dòng `KẾ HOẠCH:` (đánh dấu ý "
     "[đã có]/[thiếu]) rồi gọi ĐÚNG công cụ cho ý thiếu đó.\n"
     "- TUYỆT ĐỐI KHÔNG resolve/tra thêm văn bản có số hiệu chỉ xuất hiện "
@@ -174,12 +200,66 @@ def _render_plan_block(
     return block
 
 
+# Citation codes ([a3z9]) inside PRIOR assistant answers point at tool results
+# of PAST turns — they do not exist in this turn's results, and the synthesis
+# rule only allows codes that appear in tool output. Strip them from the digest
+# so the model cannot copy a stale code into the new answer.
+_STALE_CITATION_RE = re.compile(r"\[[a-zA-Z0-9]{4}\]")
+# Frontend @mention tags carried inside stored user turns — machine routing info
+# (consumed by the sticky-doc logic in supervisor.py), noise for the LLM.
+_DOC_TAG_RE = re.compile(r"<document_id=[^>]+>", re.IGNORECASE)
+
+_HISTORY_USER_CAP = 400
+_HISTORY_ASSISTANT_CAP = 700
+
+
+def _render_history_block(history: list[tuple[str, str]] | None) -> str:
+    """Render prior conversation turns as a digest block.
+
+    ``history`` is (role, content) pairs oldest→newest, current question
+    EXCLUDED (see supervisor._get_prior_history). Gives the loop enough
+    conversational grounding to resolve references the follow-up condenser
+    missed ("văn bản này", "điều đó", elliptical follow-ups) — the condense
+    gate is precision-first on purpose, so this is the recovery path when it
+    skips a genuinely dependent question. The block is explicitly framed as
+    NON-AUTHORITATIVE: rules 1/3b keep their force, answers still come from
+    tools called THIS turn.
+    """
+    lines: list[str] = []
+    for role, content in history or []:
+        content = str(content or "").strip()
+        if not content:
+            continue
+        if role == "user":
+            content = _DOC_TAG_RE.sub("", content).strip()
+            speaker, cap = "Người dùng", _HISTORY_USER_CAP
+        else:
+            content = _STALE_CITATION_RE.sub("", content)
+            speaker, cap = "Trợ lý", _HISTORY_ASSISTANT_CAP
+        if len(content) > cap:
+            content = content[:cap] + "…"
+        if content:
+            lines.append(f"{speaker}: {content}")
+    if not lines:
+        return ""
+    return (
+        "\n\n═══════════════ HỘI THOẠI TRƯỚC ĐÓ (chỉ để hiểu câu hỏi) ═══════════════\n"
+        + "\n".join(lines)
+        + "\nDùng đoạn hội thoại trên CHỈ để hiểu câu hỏi hiện tại (giải nghĩa "
+        '"văn bản này", "điều đó", câu hỏi nối tiếp...). Nó KHÔNG phải nguồn trả lời: '
+        "mọi căn cứ pháp lý vẫn phải lấy từ CÔNG CỤ gọi trong lượt này — quy tắc 1 và 3b "
+        "giữ nguyên hiệu lực, KHÔNG dùng lại mã nguồn của các lượt trước."
+    )
+
+
 def build_react_system_prompt(
     memory_context: str = "",
     plan: list[dict] | None = None,
     extracted_params: dict | None = None,
+    history: list[tuple[str, str]] | None = None,
 ) -> str:
-    """Render the system prompt, injecting pre-recalled memory + the query plan."""
+    """Render the system prompt, injecting pre-recalled memory, the query plan
+    and a digest of prior conversation turns."""
     block = _render_plan_block(plan, extracted_params)
     if memory_context and memory_context.strip():
         block += (
@@ -187,4 +267,5 @@ def build_react_system_prompt(
             + memory_context.strip()
             + "\nDùng ngữ cảnh này khi câu hỏi liên quan tới người dùng; nếu cần thêm, gọi recall_memory."
         )
+    block += _render_history_block(history)
     return REACT_SYSTEM_PROMPT.format(memory_context=block)

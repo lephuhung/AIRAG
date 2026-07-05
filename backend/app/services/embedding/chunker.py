@@ -183,7 +183,7 @@ class LegalDocumentChunker:
 
     @classmethod
     def has_legal_structure(cls, text: str) -> bool:
-        from app.services.heading_path import find_headings
+        from app.services.parsing.heading_path import find_headings
 
         dieu = [h for h in find_headings(text) if h.title.lower().startswith("điều")]
         return len(dieu) >= cls.MIN_DIEU_HEADINGS
@@ -194,7 +194,7 @@ class LegalDocumentChunker:
         source: str = "",
         extra_metadata: dict | None = None,
     ) -> list[TextChunk]:
-        from app.services.heading_path import find_headings
+        from app.services.parsing.heading_path import find_headings
 
         if not text.strip():
             return []

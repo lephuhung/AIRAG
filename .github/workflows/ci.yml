@@ -1,0 +1,68 @@
+name: CI
+
+# Offline, no-secret checks only. The retrieval golden set, prompt-eval suite and
+# RAG/RAGAS evals need the live stack (Chroma/Postgres + vLLM providers) and are
+# run out-of-band via the Makefile (`make test-recall`, `make eval-prompts`, …),
+# NOT here — CI stays fast and dependency-light.
+
+on:
+  push:
+    branches: [main, agent]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-smoke:
+    name: Backend syntax smoke (py_compile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Byte-compile backend sources
+        # Catches syntax / bad-import-time errors without installing the heavy
+        # runtime deps (torch, docling, …). Excludes vendored/generated dirs.
+        run: |
+          python -m compileall -q \
+            backend/app backend/scripts backend/tests
+      - name: Validate golden-set dataset & baseline JSON
+        run: |
+          python - <<'PY'
+          import json, sys
+          from pathlib import Path
+          # baseline_recall.json must stay valid JSON (soft gate reads it)
+          json.loads(Path("backend/tests/retrieval/baseline_recall.json").read_text())
+          # golden dataset must stay valid YAML with a cases list
+          try:
+              import yaml
+          except ModuleNotFoundError:
+              sys.exit(0)  # PyYAML not present in this minimal env — skip
+          doc = yaml.safe_load(Path("backend/tests/retrieval/datasets/golden_retrieval.yaml").read_text())
+          assert isinstance(doc.get("cases"), list) and doc["cases"], "golden set has no cases"
+          print(f"golden set OK: {len(doc['cases'])} cases")
+          PY
+
+  frontend:
+    name: Frontend lint + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Enable pnpm
+        run: corepack enable
+      - name: Install deps
+        run: pnpm install --no-frozen-lockfile
+      - name: Lint
+        run: pnpm lint
+      - name: Type-check + build
+        run: pnpm build

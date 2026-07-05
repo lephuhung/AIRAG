@@ -26,9 +26,9 @@ from app.core.database import async_session_maker
 from app.models.document_type import DocumentType as _DocumentType  # noqa: F401
 from app.models.document import Document, DocumentStatus
 from app.queue.messages import EmbedMessage
-from app.services.embedder import get_embedding_service
-from app.services.heading_path import extract_article_nos
-from app.services.vector_store import get_vector_store
+from app.services.embedding.embedder import get_embedding_service
+from app.services.parsing.heading_path import extract_article_nos
+from app.services.embedding.vector_store import get_vector_store
 from app.workers.utils import check_and_finalize
 
 logger = logging.getLogger(__name__)
@@ -83,7 +83,7 @@ async def handle_embed(payload: dict) -> None:
             # embeddings + citation snippets, so remove it here. No-op for
             # non-OCR (Docling) documents — strip_ocr_layout only touches text
             # that actually carries the layout markers.
-            from app.services.ocr_service import strip_ocr_layout
+            from app.services.parsing.ocr_service import strip_ocr_layout
             for c in chunks_data:
                 c["content"] = strip_ocr_layout(c["content"])
 
@@ -95,7 +95,7 @@ async def handle_embed(payload: dict) -> None:
             embed_texts = [c["content"] for c in chunks_data]
             if settings.HRAG_ENABLE_CONTEXTUAL_EMBEDDINGS:
                 try:
-                    from app.services.contextual_embedder import enrich_chunks_with_context
+                    from app.services.embedding.contextual_embedder import enrich_chunks_with_context
                     from app.services.storage_service import get_storage_service
 
                     document_markdown = ""

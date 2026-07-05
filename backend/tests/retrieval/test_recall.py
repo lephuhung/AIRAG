@@ -105,7 +105,7 @@ def _article_matches(chunk, article_nos: list[int]) -> bool:
 @pytest.mark.parametrize("case", CASES, ids=[c["id"] for c in CASES])
 async def test_case_retrieval(case):
     from app.core.database import async_session_maker
-    from app.services.hrag_service import HRAGService
+    from app.services.retrieval.hrag_service import HRAGService
 
     primary = await _resolve_doc(case["expect_document"])
     if not primary:

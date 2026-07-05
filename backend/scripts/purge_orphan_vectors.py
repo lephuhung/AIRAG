@@ -31,7 +31,7 @@ from sqlalchemy import select
 
 from app.core.database import async_session_maker
 from app.models.document import Document
-from app.services.vector_store import VectorStore, get_chroma_client
+from app.services.embedding.vector_store import VectorStore, get_chroma_client
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("purge_orphan_vectors")

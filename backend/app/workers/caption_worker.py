@@ -28,11 +28,11 @@ from app.core.database import async_session_maker
 from app.models.document_type import DocumentType as _DocumentType  # noqa: F401
 from app.models.document import Document, DocumentImage, DocumentStatus, DocumentTable
 from app.queue.messages import CaptionMessage
-from app.services.deep_document_parser import DeepDocumentParser
-from app.services.embedder import get_embedding_service
+from app.services.parsing.deep_document_parser import DeepDocumentParser
+from app.services.embedding.embedder import get_embedding_service
 from app.services.models.parsed_document import ExtractedImage, ExtractedTable
 from app.services.storage_service import get_storage_service
-from app.services.vector_store import get_vector_store
+from app.services.embedding.vector_store import get_vector_store
 from app.workers.utils import check_and_finalize
 
 logger = logging.getLogger(__name__)

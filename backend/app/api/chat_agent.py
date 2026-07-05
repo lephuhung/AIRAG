@@ -19,9 +19,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 import string
 import uuid
+from contextvars import ContextVar
 from typing import AsyncGenerator, Optional
 
 from sqlalchemy import select
@@ -44,6 +46,26 @@ logger = logging.getLogger(__name__)
 
 MAX_VISION_IMAGES = 3
 SSE_HEARTBEAT_INTERVAL = 15  # seconds
+
+# Workspace ids whose search failed in the most recent _execute_search_documents
+# call on this async context. Lets downstream nodes distinguish "searched
+# everything, found nothing" from "part of the corpus was unsearchable" (e.g.
+# CUDA OOM) — the latter must never be presented as a confident "not found".
+last_search_failures: ContextVar[list[str]] = ContextVar(
+    "last_search_failures", default=[]
+)
+
+# Bound how many per-workspace searches may run GPU inference (embed + rerank)
+# at once. The searches fan out with asyncio.gather and the reranker runs in
+# real threads (asyncio.to_thread in deep_retriever), so without a cap N
+# workspaces multiply the activation-memory peak N-fold — enough to exhaust the
+# thin GPU slack shared with the vLLM engines (OOM incident 2026-07-04: backend
+# grew 4.8→7.9GB after one 5-way fan-out and every later search OOM'd).
+#
+# gpu_search_slot() layers a per-process soft cap AND (when REDIS_ENABLED) a
+# cluster-wide hard cap, so this guard keeps holding when the backend runs >1
+# worker process / replica on the shared GPU.
+from app.core.gpu_semaphore import gpu_search_slot
 
 _CITATION_ID_CHARS = string.ascii_lowercase + string.digits
 
@@ -247,8 +269,8 @@ async def _execute_search_documents(
     Returns:
         (context_text, sources, image_refs, image_parts_for_vision, kg_summaries)
     """
-    from app.services.rag_service import get_rag_service
-    from app.services.hrag_service import HRAGService
+    from app.services.retrieval.rag_service import get_rag_service
+    from app.services.retrieval.hrag_service import HRAGService
     from pathlib import Path as _P
 
     # Translate search_mode to HRAGService.query_deep mode param
@@ -259,6 +281,8 @@ async def _execute_search_documents(
 
     all_chunks = []
     all_kg_summaries = []
+    failed_searches: list[tuple[str, str]] = []  # (workspace_id, error)
+    last_search_failures.set([])
 
     # Get workspace titles for better labeling
     from app.models.knowledge_base import KnowledgeBase
@@ -368,9 +392,10 @@ async def _execute_search_documents(
                         f"{len(result.chunks)} chunks"
                     )
                 except Exception as e:
-                    logger.warning(
+                    logger.error(
                         f"[RAG] UUID-scoped search failed on workspace {workspace_id}: {e}"
                     )
+                    failed_searches.append((str(workspace_id), f"{type(e).__name__}: {e}"))
         # Skip the broad workspace loop below
     else:
         # Fan out the per-workspace searches CONCURRENTLY. Each query_deep hits
@@ -382,25 +407,45 @@ async def _execute_search_documents(
         import asyncio as _asyncio
 
         async def _search_one_ws(workspace_id):
-            """Query ONE workspace on its own db session. Returns (chunks, kg)."""
+            """Query ONE workspace on its own db session. Returns (chunks, kg, error)."""
             logger.info(
                 f"[RAG] External Search: query='{query}' on workspace {workspace_id}"
             )
             packed: list = []          # (score, chunk, citation, workspace_id)
             kg_summary: str | None = None
+            error: str | None = None
             async with AsyncSessionLocal() as ws_db:
                 rag_service = get_rag_service(ws_db, workspace_id)
                 chunks = []
                 citations = []
                 if isinstance(rag_service, HRAGService):
-                    try:
-                        result = await rag_service.query_deep(
+                    async def _query():
+                        return await rag_service.query_deep(
                             question=query,
                             top_k=min(top_k, 10),
                             document_ids=document_ids,
                             mode=hrag_mode,
                             include_images=False,
                         )
+
+                    try:
+                        async with gpu_search_slot():
+                            try:
+                                result = await _query()
+                            except Exception as e:
+                                # CUDA OOM here is usually VRAM fragmentation of the
+                                # long-running backend process, not a real capacity
+                                # limit — free the cache and retry once.
+                                if "out of memory" not in str(e).lower():
+                                    raise
+                                logger.warning(
+                                    f"[RAG] CUDA OOM on workspace {workspace_id} — "
+                                    f"empty_cache + retry once"
+                                )
+                                import torch
+
+                                torch.cuda.empty_cache()
+                                result = await _query()
                         chunks = result.chunks
                         citations = result.citations
                         if result.knowledge_graph_summary:
@@ -408,7 +453,8 @@ async def _execute_search_documents(
                                 f"### Knowledge Graph Insights\n{result.knowledge_graph_summary}"
                             )
                     except Exception as e:
-                        logger.warning(f"Search failed for workspace {workspace_id}: {e}")
+                        error = f"{type(e).__name__}: {e}"
+                        logger.error(f"Search failed for workspace {workspace_id}: {e}")
                 else:
                     from types import SimpleNamespace
 
@@ -432,7 +478,8 @@ async def _execute_search_documents(
                                 )
                             )
                     except Exception as e:
-                        logger.warning(
+                        error = f"{type(e).__name__}: {e}"
+                        logger.error(
                             f"Legacy search failed for workspace {workspace_id}: {e}"
                         )
 
@@ -441,21 +488,61 @@ async def _execute_search_documents(
                 citation = citations[i] if i < len(citations) else None
                 score = getattr(chunk, "score", 0.0)
                 packed.append((score, chunk, citation, workspace_id))
-            return packed, kg_summary
+            return packed, kg_summary, error
 
         ws_results = await _asyncio.gather(
             *[_search_one_ws(ws) for ws in workspace_ids]
         )
-        for packed, kg_summary in ws_results:
+        for (packed, kg_summary, error), ws_id in zip(ws_results, workspace_ids):
             all_chunks.extend(packed)
             if kg_summary:
                 all_kg_summaries.append(kg_summary)
+            if error:
+                failed_searches.append((str(ws_id), error))
 
     # Sort all aggregated chunks by score descending
     all_chunks.sort(key=lambda x: x[0], reverse=True)
     logger.info(
         f"[RAG] Found total {len(all_chunks)} potential chunks across {len(workspace_ids)} workspaces"
     )
+
+    # Return the fan-out's activation pool to the shared GPU. Without this the
+    # caching allocator keeps the multi-workspace peak reserved indefinitely,
+    # eating the headroom the co-tenant vLLM engines/backup allocations rely on
+    # (with expandable_segments the freed cache actually shrinks VRAM usage).
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    # Surface degraded searches instead of silently pretending the corpus was
+    # fully covered — a failed workspace must not read as "no results there".
+    if failed_searches:
+        last_search_failures.set([ws for ws, _ in failed_searches])
+        logger.error(
+            f"[RAG] Search DEGRADED: {len(failed_searches)}/{len(workspace_ids)} "
+            "workspace(s) failed: "
+            + "; ".join(f"{ws[:8]}: {err[:150]}" for ws, err in failed_searches)
+        )
+        try:
+            from app.services.agent.streaming import push_event
+
+            await push_event(
+                {},
+                "status",
+                {
+                    "step": "warning",
+                    "detail": (
+                        f"⚠️ Không truy vấn được {len(failed_searches)}/"
+                        f"{len(workspace_ids)} kho tài liệu — kết quả có thể thiếu."
+                    ),
+                },
+            )
+        except Exception:
+            pass
 
     # Take top_k
     best_chunks = all_chunks[:top_k]
@@ -487,7 +574,7 @@ async def _execute_search_documents(
                 "superseded_by": doc.superseded_by_number,
             }
 
-    from app.services.heading_path import extract_article_nos
+    from app.services.parsing.heading_path import extract_article_nos
 
     for score, chunk, citation, workspace_id in best_chunks:
         cid = _generate_citation_id(existing_ids)
@@ -559,6 +646,19 @@ async def _execute_search_documents(
         )
 
     context = ""
+    if failed_searches and not best_chunks:
+        context += (
+            "⚠️ LƯU Ý HỆ THỐNG: một phần kho tài liệu tạm thời KHÔNG truy vấn được "
+            f"({len(failed_searches)}/{len(workspace_ids)} workspace lỗi). "
+            "KHÔNG được kết luận là 'không có thông tin' — hãy nói rõ hệ thống "
+            "đang gặp sự cố truy vấn và đề nghị người dùng thử lại sau.\n\n"
+        )
+    elif failed_searches:
+        context += (
+            "⚠️ LƯU Ý HỆ THỐNG: kết quả bên dưới CÓ THỂ THIẾU — một phần kho tài "
+            "liệu tạm thời không truy vấn được. Nếu không tìm thấy thông tin được "
+            "hỏi, hãy nói rõ điều này thay vì khẳng định thông tin không tồn tại.\n\n"
+        )
     if all_kg_summaries:
         context += "## Knowledge Graph Entities & Relationships\n"
         context += "\n\n".join(all_kg_summaries)

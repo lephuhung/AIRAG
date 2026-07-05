@@ -28,7 +28,7 @@ def preload_models() -> None:
     logger.info("[preload] Loading retrieval models …")
 
     # 1. Embedding model (sentence-transformers)
-    from app.services.embedder import get_embedding_service
+    from app.services.embedding.embedder import get_embedding_service
 
     emb = get_embedding_service()
     _ = emb.model  # triggers lazy load
@@ -37,7 +37,7 @@ def preload_models() -> None:
     emb.warmup()
 
     # 2. Reranker model (cross-encoder)
-    from app.services.reranker import get_reranker_service
+    from app.services.retrieval.reranker import get_reranker_service
 
     rr = get_reranker_service()
     _ = rr.model  # triggers lazy load
@@ -86,7 +86,7 @@ def preload_worker_models(worker_type: str) -> None:
 
     elif worker_type == "embed":
         # Embedding model (same as retrieval)
-        from app.services.embedder import get_embedding_service
+        from app.services.embedding.embedder import get_embedding_service
 
         emb = get_embedding_service()
         _ = emb.model
@@ -148,7 +148,7 @@ def _preload_ocr() -> None:
     try:
         t0 = time.time()
         logger.info("[preload] Loading local OCR model (HunyuanOCR) …")
-        from app.services.ocr_service import HunyuanOCRService
+        from app.services.parsing.ocr_service import HunyuanOCRService
 
         svc = HunyuanOCRService()
         # Trigger the lazy vLLM engine load
