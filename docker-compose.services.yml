@@ -611,6 +611,10 @@ services:
       # Flip to "true" (with the redis service up) to enable multi-worker /
       # multi-replica: cross-process Stop, shared GPU limit + retrieval cache.
       REDIS_ENABLED: ${REDIS_ENABLED:-false}
+      # Backend worker processes. Default 1. >1 needs the production image
+      # (APP_ENV=production — the dev target runs --reload/1 worker), REDIS_ENABLED
+      # =true, GPU headroom for N× retrieval models, and AUTO_CREATE_TABLES=false.
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}
       MINIO_ENDPOINT: http://minio:9000
       MINIO_WEBHOOK_ENABLED: "false"
       NEO4J_URI: bolt://neo4j:7687

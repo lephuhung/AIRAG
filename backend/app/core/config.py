@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     REDIS_ENABLED: bool = Field(default=False)
     REDIS_URL: str = Field(default="redis://localhost:6379/0")
 
+    # Number of backend worker processes (uvicorn --workers). Default 1 keeps the
+    # single-process behaviour. Raising it REQUIRES REDIS_ENABLED=true (cross-
+    # process Stop / GPU cap / cache) + GPU headroom for N× retrieval models.
+    WEB_CONCURRENCY: int = Field(default=1)
+
     # ── GPU search concurrency (shared-VRAM guard for the RAG fan-out) ──────
     # Tier 1 (always on): per-process soft cap. Tier 2 (only when REDIS_ENABLED):
     # a cluster-wide hard cap so N backend worker processes / replicas sharing

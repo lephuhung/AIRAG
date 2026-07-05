@@ -38,6 +38,38 @@ async def lifespan(app: FastAPI):
     import os
 
     auto_create = os.environ.get("AUTO_CREATE_TABLES", "true").lower() == "true"
+
+    # ── Multi-worker readiness guard ──────────────────────────────────────
+    # Each uvicorn/gunicorn worker is a SEPARATE process: it runs this whole
+    # lifespan, opens its own DB pool, and (lazily) loads its OWN embedder +
+    # reranker into GPU VRAM. Raising WEB_CONCURRENCY>1 therefore requires
+    # REDIS_ENABLED (else Stop / GPU cap / retrieval cache fall back to
+    # per-process state and stop being correct across workers), GPU headroom
+    # for N× retrieval models, and running the inline migrations once up front.
+    web_concurrency = int(os.environ.get("WEB_CONCURRENCY", "1") or "1")
+    if web_concurrency > 1:
+        if not settings.REDIS_ENABLED:
+            logger.warning(
+                "WEB_CONCURRENCY=%d but REDIS_ENABLED=false — the Stop button, the "
+                "GPU-search concurrency cap and the retrieval cache are per-process "
+                "and will NOT be correct across workers. Set REDIS_ENABLED=true.",
+                web_concurrency,
+            )
+        if auto_create:
+            logger.warning(
+                "WEB_CONCURRENCY=%d with AUTO_CREATE_TABLES=true — all %d workers will "
+                "run the inline schema migrations concurrently at boot. Prefer running "
+                "migrations once with a single worker, then deploy with "
+                "AUTO_CREATE_TABLES=false.",
+                web_concurrency, web_concurrency,
+            )
+        logger.warning(
+            "WEB_CONCURRENCY=%d — each worker loads its OWN embedder + reranker into "
+            "GPU VRAM (~N× the retrieval-model footprint). Ensure GPU headroom or move "
+            "retrieval models to a dedicated service before scaling.",
+            web_concurrency,
+        )
+
     if auto_create:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)

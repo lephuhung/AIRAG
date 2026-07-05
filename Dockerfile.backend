@@ -48,8 +48,11 @@ RUN mkdir -p data/docling data/lightrag uploads
 
 EXPOSE 8080
 
-# Production mode: multiple workers
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
+# Production mode: worker count from WEB_CONCURRENCY (default 1). Shell form so
+# the env var is expanded at container start. WEB_CONCURRENCY>1 requires
+# REDIS_ENABLED=true + GPU headroom for N× retrieval models (see app/main.py
+# lifespan guard). Keep AUTO_CREATE_TABLES=false when scaling out (migrate once).
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers ${WEB_CONCURRENCY:-1}"]
 
 
 # ── Stage: development ───────────────────────────────────
