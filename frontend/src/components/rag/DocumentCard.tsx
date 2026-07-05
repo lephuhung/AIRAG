@@ -9,6 +9,9 @@ import {
   ImageIcon,
   Network,
   Play,
+  MoreHorizontal,
+  Download,
+  RefreshCw,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -92,6 +95,8 @@ interface DocumentCardProps {
   onToggleSelect?: (id: string) => void;
   onDelete: (id: string) => void;
   onProcess: (id: string) => void;
+  onReindex?: (id: string) => void;
+  onDownload?: (doc: Document) => void;
   onClick?: (doc: Document) => void;
   showSubTasks?: boolean;
   isProcessing?: boolean;
@@ -106,6 +111,8 @@ export const DocumentCard = memo(({
   onToggleSelect,
   onDelete,
   onProcess,
+  onReindex,
+  onDownload,
   onClick,
   showSubTasks: forceShowSubTasks,
   isProcessing,
@@ -135,6 +142,21 @@ export const DocumentCard = memo(({
     return () => observer.disconnect();
   }, []);
 
+  // Action dropdown menu (mirrors FileCard's menu)
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!isMenuOpen) return;
+    const handleClick = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setIsMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [isMenuOpen]);
+
   // Flash animation when user just clicked "Analyze"
   const [justTriggered, setJustTriggered] = useState(false);
   useEffect(() => {
@@ -144,10 +166,14 @@ export const DocumentCard = memo(({
     }
   }, [justTriggered]);
 
-  const handleProcess = (e: React.MouseEvent) => {
-    e.stopPropagation();
+  const triggerProcess = () => {
     setJustTriggered(true);
     onProcess(doc.id);
+  };
+
+  const handleProcess = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    triggerProcess();
   };
 
   return (
@@ -168,6 +194,7 @@ export const DocumentCard = memo(({
           ? "border-blue-400/50 shadow-[0_0_12px_-3px_rgba(96,165,250,0.3)]"
           : "border-border hover:shadow-md hover:-translate-y-0.5",
         selected && "border-primary ring-1 ring-primary/30 shadow-sm",
+        isMenuOpen && "z-30",
         doc.status === "indexed" || doc.status === "building_kg" ? "cursor-pointer" : "cursor-default",
         justTriggered && "ring-2 ring-blue-400/60",
         className
@@ -235,18 +262,79 @@ export const DocumentCard = memo(({
               </button>
             )}
 
-            <Button
-              variant="ghost"
-              size="icon"
-              onClick={(e) => {
-                e.stopPropagation();
-                onDelete(doc.id);
-              }}
-              className="h-7 w-7 opacity-0 group-hover:opacity-100 transition-opacity"
-              disabled={isProcessing}
-            >
-              <Trash2 className="w-3.5 h-3.5 text-destructive" />
-            </Button>
+            <div className="relative" ref={menuRef}>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setIsMenuOpen(!isMenuOpen);
+                }}
+                className={cn(
+                  "h-7 w-7 transition-opacity",
+                  isMenuOpen ? "opacity-100 bg-muted" : "opacity-0 group-hover:opacity-100"
+                )}
+              >
+                <MoreHorizontal className="w-3.5 h-3.5" />
+              </Button>
+
+              {isMenuOpen && (
+                <div
+                  className="absolute right-0 top-full mt-1 w-44 bg-card border rounded-lg shadow-xl z-20 py-1 overflow-hidden"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {doc.status === "pending" && (
+                    <button
+                      className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted transition-colors text-left font-semibold text-blue-500"
+                      onClick={() => {
+                        triggerProcess();
+                        setIsMenuOpen(false);
+                      }}
+                      disabled={isProcessing}
+                    >
+                      <RefreshCw className={cn("w-3.5 h-3.5", isProcessing && "animate-spin")} />
+                      {t("files.analyze")}
+                    </button>
+                  )}
+                  {onDownload && (
+                    <button
+                      className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted transition-colors text-left"
+                      onClick={() => {
+                        onDownload(doc);
+                        setIsMenuOpen(false);
+                      }}
+                    >
+                      <Download className="w-3.5 h-3.5 text-muted-foreground" />
+                      {t("common.download")}
+                    </button>
+                  )}
+                  {onReindex && (
+                    <button
+                      className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-muted transition-colors text-left"
+                      onClick={() => {
+                        onReindex(doc.id);
+                        setIsMenuOpen(false);
+                      }}
+                    >
+                      <RefreshCw className="w-3.5 h-3.5 text-muted-foreground/70" />
+                      {t("files.re_analyze")}
+                    </button>
+                  )}
+                  <div className="h-px bg-border my-1" />
+                  <button
+                    className="w-full flex items-center gap-2 px-3 py-2 text-sm text-destructive hover:bg-destructive/10 transition-colors text-left"
+                    onClick={() => {
+                      onDelete(doc.id);
+                      setIsMenuOpen(false);
+                    }}
+                    disabled={isProcessing}
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    {t("common.delete")}
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         </div>
 

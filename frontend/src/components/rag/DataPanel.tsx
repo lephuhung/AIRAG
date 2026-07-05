@@ -45,6 +45,8 @@ interface DataPanelProps {
   isUploading: boolean;
   onDelete: (id: string) => void;
   onProcess: (id: string) => void;
+  onReindex: (id: string) => void;
+  onDownload: (doc: Document) => void;
   isProcessing: boolean;
   onUpdateWorkspace: (data: { name: string; description?: string }) => Promise<void>;
 }
@@ -61,6 +63,8 @@ export const DataPanel = memo(function DataPanel({
   isUploading,
   onDelete,
   onProcess,
+  onReindex,
+  onDownload,
   isProcessing,
   onUpdateWorkspace,
 }: DataPanelProps) {
@@ -303,6 +307,8 @@ export const DataPanel = memo(function DataPanel({
                     selected={doc.id === selectedDocId}
                     onDelete={(id) => setDeleteDocConfirm(id)}
                     onProcess={onProcess}
+                    onReindex={onReindex}
+                    onDownload={onDownload}
                     isProcessing={isProcessing}
                     onClick={onSelectDoc}
                     className={cn(

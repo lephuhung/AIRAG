@@ -7,7 +7,7 @@ import { DataPanel } from "@/components/rag/DataPanel";
 import { VisualPanel } from "@/components/rag/VisualPanel";
 import { useWorkspaceStore } from "@/stores/workspaceStore";
 import { useWorkspace, useUpdateWorkspace } from "@/hooks/useWorkspaces";
-import { useUploadDocuments } from "@/hooks/useDocuments";
+import { useUploadDocuments, useReindexDocument } from "@/hooks/useDocuments";
 import { api } from "@/lib/api";
 import type { Document, RAGStats, DocumentStatus } from "@/types";
 
@@ -121,6 +121,12 @@ export function WorkspacePage() {
     onError: () => toast.error(t("workspace.delete_failed")),
   });
 
+  const reindexDoc = useReindexDocument(workspaceId);
+
+  const handleDownload = useCallback((doc: Document) => {
+    api.downloadFile(`/documents/${doc.id}/download`, doc.original_filename);
+  }, []);
+
   const processDoc = useMutation({
     mutationFn: (docId: string) => api.post(`/rag/process/${docId}`),
     onSuccess: () => {
@@ -176,6 +182,8 @@ export function WorkspacePage() {
         isUploading={isUploading}
         onDelete={(id) => deleteDoc.mutate(id)}
         onProcess={(id) => processDoc.mutate(id)}
+        onReindex={(id) => reindexDoc.mutate(id)}
+        onDownload={handleDownload}
         isProcessing={processDoc.isPending}
         onUpdateWorkspace={handleUpdateWorkspace}
       />

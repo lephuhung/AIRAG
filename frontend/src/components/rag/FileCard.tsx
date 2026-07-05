@@ -157,6 +157,7 @@ export const FileCard = memo(function FileCard({
       className={cn(
         "group relative flex flex-col bg-card/60 backdrop-blur-md border rounded-xl shadow-sm hover:shadow-xl hover:-translate-y-0.5 transition-all duration-300",
         status === "failed" ? "border-destructive/30" : "border-border/60",
+        isMenuOpen && "z-30",
         className
       )}
     >
@@ -166,8 +167,8 @@ export const FileCard = memo(function FileCard({
         {/* Main Info */}
         <div className="flex items-start gap-3">
           <div className={cn(
-            "p-3 rounded-lg bg-background/80 border shadow-sm",
-            fileConfig.color.replace("text-", "bg-").replace("-400", "-400/10")
+            "p-3 rounded-lg border shadow-sm",
+            fileConfig.bgColor
           )}>
             <FileIcon className={cn("w-6 h-6", fileConfig.color)} />
           </div>
