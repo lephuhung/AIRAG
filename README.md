@@ -1,277 +1,230 @@
-# NexusRAG
+# AIRAG — Hybrid RAG for Vietnamese Legal & Administrative Documents
 
-### Hybrid Knowledge Base with Agentic Chat, Citations & Knowledge Graph
+### Vector search + Knowledge Graph + agentic chat with citations
 
-[![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
+[![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://python.org)
 [![React](https://img.shields.io/badge/React_19-61DAFB?style=for-the-badge&logo=react&logoColor=black)](https://react.dev)
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://docker.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
 
-**Upload documents. Ask questions. Get cited answers.**
+**Upload documents → ask questions → get answers grounded in cited sources.**
 
-NexusRAG combines vector search, knowledge graph extraction, and LLM-powered chat into one seamless RAG pipeline — with automatic citations, agentic routing, and support for Gemini, Ollama, or any OpenAI-compatible provider.
+AIRAG (a.k.a. Hybrid RAG / NexusRAG) is a knowledge base that combines dense vector
+search, lexical BM25, temporal + legal knowledge graphs, and an LLM chat agent — tuned
+for Vietnamese administrative/legal documents (Nghị quyết, Quyết định, Công văn, …) with
+automatic citations, a document-validity layer, OCR for scanned PDFs, and voice I/O.
 
-[Features](#features) · [Quick Start](#quick-start) · [Architecture](#architecture) · [Tech Stack](#tech-stack) · [Configuration](#configuration)
-
----
-
-## Features
-
-### Deep Document Parsing
-
-NexusRAG uses [Docling](https://github.com/docling-project/docling) for structural document understanding:
-
-- **Structural preservation** — Heading hierarchy (`H1 > H2 > H3`), page boundaries, paragraph grouping
-- **Multi-format** — PDF, DOCX, PPTX, HTML, TXT with consistent markdown output
-- **Hybrid chunking** — Semantic + structural boundaries (respects headings, tables; never splits mid-sentence)
-- **Page-aware metadata** — Every chunk carries page number, heading path, and image/table references
-
-### Hybrid Retrieval Pipeline
-
-| Stage | Technology | Details |
-|---|---|---|
-| **Embedding** | BAAI/bge-m3 | 1024-dim multilingual bi-encoder |
-| **Vector Search** | ChromaDB | Cosine similarity, over-fetch top-20 |
-| **Knowledge Graph** | LightRAG / LegalKG | Entity/relationship extraction for Vietnamese admin docs |
-| **Reranking** | BAAI/bge-reranker-v2-m3 | Cross-encoder joint scoring |
-| **Generation** | Gemini / Ollama / OpenAI-compatible | Streaming chat with function calling |
-
-**Retrieval flow:**
-1. Vector over-fetch (top-20) + KG entity lookup run in parallel
-2. Cross-encoder reranking — all candidates scored jointly with the query
-3. Keep top-8 above relevance threshold, with fallback to top-3
-4. Media discovery — find images/tables on matched pages
-
-### Citation System
-
-Every answer is grounded in source documents with **4-character citation IDs** (e.g., `[a3z1]`):
-
-- Inline clickable badges embedded in answer text
-- Source cards showing filename, page number, heading path, and relevance score
-- Cross-navigation — click a citation to jump to the exact section in the document viewer
-- Image references cited separately as `[IMG-p4f2]`
-
-### Knowledge Graph
-
-Interactive force-directed graph built from extracted entities and relationships:
-
-- **Entity types** — Person, Organization, Product, Location, Event, Regulation, etc.
-- **Pan & zoom** — Mouse drag, scroll wheel, keyboard reset
-- **Node interaction** — Click to select, hover to highlight edges, drag to reposition
-- **Query modes** — Naive, Local (multi-hop), Global, Hybrid
-
-NexusRAG also includes **LegalKG** — a domain-specific KG extraction service tuned for Vietnamese administrative documents (Nghị quyết, Quyết định, Công văn, etc.).
-
-### Agentic Chat
-
-A LangGraph-based chat agent with real-time SSE streaming:
-
-- **Agent steps** — Visual timeline: Analyzing → Retrieving → Generating → Done
-- **11 intent types** — `search`, `list_docs`, `summarize`, `kg_query`, `search_doc_num`, `search_abbr`, `write_summarize`, `write_suggest_edits`, `write_grammar_check`, `greeting`, `personal`
-- **Extended thinking** — Configurable reasoning depth (minimal → high)
-- **Chat history** — Persistent per workspace with message ratings
-
-### Multi-Provider LLM
-
-Switch between cloud and local models with a single env var:
-
-| Provider | Models | Notes |
-|---|---|---|
-| **Gemini** | `gemini-2.5-flash`, `gemini-3.1-flash-lite` | Cloud — auto thinking budget |
-| **Ollama** | `qwen3.5:9b`, `gemma3:12b`, etc. | Local — native protocol |
-| **OpenAI-compatible** | vLLM, LM Studio | Self-hosted OpenAI-compatible endpoints |
-
-### Workspace Isolation
-
-Each workspace has its own:
-- ChromaDB collection
-- LightRAG KG directory
-- Chat history
-- Custom system prompt (optional override per document type)
-
-Multi-tenancy enforced via PostgreSQL `tenant` model and JWT claims.
+[Highlights](#highlights) · [Quick start](#quick-start) · [Architecture](#architecture) · [Scaling out](#scaling-out) · [Configuration](#configuration) · [Ports](#service-ports)
 
 ---
 
-## Quick Start
+## Highlights
 
-### Option A: Docker (Full Stack)
+- **Hybrid retrieval** — dense (bi-encoder) + BM25 lexical, fused with Reciprocal Rank
+  Fusion, then re-scored by a cross-encoder reranker; optional Knowledge-Graph context.
+- **Legal-aware** — structure-aware chunking (Phần / Chương / Mục / Điều), a
+  document-**validity layer** (effective / amended / superseded) that demotes or warns on
+  outdated documents, and a **LegalKG** entity graph on Neo4j.
+- **Agentic chat** — a single **LangGraph supervisor** classifies intent and routes in one
+  LLM call, with an opt-in tool-calling **ReAct executor** for RAG queries. Answers stream
+  over SSE with inline 4-char citations (e.g. `[a3z1]`).
+- **Deep parsing + OCR** — Docling for born-digital PDF/DOCX/PPTX; a self-hosted vLLM OCR
+  engine reconstructs scanned pages (with Vietnamese-diacritic handling).
+- **Voice** — local Whisper speech-to-text for the chat mic, and TTS for spoken answers.
+- **Reach the agent from anywhere** — REST + SSE, generic **API keys**, and a **Telegram**
+  bot (self-service account linking, DB-managed bot config).
+- **Multi-tenant** — per-workspace vector collections, KG namespace, chat history and
+  optional per-document-type system prompts; JWT + tenant model; automatic **audit logging**.
+- **Horizontally scalable** — an optional Redis layer makes cross-process Stop, a
+  cluster-wide GPU concurrency cap, and a shared retrieval cache work across multiple
+  backend workers/replicas (see [Scaling out](#scaling-out)).
+- **Observability** — Langfuse LLM/LangGraph tracing + Loki/Grafana log aggregation.
+
+---
+
+## Quick start
+
+Everything runs via Docker Compose. There are **three** compose files:
+
+| File | Contents |
+|---|---|
+| `docker-compose.services.yml` | Full app stack — infra (PostgreSQL, ChromaDB, RabbitMQ, MinIO, Neo4j, Redis) **plus** backend, frontend and the parse/embed/caption/kg/memory workers, behind Traefik. |
+| `docker-compose.vllm.yml` | The two self-hosted vLLM engines (OCR + memory/intent model). Split out because they own the GPU. |
+| `docker-compose.langfuse.yml` | Optional self-hosted Langfuse tracing stack. |
 
 ```bash
 cp .env.example .env
-# Edit .env — set GOOGLE_AI_API_KEY (or configure Ollama)
-docker compose up -d
+# Edit .env — set GOOGLE_AI_API_KEY (default LLM provider is Gemini),
+# or switch LLM_PROVIDER=ollama | openai_compatible.
+
+# 1) (optional) GPU inference engines — OCR + intent/memory model
+docker compose -f docker-compose.vllm.yml up -d
+
+# 2) the whole application + infrastructure
+docker compose -f docker-compose.services.yml up -d
 ```
 
-First build takes ~5–10 minutes (~2.5GB ML models). Access at http://localhost:5174
+The stack is served through **Traefik** on `:80` (host `service.hatinh.local` → backend,
+frontend on its own route). Backend health/docs are on `:8080` (`/health`, `/docs`).
+Source dirs (`./backend`, frontend) are bind-mounted for live reload in the default
+`development` target.
 
-### Option B: Local Development
+> The old top-level `run_dev.sh` / `run_bk.sh` / `run_fe.sh` / `run_workers.sh` /
+> `setup.sh` scripts were removed — start everything through Docker Compose.
 
-```bash
-./setup.sh                    # One-time setup: venv, pip deps, infra services, frontend deps
-./run_dev.sh                  # Starts backend + frontend + workers combined
-```
-
-Or manually in three terminals:
-
-```bash
-# Terminal 1 — Backend (port 8080)
-./run_bk.sh
-
-# Terminal 2 — Frontend (port 5174)
-./run_fe.sh
-
-# Terminal 3 — Workers (parse, embed, caption, kg)
-./run_workers.sh
-```
-
-### Frontend Only
+### Frontend-only local dev
 
 ```bash
 cd frontend
 pnpm install
-pnpm dev          # Dev server on port 5174
-pnpm build        # Production bundle → dist/
+pnpm dev      # Vite dev server on :5174 (proxies /api → backend:8080)
+pnpm build    # production bundle → dist/
 ```
 
 ---
 
 ## Architecture
 
-### Document Processing Pipeline
+### Document processing pipeline
+
+`parse_worker` fans out to **three independent RabbitMQ queues that run in parallel**
+(not sequentially); the document is finalized once all three complete:
 
 ```
-Upload → parse_worker → embed_worker → caption_worker → kg_worker
-             ↓                ↓               ↓               ↓
-           MinIO          ChromaDB       MinIO (captions)  LightRAG / LegalKG
+Upload ──► parse_worker ─┬─► embed_worker    → ChromaDB (vectors)
+   (MinIO,  Docling/OCR)  ├─► caption_worker  → MinIO captions, then re-embeds
+                          └─► kg_worker       → LegalKG (Neo4j) / LightRAG
 ```
 
-Workers are selected at runtime via the `WORKER_TYPE` env var.
+Worker type is chosen per process via `WORKER_TYPE` (`parse` | `embed` | `caption` |
+`kg` | `memory`). Uploads are de-duplicated by `content_hash` (sha256). Scanned PDFs are
+detected and routed through the vLLM OCR engine.
 
-### Chat Agent (LangGraph)
+### Retrieval
 
 ```
-START
-  → abbr_expander        (expand abbreviations before routing)
-  → memory_recall        (load user memories from Graphiti)
-  → intent_classifier    (classify + rewrite query via Qwen3-4B)
-  → [direct_answer]      (greeting / personal intent)
-  → [write_executor]     (write_summarize / suggest_edits / grammar_check)
-  → [agent_rag_executor] (search / list_docs / summarize / kg_query / search_doc_num / search_abbr)
-      → [write_executor] (intent=summarize: RAG fetches doc, Write summarizes)
-      → [answer_generator]
-  → END
+question
+  ├─ dense vector over-fetch (ChromaDB)   ┐
+  ├─ BM25 lexical search                  ├─ run in parallel
+  └─ Knowledge-Graph lookup               ┘
+        └─► RRF merge (vector + BM25)
+              └─► cross-encoder rerank → top-k
+                    └─► validity layer: demote / warn on superseded documents
+                          └─► assemble cited context for the LLM
 ```
 
-Controlled by `NEXUSRAG_AGENT_BACKEND` (`legacy` | `langgraph`).
+### Chat agent (LangGraph supervisor)
+
+A single supervisor graph classifies intent **and** routes in one LLM call, with optional
+memory recall (Graphiti), multi-step decomposition, and a result evaluator that may
+re-route:
+
+```
+START → query_analyzer → supervisor ─┬─ rag → answer_generator
+                                      ├─ resolve_doc → …
+                                      ├─ write  → docx/answer
+                                      ├─ people → mongo_formatter
+                                      └─ direct → answer
+                              → result_evaluator → END
+```
+
+Setting `NEXUSRAG_LG_RAG_REACT=true` routes RAG-group queries to a tool-calling **ReAct
+executor** instead of the fixed intent→tool chain: the model is given the RAG tool schemas
+(search / section / kg / resolve_doc / memory) and decides which to call.
 
 ### Storage
 
 | Service | Purpose |
 |---|---|
-| **PostgreSQL** | Document metadata, chunks, chat history, workspaces, users, tenants |
-| **ChromaDB** | Vector embeddings (HTTP client, containerized) |
-| **MinIO** | Raw uploads, parsed markdown, captions (S3-compatible) |
-| **LightRAG** | File-based KG (NetworkX + NanoVectorDB) |
-| **Neo4j** | Optional KG backend for LegalKGService |
+| **PostgreSQL** (pgvector) | Metadata, chunks, chat history, users, workspaces, tenants, audit logs, LightRAG KV/vector store |
+| **ChromaDB** | Dense vector embeddings — one collection per workspace |
+| **MinIO** | Raw uploads, parsed markdown, image captions (S3-compatible) |
+| **Neo4j** | LegalKG entity graph + Graphiti temporal memory |
+| **Redis** | Optional shared cross-process state for multi-worker (Stop, GPU cap, cache) |
+| **LightRAG** | File-based graph (`data/lightrag/kb_{id}/`) when `HRAG_KG_MODE=lightrag` |
 
 ---
 
-## Tech Stack
+## Scaling out
 
-### Backend
+By default the backend runs as a **single process** (`WEB_CONCURRENCY=1`), which keeps some
+state in-process. A **Redis layer** (opt-in, `REDIS_ENABLED=true`) makes the backend safe to
+run as multiple worker processes / replicas:
 
-| Technology | Purpose |
-|---|---|
-| **FastAPI** | Async web framework with SSE streaming |
-| **SQLAlchemy 2.0** | Async ORM with PostgreSQL (asyncpg) |
-| **ChromaDB** | Vector store — per-workspace collections |
-| **LightRAG / LegalKG** | Knowledge graph extraction |
-| **Docling** | Document parsing (PDF, DOCX, PPTX) |
-| **BAAI/bge-m3** | Embeddings (1024-dim) |
-| **BAAI/bge-reranker-v2-m3** | Cross-encoder reranking |
-| **LangGraph** | Agent state machine |
+| Concern | Single process (default) | With Redis |
+|---|---|---|
+| Stop button (cancel a run) | in-process registry | pub/sub — reaches whichever worker owns the run |
+| GPU-search concurrency cap | per-process semaphore | cluster-wide, self-healing permit (protects shared VRAM) |
+| Retrieval cache | per-process dict | shared cache with per-workspace invalidation |
+| DB session per request | ✅ request-private (fixed) | ✅ |
 
-### Frontend
+To scale out (on a machine with GPU headroom): build the **production** image
+(`APP_ENV=production`), set `REDIS_ENABLED=true` and `WEB_CONCURRENCY=N`, run the inline
+migrations once with a single worker then set `AUTO_CREATE_TABLES=false`. A lifespan guard
+warns if these prerequisites are missing.
 
-| Technology | Purpose |
-|---|---|
-| **React 19** + **TypeScript** | UI framework |
-| **Vite** | Dev server and bundler |
-| **TailwindCSS** | Styling with dark/light theme |
-| **Zustand** | Client state management |
-| **React Query v5** | Server state (fetching, caching, mutations) |
-| **Framer Motion** | Animations |
-| **React Router v7** | Routing (multi-page SPA) |
-| **react-markdown** + **KaTeX** | Markdown + LaTeX rendering |
-
-### Infrastructure
-
-| Technology | Purpose |
-|---|---|
-| **PostgreSQL 15** (pgvector) | Metadata + vector storage |
-| **ChromaDB** | Vector embeddings |
-| **RabbitMQ** | Async job queue |
-| **MinIO** | Object storage |
-| **nginx** | Reverse proxy + SPA serving |
-| **Docker Compose** | Full-stack deployment |
+> ⚠️ Each worker loads its **own** embedder + reranker into GPU VRAM, so `WEB_CONCURRENCY>1`
+> requires either spare VRAM or moving the retrieval models to a dedicated inference service.
 
 ---
 
 ## Configuration
 
-All configuration via `.env` (copy from `.env.example`). Two prefix families coexist:
-
-- `NEXUSRAG_*` — core pipeline settings
-- `HRAG_*` — additional features (contextual embeddings, BM25)
-
-### Key Variables
+All settings come from `.env` (copy `.env.example`). Config keys use two prefixes:
+`HRAG_*` (retrieval/pipeline) and `NEXUSRAG_*` (agent). Selected defaults:
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_PROVIDER` | `gemini` | `gemini`, `ollama`, or `openai_compatible` |
+| `LLM_PROVIDER` | `gemini` | `gemini` \| `ollama` \| `openai_compatible` |
 | `GOOGLE_AI_API_KEY` | — | Required for Gemini |
-| `NEXUSRAG_AGENT_BACKEND` | `langgraph` | `legacy` or `langgraph` |
-| `NEXUSRAG_ENABLE_KG` | `true` | Toggle knowledge graph extraction |
-| `NEXUSRAG_ENABLE_IMAGE_CAPTIONING` | `true` | LLM captioning for extracted images |
-| `NEXUSRAG_VECTOR_PREFETCH` | `20` | Candidates before reranking |
-| `NEXUSRAG_RERANKER_TOP_K` | `8` | Final results after reranking |
-| `HRAG_ENABLE_CONTEXTUAL_EMBEDDINGS` | `true` | Contextual embedding enrichment |
-| `HRAG_ENABLE_BM25` | `false` | Enable BM25 alongside vector search |
+| `HRAG_ENABLED` | `true` | Use the hybrid retrieval service (vs. legacy) |
+| `HRAG_KG_MODE` | `legal` | `legal` (LegalKG/Neo4j) or `lightrag` |
+| `HRAG_ENABLE_KG` | `true` | Toggle KG extraction |
+| `HRAG_ENABLE_BM25` | `true` | Hybrid BM25 alongside vector search |
+| `HRAG_ENABLE_CONTEXTUAL_EMBEDDINGS` | `false` | LLM-generated context prepended before embedding |
+| `HRAG_EMBEDDING_MODEL` | `BAAI/bge-m3` | Bi-encoder (1024-dim); override per deployment |
+| `HRAG_RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` | Cross-encoder reranker |
+| `NEXUSRAG_LG_RAG_REACT` | `false` | Route RAG queries to the tool-calling ReAct executor |
+| `REDIS_ENABLED` | `false` | Enable the shared cross-process state layer |
+| `WEB_CONCURRENCY` | `1` | Backend worker processes (see [Scaling out](#scaling-out)) |
+| `AUTO_CREATE_TABLES` | `true` | Run inline schema migrations at startup |
 
-See `.env.example` for all ~208 configuration options.
+See `.env.example` for the full set of options.
 
 ---
 
-## API
+## Service ports
 
-All endpoints prefixed with `/api/v1`. Interactive docs at http://localhost:8080/docs
+Published by `docker-compose.services.yml` (host → container):
 
-### Core Endpoints
-
-| Method | Path | Description |
+| Service | Port(s) | Notes |
 |---|---|---|
-| `GET/POST` | `/workspaces` | List / create workspaces |
-| `PUT/DELETE` | `/workspaces/{id}` | Update / delete workspace |
-| `POST` | `/documents/upload/{workspace_id}` | Upload document |
-| `GET` | `/documents/{id}/markdown` | Get parsed content |
-| `DELETE` | `/documents/{id}` | Delete document |
-| `POST` | `/rag/query/{workspace_id}` | Hybrid search |
-| `POST` | `/rag/chat/{workspace_id}/stream` | Streaming chat (SSE) |
-| `GET` | `/rag/chat/{workspace_id}/history` | Chat history |
-| `GET` | `/rag/graph/{workspace_id}` | Knowledge graph data |
-| `GET` | `/rag/analytics/{workspace_id}` | Workspace analytics |
+| Traefik | `80`, `8089` | App entrypoint + dashboard |
+| Backend | `8080` | FastAPI — `/health`, `/docs` |
+| Frontend | via Traefik | React 19 + Vite SPA |
+| PostgreSQL | `5433` | pgvector |
+| ChromaDB | `8002` | Vector store |
+| Redis | `6380` | Scale-out state (opt-in) |
+| RabbitMQ | `5672`, `15672` | Broker + management UI (guest/guest) |
+| MinIO | `9000`, `9001` | S3 API + console |
+| Neo4j | `7474`, `7687` | Browser + Bolt |
+| Grafana / Loki | `3000` / `3100` | Log dashboards + aggregation |
+| vLLM OCR / memory | `8001` / `8088` | From `docker-compose.vllm.yml` |
 
 ---
 
-## Document Types
+## Tech stack
 
-NexusRAG classifies Vietnamese administrative documents into 29 types:
+**Backend** — FastAPI (async, SSE) · SQLAlchemy 2.0 + asyncpg · LangGraph · Docling ·
+ChromaDB · Neo4j / LightRAG · sentence-transformers (bge-m3 / bge-reranker-v2-m3) ·
+faster-whisper (STT) · Redis · RabbitMQ (aio-pika) · MinIO (aioboto3).
 
-Nghị quyết (cá biệt), Quyết định (cá biệt), Chỉ thị, Quy chế, Quy định, Thông báo, Hướng dẫn, Chương trình, Kế hoạch, Phương án, Đề án, Dự án, Báo cáo, Biên bản, Tờ trình, Hợp đồng, Công văn, Công điện, Bản ghi nhớ, Bản thỏa thuận, Giấy ủy quyền, Giấy mời, Giấy giới thiệu, Giấy nghỉ phép, Phiếu gửi, Phiếu chuyển, Phiếu báo, Thư công.
+**Frontend** — React 19 + TypeScript 5.9 · Vite 7 · TailwindCSS 4 · Zustand · React Query
+v5 · React Router v7 · react-markdown + KaTeX.
 
-Each type can have a custom system prompt and KG extraction prompt per workspace.
+**LLM providers** — Gemini (`gemini-2.5-flash`), Ollama, or any OpenAI-compatible endpoint
+(vLLM). The intent classifier / memory agent runs on a self-hosted vLLM model.
 
 ---
 

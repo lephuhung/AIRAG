@@ -7,7 +7,11 @@
 # MinIO: uses shared hrag-minio from docker-compose.services.yml
 #
 # Usage:
+#   Included by docker-compose.services.yml (include:) — the main stack brings
+#   this up/down automatically. Standalone still works:
 #   docker compose -f docker-compose.langfuse.yml up -d
+# NOTE: service name is `langfuse-redis` (NOT `redis`) to avoid colliding with
+# the backend's ephemeral hrag-redis defined in docker-compose.services.yml.
 
 networks:
   default:
@@ -23,9 +27,15 @@ services:
     container_name: airag-langfuse-minio-init
     entrypoint: ["/bin/sh", "-c"]
     command:
+      # Retry until hrag-minio is reachable — this stack may start before (or
+      # together with) the services stack, and include: forbids cross-file
+      # depends_on, so ordering is handled here instead of a fixed sleep.
       - |
-        sleep 5 &&
-        mc alias set local http://hrag-minio:9000 minioadmin minioadmin &&
+        for i in $$(seq 1 60); do
+          mc alias set local http://hrag-minio:9000 minioadmin minioadmin && break
+          echo "hrag-minio not ready (attempt $$i/60), retrying in 2s..."
+          sleep 2
+        done &&
         mc mb local/langfuse --ignore-existing &&
         mc anonymous set download local/langfuse &&
         echo "Bucket langfuse ready"
@@ -41,7 +51,7 @@ services:
         condition: service_completed_successfully
       langfuse-postgres:
         condition: service_healthy
-      redis:
+      langfuse-redis:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
@@ -68,7 +78,7 @@ services:
       CLICKHOUSE_CLUSTER_ENABLED: "false"
 
       # Redis
-      REDIS_HOST: redis
+      REDIS_HOST: langfuse-redis
       REDIS_PORT: 6379
       REDIS_AUTH: ${REDIS_AUTH:-redis_secret}
 
@@ -124,7 +134,7 @@ services:
     depends_on:
       langfuse-postgres:
         condition: service_healthy
-      redis:
+      langfuse-redis:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
@@ -164,7 +174,7 @@ services:
       retries: 10
       start_period: 2s
 
-  redis:
+  langfuse-redis:
     image: docker.io/redis:7
     restart: always
     command: >

@@ -49,8 +49,12 @@ services:
     environment:
       NVIDIA_VISIBLE_DEVICES: "0"
       FLASHINFER_DISABLE_VERSION_CHECK: "1"
+      # Serve from the local HF cache only — never hit the hub. Upstream revision
+      # bumps otherwise force a full re-download on container recreate (2026-07-05:
+      # gemma re-download 16GB × N retries filled the disk and crash-looped).
+      HF_HUB_OFFLINE: "1"
     volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
+      - /root/.cache/huggingface:/root/.cache/huggingface
     command:
       - baidu/Unlimited-OCR
       - --port
@@ -125,8 +129,11 @@ services:
       FLASHINFER_DISABLE_VERSION_CHECK: "1"
       VLLM_USE_V1: "0"
       VLLM_DISABLE_NIXL: "1"
+      # Serve from the local HF cache only (see vllm-ocr note) — cached snapshot
+      # fee6332 is complete; hub's newer revision must not trigger a re-download.
+      HF_HUB_OFFLINE: "1"
     volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
+      - /root/.cache/huggingface:/root/.cache/huggingface
     command:
       - google/gemma-4-E4B-it
       - --port
