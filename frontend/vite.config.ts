@@ -12,7 +12,7 @@ export default defineConfig({
   },
   server: {
     port: 5174,
-    allowedHosts: ['rag.hatinh.local', 'localhost', '127.0.0.1'],
+    allowedHosts: ['rag.hatinh.local', 'rag.zbots.store', 'localhost', '127.0.0.1'],
     proxy: {
       '/api': {
         target: process.env.VITE_API_PROXY_URL || 'http://backend:8080',

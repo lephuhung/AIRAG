@@ -55,8 +55,12 @@ services:
   #   - cert.pem                                   → origin cert (cloudflared login)
   #   - config.yml                                 → tunnel name + ingress rules
   #   - 95713781-76f3-40ca-b96f-25433b340d7d.json  → per-tunnel credentials (secret)
-  # config.yml routes Host(bot.zbots.store) → http://hrag-backend:8080 — cloudflared
-  # is on hrag_network so it reaches the backend by container name.
+  # config.yml routes Host(bot.zbots.store) → http://hrag-backend:8080 and
+  # Host(rag.zbots.store) → http://hrag-frontend:5174 (full web UI; Vite proxies
+  # /api + /minio-direct itself) — cloudflared is on hrag_network so it reaches
+  # both by container name. New hostname? add an ingress rule in config.yml, run
+  # `cloudflared tunnel route dns zbots-tunnel <host>` (inside the container),
+  # add the host to vite allowedHosts, then restart cloudflared (+ frontend).
   # The Telegram webhook then becomes:
   #   https://bot.zbots.store/api/v1/integrations/telegram/webhook
   # Only starts with the "tunnel" profile so the rest of the stack can run without it:
@@ -795,6 +799,12 @@ services:
     environment:
       - VITE_API_PROXY_URL=http://backend:8080
       - VITE_MINIO_PROXY_URL=http://minio:9000
+      # Link-preview / SEO metadata → %VITE_*% placeholders in index.html.
+      # Override in the root .env; defaults below.
+      - VITE_SITE_NAME=${VITE_SITE_NAME:-AIRAG}
+      - VITE_SITE_TITLE=${VITE_SITE_TITLE:-AIRAG - AI Workspace}
+      - "VITE_SITE_DESCRIPTION=${VITE_SITE_DESCRIPTION:-Trợ lý AI tra cứu kho tri thức nội bộ: tìm kiếm ngữ nghĩa, đồ thị tri thức và chat có trích dẫn nguồn từ văn bản của bạn.}"
+      - VITE_PUBLIC_URL=${VITE_PUBLIC_URL:-https://rag.zbots.store}
     networks:
       - hrag_network
     labels:
