@@ -24,6 +24,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
+from app.core.config import settings
 from app.core.deps import get_db, require_superadmin
 from app.models.document import Document, DocumentStatus
 from app.models.user import User
@@ -160,11 +161,12 @@ async def _check_openai_health(
 
 
 async def _check_simple_health(url: str | None) -> dict[str, Any]:
-    """Check a plain ``GET {base}/health`` service (embed-rerank / stt).
+    """Check a plain ``GET {base}/health`` service (embed-rerank / stt / tts).
 
-    These expose a custom ``/health`` (``{status, model, ...}``), not an
-    OpenAI ``/models`` endpoint. A trailing ``/v1`` (e.g. STT_OPENAI_BASE_URL)
-    is stripped so we hit ``/health`` at the service root.
+    These expose a custom ``/health`` (``{status, model, ...}`` — omnivoice
+    reports ``model_id``), not an OpenAI ``/models`` endpoint. A trailing
+    ``/v1`` (e.g. STT_OPENAI_BASE_URL) is stripped so we hit ``/health`` at
+    the service root.
     """
     if not url:
         return {"status": "disabled", "error": "not configured"}
@@ -180,7 +182,7 @@ async def _check_simple_health(url: str | None) -> dict[str, Any]:
             st = str(data.get("status", "")).lower()
             return {
                 "status": "healthy" if st in ("ok", "healthy") else "warning",
-                "model": data.get("model"),
+                "model": data.get("model") or data.get("model_id"),
                 "url": url,
             }
     except Exception as exc:
@@ -393,6 +395,7 @@ async def workers_health(
         # Model-offload microservices (scale-out) — plain /health, not /models.
         _check_simple_health(os.getenv("HRAG_EMBED_RERANK_URL")),
         _check_simple_health(os.getenv("STT_OPENAI_BASE_URL")),
+        _check_simple_health(settings.TTS_OMNIVOICE_BASE_URL),
     ]
     llm_results = await asyncio.gather(*llm_tasks)
 
@@ -402,6 +405,7 @@ async def workers_health(
         "main_llm": llm_results[2],
         "embed_rerank": llm_results[3],
         "stt": llm_results[4],
+        "tts": llm_results[5],
     }
 
     return health
@@ -1049,6 +1053,16 @@ def _gpu_process_label(pid: int) -> str:
 
     if "uvicorn" in joined and "app.main:app" in joined:
         return "backend (uvicorn)"
+
+    # Model-offload sidecars: name them by role, not by their generic
+    # executable ("uvicorn" / "omnivoice-server"), so the GPU panel reads
+    # like the services list.
+    if "omnivoice" in joined:
+        return "TTS · OmniVoice"
+    if "embed_rerank_service" in joined:
+        return "Embed + Rerank"
+    if "stt_service" in joined:
+        return "STT · Whisper"
 
     exe = os.path.basename(argv[0])
     if exe.startswith("python") and len(argv) > 1:

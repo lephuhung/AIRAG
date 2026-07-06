@@ -722,6 +722,12 @@ export interface WorkerHealthCheck {
         error?: string;
         url?: string;
       };
+      tts?: {
+        status: string;
+        model?: string;
+        error?: string;
+        url?: string;
+      };
     };
   };
 }

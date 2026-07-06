@@ -770,6 +770,7 @@
       "main_llm": "Mô hình ngôn ngữ (Qwen)",
       "embed_rerank": "Embed + Rerank",
       "stt": "Nhận dạng giọng nói",
+      "tts": "Tổng hợp giọng nói",
       "in_progress": "Đang xử lý: {{count}}",
       "failed": "Thất bại: {{count}}",
       "messages": "Tin nhắn: {{count}}",

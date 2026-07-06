@@ -746,6 +746,7 @@
       "main_llm": "Language Model (Qwen)",
       "embed_rerank": "Embed + Rerank",
       "stt": "Speech-to-Text",
+      "tts": "Text-to-Speech",
       "in_progress": "In progress: {{count}}",
       "failed": "Failed: {{count}}",
       "messages": "Messages: {{count}}",
