@@ -1194,6 +1194,28 @@ Chỉ trả lời bằng tiếng Việt, ngắn gọn (dưới 100 từ).
         return None
 
 
+# Minimum score (0..100 tool units) for a VECTOR-ONLY top candidate to be
+# presented as "Đã xác định". Mirrors resolve_doc_agent MEDIUM_CONFIDENCE_THRESHOLD
+# (0.30): below it, a vector nearest-neighbor is a guess, not a match — scoping
+# the agent onto it answers from the wrong document (observed: "Luật An ninh mạng
+# 2024" → "CV 3966 Cục thuế.pdf" at score 0). DB hits (exact number/title) are
+# trusted at any score and are NOT gated here.
+_MIN_VECTOR_RESOLVE_SCORE = 30
+
+
+def _is_low_confidence_vector_match(top: dict, top_score: int) -> bool:
+    """True when the top resolve candidate is a VECTOR-ONLY nearest-neighbor guess
+    below the confidence threshold — must NOT be presented as a confident match.
+    DB hits (``db_query`` strategy) are trusted at any score → never low-confidence.
+    Pure predicate (no I/O) so it is directly unit-testable."""
+    strategies = top.get("strategies") or []
+    return (
+        "vector" in strategies
+        and "db_query" not in strategies
+        and top_score < _MIN_VECTOR_RESOLVE_SCORE
+    )
+
+
 async def resolve_document_reference(
     reference: str,
     workspace_ids: list[int],
@@ -1284,6 +1306,33 @@ async def resolve_document_reference(
             and top_from_db
             and (candidates[1]["score"] / max(top_score, 1)) >= 0.75
         )
+
+        # ── Vector-fallback confidence gate ──────────────────────────────────
+        # A vector-ONLY top candidate (no DB number/title hit) below the medium
+        # threshold is a nearest-neighbor guess, not a real match. Presenting it
+        # as "Đã xác định" scopes the agent onto an unrelated document, which then
+        # answers the user about the wrong file (observed: "Luật An ninh mạng
+        # 2024" → "CV 3966 Cục thuế.pdf" at score ~0). Demote to not-found so the
+        # agent reports the named document isn't in the kho. DB hits (exact
+        # number/title) are trusted at any score, so this never touches them.
+        if _is_low_confidence_vector_match(top, top_score):
+            logger.info(
+                f"[resolve_document_reference] top vector-only candidate score "
+                f"{top_score} < {_MIN_VECTOR_RESOLVE_SCORE} — '{reference}' not "
+                f"confidently resolved; reporting not-found"
+            )
+            return {
+                "candidates": [],
+                "total": 0,
+                "ambiguous": False,
+                "message": (
+                    f"Không tìm thấy văn bản khớp với '{reference}' trong kho. "
+                    f"Vui lòng kiểm tra lại số hiệu/tên văn bản, hoặc yêu cầu "
+                    f"liệt kê các văn bản hiện có."
+                ),
+                "section_reference": section_reference,
+                "suggestion": None,
+            }
 
         # ── Low-score LLM suggestion (ported legacy behaviour) ───────────────
         suggestion = None

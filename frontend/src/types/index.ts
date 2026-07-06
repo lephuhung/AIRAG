@@ -709,6 +709,19 @@ export interface WorkerHealthCheck {
         error?: string;
         url?: string;
       };
+      // Model-offload microservices (scale-out) — optional; absent on older backends.
+      embed_rerank?: {
+        status: string;
+        model?: string;
+        error?: string;
+        url?: string;
+      };
+      stt?: {
+        status: string;
+        model?: string;
+        error?: string;
+        url?: string;
+      };
     };
   };
 }

@@ -768,6 +768,8 @@
       "ocr_service": "Dịch vụ OCR",
       "qwen_memory": "Bộ nhớ Qwen",
       "main_llm": "Mô hình ngôn ngữ (Qwen)",
+      "embed_rerank": "Embed + Rerank",
+      "stt": "Nhận dạng giọng nói",
       "in_progress": "Đang xử lý: {{count}}",
       "failed": "Thất bại: {{count}}",
       "messages": "Tin nhắn: {{count}}",

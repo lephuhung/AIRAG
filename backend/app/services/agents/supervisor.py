@@ -435,6 +435,11 @@ thay thế ("nó", "này", "đó", "văn bản trên"...), tỉnh lược chủ 
    - Câu hỏi đã nêu rõ chủ đề/đối tượng của riêng nó → phu_thuoc=false, KỂ CẢ khi trùng \
 chủ đề với lịch sử. Dạng "X như thế nào?", "thế nào là X?", "làm thế nào để X?" với X \
 đầy đủ → phu_thuoc=false.
+   - Dạng HỎI VỀ CÁCH/QUY TRÌNH/TIÊU CHÍ của một khái niệm tự-đủ-nghĩa \
+("cách xác định X", "cách tính X", "tiêu chí X", "quy trình X") với X là một thuật ngữ có \
+nghĩa độc lập (vd "độ mật", "độ mật của tài liệu", "thời hiệu") → phu_thuoc=false. KHÔNG \
+chèn thêm định ngữ ("của ...") lấy từ lịch sử vào X. (Khác với câu hỏi TỈNH LƯỢC một giá \
+trị cụ thể gắn với văn bản — "thời hạn là bao lâu?" — dạng đó mới phu_thuoc=true.)
    - Câu hỏi ĐỔI sang chủ đề khác hẳn lịch sử → phu_thuoc=false.
 
 2. VIẾT LẠI (chỉ khi phu_thuoc=true): viết lại thành MỘT câu hỏi độc lập, tự chứa ngữ \
@@ -572,6 +577,136 @@ _CORPUS_BROADENING_CUES = re.compile(
     r"tìm\s*(kiếm\s*)?(các\s*)?(văn\s*bản|tài\s*liệu))",
     re.IGNORECASE | re.UNICODE,
 )
+
+# Vietnamese legal document number: ordinal / year / type, e.g. "13/2023/NĐ-CP",
+# "24/2018/QH14", "03/2017/TT-BTTTT". The full ordinal/YEAR/TYPE form is
+# unambiguous (won't collide with plain dates) — exactly the shape the model
+# fabricates when it fills a grounding gap from parametric memory. Used by the
+# grounding guard to detect answer-cited numbers absent from the retrieved sources.
+_LEGAL_DOC_NUM_RE = re.compile(
+    r"\b(\d{1,4})\s*/\s*((?:19|20)\d{2})\s*/\s*([A-ZĐ][A-Za-zĐđ0-9\-]{1,14})",
+    re.UNICODE,
+)
+
+
+def _extract_doc_numbers(text: str) -> set[str]:
+    """Normalised set of legal document numbers appearing in ``text``."""
+    out: set[str] = set()
+    for num, year, typ in _LEGAL_DOC_NUM_RE.findall(text or ""):
+        out.add(f"{num}/{year}/{typ.upper().replace(' ', '')}")
+    return out
+
+
+def _ungrounded_doc_numbers(answer: str, grounded_text: str) -> set[str]:
+    """Document numbers cited in ``answer`` that appear nowhere in ``grounded_text``.
+
+    A non-empty result means the answer presents a văn bản số hiệu that was never
+    in the retrieved sources / tool results / prompt — i.e. it was invented from
+    the model's training memory, not grounded in the kho.
+    """
+    cited = _extract_doc_numbers(answer)
+    if not cited:
+        return set()
+    grounded = _extract_doc_numbers(grounded_text)
+    return {c for c in cited if c not in grounded}
+
+
+# Article reference: "Điều 8", "Điều 10", "Điều 8a" (case-insensitive). Lower
+# entropy than a document number — "Điều 5" collides across most documents — so a
+# cited-but-absent article is only a SOFT signal (drives the transparency caveat,
+# never a retract): flag an article number that appears in NO retrieved source.
+_ARTICLE_RE = re.compile(r"(?:Điều|điều)\s+(\d{1,3}[a-zăâ]?)", re.UNICODE)
+
+
+def _extract_article_numbers(text: str) -> set[str]:
+    """Normalised set of article numbers ("Điều N") appearing in ``text``."""
+    return {m.lower() for m in _ARTICLE_RE.findall(text or "")}
+
+
+def _ungrounded_article_numbers(answer: str, grounded_text: str) -> set[str]:
+    """Article numbers cited in ``answer`` that appear in NO source. Recall-limited
+    on purpose (won't catch "Điều 8 of the wrong document" — that number is present
+    somewhere) but high-precision for pure inventions ("Điều 99" nobody retrieved)."""
+    cited = _extract_article_numbers(answer)
+    if not cited:
+        return set()
+    grounded = _extract_article_numbers(grounded_text)
+    return {c for c in cited if c not in grounded}
+
+
+# Pre-synthesis sufficiency gate (memory agent). Deliberately biased toward
+# "đủ"=true (fail-safe for recall): only declares insufficiency when the sources
+# CLEARLY miss the question's core — so a valid answer is never blocked, while
+# the partial-grounding fabrication case (on-topic-ish chunks that don't cover
+# what was asked) is caught before the model is told to "write the answer".
+_SUFFICIENCY_GATE_PROMPT = (
+    "Bạn là BỘ LỌC CĂN CỨ cho hệ thống hỏi–đáp văn bản pháp luật Việt Nam. "
+    "Cho một CÂU HỎI và các TRÍCH ĐOẠN lấy từ kho văn bản, hãy phán xét: các "
+    "trích đoạn có chứa thông tin để TRẢ LỜI TRỰC TIẾP nội dung được hỏi không?\n"
+    "- Trả \"du\"=false CHỈ KHI các trích đoạn RÕ RÀNG KHÔNG đề cập nội dung câu "
+    "hỏi — ví dụ câu hỏi về CHẾ TÀI/XỬ PHẠT nhưng trích đoạn chỉ nói về PHÂN "
+    "LOẠI/khái niệm, hoặc trích đoạn thuộc lĩnh vực khác hẳn.\n"
+    "- Nếu có ÍT NHẤT MỘT trích đoạn phủ được ý chính của câu hỏi, trả \"du\"=true.\n"
+    "- Khi phân vân, trả \"du\"=true.\n"
+    "CHỈ trả về JSON, không giải thích: "
+    "{\"du\": true|false, \"thieu\": \"<khía cạnh của câu hỏi mà nguồn KHÔNG có, "
+    "ngắn gọn; để rỗng nếu đủ>\"}"
+)
+
+
+async def _judge_sources_sufficient(question: str, sources_digest: str) -> tuple[bool, str]:
+    """Memory-agent relevance gate: do the retrieved ``sources_digest`` chunks
+    contain the answer to ``question``? Returns ``(sufficient, missing_aspect)``.
+
+    Catches the 'partial grounding' fabrication class: retrieval returns chunks
+    that are on-topic-ish but do NOT cover what was asked (e.g. "Điều 8 phân loại
+    cấp độ" for a *xử phạt* question), so a synthesising model anchors on the
+    real chunk and invents the rest. Run BEFORE synthesis, the model is never
+    asked to write prose it can't ground.
+
+    Fail-open → ``(True, "")`` on any error/parse failure so a flaky small-model
+    check never blocks a valid answer (the output grounding guard backstops).
+    Module-level (not a closure) so the prompt-eval suite can call it directly.
+    """
+    if not (sources_digest or "").strip():
+        return (False, "")
+    try:
+        from app.services.llm.types import LLMMessage as _GateMsg
+        from app.services.llm import get_memory_agent
+        from app.services.agent.nodes import strip_thinking_tags
+
+        gate_llm = get_memory_agent()
+        gate_user = f"CÂU HỎI:\n{question}\n\nTRÍCH ĐOẠN NGUỒN:\n{sources_digest}"
+        raw = ""
+        async for c in gate_llm.astream(
+            [_GateMsg(role="user", content=gate_user)],
+            system_prompt=_SUFFICIENCY_GATE_PROMPT,
+            temperature=0.0,
+            max_tokens=200,
+            think=False,
+        ):
+            if getattr(c, "text", None):
+                raw += str(c.text)
+        raw = strip_thinking_tags(raw or "").strip()
+        if "```json" in raw:
+            raw = raw.split("```json")[-1].split("```")[0].strip()
+        elif "```" in raw:
+            parts = raw.split("```")
+            if len(parts) >= 3:
+                raw = parts[1].strip()
+        _s, _e = raw.find("{"), raw.rfind("}")
+        if _s != -1 and _e != -1:
+            raw = raw[_s:_e + 1]
+        data = json.loads(raw)
+        du = bool(data.get("du", True))
+        thieu = str(data.get("thieu") or "").strip()
+        logger.info(f"[sufficiency_gate] du={du} thieu={thieu!r}")
+        return (du, thieu)
+    except Exception as ex:
+        logger.warning(
+            f"[sufficiency_gate] failed ({ex}) — fail-open (sufficient)"
+        )
+        return (True, "")
 
 
 def _recent_attached_doc_ids(state: SupervisorState, max_turns: int = 6) -> list[str]:
@@ -2144,6 +2279,9 @@ async def react_executor_node(state: SupervisorState) -> dict:
     think_tools = bool(getattr(settings, "NEXUSRAG_REACT_THINK_TOOL_TURNS", True))
     judge_on = bool(getattr(settings, "NEXUSRAG_REACT_JUDGE", True))
     max_reflections = int(getattr(settings, "NEXUSRAG_REACT_MAX_REFLECTIONS", 2))
+    grounding_guard = bool(getattr(settings, "NEXUSRAG_REACT_GROUNDING_GUARD", True))
+    sufficiency_gate = bool(getattr(settings, "NEXUSRAG_REACT_SUFFICIENCY_GATE", True))
+    sufficiency_retry = bool(getattr(settings, "NEXUSRAG_REACT_SUFFICIENCY_RETRY", True))
     # Plan lines reused by the judge to check completeness.
     _plan_lines = [
         (sq.get("query") or "").strip()
@@ -2338,6 +2476,105 @@ async def react_executor_node(state: SupervisorState) -> dict:
         "trước khi áp dụng.*"
     )
 
+    def _grounded_corpus() -> str:
+        """Everything the model was given as evidence this turn — for the
+        grounding guard to check answer citations against. Excludes ASSISTANT
+        messages so a prior fabricated draft can't 'ground' its own number."""
+        parts = [system_prompt or ""]
+        for m in msgs:
+            if getattr(m, "role", "") in ("user", "tool"):
+                parts.append(getattr(m, "content", "") or "")
+        for s in sources:
+            parts.append(getattr(s, "content", "") or "")
+        return "\n".join(parts)
+
+    def _kho_sources_tail() -> str:
+        """Shared closing line for honest-fallback replies: point the user at the
+        real documents actually retrieved (so the reply stays useful), or ask
+        them to add the governing text when nothing relevant was found."""
+        _srcs: list[str] = []
+        for s in sources:
+            name = getattr(s, "source_file", None) or getattr(s, "title", None)
+            if name and name not in _srcs:
+                _srcs.append(name)
+        if _srcs:
+            return (
+                "\nVăn bản liên quan hiện có trong kho: "
+                + ", ".join(f"**{n}**" for n in _srcs[:6])
+                + ". Bạn có thể hỏi cụ thể trong các văn bản này, hoặc bổ sung vào "
+                "kho văn bản quy định trực tiếp về vấn đề cần hỏi."
+            )
+        return (
+            "\nBạn vui lòng cung cấp/bổ sung vào kho văn bản quy định trực tiếp "
+            "về vấn đề cần hỏi để tôi trả lời chính xác."
+        )
+
+    def _grounding_replacement(ungrounded: set[str]) -> str:
+        """Honest fallback shown when the answer fabricated document numbers:
+        names the invented số hiệu + the real sources actually retrieved."""
+        nums = ", ".join(sorted(ungrounded))
+        lines = [
+            "Tôi chưa đủ căn cứ trong kho văn bản để trả lời chính xác câu hỏi này.",
+        ]
+        if nums:
+            lines.append(
+                f"\nCác số hiệu văn bản vừa được nêu (**{nums}**) **không có trong "
+                "kho** — vui lòng không dựa vào chúng."
+            )
+        lines.append(_kho_sources_tail())
+        return "\n".join(lines)
+
+    def _insufficient_reply(missing: str) -> str:
+        """Honest fallback returned by the pre-synthesis sufficiency gate: the
+        collected sources don't cover the question, so we say so plainly instead
+        of asking the model to write (and fabricate) an answer."""
+        head = "Tôi chưa tìm thấy đủ căn cứ trong kho văn bản để trả lời câu hỏi này"
+        head += f" (kho chưa có nội dung về: {missing})." if missing else "."
+        return head + _kho_sources_tail()
+
+    async def _sources_answer_question() -> tuple[bool, str]:
+        """Pre-synthesis relevance gate: do the collected sources actually cover
+        the question? Thin wrapper over the module-level `_judge_sources_sufficient`
+        (importable → prompt-eval'd) that supplies the closure's sources digest."""
+        if not sources:
+            return (False, "")
+        return await _judge_sources_sufficient(user_message or query, _sources_digest())
+
+    def _grounding_breach(answer: str) -> set[str]:
+        """Ungrounded document numbers that should trigger retract-and-replace,
+        or empty when the answer is acceptable.
+
+        Fires only when (a) the guard is on, (b) the answer cites a số hiệu
+        absent from the retrieved evidence, AND (c) the judge was unsatisfied
+        (verdict=revise) or skipped entirely (verdict None). An affirmative judge
+        'pass' is respected — we don't fight a clean verdict."""
+        if not grounding_guard:
+            return set()
+        if (_last_verdict or {}).get("verdict") not in ("revise", None):
+            return set()
+        return _ungrounded_doc_numbers(answer, _grounded_corpus())
+
+    def _article_suspect(answer: str) -> set[str]:
+        """Article numbers cited in the answer but present in NO source. A SOFT
+        signal (drives the transparency caveat, never a retract) — surfaced even
+        on a judge 'pass' so an invented Điều/Khoản isn't presented as authoritative.
+        Runs only when no doc-number breach already replaced the answer."""
+        if not grounding_guard:
+            return set()
+        return _ungrounded_article_numbers(answer, _grounded_corpus())
+
+    def _doc_number_suspect(answer: str) -> set[str]:
+        """Ungrounded document numbers regardless of verdict — the SOFT-caveat
+        residual for the judge-PASS case. The retract path (_grounding_breach)
+        only fires on revise/skip so a doc number absent from every source can
+        still slip through an answer the judge approved (A/B: "85/2016/NĐ-CP"
+        surviving in a passed comparison). Here it only adds the caveat — a full
+        retract of an otherwise-approved, mostly-grounded answer would be too
+        aggressive. Reached only in the caveat branch (no breach replaced it)."""
+        if not grounding_guard:
+            return set()
+        return _ungrounded_doc_numbers(answer, _grounded_corpus())
+
     async def _memory_notice() -> str:
         """Notice about remembered personal info. Prefer facts the model explicitly
         saved via save_memory; otherwise fall back to the deterministic parallel
@@ -2370,12 +2607,29 @@ async def react_executor_node(state: SupervisorState) -> dict:
         final = sanitize_citations(final, _valid_cids)
         if not final:
             final = "Xin lỗi, tôi chưa tạo được câu trả lời từ kho văn bản."
-        # Transparency caveat: when the answer is finalised on a 'revise' verdict
-        # (the judge was NOT satisfied but the reflection/step budget is spent),
-        # warn the user instead of presenting possibly-ungrounded article/section
-        # numbers as authoritative. Only fires on 'revise' — a 'pass' (or a judge
-        # that failed and fail-opened to pass) never adds this.
-        if (_last_verdict or {}).get("verdict") == "revise":
+        # Grounding guard: if the answer cites document numbers absent from the
+        # sources and the judge was unsatisfied/skipped, the citations were
+        # invented from parametric memory — replace the whole answer with an
+        # honest "not enough grounded basis" reply instead of a soft caveat.
+        _breach = _grounding_breach(final)
+        if _breach:
+            logger.warning(
+                f"[react_executor] grounding guard: ungrounded doc numbers "
+                f"{sorted(_breach)} not in sources — replacing answer "
+                f"(verdict={(_last_verdict or {}).get('verdict')!r})"
+            )
+            final = _grounding_replacement(_breach)
+        # Transparency caveat: warn instead of presenting possibly-ungrounded
+        # doc/article numbers as authoritative. Fires on a 'revise' verdict
+        # (judge unsatisfied, budget spent) OR when the answer cites a doc number
+        # / "Điều N" absent from every source — the soft residual for the
+        # judge-PASS case the retract path deliberately skips. Reached only when
+        # the answer was NOT already replaced above (the replacement IS the warning).
+        elif (
+            (_last_verdict or {}).get("verdict") == "revise"
+            or _doc_number_suspect(final)
+            or _article_suspect(final)
+        ):
             final = final + _REVISE_CAVEAT
         final = final + await _memory_notice()
         # Replay the finalised, sanitised answer (no speculative tokens were sent,
@@ -2710,6 +2964,71 @@ async def react_executor_node(state: SupervisorState) -> dict:
         # broadening, which routes here without an attached scope.)
         _attached_scope = bool(ctx.uploaded_document_ids or state.get("document_ids"))
         _broadened = bool(_CORPUS_BROADENING_CUES.search(user_message or ""))
+        # Pre-synthesis sufficiency gate: before asking the model to write the
+        # final answer, verify the collected sources actually cover the question.
+        # Skip for attached-file scope — that path has its own honest "không có
+        # trong file đính kèm" instruction below. When the gate says the sources
+        # don't cover the question, return an honest reply instead of letting the
+        # model synthesise (and fabricate) from thin grounding.
+        if sufficiency_gate and not (_attached_scope and not _broadened):
+            _ok, _missing = await _sources_answer_question()
+            # Targeted retry: before giving up, run ONE search aimed at exactly
+            # the missing aspect the gate named, then re-check. Rescues a document
+            # that IS in the kho but was missed by the loop's query phrasing;
+            # finds nothing new when the document genuinely isn't there.
+            if not _ok and sufficiency_retry and _missing:
+                _before = len(sources)
+                _retry_q = f"{(user_message or query)} {_missing}".strip()
+                logger.info(
+                    f"[react_executor] sufficiency retry: targeted search "
+                    f"missing={_missing!r}"
+                )
+                await push_event(state, "status", {"step": "searching", "detail": "Đang tìm bổ sung phần còn thiếu..."})
+                try:
+                    _r = await dispatch_tool("search_documents", {"query": _retry_q}, ctx)
+                    sources.extend(_r.get("sources", []) or [])
+                    images.extend(_r.get("images", []) or [])
+                    # No orphan tool-message (there is no matching assistant
+                    # tool_call) — feed the retrieved content back as context text
+                    # so a subsequent synthesis can actually use it.
+                    if _r.get("summary"):
+                        msgs.append(_LLMMsg(
+                            role="user",
+                            content=(
+                                f"KẾT QUẢ TÌM BỔ SUNG cho phần còn thiếu "
+                                f"({_missing}):\n{_r.get('summary')}"
+                            ),
+                        ))
+                except Exception as _ex:
+                    logger.warning(f"[react_executor] sufficiency retry failed ({_ex})")
+                # Re-check only when the retry actually surfaced new sources.
+                if len(sources) > _before:
+                    await _emit_artifacts()
+                    _ok, _missing = await _sources_answer_question()
+                    logger.info(
+                        f"[react_executor] sufficiency re-check after retry: "
+                        f"du={_ok} (+{len(sources) - _before} sources)"
+                    )
+            if not _ok:
+                logger.warning(
+                    f"[react_executor] sufficiency gate BLOCKED synthesis "
+                    f"({len(sources)} sources don't cover the question; "
+                    f"missing={_missing!r}) — returning honest fallback"
+                )
+                await _emit_artifacts()
+                _reply = _insufficient_reply(_missing) + await _memory_notice()
+                await _stream_out(_reply)
+                _last_verdict = {"verdict": "insufficient_sources", "score": 0.0}
+                return {
+                    "final_answer": _reply,
+                    "sources": sources,
+                    "images": images,
+                    "document_ids": ctx.document_ids,
+                    "next_agent": AgentType.FINISH,
+                    "judge_verdict": "insufficient_sources",
+                    "judge_score": 0.0,
+                    "judge_feedback": _missing,
+                }
         if _attached_scope and not _broadened:
             synthesis_instr = (
                 "Hãy trả lời CHỈ dựa trên nội dung của FILE ĐÍNH KÈM đã thu thập ở trên. "
@@ -2771,13 +3090,36 @@ async def react_executor_node(state: SupervisorState) -> dict:
         # path: trivial single-round queries don't pay the ~5s judge).
         if judge_on and (_plan_lines or tool_rounds > 1):
             _last_verdict = await _judge(final)
-        tail = ""
-        if (_last_verdict or {}).get("verdict") == "revise":
-            tail += _REVISE_CAVEAT
-        tail += await _memory_notice()
-        if tail:
-            await push_event(state, "token", tail)
-            final += tail
+        # Grounding guard: the draft was streamed LIVE, but if it cites document
+        # numbers absent from the sources (judge unsatisfied/skipped), those were
+        # fabricated from parametric memory. Retract the streamed text
+        # (token_rollback clears the client buffer) and stream an honest
+        # replacement in its place — this ENFORCES the revise verdict the caveat
+        # path merely softened.
+        _breach = _grounding_breach(final)
+        if _breach:
+            logger.warning(
+                f"[react_executor] grounding guard (live): ungrounded doc numbers "
+                f"{sorted(_breach)} — retracting streamed draft + replacing "
+                f"(verdict={(_last_verdict or {}).get('verdict')!r})"
+            )
+            await push_event(state, "token_rollback", {})
+            final = _grounding_replacement(_breach) + await _memory_notice()
+            await _stream_out(final)
+        else:
+            tail = ""
+            # 'revise' verdict OR a doc number / "Điều N" cited but absent from
+            # every source (soft signal, surfaced even on 'pass') → caveat.
+            if (
+                (_last_verdict or {}).get("verdict") == "revise"
+                or _doc_number_suspect(final)
+                or _article_suspect(final)
+            ):
+                tail += _REVISE_CAVEAT
+            tail += await _memory_notice()
+            if tail:
+                await push_event(state, "token", tail)
+                final += tail
         logger.info(
             f"[react_executor] done (live-streamed synthesis): {len(sources)} sources, "
             f"answer={len(final)} chars, judge={_last_verdict.get('verdict')!r} "

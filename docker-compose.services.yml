@@ -594,6 +594,92 @@ services:
       com.hrag.service: omnivoice
       com.hrag.stack: hrag
 
+  # ── Embed + Rerank GPU microservice ──────────────────────────────────────
+  # Hosts the SentenceTransformer embedder + CrossEncoder reranker on GPU 0 and
+  # serves them over HTTP (:8090). Backend/workers set HRAG_EMBED_RERANK_URL to
+  # this and become thin HTTP clients → they hold NO GPU state, so the backend
+  # can run WEB_CONCURRENCY>1 without N× copies of the retrieval models. It runs
+  # the very same image + code in *in-process* mode (HRAG_EMBED_RERANK_URL empty).
+  # One shared copy fields the whole cluster; EMBED_RERANK_CONCURRENCY bounds the
+  # rerank fan-out (memory `search-cuda-oom-silent-fail`). Models are already in
+  # the HF cache (backend loads them today) → no new download. See docs/scaling.md.
+  embed-rerank:
+    # Reuse the already-built backend image (identical code; source is bind-mounted
+    # live below) — no separate build, which would redundantly rebuild multiple GB
+    # and, on a near-full disk, fail at `pip install`.
+    image: airag-backend:latest
+    container_name: hrag-embed-rerank
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      # Must be EMPTY here — this process IS the model host (in-process mode).
+      HRAG_EMBED_RERANK_URL: ""
+      HRAG_EMBEDDING_DEVICE: cuda
+      HRAG_RERANKER_DEVICE: cuda
+      CUDA_VISIBLE_DEVICES: "0"
+      # Hard ceiling on concurrent GPU batches (embed + rerank share the GPU).
+      EMBED_RERANK_CONCURRENCY: "1"
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+    command: ["uvicorn", "embed_rerank_service.main:app", "--host", "0.0.0.0", "--port", "8090"]
+    volumes:
+      - /root/.cache/huggingface:/root/.cache/huggingface
+      - ./backend:/app/backend:rw   # live source, same as backend/workers
+    networks:
+      - hrag_network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 120s   # model load + warmup takes tens of seconds
+    restart: unless-stopped
+    labels:
+      com.hrag.service: embed-rerank
+      com.hrag.stack: hrag
+
+  # ── Whisper STT microservice (CPU sidecar) ───────────────────────────────
+  # Hosts faster-whisper (CTranslate2, CPU int8) behind an OpenAI-compatible
+  # /v1/audio/transcriptions endpoint (:8091). Backend sets STT_PROVIDER=openai +
+  # STT_OPENAI_BASE_URL to this and drops its in-process Whisper copy → backend
+  # workers stay pure-CPU. NO GPU reservation: STT is deliberately CPU (CTranslate2
+  # needs CUDA 12 but the image ships CUDA 13), so it never touches the 48GB GPU.
+  # Reuses the backend image (source bind-mounted). Runs in-process mode
+  # (STT_PROVIDER=faster_whisper here — it IS the model host). See docs/scaling.md.
+  stt:
+    image: airag-backend:latest
+    container_name: hrag-stt
+    env_file: .env
+    environment:
+      STT_PROVIDER: faster_whisper   # must be local here — this process hosts the model
+      STT_FW_MODEL: large-v3
+      STT_FW_DEVICE: cpu
+      STT_FW_COMPUTE_TYPE: int8
+    command: ["uvicorn", "stt_service.main:app", "--host", "0.0.0.0", "--port", "8091"]
+    volumes:
+      - /root/.cache/huggingface:/root/.cache/huggingface
+      - ./backend:/app/backend:rw
+    networks:
+      - hrag_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8091/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 180s   # large-v3 CPU load ~70s + first-call compile
+    restart: unless-stopped
+    labels:
+      com.hrag.service: stt
+      com.hrag.stack: hrag
+
   backend:
     build:
       context: .
@@ -614,6 +700,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      embed-rerank:
+        condition: service_healthy
+      stt:
+        condition: service_started
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/hrag
@@ -626,8 +716,13 @@ services:
       REDIS_ENABLED: ${REDIS_ENABLED:-false}
       # Backend worker processes. Default 1. >1 needs the production image
       # (APP_ENV=production — the dev target runs --reload/1 worker), REDIS_ENABLED
-      # =true, GPU headroom for N× retrieval models, and AUTO_CREATE_TABLES=false.
+      # =true, and AUTO_CREATE_TABLES=false. GPU headroom is NO LONGER the limit:
+      # with HRAG_EMBED_RERANK_URL set the backend holds no GPU state, so N workers
+      # cost only CPU/RAM (retrieval models live in the embed-rerank service).
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}
+      # Route embed/rerank to the GPU microservice (default on). Set empty to load
+      # the models in-process in the backend instead. See docs/scaling.md.
+      HRAG_EMBED_RERANK_URL: ${HRAG_EMBED_RERANK_URL-http://embed-rerank:8090}
       MINIO_ENDPOINT: http://minio:9000
       MINIO_WEBHOOK_ENABLED: "false"
       NEO4J_URI: bolt://neo4j:7687
@@ -643,11 +738,11 @@ services:
       GRAPHITI_LLM_BASE_URL: http://vllm-memory:8088/v1
       LEGAL_KG_LLM_BASE_URL: http://vllm-memory:8088/v1
       TTS_OMNIVOICE_BASE_URL: http://omnivoice:8880/v1
-      # Whisper (STT) runs on CPU: CTranslate2 4.8 needs CUDA 12 (libcublas.so.12)
-      # but this image ships CUDA 13, so GPU inference can't load. CPU+int8 is
-      # offline and reliable; switch to GPU later only with a CUDA-12 stack.
-      STT_FW_DEVICE: cpu
-      STT_FW_COMPUTE_TYPE: int8
+      # Whisper (STT) now lives in the `stt` CPU sidecar — the backend is a thin
+      # OpenAI-compatible client and holds NO Whisper model (so it scales on CPU).
+      # Set STT_PROVIDER=faster_whisper + empty base URL to run it in-process again.
+      STT_PROVIDER: openai
+      STT_OPENAI_BASE_URL: http://stt:8091/v1
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "langfuse.hatinh.local:10.10.0.241"

@@ -31,7 +31,11 @@ SYSTEM_PROMPT = (
     "  Thông tư liên tịch   : [số]/[năm]/TTLT-[BỘ1]-[BỘ2]\n\n"
     "MÃ CƠ QUAN: BCA=Công an|BTC=Tài chính|BCT=Công Thương|BTP=Tư pháp\n"
     "            BYT=Y tế|BNV=Nội vụ|BGDĐT=Giáo dục|BXD=Xây dựng\n"
-    "            BGTVT=Giao thông|NHNN=Ngân hàng NN|CP=Chính phủ|TTg=Thủ tướng\n"
+    "            BGTVT=Giao thông|NHNN=Ngân hàng NN|CP=Chính phủ|TTg=Thủ tướng\n\n"
+    "QUAN TRỌNG: nếu câu hỏi ĐÃ chứa số ký hiệu ĐẦY ĐỦ (vd '100/2019/NĐ-CP', "
+    "'12/2024/NQ-HĐND', '24/2018/QH14') → CHÉP NGUYÊN VĂN vào document_number, KHÔNG "
+    "để trống. doc_number_candidates chỉ dùng khi phải SUY ĐOÁN số (câu hỏi chỉ nhớ "
+    "số lẻ hoặc tên, không có số ký hiệu đầy đủ).\n"
 )
 
 EXAMPLES = (
@@ -45,7 +49,11 @@ EXAMPLES = (
     '"title_keywords":["an ninh","mạng"],"issuing_agency_text":"Quốc hội","year":"2018","section_reference":""}\n'
     "Ví dụ 3 - nhớ nội dung: \"Nghị định về xử phạt vi phạm giao thông\"\n"
     '{"doc_type_slug":"nghi_dinh","document_number":"","doc_number_candidates":[],'
-    '"title_keywords":["xử phạt","vi phạm","giao thông"],"issuing_agency_text":"Chính phủ","year":"","section_reference":""}'
+    '"title_keywords":["xử phạt","vi phạm","giao thông"],"issuing_agency_text":"Chính phủ","year":"","section_reference":""}\n'
+    "Ví dụ 4 - có SỐ ĐẦY ĐỦ (chép nguyên văn, không để trống): \"Nghị định 100/2019/NĐ-CP về xử phạt giao thông\"\n"
+    '{"doc_type_slug":"nghi_dinh","document_number":"100/2019/NĐ-CP",'
+    '"doc_number_candidates":["100/2019/NĐ-CP"],'
+    '"title_keywords":["xử phạt","giao thông"],"issuing_agency_text":"Chính phủ","year":"2019","section_reference":""}'
 )
 
 

@@ -25,6 +25,17 @@ app deps and the reachable providers (vLLM, Chroma, Postgres) already live. The
 | [auth.md](auth.md) | JWT vs API key, login, minting a token | debug-chat needs a **JWT** |
 | [workers.md](workers.md) | 5 worker roles, queues, control plane | pause via API, not docker |
 | [embedding.md](embedding.md) | in-process embedder/reranker, hybrid retrieval | search is **serial** (GPU semaphore) |
+| [scaling.md](scaling.md) | multi-worker / Redis scale-out runbook | `WEB_CONCURRENCY>1` needs `REDIS_ENABLED` + GPU headroom |
+
+## Keeping these docs in sync (REQUIRED)
+
+Architecture changes MUST update the doc that describes them, **in the same
+change** — see the "Keeping architecture docs in sync" rule in `CLAUDE.md` for the
+full doc→owner map and rules. In short: touch a service/worker/agent-graph/config
+flag/port/storage/pipeline/scale-out, and you also touch `README.md`, `CLAUDE.md`,
+`AGENTS.md`, and the relevant `docs/*.md` in this table (plus `.env.example` for a
+new flag/default). The pre-commit hook (`.claude/settings.json`) reminds you; a
+stale doc is treated as a bug.
 
 ## Endpoints to test (all under `http://localhost:8080/api/v1`, JWT unless noted)
 
@@ -66,6 +77,21 @@ make compare-prompts A=old.json B=new.json
 Reports land in `backend/tests/{prompts,retrieval}/reports/` (git-ignored). The
 prompt suite is skipped unless `PROMPT_EVAL=1` (handled by the `make` target) so a
 bare `pytest` never talks to the models.
+
+**Anti-fabrication guards** (2026-07-05) have a two-layer eval:
+- `tests/services/test_grounding_guard.py` — LAYER 1, deterministic (no LLM,
+  runs under a bare `pytest`): `_extract_doc_numbers` / `_ungrounded_doc_numbers`
+  flag legal doc numbers cited in an answer but absent from the sources (hard
+  retract), plus `_ungrounded_article_numbers` for `Điều N` inventions (soft
+  caveat only — collision-prone, so recall-limited by design).
+- `tests/prompts/test_sufficiency_gate.py` — LAYER 2, live (`PROMPT_EVAL=1`):
+  `_judge_sources_sufficient` (memory agent) must call a partial-grounding case
+  (penalty question, classification-only sources) INSUFFICIENT while still
+  passing questions the sources genuinely cover. Rate-based (N runs, majority).
+- `tests/services/test_resolve_confidence_gate.py` — deterministic: the resolve
+  vector-fallback gate (`_is_low_confidence_vector_match`) demotes a vector-only
+  nearest-neighbor below the medium threshold (30 == 0.30) to not-found, so a
+  named document absent from the workspace stops resolving to an unrelated file.
 
 ## Agent A/B harness
 

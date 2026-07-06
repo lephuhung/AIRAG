@@ -16,7 +16,7 @@ containers (in `docker-compose.vllm.yml`, on the shared external network
 | Role | Container / host | URL (from backend) | Model | Restartable? |
 |------|------------------|--------------------|-------|--------------|
 | **Main answer LLM** | remote `10.10.0.240:8000` | `OPENAI_COMPATIBLE_BASE_URL` / `OLLAMA_HOST` = `http://10.10.0.240:8000/v1` | `Qwen/Qwen3.6-35B-A3B-FP8` | ❌ not ours |
-| **Classifier / memory agent / Graphiti / LegalKG** | `hrag-vllm-memory` :8088 | `MEMORY_AGENT_BASE_URL` = `http://vllm-memory:8088/v1` | `qwen-memory` (gemma-4-E4B-it) | ❌ do not |
+| **Memory agent** (legacy classifier, disambig, condense, query_analyzer, resolve_doc, Graphiti, LegalKG) | `hrag-vllm-memory` :8088 | `MEMORY_AGENT_BASE_URL` = `http://vllm-memory:8088/v1` | `qwen-memory` (Qwen3.5-4B) | ❌ do not |
 | **OCR (parse path)** | `hrag-vllm-ocr` :8001 | `HUNYUAN_OCR_API_URL` = `http://vllm-ocr:8001/v1` | `unlimited-ocr` | ❌ do not |
 
 Runtime config (2026-07): `LLM_PROVIDER=openai_compatible`,

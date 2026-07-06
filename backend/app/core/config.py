@@ -256,6 +256,16 @@ class Settings(BaseSettings):
     # GPU device placement
     HRAG_DOCLING_DEVICE: str = Field(default="auto")
     HRAG_EMBEDDING_DEVICE: str = Field(default="auto")
+    HRAG_RERANKER_DEVICE: str = Field(default="auto")
+
+    # Remote embed/rerank microservice (scale-out). When HRAG_EMBED_RERANK_URL is
+    # set, EmbeddingService/RerankerService become thin HTTP clients calling the
+    # hrag-embed-rerank service instead of loading the models in-process — so
+    # backend workers hold NO GPU state and can scale on CPU (WEB_CONCURRENCY>1).
+    # Unset (default) = in-process load, which is also how the microservice
+    # itself runs. See docs/scaling.md.
+    HRAG_EMBED_RERANK_URL: str = Field(default="")
+    HRAG_EMBED_RERANK_TIMEOUT: float = Field(default=30.0)
 
     # OCR
     HRAG_ENABLE_OCR: bool = Field(default=True)
@@ -405,6 +415,34 @@ class Settings(BaseSettings):
     # How many times the judge may bounce the draft back for revision before the
     # answer is forced out (bounds the reflect→act→reflect loop).
     NEXUSRAG_REACT_MAX_REFLECTIONS: int = Field(default=2)
+    # Grounding guard (anti-fabrication enforcement). After synthesis+judge, if
+    # the answer cites Vietnamese legal document numbers (e.g. "13/2023/NĐ-CP")
+    # that appear NOWHERE in the retrieved sources/tool results AND the judge was
+    # unsatisfied (verdict=revise) or was skipped, the answer is RETRACTED
+    # (token_rollback on the live-streamed path) and replaced with an honest
+    # "not enough grounded basis" answer that lists which cited numbers are not
+    # in the kho. This ENFORCES the judge's revise verdict — the live-streaming
+    # synthesis path otherwise only softened it with a caveat while the fabricated
+    # body still reached the user. Set False to restore caveat-only behaviour.
+    NEXUSRAG_REACT_GROUNDING_GUARD: bool = Field(default=True)
+    # Sufficiency gate (pre-synthesis anti-fabrication). BEFORE the final answer
+    # is written, the memory agent judges whether the collected sources actually
+    # cover what was asked. If not — retrieval returned nothing, or chunks that
+    # are on-topic-ish but miss the question's core (e.g. "Điều 8 phân loại cấp
+    # độ" retrieved for a question about "xử phạt") — synthesis is SKIPPED and an
+    # honest "not enough grounded basis" reply is returned, so the model is never
+    # asked to write prose it can't ground (the partial-grounding fabrication
+    # class). Fail-open: a flaky/errored check lets synthesis proceed (the output
+    # grounding guard backstops). Set False to always synthesise.
+    NEXUSRAG_REACT_SUFFICIENCY_GATE: bool = Field(default=True)
+    # Targeted retry for the sufficiency gate: when the gate declares the sources
+    # insufficient and NAMES the missing aspect, run ONE more search aimed at
+    # exactly that aspect before giving up, then re-check. Rescues the case where
+    # the earlier loop's query phrasing missed a document that IS in the kho;
+    # when the document genuinely isn't there, the retry finds nothing new and
+    # the honest fallback still fires. Bounded to a single extra search (no loop)
+    # so latency stays predictable. Requires NEXUSRAG_REACT_SUFFICIENCY_GATE.
+    NEXUSRAG_REACT_SUFFICIENCY_RETRY: bool = Field(default=True)
     # Prior conversation turns injected into the ReAct system prompt as a digest
     # ("HỘI THOẠI TRƯỚC ĐÓ") so the loop can resolve references the follow-up
     # condenser missed ("văn bản này", "điều đó", elliptical follow-ups). The

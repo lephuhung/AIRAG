@@ -49,7 +49,7 @@ Everything runs via Docker Compose. There are **three** compose files:
 
 | File | Contents |
 |---|---|
-| `docker-compose.services.yml` | Full app stack — infra (PostgreSQL, ChromaDB, RabbitMQ, MinIO, Neo4j, Redis) **plus** backend, frontend and the parse/embed/caption/kg/memory workers, behind Traefik. |
+| `docker-compose.services.yml` | Full app stack — infra (PostgreSQL, ChromaDB, RabbitMQ, MinIO, Neo4j, Redis) **plus** backend, frontend, the parse/embed/caption/kg/memory workers, and the model-offload services (`embed-rerank` GPU, `stt` CPU), behind Traefik. |
 | `docker-compose.vllm.yml` | The two self-hosted vLLM engines (OCR + memory/intent model). Split out because they own the GPU. |
 | `docker-compose.langfuse.yml` | Optional self-hosted Langfuse tracing stack. |
 
@@ -164,8 +164,14 @@ To scale out (on a machine with GPU headroom): build the **production** image
 migrations once with a single worker then set `AUTO_CREATE_TABLES=false`. A lifespan guard
 warns if these prerequisites are missing.
 
-> ⚠️ Each worker loads its **own** embedder + reranker into GPU VRAM, so `WEB_CONCURRENCY>1`
-> requires either spare VRAM or moving the retrieval models to a dedicated inference service.
+> ℹ️ Retrieval models no longer live in the backend process: the embedder + reranker run in a
+> dedicated **`embed-rerank`** GPU service (`HRAG_EMBED_RERANK_URL`, on by default in compose)
+> and Whisper STT in a **`stt`** CPU sidecar (`STT_PROVIDER=openai`). So `WEB_CONCURRENCY>1` is
+> **no longer GPU-bound** — the backend scales on CPU/RAM. (Ingestion workers still embed
+> locally for now.)
+
+📖 **Full turn-up runbook (post hardware upgrade):** [`docs/scaling.md`](docs/scaling.md) —
+step-by-step checklist, the GPU-VRAM constraint, per-phase knobs, and verification commands.
 
 ---
 
@@ -185,6 +191,7 @@ All settings come from `.env` (copy `.env.example`). Config keys use two prefixe
 | `HRAG_ENABLE_CONTEXTUAL_EMBEDDINGS` | `false` | LLM-generated context prepended before embedding |
 | `HRAG_EMBEDDING_MODEL` | `BAAI/bge-m3` | Bi-encoder (1024-dim); override per deployment |
 | `HRAG_RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` | Cross-encoder reranker |
+| `HRAG_EMBED_RERANK_URL` | `` (empty) | Set → embed/rerank run in the `embed-rerank` GPU service (empty = in-process); compose defaults it to `http://embed-rerank:8090` |
 | `NEXUSRAG_LG_RAG_REACT` | `false` | Route RAG queries to the tool-calling ReAct executor |
 | `REDIS_ENABLED` | `false` | Enable the shared cross-process state layer |
 | `WEB_CONCURRENCY` | `1` | Backend worker processes (see [Scaling out](#scaling-out)) |
@@ -209,6 +216,8 @@ Published by `docker-compose.services.yml` (host → container):
 | RabbitMQ | `5672`, `15672` | Broker + management UI (guest/guest) |
 | MinIO | `9000`, `9001` | S3 API + console |
 | Neo4j | `7474`, `7687` | Browser + Bolt |
+| embed-rerank | `8090` | GPU embed + rerank microservice (scale-out offload) |
+| stt | `8091` | Whisper speech-to-text (CPU-only sidecar) |
 | Grafana / Loki | `3000` / `3100` | Log dashboards + aggregation |
 | vLLM OCR / memory | `8001` / `8088` | From `docker-compose.vllm.yml` |
 

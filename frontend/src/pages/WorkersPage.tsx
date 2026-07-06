@@ -737,6 +737,58 @@ export function WorkersPage() {
                         )}
                       </div>
                     )}
+
+                    {/* Embed + Rerank service */}
+                    {health.checks.llm_services?.embed_rerank && (
+                      <div className="flex-1 p-3 flex items-center justify-between gap-3 min-w-0">
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <div className={cn(
+                            "w-2 h-2 rounded-full flex-shrink-0",
+                            health.checks.llm_services.embed_rerank.status === "healthy" ? "bg-green-400" :
+                            health.checks.llm_services.embed_rerank.status === "warning" ? "bg-amber-400" : "bg-destructive"
+                          )} title={health.checks.llm_services.embed_rerank.status} />
+                          <div className="flex flex-col min-w-0">
+                            <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground/70 leading-none mb-1">
+                              {t("workers.health.embed_rerank")}
+                            </span>
+                            <span className="text-xs font-semibold truncate" title={health.checks.llm_services.embed_rerank.model}>
+                              {health.checks.llm_services.embed_rerank.model || "—"}
+                            </span>
+                          </div>
+                        </div>
+                        {health.checks.llm_services.embed_rerank.error && (
+                          <span className="text-[10px] text-destructive font-medium truncate max-w-[100px]" title={health.checks.llm_services.embed_rerank.error}>
+                            {health.checks.llm_services.embed_rerank.error}
+                          </span>
+                        )}
+                      </div>
+                    )}
+
+                    {/* STT (Whisper) service */}
+                    {health.checks.llm_services?.stt && (
+                      <div className="flex-1 p-3 flex items-center justify-between gap-3 min-w-0">
+                        <div className="flex items-center gap-2.5 min-w-0">
+                          <div className={cn(
+                            "w-2 h-2 rounded-full flex-shrink-0",
+                            health.checks.llm_services.stt.status === "healthy" ? "bg-green-400" :
+                            health.checks.llm_services.stt.status === "warning" ? "bg-amber-400" : "bg-destructive"
+                          )} title={health.checks.llm_services.stt.status} />
+                          <div className="flex flex-col min-w-0">
+                            <span className="text-[11px] font-bold uppercase tracking-wider text-muted-foreground/70 leading-none mb-1">
+                              {t("workers.health.stt")}
+                            </span>
+                            <span className="text-xs font-semibold truncate" title={health.checks.llm_services.stt.model}>
+                              {health.checks.llm_services.stt.model || "—"}
+                            </span>
+                          </div>
+                        </div>
+                        {health.checks.llm_services.stt.error && (
+                          <span className="text-[10px] text-destructive font-medium truncate max-w-[100px]" title={health.checks.llm_services.stt.error}>
+                            {health.checks.llm_services.stt.error}
+                          </span>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </div>
               </Section>

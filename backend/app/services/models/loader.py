@@ -25,31 +25,37 @@ logger = logging.getLogger(__name__)
 def preload_models() -> None:
     """Eagerly load Embedding + Reranker models used by the API server."""
     t0 = time.time()
-    logger.info("[preload] Loading retrieval models …")
+    from app.core.config import settings
 
-    # 1. Embedding model (sentence-transformers)
-    from app.services.embedding.embedder import get_embedding_service
+    # In remote embed/rerank mode the models live in the hrag-embed-rerank
+    # service — this process must NOT load them (it holds no GPU state).
+    if settings.HRAG_EMBED_RERANK_URL:
+        logger.info("[preload] remote embed/rerank mode — skipping local retrieval models")
+    else:
+        logger.info("[preload] Loading retrieval models …")
 
-    emb = get_embedding_service()
-    _ = emb.model  # triggers lazy load
-    logger.info(f"[preload] Embedding model ready ({emb.model_name})")
-    # Warmup: encode dummy texts to initialize CUDA kernels
-    emb.warmup()
+        # 1. Embedding model (sentence-transformers)
+        from app.services.embedding.embedder import get_embedding_service
 
-    # 2. Reranker model (cross-encoder)
-    from app.services.retrieval.reranker import get_reranker_service
+        emb = get_embedding_service()
+        _ = emb.model  # triggers lazy load
+        logger.info(f"[preload] Embedding model ready ({emb.model_name})")
+        # Warmup: encode dummy texts to initialize CUDA kernels
+        emb.warmup()
 
-    rr = get_reranker_service()
-    _ = rr.model  # triggers lazy load
-    logger.info(f"[preload] Reranker model ready ({rr.model_name})")
-    # Warmup: score dummy pairs to initialize CUDA kernels
-    rr.warmup()
+        # 2. Reranker model (cross-encoder)
+        from app.services.retrieval.reranker import get_reranker_service
 
-    elapsed = time.time() - t0
-    logger.info(f"[preload] Retrieval models loaded + warmed up in {elapsed:.1f}s")
+        rr = get_reranker_service()
+        _ = rr.model  # triggers lazy load
+        logger.info(f"[preload] Reranker model ready ({rr.model_name})")
+        # Warmup: score dummy pairs to initialize CUDA kernels
+        rr.warmup()
+
+        elapsed = time.time() - t0
+        logger.info(f"[preload] Retrieval models loaded + warmed up in {elapsed:.1f}s")
 
     # 3. Memory Agent (Qwen via vLLM API — used by chat_agent for memory extraction)
-    from app.core.config import settings
 
     if settings.MEMORY_AGENT_LOCAL:
         try:
@@ -85,12 +91,17 @@ def preload_worker_models(worker_type: str) -> None:
         _preload_ocr()
 
     elif worker_type == "embed":
-        # Embedding model (same as retrieval)
-        from app.services.embedding.embedder import get_embedding_service
+        from app.core.config import settings
 
-        emb = get_embedding_service()
-        _ = emb.model
-        logger.info(f"[preload] Embedding model ready ({emb.model_name})")
+        if settings.HRAG_EMBED_RERANK_URL:
+            logger.info("[preload] remote embed/rerank mode — skipping local embedder")
+        else:
+            # Embedding model (same as retrieval)
+            from app.services.embedding.embedder import get_embedding_service
+
+            emb = get_embedding_service()
+            _ = emb.model
+            logger.info(f"[preload] Embedding model ready ({emb.model_name})")
 
     elif worker_type == "caption":
         # Caption worker uses LLM providers — no heavy local model to preload

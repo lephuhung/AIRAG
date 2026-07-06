@@ -16,6 +16,20 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 
+# Shared HTTP client for remote embed/rerank mode (lazy singleton). A blocking
+# client is fine: every call site is sync and already wrapped in asyncio.to_thread.
+_http_client = None
+
+
+def _get_http_client():
+    global _http_client
+    if _http_client is None:
+        import httpx
+
+        _http_client = httpx.Client(timeout=settings.HRAG_EMBED_RERANK_TIMEOUT)
+    return _http_client
+
+
 class EmbeddingService:
     """
     Service for generating text embeddings.
@@ -34,10 +48,32 @@ class EmbeddingService:
     def __init__(self, model_name: Optional[str] = None):
         self.model_name = model_name or settings.HRAG_EMBEDDING_MODEL
         self._model = None
+        # Remote mode: call the hrag-embed-rerank service over HTTP instead of
+        # loading the model locally. Toggle inside the class (not just the
+        # singleton) because some callers construct EmbeddingService() directly.
+        self._remote = (settings.HRAG_EMBED_RERANK_URL or "").rstrip("/") or None
+        self._remote_dim: Optional[int] = None
+
+    def _post_embed(self, texts: list[str]) -> list[list[float]]:
+        """POST texts to the remote /embed endpoint (remote mode only)."""
+        resp = _get_http_client().post(
+            f"{self._remote}/embed", json={"texts": texts}
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if self._remote_dim is None:
+            self._remote_dim = data.get("dimension")
+        return data["embeddings"]
 
     @property
     def model(self):
         """Lazy load the model onto the configured device."""
+        if self._remote:
+            raise RuntimeError(
+                "EmbeddingService.model accessed in remote mode "
+                "(HRAG_EMBED_RERANK_URL set) — no local model is loaded. "
+                "This process must not hold GPU embedder state."
+            )
         if self._model is None:
             from sentence_transformers import SentenceTransformer
             device = settings.HRAG_EMBEDDING_DEVICE  # "auto" | "cpu" | "cuda"
@@ -55,6 +91,17 @@ class EmbeddingService:
     @property
     def dimension(self) -> int:
         """Return the embedding dimension size."""
+        if self._remote:
+            if self._remote_dim is None:
+                # Lazily fetch from the service health endpoint (before any embed
+                # call), fall back to the static lookup if unreachable.
+                try:
+                    resp = _get_http_client().get(f"{self._remote}/health")
+                    resp.raise_for_status()
+                    self._remote_dim = resp.json().get("dimension")
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"[embedder] remote /health dim fetch failed: {e}")
+            return self._remote_dim or self._KNOWN_DIMS.get(self.model_name, 1024)
         if self._model is not None:
             return self._model.get_embedding_dimension()
         return self._KNOWN_DIMS.get(self.model_name, 1024)
@@ -63,6 +110,8 @@ class EmbeddingService:
         """Generate embedding for a single text."""
         if not text.strip():
             raise ValueError("Cannot embed empty text")
+        if self._remote:
+            return self._post_embed([text])[0]
         embedding = self.model.encode(
             text,
             convert_to_numpy=True,
@@ -77,13 +126,18 @@ class EmbeddingService:
         valid_texts = [t for t in texts if t.strip()]
         if not valid_texts:
             raise ValueError("All texts are empty")
-        embeddings = self.model.encode(
-            valid_texts,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            batch_size=settings.HRAG_EMBEDDING_BATCH_SIZE,
-        )
-        result = embeddings.tolist()
+        if self._remote:
+            # Same empty-text filtering as local so behavior (and the ChromaDB
+            # length-mismatch warning below) is byte-identical across the boundary.
+            result = self._post_embed(valid_texts)
+        else:
+            embeddings = self.model.encode(
+                valid_texts,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                batch_size=settings.HRAG_EMBEDDING_BATCH_SIZE,
+            )
+            result = embeddings.tolist()
         if len(result) != len(texts):
             logger.warning(
                 f"[embedder] Filtered {len(texts) - len(result)} empty/whitespace texts "
@@ -106,6 +160,9 @@ class EmbeddingService:
                    dummy strings. Providing real texts (e.g., common queries)
                    gives better warmup quality.
         """
+        if self._remote:
+            logger.info("[embedder] remote mode — warmup handled by the service")
+            return
         warmup_texts = texts or [
             "Vietnamese administrative document query",
             "Legal regulation search",

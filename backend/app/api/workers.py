@@ -159,6 +159,34 @@ async def _check_openai_health(
         return {"status": "unhealthy", "error": str(exc), "url": url}
 
 
+async def _check_simple_health(url: str | None) -> dict[str, Any]:
+    """Check a plain ``GET {base}/health`` service (embed-rerank / stt).
+
+    These expose a custom ``/health`` (``{status, model, ...}``), not an
+    OpenAI ``/models`` endpoint. A trailing ``/v1`` (e.g. STT_OPENAI_BASE_URL)
+    is stripped so we hit ``/health`` at the service root.
+    """
+    if not url:
+        return {"status": "disabled", "error": "not configured"}
+    try:
+        base = url.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[:-3]
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(f"{base}/health")
+            if resp.status_code != 200:
+                return {"status": "unhealthy", "error": f"HTTP {resp.status_code}", "url": url}
+            data = resp.json()
+            st = str(data.get("status", "")).lower()
+            return {
+                "status": "healthy" if st in ("ok", "healthy") else "warning",
+                "model": data.get("model"),
+                "url": url,
+            }
+    except Exception as exc:
+        return {"status": "unhealthy", "error": str(exc), "url": url}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Health Check
 # ══════════════════════════════════════════════════════════════════════════════
@@ -362,6 +390,9 @@ async def workers_health(
             os.getenv("OPENAI_COMPATIBLE_MODEL"),
             os.getenv("OPENAI_COMPATIBLE_API_KEY"),
         ),
+        # Model-offload microservices (scale-out) — plain /health, not /models.
+        _check_simple_health(os.getenv("HRAG_EMBED_RERANK_URL")),
+        _check_simple_health(os.getenv("STT_OPENAI_BASE_URL")),
     ]
     llm_results = await asyncio.gather(*llm_tasks)
 
@@ -369,6 +400,8 @@ async def workers_health(
         "ocr": llm_results[0],
         "memory": llm_results[1],
         "main_llm": llm_results[2],
+        "embed_rerank": llm_results[3],
+        "stt": llm_results[4],
     }
 
     return health

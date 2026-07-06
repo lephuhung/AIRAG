@@ -744,6 +744,8 @@
       "ocr_service": "OCR Service",
       "qwen_memory": "Qwen Memory",
       "main_llm": "Language Model (Qwen)",
+      "embed_rerank": "Embed + Rerank",
+      "stt": "Speech-to-Text",
       "in_progress": "In progress: {{count}}",
       "failed": "Failed: {{count}}",
       "messages": "Messages: {{count}}",
