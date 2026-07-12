@@ -553,8 +553,9 @@ async def _call_llm(
     for attempt in range(4):
         try:
             async with _LLM_SEMAPHORE:
-                response = await provider.acomplete(
-                    messages, temperature=0.0, max_tokens=max_tokens
+                response = await asyncio.wait_for(
+                    provider.acomplete(messages, temperature=0.0, max_tokens=max_tokens),
+                    timeout=60,
                 )
             _logger = _kg_log_ctx.get()
             if _logger is not None:
@@ -632,6 +633,8 @@ class LegalKGService:
             self._driver = AsyncGraphDatabase.driver(
                 settings.NEO4J_URI,
                 auth=(settings.NEO4J_USERNAME, settings.NEO4J_PASSWORD),
+                connection_timeout=10,
+                connection_acquisition_timeout=15,
             )
             logger.info(f"LegalKGService connected to Neo4j for workspace {self.workspace_id}")
         except ImportError:

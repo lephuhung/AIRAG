@@ -822,10 +822,17 @@ services:
   loki:
     image: grafana/loki:3.2.0
     container_name: hrag-loki
+    command: -config.file=/etc/loki/local-config.yaml
     ports:
       - "3100:3100"
     volumes:
       - hrag_loki_data:/var/loki
+      - ./infra/loki/local-config.yaml:/etc/loki/local-config.yaml:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
     networks:
       - hrag_network
     restart: unless-stopped

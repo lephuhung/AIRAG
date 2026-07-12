@@ -428,6 +428,7 @@ def build_initial_state(
     user_id: Optional[uuid.UUID] = None,
     session_id: Optional[str] = None,
     document_ids: Optional[list[uuid.UUID]] = None,
+    user_can_use_people: bool = False,
 ) -> dict:
     """
     Build the initial AgentState dict from a chat request.
@@ -459,6 +460,7 @@ def build_initial_state(
         "session_id": session_id,
         "system_prompt": system_prompt,
         "enable_thinking": enable_thinking,
+        "user_can_use_people": user_can_use_people,
         # _db lưu ở đây để stream_agent_to_sse đọc và inject vào _db_ctx
         # LangGraph sẽ strip key này trước khi truyền vào nodes
         # → nodes phải dùng get_current_db() thay vì state.get("_db")

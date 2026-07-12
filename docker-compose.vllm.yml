@@ -149,9 +149,9 @@ services:
       # req). Hạ từ 0.42 (gemma) → trả ~7GB về pool cho +1 backend worker
       # (embedder+reranker ~6.4GB). Xem docs/scaling.md.
       - --gpu-memory-utilization
-      - "0.28"
+      - "0.50"
       - --max-num-seqs
-      - "32"
+      - "64"
       - --trust-remote-code
       - --served-model-name
       - qwen-memory

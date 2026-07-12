@@ -165,6 +165,18 @@ async def people_agent_node(state: SupervisorState) -> dict:
     query = state.get("rewritten_query") or state.get("original_query", "")
     logger.info(f"[LANGGRAPH_NODE] Entering people_agent_node, intent={intent!r}")
 
+    if not state.get("user_can_use_people", False):
+        logger.info(
+            f"[people_agent_node] Skipped for user_id={state.get('user_id')!r} (no permission)"
+        )
+        await push_event(state, "status", {"step": "searching", "detail": "Không tìm thấy dữ liệu."})
+        return {
+            "mongo_results": [],
+            "kg_summaries": ["Không tìm thấy dữ liệu."],
+            "final_answer": "Không tìm thấy dữ liệu.",
+            "next_agent": AgentType.FINISH,
+        }
+
     await push_event(state, "status", {"step": "searching", "detail": "Đang tìm kiếm..."})
 
     if intent not in PEOPLE_TOOL_REGISTRY:

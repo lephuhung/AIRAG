@@ -212,6 +212,10 @@ class SupervisorState(TypedDict, total=False):
     judge_score: float | None       # 0..1 quality score from the judge
     judge_feedback: str | None      # judge's critique of the last draft
 
+    # Permission: whether the current user is allowed to use the people agent.
+    # Only superadmins can search MongoDB for person records (CCCD, BHXH, etc.).
+    user_can_use_people: bool
+
 
 # =============================================================================
 # Write Action Constants

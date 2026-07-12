@@ -47,6 +47,10 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 from app.prompts.agents.supervisor_prompt import _SUPERVISOR_PROMPT
+from app.prompts.agents.supervisor_scope import (
+    build_supervisor_system_prompt,
+    classify_supervisor_scope,
+)
 
 # Intent abbreviation → canonical name (safety net for LLM shortcutting intent names)
 # P0-6: Expanded to cover more observed LLM shorthand patterns.
@@ -1392,12 +1396,25 @@ async def supervisor_node(state: SupervisorState) -> dict:
             _ctx_parts.append("")
             _analyzer_context = "\n".join(_ctx_parts)
 
+        _supervisor_scope = classify_supervisor_scope(
+            query_for_classifier,
+            has_doc_ids=bool(state.get("document_ids")),
+        )
+        _system_prompt = build_supervisor_system_prompt(
+            scope=_supervisor_scope,
+            max_iterations=max_iter,
+            analyzer_context=_analyzer_context,
+        )
+        if _supervisor_scope != "full":
+            logger.info(
+                f"[supervisor] scope='{_supervisor_scope}' "
+                f"({len(_system_prompt)} chars, ~{len(_system_prompt) // 4} tokens) "
+                f"for query={query_for_classifier[:60]!r}"
+            )
+
         async for chunk in classifier.astream(
             [_LLMMsg(role="user", content=query_for_classifier)],
-            system_prompt=_SUPERVISOR_PROMPT.format(
-                max_iterations=max_iter,
-                analyzer_context=_analyzer_context,
-            ),
+            system_prompt=_system_prompt,
             temperature=0.0,
             max_tokens=256,  # JSON output ~100-150 tokens; reduced from 512 to save latency
             think=False,  # Disable thinking to reduce latency for classification
@@ -2225,8 +2242,8 @@ async def react_executor_node(state: SupervisorState) -> dict:
     from app.services.agent.nodes import strip_thinking_tags
     from app.services.llm import get_llm_provider
     from app.services.llm.types import LLMMessage as _LLMMsg
-    from app.services.agents.react_tools import ToolContext, RAG_TOOL_SCHEMAS, dispatch_tool
-    from app.prompts.agents.react_prompt import build_react_system_prompt
+    from app.services.agents.react_tools import ToolContext, RAG_TOOL_SCHEMAS, dispatch_tool, get_tools_for_query_type
+    from app.prompts.agents.react_prompt import build_react_system_prompt, classify_query_type
 
     user_message = _extract_user_message(state)
     query = state.get("rewritten_query") or state.get("original_query") or user_message
@@ -2235,9 +2252,14 @@ async def react_executor_node(state: SupervisorState) -> dict:
     # memory worker persists the same facts every turn (add_conversation_episode),
     # so we surface the notice from this extraction instead of relying on the model
     # calling save_memory (which it does inconsistently). Read-only — no double save.
+    # SKIP when the user attached a file: personal facts are irrelevant for
+    # document-reading tasks, and the word 'tôi' in 'cho tôi bảng...' is polite
+    # phrasing, not a personal-fact disclosure.
     from app.services.memory.graphiti_client import extract_personal_facts as _extract_facts
     _auto_fact_task = (
-        asyncio.create_task(_extract_facts(user_message)) if user_message else None
+        asyncio.create_task(_extract_facts(user_message))
+        if user_message and not state.get("document_ids")
+        else None
     )
     max_steps = getattr(settings, "NEXUSRAG_REACT_MAX_TOOL_STEPS", 6)
     top_k = getattr(settings, "NEXUSRAG_REACT_TOP_K", 8)
@@ -2267,11 +2289,21 @@ async def react_executor_node(state: SupervisorState) -> dict:
     # non-authoritative so rule 3b (store = source of truth) keeps its force.
     _hist_turns = int(getattr(settings, "NEXUSRAG_REACT_HISTORY_TURNS", 6))
     _prior_turns = _get_prior_history(state, max_turns=_hist_turns) if _hist_turns > 0 else []
+    # ── Query-type classification (regex, deterministic) + filtered tools ─
+    _has_file = bool(state.get("document_ids"))
+    _qtype = classify_query_type(user_message or query, has_attached_file=_has_file)
+    _tools = get_tools_for_query_type(_qtype)
+    logger.info(
+        f"[react_executor] query_type={_qtype} has_file={_has_file} "
+        f"tools={len(_tools)}/{len(RAG_TOOL_SCHEMAS)}"
+    )
     system_prompt = build_react_system_prompt(
         state.get("user_memory_context", "") or "",
         plan=_plan,
         extracted_params=state.get("extracted_params"),
         history=_prior_turns,
+        query_type=_qtype,
+        has_attached_file=_has_file,
     )
     if _prior_turns:
         logger.info(f"[react_executor] history digest injected ({len(_prior_turns)} prior turns)")
@@ -2339,7 +2371,7 @@ async def react_executor_node(state: SupervisorState) -> dict:
         async for c in llm.astream(
             msgs,
             system_prompt=system_prompt,
-            tools=RAG_TOOL_SCHEMAS if use_tools else None,
+            tools=_tools if use_tools else None,
             tool_choice="auto" if use_tools else None,
             temperature=0.1,
             max_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
@@ -2579,7 +2611,14 @@ async def react_executor_node(state: SupervisorState) -> dict:
         """Notice about remembered personal info. Prefer facts the model explicitly
         saved via save_memory; otherwise fall back to the deterministic parallel
         extraction (the worker persists these regardless) so the notice appears
-        even when the model forgot to call the tool."""
+        even when the model forgot to call the tool.
+
+        SKIP when the user uploaded a file and is asking about file content —
+        personal facts are irrelevant for document-reading tasks; the word 'tôi'
+        in 'cho tôi bảng...' is just a polite pronoun, not a personal query.
+        """
+        if ctx.uploaded_document_ids:
+            return ""
         from app.services.agent.nodes import build_memory_saved_notice
         _notice_facts = list(saved_facts)
         if _auto_fact_task is not None:

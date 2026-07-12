@@ -206,6 +206,7 @@ async def langgraph_chat_stream(
         user_id=user_id,
         session_id=session_id,
         document_ids=getattr(request, "document_ids", None),
+        user_can_use_people=user_is_superadmin,
     )
 
     # Run graph — collect events for persistence

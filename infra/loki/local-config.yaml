@@ -5,11 +5,11 @@ server:
   grpc_listen_port: 9095
 
 common:
-  path_prefix: /loki
+  path_prefix: /var/loki
   storage:
     filesystem:
-      chunks_directory: /loki/chunks
-      rules_directory: /loki/rules
+      chunks_directory: /var/loki/chunks
+      rules_directory: /var/loki/rules
   replication_factor: 1
   ring:
     kvstore:
@@ -25,6 +25,17 @@ schema_config:
       index:
         prefix: loki_index_
         period: 24h
+
+limits_config:
+  retention_period: 168h
+  max_entries_limit_per_query: 5000
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  max_cache_freshness_per_query: 10m
+
+table_manager:
+  retention_deletes_enabled: true
+  retention_period: 168h
 
 ruler:
   alertmanager_url: http://localhost:9093

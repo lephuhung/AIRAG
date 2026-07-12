@@ -169,6 +169,27 @@ async def _adapt_resolve_document_reference(args: dict, ctx: ToolContext) -> dic
     )
     candidates = res.get("candidates", []) or []
     ambiguous = bool(res.get("ambiguous"))
+
+    # ── Attached-file citation guard ─────────────────────────────────────
+    # When the user uploaded a file and resolution returns zero candidates
+    # for a reference that looks like a legal document number (e.g.
+    # "13/2023/NĐ-CP"), it is almost certainly a citation WITHIN the
+    # attached file — NOT a request to find that document in the KB.
+    # Append a contextual note so the LLM reads the attached file instead
+    # of treating the "not found" as a dead end.
+    if not candidates and ctx.uploaded_document_ids:
+        import re as _re_guard
+        _doc_num_hint = _re_guard.search(
+            r"\d{1,4}\s*/\s*((?:19|20)\d{2})\s*/\s*[A-ZĐ]", reference, _re_guard.UNICODE
+        )
+        if _doc_num_hint:
+            res["message"] = (
+                f"{res['message']} "
+                f"LƯU Ý: số hiệu '{reference}' có thể được trích dẫn BÊN TRONG "
+                f"file đính kèm (phần căn cứ pháp lý) — hãy đọc nội dung file "
+                f"đính kèm bằng read_uploaded_document để tìm thông tin người "
+                f"dùng cần, không tiếp tục tra cứu số hiệu này."
+            )
     # Auto-scope subsequent searches when exactly one unambiguous match — the
     # LLM does not need to handle the UUID; the next search_documents/section
     # call is automatically restricted to this document.
@@ -724,6 +745,74 @@ RAG_TOOL_SCHEMAS: list[dict] = [
         ["question"],
     ),
 ]
+
+# ──────────────────────────────────────────────────────────────────────────
+# Tool-schema filtering by query type
+# ──────────────────────────────────────────────────────────────────────────
+
+# Tool names per query type — each list is a subset of TOOL_REGISTRY keys.
+# The executor receives ONLY the schemas for these names, so the LLM sees a
+# focused toolset (fewer choices → better decisions for small models).
+_QUERY_TYPE_TOOLS: dict[str, list[str]] = {
+    "attached_file": [
+        "read_uploaded_document",
+        "summarize_long_document",
+        "search_documents",
+        "check_document_format",
+        "ask_user",
+    ],
+    "doc_relations": [
+        "get_document_relations",
+        "resolve_document_reference",
+        "search_documents",
+        "search_document_section",
+        "list_documents",
+        "ask_user",
+    ],
+    "doc_reference": [
+        "resolve_document_reference",
+        "search_documents",
+        "search_document_section",
+        "query_knowledge_graph",
+        "get_document_relations",
+        "list_documents",
+        "get_document_content",
+        "search_abbreviation",
+        "search_documents_number",
+        "ask_user",
+    ],
+    "personal": [
+        "recall_memory",
+        "save_memory",
+        "search_documents",
+        "resolve_document_reference",
+        "search_abbreviation",
+        "ask_user",
+    ],
+    "general": [
+        "search_documents",
+        "resolve_document_reference",
+        "query_knowledge_graph",
+        "get_document_relations",
+        "search_abbreviation",
+        "search_documents_number",
+        "ask_user",
+    ],
+}
+
+
+def get_tools_for_query_type(query_type: str) -> list[dict]:
+    """Return the filtered list of tool schemas for the given query type.
+
+    Falls back to the full ``RAG_TOOL_SCHEMAS`` when ``query_type`` is
+    unrecognised or ``None`` — backward-compatible with callers that don't
+    use classification.
+    """
+    names = _QUERY_TYPE_TOOLS.get(query_type)
+    if names is None:
+        return RAG_TOOL_SCHEMAS
+    name_set = set(names)
+    return [s for s in RAG_TOOL_SCHEMAS if s["function"]["name"] in name_set]
 
 
 async def dispatch_tool(name: str, args: dict, ctx: ToolContext) -> dict:

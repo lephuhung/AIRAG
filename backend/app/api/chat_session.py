@@ -814,6 +814,7 @@ async def chat_stream_session(
                     user_id=user.id,
                     session_id=session_id,
                     document_ids=request.document_ids,
+                    user_can_use_people=user.is_superadmin,
                 )
 
                 logger.info(

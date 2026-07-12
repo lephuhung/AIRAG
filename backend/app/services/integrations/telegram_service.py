@@ -431,6 +431,7 @@ async def _handle_question(db, chat_id: str, question: str, tg_user_id: str | No
             user_id=user.id,
             session_id=str(session.id),
             document_ids=None,
+            user_can_use_people=user.is_superadmin,
         )
         graph = get_supervisor_graph()
         async for ev in stream_agent_events(graph, initial_state, channel="telegram"):
