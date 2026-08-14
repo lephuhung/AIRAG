@@ -33,6 +33,10 @@ easyocr>=1.7.0
 # DOCX formatting extraction
 python-docx>=1.1.0
 
+# Fast scanned-vs-text PDF classification (content-stream sampling, ~10-50ms).
+# Prebuilt Rust wheels; decides whether a PDF goes to OCR or Docling.
+pdf-inspector>=0.2.6
+
 # PDF rendering for scanned PDF detection + OCR pre-processing
 pymupdf>=1.24.0
 

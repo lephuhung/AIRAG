@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<!--
+  ClickHouse log hygiene. The system log tables (trace_log, text_log, …) do
+  NOT support a top-level <ttl> config key in this version — setting one
+  causes the tables to be dropped at startup. TTLs are managed via
+  ALTER TABLE ... MODIFY TTL instead. This file only reduces log verbosity,
+  which was the source of both the ~17 GB log growth and the sustained
+  200% CPU from AsyncLogger/TraceCollector threads.
+-->
+<clickhouse>
+    <logger>
+        <level>warning</level>
+    </logger>
+
+    <text_log>
+        <level>warning</level>
+    </text_log>
+</clickhouse>

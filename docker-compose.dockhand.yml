@@ -1,0 +1,34 @@
+# ============================================================
+# Dockhand — Docker management UI (https://dockhand.pro)
+#
+# Separate from the app stack. Runs the official image with the
+# host Docker socket mounted so it can manage containers/stacks.
+#
+#   docker compose -f docker-compose.dockhand.yml up -d
+#
+# First launch has NO authentication — open the UI and create an
+# admin user under Settings > Authentication immediately.
+# Host port 3002 (3000 = Grafana, 3001 taken). License: BSL 1.1 (free for
+# personal / internal business use).
+# ============================================================
+
+services:
+  dockhand:
+    image: fnsys/dockhand:latest
+    container_name: dockhand
+    restart: unless-stopped
+    # Entrypoint starts as root, fixes volume permissions, then drops
+    # to PUID/PGID. group_add gives access to the Docker socket.
+    environment:
+      - PUID=1000
+      - PGID=1000
+    group_add:
+      - "988"  # docker group GID on this host (stat -c '%g' /var/run/docker.sock)
+    ports:
+      - "3002:3000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - dockhand_data:/app/data
+
+volumes:
+  dockhand_data:

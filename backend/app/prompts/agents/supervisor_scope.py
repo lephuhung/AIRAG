@@ -38,9 +38,9 @@ full prompt:
                          keyword). Output is forced: ``direct / greeting``.
   - ``personal``      — query asks only about the user's own system identity
                          ("tôi là ai", "hồ sơ của tôi") with NO doc keyword.
-  - ``people``        — query carries a CCCD (9-12 digit) / SĐT VN
-                         (10 digit 0-leading) / BHXH (10 digit) / or a
-                         clearly-named person cue. Output is forced: ``people``.
+  - ``people``        — query carries a CCCD (9–12 digits, usually 0-leading) /
+                         SĐT VN (exactly 10 digits, always 0-leading) / BHXH /
+                         or a clearly-named person cue. Output is forced: ``people``.
   - ``rag_named_doc`` — query mentions a named legal document type
                          (Luật/Nghị định/Thông tư/...) and is likely
                          heading toward search/section/summarize.
@@ -118,15 +118,24 @@ _SS_PEOPLE_RULES = """\
 ═══════════════════════════════════════════════════════════════════════════════
 PEOPLE LOOKUP — query carries a person identifier or a person-name cue
 ═══════════════════════════════════════════════════════════════════════════════
+IDENTIFIER FORMAT (Vietnam — IMPORTANT):
+  • Số điện thoại (SĐT): ĐÚNG 10 chữ số, LUÔN bắt đầu bằng "0"
+    (vd: 0973289934, 0915082134). Không bỏ số 0 đầu.
+  • Số CCCD / căn cước công dân: 9–12 chữ số, THƯỜNG bắt đầu bằng "0"
+    (vd: 079203012345, 001088012345). Giữ nguyên số 0 đầu; đừng nhầm với
+    số hiệu văn bản (vd: 13/2023/NĐ-CP).
+  • BHXH: ~10 chữ số khi kèm từ khóa BHXH/bảo hiểm xã hội.
+
 Pick the matching intent and route next_agent="people":
 
   intent = "mongo_search_cccd"   if query contains a 9-12 digit number
-                                 AND mentions CCCD/căn cước/ID card
+                                 (often 0-leading) AND mentions CCCD/căn cước/
+                                 ID card
   intent = "mongo_search_phone"  if query contains a 10-digit 0-leading VN
                                  phone number (SĐT/điện thoại/phone)
-  intent = "mongo_search_bhxh"   if query contains a ~10 digit number AND
+  intent = "mongo_search_bhxh"  if query contains a ~10 digit number AND
                                  mentions BHXH/bảo hiểm xã hội
-  intent = "mongo_search_name"   if query asks for a person by name without
+  intent = "mongo_search_name"  if query asks for a person by name without
                                  any of the above identifiers (e.g. "Tìm ông
                                  Nguyễn Văn A")
 
@@ -228,10 +237,12 @@ INTENT TAXONOMY
 └───────────────────────────────────────────────────────────────────────────┘
 
 ┌─ PEOPLE GROUP (next_agent = "people") ───────────────────────────────────┐
-│  mongo_search_cccd    Look up person by CCCD number.                    │
-│  mongo_search_name    Find person by full name.                        │
-│  mongo_search_bhxh    Look up by BHXH (social insurance) number.        │
-│  mongo_search_phone   Find by phone number.                             │
+│  mongo_search_cccd    Look up person by CCCD (9–12 digits, usually       │
+│                       starts with 0, e.g. 079203012345). Keep leading 0. │
+│  mongo_search_name    Find person by full name.                          │
+│  mongo_search_bhxh    Look up by BHXH (social insurance) number.         │
+│  mongo_search_phone   Find by VN phone: exactly 10 digits starting with  │
+│                       0 (e.g. 0973289934). Never drop the leading 0.     │
 └───────────────────────────────────────────────────────────────────────────┘
 
 ┌─ DIRECT GROUP (next_agent = "direct") ───────────────────────────────────┐
@@ -256,6 +267,9 @@ CRITICAL DISAMBIGUATION RULES
 ⑥ "Tìm Nguyễn Văn A" → mongo_search_name. "Tìm văn bản về Nguyễn Văn A" → search.
 ⑦ "Văn bản số 53/2022/NĐ-CP nội dung gì?" → resolve_doc + search. "Tìm văn
    bản số 53/2022/NĐ-CP" → search_doc_num.
+⑧ Phone vs CCCD: SĐT = 10 digits starting with 0 (0973…). CCCD = 9–12 digits,
+   usually starting with 0 (0792… / 0010…). Keep the leading 0; do NOT route
+   these as document search.
 
 (Three more rules are enforced by code safety nets at runtime — see
 supervisor.py: keyword safety nets 0/1/2 and resolve_doc prerequisite
@@ -556,8 +570,73 @@ def classify_supervisor_scope(
     return "full"
 
 
+def people_intent_from_query(user_message: str) -> str:
+    """Pick the mongo_* intent for an unambiguous people-scope query."""
+    msg = (user_message or "").strip()
+    msg_lower = msg.lower()
+    if bool(_VN_PHONE_RE.search(msg)) or (
+        bool(_MASKED_ID_RE.search(msg))
+        and any(kw in msg_lower for kw in ("sđt", "số điện thoại", "điện thoại", "phone", "liên lạc"))
+    ):
+        return "mongo_search_phone"
+    if bool(_CCCD_RE.search(msg)) and any(
+        kw in msg_lower for kw in ("cccd", "căn cước", "căn cước công dân", "id card")
+    ):
+        return "mongo_search_cccd"
+    if bool(_BHXX_RE.search(msg)) and any(
+        kw in msg_lower for kw in ("bhxh", "bảo hiểm xã hội", "bảo hiểm")
+    ):
+        return "mongo_search_bhxh"
+    if _PERSON_NAME_LOOKUP_CUE_RE.search(msg):
+        return "mongo_search_name"
+    return "mongo_search_advanced"
+
+
+def deterministic_decision_for_scope(scope: str, user_message: str) -> dict | None:
+    """Return a full routing decision when ``scope`` is unambiguous.
+
+    Used to short-circuit the thinking LLM for greeting / personal / people
+    queries — chatty proxy models often answer in prose instead of JSON and
+    would otherwise fall back to RAG (wrong for phone/CCCD lookups).
+    """
+    if scope == "greeting":
+        return {
+            "next_agent": "direct",
+            "intent": "greeting",
+            "task_plan": ["greeting"],
+            "pending_intent": None,
+            "needs_memory": False,
+            "is_legal_query": False,
+            "reasoning": "deterministic scope=greeting",
+        }
+    if scope == "personal":
+        return {
+            "next_agent": "direct",
+            "intent": "personal",
+            "task_plan": ["personal"],
+            "pending_intent": None,
+            "needs_memory": True,
+            "is_legal_query": False,
+            "reasoning": "deterministic scope=personal",
+        }
+    if scope == "people":
+        intent = people_intent_from_query(user_message)
+        return {
+            "next_agent": "people",
+            "intent": intent,
+            "task_plan": [intent],
+            "pending_intent": None,
+            "needs_memory": False,
+            "is_legal_query": False,
+            "reasoning": f"deterministic scope=people → {intent}",
+        }
+    return None
+
+
 __all__ = [
     "classify_supervisor_scope",
     "build_supervisor_system_prompt",
+    "people_intent_from_query",
+    "deterministic_decision_for_scope",
     "_SCOPE_SECTIONS",
 ]

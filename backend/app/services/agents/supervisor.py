@@ -50,6 +50,7 @@ from app.prompts.agents.supervisor_prompt import _SUPERVISOR_PROMPT
 from app.prompts.agents.supervisor_scope import (
     build_supervisor_system_prompt,
     classify_supervisor_scope,
+    deterministic_decision_for_scope,
 )
 
 # Intent abbreviation → canonical name (safety net for LLM shortcutting intent names)
@@ -870,12 +871,17 @@ def _parse_supervisor_response(raw: str) -> dict:
     Extracts task_plan (Phase 4) and computes pending_intent from it.
     After parsing, enforces intent→agent agreement: if the intent maps to
     a different agent than what the LLM chose, the intent-based mapping wins.
+
+    Chatty proxy models (e.g. via 9router) sometimes answer the user question
+    in prose instead of returning routing JSON. We try to salvage an embedded
+    ``{...}`` object first; on total failure we fall back to RAG/search — NEVER
+    ``finish`` — so the user still gets a retrieval-backed answer.
     """
-    raw = raw.strip()
+    raw = (raw or "").strip()
 
     # Strip thinking tags (thinking-capable models with reasoning enabled)
     import re as _re_parse
-    raw = _re_parse.sub(r'<think>.*?</think>', '', raw, flags=_re_parse.DOTALL).strip()
+    raw = _re_parse.sub(r"<think>.*?</think>", "", raw, flags=_re_parse.DOTALL).strip()
 
     # Strip markdown code fences
     if "```json" in raw:
@@ -885,8 +891,37 @@ def _parse_supervisor_response(raw: str) -> dict:
         if len(parts) >= 3:
             raw = parts[1].strip()
 
+    data: dict | None = None
     try:
         data = json.loads(raw)
+    except json.JSONDecodeError:
+        # Salvage first/last balanced-ish JSON object from prose
+        start, end = raw.find("{"), raw.rfind("}")
+        if start != -1 and end > start:
+            try:
+                data = json.loads(raw[start : end + 1])
+                logger.info(
+                    "[supervisor] Salvaged JSON object embedded in prose "
+                    f"({len(raw)} chars → {end - start + 1} chars)"
+                )
+            except json.JSONDecodeError:
+                data = None
+
+    if not isinstance(data, dict):
+        logger.warning(
+            f"[supervisor] Failed to parse JSON (falling back to rag/search): {raw[:200]!r}"
+        )
+        return {
+            "next_agent": AgentType.RAG,
+            "intent": "search",
+            "task_plan": ["search"],
+            "pending_intent": None,
+            "needs_memory": False,
+            "is_legal_query": True,
+            "reasoning": "Parse failed, defaulting to rag/search",
+        }
+
+    try:
         next_agent = data.get("next_agent", "finish")
         intent = data.get("intent", "search")
         task_plan = data.get("task_plan") or []
@@ -913,9 +948,9 @@ def _parse_supervisor_response(raw: str) -> dict:
                 next_agent = corrected
             else:
                 logger.warning(
-                    f"[supervisor] Invalid next_agent '{next_agent}', defaulting to 'finish'"
+                    f"[supervisor] Invalid next_agent '{next_agent}', defaulting to 'rag'"
                 )
-                next_agent = AgentType.FINISH
+                next_agent = AgentType.RAG
 
         # ── Deterministic intent→agent override ──────────────────────────
         expected_agent = _INTENT_TO_AGENT_FALLBACK.get(intent)
@@ -963,12 +998,16 @@ def _parse_supervisor_response(raw: str) -> dict:
             "is_legal_query": is_legal_query,
             "reasoning": data.get("reasoning", ""),
         }
-    except json.JSONDecodeError:
-        logger.warning(f"[supervisor] Failed to parse JSON: {raw[:200]!r}")
+    except Exception as e:
+        logger.warning(f"[supervisor] JSON parsed but decision extract failed: {e}")
         return {
-            "next_agent": AgentType.FINISH, "intent": "search",
-            "task_plan": [], "pending_intent": None,
-            "reasoning": "Parse failed, defaulting to finish",
+            "next_agent": AgentType.RAG,
+            "intent": "search",
+            "task_plan": ["search"],
+            "pending_intent": None,
+            "needs_memory": False,
+            "is_legal_query": True,
+            "reasoning": "Decision extract failed, defaulting to rag/search",
         }
 
 
@@ -1168,7 +1207,7 @@ async def supervisor_node(state: SupervisorState) -> dict:
     5. Parse response and update state
     6. For multi-step queries, build proper task_plan from sub_queries
     """
-    # get_llm_provider not needed here — supervisor uses OllamaLLMProvider directly
+    # get_llm_provider not needed here — supervisor uses get_thinking_provider()
 
     user_message = _extract_user_message(state)
     iterations = state.get("iterations", 0)
@@ -1346,27 +1385,10 @@ async def supervisor_node(state: SupervisorState) -> dict:
                     expanded_message = query_for_classifier
                     was_modified = True
 
-        # Phase 4: Use Qwen3.6-35B for plan-aware classification
-        # We check the OLLAMA_HOST to decide whether to use native Ollama
-        # or OpenAI-compatible provider (e.g. vLLM serving the 35B model).
-        from app.core.config import settings
-        from app.services.agent.langfuse_tracing import trace_llm
-        if "/v1" in settings.OLLAMA_HOST:
-            from app.services.llm.openai_compatible import OpenAICompatibleLLMProvider
-            classifier = OpenAICompatibleLLMProvider(
-                base_url=settings.OLLAMA_HOST,
-                model=settings.OLLAMA_MODEL,
-                api_key="none"
-            )
-        else:
-            from app.services.llm.ollama import OllamaLLMProvider
-            classifier = OllamaLLMProvider(
-                host=settings.OLLAMA_HOST,
-                model=settings.OLLAMA_MODEL,
-            )
-        # Langfuse: trace the intent-classification LLM call as a generation
-        classifier = trace_llm(classifier, label="supervisor_classifier")
-        response_text = ""
+        # Phase 4: Thinking/routing LLM via OpenAI-compatible gateway
+        # (NEXUSRAG_LG_THINKING_BASE_URL + MODEL). Swap MODEL to A/B-test
+        # routing quality without touching the main answer LLM.
+        from app.services.llm import get_thinking_provider, _resolve_thinking_endpoint
 
         # Phase 5: Build analyzer context string for supervisor prompt
         _analyzer_context = ""
@@ -1400,29 +1422,82 @@ async def supervisor_node(state: SupervisorState) -> dict:
             query_for_classifier,
             has_doc_ids=bool(state.get("document_ids")),
         )
-        _system_prompt = build_supervisor_system_prompt(
-            scope=_supervisor_scope,
-            max_iterations=max_iter,
-            analyzer_context=_analyzer_context,
-        )
-        if _supervisor_scope != "full":
+
+        # Unambiguous scopes (people / greeting / personal): skip the thinking
+        # LLM. Chatty proxy models otherwise answer in prose → parse fail →
+        # rag fallback, which is wrong for phone/CCCD lookups (and slow).
+        _det = deterministic_decision_for_scope(_supervisor_scope, query_for_classifier)
+        if _det is not None:
             logger.info(
-                f"[supervisor] scope='{_supervisor_scope}' "
-                f"({len(_system_prompt)} chars, ~{len(_system_prompt) // 4} tokens) "
-                f"for query={query_for_classifier[:60]!r}"
+                f"[supervisor] Deterministic route scope={_supervisor_scope!r} → "
+                f"next_agent={_det['next_agent']!r} intent={_det['intent']!r} "
+                f"(skip thinking LLM)"
             )
+            decision = _det
+        else:
+            _t_url, _t_alias, _ = _resolve_thinking_endpoint()
+            logger.info(
+                f"[supervisor] thinking provider: alias={_t_alias!r} @ {_t_url!r} "
+                f"(remap upstream on the proxy — no app restart)"
+            )
+            classifier = get_thinking_provider()
+            _system_prompt = build_supervisor_system_prompt(
+                scope=_supervisor_scope,
+                max_iterations=max_iter,
+                analyzer_context=_analyzer_context,
+            )
+            if _supervisor_scope != "full":
+                logger.info(
+                    f"[supervisor] scope='{_supervisor_scope}' "
+                    f"({len(_system_prompt)} chars, ~{len(_system_prompt) // 4} tokens) "
+                    f"for query={query_for_classifier[:60]!r}"
+                )
 
-        async for chunk in classifier.astream(
-            [_LLMMsg(role="user", content=query_for_classifier)],
-            system_prompt=_system_prompt,
-            temperature=0.0,
-            max_tokens=256,  # JSON output ~100-150 tokens; reduced from 512 to save latency
-            think=False,  # Disable thinking to reduce latency for classification
-        ):
-            if hasattr(chunk, "text") and chunk.text:
-                response_text += str(chunk.text)
+            # Force JSON-only output: chatty proxy models (9router → grok/etc.) otherwise
+            # answer the legal question in prose, burn max_tokens, then we used to END.
+            _classify_user = (
+                "You are a ROUTING classifier. Do NOT answer the user's question. "
+                "Output ONE JSON object only (no markdown, no prose) with keys: "
+                "next_agent, intent, task_plan, needs_memory, is_legal_query, reasoning.\n\n"
+                f"USER MESSAGE:\n{query_for_classifier}"
+            )
+            response_text = ""
+            async for chunk in classifier.astream(
+                [_LLMMsg(role="user", content=_classify_user)],
+                system_prompt=_system_prompt,
+                temperature=0.0,
+                max_tokens=160,  # routing JSON only; keep short so chatty models can't rant
+                think=False,  # Disable thinking to reduce latency for classification
+            ):
+                if hasattr(chunk, "text") and chunk.text:
+                    response_text += str(chunk.text)
+                    # Early-stop once a complete JSON object is buffered — prevents
+                    # waiting for a long prose answer after a valid routing blob.
+                    if "{" in response_text and "}" in response_text:
+                        _s, _e = response_text.find("{"), response_text.rfind("}")
+                        if _e > _s:
+                            try:
+                                json.loads(response_text[_s : _e + 1])
+                                logger.info(
+                                    f"[supervisor] Early-stop classifier stream "
+                                    f"({len(response_text)} chars, valid JSON)"
+                                )
+                                break
+                            except json.JSONDecodeError:
+                                pass
 
-        decision = _parse_supervisor_response(response_text)
+            decision = _parse_supervisor_response(response_text)
+            # If parse fell back to rag but regex scope was people-ish, trust scope.
+            if (
+                _supervisor_scope == "people"
+                and decision.get("next_agent") == AgentType.RAG
+                and "Parse failed" in str(decision.get("reasoning", ""))
+            ):
+                decision = deterministic_decision_for_scope("people", query_for_classifier) or decision
+                logger.warning(
+                    "[supervisor] Parse-fail rag override → people "
+                    f"(intent={decision.get('intent')!r})"
+                )
 
         # ── Keyword safety net 0: needs_memory fallback ─────────────────────
         # If the query explicitly contains personal pronouns, forcefully trigger
@@ -2279,6 +2354,13 @@ async def react_executor_node(state: SupervisorState) -> dict:
     )
 
     llm = get_llm_provider()
+    # Optional separate model for pass/revise evaluation so routing/thinking
+    # A/B tests don't require swapping the tool-calling / synthesis model.
+    if bool(getattr(settings, "NEXUSRAG_LG_THINKING_FOR_JUDGE", True)):
+        from app.services.llm import get_thinking_provider
+        judge_llm = get_thinking_provider()
+    else:
+        judge_llm = llm
     # Inject the query_analyzer plan (sub_queries) as an explicit checklist so
     # the loop knows every sub-question it must cover; also feeds the judge.
     _plan = state.get("sub_queries") or None
@@ -2719,7 +2801,7 @@ async def react_executor_node(state: SupervisorState) -> dict:
 
         async def _call() -> dict:
             raw = ""
-            async for c in llm.astream(
+            async for c in judge_llm.astream(
                 [_LLMMsg(role="user", content=user_prompt)],
                 system_prompt=JUDGE_SYSTEM_PROMPT,
                 temperature=0.0,

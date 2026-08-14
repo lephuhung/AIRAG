@@ -55,6 +55,9 @@ list_docs        : List available documents
 search_doc_num   : Search by document number
 search_abbr      : Abbreviation meaning
 mongo_search_*   : Person lookup (cccd/name/bhxh/phone)
+                   - phone: exactly 10 digits, ALWAYS starts with 0 (e.g. 0973289934)
+                   - CCCD: 9–12 digits, usually starts with 0 (e.g. 079203012345)
+                   Preserve leading zeros in person_ids / rewritten queries.
 greeting         : Pure greeting
 personal         : About user themselves
 

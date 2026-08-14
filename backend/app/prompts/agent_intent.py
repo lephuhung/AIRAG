@@ -39,10 +39,10 @@ Intent categories:
 - "write_suggest_edits" : user provides a TEXT PASSAGE and wants editing/improvement suggestions
 - "write_grammar_check" : user provides a TEXT PASSAGE and wants grammar/style checking
 - "write_format_check"  : user wants to CHECK or EVALUATE the FORMATTING of an attached Word document (margins, fonts, line spacing, etc.) — user mentions "định dạng", "kiểm tra định dạng", "format", "căn lề", "cỡ chữ", "trình bày"
-- "mongo_search_cccd"  : user asks to look up a person by their CCCD (Căn cước công dân) number. The query contains a national ID number (12 digits).
+- "mongo_search_cccd"  : user asks to look up a person by their CCCD (Căn cước công dân) number. CCCD is 9–12 digits and usually starts with 0 (e.g. 079203012345, 001088012345). Keep the leading 0.
 - "mongo_search_name"  : user asks to find/search for a person by their name.
 - "mongo_search_bhxh"  : user asks to look up a person by their BHXH (Bảo hiểm xã hội) number.
-- "mongo_search_phone"  : user asks to find a person by their phone number.
+- "mongo_search_phone"  : user asks to find a person by their Vietnamese phone number. Phone is exactly 10 digits and ALWAYS starts with 0 (e.g. 0973289934). Never drop the leading 0.
 
 Output format:
 {"intent": "<category>", "rewritten_query": "<improved Vietnamese/English search query>", "needs_tool": true|false, "write_action": "<action or empty>", "text_input": "<extracted text or empty>"}
@@ -57,10 +57,10 @@ Rules:
 - For "write_suggest_edits": write_action = "suggest_edits"
 - For "write_grammar_check": write_action = "grammar_check"
 - For "write_format_check": write_action = "format_check", set needs_tool to false
-- For "mongo_search_cccd": rewritten_query = the CCCD number itself (digits only, 9-12 digits)
+- For "mongo_search_cccd": rewritten_query = the CCCD number itself (digits only, 9-12 digits, usually 0-leading — preserve the leading 0)
 - For "mongo_search_name": rewritten_query = the person's name or partial name
 - For "mongo_search_bhxh": rewritten_query = the BHXH number
-- For "mongo_search_phone": rewritten_query = the phone number
+- For "mongo_search_phone": rewritten_query = the phone number (10 digits starting with 0 — preserve the leading 0)
 - For "resolve_doc": set rewritten_query to the full document reference as-is (e.g., "Luật An ninh mạng 2025", "Nghị định 60/2019"). Preserve the full reference including type keywords, names, and years.
 - For all other intents: rewrite the query to be specific and detailed for retrieval
 - If the message contains a document ID, preserve it in the output

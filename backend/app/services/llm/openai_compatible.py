@@ -93,15 +93,26 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         base_url: str = "http://10.10.0.240:8000/v1",
         model: str = "default",
         api_key: str = "none",
+        *,
+        alias_model: bool = False,
     ):
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._api_key = api_key
+        # When True, ``self._model`` is a stable proxy alias: always send that
+        # name on requests and expose it as our canonical model id (Langfuse /
+        # logs), ignoring whatever upstream id the gateway echoes back.
+        self._alias_model = alias_model
         self._sync_client_instance: Optional[object] = None
         self._async_client_instance: Optional[object] = None
         # Token usage from the most recent call — read by the Langfuse tracing
         # wrapper (TracedLLMProvider) to populate generation usage_details.
         self._last_usage: Optional[dict] = None
+
+    @property
+    def model(self) -> str:
+        """Canonical model id for tracing/logs — always the request alias when set."""
+        return self._model
 
     @staticmethod
     def _usage_dict(usage) -> Optional[dict]:

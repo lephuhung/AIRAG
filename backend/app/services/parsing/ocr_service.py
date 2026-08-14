@@ -230,9 +230,53 @@ class HunyuanOCRService:
         """
         Return True if the PDF is predominantly scanned (image-based).
 
-        Counts pages with fewer than _MIN_CHARS_PER_PAGE selectable characters.
-        If that fraction meets or exceeds HRAG_OCR_SCANNED_THRESHOLD the
-        file is classified as scanned.
+        Primary path: pdf-inspector's content-stream detection (~10-50ms, no
+        full text extraction). text_based → False, scanned/image_based → True,
+        mixed → ratio of pages_needing_ocr vs HRAG_OCR_SCANNED_THRESHOLD.
+
+        Falls back to the PyMuPDF character-count heuristic when pdf-inspector
+        is unavailable or fails.
+        """
+        try:
+            import pdf_inspector
+        except ImportError:
+            logger.warning(
+                "pdf-inspector not installed — falling back to PyMuPDF "
+                "scan detection. Install with: pip install pdf-inspector"
+            )
+            return HunyuanOCRService._is_scanned_pdf_pymupdf(file_path)
+
+        try:
+            result = pdf_inspector.detect_pdf(str(file_path))
+        except Exception as e:
+            logger.warning(
+                f"pdf-inspector detection failed ({file_path}): {e} "
+                "— falling back to PyMuPDF"
+            )
+            return HunyuanOCRService._is_scanned_pdf_pymupdf(file_path)
+
+        if result.pdf_type == "text_based":
+            scanned = False
+        elif result.pdf_type in ("scanned", "image_based"):
+            scanned = True
+        else:  # mixed — decide by the fraction of pages lacking text
+            ratio = len(result.pages_needing_ocr) / max(result.page_count, 1)
+            scanned = ratio >= settings.HRAG_OCR_SCANNED_THRESHOLD
+
+        logger.info(
+            f"PDF scan-check: {file_path} — pdf-inspector type={result.pdf_type}, "
+            f"confidence={result.confidence:.2f}, "
+            f"pages_needing_ocr={len(result.pages_needing_ocr)}/{result.page_count} "
+            f"→ {'OCR' if scanned else 'text-layer'} path"
+        )
+        return scanned
+
+    @staticmethod
+    def _is_scanned_pdf_pymupdf(file_path: str | Path) -> bool:
+        """
+        PyMuPDF fallback: counts pages with fewer than _MIN_CHARS_PER_PAGE
+        selectable characters. If that fraction meets or exceeds
+        HRAG_OCR_SCANNED_THRESHOLD the file is classified as scanned.
         """
         try:
             import fitz  # PyMuPDF
@@ -252,9 +296,9 @@ class HunyuanOCRService:
             doc.close()
 
             logger.info(
-                f"PDF scan-check: {file_path} — {text_poor_pages}/{total_pages} "
-                f"pages below text threshold (ratio={ratio:.2f}, "
-                f"threshold={settings.HRAG_OCR_SCANNED_THRESHOLD})"
+                f"PDF scan-check (pymupdf fallback): {file_path} — "
+                f"{text_poor_pages}/{total_pages} pages below text threshold "
+                f"(ratio={ratio:.2f}, threshold={settings.HRAG_OCR_SCANNED_THRESHOLD})"
             )
             return ratio >= settings.HRAG_OCR_SCANNED_THRESHOLD
 

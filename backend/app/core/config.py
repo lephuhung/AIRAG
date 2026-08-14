@@ -357,8 +357,27 @@ class Settings(BaseSettings):
     # Max agent iterations (loop guard for LangGraph tool_executor → answer cycle)
     NEXUSRAG_LG_MAX_ITERATIONS: int = Field(default=6)
 
+    # Thinking / routing LLM — OpenAI-compatible PROXY (9router on :20128).
+    # App ALWAYS sends the fixed alias (default "nexusrag-thinking"). Remap that
+    # alias → real upstream on 9router; no backend restart for model A/B.
+    # ANTHROPIC_* are accepted as aliases (9router / Claude-compatible env style).
+    NEXUSRAG_LG_THINKING_BASE_URL: str = Field(default="http://host.docker.internal:20128/v1")
+    NEXUSRAG_LG_THINKING_MODEL: str = Field(default="nexusrag-thinking")
+    NEXUSRAG_LG_THINKING_API_KEY: str = Field(default="")
+    # When True, ReAct's LLM-as-judge (pass/revise) also uses the thinking
+    # provider. Tool-calling + answer synthesis still use get_llm_provider().
+    NEXUSRAG_LG_THINKING_FOR_JUDGE: bool = Field(default=True)
+
+    # 9router / Anthropic-compatible env aliases (optional). Used when the
+    # matching NEXUSRAG_LG_THINKING_* value is empty.
+    ANTHROPIC_BASE_URL: str = Field(default="")
+    ANTHROPIC_AUTH_TOKEN: str = Field(default="")
+    ANTHROPIC_DEFAULT_FABLE_MODEL: str = Field(default="")
+
     # Classifier model: reuse the memory agent (gemma-4-E4B, served as `qwen-memory`) for intent classification.
     # Set to False to use the main LLM provider instead (slower but no extra model needed).
+    # NOTE: only affects the *legacy* classifier in nodes.py — the active
+    # supervisor_node uses get_thinking_provider() (NEXUSRAG_LG_THINKING_*).
     NEXUSRAG_LG_USE_MEMORY_AGENT_AS_CLASSIFIER: bool = Field(default=True)
 
     # LangGraph checkpointer backend:
