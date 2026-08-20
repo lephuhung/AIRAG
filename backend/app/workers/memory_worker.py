@@ -1,21 +1,23 @@
 """
 Memory Worker
 =============
-Consumes ``hrag.memory`` messages and persists each user turn as a Graphiti
-personal-memory episode (LLM fact-extraction + Neo4j write).
+Consumes ``hrag.memory`` messages and persists each user turn to the selected
+memory backend(s) (Graphiti episode and/or OpenViking session-commit) per
+``NEXUSRAG_MEMORY_BACKEND`` — dispatched via :mod:`app.services.memory.memory_backend`.
 
 Why a dedicated worker instead of an in-request ``asyncio.create_task``:
   * Durable — the message is persisted on the broker, so a fact survives an API
     process restart/crash between the response and the save.
-  * Retried — :func:`add_conversation_episode` raises on a transient Graphiti /
-    Neo4j failure, which the ``consume()`` loop turns into a delayed retry
+  * Retried — :func:`add_conversation_episode` raises on a transient backend
+    failure, which the ``consume()`` loop turns into a delayed retry
     (5s/15s/60s) and finally a dead-letter, instead of a silent warning.
-  * Off the hot path — the two LLM calls + graph write no longer compete with
-    the chat response for the API event loop.
+  * Off the hot path — the LLM work (Graphiti extraction) / server-side commit
+    (OpenViking) no longer competes with the chat response for the API loop.
 
-Idempotency: re-delivering the same turn re-adds the same fact text to the same
-user entity. Graphiti resolves it to the existing entity/edge, so a duplicate
-delivery is effectively a no-op rather than a corruption — no extra flag needed.
+Idempotency: re-delivering the same turn re-adds the same fact text; Graphiti
+resolves it to the existing entity/edge and OpenViking's extraction pipeline
+dedups candidate memories, so a duplicate delivery is effectively a no-op
+rather than a corruption — no extra flag needed.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ import logging
 import uuid
 
 from app.queue.messages import MemorySaveMessage
-from app.services.memory.graphiti_client import add_conversation_episode
+from app.services.memory.memory_backend import add_conversation_episode
 
 logger = logging.getLogger(__name__)
 

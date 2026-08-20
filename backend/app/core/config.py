@@ -267,6 +267,13 @@ class Settings(BaseSettings):
     HRAG_EMBED_RERANK_URL: str = Field(default="")
     HRAG_EMBED_RERANK_TIMEOUT: float = Field(default=30.0)
 
+    # PII extraction microservice (people-agent enhancement)
+    # When set, the people-agent calls this service to extract phone numbers,
+    # CCCD, BHXH and human names from Vietnamese queries before routing to MongoDB.
+    # Unset = skip PII extraction (fallback to regex / LLM extraction).
+    PII_SERVICE_URL: str = Field(default="")
+    PII_SERVICE_TIMEOUT: float = Field(default=5.0)
+
     # OCR
     HRAG_ENABLE_OCR: bool = Field(default=True)
     HRAG_OCR_SCANNED_THRESHOLD: float = Field(default=0.5)
@@ -488,6 +495,21 @@ class Settings(BaseSettings):
     # Embedding dimension — must match HRAG_EMBEDDING_MODEL's output dim
     # (vietlegal-harrier-0.6b = 1024). Update both together if you swap models.
     GRAPHITI_EMBEDDING_DIM: int = Field(default=1024)
+
+    # ── OpenViking Memory (context DB, dedicated server on :1933) ────────────
+    # Optional second memory backend: OpenViking stores user memories as a tiered
+    # viking:// filesystem and runs its own async LLM extraction on session commit.
+    # Backend selection for the agent pipeline (memory_recall node + memory worker):
+    #   graphiti   (default) | openviking | both | none
+    # OPENVIKING_URL empty = OpenViking disabled regardless of the selector.
+    NEXUSRAG_MEMORY_BACKEND: str = Field(default="graphiti")
+    OPENVIKING_URL: str = Field(default="")
+    OPENVIKING_API_KEY: str = Field(default="")
+    OPENVIKING_ACCOUNT: str = Field(default="nexusrag")
+    OPENVIKING_TIMEOUT: float = Field(default=30.0)
+    OPENVIKING_TOP_K: int = Field(default=5)
+    # Optional minimum relevance score for memory recall (None = server default).
+    OPENVIKING_SCORE_THRESHOLD: float | None = Field(default=None)
 
     # MongoDB — People Search
     MONGO_HOST: str = Field(default="localhost")

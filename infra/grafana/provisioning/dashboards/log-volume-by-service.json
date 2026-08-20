@@ -13,7 +13,7 @@
       "targets": [
         {
           "datasource": { "type": "loki", "uid": "loki" },
-          "expr": "sum by (service) (rate({stack=\"nexusrag\"} | logproto.LineCounter[])[5m]))",
+          "expr": "sum by (service) (rate({stack=\"hrag\"} [5m]))",
           "legendFormat": "{{service}}"
         }
       ],
@@ -26,7 +26,7 @@
       "targets": [
         {
           "datasource": { "type": "loki", "uid": "loki" },
-          "expr": "topk(5, sum by (service) (rate({stack=\"nexusrag\"} |= \"ERROR\" | logproto.LineCounter[])[5m])))",
+          "expr": "topk(5, sum by (service) (rate({stack=\"hrag\"} |= \"ERROR\" [5m])))",
           "legendFormat": "{{service}} errors/s"
         }
       ],
@@ -39,7 +39,7 @@
       "targets": [
         {
           "datasource": { "type": "loki", "uid": "loki" },
-          "expr": "sum by (service) (rate({stack=\"nexusrag\"} | logproto.LineCounter[])[1h]))",
+          "expr": "sum by (service) (rate({stack=\"hrag\"} [1h]))",
           "legendFormat": "{{service}} logs/hr"
         }
       ],

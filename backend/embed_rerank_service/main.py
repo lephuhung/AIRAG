@@ -14,6 +14,10 @@ Endpoints:
     POST /embed    → {texts:[...]}  -> {model, dimension, embeddings:[[...]]}
     POST /rerank   → {query, documents:[...], top_k?, min_score?}
                      -> {model, results:[{index, score, text}]}
+    POST /v1/embeddings → OpenAI-compatible DENSE embedding endpoint (used by
+                     OpenViking's context-DB server as its embedding provider).
+                     Accepts {"model", "input" (str | list[str]), dimensions?,
+                     encoding_format?} and replies in OpenAI format.
 
 GPU safety: a single shared model now fields every worker's requests, and the
 rerank fan-out is the known VRAM-spike path (memory `search-cuda-oom-silent-fail`).
@@ -80,6 +84,22 @@ class RerankRequest(BaseModel):
     min_score: float | None = None
 
 
+class OpenAiEmbedRequest(BaseModel):
+    """OpenAI-compatible request shape (what the openai SDK sends).
+
+    Extra fields (``dimensions``, ``encoding_format``, etc.) are accepted and
+    ignored — SentenceTransformer embeddings are fixed-dim.
+    """
+
+    model: str | None = None
+    input: str | list[str]
+    dimensions: int | None = None
+    encoding_format: str | None = None
+    user: str | None = None
+
+    model_config = {"extra": "ignore"}
+
+
 @app.get("/health")
 async def health():
     emb = get_embedding_service()
@@ -110,4 +130,48 @@ async def rerank(req: RerankRequest):
     return {
         "model": rr.model_name,
         "results": [{"index": r.index, "score": r.score, "text": r.text} for r in results],
+    }
+
+
+@app.post("/v1/embeddings")
+async def openai_embeddings(req: OpenAiEmbedRequest):
+    """OpenAI-compatible embeddings endpoint for OpenViking / external clients.
+
+    Reuses the same SentenceTransformer embedder as /embed, under the same GPU
+    semaphore. Response follows the OpenAI schema so the ``openai`` Python SDK
+    (used by OpenViking's openai embedding provider) can consume it directly:
+
+        {"object": "list",
+         "data": [{"object": "embedding", "embedding": [...], "index": 0}],
+         "model": <configured model name>, "usage": {...}}
+    """
+    emb = get_embedding_service()
+
+    # Normalize input: OpenAI allows a single string or a list of strings.
+    if isinstance(req.input, str):
+        texts = [req.input]
+    else:
+        texts = list(req.input)
+    if not texts:
+        raise ValueError("input must be a non-empty string or list of strings")
+
+    async with _gpu_sema:
+        vectors = await asyncio.to_thread(emb.embed_texts, texts)
+
+    data = [
+        {
+            "object": "embedding",
+            "embedding": vec,
+            "index": i,
+        }
+        for i, vec in enumerate(vectors)
+    ]
+    return {
+        "object": "list",
+        "data": data,
+        "model": req.model or emb.model_name,
+        "usage": {
+            "prompt_tokens": sum(len(t.split()) for t in texts),
+            "total_tokens": sum(len(t.split()) for t in texts),
+        },
     }

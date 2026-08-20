@@ -1,0 +1,1 @@
+"""PII extraction microservice entrypoint."""

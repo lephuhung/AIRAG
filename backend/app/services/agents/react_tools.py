@@ -526,7 +526,7 @@ async def _adapt_summarize_long_document(args: dict, ctx: ToolContext) -> dict:
 # ──────────────────────────────────────────────────────────────────────────
 
 async def _adapt_recall_memory(args: dict, ctx: ToolContext) -> dict:
-    from app.services.memory.graphiti_client import search_user_memory
+    from app.services.memory.memory_backend import search_user_memory
 
     if not ctx.user_id:
         return tool_result("Không có ngữ cảnh người dùng để truy hồi.")
@@ -539,16 +539,16 @@ async def _adapt_recall_memory(args: dict, ctx: ToolContext) -> dict:
 
 
 async def _adapt_save_memory(args: dict, ctx: ToolContext) -> dict:
-    from app.services.memory.graphiti_client import save_user_fact_background
+    from app.services.memory.memory_backend import save_user_fact_background
 
     fact = (args.get("fact") or "").strip()
     if not ctx.user_id:
         return tool_result("Không thể lưu: thiếu ngữ cảnh người dùng.")
     if not fact:
         return tool_result("Không thể lưu: thiếu nội dung 'fact'.")
-    # Fire-and-forget: the Graphiti write is slow (~30-50s of LLM extraction) and
-    # must NOT block the answer. Schedule it in the background and optimistically
-    # report success (the write is best-effort; failures are logged, not surfaced).
+    # Fire-and-forget: memory writes are slow (LLM extraction / server-side
+    # vectorization) and must NOT block the answer. Schedule in the background
+    # and optimistically report success (best-effort; failures are logged).
     save_user_fact_background(ctx.user_id, fact)
     return tool_result("Đã ghi nhớ.", data={"saved": True})
 

@@ -13,7 +13,7 @@
       "targets": [
         {
           "datasource": { "type": "loki", "uid": "loki" },
-          "expr": "rate({service=~\"$service\"} | logproto.LineCounter[])[5m])",
+          "expr": "rate({service=~\"$service\"} [5m])",
           "legendFormat": "{{service}}"
         }
       ],
@@ -39,7 +39,7 @@
       "targets": [
         {
           "datasource": { "type": "loki", "uid": "loki" },
-          "expr": "rate({service=~\"$service\"} |= \"ERROR\" | logproto.LineCounter[])[5m])",
+          "expr": "rate({service=~\"$service\"} |= \"ERROR\" [5m])",
           "legendFormat": "{{service}} errors/s"
         }
       ],

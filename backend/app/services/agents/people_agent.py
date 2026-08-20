@@ -15,6 +15,7 @@ Uses existing tool functions from app.services.agent.tools.
 from __future__ import annotations
 
 import logging
+import re as _re
 from typing import TYPE_CHECKING, Callable
 
 from app.services.agent.langfuse_tracing import _get_langfuse_client
@@ -76,7 +77,7 @@ async def _tool_mongo_phone(state: SupervisorState):
 
 
 async def _tool_mongo_advanced(state: SupervisorState):
-    """Search MongoDB people using multiple criteria extracted via LLM."""
+    """Search MongoDB people using multiple criteria extracted via PII or LLM."""
     from app.services.agent.tools import search_people_advanced
     from app.services.llm import get_llm_provider
     from app.services.llm.types import LLMMessage
@@ -84,8 +85,23 @@ async def _tool_mongo_advanced(state: SupervisorState):
     import re
 
     user_query = state.get("rewritten_query", state.get("original_query", ""))
-    
-    # Simple extraction prompt
+
+    pii_criteria = state.get("_pii_criteria")
+    if pii_criteria:
+        criteria = {
+            "name": pii_criteria.get("name", ""),
+            "dob": pii_criteria.get("dob", ""),
+            "address": pii_criteria.get("address", ""),
+            "phone": pii_criteria.get("phone", ""),
+            "cccd": pii_criteria.get("cccd", ""),
+            "bhxh": pii_criteria.get("bhxh", ""),
+        }
+        logger.info(f"[_tool_mongo_advanced] Using pre-extracted PII criteria: {criteria}")
+        async for res in search_people_advanced(criteria, limit=10):
+            yield res
+        return
+
+    # ── Fallback: LLM extraction (legacy path when PII service is off / failed) ──
     sys_prompt = (
         "Bạn là một chuyên gia trích xuất dữ liệu. Hãy phân tích yêu cầu của người dùng "
         "và trích xuất các thông tin tìm kiếm sau thành mã JSON thật chuẩn xác (chỉ trả về JSON, không giải thích).\n"
@@ -95,7 +111,7 @@ async def _tool_mongo_advanced(state: SupervisorState):
         'Người dùng: "Tìm người có tên Nguyễn Văn A, sinh năm 1995, quê ở Hà Nội"\n'
         'Output JSON: {"name": "Nguyễn Văn A", "dob": "1995", "address": "Hà Nội", "phone": ""}'
     )
-    
+
     llm = get_llm_provider()
     extraction_res = await llm.acomplete(
         messages=[
@@ -104,9 +120,9 @@ async def _tool_mongo_advanced(state: SupervisorState):
         ],
         temperature=0.0
     )
-    
+
     content = extraction_res if isinstance(extraction_res, str) else getattr(extraction_res, "content", "{}")
-    
+
     # Parsing JSON robustly
     criteria = {}
     try:
@@ -143,6 +159,108 @@ PEOPLE_TOOL_REGISTRY: dict[str, tuple[Callable, Callable]] = {
 
 
 # =============================================================================
+# PII-based Smart Routing
+# =============================================================================
+
+async def _extract_pii_and_route(state: SupervisorState) -> tuple[str, str, dict]:
+    """Use PII extraction service to determine the best intent and query.
+
+    Returns (intent, query, criteria_dict).
+    When PII service is unavailable or returns nothing, falls back to the
+    existing intent + rewritten_query from the supervisor.
+    """
+    from app.services.pii import extract_pii
+
+    original_query = state.get("original_query", "")
+    rewritten_query = state.get("rewritten_query") or original_query
+    fallback_intent = state.get("intent", "mongo_search_name")
+
+    # Only invoke PII extraction when the query looks like it might contain
+    # person identifiers or names.
+    pii_text = rewritten_query or original_query
+    if not pii_text or len(pii_text.strip()) < 3:
+        return fallback_intent, rewritten_query, {}
+
+    entities = await extract_pii(pii_text)
+    if not entities:
+        logger.info("[people_agent_node] PII extraction skipped/unavailable, using fallback intent=%s", fallback_intent)
+        return fallback_intent, rewritten_query, {}
+
+    phone_numbers = entities.get("phone_number", [])
+    id_numbers = entities.get("id_number", [])
+    human_names = entities.get("human_name", [])
+
+    # Clean id_numbers: strip non-digits for length heuristics
+    clean_ids = [_re.sub(r"\D", "", id_val) for id_val in id_numbers]
+
+    # ── Single-criterion routing ──────────────────────────────────────────
+    if phone_numbers and not id_numbers and not human_names:
+        intent = "mongo_search_phone"
+        # Search ALL extracted numbers (not just the first). search_by_phone()
+        # accepts a comma list and extracts every 10-digit group ($in match),
+        # so "a, b, c" finds people for every number the PII model returned.
+        query = ", ".join(phone_numbers)
+        logger.info("[people_agent_node] PII route → phone: %s", query)
+        return intent, query, {}
+
+    if clean_ids and not phone_numbers and not human_names:
+        id_val = clean_ids[0]
+        if len(id_val) == 12:
+            intent = "mongo_search_cccd"
+            query = id_val
+            logger.info("[people_agent_node] PII route → cccd: %s", query)
+            return intent, query, {}
+        if len(id_val) == 10:
+            intent = "mongo_search_bhxh"
+            query = id_val
+            logger.info("[people_agent_node] PII route → bhxh: %s", query)
+            return intent, query, {}
+        # Unknown length id — treat as generic id search via advanced
+        intent = "mongo_search_advanced"
+        criteria = {"name": "", "dob": "", "address": "", "phone": "", "cccd": id_val}
+        logger.info("[people_agent_node] PII route → advanced (unknown id %d digits): %s", len(id_val), id_val)
+        return intent, pii_text, criteria
+
+    if human_names and not phone_numbers and not clean_ids:
+        intent = "mongo_search_name"
+        query = human_names[0]
+        logger.info("[people_agent_node] PII route → name: %s", query)
+        return intent, query, {}
+
+    # ── Multi-criteria routing (name + phone / id / address) ─────────────
+    if phone_numbers or clean_ids or human_names:
+        intent = "mongo_search_advanced"
+        cccd = ""
+        bhxh = ""
+        for id_val in clean_ids:
+            if len(id_val) == 12:
+                cccd = id_val
+            elif len(id_val) == 10:
+                bhxh = id_val
+            else:
+                # If only one id and length is weird, put it in cccd field
+                # (the advanced tool searches across fields with OR logic)
+                cccd = id_val if not cccd else cccd
+
+        criteria = {
+            "name": human_names[0] if human_names else "",
+            "dob": "",
+            "address": "",
+            "phone": phone_numbers[0] if phone_numbers else "",
+            "cccd": cccd,
+            "bhxh": bhxh,
+        }
+        logger.info(
+            "[people_agent_node] PII route → advanced (name=%r phone=%r cccd=%r bhxh=%r)",
+            criteria["name"], criteria["phone"], criteria["cccd"], criteria["bhxh"],
+        )
+        return intent, pii_text, criteria
+
+    # Nothing useful extracted → fallback
+    return fallback_intent, rewritten_query, {}
+
+
+# =============================================================================
 # People Agent Node
 # =============================================================================
 
@@ -151,19 +269,26 @@ async def people_agent_node(state: SupervisorState) -> dict:
     Execute MongoDB people search based on intent.
 
     Flow:
-    1. Look up tool in registry
-    2. Call tool function
-    3. Map result to SupervisorState
-    4. Emit sources/images events for SSE streaming
-    5. Return partial state update
+    1. (NEW) Call PII extraction service to refine intent + query
+    2. Look up tool in registry
+    3. Call tool function
+    4. Map result to SupervisorState
+    5. Emit sources/images events for SSE streaming
+    6. Return partial state update
     """
     from app.services.agents.models import AgentType
     from app.services.agent.streaming import push_event
 
     langfuse = _get_langfuse_client()
-    intent = state.get("intent", "mongo_search_name")
-    query = state.get("rewritten_query") or state.get("original_query", "")
-    logger.info(f"[LANGGRAPH_NODE] Entering people_agent_node, intent={intent!r}")
+
+    # Phase 0: PII extraction for smarter routing
+    intent, query, pii_criteria = await _extract_pii_and_route(state)
+    # Inject the refined query back into state so downstream nodes see it
+    state["rewritten_query"] = query
+    if pii_criteria:
+        state["_pii_criteria"] = pii_criteria
+
+    logger.info(f"[LANGGRAPH_NODE] Entering people_agent_node, intent={intent!r}, query={query!r}")
 
     if not state.get("user_can_use_people", False):
         logger.info(
@@ -279,8 +404,6 @@ async def people_agent_node(state: SupervisorState) -> dict:
 # =============================================================================
 # People Document Search Node
 # =============================================================================
-
-import re as _re
 
 # Common name keys across the various people collections (BHXH/LG/EVN/…). Used to
 # anchor document relevance on the matched person's actual name.

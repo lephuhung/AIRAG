@@ -603,9 +603,9 @@ async def chat_stream_session(
             except Exception as e:
                 logger.warning(f"[session/{session_id}] Failed to save exchange summary: {e}", exc_info=True)
 
-            # Graphiti save (separate session)
+            # Memory save (separate session) — backend(s) per NEXUSRAG_MEMORY_BACKEND
             try:
-                from app.services.memory.graphiti_client import add_conversation_episode
+                from app.services.memory.memory_backend import add_conversation_episode
                 if user_id and user_message and text:
                     await add_conversation_episode(
                         user_id=user_id,
@@ -614,7 +614,7 @@ async def chat_stream_session(
                         session_id=session_id,
                     )
             except Exception as e:
-                logger.error(f"[session/{session_id}] Graphiti save failed: {e}", exc_info=True)
+                logger.error(f"[session/{session_id}] Memory save failed: {e}", exc_info=True)
 
         except Exception as e:
             logger.error(f"[session/{session_id}] Background persistence failed: {e}", exc_info=True)

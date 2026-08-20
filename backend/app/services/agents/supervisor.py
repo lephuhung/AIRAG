@@ -3774,7 +3774,8 @@ async def _memory_recall_wrapper(state: SupervisorState) -> dict:
         return {}
 
     try:
-        from app.services.memory.graphiti_client import search_user_memory
+        from app.core.config import settings as _cfg
+        from app.services.memory.memory_backend import search_user_memory
 
         uid = user_id
         if isinstance(uid, int):
@@ -3782,7 +3783,7 @@ async def _memory_recall_wrapper(state: SupervisorState) -> dict:
         elif isinstance(uid, str):
             uid = _uuid.UUID(uid)
 
-        memory = await search_user_memory(uid, user_message, top_k=5)
+        memory = await search_user_memory(uid, user_message, top_k=getattr(_cfg, "OPENVIKING_TOP_K", 5))
         if langfuse:
             try:
                 obs = langfuse.start_observation(
@@ -3801,10 +3802,10 @@ async def _memory_recall_wrapper(state: SupervisorState) -> dict:
                 logger.warning(f"[langfuse] memory_recall span failed: {e}")
 
         if memory and "No relevant memories" not in memory:
-            logger.info(f"[memory_recall_wrapper] Graphiti injected {len(memory)} chars")
+            logger.info(f"[memory_recall_wrapper] memory injected {len(memory)} chars")
             return {"user_memory_context": memory}
         else:
-            logger.info(f"[memory_recall_wrapper] Graphiti found no relevant memory for user_id={uid}")
+            logger.info(f"[memory_recall_wrapper] no relevant memory for user_id={uid}")
     except Exception as e:
         logger.warning(f"[memory_recall_wrapper] failed: {e}")
         if langfuse:

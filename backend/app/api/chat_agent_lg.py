@@ -269,9 +269,10 @@ async def langgraph_chat_stream(
         logger.warning(f"[lg_endpoint] Failed to persist assistant message: {e}")
         await db.rollback()
 
-    # Enqueue the turn for a durable Graphiti personal-memory save. The memory
-    # worker does the LLM fact-extraction + Neo4j write with RabbitMQ retry/DLQ;
-    # if the broker is unreachable we fall back to an in-process background save.
+    # Enqueue the turn for a durable personal-memory save (backend(s) selected by
+    # NEXUSRAG_MEMORY_BACKEND: Graphiti and/or OpenViking). The memory worker does
+    # the extraction/commit with RabbitMQ retry/DLQ; if the broker is unreachable
+    # we fall back to an in-process background save.
     if user_id and request.message and final_answer:
         try:
             from app.queue.publisher import publish_memory_save_task
@@ -285,7 +286,7 @@ async def langgraph_chat_stream(
         except Exception as e:
             logger.warning(f"[lg_endpoint] Graphiti memory enqueue failed ({e}) — falling back to in-process save")
             try:
-                from app.services.memory.graphiti_client import add_conversation_episode
+                from app.services.memory.memory_backend import add_conversation_episode
                 import asyncio
 
                 uid = user_id
@@ -302,7 +303,7 @@ async def langgraph_chat_stream(
                             session_id=sid,
                         )
                     except Exception as e2:
-                        logger.warning(f"[lg_endpoint] Graphiti episode save failed: {e2}")
+                        logger.warning(f"[lg_endpoint] memory save failed: {e2}")
 
                 asyncio.create_task(_bg_save())
             except Exception as e2:

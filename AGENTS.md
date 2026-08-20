@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **AIRAG** (6719 symbols, 15154 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **AIRAG** (6972 symbols, 15610 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
@@ -60,6 +60,7 @@ Start here:
 | Test / eval / A-B entrypoints (the `make` targets) | [`docs/harness.md`](docs/harness.md) |
 | Multi-worker / Redis scale-out runbook | [`docs/scaling.md`](docs/scaling.md) |
 | vLLM engines (never restart them), workers, embedding, auth | [`docs/`](docs/) |
+| OpenViking memory backend (context-DB, LangGraph memory) | [`docs/openviking.md`](docs/openviking.md) |
 | Product overview, quick start | [`README.md`](README.md) |
 
 Two facts worth knowing before you touch anything (both spelled out in `CLAUDE.md`):

@@ -23,6 +23,12 @@ redis[hiredis]>=5.0
 # Embeddings & reranking
 sentence-transformers>=2.2.2
 
+# PII extraction (Meddies/meddies-pii-v2 — 350M encoder token-classification)
+# Custom loader modeling_meddies_pii.py imports PeftModel at top level → peft required.
+transformers>=4.35.0
+accelerate>=0.20.0
+peft>=0.13.0
+
 # Document parsing (Docling)
 docling>=2.0.0
 # EasyOCR — the only bundled OCR engine that reads Vietnamese diacritics
@@ -90,6 +96,9 @@ langchain>=0.3.0
 
 # Graphiti — temporal knowledge graph memory (uses Neo4j already in stack)
 graphiti-core>=0.3.0
+
+# OpenViking — context DB memory backend (server runs separately in compose)
+openviking-sdk>=0.1.1
 
 # Digital signature extraction (PDF)
 asn1crypto>=1.5.0

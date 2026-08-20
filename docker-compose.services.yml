@@ -272,7 +272,6 @@ services:
       WORKER_DRAIN_TIMEOUT: "30"
       WORKER_HEALTH_PORT: "8081"
       HUNYUAN_OCR_API_URL: http://vllm-ocr:8001/v1
-      MEMORY_AGENT_BASE_URL: http://vllm-memory:8088/v1
     volumes:
       - /root/.cache/huggingface:/root/.cache/huggingface
       # Persist OCR model caches across container recreates → fast startup
@@ -286,6 +285,7 @@ services:
       - hrag_network
     extra_hosts:
       - "langfuse.hatinh.local:10.10.0.241"
+      - "host.docker.internal:host-gateway"
     deploy:
       replicas: 1
       resources:
@@ -341,7 +341,6 @@ services:
       NEXUSRAG_EMBEDDING_DEVICE: cuda
       WORKER_DRAIN_TIMEOUT: "30"
       WORKER_HEALTH_PORT: "8081"
-      MEMORY_AGENT_BASE_URL: http://vllm-memory:8088/v1
       WORKER_EMBED_TIMEOUT: "300"
       HRAG_CONTEXTUAL_CONCURRENCY: "16"
     volumes:
@@ -353,6 +352,7 @@ services:
       - hrag_network
     extra_hosts:
       - "langfuse.hatinh.local:10.10.0.241"
+      - "host.docker.internal:host-gateway"
     deploy:
       replicas: 1
       resources:
@@ -418,6 +418,7 @@ services:
       - hrag_network
     extra_hosts:
       - "langfuse.hatinh.local:10.10.0.241"
+      - "host.docker.internal:host-gateway"
     stop_grace_period: 60s
     command: ["python", "-m", "app.workers.runner"]
     restart: always
@@ -465,7 +466,6 @@ services:
       CUDA_VISIBLE_DEVICES: "0"
       WORKER_DRAIN_TIMEOUT: "30"
       WORKER_HEALTH_PORT: "8081"
-      LEGAL_KG_LLM_BASE_URL: http://vllm-memory:8088/v1
     volumes:
       - /root/.cache/huggingface:/root/.cache/huggingface
       - hrag_data:/app/backend/data
@@ -474,6 +474,7 @@ services:
       - hrag_network
     extra_hosts:
       - "langfuse.hatinh.local:10.10.0.241"
+      - "host.docker.internal:host-gateway"
     stop_grace_period: 60s
     command: ["python", "-m", "app.workers.runner"]
     restart: always
@@ -513,8 +514,6 @@ services:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/hrag
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       NEO4J_URI: bolt://neo4j:7687
-      MEMORY_AGENT_BASE_URL: http://vllm-memory:8088/v1
-      GRAPHITI_LLM_BASE_URL: http://vllm-memory:8088/v1
       WORKER_TYPE: memory
       AUTO_CREATE_TABLES: "false"
       WORKER_DRAIN_TIMEOUT: "30"
@@ -526,6 +525,7 @@ services:
       - hrag_network
     extra_hosts:
       - "langfuse.hatinh.local:10.10.0.241"
+      - "host.docker.internal:host-gateway"
     stop_grace_period: 60s
     command: ["python", "-m", "app.workers.runner"]
     restart: always
@@ -650,6 +650,36 @@ services:
       com.hrag.service: embed-rerank
       com.hrag.stack: hrag
 
+  # ── PII extraction microservice (CPU) ──────────────────────────────────
+  # Hosts the Meddies/meddies-pii-v2 model (350M-param causal LM) for
+  # multilingual PII extraction, served over HTTP (:8092). The people-agent
+  # calls this to extract phone numbers, CCCD, BHXH and human names from
+  # Vietnamese queries before routing to MongoDB. CPU-only by default.
+  pii-service:
+    image: airag-backend:latest
+    container_name: hrag-pii-service
+    env_file: .env
+    environment:
+      PII_MODEL_NAME: Meddies/meddies-pii-v2
+      PII_DEVICE: cpu
+      PII_CONCURRENCY: "2"
+    command: ["uvicorn", "pii_service.main:app", "--host", "0.0.0.0", "--port", "8092"]
+    volumes:
+      - /root/.cache/huggingface:/root/.cache/huggingface
+      - ./backend:/app/backend:rw
+    networks:
+      - hrag_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8092/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 120s
+    restart: unless-stopped
+    labels:
+      com.hrag.service: pii-service
+      com.hrag.stack: hrag
+
   # ── Whisper STT microservice (CPU sidecar) ───────────────────────────────
   # Hosts faster-whisper (CTranslate2, CPU int8) behind an OpenAI-compatible
   # /v1/audio/transcriptions endpoint (:8091). Backend sets STT_PROVIDER=openai +
@@ -708,6 +738,8 @@ services:
         condition: service_healthy
       stt:
         condition: service_started
+      pii-service:
+        condition: service_started
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/hrag
@@ -738,15 +770,15 @@ services:
       PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
       RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
       HUNYUAN_OCR_API_URL: http://vllm-ocr:8001/v1
-      MEMORY_AGENT_BASE_URL: http://vllm-memory:8088/v1
-      GRAPHITI_LLM_BASE_URL: http://vllm-memory:8088/v1
-      LEGAL_KG_LLM_BASE_URL: http://vllm-memory:8088/v1
       TTS_OMNIVOICE_BASE_URL: http://omnivoice:8880/v1
       # Whisper (STT) now lives in the `stt` CPU sidecar — the backend is a thin
       # OpenAI-compatible client and holds NO Whisper model (so it scales on CPU).
       # Set STT_PROVIDER=faster_whisper + empty base URL to run it in-process again.
       STT_PROVIDER: openai
       STT_OPENAI_BASE_URL: http://stt:8091/v1
+      # Route PII extraction to the CPU microservice (default on). Set empty to
+      # skip PII extraction in the people-agent (fallback to regex / LLM).
+      PII_SERVICE_URL: ${PII_SERVICE_URL-http://pii-service:8092}
     extra_hosts:
       - "host.docker.internal:host-gateway"
       - "langfuse.hatinh.local:10.10.0.241"
@@ -779,6 +811,8 @@ services:
       - "traefik.http.routers.backend.rule=Host(`service.hatinh.local`)"
       - "traefik.http.routers.backend.entrypoints=http"
       - "traefik.http.services.backend.loadbalancer.server.port=8080"
+      - "com.hrag.service=backend"
+      - "com.hrag.stack=hrag"
     restart: unless-stopped
 
   # ── Frontend ─────────────────────────────────────────────────────────
@@ -812,6 +846,8 @@ services:
       - "traefik.http.routers.frontend.rule=Host(`rag.hatinh.local`)"
       - "traefik.http.routers.frontend.entrypoints=http"
       - "traefik.http.services.frontend.loadbalancer.server.port=5174"
+      - "com.hrag.service=frontend"
+      - "com.hrag.stack=hrag"
     restart: unless-stopped
 
   # ═══════════════════════════════════════════════════════════════════════════
@@ -845,7 +881,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./infra/promtail:/etc/promtail:ro
       - hrag_promtail_positions:/tmp/promtail
-      - /home/docker/containers:/home/docker/containers:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
     command: -config.expand-env=true -config.file=/etc/promtail/config.yml
     networks:
       - hrag_network
@@ -878,6 +914,121 @@ services:
       - "traefik.http.routers.grafana.entrypoints=http"
       - "traefik.http.services.grafana.loadbalancer.server.port=3000"
 
+  # ── OpenViking (context-DB memory for LangGraph agents) ──────────────────
+  # Optional memory backend selected via NEXUSRAG_MEMORY_BACKEND (openviking/both).
+  # The backend reaches it at http://openviking:1933 over hrag_network; port 1933
+  # is also published for the `ov` CLI / debugging. Config is injected wholesale
+  # through OPENVIKING_CONF_CONTENT (server reads it via os.path.expandvars, so
+  # $OPENVIKING_* placeholders resolve from env_file .env / environment).
+  #   - embedding → AIRAG's own embed-rerank service (/v1/embeddings, OpenAI-compat)
+  #   - vlm      → AIRAG's memory-agent LLM proxy (host.docker.internal:20128 / airag-memory)
+  openviking:
+    image: ghcr.io/volcengine/openviking:latest
+    container_name: hrag-openviking
+    ports:
+      - "1933:1933"
+    env_file: .env
+    environment:
+      OPENVIKING_SERVER_PORT: "1933"
+      OPENVIKING_VLM_BASE_URL: ${OPENVIKING_VLM_BASE_URL:-http://host.docker.internal:20128/v1}
+      OPENVIKING_VLM_MODEL: ${OPENVIKING_VLM_MODEL:-airag-memory}
+      OPENVIKING_VLM_API_KEY: ${OPENVIKING_VLM_API_KEY:-sk-nexusrag}
+      OPENVIKING_EMBED_BASE_URL: ${OPENVIKING_EMBED_BASE_URL:-http://embed-rerank:8090/v1}
+      OPENVIKING_EMBED_MODEL: ${OPENVIKING_EMBED_MODEL:-vietlegal-harrier}
+      OPENVIKING_EMBED_API_KEY: ${OPENVIKING_EMBED_API_KEY:-sk-none}
+      # Full ov.conf injected at boot (entrypoint writes it to /app/.openviking/ov.conf).
+      OPENVIKING_CONF_CONTENT: |
+        {
+          "server": {
+            "host": "0.0.0.0",
+            "port": 1933,
+            "root_api_key": "$OPENVIKING_API_KEY",
+            "auth_mode": "trusted"
+          },
+          "storage": {
+            "workspace": "/app/data",
+            "vectordb": {
+              "name": "context",
+              "backend": "local",
+              "project": "default"
+            },
+            "agfs": {
+              "backend": "local",
+              "timeout": 10,
+              "pathlock": {
+                "provider": "filesystem",
+                "lock_expire_secs": 30.0
+              }
+            }
+          },
+          "queue_workers": {
+            "external_parse": {"max_concurrent": 2},
+            "add_resource": {"max_concurrent": 2, "file_vectorization_concurrency": 4},
+            "session_commit": {"max_concurrent": 4}
+          },
+          "embedding": {
+            "dense": {
+              "provider": "openai",
+              "model": "$OPENVIKING_EMBED_MODEL",
+              "api_base": "$OPENVIKING_EMBED_BASE_URL",
+              "api_key": "$OPENVIKING_EMBED_API_KEY",
+              "dimension": 1024,
+              "input": "text"
+            },
+            "text_source": "content_only",
+            "max_input_tokens": 4096
+          },
+          "vlm": {
+            "provider": "openai",
+            "model": "$OPENVIKING_VLM_MODEL",
+            "api_base": "$OPENVIKING_VLM_BASE_URL",
+            "api_key": "$OPENVIKING_VLM_API_KEY",
+            "temperature": 0.0,
+            "max_retries": 2,
+            "media": {"enabled": false}
+          },
+          "retrieval": {
+            "hotness_alpha": 0.0,
+            "score_propagation_alpha": 1.0,
+            "recall_intent_timeout_s": 5.0,
+            "recall_rewrite_timeout_s": 30.0
+          },
+          "auto_generate_l0": true,
+          "auto_generate_l1": true,
+          "default_search_mode": "thinking",
+          "default_search_limit": 3,
+          "memory": {
+            "version": "v2",
+            "extraction_enabled": true,
+            "session_skill_extraction_enabled": false
+          },
+          "log": {
+            "level": "INFO",
+            "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            "output": "stdout",
+            "rotation": true,
+            "rotation_days": 3,
+            "rotation_interval": "midnight"
+          }
+        }
+    volumes:
+      - hrag_openviking_config:/app/.openviking
+      - hrag_openviking_data:/app/data
+    networks:
+      - hrag_network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "openviking-entrypoint", "--healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    labels:
+      com.hrag.service: openviking
+      com.hrag.stack: hrag
+
 volumes:
   hrag_postgres_data:
   hrag_chroma_data:
@@ -892,3 +1043,5 @@ volumes:
   hrag_promtail_positions:
   hrag_omnivoice_profiles:
   hrag_omnivoice_hf:
+  hrag_openviking_config:
+  hrag_openviking_data:

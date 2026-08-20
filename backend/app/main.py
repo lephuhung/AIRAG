@@ -723,16 +723,16 @@ async def lifespan(app: FastAPI):
 
         app.state._warm_stt_task = asyncio.create_task(_background_warm_stt())
 
-    # ── Graphiti Memory Initialization ───────────────────────────────────
-    # Build Neo4j indices and constraints required by Graphiti's knowledge
-    # graph memory layer.  Idempotent — safe to call on every startup.
-    # Non-fatal: if Neo4j is unavailable, memory falls back to empty context.
+    # ── Memory Backend Initialization ───────────────────────────────────
+    # Initializes whichever backend(s) NEXUSRAG_MEMORY_BACKEND selects:
+    # Graphiti (Neo4j indices/constraints) and/or OpenViking (server health).
+    # Idempotent + non-fatal — a missing backend degrades to empty memory context.
     try:
-        from app.services.memory.graphiti_client import initialize_graphiti
+        from app.services.memory.memory_backend import initialize_memory
 
-        await initialize_graphiti()
-    except Exception as _graphiti_err:
-        logger.warning(f"Graphiti memory init failed (non-fatal): {_graphiti_err}")
+        await initialize_memory()
+    except Exception as _mem_err:
+        logger.warning(f"Memory init failed (non-fatal): {_mem_err}")
 
     # ── MongoDB Connection Warmup ─────────────────────────────────────────
     # Pre-establish MongoDB TCP connection so the first search request is instant.

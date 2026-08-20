@@ -55,8 +55,8 @@ Everything runs via Docker Compose. There are **three** compose files:
 
 ```bash
 cp .env.example .env
-# Edit .env — set GOOGLE_AI_API_KEY (default LLM provider is Gemini),
-# or switch LLM_PROVIDER=ollama | openai_compatible.
+# Edit .env — all LLM calls route through an OpenAI-compatible proxy by default.
+# Set model aliases (e.g. airag-main, airag-memory) on your proxy, then restart.
 
 # 1) (optional) GPU inference engines — OCR + intent/memory model
 docker compose -f docker-compose.vllm.yml up -d
@@ -117,8 +117,8 @@ question
 ### Chat agent (LangGraph supervisor)
 
 A single supervisor graph classifies intent **and** routes in one LLM call, with optional
-memory recall (Graphiti), multi-step decomposition, and a result evaluator that may
-re-route:
+memory recall (Graphiti and/or OpenViking via `NEXUSRAG_MEMORY_BACKEND`), multi-step
+decomposition, and a result evaluator that may re-route:
 
 ```
 START → query_analyzer → supervisor ─┬─ rag → answer_generator
@@ -141,6 +141,7 @@ executor** instead of the fixed intent→tool chain: the model is given the RAG 
 | **ChromaDB** | Dense vector embeddings — one collection per workspace |
 | **MinIO** | Raw uploads, parsed markdown, image captions (S3-compatible) |
 | **Neo4j** | LegalKG entity graph + Graphiti temporal memory |
+| **OpenViking** | Optional context-DB memory backend (per-user `viking://` memories, async LLM extraction) — see `docs/openviking.md` |
 | **Redis** | Optional shared cross-process state for multi-worker (Stop, GPU cap, cache) |
 | **LightRAG** | File-based graph (`data/lightrag/kb_{id}/`) when `HRAG_KG_MODE=lightrag` |
 
@@ -182,8 +183,11 @@ All settings come from `.env` (copy `.env.example`). Config keys use two prefixe
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_PROVIDER` | `gemini` | `gemini` \| `ollama` \| `openai_compatible` |
-| `GOOGLE_AI_API_KEY` | — | Required for Gemini |
+| `LLM_PROVIDER` | `openai_compatible` | `gemini` \| `ollama` \| `openai_compatible` |
+| `OPENAI_COMPATIBLE_BASE_URL` | `http://host.docker.internal:20128/v1` | Proxy endpoint for all LLM calls |
+| `OPENAI_COMPATIBLE_MODEL` | `airag-main` | Model alias resolved by the proxy |
+| `MEMORY_AGENT_BASE_URL` | `http://host.docker.internal:20128/v1` | Proxy endpoint for classify / KG / memory |
+| `MEMORY_AGENT_MODEL` | `airag-memory` | Smaller alias for agent/internal tasks |
 | `HRAG_ENABLED` | `true` | Use the hybrid retrieval service (vs. legacy) |
 | `HRAG_KG_MODE` | `legal` | `legal` (LegalKG/Neo4j) or `lightrag` |
 | `HRAG_ENABLE_KG` | `true` | Toggle KG extraction |
@@ -193,9 +197,29 @@ All settings come from `.env` (copy `.env.example`). Config keys use two prefixe
 | `HRAG_RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` | Cross-encoder reranker |
 | `HRAG_EMBED_RERANK_URL` | `` (empty) | Set → embed/rerank run in the `embed-rerank` GPU service (empty = in-process); compose defaults it to `http://embed-rerank:8090` |
 | `NEXUSRAG_LG_RAG_REACT` | `false` | Route RAG queries to the tool-calling ReAct executor |
+| `NEXUSRAG_MEMORY_BACKEND` | `graphiti` | Agent memory backend: `graphiti` \| `openviking` \| `both` \| `none` (see `docs/openviking.md`) |
+| `OPENVIKING_URL` | _(empty)_ | OpenViking server URL (compose: `http://openviking:1933`); empty = disabled |
 | `REDIS_ENABLED` | `false` | Enable the shared cross-process state layer |
 | `WEB_CONCURRENCY` | `1` | Backend worker processes (see [Scaling out](#scaling-out)) |
 | `AUTO_CREATE_TABLES` | `true` | Run inline schema migrations at startup |
+
+### LLM proxy setup (recommended)
+
+By default all workers and the backend call a single **OpenAI-compatible proxy**
+(`host.docker.internal:20128/v1`). You define **model aliases** in `.env`; the proxy
+routes each alias to the actual model:
+
+| Alias | Used for | Typical model size |
+|---|---|---|
+| `airag-main` | Chat, caption images/tables, answer generation | Medium–large |
+| `airag-memory` | Document classify, contextual embed, KG extract, memory facts | Small–medium |
+| `airag-thinking` | Supervisor intent classification & judge | Small–medium |
+
+**Switch models without rebuilding:** change the alias-to-model mapping on the
+proxy (e.g. LiteLLM, nginx, or a custom gateway). No container restart required.
+
+If you prefer direct endpoints instead of a proxy, edit `.env` and set each
+`BASE_URL` / `MODEL` to the real endpoint.
 
 See `.env.example` for the full set of options.
 
@@ -216,10 +240,12 @@ Published by `docker-compose.services.yml` (host → container):
 | RabbitMQ | `5672`, `15672` | Broker + management UI (guest/guest) |
 | MinIO | `9000`, `9001` | S3 API + console |
 | Neo4j | `7474`, `7687` | Browser + Bolt |
-| embed-rerank | `8090` | GPU embed + rerank microservice (scale-out offload) |
+| embed-rerank | `8090` | GPU embed + rerank microservice (scale-out offload); also serves OpenAI-compatible `/v1/embeddings` for OpenViking |
 | stt | `8091` | Whisper speech-to-text (CPU-only sidecar) |
+| OpenViking | `1933` | Optional context-DB memory server (backed by embed-rerank + memory-agent LLM) |
 | Grafana / Loki | `3000` / `3100` | Log dashboards + aggregation |
-| vLLM OCR / memory | `8001` / `8088` | From `docker-compose.vllm.yml` |
+| vLLM OCR / memory | `8001` / `8088` | From `docker-compose.vllm.yml` (optional) |
+| LLM proxy | `20128` | OpenAI-compatible proxy on host (optional, set in `.env`) |
 
 ---
 
@@ -232,8 +258,10 @@ faster-whisper (STT) · Redis · RabbitMQ (aio-pika) · MinIO (aioboto3).
 **Frontend** — React 19 + TypeScript 5.9 · Vite 7 · TailwindCSS 4 · Zustand · React Query
 v5 · React Router v7 · react-markdown + KaTeX.
 
-**LLM providers** — Gemini (`gemini-2.5-flash`), Ollama, or any OpenAI-compatible endpoint
-(vLLM). The intent classifier / memory agent runs on a self-hosted vLLM model.
+**LLM providers** — Any OpenAI-compatible endpoint (vLLM, LiteLLM, Ollama with
+`/v1` suffix, etc.) routed through a proxy. Model aliases (`airag-main`,
+`airag-memory`, `airag-thinking`) are resolved by the proxy — no rebuild needed
+when switching models. Gemini and native Ollama are also supported.
 
 ---
 
