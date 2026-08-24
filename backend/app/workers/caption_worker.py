@@ -42,6 +42,12 @@ _CAPTION_SEMAPHORE = asyncio.Semaphore(settings.HRAG_CAPTION_CONCURRENCY)
 
 
 async def handle_caption(payload: dict) -> None:
+    # Config watch first: pick up WebUI LLM changes before resolving any
+    # provider (main / vision used by image+table captioning below).
+    # Fail-open — never blocks the message.
+    from app.workers.config_watch import ensure_fresh_config
+    await ensure_fresh_config()
+
     msg = CaptionMessage(**payload)
     logger.info(f"[caption_worker] doc={msg.document_id}")
 
@@ -215,7 +221,10 @@ async def _caption_images_concurrent(images: list[ExtractedImage]) -> None:
         "- If text is not clearly readable, say so."
     )
 
-    provider = get_llm_provider()
+    # Image captions use the dedicated 'vision' role (inherits 'main' unless
+    # an admin overrode it on the WebUI) so a text-only chat model doesn't
+    # silently disable image captioning.
+    provider = get_llm_provider(role="vision")
     if not provider.supports_vision():
         logger.warning("[caption_worker] LLM does not support vision — skipping image captions")
         return

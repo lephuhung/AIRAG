@@ -22,6 +22,7 @@ import {
   X,
   ScrollText,
   ScanText,
+  Cpu,
 } from "lucide-react";
 import { useWorkspaces } from "@/hooks/useWorkspaces";
 import { useMyTenants } from "@/hooks/useMyTenants";
@@ -91,6 +92,7 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle, isNarrow }: 
   const isAdminTenantsPage = location.pathname === "/admin/tenants";
   const isAdminDocTypesPage = location.pathname === "/admin/document-types";
   const isAdminAbbreviationsPage = location.pathname === "/admin/abbreviations";
+  const isAdminLlmConfigPage = location.pathname === "/admin/llm";
   const isAdminDashboardPage = location.pathname === "/admin/dashboard";
 
   return (
@@ -284,6 +286,19 @@ export const Sidebar = memo(function Sidebar({ collapsed, onToggle, isNarrow }: 
             >
               <BookMarked className="w-4 h-4 flex-shrink-0" />
               {!collapsed && <span className="truncate">{t("nav.admin.abbreviations")}</span>}
+            </button>
+            <button
+              onClick={() => navigate("/admin/llm")}
+              className={cn(
+                "w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm transition-colors",
+                isAdminLlmConfigPage
+                  ? "bg-primary/10 text-primary font-medium"
+                  : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+              )}
+              title={collapsed ? t("nav.admin.llm") : undefined}
+            >
+              <Cpu className="w-4 h-4 flex-shrink-0" />
+              {!collapsed && <span className="truncate">{t("nav.admin.llm")}</span>}
             </button>
             <button
               onClick={() => navigate("/system-logs")}

@@ -179,11 +179,16 @@ class EmbeddingService:
 _default_service: Optional[EmbeddingService] = None
 
 
-def get_embedding_service() -> EmbeddingService:
-    """Get or create the default embedding service."""
+def get_embedding_service(model_name: Optional[str] = None) -> EmbeddingService:
+    """Get or create the default embedding service.
+
+    ``model_name`` (optional) lets the pre-loader inject a WebUI override at
+    process start (restart-only semantics, plan §12.4). Callers that omit it
+    keep the .env-configured singleton.
+    """
     global _default_service
     if _default_service is None:
-        _default_service = EmbeddingService()
+        _default_service = EmbeddingService(model_name=model_name)
     return _default_service
 
 

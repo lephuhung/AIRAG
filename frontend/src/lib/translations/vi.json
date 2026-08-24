@@ -17,6 +17,7 @@
       "tenants": "Tổ chức",
       "document_types": "Loại tài liệu",
       "abbreviations": "Từ viết tắt",
+      "llm": "Mô hình LLM",
       "system_logs": "Nhật ký hoạt động"
     },
     "my_tenants": "Tổ chức của tôi",
@@ -784,6 +785,124 @@
     "cancel_failed": "Hủy xử lý tài liệu thất bại"
   },
   "admin": {
+    "llm": {
+      "title": "Cấu hình Mô hình LLM",
+      "subtitle": "Chọn model cho từng vai trò — không cần sửa .env hay restart",
+      "load_failed": "Không tải được cấu hình LLM",
+      "provider": "Provider",
+      "base_url": "Base URL",
+      "model": "Model",
+      "presets": {
+        "label": "Preset nhanh:"
+      },
+      "badge": {
+        "override": "Override DB",
+        "env": ".env default"
+      },
+      "vision": {
+        "inherit": "Dùng Main LLM (kế thừa)",
+        "inherit_hint": "Vision đang dùng chung model với Main LLM. Tắt chế độ này để chỉ định model vision riêng (vd: qwen2.5-vl, gemma3:12b, gemini-2.5-flash).",
+        "inherit_hint_short": "Kế thừa model Main LLM"
+      },
+      "api_key": {
+        "stored": "đang dùng key đã lưu",
+        "not_needed": "Ollama local không cần API key"
+      },
+      "models": {
+        "refresh": "Lấy lại danh sách model",
+        "failed_badge": "Không lấy được danh sách — nhập tay",
+        "loaded": "Đã tải {{count}} model từ endpoint"
+      },
+      "test": {
+        "button": "Kiểm tra kết nối",
+        "ok": "Kết nối OK · {{latency}}ms · {{count}} model",
+        "fail": "Kết nối thất bại: {{error}}",
+        "required_hint": "Phạm vi lưu: cần Kiểm tra kết nối thành công trước (server cũng tự test lại trước khi ghi).",
+        "fail_short": "Thất bại"
+      },
+      "reset": "Về mặc định",
+      "reset_confirm_title": "Xoá override?",
+      "reset_confirm_msg": "Role này sẽ quay về dùng cấu hình .env mặc định. Thao tác có hiệu lực ngay, không cần restart.",
+      "updated_at": "Cập nhật lúc {{date}}",
+      "role": {
+        "main": {
+          "title": "Main LLM",
+          "desc": "Sinh câu trả lời chat, direct answer, caption bảng trong tài liệu"
+        },
+        "vision": {
+          "title": "Vision",
+          "desc": "Caption ảnh trong tài liệu — nên là model hỗ trợ thị giác"
+        },
+        "thinking": {
+          "title": "Thinking",
+          "desc": "Định tuyến supervisor & ReAct judge của LangGraph agent"
+        },
+        "memory_agent": {
+          "title": "Memory Agent",
+          "desc": "Phân loại intent, condense follow-up, contextual embeddings"
+        },
+        "kg_extract": {
+          "title": "KG Extraction",
+          "desc": "Trích xuất thực thể & quan hệ kiến thức từ văn bản"
+        },
+        "graphiti": {
+          "title": "Graphiti Memory",
+          "desc": "Trích xuất fact/entity từ hội thoại vào temporal knowledge graph"
+        },
+        "stt": {
+          "title": "STT (Voice → Text)",
+          "desc": "Chuyển giọng nói thành văn bản (Whisper / OpenAI-compatible)"
+        },
+        "tts": {
+          "title": "TTS (Text → Voice)",
+          "desc": "Đọc câu trả lời thành giọng nói"
+        },
+        "embedding": {
+          "title": "Embedding",
+          "desc": "Vector hoá chunk tài liệu cho tìm kiếm — đổi model cần restart + reindex"
+        },
+        "rerank": {
+          "title": "Reranker",
+          "desc": "Xếp hạng lại đoạn trích sau khi tìm vector/BM25 — đổi model cần restart"
+        }
+      },
+      "toast": {
+        "saved": "Đã lưu cấu hình — có hiệu lực ngay không cần restart",
+        "save_failed": "Lưu thất bại",
+        "reset": "Đã xoá override — quay về cấu hình .env",
+        "reset_failed": "Xoá override thất bại"
+      },
+      "v2": {
+        "conn_title": "Kết nối Models",
+        "conn_desc": "Khai báo endpoint + API key một lần — các nhiệm vụ bên dưới chỉ chọn và dùng",
+        "add_conn": "Thêm kết nối",
+        "edit_conn": "Sửa kết nối",
+        "delete_conn": "Xoá",
+        "delete_confirm_title": "Xoá kết nối này?",
+        "delete_confirm_msg": "Kết nối \"{name}\" sẽ bị xoá. Nếu còn nhiệm vụ đang dùng, hệ thống sẽ yêu cầu gán lại trước.",
+        "name": "Tên kết nối",
+        "is_vllm": "Server là vLLM (gửi chat_template_kwargs)",
+        "is_vllm_hint": "Chỉ bật với endpoint chạy vLLM trực tiếp. Tắt nếu gặp lỗi 400 Unknown parameter (OpenAI thật, một số proxy nghiêm ngặt).",
+        "loading_models": "Đang tải danh sách model…",
+        "no_conns": "Chưa có kết nối nào — bấm \"Thêm kết nối\" để khai báo endpoint đầu tiên.",
+        "conn_saved": "Đã lưu kết nối",
+        "conn_deleted": "Đã xoá kết nối",
+        "conn_delete_blocked": "Không xoá được — đang được dùng bởi: {{roles}}. Gán các nhiệm vụ đó sang kết nối khác hoặc về .env trước.",
+        "delete_failed": "Xoá kết nối thất bại",
+        "used_by": "Đang dùng: {{roles}}",
+        "assign_title": "Phân công nhiệm vụ",
+        "assign_desc": "Mỗi nhiệm vụ chọn 1 kết nối + 1 model phù hợp từ danh sách của kết nối đó",
+        "env_option": "Theo .env",
+        "env_model_hint": "Theo cấu hình .env",
+        "env_running": ".env đang chạy",
+        "env_override_warning": "Đang ghi đè model của .env — giữ nguyên provider/url/key từ .env, chỉ đổi model. Có hiệu lực ngay khi lưu.",
+        "type_model": "Nhập tên model (endpoint không cho phép liệt kê)",
+        "pick_model": "Chọn hoặc nhập model…",
+        "assigned": "Đã phân công nhiệm vụ",
+        "banner_embedding": "Đổi model embedding chỉ áp dụng sau RESTART backend, và PHẢI reindex vector vì dimension thay đổi.",
+        "banner_rerank": "Đổi model rerank chỉ áp dụng sau RESTART backend."
+      }
+    },
     "dashboard": {
       "title": "Bảng điều khiển hệ thống",
       "subtitle": "Tổng quan về việc sử dụng và các thông số hệ thống",

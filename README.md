@@ -196,8 +196,31 @@ All settings come from `.env` (copy `.env.example`). Config keys use two prefixe
 | `REDIS_ENABLED` | `false` | Enable the shared cross-process state layer |
 | `WEB_CONCURRENCY` | `1` | Backend worker processes (see [Scaling out](#scaling-out)) |
 | `AUTO_CREATE_TABLES` | `true` | Run inline schema migrations at startup |
+| `SETTING_ENCRYPTION_KEY` | `` | Fernet key for API keys stored in `system_settings` (empty = derived from `JWT_SECRET_KEY`) |
 
 See `.env.example` for the full set of options.
+
+### Runtime LLM config (WebUI)
+
+LLM models can be re-assigned per task from the admin UI (`/admin/llm`, superadmin
+only) **without touching `.env` or restarting**: `.env` remains the default and
+DB rows in the `system_settings` table act as overrides. Two levels:
+
+- **Connections** (`llm_conn.*`): an endpoint declared once (provider, base_url,
+  api_key — Fernet-encrypted at rest). Defaults for services in the Docker
+  network are seeded automatically at startup (`vllm-main`, `vllm-memory`,
+  `embed-rerank`, `stt-whisper`, `tts-omnivoice`, …; unreachable hosts are
+  skipped). Seeding is idempotent — user edits are never overwritten.
+- **Assignments** (`llm_role.*`): each role (`main`, `vision`, `thinking`,
+  `memory_agent`, `kg_extract`, `graphiti`, `stt`, `tts`, `embedding`, `rerank`)
+  picks a connection + model. Embedding/rerank overrides apply on **restart**
+  (GPU preload + vector dimension constraints); all other roles take effect on
+  the next request/message.
+
+Propagation is version-based: every write bumps `_config_version`; the backend
+refreshes its in-process snapshot via a throttled middleware (~1 check/s) and
+workers check the version at the start of each message (`config_watch.py`).
+Design details: `docs/plan-llm-runtime-config.md`.
 
 ---
 

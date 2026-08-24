@@ -24,6 +24,7 @@ from app.api.integrations import router as integrations_router
 from app.api.tts import router as tts_router
 from app.api.stt import router as stt_router
 from app.api.ocr import router as ocr_router
+from app.api.llm_config import router as llm_config_router
 
 api_router = APIRouter()
 api_router.include_router(auth_router)
@@ -46,3 +47,4 @@ api_router.include_router(integrations_router)
 api_router.include_router(tts_router)
 api_router.include_router(stt_router)
 api_router.include_router(ocr_router)
+api_router.include_router(llm_config_router)

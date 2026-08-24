@@ -18,6 +18,7 @@ from app.models.integration import (
 )
 from app.models.audit_log import AuditLog
 from app.models.agent_trace import AgentTrace
+from app.models.system_setting import SystemSetting
 
 __all__ = [
     "KnowledgeBase",
@@ -41,4 +42,5 @@ __all__ = [
     "TelegramLinkCode",
     "AuditLog",
     "AgentTrace",
+    "SystemSetting",
 ]

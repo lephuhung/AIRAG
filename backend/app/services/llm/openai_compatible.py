@@ -95,6 +95,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         api_key: str = "none",
         *,
         alias_model: bool = False,
+        is_vllm: bool = False,
     ):
         self._base_url = base_url.rstrip("/")
         self._model = model
@@ -103,6 +104,10 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         # name on requests and expose it as our canonical model id (Langfuse /
         # logs), ignoring whatever upstream id the gateway echoes back.
         self._alias_model = alias_model
+        # When True, send the vLLM-only ``chat_template_kwargs`` extra_body
+        # (thinking toggle). Strict third-party APIs (OpenAI, DeepSeek, …)
+        # reject unknown params with 400 — keep this OFF for those endpoints.
+        self._is_vllm = is_vllm
         self._sync_client_instance: Optional[object] = None
         self._async_client_instance: Optional[object] = None
         # Token usage from the most recent call — read by the Langfuse tracing
@@ -158,6 +163,16 @@ class OpenAICompatibleLLMProvider(LLMProvider):
             text = _THINK_RE.sub("", text).strip()
         return text
 
+    def _thinking_extra(self, think: bool) -> dict:
+        """extra_body kwargs for the thinking toggle — vLLM servers only.
+
+        Returns {} for non-vLLM endpoints so strict OpenAI-compatible APIs
+        never receive the vLLM-only ``chat_template_kwargs`` parameter.
+        """
+        if not self._is_vllm:
+            return {}
+        return {"extra_body": {"chat_template_kwargs": {"enable_thinking": think}}}
+
     @staticmethod
     def _parse_xml_tool_call(xml_str: str) -> dict | None:
         """Fallback parser for Qwen-style XML tool calls: <function=name><parameter=key>val</parameter></function>"""
@@ -193,7 +208,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                 messages=oai_msgs,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                extra_body={"chat_template_kwargs": {"enable_thinking": think}},
+                **self._thinking_extra(think),
             )
             self._last_usage = self._usage_dict(getattr(response, "usage", None))
             content = response.choices[0].message.content or ""
@@ -221,7 +236,7 @@ class OpenAICompatibleLLMProvider(LLMProvider):
                 messages=oai_msgs,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                extra_body={"chat_template_kwargs": {"enable_thinking": think}},
+                **self._thinking_extra(think),
             )
             self._last_usage = self._usage_dict(getattr(response, "usage", None))
             content = response.choices[0].message.content or ""
@@ -276,7 +291,8 @@ class OpenAICompatibleLLMProvider(LLMProvider):
         if tool_choice:
             kwargs["tool_choice"] = tool_choice
         # Qwen3.5 vLLM: use chat_template_kwargs to control thinking
-        kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": think}}
+        if self._is_vllm:
+            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": think}}
 
         try:
             client = self._async_client()

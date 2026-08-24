@@ -18,14 +18,63 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_restart_only_models() -> tuple[Optional[str], Optional[str]]:
+    """WebUI overrides for embedding/rerank roles (plan §12.4).
+
+    RESTART-ONLY semantics: read ONCE here, before any model is constructed.
+    Returns ``(embedding_model, reranker_model)`` — None entries mean "use the
+    .env default". A big warning is logged because changing the embedding
+    model invalidates existing vector dimensions (full reindex required).
+    """
+    embedding_model: Optional[str] = None
+    reranker_model: Optional[str] = None
+    try:
+        from app.services.runtime_config import get_effective_sync
+
+        emb_cfg = get_effective_sync("embedding")
+        rr_cfg = get_effective_sync("rerank")
+        if emb_cfg.source == "db" and emb_cfg.model:
+            embedding_model = emb_cfg.model
+            logger.warning(
+                "[preload] EMBEDDING model overridden via WebUI → %r "
+                "(restart semantics applied now; changing dimensions vs the "
+                "indexed corpus REQUIRES a full reindex)",
+                embedding_model,
+            )
+        if rr_cfg.source == "db" and rr_cfg.model:
+            reranker_model = rr_cfg.model
+            logger.warning(
+                "[preload] RERANKER model overridden via WebUI → %r "
+                "(restart semantics applied now)",
+                reranker_model,
+            )
+        if emb_cfg.source == "db" and emb_cfg.base_url:
+            logger.info(
+                "[preload] embedding connection base_url=%s noted (local "
+                "SentenceTransformer loading ignores it; remote embed-rerank "
+                "mode still uses HRAG_EMBED_RERANK_URL)",
+                emb_cfg.base_url,
+            )
+    except Exception as exc:
+        logger.warning(
+            f"[preload] runtime-config model overrides unavailable ({exc}) — using .env"
+        )
+    return embedding_model, reranker_model
 
 
 def preload_models() -> None:
     """Eagerly load Embedding + Reranker models used by the API server."""
     t0 = time.time()
     from app.core.config import settings
+
+    # WebUI embedding/rerank overrides — restart-only, resolved before any
+    # model construction (plan §12.4).
+    emb_override, rr_override = _resolve_restart_only_models()
 
     # In remote embed/rerank mode the models live in the hrag-embed-rerank
     # service — this process must NOT load them (it holds no GPU state).
@@ -37,7 +86,7 @@ def preload_models() -> None:
         # 1. Embedding model (sentence-transformers)
         from app.services.embedding.embedder import get_embedding_service
 
-        emb = get_embedding_service()
+        emb = get_embedding_service(model_name=emb_override)
         _ = emb.model  # triggers lazy load
         logger.info(f"[preload] Embedding model ready ({emb.model_name})")
         # Warmup: encode dummy texts to initialize CUDA kernels
@@ -46,7 +95,7 @@ def preload_models() -> None:
         # 2. Reranker model (cross-encoder)
         from app.services.retrieval.reranker import get_reranker_service
 
-        rr = get_reranker_service()
+        rr = get_reranker_service(model_name=rr_override)
         _ = rr.model  # triggers lazy load
         logger.info(f"[preload] Reranker model ready ({rr.model_name})")
         # Warmup: score dummy pairs to initialize CUDA kernels
@@ -96,10 +145,12 @@ def preload_worker_models(worker_type: str) -> None:
         if settings.HRAG_EMBED_RERANK_URL:
             logger.info("[preload] remote embed/rerank mode — skipping local embedder")
         else:
-            # Embedding model (same as retrieval)
+            # Embedding model (same as retrieval) — WebUI override applies at
+            # worker start too (restart-only semantics, plan §12.4).
             from app.services.embedding.embedder import get_embedding_service
 
-            emb = get_embedding_service()
+            w_emb, _w_rr = _resolve_restart_only_models()
+            emb = get_embedding_service(model_name=w_emb)
             _ = emb.model
             logger.info(f"[preload] Embedding model ready ({emb.model_name})")
 

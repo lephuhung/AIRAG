@@ -1,4 +1,17 @@
 import { useAuthStore } from "@/stores/authStore";
+import type {
+  ConnectionDeleteResult,
+  ConnectionSaveResult,
+  ConnectionUpsertPayload,
+  LlmConfigState,
+  LlmModelsRequest,
+  LlmModelsResponse,
+  LlmRole,
+  LlmTestRequest,
+  LlmTestResult,
+  RoleAssignPayload,
+  RoleAssignResult,
+} from "@/types/llmConfig";
 
 const BASE_URL = import.meta.env.VITE_API_URL || "/api/v1";
 
@@ -146,8 +159,8 @@ class ApiClient {
     });
   }
 
-  delete(path: string) {
-    return this.request(path, { method: "DELETE" });
+  delete<T = unknown>(path: string) {
+    return this.request(path, { method: "DELETE" }) as Promise<T>;
   }
 
   async downloadFile(path: string, filename: string): Promise<void> {
@@ -281,6 +294,57 @@ class ApiClient {
       throw new Error(detail);
     }
     return JSON.parse(res.body);
+  }
+
+  // ── Admin: LLM runtime config V2 (/admin/llm-config) ───────────────────
+
+  getLlmConfig() {
+    return this.get<LlmConfigState>("/admin/llm-config");
+  }
+
+  /** Save a connection (endpoint + key). Blank api_key keeps the stored one. */
+  saveConnection(connId: string, payload: ConnectionUpsertPayload) {
+    return this.put<ConnectionSaveResult>(
+      `/admin/llm-config/connections/${encodeURIComponent(connId)}`,
+      payload,
+    );
+  }
+
+  /** Delete a connection. force=true also clears referencing role assignments. */
+  deleteConnection(connId: string, force = false) {
+    return this.delete<ConnectionDeleteResult>(
+      `/admin/llm-config/connections/${encodeURIComponent(connId)}${
+        force ? "?force=true" : ""
+      }`,
+    );
+  }
+
+  /** Assign a connection (+ model) to a role — V2 shape {conn_id, model}. */
+  updateLlmConfig(role: LlmRole, payload: RoleAssignPayload) {
+    return this.put<RoleAssignResult>(`/admin/llm-config/${role}`, payload);
+  }
+
+  /** Clear a role's assignment override → back to .env defaults. */
+  deleteLlmConfigOverride(role: LlmRole) {
+    return this.delete<{ role: string; cleared: boolean }>(
+      `/admin/llm-config/${role}`,
+    );
+  }
+
+  /** Test a full candidate config before saving. Server pings the real endpoint. */
+  testLlmConfig(payload: LlmTestRequest) {
+    return this.post<LlmTestResult>("/admin/llm-config/test", payload);
+  }
+
+  /** Light model listing only — no completion ping, no save.
+   *  Accepts {conn_id} or raw {provider, base_url, api_key}. */
+  listLlmModels(payload: LlmModelsRequest) {
+    return this.post<LlmModelsResponse>("/admin/llm-config/models", payload);
+  }
+
+  /** Model catalogue for one stored connection (credentials resolved server-side). */
+  listLlmModelsByConn(connId: string) {
+    return this.listLlmModels({ conn_id: connId });
   }
 
   async uploadFile<T>(

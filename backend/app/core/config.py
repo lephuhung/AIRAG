@@ -504,6 +504,11 @@ class Settings(BaseSettings):
 
     # Authentication (JWT)
     JWT_SECRET_KEY: str = Field(default="change-me-in-production-use-a-real-secret-key")
+    # Master key for encrypting LLM API keys stored in the system_settings table
+    # (WebUI runtime LLM config). Empty → derived from JWT_SECRET_KEY with a
+    # fixed info string. Rotating/losing this key invalidates stored API keys —
+    # decrypt failures fail-open to the .env defaults (see runtime_config.py).
+    SETTING_ENCRYPTION_KEY: str = Field(default="")
     JWT_ALGORITHM: str = Field(default="HS256")
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=30)
     JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=7)

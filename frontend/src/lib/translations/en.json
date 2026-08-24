@@ -17,6 +17,7 @@
       "tenants": "Tenants",
       "document_types": "Document Types",
       "abbreviations": "Abbreviations",
+      "llm": "LLM Models",
       "system_logs": "Activity Log"
     },
     "my_tenants": "My Tenants",
@@ -793,6 +794,124 @@
     "top_entities": "Top Entities"
   },
   "admin": {
+    "llm": {
+      "title": "LLM Model Configuration",
+      "subtitle": "Pick a model per role — no .env edits, no restarts",
+      "load_failed": "Failed to load LLM configuration",
+      "provider": "Provider",
+      "base_url": "Base URL",
+      "model": "Model",
+      "presets": {
+        "label": "Quick presets:"
+      },
+      "badge": {
+        "override": "DB override",
+        "env": ".env default"
+      },
+      "vision": {
+        "inherit": "Use Main LLM (inherit)",
+        "inherit_hint": "Vision currently shares the Main LLM model. Turn this off to point it at a dedicated vision model (e.g. qwen2.5-vl, gemma3:12b, gemini-2.5-flash).",
+        "inherit_hint_short": "Inherits the Main LLM model"
+      },
+      "api_key": {
+        "stored": "stored key in use",
+        "not_needed": "Local Ollama needs no API key"
+      },
+      "models": {
+        "refresh": "Reload model list",
+        "failed_badge": "Could not list models — type manually",
+        "loaded": "Loaded {{count}} models from endpoint"
+      },
+      "test": {
+        "button": "Test connection",
+        "ok": "Connected · {{latency}}ms · {{count}} models",
+        "fail": "Connection failed: {{error}}",
+        "required_hint": "Save requires a successful Test first (the server re-tests before writing).",
+        "fail_short": "Failed"
+      },
+      "reset": "Reset",
+      "reset_confirm_title": "Remove override?",
+      "reset_confirm_msg": "This role will fall back to the default .env configuration. Takes effect immediately, no restart needed.",
+      "updated_at": "Updated {{date}}",
+      "role": {
+        "main": {
+          "title": "Main LLM",
+          "desc": "Chat answer generation, direct answers, table captioning"
+        },
+        "vision": {
+          "title": "Vision",
+          "desc": "Image captioning during indexing — should be a vision-capable model"
+        },
+        "thinking": {
+          "title": "Thinking",
+          "desc": "LangGraph supervisor routing & ReAct judge"
+        },
+        "memory_agent": {
+          "title": "Memory Agent",
+          "desc": "Intent classification, follow-up condensing, contextual embeddings"
+        },
+        "kg_extract": {
+          "title": "KG Extraction",
+          "desc": "Entity & relation extraction for the knowledge graph"
+        },
+        "graphiti": {
+          "title": "Graphiti Memory",
+          "desc": "Fact/entity extraction from conversations into the temporal knowledge graph"
+        },
+        "stt": {
+          "title": "STT (Voice → Text)",
+          "desc": "Speech-to-text transcription (Whisper / OpenAI-compatible)"
+        },
+        "tts": {
+          "title": "TTS (Text → Voice)",
+          "desc": "Reads answers aloud"
+        },
+        "embedding": {
+          "title": "Embedding",
+          "desc": "Vectorises document chunks for retrieval — changing needs restart + reindex"
+        },
+        "rerank": {
+          "title": "Reranker",
+          "desc": "Re-ranks retrieved chunks after vector/BM25 search — changing needs restart"
+        }
+      },
+      "toast": {
+        "saved": "Configuration saved — effective immediately, no restart",
+        "save_failed": "Failed to save",
+        "reset": "Override removed — back to .env defaults",
+        "reset_failed": "Failed to remove override"
+      },
+      "v2": {
+        "conn_title": "Model Connections",
+        "conn_desc": "Declare an endpoint + API key once — tasks below just pick and use it",
+        "add_conn": "Add connection",
+        "edit_conn": "Edit connection",
+        "delete_conn": "Delete",
+        "delete_confirm_title": "Delete this connection?",
+        "delete_confirm_msg": "Connection \"{name}\" will be removed. If any task still uses it, you must reassign first.",
+        "name": "Connection name",
+        "is_vllm": "Server is a vLLM instance (sends chat_template_kwargs)",
+        "is_vllm_hint": "Enable only for direct vLLM endpoints. Disable on strict APIs that reject unknown params (OpenAI itself, some proxies).",
+        "loading_models": "Loading model list…",
+        "no_conns": "No connections yet — click \"Add connection\" to declare your first endpoint.",
+        "conn_saved": "Connection saved",
+        "conn_deleted": "Connection deleted",
+        "conn_delete_blocked": "Cannot delete — still referenced by: {{roles}}. Reassign those tasks or set them back to .env first.",
+        "delete_failed": "Failed to delete connection",
+        "used_by": "Used by: {{roles}}",
+        "assign_title": "Task Assignments",
+        "assign_desc": "Each task picks one connection + one model from its catalogue",
+        "env_option": "Follow .env",
+        "env_model_hint": "Following .env config",
+        "env_running": ".env running",
+        "env_override_warning": "Overriding the .env model — provider/url/key still come from .env, only the model changes. Takes effect on save.",
+        "type_model": "Type a model name (endpoint hides its catalogue)",
+        "pick_model": "Pick or type a model…",
+        "assigned": "Assignment saved",
+        "banner_embedding": "Changing the embedding model only applies after a backend RESTART and REQUIRES vector reindexing (dimension changes).",
+        "banner_rerank": "Changing the rerank model only applies after a backend restart."
+      }
+    },
     "dashboard": {
       "title": "System Dashboard",
       "subtitle": "Overview of usage and system parameters",

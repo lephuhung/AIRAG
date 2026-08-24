@@ -767,6 +767,22 @@ async def lifespan(app: FastAPI):
         except Exception as _redis_err:
             logger.warning(f"Redis warmup failed (non-fatal): {_redis_err}")
 
+    # ── Runtime LLM config: load DB overrides into the snapshot cache ─────
+    # Without this, a restarted backend (or any uvicorn worker that did not
+    # serve the original PUT) would silently ignore admin-saved overrides
+    # and fall back to .env defaults on every chat request.
+    try:
+        from app.services.runtime_config import ensure_default_connections, refresh_snapshot
+
+        if await refresh_snapshot():
+            logger.info("[runtime_config] DB LLM overrides loaded at startup")
+        seeded = await ensure_default_connections()
+        if seeded:
+            logger.info(f"[runtime_config] default connections seeded: {seeded}")
+            await refresh_snapshot()
+    except Exception as _rc_err:
+        logger.warning(f"[runtime_config] startup refresh failed (using .env): {_rc_err}")
+
     yield
     logger.info("Shutting down...")
     await engine.dispose()
@@ -809,6 +825,20 @@ app.add_middleware(
 from app.middleware.audit import AuditMiddleware  # noqa: E402
 
 app.add_middleware(AuditMiddleware)
+
+
+@app.middleware("http")
+async def runtime_config_refresh_middleware(request, call_next):
+    """Keep the runtime-config snapshot fresh across API processes.
+
+    Throttled to ~1 version-check/second/process (cheap clock gate in
+    runtime_config.maybe_refresh); multi-process deployments see admin
+    config changes within one request of the DB version bump.
+    """
+    from app.services.runtime_config import maybe_refresh
+
+    await maybe_refresh()
+    return await call_next(request)
 
 
 @app.exception_handler(Exception)

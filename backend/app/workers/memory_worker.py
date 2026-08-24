@@ -36,6 +36,11 @@ async def handle_memory(payload: dict) -> None:
     retry. ``add_conversation_episode`` only raises on a real write failure;
     a turn with no extractable personal fact returns normally (acked, no retry).
     """
+    # Config watch first: pick up WebUI LLM changes before resolving any
+    # provider (graphiti/memory_agent). Fail-open — never blocks the message.
+    from app.workers.config_watch import ensure_fresh_config
+    await ensure_fresh_config()
+
     msg = MemorySaveMessage(**payload)
 
     if not str(msg.user_id).strip() or not msg.user_message.strip():

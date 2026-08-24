@@ -26,6 +26,18 @@ Finalization is checked once all three (embed/caption/kg) complete.
 Each worker also serves liveness/readiness on **:8081** — `GET /health`,
 `GET /ready`.
 
+### Runtime LLM config sync (`config_watch.py`)
+LLM models are assignable per task from the admin WebUI (see README "Runtime
+LLM config" and `docs/plan-llm-runtime-config.md`). Workers pick up changes
+WITHOUT restart: at the start of every message handler, caption/kg/memory/embed
+workers call `ensure_fresh_config()` which reads `_config_version` from the
+`system_settings` table and refreshes the in-process provider snapshot when it
+changed. Cost is one cheap SELECT per message; the check is fail-open (errors
+are logged and ignored — a config hiccup never kills a worker or drops a
+message). A job already in flight finishes with the previous model; the next
+message uses the new one. Embedding/rerank model overrides are the exception —
+they apply only on worker/backend restart (GPU preload + vector dimension).
+
 ## Control plane — pause/resume WITHOUT docker.sock
 
 Workers subscribe to the `hrag.control` fanout exchange

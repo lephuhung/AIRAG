@@ -30,6 +30,12 @@ logger = logging.getLogger(__name__)
 
 
 async def handle_kg(payload: dict) -> None:
+    # Config watch first: pick up WebUI LLM changes before resolving any
+    # provider (kg_extract / main via legal_kg + knowledge_graph services).
+    # Fail-open — never blocks the message.
+    from app.workers.config_watch import ensure_fresh_config
+    await ensure_fresh_config()
+
     msg = KGMessage(**payload)
     logger.info(
         f"[kg_worker] doc={msg.document_id} workspace={msg.workspace_id} "

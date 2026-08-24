@@ -158,9 +158,13 @@ class RerankerService:
 _default_service: Optional[RerankerService] = None
 
 
-def get_reranker_service() -> RerankerService:
-    """Get or create the default reranker service."""
+def get_reranker_service(model_name: Optional[str] = None) -> RerankerService:
+    """Get or create the default reranker service.
+
+    ``model_name`` (optional) lets the pre-loader inject a WebUI override at
+    process start (restart-only semantics, plan §12.4).
+    """
     global _default_service
     if _default_service is None:
-        _default_service = RerankerService()
+        _default_service = RerankerService(model_name=model_name)
     return _default_service

@@ -74,6 +74,9 @@ _IDENTITY_PATTERNS = re.compile(
 # ---------------------------------------------------------------------------
 
 _graphiti_client: Any | None = None  # graphiti_core.Graphiti
+# Runtime-config snapshot version the current client was built with (mutable
+# dict so the rebuild guard in get_graphiti_client() needs no extra global).
+_graphiti_config_version: dict = {"v": -1}
 
 
 # ---------------------------------------------------------------------------
@@ -152,8 +155,23 @@ def get_graphiti_client():
     SDK finds the key without needing a real OpenAI account.
     """
     global _graphiti_client
+
+    # Rebuild guard: when the admin changes the Graphiti LLM config via the
+    # WebUI (runtime-config version bump), drop the cached client so the next
+    # call rebuilds it with the new model/endpoint. Cheap — the constructor
+    # only stores config; Neo4j indices are created separately in
+    # initialize_graphiti() and are idempotent.
     if _graphiti_client is not None:
-        return _graphiti_client
+        from app.services.runtime_config import snapshot_version as _rt_version
+
+        if _graphiti_config_version.get("v") != _rt_version():
+            logger.info(
+                f"[graphiti] Runtime LLM config changed "
+                f"({_graphiti_config_version.get('v')} → {_rt_version()}) — rebuilding client"
+            )
+            _graphiti_client = None
+        else:
+            return _graphiti_client
 
     try:
         from graphiti_core import Graphiti
@@ -170,14 +188,20 @@ def get_graphiti_client():
     # We use our own configured key (defaults to "sk-nexusrag" for local endpoints).
     import os
 
-    if not os.environ.get("OPENAI_API_KEY"):
-        os.environ["OPENAI_API_KEY"] = settings.GRAPHITI_LLM_API_KEY
+    from app.services.runtime_config import get_effective_sync, snapshot_version
+
+    # Effective Graphiti LLM config: DB override (WebUI) over GRAPHITI_LLM_* env.
+    # Set UNCONDITIONALLY on every (re)build so a key rotated via the WebUI
+    # propagates to Graphiti's internal OpenAI-SDK consumers too.
+    _cfg = get_effective_sync("graphiti")
+    os.environ["OPENAI_API_KEY"] = _cfg.api_key
 
     llm_config = LLMConfig(
-        api_key=settings.GRAPHITI_LLM_API_KEY,
-        model=settings.GRAPHITI_LLM_MODEL,
-        base_url=settings.GRAPHITI_LLM_BASE_URL,
+        api_key=_cfg.api_key,
+        model=_cfg.model,
+        base_url=_cfg.base_url,
     )
+    globals()["_graphiti_config_version"]["v"] = snapshot_version()
     # max_tokens is the OUTPUT budget and MUST leave room for the INPUT within the
     # served model's context window. qwen-memory (vllm-memory:8088) has
     # max_model_len=8192. Setting the constructor default is NOT enough: Graphiti's
@@ -208,7 +232,7 @@ def get_graphiti_client():
     )
     logger.info(
         f"[graphiti] Client created — Neo4j: {settings.NEO4J_URI}, "
-        f"LLM: {settings.GRAPHITI_LLM_MODEL} @ {settings.GRAPHITI_LLM_BASE_URL}"
+        f"LLM: {_cfg.model} @ {_cfg.base_url} (source={_cfg.source})"
     )
     return _graphiti_client
 

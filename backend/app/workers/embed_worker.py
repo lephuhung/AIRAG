@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 
 
 async def handle_embed(payload: dict) -> None:
+    # Config watch first: pick up WebUI LLM changes before resolving any
+    # provider — in particular BEFORE contextual enrichment below, where
+    # contextual_embedder resolves the memory_agent LLM. Fail-open.
+    from app.workers.config_watch import ensure_fresh_config
+    await ensure_fresh_config()
+
     msg = EmbedMessage(**payload)
     logger.info(f"[embed_worker] doc={msg.document_id}")
 
