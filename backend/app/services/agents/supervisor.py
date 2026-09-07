@@ -1412,6 +1412,8 @@ async def supervisor_node(state: SupervisorState) -> dict:
                 _ctx_parts.append(f"Sections: {_qa_params['sections']}")
             if _qa_params.get("comparison_mode"):
                 _ctx_parts.append("Mode: COMPARISON (user wants to compare items)")
+            if state.get("needs_comparison"):
+                _ctx_parts.append("Comparison required: user wants to compare their context vs. document requirements")
             _ctx_parts.append("")
             _ctx_parts.append("Use this pre-analyzed context to inform your routing decision.")
             _ctx_parts.append("For multi-step queries, the system will handle step progression automatically.")
@@ -3468,7 +3470,15 @@ def route_from_resolve_doc(state: SupervisorState) -> str:
             logger.warning(f"[langfuse] route_from_resolve_doc span failed: {e}")
 
     # If we have a pending_intent from the supervisor's task_plan, continue with it
-    # even if resolve_doc couldn't fully resolve (ambiguous case)
+    # even if resolve_doc couldn't fully resolve (ambiguous case).
+    # FINISH precedence: when resolve_doc_agent explicitly set
+    # next_agent=FINISH (ambiguous/not-found; final answer already streamed),
+    # the graph MUST end regardless of pending_intent — otherwise the post-
+    # resolve_doc node re-runs and duplicates the streamed answer.
+    if next_agent == AgentType.FINISH:
+        logger.info("[LANGGRAPH_ROUTE] resolve_doc_agent -> END (not found / ambiguous)")
+        return END
+
     if pending_intent:
         logger.info(
             f"[route_from_resolve_doc] pending_intent={pending_intent!r}, "
@@ -3483,10 +3493,6 @@ def route_from_resolve_doc(state: SupervisorState) -> str:
         elif pending_intent == "summarize":
             logger.info("[LANGGRAPH_ROUTE] resolve_doc_agent -> answer_generator (pending summarize)")
             return "answer_generator"
-
-    if next_agent == AgentType.FINISH:
-        logger.info("[LANGGRAPH_ROUTE] resolve_doc_agent -> END (not found / ambiguous)")
-        return END
 
     if intent == "search_section" and section_ref:
         logger.info(f"[LANGGRAPH_ROUTE] resolve_doc_agent -> rag (has section_ref={section_ref!r})")

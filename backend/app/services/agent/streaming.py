@@ -325,7 +325,15 @@ async def stream_agent_events(
             elif ev_type == "token_rollback":
                 # Speculative answer tokens turned out to precede a tool call —
                 # discard them so the final `complete` answer stays clean.
+                # Also reset every other answer accumulator (sources, images,
+                # abbreviations, people_data) so the terminal ``complete`` event
+                # carries the cleared snapshot — pre-rollback artifacts must NOT
+                # survive into the persisted message / SSE relay.
                 final_answer = ""
+                all_sources = []
+                all_images = []
+                all_potentials = []
+                all_people_data = []
                 yield {"event": "token_rollback", "data": {}}
 
             elif ev_type == "thinking":

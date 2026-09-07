@@ -175,6 +175,14 @@ class SupervisorState(TypedDict, total=False):
     # Controls whether memory_recall → query_enricher runs before target agent
     needs_memory: bool
 
+    # Phase 5: Comparison flag (set by query_analyzer_node via regex on the
+    # user message: has_comparison AND has_personal). Read by
+    # supervisor_node so downstream nodes can render a comparison answer
+    # (user context vs. doc requirements). Without this declaration on
+    # SupervisorState, LangGraph's TypedDict key filtering silently drops
+    # the value between node boundaries — the regression this field pins.
+    needs_comparison: bool
+
     # Phase 4: Plan-Aware Supervisor
     # task_plan: ordered list of intents the supervisor plans to execute
     # e.g. ["resolve_doc", "search_section"] for "Tóm tắt điều 3 Luật ANM 2018"

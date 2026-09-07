@@ -220,7 +220,24 @@ async def delete_chat_session(
         )
         chat_upload_docs = chat_upload_docs_result.scalars().all()
 
+        # ── Authorization gate (Task 1 / B1) ────────────────────────────
+        # Read access to a shared workspace never grants deletion
+        # authority. ``_authorize_delete`` re-verifies ``uploaded_by`` per
+        # doc and the chat-upload / session-attached linkage; the
+        # destructive storage / RAG / DB delete paths below run ONLY on
+        # the returned ids. A doc owned by another uploader (e.g. a
+        # workspace-shared reference appearing in a message) is silently
+        # excluded — the helper logs the skip.
+        authorized_doc_ids = await _authorize_delete(
+            db,
+            user,
+            [doc.id for doc in chat_upload_docs],
+            caller_session_id=str(session_id),
+        )
+        authorized_doc_set = set(authorized_doc_ids)
         for doc in chat_upload_docs:
+            if doc.id not in authorized_doc_set:
+                continue
             # Delete from ChromaDB vector store
             try:
                 from app.services.retrieval.rag_service import get_rag_service
@@ -242,8 +259,11 @@ async def delete_chat_session(
                     logger.warning(f"[session/{session_id}] Failed to delete MinIO markdown {doc.markdown_s3_key}: {e}")
             # Delete DB record
             await db.delete(doc)
-        if chat_upload_docs:
-            logger.info(f"[session/{session_id}] Deleted {len(chat_upload_docs)} chat-upload documents")
+        deleted_count = len(authorized_doc_ids)
+        if deleted_count:
+            logger.info(
+                f"[session/{session_id}] Deleted {deleted_count} chat-upload documents"
+            )
 
     # Delete the session (cascade deletes ChatMessage, ChatFile, ExchangeSummary rows)
     await db.delete(session)
@@ -410,6 +430,164 @@ from app.schemas.rag import ChatRequest
 from app.api.chat_agent import _get_accessible_workspaces
 
 
+# ---------------------------------------------------------------------------
+# Attachment ACL + delete authorization helpers (Task 1 / B1).
+#
+# Background: the pre-existing ``delete_chat_session`` endpoint only
+# filtered chat-upload docs by ``is_chat_upload == True`` and was in
+# scope only because ``ChatSession.user_id == user.id``. The bug fixed
+# here is that an uploader's chat upload appearing in another user's
+# session (via shared workspace reference) could be deleted by that
+# other user. Rule B closes the hole by re-requiring
+# ``uploaded_by == user.id`` AT delete time, with the session id passed
+# in to ensure the doc was attached to THAT session.
+# ---------------------------------------------------------------------------
+
+
+async def _filter_accessible_document_ids(
+    db: AsyncSession,
+    user: User,
+    workspace_ids: list[uuid.UUID],
+    requested: list[uuid.UUID] | None,
+) -> list[uuid.UUID]:
+    """Intersection of ``requested`` with documents whose workspace is
+    in ``workspace_ids``. Returns the filtered list. Pure SQL — does
+    not call the LLM.
+
+    Used by ``chat_stream_session`` so a request referencing a doc the
+    user cannot access in their accessible workspaces is silently
+    dropped before the supervisor graph runs (prevents the graph from
+    operating on docs the user has no read access to).
+    """
+    if not requested:
+        return []
+    result = await db.execute(
+        select(Document).where(
+            Document.id.in_(requested),
+            Document.workspace_id.in_(workspace_ids),
+        )
+    )
+    accessible = {doc.id for doc in result.scalars().all()}
+    filtered = [d for d in requested if d in accessible]
+    dropped = [d for d in requested if d not in accessible]
+    if dropped:
+        logger.info(
+            "[user/%s] filtered out inaccessible doc_ids: %s",
+            user.id,
+            dropped,
+        )
+    return filtered
+
+
+async def _authorize_delete(
+    db: AsyncSession,
+    user: User,
+    document_ids: list[uuid.UUID],
+    *,
+    caller_session_id: str | None = None,
+) -> list[uuid.UUID]:
+    """Return the subset of ``document_ids`` the caller is permitted to
+    delete. Used by ``delete_chat_session`` to gate the destructive
+    storage / RAG / DB delete paths.
+
+    Authorization rules (a document is deletable ONLY when one applies):
+
+      A. ``Document.uploaded_by == user.id``
+         Direct ownership — the user uploaded the doc themselves;
+         unambiguous, no session linkage required.
+
+      B. ``Document.is_chat_upload == True
+         AND caller_session_id is provided
+         AND the doc was attached to a message in that session
+         AND the doc's ``uploaded_by`` == user.id``
+         Chat-upload via session-attached delete. ``caller_session_id``
+         prevents "any of the user's sessions" from qualifying a doc
+         that belongs to a different uploader — it must be attached to
+         the SPECIFIC session the caller is deleting.
+
+      C. Otherwise NOT deletable. The doc is excluded from the delete
+         set; a log line is emitted and the helper returns the
+         filtered list. The ChromaDB / MinIO / DB delete paths
+         operate ONLY on the returned ids.
+    """
+    if not document_ids:
+        return []
+
+    # Fetch all candidate docs in a single query.
+    result = await db.execute(
+        select(Document).where(Document.id.in_(document_ids))
+    )
+    docs_by_id = {doc.id: doc for doc in result.scalars().all()}
+
+    # Pre-fetch the message-document_ids for the caller's session (rule B
+    # requires that the doc was attached to a message IN THIS session).
+    session_attached_doc_ids: set[uuid.UUID] | None = None
+    if caller_session_id is not None:
+        try:
+            caller_uuid = uuid.UUID(str(caller_session_id))
+        except (ValueError, TypeError):
+            caller_uuid = None
+        if caller_uuid is not None:
+            msg_result = await db.execute(
+                select(ChatMessage.document_ids).where(
+                    ChatMessage.session_id == caller_uuid
+                )
+            )
+            session_attached_doc_ids = set()
+            for row in msg_result.scalars().all():
+                if not row:
+                    continue
+                for doc_id_str in row:
+                    try:
+                        session_attached_doc_ids.add(uuid.UUID(str(doc_id_str)))
+                    except (ValueError, TypeError):
+                        continue
+
+    deletable: list[uuid.UUID] = []
+    for doc_id in document_ids:
+        doc = docs_by_id.get(doc_id)
+        if doc is None:
+            # Already gone or never existed — skip silently.
+            continue
+        if doc.uploaded_by == user.id:
+            # Rule A: direct ownership — always deletable.
+            deletable.append(doc_id)
+            continue
+        if (
+            doc.is_chat_upload
+            and caller_session_id is not None
+            and session_attached_doc_ids is not None
+            and doc_id in session_attached_doc_ids
+        ):
+            # Rule B: chat upload attached to caller's session. Even
+            # though we got here, doc.uploaded_by != user.id (else rule A
+            # would've matched) — explicitly log and skip.
+            logger.info(
+                "[session/%s] DELETE skipped: doc=%s not owned by user=%s",
+                caller_session_id,
+                doc_id,
+                user.id,
+            )
+            continue
+        # Rule C: not deletable. Log the skip and the reason.
+        if caller_session_id is not None:
+            logger.info(
+                "[session/%s] DELETE skipped: doc=%s not owned by user=%s",
+                caller_session_id,
+                doc_id,
+                user.id,
+            )
+        else:
+            logger.info(
+                "[user/%s] DELETE skipped: doc=%s not owned by user=%s",
+                user.id,
+                doc_id,
+                user.id,
+            )
+
+    return deletable
+
+
 @router.post("/{session_id}/stream")
 async def chat_stream_session(
     session_id: str,
@@ -436,9 +614,16 @@ async def chat_stream_session(
     user_msg_id = f"msg_{uuid.uuid4().hex[:8]}"
 
     # Save user message
+    # Filter document_ids to only those in the caller's accessible
+    # workspaces — prevents the supervisor graph from operating on
+    # docs the user has no read access to. See _filter_accessible_document_ids.
+    workspace_ids = await _get_accessible_workspaces(db, user)
+    accessible_doc_ids = await _filter_accessible_document_ids(
+        db, user, workspace_ids, request.document_ids
+    )
     # Convert UUIDs to strings for JSON serialization
     doc_ids_json = (
-        [str(d) for d in request.document_ids] if request.document_ids else None
+        [str(d) for d in accessible_doc_ids] if accessible_doc_ids else None
     )
     user_msg = ChatMessage(
         session_id=session_id,
@@ -450,9 +635,6 @@ async def chat_stream_session(
     )
     db.add(user_msg)
     await db.commit()
-
-    # Get accessible workspaces for cross-workspace search
-    workspace_ids = await _get_accessible_workspaces(db, user)
 
     # Get system prompt
     from app.prompts.chat import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
@@ -852,6 +1034,15 @@ async def chat_stream_session(
                                     elif ev_type == "complete":
                                         if "answer" in ev_data:
                                             accumulated_text = ev_data["answer"]
+                                    elif ev_type == "token_rollback":
+                                        # The streaming core reset final_answer
+                                        # + sources + images on rollback; mirror
+                                        # the same clearing here so the inline
+                                        # / background persistence rows do NOT
+                                        # persist the pre-rollback draft.
+                                        accumulated_text = ""
+                                        final_sources = []
+                                        final_images = []
                                     elif ev_type == "potential_abbreviations":
                                         final_potential_abbreviations = ev_data.get(
                                             "abbreviations", []
