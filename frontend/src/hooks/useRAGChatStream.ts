@@ -509,13 +509,24 @@ export function useRAGChatStream(
                     break;
 
                   case "token_rollback":
-                    // Clear speculative tokens
+                    // Clear speculative tokens and all retractable artifacts
+                    // Per B5: token_rollback must clear localSources, localImages,
+                    // pendingSources, pendingImages, peopleData, potentialAbbreviations
                     bufferRef.current = "";
                     if (rafRef.current) {
                       cancelAnimationFrame(rafRef.current);
                       rafRef.current = undefined;
                     }
                     setStreamingContent("");
+                    // Clear all retractable artifacts
+                    localSources = [];
+                    localImages = [];
+                    localPeople = [];
+                    setPendingSources([]);
+                    setPendingImages([]);
+                    setPendingPeople([]);
+                    peopleDataRef.current = [];
+                    setPotentialAbbreviations([]);
                     break;
 
                   case "complete": {
