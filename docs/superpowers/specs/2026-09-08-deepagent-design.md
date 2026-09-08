@@ -2134,10 +2134,523 @@ if tool.name not in TOOL_ALLOWLIST:
 |---|----------|--------|
 | Q24 | Deep Agents release pin | **A** — Pin known-good + hard compat test gate |
 | Q25 | Pilot dataset construction | **A** — Manual annotation 20-30 cases (2-3 tuần SME) |
+| Q26 | Metrics path | **B** — Loki log-derived (no Prometheus) |
+| Q27 | Cohort model | **A** — `users.cohort_id` column + audit table + admin endpoint |
+| Q28 | AGENTS.md / CLAUDE.md policy | **C** — Hybrid: CLAUDE.md canonical, AGENTS.md = gitnexus + config shortcuts only |
 
 ---
 
-# Consolidated Open Items (O1-O37)
+# Section E — Canary + Rollout
+
+## E.1 Scope
+
+Per handoff §5E + proposal Phase 4: rollout plan SAU pilot đạt gate. Includes feature flags, admission cohorts, A/B testing, rollback, documentation.
+
+## E.2 Feature flags — 8 flags, 3 bundles
+
+**Bundle structure** (atomic per bundle per Q10.A):
+
+| Bundle | Flags | Phase | Atomic switch |
+|--------|-------|-------|---------------|
+| **Preprocessor bundle** | `NEXUSRAG_SEMANTIC_PREPROCESSOR` | Phase 1A | single env change + restart |
+| **Complexity bundle** | `NEXUSRAG_COMPLEXITY_SHADOW`, `NEXUSRAG_COMPLEXITY_ACTIVE` | Phase 1B | both, mutually exclusive |
+| **Deep Agent bundle** | `NEXUSRAG_DEEP_ENABLED`, `NEXUSRAG_DEEP_SHADOW`, `NEXUSRAG_AGENT_DEADLINE_SECONDS`, `NEXUSRAG_DEEP_MAX_PARALLEL`, `NEXUSRAG_DEEP_MAX_DOMAIN_CALLS` | Phase 2 | single env change + restart |
+
+**Flag list**:
+
+| Flag | Default | Bundle | Effect |
+|------|---------|--------|--------|
+| `NEXUSRAG_SEMANTIC_PREPROCESSOR` | `false` | Preprocessor | Enables semantic_preprocessor + SupervisorState extensions |
+| `NEXUSRAG_COMPLEXITY_SHADOW` | `false` | Complexity | Observe new classifier; route by legacy |
+| `NEXUSRAG_COMPLEXITY_ACTIVE` | `false` | Complexity | New classifier sole authority (mutually exclusive with SHADOW) |
+| `NEXUSRAG_DEEP_ENABLED` | `false` | Deep Agent | Enables deep_research_coordinator_node + edge |
+| `NEXUSRAG_DEEP_SHADOW` | `false` | Deep Agent | Deep Agent parallel; route by fallback |
+| `NEXUSRAG_AGENT_DEADLINE_SECONDS` | `28` | Deep Agent | Absolute deadline (handoff §3 initial) |
+| `NEXUSRAG_DEEP_MAX_PARALLEL` | `2` | Deep Agent | Max parallel branches |
+| `NEXUSRAG_DEEP_MAX_DOMAIN_CALLS` | `6` | Deep Agent | Max domain tool calls per run |
+
+**Dependency chain** (validated at startup, clear error message):
+
+```python
+class Settings(BaseSettings):
+    NEXUSRAG_SEMANTIC_PREPROCESSOR: bool = False
+    NEXUSRAG_COMPLEXITY_SHADOW: bool = False
+    NEXUSRAG_COMPLEXITY_ACTIVE: bool = False
+    NEXUSRAG_DEEP_ENABLED: bool = False
+    NEXUSRAG_DEEP_SHADOW: bool = False
+    NEXUSRAG_AGENT_DEADLINE_SECONDS: int = 28
+    NEXUSRAG_DEEP_MAX_PARALLEL: int = 2
+    NEXUSRAG_DEEP_MAX_DOMAIN_CALLS: int = 6
+
+    @model_validator(mode="after")
+    def _validate_flag_dependency_chain(self):
+        if self.NEXUSRAG_COMPLEXITY_ACTIVE and not self.NEXUSRAG_SEMANTIC_PREPROCESSOR:
+            raise ValueError("COMPLEXITY_ACTIVE requires SEMANTIC_PREPROCESSOR")
+        if self.NEXUSRAG_COMPLEXITY_SHADOW and not self.NEXUSRAG_SEMANTIC_PREPROCESSOR:
+            raise ValueError("COMPLEXITY_SHADOW requires SEMANTIC_PREPROCESSOR")
+        if self.NEXUSRAG_COMPLEXITY_SHADOW and self.NEXUSRAG_COMPLEXITY_ACTIVE:
+            raise ValueError("COMPLEXITY_SHADOW and COMPLEXITY_ACTIVE are mutually exclusive")
+        if self.NEXUSRAG_DEEP_ENABLED and not self.NEXUSRAG_COMPLEXITY_ACTIVE:
+            raise ValueError("DEEP_ENABLED requires COMPLEXITY_ACTIVE")
+        if self.NEXUSRAG_DEEP_SHADOW and self.NEXUSRAG_DEEP_ENABLED:
+            raise ValueError("DEEP_SHADOW and DEEP_ENABLED are mutually exclusive")
+        return self
+```
+
+**Flag snapshot at ingress** (NOT using `snapshot_version()` for flags):
+
+```python
+class FlagSnapshot(BaseModel):
+    semantic_preprocessor: bool
+    complexity_shadow: bool
+    complexity_active: bool
+    deep_enabled: bool
+    deep_shadow: bool
+    deadline_seconds: int
+    max_parallel: int
+    max_domain_calls: int
+    captured_at: float
+    process_pid: int
+
+def create_flag_snapshot(settings: Settings) -> FlagSnapshot:
+    return FlagSnapshot(
+        semantic_preprocessor=settings.NEXUSRAG_SEMANTIC_PREPROCESSOR,
+        # ... capture all 8
+        captured_at=time.time(),
+        process_pid=os.getpid(),
+    )
+
+# Persist with request metadata
+state["flag_snapshot"] = create_flag_snapshot(settings).model_dump()
+```
+
+**Hot flag reload — DEFERRED** (O45): Phase 2 uses **env-based flags + redeploy** (~2 min, NOT `<30s`). Aspirational `<30s` requires DB-backed settings + multi-worker pub/sub + ack. Document this in `docs/scaling.md` and `CLAUDE.md`.
+
+## E.3 Admission cohorts (Q27.A — `users.cohort_id` + audit)
+
+**Schema**:
+
+```python
+class User(Base):
+    # ... existing
+    cohort_id: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
+    cohort_assigned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+class CohortAudit(Base):
+    __tablename__ = "cohort_audit"
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id"))
+    cohort_id: Mapped[str] = mapped_column(String(64))
+    changed_by: Mapped[UUID] = mapped_column(ForeignKey("users.id"))
+    reason: Mapped[str] = mapped_column(String(256))
+    changed_at: Mapped[datetime] = mapped_column(server_default=func.now())
+```
+
+**Cohort definitions** in `system_settings`:
+
+```json
+{
+  "experiments": {
+    "deep_agent_canary": {
+      "version": "v1",
+      "stages": {
+        "E.0_internal": {"percent": 0, "eligible_only": false},
+        "E.1_5pct": {"percent": 5, "eligible_only": true},
+        "E.2_25pct": {"percent": 25, "eligible_only": true},
+        "E.3_50pct": {"percent": 50, "eligible_only": true},
+        "E.4_100pct": {"percent": 100, "eligible_only": true}
+      },
+      "salt": "deep_canary_v1_salt_2026_09_08",
+      "denominator": "deep_eligible_requests"
+    }
+  }
+}
+```
+
+**Deterministic sticky allocation**:
+
+```python
+import hashlib
+
+EXPERIMENT_SALT = "deep_canary_v1_salt_2026_09_08"
+
+def is_user_in_experiment(user_id: UUID, experiment_name: str, percent: int) -> bool:
+    """Stable hash allocation: user always in/out for given experiment+percent."""
+    user = get_user(user_id)
+    # 1. Manual override
+    if user.cohort_id == "force_in": return True
+    if user.cohort_id == "force_out": return False
+    # 2. Internal always-in
+    if user.is_superadmin or (user.cohort_id and user.cohort_id.startswith("internal_")):
+        return True
+    # 3. Hash allocation
+    h = hashlib.sha256(f"{user_id}:{EXPERIMENT_SALT}".encode()).digest()
+    bucket = int.from_bytes(h[:4], "big") % 100
+    return bucket < percent
+```
+
+**Denominator = deep-eligible requests** (NOT total traffic): only queries routed through new classifier count.
+
+## E.4 A/B testing — separate file `ab_deep_eval.py`
+
+```python
+# backend/scripts/ab_deep_eval.py (NEW — not extending ab_eval.py)
+"""A/B eval for Deep Agent compare_sections pilot.
+
+Drives SSE/LangGraph path (not /rag/debug-chat). Reports completion_status,
+grounding fail rate, late event rate.
+"""
+```
+
+**Frozen dataset** (Q25.A):
+
+```yaml
+# backend/tests/retrieval/datasets/deep_compare_sections_golden.yaml (NEW)
+# 30 manual + 20 adversarial = 50 unique cases (NO overlap; SME adjudication for borderline)
+# Frozen at Phase 2 prep; NEVER modified during A/B
+- id: dc_001
+  category: cross_document_compare
+  query: "So sánh Chương II NĐ 13/2023/NĐ-CP với Chương III NĐ 24/2018/QH14"
+  expected:
+    completion_status: complete
+    citations_min: 2
+    structural_comparison: true
+```
+
+**Makefile targets**:
+
+```makefile
+ab-deep:
+	cd backend && python scripts/ab_deep_eval.py \
+		--arm-a base --arm-b deep \
+		--queries tests/retrieval/datasets/deep_compare_sections_golden.yaml \
+		--workspace $(WORKSPACE) \
+		--output reports/ab_deep_base_$$(date +%s).json
+
+ab-deep-compare:
+	cd backend && python scripts/ab_deep_compare.py $(A) $(B) \
+		--output reports/ab_deep_diff_$$(date +%s).json
+```
+
+**Metrics**:
+
+| Metric | Numerator | Denominator |
+|--------|-----------|-------------|
+| `latency_p95` | n/a (percentile) | all requests |
+| `completion_status_rate{status}` | count by status | **deep-eligible requests** |
+| `grounding_fail_rate` | guard retracted | synthesis calls |
+| `citation_sanitizer_fail_rate` | sanitizer rejected | synthesis calls |
+| `late_event_rate` | events after terminal | total requests |
+| `cohort_adherence_rate` | routed by experiment rule | deep-eligible |
+
+**Per-report config snapshot** (handoff §8):
+
+```json
+{
+  "arm": "base|deep",
+  "flag_snapshot": {...},
+  "model_snapshot": {...},
+  "config_revision": "...",
+  "cold_cache": true|false,
+  "warm_cache": true|false,
+  "concurrency": N,
+  "workload": "deep_compare_sections_golden",
+  "dataset_version": "v1_frozen_2026_09_08",
+  "dataset_size": 50,
+  "deep_eligible_count": N,
+  "timestamp": "..."
+}
+```
+
+## E.5 Rollback strategy
+
+**Rollback matrix**:
+
+| Trigger | Action | Realistic time |
+|---------|--------|----------------|
+| Cross-workspace leak (1 case) | `NEXUSRAG_DEEP_ENABLED=false` in env + redeploy | ~2 min (env-based, NOT <30s until O45) |
+| Grounding guard fail accepted (>0) | Same | ~2 min |
+| Latency p95 >30s sustained | Same | ~2 min |
+| Late events after terminal (any) | Same + investigate | ~2 min |
+| Rollback persistence bug | Same + revert default + redeploy | ~2 min |
+
+**Smoke dataset** (`scripts/rollback_smoke.py`):
+
+```python
+SMOKE_DATASET = [
+    {"id": "smoke_01", "query": "Điều 5 văn bản X quy định gì?",
+     "expected_status": "complete", "max_latency_ms": 5000},
+    {"id": "smoke_02", "query": "Tìm NĐ 13/2023/NĐ-CP",
+     "expected_status": "complete", "max_latency_ms": 5000},
+    {"id": "smoke_03", "query": "Tóm tắt văn bản X",
+     "expected_status": "complete", "max_latency_ms": 10000},
+    {"id": "smoke_04", "query": "Xin chào",
+     "expected_status": "complete", "max_latency_ms": 2000},
+    {"id": "smoke_05", "query": "Điều 5 và Điều 7 của X khác nhau thế nào?",
+     "expected_status": "complete", "max_latency_ms": 10000},
+]
+# Run via /rag/debug-chat with NEXUSRAG_DEEP_ENABLED=false
+```
+
+**Backward-compat migration test**:
+
+```python
+# backend/tests/migrations/test_deepagent_backward_compat.py (NEW)
+def test_semantic_context_column_nullable_and_writable():
+    """Base arm writes rows; semantic_context column stays NULL or any value."""
+    with NEXUSRAG_SEMANTIC_PREPROCESSOR=false:
+        chat = create_chat_message(metadata={})
+        assert chat.metadata.get("semantic_context") is None
+
+def test_routing_trace_column_nullable():
+    with NEXUSRAG_SEMANTIC_PREPROCESSOR=false:
+        trace = create_agent_trace(routing_trace=None)
+        assert trace.routing_trace is None
+
+def test_preprocessor_marker_column_nullable():
+    with NEXUSRAG_SEMANTIC_PREPROCESSOR=false:
+        state = build_initial_state(messages=...)
+        assert state.get("_preprocessor_marker") is None
+```
+
+**Late-event producer-side prevention**:
+
+```python
+class StreamingContext:
+    def __init__(self):
+        self.terminal_emitted = asyncio.Event()
+        self._producer_queue = asyncio.Queue()
+
+    async def push_event(self, ev):
+        if self.terminal_emitted.is_set():
+            logger.warning("late event after terminal: %s", ev)
+            structlog.get_logger().error("deep_agent_late_event", run_id=..., event_type=...)
+            return  # do NOT emit
+        await self._producer_queue.put(ev)
+
+    async def emit_terminal(self, ev):
+        async with self._terminal_lock:
+            await self._producer_queue.put(ev)
+            self.terminal_emitted.set()
+```
+
+**Base arm validation** (`scripts/validate_base_arm.py`):
+
+```python
+PRE_DEEP_REPORT_PATH = "tests/reports/ab_base_pre_deepagent_v0.json"  # frozen
+TOLERANCES = {
+    "latency_p95": {"max_increase_ms": 500, "max_increase_pct": 10},
+    "completion_status_rate{complete}": {"min": 0.85},
+    "completion_status_rate{error}": {"max": 0.05},
+}
+# Fail (exit non-zero) if base arm regresses vs pre-deep report
+```
+
+## E.6 Documentation updates (Q28.C)
+
+**Policy** (Q28.C — hybrid):
+- `CLAUDE.md` is **canonical** for architecture, agents, config flags, conventions.
+- `AGENTS.md` contains ONLY: (a) gitnexus guidance (impact/detect_changes rules), (b) critical config shortcuts (env var names for grep), (c) explicit pointer to CLAUDE.md for architecture.
+- **No duplication** of architecture/conventions in AGENTS.md.
+
+**Per-phase atomic updates**:
+
+```bash
+# Example: when enabling NEXUSRAG_SEMANTIC_PREPROCESSOR
+git commit -m "feat(phase1a): enable semantic preprocessor
+
+Code: semantic_preprocessor.py + tests
+Docs: README.md, CLAUDE.md (config table), .env.example,
+      docs/harness.md (test target)
+AGENTS.md: no change (pointer already exists)
+"
+```
+
+**`CLAUDE.md` config table** (when each flag is implemented):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NEXUSRAG_SEMANTIC_PREPROCESSOR` | `false` | Enables semantic_preprocessor node + SupervisorState extensions |
+| `NEXUSRAG_COMPLEXITY_SHADOW` | `false` | Observe new complexity classifier; route by legacy |
+| `NEXUSRAG_COMPLEXITY_ACTIVE` | `false` | New complexity classifier is sole authority |
+| `NEXUSRAG_DEEP_ENABLED` | `false` | Enables Deep Agent compare_sections pilot |
+| `NEXUSRAG_DEEP_SHADOW` | `false` | Deep Agent parallel; route by fallback |
+| `NEXUSRAG_AGENT_DEADLINE_SECONDS` | `28` | Absolute request deadline |
+| `NEXUSRAG_DEEP_MAX_PARALLEL` | `2` | Max parallel branches in Deep Agent |
+| `NEXUSRAG_DEEP_MAX_DOMAIN_CALLS` | `6` | Max tool calls per Deep Agent run |
+| `NEXUSRAG_SHADOW_SAMPLE_RATE` | `0.1` | Shadow mode sampling rate (production) |
+| `NEXUSRAG_SHADOW_CANARY_RATE` | `1.0` | Shadow mode sampling rate (canary) |
+| `NEXUSRAG_SHADOW_LOG_PATH` | `/app/backend/logs/routing_shadow.jsonl` | Shadow log path |
+
+**`docs/scaling.md` capacity**:
+
+```markdown
+## Deep Agent capacity accounting
+
+`WEB_CONCURRENCY` × admitted deep-eligible requests × `NEXUSRAG_DEEP_MAX_PARALLEL`
+= max concurrent upstream LLM calls per backend instance.
+
+Example: 4 WEB_CONCURRENCY × 100 admitted × 2 parallel = 800 concurrent LLM calls.
+Upstream provider queueing + cancellation budget per call is critical.
+Cluster-wide guard: sum across instances ≤ upstream provider rate limit.
+GPU semaphore (existing for embedding) does NOT bound LLM fan-out.
+```
+
+## E.7 Observability — Q26.B Loki log-derived metrics
+
+**6 metrics via structured logging** (no Prometheus client):
+
+```python
+# backend/app/services/observability/metrics.py (NEW)
+import structlog
+
+def emit_completion_status(status, run_id, config_revision):
+    structlog.get_logger().info(
+        "deep_agent_completion_status",
+        status=status, run_id=run_id, config_revision=config_revision,
+    )
+
+def emit_latency(stage, latency_ms, run_id):
+    structlog.get_logger().info(
+        "deep_agent_latency", stage=stage, latency_ms=latency_ms, run_id=run_id,
+    )
+
+def emit_grounding_guard_fail(run_id, retracted_text_hash):
+    structlog.get_logger().warning(
+        "deep_agent_grounding_guard_fail", run_id=run_id,
+        retracted_text_hash=retracted_text_hash,
+    )
+
+def emit_citation_sanitizer_fail(run_id, invalid_ids):
+    structlog.get_logger().warning(
+        "deep_agent_citation_sanitizer_fail", run_id=run_id, invalid_ids=str(invalid_ids),
+    )
+
+def emit_late_event(run_id, event_type):
+    """CRITICAL: must be 0. Alert in Grafana."""
+    structlog.get_logger().error("deep_agent_late_event", run_id=run_id, event_type=event_type)
+
+def emit_tool_budget_exhausted(run_id, task_id, budget_type):
+    structlog.get_logger().warning(
+        "deep_agent_tool_budget_exhausted", run_id=run_id, task_id=task_id, budget_type=budget_type,
+    )
+```
+
+**Grafana/Loki queries**:
+
+```logql
+# Completion status rate
+sum(rate({app="backend"} | json | event="deep_agent_completion_status" | status="complete" [5m]))
+  / sum(rate({app="backend"} | json | event="deep_agent_completion_status" [5m]))
+
+# Latency p95 by stage
+quantile_over_time(0.95,
+  {app="backend"} | json | event="deep_agent_latency" | latency_ms [5m] by (stage))
+
+# CRITICAL: Late events alert (must be 0)
+sum(rate({app="backend"} | json | event="deep_agent_late_event" [5m])) > 0
+```
+
+**Langfuse** (per review finding 6):
+
+```python
+class TracedLLMProvider:
+    def _emit_observation(self, *, prompt, completion, usage, **metadata):
+        obs = langfuse.generation(
+            name=metadata.get("agent_type", "llm_call"),
+            model=self.config_snapshot.model,
+            input=prompt, output=completion, usage=usage,
+            metadata={
+                "run_id": metadata.get("run_id"),
+                "config_revision": metadata.get("config_revision"),
+                "agent_type": metadata.get("agent_type"),
+                "execution_mode": metadata.get("execution_mode"),
+                "cohort_id": metadata.get("cohort_id"),
+                "task_id": metadata.get("task_id"),
+            },
+            session_id=metadata.get("run_id"),  # ← run_id as session_id
+            tags=[
+                f"config_revision:{metadata.get('config_revision')}",
+                f"agent_type:{metadata.get('agent_type')}",
+                f"execution_mode:{metadata.get('execution_mode')}",
+            ],
+        )
+
+# streaming.py — set Langfuse session_id = run_id at ingress
+async def stream_agent_to_sse(...):
+    run_id = str(uuid4())
+    langfuse_context.update_current_observation(
+        session_id=run_id,
+        metadata={"run_id": run_id, "config_revision": flag_snapshot.config_revision},
+    )
+```
+
+**PII redaction cho Langfuse + A/B reports** (per review finding 6):
+
+```python
+def _redact_langfuse_payload(payload: dict) -> dict:
+    if "input" in payload:
+        payload["input"] = _redact_user_query(payload["input"])
+    if "output" in payload:
+        payload["output"] = _redact_user_query(payload["output"])
+    if "metadata" in payload and "document_id" in payload["metadata"]:
+        payload["metadata"]["document_id"] = _redact_doc_id(payload["metadata"]["document_id"])
+    return payload
+```
+
+## E.8 Acceptance criteria
+
+| Stage | Gate | Direction | Sample | CI |
+|-------|------|-----------|--------|-----|
+| E.0 internal | Latency p95 <30s; no leak; ≥90% pilot correctness | upper bound | manual | n/a |
+| E.1 5% | 0 grounding fails accepted; completion rates within baseline | equal-or-better | ≥50 deep-eligible req | 95% |
+| E.2 25% | Late events = 0; rollback drill completes | upper bound | ≥250 deep-eligible req | 95% |
+| E.3 50% | Latency stable under 2x baseline concurrency | within +10% | ≥500 deep-eligible req | 95% |
+| E.4 100% | Sustained 7 days | continuous | n/a | n/a |
+
+**Denominators**:
+- `completion_status_rate`: denominator = deep-eligible requests
+- `grounding_fail_rate`: denominator = synthesis calls (where guard could fire)
+- `late_event_rate`: denominator = total requests (any path)
+
+**Sample size + CI**: with N deep-eligible req at expected rate p, margin ≈ `1.96 × sqrt(p(1-p)/N)`. For p=0.05, N=500 gives ±0.019. We require N ≥ 50 (E.1), ≥250 (E.2), ≥500 (E.3) for 95% CI to detect ≥10% rate change.
+
+## E.9 Open items (Section E)
+
+| O# | Item | Phase | Blocking? |
+|----|------|-------|-----------|
+| O38 | `ab_deep_eval.py` + paired dataset | Phase 2 prep | Yes |
+| O39 | `users.cohort_id` column + audit table (Q27.A) | Phase 2 prep | Yes |
+| O40 | 6 metric emit points + Grafana/Loki queries (Q26.B) | Phase 2 | Yes |
+| O41 | Rollback drill script + smoke dataset (5-10 queries) | Phase 2 prep | Yes |
+| O42 | Documentation sync per phase (atomic commit) | Each phase | Yes |
+| O43 | Flag retirement after 2 release cycles | Post E.4 | Recommended |
+| O44 | Grafana dashboard for Deep Agent metrics | Phase 2 | Yes |
+| **O45** | **DB-backed settings + multi-worker pub/sub + ack (for future `<30s` rollback)** | Post-Phase 2 | Future enhancement |
+| **O46** | **Deterministic sticky cohort allocation + exclusion precedence** | Phase 2 prep | Yes |
+| **O47** | **Backward-compat migration test (base arm after migration)** | Phase 0 | Yes |
+| **O48** | **Base arm validation vs immutable pre-deep report (statistical tolerances)** | Phase 2 | Yes |
+| **O49** | **Late-event producer-side prevention (queue close on terminal)** | Phase 2 | Yes |
+| **O50** | **AGENTS.md/CLAUDE.md hybrid policy (Q28.C)** | Each phase | Yes |
+| **O51** | **Langfuse session_id = run_id + propagate agent_type/config_revision/execution_mode** | Phase 0 | Yes |
+| **O52** | **PII redaction cho Langfuse + A/B reports** | Phase 1A | Yes |
+| **O53** | **Scaling doc capacity: `WEB_CONCURRENCY × admitted × DEEP_MAX_PARALLEL` + LLM fan-out guard** | Phase 2 | Yes |
+| **O54** | **Dataset overlap definition (30 manual + 20 adversarial = 50 unique; SME adjudication)** | Phase 2 prep | Yes |
+| **O55** | **Cohort gate directionality + min sample N + CI bounds + separate deep-eligible denominators** | Phase 2 prep | Yes |
+| **O56** | **Flag snapshot at ingress (capture flag values once; persist; NOT use `snapshot_version()` for flags)** | Phase 0 | Yes |
+| **O57** | **Production config: rollback time = deployment pipeline (~2 min env-based), NOT `<30s` until O45 built** | Each phase | Yes (honesty) |
+
+## E.10 Decisions log update
+
+| # | Question | Choice |
+|---|----------|--------|
+| Q26 | Metrics path | **B** — Loki log-derived (no Prometheus) |
+| Q27 | Cohort model | **A** — `users.cohort_id` column + audit table + admin endpoint |
+| Q28 | AGENTS.md / CLAUDE.md policy | **C** — Hybrid: CLAUDE.md canonical, AGENTS.md = gitnexus + config shortcuts only |
+
+---
+
+# Consolidated Open Items (O1-O57)
 
 | O# | Item | Phase | Blocking? |
 |----|------|-------|-----------|
@@ -2178,17 +2691,37 @@ if tool.name not in TOOL_ALLOWLIST:
 | O35 | Outer asyncio.wait_for + child cleanup (D.7) | Phase 2 | Yes |
 | O36 | Drop compare_pair tool; enforce allowlist + max 2 tasks (D.10) | Phase 2 | Yes |
 | O37 | Provider patches: tool_call_id / thought_signature preservation (D.3) | Phase 2 prep | Yes |
+| O38 | `ab_deep_eval.py` + paired dataset (E.4) | Phase 2 prep | Yes |
+| O39 | `users.cohort_id` column + audit table (Q27.A, E.3) | Phase 2 prep | Yes |
+| O40 | 6 metric emit points + Grafana/Loki queries (Q26.B, E.7) | Phase 2 | Yes |
+| O41 | Rollback drill script + smoke dataset (E.5) | Phase 2 prep | Yes |
+| O42 | Documentation sync per phase (E.6) | Each phase | Yes |
+| O43 | Flag retirement after 2 release cycles | Post E.4 | Recommended |
+| O44 | Grafana dashboard for Deep Agent metrics | Phase 2 | Yes |
+| O45 | DB-backed settings + multi-worker pub/sub + ack (future `<30s` rollback) | Post-Phase 2 | Future enhancement |
+| O46 | Deterministic sticky cohort allocation + exclusion precedence (E.3) | Phase 2 prep | Yes |
+| O47 | Backward-compat migration test (E.5) | Phase 0 | Yes |
+| O48 | Base arm validation vs immutable pre-deep report (E.5) | Phase 2 | Yes |
+| O49 | Late-event producer-side prevention (E.5) | Phase 2 | Yes |
+| O50 | AGENTS.md/CLAUDE.md hybrid policy (Q28.C, E.6) | Each phase | Yes |
+| O51 | Langfuse session_id = run_id + propagate attributes (E.7) | Phase 0 | Yes |
+| O52 | PII redaction cho Langfuse + A/B reports (E.7) | Phase 1A | Yes |
+| O53 | Scaling doc capacity: WEB_CONCURRENCY × DEEP_MAX_PARALLEL (E.6) | Phase 2 | Yes |
+| O54 | Dataset overlap definition (E.4) | Phase 2 prep | Yes |
+| O55 | Cohort gate directionality + min sample N + CI bounds (E.8) | Phase 2 prep | Yes |
+| O56 | Flag snapshot at ingress (E.2) | Phase 0 | Yes |
+| O57 | Production config: rollback time = deployment pipeline (~2 min), not <30s (E.5) | Each phase | Yes (honesty) |
 
 ---
 
 # Self-Review Checklist
 
-After writing Sections A, B, C, D, the author should run this check (per brainstorming skill):
+After writing Sections A, B, C, D, E, the author should run this check (per brainstorming skill):
 
-- [x] **Placeholder scan**: No TBD/TODO in Sections A/B/C/D content
-- [x] **Internal consistency**: A contracts match B/C/D usage; D.3 adapter aligns with provider constraints; D.6 citation namespace consistent with Section A.5 Evidence
-- [x] **Scope check**: A/B/C/D focused on contracts + preprocessing + routing + Deep Agent pilot (Phase 0/1A/1B/2 scope)
-- [x] **Ambiguity check**: Each contract has explicit invariants; fallback tables deterministic; pilot scope bounded
+- [x] **Placeholder scan**: No TBD/TODO in Sections A/B/C/D/E content
+- [x] **Internal consistency**: A contracts match B/C/D/E usage; E.2 flag bundles align with Section A-D phases; E.3 cohort integration aligns with existing `users` schema; E.7 observability reuses existing Loki stack
+- [x] **Scope check**: A/B/C/D/E focused on contracts + preprocessing + routing + Deep Agent pilot + canary/rollout (Phase 0/1A/1B/2/3/4 scope)
+- [x] **Ambiguity check**: Each contract has explicit invariants; flag dependency chain validated; cohort allocation deterministic; rollback matrix specifies realistic time (NOT aspirational <30s)
 
 **Status**: PASS. Ready for user review.
 
@@ -2196,7 +2729,7 @@ After writing Sections A, B, C, D, the author should run this check (per brainst
 
 # Approval & Next Steps
 
-This spec covers Sections A, B, C, D. User reviews and approves BEFORE continuing to Section E (Canary + Rollout) and Section F (Phase 0 Blockers).
+This spec covers Sections A, B, C, D, E. Section F (Phase 0 Blockers) remains TBD.
 
 After full spec approval (A through F), the **writing-plans** skill is invoked to produce implementation plans per task, per phase, with TDD scaffolding.
 
