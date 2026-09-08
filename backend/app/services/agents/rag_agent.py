@@ -633,8 +633,12 @@ async def _execute_search_section(section_reference: str, workspace_ids, documen
 
     try:
         db = get_current_db()
+        # Per B6: add workspace_id predicate to prevent access to docs in inaccessible workspaces
         doc_result = await db.execute(
-            select(Document).where(Document.id == document_ids[0])
+            select(Document).where(
+                Document.id == document_ids[0],
+                Document.workspace_id.in_(workspace_ids),
+            )
         )
         doc = doc_result.scalar_one_or_none()
 
