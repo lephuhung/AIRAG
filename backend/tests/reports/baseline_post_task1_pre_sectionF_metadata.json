@@ -1,0 +1,21 @@
+{
+  "label": "post_task1_pre_sectionF",
+  "commit_sha": "acdb9e2b7563d689cfc8a6a385912ae2aef08815",
+  "captured_at": "2026-09-08T10:35:00Z",
+  "flags": {
+    "NEXUSRAG_SEMANTIC_PREPROCESSOR": "unknown",
+    "NEXUSRAG_COMPLEXITY_SHADOW": "unknown",
+    "NEXUSRAG_COMPLEXITY_ACTIVE": "unknown",
+    "NEXUSRAG_DEEP_ENABLED": "unknown",
+    "NEXUSRAG_DEEP_SHADOW": "unknown",
+    "NEXUSRAG_AGENT_DEADLINE_SECONDS": "unknown",
+    "NEXUSRAG_DEEP_MAX_PARALLEL": "unknown",
+    "NEXUSRAG_DEEP_MAX_DOMAIN_CALLS": "unknown"
+  },
+  "model_snapshot": {
+    "error": "No module named 'app.services.runtime_config'"
+  },
+  "config_revision": "import_error",
+  "corpus_index_revision": "unknown",
+  "dataset_hash": "computed_at_capture_time"
+}

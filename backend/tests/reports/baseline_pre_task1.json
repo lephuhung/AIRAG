@@ -1,0 +1,15 @@
+{
+  "meta": {
+    "commit": "86964bc",
+    "label": "pre_task1",
+    "captured_at": "pre_task1_capture_time"
+  },
+  "aggregate": {
+    "latency_p50": 0.0,
+    "latency_p95": 0.0,
+    "latency_p99": 0.0,
+    "completion_rate": 0.0,
+    "refusal_rate_positive": 0.0
+  },
+  "cases": []
+}
