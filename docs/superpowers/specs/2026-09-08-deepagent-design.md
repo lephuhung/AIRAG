@@ -19,24 +19,42 @@ This spec covers the implementation of the **Hybrid Supervisor + Deep Agent** ar
 | 2 | D: Deep Agent pilot compare_sections | Section D (TBD) |
 | 3-4 | E: Long summary + cross-agent + canary | Section E (TBD) |
 
-## 0.1 Decisions log
+## 0.1 Decisions log (CANONICAL Q1–Q30)
 
-Decisions made through Q&A during brainstorming; all marked RESOLVED:
+Decisions made through Q&A during brainstorming; all marked RESOLVED with cross-section implementation reference:
 
-| # | Question | Choice |
-|---|----------|--------|
-| Q1 | Scope of this session | **A** — Full design + spec only for all 5 phases, no code |
-| Q2 | Routing integration với existing `query_analyzer_node` | **B** — Bỏ `query_analyzer`; thêm `semantic_preprocessor_node` trước `supervisor` |
-| Q3 | Deep Agents ↔ LLMProvider integration | **A** — Adapter-first: `langchain_adapter.py` wrap `LLMProvider` → `BaseChatModel` |
-| Q4 | Module layout cho Deep Agent | **A** — Subpackage `agents/deep_research/{graph,contracts,tools,budget,evidence}.py` |
-| Q5 | Disposition of Phase 5 fields | **A** — Repurpose (`query_complexity`→`complexity_decision`, etc.) |
-| Q6 | SemanticContext persistence approach | **A** — Nullable JSON column `chat_messages.semantic_context` |
-| Q7 | Citation safety policy | **B** — Best-effort regex + validate với verified document_id |
-| Q8 | resolve_candidates strategy | **C** — Bypass hoàn toàn; viết `safe_lookup_metadata_only` primitive mới |
-| Q9 | DocumentAlias strategy | **A** — Phase 0 migration tạo model + table mới |
-| Q10 | Atomic migration strategy | **A** — One-shot feature flag `NEXUSRAG_SEMANTIC_PREPROCESSOR` |
-| Q11 | RuntimeHints.cross_domain source | **A** — Derived from semantic_context (≥1 person id AND ≥1 doc ref) |
-| Q12 | Shadow log strategy | **A** — Mounted durable volume + PII redaction + 7-day rotation + asyncio.Lock |
+| # | Question | Choice | Owning Section / Item |
+|---|----------|--------|------------------------|
+| Q1 | Scope of this session | **A** — Full design + spec only for all 5 phases, no code | All sections |
+| Q2 | Routing integration với existing `query_analyzer_node` | **B** — Bỏ `query_analyzer`; thêm `semantic_preprocessor_node` trước `supervisor` | B.7 |
+| Q3 | Deep Agents ↔ LLMProvider integration | **A** — Adapter-first: `langchain_adapter.py` wrap `LLMProvider` → `BaseChatModel` | D.3 |
+| Q4 | Module layout cho Deep Agent | **A** — Subpackage `agents/deep_research/{graph,contracts,tools,budget,evidence}.py` | D.2 |
+| Q5 | Disposition of Phase 5 fields | **A** — Repurpose (`query_complexity`→`complexity_decision`, etc.) | B.7 (compat derivation) |
+| Q6 | SemanticContext persistence approach | **A** — Nullable JSON column `chat_messages.semantic_context` | A.8, B.11 |
+| Q7 | Citation safety policy | **B** — Best-effort regex + validate với verified document_id | A.5, D.8 |
+| Q8 | resolve_candidates strategy | **C** — Bypass hoàn toàn; viết `safe_lookup_metadata_only` primitive mới | B.4 |
+| Q9 | DocumentAlias strategy | **A** — Phase 0 migration tạo model + table mới | B.4, O6 |
+| Q10 | Atomic migration strategy | **A** — One-shot feature flag `NEXUSRAG_SEMANTIC_PREPROCESSOR` | B.7, E.2 |
+| Q11 | RuntimeHints.cross_domain source | **A** — Derived from semantic_context (≥1 person id AND ≥2 doc refs; threshold aligned) | C.4, O63 |
+| Q12 | Shadow log strategy | **A** — Mounted durable volume + PII redaction + 7-day rotation + asyncio.Lock | C.5, E.5 |
+| Q13 | Confidence choice scope (B.6) | **A** — Strict `remaining > reserve`, never start at exactly reserve | B.6 |
+| Q14 | Fast-path greeting abbr expansion | **A** — Greeting is ONLY exception (no abbr expansion) | B.3 |
+| Q15 | Document ref `regex_bare_number` policy | **A** — Allowed (prefix-only, low confidence) | B.4 |
+| Q16 | Validation module location | Pure functions in `contracts_validation.py` | A.7 |
+| Q17 | NFD span handling | NFC-normalized view + raw-span mapping | B.5 |
+| Q18 | Anti-downgrade trigger consistency | `cross_domain AND >=2 refs` aligned with Rule 1 | C.4, O63 |
+| Q19 | Cross-agent deep out of pilot scope | Fallback to supervisor with log warning | C.4, O64 |
+| Q20 | Evidence byte-safe truncation | `raw_content_bytes` field; truncate by bytes | A.5, D.5, O65 |
+| Q21 | push_event signature | `(state, ev_type, ev_data)` per `streaming.py:403-422` | D.5, O66 |
+| Q22 | RuntimeContext clock domain | ONE clock (`time.monotonic()`); `absolute_deadline_monotonic` | A.6 |
+| Q23 | Cancellation event scope | Coordinator-level shared; branches hold REFERENCE | A.6 |
+| Q24 | Deep Agents release pin | **A** — Pin known-good + hard compat test gate (BEFORE implementation) | D.3, O1 |
+| Q25 | Pilot dataset construction | **A** — Manual annotation 20-30 cases (2-3 tuần SME) | D.11, O26 |
+| Q26 | Metrics path | **B** — Loki log-derived (no Prometheus) | E.7, O40 |
+| Q27 | Cohort model | **A** — `users.cohort_id` column + audit table + admin endpoint | E.3, O39 |
+| Q28 | AGENTS.md / CLAUDE.md policy | **C** — Hybrid: CLAUDE.md canonical, AGENTS.md = gitnexus + config shortcuts only | E.6, O50 |
+| Q29 | Baseline strategy | **A** — TWO worktrees pinned (pre-Task-1 + post-Task-1) + full snapshot metadata | F.4, O58 |
+| Q30 | B6 scope | **A** — Narrow: chat_session ingress + markdown fallback only (other callers → O74) | F.5, O71 |
 
 ## 0.2 Glossary
 
@@ -98,14 +116,28 @@ supervisor_node (REFACTORED — Section C)
 
 ## A.1 `PreprocessingResult` (SemanticContext wrapper) + nested types
 
+**Offset semantics**: All `span_offset` values are **Python code-point (str-level) half-open intervals** over `original_query` (immutable). NOT UTF-8 byte offsets. `original_span == original_query[span_offset[0]:span_offset[1]]` is enforced by `_check_raw_slice_equality`.
+
+**Span nesting**: Abbreviations may be **nested inside** a document ref (e.g. `regex_abbr_then_doc` produces abbreviation "NĐ" inside ref "NĐ X"). Top-level refs are pairwise non-overlapping; abbreviations may nest within any ref.
+
 ```python
+class BlockingAmbiguity(BaseModel):
+    """Structured ambiguity marker (essential = blocks routing; non-essential = informational)."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    description: str                       # human-readable, Vietnamese
+    essential: bool                        # True = blocks routing; False = informational
+    source_ref: str | None = None          # ref_id if ambiguity is tied to a ref
+    category: Literal["user_identity", "document_identity", "scope", "intent_ambiguous"]
+
+
 class AbbreviationEntry(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     span: str
-    span_offset: tuple[int, int]          # (start, end) UTF-8 half-open on original_query (immutable)
+    span_offset: tuple[int, int]          # (start, end) Python code-point half-open on original_query (immutable)
     short_form: str                        # normalized lowercase
-    chosen: str | None = None
+    chosen: str | None = None              # full_form; None when ambiguous
     candidates: list[AbbreviationCandidate]
     status: Literal["resolved", "ambiguous", "unknown", "not_in_db"]
     confidence: Literal["high", "low"] | None = None
@@ -123,7 +155,7 @@ class DocumentRefEntry(BaseModel):
 
     ref_id: str                            # "r1", "r2"; stable, unique
     original_span: str
-    span_offset: tuple[int, int]
+    span_offset: tuple[int, int]          # Python code-point half-open on original_query
     reference: str                         # normalized name
     section_reference: str | None = None
     document_handle: UUID4 | None = None   # server-validated Document.id; LLM cannot create
@@ -171,7 +203,7 @@ class PreprocessingResult(BaseModel):
     normalized_query: str | None = None
     abbreviations: list[AbbreviationEntry] = []
     document_refs: list[DocumentRefEntry] = []
-    blocking_ambiguities: list[str] = []
+    blocking_ambiguities: list[BlockingAmbiguity] = []  # structured, with essential flag
     preprocessing_status: Literal["ok", "partial", "complete", "error"]
     preprocessor_trace: list[TraceEvent]
 
@@ -192,15 +224,31 @@ class PreprocessingResult(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _check_spans_non_overlapping(self):
-        spans = sorted(
-            [(abbr.span_offset, "abbr") for abbr in self.abbreviations]
-            + [(ref.span_offset, "ref") for ref in self.document_refs]
-        )
+    def _check_ref_spans_non_overlapping(self):
+        """Top-level document_refs must be pairwise non-overlapping.
+        Abbreviations MAY nest inside refs (per `regex_abbr_then_doc`)."""
+        spans = sorted([(ref.span_offset, ref.ref_id) for ref in self.document_refs])
         for i in range(len(spans) - 1):
             (s1, _), (s2, _) = spans[i], spans[i+1]
-            if s1[1] > s2[0]:  # half-open: [s1[0], s1[1])
-                raise ValueError(f"overlapping spans: {s1} and {s2}")
+            if s1[1] > s2[0]:
+                raise ValueError(f"overlapping ref spans: {s1} and {s2}")
+        return self
+
+    @model_validator(mode="after")
+    def _check_raw_slice_equality(self):
+        """Each original_span MUST equal original_query[span_offset[0]:span_offset[1]]."""
+        for abbr in self.abbreviations:
+            s, e = abbr.span_offset
+            if self.original_query[s:e] != abbr.span:
+                raise ValueError(
+                    f"abbr span mismatch: {abbr.span!r} != query[{s}:{e}]={self.original_query[s:e]!r}"
+                )
+        for ref in self.document_refs:
+            s, e = ref.span_offset
+            if self.original_query[s:e] != ref.original_span:
+                raise ValueError(
+                    f"ref {ref.ref_id} span mismatch: {ref.original_span!r} != query[{s}:{e}]={self.original_query[s:e]!r}"
+                )
         return self
 
     @model_validator(mode="after")
@@ -214,8 +262,10 @@ class PreprocessingResult(BaseModel):
 
     @model_validator(mode="after")
     def _check_blocking_ambiguities_scope(self):
+        """blocking_ambiguities must NOT contain infrastructure errors (not_found, outage)."""
         bad = [a for a in self.blocking_ambiguities
-               if any(kw in a.lower() for kw in ("không tìm thấy", "not found", "outage", "timeout"))]
+               if any(kw in a.description.lower()
+                      for kw in ("không tìm thấy", "not found", "outage", "timeout"))]
         if bad:
             raise ValueError(f"blocking_ambiguities contains infrastructure errors: {bad}")
         return self
@@ -353,15 +403,23 @@ class Evidence(BaseModel):
 
     Citation safety (Q7.B): citation_number/citation_article chỉ accept
     khi KHỚP với verified document_id metadata.
+
+    Truncation semantics:
+    - `raw_content_bytes` = bytes of original (uncut) content from source
+    - `content_size_bytes` = bytes of `raw_content` actually stored (may be < raw_content_bytes)
+    - When truncation occurs: raw_content truncated to MAX_RAW_CONTENT_BYTES,
+      `content_size_bytes` < `raw_content_bytes`, TaskResult sets `truncated=True`
+    - Validator allows content_size_bytes <= MAX; tracks truncation via raw_content_bytes > MAX
     """
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     evidence_id: str                       # "{task_id}:c{N}" or central UUID
     task_id: str
     source_id: str                         # server-generated UUID; unique per fetch
-    raw_content: str
-    content_hash: str                      # sha256 of raw_content
-    content_size_bytes: int
+    raw_content: str                       # possibly truncated to MAX_RAW_CONTENT_BYTES
+    content_hash: str                      # sha256 of raw_content (truncated)
+    content_size_bytes: int                # bytes of raw_content (== len(raw_content.encode('utf-8')))
+    raw_content_bytes: int                 # bytes of ORIGINAL uncut content (>= content_size_bytes)
     redacted: bool = False
     document_id: UUID4 | None = None
     document_version: str | None = None
@@ -373,7 +431,7 @@ class Evidence(BaseModel):
     citation_article: str | None = None
     provenance: Provenance
 
-    MAX_RAW_CONTENT_BYTES = 50_000  # retention cap; truncate raises truncated=True in TaskResult
+    MAX_RAW_CONTENT_BYTES = 50_000  # retention cap; truncation recorded via raw_content_bytes > MAX
 
     @model_validator(mode="after")
     def _check_citation_anchored(self):
@@ -387,8 +445,13 @@ class Evidence(BaseModel):
 
     @model_validator(mode="after")
     def _check_size_retention(self):
+        # Allow storage up to MAX; record truncation via raw_content_bytes > MAX
         if self.content_size_bytes > self.MAX_RAW_CONTENT_BYTES:
             raise ValueError(f"raw_content exceeds retention cap {self.MAX_RAW_CONTENT_BYTES}")
+        if self.raw_content_bytes < self.content_size_bytes:
+            raise ValueError(
+                f"raw_content_bytes ({self.raw_content_bytes}) < content_size_bytes ({self.content_size_bytes})"
+            )
 
 
 class Provenance(BaseModel):
@@ -401,6 +464,8 @@ class Provenance(BaseModel):
     fetched_by: UUID4
     workspace_scope: list[UUID4]
     acl_checked: bool = True
+    acl_checked_at: float | None = None    # epoch seconds; recorded when ACL verified
+    acl_version: str | None = None        # policy version (e.g., "v1")
     tool_call_id: str | None = None
     run_id: str
 ```
@@ -408,6 +473,15 @@ class Provenance(BaseModel):
 **Citation safety** (Q7.B): `citation_number` / `citation_article` extracted by existing regex (`_extract_doc_numbers`, `_extract_article_numbers` in `supervisor.py`). Worker only fills when matches verified `document_id` metadata. Validator auto-rejects if LLM invents citation.
 
 ## A.6 `RuntimeContext` + budget types
+
+**Clock domain**: ONE consistent clock (`time.monotonic()`) used throughout B/D for budget/deadline arithmetic. `RuntimeContext` exposes:
+- `absolute_deadline_monotonic: float` — `time.monotonic()` value at which request must terminate
+- `absolute_deadline_epoch: float | None` — wall-clock for log correlation only (NEVER used for arithmetic)
+- `remaining_budget_sec: float` — `absolute_deadline_monotonic - time.monotonic()`, updated at each check
+
+**Budget race**: All `ConsumedBudget` increments MUST go through `BudgetGuard.try_consume_*` methods (atomic with internal `asyncio.Lock`). Tools and workers MUST NOT directly mutate `consumed_budget` fields.
+
+**Cancellation scope**: `cancellation_event` is **coordinator-level shared** (single event per request). Each parallel branch holds a REFERENCE to the same event (NOT a copy). When set, all branches observe it within one event-loop iteration.
 
 ```python
 class RuntimeContext(BaseModel):
@@ -419,15 +493,17 @@ class RuntimeContext(BaseModel):
     people_permission: bool
     session_id: str | None
     run_id: str
-    config_revision: str                   # runtime_config._config_version at request start
-    absolute_deadline: float               # epoch seconds
-    remaining_budget_sec: float
-    model_snapshot: ModelSnapshot
+    config_revision: str                   # runtime_config._config_version at request start (frozen)
+    absolute_deadline_monotonic: float    # time.monotonic() value
+    absolute_deadline_epoch: float | None = None  # wall-clock for log correlation ONLY
+    remaining_budget_sec: float          # = absolute_deadline_monotonic - time.monotonic()
+    model_snapshot: ModelSnapshot         # frozen at ingress; includes config_revision
     tool_budget: ToolBudget
-    consumed_budget: ConsumedBudget
-    cancellation_event: asyncio.Event      # shared across branches
+    consumed_budget: ConsumedBudget       # mutated ONLY via BudgetGuard.try_consume_*
+    budget_guard: BudgetGuard             # holds internal asyncio.Lock; tools/workers call try_consume_*
+    cancellation_event: asyncio.Event     # coordinator-level shared; branches hold reference
     tool_allowlist: set[str]
-    preprocessing: PreprocessorBudgetConfig  # NEW — preprocessor-specific budget
+    preprocessing: PreprocessorBudgetConfig
 
 
 class ModelSnapshot(BaseModel):
@@ -449,7 +525,7 @@ class ToolBudget(BaseModel):
 
 
 class ConsumedBudget(BaseModel):
-    """Atomic counters; single writer per request."""
+    """Atomic counters; mutated ONLY via BudgetGuard (which holds the lock)."""
     model_config = ConfigDict(extra="forbid", frozen=False)
 
     coordinator_rounds: int = 0
@@ -457,12 +533,6 @@ class ConsumedBudget(BaseModel):
     worker_llm_rounds_per_task: dict[str, int] = {}
     tokens_emitted: int = 0
     evidence_emitted: int = 0
-
-    def try_consume_coordinator_round(self, ctx: RuntimeContext) -> bool:
-        if self.coordinator_rounds >= ctx.tool_budget.max_coordinator_rounds:
-            return False
-        self.coordinator_rounds += 1
-        return True
 
 
 class PreprocessorBudgetConfig(BaseModel):
@@ -473,12 +543,14 @@ class PreprocessorBudgetConfig(BaseModel):
     disambig_reserve_sec: float = 3.0          # remaining > 3s required to START disambig
 ```
 
-**Concurrency invariants**:
-- `consumed_budget` single writer per request (coordinator); workers READ-ONLY
-- Each parallel branch has its own `RuntimeContext` (DB session + `asyncio.Event` independent)
-- `absolute_deadline` SHARED; `remaining_budget_sec` per-branch derived
+**Concurrency invariants** (clarified):
+- `consumed_budget` mutated ONLY via `BudgetGuard.try_consume_*` (atomic with internal `asyncio.Lock`); direct field mutation by tools/workers is FORBIDDEN
+- All clock arithmetic uses `time.monotonic()` (NOT `time.time()` / epoch seconds)
+- `cancellation_event` is coordinator-level SHARED (single event per request); branches hold REFERENCE to the same event
+- Each parallel branch has its own DB session; otherwise shares `RuntimeContext`
+- `absolute_deadline_monotonic` SHARED; `remaining_budget_sec` derived per check
 - `RuntimeContext` NEVER serialized to checkpoint
-- `cancellation_event.set()` by deadline handler external to graph
+- `cancellation_event.set()` by deadline handler external to graph; budget watcher uses `asyncio.wait_for(coro, timeout=...)` (NOT periodic watcher alone)
 
 ## A.7 Validation module (pure functions)
 
@@ -496,17 +568,61 @@ def build_routing_decision(
 
 ## A.8 Persistence map
 
-| Field | Persist? | Nơi lưu | Migration |
+**Round-trip semantics**: `PreprocessingResult` is a RUNTIME object; persistence stores a **compact subset** for history replay only. Round-trip from `chat_messages.semantic_context` column restores a **minimum reconstruction** with available fields — NOT the full `PreprocessingResult`. Fields not persisted default to empty/safe values.
+
+**Persisted semantic-context schema** (`chat_messages.semantic_context` JSONB, nullable):
+
+```python
+class PersistedSemanticContext(BaseModel):
+    """Compact subset persisted to chat_messages.semantic_context.
+    Round-trip restores fields with safe defaults; NOT full PreprocessingResult."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    version: str = "1.0"                   # schema version
+    original_query: str | None = None     # KEPT (small; sanitized if PII)
+    normalized_query: str | None = None
+    preprocessing_status: Literal["ok", "partial", "complete", "error"]
+    abbreviations: list[PersistedAbbreviation] = []
+    document_refs: list[PersistedDocumentRef] = []
+    blocking_ambiguities: list[PersistedBlockingAmbiguity] = []
+    # NOT persisted: preprocessor_trace, candidates lists, full reasoning text
+
+
+class PersistedAbbreviation(BaseModel):
+    span: str
+    short_form: str
+    chosen: str | None = None
+    status: Literal["resolved", "ambiguous", "unknown", "not_in_db"]
+
+
+class PersistedDocumentRef(BaseModel):
+    ref_id: str
+    reference: str                         # normalized name KEPT
+    section_reference: str | None = None
+    document_handle: str | None = None     # KEPT (re-verify ACL on reuse per B.4)
+    resolution_status: Literal["resolved", "ambiguous", "not_found", "deferred", "error"]
+
+
+class PersistedBlockingAmbiguity(BaseModel):
+    description: str
+    essential: bool                        # structural flag
+    source_ref: str | None = None
+    category: str | None = None
+```
+
+**Persistence map**:
+
+| Field | Persist? | Nơi lưu | Migration / schema |
 |-------|----------|----------|-----------|
-| `PreprocessingResult` | **Có** (compact, sanitized) | `chat_messages.semantic_context` (JSONB NULL — column mới) | Phase 0: ADD COLUMN nullable; serializer strips `candidates`, `preprocessor_trace.notes`, `*_offsets`; giữ `ref_id`, `status`, `resolution_status`, `blocking_ambiguities`, `preprocessing_status` |
-| `RoutingDecision` | **Không** as data; **Có** sanitized trace | `agent_traces.routing_trace` (JSONB NULL — column mới) | Phase 0 migration; chứa `execution_mode`, `reason_code`, `fallback_reason`, `config_revision`, `run_id`; KHÔNG chứa `clarification_question` |
+| `PersistedSemanticContext` | **Có** (compact, sanitized) | `chat_messages.semantic_context` (JSONB NULL — column mới) | Phase 0: ADD COLUMN nullable; serializer emits `PersistedSemanticContext`; round-trip restores via `from_persisted_dict()` |
+| `RoutingDecision` | **Không** as data; **Có** sanitized trace | `agent_traces.routing_trace` (JSONB NULL — column mới) | Phase 0; chứa `execution_mode`, `reason_code`, `fallback_reason`, `config_revision`, `run_id`; KHÔNG chứa `clarification_question` |
 | `RuntimeContext` | **Không bao giờ** | — | — |
 | `TaskSpec` / `TaskResult` / `Evidence` | **Không** (pilot) | — | Phase 3+ if cross-worker |
-| `Provenance` | **Có** (minimal) | `agent_traces.evidence_provenance` (JSONB NULL — column mới) | Phase 0 migration; chỉ `evidence_id`, `source_id`, `document_id`, `fetched_by`, `tool_call_id`, `run_id` |
+| `Provenance` | **Có** (minimal) | `agent_traces.evidence_provenance` (JSONB NULL — column mới) | Phase 0; `evidence_id`, `source_id`, `document_id`, `fetched_by`, `tool_call_id`, `run_id`, `acl_checked_at`, `acl_version` |
 
 **Serialization helpers** in `semantic_preprocessor.py`:
-- `to_persisted_dict(result: PreprocessingResult) -> dict`
-- `from_persisted_dict(d: dict) -> PreprocessingResult`
+- `to_persisted_dict(result: PreprocessingResult) -> PersistedSemanticContext`
+- `from_persisted_dict(d: dict | PersistedSemanticContext) -> PreprocessingResult` — restores minimum reconstruction with safe defaults; `preprocessor_trace=[]`, `candidates=[]`, missing fields default per schema
 
 ## A.9 Test strategy
 
@@ -1177,20 +1293,27 @@ def build_routing_decision(
     ...
 ```
 
-**Trusted-fact fallback table** (10 rules):
+**Trusted-fact fallback table** (10 rules; cross-domain threshold CONSISTENT across all triggers = `cross_domain AND >=2 refs`):
 
 | # | Trusted fact | Fallback RoutingDecision | Notes |
 |---|---|---|---|
 | 1 | `user_request_semantics` = compare/merge + ≥2 refs resolved AND NOT inline_content_sufficient-only | `deepagent`, `multi_target_compare` | user-request semantics required |
 | 2 | ≥2 refs mixed resolved/ambiguous (NOT user-request compare/merge) | `supervisor` first; coordinator xử lý ambiguity | NOT auto-deep |
-| 3 | `RuntimeHints.cross_domain=true` AND ≥2 refs | `deepagent`, `cross_agent_dependency` | Q11.A derived |
+| 3 | `RuntimeHints.cross_domain=true` AND ≥2 refs | `deepagent`, `cross_agent_dependency` | Q11.A derived; threshold matches Rule 1 |
 | 4 | `summary_execution=needs_map_reduce` | `deepagent`, `long_document` | |
 | 5 | `summary_execution=unknown` + single doc + no complex hint | `supervisor` + `needs_probe=true`, `summary_size_unknown` | |
 | 6 | `inline_content_sufficient=true` AND NOT cross_domain | `supervisor`, `inline_content` | override LLM deep |
-| 7 | `blocking_ambiguities` non-empty essential | `clarify`, `missing_reference` | |
+| 7 | `blocking_ambiguities` non-empty essential | `clarify`, `missing_reference` | uses structured `BlockingAmbiguity.essential` |
 | 8 | All refs `not_found` AND retryable | `supervisor`, `single_workflow` + "sources missing" in final | NOT clarify |
 | 9 | Pure greeting / people fast-path | `supervisor`, `single_workflow` (no LLM call) | pure gate |
 | 10 | Default (insufficient evidence) | `supervisor`, `single_workflow` | safe downgrade |
+
+**Deep Agent executor scope check** (after rule selection):
+
+If `execution_mode="deepagent"` is selected but Deep Agent pilot only supports `compare_sections` (Section D.1 scope):
+- If `work_type=compare` + refs resolved → execute via Deep Agent
+- If `work_type=cross_agent` OR `work_type=multi_goal` (out of pilot scope) → fall back to `supervisor` with `reason_code="single_workflow"` + log warning "deep_agent_out_of_pilot_scope"
+- This fallback applies BEFORE invoking Deep Agent; preserves C.4 decision semantics
 
 **`user_request_semantics` detection**:
 
@@ -1206,29 +1329,36 @@ _USER_REQUEST_MULTI_GOAL_RE = re.compile(
 )
 ```
 
-**Anti-downgrade invariant**:
+**Anti-downgrade invariant** (threshold CONSISTENT with Rule 1: `cross_domain AND >=2 refs`):
 
 ```python
 def _anti_downgrade_check(llm_failed, semantic_context, runtime_hints, candidate_decision):
-    """Nếu semantic/raw structural evidence chỉ ra deep trigger, KHÔNG downgrade."""
-    # Trigger 1: raw query has explicit compare/merge AND ≥2 distinct doc refs
+    """Nếu semantic/raw structural evidence chỉ ra deep trigger, KHÔNG downgrade.
+    Deep trigger = (compare/merge semantics OR cross_domain) AND >=2 distinct refs."""
     has_compare_semantic = "compare" in _detect_user_request_semantics(semantic_context.original_query)
     has_distinct_refs = len({r.document_handle or r.reference for r in semantic_context.document_refs}) >= 2
+    deep_evidence = (has_compare_semantic or runtime_hints.cross_domain) and has_distinct_refs
+
+    # Trigger 1: compare/merge + multi-target → deepagent multi_target_compare
     if llm_failed and has_compare_semantic and has_distinct_refs:
         return RoutingDecision(execution_mode="deepagent", work_type="compare",
                                reason_code="multi_target_compare", needs_document_probe=False)
 
-    # Trigger 2: cross-domain hint derived from semantic context
-    if llm_failed and runtime_hints.cross_domain:
+    # Trigger 2: cross-domain + multi-target → deepagent cross_agent_dependency
+    # NOTE: cross_domain ALONE (without ≥2 refs) does NOT trigger deep → stay supervisor
+    if llm_failed and runtime_hints.cross_domain and has_distinct_refs:
         return RoutingDecision(execution_mode="deepagent", work_type="cross_agent",
                                reason_code="cross_agent_dependency", needs_document_probe=False)
 
     # Trigger 3: incomplete preprocessing (timeout) + multi-target evidence
     if semantic_context.preprocessing_status in ("partial", "error") and has_distinct_refs:
-        if semantic_context.blocking_ambiguities:
-            return RoutingDecision(execution_mode="clarify", ...)
-        return RoutingDecision(execution_mode="deepagent", work_type="compare",
-                               reason_code="multi_target_compare", needs_document_probe=False)
+        if any(a.essential for a in semantic_context.blocking_ambiguities):
+            return RoutingDecision(execution_mode="clarify", work_type="lookup",
+                                   reason_code="missing_reference",
+                                   clarification_question="; ".join(a.description for a in semantic_context.blocking_ambiguities))
+        if deep_evidence:
+            return RoutingDecision(execution_mode="deepagent", work_type="compare",
+                                   reason_code="multi_target_compare", needs_document_probe=False)
 
     return candidate_decision
 ```
@@ -1637,8 +1767,8 @@ class RetrieveSectionTool(BaseTool):
             raise ToolError("tool budget exhausted")
         
         # 4. Emit progress event (mapped to existing 'status' event per D.9)
-        await push_event({
-            "type": "status",
+        # NOTE: actual push_event signature is (state, ev_type, ev_data); adjust at impl
+        await push_event(self.ctx.state, "status", {
             "status": "deep_agent_progress",
             "task_id": ref_id,
             "task_status": "started",
@@ -1664,21 +1794,33 @@ class RetrieveSectionTool(BaseTool):
         # 6. ACL outcome recording
         acl_checked_at = time.time()
         
-        # 7. Build Evidence
+        # 7. Build Evidence with byte-safe truncation
+        raw_bytes = content.text.encode('utf-8')
+        raw_content_bytes = len(raw_bytes)
+        truncated = False
+        if raw_content_bytes > Evidence.MAX_RAW_CONTENT_BYTES:
+            truncated = True
+            stored_bytes = raw_bytes[:Evidence.MAX_RAW_CONTENT_BYTES]
+            stored_text = stored_bytes.decode('utf-8', errors='replace')
+        else:
+            stored_text = content.text
+            stored_bytes = raw_bytes
+        
         evidence = Evidence(
             evidence_id=f"{self.ctx.run_id}:{ref_id}",
             task_id=ref_id,
             source_id=str(uuid4()),
-            raw_content=content.text,
-            content_hash=sha256(content.text.encode('utf-8')).hexdigest(),
-            content_size_bytes=len(content.text.encode('utf-8')),
+            raw_content=stored_text,
+            content_hash=sha256(stored_bytes).hexdigest(),
+            content_size_bytes=len(stored_bytes),
+            raw_content_bytes=raw_content_bytes,  # ORIGINAL uncut size
             redacted=False,
             document_id=ref.document_handle,
             document_version=content.document_version,
             workspace_id=ref.metadata.workspace_id,
             section_path=ref.section_reference,
             page_or_chunk=content.page_range,
-            chunk_offsets=(0, len(content.text.encode('utf-8'))),
+            chunk_offsets=(0, len(stored_bytes)),
             provenance=Provenance(
                 fetcher="deep_worker",
                 fetched_at=acl_checked_at,
@@ -1692,19 +1834,28 @@ class RetrieveSectionTool(BaseTool):
             ),
         )
         evidence_registry.add(evidence)
-        self.ctx.consumed_budget.domain_tool_calls += 1
+        # Atomic budget consumption (per A.6: NEVER direct increment)
+        await self.ctx.budget_guard.try_consume_tool_call()
         
-        # 8. Completion event
-        await push_event({
-            "type": "status",
+        # 8. If truncated, emit truncation warning
+        if truncated:
+            await push_event(self.ctx.state, "status", {
+                "status": "deep_agent_truncated",
+                "task_id": ref_id,
+                "raw_content_bytes": raw_content_bytes,
+                "stored_bytes": len(stored_bytes),
+            })
+        
+        # 9. Completion event
+        await push_event(self.ctx.state, "status", {
             "status": "deep_agent_progress",
             "task_id": ref_id,
             "task_status": "completed",
             "evidence_id": evidence.evidence_id,
         })
         
-        # 9. Return raw content for coordinator context
-        return content.text
+        # 10. Return stored text (possibly truncated) for coordinator context
+        return stored_text
     
     async def _revalidate_acl(self, ref: DocumentRefEntry) -> None:
         """Re-validate Document.id + workspace + principal at boundary.
@@ -1807,11 +1958,16 @@ class EvidenceRegistry:
         return list(self._by_id.values())
     
     def coverage_for(self, task_id: str, requested: int) -> Coverage:
-        """Programmatic coverage check (per review finding 7)."""
+        """Programmatic coverage check (per review finding 7).
+        
+        `truncated` = count of evidence where raw_content_bytes > MAX (original uncut > cap).
+        Uses raw_content_bytes (NOT content_size_bytes) since A.5 accepts truncated
+        storage; coverage.truncated reflects SOURCE truncation, not storage truncation.
+        """
         ids = self._by_doc_ref.get(task_id, [])
         resolved = len(ids)
         read = sum(1 for eid in ids if self._by_id[eid].chunk_offsets is not None)
-        truncated = sum(1 for eid in ids if self._by_id[eid].content_size_bytes > Evidence.MAX_RAW_CONTENT_BYTES)
+        truncated = sum(1 for eid in ids if self._by_id[eid].raw_content_bytes > Evidence.MAX_RAW_CONTENT_BYTES)
         return Coverage(requested=requested, resolved=resolved, read=read, truncated=truncated)
 
 
@@ -2658,7 +2814,7 @@ def _redact_langfuse_payload(payload: dict) -> dict:
 | O2 | `langchain_adapter.py` (Q3.A) | Phase 2 | Yes |
 | O3 | `safe_lookup_metadata_only` primitive | Phase 1A | Yes |
 | O4 | `Document.version` representation | Phase 0 | Yes |
-| O5 | `tool_allowlist` for Deep Agent | Phase 2 | Yes (also O31) |
+| O5 | `tool_allowlist` for Deep Agent (merged: see O31 + O36) | Phase 2 | Yes |
 | O6 | DocumentAlias model + migration (Q9.A) | Phase 0 | Yes |
 | O7 | Atomic feature flag + one-shot enable (Q10.A) | Phase 0 + 1A | Yes |
 | O8 | AgentTrace schema migration | Phase 0 | Yes |
@@ -2711,17 +2867,312 @@ def _redact_langfuse_payload(payload: dict) -> dict:
 | O55 | Cohort gate directionality + min sample N + CI bounds (E.8) | Phase 2 prep | Yes |
 | O56 | Flag snapshot at ingress (E.2) | Phase 0 | Yes |
 | O57 | Production config: rollback time = deployment pipeline (~2 min), not <30s (E.5) | Each phase | Yes (honesty) |
+| O58 | Baseline capture script `capture_baselines.sh` (Q29.A: TWO worktrees + full snapshot metadata) | Phase 0 prep | Yes |
+| O59 | Regression verify on existing B1-B4 tests | Phase 0 | Yes |
+| **O60** | **Span nesting validator (allow abbreviation inside ref for `regex_abbr_then_doc`)** | Phase 0/1A | Yes |
+| **O61** | **Raw-slice equality validator on PreprocessingResult (A.1 `_check_raw_slice_equality`)** | Phase 0/1A | Yes |
+| **O62** | **`BlockingAmbiguity` structural dataclass (essential: bool) in A.1** | Phase 0/1A | Yes |
+| **O63** | **Cross-domain threshold consistency (C.4 + anti-downgrade: `cross_domain AND >=2 refs`)** | Phase 0/1A | Yes |
+| **O64** | **Deep Agent executor scope fallback (work_type cross_agent/multi_goal → supervisor when out of pilot scope)** | Phase 1B | Yes |
+| **O65** | **Evidence byte-safe truncation (A.5 raw_content_bytes field; D.5 truncate by bytes)** | Phase 2 | Yes |
+| **O66** | **`push_event` signature `(state, ev_type, ev_data)` correction in D tools** | Phase 2 | Yes |
+| O67 | Phase 0 gate review — all gates pass + baselines captured + ACL negative tests = 0 leaks | Phase 0 end | Yes |
+| O68 | B3 prompt consumption regression test (`test_comparison_prompt_assembly.py`) | Phase 0 | Yes |
+| O69 | B4 source snapshot dedup contract + regression test + fix `streaming.py:311-314` | Phase 0 | Yes |
+| O70 | B5 frontend + persistence complete rollback | Phase 0 | Yes |
+| O71 | B6 narrow ACL fix (chat_session.py:989-1005 + rag_agent.py:635-651) — Q30.A | Phase 0 | Yes |
+| O72 | Test isolation SAVEPOINT pattern fix (`test_attachment_delete_acl.py:55-68`) | Phase 0 | Yes |
+| O73 | Force-track baselines in git (`backend/tests/reports/baseline_*.json`) | Phase 0 prep | Yes |
+| O74 | Full audit of `build_initial_state` callers + document-content tool boundaries (deferred from B6 Q30.A scope) | Future | Recommended |
 
 ---
 
-# Self-Review Checklist
+# Section F — Phase 0 Blockers
 
-After writing Sections A, B, C, D, E, the author should run this check (per brainstorming skill):
+## F.1 Scope — REVISED
 
-- [x] **Placeholder scan**: No TBD/TODO in Sections A/B/C/D/E content
-- [x] **Internal consistency**: A contracts match B/C/D/E usage; E.2 flag bundles align with Section A-D phases; E.3 cohort integration aligns with existing `users` schema; E.7 observability reuses existing Loki stack
-- [x] **Scope check**: A/B/C/D/E focused on contracts + preprocessing + routing + Deep Agent pilot + canary/rollout (Phase 0/1A/1B/2/3/4 scope)
-- [x] **Ambiguity check**: Each contract has explicit invariants; flag dependency chain validated; cohort allocation deterministic; rollback matrix specifies realistic time (NOT aspirational <30s)
+Per handoff §5A: baseline + safety/contract blockers. **KHÔNG phải tất cả 6 đều unfixed** — Task-1 commits đã resolve B1-B4.
+
+**Section F actual scope**:
+- ✅ **B1, B2**: Already fixed by Task-1 (`3179cf9` + `acdb9e2`). Regression VERIFY only.
+- ✅ **B3**: Schema/producer fixed. Prompt consumption path chưa có regression test — ADD test.
+- ⚠️ **B4**: Terminal accumulator works, BUT snapshot dedup contract broken — FIX + test.
+- ❌ **B5**: Frontend rollback incomplete + persistence misses 2 fields — FIX + test.
+- ❌ **B6**: Active ACL leak — FIX (narrow: 2 paths only).
+
+**Section F does NOT**:
+- Re-apply Task-1 fixes (would destroy baseline semantics)
+- Refactor unrelated code
+- Optimize non-related performance
+- Change contract signatures
+
+## F.2 Blocker status — REVISED
+
+| # | Status | Evidence | Action in F |
+|---|--------|----------|-------------|
+| B1 | ✅ Fixed by Task-1 | `chat_session.py:160-270,516-588`; `test_attachment_delete_acl.py` passes | Regression verify + fix test isolation (SAVEPOINT pattern) |
+| B2 | ✅ Fixed by Task-1 | `supervisor.py:3427-3452,3474-3480` (**route_from_resolve_doc**, not route_from_supervisor); `test_route_from_resolve_doc_finish.py` passes | Regression verify; rename file in docs |
+| B3 | ⚠️ Partial | Schema + producer OK (`models.py:178-184`, `supervisor.py:1108-1130`); prompt assembly path (`nodes.py:918-927`, `answer_instructions.py:188-226`) NOT regression-tested | ADD regression test for actual prompt consumption |
+| B4 | ⚠️ Partial | Terminal complete returns accumulator (`streaming.py:292-301`); BUT: streaming consumer overwrites (`streaming.py:311-314`); multiple publishers emit independent lists; frontend overwrites `localSources` (`useRAGChatStream.ts:442-445`) | DEFINE snapshot dedup contract + FIX + regression test |
+| B5 | ❌ Open | Frontend rollback clears only token buffer (`useRAGChatStream.ts:511-519`); backend persistence doesn't clear `final_potential_abbreviations` + `final_people_data` (`chat_session.py:1037-1051`) | FIX frontend + persistence complete rollback; E2E test |
+| B6 | ❌ Open (narrow) | `chat_session.py:989-1005` passes raw `request.document_ids`; `rag_agent.py:635-639,647-651` markdown fallback no workspace predicate | FIX 2 paths only (Q30.A); O74 defers full audit |
+
+## F.3 Regression test strategy — REVISED (use EXISTING test files)
+
+**Do NOT create new test files** — use existing:
+
+| Test file | Covers | Action |
+|-----------|--------|--------|
+| `backend/tests/agents/test_attachment_delete_acl.py` | B1 | Run + fix test isolation (SAVEPOINT pattern at `:55-68`) |
+| `backend/tests/agents/test_route_from_resolve_doc_finish.py` | B2 | Run; doc renaming |
+| `backend/tests/agents/test_supervisor_state_passes_needs_comparison.py` | B3 schema | ADD test for prompt consumption path |
+| `backend/tests/agents/test_stream_rollback.py` | B4 partial + B5 partial | ADD dedup contract test; EXPAND to cover frontend + persistence completion |
+| `backend/tests/agents/test_session_acl_ingress.py` (NEW, narrow) | B6 | Test `_filter_accessible_document_ids` at chat_session ingress + workspace predicate in markdown fallback |
+
+**B3 prompt consumption regression test** (NEW — `test_comparison_prompt_assembly.py`):
+
+```python
+def test_answer_generator_includes_comparison_when_flag_true(monkeypatch):
+    state = make_state(needs_comparison=True)
+    captured_prompt = capture_prompt_assembly(state)
+    assert "compare" in captured_prompt.lower() or "so sánh" in captured_prompt.lower()
+    assert "user context" in captured_prompt.lower() or "context của người dùng" in captured_prompt.lower()
+
+def test_answer_generator_excludes_comparison_when_flag_false():
+    state = make_state(needs_comparison=False)
+    captured_prompt = capture_prompt_assembly(state)
+    assert "compare user context vs document requirements" not in captured_prompt.lower()
+```
+
+**B4 source snapshot dedup contract** (NEW — `test_source_snapshot_dedup.py`):
+
+**Contract**: `sources` event is **cumulative deduplicated snapshot**. Identity: `(document_id, page_or_chunk, content_hash)`; fall back deterministic. Multi-source same content preserved.
+
+```python
+def test_multiple_rounds_accumulate_without_loss():
+    ctx = make_streaming_context()
+    push_sources(ctx, [Source(doc="A", chunk="p.1")])
+    push_sources(ctx, [Source(doc="A", chunk="p.1"), Source(doc="B", chunk="p.2")])
+    sources = get_terminal_sources(ctx)
+    assert len(sources) == 2
+    assert Source(doc="A", chunk="p.1") in sources
+    assert Source(doc="B", chunk="p.2") in sources
+
+def test_duplicate_identity_dedup():
+    ctx = make_streaming_context()
+    push_sources(ctx, [Source(doc="A", chunk="p.1")])
+    push_sources(ctx, [Source(doc="A", chunk="p.1")])
+    sources = get_terminal_sources(ctx)
+    assert len(sources) == 1
+
+def test_multi_source_same_content_preserved():
+    ctx = make_streaming_context()
+    push_sources(ctx, [
+        Source(doc="A", chunk="p.1", source_id="src1"),
+        Source(doc="A", chunk="p.1", source_id="src2"),
+    ])
+    sources = get_terminal_sources(ctx)
+    assert len(sources) == 2  # provenance preserved
+```
+
+**B5 frontend + persistence rollback** (NEW + expand existing — `test_rollback_complete_e2e.py`):
+
+```python
+def test_frontend_clears_all_artifacts_on_rollback():
+    """Frontend reducer test: token_rollback clears localSources/Images/pendingSources/pendingImages/people."""
+    initial = frontend_state(
+        localSources=[Source("A","p.1")], localImages=[Image("img1")],
+        pendingSources=[Source("B","p.2")], pendingImages=[Image("img2")],
+        people_data=PeopleRecord(id="p1"),
+    )
+    new = frontend_reducer(initial, {"type": "token_rollback"})
+    assert new["localSources"] == []
+    assert new["localImages"] == []
+    assert new["pendingSources"] == []
+    assert new["pendingImages"] == []
+    assert new["people_data"] is None
+
+def test_persistence_clears_all_final_fields_on_rollback():
+    chat_msg = create_chat_message(text="...", sources=[...], images=[...],
+                                   potential_abbreviations=["BMNN"], people_data=PeopleRecord(id="p1"))
+    session_persistence.rollback(chat_msg)
+    reloaded = reload(chat_msg.id)
+    assert reloaded.text in (None, "")
+    assert reloaded.sources == []
+    assert reloaded.images == []
+    assert reloaded.potential_abbreviations == []
+    assert reloaded.people_data is None
+
+def test_terminal_complete_overrides_frontend_local():
+    """Backend `complete.sources/images` is authoritative; frontend uses it."""
+```
+
+**B6 narrow fix tests** (NEW — `test_session_acl_ingress.py`):
+
+```python
+def test_unfiltered_doc_ids_filtered_at_ingress():
+    user = create_user(workspace_ids=[ws_a])
+    request = ChatRequest(document_ids=[doc_in_ws_a.id, doc_in_ws_b.id])
+    state = build_initial_state_for_session(user=user, request=request, ...)
+    assert state["document_ids"] == [doc_in_ws_a.id]
+
+def test_markdown_fallback_workspace_predicate():
+    # Doc in ws A; user has ws B only → not-found, not the doc
+    # Spy on markdown download; assert not called
+
+def test_attacker_session_cannot_access_foreign_doc():
+    # Negative: attacker adds doc_id of victim's doc to their session request
+```
+
+## F.4 Baseline strategy — REVISED (Q29.A — two worktrees + full snapshot)
+
+**Two baselines** captured in **two SEPARATE worktrees** (cannot use one worktree for both):
+
+```bash
+#!/bin/bash
+# scripts/capture_baselines.sh (NEW)
+set -e
+
+capture_snapshot() {
+    local label="$1"
+    local sha="$2"
+    cat > /home/AIRAG/backend/tests/reports/baseline_${label}_metadata.json <<EOF
+{
+  "label": "${label}",
+  "commit_sha": "${sha}",
+  "captured_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "flags": {
+    "NEXUSRAG_SEMANTIC_PREPROCESSOR": "false",
+    "NEXUSRAG_COMPLEXITY_ACTIVE": "false",
+    "NEXUSRAG_DEEP_ENABLED": "false"
+  },
+  "model_snapshot": $(python -c "from app.services.runtime_config import snapshot_version; print(snapshot_version())"),
+  "config_revision": "${RUNTIME_CONFIG_REVISION}",
+  "corpus_index_revision": "${CORPUS_INDEX_REVISION}",
+  "dataset_hash": "${DATASET_HASH}"
+}
+EOF
+}
+
+# 1. Capture TRUE pre-Task-1 baseline from pinned worktree
+git worktree add /tmp/airag_pre_task1 2b19a2d  # parent of 3179cf9
+cd /tmp/airag_pre_task1
+docker compose -f docker-compose.services.yml up -d
+make dev-deps
+make test-recall test-section test-validity
+make eval-prompts
+mkdir -p backend/tests/reports
+cp backend/tests/reports/*.json /home/AIRAG/backend/tests/reports/baseline_pre_task1_*.json
+capture_snapshot "pre_task1" "$(git rev-parse HEAD)"
+
+# 2. Capture post-Task-1 (current HEAD) baseline in separate worktree
+cd /home/AIRAG
+git worktree add /tmp/airag_post_task1 HEAD  # Task-1 tip: 3179cf9 + acdb9e2
+cd /tmp/airag_post_task1
+make test-recall test-section test-validity
+make eval-prompts
+cp backend/tests/reports/*.json /home/AIRAG/backend/tests/reports/baseline_post_task1_pre_sectionF_*.json
+capture_snapshot "post_task1_pre_sectionF" "$(git rev-parse HEAD)"
+
+# Cleanup
+git worktree remove /tmp/airag_pre_task1
+git worktree remove /tmp/airag_post_task1
+
+echo "Baselines captured with full snapshot metadata."
+```
+
+**Baseline files** (each with paired `*_metadata.json`):
+- `baseline_pre_task1_*.json` + `baseline_pre_task1_metadata.json` — true pre-B1-B4-fix snapshot (worktree pinned to `2b19a2d`)
+- `baseline_post_task1_pre_sectionF_*.json` + `baseline_post_task1_pre_sectionF_metadata.json` — current state (B1-B4 fixed, B5+B6 open)
+
+**Snapshot metadata** (per `baseline_*_metadata.json`):
+- `commit_sha`: exact git SHA of worktree HEAD
+- `captured_at`: ISO 8601 timestamp
+- `flags`: all 8 deepagent flags (expected false at baseline time)
+- `model_snapshot`: provider + model + base_url
+- `config_revision`: runtime_config._config_version (per `runtime_config.py:242-256`)
+- `corpus_index_revision`: Chroma collection version
+- `dataset_hash`: sha256 of dataset YAML
+
+**Note**: Both baselines are **post-Phase 0 build** (atomic feature flag NOT enabled). Phase 1A enable happens after Section F gate passes.
+
+**Reports directory** (per `harness.md:69-79`): `backend/tests/reports/` is git-ignored; explicit force-track needed for baselines (O73).
+
+## F.5 Fix scope rules — REVISED
+
+| Blocker | Fix scope |
+|---------|-----------|
+| B3 | ADD regression test for prompt consumption path (no code fix; just test) |
+| B4 | DEFINE sources snapshot contract + FIX `streaming.py:311-314` overwrite behavior + ADD dedup by `(doc_id, page_or_chunk, content_hash)` |
+| B5 | Frontend: clear `localSources/localImages/pendingSources/pendingImages/people_data` on `token_rollback` event; Backend: persistence clear `final_potential_abbreviations` + `final_people_data` |
+| B6 (narrow) | (a) `chat_session.py:989-1005` filter `request.document_ids` against `_filter_accessible_document_ids`; (b) `rag_agent.py:635-651` add workspace_id predicate to Document query |
+
+**NOT allowed**: refactor, perf optimize, new features, contract signature changes, audit other `build_initial_state` callers (deferred O74), re-apply Task-1 B1-B4 fixes.
+
+**Atomic commit pattern**:
+
+```bash
+git commit -m "fix(phase0): B4 source snapshot dedup contract
+Test: backend/tests/agents/test_source_snapshot_dedup.py
+Fix: streaming.py:311-314 dedup by (doc_id, page_or_chunk, content_hash)
+Baseline: no regression vs baseline_post_task1_pre_sectionF
+"
+
+git commit -m "fix(phase0): B5 frontend + persistence complete rollback
+Tests: backend/tests/agents/test_rollback_complete_e2e.py
+Fix: frontend useRAGChatStream.ts:511-519 + chat_session.py:1037-1051
+Baseline: no regression
+"
+
+git commit -m "fix(phase0): B6 narrow ACL fix (chat_session ingress + markdown fallback)
+Tests: backend/tests/agents/test_session_acl_ingress.py
+Fix: chat_session.py:989-1005 + rag_agent.py:635-651
+Baseline: no cross-workspace leak in negative tests
+"
+```
+
+## F.6 Acceptance criteria — REVISED
+
+| Gate | Criterion |
+|------|-----------|
+| B1 regression | `pytest test_attachment_delete_acl.py` passes; test isolation uses SAVEPOINT |
+| B2 regression | `pytest test_route_from_resolve_doc_finish.py` passes |
+| B3 prompt consumption | NEW `test_comparison_prompt_assembly.py` passes |
+| B4 snapshot dedup | NEW `test_source_snapshot_dedup.py` passes |
+| B5 complete rollback | NEW `test_rollback_complete_e2e.py` passes (frontend + persistence + E2E) |
+| B6 narrow ACL | NEW `test_session_acl_ingress.py` passes; cross-workspace leak = 0 |
+| Both baselines captured | `baseline_pre_task1_*.json` + `baseline_post_task1_pre_sectionF_*.json` exist (with `_metadata.json`) |
+| No regression | All Task-1 B1-B4 tests still pass; baseline metrics not degraded |
+
+## F.7 Open items (Section F)
+
+(See O58-O74 in consolidated open items above.)
+
+## F.8 Decisions log update (Q29, Q30)
+
+| # | Question | Choice |
+|---|----------|--------|
+| Q29 | Baseline strategy | **A** — TWO worktrees pinned (pre-Task-1 + post-Task-1) + full snapshot metadata |
+| Q30 | B6 scope | **A** — Narrow: chat_session ingress + markdown fallback only (other callers → O74) |
+
+---
+
+# Self-Review Checklist (POST CROSS-SECTION REVIEW)
+
+After writing Sections A through F, with cross-section review applied (15 conflicts fixed), the author ran this check (per brainstorming skill):
+
+- [x] **Placeholder scan**: No TBD/TODO in Sections A/B/C/D/E/F content
+- [x] **Internal consistency** (post cross-section fixes):
+  - A.1 offset semantics = Python code-point (matches B.5); nested spans allowed (matches B.2 `regex_abbr_then_doc`); raw-slice validator added
+  - A.1 `BlockingAmbiguity` structural (matches C.3/C.4 `essential` distinction)
+  - A.5 `raw_content_bytes` field (matches D.5 byte truncation); `Provenance.acl_checked_at`/`acl_version` added (matches D.5)
+  - A.6 ONE clock domain `time.monotonic()` (matches B/D); `budget_guard` field added (matches D atomic consumption); cancellation_event scope clarified
+  - A.8 persisted schema explicit (round-trip via `PersistedSemanticContext` with safe defaults)
+  - C.4 cross-domain threshold consistent (`cross_domain AND >=2 refs`); Deep Agent executor scope fallback (work_type cross_agent/multi_goal → supervisor when out of pilot scope)
+  - D.5 Evidence byte-safe truncation; `push_event` signature `(state, ev_type, ev_data)`; `budget_guard.try_consume_tool_call()` atomic
+  - F.4 two worktrees + full snapshot metadata; F.5 narrow B6 scope
+- [x] **Scope check**: A-F covers contracts + preprocessing + routing + Deep Agent pilot + canary/rollout + Phase 0 blockers (Phase 0/1A/1B/2/3/4 scope)
+- [x] **Ambiguity check**: Each contract has explicit invariants; flag dependency chain validated; cohort allocation deterministic; rollback matrix specifies realistic time (NOT aspirational <30s); baseline strategy explicit with full snapshot metadata; cross-domain threshold aligned across C.4 + anti-downgrade
 
 **Status**: PASS. Ready for user review.
 
@@ -2729,7 +3180,7 @@ After writing Sections A, B, C, D, E, the author should run this check (per brai
 
 # Approval & Next Steps
 
-This spec covers Sections A, B, C, D, E. Section F (Phase 0 Blockers) remains TBD.
+This spec covers Sections A through F (ALL FINAL).
 
 After full spec approval (A through F), the **writing-plans** skill is invoked to produce implementation plans per task, per phase, with TDD scaffolding.
 
