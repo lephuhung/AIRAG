@@ -1423,22 +1423,734 @@ class RoutingMetricsReport(BaseModel):
 | O22 | RuntimeHints.cross_domain derivation from semantic_context (Q11.A) | Phase 0 | Yes |
 | O23 | user_wrapper JSON serialization replace at supervisor.py:1460-1465 | Phase 0 | Yes |
 
----
+# Section D — Deep Agent Pilot (compare_sections)
 
-# Consolidated Open Items (O1-O23)
+## D.1 Scope
+
+Phase 2 pilot per handoff §2: **so sánh hai chương thuộc hai văn bản đã ingest/index**.
+
+**Pilot inputs**: User query "So sánh Chương II Nghị định X với Chương III Nghị định Y"; Preprocessing output: 2 `DocumentRefEntry` resolved, both with `section_reference`; Expected: structured comparison with verified citations.
+
+**Pilot KHÔNG bao gồm**: map-reduce summary, cross-agent people, HITL, recursive general-purpose delegation, filesystem/shell access, model-facing `compare_pair` tool.
+
+## D.2 Module placement
+
+```
+backend/app/services/agents/deep_research/
+├── __init__.py
+├── graph.py           # create_deep_research_graph()
+├── contracts.py       # re-export from Section A
+├── tools.py           # RetrieveSectionTool
+├── budget.py          # deadline + budget + cancellation
+└── evidence.py        # registry + citation IDs
+
+backend/app/services/llm/
+├── langchain_adapter.py   # NEW (Q3.A)
+└── providers_patch.py     # tool_call_id + thought_signature preservation
+
+backend/app/services/agent/
+└── document_accessor.py   # NEW (O24)
+```
+
+**Integration owners** (spec NOT self-contained):
+- `backend/app/services/agents/supervisor.py` — graph + state + flag + cancellation
+- `backend/app/services/agent/streaming.py` — SSE draining + terminal envelope
+- `backend/app/api/chat_session.py` — persistence + completion_status
+- `frontend/src/hooks/useRAGChatStream.ts` — completion_status rendering
+
+## D.3 `langchain_adapter.py` (Q3.A + Q24.A)
+
+### Dependency pinning (Q24.A — hard compatibility gate)
+
+```toml
+# backend/requirements.txt — pinned versions after compat test passes
+deepagents==0.2.5
+langchain-core==0.3.X
+langgraph==0.2.X
+```
+
+**Pre-implementation gate** `scripts/compat_test.sh` (MUST pass before D code lands): import test, BaseChatModel surface, adapter/provider roundtrip, Langfuse callback, cancellation, hot config reload. If any gate fails → **escalate, do NOT silently swap provider**.
+
+### Provider patch (tool_call_id preservation)
+
+Per review finding 1.3 — adapter alone cannot synthesize IDs; providers must preserve them.
+
+```python
+# backend/app/services/llm/openai_compatible.py — MODIFY
+# Fix: preserve provider-emitted tool_call_id (currently discarded at :324-335)
+async def astream(self, messages, ...):
+    async for chunk in self._raw_stream(messages):
+        for choice in chunk.choices:
+            if choice.delta.tool_calls:
+                for tc in choice.delta.tool_calls:
+                    yield StreamChunk(
+                        text=...,
+                        tool_calls=[ToolCall(
+                            id=tc.id or generate_synthetic_id(...),  # fallback only
+                            name=tc.function.name,
+                            args=tc.function.arguments,
+                        )],
+                    )
+```
+
+Similarly Gemini (preserve `thought_signature`) and Ollama (assign UUID with deterministic derivation).
+
+### Adapter spec
+
+```python
+class LangChainLLMAdapter(BaseChatModel):
+    """Wrap AIRAG LLMProvider → LangChain BaseChatModel.
+    
+    Used only by Deep Agents. Existing supervisor/RAG path keeps LLMProvider directly.
+    """
+    provider: Any
+    config_snapshot: ModelSnapshot
+    langfuse_handler: Any | None = None
+    run_id: str
+    cancellation_event: asyncio.Event | None = None
+    principal_id: UUID4 | None = None
+    task_id: str | None = None
+    parent_agent_type: str = "deepagent"
+    
+    @property
+    def _llm_type(self) -> str:
+        return f"airag-{self.config_snapshot.provider}"
+    
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        raise NotImplementedError("Deep Agent uses async path")
+    
+    async def _agenerate(self, messages, stop=None, run_manager=None, **kwargs) -> ChatResult:
+        """Async bridge: BaseMessage → LLMMessage → provider.astream → ChatResult.
+        
+        Propagates: tool_call IDs from provider (NEVER synthetic unless provider
+        genuinely omits; if synthetic, must be deterministic per-call); Langfuse
+        callbacks via run_manager + nested manual span under root; cancellation_event
+        check between chunks; run_id + config_revision + session_id + task_id.
+        """
+        lc_messages = [_lc_to_llm(m) for m in messages]
+        aggregated_text = ""
+        aggregated_tool_calls: list[ToolCall] = []
+        usage = None
+        
+        async for chunk in self.provider.astream(lc_messages, ...):
+            if self.cancellation_event and self.cancellation_event.is_set():
+                raise asyncio.CancelledError("cancellation_event set")
+            if run_manager:
+                run_manager.on_llm_new_token(chunk.text or "")
+            aggregated_text += chunk.text or ""
+            if chunk.tool_calls:
+                aggregated_tool_calls.extend(chunk.tool_calls)
+            usage = chunk.usage or usage
+        
+        message = AIMessage(
+            content=aggregated_text,
+            tool_calls=[{"id": tc.id, "name": tc.name, "args": tc.args} for tc in aggregated_tool_calls],
+        )
+        return ChatResult(generations=[ChatGeneration(message=message)])
+    
+    def bind_tools(self, tools, **kwargs):
+        return self
+    
+    @property
+    def _identifying_params(self):
+        return {
+            "provider": self.config_snapshot.provider,
+            "model": self.config_snapshot.model,
+            "run_id": self.run_id,
+            "config_revision": self.config_snapshot.config_revision,
+        }
+```
+
+### Runtime config snapshot (per review finding 1.4)
+
+```python
+# In deep_research_coordinator_node, ONCE at ingress:
+config_snapshot = runtime_config.snapshot_version()  # frozen
+ctx.config_revision = config_snapshot.revision
+# Provider NEVER re-resolved mid-run
+```
+
+## D.4 Coordinator factory
+
+```python
+def create_deep_research_graph(ctx, semantic_context) -> CompiledGraph:
+    """Bounded Deep Agent for one request (pilot: compare_sections only)."""
+    llm = LangChainLLMAdapter(provider=get_llm_provider(), config_snapshot=ctx.model_snapshot, ...)
+    tools = build_pilot_tools(ctx, semantic_context)  # ONE tool: RetrieveSectionTool
+    evidence_registry = EvidenceRegistry(run_id=ctx.run_id)
+    budget_guard = BudgetGuard(ctx=ctx, evidence_registry=evidence_registry)
+    
+    # No sub-agents, no planning middleware (pilot scope = single coordinator)
+    # Built-in tools disabled (proposal §1: no recursive general-purpose delegation)
+    agent = create_deep_agent(
+        model=llm,
+        tools=tools,
+        system_prompt=build_coordinator_system_prompt(semantic_context, ctx),
+    )
+    return wrap_with_budget_guard(agent, budget_guard, evidence_registry)
+```
+
+### Coordinator system prompt
+
+```
+Bạn là điều phối viên so sánh tài liệu cho AIRAG (pilot scope).
+NHIỆM VỤ: So sánh các phạm vi đã resolved. Bạn có ≥2 document_refs.
+CÔNG CỤ: retrieve_section(ref_id) — đọc đầy đủ nội dung một section.
+QUY TẮC:
+1. Gọi retrieve_section cho MỖI ref_id resolved.
+2. Sau evidence, kiểm tra coverage bằng evidence_registry (programmatic).
+3. Synthesis: MỘT LẦN, dùng evidence từ registry. Citation chỉ từ Evidence.provenance.
+4. KHÔNG phát minh. KHÔNG parametric knowledge. KHÔNG delegate subagent.
+```
+
+## D.5 Tools (pilot scope = ONE tool)
+
+```python
+def build_pilot_tools(ctx, semantic_context) -> list[BaseTool]:
+    return [RetrieveSectionTool(ctx=ctx, semantic_context=semantic_context)]
+
+
+class RetrieveSectionTool(BaseTool):
+    """Read full structural section from a resolved document_ref.
+    
+    ACL: re-validates Document.id + workspace_id + principal at boundary.
+    """
+    name: str = "retrieve_section"
+    description: str = "Đọc đầy đủ nội dung một phạm vi (Chương/Điều) từ văn bản resolved. Input: ref_id. Output: raw text + section path + page range."
+    args_schema: type[BaseModel] = RetrieveSectionArgs
+    ctx: RuntimeContext
+    semantic_context: PreprocessingResult
+    
+    async def _arun(self, ref_id: str) -> str:
+        # 1. Look up ref
+        ref = _find_ref(self.semantic_context, ref_id)
+        if ref is None:
+            raise ToolError(f"unknown ref_id: {ref_id}")
+        
+        # 2. **ACL re-validation at boundary** (per review finding 6)
+        await self._revalidate_acl(ref)
+        
+        # 3. Cancellation + budget
+        if self.ctx.cancellation_event.is_set():
+            raise ToolError("request cancelled")
+        if self.ctx.consumed_budget.domain_tool_calls >= self.ctx.tool_budget.max_domain_tool_calls:
+            raise ToolError("tool budget exhausted")
+        
+        # 4. Emit progress event (mapped to existing 'status' event per D.9)
+        await push_event({
+            "type": "status",
+            "status": "deep_agent_progress",
+            "task_id": ref_id,
+            "task_status": "started",
+            "config_revision": self.ctx.config_revision,
+        })
+        
+        # 5. Read full section via DocumentAccessor
+        async with branch_session_factory() as session:
+            try:
+                content = await asyncio.wait_for(
+                    DocumentAccessor.read_full_section(
+                        document_id=ref.document_handle,
+                        section_reference=ref.section_reference,
+                        principal_id=self.ctx.principal_id,
+                        allowed_workspace_ids=self.ctx.allowed_workspace_ids,
+                        session=session,
+                    ),
+                    timeout=self.ctx.preprocessing.per_call_timeout_sec,
+                )
+            except asyncio.TimeoutError:
+                raise ToolError(f"section read timeout for {ref_id}")
+        
+        # 6. ACL outcome recording
+        acl_checked_at = time.time()
+        
+        # 7. Build Evidence
+        evidence = Evidence(
+            evidence_id=f"{self.ctx.run_id}:{ref_id}",
+            task_id=ref_id,
+            source_id=str(uuid4()),
+            raw_content=content.text,
+            content_hash=sha256(content.text.encode('utf-8')).hexdigest(),
+            content_size_bytes=len(content.text.encode('utf-8')),
+            redacted=False,
+            document_id=ref.document_handle,
+            document_version=content.document_version,
+            workspace_id=ref.metadata.workspace_id,
+            section_path=ref.section_reference,
+            page_or_chunk=content.page_range,
+            chunk_offsets=(0, len(content.text.encode('utf-8'))),
+            provenance=Provenance(
+                fetcher="deep_worker",
+                fetched_at=acl_checked_at,
+                fetched_by=self.ctx.principal_id,
+                workspace_scope=self.ctx.allowed_workspace_ids,
+                acl_checked=True,
+                acl_checked_at=acl_checked_at,
+                acl_version="v1",
+                tool_call_id=None,
+                run_id=self.ctx.run_id,
+            ),
+        )
+        evidence_registry.add(evidence)
+        self.ctx.consumed_budget.domain_tool_calls += 1
+        
+        # 8. Completion event
+        await push_event({
+            "type": "status",
+            "status": "deep_agent_progress",
+            "task_id": ref_id,
+            "task_status": "completed",
+            "evidence_id": evidence.evidence_id,
+        })
+        
+        # 9. Return raw content for coordinator context
+        return content.text
+    
+    async def _revalidate_acl(self, ref: DocumentRefEntry) -> None:
+        """Re-validate Document.id + workspace + principal at boundary.
+        
+        Per review finding 6: independent of upstream session filtering
+        (which is buggy per chat_session.py:989-1000)."""
+        async with branch_session_factory() as session:
+            doc = await session.execute(
+                select(Document).where(
+                    Document.id == ref.document_handle,
+                    Document.workspace_id.in_(self.ctx.allowed_workspace_ids),
+                    Document.deleted_at.is_(None),
+                )
+            )
+            doc_row = doc.scalar_one_or_none()
+            if doc_row is None:
+                raise ToolError(f"ref {ref.ref_id} not authorized (doc={ref.document_handle})")
+```
+
+### `DocumentAccessor.read_full_section` (O24 — NEW)
+
+```python
+class DocumentAccessor:
+    """Strict structural section reader. No semantic fallback.
+    
+    Constraints (per review finding 2):
+    - Document row constrained by BOTH document_id AND authorized workspace/principal
+    - Markdown from MinIO using Document.markdown_s3_key
+    - Structural parser deterministically identifies chapter/article range
+    """
+    @staticmethod
+    async def read_full_section(
+        document_id: UUID, section_reference: str,
+        principal_id: UUID, allowed_workspace_ids: list[UUID],
+        session: AsyncSession,
+    ) -> SectionContent:
+        # 1. ACL via Document query (NOT relying on upstream)
+        doc = await session.execute(
+            select(Document).where(
+                Document.id == document_id,
+                Document.workspace_id.in_(allowed_workspace_ids),
+                Document.deleted_at.is_(None),
+            )
+        )
+        doc_row = doc.scalar_one_or_none()
+        if doc_row is None:
+            raise DocumentAccessError(f"doc {document_id} not accessible")
+        
+        # 2. Download markdown from MinIO
+        markdown = await _download_markdown(doc_row.markdown_s3_key)
+        
+        # 3. Structural parse
+        sections = _parse_structural_sections(markdown, doc_row)
+        section_content = _find_section(sections, section_reference, doc_row)
+        
+        if section_content is None:
+            return SectionContent(text="", page_range=None, section_path=section_reference,
+                                  document_version=str(doc_row.updated_at),
+                                  is_truncated=False, not_found=True)
+        
+        # 4. Apply retention cap
+        if len(section_content.text.encode('utf-8')) > Evidence.MAX_RAW_CONTENT_BYTES:
+            section_content.text = section_content.text[:Evidence.MAX_RAW_CONTENT_BYTES]
+            section_content.is_truncated = True
+        
+        return section_content
+```
+
+## D.6 Evidence registry + citation
+
+```python
+class EvidenceRegistry:
+    def __init__(self, run_id: str):
+        self._by_id: dict[str, Evidence] = {}
+        self._by_content_hash: dict[str, list[str]] = {}
+        self._by_doc_ref: dict[str, list[str]] = {}
+        self._citation_counter: dict[str, int] = {}
+    
+    def add(self, evidence: Evidence) -> None:
+        """Dedup by content_hash; preserve multi-source if same content from
+        different sources (per review finding 6)."""
+        if evidence.content_hash in self._by_content_hash:
+            existing_ids = self._by_content_hash[evidence.content_hash]
+            existing_sources = {self._by_id[eid].source_id for eid in existing_ids if eid in self._by_id}
+            if evidence.source_id in existing_sources:
+                return  # duplicate
+            # Different source → keep both (provenance preserved)
+            self._by_id[evidence.evidence_id] = evidence
+            existing_ids.append(evidence.evidence_id)
+        else:
+            self._by_id[evidence.evidence_id] = evidence
+            self._by_content_hash.setdefault(evidence.content_hash, []).append(evidence.evidence_id)
+        self._by_doc_ref.setdefault(evidence.task_id, []).append(evidence.evidence_id)
+    
+    def by_task(self, task_id: str) -> list[Evidence]:
+        ids = self._by_doc_ref.get(task_id, [])
+        return [self._by_id[eid] for eid in ids if eid in self._by_id]
+    
+    def all(self) -> list[Evidence]:
+        return list(self._by_id.values())
+    
+    def coverage_for(self, task_id: str, requested: int) -> Coverage:
+        """Programmatic coverage check (per review finding 7)."""
+        ids = self._by_doc_ref.get(task_id, [])
+        resolved = len(ids)
+        read = sum(1 for eid in ids if self._by_id[eid].chunk_offsets is not None)
+        truncated = sum(1 for eid in ids if self._by_id[eid].content_size_bytes > Evidence.MAX_RAW_CONTENT_BYTES)
+        return Coverage(requested=requested, resolved=resolved, read=read, truncated=truncated)
+
+
+# Internal citation: {task_id}:c{N}
+def generate_internal_citation_id(task_id: str, counter: int) -> str:
+    return f"{task_id}:c{counter}"
+
+
+# External projection: ChatSourceChunk.index (sanitized, sorted for stable rendering)
+def project_external_citation(internal_id: str, registry: EvidenceRegistry) -> int:
+    """Map internal citation ID to external ChatSourceChunk.index.
+    
+    Per review finding additional-4: must NOT leak task_id;
+    sorted by (document_id, section_path, page_or_chunk) for determinism.
+    """
+    evidence = registry._by_id.get(internal_id)
+    if evidence is None:
+        raise ValueError(f"unknown citation: {internal_id}")
+    return _external_index_for(evidence)
+
+
+class CitationSanitizer:
+    """Validates that synthesis output ONLY cites evidence in registry.
+    
+    Per review finding 4: ground corpus = registry Evidence ONLY,
+    not arbitrary coordinator/system text.
+    """
+    @staticmethod
+    def validate_synthesis(synthesis_text: str, registry: EvidenceRegistry) -> tuple[bool, set[str]]:
+        cited = _extract_citation_refs(synthesis_text)  # [N], (N), etc.
+        valid = set(registry._by_id.keys())
+        invalid = cited - valid
+        return (not invalid, invalid)
+```
+
+## D.7 Budget enforcement (deadline cancellation + atomic counters)
+
+```python
+class BudgetGuard:
+    def __init__(self, ctx, evidence_registry):
+        self.ctx = ctx
+        self.evidence = evidence_registry
+        self._coordinator_lock = asyncio.Lock()
+        self._tool_lock = asyncio.Lock()
+    
+    async def wrap_run(self, agent_run_coro):
+        """Outer deadline enforcement.
+        
+        Per review finding additional-5: periodic watcher alone cannot stop
+        in-flight MinIO/LLM calls or pending gather children. Use outer
+        asyncio.wait_for + task cancellation + explicit child cleanup.
+        """
+        deadline_at = self.ctx.absolute_deadline
+        watcher = asyncio.create_task(self._deadline_watcher(deadline_at))
+        try:
+            return await asyncio.wait_for(
+                agent_run_coro,
+                timeout=max(0.0, deadline_at - time.monotonic()),
+            )
+        except asyncio.TimeoutError:
+            self.ctx.cancellation_event.set()
+            return self._build_deadline_result()
+        finally:
+            watcher.cancel()
+            try:
+                await watcher
+            except asyncio.CancelledError:
+                pass
+    
+    async def _deadline_watcher(self, deadline_at: float):
+        """Sets cancellation_event when deadline approaches."""
+        while True:
+            remaining = deadline_at - time.monotonic()
+            if remaining <= 0.5:
+                self.ctx.cancellation_event.set()
+                return
+            await asyncio.sleep(min(0.5, remaining / 2))
+    
+    async def try_consume_coordinator_round(self) -> bool:
+        async with self._coordinator_lock:
+            if self.ctx.consumed_budget.coordinator_rounds >= self.ctx.tool_budget.max_coordinator_rounds:
+                return False
+            self.ctx.consumed_budget.coordinator_rounds += 1
+            return True
+    
+    async def try_consume_tool_call(self) -> bool:
+        async with self._tool_lock:
+            if self.ctx.consumed_budget.domain_tool_calls >= self.ctx.tool_budget.max_domain_tool_calls:
+                return False
+            self.ctx.consumed_budget.domain_tool_calls += 1
+            return True
+    
+    async def try_consume_worker_round(self, task_id: str) -> bool:
+        async with self._tool_lock:
+            current = self.ctx.consumed_budget.worker_llm_rounds_per_task.get(task_id, 0)
+            if current >= self.ctx.tool_budget.max_worker_llm_rounds:
+                return False
+            self.ctx.consumed_budget.worker_llm_rounds_per_task[task_id] = current + 1
+            return True
+```
+
+## D.8 Pilot flow (compare_sections) — REVISED
+
+```text
+supervisor_node routes to deep_research_coordinator_node
+  │
+  ▼
+deep_research_coordinator_node
+  ├─ Build adapter + tools + evidence_registry + budget_guard
+  ├─ Snapshot runtime_config (frozen for run)
+  │
+  ▼
+budget_guard.wrap_run(create_deep_agent(...))
+  ├─ Outer asyncio.wait_for(deadline - now)
+  │
+  ▼
+[Coordinator LLM call #1 — PLAN] (budget → 1/4)
+  Output: tool_calls = [retrieve_section(r1), retrieve_section(r2)]
+  │
+  ▼
+[Tool execution — PARALLEL]
+  asyncio.gather(retrieve_section(r1), retrieve_section(r2))
+  Each tool: ACL re-validate, budget check (2/6), DocumentAccessor, Evidence + registry.add
+  │
+  ▼
+[Programmatic COVERAGE CHECK — no LLM call]
+  For each ref_id in semantic_context.document_refs:
+    coverage = evidence_registry.coverage_for(ref_id, requested=1)
+    if coverage.read < 1: missing.append(ref_id)
+  │
+  ▼ (if coverage OK)
+[Coordinator LLM call #2 — SYNTHESIS, BUFFERED] (budget → 2/4)
+  Single LLM call with all evidence blocks; BUFFER for validation
+  │
+  ▼
+[Citation Sanitizer — per review finding 4]
+  CitationSanitizer.validate_synthesis(synthesis, registry)
+  If invalid → reject + retry (max 1); if still invalid → completion_status=partial
+  │
+  ▼
+[Grounding guard — reuses _ungrounded_doc_numbers]
+  Corpus = registry Evidence ONLY; validate no fabricated numbers / wrong-doc same-article
+  If ungrounded → retract synthesis, completion_status=partial
+  │
+  ▼
+[Emit answer tokens ONCE after validation]
+  Push 'token' events
+  │
+  ▼
+[Terminal emission — extended envelope]
+  Push 'complete' event with completion_status + answer + evidence_ids + sources (projected) + missing_requirements
+```
+
+**Failure modes**:
+- Tool error 1 ref → coverage partial → completion_status=partial, missing_requirements=[ref_id]
+- Tool error both → dead-letter check (timeout vs auth) → completion_status=error or partial
+- Coordinator round cap → partial, missing_requirements=["budget_exhausted"]
+- Absolute deadline → completion_status=deadline
+- Citation sanitizer fail → partial, missing_requirements=["citation_failed"]
+- Grounding guard fail → partial, missing_requirements=["grounding_guard_failed"]
+
+**Coverage measurement** (per A.4):
+- `requested` = number of refs with `resolution_status="resolved"`
+- `resolved` = evidence_registry entries
+- `read` = evidence with `chunk_offsets` populated
+- `truncated` = evidence with `content_size_bytes > MAX_RAW_CONTENT_BYTES`
+
+## D.9 SSE integration — REVISED for backward compat
+
+Per review finding 5: `streaming.py:290-354` recognizes only `status|sources|images|token|token_rollback|thinking|potential_abbreviations|error|people_data`. Map Deep events to existing types.
+
+```python
+# In RetrieveSectionTool._arun (D.5) — use existing event types
+await push_event({
+    "type": "status",
+    "status": "deep_agent_progress",  # NEW status value within existing 'status' event
+    "task_id": ref_id,
+    "task_status": "started",
+})
+```
+
+```python
+# Synthesis token emission (after validation, per D.8)
+async def emit_synthesis_tokens(text_chunks):
+    for chunk in text_chunks:
+        await push_event({"type": "token", "content": chunk})
+```
+
+```python
+# Terminal envelope — EXTEND existing 'complete' (do NOT push separate terminal event)
+async def emit_terminal_event(result: DeepAgentResult):
+    external_sources = [_evidence_to_source_chunk(e, registry) for e in result.evidence]
+    await push_event({
+        "type": "complete",
+        "answer": result.answer_text,
+        "sources": external_sources,
+        "images": [],
+        "potential_abbreviations": [],
+        "people_data": None,
+        # NEW fields (extended envelope; frontend can ignore for backward compat):
+        "completion_status": result.completion_status,  # complete|partial|clarification|deadline|error
+        "evidence_ids": result.evidence_ids,
+        "missing_requirements": result.missing_requirements,
+        "routing_trace": {
+            "config_revision": ctx.config_revision,
+            "run_id": ctx.run_id,
+            "model_snapshot": ctx.model_snapshot.model_dump(),
+        },
+    })
+```
+
+**Sources sent BEFORE tokens** — frontend needs source citations before token text.
+
+**Rollback persistence**: grounding guard retract → `token_rollback` event + accumulator rollback + persistence rollback (`chat_session.py:1037-1045`).
+
+**Frontend update** (`frontend/src/hooks/useRAGChatStream.ts`):
+- Render `completion_status="partial"` as user-visible warning
+- Render `completion_status="deadline"` as "deadline — partial answer"
+- Handle `status.deep_agent_progress` for UI feedback
+
+## D.10 Tool allowlist + scope enforcement (per review finding 7)
+
+```python
+# In create_deep_research_graph:
+TOOL_ALLOWLIST = frozenset({"retrieve_section"})
+MAX_IMMUTABLE_TASKS = 2
+
+# Build-time enforcement
+assert all(t.name in TOOL_ALLOWLIST for t in tools), "tools outside allowlist"
+
+# Runtime enforcement (in BudgetGuard + RetrieveSectionTool)
+if tool.name not in TOOL_ALLOWLIST:
+    raise ToolError(f"tool {tool.name} not in allowlist for pilot")
+```
+
+## D.11 Test strategy
+
+### Component tests (`backend/tests/deep_research/`)
+
+| Component | Tests |
+|-----------|-------|
+| `langchain_adapter` | `_agenerate` message conversion; tool_call_id propagation; cancellation; Langfuse callback nesting với run_id + config_revision; hot config reload isolation; `_llm_type` correct |
+| `OpenAICompatibleProvider` patch | tool_call_id preserved across streaming chunks; không bị collapse bởi index |
+| `GeminiProvider` patch | thought_signature preserved cho function-call continuation |
+| `RetrieveSectionTool` | ACL pass/fail; cancellation mid-read; budget exhausted; full section returned với chunk_offsets |
+| `DocumentAccessor.read_full_section` | duplicate heading preserved; malformed OCR → flag + fallback; chapter boundary; nested article; same title/different doc; missing markdown → not_found; oversized → truncated=True |
+| `EvidenceRegistry` | add dedup by content_hash; add distinct same content (preserve both); by_task; coverage_for |
+| `BudgetGuard` | coordinator round atomic; tool budget atomic; outer timeout fires; child tasks cancelled; partial result on deadline |
+| `CitationSanitizer` | valid synthesis passes; fabricated citation ID rejected; rejected synthesis → partial + missing_requirements |
+
+### Pilot E2E tests (`backend/tests/agents/test_deep_compare_sections.py`)
+
+| # | Case | Expected |
+|---|------|----------|
+| PE1 | "So sánh Chương II NĐ 13/2023/NĐ-CP với Chương III NĐ 24/2018/QH14" | 2 retrieve_section calls; coverage both ok; synthesis với both verified citations; complete |
+| PE2 | X has section, Y is full-doc only | coverage partial; missing_requirements=[Y.ref_id]; honest partial answer |
+| PE3 | ACL fail on one ref | coverage partial; missing_requirements=["ref_unauthorized"]; ToolError raised |
+| PE4 | Coordinator round cap hit | completion_status=partial; missing_requirements=["budget_exhausted"] |
+| PE5 | Absolute deadline hit mid-synthesis | completion_status=deadline; partial evidence preserved; NO late events |
+| PE6 | LLM fabricates doc number in synthesis | grounding guard retracts; token_rollback event; completion_status=partial |
+| PE7 | Same content from different source | hai Evidence entries preserved (cùng content_hash, khác source_id) |
+| PE8 | Cross-section same doc | 2 retrieve_section same doc; coverage both ok |
+| PE9 | Inline content override | supervisor suppresses deep; inline compare |
+| PE10 | Cancellation between tool calls | partial evidence preserved; SSE terminal; NO late events |
+| PE11 | Citation invalid (LLM cites [99] không tồn tại) | CitationSanitizer rejects; completion_status=partial |
+| PE12 | Tool allowlist violation | rejected at runtime; completion_status=partial |
+
+### Acceptance gates (handoff §6 + Q25.A)
+
+| Metric | Gate (Q25.A: 30 manual cases) |
+|--------|-------------------------------|
+| Pilot compare correctness | ≥90% of 30 cases |
+| JSON valid (synthesis) | ≥99% |
+| Cross-workspace leak | 0 |
+| Grounding guard fail accepted | 0 |
+| Latency p95 | <30s |
+| Late events after terminal | 0 |
+| Rollback correctness | grounding retract → accumulator + persistence rollback |
+
+### Pilot dataset (Q25.A — manual annotation)
+
+**20-30 cases** (Q25.A):
+- 10 cross-document compare (2 văn bản khác nhau)
+- 5 cross-section same document
+- 5 inline-content variations
+- 5 adversarial (wrong-doc same Điều N; fabricated; ACL fail; deadline; truncation)
+- 5 negative (should NOT route to deepagent)
+
+**Annotation format**:
+- Input: query + semantic_context (gold)
+- Expected: completion_status, comparison answer, citations, missing_requirements
+- Ground truth: SME labels kết luận pháp lý + verify doc numbers
+
+**SME effort**: 2-3 tuần cho 20-30 cases (legal expert review).
+
+## D.12 Open items (Section D)
 
 | O# | Item | Phase | Blocking? |
 |----|------|-------|-----------|
-| O1 | Deep Agents version pin + dependency set | Phase 2 | Yes |
+| O1 | Deep Agents release pin (Q24.A) | Phase 2 prep | Yes |
+| O2 | `langchain_adapter.py` | Phase 2 | Yes (D.3) |
+| O24 | `DocumentAccessor.read_full_section` | Phase 2 | Yes (D.5) |
+| O25 | Compatibility gate `scripts/compat_test.sh` | Phase 2 prep | Yes |
+| O26 | Pilot dataset (Q25.A — manual annotation 20-30 cases, 2-3 tuần SME) | Phase 2 prep | Yes |
+| O27 | Deep synthesis adapter + CitationSanitizer + validate-before-emit | Phase 2 | Yes |
+| O28 | `completion_status` payload schema + persistence path | Phase 2 | Yes |
+| O29 | `SourcesSnapshotAccumulator` reuse vs new | Phase 2 | Yes |
+| O30 | Rollback persistence E2E test | Phase 2 | Yes |
+| O31 | `tool_allowlist` + max 2 immutable tasks at runtime | Phase 2 | Yes |
+| O32 | Concurrency / parallel branch tests | Phase 2 | Yes |
+| **O33** | **Fix pre-existing `chat_session.py:989-1000` unfiltered doc_ids + `rag_agent.py:635-651` markdown fallback without workspace predicate** | Phase 0 | Yes (security debt) |
+| **O34** | **Evidence ID external projection (internal `{task_id}:cN` → external ChatSourceChunk.index; sanitized; sorted)** | Phase 2 | Yes |
+| **O35** | **Outer `asyncio.wait_for(deadline)` + outer task cancellation + child cleanup; NOT periodic watcher alone** | Phase 2 | Yes |
+| **O36** | **Drop `compare_pair` tool; enforce `TOOL_ALLOWLIST = {retrieve_section}` + `MAX_IMMUTABLE_TASKS = 2`** | Phase 2 | Yes |
+| **O37** | **Provider patches: preserve tool_call_id (OpenAI), thought_signature (Gemini), UUID (Ollama); provider-level tests parallel/fragmented/roundtrip** | Phase 2 prep | Yes |
+
+## D.13 Decisions log update
+
+| # | Question | Choice |
+|---|----------|--------|
+| Q24 | Deep Agents release pin | **A** — Pin known-good + hard compat test gate |
+| Q25 | Pilot dataset construction | **A** — Manual annotation 20-30 cases (2-3 tuần SME) |
+
+---
+
+# Consolidated Open Items (O1-O37)
+
+| O# | Item | Phase | Blocking? |
+|----|------|-------|-----------|
+| O1 | Deep Agents release pin (Q24.A) | Phase 2 prep | Yes |
 | O2 | `langchain_adapter.py` (Q3.A) | Phase 2 | Yes |
-| O3 | `safe_lookup_metadata_only` primitive | Phase 1A | Yes (Section B.4) |
-| O4 | `Document.version` representation (proposal §1.1) | Phase 0 | Yes |
-| O5 | `tool_allowlist` for Deep Agent | Phase 2 | Yes |
+| O3 | `safe_lookup_metadata_only` primitive | Phase 1A | Yes |
+| O4 | `Document.version` representation | Phase 0 | Yes |
+| O5 | `tool_allowlist` for Deep Agent | Phase 2 | Yes (also O31) |
 | O6 | DocumentAlias model + migration (Q9.A) | Phase 0 | Yes |
-| O7 | Atomic feature flag + one-shot enable (Q10.A) | Phase 0 build + 1A enable | Yes |
-| O8 | AgentTrace schema migration (`routing_trace`, `preprocessor_marker`) | Phase 0 | Yes |
+| O7 | Atomic feature flag + one-shot enable (Q10.A) | Phase 0 + 1A | Yes |
+| O8 | AgentTrace schema migration | Phase 0 | Yes |
 | O9 | DocumentAlias data seeding script | Phase 0 | Recommended |
-| O10 | Verify `agent_traces` migration compat in lifespan | Phase 0 | Yes |
+| O10 | Verify `agent_traces` migration compat | Phase 0 | Yes |
 | O11 | supervisor_scope.py updates + supervisor.py JSON user message | Phase 0 | Yes |
 | O12 | 120-case golden dataset construction + PII scrubbing | Phase 0 | Yes |
 | O13 | Shadow log infrastructure (Q12.A) | Phase 0 | Yes |
@@ -1452,25 +2164,31 @@ class RoutingMetricsReport(BaseModel):
 | O21 | Baseline test_supervisor_routing.py:85-90 quarantine | Phase 0 | Yes |
 | O22 | RuntimeHints.cross_domain derivation (Q11.A) | Phase 0 | Yes |
 | O23 | supervisor.py:1460-1465 user_wrapper JSON serialization | Phase 0 | Yes |
-
----
-
-# TBD — Sections to be added
-
-- **Section D**: Deep Agent Pilot (compare_sections) — subpackage design, evidence registry, budget, adapter, pilot flow, SSE/terminal
-- **Section E**: Long summary + cross-agent + canary + rollout
-- **Section F (Phase 0)**: Baseline + safety/contract blockers (attachment access, ownership, resolver FINISH, field comparison, source snapshot, rollback persistence)
+| O24 | DocumentAccessor.read_full_section (D.5) | Phase 2 | Yes |
+| O25 | Compatibility gate scripts/compat_test.sh (D.3) | Phase 2 prep | Yes |
+| O26 | Pilot dataset 20-30 manual annotation (D.11) | Phase 2 prep | Yes |
+| O27 | Deep synthesis adapter + CitationSanitizer (D.8) | Phase 2 | Yes |
+| O28 | completion_status payload schema + persistence (D.9) | Phase 2 | Yes |
+| O29 | SourcesSnapshotAccumulator reuse vs new (D.9) | Phase 2 | Yes |
+| O30 | Rollback persistence E2E test (D.9) | Phase 2 | Yes |
+| O31 | tool_allowlist enforcement + max 2 tasks (D.10) | Phase 2 | Yes |
+| O32 | Concurrency / parallel branch tests (D.7) | Phase 2 | Yes |
+| O33 | Fix pre-existing ACL handoff (chat_session.py:989-1000 + rag_agent.py:635-651) | Phase 0 | Yes (security debt) |
+| O34 | Evidence ID external projection (D.6) | Phase 2 | Yes |
+| O35 | Outer asyncio.wait_for + child cleanup (D.7) | Phase 2 | Yes |
+| O36 | Drop compare_pair tool; enforce allowlist + max 2 tasks (D.10) | Phase 2 | Yes |
+| O37 | Provider patches: tool_call_id / thought_signature preservation (D.3) | Phase 2 prep | Yes |
 
 ---
 
 # Self-Review Checklist
 
-After writing, the author should run this check (per brainstorming skill):
+After writing Sections A, B, C, D, the author should run this check (per brainstorming skill):
 
-- [x] **Placeholder scan**: No TBD/TODO in Sections A/B/C content (only in "TBD" section markers for D/E/F)
-- [x] **Internal consistency**: A contracts match B/C usage; C.4 fallback table aligns with prompt rules
-- [x] **Scope check**: A/B/C focused on contracts + preprocessing + routing (per Phase 0/1A/1B scope)
-- [x] **Ambiguity check**: Each contract has explicit invariants; fallback table is deterministic; status taxonomy explicit
+- [x] **Placeholder scan**: No TBD/TODO in Sections A/B/C/D content
+- [x] **Internal consistency**: A contracts match B/C/D usage; D.3 adapter aligns with provider constraints; D.6 citation namespace consistent with Section A.5 Evidence
+- [x] **Scope check**: A/B/C/D focused on contracts + preprocessing + routing + Deep Agent pilot (Phase 0/1A/1B/2 scope)
+- [x] **Ambiguity check**: Each contract has explicit invariants; fallback tables deterministic; pilot scope bounded
 
 **Status**: PASS. Ready for user review.
 
@@ -1478,6 +2196,7 @@ After writing, the author should run this check (per brainstorming skill):
 
 # Approval & Next Steps
 
-This spec covers Sections A, B, C. User reviews and approves BEFORE continuing to Section D (Deep Agent Pilot).
+This spec covers Sections A, B, C, D. User reviews and approves BEFORE continuing to Section E (Canary + Rollout) and Section F (Phase 0 Blockers).
 
 After full spec approval (A through F), the **writing-plans** skill is invoked to produce implementation plans per task, per phase, with TDD scaffolding.
+
