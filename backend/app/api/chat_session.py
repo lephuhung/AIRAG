@@ -1040,9 +1040,12 @@ async def chat_stream_session(
                                         # the same clearing here so the inline
                                         # / background persistence rows do NOT
                                         # persist the pre-rollback draft.
+                                        # Per B5: clear all final fields
                                         accumulated_text = ""
                                         final_sources = []
                                         final_images = []
+                                        final_potential_abbreviations = []
+                                        final_people_data = []
                                     elif ev_type == "potential_abbreviations":
                                         final_potential_abbreviations = ev_data.get(
                                             "abbreviations", []
