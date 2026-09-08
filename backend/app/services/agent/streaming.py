@@ -40,6 +40,8 @@ from typing import AsyncGenerator, Optional
 from langfuse import get_client, propagate_attributes
 from langfuse.langchain import CallbackHandler
 
+from app.services.agent.sources_accumulator import SourcesSnapshotAccumulator, Source as AccSource
+
 logger = logging.getLogger(__name__)
 
 SSE_HEARTBEAT_INTERVAL = 15  # seconds
@@ -195,7 +197,9 @@ async def stream_agent_events(
 
     # Tracking cho complete event
     final_answer = ""
-    all_sources: list = []
+    sources_acc = SourcesSnapshotAccumulator()
+    # Keep track of original source dicts for output (per B4: preserve original format)
+    original_sources: list = []
     all_images: list = []
     all_potentials: list = []
     all_people_data: list = []
@@ -292,6 +296,24 @@ async def stream_agent_events(
             if ev_type == "done":
                 run_completed = True
                 # Pipeline xong — emit complete event
+                # Return deduplicated sources in original format
+                all_sources = []
+                seen_keys = set()
+                for s in original_sources:
+                    if isinstance(s, dict):
+                        # Use id as fallback for deduplication if no document_id/source_id
+                        doc_id = s.get("document_id") or s.get("doc", "")
+                        chunk = s.get("chunk", s.get("page_or_chunk", ""))
+                        content_hash = s.get("content_hash", s.get("chunk_id", ""))
+                        source_id = s.get("source_id")
+                        # Fallback to 'id' field if no document_id/source_id for backward compat
+                        fallback_id = s.get("id")
+                        key = (doc_id, chunk, content_hash, source_id or fallback_id or "")
+                        if key not in seen_keys:
+                            seen_keys.add(key)
+                            all_sources.append(s)
+                    else:
+                        all_sources.append(s)
                 yield {"event": "complete", "data": {
                     "answer": final_answer,
                     "sources": all_sources,
@@ -309,9 +331,47 @@ async def stream_agent_events(
                 yield {"event": "status", "data": item[1]}
 
             elif ev_type == "sources":
-                all_sources = item[1]
+                # Accumulate sources (cumulative deduplicated per B4 contract)
+                # Keep original dict format for backward compatibility
+                incoming_sources = item[1] if item[1] else []
+                for s in incoming_sources:
+                    if isinstance(s, dict):
+                        # Create a Source object for deduplication tracking
+                        acc_source = AccSource(
+                            doc=s.get("doc", ""),
+                            chunk=s.get("chunk", s.get("page_or_chunk", "")),
+                            content_hash=s.get("content_hash", s.get("chunk_id", "")),
+                            source_id=s.get("source_id"),
+                            document_id=s.get("document_id"),
+                        )
+                        sources_acc.add([acc_source])
+                        # Also track the original dict for output
+                        original_sources.append(s)
+                    elif hasattr(s, "document_id"):
+                        sources_acc.add([s])
+                        original_sources.append(s)
+                    else:
+                        original_sources.append(s)
+                # Emit deduplicated sources (based on accumulator, output original format)
+                all_sources = []
+                seen_keys = set()
+                for s in original_sources:
+                    if isinstance(s, dict):
+                        # Use id as fallback for deduplication if no document_id/source_id
+                        doc_id = s.get("document_id") or s.get("doc", "")
+                        chunk = s.get("chunk", s.get("page_or_chunk", ""))
+                        content_hash = s.get("content_hash", s.get("chunk_id", ""))
+                        source_id = s.get("source_id")
+                        # Fallback to 'id' field if no document_id/source_id for backward compat
+                        fallback_id = s.get("id")
+                        key = (doc_id, chunk, content_hash, source_id or fallback_id or "")
+                        if key not in seen_keys:
+                            seen_keys.add(key)
+                            all_sources.append(s)
+                    else:
+                        all_sources.append(s)
                 yield {"event": "sources", "data": {"sources": all_sources}}
-                logger.info(f"[stream] Emitted {len(all_sources)} sources")
+                logger.info(f"[stream] Emitted {len(all_sources)} sources (accumulated)")
 
             elif ev_type == "images":
                 all_images = item[1]
@@ -330,7 +390,8 @@ async def stream_agent_events(
                 # carries the cleared snapshot — pre-rollback artifacts must NOT
                 # survive into the persisted message / SSE relay.
                 final_answer = ""
-                all_sources = []
+                sources_acc.clear()
+                original_sources = []  # Also clear original sources
                 all_images = []
                 all_potentials = []
                 all_people_data = []
