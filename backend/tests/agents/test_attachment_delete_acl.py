@@ -62,10 +62,17 @@ async def db() -> AsyncIterator[AsyncSession]:
     async with async_session_maker() as session:
         # Outer transaction — never committed; rolled back at teardown.
         await session.begin()
+        # Nested SAVEPOINT — commits inside the test are absorbed here,
+        # and rollback() at teardown undoes the entire outer transaction.
+        nested = await session.begin_nested()
         try:
             yield session
         finally:
-            await session.rollback()
+            try:
+                await nested.rollback()  # Rollback the savepoint
+            except Exception:
+                pass  # Savepoint already released if test committed
+            await session.rollback()  # Rollback outer transaction
 
 
 @pytest_asyncio.fixture
