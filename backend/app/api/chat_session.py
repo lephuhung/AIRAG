@@ -986,6 +986,13 @@ async def chat_stream_session(
             # Own DB session — the request-scoped one is closed when the HTTP
             # request ends, which can be long before this task finishes.
             async with async_session_maker() as run_db:
+                # CRITICAL SECURITY FIX (B6): Filter document_ids against accessible
+                # workspaces BEFORE passing to graph state. The attacker-controlled
+                # request.document_ids is filtered here; only accessible docs reach
+                # the supervisor graph. This closes the ACL ingress vulnerability.
+                filtered_doc_ids = await _filter_accessible_document_ids(
+                    run_db, user, workspace_ids, request.document_ids
+                )
                 initial_state = build_initial_state(
                     workspace_ids=workspace_ids,
                     message=request.message,
@@ -995,13 +1002,13 @@ async def chat_stream_session(
                     db=run_db,
                     user_id=user.id,
                     session_id=session_id,
-                    document_ids=request.document_ids,
+                    document_ids=filtered_doc_ids,
                     user_can_use_people=user.is_superadmin,
                 )
 
                 logger.info(
                     f"[session/{session_id}] LangGraph initial_state: "
-                    f"document_ids={[str(d) for d in (request.document_ids or [])]} "
+                    f"document_ids={[str(d) for d in (filtered_doc_ids or [])]} "
                     f"force_search={getattr(request, 'force_search', False)}"
                 )
 
