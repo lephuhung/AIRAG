@@ -2,7 +2,8 @@
   "meta": {
     "commit": "86964bc",
     "label": "pre_task1",
-    "captured_at": "pre_task1_capture_time"
+    "captured_at": "pre_task1_placeholder",
+    "note": "Run 'make test-recall test-section test-validity eval-prompts' in worktree for real values"
   },
   "aggregate": {
     "latency_p50": 0.0,

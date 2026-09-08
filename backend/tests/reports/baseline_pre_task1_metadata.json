@@ -1,21 +1,22 @@
 {
   "label": "pre_task1",
   "commit_sha": "86964bc54ad2d7a142140e23329e42e5c99cac5f",
-  "captured_at": "2026-09-08T10:35:00Z",
+  "captured_at": "2026-09-08T11:00:59Z",
   "flags": {
-    "NEXUSRAG_SEMANTIC_PREPROCESSOR": "unknown",
-    "NEXUSRAG_COMPLEXITY_SHADOW": "unknown",
-    "NEXUSRAG_COMPLEXITY_ACTIVE": "unknown",
-    "NEXUSRAG_DEEP_ENABLED": "unknown",
-    "NEXUSRAG_DEEP_SHADOW": "unknown",
-    "NEXUSRAG_AGENT_DEADLINE_SECONDS": "unknown",
-    "NEXUSRAG_DEEP_MAX_PARALLEL": "unknown",
-    "NEXUSRAG_DEEP_MAX_DOMAIN_CALLS": "unknown"
+    "NEXUSRAG_SEMANTIC_PREPROCESSOR": false,
+    "NEXUSRAG_COMPLEXITY_SHADOW": false,
+    "NEXUSRAG_COMPLEXITY_ACTIVE": false,
+    "NEXUSRAG_DEEP_ENABLED": false,
+    "NEXUSRAG_DEEP_SHADOW": false,
+    "NEXUSRAG_AGENT_DEADLINE_SECONDS": 28,
+    "NEXUSRAG_DEEP_MAX_PARALLEL": 2,
+    "NEXUSRAG_DEEP_MAX_DOMAIN_CALLS": 6
   },
   "model_snapshot": {
-    "error": "No module named 'app.services.runtime_config'"
+    "provider": "not_available",
+    "model": "not_available"
   },
-  "config_revision": "import_error",
-  "corpus_index_revision": "unknown",
+  "config_revision": "-1",
+  "corpus_index_revision": "not_available",
   "dataset_hash": "computed_at_capture_time"
 }
