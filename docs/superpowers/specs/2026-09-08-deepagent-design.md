@@ -3182,5 +3182,22 @@ After writing Sections A through F, with cross-section review applied (15 confli
 
 This spec covers Sections A through F (ALL FINAL).
 
-After full spec approval (A through F), the **writing-plans** skill is invoked to produce implementation plans per task, per phase, with TDD scaffolding.
+**Implementation plans produced** (per writing-plans skill):
+
+| Plan | Phase | Tasks | Status |
+|------|-------|-------|--------|
+| `docs/superpowers/plans/2026-09-08-deepagent-phase0-blockers.md` | Phase 0 | 11 | ✅ committed (`53e1e3a`) |
+| `docs/superpowers/plans/2026-09-08-deepagent-phase1a-preprocessor.md` | Phase 1A | 12 (+Task 2.5 +Task 6.5) | ✅ committed (`53e1e3a` + cross-section fixes) |
+| `docs/superpowers/plans/2026-09-08-deepagent-phase1b-router.md` | Phase 1B | 9 | ✅ committed (`53e1e3a` + cross-section fixes) |
+| `docs/superpowers/plans/2026-09-08-deepagent-phase2-pilot.md` | Phase 2 | 15 (+Task 0) | ✅ committed (`53e1e3a` + cross-section fixes) |
+| `docs/superpowers/plans/2026-09-08-deepagent-phase2-deferred.md` | Phase 2.5 (deferred) | 22 | ✅ committed (`52980d8`) |
+
+**Execution order** (sequential):
+- Phase 0 → 1A → 1B → 2 (per Plans 0/1A/1B/2)
+- Phase 2.5 (Plan deferred) can run PARTIALLY in parallel with each phase (Part A with Phase 0, Part B with Phase 1A, etc.)
+- Phase 2.5 gate (Task F.1) must succeed before Phase 2 production enable.
+
+**Total deliverables**:
+- Spec: 3186+ lines, 6 sections (A-F), Q1-Q30 decisions, O1-O74 open items
+- Plans: 5 files, ~7000 lines, 69 atomic tasks total
 
