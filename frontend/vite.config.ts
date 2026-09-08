@@ -10,6 +10,9 @@ export default defineConfig({
       '@': path.resolve(__dirname, './src'),
     },
   },
+  test: {
+    environment: 'happy-dom',
+  },
   server: {
     port: 5174,
     allowedHosts: ['rag.hatinh.local', 'rag.zbots.store', 'localhost', '127.0.0.1'],
