@@ -296,24 +296,24 @@ async def stream_agent_events(
             if ev_type == "done":
                 run_completed = True
                 # Pipeline xong — emit complete event
-                # Return deduplicated sources in original format
+                # Use SourcesSnapshotAccumulator as single source of truth for dedup
+                # (per B4 contract). Emit original dict format, filtered by deduped keys.
+                deduped_keys = set()
+                for s in sources_acc.deduplicated():
+                    key = (s.document_id or s.doc, s.chunk, s.content_hash, s.source_id or "")
+                    deduped_keys.add(key)
                 all_sources = []
-                seen_keys = set()
-                for s in original_sources:
-                    if isinstance(s, dict):
-                        # Use id as fallback for deduplication if no document_id/source_id
-                        doc_id = s.get("document_id") or s.get("doc", "")
-                        chunk = s.get("chunk", s.get("page_or_chunk", ""))
-                        content_hash = s.get("content_hash", s.get("chunk_id", ""))
-                        source_id = s.get("source_id")
-                        # Fallback to 'id' field if no document_id/source_id for backward compat
-                        fallback_id = s.get("id")
-                        key = (doc_id, chunk, content_hash, source_id or fallback_id or "")
-                        if key not in seen_keys:
-                            seen_keys.add(key)
-                            all_sources.append(s)
+                for orig in original_sources:
+                    if isinstance(orig, dict):
+                        doc_id = orig.get("document_id") or orig.get("doc", "")
+                        chunk = orig.get("chunk", orig.get("page_or_chunk", ""))
+                        content_hash = orig.get("content_hash", orig.get("chunk_id", ""))
+                        source_id = orig.get("source_id")
+                        key = (doc_id, chunk, content_hash, source_id or "")
+                        if key in deduped_keys:
+                            all_sources.append(orig)
                     else:
-                        all_sources.append(s)
+                        all_sources.append(orig)
                 yield {"event": "complete", "data": {
                     "answer": final_answer,
                     "sources": all_sources,
@@ -331,8 +331,7 @@ async def stream_agent_events(
                 yield {"event": "status", "data": item[1]}
 
             elif ev_type == "sources":
-                # Accumulate sources (cumulative deduplicated per B4 contract)
-                # Keep original dict format for backward compatibility
+                # Accumulate sources via SourcesSnapshotAccumulator (single source of truth, per B4)
                 incoming_sources = item[1] if item[1] else []
                 for s in incoming_sources:
                     if isinstance(s, dict):
@@ -345,31 +344,32 @@ async def stream_agent_events(
                             document_id=s.get("document_id"),
                         )
                         sources_acc.add([acc_source])
-                        # Also track the original dict for output
+                        # Also track the original dict for rollback and output
                         original_sources.append(s)
                     elif hasattr(s, "document_id"):
                         sources_acc.add([s])
                         original_sources.append(s)
                     else:
                         original_sources.append(s)
-                # Emit deduplicated sources (based on accumulator, output original format)
+                # Emit deduplicated sources using accumulator (B4 contract)
+                # Use accumulator's keys to filter original_sources for deduplication
+                deduped_keys = set()
+                for s in sources_acc.deduplicated():
+                    key = (s.document_id or s.doc, s.chunk, s.content_hash, s.source_id or "")
+                    deduped_keys.add(key)
+                # Emit original dict format, filtered by deduped keys
                 all_sources = []
-                seen_keys = set()
-                for s in original_sources:
-                    if isinstance(s, dict):
-                        # Use id as fallback for deduplication if no document_id/source_id
-                        doc_id = s.get("document_id") or s.get("doc", "")
-                        chunk = s.get("chunk", s.get("page_or_chunk", ""))
-                        content_hash = s.get("content_hash", s.get("chunk_id", ""))
-                        source_id = s.get("source_id")
-                        # Fallback to 'id' field if no document_id/source_id for backward compat
-                        fallback_id = s.get("id")
-                        key = (doc_id, chunk, content_hash, source_id or fallback_id or "")
-                        if key not in seen_keys:
-                            seen_keys.add(key)
-                            all_sources.append(s)
+                for orig in original_sources:
+                    if isinstance(orig, dict):
+                        doc_id = orig.get("document_id") or orig.get("doc", "")
+                        chunk = orig.get("chunk", orig.get("page_or_chunk", ""))
+                        content_hash = orig.get("content_hash", orig.get("chunk_id", ""))
+                        source_id = orig.get("source_id")
+                        key = (doc_id, chunk, content_hash, source_id or "")
+                        if key in deduped_keys:
+                            all_sources.append(orig)
                     else:
-                        all_sources.append(s)
+                        all_sources.append(orig)
                 yield {"event": "sources", "data": {"sources": all_sources}}
                 logger.info(f"[stream] Emitted {len(all_sources)} sources (accumulated)")
 
