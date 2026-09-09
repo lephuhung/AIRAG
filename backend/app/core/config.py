@@ -546,6 +546,12 @@ class Settings(BaseSettings):
     # No trailing slash.
     FRONTEND_BASE_URL: str = Field(default="")
 
+    # ── Phase 1A: Semantic preprocessor atomic enable (B.11 0.5) ─────────────
+    # When True, semantic_preprocessor_node runs before supervisor_node;
+    # legacy abbreviation expansion is suppressed via _preprocessor_marker.
+    # Default False. Atomic single-env-change enable per Phase 1A plan.
+    NEXUSRAG_SEMANTIC_PREPROCESSOR: bool = Field(default=False)
+
     model_config = {
         "env_file": str(ENV_FILE),
         "env_file_encoding": "utf-8",
