@@ -1,7 +1,9 @@
 {
   "label": "pre_task1",
   "commit_sha": "86964bc54ad2d7a142140e23329e42e5c99cac5f",
-  "captured_at": "2026-09-08T11:00:59Z",
+  "commit_time": "2026-08-24T01:40:35+00:00",
+  "commit_message": "feat(llm): c\u1ea5u h\u00ecnh LLM runtime qua WebUI, kh\u00f4ng ph\u1ee5 thu\u1ed9c .env",
+  "captured_at": "2026-09-09T01:23:58Z",
   "flags": {
     "NEXUSRAG_SEMANTIC_PREPROCESSOR": false,
     "NEXUSRAG_COMPLEXITY_SHADOW": false,
@@ -18,5 +20,5 @@
   },
   "config_revision": "-1",
   "corpus_index_revision": "not_available",
-  "dataset_hash": "computed_at_capture_time"
+  "dataset_hash": "d29a69b41ce9238550fdaa0e891d5e7340d69328dc858941264a956648f88c38"
 }

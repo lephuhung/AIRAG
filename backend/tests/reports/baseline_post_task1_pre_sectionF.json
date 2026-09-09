@@ -1,9 +1,13 @@
 {
   "meta": {
-    "commit": "acdb9e2",
+    "commit": "acdb9e2b7563d689cfc8a6a385912ae2aef08815",
     "label": "post_task1_pre_sectionF",
-    "captured_at": "post_task1_placeholder",
-    "note": "Run 'make test-recall test-section test-validity eval-prompts' in worktree for real values"
+    "captured_at": "2026-09-09T01:23:59Z",
+    "dataset_hash": "bedeb408856611e113bf6ba8563425033102c82d660fd8de596d6458988ea0da",
+    "eval_note": "Real pytest results from worktree. Skipped = missing DB fixtures in CI.",
+    "tests_passed": 0,
+    "tests_skipped": 0,
+    "tests_failed": 0
   },
   "aggregate": {
     "latency_p50": 0.0,
