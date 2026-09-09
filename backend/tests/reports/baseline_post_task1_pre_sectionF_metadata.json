@@ -3,7 +3,7 @@
   "commit_sha": "acdb9e2b7563d689cfc8a6a385912ae2aef08815",
   "commit_time": "2026-09-07T13:06:24+00:00",
   "commit_message": "test(task-1): behavior regression tests for B1/B2/B3/B4 contracts",
-  "captured_at": "2026-09-09T01:23:59Z",
+  "captured_at": "2026-09-09T02:17:55Z",
   "flags": {
     "NEXUSRAG_SEMANTIC_PREPROCESSOR": false,
     "NEXUSRAG_COMPLEXITY_SHADOW": false,

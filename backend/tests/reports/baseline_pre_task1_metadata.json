@@ -3,7 +3,7 @@
   "commit_sha": "86964bc54ad2d7a142140e23329e42e5c99cac5f",
   "commit_time": "2026-08-24T01:40:35+00:00",
   "commit_message": "feat(llm): c\u1ea5u h\u00ecnh LLM runtime qua WebUI, kh\u00f4ng ph\u1ee5 thu\u1ed9c .env",
-  "captured_at": "2026-09-09T01:23:58Z",
+  "captured_at": "2026-09-09T02:17:46Z",
   "flags": {
     "NEXUSRAG_SEMANTIC_PREPROCESSOR": false,
     "NEXUSRAG_COMPLEXITY_SHADOW": false,

@@ -2,18 +2,18 @@
   "meta": {
     "commit": "86964bc54ad2d7a142140e23329e42e5c99cac5f",
     "label": "pre_task1",
-    "captured_at": "2026-09-09T01:23:58Z",
+    "captured_at": "2026-09-09T02:17:46Z",
     "dataset_hash": "d29a69b41ce9238550fdaa0e891d5e7340d69328dc858941264a956648f88c38",
     "eval_note": "Real pytest results from worktree. Skipped = missing DB fixtures in CI.",
-    "tests_passed": 0,
-    "tests_skipped": 0,
+    "tests_passed": 15,
+    "tests_skipped": 34,
     "tests_failed": 0
   },
   "aggregate": {
     "latency_p50": 0.0,
     "latency_p95": 0.0,
     "latency_p99": 0.0,
-    "completion_rate": 0.0,
+    "completion_rate": 0.3061,
     "refusal_rate_positive": 0.0
   },
   "cases": []
