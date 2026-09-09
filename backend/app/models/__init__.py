@@ -19,6 +19,7 @@ from app.models.integration import (
 from app.models.audit_log import AuditLog
 from app.models.agent_trace import AgentTrace
 from app.models.system_setting import SystemSetting
+from app.models.document_alias import DocumentAlias
 
 __all__ = [
     "KnowledgeBase",

@@ -397,23 +397,59 @@ async def lifespan(app: FastAPI):
 
             # --- Abbreviations Table (Explicit for clarity or metadata sync) ---
             await conn.execute(
-                text("""
-                CREATE TABLE IF NOT EXISTS abbreviations (
-                    id SERIAL PRIMARY KEY,
-                    short_form VARCHAR(50) NOT NULL,
-                    full_form VARCHAR(255) NOT NULL,
-                    description TEXT,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    is_active BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    updated_at TIMESTAMP DEFAULT NOW()
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS abbreviations (
+                        id SERIAL PRIMARY KEY,
+                        short_form VARCHAR(50) NOT NULL,
+                        full_form VARCHAR(255) NOT NULL,
+                        description TEXT,
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        is_active BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMP DEFAULT NOW(),
+                        updated_at TIMESTAMP DEFAULT NOW()
+                    )
+                """
                 )
-            """)
             )
             await conn.execute(
                 text(
                     "CREATE INDEX IF NOT EXISTS ix_abbreviations_short_form ON abbreviations(short_form)"
                 )
+            )
+
+            # --- DocumentAlias Table (Phase 1A — B.4 / Q9.A) ---
+            await conn.execute(
+                text(
+                    """
+                    CREATE TABLE IF NOT EXISTS document_aliases (
+                        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                        document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                        alias_text VARCHAR(512) NOT NULL,
+                        alias_type VARCHAR(32) NOT NULL,
+                        workspace_id UUID NOT NULL REFERENCES knowledge_bases(id),
+                        created_at TIMESTAMPTZ DEFAULT now(),
+                        updated_at TIMESTAMPTZ
+                    )
+                """
+                )
+            )
+            await conn.execute(
+                text(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS uq_alias_text_workspace_type
+                    ON document_aliases(alias_text, workspace_id, alias_type)
+                """
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_alias_workspace
+                    ON document_aliases(workspace_id)"
+                )
+            )
+            await conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_alias_text ON document_aliases(alias_text)")
             )
             # Ensure ALL lowercase enum values exist in PostgreSQL.
             # On a fresh DB, create_all() + values_callable creates them lowercase.
