@@ -14,6 +14,11 @@ import uuid
 import operator
 from app.schemas.rag import ChatSourceChunk, ChatImageRef
 
+# Forward reference types — defined in their respective modules to avoid circular imports
+PreprocessingResult: "not yet available"  # set after import in supervisor.py
+RoutingDecision: "not yet available"
+BudgetGuard: "not yet available"
+
 
 # =============================================================================
 # Intent Definitions (16 intents from nodes.py:_CLASSIFIER_SYSTEM)
@@ -223,6 +228,26 @@ class SupervisorState(TypedDict, total=False):
     # Permission: whether the current user is allowed to use the people agent.
     # Only superadmins can search MongoDB for person records (CCCD, BHXH, etc.).
     user_can_use_people: bool
+
+    # ── Phase 1A: Semantic preprocessor output ────────────────────────────────
+    # Set by semantic_preprocessor_node; contains refs, abbrs, ambiguities.
+    semantic_context: "PreprocessingResult | None"
+
+    # ── Phase 1A: Complexity routing decision ──────────────────────────────────
+    # Set by supervisor_node; execution_mode ∈ {supervisor, deepagent, clarify}
+    complexity_route: "RoutingDecision | None"
+
+    # ── Phase 1A: Trusted preprocessor marker ────────────────────────────────
+    # "semantic_v1" when preprocessor ran; suppresses duplicate abbr expansion
+    # in supervisor_node (B.7). Set by semantic_preprocessor_node.
+    _preprocessor_marker: "Literal['semantic_v1'] | None"
+
+    # ── Phase 1A: Runtime flag snapshot ──────────────────────────────────────
+    # Frozen at request ingress; used for replay/debugging (per E.2).
+    flag_snapshot: "dict | None"
+
+    # ── Phase 1B+: Budget guard (set by deep_research_coordinator) ───────────
+    budget_guard: "BudgetGuard | None"
 
 
 # =============================================================================
