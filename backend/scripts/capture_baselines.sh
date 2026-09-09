@@ -156,19 +156,27 @@ run_evals_and_capture() {
     echo "Running pytest in ${wt}..." >&2
 
     if [ -d "${wt}/backend" ]; then
-        (cd "${wt}/backend" && python -m pytest tests/retrieval/ tests/prompts/ -v --tb=short 2>&1 | tee "${log_file}" || true) || true
+        # Run pytest: stdout+stderr go directly to log file.
+        # tee writes to stdout too (pollutes command-substitution capture),
+        # so we use direct redirection instead. || true ensures subshell
+        # always exits 0 so the caller captures only the echo path.
+        (cd "${wt}/backend" && python -m pytest tests/retrieval/ tests/services/ -q --tb=no > "${log_file}" 2>&1 || true) || true
     fi
 
-    local passed skipped failed
-    passed=$(grep -c " PASSED" "${log_file}" 2>/dev/null || echo 0)
-    skipped=$(grep -c " SKIPPED" "${log_file}" 2>/dev/null || echo 0)
-    failed=$(grep -c " FAILED" "${log_file}" 2>/dev/null || echo 0)
-
+    # Parse pytest summary line directly with Python to avoid bash newline/escape issues.
     python3 -c "
-import json
-result = {'passed': ${passed}, 'skipped': ${skipped}, 'failed': ${failed}}
-with open('${eval_json}', 'w') as f:
-    json.dump(result, f)
+import json, re, sys
+from pathlib import Path
+text = Path('${log_file}').read_text()
+m = re.search(r'([0-9]+) passed', text)
+p = int(m.group(1)) if m else 0
+m = re.search(r'([0-9]+) skipped', text)
+s = int(m.group(1)) if m else 0
+m = re.search(r'([0-9]+) failed', text)
+f = int(m.group(1)) if m else 0
+result = {'passed': p, 'skipped': s, 'failed': f}
+with open('${eval_json}', 'w') as fh:
+    json.dump(result, fh)
 "
     echo "${eval_json}"
 }
