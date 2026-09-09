@@ -27,6 +27,7 @@ from app.services.agents.models import (
     AgentType,
     Intent,
 )
+from app.services.agents.semantic_preprocessor import semantic_preprocessor_node  # noqa: E402
 def _get_langfuse_client():
     from app.services.agent.langfuse_tracing import _get_langfuse_client as get_client
     return get_client()
@@ -3508,12 +3509,77 @@ def route_from_resolve_doc(state: SupervisorState) -> str:
 # =============================================================================
 # Graph Builder
 # =============================================================================
+# Routing helpers (shared by both legacy and new graphs)
+# =============================================================================
+
+
+def route_from_enricher(state: SupervisorState) -> str:
+    """Route after query enrichment to the correct agent.
+
+    personal intent → direct (answer from memory, no RAG needed)
+    all other intents → their designated agent
+    """
+    langfuse = _get_langfuse_client()
+    next_agent = state.get("next_agent", AgentType.FINISH)
+    intent = state.get("intent", "")
+
+    if intent == "personal":
+        target = "direct"
+    else:
+        _MAP = {
+            AgentType.RAG: "rag",
+            AgentType.WRITE: "write",
+            AgentType.DIRECT: "direct",
+            AgentType.PEOPLE: "people",
+        }
+        target = _MAP.get(next_agent, "direct")
+
+    if langfuse:
+        try:
+            obs = langfuse.start_observation(
+                name="route_from_enricher",
+                input={
+                    "next_agent": str(next_agent),
+                    "intent": str(intent),
+                    "has_memory_context": bool(state.get("user_memory_context")),
+                },
+                level="DEFAULT",
+            )
+            obs.update(output={"target_node": target})
+            obs.end()
+        except Exception as e:
+            logger.warning(f"[langfuse] route_from_enricher span failed: {e}")
+
+    if intent == "personal":
+        logger.info("[LANGGRAPH_ROUTE] query_enricher -> direct (personal intent)")
+        return "direct"
+
+    _MAP = {
+        AgentType.RAG: "rag",
+        AgentType.WRITE: "write",
+        AgentType.DIRECT: "direct",
+        AgentType.PEOPLE: "people",
+    }
+    target = _MAP.get(next_agent, "direct")
+    if target == "rag" and _react_on():
+        target = "react_executor"
+    logger.info(
+        f"[LANGGRAPH_ROUTE] query_enricher -> {target} (intent={intent!r}, next_agent={next_agent!r})"
+    )
+    return target
+
+
+# =============================================================================
 
 def create_supervisor_graph():
     """
     Build and compile the supervisor-based multi-agent graph.
 
-    Phase 5 Flow (Query Analyzer + Result Evaluator + Multi-Step):
+    Per B.7 / Q10: atomic switch on NEXUSRAG_SEMANTIC_PREPROCESSOR flag.
+    - False (default): use _build_legacy_graph() — current Phase 5 graph
+    - True: use _build_new_graph() — replaces query_analyzer with semantic_preprocessor
+
+    Phase 5 Legacy Flow:
         START → query_analyzer → supervisor
                   ├── [needs_memory=True] → memory_recall → query_enricher
                   │     ├── [personal] → direct
@@ -3527,13 +3593,19 @@ def create_supervisor_graph():
                         ├── direct → END
                         └── people → mongo_formatter → END
 
-    result_evaluator checks quality and handles:
-    - Multi-step sub_queries: advance to next step → supervisor
-    - Empty results: retry with fallback strategy → rag
-    - Sufficient results: → answer_generator
-
-    resolve_doc always bypasses memory (no personal context needed).
+    Phase 1A New Flow (flag=True):
+        START → semantic_preprocessor → supervisor
+                  [rest of flow identical to legacy]
     """
+    from app.core.config import settings
+
+    if getattr(settings, "NEXUSRAG_SEMANTIC_PREPROCESSOR", False):
+        return _build_new_graph()
+    return _build_legacy_graph()
+
+
+def _build_legacy_graph():
+    """Legacy graph: START → query_analyzer → supervisor (Phase 5)."""
     graph = StateGraph(SupervisorState)
 
     # Nodes
@@ -3581,62 +3653,6 @@ def create_supervisor_graph():
 
     # memory_recall → query_enricher (always: enricher is a no-op when not needed)
     graph.add_edge("memory_recall", "query_enricher")
-
-    # query_enricher → target agent based on next_agent / intent
-    def route_from_enricher(state: SupervisorState) -> str:
-        """Route after query enrichment to the correct agent.
-
-        personal intent → direct (answer from memory, no RAG needed)
-        all other intents → their designated agent
-        """
-        langfuse = _get_langfuse_client()
-        next_agent = state.get("next_agent", AgentType.FINISH)
-        intent = state.get("intent", "")
-
-        if intent == "personal":
-            target = "direct"
-        else:
-            _MAP = {
-                AgentType.RAG: "rag",
-                AgentType.WRITE: "write",
-                AgentType.DIRECT: "direct",
-                AgentType.PEOPLE: "people",
-            }
-            target = _MAP.get(next_agent, "direct")
-
-        if langfuse:
-            try:
-                obs = langfuse.start_observation(
-                    name="route_from_enricher",
-                    input={
-                        "next_agent": str(next_agent),
-                        "intent": str(intent),
-                        "has_memory_context": bool(state.get("user_memory_context")),
-                    },
-                    level="DEFAULT",
-                )
-                obs.update(output={"target_node": target})
-                obs.end()
-            except Exception as e:
-                logger.warning(f"[langfuse] route_from_enricher span failed: {e}")
-
-        if intent == "personal":
-            logger.info("[LANGGRAPH_ROUTE] query_enricher -> direct (personal intent)")
-            return "direct"
-
-        _MAP = {
-            AgentType.RAG: "rag",
-            AgentType.WRITE: "write",
-            AgentType.DIRECT: "direct",
-            AgentType.PEOPLE: "people",
-        }
-        target = _MAP.get(next_agent, "direct")
-        if target == "rag" and _react_on():
-            target = "react_executor"
-        logger.info(
-            f"[LANGGRAPH_ROUTE] query_enricher -> {target} (intent={intent!r}, next_agent={next_agent!r})"
-        )
-        return target
 
     graph.add_conditional_edges(
         "query_enricher",
@@ -3701,6 +3717,113 @@ def create_supervisor_graph():
     graph.add_edge("answer_generator", END)
     graph.add_edge("mongo_formatter", END)
     graph.add_edge("react_executor", END)  # RAG group (flag) — executor is terminal
+
+    return graph.compile()
+
+
+def _build_new_graph():
+    """
+    New graph: START → semantic_preprocessor → supervisor.
+
+    Per B.7 / Q2: query_analyzer is REMOVED; semantic_preprocessor runs first.
+    supervisor_node checks _preprocessor_marker = "semantic_v1" to skip duplicate
+    abbreviation expansion (O17).
+    """
+    graph = StateGraph(SupervisorState)
+
+    # Nodes
+    graph.add_node("semantic_preprocessor", semantic_preprocessor_node)  # Phase 1A: NEW
+    graph.add_node("supervisor", supervisor_node)
+    graph.add_node("result_evaluator", result_evaluator_node)
+    graph.add_node("memory_recall", _memory_recall_wrapper)
+    graph.add_node("query_enricher", _query_enricher_wrapper)
+    graph.add_node("rag", _rag_agent_wrapper)
+    graph.add_node("resolve_doc_agent", _resolve_doc_agent_wrapper)
+    graph.add_node("write", _write_agent_wrapper)
+    graph.add_node("people", _people_agent_wrapper)
+    graph.add_node("people_doc_search", _people_doc_search_wrapper)
+    graph.add_node("direct", direct_answer_node)
+    graph.add_node("answer_generator", answer_generator_node)
+    graph.add_node("mongo_formatter", mongo_formatter_node)
+    graph.add_node("react_executor", react_executor_node)
+
+    # Edges — Phase 1A: START → semantic_preprocessor → supervisor
+    graph.add_edge(START, "semantic_preprocessor")
+    graph.add_edge("semantic_preprocessor", "supervisor")
+
+    # Re-use all routing edges from legacy (conditional routing + terminal edges)
+    # Conditional edges from supervisor (same as legacy)
+    graph.add_conditional_edges(
+        "supervisor",
+        route_from_supervisor,
+        {
+            "memory_recall": "memory_recall",
+            "rag": "rag",
+            "write": "write",
+            "direct": "direct",
+            "people": "people",
+            "answer_generator": "answer_generator",
+            "resolve_doc_agent": "resolve_doc_agent",
+            "react_executor": "react_executor",
+            END: END,
+        },
+    )
+
+    # memory_recall → query_enricher
+    graph.add_edge("memory_recall", "query_enricher")
+
+    # query_enricher routing (copy of route_from_enricher from legacy)
+    graph.add_conditional_edges(
+        "query_enricher",
+        route_from_enricher,
+        {
+            "rag": "rag",
+            "write": "write",
+            "direct": "direct",
+            "people": "people",
+            "react_executor": "react_executor",
+        },
+    )
+
+    # RAG → result_evaluator
+    graph.add_conditional_edges(
+        "rag",
+        route_from_rag,
+        {
+            "supervisor": "supervisor",
+            "result_evaluator": "result_evaluator",
+        },
+    )
+
+    # resolve_doc_agent routing
+    graph.add_conditional_edges(
+        "resolve_doc_agent",
+        route_from_resolve_doc,
+        {
+            "answer_generator": "answer_generator",
+            "rag": "rag",
+            END: END,
+        },
+    )
+
+    # result_evaluator routing
+    graph.add_conditional_edges(
+        "result_evaluator",
+        route_from_evaluator,
+        {
+            "answer_generator": "answer_generator",
+            "rag": "rag",
+            "supervisor": "supervisor",
+        },
+    )
+
+    graph.add_edge("write", END)
+    graph.add_edge("people", "people_doc_search")
+    graph.add_edge("people_doc_search", "mongo_formatter")
+    graph.add_edge("direct", END)
+    graph.add_edge("answer_generator", END)
+    graph.add_edge("mongo_formatter", END)
+    graph.add_edge("react_executor", END)
 
     return graph.compile()
 
