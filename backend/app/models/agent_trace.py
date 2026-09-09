@@ -16,6 +16,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import String, Text, DateTime, Integer, Boolean, JSON
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -60,3 +61,10 @@ class AgentTrace(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, index=True
     )
+
+    # Phase 1A (B.11 0.3): Canonical RoutingDecision trace + preprocessor marker
+    # routing_trace: JSONB storing execution_mode, reason_code, fallback_reason,
+    #                config_revision, run_id (per A.8 persistence map).
+    # preprocessor_marker: "semantic_v1" when preprocessor ran; NULL otherwise.
+    routing_trace: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    preprocessor_marker: Mapped[str | None] = mapped_column(String(32), nullable=True)

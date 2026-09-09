@@ -713,6 +713,25 @@ async def lifespan(app: FastAPI):
             logger.info("users.totp_secret / totp_enabled columns ensured")
         except Exception as _2fa_err:
             logger.warning(f"2FA columns migration failed (non-fatal): {_2fa_err}")
+
+        # Phase 1A (B.11 0.3): agent_traces routing_trace + preprocessor_marker
+        try:
+            async with engine.begin() as _trace_conn:
+                await _trace_conn.execute(
+                    text(
+                        "ALTER TABLE agent_traces ADD COLUMN IF NOT EXISTS routing_trace JSONB"
+                    )
+                )
+                await _trace_conn.execute(
+                    text(
+                        "ALTER TABLE agent_traces ADD COLUMN IF NOT EXISTS preprocessor_marker VARCHAR(32)"
+                    )
+                )
+            logger.info("agent_traces.routing_trace / preprocessor_marker columns ensured")
+        except Exception as _trace_err:
+            logger.warning(
+                f"agent_traces migration failed (non-fatal): {_trace_err}"
+            )
     else:
         logger.info("AUTO_CREATE_TABLES=false — skipping auto-migration")
 
