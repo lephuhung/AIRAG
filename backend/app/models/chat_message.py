@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import ForeignKey, Text, DateTime, JSON, String
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -54,3 +54,8 @@ class ChatMessage(Base):
     session: Mapped["ChatSession"] = relationship(
         "ChatSession", back_populates="messages"
     )
+
+    # Phase 1A (B.11 0.2): Persisted semantic context from preprocessor
+    # Nullable JSONB — stores PersistedSemanticContext (compact subset).
+    # NULL when preprocessor is disabled (NEXUSRAG_SEMANTIC_PREPROCESSOR=false).
+    semantic_context: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

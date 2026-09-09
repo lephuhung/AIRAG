@@ -387,6 +387,12 @@ async def lifespan(app: FastAPI):
                     "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS user_id INTEGER REFERENCES users(id)"
                 )
             )
+            # Phase 1A (B.11 0.2): semantic_context JSONB column
+            await conn.execute(
+                text(
+                    "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS semantic_context JSONB"
+                )
+            )
 
             # document_type_system_prompts: kg_system_prompt
             await conn.execute(
