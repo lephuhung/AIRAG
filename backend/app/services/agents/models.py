@@ -9,15 +9,18 @@ Contains:
 - INTENT_TO_AGENT mapping
 """
 
-from typing import Literal, TypedDict, Annotated
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Literal, TypedDict, Annotated
 import uuid
 import operator
 from app.schemas.rag import ChatSourceChunk, ChatImageRef
 
-# Forward reference types — defined in their respective modules to avoid circular imports
-PreprocessingResult: "not yet available"  # set after import in supervisor.py
-RoutingDecision: "not yet available"
-BudgetGuard: "not yet available"
+# Real imports (not TYPE_CHECKING) because LangGraph's get_type_hints evaluates
+# these at runtime when building the StateGraph. safe: semantic_preprocessor.py
+# only imports SupervisorState inside functions (lazy), not at module level.
+from app.services.agents.semantic_preprocessor import PreprocessingResult  # noqa: E402
+from app.services.agents.complexity import RoutingDecision  # noqa: E402
 
 
 # =============================================================================
@@ -231,23 +234,23 @@ class SupervisorState(TypedDict, total=False):
 
     # ── Phase 1A: Semantic preprocessor output ────────────────────────────────
     # Set by semantic_preprocessor_node; contains refs, abbrs, ambiguities.
-    semantic_context: "PreprocessingResult | None"
+    semantic_context: PreprocessingResult | None  # type: ignore[misc]
 
     # ── Phase 1A: Complexity routing decision ──────────────────────────────────
     # Set by supervisor_node; execution_mode ∈ {supervisor, deepagent, clarify}
-    complexity_route: "RoutingDecision | None"
+    complexity_route: RoutingDecision | None  # type: ignore[misc]
 
     # ── Phase 1A: Trusted preprocessor marker ────────────────────────────────
     # "semantic_v1" when preprocessor ran; suppresses duplicate abbr expansion
     # in supervisor_node (B.7). Set by semantic_preprocessor_node.
-    _preprocessor_marker: "Literal['semantic_v1'] | None"
+    _preprocessor_marker: Literal["semantic_v1"] | None
 
     # ── Phase 1A: Runtime flag snapshot ──────────────────────────────────────
     # Frozen at request ingress; used for replay/debugging (per E.2).
-    flag_snapshot: "dict | None"
+    flag_snapshot: dict | None
 
     # ── Phase 1B+: Budget guard (set by deep_research_coordinator) ───────────
-    budget_guard: "BudgetGuard | None"
+    budget_guard: dict | None  # BudgetGuard defined in Phase 1B+
 
 
 # =============================================================================

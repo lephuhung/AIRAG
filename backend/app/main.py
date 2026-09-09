@@ -450,8 +450,10 @@ async def lifespan(app: FastAPI):
             )
             await conn.execute(
                 text(
-                    "CREATE INDEX IF NOT EXISTS ix_alias_workspace
-                    ON document_aliases(workspace_id)"
+                    """
+                    CREATE INDEX IF NOT EXISTS ix_alias_workspace
+                    ON document_aliases(workspace_id)
+                    """
                 )
             )
             await conn.execute(
