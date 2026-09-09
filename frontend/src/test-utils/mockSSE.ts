@@ -8,8 +8,15 @@ export function mockSSEResponse(events: Array<Record<string, unknown>>): Readabl
     return new ReadableStream({
         start(controller) {
             for (const event of events) {
-                const sseLine = `data: ${JSON.stringify(event)}\n\n`;
-                controller.enqueue(encoder.encode(sseLine));
+                // SSE spec: event: <type>\ndata: <json>\n\n
+                // The SSE parser in useRAGChatStream reads 'event:' lines FIRST
+                // to determine currentEventType, then processes 'data:' lines.
+                // Without 'event:', currentEventType stays empty/unknown and
+                // handlers for 'sources', 'token_rollback', etc. never fire.
+                if (event.type) {
+                    controller.enqueue(encoder.encode(`event: ${event.type}\n`));
+                }
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
             }
             controller.close();
         },
