@@ -1,94 +1,141 @@
 # LangGraph v2 Contract-First Architecture
 
-**Date:** 2026-09-10  
-**Status:** Approved design  
-**Source direction:** `docs/agent-contract-langgraph-deepagent.md`  
-**Supersedes for this initiative:** the previous DeepAgent implementation specs and plans
+**Date:** 2026-09-10
+
+**Status:** Review / Proposed
+
+**Revision basis:** commit `977e1f12b87efe49a70e25ab2b287986e5c3f2bd`
+
+**Source direction:** `docs/agent-contract-langgraph-deepagent.md`
+
+**Scope:** architecture and contracts only; no runtime implementation is authorized by this revision
 
 ## 1. Objective
 
-Build a new contract-first LangGraph architecture without refactoring the existing `supervisor.py` in place. The new graph is composed from independently testable domain subgraphs, preserves deterministic fast paths, and uses a DeepAgent subgraph for dependent, multi-step research.
+Build a contract-first LangGraph v2 architecture with explicit boundaries between:
 
-“DeepAgent” in this design means an AIRAG orchestration subgraph implemented with LangGraph primitives. It is not an external library.
+- LangGraph orchestration and lifecycle;
+- complex research orchestration;
+- domain capabilities;
+- conversation and semantic context;
+- trusted authorization scope;
+- business task requests and results;
+- evidence, coverage, synthesis, and grounding.
 
-## 2. Decisions
+The design must preserve simple-query latency, reuse valuable Phase-1 preprocessing work, and avoid a big-bang rewrite of existing business services.
+
+## 2. Retained architecture decisions
 
 1. Create `backend/app/services/agents/supervisor_v2.py`; do not add v2 behavior to `supervisor.py`.
-2. Select v1 or v2 at an external integration boundary using `NEXUSRAG_AGENT_GRAPH_VERSION=v1|v2`.
-3. Organize v2 as domain subgraphs with minimal typed input/output state.
-4. Use the existing chat-history database as the conversation source of truth. LangGraph checkpoints support execution, interrupt, and resume only.
-5. Run deterministic semantic extraction and a small semantic model in parallel, then reconcile their outputs.
-6. Persist a rolling thread summary and a semantic snapshot for each user message.
-7. Use a small model for semantic analysis, query analysis, conversation summary, and semantic evidence evaluation.
-8. Use deterministic code for permission gates, routing policy, scope enforcement, budgets, contract validation, and hard evidence checks.
-9. Use the main model for complex planning, evidence reasoning, and final-answer synthesis.
-10. Allow template responses for simple People lookup, document metadata/listing, and exact section retrieval.
-11. Use a hybrid DeepAgent planner: initial dependency DAG, parallel ready-task execution, evidence evaluation, and bounded append-only replanning.
-12. A required target that cannot be resolved or read blocks synthesis and triggers clarification with candidate documents.
+2. Select v1 or v2 at an integration boundary using a feature/config flag.
+3. Compose v2 from independently testable domain subgraphs with typed input/output contracts.
+4. Treat the chat database as the conversation source of truth. LangGraph checkpoints support execution, interrupt, and resume only.
+5. Keep permission, authorization, scope enforcement, budgets, plan validation, and hard evidence checks deterministic.
+6. Never expose MongoDB, vector DB, Neo4j clients, or raw database interfaces directly to a model.
+7. Preserve deterministic fast paths for simple requests.
+8. Use planning, evidence collection, evidence evaluation, bounded replanning, synthesis, and grounding for complex requests.
+9. Preserve citation and provenance through the final answer.
+10. Roll out through offline replay, shadow mode, canary, and gradual cutover.
+11. Keep v1 until v2 passes explicit correctness, latency, grounding, permission, and cost benchmarks.
 
-## 3. Authorization and scope semantics
+## 3. Terminology and framework boundary
 
-The backend authenticates the caller and passes:
+### 3.1 LangGraph
 
-```python
-workspace_ids: list[UUID]
-can_read_people: bool
+LangGraph owns runtime concerns:
+
+```text
+LangGraph
+= state lifecycle
++ node/subgraph composition
++ Command/Send routing
++ checkpointing
++ interrupt/resume
++ streaming lifecycle
 ```
 
-`workspace_ids` is the complete document-search authorization boundary for the request. A user may read all documents within those workspaces. DeepAgent does not perform ACL reasoning. Capability adapters inject the trusted workspace list; an LLM cannot supply or modify it in tool input.
+LangGraph types do not become business contracts. A capability result never contains `goto`, `Command`, `Send`, or graph topology.
 
-`target_document_ids` has business—not authorization—semantics. It identifies documents that the user explicitly selected, attached, quoted, or required the system to read. DeepAgent may discover supporting documents within `workspace_ids`, but discovered documents do not satisfy an unread required target.
+### 3.2 ComplexResearchGraph
 
-People data uses one deterministic gate:
+This spec replaces the overloaded name “DeepAgent” with `ComplexResearchGraph`.
 
-- `can_read_people=false`: People capabilities are not exposed; direct invocation is denied by the service as defense in depth.
-- `can_read_people=true`: People lookup, including CCCD/BHXH, is permitted.
+```text
+ComplexResearchGraph
+= AIRAG contract and orchestration semantics for complex research.
+```
 
-Permission values are recalculated by the backend on resume. They are never inferred by a model or persisted as conversational memory.
+It must support:
 
-## 4. Top-level architecture
+- executable planning;
+- multi-step and multi-document research;
+- domain capability invocation;
+- dependency handling and bounded parallelism;
+- evidence and target-unit coverage evaluation;
+- append-only bounded replanning;
+- synthesis after evidence sufficiency;
+- clarification when an essential target or ambiguity blocks completion.
+
+This design intentionally does **not** select the implementation framework. Conforming implementations may include:
+
+- a native LangGraph planner/executor;
+- a Deep Agents library adapter;
+- another implementation that satisfies the same contracts, invariants, lifecycle, and benchmark gates.
+
+Selecting or rejecting the Deep Agents library is a later explicit architecture decision. It requires a compatibility and benchmark spike; absence of the library from initial code is not a decision to reject it.
+
+### 3.3 ResearchOrchestrator
+
+`ResearchOrchestrator` is the implementation-facing interface behind `ComplexResearchGraph`. The graph composition depends on this interface rather than on a particular planner library.
+
+## 4. Updated target architecture
 
 ```text
 Backend ingress
-├── authenticate caller
-├── calculate workspace_ids
-├── calculate can_read_people
-└── load conversation history
-          ↓
-supervisor_v2.py
-          ↓
-Context Subgraph
+├── authenticate
+├── calculate workspace authorization
+├── calculate People permission
+├── persist ORIGINAL user message
+└── load conversation context
+        ↓
+Context / Semantic Subgraph
 ├── deterministic extraction
-├── small-model semantic analysis
+├── conversational coreference resolution
+├── protected abbreviation resolution
+├── optional small semantic model
 ├── reconciliation
-└── semantic-context persistence
-          ↓
-Routing Subgraph
-├── small-model QueryAnalysis
-└── deterministic fast/deep/clarify routing
-          ↓
-   ┌──────┼────────────────┐
-   ↓      ↓                ↓
-Clarify  Fast path       DeepAgent Subgraph
-         ├── People      ├── initial plan
-         ├── Document    ├── validate DAG
-         └── Section     ├── dispatch domain subgraphs
-                         ├── collect evidence
-                         ├── evaluate evidence
-                         ├── bounded replan
-                         └── main-model synthesis
-                              ↓
-                       Grounding Subgraph
-                       ├── citation validation
-                       ├── target coverage
-                       └── final response
+└── persist semantic snapshot
+        ↓
+Query Analysis
+        ↓
+Deterministic Router
+├── clarify
+├── fast domain path
+└── complex research
+        ↓
+ComplexResearchGraph
+├── create executable DAG
+├── validate DAG
+├── dispatch domain tasks
+├── AgentRequest + CapabilityRuntimeContext
+├── AgentResult + Evidence + Coverage
+├── coverage/evidence evaluation
+├── bounded append-only replan
+└── synthesis
+        ↓
+Grounding
+├── required-target coverage
+├── evidence/citation validation
+└── unsupported-claim handling
+        ↓
+FinalResponse
 ```
 
-## 5. Module layout
+## 5. Module layout and subgraph boundaries
 
 ```text
 backend/app/services/agents/
-├── supervisor.py                    # unchanged v1
+├── supervisor.py                    # unchanged v1 implementation
 ├── supervisor_v2.py                 # v2 composition root
 └── v2/
     ├── contracts/
@@ -98,7 +145,7 @@ backend/app/services/agents/
     │   └── evidence.py
     ├── context_graph/
     ├── routing_graph/
-    ├── deep_agent_graph/
+    ├── complex_research_graph/
     ├── people_graph/
     ├── document_graph/
     ├── section_graph/
@@ -108,36 +155,92 @@ backend/app/services/agents/
     └── adapters/
 ```
 
-`supervisor_v2.py` only composes subgraphs, declares edges, and exposes the public graph builder. Domain logic belongs in focused modules.
+`supervisor_v2.py` only composes subgraphs, declares graph edges, and exposes the public graph builder. It does not contain domain logic.
 
 Each subgraph:
 
-- has its own minimal input/output schema;
-- does not read arbitrary root-state fields;
-- communicates through shared business contracts;
+- has minimal typed input/output state;
+- cannot read or mutate arbitrary root-state fields;
+- communicates through shared contracts;
 - can be compiled and tested independently;
-- may use LangGraph `Command` or `Send` internally, but those routing primitives never appear in business contracts.
+- may use LangGraph primitives internally without leaking them across business boundaries.
 
-Initial domains are People, Document, and Section. KG becomes a separate subgraph only when required by a validated use case.
+Initial domains are People, Document, and Section. KG becomes a separate subgraph only for a validated use case.
 
-## 6. Core contracts
+## 6. Data objects and ownership
 
-All persisted and boundary contracts are versioned Pydantic v2 models with forbidden extra fields. Runtime-only LangGraph state remains distinct from business contracts.
+```text
+Raw User Request
+    ↓
+RequestContext
++
+ConversationContext
+    ↓
+SemanticContext
+    ↓
+QueryAnalysis
+    ↓
+RouteDecision
+    ↓
+TaskPlan / DAG
+    ↓
+AgentRequest
++
+CapabilityRuntimeContext
+    ↓
+AgentResult
++
+Evidence
++
+Coverage
+    ↓
+EvidenceEvaluation
+    ↓
+Synthesis
+    ↓
+GroundingResult
+    ↓
+FinalResponse
+```
 
-### 6.1 Root state
+| Object | Owner | Notes |
+|---|---|---|
+| `RequestContext` | Backend ingress | Authenticated request metadata and initial required-document bindings |
+| `CapabilityRuntimeContext` | Backend/runtime adapter | Trusted authorization, capability allowlist, deadline |
+| `ConversationContext` | Context layer | Short-term discourse state sourced from chat DB |
+| `SemanticContext` | Context layer | Meaning of the current request after resolution/normalization |
+| `QueryAnalysis` | Query analyzer | Semantic structure and dependency hints, not an executable plan |
+| `RouteDecision` | Deterministic router | `clarify`, fast domain path, or complex research |
+| `TaskPlan` / DAG | `ComplexResearchGraph` | Executable tasks and dependencies |
+| `AgentRequest` | Planner/orchestrator | Business operation requested from a capability |
+| `AgentResult` / `Evidence` | Capability | Business result and provenance-anchored evidence |
+| `CoverageObservation` | Capability | Facts observed while executing a task; never authoritative completion |
+| `Coverage` / `EvidenceEvaluation` | Evaluator | Authoritative requirement-level completion and semantic sufficiency |
+| `GroundingResult` / `FinalResponse` | Answer layer | Validated user-facing output |
+
+## 7. Core contract rules
+
+All boundary and persisted contracts are versioned Pydantic v2 models with forbidden extra fields. Runtime-only objects such as DB sessions, cancellation events, LangGraph commands, and raw clients are excluded from persisted business contracts.
+
+### 7.1 Root graph state
 
 ```python
 class SupervisorV2State(TypedDict):
     request: RequestContext
+    runtime: CapabilityRuntimeContext
     conversation: ConversationContext
     semantic: SemanticContext
     query_analysis: QueryAnalysis | None
+    route_decision: RouteDecision | None
     execution: ExecutionState
     clarification: ClarificationRequest | None
+    grounding: GroundingResult | None
     final_response: FinalResponse | None
 ```
 
-### 6.2 Request context
+Nested objects cross subgraph boundaries through explicit input/output adapters. A domain subgraph never receives the entire root state unless its input schema explicitly requires every field. `runtime` is trusted, request-scoped, and never persisted or exposed as model-controlled state. Context/document resolvers and clarification-candidate lookup receive a read-only resolver view derived from `CapabilityRuntimeContext`, so every candidate query is filtered by current `workspace_ids` before identity or metadata is returned.
+
+### 7.2 Request context
 
 ```python
 class RequestContext(BaseModel):
@@ -148,60 +251,348 @@ class RequestContext(BaseModel):
     thread_id: str
     user_id: UUID
     original_query: str
-    workspace_ids: list[UUID]
-    target_document_ids: list[UUID]
-    attached_document_ids: list[UUID]
-    can_read_people: bool
-    deadline_at: datetime
+    required_documents: tuple[ScopedDocument, ...]
+    attached_document_ids: tuple[UUID, ...]
 ```
 
-Trusted fields are built by backend adapters and cannot be produced by model output.
+Authorization fields are deliberately absent. They belong to trusted runtime context, not the business request.
 
-### 6.3 Conversation and semantic context
+## 8. Document roles and required scope
+
+### 8.1 Role-based binding
+
+V2 adopts role-based document binding as the canonical contract:
+
+```python
+class ScopedDocument(BaseModel):
+    contract_version: Literal["2.0"]
+    binding_id: str
+    document_id: UUID
+    role: Literal["target", "reference", "supporting", "discovered"]
+    required: bool
+    source_ref_id: str | None = None
+    section_ref: str | None = None
+```
+
+Semantics:
+
+- `target`: subject being read, analyzed, compared, or evaluated;
+- `reference`: normative or comparative basis required for the objective;
+- `supporting`: explicitly bound supplemental material;
+- `discovered`: material found during research and not silently promoted to target/reference.
+
+A required binding is a completion requirement, not an authorization grant. Authorization still comes only from `CapabilityRuntimeContext.workspace_ids`. `required` is explicit: user-bound targets and references are normally `True`; incidental supporting/discovered bindings are `False` unless a validated plan deliberately promotes them into a new required binding. Role-sensitive validation rejects an accidental `discovered + required=True` binding without an explicit promotion reason.
+
+### 8.2 Canonical use cases
+
+```text
+"So sánh A và B"
+A = required target
+B = required target
+
+"Kiểm tra F1/F2 theo A"
+F1 = required target
+F2 = required target
+A  = required reference
+
+"Phân tích A và tìm các văn bản liên quan"
+A = required target
+newly found documents = discovered/supporting
+
+"Kiểm tra F1/F2 theo quy định hiện hành"
+F1/F2 = required targets
+references = discovered within authorized workspaces, then explicitly bound as references by the plan
+```
+
+A required target or reference cannot be silently replaced by a discovered document. The role and `binding_id` must survive task fan-out, evidence fan-in, evaluation, synthesis, and citation rendering.
+
+## 9. Trusted runtime context and capability boundary
+
+### 9.1 CapabilityRuntimeContext
+
+```python
+class CapabilityRuntimeContext(BaseModel):
+    contract_version: Literal["2.0"]
+    request_id: str
+    run_id: str
+    user_id: UUID
+    workspace_ids: tuple[UUID, ...]
+    can_read_people: bool
+    allowed_capabilities: frozenset[str]
+    deadline_at: datetime
+    config_revision: str
+```
+
+This object is constructed by trusted backend/runtime code. Model output cannot create or alter it.
+
+### 9.2 Standard capability signature
+
+```python
+async def execute(
+    request: AgentRequest,
+    runtime: CapabilityRuntimeContext,
+) -> AgentResult:
+    ...
+```
+
+```text
+AgentRequest
+= what the model/task asks to do.
+
+CapabilityRuntimeContext
+= what the backend permits, where, and until when.
+
+Capability
+= executes request ∩ runtime authorization.
+```
+
+The capability adapter injects `workspace_ids`; tool arguments generated by a model never contain trusted authorization scope. A capability validates its name against `allowed_capabilities` and applies People permission defense in depth.
+
+### 9.3 People permission
+
+- `can_read_people=false`: People capabilities are omitted from the request-scoped registry; direct execution returns `denied`.
+- `can_read_people=true`: People lookup, including CCCD/BHXH, is allowed.
+
+The backend recalculates authorization and People permission for each request and resume.
+
+## 10. ConversationContext and SemanticContext
+
+### 10.1 ConversationContext
 
 ```python
 class ConversationContext(BaseModel):
     contract_version: Literal["2.0"]
     thread_id: str
     summary: str
-    active_entities: list[ActiveEntity]
+    summary_version: int
+    active_entities: tuple[ActiveEntity, ...]
     last_focus: EntityReference | None
-    open_questions: list[str]
-    recent_turns: list[ConversationTurn]
+    open_questions: tuple[str, ...]
+    recent_turns: tuple[ConversationTurn, ...]
     built_through_message_id: str | None
+```
 
+It is structured short-term discourse state. It avoids sending an unbounded history to every agent.
+
+### 10.2 Conversation context is not memory
+
+```text
+Conversation Context
+= short-term discourse state.
+
+Memory
+= long-term user-related context.
+```
+
+Resolve from conversation context:
+
+- “nghị định này”;
+- “văn bản trên”;
+- “người vừa nói”;
+- “file thứ hai”;
+- “điều vừa nói”.
+
+Long-term memory may be consulted for statements such as “đơn vị tôi” or durable user information, subject to its own permission and relevance policy. It must not replace conversation resolution when the antecedent is present in the thread.
+
+### 10.3 SemanticContext
+
+```python
 class SemanticContext(BaseModel):
     contract_version: Literal["2.0"]
     original_query: str
     contextualized_query: str
     normalized_query: str
-    abbreviations: list[AbbreviationResolution]
-    coreferences: list[CoreferenceResolution]
-    document_refs: list[DocumentReference]
-    person_refs: list[EntityReference]
-    section_refs: list[SectionReference]
-    blocking_ambiguities: list[BlockingAmbiguity]
+    abbreviations: tuple[AbbreviationResolution, ...]
+    coreferences: tuple[CoreferenceResolution, ...]
+    document_refs: tuple[DocumentReference, ...]
+    person_refs: tuple[EntityReference, ...]
+    section_refs: tuple[SectionReference, ...]
+    blocking_ambiguities: tuple[BlockingAmbiguity, ...]
 ```
 
-Identifiers suggested by the semantic model are accepted only after reconciliation against deterministic candidates or database records. Exact deterministic matches take precedence. A conflict affecting target identity, scope, or objective triggers clarification.
+The three query forms are distinct:
 
-### 6.4 Query analysis
+```text
+original_query
+= immutable raw user input.
+
+contextualized_query
+= conversational references resolved.
+
+normalized_query
+= contextualized query with validated abbreviation/entity/document normalization.
+```
+
+Example:
+
+```text
+Previous turn:
+"Nghị định 13/2023/NĐ-CP quy định gì?"
+
+Current original_query:
+"NĐ này có quy định về DLCN không?"
+
+contextualized_query:
+"NĐ 13/2023/NĐ-CP có quy định về DLCN không?"
+
+normalized_query:
+"Nghị định 13/2023/NĐ-CP có quy định về dữ liệu cá nhân không?"
+```
+
+Query analysis runs only after this stage.
+
+### 10.4 Context resolution does not grant access
+
+```text
+ConversationContext
+    ↓
+resolve "nghị định này" → A
+    ↓
+current runtime workspace authorization
+    ↓
+authorized capability execution
+```
+
+An entity seen in a previous turn may no longer be accessible. Current authorization always wins.
+
+## 11. Semantic preprocessing and abbreviation reuse
+
+The semantic preprocessing stage always exists, but expensive semantic-model work is conditional.
+
+### 11.1 Abbreviation pipeline
+
+```text
+raw query
+ ↓
+protect identifiers and literals
+ ↓
+cheap candidate detection
+ ↓
+no candidate ─────────────→ continue
+ ↓
+batch DB lookup
+ ├── unique ──────────────→ normalize
+ ├── ambiguous ───────────→ conditional disambiguation
+ └── unknown ─────────────→ preserve original
+```
+
+Protected spans include:
+
+- legal document numbers such as `12/2024/NĐ-CP`;
+- CCCD, BHXH, phone numbers, and other IDs;
+- quoted literals;
+- validated document identifiers.
+
+Abbreviations are never expanded blindly. The contract retains:
+
+```python
+class AbbreviationResolution(BaseModel):
+    span: str
+    short_form: str
+    chosen: str | None
+    candidates: tuple[AbbreviationCandidate, ...]
+    status: Literal["resolved", "ambiguous", "unknown", "not_in_db"]
+    source: str
+    confidence: float | None
+```
+
+Complex research may call the shared `abbreviation.resolve` capability for abbreviations discovered during research. It must not duplicate preprocessing logic.
+
+### 11.2 Conditional small semantic model
+
+```text
+deterministic extraction
+       ↓
+context/semantic complexity gate
+       ├── fully resolved + simple
+       │      ↓
+       │   skip semantic LLM
+       │
+       └── ambiguous/compound/context-dependent
+              ↓
+          small semantic model
+              ↓
+          deterministic reconciliation
+```
+
+Examples that skip the semantic model when deterministically resolved:
+
+- “Xin chào”;
+- a validated direct CCCD lookup;
+- exact document metadata lookup;
+- exact document-and-section retrieval.
+
+The semantic model may select or describe validated candidates but cannot create trusted document IDs, workspace authorization, or permissions.
+
+## 12. Query analysis and deterministic routing
+
+`QueryAnalysis` describes semantic structure; it is not an executable planner.
 
 ```python
 class QueryAnalysis(BaseModel):
+    contract_version: Literal["2.0"]
     work_type: Literal[
-        "lookup", "retrieve", "explain", "compare",
+        "direct", "lookup", "retrieve", "explain", "compare",
         "summarize", "cross_domain", "multi_goal",
     ]
-    required_capabilities: list[str]
-    dependencies: list[TaskDependency]
     semantic_complexity: Literal["simple", "compound", "deep"]
+    capability_hints: tuple[str, ...]
+    dependency_hints: tuple[SemanticDependencyHint, ...]
     requires_synthesis: bool
 ```
 
-The small model describes the request. Deterministic routing code chooses fast, deep, or clarify and validates all named capabilities.
+For example, “People result is required before document search” is a dependency hint. It has no task ID and is not executable.
 
-### 6.5 Agent request and result
+Only `ComplexResearchGraph` creates the executable DAG containing task IDs, `depends_on`, capability names, document bindings, and completion criteria.
+
+The deterministic router owns `RouteDecision`:
+
+```python
+class RouteDecision(BaseModel):
+    contract_version: Literal["2.0"]
+    route: Literal["direct", "clarify", "fast_domain", "complex_research"]
+    reason_code: str
+    domain: str | None = None
+```
+
+Routing priority:
+
+1. Greeting or deterministic conversational direct response → direct.
+2. Essential ambiguity or unresolved required binding → clarify.
+3. Simple People lookup → permission gate and fast People path.
+4. Document metadata/listing → fast Document path.
+5. Exact section retrieval → fast Section path.
+6. Compare, cross-domain, multi-goal, dependent research, compliance, or unresolved evidence needs → complex research.
+7. Other bounded work → domain path and Answer Policy.
+
+## 13. Task plan and capability contracts
+
+### 13.1 Executable plan
+
+```python
+class TaskPlan(BaseModel):
+    contract_version: Literal["2.0"]
+    plan_id: str
+    objective: str
+    tasks: tuple[TaskSpec, ...]
+
+class TaskSpec(BaseModel):
+    contract_version: Literal["2.0"]
+    task_id: str
+    capability: str
+    objective: str
+    document_bindings: tuple[ScopedDocument, ...]
+    input: CapabilityInput
+    depends_on: tuple[str, ...]
+    completion_criteria: tuple[str, ...]
+    replan_reason: str | None = None
+    triggered_by_task_ids: tuple[str, ...] = ()
+    triggered_by_evidence_ids: tuple[str, ...] = ()
+```
+
+Runtime validates task IDs, acyclic dependencies, capability allowlist, document roles, budgets, and scope before execution.
+
+### 13.2 Business task request
 
 ```python
 class AgentRequest(BaseModel):
@@ -211,12 +602,17 @@ class AgentRequest(BaseModel):
     parent_task_id: str | None = None
     capability: str
     objective: str
-    inputs: dict[str, Any]
-    required_target_ids: list[UUID]
-    discovered_document_refs: list[DocumentReference]
-    depends_on: list[str]
-    completion_criteria: list[str]
+    document_bindings: tuple[ScopedDocument, ...]
+    input: CapabilityInput
+    depends_on: tuple[str, ...]
+    completion_criteria: tuple[str, ...]
+```
 
+`CapabilityInput` is a discriminated union of capability-specific Pydantic models such as `PeopleLookupInput`, `DocumentSearchInput`, and `SectionReadInput`; it is not a free-form dictionary. Every input model forbids extra fields and excludes reserved trusted keys (`workspace_ids`, permission flags, capability allowlists, deadlines, runtime IDs). Document identifiers in an input must reference validated `document_bindings`. The same typed input rule applies to `TaskSpec`. `AgentRequest` excludes workspace authorization and permission fields.
+
+### 13.3 Domain result
+
+```python
 class AgentResult(BaseModel):
     contract_version: Literal["2.0"]
     request_id: str
@@ -226,42 +622,78 @@ class AgentResult(BaseModel):
         "needs_input", "denied", "error",
     ]
     data: dict[str, Any] | None
-    evidence: list[Evidence]
-    coverage: Coverage
-    missing: list[MissingRequirement]
-    answer_mode: Literal["template", "synthesis_required"]
+    evidence: tuple[Evidence, ...]
+    coverage_observations: tuple[CoverageObservation, ...]
+    missing: tuple[MissingRequirement, ...]
     error: AgentError | None
 ```
 
-`AgentRequest` intentionally excludes `workspace_ids` and People permission. The capability boundary receives trusted runtime context separately.
+`answer_mode` is not part of `AgentResult`. Template rendering versus model synthesis is Answer Policy owned by orchestration/presentation code. Capabilities report only `CoverageObservation` facts (resolved range, bytes/pages/chunks read, truncation, failure); the evaluator alone constructs authoritative `Coverage` by matching those observations and evidence against the requested target units.
 
 Status semantics are strict:
 
-- `success`: objective completed within the supplied runtime scope;
-- `partial`: useful result exists but non-blocking requirements remain;
-- `not_found`: lookup completed normally and found nothing;
-- `needs_input`: user input is required;
-- `denied`: permission gate rejected the operation;
-- `error`: runtime or infrastructure failure.
+- `success`: capability objective completed within runtime authorization;
+- `partial`: useful result exists but declared requirements remain incomplete;
+- `not_found`: lookup completed normally within scope and found nothing;
+- `needs_input`: user/caller input is required;
+- `denied`: deterministic permission or authorization gate rejected execution;
+- `error`: runtime, dependency, timeout, or infrastructure failure.
 
-Timeout and backend outage must never become `not_found`.
+Timeout and backend outage never become `not_found`.
 
-### 6.6 Coverage and evidence
+## 14. Coverage by logical target unit
+
+Coverage is measured against required logical units, not only document UUIDs.
 
 ```python
-class Coverage(BaseModel):
-    required: list[UUID]
-    resolved: list[UUID]
-    read: list[UUID]
-    unreadable: list[UUID]
-    missing: list[UUID]
-    truncated: list[UUID]
+class CoverageObservation(BaseModel):
+    contract_version: Literal["2.0"]
+    target_id: str
+    binding_id: str
+    document_id: UUID
+    observed_range: str | None = None
+    outcome: Literal["resolved", "read", "missing", "unreadable", "truncated"]
 
+class CoverageItem(BaseModel):
+    contract_version: Literal["2.0"]
+    target_id: str
+    binding_id: str
+    document_id: UUID
+    role: Literal["target", "reference", "supporting", "discovered"]
+    section_ref: str | None = None
+    requested_range: str | None = None
+    observed_range: str | None = None
+    status: Literal[
+        "resolved", "read_complete", "read_partial",
+        "missing", "unreadable", "truncated",
+    ]
+
+class Coverage(BaseModel):
+    contract_version: Literal["2.0"]
+    items: tuple[CoverageItem, ...]
+```
+
+A target unit may represent:
+
+- an entire document;
+- Chapter II of document A;
+- Article 5 of document A;
+- an uploaded file;
+- a required reference range.
+
+Reading Chapter I of A cannot complete a requirement for Chapter II of A. A required unit is sufficient only when the requested range is read completely or the completion criteria explicitly allow partial coverage.
+
+## 15. Evidence contract
+
+```python
 class Evidence(BaseModel):
+    contract_version: Literal["2.0"]
     evidence_id: str
     task_id: str
     source_type: Literal["document", "knowledge_graph", "people", "memory"]
-    role: Literal["target", "discovered", "supporting"]
+    role: Literal["target", "reference", "discovered", "supporting"]
+    binding_id: str | None
+    target_id: str | None
     document_id: UUID | None
     workspace_id: UUID | None
     section_path: str | None
@@ -272,197 +704,538 @@ class Evidence(BaseModel):
     provenance: Provenance
 ```
 
-All document evidence requires a verified `document_id`. Citation metadata must map to evidence and verified document metadata. Evidence preserves task and source provenance through fan-out and fan-in.
+Rules:
 
-## 7. Context and persistence design
+- `source_type=document` requires verified `document_id` and `workspace_id`;
+- document evidence with role `target` or `reference` also requires `binding_id` and `target_id`, each matching a declared target unit;
+- `discovered`/`supporting` document evidence may omit `target_id` only when it is not attached to a required unit;
+- People, memory, and KG evidence may omit document fields but must carry source-specific identity in typed provenance/metadata;
+- role, binding, task, document, and section provenance survive fan-out/fan-in;
+- synthesis never infers source identity from evidence text;
+- evidence from different documents is not deduplicated into one provenance record merely because content hashes match;
+- citation metadata must map to verified evidence and document metadata.
 
-The chat database is the source of truth. LangGraph checkpoint state is a resumable execution snapshot, not the authoritative conversation record.
-
-For each user message, persist a semantic snapshot containing:
-
-- original, contextualized, and normalized query;
-- resolved entities and their provenance;
-- abbreviations and coreferences;
-- ambiguities;
-- contract, model, and configuration revisions.
-
-For each thread, persist a rolling structured summary containing:
-
-- concise text summary;
-- active documents, people, sections, and files;
-- last focus;
-- open questions;
-- `built_through_message_id`;
-- schema version.
-
-The Context subgraph reads the persisted context and recent turns. It reconstructs from history only when data is missing or incompatible. It runs deterministic extraction and a small-model semantic pass concurrently, reconciles them, then persists the resulting snapshot. Conversation references never grant permission; current `workspace_ids` remain authoritative.
-
-## 8. Routing and fast paths
-
-Deterministic routing applies the following priority:
-
-1. Missing or ambiguous required target/objective: clarify.
-2. Simple People lookup: People gate, capability, template response.
-3. Document metadata/listing: Document subgraph, template response.
-4. Exact resolved section retrieval: Section subgraph, verbatim/template response with citation.
-5. Compare, cross-domain dependency, multi-goal, dependent research, or insufficient single-step evidence: DeepAgent.
-6. Other bounded domain work: domain subgraph, followed by synthesis only if requested.
-
-Exact section retrieval bypasses the main model only when the user requests retrieval. Explain, compare, evaluate, or summarize requests still require synthesis.
-
-## 9. DeepAgent subgraph
-
-DeepAgent uses a hybrid planning loop:
+## 16. ComplexResearchGraph behavior
 
 ```text
-initial plan
+semantic objective + dependency hints
+→ create executable TaskPlan/DAG
 → deterministic plan validation
-→ dispatch ready tasks in parallel with Send
-→ execute domain subgraphs
-→ collect AgentResult and Evidence
-→ deterministic evidence validation
-→ small-model semantic evaluation
+→ dispatch ready tasks in parallel
+→ call domain capabilities with AgentRequest + CapabilityRuntimeContext
+→ collect AgentResult + Evidence + Coverage
+→ deterministic evidence checks
+→ optional small-model semantic evidence evaluation
     ├── sufficient → synthesis
-    ├── required target missing → clarification
-    ├── evidence gap → bounded replan
+    ├── required binding blocked → clarification
+    ├── evidence gap → bounded append-only replan
     └── terminal failure → typed failure response
 ```
 
 Plan rules:
 
 - task IDs are unique;
-- dependencies form an acyclic graph;
-- capabilities must exist in the request-scoped registry;
+- dependencies are acyclic;
+- capability names must be request-authorized;
+- child tasks cannot exceed authorized workspaces;
 - completed task records are immutable;
-- replanning appends tasks and records a reason plus evidence/task dependencies;
-- parallel branches receive minimal task state;
-- runtime enforces maximum branches, tasks, tool calls, replan rounds, deadlines, and cancellation.
+- replanning only appends tasks and records `replan_reason`, `triggered_by_task_ids`, and `triggered_by_evidence_ids`; at least one trigger is required for every appended task;
+- maximum branches, tasks, tool calls, replan rounds, deadlines, and cancellation are runtime-enforced;
+- only the outer synthesis layer streams final-answer content.
 
-The main model creates the initial plan and bounded additions. Runtime validation, not the model, decides whether a plan can execute.
+## 17. Evidence evaluation, Answer Policy, and grounding
 
-## 10. Evidence evaluation and grounding
+### 17.1 Hard deterministic evaluation
 
-Evidence evaluation has two layers.
+Validate:
 
-### Hard deterministic checks
+- every required target/reference unit is resolved and read at the requested range;
+- task completion criteria are satisfied;
+- evidence provenance and content hashes are valid;
+- citation references map to evidence;
+- capability permission and status semantics are valid;
+- timeout, error, and truncation are represented honestly.
 
-- required-target resolution and read coverage;
-- provenance and content-hash integrity;
-- citation-to-evidence mapping;
-- task completion criteria;
-- permission and capability status;
-- error, timeout, and truncation semantics.
+### 17.2 Semantic evaluation
 
-### Small-model semantic evaluation
-
-The model returns structured judgments for:
+A small model may return a structured `EvidenceEvaluation` for:
 
 - relevance to the objective;
-- missing aspects;
+- semantic coverage gaps;
 - contradictions;
-- semantic sufficiency for synthesis.
+- sufficiency for synthesis;
+- targeted research suggestions.
 
-The small model cannot modify evidence or claim that unread material was read.
+The model cannot modify evidence, coverage, authorization, or completion records.
 
-The Grounding subgraph validates every synthesized answer. Unsupported citations are rejected. An ungrounded answer receives at most one revision; if it remains invalid, the system returns a transparent insufficient-evidence response.
+### 17.3 Answer Policy
 
-## 11. Blocking clarification and resume
+Answer Policy—not the capability—decides between:
 
-An unreadable, unresolved, or ambiguous required target prevents synthesis. The system searches for candidate documents inside `workspace_ids` and emits:
+- deterministic template/verbatim rendering;
+- main-model synthesis;
+- clarification;
+- insufficient-evidence fallback.
+
+Fast People, metadata/listing, and exact section retrieval may use deterministic rendering. Explain, compare, compliance, summarize, and cross-domain requests require synthesis.
+
+### 17.4 Grounding
+
+Grounding runs before successful completion of **every** answer. Deterministic/template responses use the hard validation subset; synthesized responses additionally run unsupported-claim checks and bounded revision:
+
+- verify required-unit coverage;
+- map citations to evidence and document metadata;
+- detect unsupported claims or references;
+- allow at most one bounded revision;
+- return a transparent insufficient-evidence response if validation still fails.
+
+## 18. Clarification and resume
+
+The following conditions block synthesis:
+
+- required target unresolved;
+- required reference unresolved when the objective depends on it;
+- required binding ambiguous;
+- required unit unreadable;
+- essential semantic ambiguity.
 
 ```python
 class ClarificationRequest(BaseModel):
     contract_version: Literal["2.0"]
     clarification_id: str
     reason: Literal[
-        "target_not_found", "target_ambiguous",
-        "target_unreadable", "semantic_ambiguity",
+        "required_document_not_found",
+        "required_document_ambiguous",
+        "required_unit_unreadable",
+        "semantic_ambiguity",
     ]
     question: str
-    unresolved_targets: list[TargetReference]
-    candidates: list[DocumentCandidate]
+    unresolved_bindings: tuple[ScopedDocumentCandidate, ...]
+    candidates: tuple[DocumentCandidate, ...]
     resumable: bool
     expires_at: datetime
 ```
 
-Candidate documents are suggestions only. They become required targets only after user confirmation.
+Candidate lookup receives a trusted resolver view of the current `CapabilityRuntimeContext`; candidates are filtered in-query by authorized `workspace_ids` before any title or metadata is returned. Candidates remain candidates until the user confirms a binding. The main model cannot guess among equally plausible conversational references.
 
-The graph prefers LangGraph interrupt/resume. On every resume, the backend recalculates permissions. If the checkpoint expired, failed, or uses an incompatible contract version, the backend creates a replacement run linked with `parent_run_id` and imports only validated semantic and clarification data.
+The graph prefers LangGraph interrupt/resume. On resume:
 
-## 12. Testing
+1. backend recalculates current workspace authorization and People permission;
+2. stored entity/document references are revalidated;
+3. compatible checkpoints resume;
+4. expired, failed, or contract-incompatible checkpoints create a replacement run linked by `parent_run_id`;
+5. only validated semantic and clarification data is imported into the replacement run.
 
-### Contract tests
+## 19. Conversation persistence, concurrency, and versioning
 
-- unsupported versions and extra fields are rejected;
-- plan cycles and unknown capabilities are rejected;
-- model output cannot inject trusted scope fields;
-- citation must map to verified evidence;
-- required-target coverage blocks synthesis when incomplete;
-- all result statuses retain distinct semantics.
+### 19.1 Raw user message invariant
 
-### Subgraph tests
+V2 persists `request.message` unchanged before semantic preprocessing:
 
-Each subgraph is compiled and tested independently for:
+```text
+request.message
+    ↓
+persist raw/original ChatMessage.content
+    ↓
+Context / Semantic Subgraph
+    ↓
+persist semantic snapshot separately
+```
+
+V2 must not persist expanded or normalized text in place of raw user content. `chat_messages.semantic_context` stores the versioned semantic snapshot.
+
+### 19.2 Per-message semantic snapshot
+
+Persist:
+
+- original, contextualized, and normalized query;
+- resolved entities and provenance;
+- abbreviation/coreference results;
+- blocking ambiguities;
+- contract, model, and config revisions.
+
+### 19.3 Rolling thread summary
+
+Persist:
+
+- concise summary;
+- structured active entities and last focus;
+- open questions;
+- `summary_version`;
+- `built_through_message_id`.
+
+### 19.4 Concurrent update policy
+
+Rolling-summary writes use optimistic concurrency:
+
+```text
+read summary_version=N
+→ build update through message M
+→ UPDATE ... WHERE summary_version=N
+→ success: version=N+1
+→ conflict: reload latest summary and reconstruct/merge from missing ordered messages
+```
+
+A stale request cannot overwrite a newer summary. `built_through_message_id` must advance monotonically according to persisted message order. If compare-and-swap fails repeatedly, the request may continue with its per-message semantic snapshot while scheduling deterministic summary reconstruction; summary conflict is not permission to discard messages.
+
+## 20. Existing Phase-1 disposition
+
+The current Phase-1 code contains useful contracts and validation. V2 must reuse or adapt them rather than rewriting equivalent logic without reason.
+
+| Existing artifact | V2 disposition |
+|---|---|
+| `semantic_preprocessor.PreprocessingResult` | Migrate concepts and validators into v2 `SemanticContext`; provide an adapter during transition |
+| `AbbreviationEntry` | Reuse/adapt as `AbbreviationResolution`; preserve span, candidates, status, source, and confidence |
+| `DocumentRefEntry` | Reuse/adapt into `DocumentReference` and then explicit `ScopedDocument` bindings |
+| `BlockingAmbiguity` | Reuse/adapt; essential ambiguity remains a deterministic clarify gate |
+| `TraceEvent` | Reuse/adapt for preprocessing observability; do not expose as business task data |
+| Phase-1 `RoutingDecision` | Do not complete the old design for v2; v2 uses semantic `QueryAnalysis` plus deterministic `RouteDecision` |
+| Phase-1 additions to `SupervisorState` | V1 compatibility only; not the v2 business interface |
+| `chat_messages.semantic_context` 1.x | Define version-aware reader/adapter and migration to v2 snapshots |
+| Existing abbreviation lookup/disambiguation | Reuse behind preprocessing and shared `abbreviation.resolve`; do not duplicate |
+
+No Phase 1B router/preprocessor implementation should proceed in parallel under the superseded design. Work must first be classified as v1 compatibility or v2 contract migration.
+
+## 21. Required use cases and expected flow
+
+### 21.1 Simple People
+
+```text
+"CCCD của A là gì?"
+→ deterministic/simple analysis
+→ People permission gate
+→ fast People capability
+→ deterministic answer policy
+```
+
+### 21.2 Simple document retrieval
+
+```text
+"Điều 5 A nói gì?"
+→ exact document + section resolution
+→ fast Section capability
+→ verbatim/template answer with citation
+```
+
+### 21.3 Conversational follow-up
+
+```text
+Turn 1: asks about A
+Turn 2: "nghị định này..."
+→ ConversationContext resolves A
+→ current authorization revalidation
+→ semantic normalization
+→ routing
+```
+
+### 21.4 Ambiguous follow-up
+
+```text
+Turn 1: compares A and B
+Turn 2: "nghị định này có hiệu lực khi nào?"
+→ A and B both plausible
+→ ClarificationRequest
+```
+
+### 21.5 Multi-document range comparison
+
+```text
+"So sánh Chương II A với Chương III B"
+→ two required target units
+→ complex DAG/fan-out
+→ coverage requires the exact chapters
+→ comparison synthesis
+```
+
+### 21.6 Cross-domain dependency
+
+```text
+"CCCD của A xuất hiện trong nghị định nào?"
+→ People lookup task
+→ CCCD result
+→ dependent document research task
+→ evidence evaluation and synthesis
+```
+
+### 21.7 Target/reference compliance
+
+```text
+"Kiểm tra F1/F2 có đúng quy định A"
+→ F1/F2 required targets
+→ A required reference
+→ role-preserving evidence
+→ compliance synthesis
+```
+
+### 21.8 Reference discovery
+
+```text
+"Kiểm tra F1/F2 theo quy định hiện hành"
+→ F1/F2 required targets remain immutable
+→ discover candidate references in authorized workspaces
+→ bind selected references explicitly
+→ evaluate target units against reference units
+```
+
+### 21.9 People permission denial
+
+```text
+can_read_people=false
+→ People capability not exposed
+→ direct invocation also denied
+```
+
+### 21.10 Resume after authorization change
+
+```text
+A was previously accessible
+→ resume recalculates workspace authorization
+→ current authorization wins
+→ deny/clarify if A is no longer accessible
+```
+
+### 21.11 Abbreviation
+
+```text
+"NĐ 13 quy định gì về DLCN?"
+→ original preserved
+→ protected document identifier
+→ shared abbreviation lookup
+→ normalized SemanticContext
+→ routing
+```
+
+### 21.12 Incomplete evidence
+
+```text
+many sources exist, but required section is missing
+→ CoverageItem is missing/read_partial
+→ EvidenceEvaluation insufficient
+→ no complete synthesis
+```
+
+## 22. Explicit invariants
+
+1. `original_query` and raw persisted user content are immutable.
+2. An LLM cannot create or widen workspace authorization.
+3. An LLM cannot grant People or other permissions.
+4. Context or coreference resolution does not grant access.
+5. Required targets/references cannot be silently replaced by discovered documents.
+6. Child tasks cannot exceed authorized workspace scope.
+7. Target/reference roles and binding IDs survive fan-out/fan-in.
+8. Document evidence requires a verified `document_id`.
+9. Section/range requirements complete only when the requested unit is read.
+10. Timeout or dependency outage is not `not_found`.
+11. Essential ambiguity triggers clarification, not model guessing.
+12. Completed task records are immutable.
+13. Replanning is append-only and bounded.
+14. Capability results contain no LangGraph routing instruction.
+15. Only the outer synthesis layer streams final-answer content.
+16. Grounding and citation validation occur before successful completion.
+17. Current request/resume authorization overrides persisted conversation context.
+18. Capabilities receive trusted scope only through `CapabilityRuntimeContext`.
+19. Evidence deduplication never destroys source/task/document provenance.
+20. Query analysis provides hints; only `ComplexResearchGraph` owns executable planning.
+
+## 23. Supporting boundary contracts
+
+The following first-class objects are versioned Pydantic contracts, not implied dictionaries:
+
+```python
+class ExecutionState(BaseModel):
+    contract_version: Literal["2.0"]
+    plan: TaskPlan | None
+    task_results: tuple[AgentResult, ...]
+    evidence_evaluation: EvidenceEvaluation | None
+
+class EvidenceEvaluation(BaseModel):
+    contract_version: Literal["2.0"]
+    status: Literal["sufficient", "insufficient", "contradictory", "needs_input"]
+    coverage: Coverage
+    missing: tuple[MissingRequirement, ...]
+    contradictions: tuple[str, ...]
+    suggested_research: tuple[str, ...]
+
+class Provenance(BaseModel):
+    contract_version: Literal["2.0"]
+    source_id: str
+    fetcher: str
+    fetched_at: datetime
+    tool_call_id: str | None
+    run_id: str
+
+class MissingRequirement(BaseModel):
+    contract_version: Literal["2.0"]
+    requirement_id: str
+    description: str
+    target_id: str | None
+
+class AgentError(BaseModel):
+    contract_version: Literal["2.0"]
+    code: str
+    message: str
+    retryable: bool
+
+class GroundingResult(BaseModel):
+    contract_version: Literal["2.0"]
+    status: Literal["pass", "revise", "insufficient"]
+    unsupported_claims: tuple[str, ...]
+    citation_errors: tuple[str, ...]
+
+class FinalResponse(BaseModel):
+    contract_version: Literal["2.0"]
+    status: Literal["success", "clarify", "denied", "insufficient", "error"]
+    content: str
+    evidence_ids: tuple[str, ...]
+```
+
+Checkpoint compatibility is determined from graph version plus the versions of root and nested contracts. Version adapters may read older persisted snapshots; runtime-only state is never treated as durable business data.
+
+## 24. Testing and benchmark gates
+
+### 24.1 Contract tests
+
+- reject unsupported versions and extra fields;
+- reject model/tool attempts to inject trusted scope;
+- reject plan cycles, unknown capabilities, and invalid document roles;
+- require verified document identity for document evidence;
+- preserve role/binding/task provenance;
+- reject completion when any required target unit is missing or wrong-range;
+- preserve distinct result status semantics;
+- validate v1 semantic-snapshot migration/read compatibility.
+
+### 24.2 Subgraph tests
+
+Compile and test each subgraph independently for:
 
 - input/output validation;
-- routing and terminal states;
-- malformed model output;
+- deterministic routing and terminal state;
+- conditional semantic-model invocation;
+- malformed structured model output;
 - permission denial;
 - timeout, retry, cancellation, and budget exhaustion;
-- interrupt and resume behavior.
+- clarification interrupt/resume;
+- conversation-summary compare-and-swap conflicts.
 
-### End-to-end cases
+### 24.3 End-to-end tests
 
-1. Allowed and denied People lookup.
-2. Document metadata/listing template response.
-3. Exact section verbatim response with citation.
-4. Resolved conversational follow-up.
-5. Ambiguous follow-up clarification.
-6. Multi-document comparison.
-7. People-to-document dependency.
-8. Missing target, candidate selection, interrupt, and resume.
-9. Abundant but semantically irrelevant evidence.
-10. Unsupported citation generated by the main model.
-11. Workspace access changed before resume.
-12. Expired checkpoint replaced by a linked run.
+The twelve flows in Section 21 are mandatory acceptance scenarios.
 
-## 13. Observability
+### 24.4 Benchmarks
+
+Track separately for fast and complex paths:
+
+- routing accuracy;
+- coreference and abbreviation accuracy;
+- required-unit coverage;
+- citation faithfulness;
+- permission and scope violations;
+- p50/p95 latency;
+- token/tool-call cost;
+- replan and clarification rate;
+- answer correctness against v1 baselines.
+
+Fast-path latency must not regress materially because of conversation or semantic processing. The exact threshold is an implementation-plan decision backed by baseline measurement.
+
+## 25. Observability
 
 Record:
 
-- graph, contract, model, and configuration versions;
-- semantic reconciliation conflicts;
-- routing decision and reason;
+- graph, contract, model, and config versions;
+- semantic gate outcome and whether a small model ran;
+- reconciliation conflicts;
+- route and reason code;
 - initial plan and append-only replans;
 - task status and latency;
-- required-target coverage;
+- required-unit coverage;
+- document role/binding IDs;
 - People permission denials;
 - evidence IDs and grounding failures;
 - interrupt/resume lineage;
-- token, task, branch, tool-call, and replan budgets.
+- summary concurrency conflicts;
+- token, branch, task, tool-call, and replan budgets.
 
 Logs and traces redact or hash CCCD, BHXH, phone numbers, and other sensitive values.
 
-## 14. Rollout
+## 26. Migration strategy
 
-Use `NEXUSRAG_AGENT_GRAPH_VERSION=v1|v2` at an integration boundary outside both supervisor implementations.
+Do not rewrite business services in one step.
 
-1. Build and test v2 independently.
-2. Replay curated and historical cases offline.
-3. Shadow semantic analysis and routing without serving v2 output.
-4. Canary v2 by user/cohort.
-5. Compare correctness, target coverage, citation faithfulness, permission behavior, latency, and cost.
-6. Increase v2 traffic gradually.
-7. Set v2 as default after gates pass.
-8. Remove v1 in a separate, explicitly reviewed change.
+### Phase 0 — Orchestrator compatibility and benchmark spike
 
-The v2 implementation must update `CLAUDE.md`, `.env.example`, relevant harness documentation, and this architecture document in the same change. Re-index GitNexus after structural changes.
+- compare native LangGraph planner/executor with a Deep Agents adapter against the same contract fixtures;
+- verify structured planning, interrupts, streaming ownership, capability injection, checkpoint behavior, and bounded replanning;
+- produce a recorded architecture decision selecting the initial implementation;
+- keep all spike code isolated and non-production.
 
-## 15. Explicit non-goals for initial v2
+This bounded spike is explicitly exempt from the no-runtime gate only as disposable evaluation code. No production graph composition begins until the architecture decision is approved and this spec is promoted to **Approved design**.
 
-- Refactoring `supervisor.py` in place.
-- Reusing `SupervisorState` as the v2 business interface.
-- Exposing database/vector/KG clients directly to models.
-- Letting an LLM decide permissions or construct workspace scope.
-- Adding every possible domain subgraph before a validated use case.
-- Removing v1 before canary evidence supports cutover.
+### Phase 1 — Contracts, context semantics, and adapters
+
+- define v2 contracts;
+- add v1-to-v2 semantic adapters;
+- preserve raw ingress content;
+- define versioned semantic snapshot reads/writes;
+- reuse abbreviation preprocessing.
+
+### Phase 2 — Supervisor v2 composition and fast paths
+
+- build `supervisor_v2.py` composition;
+- integrate Context, Routing, People, Document, and Section subgraphs;
+- use existing services through capability adapters;
+- establish fast-path latency baselines and gates.
+
+### Phase 3 — Complex research comparison pilot
+
+- implement the orchestrator selected by the Phase 0 architecture decision;
+- pilot multi-document/range comparison;
+- validate role-based binding and target-unit coverage.
+
+### Phase 4 — Cross-domain People to Documents
+
+- add validated dependent People → Document research;
+- enforce People gating and evidence separation.
+
+### Phase 5 — Evidence evaluator and bounded replanning
+
+- add hard evaluator;
+- add conditional semantic evaluator;
+- enable append-only bounded replanning.
+
+### Phase 6 — Shadow and canary
+
+- offline replay;
+- shadow semantic/routing decisions;
+- canary by user/cohort;
+- gradual traffic increase.
+
+### Phase 7 — V1 disposition
+
+Only after benchmark gates pass, consider deprecating the custom v1 supervisor/ReAct path in a separate reviewed change.
+
+## 27. Rollout configuration
+
+Use an integration-boundary setting such as:
+
+```text
+NEXUSRAG_AGENT_GRAPH_VERSION=v1|v2
+```
+
+The selector lives outside `supervisor.py` and `supervisor_v2.py`. Architecture-changing implementation must update `CLAUDE.md`, `.env.example`, relevant harness documentation, and this spec in the same change. Re-index GitNexus after structural changes.
+
+## 28. Open decisions and approval gate
+
+This revision is **Review / Proposed**, not implementation-approved, because the following decision remains open:
+
+1. `ComplexResearchGraph` implementation: native LangGraph, Deep Agents adapter, or another conforming orchestrator. Resolve through a bounded compatibility/benchmark spike before implementation selection.
+
+The following design choices are fixed by this revision:
+
+- role-based `ScopedDocument` bindings for target/reference/supporting/discovered semantics;
+- conditional, not mandatory, small semantic-model execution;
+- QueryAnalysis as semantic hints rather than an executable planner;
+- typed `CapabilityRuntimeContext` separate from `AgentRequest`;
+- target-unit/range-level coverage;
+- Answer Policy outside `AgentResult`.
+
+No runtime code should be implemented merely to match this spec until the open orchestrator decision is reviewed and the status is explicitly promoted to **Approved design**.
