@@ -4,7 +4,7 @@
 
 **Status:** Approved design
 
-**Revision basis:** commit `15069012a8ad38a3f814421ade3413da9992f098`
+**Revision basis:** commit `0f945c38485151e72c60b9e8fa327f2ab3749a04`
 
 **Source direction:** `docs/agent-contract-langgraph-deepagent.md`
 
@@ -326,6 +326,8 @@ class ScopedDocument(BaseModel):
     contract_version: Literal["2.0"]
     binding_id: str
     document_id: UUID
+    document_revision: str
+    revision_policy: Literal["pinned", "latest_required"] = "pinned"
     role: DocumentRole
     required: bool
     source_ref_id: str | None = None
@@ -396,7 +398,7 @@ Semantic Finalization → persisted SemanticContext
 QueryAnalysis → Router
 ```
 
-Only the Binding resolver creates UUID-backed bindings for text references. It merges known resources, conversation-derived references, attachments selected by semantics, and newly resolved references. Essential unresolved references route to clarification.
+Only the Binding resolver creates UUID-backed bindings for text references. It merges known resources, conversation-derived references, attachments selected by semantics, and newly resolved references. When ingress supplies only a known `document_id`, the Binding resolver resolves and pins the current authorized immutable `document_revision`; downstream tasks never fetch an implicit “latest” revision. Essential unresolved references route to clarification. `revision_policy="pinned"` is the default. Queries explicitly asking for “current/latest” use `latest_required`; they require the latest authorized revision at binding/evidence validation and cannot reuse an older pinned revision. A newer revision creates a new binding—never an in-place silent upgrade.
 
 ### 8.4 Attachment semantics
 
@@ -414,7 +416,7 @@ Search never creates a binding directly:
 document.search
 → DocumentDiscoveryCandidate
 → planner emits BindingAdditionRequest
-→ Binding Resolver validates authorization/policy and creates B1
+→ Binding Resolver revalidates candidate document_revision and authorization/policy, then creates B1
    role=discovered, required=false
 → planner may emit BindingPromotionRequest for B1
 → Binding Resolver creates immutable B2
@@ -530,6 +532,23 @@ class DocumentReference(BaseModel):
     resolved_document_id: UUID | None = None
     candidate_document_ids: tuple[UUID, ...] = ()
 
+WorkType = Literal[
+    "direct", "lookup", "retrieve", "explain", "summarize",
+    "compare", "evaluate", "cross_domain", "multi_goal",
+]
+Domain = Literal[
+    "people", "document", "section", "write",
+    "knowledge_graph", "memory",
+]
+
+class SemanticAnalysisHints(BaseModel):
+    contract_version: Literal["2.0"]
+    work_type_hint: WorkType | None = None
+    domain_hints: tuple[Domain, ...] = ()
+    capability_hints: tuple[str, ...] = ()
+    dependency_hints: tuple[SemanticDependencyHint, ...] = ()
+    requires_synthesis_hint: bool | None = None
+
 class SemanticDraft(BaseModel):
     contract_version: Literal["2.0"]
     original_query: str
@@ -540,6 +559,7 @@ class SemanticDraft(BaseModel):
     person_refs: tuple[EntityReference, ...]
     section_refs: tuple[SectionReference, ...]
     preliminary_ambiguities: tuple[BlockingAmbiguity, ...]
+    analysis_hints: SemanticAnalysisHints | None = None
 
 class SemanticContext(BaseModel):
     contract_version: Literal["2.0"]
@@ -673,19 +693,13 @@ The semantic model may select or describe validated candidates but cannot create
 
 ## 12. Query analysis and deterministic routing
 
-`QueryAnalysis` describes semantic structure; it is not an executable planner. Analysis is deterministic-first: rules classify confident greetings, People lookup, exact Section retrieval, and bounded Write operations. Only uncertain cases call the small model. If the Context layer already ran that model, Query Analysis reuses its structured semantic output rather than making a duplicate call. Simple requests require zero planner calls.
+`QueryAnalysis` describes semantic structure; it is not an executable planner. Analysis is deterministic-first: rules classify confident greetings, People lookup, exact Section retrieval, and bounded Write operations. It combines deterministic facts with validated `SemanticAnalysisHints`; raw model prose/reasoning is never reused. Only uncertain or low-confidence cases call the small model again. Simple requests require zero planner calls.
 
 ```python
 class QueryAnalysis(BaseModel):
     contract_version: Literal["2.0"]
-    work_type: Literal[
-        "direct", "lookup", "retrieve", "explain", "summarize",
-        "compare", "evaluate", "cross_domain", "multi_goal",
-    ]
-    domains: tuple[Literal[
-        "people", "document", "section", "write",
-        "knowledge_graph", "memory",
-    ], ...]
+    work_type: WorkType
+    domains: tuple[Domain, ...]
     capability_hints: tuple[str, ...]
     dependency_hints: tuple[SemanticDependencyHint, ...]
     semantic_complexity: Literal["simple", "compound", "deep"]
@@ -816,6 +830,8 @@ class TargetUnit(BaseModel):
     target_id: str
     binding_id: str
     document_id: UUID
+    document_revision: str
+    revision_policy: Literal["pinned", "latest_required"] = "pinned"
     role: DocumentRole
     requested_locator: ContentLocator
     completion_criteria: tuple[CompletionCriterion, ...]
@@ -841,7 +857,7 @@ class TaskSpec(BaseModel):
     triggered_by_evidence_ids: tuple[str, ...] = ()
 ```
 
-Deterministic completion criteria (`coverage`, `exact_lookup`, `minimum_evidence`, `entity_resolution`) are enforced by the hard evaluator; only `semantic` criteria go to the semantic evaluator. `read_complete` is mandatory by default for legal comparison, compliance, and exact-section summary. `read_partial` is accepted only when the user/objective explicitly requests sampling/preview or a deterministic policy builder authorizes it and records `allow_partial_reason`; planner output cannot downgrade the default by itself. Runtime validates unique `target_id` values, target-unit bindings/locators, task IDs, acyclic dependencies, capability allowlist, document roles, budgets, and scope before execution. Every `CoverageObservation.target_id`, `CoverageItem.target_id`, and bound `EvidenceRecord.target_id`/`EvidenceRef.target_id` must reference a declared `TaskPlan.target_units` entry.
+Deterministic completion criteria (`coverage`, `exact_lookup`, `minimum_evidence`, `entity_resolution`) are enforced by the hard evaluator; only `semantic` criteria go to the semantic evaluator. `read_complete` is mandatory by default for legal comparison, compliance, and exact-section summary. `MinimumEvidenceCriterion` is supplemental and never substitutes for required target-unit `CoverageCriterion`; three off-target chunks cannot satisfy legal comparison/compliance coverage. `read_partial` is accepted only when the user/objective explicitly requests sampling/preview or a deterministic policy builder authorizes it and records `allow_partial_reason`; planner output cannot downgrade the default by itself. Runtime validates unique `target_id` values, target-unit bindings/locators, task IDs, acyclic dependencies, capability allowlist, document roles, budgets, and scope before execution. Every current-run `CoverageObservation.target_id`, `CoverageItem.target_id`, and direct bound `EvidenceRecord.target_id`/`EvidenceRef.target_id` must reference a declared current `TaskPlan.target_units` entry. An `AdoptedEvidenceRef` keeps its immutable source IDs but must map through an accepted `EvidenceAdoption.target_id`/`target_binding_id`/`target_task_id`, each validated against the current run.
 
 ### 13.2 Business task request
 
@@ -879,13 +895,11 @@ class DocumentReadOutput(BaseModel):
     contract_version: Literal["2.0"]
     kind: Literal["document_read"]
     locator: ContentLocator
-    evidence_refs: tuple[EvidenceRef, ...]
 
 class SectionReadOutput(BaseModel):
     contract_version: Literal["2.0"]
     kind: Literal["section_read"]
     locator: ContentLocator
-    evidence_refs: tuple[EvidenceRef, ...]
 
 class KnowledgeGraphOutput(BaseModel):
     contract_version: Literal["2.0"]
@@ -983,6 +997,7 @@ class CoverageObservation(BaseModel):
     target_id: str
     binding_id: str
     document_id: UUID
+    document_revision: str
     observed_locators: tuple[ContentLocator, ...]
     outcome: Literal["resolved", "read", "missing", "unreadable", "truncated"]
 
@@ -991,6 +1006,7 @@ class CoverageItem(BaseModel):
     target_id: str
     binding_id: str
     document_id: UUID
+    document_revision: str
     role: DocumentRole
     requested_locator: ContentLocator
     observed_locators: tuple[ContentLocator, ...]
@@ -1012,7 +1028,7 @@ A target unit may represent:
 - an uploaded file;
 - a required reference range.
 
-Locator variants reject impossible field combinations by construction. Page/chunk endpoints must be ordered. Section/article locators require stable ingestion `structure_node_id`; human-readable heading/article text is descriptive, not canonical identity. The evaluator computes containment/coverage from structured locators and document structure metadata. Reading Chapter I of A cannot complete a requirement for Chapter II of A; it deterministically produces `missing` for that requested locator. Reading only part of Chapter II produces `read_partial`. A required unit is sufficient only when the requested locator is completely covered or the completion criteria explicitly allow partial coverage.
+Locator variants reject impossible field combinations by construction. Page/chunk endpoints must be ordered. Section/article locators require stable ingestion `structure_node_id`; human-readable heading/article text is descriptive, not canonical identity. The evaluator computes containment/coverage from structured locators and document structure metadata. Reading Chapter I of A cannot complete a requirement for Chapter II of A; it deterministically produces `missing` for that requested locator. Reading only part of Chapter II produces `read_partial`. A required unit is sufficient only when the requested locator is completely covered or the completion criteria explicitly allow partial coverage. Canonical target identity is `document_id + document_revision + ContentLocator`; a requested/observed revision mismatch can never be complete. It yields a stale-binding/target outcome requiring reacquisition, explicit rebinding, or typed failure—never silent upgrade.
 
 ## 15. Evidence contract
 
@@ -1021,9 +1037,10 @@ EvidencePurpose = Literal["discovery", "coverage", "supporting"]
 
 class EvidenceRef(BaseModel):
     contract_version: Literal["2.0"]
+    ref_kind: Literal["direct"] = "direct"
     evidence_id: str
     task_id: str
-    source_type: Literal["document", "knowledge_graph", "people", "memory"]
+    source_type: Literal["document", "knowledge_graph", "people", "memory", "derived"]
     role: DocumentRole | None
     purpose: EvidencePurpose
     target_id: str | None
@@ -1038,11 +1055,12 @@ class EvidenceRecord(BaseModel):
     run_id: str
     parent_run_id: str | None = None
     task_id: str
-    source_type: Literal["document", "knowledge_graph", "people", "memory"]
+    source_type: Literal["document", "knowledge_graph", "people", "memory", "derived"]
     role: DocumentRole | None
     binding_id: str | None
     target_id: str | None
     document_id: UUID | None
+    document_revision: str | None
     workspace_id: UUID | None
     purpose: EvidencePurpose
     locator: ContentLocator | None
@@ -1066,16 +1084,18 @@ Rules:
 - role, binding, task, document, and section provenance survive fan-out/fan-in;
 - synthesis never infers source identity from evidence text;
 - evidence from different documents is not deduplicated into one provenance record merely because content hashes match;
-- `source_type` must match `source_identity.kind`; for document evidence, top-level `document_id`/`workspace_id` must equal `DocumentSourceIdentity.document_id`/`workspace_id`;
+- `source_type` must match `source_identity.kind`; for document evidence, top-level `document_id`/`document_revision`/`workspace_id` must equal `DocumentSourceIdentity.document_id`/`document_revision`/`workspace_id`;
 - an `EvidenceRef` is a deterministic projection of one authoritative `EvidenceRecord`: IDs, task, source type, role, purpose, target, locator, document revision, and content hash must match exactly;
 - citation metadata must map to verified evidence, immutable document revision, and the same canonical locator coordinate system used by `TargetUnit` and `CoverageObservation`;
 - `purpose="discovery"` search evidence can guide planning but cannot produce `read_complete`; only authoritative `document.read`/`section.read` evidence with `purpose="coverage"` can support coverage completion.
 
 ### 15.1 Evidence Store lifecycle
 
-Evidence payloads are purpose-limited: store only fields required for the task, never a full People/Mongo record when one field and provenance suffice. The Evidence Store enforces authorization-bound reads, encryption at rest, source-specific retention/TTL, expiry and deletion behavior, PII minimization, and audited access. Every record carries an `EvidenceRetentionPolicy` classification and expiry.
+Evidence payloads are purpose-limited: store only fields required for the task, never a full People/Mongo record when one field and provenance suffice. Minimization happens before persistence: `raw capability result → Evidence Builder/Minimizer → deterministic PII/data classification → EvidenceRecord → Evidence Store`. Models cannot choose or downgrade retention classification; source, capability, workspace policy, and selected data class derive it deterministically. The Evidence Store enforces authorization-bound reads, encryption at rest, source-specific retention/TTL, expiry and deletion behavior, PII minimization, and audited access. Every record carries an `EvidenceRetentionPolicy` classification and expiry.
 
-Every record is keyed and indexed by `request_id`, `run_id`, `task_id`, and `evidence_id`; it also records optional `parent_run_id`, retention state, and validation state. Document evidence pins an immutable `document_revision`; a changed content revision makes old refs stale and forces reacquisition. Re-indexing may reuse evidence only under an explicit compatibility rule proving the content revision and locator coordinate system unchanged. Interrupt/resume in the same run reuses validated refs. Replans append new records and never mutate prior evidence. An expired run follows retention policy without breaking a still-valid checkpoint. A replacement run imports only `EvidenceRef` links to previously validated records, records lineage, and revalidates current authorization plus source availability before use; it never blindly copies raw payloads. Missing/expired evidence forces reacquisition or an insufficient result.
+Every record is keyed and indexed by `request_id`, `run_id`, `task_id`, and `evidence_id`; it also records optional `parent_run_id`, retention state, and validation state. Same-run resume preserves run-local `binding_id`, `target_id`, and `task_id`. Replacement runs treat these IDs as run-local and use `EvidenceAdoption`; semantic compatibility is based on document ID + revision + locator + role, not accidental ID equality. Document evidence pins an immutable `document_revision`; a changed content revision makes old refs stale and forces reacquisition. Re-indexing may reuse evidence only under an explicit compatibility rule proving the content revision and locator coordinate system unchanged. Interrupt/resume in the same run reuses validated refs. Replans append new records and never mutate prior evidence. An expired run follows retention policy without breaking a still-valid checkpoint. A replacement run imports only typed `AdoptedEvidenceRef` values pairing the immutable source `EvidenceRef` with an accepted `EvidenceAdoption`; it never places an old run-local ref directly into current-run planning/evaluation state or blindly copies raw payloads. Missing/expired evidence forces reacquisition or an insufficient result.
+
+Replacement-run reuse is explicit: `old EvidenceRef → Evidence Adoption Validator → EvidenceAdoption → AdoptedEvidenceRef`. The validator checks current ACL, immutable document revision, retention, source availability, locator validity, and semantic target compatibility. `accepted` adoption maps old evidence to new run-local task/binding/target IDs without mutating the original `EvidenceRecord`; `stale`, `denied`, or `missing` evidence is never hydrated or exposed. Planning, evaluation, and hydration consume `EvidenceUseRef = EvidenceRef | AdoptedEvidenceRef`. For an adopted ref, current-run task/binding/target validation uses the adoption mapping while content/revision/locator integrity resolves through the immutable source ref and record.
 
 ## 16. ComplexResearchGraph behavior
 
@@ -1088,7 +1108,7 @@ class DiscoveryPolicy(BaseModel):
     allow_supporting_discovery: bool
     max_discovered_documents: int
     workspace_search_allowed: bool
-    allowed_capabilities: tuple[str, ...]
+    discovery_capabilities: tuple[str, ...]
 
 class ResearchBudgetView(BaseModel):
     contract_version: Literal["2.0"]
@@ -1115,13 +1135,13 @@ class ResearchPlanningInput(BaseModel):
     capability_catalog: tuple[CapabilityDescriptor, ...]
     discovery_policy: DiscoveryPolicy
     budget: ResearchBudgetView
-    prior_evidence: tuple[EvidenceRef, ...]
+    prior_evidence: tuple[EvidenceUseRef, ...]
     prior_evaluation: EvidenceEvaluation | None
 ```
 
 It excludes DB sessions, raw clients, full chat history, ACL internals, and legacy `SupervisorState`. `ResearchBudgetView` exposes planning limits, not mutable runtime counters; runtime enforces them independently. The request-scoped capability registry/catalog is built as `base registrations ∩ permissions ∩ feature flags ∩ environment availability`; unavailable or unauthorized capabilities do not appear to the planner, while execute-time checks remain defense in depth. Descriptor flags tell the planner whether a capability may discover documents or produce authoritative coverage.
 
-Authorization scope, semantic bindings, and discovery policy are separate: authorization says where reads are permitted; `DocumentBindingSet` says which documents/objective roles are in scope; `DiscoveryPolicy` says whether and how research may expand. A deterministic Research Policy Builder derives `DiscoveryPolicy` from finalized semantics and `QueryAnalysis`. “Compare A and B” normally disables discovery; “check A against current regulations” enables bounded reference discovery. The planner cannot exceed this policy.
+Authorization scope, semantic bindings, and discovery policy are separate: authorization says where reads are permitted; `DocumentBindingSet` says which documents/objective roles are in scope; `DiscoveryPolicy` says whether and how research may expand. Effective discovery tools are `request-scoped capability registry ∩ DiscoveryPolicy.discovery_capabilities`; this field restricts discovery and never grants permission. A deterministic Research Policy Builder derives `DiscoveryPolicy` from finalized semantics and `QueryAnalysis`. “Compare A and B” normally disables discovery; “check A against current regulations” enables bounded reference discovery. The planner cannot exceed this policy.
 
 Task semantic scope is local: each `TaskSpec.document_bindings` contains only bindings needed by that task, and `child task bindings ⊆ parent resolved bindings`. Reference-discovery tasks may search authorized workspaces only through an explicitly discovery-capable input/capability.
 
@@ -1208,34 +1228,86 @@ A small model may return a structured `EvidenceEvaluation` for:
 - sufficiency for synthesis;
 - targeted research suggestions.
 
+A detected contradiction is not automatically a failure. When conflicting claims are themselves well supported and the objective is comparison, evaluation may be `status="sufficient"` with populated `contradictions`. Use `status="contradictory"` only when an unresolved evidence conflict prevents a safe conclusion.
+
 The semantic evaluator receives only `SemanticCriterion` entries and reports their satisfaction in structured form. The hard evaluator combines those structured semantic outcomes with its own deterministic-criterion results to produce final `EvidenceEvaluation`; it never interprets natural-language criteria itself. The model cannot modify evidence, coverage, authorization, or completion records.
 
 ### 17.3 Typed synthesis boundary
 
 ```python
+class SynthesisBudget(BaseModel):
+    contract_version: Literal["2.0"]
+    max_evidence_items: int
+    max_total_chars: int
+    max_total_tokens: int
+
 class SynthesisInput(BaseModel):
     contract_version: Literal["2.0"]
     mode: Literal["fast", "complex"]
     semantic: SemanticContext
     bindings: DocumentBindingSet
     evaluation: EvidenceEvaluation | None
-    evidence_refs: tuple[EvidenceRef, ...]
+    evidence_refs: tuple[EvidenceUseRef, ...]
+    budget: SynthesisBudget
+
+class SynthesisEvidence(BaseModel):
+    contract_version: Literal["2.0"]
+    evidence_id: str
+    source_type: Literal["document", "knowledge_graph", "people", "memory", "derived"]
+    role: DocumentRole | None
+    purpose: EvidencePurpose
+    target_id: str | None
+    document_id: UUID | None
+    document_revision: str | None
+    locator: ContentLocator | None
+    content: str
+    display_source: str | None = None
+    source_evidence_ids: tuple[str, ...] = ()
+
+class SynthesisEvidenceBundle(BaseModel):
+    contract_version: Literal["2.0"]
+    evidence: tuple[SynthesisEvidence, ...]
+    truncated: bool = False
+    omitted_evidence_ids: tuple[str, ...] = ()
+
+class AnswerClaim(BaseModel):
+    contract_version: Literal["2.0"]
+    claim_id: str
+    text: str
+    evidence_ids: tuple[str, ...]
 
 class CitationRef(BaseModel):
+    contract_version: Literal["2.0"]
     citation_id: str
+    claim_id: str
     evidence_id: str
 
 class AnswerDraft(BaseModel):
     contract_version: Literal["2.0"]
+    draft_version: int
     content: str
+    claims: tuple[AnswerClaim, ...]
     citations: tuple[CitationRef, ...]
 ```
 
 ```text
-EvidenceEvaluation → SynthesisInput → main model → AnswerDraft → Grounding → FinalResponse
+SynthesisInput
+→ Evidence Hydrator
+  ├── current ACL
+  ├── retention/expiry
+  ├── revision and locator validity
+  ├── source availability
+  └── SynthesisBudget
+→ SynthesisEvidenceBundle
+→ main model
+→ AnswerDraft with claim-to-evidence links
+→ Grounding
+→ FinalResponse
 ```
 
-For `mode="complex"`, validation requires `evaluation.status="sufficient"`. For `mode="fast"`, `evaluation` may be absent because deterministic route/capability/coverage prechecks supply synthesis readiness; all cited evidence still passes Grounding. The answer model emits typed `CitationRef` values, not authoritative free-form citation markers. Grounding follows each citation through `EvidenceRecord → DocumentSourceIdentity → document_revision → ContentLocator`. Unsupported citation yields `GroundingResult.revise`; failed revision yields `FinalResponse.insufficient`.
+The model has no direct Evidence Store access. Hydration is bounded; overflow is ranked/compacted or map-reduced before final synthesis. Compaction output is persisted as a new immutable `EvidenceRecord(source_type="derived")` with `DerivedSourceIdentity.source_evidence_ids`; its `EvidenceRef` becomes the only citeable ID for the summary. Grounding recursively resolves that record to every source record and validates each source document/revision/locator. A multi-source summary never pretends to have one document identity. `SynthesisEvidence.source_evidence_ids` is a hydrated display of this authoritative stored lineage, not an unpersisted evidence identity. Omitted evidence is explicit.
+
+For `mode="complex"`, validation requires a suitable evaluation status. For `mode="fast"`, evaluation may be absent because deterministic prechecks supply synthesis readiness; domain responses still use hydrated evidence. Each factual claim maps to one or more evidence IDs; UI citation markers are presentation only. `AnswerDraft` validation requires unique non-empty `claim_id` values and unique `citation_id` values; every `CitationRef.claim_id` must exist, its `evidence_id` must belong to that claim's `evidence_ids`, and the set of `(claim_id, evidence_id)` citation pairs must exactly equal the deduplicated claim/evidence relationship set. Claims and citations therefore cannot diverge. Grounding validates `claim → EvidenceRecord → DocumentSourceIdentity → document_revision → ContentLocator`. Unsupported claim/citation yields `revise`; revision emits a wholly new `AnswerDraft` with new claim/evidence mappings, then grounds once more. Old mappings are never reused blindly; second failure yields `FinalResponse.insufficient`.
 
 ### 17.4 Answer Policy
 
@@ -1254,6 +1326,8 @@ Grounding runs before successful completion of **every** answer. Deterministic/t
 
 - verify required-unit coverage;
 - map citations to evidence and document metadata;
+- validate every factual `AnswerClaim` has existing, currently valid evidence whose content supports the claim;
+- reject wrong-revision or invalid-locator citation links;
 - detect unsupported claims or references;
 - allow at most one bounded revision;
 - return a transparent insufficient-evidence response if validation still fails.
@@ -1576,6 +1650,72 @@ AgentResult.status=success
 → EvidenceEvaluation.status=insufficient
 ```
 
+### 21.23 Revision changes during run
+
+```text
+requested A/R1; observed A/R2 → reject coverage and require reacquisition/rebinding
+```
+
+### 21.24 Cross-run evidence reuse
+
+```text
+old EvidenceRef + replacement run → EvidenceAdoption validation required
+```
+
+### 21.25 Expired evidence
+
+```text
+expired EvidenceRecord → hydrator omits/rejects it; synthesis cannot consume it
+```
+
+### 21.26 Unauthorized reused evidence
+
+```text
+current ACL denies source → adoption denied; payload never exposed
+```
+
+### 21.27 Claim without evidence
+
+```text
+AnswerClaim.evidence_ids empty/invalid → grounding revise, then insufficient on second failure
+```
+
+### 21.28 Citation wrong revision
+
+```text
+citation evidence revision differs from target/evidence record → grounding failure
+```
+
+### 21.29 Search without authoritative read
+
+```text
+vector search finds correct chunk but no read capability runs → no read_complete
+```
+
+### 21.30 People evidence minimization
+
+```text
+task requests CCCD from a full record → minimizer persists only required CCCD + provenance
+```
+
+### 21.31 Fast Section evidence
+
+```text
+fast Section → shared capability → EvidenceRecord/Store → EvidenceRef → answer
+```
+
+### 21.32 Greeting
+
+```text
+direct greeting → no domain claim and no EvidenceRecord required
+```
+
+### 21.33 Synthesis budget overflow
+
+```text
+evidence exceeds SynthesisBudget → bounded compaction/map-reduce with source lineage preserved
+```
+
 ## 22. Explicit invariants
 
 1. `original_query` and raw persisted user content are immutable.
@@ -1615,6 +1755,17 @@ AgentResult.status=success
 35. Search results cannot complete read coverage; authoritative read observations are required.
 36. Unauthorized document identity is invisible to clarification; explicit unauthorized UUID access is `denied`.
 37. Child task semantic bindings are a subset of parent resolved bindings except explicit authorized reference discovery.
+38. Document identity is always pinned as `document_id + document_revision`; revision mismatch cannot complete coverage.
+39. Binding Resolver pins revisions; downstream tasks never resolve an implicit latest revision.
+40. Evidence Hydrator—not the model—loads purpose-limited evidence under current ACL, retention, revision, source, and synthesis budgets.
+41. Every factual claim has typed claim-to-evidence mappings validated by Grounding.
+42. Replacement-run evidence reuse requires immutable `EvidenceAdoption`; run-local task/binding/target IDs are never assumed equivalent.
+43. CapabilityOutput contains domain data only; `AgentResult.evidence_refs` is the sole task-level evidence-ref authority.
+44. Discovery policy restricts research tools through `discovery_capabilities` and never grants authorization.
+45. Fast domain paths use the same Evidence Store contracts as complex paths; only non-factual direct responses require no evidence.
+46. Evidence security classification is derived deterministically before persistence and cannot be downgraded by a model.
+47. `MinimumEvidenceCriterion` never replaces required target/reference coverage.
+48. Grounding revision creates and revalidates a new AnswerDraft and claim/evidence mappings.
 
 ## 23. Supporting boundary contracts
 
@@ -1655,15 +1806,21 @@ class MemorySourceIdentity(BaseModel):
     kind: Literal["memory"]
     memory_id: str
 
+class DerivedSourceIdentity(BaseModel):
+    kind: Literal["derived"]
+    source_evidence_ids: tuple[str, ...]
+
 EvidenceSourceIdentity = Annotated[
     DocumentSourceIdentity | PeopleSourceIdentity |
-    KnowledgeGraphSourceIdentity | MemorySourceIdentity,
+    KnowledgeGraphSourceIdentity | MemorySourceIdentity |
+    DerivedSourceIdentity,
     Field(discriminator="kind"),
 ]
 
 class DocumentDiscoveryCandidate(BaseModel):
     contract_version: Literal["2.0"]
     document_id: UUID
+    document_revision: str
     source_task_id: str
     evidence_ids: tuple[str, ...]
     reason: str
@@ -1671,6 +1828,7 @@ class DocumentDiscoveryCandidate(BaseModel):
 class BindingAdditionRequest(BaseModel):
     contract_version: Literal["2.0"]
     document_id: UUID
+    document_revision: str
     requested_role: Literal["discovered", "supporting"]
     reason: str
     triggered_by_task_ids: tuple[str, ...]
@@ -1694,6 +1852,28 @@ class DocumentCandidate(BaseModel):
     label: str
     match_basis: str
     confidence: float
+
+class EvidenceAdoption(BaseModel):
+    contract_version: Literal["2.0"]
+    source_evidence_id: str
+    source_run_id: str
+    target_run_id: str
+    target_task_id: str | None = None
+    target_binding_id: str | None = None
+    target_id: str | None = None
+    status: Literal["accepted", "stale", "denied", "missing"]
+    validation_reason: str | None = None
+
+class AdoptedEvidenceRef(BaseModel):
+    contract_version: Literal["2.0"]
+    ref_kind: Literal["adopted"] = "adopted"
+    source_ref: EvidenceRef
+    adoption: EvidenceAdoption
+
+EvidenceUseRef = Annotated[
+    EvidenceRef | AdoptedEvidenceRef,
+    Field(discriminator="ref_kind"),
+]
 
 class EvidenceRetentionPolicy(BaseModel):
     contract_version: Literal["2.0"]
@@ -1729,7 +1909,8 @@ class GroundingResult(BaseModel):
     contract_version: Literal["2.0"]
     status: Literal["pass", "revise", "insufficient"]
     citations: tuple[CitationRef, ...]
-    unsupported_claims: tuple[str, ...]
+    unsupported_claim_ids: tuple[str, ...]
+    invalid_evidence_ids: tuple[str, ...]
     citation_errors: tuple[str, ...]
 
 class FinalResponse(BaseModel):
@@ -1762,7 +1943,13 @@ Checkpoint compatibility is determined from graph version plus the versions of r
 - validate stable `RouteReason` values;
 - validate every capability output variant is versioned, typed, and registered, including Memory and Abbreviation;
 - validate `EvidenceRef` is an exact projection of its `EvidenceRecord` and document source identities cannot disagree;
-- validate fast/complex `SynthesisInput` invariants and citation mapping preservation through `AnswerDraft → GroundingResult → FinalResponse`.
+- validate fast/complex `SynthesisInput`, hydration-budget, omission, and derived-evidence lineage invariants;
+- validate revision equality across binding, target, coverage, evidence projection, and citation grounding;
+- validate `EvidenceAdoption` under current ACL, retention, revision, locator, and run-local ID mapping;
+- validate claim-level support and citation mapping preservation through `AnswerDraft → GroundingResult → FinalResponse`;
+- reject direct old run-local refs and validate `AdoptedEvidenceRef` mappings in planning, evaluation, and hydration;
+- validate derived EvidenceRecords recursively preserve all source revision/locator identities;
+- reject duplicate or divergent claim/citation mappings and require exact `(claim_id, evidence_id)` referential integrity.
 
 ### 24.2 Subgraph tests
 
@@ -1786,7 +1973,7 @@ Compile and test each subgraph independently for:
 
 ### 24.3 End-to-end tests
 
-All twenty-two flows in Section 21 are mandatory acceptance scenarios.
+All thirty-three flows in Section 21 are mandatory acceptance scenarios.
 
 ### 24.4 Benchmarks
 
@@ -1928,12 +2115,37 @@ Deterministic-first QueryAnalysis → RouteDecision
                ↓
         Coverage / EvidenceEvaluation
                ↓
-        SynthesisInput → AnswerDraft
+        SynthesisInput → Evidence Hydrator → SynthesisEvidenceBundle
+               ↓
+        AnswerDraft(claims + claim/evidence links)
                ↓
         Grounding → FinalResponse
 ```
 
-## 29. Final ownership principle
+## 29. Final evidence chain
+
+```text
+DocumentReference
+→ Binding Resolver
+→ ScopedDocument(document_id + document_revision + role + locator)
+→ TargetUnit(binding_id + document identity/revision + requested_locator)
+→ Shared Capability
+→ Evidence Builder/Minimizer
+→ EvidenceRecord(document identity/revision + locator + content_hash + provenance)
+→ Evidence Store
+→ EvidenceRef
+→ CoverageObservation(document_revision + observed locator)
+→ Coverage / EvidenceEvaluation
+→ Evidence Hydrator
+→ SynthesisEvidenceBundle
+→ AnswerDraft(claims + claim-to-evidence mapping)
+→ Grounding
+→ FinalResponse
+```
+
+Document identity without revision is insufficient. Evidence existence does not imply claim support. Search does not imply read coverage. `EvidenceRef` does not contain synthesis content. Old evidence is never reused across runs without adoption validation. Model claims and citation links remain proposals until Grounding validates them.
+
+## 30. Final ownership principle
 
 ```text
 LangGraph owns workflow.
@@ -1951,19 +2163,19 @@ Answer layer owns synthesis and grounding.
 
 LLM/subagent output is never authoritative for scope, permission, document identity, binding state, coverage, or evidence integrity.
 
-## 30. Open decision and approval gate
+## 31. Open decision and approval gate
 
-This revision is **Approved design**. It closes all final consistency gates:
+This revision is **Approved design**. It closes the evidence/synthesis hardening gates:
 
-1. clarification uses stable `candidate_id` and persisted ordinal mapping;
-2. document evidence pins immutable revision identity;
-3. Evidence and Coverage share `ContentLocator`;
-4. capability inputs and outputs are discriminated typed unions;
-5. discovery → addition → promotion is explicit and Binding-Resolver-owned;
-6. partial coverage requires deterministic authorization and reason;
-7. `DiscoveryPolicy` is separate from authorization and bindings;
-8. Evidence Store owns security, retention, minimization, audit, and payload provenance;
-9. `SynthesisInput → AnswerDraft → Grounding → FinalResponse` is typed.
+1. immutable `document_revision` is pinned across Binding → TargetUnit → CoverageObservation/Item → Evidence;
+2. Binding Resolver owns revision selection and stale/latest rebinding semantics;
+3. Evidence Hydrator creates a bounded `SynthesisEvidenceBundle` after ACL, retention, revision, locator, source, and budget validation;
+4. `AnswerDraft` carries typed claims and claim-to-evidence mappings validated by Grounding;
+5. replacement-run reuse requires explicit immutable `EvidenceAdoption` and run-local ID mapping;
+6. Evidence and Coverage share canonical `ContentLocator` coordinates;
+7. capability outputs contain domain data while `AgentResult.evidence_refs` remains authoritative;
+8. discovery policy, revision policy, evidence minimization/governance, and shared fast/complex evidence semantics are explicit;
+9. the final evidence chain preserves revision, locator, provenance, claim support, and citations end to end.
 
 The following implementation decision intentionally remains open for the Phase 0 compatibility/benchmark spike:
 
