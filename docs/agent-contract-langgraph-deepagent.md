@@ -1,94 +1,685 @@
 # AIRAG Agent Contract v1 — Nghiên cứu cải thiện LangGraph và tích hợp DeepAgent
 
-**Trạng thái:** DRAFT / research design. Tài liệu này mô tả contract giao tiếp giữa Supervisor, DeepAgent và các capability/domain worker. Chưa phải chỉ thị triển khai runtime.
+**Trạng thái:** DRAFT / research design — dùng để review kiến trúc trước khi triển khai.
 
-**Mục tiêu:** Chuẩn hóa cách các thành phần trong AIRAG giao tiếp khi xử lý câu hỏi đơn giản và phức tạp, đặc biệt với multi-step, multi-document, cross-agent và DeepAgent planning. Contract phải giữ rõ scope, quyền truy cập, provenance và trạng thái thiếu dữ liệu mà không buộc mọi component dùng chung toàn bộ `SupervisorState`.
+**Mục tiêu:** Chuẩn hóa luồng dữ liệu và contract giao tiếp giữa Semantic Context Builder, Query Analyzer, Supervisor, DeepAgent và các capability/domain worker; giữ fast path cho câu hỏi đơn giản nhưng hỗ trợ tốt multi-step, multi-document, cross-agent, conversation follow-up, abbreviation resolution và evidence-driven reasoning.
 
 **Liên quan:** `docs/deepagent-hybrid-proposal.md`, `backend/app/services/agents/models.py`, `backend/app/services/agent/state.py`.
 
 ---
 
-## 1. Bối cảnh và vấn đề hiện tại
+## 1. Quyết định kiến trúc chính
 
-AIRAG hiện dùng LangGraph làm orchestration layer. Các node/agent chia sẻ nhiều trường qua `SupervisorState`, gồm query, workspace, document scope, retrieval sources, Mongo results, KG summaries, write inputs, task plan, retry, judge verdict và permission.
-
-Cách này phù hợp khi graph còn nhỏ, nhưng bắt đầu tạo coupling khi thêm DeepAgent và các workflow đa bước:
-
-- Supervisor, RAG, People, Resolve Doc và Answer Generator cùng phụ thuộc một state lớn.
-- Một capability đơn giản như tra cứu người phải hiểu nhiều field thuộc orchestration.
-- DeepAgent nếu gọi trực tiếp các node hiện tại sẽ phải giả lập `SupervisorState`, làm coupling tăng mạnh.
-- `sources`, `mongo_results`, `kg_summaries` và `final_answer` hiện vừa là state runtime vừa được dùng như output ngầm giữa các agent.
-- Multi-step cần biết bước nào còn thiếu evidence; `bool(sources)` không đủ mô tả task completion.
-- Scope của query phức tạp cần thể hiện rõ: toàn workspace, một số document cụ thể, file upload là target, văn bản pháp lý là reference, hoặc cho phép discovery thêm reference.
-
-Đề xuất: tách rõ hai tầng.
+LangGraph vẫn là orchestration/runtime layer. AIRAG cần thêm một domain contract riêng.
 
 ```text
 LangGraph
-= orchestration transport + state transitions + routing
+= state + routing + lifecycle + Command/Send/subgraph
 
 AIRAG Agent Contract
-= semantic interface giữa Supervisor / DeepAgent / capability
+= semantics + scope + permission + task/result + evidence
 ```
 
-LangGraph State vẫn tồn tại, nhưng không còn là contract nghiệp vụ duy nhất giữa mọi component.
+Không dùng `SupervisorState` như universal business interface cho mọi agent/capability.
+
+Kiến trúc mục tiêu:
+
+```text
+User Request
+    ↓
+Request Context / ACL
+    ↓
+Semantic Context Builder
+    ↓
+Query Analysis
+    ↓
+Supervisor
+    ├── fast ──→ Existing Fast Path
+    │
+    ├── clarify ──→ Clarification
+    │
+    └── deep ──→ DeepAgent
+                    ↓
+                 Task Plan
+                    ↓
+                 AgentRequest
+                    ↓
+                 Capability
+                    ↓
+                 AgentResult + Evidence
+                    ↓
+              Evidence Evaluator
+                 │          │
+              missing    sufficient
+                 │          │
+                 └── DeepAgent
+                            ↓
+                        Synthesis
+                            ↓
+                    Grounding/Citation
+                            ↓
+                        Final Answer
+```
 
 ---
 
-## 2. Nguyên tắc thiết kế
+## 2. Vấn đề cần giải quyết
 
-1. **Contract độc lập với executor.** Người gọi có thể là Supervisor, DeepAgent, subgraph hoặc worker khác; capability không cần biết caller là ai.
-2. **Scope explicit.** Mỗi request/task phải biết workspace và document scope được phép truy cập.
-3. **Child task chỉ được thu hẹp authorization scope.** Không tự mở rộng sang workspace/document ngoài parent scope nếu policy không cho phép.
-4. **Target và reference là hai vai trò khác nhau.** File cần phân tích không đồng nghĩa với nguồn chuẩn dùng để đối chiếu.
-5. **Permission không do LLM quyết định.** Tool exposure và service layer đều phải enforce quyền.
-6. **Output có status chuẩn.** `success`, `partial`, `not_found`, `needs_input`, `denied`, `error` phải có semantics thống nhất.
-7. **Evidence là first-class object.** Claim hoặc kết luận phải truy được về document/source cụ thể.
-8. **Agent và Capability là hai khái niệm khác nhau.** Agent có reasoning/planning; capability cung cấp một khả năng nghiệp vụ có interface chặt.
-9. **LangGraph `Command` không phải AgentResult.** AgentResult mô tả “đã xảy ra gì”; Command mô tả “đi đâu tiếp”.
-10. **Contract versioned.** Thay đổi schema phá tương thích phải tăng version.
+AIRAG hiện chia sẻ nhiều field qua `SupervisorState`: query, workspace/document scope, sources, Mongo results, KG summaries, task plan, retry state, judge state, permission và output.
+
+Khi thêm DeepAgent, cách này tạo một số vấn đề:
+
+- DeepAgent phải biết quá nhiều implementation detail của graph hiện tại.
+- People/RAG/Resolve Doc dễ bị biến thành pseudo-agent phụ thuộc toàn bộ Supervisor state.
+- `sources`, `kg_summaries`, `mongo_results`, `final_answer` vừa là runtime state vừa là output ngầm giữa component.
+- `bool(sources)` không nói được câu hỏi phức tạp đã đủ evidence hay chưa.
+- Follow-up như “nghị định này”, “người đó”, “điều trên”, “file thứ hai” không thể xử lý chắc chắn nếu chỉ nhìn query hiện tại.
+- Viết tắt có thể làm query analyzer/supervisor phân loại sai nếu được resolve quá muộn.
+- Một `document_ids` duy nhất không đủ biểu diễn target document và reference document.
 
 ---
 
-## 3. Phân biệt Agent và Capability
+## 3. Nguyên tắc contract
+
+1. Contract độc lập với caller: Supervisor, DeepAgent, subgraph hay worker đều dùng cùng interface.
+2. `workspace_ids` và document scope là explicit, không suy ra từ prompt.
+3. Child task chỉ được thu hẹp authorization scope của parent.
+4. Target document và reference document là hai vai trò khác nhau.
+5. Conversation context không đồng nghĩa permission.
+6. Permission không do LLM quyết định.
+7. Original query luôn được giữ nguyên; mọi normalized/contextualized query chỉ là derived data.
+8. Abbreviation/coreference resolution phải có status/provenance, không chỉ overwrite text.
+9. Evidence là first-class object và phải giữ provenance theo task/document.
+10. `AgentResult` mô tả kết quả nghiệp vụ; LangGraph `Command` quyết định routing.
+11. `partial`, `not_found`, `needs_input`, `denied`, `error` phải có semantics khác nhau.
+12. Contract phải versioned.
+
+---
+
+# PHẦN A — INPUT CONTEXT
+
+## 4. Ba lớp context cần tách riêng
+
+AIRAG nên tách ba khái niệm:
+
+```text
+ConversationContext
+= hội thoại trước đang nói về object nào?
+
+SemanticContext
+= câu hiện tại sau khi resolve context/viết tắt/tham chiếu được hiểu thế nào?
+
+ExecutionScope
+= request/task được phép truy cập dữ liệu nào?
+```
+
+Thêm lớp thứ tư:
+
+```text
+ExecutionContext
+= ai đang gọi, session nào, có permission gì?
+```
+
+Không trộn bốn lớp này thành một state lớn.
+
+---
+
+## 5. `ConversationContext`
+
+Conversation context dùng cho short-term discourse state, đặc biệt với follow-up.
+
+Không nên gửi toàn bộ lịch sử 30–50 turn vào mọi capability. Thay vào đó lưu một context đã chuẩn hóa.
+
+```python
+class ConversationContext(BaseModel):
+    thread_id: str | None = None
+
+    active_documents: list["ActiveEntity"] = Field(default_factory=list)
+    active_people: list["ActiveEntity"] = Field(default_factory=list)
+    active_sections: list["ActiveEntity"] = Field(default_factory=list)
+    active_files: list["ActiveEntity"] = Field(default_factory=list)
+
+    last_focus: "EntityReference | None" = None
+
+    previous_query: str | None = None
+    previous_intent: str | None = None
+```
+
+Ví dụ:
+
+```text
+Turn 1: "Nghị định A quy định gì về dữ liệu cá nhân?"
+Turn 2: "Nghị định này có quy định mức phạt không?"
+```
+
+Sau turn 1:
+
+```json
+{
+  "active_documents": [
+    {
+      "entity_id": "doc-A",
+      "label": "Nghị định A",
+      "introduced_turn_id": "turn-1"
+    }
+  ],
+  "last_focus": {
+    "entity_type": "document",
+    "entity_id": "doc-A"
+  }
+}
+```
+
+Turn 2 có thể resolve `"Nghị định này" -> doc-A` trước khi vào Query Analyzer.
+
+### Conversation Context khác Memory
+
+```text
+"nghị định này"
+"người vừa nói"
+"file thứ hai"
+"điều trên"
+→ Conversation Context
+
+"đơn vị tôi"
+"sở thích của tôi"
+"thông tin dài hạn về người dùng"
+→ Memory
+```
+
+Không dùng long-term memory để giải quyết coreference đang có antecedent ngay trong conversation.
+
+---
+
+## 6. `SemanticContext`
+
+`SemanticContext` là output của semantic preprocessing/context resolution.
+
+```python
+class SemanticContext(BaseModel):
+    original_query: str
+    contextualized_query: str
+    normalized_query: str
+
+    abbreviations: list["AbbreviationResolution"] = Field(default_factory=list)
+    coreferences: list["CoreferenceResolution"] = Field(default_factory=list)
+
+    document_refs: list["DocumentReference"] = Field(default_factory=list)
+    person_refs: list["EntityReference"] = Field(default_factory=list)
+    section_refs: list["SectionReference"] = Field(default_factory=list)
+
+    blocking_ambiguities: list[str] = Field(default_factory=list)
+```
+
+Giữ đủ ba dạng query:
+
+```text
+original_query
+= text đúng như user nhập
+
+contextualized_query
+= đã resolve "nghị định này", "người đó", "file thứ hai"...
+
+normalized_query
+= contextualized query + abbreviation/entity normalization
+```
+
+Ví dụ:
+
+```text
+original_query:
+"NĐ này quy định gì về DLCN?"
+
+contextualized_query:
+"NĐ 13/2023/NĐ-CP quy định gì về DLCN?"
+
+normalized_query:
+"Nghị định 13/2023/NĐ-CP quy định gì về dữ liệu cá nhân?"
+```
+
+Downstream có thể đọc normalized query để reasoning nhưng vẫn audit được raw input.
+
+---
+
+## 7. Contract cho từ viết tắt
+
+Không đặt abbreviation trong `ExecutionScope`. Abbreviation là semantic metadata.
+
+```python
+class AbbreviationResolution(BaseModel):
+    span: str
+    short_form: str
+
+    chosen: str | None = None
+    candidates: list[str] = Field(default_factory=list)
+
+    status: Literal[
+        "resolved",
+        "ambiguous",
+        "unknown",
+    ]
+
+    source: str | None = None
+    confidence: float | None = None
+```
+
+Ví dụ:
+
+```json
+{
+  "span": "DLCN",
+  "short_form": "DLCN",
+  "chosen": "dữ liệu cá nhân",
+  "candidates": ["dữ liệu cá nhân"],
+  "status": "resolved"
+}
+```
+
+Nếu nhiều nghĩa:
+
+```json
+{
+  "span": "BMNN",
+  "short_form": "BMNN",
+  "chosen": null,
+  "candidates": ["...", "..."],
+  "status": "ambiguous"
+}
+```
+
+### Workflow abbreviation
+
+Mọi query đi qua semantic preprocessing, nhưng không phải mọi query gọi full abbreviation resolution.
+
+```text
+Query
+ ↓
+protect identifiers
+ ↓
+detect abbreviation candidates       ← cheap / always
+ ↓
+no candidate? ───────────────→ continue
+ ↓ yes
+batch abbreviation lookup
+ ↓
+unique meaning ──────────────→ annotate + normalize
+multiple meanings ───────────→ conditional disambiguation
+unknown ─────────────────────→ keep original
+```
+
+Không gọi một LLM abbreviation agent cho mọi câu hỏi.
+
+### Identifier protection
+
+Không expand mù quáng các span như:
+
+```text
+12/2024/NĐ-CP
+012345678901
+QĐ123
+A01
+quoted literals
+```
+
+Document numbers, CCCD, phone, IDs và quoted text phải được protect trước abbreviation normalization.
+
+### DeepAgent và abbreviation
+
+Global Semantic Context Builder xử lý abbreviation trong user query. Nếu DeepAgent gặp abbreviation mới trong quá trình research, nó có thể dùng capability:
+
+```text
+abbreviation.resolve
+```
+
+Cả hai cùng dùng chung abbreviation service, không duplicate logic.
+
+---
+
+## 8. Contract cho coreference/follow-up
+
+```python
+class CoreferenceResolution(BaseModel):
+    span: str
+
+    entity_type: Literal[
+        "document",
+        "person",
+        "section",
+        "workspace",
+        "file",
+    ]
+
+    resolved_id: str | None = None
+    resolved_label: str | None = None
+
+    source_turn_id: str | None = None
+
+    status: Literal[
+        "resolved",
+        "ambiguous",
+        "unresolved",
+    ]
+
+    confidence: float | None = None
+```
+
+Ví dụ:
+
+```text
+Turn 1: "Nghị định A quy định gì?"
+Turn 2: "Nghị định này có mức phạt không?"
+```
+
+Semantic context của turn 2:
+
+```json
+{
+  "original_query": "Nghị định này có mức phạt không?",
+  "contextualized_query": "Nghị định A có mức phạt không?",
+  "coreferences": [
+    {
+      "span": "Nghị định này",
+      "entity_type": "document",
+      "resolved_id": "doc-A",
+      "resolved_label": "Nghị định A",
+      "source_turn_id": "turn-1",
+      "status": "resolved"
+    }
+  ]
+}
+```
+
+### Ambiguous follow-up
+
+```text
+Turn 1: "So sánh Nghị định A với Nghị định B"
+Turn 2: "Nghị định này có hiệu lực từ khi nào?"
+```
+
+Nếu không đủ căn cứ xác định A hay B:
+
+```json
+{
+  "coreferences": [
+    {
+      "span": "Nghị định này",
+      "entity_type": "document",
+      "resolved_id": null,
+      "status": "ambiguous"
+    }
+  ],
+  "blocking_ambiguities": [
+    "Không xác định được 'nghị định này' là A hay B"
+  ]
+}
+```
+
+Router nên chọn `clarify`, không để DeepAgent tự đoán.
+
+### Security invariant
+
+Coreference chỉ resolve identity, không cấp quyền:
+
+```text
+ConversationContext
+   ↓
+resolve "nghị định này" → doc-A
+   ↓
+ACL / current permissions
+   ↓
+ExecutionScope
+```
+
+Một document từng xuất hiện ở turn trước không có nghĩa user mặc nhiên được truy cập ở turn hiện tại.
+
+---
+
+# PHẦN B — QUERY SCOPE
+
+## 9. `ExecutionScope`
+
+`workspace_ids` + document IDs tạo retrieval scope của query/task.
+
+```python
+class ExecutionScope(BaseModel):
+    workspace_ids: list[str] = Field(default_factory=list)
+
+    # Compatibility / fast-path narrowing.
+    document_ids: list[str] | None = None
+
+    # SUBJECT của query/task.
+    target_document_ids: list[str] = Field(default_factory=list)
+
+    # Nguồn chuẩn/căn cứ đã resolve.
+    reference_document_ids: list[str] = Field(default_factory=list)
+
+    reference_search_scope: Literal[
+        "none",
+        "workspace",
+        "corpus",
+    ] = "none"
+
+    allow_reference_discovery: bool = False
+```
+
+### Scope semantics
+
+```text
+workspace_ids=[W1,W2]
+document_ids=null
+```
+
+→ tìm toàn W1/W2 trong ACL.
+
+```text
+workspace_ids=[W1]
+document_ids=[D1,D2]
+```
+
+→ chỉ D1/D2.
+
+Conceptually:
+
+```text
+effective_scope
+= current_user_permissions
+  ∩ workspace_ids
+  ∩ document narrowing
+```
+
+`workspace_ids` là boundary lớn hơn; document IDs là narrowing.
+
+---
+
+## 10. Target vs Reference
+
+Ví dụ user upload hai file rồi hỏi:
+
+> Kiểm tra hai file này có đúng với quy định A không.
+
+Scope:
+
+```json
+{
+  "workspace_ids": ["W1"],
+  "target_document_ids": ["F1", "F2"],
+  "reference_document_ids": ["A"],
+  "reference_search_scope": "none",
+  "allow_reference_discovery": false
+}
+```
+
+Ý nghĩa:
+
+```text
+F1,F2 = thứ cần đánh giá
+A     = chuẩn dùng để đánh giá
+```
+
+Không gom cả ba thành một `document_ids` rồi bắt synthesizer tự suy ra vai trò.
+
+### Reference discovery
+
+User:
+
+> Kiểm tra hai file này có đúng các quy định hiện hành về thể thức văn bản hành chính không.
+
+```json
+{
+  "workspace_ids": ["W1"],
+  "target_document_ids": ["F1", "F2"],
+  "reference_document_ids": [],
+  "reference_search_scope": "workspace",
+  "allow_reference_discovery": true
+}
+```
+
+DeepAgent được resolve/search thêm reference trong boundary cho phép, nhưng không được tự thêm `F3` vào target.
+
+### Parent/child scope
+
+```text
+Parent targets = [A,B,C]
+
+child [A]      OK
+child [A,B]    OK
+child [D]      DENY
+child all docs DENY
+```
+
+Target scope mặc định immutable. Reference scope chỉ dynamic khi explicit policy cho phép.
+
+---
+
+## 11. `ExecutionContext`
+
+```python
+class ExecutionContext(BaseModel):
+    user_id: str | None = None
+    session_id: str | None = None
+    trace_id: str | None = None
+
+    permissions: list[str] = Field(default_factory=list)
+
+    language: str = "vi"
+```
+
+Permission phải do backend cung cấp.
+
+Ví dụ:
+
+```json
+{
+  "user_id": "U1",
+  "permissions": ["documents.read", "people.read"],
+  "language": "vi"
+}
+```
+
+DeepAgent không được tự thêm `people.read` vì prompt yêu cầu CCCD.
+
+---
+
+# PHẦN C — QUERY ANALYSIS VÀ ROUTING
+
+## 12. `QueryAnalysis`
+
+Query Analyzer nên nhận `SemanticContext + ExecutionScope`, không chỉ raw query.
+
+```python
+class QueryAnalysis(BaseModel):
+    complexity: Literal[
+        "simple",
+        "multi_doc",
+        "multi_section",
+        "cross_agent",
+        "comparison",
+    ]
+
+    execution_mode: Literal[
+        "fast",
+        "deep",
+        "clarify",
+    ]
+
+    required_capabilities: list[str] = Field(default_factory=list)
+    dependencies: list[dict] = Field(default_factory=list)
+
+    scope: ExecutionScope
+```
+
+### Fast path
+
+Dùng khi AIRAG đã có workflow bounded/deterministic:
+
+```text
+"CCCD của A là gì?"                → People
+"Tóm tắt Điều 5 của A"             → Resolve/RAG
+"Nghị định A quy định gì về X?"    → RAG
+```
+
+### Deep path
+
+Dùng khi:
+
+- cần nhiều target rồi compare/synthesize;
+- cross-capability;
+- bước sau phụ thuộc kết quả runtime của bước trước;
+- phải evaluate evidence rồi quyết định search tiếp;
+- summary cần map-reduce/hierarchy;
+- workflow fast hiện tại không biểu diễn dependency đầy đủ.
+
+Ví dụ:
+
+```text
+"CCCD của A xuất hiện trong nghị định nào?" → deep
+"So sánh A và B về nghĩa vụ X"              → deep
+"Kiểm tra F1/F2 có đúng quy định A"         → deep
+```
+
+### Clarify
+
+Dùng khi blocking ambiguity ảnh hưởng trực tiếp target/scope/objective.
+
+---
+
+# PHẦN D — AGENT/CAPABILITY CONTRACT
+
+## 13. Phân biệt Agent và Capability
 
 ### Agent
 
-Component có reasoning/planning hoặc điều phối nhiều bước.
+Có reasoning/planning/orchestration.
 
-Ví dụ:
-
-- Supervisor
-- DeepAgent
-- Synthesis/Analysis agent nếu sau này tách riêng
+```text
+Supervisor
+DeepAgent
+Synthesis/Analysis agent (nếu tách sau này)
+```
 
 ### Capability
 
-Khả năng chuyên biệt, ưu tiên deterministic hoặc bounded behavior.
+Thực hiện domain operation với interface rõ ràng.
 
-Ví dụ:
+```text
+people.lookup
+abbreviation.resolve
+document.resolve
+document.search
+document.read_section
+document.summarize
+document.list
+kg.query
+memory.search
+```
 
-- `people.lookup`
-- `document.resolve`
-- `document.search`
-- `document.read_section`
-- `document.summarize`
-- `kg.query`
-- `memory.search`
-
-Không nên expose implementation detail như `mongo_search_name`, `mongo_search_cccd`, `search_section` cho DeepAgent nếu có thể gom chúng thành capability có schema tốt hơn.
+Không expose trực tiếp Mongo collection, vector DB client, Neo4j session hoặc internal LangGraph node cho DeepAgent.
 
 ---
 
-## 4. Contract lõi đề xuất
-
-### 4.1. `AgentRequest`
+## 14. `AgentRequest`
 
 ```python
-from pydantic import BaseModel, Field
-from typing import Any, Literal
-
-
 class AgentRequest(BaseModel):
     contract_version: str = "1.0"
 
@@ -101,196 +692,25 @@ class AgentRequest(BaseModel):
 
     inputs: dict[str, Any] = Field(default_factory=dict)
 
-    scope: "ExecutionScope"
-    context: "ExecutionContext"
+    semantic_context: SemanticContext | None = None
+    conversation_context: ConversationContext | None = None
+
+    scope: ExecutionScope
+    context: ExecutionContext
 
     expected_output: str | None = None
 ```
 
-Ý nghĩa:
+Rules:
 
-- `request_id`: định danh toàn request người dùng.
-- `task_id`: định danh task cụ thể trong plan.
-- `parent_task_id`: liên kết task tree/DAG.
-- `capability`: capability cần thực hiện.
-- `objective`: mục tiêu nghiệp vụ ở ngôn ngữ rõ ràng.
-- `inputs`: tham số nghiệp vụ.
-- `scope`: phạm vi dữ liệu được phép truy cập.
-- `context`: principal/session/permission đã xác minh.
-
-`inputs` không được dùng thay cho scope. Ví dụ `document_ids` không nên bị nhét tùy ý vào query string hoặc prompt.
+- `inputs` = task cần làm gì.
+- `scope` = được phép làm ở đâu.
+- `semantic_context` = query đã được hiểu thế nào.
+- `conversation_context` chỉ truyền khi capability thực sự cần; không mặc định gửi toàn bộ context cho mọi tool.
 
 ---
 
-### 4.2. `ExecutionContext`
-
-```python
-class ExecutionContext(BaseModel):
-    user_id: str | None = None
-    session_id: str | None = None
-
-    permissions: list[str] = Field(default_factory=list)
-
-    language: str = "vi"
-
-    trace_id: str | None = None
-```
-
-`ExecutionContext` chỉ chứa context đã được backend xác minh. LLM không được tự thêm permission.
-
-Ví dụ:
-
-```json
-{
-  "user_id": "user-123",
-  "session_id": "session-456",
-  "permissions": ["documents.read", "people.read"],
-  "language": "vi"
-}
-```
-
----
-
-## 5. Query scope: `workspace_ids` + document scope
-
-### 5.1. Quy tắc nền
-
-`workspace_ids` và `document_ids` cùng tạo thành retrieval scope của query/task.
-
-```text
-workspace_ids = [W1, W2]
-document_ids = null
-```
-
-=> được tìm trong toàn bộ W1 và W2, nhưng vẫn phải qua ACL của user.
-
-```text
-workspace_ids = [W1]
-document_ids = [D1, D2]
-```
-
-=> chỉ được tìm D1/D2 trong W1.
-
-Conceptual rule:
-
-```text
-effective_scope
-= user_permissions
-  ∩ workspace_ids
-  ∩ document_ids (nếu document_ids được chỉ định)
-```
-
-`workspace_ids` là authorization/retrieval boundary lớn hơn. `document_ids` là document-level narrowing.
-
----
-
-### 5.2. Không dùng một `document_ids` duy nhất cho mọi semantics
-
-Một query có thể vừa có target document vừa cần reference document.
-
-Ví dụ user upload 2 file và hỏi:
-
-> Kiểm tra nội dung hai file này có đúng với quy định A không.
-
-Hai file upload là **target**; văn bản A là **reference**.
-
-Nếu chỉ có:
-
-```text
-document_ids = [file1, file2]
-```
-
-thì không biểu diễn được việc phải đọc thêm A.
-
-Do đó đề xuất scope đầy đủ:
-
-```python
-class ExecutionScope(BaseModel):
-    workspace_ids: list[str] = Field(default_factory=list)
-
-    # Tài liệu là SUBJECT của task/query.
-    target_document_ids: list[str] = Field(default_factory=list)
-
-    # Tài liệu đã được xác định là nguồn tham chiếu/căn cứ.
-    reference_document_ids: list[str] = Field(default_factory=list)
-
-    # Khi không có target/reference role cụ thể, document_ids có thể dùng
-    # như document-level narrowing chung cho compatibility/fast-path.
-    document_ids: list[str] | None = None
-
-    reference_search_scope: Literal[
-        "none",
-        "workspace",
-        "corpus",
-    ] = "none"
-
-    allow_reference_discovery: bool = False
-```
-
-### 5.3. Semantics đề xuất
-
-- `workspace_ids`: vùng dữ liệu tối đa được caller cấp.
-- `document_ids`: document narrowing chung; phù hợp query Q&A/summary đơn giản.
-- `target_document_ids`: document cần phân tích, so sánh, kiểm tra hoặc tóm tắt.
-- `reference_document_ids`: document dùng làm căn cứ/đối chiếu.
-- `reference_search_scope`: nơi agent được phép tìm reference mới.
-- `allow_reference_discovery`: có được resolve/search thêm reference ngoài `reference_document_ids` hay không.
-
-Không nên cho child task tự thêm target document mới. Reference discovery chỉ hợp lệ nếu contract/policy cho phép.
-
----
-
-### 5.4. Parent scope và child task scope
-
-Ví dụ parent query:
-
-> So sánh A, B, C.
-
-Parent:
-
-```json
-{
-  "workspace_ids": ["W1"],
-  "target_document_ids": ["A", "B", "C"],
-  "allow_reference_discovery": false
-}
-```
-
-Planner có thể tạo:
-
-```text
-Task-A -> target_document_ids=[A]
-Task-B -> target_document_ids=[B]
-Task-C -> target_document_ids=[C]
-```
-
-Rule:
-
-```text
-Parent targets = [A,B,C]
-
-child [A]        OK
-child [A,B]      OK
-child [D]        DENY
-child all docs   DENY
-```
-
-Đối với reference:
-
-```text
-allow_reference_discovery=false
-=> child không được tự search reference ngoài parent.
-
-allow_reference_discovery=true
-=> child có thể resolve/search reference trong reference_search_scope,
-   nhưng không được vượt workspace/ACL.
-```
-
----
-
-## 6. `AgentResult`
-
-Mọi capability/worker nên trả về một envelope thống nhất.
+## 15. `AgentResult`
 
 ```python
 class AgentResult(BaseModel):
@@ -314,7 +734,6 @@ class AgentResult(BaseModel):
     missing: list[str] = Field(default_factory=list)
 
     confidence: float | None = None
-
     scope_used: ExecutionScope | None = None
 
     error: "AgentError" | None = None
@@ -322,27 +741,23 @@ class AgentResult(BaseModel):
 
 ### Status semantics
 
-#### `success`
-Task hoàn thành đủ mục tiêu đã được giao trong scope.
+`success` — đủ objective trong scope.
 
-#### `partial`
-Có dữ liệu hữu ích nhưng chưa đủ hoàn thành objective. Bắt buộc mô tả phần thiếu trong `missing`.
+`partial` — có kết quả hữu ích nhưng thiếu thành phần để kết luận; `missing` phải mô tả thiếu gì.
 
-#### `not_found`
-Lookup/search đã chạy thành công trong scope nhưng không tìm thấy kết quả phù hợp. Không dùng `not_found` cho timeout hoặc backend outage.
+`not_found` — search/lookup đã hoàn thành bình thường trong scope nhưng không có kết quả.
 
-#### `needs_input`
-Thiếu dữ liệu từ user hoặc caller để tiếp tục, ví dụ có nhiều Nguyễn Văn A không phân giải được.
+`needs_input` — cần user/caller cung cấp thêm dữ liệu.
 
-#### `denied`
-Principal không có quyền thực hiện capability hoặc truy cập scope.
+`denied` — không đủ permission hoặc scope violation.
 
-#### `error`
-Infrastructure/runtime failure. Phải có error code có thể audit; không biến lỗi thành `not_found`.
+`error` — infrastructure/runtime failure.
+
+Timeout/backend outage không được đổi thành `not_found`.
 
 ---
 
-## 7. Evidence contract
+## 16. Evidence
 
 ```python
 class Evidence(BaseModel):
@@ -361,6 +776,8 @@ class Evidence(BaseModel):
         "supporting",
     ] = "supporting"
 
+    task_id: str | None = None
+
     document_id: str | None = None
     document_title: str | None = None
 
@@ -370,21 +787,20 @@ class Evidence(BaseModel):
     content: str
 
     metadata: dict[str, Any] = Field(default_factory=dict)
-
     relevance: float | None = None
 ```
 
-### Invariants
+Invariants:
 
-- `source_type=document` => `document_id` phải tồn tại.
-- Evidence của comparison phải giữ document identity rõ ràng.
-- `role=target` và `role=reference` không được mất khi fan-out/fan-in.
-- Synthesizer không được đoán evidence thuộc văn bản nào dựa vào text.
-- Citation layer có thể map `evidence_id` sang source marker/UI citation sau cùng.
+- `source_type=document` ⇒ phải có `document_id`.
+- Evidence phải giữ `task_id` nếu được sinh từ DeepAgent subtask.
+- Target/reference role không được mất qua fan-out/fan-in.
+- Synthesizer không đoán document identity từ text.
+- Citation layer map `evidence_id` về citation/source UI sau cùng.
 
 ---
 
-## 8. Error contract
+## 17. Error contract
 
 ```python
 class AgentError(BaseModel):
@@ -403,13 +819,11 @@ class AgentError(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
 ```
 
-DeepAgent có thể dùng `retryable` để quyết định retry, nhưng backend vẫn phải có retry/deadline policy độc lập.
+DeepAgent có thể tham khảo `retryable`, nhưng retry/deadline policy vẫn phải do runtime enforce.
 
 ---
 
-## 9. Capability descriptor
-
-DeepAgent nên thấy capability-level interface thay vì implementation detail.
+## 18. Capability Descriptor
 
 ```python
 class CapabilityDescriptor(BaseModel):
@@ -431,140 +845,59 @@ class CapabilityDescriptor(BaseModel):
     output_schema: dict[str, Any]
 ```
 
-Ví dụ:
-
-```json
-{
-  "name": "people.lookup",
-  "version": "1.0",
-  "description": "Tra cứu cá nhân theo tên, CCCD, BHXH, điện thoại hoặc tiêu chí kết hợp",
-  "required_permissions": ["people.read"],
-  "cost_class": "cheap",
-  "supports_parallel": true
-}
-```
-
-DeepAgent không cần biết capability này dùng MongoDB hay collection nào.
+DeepAgent nên thấy capability abstraction, không thấy implementation detail.
 
 ---
 
-## 10. Contract cho People capability
+# PHẦN E — USE CASE FLOWS
 
-### Request
-
-```json
-{
-  "contract_version": "1.0",
-  "request_id": "req-1",
-  "task_id": "person-lookup-1",
-  "capability": "people.lookup",
-  "objective": "Xác định Nguyễn Văn A và lấy định danh cần cho document research",
-  "inputs": {
-    "name": "Nguyễn Văn A"
-  },
-  "scope": {
-    "workspace_ids": ["W1"],
-    "document_ids": null,
-    "target_document_ids": [],
-    "reference_document_ids": [],
-    "reference_search_scope": "none",
-    "allow_reference_discovery": false
-  },
-  "context": {
-    "user_id": "U1",
-    "permissions": ["people.read", "documents.read"],
-    "language": "vi"
-  }
-}
-```
-
-### Result
-
-```json
-{
-  "contract_version": "1.0",
-  "request_id": "req-1",
-  "task_id": "person-lookup-1",
-  "status": "success",
-  "data": {
-    "persons": [
-      {
-        "person_ref": "person-123",
-        "name": "Nguyễn Văn A",
-        "cccd": "012345678901"
-      }
-    ]
-  },
-  "evidence": [],
-  "missing": [],
-  "confidence": 1.0
-}
-```
-
-### Permission rule
-
-- Nếu user không có `people.read`, DeepAgent tốt nhất không được expose tool `people.lookup`.
-- People service vẫn phải kiểm tra permission lần nữa trước khi query database.
-- Không đưa logic permission chỉ vào prompt.
-
----
-
-## 11. Ví dụ cross-agent: CCCD của A liên quan gì đến các nghị định?
+## 19. People → Document cross-agent
 
 User:
 
 > Số căn cước công dân của Nguyễn Văn A có liên quan gì đến các nghị định?
 
-Đây là query `cross_agent` vì document research phụ thuộc kết quả People lookup.
+Query Analysis:
 
-### Routing
-
-```text
-query_analyzer
-    -> complexity=cross_agent
-    -> execution_mode=deep
-    -> capabilities=[people.lookup, document.search]
-
-supervisor
-    -> DeepAgent
+```json
+{
+  "complexity": "cross_agent",
+  "execution_mode": "deep",
+  "required_capabilities": [
+    "people.lookup",
+    "document.search"
+  ],
+  "dependencies": [
+    {
+      "from": "people.lookup",
+      "to": "document.search",
+      "reason": "CCCD lấy từ People là input cho document search"
+    }
+  ]
+}
 ```
 
-### DeepAgent plan
+DeepAgent:
 
 ```text
-T1. people.lookup(name="Nguyễn Văn A")
-T2. lấy CCCD từ T1
-T3. document.search(query=<CCCD>, scope=<query scope>)
-T4. document.search(query=<person name>, scope=<query scope>) nếu cần
-T5. xác nhận kết quả thực sự liên quan cùng người
-T6. tổng hợp mối liên hệ + evidence
+T1 people.lookup(name=A)
+    ↓
+CCCD=X
+    ↓
+T2 document.search(query=X)
+    ↓
+T3 document.search(query=A) nếu cần
+    ↓
+T4 evidence verification
+    ↓
+synthesis
 ```
 
-T2/T3 là dependency; không nên chạy document search theo CCCD trước khi T1 resolve.
-
-### Contract flow
-
-```text
-DeepAgent
-   |
-   +-- AgentRequest(capability=people.lookup)
-   |        |
-   |        +--> AgentResult(data.cccd=X)
-   |
-   +-- AgentRequest(capability=document.search, inputs.query=X)
-            |
-            +--> AgentResult(evidence=[...])
-
-DeepAgent
-   -> evaluate missing evidence
-   -> synthesize
-```
-
-DeepAgent không cần gọi trực tiếp `people_agent_node()`.
+DeepAgent không gọi trực tiếp `people_agent_node()`. Supervisor fast People path và DeepAgent tool cùng dùng chung People service/capability.
 
 ---
 
-## 12. Ví dụ multi-document: so sánh 2 hoặc N văn bản
+## 20. Multi-document comparison
 
 User:
 
@@ -575,203 +908,273 @@ Parent scope:
 ```json
 {
   "workspace_ids": ["W1"],
-  "target_document_ids": ["A", "B"],
-  "allow_reference_discovery": false
+  "target_document_ids": ["A", "B"]
 }
 ```
 
-Planner tạo:
+Execution:
 
 ```text
-Research-A -> target_document_ids=[A]
-Research-B -> target_document_ids=[B]
-
-Research-A ----+
-               +--> comparison/synthesis
-Research-B ----+
+Research-A scope=[A] ──┐
+                       ├──→ Evidence Evaluator → Compare/Synthesis
+Research-B scope=[B] ──┘
 ```
 
-Nếu N document:
+N document dùng cùng model:
 
 ```text
-Research-A -> [A]
-Research-B -> [B]
-Research-C -> [C]
+A → task A
+B → task B
+C → task C
 ...
-
-fan-in -> synthesis
+fan-in → synthesis
 ```
-
-Mỗi task trả evidence giữ `document_id`, tránh gom tất cả vào một `sources[]` không biết provenance theo task.
 
 ---
 
-## 13. Ví dụ target/reference: kiểm tra 2 file có đúng quy định A không
+## 21. Target/reference compliance
 
-User upload F1, F2 rồi hỏi:
+User:
 
-> Kiểm tra nội dung hai file này có đúng với quy định A không.
-
-Scope:
-
-```json
-{
-  "workspace_ids": ["W1"],
-  "target_document_ids": ["F1", "F2"],
-  "reference_document_ids": ["A"],
-  "reference_search_scope": "none",
-  "allow_reference_discovery": false
-}
-```
-
-Plan:
+> Kiểm tra nội dung F1 và F2 có đúng với quy định A không.
 
 ```text
-T1. extract requirements from A
-T2. extract relevant content from F1
-T3. extract relevant content from F2
-T4. map F1/F2 against requirements
-T5. report compliant / non_compliant / uncertain per requirement
+Reference A ───────→ extract requirements ──────┐
+                                                 │
+Target F1 ─────────→ extract relevant content ──┼─→ compliance matrix
+Target F2 ─────────→ extract relevant content ──┘
 ```
 
 Evidence:
 
 ```text
-EV-A-1  role=reference document=A   section=Điều 8
-EV-F1-1 role=target    document=F1  section=Mục 2
-EV-F2-1 role=target    document=F2  section=Mục 4
+EV-A-1  role=reference document=A
+EV-F1-1 role=target    document=F1
+EV-F2-1 role=target    document=F2
 ```
 
-Synthesis có thể tạo comparison matrix thay vì answer trực tiếp từ mixed sources.
+Output trung gian nên có requirement mapping, không chỉ prose answer.
 
 ---
 
-## 14. Reference discovery
-
-User:
-
-> Kiểm tra hai file này có đúng các quy định hiện hành về thể thức văn bản hành chính không.
-
-Không có reference document ID cụ thể.
-
-Scope:
-
-```json
-{
-  "workspace_ids": ["W1"],
-  "target_document_ids": ["F1", "F2"],
-  "reference_document_ids": [],
-  "reference_search_scope": "workspace",
-  "allow_reference_discovery": true
-}
-```
-
-DeepAgent có thể:
+## 22. Follow-up document reference
 
 ```text
-resolve/search relevant regulations
-    -> validated reference_document_ids
-    -> extract requirements
-    -> evaluate F1/F2
+Turn 1:
+"Nghị định A quy định gì về dữ liệu cá nhân?"
+
+Turn 2:
+"Nghị định này có quy định mức phạt không?"
 ```
 
-Nhưng không được tự thêm F3 vào `target_document_ids`.
-
-### Scope invariant
+Data flow:
 
 ```text
-TARGET SCOPE
-= immutable trừ khi caller/user thay đổi.
+ConversationContext.active_documents=[A]
+        ↓
+CoreferenceResolver
+        ↓
+"Nghị định này" → A
+        ↓
+SemanticContext.contextualized_query
+        ↓
+ExecutionScope.document_ids=[A]
+        ↓
+QueryAnalyzer → fast RAG
+```
 
-REFERENCE SCOPE
-= có thể dynamic nếu policy cho phép.
+Không cần DeepAgent chỉ vì query có coreference nếu sau resolution task trở thành simple/bounded.
+
+---
+
+## 23. Follow-up tạo complex query
+
+```text
+Turn 1:
+"Nghị định A quy định gì về X?"
+
+Turn 2:
+"So sánh nghị định này với B và cho biết nội dung nào chặt hơn."
+```
+
+Data flow:
+
+```text
+"nghị định này" → A
+        ↓
+SemanticContext.document_refs=[A,B]
+        ↓
+ExecutionScope.target_document_ids=[A,B]
+        ↓
+QueryAnalyzer
+  complexity=comparison
+  execution_mode=deep
+        ↓
+DeepAgent
+```
+
+Conversation resolution xảy ra trước complexity routing.
+
+---
+
+# PHẦN F — LANGGRAPH DATA FLOW
+
+## 24. Target Data Flow sau nâng cấp
+
+Đây là flow chuẩn đề xuất cho một request.
+
+```mermaid
+flowchart TD
+    U[User Query] --> RC[Request Context + ACL]
+    RC --> SCB[Semantic Context Builder]
+
+    SCB --> CC[Conversation/Coreference Resolution]
+    SCB --> AB[Abbreviation Resolution]
+    SCB --> DRX[Document/Entity Reference Resolution]
+
+    CC --> SC[SemanticContext]
+    AB --> SC
+    DRX --> SC
+
+    SC --> QA[Query Analyzer]
+    QA --> SUP[Supervisor]
+
+    SUP -->|clarify| CL[Clarification]
+    SUP -->|fast| FAST[Existing Fast Agent/Workflow]
+    SUP -->|deep| DA[DeepAgent]
+
+    DA --> AR[AgentRequest]
+    AR --> CAP[Domain Capability]
+    CAP --> RES[AgentResult + Evidence]
+    RES --> DA
+
+    DA --> EV[Evidence Evaluator]
+    EV -->|missing| DA
+    EV -->|sufficient| SYN[Synthesis / Answer Generator]
+
+    FAST --> G[Grounding + Citation Guard]
+    SYN --> G
+    G --> OUT[Final Answer]
+```
+
+### Data objects qua từng boundary
+
+```text
+Raw Request
+    ↓
+ConversationContext + ExecutionContext
+    ↓
+SemanticContext
+    ↓
+QueryAnalysis + ExecutionScope
+    ↓
+AgentRequest[]
+    ↓
+AgentResult[] + Evidence[]
+    ↓
+TaskEvaluationResult
+    ↓
+Final Answer + Citations
 ```
 
 ---
 
-## 15. Supervisor vs DeepAgent routing contract
+## 25. Semantic Context Builder
 
-Query Analyzer nên trả không chỉ `intent_hint`, mà thêm execution semantics.
+Đề xuất thêm stage trước Query Analyzer:
 
-Đề xuất:
-
-```python
-class QueryAnalysis(BaseModel):
-    complexity: Literal[
-        "simple",
-        "multi_doc",
-        "multi_section",
-        "cross_agent",
-        "comparison",
-    ]
-
-    execution_mode: Literal[
-        "fast",
-        "deep",
-        "clarify",
-    ]
-
-    required_capabilities: list[str]
-
-    dependencies: list[dict] = Field(default_factory=list)
-
-    scope: ExecutionScope
+```text
+START
+ ↓
+request_context / ACL
+ ↓
+semantic_context_builder
+   ├── coreference/follow-up resolution
+   ├── abbreviation candidate detection
+   ├── conditional abbreviation lookup/disambiguation
+   ├── document/person/section reference extraction
+   └── contextualized + normalized query
+ ↓
+query_analyzer
+ ↓
+supervisor
 ```
 
-### Routing heuristic
+Không bắt mọi request gọi LLM ở preprocessor. Các check rẻ/no-op phải đi trước; chỉ resolve sâu khi cần.
 
-`fast` khi pipeline hiện tại đã biết cách hoàn thành objective một cách bounded/deterministic.
+Ví dụ greeting:
 
-Ví dụ:
-
-- “CCCD của A là gì?” -> People fast path.
-- “Tóm tắt Điều 5 của A” -> Resolve + RAG fast path.
-- “Nghị định A quy định gì về X?” -> RAG fast path.
-
-`deep` khi ít nhất một điều kiện xảy ra:
-
-- phải thu thập riêng nhiều target rồi compare/synthesize;
-- cross-capability;
-- bước sau phụ thuộc dữ liệu runtime của bước trước;
-- cần evaluate evidence rồi quyết định search tiếp;
-- cần hierarchical/map-reduce summary;
-- workflow đơn giản hiện tại không biểu diễn đầy đủ dependency.
-
-Ví dụ:
-
-- “CCCD của A xuất hiện trong nghị định nào?” -> DeepAgent.
-- “So sánh A và B theo các nghĩa vụ liên quan X” -> DeepAgent.
-- “Kiểm tra F1/F2 có đúng quy định A và nêu phần không phù hợp” -> DeepAgent.
+```text
+"Xin chào"
+→ no coreference
+→ no abbreviation
+→ no document refs
+→ direct fast path
+```
 
 ---
 
-## 16. LangGraph integration
-
-### 16.1. State không phải contract
-
-Không để capability đọc/ghi tùy ý toàn bộ `SupervisorState`.
-
-Đề xuất adapter boundary:
+## 26. State ↔ Contract adapter
 
 ```text
 LangGraph State
-      |
-      | build_request()
-      v
+      ↓ build_request()
 AgentRequest
-      |
-      v
+      ↓
 Capability
-      |
-      v
+      ↓
 AgentResult
-      |
-      | apply_result()
-      v
+      ↓ apply_result()
 LangGraph State
 ```
 
-### 16.2. `Command` chỉ dùng cho orchestration
+Capability không đọc/ghi tùy ý toàn bộ `SupervisorState`.
+
+### Mapping hiện tại → contract
+
+```text
+SupervisorState.workspace_ids
+    → ExecutionScope.workspace_ids
+
+SupervisorState.document_ids
+    → ExecutionScope.document_ids
+      hoặc target_document_ids theo semantic role
+
+SupervisorState.user_id
+    → ExecutionContext.user_id
+
+SupervisorState.user_can_use_people
+    → permissions includes people.read
+
+SupervisorState.rewritten_query/original_query
+    → SemanticContext
+
+SupervisorState.abbreviation_results
+    → SemanticContext.abbreviations
+
+SupervisorState.sources
+    → Evidence[]
+
+SupervisorState.mongo_results
+    → AgentResult.data
+
+SupervisorState.kg_summaries
+    → AgentResult.data / Evidence(KG)
+
+SupervisorState.sub_queries
+    → QueryAnalysis dependencies / DeepAgent plan
+
+SupervisorState.accumulated_results
+    → AgentResult[] theo task
+```
+
+Phase đầu có thể giữ compatibility bằng adapter, chưa cần big-bang rewrite state.
+
+---
+
+## 27. LangGraph `Command` và `Send`
+
+`AgentResult` không chứa `goto`.
 
 ```python
 result = await capability.execute(request)
@@ -781,48 +1184,33 @@ if result.status == "success":
         update={"task_results": [result]},
         goto="deep_agent",
     )
-
-if result.status == "needs_input":
-    return Command(
-        update={"clarification": result},
-        goto="clarification",
-    )
 ```
-
-`AgentResult.status` không chứa `goto` vì capability không nên biết graph topology.
-
-### 16.3. Fan-out
-
-Multi-document task độc lập có thể dùng LangGraph `Send` hoặc DeepAgent subtask parallelism, nhưng mỗi branch phải nhận immutable task scope riêng.
 
 ```text
-Parent Scope [A,B,C]
+AgentResult
+= what happened
 
-Send Research(A) -> scope [A]
-Send Research(B) -> scope [B]
-Send Research(C) -> scope [C]
-
-fan-in -> evidence evaluator
+Command
+= what graph should do next
 ```
+
+Multi-document independent branches có thể dùng `Send`/subgraph hoặc bounded DeepAgent parallel task; mỗi branch phải nhận immutable child scope riêng.
 
 ---
 
-## 17. Evidence evaluator
+# PHẦN G — EVIDENCE EVALUATION
 
-Contract cho phép thay `has_results = bool(sources)` bằng semantic completion check.
+## 28. Evidence Evaluator
 
-Đề xuất evaluator input:
+Không chỉ kiểm tra `has_results = bool(sources)`.
 
 ```python
 class TaskEvaluationInput(BaseModel):
     objective: str
     requirements: list[str]
     results: list[AgentResult]
-```
 
-Output:
 
-```python
 class TaskEvaluationResult(BaseModel):
     status: Literal[
         "sufficient",
@@ -837,8 +1225,6 @@ class TaskEvaluationResult(BaseModel):
     suggested_capabilities: list[str]
 ```
 
-DeepAgent có thể dùng `missing` để targeted retry.
-
 Ví dụ:
 
 ```json
@@ -846,7 +1232,7 @@ Ví dụ:
   "status": "insufficient",
   "coverage": 0.62,
   "missing": [
-    "Quy định về ngoại lệ của văn bản B"
+    "Chưa có quy định về ngoại lệ của văn bản B"
   ],
   "suggested_capabilities": [
     "document.read_section",
@@ -855,64 +1241,15 @@ Ví dụ:
 }
 ```
 
----
-
-## 18. Mapping từ state hiện tại sang contract
-
-### Current -> Contract
-
-```text
-SupervisorState.workspace_ids
-    -> ExecutionScope.workspace_ids
-
-SupervisorState.document_ids
-    -> ExecutionScope.document_ids
-       hoặc target_document_ids tùy semantic context
-
-SupervisorState.user_id
-    -> ExecutionContext.user_id
-
-SupervisorState.user_can_use_people
-    -> permissions includes people.read
-
-SupervisorState.sources
-    -> Evidence[]
-
-SupervisorState.mongo_results
-    -> AgentResult.data
-
-SupervisorState.kg_summaries
-    -> AgentResult.data / Evidence(source_type=knowledge_graph)
-
-SupervisorState.sub_queries
-    -> DeepAgent plan/tasks hoặc QueryAnalysis dependencies
-
-SupervisorState.accumulated_results
-    -> task-scoped AgentResult[]
-```
-
-Không cần migrate toàn bộ ngay. Có thể dùng adapter để giữ compatibility với graph hiện tại trong pilot.
+DeepAgent dùng `missing` cho targeted research thay vì retry mù.
 
 ---
 
-## 19. Đề xuất boundary cho DeepAgent pilot
+# PHẦN H — PERMISSION, SECURITY, OBSERVABILITY
 
-DeepAgent pilot chỉ cần một số capability rõ ràng:
+## 29. Tool exposure theo permission
 
-```text
-people.lookup
-
-document.resolve
-document.search
-document.read_section
-document.list
-
-kg.query
-```
-
-Không expose trực tiếp database drivers, Mongo collections, Neo4j session, vector DB client hoặc internal LangGraph node.
-
-### Tool exposure theo permission
+Ví dụ People:
 
 ```text
 if people.read:
@@ -921,15 +1258,25 @@ else:
     omit people.lookup
 ```
 
-Service layer vẫn kiểm tra lại permission.
+Nhưng People service vẫn kiểm tra quyền lần nữa.
+
+Defense in depth:
+
+```text
+Tool exposure gate
+      +
+Capability/service permission gate
+      +
+Workspace/document scope enforcement
+```
+
+Không dựa vào prompt để bảo vệ CCCD/BHXH/person data.
 
 ---
 
-## 20. Streaming và progress
+## 30. Streaming
 
-Worker/capability không nên tự stream final answer.
-
-Nên chuẩn hóa progress event riêng:
+Worker/capability không tự stream final answer.
 
 ```python
 class AgentProgressEvent(BaseModel):
@@ -948,96 +1295,117 @@ class AgentProgressEvent(BaseModel):
     detail: str | None = None
 ```
 
-Chỉ outer synthesis/answer layer phát final answer token. Điều này tránh nhiều subagent cùng stream câu trả lời chồng nhau.
+Subtasks chỉ emit progress/tool status. Outer synthesis/answer layer chịu trách nhiệm final answer stream.
 
 ---
 
-## 21. Observability và audit
+## 31. Observability
 
-Mỗi trace nên ghi được:
+Trace nên ghi:
 
 ```text
 request_id
-  -> query analysis
-  -> chosen execution_mode
-  -> task_id / parent_task_id
-  -> capability called
-  -> scope requested
-  -> scope actually used
-  -> status
-  -> evidence_ids
-  -> latency
-  -> retry/dependency failures
-  -> synthesis result
+semantic_context
+resolved coreferences
+resolved abbreviations
+query analysis
+execution_mode
+scope requested / scope used
+task_id / parent_task_id
+capability called
+status
+evidence_ids
+missing requirements
+latency
+retry/dependency failures
+final synthesis
 ```
 
-Các metric nên thêm:
+Metrics cần benchmark:
 
-- fast/deep routing accuracy;
-- capability selection accuracy;
-- scope violation count;
-- document resolution accuracy;
-- evidence coverage;
-- partial-result rate;
-- unnecessary tool-call rate;
-- cross-agent success rate;
-- comparison completeness;
-- final faithfulness/citation correctness;
-- p50/p95 latency fast path vs deep path.
-
----
-
-## 22. Các invariant bắt buộc khi triển khai
-
-1. DeepAgent không được mở rộng `workspace_ids`.
-2. Child task không được tự thêm `target_document_ids` ngoài parent scope.
-3. Reference discovery phải đi qua explicit policy.
-4. Không có permission -> capability không được expose và backend vẫn phải deny nếu bị gọi trực tiếp.
-5. `not_found` chỉ dùng khi lookup hoàn thành trong scope.
-6. Timeout/backend error không được biến thành `not_found`.
-7. Mọi document evidence phải có `document_id`.
-8. Synthesis không được mất mapping evidence -> task -> document.
-9. Capability không điều khiển trực tiếp LangGraph topology.
-10. Final answer chỉ được sinh sau khi evidence evaluator xác định đủ hoặc hệ thống trả lời rõ phần còn thiếu.
+```text
+fast/deep routing accuracy
+coreference resolution accuracy
+abbreviation resolution accuracy
+document resolution accuracy
+scope violation count
+capability selection accuracy
+evidence coverage
+partial-result rate
+cross-agent success rate
+comparison completeness
+citation correctness / faithfulness
+p50/p95 fast path latency
+p50/p95 deep path latency
+```
 
 ---
 
-## 23. Hướng migration nghiên cứu
+## 32. Các invariant bắt buộc
 
-### Phase A — Contract models + adapters
+1. `original_query` không bị overwrite.
+2. Coreference resolution không cấp permission.
+3. Abbreviation resolution phải giữ candidate/status/provenance khi có ambiguity.
+4. DeepAgent không được mở rộng `workspace_ids`.
+5. Child task không được tự thêm target document ngoài parent scope.
+6. Reference discovery chỉ khi policy cho phép.
+7. Không có permission → capability không expose; service vẫn deny direct call.
+8. `not_found` chỉ dùng khi lookup hoàn thành bình thường trong scope.
+9. Timeout/backend outage không được chuyển thành `not_found`.
+10. Mọi document evidence phải có `document_id`.
+11. Evidence phải giữ task/document provenance qua fan-out/fan-in.
+12. Capability không điều khiển graph topology.
+13. Blocking ambiguity thiết yếu → clarify, không để DeepAgent tự đoán.
+14. Final synthesis phải biết phần evidence nào còn thiếu nếu evaluator chưa đủ coverage.
 
-- Định nghĩa Pydantic models cho request/result/scope/evidence/error.
-- Không đổi routing hiện tại.
-- Adapter People/RAG hiện tại sang contract.
-- Log contract trong Langfuse để đánh giá.
+---
 
-### Phase B — DeepAgent pilot
+# PHẦN I — MIGRATION RESEARCH PLAN
 
-- Thêm `deep` execution mode trong query analyzer/supervisor.
-- DeepAgent dùng capability contract thay vì gọi node trực tiếp.
-- Pilot trên comparison 2 document và cross-agent People -> RAG.
-- Feature flag để fallback static/ReAct path hiện tại.
+## 33. Phase A — Context + Contract models
 
-### Phase C — Evidence-driven execution
+- Định nghĩa Pydantic models cho ConversationContext, SemanticContext, ExecutionScope, ExecutionContext, AgentRequest, AgentResult, Evidence, AgentError.
+- Tạo Semantic Context Builder trước Query Analyzer.
+- Tái sử dụng abbreviation service hiện tại qua adapter.
+- Thêm coreference/follow-up resolver cho document/person/section focus.
+- Chưa thay routing hiện tại.
+- Log contract vào tracing để đánh giá.
 
-- Thêm task-scoped AgentResult.
+## 34. Phase B — Contract adapters cho fast path
+
+- Adapter People và RAG hiện tại sang AgentRequest/AgentResult.
+- Không thay business behavior hiện tại.
+- Kiểm tra regression về latency và permission.
+- Mapping `SupervisorState` ↔ contract chỉ tại boundary.
+
+## 35. Phase C — DeepAgent pilot
+
+- Query Analyzer thêm `fast/deep/clarify`.
+- DeepAgent chỉ nhận curated capabilities.
+- Pilot hai nhóm:
+  - multi-document comparison;
+  - cross-agent People → document research.
+- Feature flag giữ fallback static/ReAct path hiện tại.
+
+## 36. Phase D — Evidence-driven execution
+
 - Semantic evidence evaluator.
-- Targeted retry dựa trên `missing`.
-- Fan-out multi-document khi task độc lập.
+- `partial + missing` targeted retry.
+- task-scoped AgentResult.
+- bounded fan-out cho multi-document.
 
-### Phase D — Simplify orchestration
+## 37. Phase E — Simplify graph
 
-- Giảm dần duplicated planning trong Supervisor.
-- Giảm reliance vào `SupervisorState` làm universal interface.
-- Đánh giá thay custom ReAct executor bằng DeepAgent complex path nếu benchmark tốt hơn.
+- Giảm duplicated planning trong Supervisor.
+- Giảm reliance vào universal SupervisorState.
+- Benchmark DeepAgent so với custom ReAct executor.
+- Chỉ retire ReAct path nếu DeepAgent tốt hơn về correctness/latency/cost và grounding.
 
 ---
 
-## 24. Bộ query dùng để nghiên cứu contract
+# PHẦN J — REVIEW CASES
 
-Nên benchmark contract với ít nhất các nhóm sau:
-
-### Fast path
+## 38. Fast path
 
 ```text
 CCCD của Nguyễn Văn A là gì?
@@ -1045,118 +1413,127 @@ Tóm tắt Điều 5 văn bản A.
 Nghị định A quy định gì về X?
 ```
 
-### Multi-document
+Kỳ vọng: semantic preprocessing gần như no-op hoặc cheap; không vào DeepAgent nếu không cần.
+
+## 39. Abbreviation
+
+```text
+NĐ 13 quy định gì về DLCN?
+So sánh NĐ 13 với Luật ANM về DLCN.
+```
+
+Kỳ vọng: abbreviation được annotate/normalize trước routing, không làm hỏng số hiệu văn bản.
+
+## 40. Conversation/coreference
+
+```text
+Turn 1: Nghị định A quy định gì về X?
+Turn 2: Nghị định này có mức phạt không?
+```
+
+Kỳ vọng: `nghị định này → A`; fast RAG.
+
+```text
+Turn 1: So sánh A và B.
+Turn 2: Nghị định này có hiệu lực khi nào?
+```
+
+Kỳ vọng: nếu ambiguous → clarify.
+
+## 41. Multi-document
 
 ```text
 So sánh Chương II của A với Chương III của B.
 So sánh A, B và C theo trách nhiệm của cơ quan quản lý.
 ```
 
-### Cross-agent
+Kỳ vọng: deep path; task scope theo từng document; provenance không bị trộn.
+
+## 42. Cross-agent
 
 ```text
 CCCD của Nguyễn Văn A xuất hiện trong nghị định nào?
 Người có BHXH X có liên quan đến những văn bản nào trong workspace?
 ```
 
-### Target/reference
+Kỳ vọng: People result làm dependency input cho document research.
+
+## 43. Target/reference
 
 ```text
 Kiểm tra hai file upload có đúng quy định A không.
-Đối chiếu file F1 với A và B, chỉ ra các điểm không phù hợp.
+Đối chiếu F1 với A và B, chỉ ra điểm không phù hợp.
 ```
 
-### Reference discovery
+Kỳ vọng: target/reference role rõ ràng.
+
+## 44. Reference discovery
 
 ```text
 Kiểm tra hai file này có đúng các quy định hiện hành về thể thức văn bản hành chính không.
-Kiểm tra A còn hiệu lực hay đã có văn bản thay thế rồi đánh giá file F1 theo quy định hiện hành.
 ```
 
-### Scope safety
+Kỳ vọng: target immutable; reference discovery chỉ trong policy scope.
+
+## 45. Scope/permission safety
 
 ```text
-User chỉ được scope [A,B] nhưng prompt yêu cầu lấy thêm D ngoài workspace.
-DeepAgent tự đề xuất mở rộng target sang C dù parent target chỉ có A,B.
+Parent chỉ cho [A,B], DeepAgent thử search D.
 User không có people.read nhưng query yêu cầu CCCD.
+Coreference resolve A từ turn trước nhưng quyền đọc A đã bị revoke.
 ```
+
+Kỳ vọng: deny ở runtime/service layer, không dựa vào model judgment.
 
 ---
 
-## 25. Câu hỏi nghiên cứu cần trả lời bằng benchmark
+## 46. Câu hỏi cần review trước implementation
 
-Đây là các câu hỏi cần số liệu trước khi khóa implementation:
-
-1. Query analyzer có phân loại `fast` vs `deep` ổn định hơn taxonomy intent hiện tại không?
-2. Có cần LLM planner riêng hay DeepAgent `write_todos` đủ tốt cho pilot?
-3. `document_ids` compatibility field có nên giữ lâu dài hay chuyển hoàn toàn sang target/reference scope?
-4. Evidence evaluator nên rule-based + LLM judge hay một structured LLM judge duy nhất?
-5. Cross-agent People -> RAG có cải thiện correctness đủ để bù latency DeepAgent không?
-6. Multi-document fan-out tối đa bao nhiêu nhánh trước khi latency/context pressure tăng mạnh?
-7. Có nên để DeepAgent synthesize final answer hay tiếp tục dùng AIRAG answer generator/citation layer?
-8. DeepAgent có thể thay custom `react_executor` sau pilot hay hai path phục vụ use case khác nhau?
-9. Contract có giúp giảm schema drift giữa `SupervisorState` và `AgentState` không?
-10. `partial`/`missing` có cải thiện targeted retry và giảm hallucination so với `has_results` hiện tại không?
+1. `ConversationContext` nên được persist ở đâu: graph/thread state, cache hay reconstruct từ recent turns?
+2. Coreference resolver dùng deterministic-first + LLM fallback hay một structured LLM pass?
+3. Semantic Context Builder có thể hợp nhất với classifier để tránh thêm latency LLM không?
+4. `document_ids` nên giữ lâu dài cho compatibility hay sau migration chỉ còn target/reference IDs?
+5. `reference_search_scope="corpus"` chính xác tương ứng data source nào trong AIRAG?
+6. Khi abbreviation ambiguous nhưng không ảnh hưởng intent/scope, có cần block query không?
+7. Evidence evaluator dùng rule + LLM judge hay structured LLM judge duy nhất?
+8. DeepAgent planner có cần explicit dependency DAG hay todo-style planning đủ cho pilot?
+9. Conversation coreference có cần giữ ordinal (`thứ nhất`, `thứ hai`) như first-class metadata không?
+10. DeepAgent có synthesize answer hay chỉ trả ResearchResult cho existing answer generator?
+11. Multi-document fan-out giới hạn bao nhiêu branch để giữ latency mục tiêu?
+12. Contract versioning/migration policy giữa fast agents và deep path sẽ được enforce ở đâu?
 
 ---
 
-## 26. Kiến trúc mục tiêu dự kiến
+## 47. Quyết định đề xuất cho Contract v1
 
-```mermaid
-flowchart TD
-    U[User Query] --> QA[Query Analyzer]
-    QA --> SUP[Supervisor]
+Để giữ YAGNI và có thể pilot an toàn:
 
-    SUP -->|fast| FAST[Existing Fast Agents]
-    FAST --> OUT[Answer]
-
-    SUP -->|deep| DA[DeepAgent]
-
-    DA -->|AgentRequest| PC[People Capability]
-    DA -->|AgentRequest| DR[Document Resolve]
-    DA -->|AgentRequest| DS[Document Search]
-    DA -->|AgentRequest| SEC[Document Section]
-    DA -->|AgentRequest| KG[KG Capability]
-
-    PC -->|AgentResult| DA
-    DR -->|AgentResult| DA
-    DS -->|AgentResult| DA
-    SEC -->|AgentResult| DA
-    KG -->|AgentResult| DA
-
-    DA --> EV[Evidence Evaluator]
-    EV -->|missing| DA
-    EV -->|sufficient| SYN[Synthesis / Answer Generator]
-    SYN --> G[Grounding + Citation Guard]
-    G --> OUT
-```
+- Thêm `ConversationContext` và `SemanticContext` trước Query Analyzer.
+- Semantic preprocessing luôn đi qua nhưng cheap/no-op by default.
+- Tái sử dụng abbreviation service hiện tại; chỉ disambiguate sâu khi cần.
+- Coreference resolution giải quyết `nghị định này`, `người đó`, `file thứ hai`, `điều trên` trước routing.
+- Giữ `original_query`, `contextualized_query`, `normalized_query` đồng thời.
+- `workspace_ids` là authorization boundary chính.
+- Giữ `document_ids` cho compatibility/fast path.
+- Complex path dùng `target_document_ids` và `reference_document_ids`.
+- Reference discovery phải explicit.
+- Chuẩn hóa AgentRequest/AgentResult/Evidence/ExecutionScope/ExecutionContext/AgentError.
+- DeepAgent gọi capability/tool adapters, không gọi trực tiếp internal LangGraph node.
+- People và abbreviation là shared capabilities/services, không bắt buộc autonomous subagent.
+- Evidence evaluator quyết định completion theo requirement coverage, không theo số lượng sources.
+- Không big-bang rewrite graph; dùng adapter + feature flag + benchmark.
 
 ### Guiding principle
 
 ```text
-LangGraph quản lý workflow và lifecycle.
-Supervisor chọn fast/deep route.
-DeepAgent lập plan và điều phối complex research.
-Capability thực hiện domain operation qua contract.
-Evidence evaluator quyết định đã đủ căn cứ chưa.
-Answer layer chịu trách nhiệm synthesis + citation cuối cùng.
+ConversationContext trả lời: trước đó đang nói về gì?
+SemanticContext trả lời: câu hiện tại thực sự có nghĩa gì?
+ExecutionScope trả lời: được phép tìm ở đâu?
+ExecutionContext trả lời: ai đang gọi và có quyền gì?
+QueryAnalysis trả lời: fast, deep hay clarify?
+AgentRequest trả lời: task cần capability làm gì?
+AgentResult + Evidence trả lời: đã tìm được gì và còn thiếu gì?
+LangGraph trả lời: workflow tiếp theo đi đâu?
 ```
 
----
-
-## 27. Quyết định đề xuất cho v1
-
-Để giữ YAGNI và giảm rủi ro, v1 nên khóa các điểm sau:
-
-- Giữ `workspace_ids` là authorization boundary chính.
-- Giữ `document_ids` để compatibility cho fast path và query scope đơn giản.
-- Thêm `target_document_ids` và `reference_document_ids` cho complex path.
-- Chỉ cho reference discovery khi `allow_reference_discovery=true`.
-- Chuẩn hóa `AgentRequest`, `AgentResult`, `Evidence`, `ExecutionScope`, `ExecutionContext`, `AgentError`.
-- DeepAgent gọi capability/tool adapters, không gọi trực tiếp LangGraph node hiện tại.
-- People lookup là capability, không bắt buộc trở thành autonomous subagent.
-- Child task scope phải là subset của parent authorization scope.
-- Evidence phải giữ provenance theo `task_id` và `document_id`.
-- Không rewrite toàn bộ graph trong phase đầu; dùng adapters + feature flag để benchmark.
-
-Tài liệu này nên được dùng làm cơ sở cho bước tiếp theo: định nghĩa Pydantic schema cụ thể, adapter mapping với state hiện tại, query-router schema `fast/deep`, và bộ test contract trước khi tích hợp DeepAgent vào runtime.
+Tài liệu này là baseline để review architecture trước khi viết implementation plan và thay đổi runtime.
