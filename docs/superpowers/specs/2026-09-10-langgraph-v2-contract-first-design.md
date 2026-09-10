@@ -4,7 +4,7 @@
 
 **Status:** Review / Proposed
 
-**Revision basis:** commit `977e1f12b87efe49a70e25ab2b287986e5c3f2bd`
+**Revision basis:** commit `d0be7f0ecebde28d86f0550a8f6fab751198a0c2`
 
 **Source direction:** `docs/agent-contract-langgraph-deepagent.md`
 
@@ -96,6 +96,7 @@ Backend ingress
 ├── calculate workspace authorization
 ├── calculate People permission
 ├── persist ORIGINAL user message
+├── capture attachments and known UI bindings
 └── load conversation context
         ↓
 Context / Semantic Subgraph
@@ -103,30 +104,46 @@ Context / Semantic Subgraph
 ├── conversational coreference resolution
 ├── protected abbreviation resolution
 ├── optional small semantic model
+├── document-reference extraction
 ├── reconciliation
 └── persist semantic snapshot
         ↓
-Query Analysis
+Document Binding Resolution
+├── initial known bindings
+├── conversational bindings
+├── resolved user references
+└── unresolved references
+        ↓
+QueryAnalysis
+├── work_type
+├── domains
+├── capability_hints
+├── dependency_hints
+├── semantic_complexity
+└── requires_synthesis
         ↓
 Deterministic Router
+├── direct
 ├── clarify
-├── fast domain path
-└── complex research
+├── fast_domain
+│   ├── People
+│   ├── Document
+│   ├── Section
+│   ├── Write
+│   └── Knowledge Graph
+└── complex_research
         ↓
 ComplexResearchGraph
-├── create executable DAG
-├── validate DAG
-├── dispatch domain tasks
-├── AgentRequest + CapabilityRuntimeContext
-├── AgentResult + Evidence + Coverage
-├── coverage/evidence evaluation
+├── executable DAG
+├── task validation
+├── domain capabilities
+├── Evidence
+├── CoverageObservation
+├── EvidenceEvaluation
 ├── bounded append-only replan
 └── synthesis
         ↓
 Grounding
-├── required-target coverage
-├── evidence/citation validation
-└── unsupported-claim handling
         ↓
 FinalResponse
 ```
@@ -149,6 +166,8 @@ backend/app/services/agents/
     ├── people_graph/
     ├── document_graph/
     ├── section_graph/
+    ├── write_graph/
+    ├── knowledge_graph/
     ├── grounding_graph/
     ├── capabilities/
     ├── persistence/
@@ -165,7 +184,7 @@ Each subgraph:
 - can be compiled and tested independently;
 - may use LangGraph primitives internally without leaking them across business boundaries.
 
-Initial domains are People, Document, and Section. KG becomes a separate subgraph only for a validated use case.
+The v2 taxonomy includes People, Document, Section, Write, and Knowledge Graph domains. Initial pilot implementation may stage them, but routing semantics are defined now: bounded single-domain Write and KG operations use fast paths; Write/KG combined with document evidence or runtime dependencies use complex research.
 
 ## 6. Data objects and ownership
 
@@ -177,6 +196,8 @@ RequestContext
 ConversationContext
     ↓
 SemanticContext
+    ↓
+DocumentBindingSet
     ↓
 QueryAnalysis
     ↓
@@ -208,7 +229,8 @@ FinalResponse
 | `RequestContext` | Backend ingress | Authenticated request metadata and initial required-document bindings |
 | `CapabilityRuntimeContext` | Backend/runtime adapter | Trusted authorization, capability allowlist, deadline |
 | `ConversationContext` | Context layer | Short-term discourse state sourced from chat DB |
-| `SemanticContext` | Context layer | Meaning of the current request after resolution/normalization |
+| `SemanticContext` / `DocumentReference` | Context layer | Meaning and unresolved/resolved references extracted from the current request |
+| `DocumentBindingSet` | Binding resolver | Authoritative resolved bindings plus unresolved references |
 | `QueryAnalysis` | Query analyzer | Semantic structure and dependency hints, not an executable plan |
 | `RouteDecision` | Deterministic router | `clarify`, fast domain path, or complex research |
 | `TaskPlan` / DAG | `ComplexResearchGraph` | Executable tasks and dependencies |
@@ -220,7 +242,13 @@ FinalResponse
 
 ## 7. Core contract rules
 
-All boundary and persisted contracts are versioned Pydantic v2 models with forbidden extra fields. Runtime-only objects such as DB sessions, cancellation events, LangGraph commands, and raw clients are excluded from persisted business contracts.
+All boundary and persisted business contracts are versioned immutable Pydantic v2 models by default:
+
+```python
+model_config = ConfigDict(extra="forbid", frozen=True)
+```
+
+This applies to `RequestContext`, `ConversationContext` snapshots, `SemanticContext`, `DocumentReference`, `DocumentBindingSet`, `ScopedDocument`, `QueryAnalysis`, `RouteDecision`, `TaskSpec`, `TaskPlan`, `AgentRequest`, `AgentResult`, `Evidence`, `CoverageObservation`, `Coverage`, `EvidenceEvaluation`, and answer contracts. Any exception must be explicit and justified. Runtime/aggregate state may evolve through LangGraph state updates, but business objects are replaced rather than mutated in place. Runtime-only objects such as DB sessions, cancellation events, LangGraph commands, and raw clients are excluded from persisted business contracts.
 
 ### 7.1 Root graph state
 
@@ -230,6 +258,7 @@ class SupervisorV2State(TypedDict):
     runtime: CapabilityRuntimeContext
     conversation: ConversationContext
     semantic: SemanticContext
+    document_bindings: DocumentBindingSet
     query_analysis: QueryAnalysis | None
     route_decision: RouteDecision | None
     execution: ExecutionState
@@ -251,11 +280,11 @@ class RequestContext(BaseModel):
     thread_id: str
     user_id: UUID
     original_query: str
-    required_documents: tuple[ScopedDocument, ...]
+    initial_document_bindings: tuple[ScopedDocument, ...]
     attached_document_ids: tuple[UUID, ...]
 ```
 
-Authorization fields are deliberately absent. They belong to trusted runtime context, not the business request.
+Authorization fields are deliberately absent. They belong to trusted runtime context, not the business request. `initial_document_bindings` contains only UUIDs already known and validated by backend/UI input, such as explicit document selection. Named documents mentioned only in text do not need a UUID at ingress; the Context layer extracts them as `DocumentReference`, and the Binding resolver resolves them later. Attachments are contextual candidates, not required bindings by default.
 
 ## 8. Document roles and required scope
 
@@ -264,14 +293,23 @@ Authorization fields are deliberately absent. They belong to trusted runtime con
 V2 adopts role-based document binding as the canonical contract:
 
 ```python
+DocumentRole = Literal["target", "reference", "supporting", "discovered"]
+
 class ScopedDocument(BaseModel):
     contract_version: Literal["2.0"]
     binding_id: str
     document_id: UUID
-    role: Literal["target", "reference", "supporting", "discovered"]
+    role: DocumentRole
     required: bool
     source_ref_id: str | None = None
-    section_ref: str | None = None
+    locator: ContentLocator | None = None
+    derived_from_binding_id: str | None = None
+    binding_reason: str | None = None
+
+class DocumentBindingSet(BaseModel):
+    contract_version: Literal["2.0"]
+    bindings: tuple[ScopedDocument, ...]
+    unresolved: tuple[DocumentReference, ...]
 ```
 
 Semantics:
@@ -281,7 +319,9 @@ Semantics:
 - `supporting`: explicitly bound supplemental material;
 - `discovered`: material found during research and not silently promoted to target/reference.
 
-A required binding is a completion requirement, not an authorization grant. Authorization still comes only from `CapabilityRuntimeContext.workspace_ids`. `required` is explicit: user-bound targets and references are normally `True`; incidental supporting/discovered bindings are `False` unless a validated plan deliberately promotes them into a new required binding. Role-sensitive validation rejects an accidental `discovered + required=True` binding without an explicit promotion reason.
+A required binding is a completion requirement, not an authorization grant. Authorization still comes only from `CapabilityRuntimeContext.workspace_ids`. `required` is explicit: user-bound targets and references are normally `True`; incidental supporting/discovered bindings are `False`.
+
+Binding lifecycle is append-only. Promotion never mutates an existing binding. If discovered binding `B1` should become a required reference, the planner emits a typed `BindingPromotionRequest`. The Binding resolver validates authorization and lineage, then appends `B2` with `role="reference"`, `required=True`, `derived_from_binding_id="B1"`, and a non-empty `binding_reason`. The Binding resolver remains the sole authoritative writer of `DocumentBindingSet`; the planner only requests additions. Validation rejects `discovered + required=True` and rejects promoted bindings without valid lineage.
 
 ### 8.2 Canonical use cases
 
@@ -305,6 +345,37 @@ references = discovered within authorized workspaces, then explicitly bound as r
 ```
 
 A required target or reference cannot be silently replaced by a discovered document. The role and `binding_id` must survive task fan-out, evidence fan-in, evaluation, synthesis, and citation rendering.
+
+### 8.3 Reference-to-binding lifecycle
+
+```text
+Raw Request
+    ↓
+RequestContext
+├── original_query
+├── attachments
+└── initial known bindings
+    ↓
+SemanticContext + DocumentReference[]
+    ↓
+Document Binding Resolution
+    ↓
+DocumentBindingSet
+├── bindings: resolved UUID-backed ScopedDocument[]
+└── unresolved: DocumentReference[]
+    ↓
+QueryAnalysis → Router
+```
+
+Only the Binding resolver creates UUID-backed bindings for text references. It merges validated initial UI bindings, conversation-derived references, attachments selected by semantics, and newly resolved references. Essential unresolved references route to clarification.
+
+### 8.4 Attachment semantics
+
+```text
+attached document != required target/reference
+```
+
+`attached_document_ids` are resources available as contextual candidates. Attaching A and B while asking a generic corpus question does not require reading A/B. Semantic resolution promotes attachments into immutable `ScopedDocument` bindings only when the request refers to them, for example “kiểm tra hai file tôi vừa gửi.” The flow is `attached_document_ids → contextual candidates → semantic resolution → DocumentBindingSet`, never automatic attachment-to-target conversion.
 
 ## 9. Trusted runtime context and capability boundary
 
@@ -397,6 +468,17 @@ Long-term memory may be consulted for statements such as “đơn vị tôi” o
 ### 10.3 SemanticContext
 
 ```python
+class DocumentReference(BaseModel):
+    contract_version: Literal["2.0"]
+    ref_id: str
+    original_span: str
+    normalized_reference: str
+    requested_role: DocumentRole | None = None
+    required: bool
+    locator: ContentLocator | None = None
+    resolution_status: Literal["unresolved", "resolved", "ambiguous", "not_found", "error"]
+    candidate_document_ids: tuple[UUID, ...] = ()
+
 class SemanticContext(BaseModel):
     contract_version: Literal["2.0"]
     original_query: str
@@ -532,48 +614,88 @@ The semantic model may select or describe validated candidates but cannot create
 class QueryAnalysis(BaseModel):
     contract_version: Literal["2.0"]
     work_type: Literal[
-        "direct", "lookup", "retrieve", "explain", "compare",
-        "summarize", "cross_domain", "multi_goal",
+        "direct", "lookup", "retrieve", "explain", "summarize",
+        "compare", "evaluate", "cross_domain", "multi_goal",
     ]
-    semantic_complexity: Literal["simple", "compound", "deep"]
+    domains: tuple[Literal[
+        "people", "document", "section", "write",
+        "knowledge_graph", "memory",
+    ], ...]
     capability_hints: tuple[str, ...]
     dependency_hints: tuple[SemanticDependencyHint, ...]
+    semantic_complexity: Literal["simple", "compound", "deep"]
     requires_synthesis: bool
 ```
 
-For example, “People result is required before document search” is a dependency hint. It has no task ID and is not executable.
+`work_type` describes what the user wants done; `domains` identifies relevant data/domain boundaries; capability and dependency hints describe likely operations and semantic ordering; `semantic_complexity` describes language/meaning complexity, not the final route. For example, “People result is required before document search” is a dependency hint. It has no task ID and is not executable.
+
+Examples:
+
+```text
+"CCCD của A là gì?"
+work_type=lookup
+ domains=[people]
+capability_hints=[people.lookup]
+semantic_complexity=simple
+
+"Nghị định A quy định gì về X?"
+work_type=explain
+domains=[document]
+capability_hints=[document.search]
+
+"CCCD của A xuất hiện trong nghị định nào?"
+work_type=cross_domain
+domains=[people, document]
+capability_hints=[people.lookup, document.search]
+dependency_hints=[people result required before document search]
+```
 
 Only `ComplexResearchGraph` creates the executable DAG containing task IDs, `depends_on`, capability names, document bindings, and completion criteria.
 
-The deterministic router owns `RouteDecision`:
+The deterministic router owns `RouteDecision`. It receives `SemanticContext`, `QueryAnalysis`, `DocumentBindingSet`, and `CapabilityRuntimeContext`:
 
 ```python
 class RouteDecision(BaseModel):
     contract_version: Literal["2.0"]
     route: Literal["direct", "clarify", "fast_domain", "complex_research"]
     reason_code: str
-    domain: str | None = None
+    domain: Literal[
+        "people", "document", "section", "write", "knowledge_graph",
+    ] | None = None
 ```
 
 Routing priority:
 
 1. Greeting or deterministic conversational direct response → direct.
 2. Essential ambiguity or unresolved required binding → clarify.
-3. Simple People lookup → permission gate and fast People path.
-4. Document metadata/listing → fast Document path.
-5. Exact section retrieval → fast Section path.
-6. Compare, cross-domain, multi-goal, dependent research, compliance, or unresolved evidence needs → complex research.
-7. Other bounded work → domain path and Answer Policy.
+3. One domain + bounded operation + no runtime dependency + no iterative evidence acquisition → prefer fast domain.
+4. Simple People lookup → fast People path after permission gate.
+5. Document metadata/listing or exact section retrieval → fast Document/Section path.
+6. Grammar check, suggest edits, format check, and rewrite/summarize supplied text → fast Write path.
+7. Bounded KG lookup → fast Knowledge Graph path.
+8. Multi-document independent research, cross-domain dependency, multi-evidence comparison, compliance/evaluation, multi-goal work, runtime task dependency, evidence-driven replanning, or hierarchical/map-reduce research → complex research.
+
+Routing follows **execution complexity, not linguistic complexity**. A linguistically deep explanation of one exact section may use fast Section retrieval followed by synthesis without a research DAG. A short People → Document question uses complex research because its execution topology has a runtime dependency. `semantic_complexity == "deep"` alone never selects complex research.
 
 ## 13. Task plan and capability contracts
 
 ### 13.1 Executable plan
 
 ```python
+class TargetUnit(BaseModel):
+    contract_version: Literal["2.0"]
+    target_id: str
+    binding_id: str
+    document_id: UUID
+    role: DocumentRole
+    requested_locator: ContentLocator
+    completion_criteria: tuple[str, ...]
+
 class TaskPlan(BaseModel):
     contract_version: Literal["2.0"]
     plan_id: str
     objective: str
+    target_units: tuple[TargetUnit, ...]
     tasks: tuple[TaskSpec, ...]
 
 class TaskSpec(BaseModel):
@@ -590,7 +712,7 @@ class TaskSpec(BaseModel):
     triggered_by_evidence_ids: tuple[str, ...] = ()
 ```
 
-Runtime validates task IDs, acyclic dependencies, capability allowlist, document roles, budgets, and scope before execution.
+Runtime validates unique `target_id` values, target-unit bindings/locators, task IDs, acyclic dependencies, capability allowlist, document roles, budgets, and scope before execution. Every `CoverageObservation.target_id`, `CoverageItem.target_id`, and bound `Evidence.target_id` must reference a declared `TaskPlan.target_units` entry.
 
 ### 13.2 Business task request
 
@@ -641,17 +763,29 @@ Status semantics are strict:
 
 Timeout and backend outage never become `not_found`.
 
+`AgentResult.status` describes the execution outcome of one declared capability/task operation. `EvidenceEvaluation.status` describes whether the accumulated evidence is sufficient for the user objective. They are independent: `AgentResult.status="success"` may coexist with `CoverageItem.status="read_partial"` and `EvidenceEvaluation.status="insufficient"`. `AgentResult.status="partial"` is reserved for a capability that completed only part of its own declared operation; it does not represent global answer completeness. Therefore `success != sufficient`.
+
 ## 14. Coverage by logical target unit
 
 Coverage is measured against required logical units, not only document UUIDs.
 
 ```python
+class ContentLocator(BaseModel):
+    contract_version: Literal["2.0"]
+    kind: Literal["document", "section", "article", "page_range", "chunk_range"]
+    heading_path: tuple[str, ...] = ()
+    article_id: str | None = None
+    page_start: int | None = None
+    page_end: int | None = None
+    chunk_start: str | None = None
+    chunk_end: str | None = None
+
 class CoverageObservation(BaseModel):
     contract_version: Literal["2.0"]
     target_id: str
     binding_id: str
     document_id: UUID
-    observed_range: str | None = None
+    observed_locators: tuple[ContentLocator, ...]
     outcome: Literal["resolved", "read", "missing", "unreadable", "truncated"]
 
 class CoverageItem(BaseModel):
@@ -659,10 +793,9 @@ class CoverageItem(BaseModel):
     target_id: str
     binding_id: str
     document_id: UUID
-    role: Literal["target", "reference", "supporting", "discovered"]
-    section_ref: str | None = None
-    requested_range: str | None = None
-    observed_range: str | None = None
+    role: DocumentRole
+    requested_locator: ContentLocator
+    observed_locators: tuple[ContentLocator, ...]
     status: Literal[
         "resolved", "read_complete", "read_partial",
         "missing", "unreadable", "truncated",
@@ -681,7 +814,7 @@ A target unit may represent:
 - an uploaded file;
 - a required reference range.
 
-Reading Chapter I of A cannot complete a requirement for Chapter II of A. A required unit is sufficient only when the requested range is read completely or the completion criteria explicitly allow partial coverage.
+Locators are validated by kind: page/chunk endpoints must be ordered, an article locator requires `article_id`, and a section locator requires a canonical heading path resolved against document structure. The evaluator computes containment/coverage from structured locators and document structure metadata. Reading Chapter I of A cannot complete a requirement for Chapter II of A; it deterministically produces `missing` for that requested locator. Reading only part of Chapter II produces `read_partial`. A required unit is sufficient only when the requested locator is completely covered or the completion criteria explicitly allow partial coverage.
 
 ## 15. Evidence contract
 
@@ -700,6 +833,7 @@ class Evidence(BaseModel):
     page_or_chunk: str | None
     content: str
     content_hash: str
+    source_identity: EvidenceSourceIdentity
     metadata: dict[str, Any]
     provenance: Provenance
 ```
@@ -709,7 +843,7 @@ Rules:
 - `source_type=document` requires verified `document_id` and `workspace_id`;
 - document evidence with role `target` or `reference` also requires `binding_id` and `target_id`, each matching a declared target unit;
 - `discovered`/`supporting` document evidence may omit `target_id` only when it is not attached to a required unit;
-- People, memory, and KG evidence may omit document fields but must carry source-specific identity in typed provenance/metadata;
+- People, memory, and KG evidence may omit document fields but must carry identity in the discriminated `EvidenceSourceIdentity` union; free-form `metadata` is supplemental and never authoritative for identity or authorization;
 - role, binding, task, document, and section provenance survive fan-out/fan-in;
 - synthesis never infers source identity from evidence text;
 - evidence from different documents is not deduplicated into one provenance record merely because content hashes match;
@@ -723,7 +857,7 @@ semantic objective + dependency hints
 → deterministic plan validation
 → dispatch ready tasks in parallel
 → call domain capabilities with AgentRequest + CapabilityRuntimeContext
-→ collect AgentResult + Evidence + Coverage
+→ collect AgentResult + Evidence + CoverageObservation
 → deterministic evidence checks
 → optional small-model semantic evidence evaluation
     ├── sufficient → synthesis
@@ -749,7 +883,7 @@ Plan rules:
 
 Validate:
 
-- every required target/reference unit is resolved and read at the requested range;
+- every required target/reference unit is resolved and read at the requested structured locator;
 - task completion criteria are satisfied;
 - evidence provenance and content hashes are valid;
 - citation references map to evidence;
@@ -777,7 +911,7 @@ Answer Policy—not the capability—decides between:
 - clarification;
 - insufficient-evidence fallback.
 
-Fast People, metadata/listing, and exact section retrieval may use deterministic rendering. Explain, compare, compliance, summarize, and cross-domain requests require synthesis.
+Fast People, metadata/listing, and exact section retrieval may use deterministic rendering. A fast path may still call synthesis—for example, exact Section retrieval followed by explanation—without invoking planner/evaluator/replanner. Compare, compliance, and cross-domain requests require synthesis after complex evidence collection.
 
 ### 17.4 Grounding
 
@@ -810,7 +944,7 @@ class ClarificationRequest(BaseModel):
         "semantic_ambiguity",
     ]
     question: str
-    unresolved_bindings: tuple[ScopedDocumentCandidate, ...]
+    unresolved_references: tuple[DocumentReference, ...]
     candidates: tuple[DocumentCandidate, ...]
     resumable: bool
     expires_at: datetime
@@ -830,10 +964,10 @@ The graph prefers LangGraph interrupt/resume. On resume:
 
 ### 19.1 Raw user message invariant
 
-V2 persists `request.message` unchanged before semantic preprocessing:
+V2 persists the raw ingress message unchanged before semantic preprocessing and assigns the same value to `RequestContext.original_query`:
 
 ```text
-request.message
+raw request.message / RequestContext.original_query
     ↓
 persist raw/original ChatMessage.content
     ↓
@@ -1014,6 +1148,91 @@ many sources exist, but required section is missing
 → no complete synthesis
 ```
 
+### 21.13 Simple Write
+
+```text
+"Kiểm tra chính tả đoạn này"
+→ work_type=evaluate, domains=[write]
+→ fast Write path
+```
+
+### 21.14 Write with document dependency
+
+```text
+"Dựa vào Nghị định A, sửa nội dung file F1"
+→ required reference A + required target F1
+→ document evidence → write dependency
+→ complex research
+```
+
+### 21.15 Simple Knowledge Graph
+
+```text
+"A thuộc đơn vị nào?"
+→ bounded KG lookup
+→ fast Knowledge Graph path
+```
+
+### 21.16 KG with document dependency
+
+```text
+"So sánh quan hệ của A trong KG với quy định tại B"
+→ KG + Document dependency
+→ complex research
+```
+
+### 21.17 Irrelevant attachments
+
+```text
+attach A/B; ask a generic question
+→ A/B remain contextual candidates
+→ no automatic required binding
+```
+
+### 21.18 Unresolved named documents
+
+```text
+"So sánh Nghị định A và B"
+→ RequestContext contains no fabricated UUIDs
+→ semantic extraction creates DocumentReference entries
+→ Binding resolver creates bindings or clarification
+```
+
+### 21.19 Wrong-section coverage
+
+```text
+request Chapter II; worker reads Chapter I
+→ structured locator mismatch
+→ CoverageItem.status=missing
+→ EvidenceEvaluation.status=insufficient
+```
+
+### 21.20 Partial-section coverage
+
+```text
+request Chapter II; only half is read
+→ CoverageItem.status=read_partial
+→ EvidenceEvaluation.status=insufficient unless criteria explicitly allow partial
+```
+
+### 21.21 Discovered-reference promotion
+
+```text
+discover binding B1 for C
+→ planner emits BindingPromotionRequest
+→ Binding resolver validates and appends immutable B2 role=reference, required=true
+→ B2.derived_from_binding_id=B1
+→ B2.binding_reason recorded
+```
+
+### 21.22 Execution success with insufficient evidence
+
+```text
+AgentResult.status=success
++ CoverageItem.status=read_partial
+→ EvidenceEvaluation.status=insufficient
+```
+
 ## 22. Explicit invariants
 
 1. `original_query` and raw persisted user content are immutable.
@@ -1036,6 +1255,14 @@ many sources exist, but required section is missing
 18. Capabilities receive trusted scope only through `CapabilityRuntimeContext`.
 19. Evidence deduplication never destroys source/task/document provenance.
 20. Query analysis provides hints; only `ComplexResearchGraph` owns executable planning.
+21. Text-named documents do not require resolved UUIDs in `RequestContext`; only the Binding resolver creates their bindings.
+22. Attachments are contextual candidates and never become required bindings automatically.
+23. Coverage completion is computed from structured `ContentLocator` values, not opaque range text or document identity alone.
+24. `AgentResult.success` does not imply `EvidenceEvaluation.sufficient`.
+25. Discovered-document promotion is requested by the planner but validated/appended only by the Binding resolver; it creates a new immutable binding with lineage and never mutates the original binding.
+26. Routing follows execution topology, not `semantic_complexity` alone.
+27. One bounded domain operation without runtime dependency or iterative acquisition prefers a fast path.
+28. Business boundary contracts are immutable by default.
 
 ## 23. Supporting boundary contracts
 
@@ -1055,6 +1282,46 @@ class EvidenceEvaluation(BaseModel):
     missing: tuple[MissingRequirement, ...]
     contradictions: tuple[str, ...]
     suggested_research: tuple[str, ...]
+
+class DocumentSourceIdentity(BaseModel):
+    kind: Literal["document"]
+    document_id: UUID
+    workspace_id: UUID
+
+class PeopleSourceIdentity(BaseModel):
+    kind: Literal["people"]
+    record_id: str
+
+class KnowledgeGraphSourceIdentity(BaseModel):
+    kind: Literal["knowledge_graph"]
+    entity_or_relation_id: str
+
+class MemorySourceIdentity(BaseModel):
+    kind: Literal["memory"]
+    memory_id: str
+
+EvidenceSourceIdentity = Annotated[
+    DocumentSourceIdentity | PeopleSourceIdentity |
+    KnowledgeGraphSourceIdentity | MemorySourceIdentity,
+    Field(discriminator="kind"),
+]
+
+class BindingPromotionRequest(BaseModel):
+    contract_version: Literal["2.0"]
+    source_binding_id: str
+    requested_role: Literal["target", "reference", "supporting"]
+    required: bool
+    binding_reason: str
+    triggered_by_task_ids: tuple[str, ...]
+    triggered_by_evidence_ids: tuple[str, ...]
+
+class DocumentCandidate(BaseModel):
+    contract_version: Literal["2.0"]
+    ref_id: str
+    document_id: UUID
+    label: str
+    match_basis: str
+    confidence: float
 
 class Provenance(BaseModel):
     contract_version: Literal["2.0"]
@@ -1119,7 +1386,7 @@ Compile and test each subgraph independently for:
 
 ### 24.3 End-to-end tests
 
-The twelve flows in Section 21 are mandatory acceptance scenarios.
+All twenty-two flows in Section 21 are mandatory acceptance scenarios.
 
 ### 24.4 Benchmarks
 
@@ -1168,11 +1435,11 @@ Do not rewrite business services in one step.
 - produce a recorded architecture decision selecting the initial implementation;
 - keep all spike code isolated and non-production.
 
-This bounded spike is explicitly exempt from the no-runtime gate only as disposable evaluation code. No production graph composition begins until the architecture decision is approved and this spec is promoted to **Approved design**.
+This bounded spike produces the architecture decision required before Phase 3 complex-orchestrator implementation. The contract and behavior design may be promoted to **Approved design** while the implementation choice remains open; approval does not imply selection of native LangGraph or a Deep Agents adapter.
 
 ### Phase 1 — Contracts, context semantics, and adapters
 
-- define v2 contracts;
+- define v2 contracts, structured content locators, and document-binding lifecycle;
 - add v1-to-v2 semantic adapters;
 - preserve raw ingress content;
 - define versioned semantic snapshot reads/writes;
@@ -1181,7 +1448,7 @@ This bounded spike is explicitly exempt from the no-runtime gate only as disposa
 ### Phase 2 — Supervisor v2 composition and fast paths
 
 - build `supervisor_v2.py` composition;
-- integrate Context, Routing, People, Document, and Section subgraphs;
+- integrate Context, Binding Resolution, Routing, People, Document, Section, Write, and bounded KG subgraphs;
 - use existing services through capability adapters;
 - establish fast-path latency baselines and gates.
 
@@ -1225,17 +1492,19 @@ The selector lives outside `supervisor.py` and `supervisor_v2.py`. Architecture-
 
 ## 28. Open decisions and approval gate
 
-This revision is **Review / Proposed**, not implementation-approved, because the following decision remains open:
+This revision remains **Review / Proposed** until reviewers confirm that the unresolved-reference lifecycle and structured target-unit locator blockers, plus the listed HIGH issues, are resolved. It may then be promoted to **Approved design** without selecting the complex-orchestrator framework.
 
-1. `ComplexResearchGraph` implementation: native LangGraph, Deep Agents adapter, or another conforming orchestrator. Resolve through a bounded compatibility/benchmark spike before implementation selection.
+The following implementation decision intentionally remains open for the Phase 0 compatibility/benchmark spike:
+
+1. `ComplexResearchGraph` implementation: native LangGraph, Deep Agents adapter, or another conforming orchestrator.
 
 The following design choices are fixed by this revision:
 
-- role-based `ScopedDocument` bindings for target/reference/supporting/discovered semantics;
+- role-based `ScopedDocument` bindings plus `DocumentReference → DocumentBindingSet` lifecycle;
 - conditional, not mandatory, small semantic-model execution;
 - QueryAnalysis as semantic hints rather than an executable planner;
 - typed `CapabilityRuntimeContext` separate from `AgentRequest`;
-- target-unit/range-level coverage;
+- target-unit coverage with structured `ContentLocator`;
 - Answer Policy outside `AgentResult`.
 
-No runtime code should be implemented merely to match this spec until the open orchestrator decision is reviewed and the status is explicitly promoted to **Approved design**.
+No production runtime code should be implemented merely to match this revision until reviewers explicitly promote its status to **Approved design**. After promotion, Phase 1/2 contract, adapter, and fast-path work may proceed; Phase 3 complex-orchestrator implementation additionally requires the Phase 0 architecture decision.
