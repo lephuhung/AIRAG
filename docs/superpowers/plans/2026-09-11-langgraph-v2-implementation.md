@@ -72,9 +72,9 @@
 | Phase 1D | frozen contract, EvidenceRecord/Use, ACL/retention/audit, checkpointer DSN and adapters pass | agent/tool/node amendment + `supervisor_v2.py` |
 | Agent/tool/node amendment | no v2 domain/use-case agents; fast/complex share one capability implementation; complex planner receives only request-scoped authorized tool catalog | Phase 2 execution implementation |
 | Phase 2 | all four evaluation statuses, blocking ambiguity finalization, checkpoint/resume, SSE/API parity, v1 default, taxonomy tests pass | complex pilots |
-| Golden A/B preflight | functional and quality comparison only; no 24-hour claim | shadow/canary |
+| Golden A/B preflight | functional comparison plus a shared-evaluator quality comparison (same evaluator version on both arms); no 24-hour claim | shadow/canary |
 | Shadow | separately compiled graph + isolated saver, zero production checkpoint/evidence/audit/chat/memory/title/event writes | canary |
-| Live canary | metrics-table reports, ≥200 completed samples per arm, ≥24 continuous hours, zero security violations, latency/error/quality/cancellation gates | percentage promotion |
+| Live canary | metrics-table reports, ≥200 completed samples per arm, ≥24 continuous hours, zero security violations, latency/error/cancellation gates (no quality field; quality is gated in the shared-evaluator preflight) | percentage promotion |
 
 ## Prohibited Sequencing
 
@@ -99,6 +99,7 @@
 19. Sharing one GC eligibility predicate between evidence retention and revision artifacts — evidence expiry must never by itself make revision artifacts deletable, and artifact reclamation must never delete evidence rows.
 20. Resuming a terminal-`failed` revision in place, or retrying without allocating a new generation — retries must be bounded, produce `retry_of_revision_id` provenance, and a failed revision stays immutable.
 21. Deriving `source_object_identity` from a user filename, client header, or otherwise non-canonical key — it must be `bucket + verbatim storage object key + version_id/etag + size + streamed sha256`, with a multipart etag never treated as a content hash.
+22. Comparing a v2-internal grounded/total ratio across arms as a live quality gate (tautological and lacking a v1 counterpart) — quality must be measured by a shared evaluator on both arms in the golden preflight, and the live gate must carry no quality field.
 18. Recreating v1-style People/RAG/Summary/Comparison domain agents inside v2 instead of nodes + shared capabilities/tools + task skills.
 19. Giving the model control of workspace IDs, People permission, ACL, deadlines, service clients, or capability-registry construction.
 20. Implementing separate fast-path and complex-agent business logic for the same capability.
@@ -122,6 +123,7 @@ The suite is ready to execute only when the revised plans prove:
 | 11 | Every schema migration is deployed before code requiring that version | Phase 1 A/B/C/D releases and Phase 3 Task 6 1→2 two-release discipline |
 | 12 | Failed ingestion has explicit, bounded retry semantics | Phase 1 `test_failed_revision_is_terminal_and_immutable`, `test_queue_redelivery_of_failed_revision_is_noop`, `test_retry_after_failure_allocates_new_generation`, `test_retry_is_bounded_and_exhausts` |
 | 13 | `source_object_identity` is canonical and stable across triggers | Phase 1 `test_source_object_identity_is_canonical`, `test_multipart_etag_is_not_a_content_hash`, `test_overwrite_same_key_changes_identity_and_creates_new_attempt`, `test_duplicate_webhook_arrival_is_idempotent`, `test_build_profile_resolution_is_deterministic` |
+| 14 | Live quality comparison is not tautological and is shared-evaluator gated | Phase 3 Task 6 excludes any quality field from live metrics; Task 1 shared evaluator + `v2-evaluator-version-fail.json` schema rejection |
 | 12 | v2 domain/use-case ownership is normalized to nodes + shared capabilities/tools + skills | Agent/tool/node amendment acceptance gate |
 | 13 | Fast and complex paths use the same capability implementation and runtime authorization boundary | Amendment tests + Phase 2/3 integration tests |
 | 14 | Summary and comparison are task strategies, not independent agents | `test_bounded_summary_is_read_plus_synthesis_not_summary_agent`, `test_compare_is_skill_not_subagent_route` |

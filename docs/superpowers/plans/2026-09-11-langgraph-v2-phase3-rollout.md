@@ -128,7 +128,7 @@ async def run_session_sse(client: httpx.AsyncClient, base_url: str, token: str, 
     return SessionRun(graph_version, terminal.name, terminal.content, terminal.citation_count, (time.perf_counter() - started) * 1000)
 ```
 
-Define `read_sse` and `require_single_terminal` in the same script.
+Define `read_sse` and `require_single_terminal` in the same script. Define `score_quality(runs, evaluator_version)` used identically for both arms, and record `evaluator_version` in every preflight report; a preflight quality comparison is valid only when both arms carry the same `evaluator_version`.
 
 - [ ] **Step 4: Add replay/A-B commands and run tests**
 
@@ -138,7 +138,7 @@ make ab ARM=v1 QUERIES=tests/retrieval/datasets/golden_retrieval.yaml WORKSPACE=
 make ab ARM=v2 QUERIES=tests/retrieval/datasets/golden_retrieval.yaml WORKSPACE=$WORKSPACE
 ```
 
-Expected: tests pass; commands produce comparable functional/quality JSON. This preflight has no 24-hour or live sample-count threshold and cannot promote a canary.
+Expected: tests pass; commands produce comparable functional JSON plus a quality comparison from the **shared evaluator** — the same evaluator implementation and version run over both arms on the golden dataset. This preflight has no 24-hour or live sample-count threshold and cannot promote a canary; it is the only place quality is compared, precisely because it is the only place both arms share one evaluator.
 
 - [ ] **Step 5: Commit before complex implementation**
 
@@ -391,7 +391,7 @@ git commit -m "feat: add side effect free v2 shadowing"
 - Create: `backend/tests/fixtures/rollout/v2-latency-fail.json`
 - Create: `backend/tests/fixtures/rollout/v2-error-rate-fail.json`
 - Create: `backend/tests/fixtures/rollout/v2-cancellation-fail.json`
-- Create: `backend/tests/fixtures/rollout/v2-quality-fail.json`
+- Create: `backend/tests/fixtures/rollout/v2-evaluator-version-fail.json`
 - Create: `backend/tests/fixtures/rollout/v2-window-fail.json`
 - Create: `backend/scripts/collect_v2_rollout_report.py`
 - Create: `backend/scripts/check_v2_rollout_gate.py`
@@ -414,7 +414,7 @@ impact({target: "app.services.agent.streaming.stream_agent_events", direction: "
 
 - [ ] **Step 2: Write deterministic selection tests**
 
-Create config defaults before constructing tests. Test DB `enabled=false` forces v1 even when environment allows v2; control row is read on every request (no process-local stale cache); explicit evaluation override requires admin; workspace allowlist precedes percentage; stable bucketing; percentage 0/100; ordinary headers ignored; v2 schema incompatibility forces v1/error before graph creation. Test session, direct SSE, Telegram, shadow, and admin-evaluation v2 starts all call `ActiveRunRegistry.register(run_id, cancellation_token)` before graph invocation and unregister in `finally`; Redis disable messages set the same token in every worker; scheduler checks it immediately before every capability dispatch; cancellation rolls back retractable output and cannot emit success. Metric tests insert terminal observations and generate deterministic arm reports matching the fixture schema. Add `test_canary_metric_producers_fire`: injecting an ACL leak, a duplicate production write, a leaked checkpoint secret field, and an ungrounded factual success each makes the corresponding counter ≥ 1, proving producers are authoritative rather than defaulted. The live checker rejects golden/preflight report schemas even when their counts are large; only reports aggregated from `agent_rollout_metrics` with continuous window metadata are eligible.
+Create config defaults before constructing tests. Test DB `enabled=false` forces v1 even when environment allows v2; control row is read on every request (no process-local stale cache); explicit evaluation override requires admin; workspace allowlist precedes percentage; stable bucketing; percentage 0/100; ordinary headers ignored; v2 schema incompatibility forces v1/error before graph creation. Test session, direct SSE, Telegram, shadow, and admin-evaluation v2 starts all call `ActiveRunRegistry.register(run_id, cancellation_token)` before graph invocation and unregister in `finally`; Redis disable messages set the same token in every worker; scheduler checks it immediately before every capability dispatch; cancellation rolls back retractable output and cannot emit success. Metric tests insert terminal observations and generate deterministic arm reports matching the fixture schema. Add `test_canary_metric_producers_fire`: injecting an ACL leak, a duplicate production write, a leaked checkpoint secret field, and an ungrounded factual success each makes the corresponding counter ≥ 1, proving producers are authoritative rather than defaulted. The live checker rejects golden/preflight report schemas even when their counts are large; only reports aggregated from `agent_rollout_metrics` with continuous window metadata are eligible. Live reports carry no quality metric: quality is compared only in the golden preflight by the shared evaluator, and the checker rejects any live report that contains a quality or evaluator field (including a preflight report passed by mistake).
 
 ```bash
 cd backend && pytest tests/api/test_agent_canary_selection.py -q
@@ -436,17 +436,16 @@ Environment values are bootstrap ceilings only. Add a singleton `agent_rollout_c
 
 - [ ] **Step 4: Implement the concrete metric collector, report schema, and rollback wiring**
 
-`RolloutMetricsCollector.record_terminal()` writes one row keyed by run ID with arm, hashed request/workspace IDs, started/completed timestamps, terminal status, latency_ms, grounded-quality score, citation count, cancellation requested/succeeded flags, and four security-violation counts (`acl_leak`, `duplicate_production_write`, `checkpoint_secret`, `ungrounded_factual_success`). It stores no query/answer/auth token. Every metric has an authoritative producer and is written explicitly at terminal emission. The four security-violation counters and all scalar fields are non-null, and a missing/default value is a validation error, never treated as secure. `grounded_quality` is nullable by design: it is set only when the terminal performed a `sufficient` evaluation and is `NULL` (with `quality_evaluated=false`) otherwise; the report computes arm means over the evaluated subset only, so the quality gate never compares across different status mixes:
+`RolloutMetricsCollector.record_terminal()` writes one row keyed by run ID with arm, hashed request/workspace IDs, started/completed timestamps, terminal status, latency_ms, citation count, cancellation requested/succeeded flags, and four security-violation counts (`acl_leak`, `duplicate_production_write`, `checkpoint_secret`, `ungrounded_factual_success`). It stores no query/answer/auth token. Every metric has an authoritative producer and is written explicitly at terminal emission; all counters and scalar fields are non-null, and a missing/default value is a validation error, never treated as secure. There is deliberately **no** `grounded_quality` field: within v2 a successful terminal already requires every material factual claim to be grounded, so a grounded/total ratio is a tautology near 1.0, and v1 has no comparable counterpart — comparing it across arms would be meaningless. The v2 grounding invariant is instead enforced as the `ungrounded_factual_success` correctness counter (must be 0), and user-visible quality is compared only in the golden A/B preflight with the shared evaluator:
 
 ```text
 checkpoint_secret          -> deterministic checkpoint serialization scanner (rejects ACL/identity/deadline/secret fields in serialized state)
-ungrounded_factual_success -> finalizer grounding invariant (success requires every material factual claim bound to an admitted EvidenceUse)
+ungrounded_factual_success -> finalizer grounding invariant (success requires every material factual claim bound to an admitted EvidenceUse); counted as a correctness violation, never used as a quality score
 acl_leak                   -> current-ACL hydration/grounding violation detector
 duplicate_production_write -> idempotency/audit mutation detector (ON CONFLICT no-op vs. second durable side effect)
-grounded_quality           -> deterministic finalizer score = admitted grounded material claims / material factual claims, emitted only for sufficient evaluations
 ```
 
-`collect_v2_rollout_report.py --arm v1|v2 --since ... --until ... --output ...` aggregates this table into versioned JSON containing arm, window bounds/hours, completed sample count, error rate, p50/p95, mean grounded quality, cancellation count/failure rate, and each security-violation count. Unit tests compare exact output with committed v1/v2 pass fixtures and security, latency, error-rate, cancellation, quality, and sample/window failure fixtures.
+`collect_v2_rollout_report.py --arm v1|v2 --since ... --until ... --output ...` aggregates this table into versioned JSON containing arm, window bounds/hours, completed sample count, error rate, p50/p95, cancellation count/failure rate, and each security-violation count — no quality field. Unit tests compare exact output with committed v1/v2 pass fixtures and security, latency, error-rate, cancellation, and sample/window failure fixtures; `v2-evaluator-version-fail.json` proves a report carrying a quality/evaluator field is rejected as a non-live schema.
 
 `ActiveRunRegistry` uses Redis sets `agent:v2:active:{worker_id}` plus pub/sub `agent:v2:cancel`; every v2 ingress registers its run/token before invoking streaming/graph code and unregisters in `finally`. The process listener maps each run ID to its local token. The disable endpoint commits `enabled=false` and incremented revision, enumerates active sets, and publishes each run ID; `stream_agent_events` converts token cancellation to rollback/cancelled terminal output, and `TaskScheduler` checks immediately before each dispatch. New requests select v1; cancelled runs never report success.
 
@@ -457,7 +456,7 @@ python scripts/collect_v2_rollout_report.py --arm v2 --since "$SINCE" --until "$
 python scripts/check_v2_rollout_gate.py --v1 tests/reports/v1-canary.json --v2 tests/reports/v2-canary.json --min-samples 200 --min-window-hours 24 --require-zero-security-violations
 ```
 
-The checker fails on any security count, missing/wrong arm or schema version, window mismatch, fewer than 200 completed requests per arm, under 24 continuous hours, v2 error-rate regression over 1 percentage point, p95 regression over 15%, cancellation failure over 0.1%, or grounded-quality loss over 2 percentage points. Fixture tests prove pass plus each failure exit code.
+The checker fails on any security count, missing/wrong arm or schema version, window mismatch, fewer than 200 completed requests per arm, under 24 continuous hours, v2 error-rate regression over 1 percentage point, p95 regression over 15%, or cancellation failure over 0.1%. Quality is out of scope for this checker by construction: a quality regression can only be detected by the shared-evaluator golden preflight, and any attempt to pass a preflight report to the live checker is rejected by schema. Fixture tests prove pass plus each failure exit code.
 
 - [ ] **Step 5: Run and commit**
 
@@ -501,7 +500,7 @@ Expected: first command finds no active stale guidance after edits; second finds
 
 - [ ] **Step 2: Execute golden preflight, then the separate live rollout gate**
 
-Golden preflight compares functionality/quality only:
+Golden preflight compares functionality/quality only, both computed by the same shared evaluator for both arms:
 
 ```bash
 make ab ARM=v1 QUERIES=tests/retrieval/datasets/golden_retrieval.yaml WORKSPACE=$WORKSPACE OUTPUT=backend/tests/reports/v1-preflight.json
@@ -517,7 +516,7 @@ python backend/scripts/collect_v2_rollout_report.py --arm v2 --since "$SINCE" --
 python backend/scripts/check_v2_rollout_gate.py --v1 backend/tests/reports/v1-live-canary.json --v2 backend/tests/reports/v2-live-canary.json --min-samples 200 --min-window-hours 24 --require-zero-security-violations
 ```
 
-Batch A/B JSON is never accepted by the live checker. Any failure calls the admin disable endpoint, verifies control revision changed, new requests select v1, and active v2 runs are cancelled without success.
+Batch A/B JSON is never accepted by the live checker, and the live gate never compares quality. Any failure calls the admin disable endpoint, verifies control revision changed, new requests select v1, and active v2 runs are cancelled without success.
 
 - [ ] **Step 3: Run final validation**
 
