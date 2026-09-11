@@ -99,7 +99,7 @@ Run `cd backend && pytest tests/migrations/v2/test_populated_legacy_migration.py
 
 - [ ] **Step 2: Implement the locked migration in exact safe order**
 
-`apply_v2_schema` uses SQLAlchemy text/DDL only, takes `pg_advisory_xact_lock`, and never imports `app.models` or calls `Base.metadata.create_all`. In one transaction it: (1) creates version/revision/build/structure tables, including implementation-only metadata: `document_revisions.generation BIGINT` (per-document monotonic allocation counter, unique per document), `revision_ingestion_attempts` with unique `(document_id, source_object_identity, build_profile)`, revision build manifest columns (`embedding_namespace`, `embedding_model_hash`, `embedding_dimension`, `vector_artifact_version`), and evidence encryption metadata columns (`ciphertext`, `encryption_key_id`, `nonce`, `encryption_algorithm`); (2) adds nullable `documents.current_revision_id`, `documents.source_deleted_at TIMESTAMPTZ NULL` (plus a partial index for tombstone lookup), `document_images.revision_id`, and `document_tables.revision_id`; (3) installs foreign keys and revision uniqueness without imposing NOT NULL on legacy child rows, and verifies that cascading deletes from `documents` cannot orphan or destroy `document_revisions`, retained evidence lineage, or revision artifacts; (4) installs DB constraints/triggers requiring revision IDs for rows written through the revision-owned pipeline; (5) verifies existing row counts/checksums are unchanged; and (6) writes schema version 1. Legacy rows stay v1-only and cannot be selected by v2. A full revision-aware reindex later creates new revision-owned child rows and atomically sets `current_revision_id`.
+`apply_v2_schema` uses SQLAlchemy text/DDL only, takes `pg_advisory_xact_lock`, and never imports `app.models` or calls `Base.metadata.create_all`. In one transaction it: (1) creates version/revision/build/structure tables, including implementation-only metadata: `document_revisions.generation BIGINT` (per-document monotonic allocation counter, unique per document), `revision_ingestion_attempts` with unique constraint `uq_revision_ingestion_attempt_key` on `(document_id, source_object_identity, build_profile)` (the `ON CONFLICT` arbiter, not a read-then-write check), revision build manifest columns (`embedding_namespace`, `embedding_model_hash`, `embedding_dimension`, `vector_artifact_version`), and evidence encryption metadata columns (`ciphertext`, `encryption_key_id`, `nonce`, `encryption_algorithm`); (2) adds nullable `documents.current_revision_id`, `documents.source_deleted_at TIMESTAMPTZ NULL` (plus a partial index for tombstone lookup), `document_images.revision_id`, and `document_tables.revision_id`; (3) installs foreign keys and revision uniqueness without imposing NOT NULL on legacy child rows, and verifies that cascading deletes from `documents` cannot orphan or destroy `document_revisions`, retained evidence lineage, or revision artifacts; (4) installs DB constraints/triggers requiring revision IDs for rows written through the revision-owned pipeline; (5) verifies existing row counts/checksums are unchanged; and (6) writes schema version 1. Legacy rows stay v1-only and cannot be selected by v2. A full revision-aware reindex later creates new revision-owned child rows and atomically sets `current_revision_id`.
 
 - [ ] **Step 3: Prove no startup metadata registration exists yet**
 
@@ -185,35 +185,73 @@ Deploy only after Release 1B readiness passes. From this release onward every wo
 
 - [ ] **Step 1: Write lifecycle tests**
 
-Test `allocate → revision-owned build → verify → publish`, profile-specific required artifacts, publish transaction updating `Document.current_revision_id`, immutable published columns, failed draft leaving prior current revision unchanged, and tombstone lookup. Assert R2 does not inherit R1 worker completion. `FULL` requires markdown+structure+vectors and configured caption/KG results; `CHAT_UPLOAD` requires markdown+structure+vectors and records caption/KG as intentionally skipped; `PARSE_ONLY` requires markdown+structure and records vector/caption/KG as intentionally skipped. Skips are not failures. Add monotonic/idempotency/manifest tests: `test_concurrent_revision_publish_does_not_regress_current` (allocate R2 then R3; publish R3 first, then R2; current stays R3 while R2 remains a historical published revision), `test_get_or_create_ingestion_attempt_is_idempotent` (same document/source/profile returns one revision), and `test_record_artifacts_persists_embedding_manifest` (the build manifest records namespace/model hash/dimension/vector artifact version).
+Test `allocate → revision-owned build → verify → publish`, profile-specific required artifacts, publish transaction updating `Document.current_revision_id`, immutable published columns, failed draft leaving prior current revision unchanged, and tombstone lookup. Assert R2 does not inherit R1 worker completion. `FULL` requires markdown+structure+vectors and configured caption/KG results; `CHAT_UPLOAD` requires markdown+structure+vectors and records caption/KG as intentionally skipped; `PARSE_ONLY` requires markdown+structure and records vector/caption/KG as intentionally skipped. Skips are not failures. Add monotonic/idempotency/manifest tests: `test_concurrent_revision_publish_does_not_regress_current` (allocate R2 then R3; publish R3 first, then R2; current stays R3 while R2 remains a historical published revision), `test_get_or_create_ingestion_attempt_is_idempotent` (same document/source/profile returns one revision), `test_concurrent_get_or_create_ingestion_attempt_is_atomic` (two concurrent sessions racing the same attempt key while neither sees an uncommitted row: exactly one `revision_ingestion_attempts` row, exactly one draft revision, both callers receive the same `revision_id`, no unhandled `UniqueViolation`, and the loser's savepoint leaves no orphan revision or advanced generation), and `test_record_artifacts_persists_embedding_manifest` (the build manifest records namespace/model hash/dimension/vector artifact version).
 
 - [ ] **Step 2: Implement explicit lifecycle**
 
 ```python
+class AttemptAlreadyClaimed(Exception):
+    """Sentinel: another transaction owns this ingest event's attempt key."""
+
 async def get_or_create_ingestion_attempt(
     self, document_id: UUID, source_object_identity: str, build_profile: RevisionBuildProfile
 ) -> tuple[DocumentRevision, bool]:
-    """Idempotent: one draft revision per (document, source object, profile)."""
-    attempt = await self.get_attempt_for_update(document_id, source_object_identity, build_profile)
-    if attempt is not None:
-        return await self.get(attempt.revision_id), False
-    generation = await self.next_generation(document_id)  # document row FOR UPDATE + MAX(generation)+1
-    revision = DocumentRevision(
-        document_id=document_id,
-        generation=generation,
-        state="draft",
-        build_profile=build_profile,
-        source_object_identity=source_object_identity,
-    )
-    self.session.add(revision)
-    self.session.add(DocumentIngestionAttempt(
-        document_id=document_id,
-        source_object_identity=source_object_identity,
-        build_profile=build_profile,
-        revision_id=revision.revision_id,
-    ))
-    await self.session.flush()
-    return revision, True
+    """Idempotent: one draft revision per (document, source object, profile).
+
+    A read-then-insert races when two transactions both miss an uncommitted row,
+    so the unique index is the arbiter, not a SELECT. We also serialize per
+    document so generation allocation stays monotonic.
+    """
+    # 1. Serialize per document BEFORE allocating a generation. Whoever holds the
+    #    document row lock runs to commit first; the other waits and then sees the
+    #    winner's committed attempt row in READ COMMITTED.
+    await self.lock_document_for_update(document_id)  # SELECT ... FOR UPDATE on documents
+
+    # 2. Build the candidate revision inside a savepoint so a lost race leaves no orphan.
+    revision: DocumentRevision
+    try:
+        async with self.session.begin_nested():
+            generation = await self.next_generation(document_id)  # MAX(generation)+1 under the lock
+            revision = DocumentRevision(
+                document_id=document_id,
+                generation=generation,
+                state="draft",
+                build_profile=build_profile,
+                source_object_identity=source_object_identity,
+            )
+            self.session.add(revision)
+            await self.session.flush()
+
+            # 3. Atomic claim. DO NOTHING means a concurrent writer already owns this key.
+            claimed = (await self.session.execute(
+                pg_insert(DocumentIngestionAttempt)
+                .values(
+                    document_id=document_id,
+                    source_object_identity=source_object_identity,
+                    build_profile=build_profile,
+                    revision_id=revision.revision_id,
+                )
+                .on_conflict_do_nothing(constraint="uq_revision_ingestion_attempt_key")
+                .returning(DocumentIngestionAttempt.revision_id)
+            )).scalar_one_or_none()
+            if claimed is None:
+                raise AttemptAlreadyClaimed  # rolls back this savepoint, discarding the draft
+    except AttemptAlreadyClaimed:
+        pass
+    else:
+        return revision, True
+
+    # 4. Lost the race: read the committed winner. This is safe under READ COMMITTED
+    #    because the conflicting insert has already committed and the document lock
+    #    prevents a second winner.
+    winner = (await self.session.execute(
+        select(DocumentIngestionAttempt.revision_id).where(
+            DocumentIngestionAttempt.document_id == document_id,
+            DocumentIngestionAttempt.source_object_identity == source_object_identity,
+            DocumentIngestionAttempt.build_profile == build_profile,
+        )
+    )).scalar_one()
+    return await self.get(winner), False
 
 async def publish(self, revision_id: UUID) -> DocumentRevision:
     revision = await self.get_for_update(revision_id)
@@ -230,7 +268,7 @@ async def publish(self, revision_id: UUID) -> DocumentRevision:
     return revision
 ```
 
-The DB-level guard for multi-process safety is a conditional update, not read-then-write: `UPDATE documents SET current_revision_id = :rid WHERE document_id = :did AND (current_revision_id IS NULL OR :generation > (SELECT generation FROM document_revisions WHERE revision_id = documents.current_revision_id))`; the loser stays `published` but historical. `record_artifacts` persists the build manifest (embedding namespace, model identity/hash, dimension, vector artifact version) so later retrieval never guesses its embedding location from current configuration. `DocumentRevision` plus revision-build rows are authoritative for processing state, `embed_done`, `captions_done`, `kg_done`, raw chunk/build manifest, markdown artifact identity, artifact verification, failures, and publication. `Document` may mirror current status for v1/UI only. `verify_draft` consults the immutable profile selected at allocation and checks exactly its required artifacts before transitioning to verified; no worker reads Document completion flags to skip work.
+The DB-level guard for multi-process safety is a conditional update, not read-then-write: `UPDATE documents SET current_revision_id = :rid WHERE document_id = :did AND (current_revision_id IS NULL OR :generation > (SELECT generation FROM document_revisions WHERE revision_id = documents.current_revision_id))`; the loser stays `published` but historical. `lock_document_for_update` raises `DocumentNotFound` when the row is absent, so an attempt can never be created for a nonexistent document. `record_artifacts` persists the build manifest (embedding namespace, model identity/hash, dimension, vector artifact version) so later retrieval never guesses its embedding location from current configuration. `DocumentRevision` plus revision-build rows are authoritative for processing state, `embed_done`, `captions_done`, `kg_done`, raw chunk/build manifest, markdown artifact identity, artifact verification, failures, and publication. `Document` may mirror current status for v1/UI only. `verify_draft` consults the immutable profile selected at allocation and checks exactly its required artifacts before transitioning to verified; no worker reads Document completion flags to skip work.
 
 - [ ] **Step 3: Test and commit**
 
@@ -290,7 +328,7 @@ Discover every message constructor and make the test fail if an unclassified cal
 
 - [ ] **Step 3: Implement allocation and propagation**
 
-All four message models require `revision_id: UUID` with no default. Producers publish only a revision returned by the lifecycle: **direct upload**, **presigned confirm**, and **chat upload** call `get_or_create_ingestion_attempt(document_id, source_object_identity, build_profile)`; **explicit reindex** is not an idempotent redelivery and calls `allocate_draft(...)` directly to create a new monotonic generation even when `upload_s3_key` is unchanged, recording `reindex_of_revision_id`; **queue retry/redelivery** never re-allocates and reuses the `revision_id` already in the message. Trigger ownership is explicit: for **presigned upload**, the MinIO `ObjectCreated` webhook records object arrival only and `/confirm` is authoritative — it validates, hashes/dedups by `(document_id, source_object_identity, build_profile)`, selects the profile, get-or-creates the revision, and publishes parse; for **chat upload** the `chat_file_<document_id>` object is normalized to the same attempt key with `CHAT_UPLOAD`, and webhook matching must recognize both `doc_<document_id>` and `chat_file_<document_id>` shapes. Redelivery of the same ingest event (duplicate webhook, `/confirm` racing its webhook, retried API call) is a no-op returning the existing revision. Workers load exactly that revision/build record, scope image/table/chunk replacement to `(document_id, revision_id)`, publish child messages with the same UUID, and update only revision-owned completion/failure state. They never query `Document.embed_done`, `captions_done`, `kg_done`, `raw_chunks_json`, `markdown_s3_key`, or status to decide revision execution. Finalization executes `record_artifacts → profile-aware verify_draft → publish`; failures mark only that draft failed. `_clone_document_to_workspace` never copies markdown/vectors or sets Document completion flags: it allocates a target-workspace revision, records explicit `cloned_from_revision_id` provenance, and runs the revision-aware build (reusing raw content/hash only), so the target binding revision is never another workspace's revision identity.
+All four message models require `revision_id: UUID` with no default. Producers publish only a revision returned by the lifecycle: **direct upload**, **presigned confirm**, and **chat upload** call the lock-then-upsert `get_or_create_ingestion_attempt(document_id, source_object_identity, build_profile)` (unique-index arbiter, no read-then-insert race); **explicit reindex** is not an idempotent redelivery and calls `allocate_draft(...)` directly to create a new monotonic generation even when `upload_s3_key` is unchanged, recording `reindex_of_revision_id`; **queue retry/redelivery** never re-allocates and reuses the `revision_id` already in the message. Trigger ownership is explicit: for **presigned upload**, the MinIO `ObjectCreated` webhook records object arrival only and `/confirm` is authoritative — it validates, hashes/dedups by `(document_id, source_object_identity, build_profile)`, selects the profile, get-or-creates the revision, and publishes parse; for **chat upload** the `chat_file_<document_id>` object is normalized to the same attempt key with `CHAT_UPLOAD`, and webhook matching must recognize both `doc_<document_id>` and `chat_file_<document_id>` shapes. Redelivery of the same ingest event (duplicate webhook, `/confirm` racing its webhook, retried API call) is a no-op returning the existing revision. Workers load exactly that revision/build record, scope image/table/chunk replacement to `(document_id, revision_id)`, publish child messages with the same UUID, and update only revision-owned completion/failure state. They never query `Document.embed_done`, `captions_done`, `kg_done`, `raw_chunks_json`, `markdown_s3_key`, or status to decide revision execution. Finalization executes `record_artifacts → profile-aware verify_draft → publish`; failures mark only that draft failed. `_clone_document_to_workspace` never copies markdown/vectors or sets Document completion flags: it allocates a target-workspace revision, records explicit `cloned_from_revision_id` provenance, and runs the revision-aware build (reusing raw content/hash only), so the target binding revision is never another workspace's revision identity.
 
 - [ ] **Step 4: Compile, test, and commit**
 
@@ -590,4 +628,4 @@ docker exec hrag-backend python -m compileall app/services/agents/v2
 docker compose -f docker-compose.services.yml config --quiet
 ```
 
-Required named tests: `test_concurrent_revision_publish_does_not_regress_current`, `test_webhook_and_confirm_create_one_revision`, `test_duplicate_webhook_is_idempotent`, `test_chat_upload_webhook_profile_is_preserved`, `test_reindex_allocates_new_revision_for_same_source_object`, `test_delete_tombstones_before_gc`, `test_current_document_view_uses_current_revision`, `test_revision_kg_does_not_leak_old_fact`, `test_historical_revision_uses_recorded_embedding_namespace`, `test_evidence_key_unavailable_fails_closed`, `test_evidence_key_rotation_keeps_old_records_readable`. Broader required coverage: populated-legacy no-fake-baseline migration; exact readiness; FULL/CHAT_UPLOAD/PARSE_ONLY verification; revision-owned worker flags; R1 SQL/object/vector/KG survival while building R2; legacy v1 works while v2 rejects not-ready; dimension mismatch preserves R1; envelope/version strictness; binding/target/task/evidence/use integrity; revision pin/current semantics; governance/expiry/ACL/audit; psycopg checkpoint DSN round-trip; prompt data isolation; and incompatible checkpoint rejection.
+Required named tests: `test_concurrent_revision_publish_does_not_regress_current`, `test_webhook_and_confirm_create_one_revision`, `test_duplicate_webhook_is_idempotent`, `test_chat_upload_webhook_profile_is_preserved`, `test_reindex_allocates_new_revision_for_same_source_object`, `test_concurrent_get_or_create_ingestion_attempt_is_atomic`, `test_delete_tombstones_before_gc`, `test_current_document_view_uses_current_revision`, `test_revision_kg_does_not_leak_old_fact`, `test_historical_revision_uses_recorded_embedding_namespace`, `test_evidence_key_unavailable_fails_closed`, `test_evidence_key_rotation_keeps_old_records_readable`. Broader required coverage: populated-legacy no-fake-baseline migration; exact readiness; FULL/CHAT_UPLOAD/PARSE_ONLY verification; revision-owned worker flags; R1 SQL/object/vector/KG survival while building R2; legacy v1 works while v2 rejects not-ready; dimension mismatch preserves R1; envelope/version strictness; binding/target/task/evidence/use integrity; revision pin/current semantics; governance/expiry/ACL/audit; psycopg checkpoint DSN round-trip; prompt data isolation; and incompatible checkpoint rejection.

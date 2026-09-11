@@ -106,7 +106,7 @@ The suite is ready to execute only when the revised plans prove:
 | # | Proof | Verified by |
 |---|---|---|
 | 1 | Revision publication is monotonic under concurrency | Phase 1 `test_concurrent_revision_publish_does_not_regress_current` |
-| 2 | All ingestion triggers converge to one revision attempt | Phase 1 `test_webhook_and_confirm_create_one_revision`, `test_duplicate_webhook_is_idempotent`, `test_chat_upload_webhook_profile_is_preserved` |
+| 2 | All ingestion triggers converge to one revision attempt | Phase 1 `test_webhook_and_confirm_create_one_revision`, `test_duplicate_webhook_is_idempotent`, `test_chat_upload_webhook_profile_is_preserved`, `test_concurrent_get_or_create_ingestion_attempt_is_atomic` |
 | 3 | Delete is logical/tombstoned before GC | Phase 1 `test_delete_tombstones_before_gc` + Task 9 eligibility rules |
 | 4 | Viewer APIs resolve the current revision correctly | Phase 1 `test_current_document_view_uses_current_revision` |
 | 5 | Clone cannot bypass the revision lifecycle | Phase 1 Task 4 clone rule + pipeline test |
