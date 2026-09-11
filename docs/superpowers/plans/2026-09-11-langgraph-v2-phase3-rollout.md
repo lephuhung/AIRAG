@@ -4,7 +4,7 @@
 
 **Goal:** Add one adaptive complex-research planning boundary over the shared Phase-2 capabilities, then validate comparison, People→Document, bounded replan/discovery, shadow execution, and controlled rollout without introducing domain agents or direct model-to-capability execution.
 
-**Architecture:** The Phase-0 winner implements `ComplexResearchGraph`, but the framework is constrained by the frozen execution model: the complex agent proposes an initial `TaskPlan` or append-only replan; deterministic validators accept/reject it; authoritative plan state is checkpointed; the shared scheduler alone dispatches capabilities; evaluator/synthesis/grounding remain outside agent authority. Agent-facing tool adapters are proposal gateways plus safe observation projectors over the same Phase-2 capabilities.
+**Architecture:** The Phase-0 winner implements `ComplexResearchGraph` as a checkpointed LangGraph subgraph, but the framework is constrained by the frozen execution model: the complex agent proposes an initial `TaskPlan` or append-only replan; deterministic validators accept/reject it; authoritative plan state is checkpointed; the shared scheduler alone dispatches capabilities; evaluator/synthesis/grounding remain outside agent authority. Agent-facing tool adapters are proposal gateways plus safe observation projectors over the same Phase-2 capabilities.
 
 **Tech Stack:** Python 3.11, selected orchestrator, LangGraph, Pydantic v2, FastAPI session SSE, Redis, PostgreSQL, pytest, benchmark JSON, Docker Compose.
 
@@ -222,7 +222,7 @@ git commit -m "feat: add governed complex agent tool gateway"
 - Test: `backend/tests/agents/v2/complex/test_comparison.py`
 
 **Interfaces:**
-- Produces: one complex planning boundary, compare skill/policy, validated two-target bounded comparison; no replan/discovery yet.
+- Produces: one adaptive planning boundary as a **checkpointed LangGraph subgraph** (`build_complex_research_subgraph`), compare skill/policy, and validated two-target bounded comparison; no replan/discovery yet.
 
 - [ ] **Step 1: Write failing comparison/ownership tests**
 
@@ -233,40 +233,55 @@ test_compare_is_skill_not_agent_route
 test_fast_and_complex_share_same_capability_instance_or_factory
 test_complex_agent_uses_request_scoped_tool_catalog
 test_complex_agent_cannot_execute_capability_without_scheduler
+test_complex_subgraph_is_checkpointed_under_supervisor_saver
+test_complex_subgraph_resumes_from_interrupt
+test_complex_subgraph_does_not_open_its_own_checkpointer
+test_complex_subgraph_uses_shared_task_scheduler
 ```
 
-- [ ] **Step 2: Implement initial-plan-only complex research**
+- [ ] **Step 2: Implement initial-plan-only complex research as a checkpointed subgraph**
 
 ```python
-class ComplexResearchGraph:
-    def __init__(
-        self,
-        planner: ResearchPlanner,
-        scheduler: TaskScheduler,
-        evaluator: EvidenceEvaluator,
-    ):
-        self._planner = planner
-        self._scheduler = scheduler
-        self._evaluator = evaluator
+# backend/app/services/agents/v2/complex_research_graph.py
+class ComplexResearchState(TypedDict, total=False):
+    contract_version: str
+    planning_input: ResearchPlanningInput
+    plan: TaskPlan
+    task_results: tuple[AgentResult, ...]
+    evaluation: EvidenceEvaluation | None
+    replans_remaining: int
 
-    async def run(
-        self,
-        planning_input: ResearchPlanningInput,
-        runtime: GraphRuntimeContext,
-    ) -> ComplexResearchResult:
-        proposed = await self._planner.create_plan(planning_input)
-        plan = validate_task_plan(proposed, planning_input.bindings)
-        await runtime.services.plan_checkpoint.persist(plan)
-        results = await self._scheduler.execute(plan, runtime)
-        evaluation = await self._evaluator.evaluate(plan, results, runtime)
-        return ComplexResearchResult(plan=plan, task_results=results, evaluation=evaluation)
+
+def build_complex_research_subgraph() -> CompiledStateGraph:
+    """Adaptive planning boundary as a checkpointed LangGraph subgraph.
+
+    Compiled WITHOUT a checkpointer so it inherits the supervisor's saver when
+    attached as the `complex_boundary` node. It never opens its own production
+    or shadow saver, which keeps shadow execution isolated.
+    """
+    graph = StateGraph(ComplexResearchState, context_schema=GraphRuntimeContext)
+    graph.add_node("plan", plan_node)
+    graph.add_node("validate_checkpoint", validate_checkpoint_node)
+    graph.add_node("execute", complex_execute_node)
+    graph.add_node("evaluate", complex_evaluate_node)
+    graph.add_node("decide", decide_node)
+    graph.add_node("finalize", finalize_node)
+    graph.set_entry_point("plan")
+    _add_complex_edges(graph)
+    return graph.compile()
 ```
 
 The planner may choose capabilities only by placing them into `TaskSpec`. No framework-native tool call may bypass the gateway/scheduler invariant. For this pilot, reject discovery/replan. `skills/compare/policy.py` is framework-neutral; if Phase 0 selected Deep Agents, native skill files may mirror it under `skills/compare/`, but the Python policy remains the source of truth and no `*` placeholder path is ever created. The injected `TaskScheduler` is the shared class defined in Phase 2 (`v2/execution/scheduler.py`); Phase 3 extends it but never defines or duplicates a second scheduler.
 
 - [ ] **Step 3: Replace only Phase-2 `complex_boundary` implementation**
 
-`supervisor_v2` composition remains outer orchestration; complex path calls `ComplexResearchGraph`, then shared synthesis/grounding/finalizer nodes.
+In `create_supervisor_v2_graph(checkpointer)`, compile the subgraph and attach it as the node:
+
+```python
+graph.add_node("complex_boundary", build_complex_research_subgraph())
+```
+
+The subgraph is compiled with no `compile(checkpointer=...)` argument, so the parent's `checkpointer` namespaces and persists every subgraph step (plan checkpoint, execute, evaluate, replan). The outer supervisor remains the only saver owner, so a shadow run compiled with its isolated `InMemorySaver` makes the same subgraph checkpoint into the shadow saver and never touches production. After the subgraph terminates, the shared synthesis/grounding/finalizer nodes still render the response.
 
 - [ ] **Step 4: Test and commit**
 
@@ -382,7 +397,7 @@ planner proposes initial plan
 -> bounded repeat
 ```
 
-Planner sees validated observations/evaluation gaps, not raw evidence by default. Governed synthesis later hydrates evidence content separately.
+Planner sees validated observations/evaluation gaps, not raw evidence by default. Governed synthesis later hydrates evidence content separately. The loop is realized as `plan → validate_checkpoint → execute → evaluate → decide → (replan → validate_checkpoint)…` nodes inside the Phase-3 subgraph, so every validated plan/replan is checkpointed by the supervisor saver before the next execute step.
 
 - [ ] **Step 4: Implement discovery semantics**
 

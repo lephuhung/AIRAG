@@ -63,7 +63,7 @@
 5. [`2026-09-11-langgraph-v2-phase3-rollout.md`](2026-09-11-langgraph-v2-phase3-rollout.md)
    - golden shared-evaluator A/B preflight;
    - governed `AgentToolGateway` and `AgentToolObservation` projection;
-   - one adaptive `ComplexResearchGraph` planning/replanning boundary;
+   - one adaptive `ComplexResearchGraph` planning/replanning boundary as a checkpointed LangGraph subgraph;
    - comparison/summarization as skills over shared capabilities;
    - deterministic People→Document dependency materialization;
    - bounded replan/discovery;
@@ -120,6 +120,7 @@
 29. Allowing subagent to own TaskPlan, dispatch capability, create EvidenceUse, decide sufficiency, or emit FinalResponse.
 30. Redefining, renaming, or field-extending the frozen `CapabilityDescriptor`/`CapabilityInput`/`CapabilityOutput`/`CapabilityRuntimeContext` outside `contracts/capability.py`.
 31. Defining a second scheduler or dispatching a capability outside the single shared Phase-2 `TaskScheduler`.
+32. Compiling the complex-research subgraph with its own production/shadow checkpointer or as a module-level singleton — it must inherit the supervisor saver as the `complex_boundary` node.
 
 ## Final Execution Gate
 
@@ -153,6 +154,7 @@ The implementation suite is ready only when all are proven:
 | 24 | Quality comparison uses same arm-neutral evaluator only in golden preflight | Phase 3 Task 1 |
 | 25 | Frozen `Capability*` contract types are imported, never redefined or field-extended | Amendment gate 13 + Phase 2 static guard |
 | 26 | One shared `TaskScheduler` defines the only capability-dispatch path | Phase 2 Task 3 `test_task_scheduler_is_defined_once_and_shared` |
+| 27 | Complex research is a checkpointed LangGraph subgraph inheriting the supervisor saver | Phase 3 Task 3 `test_complex_subgraph_is_checkpointed_under_supervisor_saver`, `test_complex_subgraph_does_not_open_its_own_checkpointer` |
 
 ## Whole-Suite Validation
 

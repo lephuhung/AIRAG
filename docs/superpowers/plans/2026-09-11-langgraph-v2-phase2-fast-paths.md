@@ -567,13 +567,16 @@ def create_supervisor_v2_graph(checkpointer: BaseCheckpointSaver) -> CompiledSta
     graph.add_node("synthesize", synthesize_node)
     graph.add_node("ground", ground_node)
     graph.add_node("finalizer", finalizer_node)
+    # Phase 3 replaces only this node with the compiled complex-research subgraph.
+    # The subgraph is compiled without a checkpointer so it inherits `checkpointer`
+    # (and therefore the shadow run's isolated saver) rather than opening its own.
     graph.add_node("complex_boundary", complex_unavailable_node)
     graph.set_entry_point("context")
     _add_supervisor_edges(graph)
     return graph.compile(checkpointer=checkpointer)
 ```
 
-Lifespan owns one opened AsyncPostgresSaver context; web startup never calls saver setup/migration.
+Lifespan owns one opened AsyncPostgresSaver context; web startup never calls saver setup/migration. `complex_boundary` is the single Phase-3 replacement seam: Phase 3 attaches `build_complex_research_subgraph()` here so subgraph state, interrupt/resume, and checkpoint namespacing stay under the supervisor saver.
 
 - [ ] **Step 3: Test and commit**
 

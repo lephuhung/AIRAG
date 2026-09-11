@@ -330,7 +330,7 @@ test_task_must_be_checkpointed_before_capability_dispatch
 
 ## 6. Phase 3 Semantics: One Adaptive Complex-Research Agent
 
-`ComplexResearchGraph` is the single adaptive planning/replanning boundary. The outer LangGraph graph, validator, scheduler, evaluator, and grounding remain authoritative.
+`ComplexResearchGraph` is the single adaptive planning/replanning boundary, implemented as a **checkpointed LangGraph subgraph** (`build_complex_research_subgraph`). It is compiled without its own checkpointer and attached as the supervisor's `complex_boundary` node, so the supervisor saver checkpoints and namespaces every plan/replan/execute/evaluate step and shadow runs stay isolated. The outer LangGraph graph, validator, scheduler, evaluator, and grounding remain authoritative.
 
 Canonical research loop:
 
