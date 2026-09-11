@@ -121,6 +121,7 @@
 30. Redefining, renaming, or field-extending the frozen `CapabilityDescriptor`/`CapabilityInput`/`CapabilityOutput`/`CapabilityRuntimeContext` outside `contracts/capability.py`.
 31. Defining a second scheduler or dispatching a capability outside the single shared Phase-2 `TaskScheduler`.
 32. Compiling the complex-research subgraph with its own production/shadow checkpointer or as a module-level singleton — it must inherit the supervisor saver as the `complex_boundary` node.
+33. Introducing a `plan_checkpoint` service or an `EvidenceEvaluator` service/class — plan persistence is LangGraph state plus the supervisor saver, and evaluation is the shared `evaluate_evidence(...)` node function; `RuntimeServices` is defined once in Phase 2 and has no such fields.
 
 ## Final Execution Gate
 
@@ -155,6 +156,7 @@ The implementation suite is ready only when all are proven:
 | 25 | Frozen `Capability*` contract types are imported, never redefined or field-extended | Amendment gate 13 + Phase 2 static guard |
 | 26 | One shared `TaskScheduler` defines the only capability-dispatch path | Phase 2 Task 3 `test_task_scheduler_is_defined_once_and_shared` |
 | 27 | Complex research is a checkpointed LangGraph subgraph inheriting the supervisor saver | Phase 3 Task 3 `test_complex_subgraph_is_checkpointed_under_supervisor_saver`, `test_complex_subgraph_does_not_open_its_own_checkpointer` |
+| 28 | `RuntimeServices` is defined once and excludes `plan_checkpoint`/`EvidenceEvaluator` | Phase 2 Task 3 `test_runtime_services_excludes_plan_checkpoint_and_evaluator_service` |
 
 ## Whole-Suite Validation
 

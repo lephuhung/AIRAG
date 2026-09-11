@@ -329,6 +329,7 @@ test_task_must_be_checkpointed_before_capability_dispatch
 test_fast_people_uses_shared_capability_registry
 test_fast_document_read_uses_shared_capability_registry
 test_task_scheduler_is_defined_once_and_shared
+test_runtime_services_excludes_plan_checkpoint_and_evaluator_service
 ```
 
 - [ ] **Step 2: Implement deterministic fast plan**
@@ -402,7 +403,24 @@ resolve ready TaskSpec
 
 It stops before dispatch on cancellation/deadline. EvidenceUse insertion occurs only after TaskPlan checkpoint ownership is established.
 
-- [ ] **Step 4: Implement execute node**
+- [ ] **Step 4: Define request-scoped RuntimeServices**
+
+```python
+# Defined once, in backend/app/services/agents/v2/execution/__init__.py.
+# Implementation-level and request-scoped; never checkpointed.
+@dataclass(frozen=True)
+class RuntimeServices:
+    capability_registry: CapabilityRegistry
+    semantic_adapter: SemanticAdapter
+    binding_resolver: BindingResolver
+    chat_messages: ChatMessageRepository
+    authorization: AuthorizationService
+    evidence_hydrator: EvidenceHydrator
+```
+
+This is the only definition of the service bag referenced by `GraphRuntimeContext.services`. It deliberately excludes `plan_checkpoint` and any `EvidenceEvaluator` service: plan persistence is LangGraph state plus the supervisor checkpointer (no service), and evidence evaluation is the shared `evaluate_evidence(...)` function in `nodes/evaluate.py`. `runtime.services.<name>` may reference only these fields; an unknown service fails at construction, not at graph runtime.
+
+- [ ] **Step 5: Implement execute node**
 
 ```python
 async def execute_node(
@@ -419,7 +437,7 @@ async def execute_node(
     return execution_update(results)
 ```
 
-- [ ] **Step 5: Test and commit**
+- [ ] **Step 6: Test and commit**
 
 ```bash
 cd backend && pytest tests/agents/v2/fast_paths/test_fast_plan.py tests/agents/v2/fast_paths/test_scheduler.py -q

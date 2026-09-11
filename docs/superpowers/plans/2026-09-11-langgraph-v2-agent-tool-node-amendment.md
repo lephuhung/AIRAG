@@ -474,6 +474,8 @@ class Capability(Protocol):
 
 The shared `TaskScheduler` is defined once, in Phase 2 `execution/scheduler.py`, and is the only capability-dispatch path for both fast and complex paths. Phase 3 may modify it but must never define a second scheduler or dispatch a capability outside it.
 
+`RuntimeServices` is defined once, in Phase 2 `execution/__init__.py`, and is the only shape behind `GraphRuntimeContext.services`. It intentionally has no `plan_checkpoint` service (plan persistence is LangGraph state plus the supervisor saver) and no `EvidenceEvaluator` service (evidence evaluation is the shared `evaluate_evidence(...)` function in `nodes/evaluate.py`).
+
 `GraphRuntimeContext` belongs to nodes/scheduler/orchestration. A capability may not receive it as a substitute for `CapabilityRuntimeContext`.
 
 Agent/model-visible tool schema contains only allowed `CapabilityInput` fields. Runtime fields are injected server-side and cannot appear as model-supplied parameters.
