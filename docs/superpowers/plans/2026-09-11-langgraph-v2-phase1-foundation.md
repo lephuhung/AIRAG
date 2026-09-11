@@ -99,7 +99,7 @@ Run `cd backend && pytest tests/migrations/v2/test_populated_legacy_migration.py
 
 - [ ] **Step 2: Implement the locked migration in exact safe order**
 
-`apply_v2_schema` uses SQLAlchemy text/DDL only, takes `pg_advisory_xact_lock`, and never imports `app.models` or calls `Base.metadata.create_all`. In one transaction it: (1) creates version/revision/build/structure tables, including implementation-only metadata: `document_revisions.generation BIGINT` (per-document monotonic allocation counter, unique per document), `revision_ingestion_attempts` with unique constraint `uq_revision_ingestion_attempt_key` on `(document_id, source_object_identity, build_profile)` (the `ON CONFLICT` arbiter, not a read-then-write check), revision build manifest columns (`embedding_namespace`, `embedding_model_hash`, `embedding_dimension`, `vector_artifact_version`), revision lifecycle GC metadata (`superseded_at TIMESTAMPTZ NULL`, `artifacts_purged_at TIMESTAMPTZ NULL`), and evidence encryption metadata columns (`ciphertext`, `encryption_key_id`, `nonce`, `encryption_algorithm`, `payload_purged_at TIMESTAMPTZ NULL`); (2) adds nullable `documents.current_revision_id`, `documents.source_deleted_at TIMESTAMPTZ NULL` (plus a partial index for tombstone lookup), `document_images.revision_id`, and `document_tables.revision_id`; (3) installs foreign keys and revision uniqueness without imposing NOT NULL on legacy child rows, and verifies that cascading deletes from `documents` cannot orphan or destroy `document_revisions`, retained evidence lineage, or revision artifacts; (4) installs DB constraints/triggers requiring revision IDs for rows written through the revision-owned pipeline; (5) verifies existing row counts/checksums are unchanged; and (6) writes schema version 1. Legacy rows stay v1-only and cannot be selected by v2. A full revision-aware reindex later creates new revision-owned child rows and atomically sets `current_revision_id`.
+`apply_v2_schema` uses SQLAlchemy text/DDL only, takes `pg_advisory_xact_lock`, and never imports `app.models` or calls `Base.metadata.create_all`. In one transaction it: (1) creates version/revision/build/structure tables, including implementation-only metadata: `document_revisions.generation BIGINT` (per-document monotonic allocation counter, unique per document), `document_revisions.retry_of_revision_id UUID NULL` (retry provenance), `document_revisions.failed_at TIMESTAMPTZ NULL`/`failure_stage TEXT NULL`/`failure_class TEXT NULL` (terminal failure), `document_revisions.superseded_at`/`artifacts_purged_at` lifecycle metadata, `revision_ingestion_attempts` with unique constraint `uq_revision_ingestion_attempt_key` on `(document_id, source_object_identity, build_profile)` (the `ON CONFLICT` arbiter, not a read-then-write check) and a bounded `attempt_generation INT NOT NULL DEFAULT 1` retry counter plus `exhausted_at TIMESTAMPTZ NULL`,, revision build manifest columns (`embedding_namespace`, `embedding_model_hash`, `embedding_dimension`, `vector_artifact_version`), revision lifecycle GC metadata (`superseded_at TIMESTAMPTZ NULL`, `artifacts_purged_at TIMESTAMPTZ NULL`), and evidence encryption metadata columns (`ciphertext`, `encryption_key_id`, `nonce`, `encryption_algorithm`, `payload_purged_at TIMESTAMPTZ NULL`); (2) adds nullable `documents.current_revision_id`, `documents.source_deleted_at TIMESTAMPTZ NULL` (plus a partial index for tombstone lookup), `document_images.revision_id`, and `document_tables.revision_id`; (3) installs foreign keys and revision uniqueness without imposing NOT NULL on legacy child rows, and verifies that cascading deletes from `documents` cannot orphan or destroy `document_revisions`, retained evidence lineage, or revision artifacts; (4) installs DB constraints/triggers requiring revision IDs for rows written through the revision-owned pipeline; (5) verifies existing row counts/checksums are unchanged; and (6) writes schema version 1. Legacy rows stay v1-only and cannot be selected by v2. A full revision-aware reindex later creates new revision-owned child rows and atomically sets `current_revision_id`.
 
 - [ ] **Step 3: Prove no startup metadata registration exists yet**
 
@@ -157,7 +157,7 @@ Assert mappings match completed migration (`Document.current_revision_id` and le
 
 - [ ] **Step 3: Register post-migration ORM mappings and gate startup**
 
-Define revision/build and v2 persistence models, map only already-existing columns, and register them in `app.models.__init__` only in this post-migration release. Replace unrestricted `Base.metadata.create_all()` with `Base.metadata.create_all(tables=LEGACY_STARTUP_TABLES)`. `lifespan` checks exact compatibility before v2 services initialize; it never invokes v2 migration or DDL. EvidenceUse null-safe uniqueness maps the Task-1 SQL index. `DocumentRevision.generation` maps the monotonic per-document allocation column with its unique constraint; `DocumentIngestionAttempt` maps the unique `(document_id, source_object_identity, build_profile)` key; `DocumentRevisionBuild` maps the embedding namespace/model hash/dimension/vector-artifact-version manifest; `Document.source_deleted_at` maps the tombstone column; `EvidenceRecord` maps `ciphertext`/`encryption_key_id`/`nonce`/`encryption_algorithm`/`payload_purged_at` and exposes no plaintext column. `DocumentRevision` also maps the independent GC metadata `superseded_at` and `artifacts_purged_at`.
+Define revision/build and v2 persistence models, map only already-existing columns, and register them in `app.models.__init__` only in this post-migration release. Replace unrestricted `Base.metadata.create_all()` with `Base.metadata.create_all(tables=LEGACY_STARTUP_TABLES)`. `lifespan` checks exact compatibility before v2 services initialize; it never invokes v2 migration or DDL. EvidenceUse null-safe uniqueness maps the Task-1 SQL index. `DocumentRevision.generation` maps the monotonic per-document allocation column with its unique constraint; `DocumentIngestionAttempt` maps the unique `(document_id, source_object_identity, build_profile)` key; `DocumentRevisionBuild` maps the embedding namespace/model hash/dimension/vector-artifact-version manifest; `Document.source_deleted_at` maps the tombstone column; `EvidenceRecord` maps `ciphertext`/`encryption_key_id`/`nonce`/`encryption_algorithm`/`payload_purged_at` and exposes no plaintext column. `DocumentRevision` also maps the independent GC metadata `superseded_at` and `artifacts_purged_at`, the terminal-failure fields `failed_at`/`failure_stage`/`failure_class`, and the retry provenance `retry_of_revision_id`; `DocumentIngestionAttempt` maps `attempt_generation` and `exhausted_at`.
 
 - [ ] **Step 4: Test and commit**
 
@@ -181,11 +181,11 @@ Deploy only after Release 1B readiness passes. From this release onward every wo
 - Test: `backend/tests/agents/v2/persistence/test_document_revisions.py`
 
 **Interfaces:**
-- Produces: internal `RevisionBuildProfile = FULL | CHAT_UPLOAD | PARSE_ONLY`, monotonic `allocate_draft`/`generation`, idempotent `get_or_create_ingestion_attempt`, `record_worker_state`, `record_artifacts`, `verify_draft`, generation-safe and tombstone-guarded `publish`, `get_published`, and tombstone `mark_source_deleted` (sets `Document.source_deleted_at` and never deletes revision rows).
+- Produces: internal `RevisionBuildProfile = FULL | CHAT_UPLOAD | PARSE_ONLY`, monotonic `allocate_draft`/`generation`, failure-aware idempotent `get_or_create_ingestion_attempt`, bounded `retry_ingestion_attempt` (new generation per retry), terminal `mark_failed`, `record_worker_state`, `record_artifacts`, `verify_draft`, generation-safe and tombstone-guarded `publish`, `get_published`, and tombstone `mark_source_deleted` (sets `Document.source_deleted_at` and never deletes revision rows).
 
 - [ ] **Step 1: Write lifecycle tests**
 
-Test `allocate → revision-owned build → verify → publish`, profile-specific required artifacts, publish transaction updating `Document.current_revision_id`, immutable published columns, failed draft leaving prior current revision unchanged, and tombstone lookup. Assert R2 does not inherit R1 worker completion. `FULL` requires markdown+structure+vectors and configured caption/KG results; `CHAT_UPLOAD` requires markdown+structure+vectors and records caption/KG as intentionally skipped; `PARSE_ONLY` requires markdown+structure and records vector/caption/KG as intentionally skipped. Skips are not failures. Add monotonic/idempotency/manifest tests: `test_concurrent_revision_publish_does_not_regress_current` (allocate R2 then R3; publish R3 first, then R2; current stays R3 while R2 remains a historical published revision), `test_get_or_create_ingestion_attempt_is_idempotent` (same document/source/profile returns one revision), `test_concurrent_get_or_create_ingestion_attempt_is_atomic` (two concurrent sessions racing the same attempt key while neither sees an uncommitted row: exactly one `revision_ingestion_attempts` row, exactly one draft revision, both callers receive the same `revision_id`, no unhandled `UniqueViolation`, and the loser's savepoint leaves no orphan revision or advanced generation), `test_publish_after_tombstone_does_not_resurrect_current` (publish R1, tombstone the document, then publish a verified R2 → `DocumentTombstoned`, `documents.current_revision_id` unchanged, and a concurrent tombstone that commits between verify and CAS also leaves current unset), and `test_record_artifacts_persists_embedding_manifest` (the build manifest records namespace/model hash/dimension/vector artifact version).
+Test `allocate → revision-owned build → verify → publish`, profile-specific required artifacts, publish transaction updating `Document.current_revision_id`, immutable published columns, failed draft leaving prior current revision unchanged, and tombstone lookup. Assert R2 does not inherit R1 worker completion. `FULL` requires markdown+structure+vectors and configured caption/KG results; `CHAT_UPLOAD` requires markdown+structure+vectors and records caption/KG as intentionally skipped; `PARSE_ONLY` requires markdown+structure and records vector/caption/KG as intentionally skipped. Skips are not failures. Add monotonic/idempotency/manifest tests: `test_concurrent_revision_publish_does_not_regress_current` (allocate R2 then R3; publish R3 first, then R2; current stays R3 while R2 remains a historical published revision), `test_get_or_create_ingestion_attempt_is_idempotent` (same document/source/profile returns one revision), `test_concurrent_get_or_create_ingestion_attempt_is_atomic` (two concurrent sessions racing the same attempt key while neither sees an uncommitted row: exactly one `revision_ingestion_attempts` row, exactly one draft revision, both callers receive the same `revision_id`, no unhandled `UniqueViolation`, and the loser's savepoint leaves no orphan revision or advanced generation), `test_publish_after_tombstone_does_not_resurrect_current` (publish R1, tombstone the document, then publish a verified R2 → `DocumentTombstoned`, `documents.current_revision_id` unchanged, and a concurrent tombstone that commits between verify and CAS also leaves current unset), and `test_record_artifacts_persists_embedding_manifest` (the build manifest records namespace/model hash/dimension/vector artifact version). Add explicit failure/retry tests: `test_failed_revision_is_terminal_and_immutable` (a failed revision can never transition to verified/published and leaves the prior current revision unchanged), `test_queue_redelivery_of_failed_revision_is_noop` (redelivering a failed revision neither re-runs a stage nor allocates a new generation), `test_retry_after_failure_allocates_new_generation` (failed R1 → retry yields R2 with `generation > R1` and `retry_of_revision_id = R1`, and R1 becomes superseded), and `test_retry_is_bounded_and_exhausts` (after `MAX_REVISION_RETRIES` the attempt is marked permanently failed and `RevisionRetriesExhausted` is raised).
 
 - [ ] **Step 2: Implement explicit lifecycle**
 
@@ -193,36 +193,37 @@ Test `allocate → revision-owned build → verify → publish`, profile-specifi
 class AttemptAlreadyClaimed(Exception):
     """Sentinel: another transaction owns this ingest event's attempt key."""
 
+class RevisionRetriesExhausted(Exception):
+    """Terminal failure retry budget for an ingest attempt is exhausted."""
+
 async def get_or_create_ingestion_attempt(
     self, document_id: UUID, source_object_identity: str, build_profile: RevisionBuildProfile
 ) -> tuple[DocumentRevision, bool]:
-    """Idempotent: one draft revision per (document, source object, profile).
+    """Idempotent and failure-aware: one ACTIVE revision per (document, source object, profile).
 
     A read-then-insert races when two transactions both miss an uncommitted row,
-    so the unique index is the arbiter, not a SELECT. We also serialize per
-    document so generation allocation stays monotonic.
+    so the unique index is the arbiter, not a SELECT. Retry is an in-place UPDATE
+    of the attempt row (bumped attempt_generation) that allocates a NEW revision
+    generation; a terminal failed revision is never resumed.
     """
-    # 1. Serialize per document BEFORE allocating a generation. Whoever holds the
-    #    document row lock runs to commit first; the other waits and then sees the
-    #    winner's committed attempt row in READ COMMITTED.
+    # 1. Serialize per document. This makes generation allocation monotonic, makes
+    #    the attempt re-read see committed rows, and serializes retry updates.
     await self.lock_document_for_update(document_id)  # SELECT id FROM documents WHERE documents.id = :id FOR UPDATE
 
-    # 2. Build the candidate revision inside a savepoint so a lost race leaves no orphan.
+    # 2. Converge on an existing attempt for this ingest event.
+    attempt = await self.get_attempt_for_update(document_id, source_object_identity, build_profile)
+    if attempt is not None:
+        active = await self.get(attempt.revision_id)
+        if active is not None and active.state == "failed":
+            return await self.retry_ingestion_attempt(attempt, build_profile)  # terminal -> new generation
+        return active, False
+
+    # 3. First attempt: create the candidate revision in a savepoint so a lost race
+    #    leaves no orphan, then claim the key atomically.
     revision: DocumentRevision
     try:
         async with self.session.begin_nested():
-            generation = await self.next_generation(document_id)  # MAX(generation)+1 under the lock
-            revision = DocumentRevision(
-                document_id=document_id,
-                generation=generation,
-                state="draft",
-                build_profile=build_profile,
-                source_object_identity=source_object_identity,
-            )
-            self.session.add(revision)
-            await self.session.flush()
-
-            # 3. Atomic claim. DO NOTHING means a concurrent writer already owns this key.
+            revision = await self._new_draft(document_id, source_object_identity, build_profile)
             claimed = (await self.session.execute(
                 pg_insert(DocumentIngestionAttempt)
                 .values(
@@ -230,6 +231,7 @@ async def get_or_create_ingestion_attempt(
                     source_object_identity=source_object_identity,
                     build_profile=build_profile,
                     revision_id=revision.revision_id,
+                    attempt_generation=1,
                 )
                 .on_conflict_do_nothing(constraint="uq_revision_ingestion_attempt_key")
                 .returning(DocumentIngestionAttempt.revision_id)
@@ -241,17 +243,53 @@ async def get_or_create_ingestion_attempt(
     else:
         return revision, True
 
-    # 4. Lost the race: read the committed winner. This is safe under READ COMMITTED
-    #    because the conflicting insert has already committed and the document lock
-    #    prevents a second winner.
-    winner = (await self.session.execute(
-        select(DocumentIngestionAttempt.revision_id).where(
-            DocumentIngestionAttempt.document_id == document_id,
-            DocumentIngestionAttempt.source_object_identity == source_object_identity,
-            DocumentIngestionAttempt.build_profile == build_profile,
-        )
-    )).scalar_one()
-    return await self.get(winner), False
+    # 4. Lost the create race: converge on the committed winner, or retry it if it
+    #    already reached a terminal failure. Safe under READ COMMITTED because the
+    #    conflicting insert has committed and the document lock prevents a second winner.
+    attempt = await self.get_attempt_for_update(document_id, source_object_identity, build_profile)
+    active = await self.get(attempt.revision_id)
+    if active.state == "failed":
+        return await self.retry_ingestion_attempt(attempt, build_profile)
+    return active, False
+
+
+async def retry_ingestion_attempt(
+    self, attempt: DocumentIngestionAttempt, build_profile: RevisionBuildProfile
+) -> tuple[DocumentRevision, bool]:
+    """Bounded automatic retry. A terminal failed revision is NEVER resumed.
+
+    Every retry allocates a NEW generation with explicit provenance, marks the
+    failed revision superseded, and bumps the attempt counter in place. The
+    attempt key stays unique; only its revision pointer and counter advance.
+    """
+    if attempt.attempt_generation >= self.MAX_REVISION_RETRIES:
+        await self.mark_attempt_exhausted(attempt)  # permanent failure, surfaced to UI
+        raise RevisionRetriesExhausted(str(attempt.document_id))
+    failed = await self.get(attempt.revision_id)
+    revision = await self._new_draft(
+        attempt.document_id,
+        attempt.source_object_identity,
+        build_profile,
+        retry_of_revision_id=failed.revision_id,
+    )
+    await self.mark_superseded(failed.revision_id, superseded_by=revision.revision_id)
+    attempt.revision_id = revision.revision_id
+    attempt.attempt_generation += 1
+    await self.session.flush()
+    return revision, True
+
+
+async def mark_failed(self, revision_id: UUID, stage: str, error_class: str) -> DocumentRevision:
+    """Terminal failure. Failed revisions are immutable and can never be published."""
+    revision = await self.get_for_update(revision_id)
+    if revision.state in {"published", "verified"}:
+        raise RevisionNotFailable(str(revision_id))
+    revision.state = "failed"
+    revision.failed_at = datetime.now(timezone.utc)
+    revision.failure_stage = stage
+    revision.failure_class = error_class
+    await self.session.flush()
+    return revision
 
 async def publish(self, revision_id: UUID) -> DocumentRevision:
     revision = await self.get_for_update(revision_id)
@@ -275,6 +313,8 @@ async def publish(self, revision_id: UUID) -> DocumentRevision:
     await self.session.flush()
     return revision
 ```
+
+**Failure and retry semantics (explicit).** The revision state machine is `draft → building → verified → published`, with `draft|building → failed` terminal. A `failed` revision is immutable: it can never transition to `verified`/`published` and is never resumed in place. Three retry paths are distinct: (1) **stage redelivery** — a queue message whose revision is still `draft|building` re-runs only the incomplete stage idempotently, same `revision_id`; if the revision is already complete the message is a no-op; if it is `failed` the message is a no-op dead-letter that never allocates. (2) **automatic retry** — `get_or_create_ingestion_attempt` on a terminal-failed attempt calls `retry_ingestion_attempt`, which allocates a NEW generation with `retry_of_revision_id` provenance, marks the failed revision superseded, and bumps `attempt_generation`, bounded by `MAX_REVISION_RETRIES` (implementation setting); at the budget it calls `mark_attempt_exhausted` and raises `RevisionRetriesExhausted`. (3) **explicit user retry/reindex** — always allocates a new generation and never mutates a prior revision. Monotonic generation guarantees a retry can only become current if it is newer.
 
 The DB-level CAS is a single conditional update, not read-then-write, and uses the real `documents` primary key (`documents.id`) plus a tombstone guard:
 
@@ -349,7 +389,7 @@ Discover every message constructor and make the test fail if an unclassified cal
 
 - [ ] **Step 3: Implement allocation and propagation**
 
-All four message models require `revision_id: UUID` with no default. Producers publish only a revision returned by the lifecycle: **direct upload**, **presigned confirm**, and **chat upload** call the lock-then-upsert `get_or_create_ingestion_attempt(document_id, source_object_identity, build_profile)` (unique-index arbiter, no read-then-insert race); **explicit reindex** is not an idempotent redelivery and calls `allocate_draft(...)` directly to create a new monotonic generation even when `upload_s3_key` is unchanged, recording `reindex_of_revision_id`; **queue retry/redelivery** never re-allocates and reuses the `revision_id` already in the message. Trigger ownership is explicit: for **presigned upload**, the MinIO `ObjectCreated` webhook records object arrival only and `/confirm` is authoritative — it validates, hashes/dedups by `(document_id, source_object_identity, build_profile)`, selects the profile, get-or-creates the revision, and publishes parse; for **chat upload** the `chat_file_<document_id>` object is normalized to the same attempt key with `CHAT_UPLOAD`, and webhook matching must recognize both `doc_<document_id>` and `chat_file_<document_id>` shapes. Redelivery of the same ingest event (duplicate webhook, `/confirm` racing its webhook, retried API call) is a no-op returning the existing revision. Workers load exactly that revision/build record, scope image/table/chunk replacement to `(document_id, revision_id)`, publish child messages with the same UUID, and update only revision-owned completion/failure state. They never query `Document.embed_done`, `captions_done`, `kg_done`, `raw_chunks_json`, `markdown_s3_key`, or status to decide revision execution. Finalization executes `record_artifacts → profile-aware verify_draft → publish`; failures mark only that draft failed. `_clone_document_to_workspace` never copies markdown/vectors or sets Document completion flags: it allocates a target-workspace revision, records explicit `cloned_from_revision_id` provenance, and runs the revision-aware build (reusing raw content/hash only), so the target binding revision is never another workspace's revision identity.
+All four message models require `revision_id: UUID` with no default. Producers publish only a revision returned by the lifecycle: **direct upload**, **presigned confirm**, and **chat upload** call the lock-then-upsert `get_or_create_ingestion_attempt(document_id, source_object_identity, build_profile)` (unique-index arbiter, no read-then-insert race); **explicit reindex** is not an idempotent redelivery and calls `allocate_draft(...)` directly to create a new monotonic generation even when `upload_s3_key` is unchanged, recording `reindex_of_revision_id`; **queue retry/redelivery** never re-allocates on its own: it re-runs only an incomplete stage of a non-terminal (`draft|building`) revision, and is a no-op dead-letter if that revision is already complete or terminal-`failed`; only the bounded `retry_ingestion_attempt` path or an explicit reindex allocates a new generation. Trigger ownership is explicit: for **presigned upload**, the MinIO `ObjectCreated` webhook records object arrival only and `/confirm` is authoritative — it validates, hashes/dedups by `(document_id, source_object_identity, build_profile)`, selects the profile, get-or-creates the revision, and publishes parse; for **chat upload** the `chat_file_<document_id>` object is normalized to the same attempt key with `CHAT_UPLOAD`, and webhook matching must recognize both `doc_<document_id>` and `chat_file_<document_id>` shapes. Redelivery of the same ingest event (duplicate webhook, `/confirm` racing its webhook, retried API call) is a no-op returning the existing revision while it is non-terminal; if that revision is terminal-`failed`, the failure-aware path allocates a bounded new generation instead of silently re-running it. Workers load exactly that revision/build record, scope image/table/chunk replacement to `(document_id, revision_id)`, publish child messages with the same UUID, and update only revision-owned completion/failure state. They never query `Document.embed_done`, `captions_done`, `kg_done`, `raw_chunks_json`, `markdown_s3_key`, or status to decide revision execution. Finalization executes `record_artifacts → profile-aware verify_draft → publish`; failures mark only that draft failed. `_clone_document_to_workspace` never copies markdown/vectors or sets Document completion flags: it allocates a target-workspace revision, records explicit `cloned_from_revision_id` provenance, and runs the revision-aware build (reusing raw content/hash only), so the target binding revision is never another workspace's revision identity.
 
 - [ ] **Step 4: Compile, test, and commit**
 
@@ -658,4 +698,4 @@ docker exec hrag-backend python -m compileall app/services/agents/v2
 docker compose -f docker-compose.services.yml config --quiet
 ```
 
-Required named tests: `test_concurrent_revision_publish_does_not_regress_current`, `test_publish_after_tombstone_does_not_resurrect_current`, `test_webhook_and_confirm_create_one_revision`, `test_duplicate_webhook_is_idempotent`, `test_chat_upload_webhook_profile_is_preserved`, `test_reindex_allocates_new_revision_for_same_source_object`, `test_concurrent_get_or_create_ingestion_attempt_is_atomic`, `test_delete_tombstones_before_gc`, `test_current_document_view_uses_current_revision`, `test_revision_kg_does_not_leak_old_fact`, `test_historical_revision_uses_recorded_embedding_namespace`, `test_evidence_key_unavailable_fails_closed`, `test_evidence_key_rotation_keeps_old_records_readable`, `test_expired_evidence_alone_does_not_release_revision_artifacts`, `test_revision_artifact_gc_requires_no_retained_references`. Broader required coverage: populated-legacy no-fake-baseline migration; exact readiness; FULL/CHAT_UPLOAD/PARSE_ONLY verification; revision-owned worker flags; R1 SQL/object/vector/KG survival while building R2; legacy v1 works while v2 rejects not-ready; dimension mismatch preserves R1; envelope/version strictness; binding/target/task/evidence/use integrity; revision pin/current semantics; governance/expiry/ACL/audit; psycopg checkpoint DSN round-trip; prompt data isolation; and incompatible checkpoint rejection.
+Required named tests: `test_concurrent_revision_publish_does_not_regress_current`, `test_publish_after_tombstone_does_not_resurrect_current`, `test_webhook_and_confirm_create_one_revision`, `test_duplicate_webhook_is_idempotent`, `test_chat_upload_webhook_profile_is_preserved`, `test_reindex_allocates_new_revision_for_same_source_object`, `test_concurrent_get_or_create_ingestion_attempt_is_atomic`, `test_delete_tombstones_before_gc`, `test_current_document_view_uses_current_revision`, `test_revision_kg_does_not_leak_old_fact`, `test_historical_revision_uses_recorded_embedding_namespace`, `test_evidence_key_unavailable_fails_closed`, `test_evidence_key_rotation_keeps_old_records_readable`, `test_expired_evidence_alone_does_not_release_revision_artifacts`, `test_revision_artifact_gc_requires_no_retained_references`, `test_failed_revision_is_terminal_and_immutable`, `test_queue_redelivery_of_failed_revision_is_noop`, `test_retry_after_failure_allocates_new_generation`, `test_retry_is_bounded_and_exhausts`. Broader required coverage: populated-legacy no-fake-baseline migration; exact readiness; FULL/CHAT_UPLOAD/PARSE_ONLY verification; revision-owned worker flags; R1 SQL/object/vector/KG survival while building R2; legacy v1 works while v2 rejects not-ready; dimension mismatch preserves R1; envelope/version strictness; binding/target/task/evidence/use integrity; revision pin/current semantics; governance/expiry/ACL/audit; psycopg checkpoint DSN round-trip; prompt data isolation; and incompatible checkpoint rejection.
