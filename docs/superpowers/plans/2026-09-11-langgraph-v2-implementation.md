@@ -17,6 +17,7 @@
 - Apply [`2026-09-11-langgraph-v2-agent-tool-node-amendment.md`](2026-09-11-langgraph-v2-agent-tool-node-amendment.md) before Phase 2. It is normative for implementation taxonomy, package ownership, and tool execution path.
 - **Agent:** adaptive plan/replan proposal only. **Node:** LangGraph state/routing/lifecycle. **Capability:** atomic typed domain operation. **Skill:** task strategy. **Workflow/subgraph:** predetermined multi-step algorithm.
 - Do not create v2 People/RAG/Document/Section/KG/Summary/Comparison/Evaluation/Grounding domain agents or domain graph wrappers.
+- `CapabilityDescriptor`, `CapabilityInput`, `CapabilityOutput`, and the runtime-only `CapabilityRuntimeContext` remain frozen contracts owned by the contracts layer; plans import them and never redefine or field-extend them.
 - Fast and complex paths share the same capability implementations and request-scoped `CapabilityRegistry`.
 - “Agent chooses a tool” means it proposes `TaskSpec.capability`; it does not directly invoke a capability.
 - Every factual capability dispatch must follow `TaskPlan/TaskSpec proposal -> validation -> authoritative checkpoint -> scheduler -> capability`.
@@ -117,6 +118,7 @@
 27. Letting framework-native tool call execute capability before TaskSpec validation/checkpoint.
 28. Returning raw `CapabilityOutput` to planner by default.
 29. Allowing subagent to own TaskPlan, dispatch capability, create EvidenceUse, decide sufficiency, or emit FinalResponse.
+30. Redefining, renaming, or field-extending the frozen `CapabilityDescriptor`/`CapabilityInput`/`CapabilityOutput`/`CapabilityRuntimeContext` outside `contracts/capability.py`.
 
 ## Final Execution Gate
 
@@ -148,6 +150,7 @@ The implementation suite is ready only when all are proven:
 | 22 | Canary security metrics have authoritative producers | Phase 3 Task 7B |
 | 23 | Every migration precedes consumers requiring its version | Phase 1 + Phase 3 Task 7A/7B |
 | 24 | Quality comparison uses same arm-neutral evaluator only in golden preflight | Phase 3 Task 1 |
+| 25 | Frozen `Capability*` contract types are imported, never redefined or field-extended | Amendment gate 13 + Phase 2 static guard |
 
 ## Whole-Suite Validation
 

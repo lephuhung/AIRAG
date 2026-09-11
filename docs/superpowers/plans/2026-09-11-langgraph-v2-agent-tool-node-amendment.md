@@ -470,6 +470,8 @@ class Capability(Protocol):
     ) -> AgentResult: ...
 ```
 
+`CapabilityDescriptor`, `CapabilityInput`, `CapabilityOutput`, and the runtime-only `CapabilityRuntimeContext` are **frozen contract types owned by the contracts layer** (`contracts/capability.py`). This amendment and every plan import them; none may redefine, rename, or add fields to them. The capability package owns only the `Capability` protocol and the request-scoped registry, which is runtime/config metadata rather than a new contract.
+
 `GraphRuntimeContext` belongs to nodes/scheduler/orchestration. A capability may not receive it as a substitute for `CapabilityRuntimeContext`.
 
 Agent/model-visible tool schema contains only allowed `CapabilityInput` fields. Runtime fields are injected server-side and cannot appear as model-supplied parameters.
@@ -591,6 +593,7 @@ Before Phase 2/3 implementation is considered synchronized, prove:
 | 10 | People -> Document remains deterministic scheduler/materializer execution. |
 | 11 | Replan is append-only and cannot widen authorization. |
 | 12 | Skills/subagents cannot bypass TaskPlan validation, evaluator, evidence governance, or grounding. |
+| 13 | `CapabilityDescriptor`/`CapabilityInput`/`CapabilityOutput`/`CapabilityRuntimeContext` are imported from frozen contracts and never redefined or field-extended outside `contracts/capability.py`. |
 
 Static architecture guards:
 
@@ -606,6 +609,9 @@ set -e
   backend/app/services/agents/v2
 
 ! rg -n 'capability\.execute\(' backend/app/services/agents/v2/tools
+
+! rg -n 'class\s+Capability(Descriptor|Input|Output|RuntimeContext)' \
+  backend/app/services/agents/v2 --glob '!**/contracts/**'
 ```
 
 Focused validation:

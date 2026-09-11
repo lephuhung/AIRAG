@@ -531,7 +531,7 @@ Cover strict/frozen/envelope versioning, optional revision semantics, ID/DAG/rel
 
 - [ ] **Step 2: Implement owner-focused modules**
 
-Create `base.py`, `request.py`, `conversation.py`, `semantic.py`, `locators.py`, `binding.py`, `routing.py`, `planning.py`, `execution.py`, `evidence.py`, `evaluation.py`, `synthesis.py`, `clarification.py`, `response.py`, `state.py`, and `validation.py`. Define every union only after its variants and call `model_rebuild()` explicitly.
+Create `base.py`, `request.py`, `conversation.py`, `semantic.py`, `locators.py`, `binding.py`, `routing.py`, `planning.py`, `execution.py`, `evidence.py`, `evaluation.py`, `synthesis.py`, `clarification.py`, `response.py`, `capability.py`, `state.py`, and `validation.py`. Define every union only after its variants and call `model_rebuild()` explicitly. `capability.py` owns the frozen `CapabilityDescriptor`, `CapabilityInput`, `CapabilityOutput`, and the runtime-only `CapabilityRuntimeContext`; the capability package imports these types and never redefines or field-extends them.
 
 - [ ] **Step 3: Test and commit**
 
@@ -713,7 +713,7 @@ git commit -m "feat: add async PostgreSQL v2 checkpointing"
 - Test: `backend/tests/agents/v2/test_adapters_and_registry.py`
 
 **Interfaces:**
-- Produces: the canonical `Capability` protocol and `CapabilityDescriptor` in `capabilities/__init__.py`, typed server-internal semantic/conversation/document/deep-research ports in `adapters/`, and the ACL-filtered capability registry. `adapters/` is the server-internal port layer, not the agent-facing `tools/` gateway created in Phase 3.
+- Produces: the canonical `Capability` protocol in `capabilities/__init__.py` (importing `CapabilityDescriptor`, `CapabilityInput`, `CapabilityOutput`, and the runtime-only `CapabilityRuntimeContext` from the frozen v2 contracts), typed server-internal semantic/conversation/document/deep-research ports in `adapters/`, and the ACL-filtered capability registry. `adapters/` is the server-internal port layer, not the agent-facing `tools/` gateway created in Phase 3.
 
 - [ ] **Step 1: Write adapter tests**
 
@@ -723,6 +723,8 @@ Require raw query ownership, Draft→Binding→Finalizer flow, immutable revisio
 
 ```python
 # Defined once, in backend/app/services/agents/v2/capabilities/__init__.py.
+# `CapabilityDescriptor`, `CapabilityInput`, `CapabilityOutput`, and
+# `CapabilityRuntimeContext` are frozen contracts imported from contracts/capability.py.
 class Capability(Protocol):
     descriptor: CapabilityDescriptor
     async def execute(self, request: AgentRequest, runtime: CapabilityRuntimeContext) -> AgentResult: ...

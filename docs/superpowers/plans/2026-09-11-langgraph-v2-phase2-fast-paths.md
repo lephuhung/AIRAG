@@ -266,7 +266,7 @@ Expected: FAIL.
 
 - [ ] **Step 2: Implement the single capability protocol**
 
-Import and re-export the Phase-1 `Capability` protocol from `capabilities/__init__.py`; do not define a second one.
+Import and re-export the Phase-1 `Capability` protocol from `capabilities/__init__.py`; do not define a second one. `CapabilityDescriptor`, `CapabilityInput`, `CapabilityOutput`, and `CapabilityRuntimeContext` are imported from the frozen `contracts/capability.py`; no capability module may redefine or field-extend them.
 
 ```python
 class Capability(Protocol):
