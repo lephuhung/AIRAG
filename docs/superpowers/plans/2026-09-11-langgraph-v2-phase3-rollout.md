@@ -364,7 +364,54 @@ git commit -m "feat: add side effect free v2 shadowing"
 
 ---
 
-### Task 6: Add Deterministic Canary Controls and Rollback Gates
+### Task 6A: Apply the Rollout-Control Schema Migration (Release A, Migration-Only)
+
+**Files:**
+- Modify: `backend/app/services/agents/v2/persistence/migrate.py`
+- Create: `backend/tests/migrations/v2/test_rollout_control_migration.py`
+
+**Interfaces:**
+- Produces: an advisory-locked, idempotent 1→2 migration that creates `agent_rollout_control` and append-only `agent_rollout_metrics`, seeds exactly one disabled control row, and advances the schema without registering any consumer. `V2_SCHEMA_VERSION` becomes 2 while the supported set stays `{1, 2}` during Release A, so an already-deployed selector keeps operating v1-only until Release B flips the required version.
+
+**Release A deploys migration-capable code only.** No model, repository, selector, streaming, or metrics consumer is added here, and nothing in this release requires schema 2 at runtime.
+
+- [ ] **Step 1: Write the failing 1→2 migration test**
+
+Start from a schema-version-1 database. Assert `migrate --apply` creates both rollout tables, seeds exactly one disabled control row, is idempotent on rerun, takes the advisory lock, imports no ORM metadata, and rejects version 0, gaps, and versions newer than 2.
+
+```bash
+cd backend && pytest tests/migrations/v2/test_rollout_control_migration.py -q
+```
+
+Expected: FAIL before the 1→2 migration exists.
+
+- [ ] **Step 2: Implement the raw-SQL 1→2 migration**
+
+Add the version-2 step to `apply_v2_schema`/`check_v2_schema` using SQLAlchemy DDL only: bump `V2_SCHEMA_VERSION` to 2, create `agent_rollout_control` (singleton row) and append-only `agent_rollout_metrics`, seed one disabled control row, and keep `SUPPORTED_V2_SCHEMA_VERSIONS = {1, 2}` so Release A cannot strand a running selector.
+
+- [ ] **Step 3: Deploy and verify Release A before touching consumers**
+
+```bash
+docker exec hrag-backend python -m app.services.agents.v2.persistence.migrate --apply
+docker exec hrag-backend python -m app.services.agents.v2.persistence.migrate --check
+```
+
+Expected: schema version 2 verified, v1 remains default, and no selector/consumer behavior changed. Only after this passes may Release B be built.
+
+- [ ] **Step 4: Test and commit Release A (migration-only)**
+
+```bash
+cd backend && pytest tests/migrations/v2 -q
+node .gitnexus/run.cjs detect-changes --scope compare --base-ref main
+git add backend/app/services/agents/v2/persistence/migrate.py backend/tests/migrations/v2/test_rollout_control_migration.py
+git commit -m "feat: migrate rollout-control schema to version 2"
+```
+
+---
+
+### Task 6B: Add Deterministic Canary Controls, Consumers, and Rollback Gates (Release B, Requires Schema 2)
+
+Deploy only after Task 6A's migration is applied and verified. The readiness check flipped here requires exactly schema version 2.
 
 **Files:**
 - Create: `backend/app/models/agent_rollout_control.py`
@@ -373,7 +420,6 @@ git commit -m "feat: add side effect free v2 shadowing"
 - Modify: `backend/app/models/__init__.py`
 - Create: `backend/app/services/agent/rollout_control.py`
 - Create: `backend/app/services/agent/rollout_metrics.py`
-- Modify: `backend/app/services/agents/v2/persistence/migrate.py`
 - Modify: `backend/app/services/agents/v2/execution/scheduler.py`
 - Modify: `backend/app/core/config.py`
 - Modify: `.env.example`
@@ -432,7 +478,7 @@ NEXUSRAG_AGENT_V2_CANARY_WORKSPACES=
 NEXUSRAG_AGENT_V2_BUCKET_SALT=<secret-from-runtime>
 ```
 
-Environment values are bootstrap ceilings only. Add a singleton `agent_rollout_control` database row containing `enabled`, shadow/canary percentages, workspace allowlist, revision, and updated timestamp. `RolloutControlRepository.get_current()` is awaited on every request; no process-local cache decides an arm. Selection uses authenticated workspace ID plus persisted request ID, checks DB enabled, schema readiness, workspace allowlist, then `sha256(salt:workspace_id:request_id) % 10000 < percent * 100`. Ordinary client headers are always ignored; the admin evaluation endpoint is the only override. Increment `V2_SCHEMA_VERSION` from 1 to 2. Migration 1→2 creates `agent_rollout_control` plus append-only `agent_rollout_metrics`, then seeds exactly one disabled control row under the existing advisory lock; version 0, gaps, and versions newer than 2 remain incompatible. The same readiness check used by selector/shadow/canary requires version 2 after this task. Apply the same two-release discipline as Phase 1: release A deploys migration-capable code only (no selector/graph path requires schema 2), runs `migrate --apply` and verifies version 2; release B then deploys the selector/shadow/canary code that requires schema 2. Never deploy code requiring schema 2 before the 1→2 migration is applied and verified.
+Environment values are bootstrap ceilings only. Add a singleton `agent_rollout_control` database row containing `enabled`, shadow/canary percentages, workspace allowlist, revision, and updated timestamp. `RolloutControlRepository.get_current()` is awaited on every request; no process-local cache decides an arm. Selection uses authenticated workspace ID plus persisted request ID, checks DB enabled, schema readiness, workspace allowlist, then `sha256(salt:workspace_id:request_id) % 10000 < percent * 100`. Ordinary client headers are always ignored; the admin evaluation endpoint is the only override. This Release B requires schema version 2 (applied and verified in Task 6A); it flips `SUPPORTED_V2_SCHEMA_VERSIONS`/readiness to require exactly 2, and the same readiness check used by selector/shadow/canary enforces that before any v2 graph is created. Never deploy this code before the 1→2 migration is applied.
 
 - [ ] **Step 4: Implement the concrete metric collector, report schema, and rollback wiring**
 
@@ -458,13 +504,13 @@ python scripts/check_v2_rollout_gate.py --v1 tests/reports/v1-canary.json --v2 t
 
 The checker fails on any security count, missing/wrong arm or schema version, window mismatch, fewer than 200 completed requests per arm, under 24 continuous hours, v2 error-rate regression over 1 percentage point, p95 regression over 15%, or cancellation failure over 0.1%. Quality is out of scope for this checker by construction: a quality regression can only be detected by the shared-evaluator golden preflight, and any attempt to pass a preflight report to the live checker is rejected by schema. Fixture tests prove pass plus each failure exit code.
 
-- [ ] **Step 5: Run and commit**
+- [ ] **Step 5: Run and commit Release B**
 
 ```bash
 cd backend && pytest tests/api/test_agent_canary_selection.py tests/agents/v2/test_rollout_metrics.py -q
 cd backend && python scripts/check_v2_rollout_gate.py --v1 tests/fixtures/rollout/v1-pass.json --v2 tests/fixtures/rollout/v2-pass.json --min-samples 200 --min-window-hours 24 --require-zero-security-violations
 node .gitnexus/run.cjs detect-changes --scope compare --base-ref main
-git add backend/app/models/agent_rollout_control.py backend/app/models/agent_rollout_metric.py backend/app/models/v2_registry.py backend/app/models/__init__.py backend/app/services/agent/rollout_control.py backend/app/services/agent/rollout_metrics.py backend/app/services/agents/v2/persistence/migrate.py backend/app/services/agents/v2/execution/scheduler.py backend/app/core/config.py .env.example backend/app/services/agent/runtime_selector.py backend/app/services/agent/streaming.py backend/app/api/chat_session.py backend/app/api/chat_agent_lg.py backend/app/services/integrations/telegram_service.py backend/app/api/agent_admin.py backend/tests/api/test_agent_canary_selection.py backend/tests/agents/v2/test_rollout_metrics.py backend/tests/fixtures/rollout backend/scripts/collect_v2_rollout_report.py backend/scripts/check_v2_rollout_gate.py
+git add backend/app/models/agent_rollout_control.py backend/app/models/agent_rollout_metric.py backend/app/models/v2_registry.py backend/app/models/__init__.py backend/app/services/agent/rollout_control.py backend/app/services/agent/rollout_metrics.py backend/app/services/agents/v2/execution/scheduler.py backend/app/core/config.py .env.example backend/app/services/agent/runtime_selector.py backend/app/services/agent/streaming.py backend/app/api/chat_session.py backend/app/api/chat_agent_lg.py backend/app/services/integrations/telegram_service.py backend/app/api/agent_admin.py backend/tests/api/test_agent_canary_selection.py backend/tests/agents/v2/test_rollout_metrics.py backend/tests/fixtures/rollout backend/scripts/collect_v2_rollout_report.py backend/scripts/check_v2_rollout_gate.py
 git commit -m "feat: add deterministic v2 canary controls"
 ```
 

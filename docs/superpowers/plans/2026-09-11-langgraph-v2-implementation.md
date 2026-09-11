@@ -59,7 +59,7 @@
    - deterministic governed People→Document dependency materialization, not agent handoff;
    - bounded replan/discovery;
    - separately compiled shadow graph with isolated saver/stores;
-   - live canary metrics, kill switch, and 24-hour promotion gates.
+   - live canary metrics, kill switch, and 24-hour promotion gates; rollout-control schema 1→2 is released migration-first (Task 6A) before the consumers that require it (Task 6B).
 
 ## Hard Gates
 
@@ -119,11 +119,11 @@ The suite is ready to execute only when the revised plans prove:
 | 7 | Historical vectors resolve from recorded artifact metadata | Phase 1 `test_historical_revision_uses_recorded_embedding_namespace` |
 | 8 | Write scope has an explicit owner | Phase 2 Global Constraints (v1 owns; out of v2 scope) |
 | 9 | Evidence encryption has real key-management semantics | Phase 1 Task 8 keyring/key-ID/rotation tests |
-| 10 | Canary security metrics have deterministic producers | Phase 3 Task 6 producer mapping, non-null metrics |
-| 11 | Every schema migration is deployed before code requiring that version | Phase 1 A/B/C/D releases and Phase 3 Task 6 1→2 two-release discipline |
+| 10 | Canary security metrics have deterministic producers | Phase 3 Task 6B producer mapping, non-null metrics |
+| 11 | Every schema migration is deployed before code requiring that version | Phase 1 A/B/C/D releases and Phase 3 Task 6A (migration-only commit) before Task 6B (consumers) |
 | 12 | Failed ingestion has explicit, bounded retry semantics | Phase 1 `test_failed_revision_is_terminal_and_immutable`, `test_queue_redelivery_of_failed_revision_is_noop`, `test_retry_after_failure_allocates_new_generation`, `test_retry_is_bounded_and_exhausts` |
 | 13 | `source_object_identity` is canonical and stable across triggers | Phase 1 `test_source_object_identity_is_canonical`, `test_multipart_etag_is_not_a_content_hash`, `test_overwrite_same_key_changes_identity_and_creates_new_attempt`, `test_duplicate_webhook_arrival_is_idempotent`, `test_build_profile_resolution_is_deterministic` |
-| 14 | Live quality comparison is not tautological and is shared-evaluator gated | Phase 3 Task 6 excludes any quality field from live metrics; Task 1 shared evaluator + `v2-evaluator-version-fail.json` schema rejection |
+| 14 | Live quality comparison is not tautological and is shared-evaluator gated | Phase 3 Task 6B excludes any quality field from live metrics; Task 1 shared evaluator + `v2-evaluator-version-fail.json` schema rejection |
 | 12 | v2 domain/use-case ownership is normalized to nodes + shared capabilities/tools + skills | Agent/tool/node amendment acceptance gate |
 | 13 | Fast and complex paths use the same capability implementation and runtime authorization boundary | Amendment tests + Phase 2/3 integration tests |
 | 14 | Summary and comparison are task strategies, not independent agents | `test_bounded_summary_is_read_plus_synthesis_not_summary_agent`, `test_compare_is_skill_not_subagent_route` |
