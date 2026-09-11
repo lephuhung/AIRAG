@@ -124,6 +124,7 @@
 33. Introducing a `plan_checkpoint` service or an `EvidenceEvaluator` service/class — plan persistence is LangGraph state plus the supervisor saver, and evaluation is the shared `evaluate_evidence(...)` node function; `RuntimeServices` is defined once in Phase 2 and has no such fields.
 34. Letting `AgentToolGateway` execute a capability or checkpoint a plan — it is a proposal + observation adapter; only `TaskScheduler` executes and only graph nodes/saver checkpoint.
 35. Carrying model-visible observation through a free-form `Mapping`/dict (`safe_metadata`) instead of a typed per-capability projection; unknown result kinds must fail closed.
+36. Using the webhook `arrival_identity` as the attempt key, treating an etag as content identity, or decoding S3 event keys zero/multiple times instead of exactly once before `normalize_object_key`.
 
 ## Final Execution Gate
 
@@ -141,7 +142,7 @@ The implementation suite is ready only when all are proven:
 | 8 | Write has explicit v1 owner | Phase 2 |
 | 9 | Evidence encryption/key rotation fail closed | Phase 1 |
 | 10 | Failed ingestion retry allocates bounded new generation | Phase 1 |
-| 11 | Canonical source identity stable across triggers | Phase 1 |
+| 11 | Canonical source identity stable across triggers | Phase 1 `test_source_object_identity_is_canonical`, `test_s3_event_key_is_decoded_once_and_matches_storage_key`, `test_etag_is_a_version_selector_not_content_identity` |
 | 12 | No v2 domain-agent/domain-graph wrappers exist | Amendment + Phase 2 |
 | 13 | Fast and complex use same capability implementation | Phase 2/3 |
 | 14 | Every factual dispatch references validated checkpointed TaskSpec | Phase 2/3 |
