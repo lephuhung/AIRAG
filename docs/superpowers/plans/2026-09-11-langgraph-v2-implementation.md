@@ -125,6 +125,7 @@
 34. Letting `AgentToolGateway` execute a capability or checkpoint a plan — it is a proposal + observation adapter; only `TaskScheduler` executes and only graph nodes/saver checkpoint.
 35. Carrying model-visible observation through a free-form `Mapping`/dict (`safe_metadata`) instead of a typed per-capability projection; unknown result kinds must fail closed.
 36. Using the webhook `arrival_identity` as the attempt key, treating an etag as content identity, or decoding S3 event keys zero/multiple times instead of exactly once before `normalize_object_key`.
+37. Leaving a `verified` revision non-terminal forever when its source is tombstoned — it must become terminal `abandoned` (with `abandon_reason`) so Predicate B can reclaim its artifacts; `abandoned` is immutable and never current.
 
 ## Final Execution Gate
 
@@ -134,7 +135,7 @@ The implementation suite is ready only when all are proven:
 |---|---|---|
 | 1 | Revision publication monotonic under concurrency | Phase 1 |
 | 2 | Ingestion triggers converge atomically to one attempt | Phase 1 |
-| 3 | Tombstone precedes independent artifact GC | Phase 1 |
+| 3 | Tombstone precedes independent artifact GC | Phase 1 `test_delete_tombstones_before_gc`, `test_publish_after_tombstone_does_not_resurrect_current`, `test_verified_revision_blocked_by_tombstone_becomes_abandoned`, `test_tombstone_abandons_non_published_revisions`, `test_expired_evidence_alone_does_not_release_revision_artifacts`, `test_revision_artifact_gc_requires_no_retained_references` |
 | 4 | Current document view resolves immutable current revision | Phase 1 |
 | 5 | Clone/reindex cannot bypass revision lifecycle | Phase 1 |
 | 6 | KG facts/provenance isolated by revision | Phase 1 |
