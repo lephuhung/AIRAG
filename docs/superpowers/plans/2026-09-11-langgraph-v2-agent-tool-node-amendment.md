@@ -472,6 +472,8 @@ class Capability(Protocol):
 
 `CapabilityDescriptor`, `CapabilityInput`, `CapabilityOutput`, and the runtime-only `CapabilityRuntimeContext` are **frozen contract types owned by the contracts layer** (`contracts/capability.py`). This amendment and every plan import them; none may redefine, rename, or add fields to them. The capability package owns only the `Capability` protocol and the request-scoped registry, which is runtime/config metadata rather than a new contract.
 
+The shared `TaskScheduler` is defined once, in Phase 2 `execution/scheduler.py`, and is the only capability-dispatch path for both fast and complex paths. Phase 3 may modify it but must never define a second scheduler or dispatch a capability outside it.
+
 `GraphRuntimeContext` belongs to nodes/scheduler/orchestration. A capability may not receive it as a substitute for `CapabilityRuntimeContext`.
 
 Agent/model-visible tool schema contains only allowed `CapabilityInput` fields. Runtime fields are injected server-side and cannot appear as model-supplied parameters.

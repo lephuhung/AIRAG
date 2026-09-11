@@ -316,7 +316,7 @@ git commit -m "feat: add shared v2 capabilities"
 - Test: `backend/tests/agents/v2/fast_paths/test_scheduler.py`
 
 **Interfaces:**
-- Produces: `build_fast_plan(...) -> TaskPlan`, `fast_plan_node`, `execute_ready_tasks(...)`, and `execute_node`.
+- Produces: `build_fast_plan(...) -> TaskPlan`, `fast_plan_node`, the shared `TaskScheduler` class (plus its internal `execute_ready_tasks` step), and `execute_node`. `TaskScheduler` is the single capability-dispatch path shared by Phase 2 fast paths and Phase 3 complex research; no other module dispatches capabilities.
 
 - [ ] **Step 1: Write failing ownership/checkpoint tests**
 
@@ -328,6 +328,7 @@ Add:
 test_task_must_be_checkpointed_before_capability_dispatch
 test_fast_people_uses_shared_capability_registry
 test_fast_document_read_uses_shared_capability_registry
+test_task_scheduler_is_defined_once_and_shared
 ```
 
 - [ ] **Step 2: Implement deterministic fast plan**
@@ -364,6 +365,29 @@ def build_fast_plan(
 
 - [ ] **Step 3: Implement the only capability dispatch path**
 
+Define the shared scheduler here, in Phase 2; Phase 3 only consumes it.
+
+```python
+class TaskScheduler:
+    """The one and only capability-dispatch path for v2."""
+
+    def __init__(self, registry: CapabilityRegistry) -> None:
+        self._registry = registry
+
+    async def execute(
+        self,
+        plan: TaskPlan,
+        runtime: GraphRuntimeContext,
+        prior_results: tuple[AgentResult, ...] = (),
+    ) -> tuple[AgentResult, ...]:
+        return await execute_ready_tasks(
+            plan=plan,
+            results=prior_results,
+            registry=self._registry,
+            runtime=runtime,
+        )
+```
+
 `execute_ready_tasks` must:
 
 ```text
@@ -386,11 +410,11 @@ async def execute_node(
     runtime: GraphRuntimeContext,
 ) -> dict:
     plan = require_checkpointed_plan(state)
-    results = await execute_ready_tasks(
+    scheduler = TaskScheduler(runtime.services.capability_registry)
+    results = await scheduler.execute(
         plan=plan,
-        results=state.execution.task_results,
-        registry=runtime.services.capability_registry,
         runtime=runtime,
+        prior_results=state.execution.task_results,
     )
     return execution_update(results)
 ```

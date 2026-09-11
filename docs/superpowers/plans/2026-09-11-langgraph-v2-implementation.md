@@ -119,6 +119,7 @@
 28. Returning raw `CapabilityOutput` to planner by default.
 29. Allowing subagent to own TaskPlan, dispatch capability, create EvidenceUse, decide sufficiency, or emit FinalResponse.
 30. Redefining, renaming, or field-extending the frozen `CapabilityDescriptor`/`CapabilityInput`/`CapabilityOutput`/`CapabilityRuntimeContext` outside `contracts/capability.py`.
+31. Defining a second scheduler or dispatching a capability outside the single shared Phase-2 `TaskScheduler`.
 
 ## Final Execution Gate
 
@@ -151,6 +152,7 @@ The implementation suite is ready only when all are proven:
 | 23 | Every migration precedes consumers requiring its version | Phase 1 + Phase 3 Task 7A/7B |
 | 24 | Quality comparison uses same arm-neutral evaluator only in golden preflight | Phase 3 Task 1 |
 | 25 | Frozen `Capability*` contract types are imported, never redefined or field-extended | Amendment gate 13 + Phase 2 static guard |
+| 26 | One shared `TaskScheduler` defines the only capability-dispatch path | Phase 2 Task 3 `test_task_scheduler_is_defined_once_and_shared` |
 
 ## Whole-Suite Validation
 

@@ -262,7 +262,7 @@ class ComplexResearchGraph:
         return ComplexResearchResult(plan=plan, task_results=results, evaluation=evaluation)
 ```
 
-The planner may choose capabilities only by placing them into `TaskSpec`. No framework-native tool call may bypass the gateway/scheduler invariant. For this pilot, reject discovery/replan. `skills/compare/policy.py` is framework-neutral; if Phase 0 selected Deep Agents, native skill files may mirror it under `skills/compare/`, but the Python policy remains the source of truth and no `*` placeholder path is ever created.
+The planner may choose capabilities only by placing them into `TaskSpec`. No framework-native tool call may bypass the gateway/scheduler invariant. For this pilot, reject discovery/replan. `skills/compare/policy.py` is framework-neutral; if Phase 0 selected Deep Agents, native skill files may mirror it under `skills/compare/`, but the Python policy remains the source of truth and no `*` placeholder path is ever created. The injected `TaskScheduler` is the shared class defined in Phase 2 (`v2/execution/scheduler.py`); Phase 3 extends it but never defines or duplicates a second scheduler.
 
 - [ ] **Step 3: Replace only Phase-2 `complex_boundary` implementation**
 
