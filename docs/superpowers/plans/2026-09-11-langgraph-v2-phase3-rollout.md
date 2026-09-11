@@ -151,6 +151,8 @@ test_unknown_or_unauthorized_tool_is_rejected_at_execution
 test_planner_never_receives_runtime_secrets
 test_people_observation_does_not_expose_raw_record
 test_capability_output_is_not_model_observation_by_default
+test_observation_projection_is_typed_no_mapping
+test_unknown_result_kind_projection_fails_closed
 ```
 
 - [ ] **Step 2: Implement proposal + observation gateway (no execution)**
@@ -169,15 +171,48 @@ class ToolProposalOutcome:
     plan: TaskPlan
     rejection: ProposalRejection | None = None
 
-@dataclass(frozen=True)
-class AgentToolObservation:
+class AgentToolObservation(ContractModel):
+    """Implementation-only model observation: typed and minimized, never a free-form mapping."""
     task_id: str
     status: AgentStatus
     evidence_use_ids: tuple[UUID, ...]
     coverage: tuple[CoverageObservation, ...]
     result_kind: str
-    safe_metadata: Mapping[str, str]
+    projection: ToolObservationProjection
+
+class PeopleLookupObservation(ContractModel):
+    kind: Literal["people.lookup"] = "people.lookup"
+    matched: bool
+    dependency_scalar_available: bool          # availability flag only, never the scalar
+
+class DocumentSearchObservation(ContractModel):
+    kind: Literal["document.search"] = "document.search"
+    candidate_count: int
+    candidate_revision_refs: tuple[RevisionRef, ...]
+
+class DocumentReadObservation(ContractModel):
+    kind: Literal["document.read"] = "document.read"
+    read_unit_count: int
+
+class SectionReadObservation(ContractModel):
+    kind: Literal["section.read"] = "section.read"
+    read_unit_count: int
+
+class KnowledgeGraphObservation(ContractModel):
+    kind: Literal["knowledge_graph.query"] = "knowledge_graph.query"
+    matched_entity_count: int
+
+class NoObservation(ContractModel):
+    kind: Literal["none"] = "none"
+
+ToolObservationProjection = Annotated[
+    Union[PeopleLookupObservation, DocumentSearchObservation, DocumentReadObservation,
+          SectionReadObservation, KnowledgeGraphObservation, NoObservation],
+    Field(discriminator="kind"),
+]
 ```
+
+`ToolObservationProjection` is a discriminated union of typed per-capability projections owned by `tools/observations.py` (implementation-only). No `Mapping`/dict escape hatch and no free-form string metadata: adding an observable field requires a typed model change, and an unknown `result_kind` fails closed with `ObservationProjectionUnavailable`.
 
 `AgentToolGateway.propose(...)` must perform only:
 
@@ -208,6 +243,7 @@ The framework-facing schema contains only allowed `CapabilityInput`; runtime aut
 cd backend && pytest tests/agents/v2/complex/test_tool_gateway.py -q
 ! rg -n 'capability\.execute\(' backend/app/services/agents/v2/tools
 ! rg -n 'TaskScheduler|scheduler\.execute\(|checkpointer' backend/app/services/agents/v2/tools
+! rg -n 'safe_metadata|Mapping\[str' backend/app/services/agents/v2/tools
 node .gitnexus/run.cjs detect-changes --scope compare --base-ref main
 git add backend/app/services/agents/v2/tools backend/tests/agents/v2/complex/test_tool_gateway.py
 git commit -m "feat: add governed complex agent tool gateway"
@@ -679,6 +715,7 @@ set -e
 
 ! rg -n 'capability\.execute\(' backend/app/services/agents/v2/tools
 ! rg -n 'TaskScheduler|scheduler\.execute\(|checkpointer' backend/app/services/agents/v2/tools
+! rg -n 'safe_metadata|Mapping\[str' backend/app/services/agents/v2/tools
 ```
 
 Expected: all gates pass while v1 remains the rollback/default path until persisted rollout control promotes v2.

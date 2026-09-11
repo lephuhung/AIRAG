@@ -174,15 +174,48 @@ Complex research agent
 Use an implementation-only projection such as:
 
 ```python
-@dataclass(frozen=True)
-class AgentToolObservation:
+class AgentToolObservation(ContractModel):
+    """Implementation-only model observation: typed and minimized, never a free-form mapping."""
     task_id: str
     status: AgentStatus
     evidence_use_ids: tuple[UUID, ...]
     coverage: tuple[CoverageObservation, ...]
     result_kind: str
-    safe_metadata: Mapping[str, str]
+    projection: ToolObservationProjection
+
+class PeopleLookupObservation(ContractModel):
+    kind: Literal["people.lookup"] = "people.lookup"
+    matched: bool
+    dependency_scalar_available: bool          # availability flag only, never the scalar
+
+class DocumentSearchObservation(ContractModel):
+    kind: Literal["document.search"] = "document.search"
+    candidate_count: int
+    candidate_revision_refs: tuple[RevisionRef, ...]
+
+class DocumentReadObservation(ContractModel):
+    kind: Literal["document.read"] = "document.read"
+    read_unit_count: int
+
+class SectionReadObservation(ContractModel):
+    kind: Literal["section.read"] = "section.read"
+    read_unit_count: int
+
+class KnowledgeGraphObservation(ContractModel):
+    kind: Literal["knowledge_graph.query"] = "knowledge_graph.query"
+    matched_entity_count: int
+
+class NoObservation(ContractModel):
+    kind: Literal["none"] = "none"
+
+ToolObservationProjection = Annotated[
+    Union[PeopleLookupObservation, DocumentSearchObservation, DocumentReadObservation,
+          SectionReadObservation, KnowledgeGraphObservation, NoObservation],
+    Field(discriminator="kind"),
+]
 ```
+
+`ToolObservationProjection` is a discriminated union of typed per-capability projections owned by `tools/observations.py` (implementation-only, not frozen contracts). There is no `Mapping`/dict escape hatch and no free-form string metadata: adding an observable field requires a typed model change. `ObservationProjector.project(...)` selects the projection by `result_kind`; an unknown or missing projector fails closed with `ObservationProjectionUnavailable` instead of falling back to a generic carrier. Sensitive capabilities such as People expose only status, use IDs, counts, and availability flags; the governed scalar is materialized server-side by `PeopleDocumentDependencyAdapter` and never observed.
 
 Rules:
 
@@ -604,6 +637,7 @@ Before Phase 2/3 implementation is considered synchronized, prove:
 | 12 | Skills/subagents cannot bypass TaskPlan validation, evaluator, evidence governance, or grounding. |
 | 13 | `CapabilityDescriptor`/`CapabilityInput`/`CapabilityOutput`/`CapabilityRuntimeContext` are imported from frozen contracts and never redefined or field-extended outside `contracts/capability.py`. |
 | 14 | `AgentToolGateway` validates proposals and projects observations only; it never executes a capability or checkpoints a plan. |
+| 15 | `AgentToolObservation` exposes only typed per-capability projections; no `Mapping`/dict metadata and unknown kinds fail closed. |
 
 Static architecture guards:
 
@@ -620,6 +654,7 @@ set -e
 
 ! rg -n 'capability\.execute\(' backend/app/services/agents/v2/tools
 ! rg -n 'TaskScheduler|scheduler\.execute\(|checkpointer' backend/app/services/agents/v2/tools
+! rg -n 'safe_metadata|Mapping\[str' backend/app/services/agents/v2/tools
 
 ! rg -n 'class\s+Capability(Descriptor|Input|Output|RuntimeContext)' \
   backend/app/services/agents/v2 --glob '!**/contracts/**'

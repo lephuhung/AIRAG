@@ -123,6 +123,7 @@
 32. Compiling the complex-research subgraph with its own production/shadow checkpointer or as a module-level singleton — it must inherit the supervisor saver as the `complex_boundary` node.
 33. Introducing a `plan_checkpoint` service or an `EvidenceEvaluator` service/class — plan persistence is LangGraph state plus the supervisor saver, and evaluation is the shared `evaluate_evidence(...)` node function; `RuntimeServices` is defined once in Phase 2 and has no such fields.
 34. Letting `AgentToolGateway` execute a capability or checkpoint a plan — it is a proposal + observation adapter; only `TaskScheduler` executes and only graph nodes/saver checkpoint.
+35. Carrying model-visible observation through a free-form `Mapping`/dict (`safe_metadata`) instead of a typed per-capability projection; unknown result kinds must fail closed.
 
 ## Final Execution Gate
 
@@ -159,6 +160,7 @@ The implementation suite is ready only when all are proven:
 | 27 | Complex research is a checkpointed LangGraph subgraph inheriting the supervisor saver | Phase 3 Task 3 `test_complex_subgraph_is_checkpointed_under_supervisor_saver`, `test_complex_subgraph_does_not_open_its_own_checkpointer` |
 | 28 | `RuntimeServices` is defined once and excludes `plan_checkpoint`/`EvidenceEvaluator` | Phase 2 Task 3 `test_runtime_services_excludes_plan_checkpoint_and_evaluator_service` |
 | 29 | `AgentToolGateway` is proposal + observation only, never a second executor | Phase 3 Task 2 `test_tool_gateway_is_proposal_and_observation_only` + tools guard |
+| 30 | Model observation is a typed per-capability projection, never a `Mapping` | Phase 3 Task 2 `test_observation_projection_is_typed_no_mapping`, `test_unknown_result_kind_projection_fails_closed` + tools guard |
 
 ## Whole-Suite Validation
 
