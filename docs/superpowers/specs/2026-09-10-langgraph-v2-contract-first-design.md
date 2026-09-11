@@ -595,14 +595,15 @@ class TaskPlan(ContractModel):
 
 ```python
 AgentStatus = Literal["success", "partial", "not_found", "needs_input", "denied", "error"]
+AgentErrorCode = Literal[
+    "INVALID_INPUT", "SCOPE_VIOLATION", "PERMISSION_DENIED",
+    "AMBIGUOUS_ENTITY", "DEPENDENCY_UNAVAILABLE", "TIMEOUT",
+    "CANCELLED", "BUDGET_EXHAUSTED", "CONTRACT_MISMATCH",
+    "INTERNAL_ERROR",
+]
 
 class AgentError(ContractModel):
-    code: Literal[
-        "INVALID_INPUT", "SCOPE_VIOLATION", "PERMISSION_DENIED",
-        "AMBIGUOUS_ENTITY", "DEPENDENCY_UNAVAILABLE", "TIMEOUT",
-        "CANCELLED", "BUDGET_EXHAUSTED", "CONTRACT_MISMATCH",
-        "INTERNAL_ERROR",
-    ]
+    code: AgentErrorCode
     message: str
     retryable: bool
 
@@ -620,6 +621,11 @@ class AgentResult(ContractModel):
     evidence_uses: tuple[EvidenceUseRef, ...]
     coverage_observations: tuple[CoverageObservation, ...]
     error: AgentError | None
+
+class TaskExecutionSummary(ContractModel):
+    task_id: str
+    status: AgentStatus
+    error_code: AgentErrorCode | None = None
 ```
 
 The scheduler resolves `TaskSpec.capability` from the current registry, then invokes the already-selected capability with `AgentRequest`; capability name is therefore not copied into the request. `TaskSpec` owns scheduler dependencies. `AgentRequest` carries only task execution data. Runtime owns request/run IDs. Evaluator—not capability—derives missing requirements.
@@ -817,8 +823,10 @@ class ResearchPlanningInput(ContractModel):
     capability_catalog: tuple[CapabilityDescriptor, ...]
     discovery_policy: DiscoveryPolicy
     budget: ResearchBudgetView
-    prior_evidence: tuple[EvidenceUseRef, ...]
-    prior_evaluation: EvidenceEvaluation | None
+    current_plan: TaskPlan | None = None
+    task_outcomes: tuple[TaskExecutionSummary, ...] = ()
+    prior_evidence_uses: tuple[EvidenceUseRef, ...] = ()
+    prior_evaluation: EvidenceEvaluation | None = None
 ```
 
 Authorization answers where access is permitted. Bindings answer which documents have semantic roles. DiscoveryPolicy answers only whether/how far research may expand. Workspace search permission derives from current runtime authorization; available discovery tools derive from the request-scoped registry entries with `domain="document"` and `operation_type="search"`. Policy restricts but never grants permission or copies an allowlist.
@@ -827,7 +835,7 @@ Planner behavior does not depend on deployment/adapter version, so descriptor ve
 
 `ResearchBudgetView` is ephemeral runtime-derived planner input, never persisted or versioned. The planner consumes `max_tasks_remaining` and `max_replans_remaining` to avoid impossible plans, and consumes `max_parallel_branches` because it explicitly chooses fan-out width; the scheduler still enforces all three.
 
-Planner input excludes full chat history, DB sessions, raw clients, ACL internals, and legacy state.
+Planner input excludes full chat history, DB sessions, raw clients, ACL internals, and legacy state. Initial planning receives no current plan, outcomes, evidence uses, or evaluation. Replanning receives the current append-only TaskPlan, one TaskExecutionSummary per attempted task, current validated EvidenceUseRefs, and the latest evaluation. The planner uses these execution facts to avoid rerunning completed tasks, distinguish `not_found` from denial/timeout/infrastructure failure, preserve satisfied dependencies, append only new task IDs, and reference only existing task IDs in dependencies and ReplanTaskOrigin. Deterministic validation remains authoritative. TaskExecutionSummary is an ephemeral minimal projection of checkpointed AgentResults; it does not move execution facts into EvidenceEvaluation.
 
 ## 17. Complex research behavior
 
@@ -1083,6 +1091,7 @@ For every derivable fact the decision is explicit: **REMOVE**, **KEEP AS EPHEMER
 | available discovery capabilities/workspace search | runtime registry/ACL | backend runtime | planner filtering | no policy copy | yes | REMOVE copied fields; compute intersection |
 | CapabilityDescriptor name/domain/operation/parallel support | capability registry | registry builder | planner | ephemeral | no for parallel safety | KEEP minimal planner catalog; version/derived behavior removed |
 | ResearchBudgetView three counters | runtime budget | orchestrator | planner DAG sizing | no | yes per call | KEEP AS EPHEMERAL PROJECTION: planner selects task/replan/fan-out width |
+| `ResearchPlanningInput.current_plan/task_outcomes/prior_evidence_uses/prior_evaluation` | checkpoint execution state, evidence-use store, evaluator | orchestrator projection | replanner | no separate persistence | yes per replan call | KEEP AS EPHEMERAL PROJECTION: completed/failed tasks without evidence must remain distinguishable; EvidenceEvaluation remains evidence-only |
 | `SynthesisInput.semantic/evaluation/use refs` | semantic/evaluator/use store | orchestration | synthesizer/hydrator | no separate persistence | no | KEEP minimal factual request; evaluation is mandatory and sufficient; current plan plus bindings/runtime go only to hydrator |
 | `SynthesisEvidence.role/target_id/source_label` | plan/binding/document stores | Hydrator/Presentation | synthesizer | no | yes | KEEP AS EPHEMERAL PROJECTION: unit grouping, role semantics, readable prompt source |
 | hydrated admitted evidence set | Evidence Hydrator | hydrator | Grounding | no | yes per call | KEEP AS EPHEMERAL PROJECTION: constrain claim IDs |
@@ -1157,9 +1166,11 @@ Contract tests must prove:
 - runtime context and trusted user/run identity never serialize into RequestContext/checkpoint business state;
 - RequestContext alone owns original_query; SemanticDraft and SemanticContext do not copy it, SemanticContext carries no binding-ID projection, DocumentBindingSet has no unresolved projection, and ClarificationRequest persists only its question-specific ref IDs;
 - retrieved prompt/tool-injection instructions cause no route, capability, scope, policy, plan, or tool-execution change and remain evidence data only;
-- incompatible pre-release v2 fixtures/checkpoints are rejected rather than migrated best-effort.
+- incompatible pre-release v2 fixtures/checkpoints are rejected rather than migrated best-effort;
+- a People→Document replan sees the current plan and `T1=not_found` even when T1 produced no EvidenceUse, does not rerun T1, and appends only valid dependency/task IDs;
+- the same replan with `T1=error` and `error_code=TIMEOUT` remains distinguishable from `not_found` and cannot fabricate downstream input.
 
-Required scenario set includes simple People/Section/Write/KG, conversational and ambiguous follow-up, multi-document range comparison, People→Document, target/reference compliance, reference discovery, permission denial, resume ACL change, abbreviation normalization, wrong/partial section coverage, irrelevant attachments, unresolved named documents, discovered-reference promotion, execution-success/evidence-insufficient, document revision change, evidence expiry/reuse denial, search-without-read, fast-path evidence, synthesis-budget overflow, and synthesis-only comparison with already-valid evidence.
+Required scenario set includes simple People/Section/Write/KG, conversational and ambiguous follow-up, multi-document range comparison, People→Document with no-evidence `not_found` versus `TIMEOUT` replanning, target/reference compliance, reference discovery, permission denial, resume ACL change, abbreviation normalization, wrong/partial section coverage, irrelevant attachments, unresolved named documents, discovered-reference promotion, execution-success/evidence-insufficient, document revision change, evidence expiry/reuse denial, search-without-read, fast-path evidence, synthesis-budget overflow, and synthesis-only comparison with already-valid evidence.
 
 Explicit regression scenarios additionally prove:
 
