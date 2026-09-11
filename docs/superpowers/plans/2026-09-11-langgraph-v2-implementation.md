@@ -98,6 +98,7 @@
 18. Publishing a revision to a tombstoned document, or advancing `current_revision_id` without the `documents.source_deleted_at IS NULL` CAS guard (must fail closed, never resurrect).
 19. Sharing one GC eligibility predicate between evidence retention and revision artifacts — evidence expiry must never by itself make revision artifacts deletable, and artifact reclamation must never delete evidence rows.
 20. Resuming a terminal-`failed` revision in place, or retrying without allocating a new generation — retries must be bounded, produce `retry_of_revision_id` provenance, and a failed revision stays immutable.
+21. Deriving `source_object_identity` from a user filename, client header, or otherwise non-canonical key — it must be `bucket + verbatim storage object key + version_id/etag + size + streamed sha256`, with a multipart etag never treated as a content hash.
 18. Recreating v1-style People/RAG/Summary/Comparison domain agents inside v2 instead of nodes + shared capabilities/tools + task skills.
 19. Giving the model control of workspace IDs, People permission, ACL, deadlines, service clients, or capability-registry construction.
 20. Implementing separate fast-path and complex-agent business logic for the same capability.
@@ -120,6 +121,7 @@ The suite is ready to execute only when the revised plans prove:
 | 10 | Canary security metrics have deterministic producers | Phase 3 Task 6 producer mapping, non-null metrics |
 | 11 | Every schema migration is deployed before code requiring that version | Phase 1 A/B/C/D releases and Phase 3 Task 6 1→2 two-release discipline |
 | 12 | Failed ingestion has explicit, bounded retry semantics | Phase 1 `test_failed_revision_is_terminal_and_immutable`, `test_queue_redelivery_of_failed_revision_is_noop`, `test_retry_after_failure_allocates_new_generation`, `test_retry_is_bounded_and_exhausts` |
+| 13 | `source_object_identity` is canonical and stable across triggers | Phase 1 `test_source_object_identity_is_canonical`, `test_multipart_etag_is_not_a_content_hash`, `test_overwrite_same_key_changes_identity_and_creates_new_attempt`, `test_duplicate_webhook_arrival_is_idempotent`, `test_build_profile_resolution_is_deterministic` |
 | 12 | v2 domain/use-case ownership is normalized to nodes + shared capabilities/tools + skills | Agent/tool/node amendment acceptance gate |
 | 13 | Fast and complex paths use the same capability implementation and runtime authorization boundary | Amendment tests + Phase 2/3 integration tests |
 | 14 | Summary and comparison are task strategies, not independent agents | `test_bounded_summary_is_read_plus_synthesis_not_summary_agent`, `test_compare_is_skill_not_subagent_route` |
