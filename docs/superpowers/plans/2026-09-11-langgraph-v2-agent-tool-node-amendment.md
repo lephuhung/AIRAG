@@ -284,10 +284,9 @@ backend/app/services/agents/v2/
 │   └── people_document.py
 │
 ├── skills/                    # framework-neutral policy; native skill files may mirror after Phase 0
-│   ├── summarize/policy.py
-│   ├── compare/policy.py
-│   ├── legal_analysis/policy.py
-│   └── compliance/policy.py
+│   ├── summarize/policy.py    # Phase 3 supported (large/iterative summarize)
+│   ├── compare/policy.py      # Phase 3 supported (comparison pilot)
+│   └── (legal_analysis, compliance: future approved plan only, not created here)
 │
 ├── replanning.py
 ├── discovery.py
@@ -330,7 +329,8 @@ simple KG lookup                        -> fast_domain -> knowledge_graph.query
 bounded one-document summary            -> fast_domain -> document.read -> evaluate -> synthesize -> ground
 comparison / cross-document summary     -> complex_research
 cross-domain dependency                  -> complex_research
-compliance / multi-goal / iterative RAG -> complex_research
+multi-goal / iterative RAG               -> complex_research (supported)
+compliance / evaluate                    -> complex_research -> typed unavailable (out of scope for this rollout)
 ```
 
 Fast path:
@@ -458,6 +458,10 @@ summarize skill
 ```
 
 No `summary_agent` exists.
+
+### Supported work-type scope (normative)
+
+Phase 3 implements only `direct`, `lookup`, `retrieve`, `explain`, bounded `summarize`, `compare`, `cross_domain`, and `multi_goal`, exactly as the Phase-3 plan's scope table defines. `evaluate` (legal/compliance) and the `write` domain are out of scope for this rollout and return the typed unavailable boundary; `skills/legal_analysis` and `skills/compliance` are not created. An unsupported `WorkType`/`RouteReason` fails closed and is never silently routed to `fast_domain` or another skill.
 
 ### People -> Document
 

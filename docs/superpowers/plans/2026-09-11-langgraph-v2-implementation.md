@@ -64,7 +64,7 @@
    - golden shared-evaluator A/B preflight;
    - governed `AgentToolGateway` and `AgentToolObservation` projection;
    - one adaptive `ComplexResearchGraph` planning/replanning boundary as a checkpointed LangGraph subgraph;
-   - comparison/summarization as skills over shared capabilities;
+   - comparison/summarization as skills over shared capabilities, with an explicit supported work-type scope (compare + summarize in; evaluate/legal/compliance/write out, typed unavailable);
    - deterministic People→Document dependency materialization;
    - bounded replan/discovery;
    - isolated shadow graph;
@@ -127,6 +127,7 @@
 36. Using the webhook `arrival_identity` as the attempt key, treating an etag as content identity, or decoding S3 event keys zero/multiple times instead of exactly once before `normalize_object_key`.
 37. Leaving a `verified` revision non-terminal forever when its source is tombstoned — it must become terminal `abandoned` (with `abandon_reason`) so Predicate B can reclaim its artifacts; `abandoned` is immutable and never current.
 38. Reclaiming a revision or evidence payload while a checkpoint retention lease is active, or failing to write/release a lease for a checkpoint that pins a revision/EvidenceUse — a resumable run must never lose pinned artifacts, and an expired lease must never block GC.
+39. Creating an out-of-scope Phase-3 skill (`legal_analysis`, `compliance`) or a domain-agent wrapper, or silently routing an unsupported `WorkType`/`RouteReason` to `fast_domain` instead of failing closed with the typed unavailable response.
 
 ## Final Execution Gate
 
@@ -165,6 +166,7 @@ The implementation suite is ready only when all are proven:
 | 29 | `AgentToolGateway` is proposal + observation only, never a second executor | Phase 3 Task 2 `test_tool_gateway_is_proposal_and_observation_only` + tools guard |
 | 30 | Model observation is a typed per-capability projection, never a `Mapping` | Phase 3 Task 2 `test_observation_projection_is_typed_no_mapping`, `test_unknown_result_kind_projection_fails_closed` + tools guard |
 | 31 | Checkpoint/revision retention leases block GC for resumable runs | Phase 1 `test_checkpoint_pinning_revision_writes_lease`, `test_active_lease_blocks_artifact_and_evidence_gc`, `test_expired_lease_does_not_block_gc`, `test_terminal_run_releases_lease`, `test_resumable_interrupt_keeps_lease_until_expiry` |
+| 32 | Phase-3 supported skill/work-type scope is explicit; out-of-scope work types fail closed | Phase 3 scope table + `test_phase3_scope_excludes_legal_and_compliance_skills`, `test_unsupported_work_type_returns_typed_unavailable` |
 
 ## Whole-Suite Validation
 

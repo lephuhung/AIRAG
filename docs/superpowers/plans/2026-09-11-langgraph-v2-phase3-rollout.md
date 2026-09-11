@@ -38,14 +38,37 @@ backend/app/services/agents/v2/
 ├── dependencies/
 │   └── people_document.py
 ├── skills/
-│   ├── summarize.*
-│   ├── compare.*
-│   ├── legal_analysis.*
-│   └── compliance.*
+│   ├── summarize/policy.py      # Phase 3: large/iterative summarize policy
+│   ├── compare/policy.py        # Phase 3: comparison pilot
+│   └── (legal_analysis, compliance: future approved plan only, not created here)
 ├── replanning.py
 ├── discovery.py
 └── complex_research_graph.py
 ```
+
+## Phase-3 Supported Skill and Work-Type Scope
+
+Phase 3 implements exactly the work types below and nothing else. `WorkType`/`Domain`/`Route`/`RouteReason` are frozen contract literals and are never extended here.
+
+| Frozen `WorkType` | Route | Phase owner | Skill / workflow | Status |
+|---|---|---|---|---|
+| `direct` | `direct` | Phase 2 | none | no plan, no capability |
+| `lookup` | `fast_domain` | Phase 2 | none | shared `people.lookup` / `knowledge_graph.query` / `document.read` |
+| `retrieve` | `fast_domain` | Phase 2 | none | shared document/section read |
+| `explain` | `fast_domain` (bounded) / `complex_research` (multi-doc) | Phase 2 / Phase 3 | none | synthesis over shared capabilities |
+| `summarize` | `fast_domain` (one bounded document) / `complex_research` (large or iterative) | Phase 2 bounded; Phase 3 large | `skills/summarize/policy.py` + deterministic map/reduce workflow | supported, no summary agent |
+| `compare` | `complex_research` | Phase 3 | `skills/compare/policy.py` | supported comparison pilot |
+| `cross_domain` | `complex_research` | Phase 3 | none (deterministic materializer) | People→Document only |
+| `multi_goal` | `complex_research` | Phase 3 | bounded append-only replan/discovery | supported, no autonomous target creation |
+| `evaluate` | `complex_research` | **out of scope** | none created | legal/compliance evaluation stays v1-owned |
+
+Explicitly out of scope for this rollout:
+
+- `skills/legal_analysis/policy.py` and `skills/compliance/policy.py` are **not created**. They remain placeholders for a future approved plan; an `evaluate`/`compliance_evaluation` request returns the typed `COMPLEX_RESEARCH_UNAVAILABLE` response from the subgraph's `decide` node, never a fabricated plan or a v2 legal/compliance agent.
+- The `write` domain and Write work type stay v1-owned; v2 keeps the typed unavailable boundary (Phase 2).
+- The `memory` capability exists for retrieval/normalization, but no Phase-3 skill, agent, or work type is created around it.
+- No `summarize`/`compare`/`legal`/`compliance`/`evaluate`/`memory` domain agent or domain graph is created; skills are framework-neutral policy modules over the shared capabilities.
+- An unsupported `WorkType`/`RouteReason` fails closed with a typed unavailable response; it is never silently routed to `fast_domain` or to another skill.
 
 ---
 
@@ -277,6 +300,8 @@ test_complex_subgraph_is_checkpointed_under_supervisor_saver
 test_complex_subgraph_resumes_from_interrupt
 test_complex_subgraph_does_not_open_its_own_checkpointer
 test_complex_subgraph_uses_shared_task_scheduler
+test_phase3_scope_excludes_legal_and_compliance_skills
+test_unsupported_work_type_returns_typed_unavailable
 ```
 
 - [ ] **Step 2: Implement initial-plan-only complex research as a checkpointed subgraph**
@@ -382,12 +407,13 @@ git commit -m "feat: add governed people document dependency"
 **Files:**
 - Create: `backend/app/services/agents/v2/replanning.py`
 - Create: `backend/app/services/agents/v2/discovery.py`
+- Create: `backend/app/services/agents/v2/skills/summarize/policy.py`
 - Modify: `backend/app/services/agents/v2/complex_research_graph.py`
 - Modify: `backend/app/services/agents/v2/tools/gateway.py`
 - Test: `backend/tests/agents/v2/complex/test_replan_discovery.py`
 
 **Interfaces:**
-- Produces: append-only `validate_replan`, UUID discovery candidates, bounded PLAN→VALIDATE→CHECKPOINT→EXECUTE→EVALUATE→REPLAN loop.
+- Produces: append-only `validate_replan`, UUID discovery candidates, bounded PLAN→VALIDATE→CHECKPOINT→EXECUTE→EVALUATE→REPLAN loop, and the framework-neutral `skills/summarize/policy.py` used by the large/iterative summarize path.
 
 - [ ] **Step 1: Write failing replan/discovery tests**
 
@@ -448,7 +474,7 @@ Discovery candidate IDs use UUID; additions create supporting/discovered binding
 ```bash
 cd backend && pytest tests/agents/v2/complex/test_replan_discovery.py -q
 node .gitnexus/run.cjs detect-changes --scope compare --base-ref main
-git add backend/app/services/agents/v2/replanning.py backend/app/services/agents/v2/discovery.py backend/app/services/agents/v2/complex_research_graph.py backend/app/services/agents/v2/tools/gateway.py backend/tests/agents/v2/complex/test_replan_discovery.py
+git add backend/app/services/agents/v2/replanning.py backend/app/services/agents/v2/discovery.py backend/app/services/agents/v2/skills/summarize backend/app/services/agents/v2/complex_research_graph.py backend/app/services/agents/v2/tools/gateway.py backend/tests/agents/v2/complex/test_replan_discovery.py
 git commit -m "feat: add bounded v2 research replanning"
 ```
 
@@ -471,6 +497,7 @@ test_agent_tool_call_creates_validated_task_before_dispatch
 test_tool_adapter_cannot_call_capability_directly
 test_compare_is_skill_not_agent_route
 test_summary_is_skill_not_agent_route
+test_unsupported_work_type_returns_typed_unavailable
 test_people_observation_does_not_expose_raw_record
 test_people_document_dependency_is_not_agent_handoff
 test_replan_can_add_tasks_but_cannot_widen_authorization
