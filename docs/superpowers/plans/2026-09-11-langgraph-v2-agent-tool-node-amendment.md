@@ -250,7 +250,7 @@ Rules:
 - The `ObservationProjector` runs only after the shared `TaskScheduler` has executed and the graph has checkpointed the task; `AgentToolGateway` owns the projector but never the execution or the checkpoint.
 - No runtime secrets, service clients, ACL/workspace authority, deadlines, storage keys, or encryption metadata are model-visible.
 - Retrieved document text remains untrusted data and is not automatically returned to the planner. The planner primarily receives task status, coverage/evaluation gaps, candidate metadata explicitly admitted by policy, and EvidenceUse identities.
-- `candidate_ids` are opaque: the Binding Resolver / discovery service resolves a candidate id into an authorized `document_id` and pinned revision. The model never receives a `RevisionRef`, never owns revision truth, and cannot select a document revision directly.
+- `candidate_ids` are opaque: the request-scoped `DiscoveryCandidateRegistry` (`tools/discovery_candidates.py`) maps a candidate id to an authorized `document_id` only, and the **Binding Resolver is the sole owner that pins a revision**. The model never receives a `RevisionRef`, never owns revision truth, and cannot select a document revision directly.
 - Full evidence content is hydrated only by governed evaluator/synthesis/grounding paths.
 - People and other sensitive capabilities use stricter projection: raw CCCD, DOB, addresses, phone/email, personnel records, or unrelated fields never enter planner observation or checkpoint.
 - People -> Document scalar transfer remains a deterministic governed dependency materializer, not a planner observation.
@@ -302,7 +302,8 @@ backend/app/services/agents/v2/
 ├── tools/                     # agent-facing governed gateway (Phase 3 only)
 │   ├── adapters.py
 │   ├── gateway.py
-│   └── observations.py
+│   ├── observations.py
+│   └── discovery_candidates.py
 │
 ├── execution/
 │   ├── __init__.py

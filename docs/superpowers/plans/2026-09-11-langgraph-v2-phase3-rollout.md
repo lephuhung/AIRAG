@@ -35,7 +35,8 @@ backend/app/services/agents/v2/
 ├── tools/
 │   ├── adapters.py
 │   ├── gateway.py
-│   └── observations.py
+│   ├── observations.py
+│   └── discovery_candidates.py
 ├── dependencies/
 │   └── people_document.py
 ├── skills/
@@ -239,7 +240,7 @@ ToolObservationProjection = Annotated[
 ]
 ```
 
-`ToolObservationProjection` is a discriminated union of typed per-capability projections owned by `tools/observations.py` (implementation-only). No `Mapping`/dict escape hatch and no free-form string metadata: adding an observable field requires a typed model change, and an unknown `result_kind` fails closed with `ObservationProjectionUnavailable`. `DocumentSearchObservation` exposes only opaque `candidate_ids`: a request-scoped `DiscoveryCandidateRegistry` resolves a candidate id into an authorized `document_id` plus pinned revision, so the model never owns revision truth and cannot select a revision directly; if the planner never needs to select a specific candidate, drop `candidate_ids` and keep only `candidate_count`.
+`ToolObservationProjection` is a discriminated union of typed per-capability projections owned by `tools/observations.py` (implementation-only). No `Mapping`/dict escape hatch and no free-form string metadata: adding an observable field requires a typed model change, and an unknown `result_kind` fails closed with `ObservationProjectionUnavailable`. `DocumentSearchObservation` exposes only opaque `candidate_ids`: the request-scoped `DiscoveryCandidateRegistry` (`tools/discovery_candidates.py`) maps a `candidate_id` to an authorized `document_id` only, and the **Binding Resolver remains the sole owner that pins a revision**. If the planner never needs to select a specific candidate, drop `candidate_ids` and keep only `candidate_count`.
 
 `AgentToolGateway.propose(...)` must perform only:
 
@@ -323,7 +324,7 @@ class ComplexResearchState(TypedDict, total=False):
     semantic: SemanticContext
     bindings: DocumentBindingSet
     query_analysis: QueryAnalysis | None
-    plan: TaskPlan
+    plan: TaskPlan | None
     task_results: tuple[AgentResult, ...]
     evaluation: EvidenceEvaluation | None
     replans_remaining: int
@@ -334,16 +335,18 @@ def build_planning_input(
 ) -> ResearchPlanningInput:
     """Ephemeral projection, rebuilt on every planner/replanner call.
 
-    Never returned into checkpointed state and never persisted.
+    Uses only frozen `GraphRuntimeContext` fields (`capability_runtime`, `services`);
+    DiscoveryPolicy/ResearchBudgetView come from implementation helpers over runtime
+    config/counters, not new runtime fields. Never returned into checkpointed state.
     """
     return ResearchPlanningInput(
         semantic=state.semantic,
         bindings=state.bindings,
-        query_analysis=state.query_analysis,
-        capability_catalog=tuple(runtime.capability_registry.descriptors()),
-        discovery_policy=runtime.policy.discovery_policy,
-        budget=runtime.policy.research_budget_view(),
-        current_plan=state.get("plan"),
+        query_analysis=require_query_analysis(state),   # non-null before complex planning
+        capability_catalog=tuple(runtime.services.capability_registry.descriptors()),
+        discovery_policy=build_discovery_policy(runtime),
+        budget=build_research_budget_view(runtime),
+        current_plan=state.get("plan"),                  # None on the initial call
         task_outcomes=build_task_execution_summaries(state.get("task_results", ())),
         prior_evidence_uses=collect_evidence_use_refs(state.get("task_results", ())),
         prior_evaluation=state.get("evaluation"),
@@ -369,7 +372,7 @@ def build_complex_research_subgraph() -> CompiledStateGraph:
     return graph.compile()
 ```
 
-The planner may choose capabilities only by placing them into `TaskSpec`. No framework-native tool call may bypass the gateway/scheduler invariant. For this pilot, reject discovery/replan. `skills/compare/policy.py` is framework-neutral; if Phase 0 selected Deep Agents, native skill files may mirror it under `skills/compare/`, but the Python policy remains the source of truth and no `*` placeholder path is ever created. The injected `TaskScheduler` is the shared class defined in Phase 2 (`v2/execution/scheduler.py`); Phase 3 extends it but never defines or duplicates a second scheduler. `validate_checkpoint_node` validates via `validate_task_plan`/`validate_replan` and returns the plan into `ComplexResearchState`; the supervisor saver performs the checkpoint, so there is no `plan_checkpoint` service. The same node calls Phase-1 `retention_leases.acquire_or_refresh(run_id, revision_id, evidence_use_id)` for every revision/use it pins, and the subgraph releases the run's leases on terminal finalize or cancellation (clarification interrupt keeps its lease until resolution or TTL expiry). `complex_evaluate_node` calls the shared `evaluate_evidence(...)` from `nodes/evaluate.py`; there is no `EvidenceEvaluator` class or service. `runtime.services` exposes only the Phase-2 `RuntimeServices` fields.
+The planner may choose capabilities only by placing them into `TaskSpec`. No framework-native tool call may bypass the gateway/scheduler invariant. For this pilot, reject discovery/replan. `skills/compare/policy.py` is framework-neutral; if Phase 0 selected Deep Agents, native skill files may mirror it under `skills/compare/`, but the Python policy remains the source of truth and no `*` placeholder path is ever created. The injected `TaskScheduler` is the shared class defined in Phase 2 (`v2/execution/scheduler.py`); Phase 3 extends it but never defines or duplicates a second scheduler. `validate_checkpoint_node` validates via `validate_task_plan`/`validate_replan` and returns the plan into `ComplexResearchState`; the supervisor saver performs the checkpoint, so there is no `plan_checkpoint` service. The same node calls Phase-1 `retention_leases.acquire_or_refresh(run_id, revision_id, evidence_use_id)` for every revision/use it pins, and for every new `EvidenceUse` the execute node returns (so the use is leased before it is checkpointed). The subgraph never releases leases: interrupt keeps them active, resume refreshes them, and only the outer streaming/runner calls `release_run(run_id)` after the terminal checkpoint succeeds. `complex_evaluate_node` calls the shared `evaluate_evidence(...)` from `nodes/evaluate.py`; there is no `EvidenceEvaluator` class or service. `runtime.services` exposes only the Phase-2 `RuntimeServices` fields.
 
 - [ ] **Step 3: Replace only Phase-2 `complex_boundary` implementation with an explicit state adapter**
 
@@ -386,7 +389,7 @@ def build_complex_research_state(state: SupervisorV2State) -> ComplexResearchSta
         query_analysis=state.query_analysis,
         plan=state.execution.plan,
         task_results=state.execution.task_results,
-        evaluation=state.execution.evaluation,
+        evaluation=state.execution.evidence_evaluation,   # frozen ExecutionState field name
         replans_remaining=MAX_REPLANS,
     )
 
@@ -416,7 +419,7 @@ complex_subgraph = build_complex_research_subgraph()      # compiled WITHOUT a c
 full_graph.add_node("complex_boundary", make_complex_boundary_node(complex_subgraph))
 ```
 
-`config` carries the parent `thread_id`/checkpoint namespace, so the subgraph writes its checkpoints under the parent saver and a shadow run's isolated `InMemorySaver` is inherited. The adapter maps only the fields the child needs and merges only the execution result back; the child never reads root state and never needs `SupervisorV2State`. After the subgraph terminates, the shared synthesis/grounding/finalizer nodes render the response. `ResearchPlanningInput` is never part of `ComplexResearchState` or `SupervisorV2State` checkpoint bytes: it is rebuilt from the request-scoped registry, runtime policy/counters, and validated `AgentResult`s on every planner/replanner call, and no frozen state field is added.
+`config` carries the parent `thread_id`/checkpoint namespace, so the subgraph writes its checkpoints under the parent saver and a shadow run's isolated `InMemorySaver` is inherited. The adapter maps only the fields the child needs and merges only the execution result back; the child never reads root state and never needs `SupervisorV2State`. `ResearchPlanningInput` is never part of `ComplexResearchState` or `SupervisorV2State` checkpoint bytes: it is rebuilt from the request-scoped registry, implementation policy/budget helpers, and validated `AgentResult`s on every planner/replanner call, and no frozen state field is added. `require_query_analysis(state)` asserts a non-null `query_analysis` before any complex planning, and `plan` is `None` on the initial call.
 
 - [ ] **Step 4: Test and commit**
 
@@ -718,7 +721,7 @@ NEXUSRAG_AGENT_V2_CANARY_WORKSPACES=
 NEXUSRAG_AGENT_V2_BUCKET_SALT=<runtime-secret>
 ```
 
-DB control is authoritative within environment ceilings. Selection is server-owned and uses authenticated workspace + persisted request ID. Selection is two-stage, and the runtime selector is **not** a second semantic classifier: an obviously v1-only request — one whose frozen `domains` contains `"write"` (there is no `WorkType="write"`; `"write"` is a `Domain`, and the `WorkType`/`Domain` literals are never extended) — routes to v1 immediately. Every other request is bucketed; a v2 candidate then runs the real v2 `QueryAnalysis`/Router, and if the router returns an unsupported work/domain (`evaluate`/legal/compliance) the request falls back to v1 before any capability execution or user-visible failure. `CANARY_PERCENT=100` therefore means **100% of v2-eligible traffic**, never a global replacement of v1.
+DB control is authoritative within environment ceilings. Selection is server-owned and uses authenticated workspace + persisted request ID. The runtime selector does **not** inspect semantic domains and is not a second classifier: only an endpoint/request type that is deterministically known to be Write (for example an explicit Write endpoint) routes to v1 before bucketing. Every other request is bucketed; a v2 candidate then runs the v2 `QueryAnalysis`/Router, and if the route is `write`, `evaluate`/legal/compliance, or otherwise unsupported, the request falls back to v1 before any capability execution or user-visible output. `CANARY_PERCENT=100` therefore means **100% of v2-eligible traffic**, never a global replacement of v1.
 
 - [ ] **Step 3: Implement live metrics without pseudo-quality metric**
 

@@ -331,6 +331,7 @@ test_fast_document_read_uses_shared_capability_registry
 test_task_scheduler_is_defined_once_and_shared
 test_runtime_services_excludes_plan_checkpoint_and_evaluator_service
 test_scheduler_never_rewrites_task_input
+test_execute_leases_new_evidence_uses_before_checkpoint
 ```
 
 - [ ] **Step 2: Implement deterministic fast plan**
@@ -399,10 +400,11 @@ resolve ready TaskSpec
 -> build AgentRequest
 -> call capability.execute(request, runtime.capability_runtime)
 -> validate AgentResult.task_id/status/error/output/evidence uses
+-> acquire_or_refresh a retention lease for every newly created EvidenceUse
 -> append immutable result
 ```
 
-It stops before dispatch on cancellation/deadline. The scheduler executes `TaskSpec.input` exactly as checkpointed and MUST NOT mutate, rewrite, or lazily materialize a task input; materialization happens before the TaskSpec is appended and checkpointed. EvidenceUse insertion occurs only after TaskPlan checkpoint ownership is established.
+It stops before dispatch on cancellation/deadline. The scheduler executes `TaskSpec.input` exactly as checkpointed and MUST NOT mutate, rewrite, or lazily materialize a task input; materialization happens before the TaskSpec is appended and checkpointed. Each new EvidenceUse is leased before results are returned so it is checkpointed under an active lease; it is inserted only after TaskPlan checkpoint ownership is established.
 
 - [ ] **Step 4: Define request-scoped RuntimeServices**
 

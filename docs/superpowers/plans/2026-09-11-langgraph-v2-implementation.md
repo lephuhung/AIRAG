@@ -175,7 +175,7 @@ The implementation suite is ready only when all are proven:
 | 36 | Document search observation exposes opaque `candidate_ids` resolved by a request-scoped `DiscoveryCandidateRegistry` | Phase 3 `test_document_search_observation_exposes_candidate_ids_only`, `test_planner_cannot_select_document_revision_directly` |
 | 37 | 100% rollout means 100% of v2-eligible traffic (`write` is a Domain, selector is not a second classifier) | Phase 3 `test_rollout_100_percent_still_routes_write_to_v1`, `test_rollout_100_percent_still_routes_evaluate_to_v1`, `test_supported_compare_uses_v2_at_100_percent_eligible_rollout` |
 | 38 | `ResearchPlanningInput` is an ephemeral projection, never checkpointed | Phase 3 `test_planning_input_is_ephemeral_never_checkpointed` |
-| 39 | Binding pin acquires a lease before checkpoint; runner releases only after the terminal checkpoint | Phase 2 `test_binding_pin_acquires_lease_before_checkpoint`, `test_resume_refreshes_lease_before_continuing` |
+| 39 | Binding pin and every new EvidenceUse acquire a lease before checkpoint; resume refreshes and only the outer runner releases after the terminal checkpoint | Phase 2 `test_binding_pin_acquires_lease_before_checkpoint`, `test_resume_refreshes_lease_before_continuing`, `test_execute_leases_new_evidence_uses_before_checkpoint` |
 | 40 | Repositories mutate+flush only; the service/UoW owns the transaction | Phase 1 publish tests (`test_tombstone_race_commits_abandoned_before_error`) |
 
 ## Whole-Suite Validation
