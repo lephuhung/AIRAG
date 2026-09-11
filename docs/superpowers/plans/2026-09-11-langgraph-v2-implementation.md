@@ -100,6 +100,7 @@
 20. Resuming a terminal-`failed` revision in place, or retrying without allocating a new generation — retries must be bounded, produce `retry_of_revision_id` provenance, and a failed revision stays immutable.
 21. Deriving `source_object_identity` from a user filename, client header, or otherwise non-canonical key — it must be `bucket + verbatim storage object key + version_id/etag + size + streamed sha256`, with a multipart etag never treated as a content hash.
 22. Comparing a v2-internal grounded/total ratio across arms as a live quality gate (tautological and lacking a v1 counterpart) — quality must be measured by a shared evaluator on both arms in the golden preflight, and the live gate must carry no quality field.
+23. Blind-`DETACH DELETE` of MERGE-shared canonical KG entities during revision GC — only rows carrying the producing `revision_id` may be deleted, and a shared entity is pruned only when no other revision still references it.
 18. Recreating v1-style People/RAG/Summary/Comparison domain agents inside v2 instead of nodes + shared capabilities/tools + task skills.
 19. Giving the model control of workspace IDs, People permission, ACL, deadlines, service clients, or capability-registry construction.
 20. Implementing separate fast-path and complex-agent business logic for the same capability.
@@ -115,7 +116,7 @@ The suite is ready to execute only when the revised plans prove:
 | 3 | Delete is logical/tombstoned before GC | Phase 1 `test_delete_tombstones_before_gc`, `test_publish_after_tombstone_does_not_resurrect_current`, `test_expired_evidence_alone_does_not_release_revision_artifacts`, `test_revision_artifact_gc_requires_no_retained_references` + Task 9 independent predicates |
 | 4 | Viewer APIs resolve the current revision correctly | Phase 1 `test_current_document_view_uses_current_revision` |
 | 5 | Clone cannot bypass the revision lifecycle | Phase 1 Task 4 clone rule + pipeline test |
-| 6 | KG facts are isolated by revision | Phase 1 `test_revision_kg_does_not_leak_old_fact` |
+| 6 | KG facts are isolated by revision | Phase 1 `test_revision_kg_does_not_leak_old_fact`, `test_revision_kg_gc_preserves_shared_entities` |
 | 7 | Historical vectors resolve from recorded artifact metadata | Phase 1 `test_historical_revision_uses_recorded_embedding_namespace` |
 | 8 | Write scope has an explicit owner | Phase 2 Global Constraints (v1 owns; out of v2 scope) |
 | 9 | Evidence encryption has real key-management semantics | Phase 1 Task 8 keyring/key-ID/rotation tests |
