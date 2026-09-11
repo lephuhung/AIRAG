@@ -15,6 +15,7 @@
 - Architecture remains **Approved design** with contract freeze active; plans do not add/change frozen business-contract fields.
 - Keep `backend/app/services/agents/supervisor.py` as v1 and create independent `backend/app/services/agents/supervisor_v2.py`.
 - Apply [`2026-09-11-langgraph-v2-agent-tool-node-amendment.md`](2026-09-11-langgraph-v2-agent-tool-node-amendment.md) before Phase 2. It is normative for implementation taxonomy, package ownership, and tool execution path.
+- The frozen spec carries a **non-contract §6 erratum** (module/graph boundary) pointing to that amendment; the spec's business contracts remain higher authority and the architecture status stays Approved/frozen.
 - **Agent:** adaptive plan/replan proposal only. **Node:** LangGraph state/routing/lifecycle. **Capability:** atomic typed domain operation. **Skill:** task strategy. **Workflow/subgraph:** predetermined multi-step algorithm.
 - Do not create v2 People/RAG/Document/Section/KG/Summary/Comparison/Evaluation/Grounding domain agents or domain graph wrappers.
 - `CapabilityDescriptor`, `CapabilityInput`, `CapabilityOutput`, and the runtime-only `CapabilityRuntimeContext` remain frozen contracts owned by the contracts layer; plans import them and never redefine or field-extend them.

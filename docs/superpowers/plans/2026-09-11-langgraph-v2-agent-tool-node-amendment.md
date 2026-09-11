@@ -617,7 +617,7 @@ Phase 3 complex agent + governed tool gateway + skills
 
 Phase 2 and Phase 3 plans must directly use the package paths and execution invariants in this amendment. Do not rely on a worker mentally merging contradictory documents.
 
-If an older plan statement conflicts with this amendment on **agent/node/capability/skill ownership, package path, or tool execution path**, the synchronized Phase 2/3 plan text is the source of truth. Frozen business contracts remain higher authority than all plans.
+If an older plan statement conflicts with this amendment on **agent/node/capability/skill ownership, package path, or tool execution path**, the synchronized Phase 2/3 plan text is the source of truth. Frozen business contracts remain higher authority than all plans. The frozen spec records this in a **non-contract erratum at §6** (module and graph boundary) that points here; it changes no contract field, type, or invariant.
 
 ---
 

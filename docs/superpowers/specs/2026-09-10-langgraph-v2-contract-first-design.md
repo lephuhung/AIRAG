@@ -170,6 +170,21 @@ Grounding → RenderedCitation[] → FinalResponse
 
 ## 6. Module and graph boundary
 
+> **Non-contract erratum (2026-09-11) — implementation ownership only.**
+> The module/graph layout in this section is superseded for implementation by
+> [`../plans/2026-09-11-langgraph-v2-agent-tool-node-amendment.md`](../plans/2026-09-11-langgraph-v2-agent-tool-node-amendment.md).
+> That amendment is normative for the agent/node/capability/skill taxonomy, the
+> canonical `v2/nodes`, `v2/capabilities`, `v2/tools`, `v2/skills` package layout,
+> and the `TaskPlan -> validate -> checkpoint -> scheduler -> capability` execution
+> path. Do not create the retired `context_graph/`, `binding_graph/`,
+> `routing_graph/`, `people_graph/`, `document_graph/`, `section_graph/`,
+> `write_graph/`, `knowledge_graph/`, or `grounding_graph/` packages shown below;
+> `complex_research_graph` is a single checkpointed LangGraph subgraph.
+>
+> This erratum changes **no business-contract field, type, or invariant**. The
+> frozen contracts in this spec remain higher authority than the amendment, and
+> the architecture status stays **Approved design / contract freeze active**.
+
 ```text
 backend/app/services/agents/
 ├── supervisor.py                    # unchanged v1
