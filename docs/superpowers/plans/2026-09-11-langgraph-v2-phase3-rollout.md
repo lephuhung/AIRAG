@@ -25,6 +25,7 @@
 - Subagents, if selected by the orchestrator, are advisory/context-isolation helpers only and have no capability execution, TaskPlan, EvidenceUse, sufficiency, or FinalResponse authority.
 - Shadow v2 cannot write production checkpoints/evidence/audit/chat/memory/title or outbound events.
 - Rollout bucket selection is deterministic and server-owned.
+- Exactly one ownership chain exists: Supervisor → `complex_boundary_node` adapter → ComplexResearch subgraph → validate/lease/checkpoint → shared `TaskScheduler` → `CapabilityRegistry` → `Capability.execute`. A second scheduler, a plain-Python execute loop, an `AgentToolGateway` that dispatches, a `plan_checkpoint` service, an `EvidenceEvaluator` service, a subgraph-owned checkpointer, or scheduler input materialization is forbidden.
 - Before editing existing symbols run exact impact; before every commit run compare-scope detect-changes and stage narrow paths.
 
 Canonical Phase-3 additions:
@@ -176,6 +177,8 @@ test_people_observation_does_not_expose_raw_record
 test_capability_output_is_not_model_observation_by_default
 test_observation_projection_is_typed_no_mapping
 test_unknown_result_kind_projection_fails_closed
+test_document_search_observation_exposes_candidate_ids_only
+test_planner_cannot_select_document_revision_directly
 ```
 
 - [ ] **Step 2: Implement proposal + observation gateway (no execution)**
@@ -211,7 +214,7 @@ class PeopleLookupObservation(ContractModel):
 class DocumentSearchObservation(ContractModel):
     kind: Literal["document.search"] = "document.search"
     candidate_count: int
-    candidate_revision_refs: tuple[RevisionRef, ...]
+    candidate_ids: tuple[UUID, ...]          # opaque candidate identity only; never a revision ref
 
 class DocumentReadObservation(ContractModel):
     kind: Literal["document.read"] = "document.read"
@@ -235,7 +238,7 @@ ToolObservationProjection = Annotated[
 ]
 ```
 
-`ToolObservationProjection` is a discriminated union of typed per-capability projections owned by `tools/observations.py` (implementation-only). No `Mapping`/dict escape hatch and no free-form string metadata: adding an observable field requires a typed model change, and an unknown `result_kind` fails closed with `ObservationProjectionUnavailable`.
+`ToolObservationProjection` is a discriminated union of typed per-capability projections owned by `tools/observations.py` (implementation-only). No `Mapping`/dict escape hatch and no free-form string metadata: adding an observable field requires a typed model change, and an unknown `result_kind` fails closed with `ObservationProjectionUnavailable`. `DocumentSearchObservation` exposes only opaque `candidate_ids`: a candidate id is resolved by the Binding Resolver / discovery service into an authorized `document_id` plus pinned revision, so the model never owns revision truth and cannot select a revision directly.
 
 `AgentToolGateway.propose(...)` must perform only:
 
@@ -300,6 +303,10 @@ test_complex_subgraph_is_checkpointed_under_supervisor_saver
 test_complex_subgraph_resumes_from_interrupt
 test_complex_subgraph_does_not_open_its_own_checkpointer
 test_complex_subgraph_uses_shared_task_scheduler
+test_complex_boundary_maps_parent_to_child_state
+test_complex_boundary_maps_child_result_back_to_execution_state
+test_complex_subgraph_does_not_require_root_state_schema
+test_complex_subgraph_resumes_under_supervisor_checkpointer
 test_phase3_scope_excludes_legal_and_compliance_skills
 test_unsupported_work_type_returns_typed_unavailable
 ```
@@ -338,15 +345,55 @@ def build_complex_research_subgraph() -> CompiledStateGraph:
 
 The planner may choose capabilities only by placing them into `TaskSpec`. No framework-native tool call may bypass the gateway/scheduler invariant. For this pilot, reject discovery/replan. `skills/compare/policy.py` is framework-neutral; if Phase 0 selected Deep Agents, native skill files may mirror it under `skills/compare/`, but the Python policy remains the source of truth and no `*` placeholder path is ever created. The injected `TaskScheduler` is the shared class defined in Phase 2 (`v2/execution/scheduler.py`); Phase 3 extends it but never defines or duplicates a second scheduler. `validate_checkpoint_node` validates via `validate_task_plan`/`validate_replan` and returns the plan into `ComplexResearchState`; the supervisor saver performs the checkpoint, so there is no `plan_checkpoint` service. The same node calls Phase-1 `retention_leases.acquire_or_refresh(run_id, revision_id, evidence_use_id)` for every revision/use it pins, and the subgraph releases the run's leases on terminal finalize or cancellation (clarification interrupt keeps its lease until resolution or TTL expiry). `complex_evaluate_node` calls the shared `evaluate_evidence(...)` from `nodes/evaluate.py`; there is no `EvidenceEvaluator` class or service. `runtime.services` exposes only the Phase-2 `RuntimeServices` fields.
 
-- [ ] **Step 3: Replace only Phase-2 `complex_boundary` implementation**
+- [ ] **Step 3: Replace only Phase-2 `complex_boundary` implementation with an explicit state adapter**
 
-In `create_supervisor_v2_graph(checkpointer)`, compile the subgraph and attach it as the node:
+`SupervisorV2State` and `ComplexResearchState` are different schemas. Do not rely on implicit shared-state behavior and do not copy complex fields into the root state to make the schemas match; use an explicit boundary adapter.
 
 ```python
-graph.add_node("complex_boundary", build_complex_research_subgraph())
+def build_complex_research_state(state: SupervisorV2State, runtime: GraphRuntimeContext) -> ComplexResearchState:
+    return ComplexResearchState(
+        contract_version=state.contract_version,
+        planning_input=ResearchPlanningInput(
+            semantic=state.semantic,
+            bindings=state.bindings,
+            query_analysis=state.query_analysis,
+            capability_catalog=runtime.capability_catalog,
+            discovery_policy=state.discovery_policy,
+            budget=state.budget,
+            current_plan=state.execution.plan,
+            task_outcomes=state.execution.task_outcomes,
+            prior_evidence_uses=state.execution.prior_evidence_uses,
+            prior_evaluation=state.execution.evaluation,
+        ),
+    )
+
+def merge_complex_result_into_supervisor(state: SupervisorV2State, child: ComplexResearchState) -> dict:
+    return execution_update(
+        plan=child.plan,
+        task_results=child.task_results,
+        evaluation=child.evaluation,
+    )
+
+def make_complex_boundary_node(complex_subgraph: CompiledStateGraph):
+    async def complex_boundary_node(
+        state: SupervisorV2State,
+        runtime: GraphRuntimeContext,
+        config: RunnableConfig,
+    ) -> dict:
+        child_input = build_complex_research_state(state, runtime)
+        child_output = await complex_subgraph.ainvoke(child_input, config=config, context=runtime)
+        return merge_complex_result_into_supervisor(state, child_output)
+    return complex_boundary_node
 ```
 
-The subgraph is compiled with no `compile(checkpointer=...)` argument, so the parent's `checkpointer` namespaces and persists every subgraph step (plan checkpoint, execute, evaluate, replan). The outer supervisor remains the only saver owner, so a shadow run compiled with its isolated `InMemorySaver` makes the same subgraph checkpoint into the shadow saver and never touches production. After the subgraph terminates, the shared synthesis/grounding/finalizer nodes still render the response.
+In `create_supervisor_v2_graph(checkpointer)`:
+
+```python
+complex_subgraph = build_complex_research_subgraph()      # compiled WITHOUT a checkpointer
+full_graph.add_node("complex_boundary", make_complex_boundary_node(complex_subgraph))
+```
+
+`config` carries the parent `thread_id`/checkpoint namespace, so the subgraph writes its checkpoints under the parent saver and a shadow run's isolated `InMemorySaver` is inherited. The adapter maps only the fields the child needs and merges only the execution result back; the child never reads root state and never needs `SupervisorV2State`. After the subgraph terminates, the shared synthesis/grounding/finalizer nodes render the response.
 
 - [ ] **Step 4: Test and commit**
 
@@ -369,7 +416,7 @@ git commit -m "feat: add governed v2 comparison research"
 - Test: `backend/tests/agents/v2/complex/test_people_document.py`
 
 **Interfaces:**
-- Produces: `PeopleDocumentDependencyAdapter.materialize(...) -> DocumentSearchInput`; People planner observation remains minimized.
+- Produces: a deterministic dependency-materialization node that builds the concrete `DocumentSearchInput` **before** T2 is appended/checkpointed, so `TaskSpec.input` is authoritative and the scheduler never rewrites it; People planner observation stays minimized.
 
 - [ ] **Step 1: Write failing dependency/security tests**
 
@@ -383,13 +430,33 @@ not_found -> no T2
 PERMISSION_DENIED/TIMEOUT/error -> no T2 and remain distinct
 expired/unauthorized use -> no materialization
 no fabricated downstream input
+test_people_document_materializes_before_task_append
+test_t2_checkpoint_contains_final_document_search_input
+test_scheduler_never_rewrites_task_input
+test_people_scalar_never_enters_planner_observation
+test_people_not_found_does_not_append_t2
+test_people_timeout_does_not_fabricate_t2
 ```
 
 - [ ] **Step 2: Implement materializer**
 
-`depends_on` expresses ordering only. The scheduler recognizes a registered People→Document materializer; it receives T1 result/use refs plus current runtime, hydrates only the admitted People evidence under current ACL/expiry/minimization policy, extracts one fixed allowed scalar, validates concrete `DocumentSearchInput`, and only then dispatches T2.
+`depends_on` expresses ordering only. Materialization happens **before T2 is appended and checkpointed**, never inside the scheduler:
 
-Planner/tool observation returns status/use IDs and dependency availability metadata, never the sensitive scalar itself.
+```text
+T1 people.lookup
+-> AgentResult / governed EvidenceUse
+-> deterministic dependency-materialization node
+-> current ACL + expiry + minimization
+-> extract exact approved scalar server-side
+-> build concrete DocumentSearchInput
+-> append T2 TaskSpec(input=<concrete input>)
+-> validate_replan
+-> retention-lease commit
+-> checkpoint updated TaskPlan
+-> TaskScheduler dispatches T2 unchanged
+```
+
+The deterministic node hydrates only the admitted People evidence under current ACL/expiry/minimization policy, extracts one fixed allowed scalar, validates the concrete `DocumentSearchInput`, and only then appends T2. The scheduler executes `TaskSpec.input` exactly as checkpointed and MUST NOT mutate or lazily materialize a task input. The planner/model only sees T1 status, `evidence_use_ids`, and `dependency_scalar_available`; it never sees the scalar. No generic `TaskOutputRef` is added to frozen contracts.
 
 - [ ] **Step 3: Test and commit**
 
@@ -616,7 +683,7 @@ acl_leak
 duplicate_production_write
 ```
 
-Missing/default security fields are invalid, never interpreted as safe.
+Missing/default security fields are invalid, never interpreted as safe. Add rollout-eligibility tests: `test_rollout_100_percent_still_routes_write_to_v1`, `test_rollout_100_percent_still_routes_evaluate_to_v1`, and `test_supported_compare_uses_v2_at_100_percent_eligible_rollout`.
 
 - [ ] **Step 2: Implement controls**
 
@@ -628,7 +695,7 @@ NEXUSRAG_AGENT_V2_CANARY_WORKSPACES=
 NEXUSRAG_AGENT_V2_BUCKET_SALT=<runtime-secret>
 ```
 
-DB control is authoritative within environment ceilings. Selection is server-owned and uses authenticated workspace + persisted request ID.
+DB control is authoritative within environment ceilings. Selection is server-owned and uses authenticated workspace + persisted request ID. Selection is two-stage: first classify whether the request's work family is v2-supported (the Phase-3 scope table), then bucket only eligible requests. Unsupported families (`write`, `evaluate`/legal/compliance) always route to v1 regardless of percentage, so `CANARY_PERCENT=100` means **100% of v2-eligible traffic**, never a global replacement of v1. If eligibility is only decidable after routing inside the graph, the v2 typed-unavailable outcome falls back to v1 before any user-visible failure is emitted.
 
 - [ ] **Step 3: Implement live metrics without pseudo-quality metric**
 
@@ -700,7 +767,7 @@ shadow 5%
 -> 100%
 ```
 
-Each canary stage requires real `agent_rollout_metrics` traffic over the live gate window. Failure disables v2, increments control revision, routes new requests to v1, and cancels active v2 runs without success.
+Each canary stage requires real `agent_rollout_metrics` traffic over the live gate window. `100%` promotes 100% of v2-eligible supported traffic only; a global replacement of v1 is explicitly out of scope until Write/evaluate have approved v2 implementations. Failure disables v2, increments control revision, routes new requests to v1, and cancels active v2 runs without success.
 
 - [ ] **Step 4: Final validation**
 

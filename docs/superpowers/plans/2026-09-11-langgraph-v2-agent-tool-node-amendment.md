@@ -109,6 +109,33 @@ Rules:
 7. Model-generated workspace IDs, ACLs, deadlines, service objects, EvidenceUse IDs, or authorization flags are never accepted as execution authority.
 8. `AgentToolGateway` never executes or checkpoints: it only proposes validated append-only tasks and projects safe observations. Execution belongs to `TaskScheduler`; checkpointing belongs to the LangGraph graph and its saver.
 
+### Canonical end-to-end execution topology
+
+```text
+INGRESS -> Context -> Binding -> Semantic Finalizer -> Router
+   fast:    FastPlan -> TaskPlan
+   complex: Complex Boundary Adapter -> ComplexResearch Subgraph -> plan/replan proposal
+                       \_______________________/
+                                  v
+                        TaskPlan validation
+                                  v
+                     retention lease commit (app DB)
+                                  v
+                  LangGraph state / checkpoint (saver)
+                                  v
+                        shared TaskScheduler
+                                  v
+                       CapabilityRegistry
+                                  v
+                      Capability.execute
+                                  v
+                     AgentResult / EvidenceUse
+                                  v
+                       Evaluator -> Synthesis -> Grounding -> FinalResponse
+```
+
+People→Document: `T1 checkpoint -> T1 execute -> People EvidenceUse -> deterministic materialize node -> concrete T2 CapabilityInput -> append T2 TaskSpec -> validate -> lease -> checkpoint -> scheduler executes T2 unchanged`.
+
 ### Framework-neutral internal gateway
 
 The selected orchestrator may expose an internal gateway such as:
@@ -191,7 +218,7 @@ class PeopleLookupObservation(ContractModel):
 class DocumentSearchObservation(ContractModel):
     kind: Literal["document.search"] = "document.search"
     candidate_count: int
-    candidate_revision_refs: tuple[RevisionRef, ...]
+    candidate_ids: tuple[UUID, ...]          # opaque candidate identity only; never a revision ref
 
 class DocumentReadObservation(ContractModel):
     kind: Literal["document.read"] = "document.read"
@@ -223,6 +250,7 @@ Rules:
 - The `ObservationProjector` runs only after the shared `TaskScheduler` has executed and the graph has checkpointed the task; `AgentToolGateway` owns the projector but never the execution or the checkpoint.
 - No runtime secrets, service clients, ACL/workspace authority, deadlines, storage keys, or encryption metadata are model-visible.
 - Retrieved document text remains untrusted data and is not automatically returned to the planner. The planner primarily receives task status, coverage/evaluation gaps, candidate metadata explicitly admitted by policy, and EvidenceUse identities.
+- `candidate_ids` are opaque: the Binding Resolver / discovery service resolves a candidate id into an authorized `document_id` and pinned revision. The model never receives a `RevisionRef`, never owns revision truth, and cannot select a document revision directly.
 - Full evidence content is hydrated only by governed evaluator/synthesis/grounding paths.
 - People and other sensitive capabilities use stricter projection: raw CCCD, DOB, addresses, phone/email, personnel records, or unrelated fields never enter planner observation or checkpoint.
 - People -> Document scalar transfer remains a deterministic governed dependency materializer, not a planner observation.
@@ -368,7 +396,7 @@ test_task_must_be_checkpointed_before_capability_dispatch
 
 ## 6. Phase 3 Semantics: One Adaptive Complex-Research Agent
 
-`ComplexResearchGraph` is the single adaptive planning/replanning boundary, implemented as a **checkpointed LangGraph subgraph** (`build_complex_research_subgraph`). It is compiled without its own checkpointer and attached as the supervisor's `complex_boundary` node, so the supervisor saver checkpoints and namespaces every plan/replan/execute/evaluate step and shadow runs stay isolated. The outer LangGraph graph, validator, scheduler, evaluator, and grounding remain authoritative.
+`ComplexResearchGraph` is the single adaptive planning/replanning boundary, implemented as a **checkpointed LangGraph subgraph** (`build_complex_research_subgraph`). It is compiled without its own checkpointer and attached as the supervisor's `complex_boundary` node, so the supervisor saver checkpoints and namespaces every plan/replan/execute/evaluate step and shadow runs stay isolated. The outer LangGraph graph, validator, scheduler, evaluator, and grounding remain authoritative. Ownership is a single chain: Supervisor -> complex boundary adapter (`complex_boundary_node`) -> ComplexResearch subgraph -> validate/lease/checkpoint -> shared `TaskScheduler` -> `CapabilityRegistry` -> `Capability.execute`. No second scheduler, plain-Python execute loop, gateway dispatch, `plan_checkpoint`/`EvidenceEvaluator` service, subgraph-owned checkpointer, or scheduler input materialization is permitted.
 
 Canonical research loop:
 

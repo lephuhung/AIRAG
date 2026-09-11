@@ -129,6 +129,7 @@
 37. Leaving a `verified` revision non-terminal forever when its source is tombstoned — it must become terminal `abandoned` (with `abandon_reason`) so Predicate B can reclaim its artifacts; `abandoned` is immutable and never current.
 38. Reclaiming a revision or evidence payload while a checkpoint retention lease is active, or failing to write/release a lease for a checkpoint that pins a revision/EvidenceUse — a resumable run must never lose pinned artifacts, and an expired lease must never block GC.
 39. Creating an out-of-scope Phase-3 skill (`legal_analysis`, `compliance`) or a domain-agent wrapper, or silently routing an unsupported `WorkType`/`RouteReason` to `fast_domain` instead of failing closed with the typed unavailable response.
+40. Building a second ownership/execution path: a duplicate scheduler, a plain-Python complex execute loop, a dispatching `AgentToolGateway`, a `plan_checkpoint`/`EvidenceEvaluator` service, a subgraph-owned checkpointer, or scheduler-side `TaskSpec.input` materialization.
 
 ## Final Execution Gate
 
@@ -168,6 +169,11 @@ The implementation suite is ready only when all are proven:
 | 30 | Model observation is a typed per-capability projection, never a `Mapping` | Phase 3 Task 2 `test_observation_projection_is_typed_no_mapping`, `test_unknown_result_kind_projection_fails_closed` + tools guard |
 | 31 | Checkpoint/revision retention leases block GC for resumable runs | Phase 1 `test_checkpoint_pinning_revision_writes_lease`, `test_active_lease_blocks_artifact_and_evidence_gc`, `test_expired_lease_does_not_block_gc`, `test_terminal_run_releases_lease`, `test_resumable_interrupt_keeps_lease_until_expiry` |
 | 32 | Phase-3 supported skill/work-type scope is explicit; out-of-scope work types fail closed | Phase 3 scope table + `test_phase3_scope_excludes_legal_and_compliance_skills`, `test_unsupported_work_type_returns_typed_unavailable` |
+| 33 | Parent/child states are connected by explicit adapters and exactly one ownership chain exists | Phase 3 `test_complex_boundary_maps_parent_to_child_state`, `test_complex_boundary_maps_child_result_back_to_execution_state`, `test_complex_subgraph_does_not_require_root_state_schema` |
+| 34 | People→Document input is materialized before T2 checkpoint; scheduler never mutates `TaskSpec.input` | Phase 3 `test_people_document_materializes_before_task_append`, `test_t2_checkpoint_contains_final_document_search_input`, `test_scheduler_never_rewrites_task_input` |
+| 35 | Phase 1A creates every schema-v1 table mapped in 1B; tombstone clears the current pointer; one GC retention anchor | Phase 1 migration control test (actual tables == `V2_SCHEMA_V1_TABLES`), `test_tombstone_clears_current_revision_pointer`, `test_failed_revision_has_gc_retention_anchor` |
+| 36 | Document search observation exposes opaque `candidate_ids` only | Phase 3 `test_document_search_observation_exposes_candidate_ids_only`, `test_planner_cannot_select_document_revision_directly` |
+| 37 | 100% rollout means 100% of v2-eligible traffic, not global v1 replacement | Phase 3 `test_rollout_100_percent_still_routes_write_to_v1`, `test_rollout_100_percent_still_routes_evaluate_to_v1`, `test_supported_compare_uses_v2_at_100_percent_eligible_rollout` |
 
 ## Whole-Suite Validation
 

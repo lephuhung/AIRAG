@@ -330,6 +330,7 @@ test_fast_people_uses_shared_capability_registry
 test_fast_document_read_uses_shared_capability_registry
 test_task_scheduler_is_defined_once_and_shared
 test_runtime_services_excludes_plan_checkpoint_and_evaluator_service
+test_scheduler_never_rewrites_task_input
 ```
 
 - [ ] **Step 2: Implement deterministic fast plan**
@@ -401,7 +402,7 @@ resolve ready TaskSpec
 -> append immutable result
 ```
 
-It stops before dispatch on cancellation/deadline. EvidenceUse insertion occurs only after TaskPlan checkpoint ownership is established.
+It stops before dispatch on cancellation/deadline. The scheduler executes `TaskSpec.input` exactly as checkpointed and MUST NOT mutate, rewrite, or lazily materialize a task input; materialization happens before the TaskSpec is appended and checkpointed. EvidenceUse insertion occurs only after TaskPlan checkpoint ownership is established.
 
 - [ ] **Step 4: Define request-scoped RuntimeServices**
 
@@ -416,6 +417,7 @@ class RuntimeServices:
     chat_messages: ChatMessageRepository
     authorization: AuthorizationService
     evidence_hydrator: EvidenceHydrator
+    retention_leases: RevisionRetentionLeaseRepository
 ```
 
 This is the only definition of the service bag referenced by `GraphRuntimeContext.services`. It deliberately excludes `plan_checkpoint` and any `EvidenceEvaluator` service: plan persistence is LangGraph state plus the supervisor checkpointer (no service), and evidence evaluation is the shared `evaluate_evidence(...)` function in `nodes/evaluate.py`. `runtime.services.<name>` may reference only these fields; an unknown service fails at construction, not at graph runtime.
@@ -594,7 +596,7 @@ def create_supervisor_v2_graph(checkpointer: BaseCheckpointSaver) -> CompiledSta
     return graph.compile(checkpointer=checkpointer)
 ```
 
-Lifespan owns one opened AsyncPostgresSaver context; web startup never calls saver setup/migration. `complex_boundary` is the single Phase-3 replacement seam: Phase 3 attaches `build_complex_research_subgraph()` here so subgraph state, interrupt/resume, and checkpoint namespacing stay under the supervisor saver. Every checkpoint write that pins a `revision_id` or retains an `EvidenceUse` also calls Phase-1 `retention_leases.acquire_or_refresh(run_id, revision_id, evidence_use_id)` in the same transaction, and terminal finalization/cancellation calls `release(run_id)`; this is what keeps resumable runs from losing artifacts to GC.
+Lifespan owns one opened AsyncPostgresSaver context; web startup never calls saver setup/migration. `complex_boundary` is the single Phase-3 replacement seam: Phase 3 attaches `build_complex_research_subgraph()` here so subgraph state, interrupt/resume, and checkpoint namespacing stay under the supervisor saver. Every checkpoint write that pins a `revision_id` or retains an `EvidenceUse` first calls Phase-1 `retention_leases.acquire_or_refresh(run_id, revision_id, evidence_use_id)` and commits the lease before returning the state update that LangGraph then checkpoints; terminal finalization/cancellation releases leases only after the terminal checkpoint succeeds. Ordering is authoritative; the checkpoint DB and application DB never share a transaction. This is what keeps resumable runs from losing artifacts to GC.
 
 - [ ] **Step 3: Test and commit**
 

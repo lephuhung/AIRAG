@@ -95,11 +95,30 @@ Expected: only intentional plan/execution changes; `.orca/` remains untracked.
 
 Create a PostgreSQL test schema using populated pre-v2 `documents`, `document_images`, and `document_tables`. Run `apply_v2_schema`, then assert: schema/version and empty revision tables exist; nullable revision links/current pointer exist; every legacy row remains untouched and v1-readable; no legacy Chroma/KG/object/SQL artifact is falsely marked revision-ready; all legacy `current_revision_id` values remain null until full revision-aware reindex; rerun is idempotent. Instrument SQL and assert the migration takes its advisory lock before DDL and never imports ORM metadata, calls `create_all`, deletes legacy rows, or invents a baseline published revision.
 
-Run `cd backend && pytest tests/migrations/v2/test_populated_legacy_migration.py tests/migrations/v2/test_migration_control.py -q`; expect import failure.
+Run `cd backend && pytest tests/migrations/v2/test_populated_legacy_migration.py tests/migrations/v2/test_migration_control.py -q`; expect import failure. The control test must assert `actual_migrated_tables == V2_SCHEMA_V1_TABLES` exactly (no missing table and no hidden table that would first appear in Release 1B).
 
 - [ ] **Step 2: Implement the locked migration in exact safe order**
 
-`apply_v2_schema` uses SQLAlchemy text/DDL only, takes `pg_advisory_xact_lock`, and never imports `app.models` or calls `Base.metadata.create_all`. In one transaction it: (1) creates version/revision/build/structure tables, including implementation-only metadata: `document_revisions.generation BIGINT` (per-document monotonic allocation counter, unique per document), `document_revisions.retry_of_revision_id UUID NULL` (retry provenance), `document_revisions.failed_at TIMESTAMPTZ NULL`/`failure_stage TEXT NULL`/`failure_class TEXT NULL` (terminal failure), `document_revisions.abandoned_at TIMESTAMPTZ NULL`/`abandon_reason TEXT NULL` (terminal tombstone/GC-blocked), `document_revisions.superseded_at`/`artifacts_purged_at` lifecycle metadata, `revision_ingestion_attempts` with unique constraint `uq_revision_ingestion_attempt_key` on `(document_id, source_object_identity, build_profile)` (the `ON CONFLICT` arbiter, not a read-then-write check), canonical source component columns (`source_scheme`, `source_bucket`, `source_object_key`, `source_version_id`, `source_etag`, `source_size`, `source_sha256`), a bounded `attempt_generation INT NOT NULL DEFAULT 1` retry counter plus `exhausted_at TIMESTAMPTZ NULL`, `source_arrivals` (webhook staging: `bucket`, `object_key`, `version_id`, `etag`, `size_bytes`, `arrival_identity`, `received_at`, `processed_at`, unique on `arrival_identity`), `revision_retention_leases` (`lease_id UUID PK`, `run_id TEXT`, `revision_id UUID` FK, `evidence_use_id UUID NULL`, `acquired_at`, `expires_at`, `released_at TIMESTAMPTZ NULL`, `release_reason TEXT NULL`, null-safe unique `(run_id, revision_id, evidence_use_id)`, partial index `(revision_id, expires_at) WHERE released_at IS NULL`), revision build manifest columns (`embedding_namespace`, `embedding_model_hash`, `embedding_dimension`, `vector_artifact_version`), revision lifecycle GC metadata (`superseded_at TIMESTAMPTZ NULL`, `artifacts_purged_at TIMESTAMPTZ NULL`), and evidence encryption metadata columns (`ciphertext`, `encryption_key_id`, `nonce`, `encryption_algorithm`, `payload_purged_at TIMESTAMPTZ NULL`); (2) adds nullable `documents.current_revision_id`, `documents.source_deleted_at TIMESTAMPTZ NULL` (plus a partial index for tombstone lookup), `document_images.revision_id`, and `document_tables.revision_id`; (3) installs foreign keys and revision uniqueness without imposing NOT NULL on legacy child rows, and verifies that cascading deletes from `documents` cannot orphan or destroy `document_revisions`, retained evidence lineage, or revision artifacts; (4) installs DB constraints/triggers requiring revision IDs for rows written through the revision-owned pipeline; (5) verifies existing row counts/checksums are unchanged; and (6) writes schema version 1. Legacy rows stay v1-only and cannot be selected by v2. A full revision-aware reindex later creates new revision-owned child rows and atomically sets `current_revision_id`.
+`apply_v2_schema` uses SQLAlchemy text/DDL only, takes `pg_advisory_xact_lock`, and never imports `app.models` or calls `Base.metadata.create_all`. In one transaction it: (1) creates version/revision/build/structure tables, including implementation-only metadata: `document_revisions.generation BIGINT` (per-document monotonic allocation counter, unique per document), `document_revisions.retry_of_revision_id UUID NULL` (retry provenance), `document_revisions.failed_at TIMESTAMPTZ NULL`/`failure_stage TEXT NULL`/`failure_class TEXT NULL` (terminal failure), `document_revisions.abandoned_at TIMESTAMPTZ NULL`/`abandon_reason TEXT NULL` (terminal tombstone/GC-blocked), `document_revisions.artifact_retention_starts_at TIMESTAMPTZ NULL` (the single GC retention anchor), `document_revisions.superseded_at`/`artifacts_purged_at` lifecycle metadata, `revision_ingestion_attempts` with unique constraint `uq_revision_ingestion_attempt_key` on `(document_id, source_object_identity, build_profile)` (the `ON CONFLICT` arbiter, not a read-then-write check), canonical source component columns (`source_scheme`, `source_bucket`, `source_object_key`, `source_version_id`, `source_etag`, `source_size`, `source_sha256`), a bounded `attempt_generation INT NOT NULL DEFAULT 1` retry counter plus `exhausted_at TIMESTAMPTZ NULL`, `source_arrivals` (webhook staging: `bucket`, `object_key`, `version_id`, `etag`, `size_bytes`, `arrival_identity`, `received_at`, `processed_at`, unique on `arrival_identity`), `revision_retention_leases` (`lease_id UUID PK`, `run_id TEXT`, `revision_id UUID` FK, `evidence_use_id UUID NULL`, `acquired_at`, `expires_at`, `released_at TIMESTAMPTZ NULL`, `release_reason TEXT NULL`, null-safe unique `(run_id, revision_id, evidence_use_id)`, partial index `(revision_id, expires_at) WHERE released_at IS NULL`), revision build manifest columns (`embedding_namespace`, `embedding_model_hash`, `embedding_dimension`, `vector_artifact_version`), revision lifecycle GC metadata (`superseded_at TIMESTAMPTZ NULL`, `artifacts_purged_at TIMESTAMPTZ NULL`), and evidence encryption metadata columns (`ciphertext`, `encryption_key_id`, `nonce`, `encryption_algorithm`, `payload_purged_at TIMESTAMPTZ NULL`); (2) adds nullable `documents.current_revision_id`, `documents.source_deleted_at TIMESTAMPTZ NULL` (plus a partial index for tombstone lookup), `document_images.revision_id`, and `document_tables.revision_id`; (3) installs foreign keys and revision uniqueness without imposing NOT NULL on legacy child rows, and verifies that cascading deletes from `documents` cannot orphan or destroy `document_revisions`, retained evidence lineage, or revision artifacts; (4) installs DB constraints/triggers requiring revision IDs for rows written through the revision-owned pipeline; (5) verifies existing row counts/checksums are unchanged; (6) creates exactly the `V2_SCHEMA_V1_TABLES` set below and no others; and (7) writes schema version 1. Release 1A is the only release allowed to create v2 schema, so it must enumerate every table/index/constraint that Release 1B later maps.
+
+```python
+V2_SCHEMA_V1_TABLES = {
+    "v2_schema_version",
+    "document_revisions",
+    "document_revision_builds",
+    "document_revision_chunks",
+    "revision_ingestion_attempts",
+    "source_arrivals",
+    "revision_retention_leases",
+    "conversation_snapshots",
+    "semantic_snapshots",
+    "binding_audit",
+    "evidence_records",
+    "evidence_uses",
+}
+```
+
+Legacy rows stay v1-only and cannot be selected by v2. A full revision-aware reindex later creates new revision-owned child rows and atomically sets `current_revision_id`.
 
 - [ ] **Step 3: Prove no startup metadata registration exists yet**
 
@@ -155,11 +174,11 @@ impact({target: "app.models.document.DocumentTable", direction: "upstream"})
 
 - [ ] **Step 2: Write metadata/readiness tests**
 
-Assert mappings match completed migration (`Document.current_revision_id` and legacy image/table revision IDs remain nullable; revision-pipeline inserts require revision ownership through DB constraints), all FKs resolve, exact schema version 1 is required before v2 repositories initialize, and `LEGACY_STARTUP_TABLES` excludes every v2 table. Against a fresh legacy schema, lifespan reports the Release-1A migration command and exits before startup table creation. With schema version 1, legacy `AUTO_CREATE_TABLES` may create only allowlisted legacy tables and emits no v2 DDL.
+Assert mappings match completed migration (`Document.current_revision_id` and legacy image/table revision IDs remain nullable; revision-pipeline inserts require revision ownership through DB constraints), all FKs resolve, every v2 ORM-mapped table already exists in `V2_SCHEMA_V1_TABLES` before registration (no `create_all`/DDL is required or hidden), exact schema version 1 is required before v2 repositories initialize, and `LEGACY_STARTUP_TABLES` excludes every v2 table. Against a fresh legacy schema, lifespan reports the Release-1A migration command and exits before startup table creation. With schema version 1, legacy `AUTO_CREATE_TABLES` may create only allowlisted legacy tables and emits no v2 DDL.
 
 - [ ] **Step 3: Register post-migration ORM mappings and gate startup**
 
-Define revision/build and v2 persistence models, map only already-existing columns, and register them in `app.models.__init__` only in this post-migration release. Replace unrestricted `Base.metadata.create_all()` with `Base.metadata.create_all(tables=LEGACY_STARTUP_TABLES)`. `lifespan` checks exact compatibility before v2 services initialize; it never invokes v2 migration or DDL. EvidenceUse null-safe uniqueness maps the Task-1 SQL index. `DocumentRevision.generation` maps the monotonic per-document allocation column with its unique constraint; `DocumentIngestionAttempt` maps the unique `(document_id, source_object_identity, build_profile)` key; `DocumentRevisionBuild` maps the embedding namespace/model hash/dimension/vector-artifact-version manifest; `Document.source_deleted_at` maps the tombstone column; `EvidenceRecord` maps `ciphertext`/`encryption_key_id`/`nonce`/`encryption_algorithm`/`payload_purged_at` and exposes no plaintext column. `DocumentRevision` also maps the independent GC metadata `superseded_at` and `artifacts_purged_at`, the terminal-failure fields `failed_at`/`failure_stage`/`failure_class`, the terminal-abandon fields `abandoned_at`/`abandon_reason`, and the retry provenance `retry_of_revision_id`; `DocumentIngestionAttempt` maps `attempt_generation` and `exhausted_at`, plus the canonical source columns `source_scheme`/`source_bucket`/`source_object_key`/`source_version_id`/`source_etag`/`source_size`/`source_sha256`; `SourceArrival` maps the webhook staging row; `RevisionRetentionLease` maps the checkpoint/revision retention lease.
+Define revision/build and v2 persistence models, map only already-existing columns, and register them in `app.models.__init__` only in this post-migration release. Replace unrestricted `Base.metadata.create_all()` with `Base.metadata.create_all(tables=LEGACY_STARTUP_TABLES)`. `lifespan` checks exact compatibility before v2 services initialize; it never invokes v2 migration or DDL. EvidenceUse null-safe uniqueness maps the Task-1 SQL index. `DocumentRevision.generation` maps the monotonic per-document allocation column with its unique constraint; `DocumentIngestionAttempt` maps the unique `(document_id, source_object_identity, build_profile)` key; `DocumentRevisionBuild` maps the embedding namespace/model hash/dimension/vector-artifact-version manifest; `Document.source_deleted_at` maps the tombstone column; `EvidenceRecord` maps `ciphertext`/`encryption_key_id`/`nonce`/`encryption_algorithm`/`payload_purged_at` and exposes no plaintext column. `DocumentRevision` also maps the independent GC metadata `superseded_at` and `artifacts_purged_at`, the terminal-failure fields `failed_at`/`failure_stage`/`failure_class`, the terminal-abandon fields `abandoned_at`/`abandon_reason`, the GC retention anchor `artifact_retention_starts_at`, and the retry provenance `retry_of_revision_id`; `DocumentIngestionAttempt` maps `attempt_generation` and `exhausted_at`, plus the canonical source columns `source_scheme`/`source_bucket`/`source_object_key`/`source_version_id`/`source_etag`/`source_size`/`source_sha256`; `SourceArrival` maps the webhook staging row; `RevisionRetentionLease` maps the checkpoint/revision retention lease.
 
 - [ ] **Step 4: Test and commit**
 
@@ -185,11 +204,11 @@ Deploy only after Release 1B readiness passes. From this release onward every wo
 - Test: `backend/tests/agents/v2/persistence/test_source_identity.py`
 
 **Interfaces:**
-- Produces: internal `RevisionBuildProfile = FULL | CHAT_UPLOAD | PARSE_ONLY`, canonical `compute_source_object_identity`/`normalize_object_key`/`resolve_build_profile`, monotonic `allocate_draft`/`generation`, failure-aware idempotent `get_or_create_ingestion_attempt`, bounded `retry_ingestion_attempt` (new generation per retry), terminal `mark_failed`, terminal `abandon_revision`, `record_worker_state`, `record_artifacts`, `verify_draft`, generation-safe and tombstone-guarded `publish`, `get_published`, and tombstone `mark_source_deleted` (sets `Document.source_deleted_at`, abandons non-published revisions, and never deletes revision rows).
+- Produces: internal `RevisionBuildProfile = FULL | CHAT_UPLOAD | PARSE_ONLY`, canonical `compute_source_object_identity`/`normalize_object_key`/`resolve_build_profile`, monotonic `allocate_draft`/`generation`, failure-aware idempotent `get_or_create_ingestion_attempt`, bounded `retry_ingestion_attempt` (new generation per retry), terminal `mark_failed`, terminal `abandon_revision`, `mark_superseded`, `record_worker_state`, `record_artifacts`, `verify_draft`, generation-safe and tombstone-guarded `publish` returning `PublishOutcome`, `get_published`, and tombstone `mark_source_deleted` (clears `current_revision_id`, abandons non-published revisions, and never deletes revision rows).
 
 - [ ] **Step 1: Write lifecycle tests**
 
-Test `allocate → revision-owned build → verify → publish`, profile-specific required artifacts, publish transaction updating `Document.current_revision_id`, immutable published columns, failed draft leaving prior current revision unchanged, and tombstone lookup. Assert R2 does not inherit R1 worker completion. `FULL` requires markdown+structure+vectors and configured caption/KG results; `CHAT_UPLOAD` requires markdown+structure+vectors and records caption/KG as intentionally skipped; `PARSE_ONLY` requires markdown+structure and records vector/caption/KG as intentionally skipped. Skips are not failures. Add monotonic/idempotency/manifest tests: `test_concurrent_revision_publish_does_not_regress_current` (allocate R2 then R3; publish R3 first, then R2; current stays R3 while R2 remains a historical published revision), `test_get_or_create_ingestion_attempt_is_idempotent` (same document/source/profile returns one revision), `test_concurrent_get_or_create_ingestion_attempt_is_atomic` (two concurrent sessions racing the same attempt key while neither sees an uncommitted row: exactly one `revision_ingestion_attempts` row, exactly one draft revision, both callers receive the same `revision_id`, no unhandled `UniqueViolation`, and the loser's savepoint leaves no orphan revision or advanced generation), `test_publish_after_tombstone_does_not_resurrect_current` (publish R1, tombstone the document, then publish a verified R2 → `DocumentTombstoned`, `documents.current_revision_id` unchanged, and a concurrent tombstone that commits between verify and CAS also leaves current unset), `test_verified_revision_blocked_by_tombstone_becomes_abandoned` (publish R1, tombstone, then publish a verified R2 → R2 is terminal `abandoned` with `abandon_reason='document_tombstoned'`, current stays R1, and R2's artifacts become Predicate-B eligible), `test_tombstone_abandons_non_published_revisions` (`mark_source_deleted` moves draft/building/verified revisions to `abandoned` while already-published revisions stay historical), and `test_record_artifacts_persists_embedding_manifest` (the build manifest records namespace/model hash/dimension/vector artifact version). Add explicit failure/retry tests: `test_failed_revision_is_terminal_and_immutable` (a failed revision can never transition to verified/published and leaves the prior current revision unchanged), `test_queue_redelivery_of_failed_revision_is_noop` (redelivering a failed revision neither re-runs a stage nor allocates a new generation), `test_retry_after_failure_allocates_new_generation` (failed R1 → retry yields R2 with `generation > R1` and `retry_of_revision_id = R1`, and R1 becomes superseded), and `test_retry_is_bounded_and_exhausts` (after `MAX_REVISION_RETRIES` the attempt is marked permanently failed and `RevisionRetriesExhausted` is raised). Add canonical identity tests in `tests/agents/v2/persistence/test_source_identity.py`: `test_source_object_identity_is_canonical` (the storage key is used verbatim; the user filename and case never change the identity; an S3 event key is form-decoded exactly once before normalization), `test_multipart_etag_is_not_a_content_hash` (same etag/size but different `sha256` yields different attempt identities while sharing one arrival key), `test_s3_event_key_is_decoded_once_and_matches_storage_key` (`doc+1%20b.pdf` from the event canonicalizes to the same key as the storage-reported `doc 1 b.pdf`), `test_etag_is_a_version_selector_not_content_identity` (identity and arrival strings are stable across callers and sha256 is the only content discriminator), `test_overwrite_same_key_changes_identity_and_creates_new_attempt` (new version/etag/sha → new identity → new attempt), `test_duplicate_webhook_arrival_is_idempotent` (`source_arrivals` upsert), and `test_build_profile_resolution_is_deterministic` (`doc_*` → `FULL`, `chat_file_*` → `CHAT_UPLOAD`, explicit parse-only flag overrides).
+Test `allocate → revision-owned build → verify → publish`, profile-specific required artifacts, publish transaction updating `Document.current_revision_id`, immutable published columns, failed draft leaving prior current revision unchanged, and tombstone lookup. Assert R2 does not inherit R1 worker completion. `FULL` requires markdown+structure+vectors and configured caption/KG results; `CHAT_UPLOAD` requires markdown+structure+vectors and records caption/KG as intentionally skipped; `PARSE_ONLY` requires markdown+structure and records vector/caption/KG as intentionally skipped. Skips are not failures. Add monotonic/idempotency/manifest tests: `test_concurrent_revision_publish_does_not_regress_current` (allocate R2 then R3; publish R3 first, then R2; current stays R3 while R2 remains a historical published revision), `test_get_or_create_ingestion_attempt_is_idempotent` (same document/source/profile returns one revision), `test_concurrent_get_or_create_ingestion_attempt_is_atomic` (two concurrent sessions racing the same attempt key while neither sees an uncommitted row: exactly one `revision_ingestion_attempts` row, exactly one draft revision, both callers receive the same `revision_id`, no unhandled `UniqueViolation`, and the loser's savepoint leaves no orphan revision or advanced generation), `test_publish_after_tombstone_does_not_resurrect_current` (publish R1, tombstone the document, then publish a verified R2 → `DocumentTombstoned`, `documents.current_revision_id` unchanged, and a concurrent tombstone that commits between verify and CAS also leaves current unset), `test_verified_revision_blocked_by_tombstone_becomes_abandoned` (publish R1, tombstone, then publish a verified R2 → R2 is terminal `abandoned` with `abandon_reason='document_tombstoned'`, current stays R1, and R2's artifacts become Predicate-B eligible), `test_tombstone_abandons_non_published_revisions` (`mark_source_deleted` moves draft/building/verified revisions to `abandoned` while already-published revisions stay historical), `test_failed_is_terminal`, `test_abandoned_is_terminal`, `test_published_is_terminal`, `test_abandoned_cannot_be_failed`, `test_failed_cannot_be_abandoned`, `test_tombstone_race_commits_abandoned_before_error` (abandon is durable even though the caller raises `DocumentTombstoned`), `test_newer_generation_loser_becomes_historical_published`, `test_tombstone_clears_current_revision_pointer`, `test_deleted_former_current_revision_can_be_gc_eligible_later`, `test_tombstone_does_not_delete_published_revision_rows`, `test_retained_evidence_still_resolves_after_current_pointer_cleared`, and `test_record_artifacts_persists_embedding_manifest` (the build manifest records namespace/model hash/dimension/vector artifact version). Add explicit failure/retry tests: `test_failed_revision_is_terminal_and_immutable` (a failed revision can never transition to verified/published and leaves the prior current revision unchanged), `test_queue_redelivery_of_failed_revision_is_noop` (redelivering a failed revision neither re-runs a stage nor allocates a new generation), `test_retry_after_failure_allocates_new_generation` (failed R1 → retry yields R2 with `generation > R1` and `retry_of_revision_id = R1`, and R1 becomes superseded), and `test_retry_is_bounded_and_exhausts` (after `MAX_REVISION_RETRIES` the attempt is marked permanently failed and `RevisionRetriesExhausted` is raised). Add canonical identity tests in `tests/agents/v2/persistence/test_source_identity.py`: `test_source_object_identity_is_canonical` (the storage key is used verbatim; the user filename and case never change the identity; an S3 event key is form-decoded exactly once before normalization), `test_multipart_etag_is_not_a_content_hash` (same etag/size but different `sha256` yields different attempt identities while sharing one arrival key), `test_s3_event_key_is_decoded_once_and_matches_storage_key` (`doc+1%20b.pdf` from the event canonicalizes to the same key as the storage-reported `doc 1 b.pdf`), `test_etag_is_a_version_selector_not_content_identity` (identity and arrival strings are stable across callers and sha256 is the only content discriminator), `test_overwrite_same_key_changes_identity_and_creates_new_attempt` (new version/etag/sha → new identity → new attempt), `test_duplicate_webhook_arrival_is_idempotent` (`source_arrivals` upsert), and `test_build_profile_resolution_is_deterministic` (`doc_*` → `FULL`, `chat_file_*` → `CHAT_UPLOAD`, explicit parse-only flag overrides).
 
 - [ ] **Step 2: Implement canonical source identity and explicit lifecycle**
 
@@ -347,14 +366,27 @@ async def retry_ingestion_attempt(
 
 
 async def mark_failed(self, revision_id: UUID, stage: str, error_class: str) -> DocumentRevision:
-    """Terminal failure. Failed revisions are immutable and can never be published."""
+    """Terminal failure. Allowed only from draft|building; failed is immutable."""
     revision = await self.get_for_update(revision_id)
-    if revision.state in {"published", "verified"}:
+    if revision.state not in {"draft", "building"}:
         raise RevisionNotFailable(str(revision_id))
+    now = datetime.now(timezone.utc)
     revision.state = "failed"
-    revision.failed_at = datetime.now(timezone.utc)
+    revision.failed_at = now
+    revision.artifact_retention_starts_at = now
     revision.failure_stage = stage
     revision.failure_class = error_class
+    await self.session.flush()
+    return revision
+
+
+async def mark_superseded(
+    self, revision_id: UUID, superseded_by: UUID | None = None, at: datetime | None = None,
+) -> DocumentRevision:
+    """A previously current or terminal revision is permanently non-current now."""
+    revision = await self.get_for_update(revision_id)
+    revision.superseded_at = at or datetime.now(timezone.utc)
+    revision.artifact_retention_starts_at = revision.artifact_retention_starts_at or revision.superseded_at
     await self.session.flush()
     return revision
 
@@ -363,11 +395,13 @@ async def abandon_revision(self, revision: DocumentRevision, reason: str) -> Doc
     """Terminal tombstone/GC-blocked state. A verified revision that can never be published
     because its source was tombstoned must not linger non-terminal: abandoned is immutable and
     eligible for artifact GC, so its build output is reclaimed instead of leaking."""
-    if revision.state == "published":
+    if revision.state not in {"draft", "building", "verified"}:
         raise RevisionNotAbandonable(str(revision.revision_id))
+    now = datetime.now(timezone.utc)
     revision.state = "abandoned"
-    revision.abandoned_at = datetime.now(timezone.utc)
+    revision.abandoned_at = now
     revision.abandon_reason = reason
+    revision.artifact_retention_starts_at = now
     await self.session.flush()
     return revision
 
@@ -377,36 +411,63 @@ async def mark_source_deleted(self, document_id: UUID, reason: str = "user_delet
     document = await self.get_document_for_update(document_id)
     if document.source_deleted_at is None:
         document.source_deleted_at = datetime.now(timezone.utc)
+    # Clearing the current pointer is required: Predicate B excludes the current revision,
+    # so a tombstoned document's last revision would otherwise never be GC-eligible.
+    document.current_revision_id = None
     for revision in await self.list_non_published_for_update(document_id):  # draft|building|verified
         await self.abandon_revision(revision, reason="document_tombstoned")
     await self.session.flush()
     return document
 
 
-async def publish(self, revision_id: UUID) -> DocumentRevision:
+class PublishOutcome(str, Enum):
+    BECAME_CURRENT = "became_current"
+    PUBLISHED_HISTORICAL = "published_historical"
+    ABANDONED_SOURCE_DELETED = "abandoned_source_deleted"
+
+
+async def publish(self, revision_id: UUID) -> tuple[DocumentRevision, PublishOutcome]:
+    """Classify the CAS outcome BEFORE setting any terminal state.
+
+    Never set state='published' and then discover the source was tombstoned. The
+    abandoned transition is committed before the caller turns the outcome into a
+    DocumentTombstoned error, so the terminal state is durable.
+    """
     revision = await self.get_for_update(revision_id)
     if revision.state != "verified":
         raise RevisionNotPublishable(str(revision_id))
     document = await self.get_document_for_update(revision.document_id)
     if document.source_deleted_at is not None:
         await self.abandon_revision(revision, reason="document_tombstoned")
-        raise DocumentTombstoned(str(document.id))  # never resurrect a deleted source
-    revision.state = "published"
-    revision.published_at = datetime.now(timezone.utc)
+        await self.session.commit()  # durable before the error is surfaced
+        return revision, PublishOutcome.ABANDONED_SOURCE_DELETED
+    previous_current_id = document.current_revision_id
     advanced = await self.cas_advance_current(
         document_id=document.id,          # documents.id is the PK, not documents.document_id
         revision_id=revision.revision_id,
         generation=revision.generation,
     )
-    if advanced == 0:
-        # Either current already has a newer generation, or a concurrent tombstone won.
-        # Re-read so a tombstone fails closed; otherwise this is a historical publish.
-        if await self.is_source_deleted(document.id):
-            await self.abandon_revision(revision, reason="document_tombstoned")
-            raise DocumentTombstoned(str(document.id))
+    now = datetime.now(timezone.utc)
+    if advanced == 1:
+        revision.state = "published"
+        revision.published_at = now
+        if previous_current_id:
+            await self.mark_superseded(previous_current_id, superseded_by=revision.revision_id, at=now)
+        await self.session.flush()
+        return revision, PublishOutcome.BECAME_CURRENT
+    if await self.is_source_deleted(document.id):
+        await self.abandon_revision(revision, reason="document_tombstoned")
+        await self.session.commit()
+        return revision, PublishOutcome.ABANDONED_SOURCE_DELETED
+    # CAS lost to a newer generation: published but never current, so retention starts now.
+    revision.state = "published"
+    revision.published_at = now
+    revision.artifact_retention_starts_at = now
     await self.session.flush()
-    return revision
+    return revision, PublishOutcome.PUBLISHED_HISTORICAL
 ```
+
+Allowed transitions are exhaustive and terminal states never transition again: `mark_failed` allows `{draft, building}`, `abandon_revision` allows `{draft, building, verified}`, `publish` allows `{verified}` only. `failed`, `abandoned`, and `published` are terminal. The repository returns a `PublishOutcome` instead of raising; the caller translates `ABANDONED_SOURCE_DELETED` into the application `DocumentTombstoned` error only after the abandon commit.
 
 **Failure, abandonment, and retry semantics (explicit).** The revision state machine is `draft → building → verified → published`, with `draft|building → failed` and `draft|building|verified → abandoned` both terminal. `failed` means the build itself failed; `abandoned` means the source/document was tombstoned (or otherwise permanently blocked), so the revision can never become current. Both terminals are immutable and can never transition to `verified`/`published`; `publish` and `mark_source_deleted` commit the terminal transition before raising or returning, so an abandoned revision is durable even though `DocumentTombstoned` still propagates. Three retry paths are distinct: (1) **stage redelivery** — a queue message whose revision is still `draft|building` re-runs only the incomplete stage idempotently, same `revision_id`; if the revision is already complete the message is a no-op; if it is `failed` the message is a no-op dead-letter that never allocates. (2) **automatic retry** — `get_or_create_ingestion_attempt` on a terminal-failed attempt calls `retry_ingestion_attempt`, which allocates a NEW generation with `retry_of_revision_id` provenance, marks the failed revision superseded, and bumps `attempt_generation`, bounded by `MAX_REVISION_RETRIES` (implementation setting); at the budget it calls `mark_attempt_exhausted` and raises `RevisionRetriesExhausted`. (3) **explicit user retry/reindex** — always allocates a new generation and never mutates a prior revision. Monotonic generation guarantees a retry can only become current if it is newer.
 
@@ -668,7 +729,7 @@ git commit -m "feat: add governed evidence persistence"
 - Test: `backend/tests/workers/test_evidence_gc_worker.py`
 
 **Interfaces:**
-- Produces: two independent batchers — `run_evidence_payload_gc_batch` (evidence retention only) and `run_revision_artifact_gc_batch` (revision artifacts only) — the checkpoint/revision retention-lease API (`acquire_or_refresh`, `release`, `sweep_expired`, `has_active_lease`), concrete object/vector/revision-scoped-KG artifact delete methods, and a scheduled one-shot worker that drives both.
+- Produces: two independent batchers — `run_evidence_payload_gc_batch` (evidence retention only) and `run_revision_artifact_gc_batch` (revision artifacts only) — the single-owner `RevisionRetentionLeaseRepository` (`acquire_or_refresh`, `release_run`, `sweep_expired`, `has_active_revision_lease`, `has_active_evidence_lease`), concrete object/vector/revision-scoped-KG artifact delete methods, and a scheduled one-shot worker that drives both.
 
 - [ ] **Step 1: Impact-check destructive methods**
 
@@ -681,7 +742,7 @@ impact({target: "app.services.kg.legal_kg_service.LegalKGService.delete_document
 
 - [ ] **Step 2: Write deletion-order/idempotency tests**
 
-Test advisory lock + `FOR UPDATE SKIP LOCKED`; retry after partial object-store failure; two workers do not double-delete. Add the two independence tests: `test_expired_evidence_alone_does_not_release_revision_artifacts` (evidence `expires_at` passed and payload purged, but a live source inside retention keeps the revision's objects/vectors/KG/images/tables/chunks intact), and `test_revision_artifact_gc_requires_no_retained_references` (a superseded revision whose only unexpired evidence reference is still retained is never artifact-eligible; once that reference is expired+purged or absent, the artifact predicate can pass without any evidence needing to expire first, e.g. a tombstoned source with zero references). Also assert the evidence batcher never deletes revision artifacts and the artifact batcher never deletes evidence rows. Add `test_revision_kg_gc_preserves_shared_entities` (R1 and R2 both reference canonical entity E; GC of R1 removes only R1-scoped facts/edges/memberships/provenance, keeps E because R2 still references it and leaves R2 facts intact, prunes an entity that was R1-only, and a second run deletes zero rows — idempotent). Add lease-invariant tests: `test_checkpoint_pinning_revision_writes_lease` (a checkpoint that pins a revision writes/refreshes a lease in the same transaction), `test_active_lease_blocks_artifact_and_evidence_gc`, `test_expired_lease_does_not_block_gc`, `test_terminal_run_releases_lease`, and `test_resumable_interrupt_keeps_lease_until_expiry`.
+Test advisory lock + `FOR UPDATE SKIP LOCKED`; retry after partial object-store failure; two workers do not double-delete. Add the two independence tests: `test_expired_evidence_alone_does_not_release_revision_artifacts` (evidence `expires_at` passed and payload purged, but a live source inside retention keeps the revision's objects/vectors/KG/images/tables/chunks intact), and `test_revision_artifact_gc_requires_no_retained_references` (a superseded revision whose only unexpired evidence reference is still retained is never artifact-eligible; once that reference is expired+purged or absent, the artifact predicate can pass without any evidence needing to expire first, e.g. a tombstoned source with zero references). Also assert the evidence batcher never deletes revision artifacts and the artifact batcher never deletes evidence rows. Add `test_revision_kg_gc_preserves_shared_entities` (R1 and R2 both reference canonical entity E; GC of R1 removes only R1-scoped facts/edges/memberships/provenance, keeps E because R2 still references it and leaves R2 facts intact, prunes an entity that was R1-only, and a second run deletes zero rows — idempotent). Add lease-invariant tests: `test_checkpoint_pinning_revision_writes_lease`, `test_active_lease_blocks_artifact_and_evidence_gc`, `test_expired_lease_does_not_block_gc`, `test_terminal_run_releases_lease`, `test_resumable_interrupt_keeps_lease_until_expiry`, `test_lease_is_committed_before_checkpointable_state_update`, `test_lease_failure_prevents_revision_pin_checkpoint`, `test_checkpoint_failure_leaves_only_expiring_orphan_lease`, `test_terminal_checkpoint_happens_before_lease_release`, and `test_resume_refreshes_existing_lease` (all assert safe ordering, not cross-DB transaction atomicity). Add retention-anchor tests: `test_failed_revision_has_gc_retention_anchor`, `test_abandoned_revision_has_gc_retention_anchor`, `test_late_historical_publish_has_gc_retention_anchor`, and `test_current_revision_has_no_gc_retention_anchor_until_superseded`.
 
 - [ ] **Step 3: Implement two independent GC predicates and the worker**
 
@@ -689,11 +750,26 @@ Add `StorageService.delete_revision_artifacts(document_id, revision_id)`, `Vecto
 
 **Predicate A — evidence payload retention** (`run_evidence_payload_gc_batch`, evidence_store/gc.py): scope is `evidence_records.ciphertext` only. Eligible when `expires_at <= now()` AND `payload_purged_at IS NULL` AND no legal hold AND no active `revision_retention_lease` references the evidence use/revision (`NOT EXISTS (revision_retention_leases WHERE (evidence_use_id = ... OR revision_id = ...) AND released_at IS NULL AND expires_at > now())`), because a resumable run may still hydrate it. Action: purge ciphertext, set `payload_purged_at`, keep the row/key-id metadata for lineage, and audit the purge. This batcher must never delete objects/vectors/KG/images/tables/chunks/markdown or any `DocumentRevision`.
 
-**Predicate B — revision artifact reclamation** (`run_revision_artifact_gc_batch`, persistence/revision_gc.py): scope is one `DocumentRevision`'s artifacts. Eligible only when ALL hold, evaluated independently of Predicate A: (1) `state IN ('published','failed','abandoned')` and the revision is not `documents.current_revision_id` (an `abandoned` revision was never current); (2) `artifacts_purged_at IS NULL`; (3) no *retained* reference exists — `NOT EXISTS (evidence_records WHERE revision_id = revision.revision_id AND expires_at > now() AND payload_purged_at IS NULL)`; (4) source-resolved or retention-elapsed — `documents.source_deleted_at IS NOT NULL` OR `now() >= revision.superseded_at + retention_window`; (5) no active retention lease — `NOT EXISTS (revision_retention_leases WHERE revision_id = revision.revision_id AND released_at IS NULL AND expires_at > now())`. Action: delete external artifacts idempotently — object/markdown via `StorageService.delete_revision_artifacts`, vectors via `VectorStore.delete_revision`, and revision-scoped KG via `LegalKGService.delete_revision_artifacts` — then set `artifacts_purged_at`; the `DocumentRevision` row is retained as lineage and is never `DELETE`d here. A merely superseded/non-current revision that is still referenced, still current, or whose live source is inside retention is not eligible. `LegalKGService.delete_revision_artifacts` must delete only rows carrying the producing `revision_id` (document-derived facts, edges, memberships, provenance) and must never blind-`DETACH DELETE` a MERGE-shared canonical entity: it removes an entity only when it has no remaining membership in any other revision, and it returns the deleted count and is idempotent (a second call deletes 0).
+**Predicate B — revision artifact reclamation** (`run_revision_artifact_gc_batch`, persistence/revision_gc.py): scope is one `DocumentRevision`'s artifacts. Eligible only when ALL hold, evaluated independently of Predicate A: (1) `state IN ('published','failed','abandoned')` and the revision is not `documents.current_revision_id` (an `abandoned` revision was never current); (2) `artifacts_purged_at IS NULL`; (3) no *retained* reference exists — `NOT EXISTS (evidence_records WHERE revision_id = revision.revision_id AND expires_at > now() AND payload_purged_at IS NULL)`; (4) source-resolved or retention-elapsed — `documents.source_deleted_at IS NOT NULL` OR `now() >= revision.artifact_retention_starts_at + retention_window` where `artifact_retention_starts_at` is the single implementation anchor set when the revision becomes permanently non-current (`failed_at`, `abandoned_at`, `superseded_at`, or a historical `published_at`); a currently-published revision has no anchor and is not eligible; (5) no active retention lease — `NOT EXISTS (revision_retention_leases WHERE revision_id = revision.revision_id AND released_at IS NULL AND expires_at > now())`. Action: delete external artifacts idempotently — object/markdown via `StorageService.delete_revision_artifacts`, vectors via `VectorStore.delete_revision`, and revision-scoped KG via `LegalKGService.delete_revision_artifacts` — then set `artifacts_purged_at`; the `DocumentRevision` row is retained as lineage and is never `DELETE`d here. A merely superseded/non-current revision that is still referenced, still current, or whose live source is inside retention is not eligible. `LegalKGService.delete_revision_artifacts` must delete only rows carrying the producing `revision_id` (document-derived facts, edges, memberships, provenance) and must never blind-`DETACH DELETE` a MERGE-shared canonical entity: it removes an entity only when it has no remaining membership in any other revision, and it returns the deleted count and is idempotent (a second call deletes 0).
 
 The only coupling between the predicates is that an unexpired evidence reference *blocks* Predicate B (condition 3). Evidence expiry never triggers artifact deletion; artifact eligibility never requires evidence to have expired.
 
-**Checkpoint/revision retention-lease invariant.** A checkpoint is the only thing that can pin immutable artifacts for a run that may resume, so every checkpoint write that pins a `revision_id` (TaskPlan TargetUnit or DocumentBindingSet) or retains an `EvidenceUse` for later hydration must `acquire_or_refresh` a `revision_retention_leases` row in the same transaction as the checkpoint. Leases are control state and are never checkpointed. `acquire_or_refresh(run_id, revision_id, evidence_use_id=None, ttl=CHECKPOINT_RETENTION_LEASE_TTL)` upserts and extends `expires_at`; terminal finalization, cancellation, or clarification expiry calls `release(...)`; `sweep_expired()` is the crash-safe fallback that marks `released_at` for `expires_at <= now()`. GC reclaims a revision or evidence payload only when no lease is active (`released_at IS NULL AND expires_at > now()`); an expired lease never blocks. The TTL is bounded (config `CHECKPOINT_RETENTION_LEASE_TTL_HOURS`, at least max run duration plus resume grace) so a crashed or abandoned run cannot pin artifacts forever.
+**Checkpoint/revision retention-lease invariant (safe ordering, no cross-DB transaction).** The checkpoint lives in `CHECKPOINT_DATABASE_URL` (AsyncPostgresSaver) while revisions, evidence, and leases live in the application DB; the two never share a SQLAlchemy/psycopg transaction and the plan must not claim otherwise. Safe ordering:
+
+```text
+before emitting a graph state update that introduces or retains a revision pin:
+    acquire_or_refresh(run_id, revision_id, evidence_use_id)   # application DB
+    COMMIT the lease
+    return the state update
+    -> LangGraph writes the checkpoint afterwards
+```
+
+- lease commit succeeds, checkpoint fails → only a harmless orphan lease that TTL/`sweep_expired()` eventually releases;
+- lease write fails → the node fails and the checkpoint containing the new pin MUST NOT be written;
+- terminal ordering: the terminal state checkpoint succeeds first, then `release_run(run_id)`; never release before the terminal checkpoint;
+- interrupt/clarification: the resumable checkpoint keeps its lease active, refreshed on resume, released only on terminal completion/cancel or clarification expiry.
+
+The single owner of lease SQL is `persistence/retention_leases.py` (`RevisionRetentionLeaseRepository`), injected into `RuntimeServices.retention_leases`; GC, supervisor, complex subgraph, and every checkpoint writer consume that repository and none duplicates lease SQL. GC reclaims a revision or evidence payload only when no lease is active; an expired lease never blocks. TTL is bounded by `CHECKPOINT_RETENTION_LEASE_TTL_HOURS` (at least max run duration plus resume grace).
 
 `run_revision_artifact_gc_batch` and `run_evidence_payload_gc_batch` each take the advisory lock and `FOR UPDATE SKIP LOCKED` leases, delete idempotently, and record completion. `python -m app.workers.evidence_gc_worker --once --batch-size 100` runs Predicate A then Predicate B as separate transactions; a failure in one does not abort the other. Add a dedicated `evidence-gc` Compose service with a documented periodic command/interval and migration dependency.
 
