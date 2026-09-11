@@ -227,7 +227,13 @@ backend/app/services/agents/v2/
 │   ├── abbreviation.py
 │   └── memory.py
 │
-├── tools/
+├── adapters/                  # server-internal typed ports to v1 services; never model/tool visible
+│   ├── semantic.py
+│   ├── conversation.py
+│   ├── document.py
+│   └── deep_research.py
+│
+├── tools/                     # agent-facing governed gateway (Phase 3 only)
 │   ├── adapters.py
 │   ├── gateway.py
 │   └── observations.py
@@ -239,18 +245,18 @@ backend/app/services/agents/v2/
 ├── dependencies/
 │   └── people_document.py
 │
-├── skills/
-│   ├── summarize.*
-│   ├── compare.*
-│   ├── legal_analysis.*
-│   └── compliance.*
+├── skills/                    # framework-neutral policy; native skill files may mirror after Phase 0
+│   ├── summarize/policy.py
+│   ├── compare/policy.py
+│   ├── legal_analysis/policy.py
+│   └── compliance/policy.py
 │
 ├── replanning.py
 ├── discovery.py
 └── complex_research_graph.py
 ```
 
-Framework-specific skill representation is selected only after Phase 0. If Deep Agents wins, strategy packages may use native skill files. If native LangGraph wins, the same strategy is loaded by planner policy. Business ownership remains unchanged.
+Framework-specific skill representation is selected only after Phase 0; `skills/<name>/policy.py` is the framework-neutral source of truth and, if Deep Agents wins, native skill files may mirror it inside the same directory. `adapters/` is the server-internal port layer to legacy v1 services and is distinct from `tools/`: `tools/adapters.py` is agent-facing and must never call `capability.execute(...)` directly, while `adapters/` is never exposed to the model or the tool catalog. Phase 1 owns `adapters/` and `capabilities/__init__.py`; Phase 2 adds capability implementations and must not create a second adapter package. Business ownership remains unchanged.
 
 ### Old -> canonical path migration
 

@@ -49,6 +49,12 @@ backend/app/services/agents/v2/
 │   ├── knowledge_graph.py
 │   ├── abbreviation.py
 │   └── memory.py
+├── adapters/
+│   ├── __init__.py
+│   ├── semantic.py
+│   ├── conversation.py
+│   ├── document.py
+│   └── deep_research.py
 ├── execution/
 │   ├── __init__.py
 │   └── scheduler.py
@@ -223,14 +229,14 @@ git commit -m "feat: add v2 context binding and routing nodes"
 ### Task 2: Implement Shared Atomic Capabilities and Request-Scoped Registry
 
 **Files:**
-- Create: `backend/app/services/agents/v2/capabilities/__init__.py`
+- Modify: `backend/app/services/agents/v2/capabilities/__init__.py`
 - Create: `backend/app/services/agents/v2/capabilities/people.py`
 - Create: `backend/app/services/agents/v2/capabilities/document.py`
 - Create: `backend/app/services/agents/v2/capabilities/section.py`
 - Create: `backend/app/services/agents/v2/capabilities/knowledge_graph.py`
 - Create: `backend/app/services/agents/v2/capabilities/abbreviation.py`
 - Create: `backend/app/services/agents/v2/capabilities/memory.py`
-- Modify: `backend/app/services/agents/v2/adapters/`
+- Modify: `backend/app/services/agents/v2/adapters/__init__.py`
 - Test: `backend/tests/agents/v2/fast_paths/test_capabilities.py`
 - Test: `backend/tests/agents/v2/test_adapters_and_registry.py`
 
@@ -259,6 +265,8 @@ cd backend && pytest tests/agents/v2/fast_paths/test_capabilities.py tests/agent
 Expected: FAIL.
 
 - [ ] **Step 2: Implement the single capability protocol**
+
+Import and re-export the Phase-1 `Capability` protocol from `capabilities/__init__.py`; do not define a second one.
 
 ```python
 class Capability(Protocol):
@@ -413,7 +421,7 @@ git commit -m "feat: add deterministic v2 fast planning and scheduler"
 
 - [ ] **Step 1: Write failing evidence/grounding tests**
 
-Cover search-not-read-coverage; wrong/partial section; revision mismatch; targetless supporting use; discovery use excluded from synthesis; source tombstone; expired use; People minimization; same record/two uses; derived faithfulness; all four evaluation statuses and precedence; unmapped factual assertion revise once then insufficient; deterministic citation; synthesis budget overflow persisted as validated derived evidence; synthesis-only reuse revalidates current uses; bounded summary performs read -> evaluate -> synthesize -> ground.
+Cover search-not-read-coverage; wrong/partial section; revision mismatch; targetless supporting use; discovery use excluded from synthesis; source tombstone; expired use; People minimization; same record/two uses; derived faithfulness; all four evaluation statuses and precedence; unmapped factual assertion revise once then insufficient; deterministic citation; synthesis budget overflow persisted as validated derived evidence; synthesis-only reuse revalidates current uses; bounded summary performs read -> evaluate -> synthesize -> ground and `test_summary_is_skill_not_agent_route` (a bounded one-document summary routes through the shared document/section read capability plus synthesis, never a summary domain agent).
 
 - [ ] **Step 2: Implement evaluator authority**
 

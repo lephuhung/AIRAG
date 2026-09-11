@@ -76,7 +76,8 @@ done
 test ! -d backend/app/services/agents/v2/domain
 ! find backend/app/services/agents/v2 -type f \
   \( -name 'people_agent.py' -o -name 'summary_agent.py' -o -name 'comparison_agent.py' \
-     -o -name 'document_agent.py' -o -name 'section_agent.py' -o -name 'kg_agent.py' \) | grep .
+     -o -name 'document_agent.py' -o -name 'section_agent.py' -o -name 'kg_agent.py' \
+     -o -path '*/domain/*_graph.py' \) | grep .
 ```
 
 - [ ] **Step 2: Re-run Phase-2 gate**
@@ -213,7 +214,8 @@ git commit -m "feat: add governed complex agent tool gateway"
 ### Task 3: Implement Multi-Document Comparison Pilot Through One Complex Planner
 
 **Files:**
-- Create: `backend/app/services/agents/v2/skills/compare.*`
+- Create: `backend/app/services/agents/v2/skills/__init__.py`
+- Create: `backend/app/services/agents/v2/skills/compare/policy.py`
 - Create: `backend/app/services/agents/v2/complex_research_graph.py`
 - Modify: `backend/app/services/agents/v2/execution/scheduler.py`
 - Modify: `backend/app/services/agents/supervisor_v2.py`
@@ -260,7 +262,7 @@ class ComplexResearchGraph:
         return ComplexResearchResult(plan=plan, task_results=results, evaluation=evaluation)
 ```
 
-The planner may choose capabilities only by placing them into `TaskSpec`. No framework-native tool call may bypass the gateway/scheduler invariant. For this pilot, reject discovery/replan.
+The planner may choose capabilities only by placing them into `TaskSpec`. No framework-native tool call may bypass the gateway/scheduler invariant. For this pilot, reject discovery/replan. `skills/compare/policy.py` is framework-neutral; if Phase 0 selected Deep Agents, native skill files may mirror it under `skills/compare/`, but the Python policy remains the source of truth and no `*` placeholder path is ever created.
 
 - [ ] **Step 3: Replace only Phase-2 `complex_boundary` implementation**
 
@@ -413,6 +415,7 @@ test_fast_and_complex_share_same_capability_instance_or_factory
 test_agent_tool_call_creates_validated_task_before_dispatch
 test_tool_adapter_cannot_call_capability_directly
 test_compare_is_skill_not_agent_route
+test_summary_is_skill_not_agent_route
 test_people_observation_does_not_expose_raw_record
 test_people_document_dependency_is_not_agent_handoff
 test_replan_can_add_tasks_but_cannot_widen_authorization

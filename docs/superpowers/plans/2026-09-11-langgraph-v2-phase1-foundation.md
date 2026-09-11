@@ -704,12 +704,16 @@ git commit -m "feat: add async PostgreSQL v2 checkpointing"
 ### Task 11: Add Typed Legacy Adapters and Capability Ports
 
 **Files:**
-- Create: `backend/app/services/agents/v2/adapters/`
-- Create: `backend/app/services/agents/v2/capabilities/`
+- Create: `backend/app/services/agents/v2/adapters/__init__.py`
+- Create: `backend/app/services/agents/v2/adapters/semantic.py`
+- Create: `backend/app/services/agents/v2/adapters/conversation.py`
+- Create: `backend/app/services/agents/v2/adapters/document.py`
+- Create: `backend/app/services/agents/v2/adapters/deep_research.py`
+- Create: `backend/app/services/agents/v2/capabilities/__init__.py`
 - Test: `backend/tests/agents/v2/test_adapters_and_registry.py`
 
 **Interfaces:**
-- Produces: typed semantic/conversation/document/deep-research adapters and ACL-filtered capability registry.
+- Produces: the canonical `Capability` protocol and `CapabilityDescriptor` in `capabilities/__init__.py`, typed server-internal semantic/conversation/document/deep-research ports in `adapters/`, and the ACL-filtered capability registry. `adapters/` is the server-internal port layer, not the agent-facing `tools/` gateway created in Phase 3.
 
 - [ ] **Step 1: Write adapter tests**
 
@@ -718,10 +722,13 @@ Require raw query ownership, Draft→Binding→Finalizer flow, immutable revisio
 - [ ] **Step 2: Implement protocols/adapters and commit**
 
 ```python
+# Defined once, in backend/app/services/agents/v2/capabilities/__init__.py.
 class Capability(Protocol):
     descriptor: CapabilityDescriptor
     async def execute(self, request: AgentRequest, runtime: CapabilityRuntimeContext) -> AgentResult: ...
 ```
+
+Phase 2 imports and re-exports this protocol; it must not define a second `Capability`.
 
 ```bash
 cd backend && pytest tests/agents/v2/test_adapters_and_registry.py -q
