@@ -126,6 +126,7 @@
 35. Carrying model-visible observation through a free-form `Mapping`/dict (`safe_metadata`) instead of a typed per-capability projection; unknown result kinds must fail closed.
 36. Using the webhook `arrival_identity` as the attempt key, treating an etag as content identity, or decoding S3 event keys zero/multiple times instead of exactly once before `normalize_object_key`.
 37. Leaving a `verified` revision non-terminal forever when its source is tombstoned — it must become terminal `abandoned` (with `abandon_reason`) so Predicate B can reclaim its artifacts; `abandoned` is immutable and never current.
+38. Reclaiming a revision or evidence payload while a checkpoint retention lease is active, or failing to write/release a lease for a checkpoint that pins a revision/EvidenceUse — a resumable run must never lose pinned artifacts, and an expired lease must never block GC.
 
 ## Final Execution Gate
 
@@ -163,6 +164,7 @@ The implementation suite is ready only when all are proven:
 | 28 | `RuntimeServices` is defined once and excludes `plan_checkpoint`/`EvidenceEvaluator` | Phase 2 Task 3 `test_runtime_services_excludes_plan_checkpoint_and_evaluator_service` |
 | 29 | `AgentToolGateway` is proposal + observation only, never a second executor | Phase 3 Task 2 `test_tool_gateway_is_proposal_and_observation_only` + tools guard |
 | 30 | Model observation is a typed per-capability projection, never a `Mapping` | Phase 3 Task 2 `test_observation_projection_is_typed_no_mapping`, `test_unknown_result_kind_projection_fails_closed` + tools guard |
+| 31 | Checkpoint/revision retention leases block GC for resumable runs | Phase 1 `test_checkpoint_pinning_revision_writes_lease`, `test_active_lease_blocks_artifact_and_evidence_gc`, `test_expired_lease_does_not_block_gc`, `test_terminal_run_releases_lease`, `test_resumable_interrupt_keeps_lease_until_expiry` |
 
 ## Whole-Suite Validation
 
