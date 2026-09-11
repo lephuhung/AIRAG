@@ -171,9 +171,12 @@ The implementation suite is ready only when all are proven:
 | 32 | Phase-3 supported skill/work-type scope is explicit; out-of-scope work types fail closed | Phase 3 scope table + `test_phase3_scope_excludes_legal_and_compliance_skills`, `test_unsupported_work_type_returns_typed_unavailable` |
 | 33 | Parent/child states are connected by explicit adapters and exactly one ownership chain exists | Phase 3 `test_complex_boundary_maps_parent_to_child_state`, `test_complex_boundary_maps_child_result_back_to_execution_state`, `test_complex_subgraph_does_not_require_root_state_schema` |
 | 34 | People→Document input is materialized before T2 checkpoint; scheduler never mutates `TaskSpec.input` | Phase 3 `test_people_document_materializes_before_task_append`, `test_t2_checkpoint_contains_final_document_search_input`, `test_scheduler_never_rewrites_task_input` |
-| 35 | Phase 1A creates every schema-v1 table mapped in 1B; tombstone clears the current pointer; one GC retention anchor | Phase 1 migration control test (actual tables == `V2_SCHEMA_V1_TABLES`), `test_tombstone_clears_current_revision_pointer`, `test_failed_revision_has_gc_retention_anchor` |
-| 36 | Document search observation exposes opaque `candidate_ids` only | Phase 3 `test_document_search_observation_exposes_candidate_ids_only`, `test_planner_cannot_select_document_revision_directly` |
-| 37 | 100% rollout means 100% of v2-eligible traffic, not global v1 replacement | Phase 3 `test_rollout_100_percent_still_routes_write_to_v1`, `test_rollout_100_percent_still_routes_evaluate_to_v1`, `test_supported_compare_uses_v2_at_100_percent_eligible_rollout` |
+| 35 | Phase 1A creates every schema-v1 table mapped in 1B (`after - before == V2_SCHEMA_V1_TABLES`); tombstone clears the current pointer; one GC retention anchor | Phase 1 migration control test, `test_tombstone_clears_current_revision_pointer`, `test_failed_revision_has_gc_retention_anchor` |
+| 36 | Document search observation exposes opaque `candidate_ids` resolved by a request-scoped `DiscoveryCandidateRegistry` | Phase 3 `test_document_search_observation_exposes_candidate_ids_only`, `test_planner_cannot_select_document_revision_directly` |
+| 37 | 100% rollout means 100% of v2-eligible traffic (`write` is a Domain, selector is not a second classifier) | Phase 3 `test_rollout_100_percent_still_routes_write_to_v1`, `test_rollout_100_percent_still_routes_evaluate_to_v1`, `test_supported_compare_uses_v2_at_100_percent_eligible_rollout` |
+| 38 | `ResearchPlanningInput` is an ephemeral projection, never checkpointed | Phase 3 `test_planning_input_is_ephemeral_never_checkpointed` |
+| 39 | Binding pin acquires a lease before checkpoint; runner releases only after the terminal checkpoint | Phase 2 `test_binding_pin_acquires_lease_before_checkpoint`, `test_resume_refreshes_lease_before_continuing` |
+| 40 | Repositories mutate+flush only; the service/UoW owns the transaction | Phase 1 publish tests (`test_tombstone_race_commits_abandoned_before_error`) |
 
 ## Whole-Suite Validation
 

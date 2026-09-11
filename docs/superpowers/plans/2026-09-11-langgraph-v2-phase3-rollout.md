@@ -66,7 +66,7 @@ Phase 3 implements exactly the work types below and nothing else. `WorkType`/`Do
 Explicitly out of scope for this rollout:
 
 - `skills/legal_analysis/policy.py` and `skills/compliance/policy.py` are **not created**. They remain placeholders for a future approved plan; an `evaluate`/`compliance_evaluation` request returns the typed `COMPLEX_RESEARCH_UNAVAILABLE` response from the subgraph's `decide` node, never a fabricated plan or a v2 legal/compliance agent.
-- The `write` domain and Write work type stay v1-owned; v2 keeps the typed unavailable boundary (Phase 2).
+- The `write` domain stays v1-owned (there is no `write` `WorkType`; `"write"` is a `Domain`); v2 keeps the typed unavailable boundary (Phase 2).
 - The `memory` capability exists for retrieval/normalization, but no Phase-3 skill, agent, or work type is created around it.
 - No `summarize`/`compare`/`legal`/`compliance`/`evaluate`/`memory` domain agent or domain graph is created; skills are framework-neutral policy modules over the shared capabilities.
 - An unsupported `WorkType`/`RouteReason` fails closed with a typed unavailable response; it is never silently routed to `fast_domain` or to another skill.
@@ -157,10 +157,11 @@ git commit -m "test: add session SSE v2 evaluation harness"
 - Create: `backend/app/services/agents/v2/tools/gateway.py`
 - Create: `backend/app/services/agents/v2/tools/adapters.py`
 - Create: `backend/app/services/agents/v2/tools/observations.py`
+- Create: `backend/app/services/agents/v2/tools/discovery_candidates.py`
 - Test: `backend/tests/agents/v2/complex/test_tool_gateway.py`
 
 **Interfaces:**
-- Produces: `CapabilityInvocationProposal`, `AgentToolGateway`, request-scoped framework adapters, `AgentToolObservation`, and sensitive observation projectors.
+- Produces: `CapabilityInvocationProposal`, `AgentToolGateway`, request-scoped framework adapters, `AgentToolObservation`, sensitive observation projectors, and the request-scoped `DiscoveryCandidateRegistry` that resolves an opaque `candidate_id` into an authorized document identity before the Binding Resolver pins a revision.
 
 - [ ] **Step 1: Write failing governance tests**
 
@@ -238,7 +239,7 @@ ToolObservationProjection = Annotated[
 ]
 ```
 
-`ToolObservationProjection` is a discriminated union of typed per-capability projections owned by `tools/observations.py` (implementation-only). No `Mapping`/dict escape hatch and no free-form string metadata: adding an observable field requires a typed model change, and an unknown `result_kind` fails closed with `ObservationProjectionUnavailable`. `DocumentSearchObservation` exposes only opaque `candidate_ids`: a candidate id is resolved by the Binding Resolver / discovery service into an authorized `document_id` plus pinned revision, so the model never owns revision truth and cannot select a revision directly.
+`ToolObservationProjection` is a discriminated union of typed per-capability projections owned by `tools/observations.py` (implementation-only). No `Mapping`/dict escape hatch and no free-form string metadata: adding an observable field requires a typed model change, and an unknown `result_kind` fails closed with `ObservationProjectionUnavailable`. `DocumentSearchObservation` exposes only opaque `candidate_ids`: a request-scoped `DiscoveryCandidateRegistry` resolves a candidate id into an authorized `document_id` plus pinned revision, so the model never owns revision truth and cannot select a revision directly; if the planner never needs to select a specific candidate, drop `candidate_ids` and keep only `candidate_count`.
 
 `AgentToolGateway.propose(...)` must perform only:
 
@@ -307,6 +308,7 @@ test_complex_boundary_maps_parent_to_child_state
 test_complex_boundary_maps_child_result_back_to_execution_state
 test_complex_subgraph_does_not_require_root_state_schema
 test_complex_subgraph_resumes_under_supervisor_checkpointer
+test_planning_input_is_ephemeral_never_checkpointed
 test_phase3_scope_excludes_legal_and_compliance_skills
 test_unsupported_work_type_returns_typed_unavailable
 ```
@@ -316,12 +318,36 @@ test_unsupported_work_type_returns_typed_unavailable
 ```python
 # backend/app/services/agents/v2/complex_research_graph.py
 class ComplexResearchState(TypedDict, total=False):
+    """Checkpointed subgraph state. It never stores ResearchPlanningInput."""
     contract_version: str
-    planning_input: ResearchPlanningInput
+    semantic: SemanticContext
+    bindings: DocumentBindingSet
+    query_analysis: QueryAnalysis | None
     plan: TaskPlan
     task_results: tuple[AgentResult, ...]
     evaluation: EvidenceEvaluation | None
     replans_remaining: int
+
+
+def build_planning_input(
+    state: ComplexResearchState, runtime: GraphRuntimeContext,
+) -> ResearchPlanningInput:
+    """Ephemeral projection, rebuilt on every planner/replanner call.
+
+    Never returned into checkpointed state and never persisted.
+    """
+    return ResearchPlanningInput(
+        semantic=state.semantic,
+        bindings=state.bindings,
+        query_analysis=state.query_analysis,
+        capability_catalog=tuple(runtime.capability_registry.descriptors()),
+        discovery_policy=runtime.policy.discovery_policy,
+        budget=runtime.policy.research_budget_view(),
+        current_plan=state.get("plan"),
+        task_outcomes=build_task_execution_summaries(state.get("task_results", ())),
+        prior_evidence_uses=collect_evidence_use_refs(state.get("task_results", ())),
+        prior_evaluation=state.get("evaluation"),
+    )
 
 
 def build_complex_research_subgraph() -> CompiledStateGraph:
@@ -350,21 +376,18 @@ The planner may choose capabilities only by placing them into `TaskSpec`. No fra
 `SupervisorV2State` and `ComplexResearchState` are different schemas. Do not rely on implicit shared-state behavior and do not copy complex fields into the root state to make the schemas match; use an explicit boundary adapter.
 
 ```python
-def build_complex_research_state(state: SupervisorV2State, runtime: GraphRuntimeContext) -> ComplexResearchState:
+def build_complex_research_state(state: SupervisorV2State) -> ComplexResearchState:
+    """Explicit parent -> child mapping. Only checkpointed supervisor fields move;
+    runtime-derived planning input is built ephemerally inside the subgraph."""
     return ComplexResearchState(
         contract_version=state.contract_version,
-        planning_input=ResearchPlanningInput(
-            semantic=state.semantic,
-            bindings=state.bindings,
-            query_analysis=state.query_analysis,
-            capability_catalog=runtime.capability_catalog,
-            discovery_policy=state.discovery_policy,
-            budget=state.budget,
-            current_plan=state.execution.plan,
-            task_outcomes=state.execution.task_outcomes,
-            prior_evidence_uses=state.execution.prior_evidence_uses,
-            prior_evaluation=state.execution.evaluation,
-        ),
+        semantic=state.semantic,
+        bindings=state.bindings,
+        query_analysis=state.query_analysis,
+        plan=state.execution.plan,
+        task_results=state.execution.task_results,
+        evaluation=state.execution.evaluation,
+        replans_remaining=MAX_REPLANS,
     )
 
 def merge_complex_result_into_supervisor(state: SupervisorV2State, child: ComplexResearchState) -> dict:
@@ -380,7 +403,7 @@ def make_complex_boundary_node(complex_subgraph: CompiledStateGraph):
         runtime: GraphRuntimeContext,
         config: RunnableConfig,
     ) -> dict:
-        child_input = build_complex_research_state(state, runtime)
+        child_input = build_complex_research_state(state)
         child_output = await complex_subgraph.ainvoke(child_input, config=config, context=runtime)
         return merge_complex_result_into_supervisor(state, child_output)
     return complex_boundary_node
@@ -393,7 +416,7 @@ complex_subgraph = build_complex_research_subgraph()      # compiled WITHOUT a c
 full_graph.add_node("complex_boundary", make_complex_boundary_node(complex_subgraph))
 ```
 
-`config` carries the parent `thread_id`/checkpoint namespace, so the subgraph writes its checkpoints under the parent saver and a shadow run's isolated `InMemorySaver` is inherited. The adapter maps only the fields the child needs and merges only the execution result back; the child never reads root state and never needs `SupervisorV2State`. After the subgraph terminates, the shared synthesis/grounding/finalizer nodes render the response.
+`config` carries the parent `thread_id`/checkpoint namespace, so the subgraph writes its checkpoints under the parent saver and a shadow run's isolated `InMemorySaver` is inherited. The adapter maps only the fields the child needs and merges only the execution result back; the child never reads root state and never needs `SupervisorV2State`. After the subgraph terminates, the shared synthesis/grounding/finalizer nodes render the response. `ResearchPlanningInput` is never part of `ComplexResearchState` or `SupervisorV2State` checkpoint bytes: it is rebuilt from the request-scoped registry, runtime policy/counters, and validated `AgentResult`s on every planner/replanner call, and no frozen state field is added.
 
 - [ ] **Step 4: Test and commit**
 
@@ -695,7 +718,7 @@ NEXUSRAG_AGENT_V2_CANARY_WORKSPACES=
 NEXUSRAG_AGENT_V2_BUCKET_SALT=<runtime-secret>
 ```
 
-DB control is authoritative within environment ceilings. Selection is server-owned and uses authenticated workspace + persisted request ID. Selection is two-stage: first classify whether the request's work family is v2-supported (the Phase-3 scope table), then bucket only eligible requests. Unsupported families (`write`, `evaluate`/legal/compliance) always route to v1 regardless of percentage, so `CANARY_PERCENT=100` means **100% of v2-eligible traffic**, never a global replacement of v1. If eligibility is only decidable after routing inside the graph, the v2 typed-unavailable outcome falls back to v1 before any user-visible failure is emitted.
+DB control is authoritative within environment ceilings. Selection is server-owned and uses authenticated workspace + persisted request ID. Selection is two-stage, and the runtime selector is **not** a second semantic classifier: an obviously v1-only request — one whose frozen `domains` contains `"write"` (there is no `WorkType="write"`; `"write"` is a `Domain`, and the `WorkType`/`Domain` literals are never extended) — routes to v1 immediately. Every other request is bucketed; a v2 candidate then runs the real v2 `QueryAnalysis`/Router, and if the router returns an unsupported work/domain (`evaluate`/legal/compliance) the request falls back to v1 before any capability execution or user-visible failure. `CANARY_PERCENT=100` therefore means **100% of v2-eligible traffic**, never a global replacement of v1.
 
 - [ ] **Step 3: Implement live metrics without pseudo-quality metric**
 

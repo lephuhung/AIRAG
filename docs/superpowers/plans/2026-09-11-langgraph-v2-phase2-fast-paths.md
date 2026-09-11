@@ -141,11 +141,11 @@ Expected: both exit 0.
 - Test: `backend/tests/agents/v2/test_context_binding_routes.py`
 
 **Interfaces:**
-- Produces: `context_node`, `binding_node`, `semantic_finalizer_node`, `route_node`, plus pure helpers `build_semantic_draft`, `resolve_bindings`, `finalize_semantic`, `analyze_query`, `decide_route`.
+- Produces: `context_node`, `binding_node`, `semantic_finalizer_node`, `route_node`, plus pure helpers `build_semantic_draft`, `resolve_bindings`, `finalize_semantic`, `analyze_query`, `decide_route`. `binding_node` is the revision-pin point and acquires/commits a retention lease for every newly pinned revision before returning binding state.
 
 - [ ] **Step 1: Write failing lifecycle/routing tests**
 
-Test greeting/direct, People/fast, exact Section/fast, KG/fast, comparison/complex, cross-domain dependency/complex, required ambiguous document/clarify, Write typed unavailable, abbreviations, coreference follow-up, irrelevant attachment exclusion, ordinary/current/pinned revision behavior, prompt-injection content remaining data, and no domain-agent routing names.
+Test greeting/direct, People/fast, exact Section/fast, KG/fast, comparison/complex, cross-domain dependency/complex, required ambiguous document/clarify, Write typed unavailable, abbreviations, coreference follow-up, irrelevant attachment exclusion, ordinary/current/pinned revision behavior, prompt-injection content remaining data, no domain-agent routing names, `test_binding_pin_acquires_lease_before_checkpoint` (the binding pin's lease commits before the binding state can be checkpointed, and a lease failure fails the node), and `test_resume_refreshes_lease_before_continuing`.
 
 ```bash
 cd backend && pytest tests/agents/v2/test_context_binding_routes.py -q
@@ -191,7 +191,7 @@ async def finalize_semantic(
     )
 ```
 
-Define helpers in these node modules; none may widen runtime scope or copy binding IDs into semantic contracts.
+Define helpers in these node modules; none may widen runtime scope or copy binding IDs into semantic contracts. `binding_node` resolves and pins revisions, then — before returning the binding state update — calls `runtime.services.retention_leases.acquire_or_refresh(run_id, revision_id)` for every newly pinned revision and commits the lease. If the lease write fails the node fails and the binding pin is not checkpointed.
 
 - [ ] **Step 3: Implement deterministic-first routing**
 
@@ -596,7 +596,7 @@ def create_supervisor_v2_graph(checkpointer: BaseCheckpointSaver) -> CompiledSta
     return graph.compile(checkpointer=checkpointer)
 ```
 
-Lifespan owns one opened AsyncPostgresSaver context; web startup never calls saver setup/migration. `complex_boundary` is the single Phase-3 replacement seam: Phase 3 attaches `build_complex_research_subgraph()` here so subgraph state, interrupt/resume, and checkpoint namespacing stay under the supervisor saver. Every checkpoint write that pins a `revision_id` or retains an `EvidenceUse` first calls Phase-1 `retention_leases.acquire_or_refresh(run_id, revision_id, evidence_use_id)` and commits the lease before returning the state update that LangGraph then checkpoints; terminal finalization/cancellation releases leases only after the terminal checkpoint succeeds. Ordering is authoritative; the checkpoint DB and application DB never share a transaction. This is what keeps resumable runs from losing artifacts to GC.
+Lifespan owns one opened AsyncPostgresSaver context; web startup never calls saver setup/migration. `complex_boundary` is the single Phase-3 replacement seam: Phase 3 attaches `build_complex_research_subgraph()` here so subgraph state, interrupt/resume, and checkpoint namespacing stay under the supervisor saver. Every checkpoint write that pins a `revision_id` or retains an `EvidenceUse` first calls Phase-1 `retention_leases.acquire_or_refresh(run_id, revision_id, evidence_use_id)` and commits the lease before returning the state update that LangGraph then checkpoints. On resume the outer runner refreshes existing leases before continuing; interrupt/clarification keeps them active. Terminal release is performed by the outer streaming/runner (`release_run(run_id)`), never inside the finalizer, and only after the terminal checkpoint succeeds. Ordering is authoritative; the checkpoint DB and application DB never share a transaction. This is what keeps resumable runs from losing artifacts to GC.
 
 - [ ] **Step 3: Test and commit**
 
