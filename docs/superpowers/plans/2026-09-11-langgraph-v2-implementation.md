@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Deliver the frozen LangGraph v2 architecture through compatibility discovery, immutable revision foundations, fast paths, complex pilots, and controlled rollout while v1 remains production default.
+**Goal:** Deliver the frozen LangGraph v2 architecture through compatibility discovery, immutable revision foundations, explicit agent/tool/node ownership, fast paths, complex pilots, and controlled rollout while v1 remains production default.
 
-**Architecture:** The suite has four executable phase plans. Phase 0 discovers exact packages that support `context_schema` and proves frozen-contract parity; Phase 1 deploys migration, mappings, revision-owned ingestion, then contracts/stores/adapters in four ordered releases; Phase 2 composes v2 fast execution; Phase 3 adds complex pilots and isolated rollout.
+**Architecture:** The suite has four executable phase plans plus one normative implementation amendment. Phase 0 discovers exact packages that support `context_schema` and proves frozen-contract parity; Phase 1 deploys migration, mappings, revision-owned ingestion, then contracts/stores/adapters in four ordered releases; the agent/tool/node amendment fixes implementation ownership without changing frozen business contracts; Phase 2 composes v2 deterministic nodes and shared capabilities; Phase 3 adds the single adaptive complex-research agent, task skills, complex pilots, and isolated rollout.
 
 **Tech Stack:** Python 3.11, Pydantic v2, discovered/pinned LangGraph and checkpoint stack, FastAPI, async SQLAlchemy/PostgreSQL 15, RabbitMQ, MinIO, Chroma, Neo4j, Redis, pytest, React/Vitest, Docker Compose, GitNexus.
 
@@ -14,6 +14,9 @@
 
 - The architecture remains **Approved design** with contract freeze active; this suite does not edit the spec or add business-contract fields.
 - Keep `backend/app/services/agents/supervisor.py` as v1 and create independent `backend/app/services/agents/supervisor_v2.py`.
+- Apply [`2026-09-11-langgraph-v2-agent-tool-node-amendment.md`](2026-09-11-langgraph-v2-agent-tool-node-amendment.md) before Phase 2 implementation. Its taxonomy is normative for implementation ownership and supersedes older plan wording that calls People, Document, Section, KG, Summary, or Comparison independent agents/domain graphs.
+- In v2, only a component that dynamically plans/replans and selects the next capability from observations is an **agent**. Deterministic graph lifecycle/routing/evaluation steps are **nodes**; atomic domain operations are typed **capabilities/tools**; summarize/compare/compliance are **task strategies/skills**; predetermined multi-step algorithms are **workflows/subgraphs**.
+- Do not create v2 `people_agent`, `summary_agent`, `comparison_agent`, `document_agent`, `section_agent`, `kg_agent`, or equivalent domain-agent wrappers. Fast and complex paths must share the same capability implementations.
 - Keep chat DB as conversation truth; checkpoints hold execution/interrupt/resume only.
 - Never checkpoint current identity, ACL/workspace scope, deadline, DB/client/service objects, or capability registry.
 - Persist raw user text before semantic normalization.
@@ -37,15 +40,23 @@
    - **1B:** after migration, deploy ORM/readiness mappings; startup performs no v2 DDL;
    - **1C:** move all build state and artifacts to immutable revisions, use FULL/CHAT_UPLOAD/PARSE_ONLY profiles, preserve v1 legacy retrieval until full revision-aware reindex;
    - **1D:** implement frozen contracts, evidence/checkpoint persistence, governance, and adapters.
-3. [`2026-09-11-langgraph-v2-phase2-fast-paths.md`](2026-09-11-langgraph-v2-phase2-fast-paths.md)
-   - context/binding/finalization/routing;
+3. [`2026-09-11-langgraph-v2-agent-tool-node-amendment.md`](2026-09-11-langgraph-v2-agent-tool-node-amendment.md)
+   - define the normative `agent` vs `node` vs `capability/tool` vs `skill` vs `workflow` boundary;
+   - map current AIRAG `people_agent`, `rag_agent`, `resolve_doc_agent`, evaluator, summary, and comparison concepts to v2 ownership;
+   - prohibit one-domain/one-use-case agent wrappers;
+   - require fast and complex execution to reuse the same capability registry;
+   - reserve adaptive plan/replan/tool selection for the complex-research boundary selected in Phase 0.
+4. [`2026-09-11-langgraph-v2-phase2-fast-paths.md`](2026-09-11-langgraph-v2-phase2-fast-paths.md)
+   - context/binding/finalization/routing nodes;
    - deterministic one-task fast plans;
+   - shared typed capabilities/tools for People, Document, Section, and KG instead of domain agents;
    - shared execution package, four-status evaluator, governed hydration/grounding, clarification;
    - independent supervisor, selector, and SSE compatibility.
-4. [`2026-09-11-langgraph-v2-phase3-rollout.md`](2026-09-11-langgraph-v2-phase3-rollout.md)
+5. [`2026-09-11-langgraph-v2-phase3-rollout.md`](2026-09-11-langgraph-v2-phase3-rollout.md)
    - golden A/B preflight;
-   - comparison pilot;
-   - deterministic governed People→Document dependency materialization;
+   - single adaptive complex-research agent/planner using the request-scoped authorized tool catalog;
+   - comparison as a task skill/policy over document/section capabilities, not a `comparison_agent`;
+   - deterministic governed People→Document dependency materialization, not agent handoff;
    - bounded replan/discovery;
    - separately compiled shadow graph with isolated saver/stores;
    - live canary metrics, kill switch, and 24-hour promotion gates.
@@ -58,8 +69,9 @@
 | Phase 1A | advisory-locked migration succeeds on populated legacy DB without importing v2 ORM | Phase 1B |
 | Phase 1B | exact schema readiness; v2 models map pre-existing schema; legacy `AUTO_CREATE_TABLES` cannot emit v2 DDL | revision-aware producers |
 | Phase 1C | revision owns every build state/artifact; R1 survives R2; dimension mismatch cannot delete published vectors; legacy remains v1-only until revision-ready | bindings/evidence/coverage |
-| Phase 1D | frozen contract, EvidenceRecord/Use, ACL/retention/audit, checkpointer DSN and adapters pass | `supervisor_v2.py` |
-| Phase 2 | all four evaluation statuses, blocking ambiguity finalization, checkpoint/resume, SSE/API parity, v1 default | complex pilots |
+| Phase 1D | frozen contract, EvidenceRecord/Use, ACL/retention/audit, checkpointer DSN and adapters pass | agent/tool/node amendment + `supervisor_v2.py` |
+| Agent/tool/node amendment | no v2 domain/use-case agents; fast/complex share one capability implementation; complex planner receives only request-scoped authorized tool catalog | Phase 2 execution implementation |
+| Phase 2 | all four evaluation statuses, blocking ambiguity finalization, checkpoint/resume, SSE/API parity, v1 default, taxonomy tests pass | complex pilots |
 | Golden A/B preflight | functional and quality comparison only; no 24-hour claim | shadow/canary |
 | Shadow | separately compiled graph + isolated saver, zero production checkpoint/evidence/audit/chat/memory/title/event writes | canary |
 | Live canary | metrics-table reports, ≥200 completed samples per arm, ≥24 continuous hours, zero security violations, latency/error/quality/cancellation gates | percentage promotion |
@@ -83,6 +95,9 @@
 15. Cross-workspace clone or reindex mutating current revision artifacts in place instead of building a target revision.
 16. Treating an absent/default canary security metric as `False`/secure.
 17. Deploying code that requires schema version 2 before the 1→2 migration is applied and verified.
+18. Recreating v1-style People/RAG/Summary/Comparison domain agents inside v2 instead of nodes + shared capabilities/tools + task skills.
+19. Giving the model control of workspace IDs, People permission, ACL, deadlines, service clients, or capability-registry construction.
+20. Implementing separate fast-path and complex-agent business logic for the same capability.
 
 ## Final Execution Gate (post-amendment)
 
@@ -101,6 +116,9 @@ The suite is ready to execute only when the revised plans prove:
 | 9 | Evidence encryption has real key-management semantics | Phase 1 Task 8 keyring/key-ID/rotation tests |
 | 10 | Canary security metrics have deterministic producers | Phase 3 Task 6 producer mapping, non-null metrics |
 | 11 | Every schema migration is deployed before code requiring that version | Phase 1 A/B/C/D releases and Phase 3 Task 6 1→2 two-release discipline |
+| 12 | v2 domain/use-case ownership is normalized to nodes + shared capabilities/tools + skills | Agent/tool/node amendment acceptance gate |
+| 13 | Fast and complex paths use the same capability implementation and runtime authorization boundary | Amendment tests + Phase 2/3 integration tests |
+| 14 | Summary and comparison are task strategies, not independent agents | `test_bounded_summary_is_read_plus_synthesis_not_summary_agent`, `test_compare_is_skill_not_subagent_route` |
 
 ## Whole-Suite Validation
 
