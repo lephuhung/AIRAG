@@ -107,6 +107,7 @@ Rules:
 5. Deep Agents/native framework tool calls, if used, are interpreted as **task proposals** and routed through the same validator/checkpoint/scheduler path.
 6. Unknown, unauthorized, stale, or unplanned tool/capability references fail closed.
 7. Model-generated workspace IDs, ACLs, deadlines, service objects, EvidenceUse IDs, or authorization flags are never accepted as execution authority.
+8. `AgentToolGateway` never executes or checkpoints: it only proposes validated append-only tasks and projects safe observations. Execution belongs to `TaskScheduler`; checkpointing belongs to the LangGraph graph and its saver.
 
 ### Framework-neutral internal gateway
 
@@ -120,28 +121,31 @@ class CapabilityInvocationProposal:
     input: CapabilityInput
     depends_on: tuple[str, ...] = ()
 
+@dataclass(frozen=True)
+class ToolProposalOutcome:
+    accepted: bool
+    plan: TaskPlan                    # append-only plan with the proposed TaskSpec, or current plan unchanged
+    rejection: ProposalRejection | None = None
+
 class AgentToolGateway(Protocol):
-    async def invoke(
+    async def propose(
         self,
         proposal: CapabilityInvocationProposal,
         current_plan: TaskPlan,
         runtime: GraphRuntimeContext,
-    ) -> "AgentToolObservation": ...
+    ) -> ToolProposalOutcome: ...
 ```
 
-`AgentToolGateway.invoke()` performs exactly:
+`AgentToolGateway.propose()` performs exactly:
 
 ```text
 proposal
--> convert to new TaskSpec
--> validate append-only plan/replan
--> checkpoint updated plan
--> scheduler executes ready tasks
--> validate AgentResult/EvidenceUse
--> project a safe AgentToolObservation
+-> convert to a TaskSpec proposal
+-> validate_task_plan / validate_replan (append-only, current runtime catalog)
+-> return accepted append-only plan or typed rejection
 ```
 
-The gateway is orchestration infrastructure, not a business capability.
+It is a **proposal + observation adapter only**: it never checkpoints, never calls `TaskScheduler`, and never executes a capability. Execution stays in the normal graph flow: the complex subgraph's `validate_checkpoint` node writes the accepted plan into `ComplexResearchState`, the supervisor saver checkpoints it, the `execute` node runs the shared `TaskScheduler`, and the `ObservationProjector` (section 3) projects the resulting `AgentResult`/EvidenceUse into an `AgentToolObservation`.
 
 ---
 
@@ -183,6 +187,7 @@ class AgentToolObservation:
 Rules:
 
 - No raw connector/database payload is returned to the model.
+- The `ObservationProjector` runs only after the shared `TaskScheduler` has executed and the graph has checkpointed the task; `AgentToolGateway` owns the projector but never the execution or the checkpoint.
 - No runtime secrets, service clients, ACL/workspace authority, deadlines, storage keys, or encryption metadata are model-visible.
 - Retrieved document text remains untrusted data and is not automatically returned to the planner. The planner primarily receives task status, coverage/evaluation gaps, candidate metadata explicitly admitted by policy, and EvidenceUse identities.
 - Full evidence content is hydrated only by governed evaluator/synthesis/grounding paths.
@@ -598,6 +603,7 @@ Before Phase 2/3 implementation is considered synchronized, prove:
 | 11 | Replan is append-only and cannot widen authorization. |
 | 12 | Skills/subagents cannot bypass TaskPlan validation, evaluator, evidence governance, or grounding. |
 | 13 | `CapabilityDescriptor`/`CapabilityInput`/`CapabilityOutput`/`CapabilityRuntimeContext` are imported from frozen contracts and never redefined or field-extended outside `contracts/capability.py`. |
+| 14 | `AgentToolGateway` validates proposals and projects observations only; it never executes a capability or checkpoints a plan. |
 
 Static architecture guards:
 
@@ -613,6 +619,7 @@ set -e
   backend/app/services/agents/v2
 
 ! rg -n 'capability\.execute\(' backend/app/services/agents/v2/tools
+! rg -n 'TaskScheduler|scheduler\.execute\(|checkpointer' backend/app/services/agents/v2/tools
 
 ! rg -n 'class\s+Capability(Descriptor|Input|Output|RuntimeContext)' \
   backend/app/services/agents/v2 --glob '!**/contracts/**'

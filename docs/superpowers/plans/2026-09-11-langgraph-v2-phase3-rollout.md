@@ -145,6 +145,7 @@ Named tests:
 ```text
 test_agent_tool_call_creates_validated_task_before_dispatch
 test_tool_adapter_cannot_call_capability_directly
+test_tool_gateway_is_proposal_and_observation_only
 test_unplanned_capability_dispatch_is_rejected
 test_unknown_or_unauthorized_tool_is_rejected_at_execution
 test_planner_never_receives_runtime_secrets
@@ -152,7 +153,7 @@ test_people_observation_does_not_expose_raw_record
 test_capability_output_is_not_model_observation_by_default
 ```
 
-- [ ] **Step 2: Implement proposal gateway**
+- [ ] **Step 2: Implement proposal + observation gateway (no execution)**
 
 ```python
 @dataclass(frozen=True)
@@ -161,6 +162,12 @@ class CapabilityInvocationProposal:
     objective: str
     input: CapabilityInput
     depends_on: tuple[str, ...] = ()
+
+@dataclass(frozen=True)
+class ToolProposalOutcome:
+    accepted: bool
+    plan: TaskPlan
+    rejection: ProposalRejection | None = None
 
 @dataclass(frozen=True)
 class AgentToolObservation:
@@ -172,20 +179,16 @@ class AgentToolObservation:
     safe_metadata: Mapping[str, str]
 ```
 
-`AgentToolGateway.invoke(...)` must perform:
+`AgentToolGateway.propose(...)` must perform only:
 
 ```text
 proposal
 -> create proposed TaskSpec/append-only plan
 -> validate_task_plan or validate_replan
--> persist/checkpoint authoritative plan
--> shared TaskScheduler dispatch
--> validate AgentResult/EvidenceUse
--> ObservationProjector
--> AgentToolObservation
+-> return ToolProposalOutcome (accepted append-only plan or typed rejection)
 ```
 
-It never calls a capability directly.
+The gateway is a **proposal + observation adapter, not a second executor**: it never checkpoints, never calls `TaskScheduler`, and never executes a capability. The subgraph `validate_checkpoint` node writes the accepted plan into `ComplexResearchState`, the supervisor saver checkpoints it, the `execute` node runs the shared scheduler, and `ObservationProjector.project(...)` produces the `AgentToolObservation` only after that checkpointed execution.
 
 - [ ] **Step 3: Implement request-scoped framework adapters**
 
@@ -204,6 +207,7 @@ The framework-facing schema contains only allowed `CapabilityInput`; runtime aut
 ```bash
 cd backend && pytest tests/agents/v2/complex/test_tool_gateway.py -q
 ! rg -n 'capability\.execute\(' backend/app/services/agents/v2/tools
+! rg -n 'TaskScheduler|scheduler\.execute\(|checkpointer' backend/app/services/agents/v2/tools
 node .gitnexus/run.cjs detect-changes --scope compare --base-ref main
 git add backend/app/services/agents/v2/tools backend/tests/agents/v2/complex/test_tool_gateway.py
 git commit -m "feat: add governed complex agent tool gateway"
@@ -674,6 +678,7 @@ set -e
      -o -path '*/domain/*_graph.py' \) | grep .
 
 ! rg -n 'capability\.execute\(' backend/app/services/agents/v2/tools
+! rg -n 'TaskScheduler|scheduler\.execute\(|checkpointer' backend/app/services/agents/v2/tools
 ```
 
 Expected: all gates pass while v1 remains the rollback/default path until persisted rollout control promotes v2.
