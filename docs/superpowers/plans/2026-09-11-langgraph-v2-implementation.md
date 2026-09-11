@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Deliver the frozen LangGraph v2 architecture through compatibility discovery, immutable revision foundations, explicit agent/tool/node ownership, fast paths, complex pilots, and controlled rollout while v1 remains production default.
+**Goal:** Deliver the frozen LangGraph v2 architecture through compatibility discovery, immutable revision foundations, explicit Agent/Node/Capability/Skill ownership, deterministic fast paths, one governed complex-research planning boundary, and controlled rollout while v1 remains production default.
 
-**Architecture:** The suite has four executable phase plans plus one normative implementation amendment. Phase 0 discovers exact packages that support `context_schema` and proves frozen-contract parity; Phase 1 deploys migration, mappings, revision-owned ingestion, then contracts/stores/adapters in four ordered releases; the agent/tool/node amendment fixes implementation ownership without changing frozen business contracts; Phase 2 composes v2 deterministic nodes and shared capabilities; Phase 3 adds the single adaptive complex-research agent, task skills, complex pilots, and isolated rollout.
+**Architecture:** The suite has four executable phase plans plus one normative implementation amendment. Phase 0 discovers exact orchestration/checkpoint versions; Phase 1 establishes immutable revisions/contracts/evidence/checkpointing; the Agent/Tool/Node amendment fixes implementation ownership without changing frozen business contracts; Phase 2 builds node-based deterministic fast execution over shared typed capabilities; Phase 3 adds one adaptive complex planner whose tool proposals still pass through TaskPlan validation, checkpointing, the shared scheduler, evaluator, synthesis, and grounding.
 
 **Tech Stack:** Python 3.11, Pydantic v2, discovered/pinned LangGraph and checkpoint stack, FastAPI, async SQLAlchemy/PostgreSQL 15, RabbitMQ, MinIO, Chroma, Neo4j, Redis, pytest, React/Vitest, Docker Compose, GitNexus.
 
@@ -12,122 +12,142 @@
 
 ## Global Constraints
 
-- The architecture remains **Approved design** with contract freeze active; this suite does not edit the spec or add business-contract fields.
+- Architecture remains **Approved design** with contract freeze active; plans do not add/change frozen business-contract fields.
 - Keep `backend/app/services/agents/supervisor.py` as v1 and create independent `backend/app/services/agents/supervisor_v2.py`.
-- Apply [`2026-09-11-langgraph-v2-agent-tool-node-amendment.md`](2026-09-11-langgraph-v2-agent-tool-node-amendment.md) before Phase 2 implementation. Its taxonomy is normative for implementation ownership and supersedes older plan wording that calls People, Document, Section, KG, Summary, or Comparison independent agents/domain graphs.
-- In v2, only a component that dynamically plans/replans and selects the next capability from observations is an **agent**. Deterministic graph lifecycle/routing/evaluation steps are **nodes**; atomic domain operations are typed **capabilities/tools**; summarize/compare/compliance are **task strategies/skills**; predetermined multi-step algorithms are **workflows/subgraphs**.
-- Do not create v2 `people_agent`, `summary_agent`, `comparison_agent`, `document_agent`, `section_agent`, `kg_agent`, or equivalent domain-agent wrappers. Fast and complex paths must share the same capability implementations.
-- Keep chat DB as conversation truth; checkpoints hold execution/interrupt/resume only.
+- Apply [`2026-09-11-langgraph-v2-agent-tool-node-amendment.md`](2026-09-11-langgraph-v2-agent-tool-node-amendment.md) before Phase 2. It is normative for implementation taxonomy, package ownership, and tool execution path.
+- **Agent:** adaptive plan/replan proposal only. **Node:** LangGraph state/routing/lifecycle. **Capability:** atomic typed domain operation. **Skill:** task strategy. **Workflow/subgraph:** predetermined multi-step algorithm.
+- Do not create v2 People/RAG/Document/Section/KG/Summary/Comparison/Evaluation/Grounding domain agents or domain graph wrappers.
+- Fast and complex paths share the same capability implementations and request-scoped `CapabilityRegistry`.
+- “Agent chooses a tool” means it proposes `TaskSpec.capability`; it does not directly invoke a capability.
+- Every factual capability dispatch must follow `TaskPlan/TaskSpec proposal -> validation -> authoritative checkpoint -> scheduler -> capability`.
+- Capability model input cannot supply workspace IDs, ACL/People permissions, deadlines, feature flags, service clients, registry construction, or cancellation authority.
+- `CapabilityOutput` is not model observation by default; sensitive outputs require explicit safe observation projection.
+- Chat DB remains conversation truth; checkpoints hold execution/interrupt/resume only.
 - Never checkpoint current identity, ACL/workspace scope, deadline, DB/client/service objects, or capability registry.
 - Persist raw user text before semantic normalization.
-- Every factual execution owns a checkpointed `TaskPlan`; direct non-factual responses own no plan.
-- Do not implement binding/evidence/coverage/reuse until immutable revision publication passes.
-- Write (pasted-text grammar/proofread/rewrite) is explicitly outside the v2 rollout scope; v1 remains its owner until a separate approved implementation plan exists.
-- Keep API, SSE payloads, cancellation, citations, and frontend behavior compatible.
-- Before every phase, run its repository-drift preflight: verify Modify paths and symbols exist, Create paths do not conflict, and selected dependency imports/APIs execute.
-- Before editing an existing symbol, run exact GitNexus upstream impact and stop for HIGH/CRITICAL review.
-- Before every commit run `node .gitnexus/run.cjs detect-changes --scope compare --base-ref main`; stage only task paths.
+- Direct non-factual responses own no plan; every factual invocation owns a checkpointed TaskPlan.
+- Do not implement binding/evidence/coverage/reuse before immutable revision publication passes.
+- Write remains v1-owned/outside this v2 rollout.
+- Keep API, SSE, cancellation, citations, and frontend behavior compatible.
+- Before every phase run repository-drift preflight; before existing-symbol edits run exact GitNexus impact; before each commit run compare-scope detect-changes and stage narrow paths.
 - Keep `.orca/` untracked.
 
 ## Exact Dependency Order
 
 1. [`2026-09-11-langgraph-v2-phase0-benchmark.md`](2026-09-11-langgraph-v2-phase0-benchmark.md)
-   - discover an exact LangGraph version exposing `StateGraph(..., context_schema=...)`;
-   - discover compatible `langgraph-checkpoint-postgres` and `psycopg` versions and prove a real psycopg DSN;
-   - benchmark native versus Deep Agents with actual frozen contracts; pin only the winner stack.
+   - discover exact LangGraph version supporting `StateGraph(..., context_schema=...)`;
+   - discover compatible checkpoint-postgres/psycopg stack and prove real DSN/setup round-trip;
+   - benchmark native vs Deep Agents using frozen contracts; pin only winner stack.
+
 2. [`2026-09-11-langgraph-v2-phase1-foundation.md`](2026-09-11-langgraph-v2-phase1-foundation.md)
-   - **1A:** deploy isolated raw-SQL migration runner only; no v2 ORM registration;
-   - **1B:** after migration, deploy ORM/readiness mappings; startup performs no v2 DDL;
-   - **1C:** move all build state and artifacts to immutable revisions, use FULL/CHAT_UPLOAD/PARSE_ONLY profiles, preserve v1 legacy retrieval until full revision-aware reindex;
-   - **1D:** implement frozen contracts, evidence/checkpoint persistence, governance, and adapters.
+   - **1A:** raw-SQL migration runner only;
+   - **1B:** post-migration ORM/readiness mappings;
+   - **1C:** immutable revision-owned build state/artifacts and legacy-v1 compatibility;
+   - **1D:** frozen contracts, evidence/checkpoint governance, adapters.
+
 3. [`2026-09-11-langgraph-v2-agent-tool-node-amendment.md`](2026-09-11-langgraph-v2-agent-tool-node-amendment.md)
-   - define the normative `agent` vs `node` vs `capability/tool` vs `skill` vs `workflow` boundary;
-   - map current AIRAG `people_agent`, `rag_agent`, `resolve_doc_agent`, evaluator, summary, and comparison concepts to v2 ownership;
-   - prohibit one-domain/one-use-case agent wrappers;
-   - require fast and complex execution to reuse the same capability registry;
-   - reserve adaptive plan/replan/tool selection for the complex-research boundary selected in Phase 0.
+   - define Agent vs Node vs Capability vs Skill vs Workflow;
+   - define canonical `v2/nodes`, `v2/capabilities`, `v2/tools`, `v2/skills` layout;
+   - prohibit domain-agent/domain-graph wrappers;
+   - require `TaskPlan -> validate -> checkpoint -> scheduler` for all tool execution;
+   - require explicit sensitive-output observation projection.
+
 4. [`2026-09-11-langgraph-v2-phase2-fast-paths.md`](2026-09-11-langgraph-v2-phase2-fast-paths.md)
-   - context/binding/finalization/routing nodes;
-   - deterministic one-task fast plans;
-   - shared typed capabilities/tools for People, Document, Section, and KG instead of domain agents;
-   - shared execution package, four-status evaluator, governed hydration/grounding, clarification;
-   - independent supervisor, selector, and SSE compatibility.
+   - Context/Binding/Routing/FastPlan/Execute/Evaluate/Synthesize/Grounding/Clarification/Finalizer nodes;
+   - request-scoped shared People/Document/Section/KG capabilities;
+   - deterministic one-task fast plans and shared scheduler;
+   - independent supervisor, selector, SSE compatibility;
+   - no complex adaptive planning yet.
+
 5. [`2026-09-11-langgraph-v2-phase3-rollout.md`](2026-09-11-langgraph-v2-phase3-rollout.md)
-   - golden A/B preflight;
-   - single adaptive complex-research agent/planner using the request-scoped authorized tool catalog;
-   - comparison as a task skill/policy over document/section capabilities, not a `comparison_agent`;
-   - deterministic governed People→Document dependency materialization, not agent handoff;
+   - golden shared-evaluator A/B preflight;
+   - governed `AgentToolGateway` and `AgentToolObservation` projection;
+   - one adaptive `ComplexResearchGraph` planning/replanning boundary;
+   - comparison/summarization as skills over shared capabilities;
+   - deterministic People→Document dependency materialization;
    - bounded replan/discovery;
-   - separately compiled shadow graph with isolated saver/stores;
-   - live canary metrics, kill switch, and 24-hour promotion gates; rollout-control schema 1→2 is released migration-first (Task 6A) before the consumers that require it (Task 6B).
+   - isolated shadow graph;
+   - rollout schema migration-first Task 7A, then consumers Task 7B;
+   - live canary/kill switch/24-hour gates.
 
 ## Hard Gates
 
 | Gate | Required evidence | Blocks |
 |---|---|---|
-| Phase 0 | exact versions, `inspect.signature(StateGraph)` `context_schema` proof, real AsyncPostgresSaver DSN/setup round-trip, frozen-contract parity, committed winner report | production dependency changes |
-| Phase 1A | advisory-locked migration succeeds on populated legacy DB without importing v2 ORM | Phase 1B |
-| Phase 1B | exact schema readiness; v2 models map pre-existing schema; legacy `AUTO_CREATE_TABLES` cannot emit v2 DDL | revision-aware producers |
-| Phase 1C | revision owns every build state/artifact; R1 survives R2; dimension mismatch cannot delete published vectors; legacy remains v1-only until revision-ready | bindings/evidence/coverage |
-| Phase 1D | frozen contract, EvidenceRecord/Use, ACL/retention/audit, checkpointer DSN and adapters pass | agent/tool/node amendment + `supervisor_v2.py` |
-| Agent/tool/node amendment | no v2 domain/use-case agents; fast/complex share one capability implementation; complex planner receives only request-scoped authorized tool catalog | Phase 2 execution implementation |
-| Phase 2 | all four evaluation statuses, blocking ambiguity finalization, checkpoint/resume, SSE/API parity, v1 default, taxonomy tests pass | complex pilots |
-| Golden A/B preflight | functional comparison plus a shared-evaluator quality comparison (same evaluator version on both arms); no 24-hour claim | shadow/canary |
-| Shadow | separately compiled graph + isolated saver, zero production checkpoint/evidence/audit/chat/memory/title/event writes | canary |
-| Live canary | metrics-table reports, ≥200 completed samples per arm, ≥24 continuous hours, zero security violations, latency/error/cancellation gates (no quality field; quality is gated in the shared-evaluator preflight) | percentage promotion |
+| Phase 0 | exact versions, `context_schema` proof, real AsyncPostgresSaver round-trip, frozen-contract parity, winner report | dependency changes |
+| Phase 1A | advisory-locked populated-legacy migration, no v2 ORM import | Phase 1B |
+| Phase 1B | exact readiness; mapped pre-existing schema; startup cannot emit v2 DDL | revision producers |
+| Phase 1C | revision owns build state/artifacts; R1 survives R2; legacy remains v1-only until ready | bindings/evidence |
+| Phase 1D | frozen contracts, EvidenceRecord/Use, ACL/retention/audit, checkpoint/adapters | Phase 2 |
+| Ownership amendment | one canonical node/capability layout; no domain agents; no direct tool execution; sensitive observation projection | Phase 2/3 implementation |
+| Phase 2 | checkpoint-before-dispatch, shared capabilities, all evaluation statuses, clarification/resume, SSE/API parity, v1 default | complex pilots |
+| Complex research | tool proposal becomes validated checkpointed TaskSpec; fast/complex share capabilities; People raw data absent from planner; replan bounded | shadow/canary |
+| Golden A/B | functional + shared-evaluator quality comparison, same evaluator version both arms | shadow/canary |
+| Shadow | separately compiled graph + isolated saver/stores; zero production writes/events | canary |
+| Live canary | DB metrics, ≥200 samples/arm, ≥24h continuous, zero security violations, latency/error/cancellation gates | promotion |
 
-## Prohibited Sequencing
+## Prohibited Sequencing and Ownership
 
-1. Hardcoding package pins before API compatibility discovery.
-2. Registering v2 ORM before release 1A migration is applied and verified.
-3. Using `Document.embed_done/captions_done/kg_done/status` to drive revision work.
-4. Deleting images, tables, chunks, objects, vectors, or KG facts by document during revision build.
-5. Associating legacy Chroma/KG artifacts with a baseline revision without full revision-aware reindex.
-6. Recreating a workspace vector collection on dimension mismatch after published revisions exist.
-7. Persisting EvidenceUse before owning TaskPlan checkpoint.
+1. Hardcoding package pins before Phase-0 compatibility discovery.
+2. Registering v2 ORM before Phase-1A migration is applied/verified.
+3. Using legacy Document completion flags to decide revision work.
+4. Deleting revision artifacts by document during replacement build.
+5. Treating legacy Chroma/KG artifacts as revision-ready without full revision-aware reindex.
+6. Recreating vector collections destructively after published revisions exist.
+7. Persisting EvidenceUse before authoritative TaskPlan checkpoint.
 8. Exposing raw People rows to planner/checkpoint or fabricating People→Document input.
-9. Compiling shadow with production checkpointer or production writable stores.
-10. Treating short golden A/B output as a continuous 24-hour canary report.
-11. Inner graph/domain streaming user-facing prose.
-12. Publishing a lower-generation revision over a newer current revision (`current_revision_id` must be monotonic under concurrency).
-13. Allocating a second draft revision for a repeated ingest trigger (`document_id` + `source_object_identity` + `build_profile` converges to one attempt).
-14. Physically deleting a document's vectors/KG/objects/rows before tombstone + eligibility + GC.
-15. Cross-workspace clone or reindex mutating current revision artifacts in place instead of building a target revision.
-16. Treating an absent/default canary security metric as `False`/secure.
-17. Deploying code that requires schema version 2 before the 1→2 migration is applied and verified.
-18. Publishing a revision to a tombstoned document, or advancing `current_revision_id` without the `documents.source_deleted_at IS NULL` CAS guard (must fail closed, never resurrect).
-19. Sharing one GC eligibility predicate between evidence retention and revision artifacts — evidence expiry must never by itself make revision artifacts deletable, and artifact reclamation must never delete evidence rows.
-20. Resuming a terminal-`failed` revision in place, or retrying without allocating a new generation — retries must be bounded, produce `retry_of_revision_id` provenance, and a failed revision stays immutable.
-21. Deriving `source_object_identity` from a user filename, client header, or otherwise non-canonical key — it must be `bucket + verbatim storage object key + version_id/etag + size + streamed sha256`, with a multipart etag never treated as a content hash.
-22. Comparing a v2-internal grounded/total ratio across arms as a live quality gate (tautological and lacking a v1 counterpart) — quality must be measured by a shared evaluator on both arms in the golden preflight, and the live gate must carry no quality field.
-23. Blind-`DETACH DELETE` of MERGE-shared canonical KG entities during revision GC — only rows carrying the producing `revision_id` may be deleted, and a shared entity is pruned only when no other revision still references it.
-18. Recreating v1-style People/RAG/Summary/Comparison domain agents inside v2 instead of nodes + shared capabilities/tools + task skills.
-19. Giving the model control of workspace IDs, People permission, ACL, deadlines, service clients, or capability-registry construction.
-20. Implementing separate fast-path and complex-agent business logic for the same capability.
+9. Compiling shadow with production checkpointer/writable stores.
+10. Treating batch A/B as live 24h canary evidence.
+11. Inner nodes/capabilities streaming final user prose.
+12. Publishing lower-generation revision over newer current revision.
+13. Creating duplicate draft for repeated ingest attempt.
+14. Physically deleting document revision artifacts before tombstone + independent artifact-GC eligibility.
+15. Clone/reindex mutating published current artifacts in place.
+16. Treating absent security metric as secure.
+17. Deploying schema-2 consumers before migration 1→2 is applied/verified.
+18. Publishing/promoting revision for tombstoned source.
+19. Sharing one GC predicate between evidence retention and revision artifact reclamation.
+20. Reusing terminal-failed revision for retry instead of allocating bounded new generation.
+21. Using non-canonical source-object identity.
+22. Comparing v2-internal grounding-completeness ratio as cross-arm live quality.
+23. Blind-delete shared KG canonical entities during revision GC.
+24. Recreating v1-style People/RAG/Summary/Comparison/etc. agents or `v2/domain/*_graph.py` wrappers.
+25. Giving model control of runtime authorization/scope/deadline/service fields.
+26. Implementing separate fast vs complex business logic for same capability.
+27. Letting framework-native tool call execute capability before TaskSpec validation/checkpoint.
+28. Returning raw `CapabilityOutput` to planner by default.
+29. Allowing subagent to own TaskPlan, dispatch capability, create EvidenceUse, decide sufficiency, or emit FinalResponse.
 
-## Final Execution Gate (post-amendment)
+## Final Execution Gate
 
-The suite is ready to execute only when the revised plans prove:
+The implementation suite is ready only when all are proven:
 
-| # | Proof | Verified by |
+| # | Proof | Primary gate |
 |---|---|---|
-| 1 | Revision publication is monotonic under concurrency | Phase 1 `test_concurrent_revision_publish_does_not_regress_current` |
-| 2 | All ingestion triggers converge to one revision attempt | Phase 1 `test_webhook_and_confirm_create_one_revision`, `test_duplicate_webhook_is_idempotent`, `test_chat_upload_webhook_profile_is_preserved`, `test_concurrent_get_or_create_ingestion_attempt_is_atomic` |
-| 3 | Delete is logical/tombstoned before GC | Phase 1 `test_delete_tombstones_before_gc`, `test_publish_after_tombstone_does_not_resurrect_current`, `test_expired_evidence_alone_does_not_release_revision_artifacts`, `test_revision_artifact_gc_requires_no_retained_references` + Task 9 independent predicates |
-| 4 | Viewer APIs resolve the current revision correctly | Phase 1 `test_current_document_view_uses_current_revision` |
-| 5 | Clone cannot bypass the revision lifecycle | Phase 1 Task 4 clone rule + pipeline test |
-| 6 | KG facts are isolated by revision | Phase 1 `test_revision_kg_does_not_leak_old_fact`, `test_revision_kg_gc_preserves_shared_entities` |
-| 7 | Historical vectors resolve from recorded artifact metadata | Phase 1 `test_historical_revision_uses_recorded_embedding_namespace` |
-| 8 | Write scope has an explicit owner | Phase 2 Global Constraints (v1 owns; out of v2 scope) |
-| 9 | Evidence encryption has real key-management semantics | Phase 1 Task 8 keyring/key-ID/rotation tests |
-| 10 | Canary security metrics have deterministic producers | Phase 3 Task 6B producer mapping, non-null metrics |
-| 11 | Every schema migration is deployed before code requiring that version | Phase 1 A/B/C/D releases and Phase 3 Task 6A (migration-only commit) before Task 6B (consumers) |
-| 12 | Failed ingestion has explicit, bounded retry semantics | Phase 1 `test_failed_revision_is_terminal_and_immutable`, `test_queue_redelivery_of_failed_revision_is_noop`, `test_retry_after_failure_allocates_new_generation`, `test_retry_is_bounded_and_exhausts` |
-| 13 | `source_object_identity` is canonical and stable across triggers | Phase 1 `test_source_object_identity_is_canonical`, `test_multipart_etag_is_not_a_content_hash`, `test_overwrite_same_key_changes_identity_and_creates_new_attempt`, `test_duplicate_webhook_arrival_is_idempotent`, `test_build_profile_resolution_is_deterministic` |
-| 14 | Live quality comparison is not tautological and is shared-evaluator gated | Phase 3 Task 6B excludes any quality field from live metrics; Task 1 shared evaluator + `v2-evaluator-version-fail.json` schema rejection |
-| 12 | v2 domain/use-case ownership is normalized to nodes + shared capabilities/tools + skills | Agent/tool/node amendment acceptance gate |
-| 13 | Fast and complex paths use the same capability implementation and runtime authorization boundary | Amendment tests + Phase 2/3 integration tests |
-| 14 | Summary and comparison are task strategies, not independent agents | `test_bounded_summary_is_read_plus_synthesis_not_summary_agent`, `test_compare_is_skill_not_subagent_route` |
+| 1 | Revision publication monotonic under concurrency | Phase 1 |
+| 2 | Ingestion triggers converge atomically to one attempt | Phase 1 |
+| 3 | Tombstone precedes independent artifact GC | Phase 1 |
+| 4 | Current document view resolves immutable current revision | Phase 1 |
+| 5 | Clone/reindex cannot bypass revision lifecycle | Phase 1 |
+| 6 | KG facts/provenance isolated by revision | Phase 1 |
+| 7 | Historical vectors resolve recorded build namespace | Phase 1 |
+| 8 | Write has explicit v1 owner | Phase 2 |
+| 9 | Evidence encryption/key rotation fail closed | Phase 1 |
+| 10 | Failed ingestion retry allocates bounded new generation | Phase 1 |
+| 11 | Canonical source identity stable across triggers | Phase 1 |
+| 12 | No v2 domain-agent/domain-graph wrappers exist | Amendment + Phase 2 |
+| 13 | Fast and complex use same capability implementation | Phase 2/3 |
+| 14 | Every factual dispatch references validated checkpointed TaskSpec | Phase 2/3 |
+| 15 | Capability receives `CapabilityRuntimeContext` only | Phase 2 |
+| 16 | Agent-facing tool adapter cannot call capability directly | Phase 3 |
+| 17 | Sensitive capability output uses safe observation projection | Phase 3 |
+| 18 | People→Document remains deterministic materialization | Phase 3 |
+| 19 | Summary/compare/compliance are skills/work types, not agents | Amendment + Phase 3 |
+| 20 | Replan is append-only and cannot widen current authorization | Phase 3 |
+| 21 | Subagents have no execution/persistence/sufficiency authority | Phase 3 |
+| 22 | Canary security metrics have authoritative producers | Phase 3 Task 7B |
+| 23 | Every migration precedes consumers requiring its version | Phase 1 + Phase 3 Task 7A/7B |
+| 24 | Quality comparison uses same arm-neutral evaluator only in golden preflight | Phase 3 Task 1 |
 
 ## Whole-Suite Validation
 
@@ -143,4 +163,4 @@ make fe-build
 cd frontend && pnpm test -- ChatPanel.rollback
 ```
 
-Expected: every command exits 0; the spec remains Approved/frozen and v1 remains default until a Phase-3 live gate promotes a persisted rollout control.
+Expected: all commands exit 0; frozen spec stays Approved; v1 remains default until persisted Phase-3 rollout control promotes v2.
