@@ -14,7 +14,7 @@
 
 - Phase 1 gate must pass; v1 remains default.
 - Create `supervisor_v2.py` before selector wiring.
-- Only direct non-factual conversation bypasses factual evidence/grounding; Write stays disabled until a separate approved frozen-spec amendment defines pasted-text transformation semantics.
+- Only direct non-factual conversation bypasses factual evidence/grounding. Write (pasted-text grammar/proofread/rewrite) is explicitly **outside the LangGraph v2 rollout scope**: v1 remains its owner until a separate approved implementation plan defines non-evidence success semantics. v2 keeps a typed unavailable boundary, and no phase in this suite enables Write.
 - Only the outer adapter streams final prose.
 - Current runtime ACL replaces historical context on every resume.
 - Before each existing-symbol edit run named GitNexus impact; before each commit run compare-scope detect-changes and narrow staging.
@@ -96,7 +96,7 @@ Expected: both exit 0 before Phase 2 edits.
 
 - [ ] **Step 1: Write failing lifecycle/routing tests**
 
-Test greeting/direct, People/fast, exact Section/fast, KG/fast, comparison/complex, required ambiguous document/clarify, grammar Write/typed unavailable pending amendment, abbreviations, coreference follow-up, irrelevant attachment exclusion, ordinary/current/pinned revision behavior, and prompt-injection content remaining data.
+Test greeting/direct, People/fast, exact Section/fast, KG/fast, comparison/complex, required ambiguous document/clarify, grammar Write returning the declared out-of-scope typed unavailable response, abbreviations, coreference follow-up, irrelevant attachment exclusion, ordinary/current/pinned revision behavior, and prompt-injection content remaining data.
 
 ```bash
 cd backend && pytest tests/agents/v2/test_context_binding_routes.py -q
@@ -232,7 +232,7 @@ git commit -m "feat: add deterministic v2 fast planning"
 
 - [ ] **Step 1: Write failing evidence/grounding tests**
 
-Name tests for: search success not read coverage; wrong/partial section; revision mismatch; targetless supporting use; discovery use cannot synthesize; source tombstone; expired use; People minimization; same record/two uses; derived faithfulness; all four statuses and precedence; unmapped factual assertion revise then insufficient; deterministic citation; `test_synthesis_budget_overflow_persists_grounded_derived_evidence`; and `test_synthesis_only_existing_evidence_revalidates_current_uses_without_research`. Keep pasted-text Write disabled in v2 until a separate frozen-spec amendment defines its non-evidence success semantics; this plan does not invent that exception.
+Name tests for: search success not read coverage; wrong/partial section; revision mismatch; targetless supporting use; discovery use cannot synthesize; source tombstone; expired use; People minimization; same record/two uses; derived faithfulness; all four statuses and precedence; unmapped factual assertion revise then insufficient; deterministic citation; `test_synthesis_budget_overflow_persists_grounded_derived_evidence`; and `test_synthesis_only_existing_evidence_revalidates_current_uses_without_research`. Keep pasted-text Write disabled in v2 until a separate plan owns it; this suite does not invent that exception.
 
 ```bash
 cd backend && pytest tests/agents/v2/fast_paths/test_domain_paths.py tests/agents/v2/test_evaluation_grounding.py -q
@@ -273,7 +273,7 @@ Expected: hydration and grounding tests pass.
 
 - [ ] **Step 4: Implement independent domain graphs**
 
-Each enabled domain graph accepts typed input and returns typed output without reading root state. People, Document, Section, and KG are enabled in this phase. The router returns a typed unavailable response for Write until an approved frozen-spec amendment defines its evidence semantics; do not implement a plan-only business-contract exception. Source-backed Write, once enabled, follows normal evaluation/grounding.
+Each enabled domain graph accepts typed input and returns typed output without reading root state. People, Document, Section, and KG are enabled in this phase. The router returns a typed unavailable response for Write, which is declared out of scope for this rollout with v1 as owner; do not implement a plan-only business-contract exception. Source-backed Write, if ever enabled by a separate approved plan, follows normal evaluation/grounding.
 
 ```bash
 cd backend && pytest tests/agents/v2/fast_paths/test_domain_paths.py -q

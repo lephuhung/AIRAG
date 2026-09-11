@@ -19,6 +19,7 @@
 - Persist raw user text before semantic normalization.
 - Every factual execution owns a checkpointed `TaskPlan`; direct non-factual responses own no plan.
 - Do not implement binding/evidence/coverage/reuse until immutable revision publication passes.
+- Write (pasted-text grammar/proofread/rewrite) is explicitly outside the v2 rollout scope; v1 remains its owner until a separate approved implementation plan exists.
 - Keep API, SSE payloads, cancellation, citations, and frontend behavior compatible.
 - Before every phase, run its repository-drift preflight: verify Modify paths and symbols exist, Create paths do not conflict, and selected dependency imports/APIs execute.
 - Before editing an existing symbol, run exact GitNexus upstream impact and stop for HIGH/CRITICAL review.
@@ -76,6 +77,30 @@
 9. Compiling shadow with production checkpointer or production writable stores.
 10. Treating short golden A/B output as a continuous 24-hour canary report.
 11. Inner graph/domain streaming user-facing prose.
+12. Publishing a lower-generation revision over a newer current revision (`current_revision_id` must be monotonic under concurrency).
+13. Allocating a second draft revision for a repeated ingest trigger (`document_id` + `source_object_identity` + `build_profile` converges to one attempt).
+14. Physically deleting a document's vectors/KG/objects/rows before tombstone + eligibility + GC.
+15. Cross-workspace clone or reindex mutating current revision artifacts in place instead of building a target revision.
+16. Treating an absent/default canary security metric as `False`/secure.
+17. Deploying code that requires schema version 2 before the 1→2 migration is applied and verified.
+
+## Final Execution Gate (post-amendment)
+
+The suite is ready to execute only when the revised plans prove:
+
+| # | Proof | Verified by |
+|---|---|---|
+| 1 | Revision publication is monotonic under concurrency | Phase 1 `test_concurrent_revision_publish_does_not_regress_current` |
+| 2 | All ingestion triggers converge to one revision attempt | Phase 1 `test_webhook_and_confirm_create_one_revision`, `test_duplicate_webhook_is_idempotent`, `test_chat_upload_webhook_profile_is_preserved` |
+| 3 | Delete is logical/tombstoned before GC | Phase 1 `test_delete_tombstones_before_gc` + Task 9 eligibility rules |
+| 4 | Viewer APIs resolve the current revision correctly | Phase 1 `test_current_document_view_uses_current_revision` |
+| 5 | Clone cannot bypass the revision lifecycle | Phase 1 Task 4 clone rule + pipeline test |
+| 6 | KG facts are isolated by revision | Phase 1 `test_revision_kg_does_not_leak_old_fact` |
+| 7 | Historical vectors resolve from recorded artifact metadata | Phase 1 `test_historical_revision_uses_recorded_embedding_namespace` |
+| 8 | Write scope has an explicit owner | Phase 2 Global Constraints (v1 owns; out of v2 scope) |
+| 9 | Evidence encryption has real key-management semantics | Phase 1 Task 8 keyring/key-ID/rotation tests |
+| 10 | Canary security metrics have deterministic producers | Phase 3 Task 6 producer mapping, non-null metrics |
+| 11 | Every schema migration is deployed before code requiring that version | Phase 1 A/B/C/D releases and Phase 3 Task 6 1→2 two-release discipline |
 
 ## Whole-Suite Validation
 
