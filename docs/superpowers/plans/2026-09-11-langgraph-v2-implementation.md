@@ -95,6 +95,7 @@
 15. Cross-workspace clone or reindex mutating current revision artifacts in place instead of building a target revision.
 16. Treating an absent/default canary security metric as `False`/secure.
 17. Deploying code that requires schema version 2 before the 1→2 migration is applied and verified.
+18. Publishing a revision to a tombstoned document, or advancing `current_revision_id` without the `documents.source_deleted_at IS NULL` CAS guard (must fail closed, never resurrect).
 18. Recreating v1-style People/RAG/Summary/Comparison domain agents inside v2 instead of nodes + shared capabilities/tools + task skills.
 19. Giving the model control of workspace IDs, People permission, ACL, deadlines, service clients, or capability-registry construction.
 20. Implementing separate fast-path and complex-agent business logic for the same capability.
@@ -107,7 +108,7 @@ The suite is ready to execute only when the revised plans prove:
 |---|---|---|
 | 1 | Revision publication is monotonic under concurrency | Phase 1 `test_concurrent_revision_publish_does_not_regress_current` |
 | 2 | All ingestion triggers converge to one revision attempt | Phase 1 `test_webhook_and_confirm_create_one_revision`, `test_duplicate_webhook_is_idempotent`, `test_chat_upload_webhook_profile_is_preserved`, `test_concurrent_get_or_create_ingestion_attempt_is_atomic` |
-| 3 | Delete is logical/tombstoned before GC | Phase 1 `test_delete_tombstones_before_gc` + Task 9 eligibility rules |
+| 3 | Delete is logical/tombstoned before GC | Phase 1 `test_delete_tombstones_before_gc`, `test_publish_after_tombstone_does_not_resurrect_current` + Task 9 eligibility rules |
 | 4 | Viewer APIs resolve the current revision correctly | Phase 1 `test_current_document_view_uses_current_revision` |
 | 5 | Clone cannot bypass the revision lifecycle | Phase 1 Task 4 clone rule + pipeline test |
 | 6 | KG facts are isolated by revision | Phase 1 `test_revision_kg_does_not_leak_old_fact` |

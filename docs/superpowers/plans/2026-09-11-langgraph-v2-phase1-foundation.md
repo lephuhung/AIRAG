@@ -181,11 +181,11 @@ Deploy only after Release 1B readiness passes. From this release onward every wo
 - Test: `backend/tests/agents/v2/persistence/test_document_revisions.py`
 
 **Interfaces:**
-- Produces: internal `RevisionBuildProfile = FULL | CHAT_UPLOAD | PARSE_ONLY`, monotonic `allocate_draft`/`generation`, idempotent `get_or_create_ingestion_attempt`, `record_worker_state`, `record_artifacts`, `verify_draft`, generation-safe `publish`, `get_published`, and tombstone `mark_source_deleted` (sets `Document.source_deleted_at` and never deletes revision rows).
+- Produces: internal `RevisionBuildProfile = FULL | CHAT_UPLOAD | PARSE_ONLY`, monotonic `allocate_draft`/`generation`, idempotent `get_or_create_ingestion_attempt`, `record_worker_state`, `record_artifacts`, `verify_draft`, generation-safe and tombstone-guarded `publish`, `get_published`, and tombstone `mark_source_deleted` (sets `Document.source_deleted_at` and never deletes revision rows).
 
 - [ ] **Step 1: Write lifecycle tests**
 
-Test `allocate → revision-owned build → verify → publish`, profile-specific required artifacts, publish transaction updating `Document.current_revision_id`, immutable published columns, failed draft leaving prior current revision unchanged, and tombstone lookup. Assert R2 does not inherit R1 worker completion. `FULL` requires markdown+structure+vectors and configured caption/KG results; `CHAT_UPLOAD` requires markdown+structure+vectors and records caption/KG as intentionally skipped; `PARSE_ONLY` requires markdown+structure and records vector/caption/KG as intentionally skipped. Skips are not failures. Add monotonic/idempotency/manifest tests: `test_concurrent_revision_publish_does_not_regress_current` (allocate R2 then R3; publish R3 first, then R2; current stays R3 while R2 remains a historical published revision), `test_get_or_create_ingestion_attempt_is_idempotent` (same document/source/profile returns one revision), `test_concurrent_get_or_create_ingestion_attempt_is_atomic` (two concurrent sessions racing the same attempt key while neither sees an uncommitted row: exactly one `revision_ingestion_attempts` row, exactly one draft revision, both callers receive the same `revision_id`, no unhandled `UniqueViolation`, and the loser's savepoint leaves no orphan revision or advanced generation), and `test_record_artifacts_persists_embedding_manifest` (the build manifest records namespace/model hash/dimension/vector artifact version).
+Test `allocate → revision-owned build → verify → publish`, profile-specific required artifacts, publish transaction updating `Document.current_revision_id`, immutable published columns, failed draft leaving prior current revision unchanged, and tombstone lookup. Assert R2 does not inherit R1 worker completion. `FULL` requires markdown+structure+vectors and configured caption/KG results; `CHAT_UPLOAD` requires markdown+structure+vectors and records caption/KG as intentionally skipped; `PARSE_ONLY` requires markdown+structure and records vector/caption/KG as intentionally skipped. Skips are not failures. Add monotonic/idempotency/manifest tests: `test_concurrent_revision_publish_does_not_regress_current` (allocate R2 then R3; publish R3 first, then R2; current stays R3 while R2 remains a historical published revision), `test_get_or_create_ingestion_attempt_is_idempotent` (same document/source/profile returns one revision), `test_concurrent_get_or_create_ingestion_attempt_is_atomic` (two concurrent sessions racing the same attempt key while neither sees an uncommitted row: exactly one `revision_ingestion_attempts` row, exactly one draft revision, both callers receive the same `revision_id`, no unhandled `UniqueViolation`, and the loser's savepoint leaves no orphan revision or advanced generation), `test_publish_after_tombstone_does_not_resurrect_current` (publish R1, tombstone the document, then publish a verified R2 → `DocumentTombstoned`, `documents.current_revision_id` unchanged, and a concurrent tombstone that commits between verify and CAS also leaves current unset), and `test_record_artifacts_persists_embedding_manifest` (the build manifest records namespace/model hash/dimension/vector artifact version).
 
 - [ ] **Step 2: Implement explicit lifecycle**
 
@@ -205,7 +205,7 @@ async def get_or_create_ingestion_attempt(
     # 1. Serialize per document BEFORE allocating a generation. Whoever holds the
     #    document row lock runs to commit first; the other waits and then sees the
     #    winner's committed attempt row in READ COMMITTED.
-    await self.lock_document_for_update(document_id)  # SELECT ... FOR UPDATE on documents
+    await self.lock_document_for_update(document_id)  # SELECT id FROM documents WHERE documents.id = :id FOR UPDATE
 
     # 2. Build the candidate revision inside a savepoint so a lost race leaves no orphan.
     revision: DocumentRevision
@@ -258,17 +258,38 @@ async def publish(self, revision_id: UUID) -> DocumentRevision:
     if revision.state != "verified":
         raise RevisionNotPublishable(str(revision_id))
     document = await self.get_document_for_update(revision.document_id)
+    if document.source_deleted_at is not None:
+        raise DocumentTombstoned(str(document.id))  # never resurrect a deleted source
     revision.state = "published"
     revision.published_at = datetime.now(timezone.utc)
-    current = await self.get_published(document.current_revision_id) if document.current_revision_id else None
-    # Monotonic CAS: a lower generation may finish later but must never replace a newer current revision.
-    if current is None or revision.generation > current.generation:
-        document.current_revision_id = revision.revision_id
+    advanced = await self.cas_advance_current(
+        document_id=document.id,          # documents.id is the PK, not documents.document_id
+        revision_id=revision.revision_id,
+        generation=revision.generation,
+    )
+    if advanced == 0:
+        # Either current already has a newer generation, or a concurrent tombstone won.
+        # Re-read so a tombstone fails closed; otherwise this is a historical publish.
+        if await self.is_source_deleted(document.id):
+            raise DocumentTombstoned(str(document.id))
     await self.session.flush()
     return revision
 ```
 
-The DB-level guard for multi-process safety is a conditional update, not read-then-write: `UPDATE documents SET current_revision_id = :rid WHERE document_id = :did AND (current_revision_id IS NULL OR :generation > (SELECT generation FROM document_revisions WHERE revision_id = documents.current_revision_id))`; the loser stays `published` but historical. `lock_document_for_update` raises `DocumentNotFound` when the row is absent, so an attempt can never be created for a nonexistent document. `record_artifacts` persists the build manifest (embedding namespace, model identity/hash, dimension, vector artifact version) so later retrieval never guesses its embedding location from current configuration. `DocumentRevision` plus revision-build rows are authoritative for processing state, `embed_done`, `captions_done`, `kg_done`, raw chunk/build manifest, markdown artifact identity, artifact verification, failures, and publication. `Document` may mirror current status for v1/UI only. `verify_draft` consults the immutable profile selected at allocation and checks exactly its required artifacts before transitioning to verified; no worker reads Document completion flags to skip work.
+The DB-level CAS is a single conditional update, not read-then-write, and uses the real `documents` primary key (`documents.id`) plus a tombstone guard:
+
+```sql
+UPDATE documents
+SET current_revision_id = :rid
+WHERE documents.id = :did
+  AND documents.source_deleted_at IS NULL
+  AND (documents.current_revision_id IS NULL
+       OR :generation > (SELECT generation
+                         FROM document_revisions
+                         WHERE revision_id = documents.current_revision_id))
+```
+
+`rowcount = 0` means either a newer generation is already current or the source was tombstoned concurrently; the caller discriminates with `is_source_deleted` and raises `DocumentTombstoned` rather than resurrecting a deleted document. The losing revision stays `published` but historical. `lock_document_for_update` raises `DocumentNotFound` when `SELECT id FROM documents WHERE documents.id = :id FOR UPDATE` returns no row, so an attempt can never be created for a nonexistent document. `record_artifacts` persists the build manifest (embedding namespace, model identity/hash, dimension, vector artifact version) so later retrieval never guesses its embedding location from current configuration. `DocumentRevision` plus revision-build rows are authoritative for processing state, `embed_done`, `captions_done`, `kg_done`, raw chunk/build manifest, markdown artifact identity, artifact verification, failures, and publication. `Document` may mirror current status for v1/UI only. `verify_draft` consults the immutable profile selected at allocation and checks exactly its required artifacts before transitioning to verified; no worker reads Document completion flags to skip work.
 
 - [ ] **Step 3: Test and commit**
 
@@ -628,4 +649,4 @@ docker exec hrag-backend python -m compileall app/services/agents/v2
 docker compose -f docker-compose.services.yml config --quiet
 ```
 
-Required named tests: `test_concurrent_revision_publish_does_not_regress_current`, `test_webhook_and_confirm_create_one_revision`, `test_duplicate_webhook_is_idempotent`, `test_chat_upload_webhook_profile_is_preserved`, `test_reindex_allocates_new_revision_for_same_source_object`, `test_concurrent_get_or_create_ingestion_attempt_is_atomic`, `test_delete_tombstones_before_gc`, `test_current_document_view_uses_current_revision`, `test_revision_kg_does_not_leak_old_fact`, `test_historical_revision_uses_recorded_embedding_namespace`, `test_evidence_key_unavailable_fails_closed`, `test_evidence_key_rotation_keeps_old_records_readable`. Broader required coverage: populated-legacy no-fake-baseline migration; exact readiness; FULL/CHAT_UPLOAD/PARSE_ONLY verification; revision-owned worker flags; R1 SQL/object/vector/KG survival while building R2; legacy v1 works while v2 rejects not-ready; dimension mismatch preserves R1; envelope/version strictness; binding/target/task/evidence/use integrity; revision pin/current semantics; governance/expiry/ACL/audit; psycopg checkpoint DSN round-trip; prompt data isolation; and incompatible checkpoint rejection.
+Required named tests: `test_concurrent_revision_publish_does_not_regress_current`, `test_publish_after_tombstone_does_not_resurrect_current`, `test_webhook_and_confirm_create_one_revision`, `test_duplicate_webhook_is_idempotent`, `test_chat_upload_webhook_profile_is_preserved`, `test_reindex_allocates_new_revision_for_same_source_object`, `test_concurrent_get_or_create_ingestion_attempt_is_atomic`, `test_delete_tombstones_before_gc`, `test_current_document_view_uses_current_revision`, `test_revision_kg_does_not_leak_old_fact`, `test_historical_revision_uses_recorded_embedding_namespace`, `test_evidence_key_unavailable_fails_closed`, `test_evidence_key_rotation_keeps_old_records_readable`. Broader required coverage: populated-legacy no-fake-baseline migration; exact readiness; FULL/CHAT_UPLOAD/PARSE_ONLY verification; revision-owned worker flags; R1 SQL/object/vector/KG survival while building R2; legacy v1 works while v2 rejects not-ready; dimension mismatch preserves R1; envelope/version strictness; binding/target/task/evidence/use integrity; revision pin/current semantics; governance/expiry/ACL/audit; psycopg checkpoint DSN round-trip; prompt data isolation; and incompatible checkpoint rejection.
