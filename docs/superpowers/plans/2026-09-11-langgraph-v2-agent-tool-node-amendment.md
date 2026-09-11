@@ -2,83 +2,208 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this amendment together with the Phase 2 and Phase 3 plans. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Remove ambiguous “one use-case = one agent” ownership from LangGraph v2 and make the execution model explicit: dynamic planning belongs to the complex-research agent, deterministic orchestration belongs to LangGraph nodes, atomic domain operations belong to typed capabilities/tools, and task-specific know-how such as summarize/compare/compliance belongs to skills or deterministic workflows.
+**Goal:** Make LangGraph v2 implementation ownership unambiguous: LangGraph nodes own workflow/state lifecycle, one complex-research agent may propose adaptive plans/replans, atomic domain work lives in typed capabilities, task know-how lives in skills/workflows, and every capability execution remains governed by the frozen `TaskPlan -> validation -> checkpoint -> scheduler` path.
 
-**Architecture:** This is a normative implementation amendment to the existing frozen v2 contracts. It does **not** add or change business-contract fields. It changes implementation ownership and naming so fast paths and complex research share the same capability implementations, while only complex research may dynamically plan/replan or select tools.
+**Architecture:** This amendment is normative for implementation ownership and package layout. It does **not** add or change frozen business-contract fields. It removes the old “one use-case = one agent/domain graph” model, makes Phase 2 node/capability based, and constrains Phase 3 agent-facing tools so they can propose work but can never bypass plan validation, checkpoint ownership, authorization, evidence governance, or grounding.
 
 **Tech Stack:** Python 3.11, LangGraph Phase-0 winner, optional Deep Agents adapter if it wins Phase 0, Pydantic v2, request-scoped `CapabilityRegistry`, pytest.
 
 **Spec:** `docs/superpowers/specs/2026-09-10-langgraph-v2-contract-first-design.md`
 
+**Applies to:**
+- `docs/superpowers/plans/2026-09-11-langgraph-v2-phase2-fast-paths.md`
+- `docs/superpowers/plans/2026-09-11-langgraph-v2-phase3-rollout.md`
+
 ## Global Constraints
 
-- The frozen v2 contracts remain authoritative; this amendment changes implementation boundaries and terminology only.
-- **Agent** means a runtime component that can dynamically create/update a plan and choose the next tool/capability from observations. An LLM call alone does not make a component an agent.
-- **Node** means a LangGraph orchestration/state-lifecycle step with a predetermined responsibility. Nodes may route, validate, checkpoint, evaluate, ground, interrupt/resume, or invoke a previously selected capability; they do not own free-form domain planning.
-- **Capability/tool** means an atomic typed domain operation. It accepts typed input plus trusted runtime context, does not read arbitrary supervisor root state, and returns a minimized typed result/evidence reference.
-- **Skill** means task strategy/know-how such as summarize, compare, legal analysis, compliance evaluation, or drafting. A skill is not an independently routed agent and owns no authorization or persistence boundary.
-- **Workflow/subgraph** means a fixed multi-step algorithm used when deterministic execution is preferable (for example hierarchical large-document summarization). It may be exposed to the complex agent as one tool, but it does not gain an agent identity.
-- Fast paths invoke capabilities directly through the shared registry/scheduler. Complex research sees agent-facing tool adapters over the **same** capabilities. No duplicate business implementation is allowed.
-- Authorization, workspace scope, People permission, deadlines, feature flags, and service availability are injected by runtime. A model/tool call cannot supply or widen them.
-- Do not create v2 `people_agent`, `summary_agent`, `comparison_agent`, `document_agent`, `section_agent`, `kg_agent`, or equivalent domain-agent wrappers.
+- Frozen v2 contracts remain authoritative; this amendment changes implementation ownership, package layout, and internal runtime adapters only.
+- **Agent** means a runtime component that may propose an initial `TaskPlan`, propose append-only replans, and decide whether more research is useful from validated observations. It does not directly execute capabilities.
+- **Node** means a LangGraph orchestration/state-lifecycle step with a predetermined responsibility. Nodes may route, validate, checkpoint, evaluate, ground, interrupt/resume, synthesize, or invoke the scheduler.
+- **Capability/tool** means one bounded typed domain operation. It accepts `AgentRequest` plus `CapabilityRuntimeContext`, cannot read arbitrary supervisor state, and returns validated `AgentResult`/evidence references.
+- **Skill** means task strategy/know-how such as summarize, compare, legal analysis, or compliance. A skill owns no authorization, persistence, TaskPlan, EvidenceUse, or FinalResponse boundary.
+- **Workflow/subgraph** means a predetermined multi-step algorithm, such as hierarchical large-document summarization. It may be callable through the governed execution boundary, but it is not an autonomous agent.
+- Fast paths and complex research use the **same capability implementations** from one request-scoped registry. Duplicate People/document/KG business implementations are forbidden.
+- Current authorization, workspace scope, People permission, deadlines, feature flags, service availability, and cancellation are runtime-only and cannot be supplied or widened by model-generated input.
+- Do not create v2 `people_agent`, `summary_agent`, `comparison_agent`, `document_agent`, `section_agent`, `kg_agent`, `evaluation_agent`, `grounding_agent`, or equivalent wrappers under different filenames.
+- Write remains outside this v2 rollout and stays v1-owned until a separate approved plan defines its semantics.
 
 ---
 
 ## 1. Normative Taxonomy
 
-Use this decision rule before creating any v2 module:
+Use this decision rule before creating a v2 module:
 
 ```text
-Does the component dynamically decide what to do next from observations?
-├── yes → agent/planner boundary (complex research only)
+Does it adaptively propose what research to do next from validated observations?
+├── yes -> complex-research agent/planner boundary only
 └── no
-    ├── does it mutate/read LangGraph execution state or control routing? → node
-    ├── does it perform one bounded domain operation? → capability/tool
-    ├── does it encode task strategy/instructions? → skill
-    └── does it run a predetermined multi-step algorithm? → workflow/subgraph
+    ├── does it own LangGraph state/routing/lifecycle? -> node
+    ├── does it perform one bounded domain operation? -> capability
+    ├── does it encode task strategy/instructions? -> skill
+    └── does it run a fixed multi-step algorithm? -> workflow/subgraph
 ```
-
-Examples:
 
 | Concern | Correct v2 role | Not allowed |
 |---|---|---|
-| People lookup | `people.lookup` capability/tool | `people_agent` |
-| Document search | `document.search` capability/tool | generic `rag_agent` |
-| Document/section read | `document.read` / `section.read` capability/tool | `document_agent`, `section_agent` |
+| People lookup | `people.lookup` capability | `people_agent` |
+| Document search | `document.search` capability | generic `rag_agent` |
+| Document/section read | `document.read` / `section.read` capability | `document_agent`, `section_agent` |
+| KG lookup | `knowledge_graph.query` capability | `kg_agent` |
 | Initial document identity resolution | Binding Resolver node/service | `resolve_doc_agent` |
-| Query preprocessing/coreference/abbreviation normalization | Context/Semantic nodes + reusable capabilities | `semantic_agent` |
+| Query preprocessing/coreference/abbreviation normalization | Context/Semantic nodes + reusable services/capabilities | `semantic_agent` |
 | Evidence sufficiency | Evaluator node | `evaluation_agent` |
 | Grounding/citations | Grounding node | `grounding_agent` |
-| Summarize | work type + skill; bounded read may use fast path | `summary_agent` |
-| Compare | complex-research skill/policy | `comparison_agent` |
-| Compliance/legal evaluation | complex-research skill/policy + evaluator criteria | `compliance_agent` |
-| Large deterministic map-reduce summary | workflow exposed as a tool when needed | autonomous summary agent |
+| Bounded summary | document/section read + synthesis | `summary_agent` |
+| Comparison | complex-research skill/policy | `comparison_agent` |
+| Compliance/legal evaluation | complex skill/policy + evaluator criteria | `compliance_agent` |
+| Large map/reduce summary | deterministic workflow | autonomous summary agent |
 | Multi-step adaptive research | complex-research agent | handoff chain of domain agents |
 
 ---
 
-## 2. Existing AIRAG → v2 Ownership Map
+## 2. Hard Execution Invariant: Tools Never Bypass TaskPlan
 
-The current v1 modules remain untouched until v2 cutover, but v2 must not reproduce their naming model.
+The phrase **“agent chooses a tool”** means the agent proposes a `TaskSpec.capability` or append-only task through the governed planning boundary. It never means `LLM -> capability.execute()`.
 
-| Existing concept/module | v2 disposition |
-|---|---|
-| `services/agents/people_agent.py` | Split into People capability/service plus deterministic execute node. Permission enforcement remains at capability boundary. |
-| `services/agents/rag_agent.py` | Split into `document.search`, `document.read`, `section.read`, and KG/retrieval capabilities. No generic RAG agent. |
-| `services/agents/resolve_doc_agent.py` | Move ownership to Binding Resolver node/service. Discovery-time resolution may be exposed as a bounded tool, but initial binding remains deterministic graph ownership. |
-| `services/agents/write_agent.py` | Remains v1-owned and out of this v2 rollout. A future v2 Write design must choose capability/workflow ownership, not recreate a domain agent by default. |
-| `semantic_preprocessor.py` | Context/semantic nodes plus reusable abbreviation/entity capabilities. |
-| `result_evaluator` behavior | Deterministic evaluator node. |
-| `react_executor` behavior | Replaced by/consolidated into the single complex-research agent/planner boundary. |
-| proposed `summary_agent` | Do not create. Summary is a work type/skill over document-read tools and synthesis. |
-| proposed `comparison_agent` | Do not create. Comparison is a skill executed by the complex-research agent over multiple evidence-producing tools. |
-| `supervisor_v2.py` | Composition/orchestration graph only; it is not a domain agent and contains no business tool implementation. |
+All factual capability execution, fast or complex, must follow:
+
+```text
+Fast deterministic builder OR Complex research agent
+                    |
+                    v
+          TaskPlan / appended TaskSpec proposal
+                    |
+                    v
+      validate_task_plan / validate_replan
+                    |
+                    v
+       checkpoint authoritative TaskPlan
+                    |
+                    v
+              TaskScheduler
+                    |
+                    v
+          CapabilityRegistry lookup
+                    |
+                    v
+           Capability.execute(
+               AgentRequest,
+               CapabilityRuntimeContext,
+           )
+                    |
+                    v
+              AgentResult
+                    |
+                    v
+      EvidenceRecord / EvidenceUse / Coverage
+```
+
+Rules:
+
+1. `TaskPlan` is the authoritative executable intent for every factual invocation.
+2. A task must exist in the validated checkpointed plan before the scheduler can execute it.
+3. Only the scheduler may dispatch a capability.
+4. Agent-facing tool adapters do not call capability implementations directly.
+5. Deep Agents/native framework tool calls, if used, are interpreted as **task proposals** and routed through the same validator/checkpoint/scheduler path.
+6. Unknown, unauthorized, stale, or unplanned tool/capability references fail closed.
+7. Model-generated workspace IDs, ACLs, deadlines, service objects, EvidenceUse IDs, or authorization flags are never accepted as execution authority.
+
+### Framework-neutral internal gateway
+
+The selected orchestrator may expose an internal gateway such as:
+
+```python
+@dataclass(frozen=True)
+class CapabilityInvocationProposal:
+    capability: str
+    objective: str
+    input: CapabilityInput
+    depends_on: tuple[str, ...] = ()
+
+class AgentToolGateway(Protocol):
+    async def invoke(
+        self,
+        proposal: CapabilityInvocationProposal,
+        current_plan: TaskPlan,
+        runtime: GraphRuntimeContext,
+    ) -> "AgentToolObservation": ...
+```
+
+`AgentToolGateway.invoke()` performs exactly:
+
+```text
+proposal
+-> convert to new TaskSpec
+-> validate append-only plan/replan
+-> checkpoint updated plan
+-> scheduler executes ready tasks
+-> validate AgentResult/EvidenceUse
+-> project a safe AgentToolObservation
+```
+
+The gateway is orchestration infrastructure, not a business capability.
 
 ---
 
-## 3. Target Package Ownership
+## 3. Model Observation Boundary
 
-The frozen contracts do not require a specific Python package layout, but implementation should converge on the following ownership model:
+`CapabilityOutput` is **not** model-visible by default. Capability execution and model observation are separate boundaries.
+
+```text
+Capability
+   |
+   v
+AgentResult + EvidenceUse
+   |
+   +---------------------> scheduler/materializer/evaluator sees governed result
+   |
+   v
+ObservationProjector
+   |
+   v
+AgentToolObservation
+   |
+   v
+Complex research agent
+```
+
+Use an implementation-only projection such as:
+
+```python
+@dataclass(frozen=True)
+class AgentToolObservation:
+    task_id: str
+    status: AgentStatus
+    evidence_use_ids: tuple[UUID, ...]
+    coverage: tuple[CoverageObservation, ...]
+    result_kind: str
+    safe_metadata: Mapping[str, str]
+```
+
+Rules:
+
+- No raw connector/database payload is returned to the model.
+- No runtime secrets, service clients, ACL/workspace authority, deadlines, storage keys, or encryption metadata are model-visible.
+- Retrieved document text remains untrusted data and is not automatically returned to the planner. The planner primarily receives task status, coverage/evaluation gaps, candidate metadata explicitly admitted by policy, and EvidenceUse identities.
+- Full evidence content is hydrated only by governed evaluator/synthesis/grounding paths.
+- People and other sensitive capabilities use stricter projection: raw CCCD, DOB, addresses, phone/email, personnel records, or unrelated fields never enter planner observation or checkpoint.
+- People -> Document scalar transfer remains a deterministic governed dependency materializer, not a planner observation.
+- Memory/personal-data capabilities follow the same minimization rule.
+
+Required security test:
+
+```text
+people.lookup returns a governed People EvidenceUse
+-> planner observation contains status/use IDs only
+-> CCCD required by DocumentSearchInput is materialized server-side
+-> raw People record never enters planner prompt/checkpoint
+```
+
+---
+
+## 4. Canonical Package Ownership
+
+Phase 2 and Phase 3 must use one physical layout:
 
 ```text
 backend/app/services/agents/v2/
@@ -89,6 +214,7 @@ backend/app/services/agents/v2/
 │   ├── fast_plan.py
 │   ├── execute.py
 │   ├── evaluate.py
+│   ├── synthesize.py
 │   ├── grounding.py
 │   ├── clarification.py
 │   └── finalizer.py
@@ -102,10 +228,16 @@ backend/app/services/agents/v2/
 │   └── memory.py
 │
 ├── tools/
-│   └── adapters.py          # agent-facing adapters over CapabilityRegistry; no duplicated business logic
+│   ├── adapters.py
+│   ├── gateway.py
+│   └── observations.py
 │
 ├── execution/
+│   ├── __init__.py
 │   └── scheduler.py
+│
+├── dependencies/
+│   └── people_document.py
 │
 ├── skills/
 │   ├── summarize.*
@@ -113,247 +245,368 @@ backend/app/services/agents/v2/
 │   ├── legal_analysis.*
 │   └── compliance.*
 │
-└── complex_research_graph.py   # the only adaptive planning/tool-selection boundary
+├── replanning.py
+├── discovery.py
+└── complex_research_graph.py
 ```
 
-The physical representation of `skills/` follows the Phase-0 winner. If Deep Agents wins, these may become native `SKILL.md`/skill packages. If native LangGraph wins, the same strategy contracts are loaded by the planner policy. Do not hard-code framework-specific skill loading before Phase 0 selects the orchestrator.
+Framework-specific skill representation is selected only after Phase 0. If Deep Agents wins, strategy packages may use native skill files. If native LangGraph wins, the same strategy is loaded by planner policy. Business ownership remains unchanged.
 
-`tools/adapters.py` is intentionally thin. It converts the request-scoped `CapabilityRegistry` entries into whatever tool interface the Phase-0 winner requires. It must never reimplement People/document/KG logic.
+### Old -> canonical path migration
+
+The following Phase-2 names are retired:
+
+```text
+context_graph.py                 -> nodes/context.py
+binding_graph.py                 -> nodes/binding.py
+routing_graph.py                 -> nodes/routing.py
+planning.py                      -> nodes/fast_plan.py
+evaluation.py                    -> nodes/evaluate.py
+grounding.py                     -> nodes/grounding.py
+clarification.py                 -> nodes/clarification.py
+domain/people_graph.py           -> capabilities/people.py
+domain/document_graph.py         -> capabilities/document.py
+domain/section_graph.py          -> capabilities/section.py
+domain/knowledge_graph.py        -> capabilities/knowledge_graph.py
+```
+
+No implementation task may create both sides of one mapping.
 
 ---
 
-## 4. Phase 2 Amendment — Fast Paths Are Nodes + Capabilities
+## 5. Phase 2 Semantics: Nodes + Shared Capabilities
 
-This section supersedes any Phase-2 wording that calls People, Document, Section, or KG an “agent” or an independently reasoning “domain graph”.
-
-### Phase-2 Task 1 routing rule
-
-Keep deterministic-first routing, with these clarifications:
+Fast routing remains deterministic:
 
 ```text
-simple People lookup                    → fast_domain → people.lookup
-exact document metadata/read            → fast_domain → document.*
-exact section retrieval                 → fast_domain → section.read
-simple KG lookup                        → fast_domain → knowledge_graph.query
-bounded one-document summary            → fast_domain → document.read → synthesis
-comparison / cross-document summary     → complex_research
-cross-domain dependency                  → complex_research
-compliance / multi-goal / iterative RAG → complex_research
+simple People lookup                    -> fast_domain -> people.lookup
+exact document metadata/read            -> fast_domain -> document.*
+exact section retrieval                 -> fast_domain -> section.read
+simple KG lookup                        -> fast_domain -> knowledge_graph.query
+bounded one-document summary            -> fast_domain -> document.read -> evaluate -> synthesize -> ground
+comparison / cross-document summary     -> complex_research
+cross-domain dependency                  -> complex_research
+compliance / multi-goal / iterative RAG -> complex_research
 ```
 
-`summary` and `compare` remain `WorkType`s. They are not converted into agent route names.
-
-### Phase-2 Task 3 path replacement
-
-The following planned create paths are superseded:
+Fast path:
 
 ```text
-REMOVE FROM PLAN                         REPLACE WITH
-v2/domain/people_graph.py               v2/capabilities/people.py
-v2/domain/document_graph.py             v2/capabilities/document.py
-v2/domain/section_graph.py              v2/capabilities/section.py
-v2/domain/knowledge_graph.py            v2/capabilities/knowledge_graph.py
-                                         v2/nodes/execute.py
+semantic/routing nodes
+-> deterministic TaskPlan
+-> checkpoint
+-> execute node
+-> shared scheduler
+-> shared capability
+-> evaluator
+-> synthesis when needed
+-> grounding
+-> finalizer
 ```
 
-`test_domain_paths.py` remains valid but should assert capability behavior and scheduler/node integration rather than autonomous subgraph behavior.
+There are no independently reasoning People/Document/Section/KG subgraphs.
 
-The generic execute node performs only orchestration:
-
-```python
-async def execute_node(state: SupervisorV2State, runtime: GraphRuntimeContext) -> dict:
-    plan = require_checkpointed_plan(state)
-    results = await execute_ready_tasks(
-        plan=plan,
-        results=state["execution"].results,
-        registry=runtime.services.capability_registry,
-        runtime=runtime,
-    )
-    return execution_update(results)
-```
-
-Domain behavior remains inside capability implementations selected by `TaskSpec.capability`.
-
-### Required Phase-2 tests
-
-Add or retain named tests proving:
+Required Phase-2 tests:
 
 ```text
-test_v2_has_no_people_summary_comparison_domain_agents
+test_v2_has_no_domain_agent_or_domain_graph_wrappers
 test_fast_people_uses_shared_capability_registry
 test_fast_document_read_uses_shared_capability_registry
+test_capability_receives_capability_runtime_context_only
 test_capability_cannot_read_supervisor_root_state
 test_model_input_cannot_supply_workspace_or_acl
-test_bounded_summary_is_read_plus_synthesis_not_summary_agent
-test_compare_never_routes_to_fast_domain_agent
+test_bounded_summary_is_read_evaluate_synthesize_ground
+test_compare_never_routes_to_fast_domain
+test_task_must_be_checkpointed_before_capability_dispatch
 ```
 
 ---
 
-## 5. Phase 3 Amendment — One Adaptive Complex-Research Agent
+## 6. Phase 3 Semantics: One Adaptive Complex-Research Agent
 
-`ComplexResearchGraph` is the single v2 boundary allowed to dynamically plan/replan and choose tools. Phase 0 still determines whether its concrete implementation is Deep Agents or native LangGraph; the behavior contract remains the same.
+`ComplexResearchGraph` is the single adaptive planning/replanning boundary. The outer LangGraph graph, validator, scheduler, evaluator, and grounding remain authoritative.
 
-For a comparison request:
-
-```text
-Goal: compare A with B
-    ↓
-complex-research agent
-    ├── resolve/check bindings as required
-    ├── plan reads for A
-    ├── plan reads for B
-    ├── execute document/section tools
-    ├── inspect evidence/coverage
-    ├── bounded replan if permitted
-    └── synthesize grounded comparison
-```
-
-There is no `comparison_agent` handoff.
-
-For a complex summary request:
+Canonical research loop:
 
 ```text
-Goal: summarize document(s) under requested focus
-    ↓
-complex-research agent + summarize skill
-    ├── inspect structure
-    ├── choose bounded target units
-    ├── read required sections
-    ├── call deterministic large-summary workflow when justified
-    ├── evaluate coverage
-    └── synthesize grounded summary
+ResearchPlanningInput
+        |
+        v
+Complex research agent proposes initial TaskPlan
+        |
+        v
+validate_task_plan
+        |
+        v
+checkpoint plan
+        |
+        v
+scheduler executes ready tasks
+        |
+        v
+EvidenceEvaluation
+        |
+        +---- sufficient/terminal ----> synthesis -> grounding -> finalizer
+        |
+        v
+ResearchPlanningInput(current_plan, task_outcomes,
+                      prior_evidence_uses, prior_evaluation)
+        |
+        v
+agent proposes append-only replan
+        |
+        v
+validate_replan
+        |
+        v
+checkpoint updated plan
+        |
+        +------------------------------> scheduler
 ```
 
-There is no `summary_agent` handoff.
-
-People→Document stays a scheduler dependency materialization problem, not an agent-to-agent handoff. The complex planner can create T1/T2 dependencies, but the scheduler and governed adapter materialize only allowed typed values.
-
-Subagents are permitted only when the selected orchestrator needs **context isolation, bounded parallel research, or specialist reasoning with a strict input/output contract**. Do not create one subagent per domain merely to mirror tools.
-
-### Agent-facing tool catalog
-
-At each complex-research run:
+The agent owns only:
 
 ```text
-base capability catalog
-∩ current runtime permissions
-∩ feature flags
-∩ service availability
-= request-scoped tool catalog
+initial plan proposal
+append-only replan proposal
+research stop/continue recommendation
+skill selection/strategy
 ```
 
-If `can_read_people=False`, no People tool is exposed to the planner and execution remains fail-closed if a stale plan references it.
-
-### Required Phase-3 tests
-
-Add or retain named tests proving:
+It does **not** own:
 
 ```text
-test_complex_agent_uses_request_scoped_tool_catalog
-test_fast_and_complex_paths_share_same_capability_implementation
-test_compare_is_skill_not_subagent_route
-test_summary_is_skill_not_subagent_route
-test_people_document_dependency_is_not_agent_handoff
-test_unknown_or_unauthorized_tool_is_rejected_at_execution
-test_replan_can_add_tasks_but_cannot_widen_authorization
-test_subagent_cannot_receive_raw_people_record_or_runtime_secrets
+authorization
+binding truth
+revision identity
+capability execution
+EvidenceUse creation
+coverage truth
+evidence sufficiency
+contradiction authority
+retention
+citation grounding
+FinalResponse success
 ```
-
----
-
-## 6. Capability / Tool Contract Rules
-
-Every atomic capability/tool must satisfy all of the following:
-
-```text
-1. Typed domain input from CapabilityInput union.
-2. Trusted authorization/scope from CapabilityRuntimeContext only.
-3. No arbitrary SupervisorV2State access.
-4. No raw connector/database payload in checkpoint state.
-5. Minimized typed CapabilityOutput or EvidenceUse references.
-6. Stable AgentResult.task_id association.
-7. Cancellation/deadline propagation.
-8. Same implementation callable from deterministic fast path and complex-agent tool adapter.
-```
-
-The agent-facing adapter may add schema/description metadata for the selected framework, but must not alter authorization, scope, evidence, or business behavior.
-
----
-
-## 7. Summary / Compare / Compliance Are Task Strategies
-
-These are semantic goals, not runtime identities.
-
-### Summarize
-
-- Bounded one-document/one-section summary may remain a deterministic fast route: read evidence once, evaluate coverage, synthesize.
-- Large, multi-document, focused, or iterative summary routes to complex research.
-- A large-document map/reduce implementation is a deterministic workflow. The complex agent may invoke it as one tool when policy allows.
 
 ### Compare
 
-- Always complex when two or more independently evidenced targets must be aligned.
-- The skill defines comparison procedure and output expectations; document/section capabilities acquire evidence.
-- Evaluator verifies required coverage for every comparison side before synthesis.
+```text
+compare skill
+-> planner proposes reads for both sides
+-> scheduler executes shared document/section capabilities
+-> evaluator verifies both target coverages
+-> synthesizer creates use-bound claims
+-> grounding renders citations
+```
 
-### Compliance / legal evaluation
+No `comparison_agent` exists.
 
-- Complex research owns planning and evidence acquisition.
-- `SemanticCriterion` may encode validated target-level judgment requirements.
-- The evaluator owns sufficiency/contradiction; the agent does not self-certify evidence completeness.
+### Summary
+
+```text
+summarize skill
+-> bounded case stays fast
+-> large/iterative case uses complex planner
+-> deterministic map/reduce workflow may be proposed as governed work
+-> evaluator owns coverage
+-> synthesis/grounding remain outside agent authority
+```
+
+No `summary_agent` exists.
+
+### People -> Document
+
+`depends_on` expresses ordering only. The planner never sees raw People output.
+
+```text
+T1 people.lookup
+-> governed People EvidenceUse
+-> PeopleDocumentDependencyAdapter
+-> current ACL/expiry/minimization check
+-> exact allowed scalar
+-> concrete DocumentSearchInput
+-> T2 scheduler dispatch
+```
+
+No agent-to-agent handoff exists.
+
+Required Phase-3 tests:
+
+```text
+test_complex_agent_uses_request_scoped_tool_catalog
+test_fast_and_complex_share_same_capability_instance_or_factory
+test_agent_tool_call_creates_validated_task_before_dispatch
+test_tool_adapter_cannot_call_capability_directly
+test_compare_is_skill_not_agent_route
+test_summary_is_skill_not_agent_route
+test_people_document_dependency_is_not_agent_handoff
+test_people_observation_does_not_expose_raw_record
+test_unknown_or_unauthorized_tool_is_rejected_at_execution
+test_replan_can_add_tasks_but_cannot_widen_authorization
+test_planner_never_receives_runtime_secrets
+```
 
 ---
 
-## 8. Execution Order
+## 7. Capability Runtime Contract
 
-This amendment is applied **after Phase 0 selection semantics are known and before Phase 2 implementation begins**. It does not require a new migration or contract version.
+Capabilities receive only the narrow runtime contract:
+
+```python
+class Capability(Protocol):
+    descriptor: CapabilityDescriptor
+
+    async def execute(
+        self,
+        request: AgentRequest,
+        runtime: CapabilityRuntimeContext,
+    ) -> AgentResult: ...
+```
+
+`GraphRuntimeContext` belongs to nodes/scheduler/orchestration. A capability may not receive it as a substitute for `CapabilityRuntimeContext`.
+
+Agent/model-visible tool schema contains only allowed `CapabilityInput` fields. Runtime fields are injected server-side and cannot appear as model-supplied parameters.
+
+---
+
+## 8. Evaluator Ownership
+
+Evaluator is a node-owned authority, not an agent. “Node-owned” does not require every judgment to be purely algorithmic.
+
+```text
+Deterministic rules own:
+- coverage/read-complete semantics
+- revision/locator compatibility
+- ACL/expiry/source validity
+- criterion presence
+- status precedence
+
+Bounded model judgment MAY assist:
+- semantic criterion evaluation
+- contradiction interpretation
+- legal semantic comparison
+```
+
+Any model used inside evaluator:
+
+- receives only governed evidence;
+- cannot plan or call tools;
+- cannot change authorization/bindings/revisions;
+- returns a typed proposal validated by evaluator rules;
+- cannot self-certify final factual success outside `EvidenceEvaluation`.
+
+---
+
+## 9. Subagent Rule
+
+Subagents are optional advisory/context-isolation helpers only. They are not domain agents and have no execution authority.
+
+A subagent MAY:
+
+```text
+analyze already-authorized bounded context
+return structured recommendation
+propose strategy to the parent complex agent
+perform isolated reasoning over sanitized inputs
+```
+
+A subagent MUST NOT:
+
+```text
+own or checkpoint TaskPlan
+append authoritative TaskSpec directly
+execute a Capability
+bind/promote documents
+widen the tool catalog or ACL
+create EvidenceUse
+read raw People records/runtime secrets
+decide authoritative sufficiency
+emit FinalResponse
+```
+
+The parent complex-research boundary remains the only adaptive planning owner.
+
+---
+
+## 10. Existing AIRAG -> v2 Ownership Map
+
+| Existing module/concept | v2 disposition |
+|---|---|
+| `services/agents/people_agent.py` | People capability/service + execute node; no v2 People agent |
+| `services/agents/rag_agent.py` | `document.search`, `document.read`, `section.read`, KG capabilities |
+| `services/agents/resolve_doc_agent.py` | Binding Resolver node/service |
+| `services/agents/write_agent.py` | Remains v1-owned/out of this rollout |
+| `semantic_preprocessor.py` | Context/semantic nodes + reusable normalization services |
+| result evaluator behavior | evaluator node, deterministic rules + bounded typed judgment |
+| `react_executor` behavior | consolidated into the one complex-research planning boundary |
+| proposed summary/comparison agents | do not create; skills over shared capabilities |
+| `supervisor_v2.py` | graph composition only; no domain business implementation |
+
+---
+
+## 11. Execution Order and Plan Authority
+
+Apply this amendment after Phase 0 semantics are known and Phase 1 foundation passes, before Phase 2 implementation starts:
 
 ```text
 Phase 0 benchmark/winner
-        ↓
+        |
 Phase 1 frozen foundation
-        ↓
+        |
 THIS AMENDMENT
-        ↓
-Phase 2 nodes + shared capabilities
-        ↓
-Phase 3 single complex-research agent + tools/skills
+        |
+Phase 2 nodes + capabilities
+        |
+Phase 3 complex agent + governed tool gateway + skills
 ```
 
-If Phase 2 implementation has already begun when this amendment is applied, stop before creating any `v2/domain/*_graph.py` domain-agent wrappers and migrate the uncommitted work to the capability/node ownership above.
+Phase 2 and Phase 3 plans must directly use the package paths and execution invariants in this amendment. Do not rely on a worker mentally merging contradictory documents.
+
+If an older plan statement conflicts with this amendment on **agent/node/capability/skill ownership, package path, or tool execution path**, the synchronized Phase 2/3 plan text is the source of truth. Frozen business contracts remain higher authority than all plans.
 
 ---
 
-## 9. Amendment Acceptance Gate
+## 12. Amendment Acceptance Gate
 
-Before Phase 2 is considered ready for complex pilots, prove:
+Before Phase 2/3 implementation is considered synchronized, prove:
 
 | # | Proof |
 |---|---|
-| 1 | No v2 People/Summary/Comparison/Document/Section/KG domain agent exists. |
-| 2 | Fast and complex paths resolve the same capability implementation from the registry. |
-| 3 | Supervisor nodes own graph state/routing only; capabilities do not read arbitrary root state. |
-| 4 | Model-generated tool calls cannot provide/widen workspace IDs, People permission, ACL, deadlines, or service clients. |
-| 5 | Bounded summary is document/section evidence acquisition plus synthesis, not a summary-agent dispatch. |
-| 6 | Comparison routes to the complex-research planner and uses document/section tools. |
-| 7 | People→Document dependency is scheduler/materializer execution, not agent handoff. |
-| 8 | The complex-research agent receives only the request-scoped authorized tool catalog. |
-| 9 | Skills contain task strategy only and cannot bypass TaskPlan validation, evaluator, evidence governance, or grounding. |
+| 1 | No v2 People/Summary/Comparison/Document/Section/KG domain agent or domain graph wrapper exists. |
+| 2 | Fast and complex paths resolve the same capability implementation from the request-scoped registry. |
+| 3 | Every factual capability dispatch references a validated checkpointed TaskSpec. |
+| 4 | Agent-facing tool adapters cannot directly invoke capabilities. |
+| 5 | Capabilities receive `CapabilityRuntimeContext`, never arbitrary root/graph state. |
+| 6 | Model-generated input cannot widen workspace, People permission, ACL, deadline, feature/service authority, or cancellation state. |
+| 7 | Sensitive capability outputs use explicit observation projections; raw People records never enter planner/checkpoint. |
+| 8 | Bounded summary is read -> evaluate -> synthesize -> ground, not summary-agent dispatch. |
+| 9 | Comparison routes to one complex planner and shared document/section capabilities. |
+| 10 | People -> Document remains deterministic scheduler/materializer execution. |
+| 11 | Replan is append-only and cannot widen authorization. |
+| 12 | Skills/subagents cannot bypass TaskPlan validation, evaluator, evidence governance, or grounding. |
 
-Suggested static guard:
+Static architecture guards:
 
 ```bash
+set -e
 ! find backend/app/services/agents/v2 -type f \
   \( -name 'people_agent.py' -o -name 'summary_agent.py' -o -name 'comparison_agent.py' \
-     -o -name 'document_agent.py' -o -name 'section_agent.py' -o -name 'kg_agent.py' \) | grep .
+     -o -name 'document_agent.py' -o -name 'section_agent.py' -o -name 'kg_agent.py' \
+     -o -path '*/domain/*_graph.py' \) | grep .
+
+! rg -n \
+  'class\s+(People|Summary|Comparison|Document|Section|KG|Evaluation|Grounding).*Agent|\b(People|Summary|Comparison|Document|Section|KG)Agent\b' \
+  backend/app/services/agents/v2
+
+! rg -n 'capability\.execute\(' backend/app/services/agents/v2/tools
 ```
 
-Suggested focused validation after implementation:
+Focused validation:
 
 ```bash
 cd backend
 pytest tests/agents/v2/fast_paths tests/agents/v2/complex -q
 ```
 
-Expected: taxonomy tests and existing v2 contract/evidence tests pass with v1 still the production default.
+Expected: taxonomy, plan-ownership, sensitive-observation, contract/evidence, and shared-capability tests pass with v1 still the production default.
