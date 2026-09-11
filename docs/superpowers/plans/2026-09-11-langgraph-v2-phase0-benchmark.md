@@ -1,189 +1,187 @@
-# LangGraph v2 Phase 0 Benchmark Implementation Plan
+# LangGraph v2 Phase 0 Compatibility and Benchmark Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Resolve the one frozen-contract Write blocker and select/pin a contract-compatible orchestration implementation without changing production routing.
+**Goal:** Discover and pin an exact orchestration/checkpoint stack that supports the frozen runtime-context API and passes frozen-contract parity before any production v2 implementation.
 
-**Architecture:** Frozen contract fixtures drive native LangGraph and an isolated Deep Agents adapter through identical scenarios. Hard parity precedes latency/size comparison; the winner alone is promoted into production dependencies.
+**Architecture:** Compatibility discovery precedes candidate benchmarking. An isolated environment probes exact candidate versions for `context_schema`, AsyncPostgresSaver import/setup, and psycopg DSN operation; only passing combinations run the same typed frozen-contract scenarios for native LangGraph and Deep Agents.
 
-**Tech Stack:** Python 3.11, Pydantic v2, LangGraph, optional Deep Agents in isolated virtualenv, pytest, JSON benchmark reports.
+**Tech Stack:** Python 3.11, Pydantic v2, candidate LangGraph/Deep Agents, langgraph-checkpoint-postgres, psycopg3, PostgreSQL, pytest.
 
 **Spec:** `docs/superpowers/specs/2026-09-10-langgraph-v2-contract-first-design.md`
 
 ## Global Constraints
 
-- Production remains v1 throughout this plan.
-- Benchmark packages install only into `backend/.venv-v2-benchmark/`; do not alter the running backend image.
-- Pasted-text Write is a non-factual transform: typed WriteOutput validation is its success gate; retrieved factual content still requires evidence/evaluation/grounding.
-- Before editing `Makefile`, run GitNexus impact for the make targets being changed; before editing spec prose, no runtime-symbol impact exists.
-- Before each commit run `node .gitnexus/run.cjs detect-changes --scope compare --base-ref main`.
+- Do not edit the frozen spec or production routing.
+- Do not pre-approve or hardcode a production package version before discovery passes.
+- Candidate packages live only in `backend/.venv-v2-benchmark/`; production requirements change only after the winner is recorded.
+- Do not fall back from frozen `context_schema` to `config_schema`.
+- Phase output records exact LangGraph, checkpoint-postgres, psycopg, Pydantic, and optional Deep Agents versions.
+- Before existing-symbol edits run exact impact; before commits run compare-scope detect-changes and stage only named paths.
 
 ---
 
-### Task 1: Freeze the Pasted-Text Write Rule
+### Task 0: Verify Repository and Candidate API Preconditions
 
 **Files:**
-- Modify: `docs/superpowers/specs/2026-09-10-langgraph-v2-contract-first-design.md`
-- Test: shell assertions in this task
+- Create: `backend/scripts/probe_v2_compatibility.py`
+- Create: `backend/tests/agents/v2/orchestrator_compat/test_compatibility_probe.py`
+- Read: every Modify/Create path listed below
 
 **Interfaces:**
-- Consumes: existing Write route and factual synthesis invariant.
-- Produces: explicit non-factual transform exception consumed by Phase 2 `write_graph`.
+- Produces: `CompatibilityResult` and `probe_stack(python: Path, checkpoint_dsn: str) -> CompatibilityResult`.
 
-- [ ] **Step 1: Verify the rule is absent**
+- [ ] **Step 1: Verify paths, symbols, and create-path conflicts**
 
 ```bash
+set -e
+for path in backend/requirements.txt Makefile docs/harness.md backend/app/services/agents/supervisor.py; do test -e "$path"; done
+for path in backend/scripts/probe_v2_compatibility.py backend/scripts/benchmark_v2_orchestrators.py backend/scripts/check_v2_orchestrator_gate.py; do test ! -e "$path"; done
+rg -n 'create_supervisor_graph|StateGraph\(' backend/app/services/agents/supervisor.py
 python - <<'PY'
-from pathlib import Path
-text = Path("docs/superpowers/specs/2026-09-10-langgraph-v2-contract-first-design.md").read_text()
-required = [
-    "pasted-text Write is a non-factual transform",
-    "WriteOutput schema validation is its success gate",
-    "does not create EvidenceRecord, Coverage, EvidenceEvaluation, or AnswerClaim",
-]
-missing = [value for value in required if value not in text]
-assert missing, "amendment already present"
-print(missing)
+import re, pathlib
+plan = pathlib.Path('docs/superpowers/plans/2026-09-11-langgraph-v2-phase0-benchmark.md').read_text()
+modify = [p.split(':')[0] for p in re.findall(r'^- Modify: `([^`]+)`', plan, re.M)]
+create = [p.split(':')[0] for p in re.findall(r'^- Create: `([^`]+)`', plan, re.M)]
+missing = [p for p in modify if not pathlib.Path(p).exists()]
+conflict = [p for p in create if pathlib.Path(p).exists()]
+assert not missing and not conflict, {'missing': missing, 'conflict': conflict}
+assert pathlib.Path('docs/superpowers/specs/2026-09-10-langgraph-v2-contract-first-design.md').read_text().startswith('# LangGraph v2')
+print(f'phase0 paths ok: {len(set(modify))} modify, {len(set(create))} create')
 PY
 ```
 
-Expected: exits 0 and prints at least one missing sentence.
+Expected: all existing paths/symbols resolve and create paths do not conflict. Stop the phase on repository drift.
 
-- [ ] **Step 2: Add exactly one behavior paragraph and one acceptance bullet**
+- [ ] **Step 2: Write failing compatibility tests**
 
-```markdown
-A pasted-text Write is a non-factual transform. WriteOutput schema validation is its success gate and it does not create EvidenceRecord, Coverage, EvidenceEvaluation, or AnswerClaim. A Write operation that reads external factual sources is not this exception and follows the factual evidence/evaluation/grounding path.
+```python
+from scripts.probe_v2_compatibility import probe_current_interpreter
+
+def test_state_graph_supports_frozen_context_schema() -> None:
+    result = probe_current_interpreter("postgresql://postgres:postgres@hrag-postgres:5432/hrag_test")
+    assert result.context_schema_supported
+    assert result.async_postgres_saver_imported
+    assert result.psycopg_dsn_opened
 ```
 
-Add an acceptance test sentence requiring a grammar-only request to return typed output with no evidence and a source-backed rewrite to require sufficient grounded evidence.
-
-- [ ] **Step 3: Verify exact contract text and frozen status**
+Run:
 
 ```bash
-python - <<'PY'
-from pathlib import Path
-text = Path("docs/superpowers/specs/2026-09-10-langgraph-v2-contract-first-design.md").read_text()
-for value in (
-    "**Status:** Approved design",
-    "pasted-text Write is a non-factual transform",
-    "WriteOutput schema validation is its success gate",
-    "does not create EvidenceRecord, Coverage, EvidenceEvaluation, or AnswerClaim",
-):
-    assert value in text, value
-PY
-git diff --check
+cd backend && pytest tests/agents/v2/orchestrator_compat/test_compatibility_probe.py -q
 ```
 
-Expected: both commands exit 0.
+Expected: FAIL because probe module is absent.
 
-- [ ] **Step 4: Detect and commit only the amendment**
+- [ ] **Step 3: Implement exact API and DSN probe**
+
+```python
+from inspect import signature
+from importlib.metadata import version
+from langgraph.graph import StateGraph
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+assert "context_schema" in signature(StateGraph).parameters
+
+# Every langgraph import used by later-phase code examples must resolve.
+from langgraph.types import interrupt, Command
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.memory import InMemorySaver
+import langgraph.graph.state as _lg_state
+assert hasattr(_lg_state, "CompiledStateGraph")
+
+async with AsyncPostgresSaver.from_conn_string(checkpoint_dsn) as saver:
+    await saver.setup()
+```
+
+`probe_v2_compatibility.py` reports installed package versions, verifies a minimal `StateGraph(dict, context_schema=RuntimeContext)` compiles, opens a real `postgresql://` psycopg DSN, runs `AsyncPostgresSaver.setup()`, writes/reads a disposable checkpoint thread, and cleans the test thread. It must reject `postgresql+asyncpg://` rather than passing the SQLAlchemy URL through.
+
+- [ ] **Step 4: Discover passing exact candidates in isolation**
 
 ```bash
+python3 -m venv backend/.venv-v2-benchmark
+backend/.venv-v2-benchmark/bin/pip install --upgrade pip
+# For each candidate tuple from current package metadata, install exact versions into the isolated venv,
+# run the probe, and retain only passing tuples in compatibility-candidates.json.
+backend/.venv-v2-benchmark/bin/python backend/scripts/probe_v2_compatibility.py \
+  --discover \
+  --checkpoint-dsn "$CHECKPOINT_DATABASE_URL" \
+  --output backend/tests/reports/v2-compatibility-candidates.json
+backend/.venv-v2-benchmark/bin/pip check
+```
+
+Expected: report contains at least one passing exact tuple and proof that `context_schema`, AsyncPostgresSaver, and psycopg DSN operations passed. If none passes, Phase 0 stops without changing production requirements.
+
+- [ ] **Step 5: Test and commit probe only**
+
+```bash
+cd backend && pytest tests/agents/v2/orchestrator_compat/test_compatibility_probe.py -q
 node .gitnexus/run.cjs detect-changes --scope compare --base-ref main
-git add docs/superpowers/specs/2026-09-10-langgraph-v2-contract-first-design.md
+git add backend/scripts/probe_v2_compatibility.py backend/tests/agents/v2/orchestrator_compat/test_compatibility_probe.py backend/tests/reports/v2-compatibility-candidates.json
 git diff --cached --check
-git commit -m "docs: classify pasted-text write execution"
+git commit -m "test: discover compatible v2 orchestration stack"
 ```
-
-Expected: one documentation-only commit.
 
 ---
 
-### Task 2: Build Frozen Contract-Parity Fixtures
+### Task 1: Build Typed Frozen-Contract Parity Scenarios
 
 **Files:**
-- Create: `backend/tests/agents/v2/orchestrator_compat/models.py`
+- Create: `backend/tests/agents/v2/orchestrator_compat/frozen_contracts.py`
 - Create: `backend/tests/agents/v2/orchestrator_compat/scenarios.py`
 - Create: `backend/tests/agents/v2/orchestrator_compat/test_contract_parity.py`
 
 **Interfaces:**
-- Produces: `Scenario`, `CandidateResult`, `OrchestratorCandidate.run()` and `SCENARIOS`.
+- Produces: strict/frozen benchmark `SupervisorV2State`, `TaskPlan`, `AgentResult`, `TaskExecutionSummary`, `ClarificationRequest`, `GraphRuntimeContext`, `Scenario`, and `SCENARIOS` matching the approved spec.
 
-- [ ] **Step 1: Check ignore status and create a failing import test**
+- [ ] **Step 1: Write failing typed fixture tests**
 
-```bash
-git check-ignore -v backend/tests/agents/v2/orchestrator_compat/test_contract_parity.py || true
-mkdir -p backend/tests/agents/v2/orchestrator_compat
-cat > backend/tests/agents/v2/orchestrator_compat/test_contract_parity.py <<'PY'
-from app.services.agents.v2.orchestrator_compat import normalize_result
+```python
+from typing import get_type_hints
+from .frozen_contracts import SupervisorV2State, TaskPlan
 from .scenarios import SCENARIOS
 
-def test_fixture_ids_are_unique() -> None:
-    assert len({scenario.scenario_id for scenario in SCENARIOS}) == len(SCENARIOS)
+def test_scenarios_use_typed_frozen_contracts() -> None:
+    assert SCENARIOS
+    assert set(get_type_hints(SupervisorV2State)) >= {"contract_version", "execution"}
+    assert any(isinstance(s.initial_state["execution"].plan, TaskPlan) for s in SCENARIOS)
 
-def test_normalizer_removes_runtime_context() -> None:
-    state = {"contract_version": "2.0", "task_ids": ["T1"], "runtime": {"user_id": "secret"}}
-    assert normalize_result(state) == {"contract_version": "2.0", "task_ids": ["T1"]}
-PY
-cd backend && pytest tests/agents/v2/orchestrator_compat/test_contract_parity.py -q
+def test_runtime_context_is_not_in_checkpoint_json() -> None:
+    scenario = next(s for s in SCENARIOS if s.scenario_id == "acl-resume")
+    assert "workspace_ids" not in scenario.checkpoint_json()
 ```
 
-Expected: FAIL because the module and scenarios do not exist.
-
-- [ ] **Step 2: Define complete benchmark types**
-
-```python
-# backend/tests/agents/v2/orchestrator_compat/models.py
-from dataclasses import dataclass
-from typing import Awaitable, Callable
-
-@dataclass(frozen=True)
-class Scenario:
-    scenario_id: str
-    initial_state: dict[str, object]
-    expected_state: dict[str, object]
-
-@dataclass(frozen=True)
-class CandidateResult:
-    scenario_id: str
-    normalized_state: dict[str, object]
-    elapsed_ms: float
-    checkpoint_bytes: int
-    peak_bytes: int
-
-CandidateRunner = Callable[[Scenario], Awaitable[CandidateResult]]
-
-@dataclass(frozen=True)
-class OrchestratorCandidate:
-    name: str
-    run: CandidateRunner
-```
-
-Create ten concrete `SCENARIOS`: one-task fast, three-task DAG, async fan-in, not_found, TIMEOUT, append-only replan, clarification interrupt/resume, ACL replacement, cancellation, and outer-only streaming. Each fixture contains literal IDs and expected normalized state.
-
-- [ ] **Step 3: Implement deterministic normalization**
-
-```python
-# backend/app/services/agents/v2/orchestrator_compat.py
-_RUNTIME_KEYS = frozenset({"runtime", "user_id", "workspace_ids", "deadline_at", "services"})
-
-def normalize_result(value: object) -> object:
-    if isinstance(value, dict):
-        return {key: normalize_result(item) for key, item in sorted(value.items()) if key not in _RUNTIME_KEYS}
-    if isinstance(value, list):
-        return [normalize_result(item) for item in value]
-    return value
-```
-
-- [ ] **Step 4: Run parity fixture tests**
+Run and expect import failure:
 
 ```bash
 cd backend && pytest tests/agents/v2/orchestrator_compat/test_contract_parity.py -q
 ```
 
-Expected: PASS with 2 tests.
+- [ ] **Step 2: Implement exact typed benchmark contracts and scenarios**
 
-- [ ] **Step 5: Detect and commit narrow paths**
+Use `ConfigDict(extra="forbid", frozen=True, strict=True)`. Create literal, deterministic fixtures for: one-task fast plan; three-task DAG; async fan-in; no-evidence `not_found`; no-evidence `TIMEOUT`; append-only replan using `TaskExecutionSummary`; clarification interrupt/resume; changed ACL runtime replacement; cancellation; outer-only streaming. `Scenario.checkpoint_json()` serializes only `SupervisorV2State`; `GraphRuntimeContext` is supplied separately and must never appear in normalized checkpoint data.
+
+- [ ] **Step 3: Prove mandatory parity facts**
+
+Tests assert unique task/target IDs, append-only plan prefix, fan-in associated by task ID, `not_found != TIMEOUT`, current ACL replaces old runtime, cancellation dispatches no later task, one terminal outer event, and checkpoint bytes deserialize back into the same typed state.
+
+```bash
+cd backend && pytest tests/agents/v2/orchestrator_compat/test_contract_parity.py -q
+```
+
+Expected: PASS.
+
+- [ ] **Step 4: Commit typed fixtures**
 
 ```bash
 node .gitnexus/run.cjs detect-changes --scope compare --base-ref main
-git add backend/app/services/agents/v2/orchestrator_compat.py backend/tests/agents/v2/orchestrator_compat
-git commit -m "test: add v2 orchestrator parity fixtures"
+git add backend/tests/agents/v2/orchestrator_compat/frozen_contracts.py backend/tests/agents/v2/orchestrator_compat/scenarios.py backend/tests/agents/v2/orchestrator_compat/test_contract_parity.py
+git commit -m "test: add typed v2 orchestrator parity scenarios"
 ```
 
 ---
 
-### Task 3: Isolate Candidate Dependencies and Benchmark Both Candidates
+### Task 2: Benchmark Passing Stacks and Promote Only the Winner
 
 **Files:**
 - Create: `backend/requirements-v2-benchmark.txt`
@@ -197,138 +195,83 @@ git commit -m "test: add v2 orchestrator parity fixtures"
 - Modify: `docs/harness.md`
 
 **Interfaces:**
-- Produces: `evaluate_gate(report: BenchmarkReport) -> GateDecision` and a winner with exact package pins.
+- Consumes: only exact passing tuples from `v2-compatibility-candidates.json` and typed scenarios from Task 1.
+- Produces: benchmark report, `evaluate_gate()`, exact winner pins, and documented API proof.
 
-- [ ] **Step 1: Impact-check the existing make targets**
-
-```bash
-# Make targets are not indexed code symbols; inspect exact recipes instead.
-grep -nE '^(test|ab):' Makefile
-```
-
-Expected: record callers/processes/risk before editing `Makefile`; stop if risk is HIGH/CRITICAL.
-
-- [ ] **Step 2: Create the isolated environment**
-
-```text
-# backend/requirements-v2-benchmark.txt
-langgraph==0.2.76
-langgraph-checkpoint-postgres==2.0.21
-psycopg[binary,pool]==3.2.6
-deepagents==0.2.5
-pydantic==2.10.6
-pytest==8.3.5
-pytest-asyncio==0.25.3
-```
+- [ ] **Step 1: Verify current symbols and run impacts**
 
 ```bash
-python3 -m venv backend/.venv-v2-benchmark
+set -e
+test -e backend/scripts/ab_eval.py
+test -e Makefile
+test -e docs/harness.md
+rg -n 'langgraph|^test:|^ab:' backend/requirements.txt Makefile
+```
+
+Then invoke GitNexus upstream impact for the exact discovered symbols `scripts.ab_eval.cmd_run` and `scripts.ab_eval._call`. Expected: paths/symbols resolve and impact is below HIGH; otherwise stop for review rather than inventing or editing a different seam.
+
+- [ ] **Step 2: Write failing gate tests**
+
+Tests reject candidates lacking any compatibility proof or typed scenario; require exact package versions; select native on tie; make Deep Agents eligible only when parity passes, p95 ≤ native×1.15, and checkpoint bytes ≤ native×1.10.
+
+```bash
+cd backend && pytest tests/agents/v2/orchestrator_compat/test_gate.py -q
+```
+
+Expected: FAIL before checker exists.
+
+- [ ] **Step 3: Materialize discovered requirements, not guessed pins**
+
+`probe_v2_compatibility.py --write-requirements backend/requirements-v2-benchmark.txt` writes the exact passing tuple selected for benchmarking. The file must include exact LangGraph, checkpoint-postgres, psycopg, Pydantic, pytest, and candidate Deep Agents versions from the discovery report; no example version is treated as approved.
+
+```bash
+backend/.venv-v2-benchmark/bin/python backend/scripts/probe_v2_compatibility.py \
+  --input backend/tests/reports/v2-compatibility-candidates.json \
+  --write-requirements backend/requirements-v2-benchmark.txt
 backend/.venv-v2-benchmark/bin/pip install --requirement backend/requirements-v2-benchmark.txt
 backend/.venv-v2-benchmark/bin/pip check
 ```
 
-Expected: installation and `pip check` succeed. If a pin is unavailable, update the file to the installed compatible exact version and record it in the benchmark report; do not install into production requirements.
+- [ ] **Step 4: Run seeded typed parity benchmark**
 
-- [ ] **Step 3: Write gate tests first**
-
-```python
-from scripts.check_v2_orchestrator_gate import BenchmarkReport, CandidateMetrics, evaluate_gate
-
-def test_tie_selects_native() -> None:
-    report = BenchmarkReport(
-        native=CandidateMetrics(True, 10.0, 1000),
-        deep_agents=CandidateMetrics(True, 10.0, 1000),
-    )
-    assert evaluate_gate(report).winner == "native"
-
-def test_ineligible_candidate_cannot_win() -> None:
-    report = BenchmarkReport(
-        native=CandidateMetrics(True, 20.0, 1000),
-        deep_agents=CandidateMetrics(False, 1.0, 1),
-    )
-    assert evaluate_gate(report).winner == "native"
-```
-
-Run:
+Both adapters consume the actual typed Scenario objects. Run warmup 10, iterations 100, seed 20260910; measure p50/p95, peak memory, canonical typed checkpoint bytes, dependency count, interrupt/resume correctness, and outer-event count.
 
 ```bash
-cd backend && PYTHONPATH=. pytest tests/agents/v2/orchestrator_compat/test_gate.py -q
+backend/.venv-v2-benchmark/bin/python backend/scripts/benchmark_v2_orchestrators.py \
+  --compatibility-report backend/tests/reports/v2-compatibility-candidates.json \
+  --warmup 10 --iterations 100 --seed 20260910 \
+  --checkpoint-dsn "$CHECKPOINT_DATABASE_URL" \
+  --output backend/tests/reports/v2_orchestrator_benchmark.json
+backend/.venv-v2-benchmark/bin/python backend/scripts/check_v2_orchestrator_gate.py \
+  backend/tests/reports/v2_orchestrator_benchmark.json
 ```
 
-Expected: FAIL because gate types/functions are absent.
+Expected: exact winner; every mandatory parity scenario passes; report includes exact versions and API/DSN proof.
 
-- [ ] **Step 4: Implement complete gate types and thresholds**
+- [ ] **Step 5: Promote winner pins and validate container imports**
 
-```python
-from dataclasses import dataclass
-
-@dataclass(frozen=True)
-class CandidateMetrics:
-    parity_passed: bool
-    p95_ms: float
-    checkpoint_bytes: int
-
-@dataclass(frozen=True)
-class BenchmarkReport:
-    native: CandidateMetrics
-    deep_agents: CandidateMetrics
-
-@dataclass(frozen=True)
-class GateDecision:
-    winner: str
-    reason: str
-
-def evaluate_gate(report: BenchmarkReport) -> GateDecision:
-    if not report.native.parity_passed:
-        raise ValueError("native candidate failed mandatory parity")
-    deep = report.deep_agents
-    if not deep.parity_passed:
-        return GateDecision("native", "deep_agents failed parity")
-    p95_ok = deep.p95_ms <= report.native.p95_ms * 1.15
-    size_ok = deep.checkpoint_bytes <= report.native.checkpoint_bytes * 1.10
-    if p95_ok and size_ok and deep.p95_ms < report.native.p95_ms:
-        return GateDecision("deep_agents", "eligible and faster")
-    return GateDecision("native", "tie or threshold failure selects native")
-```
-
-- [ ] **Step 5: Implement and run the seeded benchmark**
-
-`benchmark_v2_orchestrators.py` must import both candidates only inside their runner functions, run all ten scenarios with warmup 10/iterations 100/seed 20260910, measure `perf_counter_ns`, `tracemalloc`, canonical JSON checkpoint bytes, and redact runtime keys through `normalize_result`.
-
-```bash
-backend/.venv-v2-benchmark/bin/python backend/scripts/benchmark_v2_orchestrators.py --warmup 10 --iterations 100 --seed 20260910 --output backend/tests/reports/v2_orchestrator_benchmark.json
-backend/.venv-v2-benchmark/bin/python backend/scripts/check_v2_orchestrator_gate.py backend/tests/reports/v2_orchestrator_benchmark.json
-```
-
-Expected: both commands exit 0 and report one winner.
-
-- [ ] **Step 6: Promote only the winning dependency pins**
-
-If native wins, replace the unbounded LangGraph requirement in `backend/requirements.txt` with the exact tested LangGraph pin and do not add Deep Agents. If Deep Agents wins, add both exact tested pins. In either case add the checkpoint stack tested with the winner as exact pins:
-
-```text
-langgraph-checkpoint-postgres==2.0.21
-psycopg[binary,pool]==3.2.6
-```
-
-If either exact checkpoint pin fails compatibility in the isolated environment, Phase 0 fails: select and record a different exact compatible pair before modifying production requirements. Verify the async API exists with `python -c 'from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver'`. Then rebuild only backend dependencies and run:
+Replace the current unbounded LangGraph dependency with exact tested winner pins. Add Deep Agents only if it wins. Add exact checkpoint-postgres and psycopg pins proven by the report. Add `CHECKPOINT_DATABASE_URL=postgresql://...` documentation; never reuse `DATABASE_URL=postgresql+asyncpg://...` directly.
 
 ```bash
 docker exec hrag-backend python -m pip check
-docker exec hrag-backend python -c 'from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver; print(AsyncPostgresSaver)'
-docker exec hrag-backend pytest tests/agents/v2/orchestrator_compat -q
+docker exec hrag-backend python - <<'PY'
+from inspect import signature
+from langgraph.graph import StateGraph
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+assert "context_schema" in signature(StateGraph).parameters
+print(AsyncPostgresSaver)
+PY
 ```
 
-Expected: PASS.
+- [ ] **Step 6: Document, test, and commit**
 
-- [ ] **Step 7: Document and commit**
-
-Update `docs/benchmarks/langgraph-v2-orchestrator.md` with versions, host/container details, parity results, p50/p95, memory, checkpoint bytes, winner, and rejection reasons. Add `v2-orchestrator-benchmark` and `v2-orchestrator-gate` Make targets and document them in `docs/harness.md`.
+Document exact versions, probe output, DSN, parity, p50/p95/memory/checkpoint bytes, winner, and rejection reasons. Add Make targets `v2-orchestrator-probe`, `v2-orchestrator-benchmark`, and `v2-orchestrator-gate`.
 
 ```bash
+cd backend && pytest tests/agents/v2/orchestrator_compat -q
 node .gitnexus/run.cjs detect-changes --scope compare --base-ref main
-git add backend/requirements-v2-benchmark.txt backend/requirements.txt backend/scripts/benchmark_v2_orchestrators.py backend/scripts/check_v2_orchestrator_gate.py backend/tests/agents/v2/orchestrator_compat backend/tests/reports/v2_orchestrator_benchmark.json docs/benchmarks/langgraph-v2-orchestrator.md Makefile docs/harness.md
+git add backend/requirements-v2-benchmark.txt backend/requirements.txt backend/scripts/probe_v2_compatibility.py backend/scripts/benchmark_v2_orchestrators.py backend/scripts/check_v2_orchestrator_gate.py backend/tests/agents/v2/orchestrator_compat backend/tests/reports/v2-compatibility-candidates.json backend/tests/reports/v2_orchestrator_benchmark.json docs/benchmarks/langgraph-v2-orchestrator.md Makefile docs/harness.md
 git diff --cached --check
-git commit -m "build: select and pin v2 orchestrator"
+git commit -m "build: select and pin compatible v2 orchestrator"
 node .gitnexus/run.cjs analyze
 ```

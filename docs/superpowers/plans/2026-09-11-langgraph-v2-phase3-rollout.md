@@ -20,7 +20,57 @@
 
 ---
 
-### Task 1: Build Session-SSE Replay and A/B Harness First
+### Task 0: Verify Phase-3 Paths, Symbols, and Rollout Preconditions
+
+**Files:**
+- Read: all Modify paths and selected orchestrator imports below
+- Test: shell preflight only
+
+**Interfaces:**
+- Produces: repository-drift manifest and verified Phase-2 baseline.
+
+- [ ] **Step 1: Verify paths and create conflicts**
+
+```bash
+set -e
+for path in backend/scripts/ab_eval.py Makefile docs/harness.md backend/app/services/agents/supervisor_v2.py backend/app/services/agents/v2/execution/scheduler.py backend/app/services/agent/runtime_selector.py backend/app/api/chat_session.py; do test -e "$path"; done
+for path in backend/app/services/agents/v2/complex_research_graph.py backend/app/services/agents/v2/dependencies/people_document.py backend/app/services/agent/shadow_runtime.py backend/app/services/agents/v2/persistence/shadow_checkpoint.py; do test ! -e "$path"; done
+python - <<'PY'
+import re, pathlib
+plan = pathlib.Path('docs/superpowers/plans/2026-09-11-langgraph-v2-phase3-rollout.md').read_text()
+modify = [p.split(':')[0] for p in re.findall(r'^- Modify: `([^`]+)`', plan, re.M)]
+create = [p.split(':')[0] for p in re.findall(r'^- Create: `([^`]+)`', plan, re.M)]
+missing = [p for p in modify if not pathlib.Path(p).exists()]
+conflict = [p for p in create if pathlib.Path(p).exists()]
+assert not missing and not conflict, {'missing': missing, 'conflict': conflict}
+print(f'phase3 paths ok: {len(set(modify))} modify, {len(set(create))} create')
+PY
+rg -n 'create_supervisor_v2_graph|resolve_agent_graph|run_agent_evaluation' backend/app
+```
+
+Expected: all Modify paths/symbols exist and Create paths do not conflict. `TaskScheduler` is intentionally not asserted here because Task 2 introduces it in `v2/execution/scheduler.py`. Use discovered qualified names for impact commands.
+
+- [ ] **Step 2: Re-run Phase-2 and dependency API gates**
+
+```bash
+docker exec hrag-backend pytest tests/agents/v2 tests/api/test_agent_runtime_selector.py tests/api/test_agent_v2_streaming.py -q
+docker exec hrag-backend python - <<'PY'
+from inspect import signature
+from langgraph.graph import StateGraph
+from langgraph.types import interrupt, Command
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.memory import InMemorySaver
+import langgraph.graph.state as _lg_state
+assert 'context_schema' in signature(StateGraph).parameters
+assert hasattr(_lg_state, 'CompiledStateGraph')
+PY
+```
+
+Expected: PASS before complex/rollout edits.
+
+---
+
+### Task 1: Build Golden Session-SSE A/B Preflight Harness
 
 **Files:**
 - Modify: `backend/scripts/ab_eval.py`
@@ -30,7 +80,7 @@
 - Modify: `docs/harness.md`
 
 **Interfaces:**
-- Produces: session-SSE driver, normalized v1/v2 report, offline replay input/output.
+- Produces: session-SSE driver, normalized golden preflight report, and offline replay input/output; it does not claim live canary duration/sample evidence.
 
 - [ ] **Step 1: Impact-check harness symbols**
 
@@ -88,7 +138,7 @@ make ab ARM=v1 QUERIES=tests/retrieval/datasets/golden_retrieval.yaml WORKSPACE=
 make ab ARM=v2 QUERIES=tests/retrieval/datasets/golden_retrieval.yaml WORKSPACE=$WORKSPACE
 ```
 
-Expected: tests pass; live commands produce comparable JSON when credentials/services are supplied.
+Expected: tests pass; commands produce comparable functional/quality JSON. This preflight has no 24-hour or live sample-count threshold and cannot promote a canary.
 
 - [ ] **Step 5: Commit before complex implementation**
 
@@ -104,6 +154,7 @@ git commit -m "test: add session SSE v2 evaluation harness"
 
 **Files:**
 - Create: `backend/app/services/agents/v2/complex_research_graph.py`
+- Modify: `backend/app/services/agents/v2/execution/scheduler.py`
 - Create: `backend/tests/agents/v2/complex/test_comparison.py`
 - Modify: `backend/app/services/agents/supervisor_v2.py`
 
@@ -141,14 +192,14 @@ class ComplexResearchGraph:
         return ComplexResearchResult(plan=plan, task_results=results)
 ```
 
-Define `ResearchPlanner`, `TaskScheduler`, and `ComplexResearchResult` in this module using approved contracts. Validator rejects discovery/replan for this pilot.
+Define `ResearchPlanner` and `ComplexResearchResult` in `complex_research_graph.py`, and define `class TaskScheduler` in `backend/app/services/agents/v2/execution/scheduler.py` (import it here — this is the single shared scheduler that Phase 3 Tasks 3 and 6 instrument for dependency materialization and cancellation). `TaskScheduler` is a thin class that owns results accumulation and dependency materialization and delegates dispatch to the Phase-2 `execute_ready_tasks(plan, results, registry, runtime)` function; its `execute(plan, runtime) -> tuple[AgentResult, ...]` method is the shared entrypoint. `ComplexResearchGraph` receives the scheduler by injection and never defines a second scheduler. Validator rejects discovery/replan for this pilot.
 
 - [ ] **Step 4: Run and commit**
 
 ```bash
 cd backend && pytest tests/agents/v2/complex/test_comparison.py -q
 node .gitnexus/run.cjs detect-changes --scope compare --base-ref main
-git add backend/app/services/agents/v2/complex_research_graph.py backend/app/services/agents/supervisor_v2.py backend/tests/agents/v2/complex/test_comparison.py
+git add backend/app/services/agents/v2/complex_research_graph.py backend/app/services/agents/v2/execution/scheduler.py backend/app/services/agents/supervisor_v2.py backend/tests/agents/v2/complex/test_comparison.py
 git commit -m "feat: add v2 comparison pilot"
 ```
 
@@ -157,15 +208,18 @@ git commit -m "feat: add v2 comparison pilot"
 ### Task 3: Implement People-to-Document Dependency Pilot
 
 **Files:**
+- Create: `backend/app/services/agents/v2/dependencies/__init__.py`
+- Create: `backend/app/services/agents/v2/dependencies/people_document.py`
 - Create: `backend/tests/agents/v2/complex/test_people_document.py`
 - Modify: `backend/app/services/agents/v2/complex_research_graph.py`
+- Modify: `backend/app/services/agents/v2/execution/scheduler.py`
 
 **Interfaces:**
-- Produces: dependency-aware People→Document execution with minimal replanner context.
+- Produces: `PeopleDocumentDependencyAdapter.materialize(...) -> DocumentSearchInput` and dependency-aware execution without generic output references.
 
 - [ ] **Step 1: Write failing dependency tests**
 
-Test People success supplies validated downstream input; `not_found` creates no EvidenceUse but remains in TaskExecutionSummary; TIMEOUT is distinct; denied does not become not_found; completed tasks never rerun; dependency input cannot be fabricated; People persistence obeys minimization/encryption/TTL/audit.
+Test People success hydrates only the governed admitted People EvidenceUse and materializes only the exact identifier required by DocumentSearchInput. Assert unrelated/sensitive People fields never enter planner input, TaskPlan, AgentResult.data, checkpoint, or downstream input. `not_found` creates no use and dispatches no T2; denied/error/TIMEOUT dispatch no T2 and remain distinct summaries; completed tasks never rerun; missing/expired/unauthorized evidence cannot be materialized; no input can be fabricated.
 
 ```bash
 cd backend && pytest tests/agents/v2/complex/test_people_document.py -q
@@ -175,7 +229,7 @@ Expected: FAIL before dependency execution is enabled.
 
 - [ ] **Step 2: Implement dependency-ready execution**
 
-The scheduler dispatches only tasks whose `depends_on` succeeded with required typed output. Build `ResearchPlanningInput.current_plan`, `task_outcomes`, `prior_evidence_uses`, and `prior_evaluation` from checkpoint/store projections. Runtime validator rejects unknown dependencies and output references.
+The scheduler treats `depends_on` as ordering only. For a recognized People→Document edge it calls `PeopleDocumentDependencyAdapter`, which receives T1 result/use refs plus current runtime, performs governed hydration with ACL/expiry/minimization checks, extracts the named allowed scalar through a fixed mapping, and constructs a concrete validated DocumentSearchInput immediately before T2 dispatch. It never exposes raw People records to the planner/checkpoint. Non-success or absent admitted use returns a typed blocked dependency and no T2 dispatch. Runtime rejects unknown dependency materializers; no generic TaskOutputRef is added.
 
 ```bash
 cd backend && pytest tests/agents/v2/complex/test_people_document.py -q
@@ -188,7 +242,7 @@ Expected: dependency and no-evidence outcome tests pass.
 ```bash
 cd backend && pytest tests/agents/v2/complex/test_people_document.py -q
 node .gitnexus/run.cjs detect-changes --scope compare --base-ref main
-git add backend/app/services/agents/v2/complex_research_graph.py backend/tests/agents/v2/complex/test_people_document.py
+git add backend/app/services/agents/v2/dependencies/__init__.py backend/app/services/agents/v2/dependencies/people_document.py backend/app/services/agents/v2/complex_research_graph.py backend/app/services/agents/v2/execution/scheduler.py backend/tests/agents/v2/complex/test_people_document.py
 git commit -m "feat: add people document dependency pilot"
 ```
 
@@ -256,6 +310,7 @@ Expected: all named complex tests pass; these scenarios are not claimed by Phase
 
 **Files:**
 - Create: `backend/app/services/agent/shadow_runtime.py`
+- Create: `backend/app/services/agents/v2/persistence/shadow_checkpoint.py`
 - Create: `backend/scripts/shadow_v2.py`
 - Create: `backend/tests/agents/v2/test_shadow_runtime.py`
 - Modify: `backend/app/core/config.py`
@@ -263,7 +318,7 @@ Expected: all named complex tests pass; these scenarios are not claimed by Phase
 - Modify: `backend/app/api/chat_session.py`
 
 **Interfaces:**
-- Produces: `ShadowRuntimeServices`, sampled v2 shadow execution, metrics-only comparison.
+- Produces: `create_shadow_supervisor_v2_graph()`, isolated saver/stores, `ShadowRuntimeServices`, sampled metrics-only execution.
 
 - [ ] **Step 1: Impact-check session execution**
 
@@ -273,7 +328,7 @@ impact({target: "app.api.chat_session.chat_stream_session", direction: "upstream
 
 - [ ] **Step 2: Write side-effect suppression tests**
 
-After adding validated shadow settings (`NEXUSRAG_AGENT_V2_SHADOW_PERCENT=0`, bucket salt, max concurrency, timeout) before constructing the test app, assert primary v1 alone persists production assistant/chat/title/memory/audit mutation/events. Shadow v2 receives read-only source snapshots but writable isolated ephemeral conversation/evidence/use/checkpoint/audit stores so normal graph writes succeed without touching production. Outbound SSE/webhook/title/memory writers are rejecting sinks. Assert v2 schema compatibility is checked before shadow selection, no shadow SSE is emitted, cancellation follows primary, and report contains only hashed request ID, route/status/latency/citation counts/error class.
+Assert shadow never calls `get_supervisor_v2_graph()` and instead calls `create_supervisor_v2_graph(checkpointer=isolated_saver)` once per isolated bundle. After a shadow run, query production checkpointer/evidence/use/audit/chat/memory/title tables and assert zero new rows; assert zero outbound SSE/webhook events. Shadow gets read-only source snapshots plus writable request-scoped isolated conversation/evidence/use/audit stores and an InMemorySaver (or dedicated temporary PostgreSQL schema in integration tests), so graph writes/read-after-write work without production access. Cancellation follows primary; report contains only hashed request ID, route/status/latency/citation count/error class.
 
 ```bash
 cd backend && pytest tests/agents/v2/test_shadow_runtime.py -q
@@ -296,14 +351,14 @@ def shadow_decision(request_id: str, percentage: int, salt: str) -> ShadowDecisi
     return ShadowDecision(bucket < percentage * 100, bucket)
 ```
 
-`ShadowRuntimeServices` supplies read-only document/source adapters and writable request-scoped in-memory implementations for conversation snapshots, evidence records/uses, checkpoints, and audits; reads observe prior writes within that shadow run. Only external side effects—production DB/object/vector mutation, SSE/webhook emission, title updates, and memory writes—raise `ShadowSideEffectError`. Before starting v2, call the same `require_v2_schema_ready()` used by selection. The session endpoint starts shadow only after primary request persistence and discards shadow output except redacted metrics.
+`create_shadow_supervisor_v2_graph()` creates a fresh isolated saver using the exact Phase-0-supported InMemorySaver API, then calls `create_supervisor_v2_graph(checkpointer=isolated_saver)`; it never reuses the production compiled singleton whose AsyncPostgresSaver is compile-time bound. `ShadowRuntimeServices` supplies read-only source adapters and writable request-scoped in-memory conversation/evidence/use/audit stores. Reject production DB/object/vector mutation, outbound SSE/webhook, title, and memory writes. Start shadow only after primary request persistence and discard output except redacted metrics.
 
 - [ ] **Step 4: Run and commit**
 
 ```bash
 cd backend && pytest tests/agents/v2/test_shadow_runtime.py -q
 node .gitnexus/run.cjs detect-changes --scope compare --base-ref main
-git add backend/app/services/agent/shadow_runtime.py backend/scripts/shadow_v2.py backend/tests/agents/v2/test_shadow_runtime.py backend/app/core/config.py .env.example backend/app/api/chat_session.py
+git add backend/app/services/agent/shadow_runtime.py backend/app/services/agents/v2/persistence/shadow_checkpoint.py backend/scripts/shadow_v2.py backend/tests/agents/v2/test_shadow_runtime.py backend/app/core/config.py .env.example backend/app/api/chat_session.py
 git commit -m "feat: add side effect free v2 shadowing"
 ```
 
@@ -359,7 +414,7 @@ impact({target: "app.services.agent.streaming.stream_agent_events", direction: "
 
 - [ ] **Step 2: Write deterministic selection tests**
 
-Create config defaults before constructing tests. Test DB `enabled=false` forces v1 even when environment allows v2; control row is read on every request (no process-local stale cache); explicit evaluation override requires admin; workspace allowlist precedes percentage; stable bucketing; percentage 0/100; ordinary headers ignored; v2 schema incompatibility forces v1/error before graph creation. Test session, direct SSE, Telegram, shadow, and admin-evaluation v2 starts all call `ActiveRunRegistry.register(run_id, cancellation_token)` before graph invocation and unregister in `finally`; Redis disable messages set the same token in every worker; scheduler checks it immediately before every capability dispatch; cancellation rolls back retractable output and cannot emit success. Metric tests insert terminal observations and generate deterministic arm reports matching the fixture schema.
+Create config defaults before constructing tests. Test DB `enabled=false` forces v1 even when environment allows v2; control row is read on every request (no process-local stale cache); explicit evaluation override requires admin; workspace allowlist precedes percentage; stable bucketing; percentage 0/100; ordinary headers ignored; v2 schema incompatibility forces v1/error before graph creation. Test session, direct SSE, Telegram, shadow, and admin-evaluation v2 starts all call `ActiveRunRegistry.register(run_id, cancellation_token)` before graph invocation and unregister in `finally`; Redis disable messages set the same token in every worker; scheduler checks it immediately before every capability dispatch; cancellation rolls back retractable output and cannot emit success. Metric tests insert terminal observations and generate deterministic arm reports matching the fixture schema. The live checker rejects golden/preflight report schemas even when their counts are large; only reports aggregated from `agent_rollout_metrics` with continuous window metadata are eligible.
 
 ```bash
 cd backend && pytest tests/api/test_agent_canary_selection.py -q
@@ -434,15 +489,25 @@ grep -RIn 'NEXUSRAG_AGENT_V2_' .env.example CLAUDE.md docs/auth.md docs/harness.
 
 Expected: first command finds no active stale guidance after edits; second finds documented controls.
 
-- [ ] **Step 2: Execute staged rollout gates**
+- [ ] **Step 2: Execute golden preflight, then the separate live rollout gate**
+
+Golden preflight compares functionality/quality only:
 
 ```bash
-make ab ARM=v1 QUERIES=tests/retrieval/datasets/golden_retrieval.yaml WORKSPACE=$WORKSPACE OUTPUT=backend/tests/reports/v1-canary.json
-make ab ARM=v2 QUERIES=tests/retrieval/datasets/golden_retrieval.yaml WORKSPACE=$WORKSPACE OUTPUT=backend/tests/reports/v2-canary.json
-python backend/scripts/check_v2_rollout_gate.py --v1 backend/tests/reports/v1-canary.json --v2 backend/tests/reports/v2-canary.json --min-samples 200 --min-window-hours 24 --require-zero-security-violations
+make ab ARM=v1 QUERIES=tests/retrieval/datasets/golden_retrieval.yaml WORKSPACE=$WORKSPACE OUTPUT=backend/tests/reports/v1-preflight.json
+make ab ARM=v2 QUERIES=tests/retrieval/datasets/golden_retrieval.yaml WORKSPACE=$WORKSPACE OUTPUT=backend/tests/reports/v2-preflight.json
+make ab-compare A=backend/tests/reports/v1-preflight.json B=backend/tests/reports/v2-preflight.json
 ```
 
-Then run shadow 5%, internal workspace canary, 5%, 25%, 50%, and 100%. Each stage must collect at least 200 completed requests per arm across a continuous 24-hour window with zero security violations before promotion. Any hard gate failure calls the admin disable endpoint, verifies the DB control revision changed, verifies new requests select v1, and verifies active v2 runs receive cancellation and cannot complete successfully.
+After preflight passes, enable shadow 5%, then internal workspace canary and 5/25/50/100% stages. For each stage, wait for actual `agent_rollout_metrics` traffic spanning a continuous 24-hour window, then collect database-backed reports and apply live thresholds:
+
+```bash
+python backend/scripts/collect_v2_rollout_report.py --arm v1 --since "$SINCE" --until "$UNTIL" --output backend/tests/reports/v1-live-canary.json
+python backend/scripts/collect_v2_rollout_report.py --arm v2 --since "$SINCE" --until "$UNTIL" --output backend/tests/reports/v2-live-canary.json
+python backend/scripts/check_v2_rollout_gate.py --v1 backend/tests/reports/v1-live-canary.json --v2 backend/tests/reports/v2-live-canary.json --min-samples 200 --min-window-hours 24 --require-zero-security-violations
+```
+
+Batch A/B JSON is never accepted by the live checker. Any failure calls the admin disable endpoint, verifies control revision changed, new requests select v1, and active v2 runs are cancelled without success.
 
 - [ ] **Step 3: Run final validation**
 

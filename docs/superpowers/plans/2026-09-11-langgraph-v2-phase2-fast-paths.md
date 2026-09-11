@@ -14,10 +14,72 @@
 
 - Phase 1 gate must pass; v1 remains default.
 - Create `supervisor_v2.py` before selector wiring.
-- Only direct greeting and pasted-text non-factual Write bypass factual evidence/grounding.
+- Only direct non-factual conversation bypasses factual evidence/grounding; Write stays disabled until a separate approved frozen-spec amendment defines pasted-text transformation semantics.
 - Only the outer adapter streams final prose.
 - Current runtime ACL replaces historical context on every resume.
 - Before each existing-symbol edit run named GitNexus impact; before each commit run compare-scope detect-changes and narrow staging.
+
+---
+
+### Task 0: Verify Phase-2 Paths, Symbols, and Selected APIs
+
+**Files:**
+- Read: all Modify paths and imports named below
+- Test: shell preflight only
+
+**Interfaces:**
+- Produces: phase manifest of exact symbols/imports; no runtime code.
+
+- [ ] **Step 1: Verify repository paths and module layout**
+
+```bash
+set -e
+for path in backend/app/main.py backend/app/api/chat_session.py backend/app/api/chat_agent_lg.py backend/app/services/integrations/telegram_service.py backend/app/services/agent/streaming.py backend/app/core/config.py; do test -e "$path"; done
+test ! -e backend/app/services/agents/v2/execution.py
+test ! -d backend/app/services/agents/v2/execution
+! rg -q 'run_agent_evaluation' backend/app
+python - <<'PY'
+import re, pathlib
+plan = pathlib.Path('docs/superpowers/plans/2026-09-11-langgraph-v2-phase2-fast-paths.md').read_text()
+modify = [p.split(':')[0] for p in re.findall(r'^- Modify: `([^`]+)`', plan, re.M)]
+create = [p.split(':')[0] for p in re.findall(r'^- Create: `([^`]+)`', plan, re.M)]
+missing = [p for p in modify if not pathlib.Path(p).exists()]
+conflict = [p for p in create if pathlib.Path(p).exists()]
+assert not missing and not conflict, {'missing': missing, 'conflict': conflict}
+print(f'phase2 paths ok: {len(set(modify))} modify, {len(set(create))} create')
+PY
+rg -n 'get_supervisor_graph|stream_agent_events|chat_stream_session|langgraph_chat_stream' backend/app
+```
+
+Expected: Modify paths exist; `execution/` package path has no conflicting `execution.py`; `run_agent_evaluation` is still undefined until Task 6; record exact symbols for impacts.
+
+- [ ] **Step 2: Verify selected dependency API**
+
+```bash
+cd backend && python - <<'PY'
+from inspect import signature
+from langgraph.graph import StateGraph
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.types import interrupt, Command
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.memory import InMemorySaver
+import langgraph.graph.state as _lg_state
+assert 'context_schema' in signature(StateGraph).parameters
+assert hasattr(_lg_state, 'CompiledStateGraph')
+print(AsyncPostgresSaver)
+PY
+```
+
+Expected: Phase-0 API proof still passes; stop on dependency drift.
+
+- [ ] **Step 3: Verify Phase-1 readiness commands**
+
+```bash
+docker exec hrag-backend python -m app.services.agents.v2.persistence.migrate --check
+docker exec hrag-backend python -m app.services.agents.v2.persistence.checkpoint --check
+```
+
+Expected: both exit 0 before Phase 2 edits.
 
 ---
 
@@ -34,7 +96,7 @@
 
 - [ ] **Step 1: Write failing lifecycle/routing tests**
 
-Test greeting/direct, People/fast, exact Section/fast, grammar Write/fast non-factual, KG/fast, comparison/complex, required ambiguous document/clarify, abbreviations, coreference follow-up, irrelevant attachment exclusion, ordinary/current/pinned revision behavior, and prompt-injection content remaining data.
+Test greeting/direct, People/fast, exact Section/fast, KG/fast, comparison/complex, required ambiguous document/clarify, grammar Write/typed unavailable pending amendment, abbreviations, coreference follow-up, irrelevant attachment exclusion, ordinary/current/pinned revision behavior, and prompt-injection content remaining data.
 
 ```bash
 cd backend && pytest tests/agents/v2/test_context_binding_routes.py -q
@@ -60,10 +122,11 @@ async def finalize_semantic(draft: SemanticDraft, bindings: DocumentBindingSet) 
         document_refs=_apply_resolution(draft.document_refs, bindings),
         person_refs=draft.person_refs,
         section_refs=draft.section_refs,
+        blocking_ambiguities=finalize_blocking_ambiguities(draft.preliminary_ambiguities, bindings),
     )
 ```
 
-Define `_normalize_validated` and `_apply_resolution` in `context_graph.py`; neither can widen scope or write binding IDs into SemanticContext.
+Define `_normalize_validated`, `_apply_resolution`, and `finalize_blocking_ambiguities` in `context_graph.py`; neither can widen scope or write binding IDs into SemanticContext. Tests prove an ambiguity resolved by binding is removed, while a remaining required ambiguity stays blocking and routes to clarify; preliminary ambiguities are never copied blindly.
 
 - [ ] **Step 3: Implement deterministic-first analyzer/router**
 
@@ -90,7 +153,8 @@ git commit -m "feat: add v2 context binding and routing"
 
 **Files:**
 - Create: `backend/app/services/agents/v2/planning.py`
-- Create: `backend/app/services/agents/v2/execution.py`
+- Create: `backend/app/services/agents/v2/execution/__init__.py`
+- Create: `backend/app/services/agents/v2/execution/scheduler.py`
 - Create: `backend/tests/agents/v2/fast_paths/test_fast_plan.py`
 - Create: `backend/tests/agents/v2/fast_paths/test_scheduler.py`
 
@@ -99,7 +163,7 @@ git commit -m "feat: add v2 context binding and routing"
 
 - [ ] **Step 1: Write failing ownership tests**
 
-Require People/KG/Write plans to have one TaskSpec and zero TargetUnits; Section/Document plans have one TaskSpec and one or more TargetUnits; direct greeting has no plan; no planner model is called. Resume must resolve each result/use/coverage task/target through the checkpointed plan.
+Require People/KG plans to have one TaskSpec and zero TargetUnits; Section/Document plans have one TaskSpec and one or more TargetUnits; direct greeting has no plan; no planner model is called. Resume must resolve each result/use/coverage task/target through the checkpointed plan.
 
 ```bash
 cd backend && pytest tests/agents/v2/fast_paths/test_fast_plan.py tests/agents/v2/fast_paths/test_scheduler.py -q
@@ -145,7 +209,7 @@ Expected: scheduler association and cancellation tests pass.
 ```bash
 cd backend && pytest tests/agents/v2/fast_paths/test_fast_plan.py tests/agents/v2/fast_paths/test_scheduler.py -q
 node .gitnexus/run.cjs detect-changes --scope compare --base-ref main
-git add backend/app/services/agents/v2/planning.py backend/app/services/agents/v2/execution.py backend/tests/agents/v2/fast_paths
+git add backend/app/services/agents/v2/planning.py backend/app/services/agents/v2/execution/__init__.py backend/app/services/agents/v2/execution/scheduler.py backend/tests/agents/v2/fast_paths
 git commit -m "feat: add deterministic v2 fast planning"
 ```
 
@@ -159,7 +223,6 @@ git commit -m "feat: add deterministic v2 fast planning"
 - Create: `backend/app/services/agents/v2/domain/people_graph.py`
 - Create: `backend/app/services/agents/v2/domain/document_graph.py`
 - Create: `backend/app/services/agents/v2/domain/section_graph.py`
-- Create: `backend/app/services/agents/v2/domain/write_graph.py`
 - Create: `backend/app/services/agents/v2/domain/knowledge_graph.py`
 - Create: `backend/tests/agents/v2/fast_paths/test_domain_paths.py`
 - Create: `backend/tests/agents/v2/test_evaluation_grounding.py`
@@ -169,7 +232,7 @@ git commit -m "feat: add deterministic v2 fast planning"
 
 - [ ] **Step 1: Write failing evidence/grounding tests**
 
-Name tests for: search success not read coverage; wrong/partial section; revision mismatch; targetless supporting use; discovery use cannot synthesize; source tombstone; expired use; People minimization; same record/two uses; derived faithfulness; sufficient gate; unmapped factual assertion revise then insufficient; deterministic citation; grammar Write no evidence; source-backed Write requires evidence; `test_synthesis_budget_overflow_persists_grounded_derived_evidence`; and `test_synthesis_only_existing_evidence_revalidates_current_uses_without_research`.
+Name tests for: search success not read coverage; wrong/partial section; revision mismatch; targetless supporting use; discovery use cannot synthesize; source tombstone; expired use; People minimization; same record/two uses; derived faithfulness; all four statuses and precedence; unmapped factual assertion revise then insufficient; deterministic citation; `test_synthesis_budget_overflow_persists_grounded_derived_evidence`; and `test_synthesis_only_existing_evidence_revalidates_current_uses_without_research`. Keep pasted-text Write disabled in v2 until a separate frozen-spec amendment defines its non-evidence success semantics; this plan does not invent that exception.
 
 ```bash
 cd backend && pytest tests/agents/v2/fast_paths/test_domain_paths.py tests/agents/v2/test_evaluation_grounding.py -q
@@ -180,15 +243,23 @@ Expected: FAIL before evaluation, grounding, and domain modules exist.
 - [ ] **Step 2: Implement deterministic evaluation**
 
 ```python
-def evaluate_evidence(plan: TaskPlan, bindings: DocumentBindingSet, results: tuple[AgentResult, ...], uses: tuple[EvidenceUse, ...]) -> EvidenceEvaluation:
-    coverage = build_coverage(plan, bindings, results, uses)
+async def evaluate_evidence(semantic: SemanticContext, plan: TaskPlan, bindings: DocumentBindingSet, results: tuple[AgentResult, ...], use_refs: tuple[EvidenceUseRef, ...], runtime: GraphRuntimeContext) -> EvidenceEvaluation:
+    hydrated = await runtime.services.evidence_hydrator.hydrate_for_evaluation(use_refs, plan, bindings, runtime.capability_runtime)
+    coverage = build_coverage(plan, bindings, results, hydrated)
     missing = find_missing_requirements(plan, coverage)
-    contradictions = find_contradictions(uses)
-    status = "sufficient" if not missing and not _blocking(contradictions) else "insufficient"
+    contradictions = analyze_contradictions(hydrated)
+    if semantic.blocking_ambiguities or has_needs_input_result(results):
+        status = "needs_input"
+    elif has_blocking_conflict(contradictions):
+        status = "contradictory"
+    elif missing:
+        status = "insufficient"
+    else:
+        status = "sufficient"
     return EvidenceEvaluation(status=status, coverage=coverage, missing=missing, contradictions=contradictions)
 ```
 
-Define `build_coverage`, `find_missing_requirements`, `find_contradictions`, and `_blocking` in the same module; source search never emits read outcome.
+Define each helper in the same module. Governed hydration resolves EvidenceUse→EvidenceRecord and checks current ACL, retention, source availability, revision, locator, and derived validation before contradiction analysis; EvidenceUse identity alone is never analyzed as content. Deterministic precedence is `needs_input` → `contradictory` → `insufficient` → `sufficient`. Search never emits read coverage.
 
 - [ ] **Step 3: Implement authorized hydration and use-bound claims**
 
@@ -202,7 +273,7 @@ Expected: hydration and grounding tests pass.
 
 - [ ] **Step 4: Implement independent domain graphs**
 
-Each domain graph accepts typed input and returns typed output without reading root state. Pasted-text Write returns validated WriteOutput directly as non-factual response; any Write request with retrieved sources enters normal evaluation/grounding.
+Each enabled domain graph accepts typed input and returns typed output without reading root state. People, Document, Section, and KG are enabled in this phase. The router returns a typed unavailable response for Write until an approved frozen-spec amendment defines its evidence semantics; do not implement a plan-only business-contract exception. Source-backed Write, once enabled, follows normal evaluation/grounding.
 
 ```bash
 cd backend && pytest tests/agents/v2/fast_paths/test_domain_paths.py -q
@@ -319,7 +390,7 @@ def create_supervisor_v2_graph(checkpointer: BaseCheckpointSaver) -> CompiledSta
     return graph.compile(checkpointer=checkpointer)
 ```
 
-`app.main.lifespan` owns `async with create_v2_checkpointer(settings.DATABASE_URL) as saver:` for the entire serving lifetime. After `check_v2_checkpoint_schema(saver)` passes, it calls `initialize_supervisor_v2_graph(saver)`; shutdown first rejects new v2 resolution, awaits active graph calls, calls `close_supervisor_v2_graph()`, then exits the saver context. `get_supervisor_v2_graph()` returns only the initialized compiled singleton and never opens a saver itself. Define `_add_supervisor_edges` in this module. `direct` and grounded paths converge on `finalizer`. `complex_boundary` is a real selected edge whose node emits a typed non-success `COMPLEX_RESEARCH_UNAVAILABLE` FinalResponse until Phase 3 replaces only that node implementation; the route is never missing and never throws an unhandled disabled exception.
+`app.main.lifespan` owns `async with create_v2_checkpointer(settings.CHECKPOINT_DATABASE_URL) as saver:` for the entire serving lifetime. After `check_v2_checkpoint_schema(saver)` passes, it calls `initialize_supervisor_v2_graph(saver)`; shutdown first rejects new v2 resolution, awaits active graph calls, calls `close_supervisor_v2_graph()`, then exits the saver context. `get_supervisor_v2_graph()` returns only the initialized compiled singleton and never opens a saver itself. Define `_add_supervisor_edges` in this module. `direct` and grounded paths converge on `finalizer`. `complex_boundary` is a real selected edge whose node emits a typed non-success `COMPLEX_RESEARCH_UNAVAILABLE` FinalResponse until Phase 3 replaces only that node implementation; the route is never missing and never throws an unhandled disabled exception.
 
 - [ ] **Step 4: Run and commit**
 
@@ -363,7 +434,7 @@ Stop for HIGH/CRITICAL risk pending review.
 
 - [ ] **Step 2: Write selector tests**
 
-Assert default v1, invalid config fail-fast, factories imported lazily, no graph constructed at module import, standalone/session/Telegram use `resolve_agent_graph`, v2 schema/checkpoint compatibility is checked before any configured selection, v2 raw text persists before normalization, and request scope is authenticated scope intersect requested scope. Assert ordinary client `X-Agent-Graph-Version` is ignored. Assert only an authenticated admin principal may call the evaluation endpoint that explicitly selects v1/v2; non-admin receives 403.
+Assert default v1, invalid config fail-fast, factories imported lazily, no graph constructed at module import, standalone/session/Telegram use `resolve_agent_graph`, v2 schema/checkpoint compatibility is checked before any configured selection, v2 raw text persists before normalization, and request scope is authenticated scope intersect requested scope. Assert ordinary client `X-Agent-Graph-Version` is ignored. Assert only an authenticated admin principal may call the evaluation endpoint that explicitly selects v1/v2; non-admin receives 403. Import `from app.api.agent_admin import run_agent_evaluation` and assert the admin route is bound to that handler so the Phase-3 impact target is stable.
 
 ```bash
 cd backend && pytest tests/api/test_agent_runtime_selector.py tests/api/test_agent_v2_ingress.py -q
@@ -385,7 +456,7 @@ async def resolve_agent_graph(version: AgentGraphVersion):
     return await get_supervisor_v2_graph()
 ```
 
-Settings validates `NEXUSRAG_AGENT_GRAPH_VERSION` and defaults to `v1`. `resolve_agent_graph("v2")` first awaits `require_v2_schema_ready()` for both v2 model tables and AsyncPostgresSaver tables. Entrypoints await the resolver only after authentication/raw message persistence and build current runtime context separately. They never read a client graph-version header. `POST /api/admin/agent-evaluation/run` uses the existing admin authorization dependency, accepts a validated server-side arm, performs the same schema check for v2, and is the sole per-request arm override used by the Phase-3 A/B driver.
+Settings validates `NEXUSRAG_AGENT_GRAPH_VERSION` and defaults to `v1`. `resolve_agent_graph("v2")` first awaits `require_v2_schema_ready()` for both v2 model tables and AsyncPostgresSaver tables. Entrypoints await the resolver only after authentication/raw message persistence and build current runtime context separately. They never read a client graph-version header. `POST /api/admin/agent-evaluation/run` is served by `async def run_agent_evaluation(...)` in `backend/app/api/agent_admin.py` (this exact name is the Phase-3 impact target). It uses the existing admin authorization dependency, accepts a validated server-side arm, performs the same schema check for v2, and is the sole per-request arm override used by the Phase-3 A/B driver.
 
 - [ ] **Step 4: Run and commit**
 

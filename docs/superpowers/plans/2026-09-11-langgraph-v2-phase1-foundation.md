@@ -4,7 +4,7 @@
 
 **Goal:** Establish immutable revision storage, canonical v2 contracts, governed evidence/checkpoint persistence, and typed adapters before any v2 graph executes.
 
-**Architecture:** Apply the first v2 DDL from an isolated raw-SQL migration before importing/registering any v2 ORM model into startup metadata. On a populated legacy database the locked migration adds nullable revision links, allocates and backfills one baseline revision per reconstructable document (including images/tables), validates the backfill, and only then installs foreign keys/non-null/current-pointer constraints; a subsequent code step registers ORM mappings that match the already-migrated schema. Ingestion then allocates drafts, builds revision-qualified artifacts, verifies them, and atomically publishes; retrieval always selects an explicit published revision.
+**Architecture:** Deliver four ordered releases: 1A deploys an isolated raw-SQL migration runner with no v2 ORM registration; 1B registers mappings only after schema readiness and never runs v2 startup DDL; 1C moves processing state and all SQL/object/vector/KG artifacts to immutable revisions with explicit build profiles; 1D adds frozen contracts, governed evidence/checkpoint persistence, and adapters. Existing legacy artifacts remain v1-only until a full revision-aware reindex publishes the first v2-ready revision.
 
 **Tech Stack:** Python 3.11, Pydantic v2, async SQLAlchemy/PostgreSQL 15, RabbitMQ, MinIO, Chroma, AsyncPostgresSaver, pytest, Docker Compose.
 
@@ -14,13 +14,72 @@
 
 - Phase 0 winner and exact runtime/checkpointer pins must be committed first.
 - Do not implement binding/evidence/coverage against mutable current-document artifacts.
-- The initial v2 migration must run before v2 models or revision columns are imported into `Base.metadata`; unlocked startup `create_all()` must never create/mutate v2 tables or columns.
+- Release 1A migration runner must deploy and apply before release 1B imports v2 mappings into `Base.metadata`; unlocked startup `create_all()` must never create/mutate v2 tables or columns.
 - Every path that can select v2 must call the same schema compatibility check first.
 - Published revisions and their artifacts are immutable; reindex is copy-on-write.
 - Before editing an existing symbol, run the qualified GitNexus impact command named by the task; stop on HIGH/CRITICAL risk.
 - Before each commit run compare-scope `detect-changes` and stage only that task's paths.
 
 ---
+
+### Task 0: Verify Phase-1 Repository and Dependency Preconditions
+
+**Files:**
+- Read: all Modify paths and named symbols in this plan
+- Test: shell preflight only
+
+**Interfaces:**
+- Produces: a recorded preflight manifest proving paths/symbols/imports before Release 1A begins.
+
+- [ ] **Step 1: Verify repository paths and module conflicts**
+
+```bash
+set -e
+for path in backend/app/main.py backend/app/models/document.py backend/app/api/documents.py backend/app/api/minio_events.py backend/app/api/rag.py backend/app/queue/messages.py backend/app/workers/parse_worker.py backend/app/workers/caption_worker.py backend/app/workers/embed_worker.py backend/app/workers/kg_worker.py backend/app/services/storage_service.py backend/app/services/embedding/vector_store.py backend/app/services/retrieval/hrag_service.py backend/app/services/agent/tools.py; do test -e "$path"; done
+test ! -e backend/app/services/agents/v2/persistence/migrate.py
+test ! -e backend/app/models/document_revision.py
+rg -n 'embed_done|captions_done|kg_done|raw_chunks_json|markdown_s3_key|delete.*Document(Image|Table)|delete_by_document_id|dimension' backend/app
+python - <<'PY'
+import re, pathlib
+plan = pathlib.Path('docs/superpowers/plans/2026-09-11-langgraph-v2-phase1-foundation.md').read_text()
+modify = [p.split(':')[0] for p in re.findall(r'^- Modify: `([^`]+)`', plan, re.M)]
+create = [p.split(':')[0] for p in re.findall(r'^- Create: `([^`]+)`', plan, re.M)]
+missing = [p for p in modify if not pathlib.Path(p).exists()]
+conflict = [p for p in create if pathlib.Path(p).exists()]
+assert not missing and not conflict, {'missing': missing, 'conflict': conflict}
+print(f'phase1 paths ok: {len(set(modify))} modify, {len(set(create))} create')
+PY
+```
+
+Expected: every Modify path exists, Create paths do not conflict, and output captures all legacy state/destructive seams. Stop on drift.
+
+- [ ] **Step 2: Verify selected dependencies and exact symbols**
+
+```bash
+cd backend && python - <<'PY'
+from inspect import signature
+from langgraph.graph import StateGraph
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+assert "context_schema" in signature(StateGraph).parameters
+print(AsyncPostgresSaver)
+PY
+node .gitnexus/run.cjs query --query "document upload parse caption embed KG reindex retrieval deletion lifecycle" || true
+```
+
+Expected: imports/API pass; record exact GitNexus-returned symbol names and use those—not guessed names—in each later impact command.
+
+- [ ] **Step 3: Confirm clean phase start**
+
+```bash
+git diff --check
+git status --short
+```
+
+Expected: only intentional plan/execution changes; `.orca/` remains untracked.
+
+---
+
+## Release 1A — Raw-SQL Migration Runner Only
 
 ### Task 1: Install the Isolated Populated-Database Migration Before ORM Registration
 
@@ -34,13 +93,13 @@
 
 - [ ] **Step 1: Write the populated-legacy-schema integration test**
 
-Create a PostgreSQL test schema using the pre-v2 `documents`, `document_images`, and `document_tables` shape; insert two documents plus image/table children and current mutable artifact metadata. Run `apply_v2_schema`, then assert: one published baseline revision per reconstructable document; every child row points to its document's baseline revision; `documents.current_revision_id` points to it; all three link columns are non-null and foreign-keyed only after backfill; an unreconstructable document is explicitly marked unavailable rather than falsely pinned; rerun is idempotent. Instrument executed SQL and assert `ADD COLUMN ... NULL` occurs before baseline allocation/update, validation queries return zero or abort, and `SET NOT NULL`/FK/current-pointer enforcement occurs last.
+Create a PostgreSQL test schema using populated pre-v2 `documents`, `document_images`, and `document_tables`. Run `apply_v2_schema`, then assert: schema/version and empty revision tables exist; nullable revision links/current pointer exist; every legacy row remains untouched and v1-readable; no legacy Chroma/KG/object/SQL artifact is falsely marked revision-ready; all legacy `current_revision_id` values remain null until full revision-aware reindex; rerun is idempotent. Instrument SQL and assert the migration takes its advisory lock before DDL and never imports ORM metadata, calls `create_all`, deletes legacy rows, or invents a baseline published revision.
 
 Run `cd backend && pytest tests/migrations/v2/test_populated_legacy_migration.py tests/migrations/v2/test_migration_control.py -q`; expect import failure.
 
 - [ ] **Step 2: Implement the locked migration in exact safe order**
 
-`apply_v2_schema` uses SQLAlchemy text/DDL only, takes `pg_advisory_xact_lock`, and never imports `app.models` or calls `Base.metadata.create_all`. In one transaction it: (1) creates version/revision/structure tables; (2) adds nullable `documents.current_revision_id`, `document_images.revision_id`, and `document_tables.revision_id`; (3) allocates a deterministic baseline revision for each reconstructable existing document and snapshots immutable workspace/artifact/structure ownership; (4) updates every existing image/table and current pointer; (5) aborts unless orphan/null/mismatched-workspace validation queries return zero; (6) installs FKs, unique indexes, and `NOT NULL` on image/table revision links; and (7) writes schema version 1. Documents that cannot produce trustworthy stable locators remain unavailable to v2 and have a null current pointer; the document pointer therefore remains nullable by design.
+`apply_v2_schema` uses SQLAlchemy text/DDL only, takes `pg_advisory_xact_lock`, and never imports `app.models` or calls `Base.metadata.create_all`. In one transaction it: (1) creates version/revision/build/structure tables; (2) adds nullable `documents.current_revision_id`, `document_images.revision_id`, and `document_tables.revision_id`; (3) installs foreign keys and revision uniqueness without imposing NOT NULL on legacy child rows; (4) installs DB constraints/triggers requiring revision IDs for rows written through the revision-owned pipeline; (5) verifies existing row counts/checksums are unchanged; and (6) writes schema version 1. Legacy rows stay v1-only and cannot be selected by v2. A full revision-aware reindex later creates new revision-owned child rows and atomically sets `current_revision_id`.
 
 - [ ] **Step 3: Prove no startup metadata registration exists yet**
 
@@ -57,11 +116,16 @@ git commit -m "feat: migrate populated databases to revision storage"
 
 ---
 
+## Release 1B — Post-Migration ORM and Readiness
+
+Deploy Release 1A, run the migration command, and verify schema version 1 before building/deploying this release. `AUTO_CREATE_TABLES` remains available only for the explicit legacy-table allowlist; it cannot create or alter v2 tables.
+
 ### Task 2: Register ORM Models Only After Schema Version 1 Is Applied
 
 **Files:**
 - Create: `backend/app/models/v2_registry.py`
 - Create: `backend/app/models/document_revision.py`
+- Create: `backend/app/models/document_revision_build.py`
 - Create: `backend/app/models/document_revision_chunk.py`
 - Create: `backend/app/models/conversation_snapshot.py`
 - Create: `backend/app/models/semantic_snapshot.py`
@@ -88,35 +152,39 @@ impact({target: "app.models.document.DocumentTable", direction: "upstream"})
 
 - [ ] **Step 2: Write metadata/readiness tests**
 
-Assert model nullability matches the completed migration (`Document.current_revision_id` nullable; image/table revision IDs non-null), all FKs resolve, exact schema version 1 is required before application startup imports/uses repositories, and `LEGACY_STARTUP_TABLES` excludes every v2 table. Against a fresh legacy schema, importing models must not be followed by startup mutation: lifespan reports the migration command and exits before `create_all` if required mapped columns/version are absent.
+Assert mappings match completed migration (`Document.current_revision_id` and legacy image/table revision IDs remain nullable; revision-pipeline inserts require revision ownership through DB constraints), all FKs resolve, exact schema version 1 is required before v2 repositories initialize, and `LEGACY_STARTUP_TABLES` excludes every v2 table. Against a fresh legacy schema, lifespan reports the Release-1A migration command and exits before startup table creation. With schema version 1, legacy `AUTO_CREATE_TABLES` may create only allowlisted legacy tables and emits no v2 DDL.
 
 - [ ] **Step 3: Register post-migration ORM mappings and gate startup**
 
-Define the revision and v2 persistence models, map the already-existing columns, and register them in `app.models.__init__` only in this post-migration deployment step. Replace unrestricted `Base.metadata.create_all()` with `Base.metadata.create_all(tables=LEGACY_STARTUP_TABLES)`. `lifespan` checks exact v2 schema compatibility before model-backed v2 services initialize; it never invokes v2 migration or DDL. EvidenceUse null-safe uniqueness is represented as an index matching Task-1 SQL.
+Define revision/build and v2 persistence models, map only already-existing columns, and register them in `app.models.__init__` only in this post-migration release. Replace unrestricted `Base.metadata.create_all()` with `Base.metadata.create_all(tables=LEGACY_STARTUP_TABLES)`. `lifespan` checks exact compatibility before v2 services initialize; it never invokes v2 migration or DDL. EvidenceUse null-safe uniqueness maps the Task-1 SQL index.
 
 - [ ] **Step 4: Test and commit**
 
 ```bash
 cd backend && pytest tests/migrations/v2/test_populated_legacy_migration.py tests/migrations/v2/test_model_metadata.py tests/migrations/v2/test_migration_control.py -q
 node .gitnexus/run.cjs detect-changes --scope compare --base-ref main
-git add backend/app/models/v2_registry.py backend/app/models/document_revision.py backend/app/models/document_revision_chunk.py backend/app/models/conversation_snapshot.py backend/app/models/semantic_snapshot.py backend/app/models/binding_audit.py backend/app/models/evidence_record.py backend/app/models/evidence_use.py backend/app/models/document.py backend/app/models/__init__.py backend/app/main.py backend/tests/migrations/v2/test_model_metadata.py
+git add backend/app/models/v2_registry.py backend/app/models/document_revision.py backend/app/models/document_revision_build.py backend/app/models/document_revision_chunk.py backend/app/models/conversation_snapshot.py backend/app/models/semantic_snapshot.py backend/app/models/binding_audit.py backend/app/models/evidence_record.py backend/app/models/evidence_use.py backend/app/models/document.py backend/app/models/__init__.py backend/app/main.py backend/tests/migrations/v2/test_model_metadata.py
 git commit -m "feat: register post-migration v2 models"
 ```
 
 ---
 
-### Task 3: Implement Draft Allocation and Atomic Publication Repository
+## Release 1C — Revision-Owned Build State and Artifacts
+
+Deploy only after Release 1B readiness passes. From this release onward every worker decision is keyed by `revision_id`; legacy Document status fields may remain UI/v1 projections but never determine whether revision work runs or skips.
+
+### Task 3: Implement Revision-Owned Build Profiles, State, and Atomic Publication
 
 **Files:**
 - Create: `backend/app/services/agents/v2/persistence/document_revisions.py`
 - Test: `backend/tests/agents/v2/persistence/test_document_revisions.py`
 
 **Interfaces:**
-- Produces: `allocate_draft`, `record_artifacts`, `verify_draft`, `publish`, `get_published`, `mark_source_deleted`.
+- Produces: internal `RevisionBuildProfile = FULL | CHAT_UPLOAD | PARSE_ONLY`, `allocate_draft`, `record_worker_state`, `record_artifacts`, `verify_draft`, `publish`, `get_published`, `mark_source_deleted`.
 
 - [ ] **Step 1: Write lifecycle tests**
 
-Test `allocate → build metadata → verify → publish`, rejection when any object/vector/structure artifact is missing, publish transaction updating `Document.current_revision_id`, immutable published columns, failed draft leaving prior current revision unchanged, and tombstone lookup.
+Test `allocate → revision-owned build → verify → publish`, profile-specific required artifacts, publish transaction updating `Document.current_revision_id`, immutable published columns, failed draft leaving prior current revision unchanged, and tombstone lookup. Assert R2 does not inherit R1 worker completion. `FULL` requires markdown+structure+vectors and configured caption/KG results; `CHAT_UPLOAD` requires markdown+structure+vectors and records caption/KG as intentionally skipped; `PARSE_ONLY` requires markdown+structure and records vector/caption/KG as intentionally skipped. Skips are not failures.
 
 - [ ] **Step 2: Implement explicit lifecycle**
 
@@ -133,7 +201,7 @@ async def publish(self, revision_id: UUID) -> DocumentRevision:
     return revision
 ```
 
-`verify_draft` checks raw, markdown, structure manifest, images/tables/chunks ownership, and exact vector namespace count before transitioning to verified.
+`DocumentRevision` plus revision-build rows are authoritative for processing state, `embed_done`, `captions_done`, `kg_done`, raw chunk/build manifest, markdown artifact identity, artifact verification, failures, and publication. `Document` may mirror current status for v1/UI only. `verify_draft` consults the immutable profile selected at allocation and checks exactly its required artifacts before transitioning to verified; no worker reads Document completion flags to skip work.
 
 - [ ] **Step 3: Test and commit**
 
@@ -162,7 +230,7 @@ git commit -m "feat: add immutable revision publication lifecycle"
 - Test: `backend/tests/workers/test_revision_pipeline.py`
 
 **Interfaces:**
-- Produces: fresh upload/reindex/minio event allocates one draft before publishing `ParseMessage`; all child messages preserve the same required UUID.
+- Produces: fresh upload/reindex/minio event allocates one draft and build profile before `ParseMessage`; all workers load/write by the same required UUID and never use Document completion flags.
 
 - [ ] **Step 1: Impact-check all producers/consumers with qualified names**
 
@@ -189,11 +257,11 @@ impact({target: "app.workers.utils.check_and_finalize", direction: "upstream"})
 
 - [ ] **Step 2: Write constructor and stale-message tests**
 
-Discover every constructor with `rg 'ParseMessage\(|CaptionMessage\(|EmbedMessage\(|KGMessage\(' backend/app` and make the test fail if an unclassified constructor remains. Parameterize `upload_document`, `presign_upload`→`confirm_upload`, `process_document_background`, `_clone_document_to_workspace`, `handle_minio_event`, `reindex_document`, `publish_parse_task`, and every worker child publish, asserting required `revision_id`. Assert each fresh upload/confirmed upload/clone/reindex allocates a draft before first publish and stale messages cannot publish a newer revision.
+Discover every message constructor and make the test fail if an unclassified caller remains. Parameterize full upload/reindex as `FULL`, chat upload as `CHAT_UPLOAD`, and parse-only entrypoints as `PARSE_ONLY`; assert allocation occurs before first publish and child messages preserve required `revision_id` and profile. Publish R1 then build R2 and assert parse deletes/replaces only `(document_id, R2)` image/table/chunk rows; R1 SQL children remain readable. Assert R1 completion flags cannot make R2 workers skip and stale messages cannot publish a newer revision.
 
 - [ ] **Step 3: Implement allocation and propagation**
 
-All four message models require `revision_id: UUID` with no default. `documents.py`, `minio_events.py`, and `rag.py` call `allocate_draft` before the first queue publish. Workers load exactly that draft, write revision-owned rows/artifacts, and publish child messages with the same UUID. Finalization executes `record_artifacts → verify_draft → publish`; failures mark only that draft failed.
+All four message models require `revision_id: UUID` with no default. Producers select one implementation-internal build profile and allocate before first queue publish. Workers load exactly that revision/build record, scope image/table/chunk replacement to `(document_id, revision_id)`, publish child messages with the same UUID, and update only revision-owned completion/failure state. They never query `Document.embed_done`, `captions_done`, `kg_done`, `raw_chunks_json`, `markdown_s3_key`, or status to decide revision execution. Finalization executes `record_artifacts → profile-aware verify_draft → publish`; failures mark only that draft failed.
 
 - [ ] **Step 4: Compile, test, and commit**
 
@@ -215,6 +283,7 @@ git commit -m "feat: propagate revision through ingestion pipeline"
 - Modify: `backend/app/services/retrieval/deep_retriever.py`
 - Modify: `backend/app/services/retrieval/rag_service.py`
 - Modify: `backend/app/services/retrieval/hrag_service.py`
+- Modify: `backend/app/api/rag.py`
 - Modify: `backend/app/services/agent/tools.py`
 - Modify: `backend/app/services/kg/legal_kg_service.py`
 - Test: `backend/tests/agents/v2/persistence/test_revision_artifacts.py`
@@ -222,7 +291,7 @@ git commit -m "feat: propagate revision through ingestion pipeline"
 - Test: `backend/tests/api/test_revision_reindex_delete.py`
 
 **Interfaces:**
-- Produces: revision-qualified keys/IDs, selected-revision retrieval, stable ContentLocator reconstruction, non-destructive reindex.
+- Produces: revision-qualified SQL/object/vector/KG identities, selected-revision retrieval, explicit legacy-v1/not-ready policy, stable locators, and dimension-safe non-destructive reindex.
 
 - [ ] **Step 1: Impact-check storage/vector/retrieval/delete symbols**
 
@@ -252,22 +321,26 @@ impact({target: "app.api.documents.delete_document", direction: "upstream"})
 
 - [ ] **Step 2: Write revision-selection tests**
 
-Tests assert old artifacts survive reindex; failed draft does not replace current; exact pinned retrieval filters SQL/Chroma/BM25 by selected `revision_id`; current retrieval first resolves `Document.current_revision_id`; image/table/chunk rows belong to that revision; mixed-revision merge is rejected; locator reconstructs from stable `structure_node_id`. `test_revision_live_callers.py` directly exercises `HRAGService.query`, `HRAGService.query_deep`, `search_documents`, `summarize_document`, `get_documents_content`, and `search_document_section`: v2 callers must pass the selected revision through every layer, while the v1 adapter must resolve `Document.current_revision_id` once and preserve today's current-document behavior without accepting an arbitrary client revision.
+Tests publish R1, build/publish R2, and prove R1 images/tables/chunks/markdown/vectors/KG remain readable. Exact retrieval filters SQL/Chroma/BM25/KG by selected revision; mixed-revision merge fails; locators reconstruct from stable structure-node IDs. A populated legacy document with only old Chroma/KG/object artifacts remains v1-readable but v2 binding/retrieval returns `REVISION_NOT_READY`; after full revision-aware reindex v2 succeeds. Simulate a new embedding dimension while R1 vectors exist and assert R2 build fails closed or uses a new dimension namespace without deleting/recreating R1's collection. Prove the destructive reindex seams are gone: `reindex_document` must not pre-delete current revision artifacts or reset Document completion flags before a replacement revision publishes, and `reindex_workspace` must never call `VectorStore.delete_collection()` while published revisions exist. Live-caller tests exercise HRAG and agent tools with selected revision; v1 stays on its named legacy/current adapter.
 
 - [ ] **Step 3: Implement revision-qualified artifacts**
 
-Use `documents/{document_id}/revisions/{revision_id}/...` object keys and `doc_{document_id}_rev_{revision_id}_node_{structure_node_id}` vector IDs. Every vector metadata row contains revision and structure node. Adapt `HRAGService` and agent tool entrypoints to call a shared revision-selected retrieval port. The v2 port requires `revision_id`; a named `CurrentDocumentRetrievalAdapter` used only by v1 resolves `Document.current_revision_id` server-side and then calls that same port. Every vector/BM25/KG retrieval entrypoint filters the selected revision; no fallback to mutable chunks or document-wide KG facts occurs after selection. Reindex no longer deletes old markdown/vector artifacts before build.
+Use revision-qualified object keys, vector IDs/metadata, BM25 corpus entries, and KG provenance. Use an embedding-model/dimension-qualified collection namespace such as `ws_{workspace}_embed_{model_hash}_d{dimension}`; dimension mismatch never calls collection delete/recreate and instead selects a compatible namespace or raises `EmbeddingMigrationRequired`. The v2 port requires a published, artifact-verified revision; it never falls back to legacy chunks/KG. Legacy documents continue through the unchanged v1 retrieval adapter until full revision-aware reindex publishes a ready revision and atomically sets current pointer. Reindex and delete never remove old revision artifacts; GC is the only eligible deletion path. Remove the unconditional workspace collection delete from `reindex_workspace` and the pre-emptive `rag_service.delete_document`/artifact purge from `reindex_document`: both must allocate a new draft revision and publish atomically instead of mutating the current revision in place.
 
 - [ ] **Step 4: Test and commit**
 
 ```bash
 cd backend && pytest tests/agents/v2/persistence/test_revision_artifacts.py tests/agents/v2/persistence/test_revision_live_callers.py tests/api/test_revision_reindex_delete.py -q
 node .gitnexus/run.cjs detect-changes --scope compare --base-ref main
-git add backend/app/services/storage_service.py backend/app/services/embedding/vector_store.py backend/app/services/retrieval/deep_retriever.py backend/app/services/retrieval/rag_service.py backend/app/services/retrieval/hrag_service.py backend/app/services/agent/tools.py backend/app/services/kg/legal_kg_service.py backend/tests/agents/v2/persistence/test_revision_artifacts.py backend/tests/agents/v2/persistence/test_revision_live_callers.py backend/tests/api/test_revision_reindex_delete.py
+git add backend/app/services/storage_service.py backend/app/services/embedding/vector_store.py backend/app/services/retrieval/deep_retriever.py backend/app/services/retrieval/rag_service.py backend/app/services/retrieval/hrag_service.py backend/app/api/rag.py backend/app/services/agent/tools.py backend/app/services/kg/legal_kg_service.py backend/tests/agents/v2/persistence/test_revision_artifacts.py backend/tests/agents/v2/persistence/test_revision_live_callers.py backend/tests/api/test_revision_reindex_delete.py
 git commit -m "feat: select immutable revisions for retrieval"
 ```
 
 ---
+
+## Release 1D — Frozen Contracts, Stores, Checkpoint, and Adapters
+
+Begin only after the Release-1C gate proves at least one revision-ready document and legacy-not-ready rejection. This release does not activate a v2 graph.
 
 ### Task 6: Implement Canonical Contracts and Pure Validators
 
@@ -396,16 +469,17 @@ git commit -m "feat: add evidence and revision garbage collection"
 ### Task 10: Install and Initialize Async PostgreSQL Checkpointing
 
 **Files:**
-- Modify: `backend/requirements.txt`
+- Modify: `backend/app/core/config.py`
+- Modify: `.env.example`
 - Create: `backend/app/services/agents/v2/persistence/checkpoint.py`
 - Test: `backend/tests/agents/v2/persistence/test_checkpoint.py`
 
 **Interfaces:**
-- Produces: `create_v2_checkpointer(database_url) -> AsyncPostgresSaver`, `setup_v2_checkpointer(database_url) -> None`.
+- Produces: validated `CHECKPOINT_DATABASE_URL`, `create_v2_checkpointer(checkpoint_dsn) -> AsyncPostgresSaver`, and `setup_v2_checkpointer(checkpoint_dsn) -> None`.
 
 - [ ] **Step 1: Verify Phase-0 exact pins and write failing tests**
 
-Assert `backend/requirements.txt` contains the Phase-0-recorded exact `langgraph-checkpoint-postgres` and `psycopg[binary,pool]` pins. Tests reject non-Postgres URLs, call saver `setup()` during migration/deployment, pass `thread_id` via configurable metadata, and reject incompatible state versions.
+Assert production requirements contain Phase-0 exact pins. Settings requires a psycopg-compatible `CHECKPOINT_DATABASE_URL=postgresql://...`; tests reject `postgresql+asyncpg://`, absent credentials, and accidental direct reuse of `settings.DATABASE_URL`. Against disposable PostgreSQL, open `AsyncPostgresSaver.from_conn_string(settings.CHECKPOINT_DATABASE_URL)`, run setup, write/read a checkpoint with configurable thread ID, and reject incompatible state versions.
 
 - [ ] **Step 2: Implement async lifecycle**
 
@@ -413,12 +487,13 @@ Assert `backend/requirements.txt` contains the Phase-0-recorded exact `langgraph
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 @asynccontextmanager
-async def create_v2_checkpointer(database_url: str):
-    async with AsyncPostgresSaver.from_conn_string(database_url) as saver:
+async def create_v2_checkpointer(checkpoint_dsn: str):
+    validate_psycopg_dsn(checkpoint_dsn)
+    async with AsyncPostgresSaver.from_conn_string(checkpoint_dsn) as saver:
         yield saver
 
-async def setup_v2_checkpointer(database_url: str) -> None:
-    async with create_v2_checkpointer(database_url) as saver:
+async def setup_v2_checkpointer(checkpoint_dsn: str) -> None:
+    async with create_v2_checkpointer(checkpoint_dsn) as saver:
         await saver.setup()
 ```
 
@@ -430,7 +505,7 @@ Add `checkpoint --setup` and `checkpoint --check` CLI modes; check verifies save
 cd backend && python -m pip check
 cd backend && pytest tests/agents/v2/persistence/test_checkpoint.py -q
 node .gitnexus/run.cjs detect-changes --scope compare --base-ref main
-git add backend/requirements.txt backend/app/services/agents/v2/persistence/checkpoint.py backend/tests/agents/v2/persistence/test_checkpoint.py
+git add backend/app/core/config.py .env.example backend/app/services/agents/v2/persistence/checkpoint.py backend/tests/agents/v2/persistence/test_checkpoint.py
 git commit -m "feat: add async PostgreSQL v2 checkpointing"
 ```
 
@@ -466,7 +541,9 @@ git commit -m "feat: add typed v2 adapters and capabilities"
 node .gitnexus/run.cjs analyze
 ```
 
-## Phase 1 §26 Gate
+## Phase 1 Release and §26 Gates
+
+Deploy in three separate application releases after the Phase-0 dependency release: **A)** migration-runner code only, no v2 ORM registration; run `migrate --apply` and verify schema version; **B)** ORM/readiness code, startup refuses incompatible schema and performs legacy allowlisted `create_all` only; **C)** revision-aware producers/workers with v2 still unselectable; then **D)** contracts/stores/checkpoint/adapters. Never assume migration-only and post-migration mappings deploy atomically.
 
 Phase 1 owns contract/persistence acceptance only; People→Document, synthesis budget overflow, and synthesis-only reuse are not claimed here.
 
@@ -478,4 +555,4 @@ docker exec hrag-backend python -m compileall app/services/agents/v2
 docker compose -f docker-compose.services.yml config --quiet
 ```
 
-Required named coverage: envelope/version strictness, binding/target/task/evidence/use integrity, immutable revision pin/current semantics, revision-requirement relation, EvidenceUse purpose/target rules, governance/expiry/ACL/audit, prompt data isolation at adapters, and incompatible checkpoint rejection.
+Required named coverage: populated-legacy no-fake-baseline migration; exact readiness; FULL/CHAT_UPLOAD/PARSE_ONLY verification; revision-owned worker flags; R1 SQL/object/vector/KG survival while building R2; legacy v1 works while v2 rejects not-ready; dimension mismatch preserves R1; envelope/version strictness; binding/target/task/evidence/use integrity; revision pin/current semantics; governance/expiry/ACL/audit; psycopg checkpoint DSN round-trip; prompt data isolation; and incompatible checkpoint rejection.
