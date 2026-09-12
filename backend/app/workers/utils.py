@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from enum import Enum
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,6 +43,38 @@ logger = logging.getLogger(__name__)
 TERMINAL_REVISION_STATUSES: frozenset[str] = frozenset(
     {"failed", "published", "abandoned"}
 )
+
+
+class FinalizeOutcome(str, Enum):
+    """Outcome of one opportunistic revision finalization.
+
+    - ``PUBLISHED``: the revision is published (it just published, or was
+      already published by a racing stage).
+    - ``NOT_READY``: the build is still incomplete, or another worker raced the
+      revision into a non-ready state. Nothing to do yet.
+    - ``FAILED``: the revision is terminal ``failed``.
+    - ``ABANDONED``: the revision was abandoned (the source was tombstoned).
+    - ``NO_REVISION``: no revision row exists for the id.
+    """
+
+    PUBLISHED = "published"
+    NOT_READY = "not_ready"
+    FAILED = "failed"
+    ABANDONED = "abandoned"
+    NO_REVISION = "no_revision"
+
+
+@dataclass(frozen=True)
+class FinalizeResult:
+    """Result of :func:`finalize_revision_if_complete`.
+
+    ``failure_stage`` / ``failure_class`` are set for ``FAILED`` so the caller
+    can mirror the reason onto the ``Document`` row.
+    """
+
+    outcome: FinalizeOutcome
+    failure_stage: str | None = None
+    failure_class: str | None = None
 
 
 @dataclass(frozen=True)
@@ -262,9 +295,22 @@ async def record_embed_artifacts(
     )
 
 
+def _terminal_finalize_result(revision: DocumentRevision) -> FinalizeResult:
+    """Classify an already-terminal revision for the finalization caller."""
+    if revision.status == "failed":
+        return FinalizeResult(
+            FinalizeOutcome.FAILED,
+            failure_stage=revision.failure_stage,
+            failure_class=revision.failure_class,
+        )
+    if revision.status == "abandoned":
+        return FinalizeResult(FinalizeOutcome.ABANDONED)
+    return FinalizeResult(FinalizeOutcome.PUBLISHED)
+
+
 async def finalize_revision_if_complete(
     revision_id, *, expect_complete: bool = False
-) -> None:
+) -> FinalizeResult:
     """Opportunistically verify + publish a revision whose artifacts are complete.
 
     Safe to call from every worker stage: it is a no-op when the build is
@@ -279,6 +325,10 @@ async def finalize_revision_if_complete(
     later stage will arrive, so the revision would otherwise stay ``building``
     forever. It is logged at error and terminalized via ``mark_failed`` so the
     failure is visible and the revision is never resumed.
+
+    Returns the :class:`FinalizeResult` the caller must mirror onto the
+    ``Document`` row (see :func:`apply_finalize_outcome`): a worker must never
+    mark a document ``INDEXED`` when its revision did not publish.
     """
     from app.core.database import async_session_maker
 
@@ -288,8 +338,10 @@ async def finalize_revision_if_complete(
     async with async_session_maker() as db:
         repo = DocumentRevisionsRepository(db)
         revision = await repo.get(revision_id)
-        if revision is None or revision.status in TERMINAL_REVISION_STATUSES:
-            return
+        if revision is None:
+            return FinalizeResult(FinalizeOutcome.NO_REVISION)
+        if revision.status in TERMINAL_REVISION_STATUSES:
+            return _terminal_finalize_result(revision)
         if revision.status in ("draft", "building"):
             try:
                 await repo.verify_draft(revision_id)
@@ -302,39 +354,92 @@ async def finalize_revision_if_complete(
                         revision_id,
                         exc,
                     )
+                    failure_class = type(exc).__name__
                     try:
                         await repo.mark_failed(
                             revision_id,
                             stage="verify",
-                            error_class=type(exc).__name__,
+                            error_class=failure_class,
                         )
                         await db.commit()
                     except Exception:
                         await db.rollback()
-                return
+                        return FinalizeResult(FinalizeOutcome.NOT_READY)
+                    return FinalizeResult(
+                        FinalizeOutcome.FAILED,
+                        failure_stage="verify",
+                        failure_class=failure_class,
+                    )
+                return FinalizeResult(FinalizeOutcome.NOT_READY)
             except ValueError:
                 # Non-verifiable state (e.g. raced to abandoned) — stop.
-                return
+                return FinalizeResult(FinalizeOutcome.NOT_READY)
 
     # Transaction 2: publish (verified -> published) via the generation CAS.
     async with async_session_maker() as db:
         repo = DocumentRevisionsRepository(db)
         revision = await repo.get(revision_id)
-        if revision is None or revision.status in TERMINAL_REVISION_STATUSES:
-            return
+        if revision is None:
+            return FinalizeResult(FinalizeOutcome.NO_REVISION)
+        if revision.status in TERMINAL_REVISION_STATUSES:
+            return _terminal_finalize_result(revision)
         if revision.status != "verified":
-            return
+            return FinalizeResult(FinalizeOutcome.NOT_READY)
         try:
             revision, outcome = await repo.publish(revision_id)
             await db.commit()
         except RevisionNotPublishable:
-            return
+            return FinalizeResult(FinalizeOutcome.NOT_READY)
         if outcome is PublishOutcome.ABANDONED_SOURCE_DELETED:
             logger.info(
                 "[finalize] revision %s abandoned — source tombstoned",
                 revision_id,
             )
+            return FinalizeResult(FinalizeOutcome.ABANDONED)
+        return FinalizeResult(FinalizeOutcome.PUBLISHED)
 
+
+async def apply_finalize_outcome(document_id, result: FinalizeResult) -> None:
+    """Mirror a finalization outcome onto the ``Document`` row (v1/UI mirror).
+
+    The revision is authoritative: ``INDEXED`` is written ONLY for
+    ``PUBLISHED``, and a revision terminalized ``failed`` mirrors ``FAILED``
+    with the failure stage/class — so a document is never reported indexed
+    while its revision failed. ``NOT_READY`` / ``ABANDONED`` / ``NO_REVISION``
+    leave the mirror untouched (the pipeline outcome is not final).
+    """
+    from app.core.database import async_session_maker
+
+    async with async_session_maker() as db:
+        row = await db.execute(
+            select(Document).where(Document.id == document_id).with_for_update()
+        )
+        fresh = row.scalar_one_or_none()
+        if fresh is None:
+            return
+        # FAILED is terminal — only an admin retry clears it, and its error
+        # message (the original stage failure) is more useful than ours.
+        if fresh.status == DocumentStatus.FAILED:
+            return
+        if result.outcome is FinalizeOutcome.PUBLISHED:
+            if fresh.status != DocumentStatus.INDEXED:
+                fresh.status = DocumentStatus.INDEXED
+                await db.commit()
+                logger.info(
+                    f"[finalize] doc={document_id} → INDEXED (revision published)"
+                )
+            return
+        if result.outcome is FinalizeOutcome.FAILED:
+            fresh.status = DocumentStatus.FAILED
+            fresh.error_message = (
+                f"revision_failed: {result.failure_stage or 'verify'}: "
+                f"{result.failure_class or 'unknown'}"
+            )[:500]
+            await db.commit()
+            logger.error(
+                f"[finalize] doc={document_id} → FAILED "
+                f"(revision {result.failure_stage}:{result.failure_class})"
+            )
 
 
 async def check_and_finalize(
@@ -359,10 +464,15 @@ async def check_and_finalize(
     The status transition above is the **v1/UI mirror** of pipeline progress.
     When ``revision_id`` is supplied, reaching the completion condition also
     finalises the owning revision (``verify_draft`` then ``publish`` in
-    separate transactions, see :func:`finalize_revision_if_complete`). This
-    function is therefore the single publication choke point for a
-    multi-stage build; individual stage execution decisions are made from
-    revision-owned state by each worker, never from these flags.
+    separate transactions, see :func:`finalize_revision_if_complete`) and the
+    mirror status follows the REVISION outcome
+    (:func:`apply_finalize_outcome`): ``INDEXED`` is written only when the
+    revision actually published, and ``FAILED`` when the revision was
+    terminalized by verification. The inline ``INDEXED`` writes below are the
+    legacy path for a message that carries no revision. This function is
+    therefore the single publication choke point for a multi-stage build;
+    individual stage execution decisions are made from revision-owned state by
+    each worker, never from these flags.
     """
     from app.core.database import async_session_maker
 
@@ -383,6 +493,11 @@ async def check_and_finalize(
 
         changed = False
 
+        # A message naming a revision must NOT flip the mirror to INDEXED by
+        # itself: the revision is authoritative and may turn out to be
+        # unpublishable. ``apply_finalize_outcome`` writes the final status.
+        mirror_completes = revision_id is None
+
         # Chat-upload documents: skip KG and caption workers, so only embed_done is needed
         if fresh.is_chat_upload:
             if fresh.embed_done:
@@ -390,7 +505,7 @@ async def check_and_finalize(
                 if fresh.raw_chunks_json is not None:
                     fresh.raw_chunks_json = None
                     changed = True
-                if fresh.status != DocumentStatus.INDEXED:
+                if mirror_completes and fresh.status != DocumentStatus.INDEXED:
                     fresh.status = DocumentStatus.INDEXED
                     changed = True
                     logger.info(
@@ -407,9 +522,9 @@ async def check_and_finalize(
                 fresh.raw_chunks_json = None
                 changed = True
             if fresh.kg_done:
-                # All three done → INDEXED
+                # All three done → revision finalize decides the mirror status
                 completed = True
-                if fresh.status != DocumentStatus.INDEXED:
+                if mirror_completes and fresh.status != DocumentStatus.INDEXED:
                     fresh.status = DocumentStatus.INDEXED
                     changed = True
                     logger.info(
@@ -434,4 +549,7 @@ async def check_and_finalize(
     # required stage reported done, so an incomplete artifact set is a real
     # failure (not "not ready yet").
     if completed and revision_id is not None:
-        await finalize_revision_if_complete(revision_id, expect_complete=True)
+        outcome = await finalize_revision_if_complete(
+            revision_id, expect_complete=True
+        )
+        await apply_finalize_outcome(document.id, outcome)

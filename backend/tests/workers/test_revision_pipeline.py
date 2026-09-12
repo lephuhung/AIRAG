@@ -24,7 +24,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.models.document import Document, DocumentImage, DocumentTable
+from app.models.document import Document, DocumentImage, DocumentStatus, DocumentTable
 from app.models.document_ingestion_attempt import DocumentIngestionAttempt
 from app.models.document_revision import DocumentRevision
 from app.models.source_arrival import SourceArrival
@@ -32,6 +32,7 @@ from app.queue.messages import CaptionMessage, EmbedMessage, KGMessage, ParseMes
 from app.queue.publisher import (
     allocate_clone_revision,
     allocate_commit_and_publish_parse,
+    allocate_commit_and_publish_retry,
     allocate_ingest_revision,
     allocate_reindex_revision,
     record_source_arrival,
@@ -47,6 +48,9 @@ from app.services.agents.v2.persistence.source_identity import (
     resolve_build_profile,
 )
 from app.workers.utils import (
+    FinalizeOutcome,
+    apply_finalize_outcome,
+    check_and_finalize,
     delete_stage_children,
     finalize_revision_if_complete,
     load_revision_caption_targets,
@@ -180,6 +184,15 @@ def _balanced_call(text: str, start: int) -> str:
             if depth == 0:
                 return text[start : i + 1]
     return text[start:]
+
+
+def _function_source(source: str, name: str) -> str:
+    """Return the source of a module-level function definition."""
+    match = re.search(rf"^async def {re.escape(name)}\(", source, re.MULTILINE)
+    assert match is not None, f"{name} not found"
+    following = re.search(r"^(?:@|async def |def )", source[match.end() :], re.MULTILINE)
+    end = match.end() + (following.start() if following else len(source))
+    return source[match.start() : end]
 
 
 def test_all_pipeline_message_constructors_supply_revision_id():
@@ -987,3 +1000,337 @@ async def test_finalize_with_expect_complete_publishes_complete_revision(
         document = await db.get(Document, doc_id)
     assert row.status == "published"
     assert document.current_revision_id == revision_id
+
+
+# ---------------------------------------------------------------------------
+# Admin retry producers — explicit recovery always allocates a new generation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_admin_retry_publishes_new_revision_generation(
+    async_engine, document_factory, monkeypatch
+):
+    """An operator retry allocates a HIGHER generation and publishes its UUID.
+
+    ``ParseMessage`` requires ``revision_id`` + ``build_profile`` with no
+    default, so the superadmin recovery path must publish a lifecycle revision:
+    reusing the prior one would mutate it, and a revision-less payload would
+    raise ValidationError and dead-letter (the operator recovery path would be
+    broken). The allocation must also be committed before the publish, because
+    the worker loads the revision from its own connection.
+    """
+    maker = _session_maker(async_engine)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        key = _doc_key(ws, doc_id)
+        document = await db.get(Document, doc_id)
+        document.upload_s3_key = key
+        document.content_hash = "a" * 64
+        prior, _created = await _allocate_full(db, doc_id, key=key, sha="a" * 64)
+        await _build_and_publish(db, prior, FULL)
+        await db.commit()
+        prior_id = prior.revision_id
+        prior_generation = prior.generation
+    assert prior_generation == 1
+
+    published: dict = {}
+
+    async def spy_publish_parse_task(
+        *, document_id, workspace_id, minio_key, original_filename,
+        revision_id, build_profile,
+    ):
+        published.update(
+            document_id=document_id,
+            revision_id=revision_id,
+            build_profile=build_profile,
+            minio_key=minio_key,
+        )
+        # A separate connection — proves the allocation was COMMITTED.
+        async with maker() as observer:
+            published["revision"] = await observer.get(DocumentRevision, revision_id)
+
+    monkeypatch.setattr(
+        "app.queue.publisher.publish_parse_task", spy_publish_parse_task
+    )
+
+    async with maker() as db:
+        revision, profile = await allocate_commit_and_publish_retry(
+            db,
+            doc_id,
+            workspace_id=ws,
+            object_key=key,
+            original_filename="orig.pdf",
+            size_bytes=1024,
+            content_sha256="a" * 64,
+            etag="a" * 64,
+            previous_revision_id=prior_id,
+        )
+
+    assert revision.revision_id is not None
+    assert revision.generation > prior_generation
+    assert revision.reindex_of_revision_id == prior_id
+    assert profile is FULL
+    # The published payload carries the new revision and a valid profile.
+    assert published["revision_id"] == revision.revision_id
+    assert RevisionBuildProfile(published["build_profile"]) is FULL
+    assert published["minio_key"] == key
+    assert published["revision"] is not None, (
+        "the retry revision must be committed before publish_parse_task runs"
+    )
+    assert published["revision"].status == "draft"
+    # And it is exactly the payload shape the parser now accepts.
+    ParseMessage(
+        document_id=published["document_id"],
+        workspace_id=ws,
+        revision_id=published["revision_id"],
+        build_profile=published["build_profile"],
+        minio_key=published["minio_key"],
+        original_filename="orig.pdf",
+    )
+    # Explicit retry never mutates the prior revision.
+    async with maker() as db:
+        prior_row = await db.get(DocumentRevision, prior_id)
+    assert prior_row.status == "published"
+
+
+@pytest.mark.asyncio
+async def test_admin_retry_resolves_chat_profile_from_real_object_key(
+    async_engine, document_factory, monkeypatch
+):
+    """A ``chat_file_<document_id>`` key retries as ``CHAT_UPLOAD``, never FULL."""
+    maker = _session_maker(async_engine)
+    doc_id = document_factory(is_chat_upload=True)
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        key = _chat_key(ws, doc_id)
+        document = await db.get(Document, doc_id)
+        document.upload_s3_key = key
+        document.content_hash = "b" * 64
+        await db.commit()
+
+    published: dict = {}
+
+    async def spy_publish_parse_task(
+        *, document_id, workspace_id, minio_key, original_filename,
+        revision_id, build_profile,
+    ):
+        published.update(
+            revision_id=revision_id,
+            build_profile=build_profile,
+            minio_key=minio_key,
+        )
+
+    monkeypatch.setattr(
+        "app.queue.publisher.publish_parse_task", spy_publish_parse_task
+    )
+
+    async with maker() as db:
+        revision, profile = await allocate_commit_and_publish_retry(
+            db,
+            doc_id,
+            workspace_id=ws,
+            object_key=key,
+            original_filename="orig.pdf",
+            size_bytes=1024,
+            content_sha256="b" * 64,
+            etag="b" * 64,
+        )
+
+    assert profile is CHAT
+    assert revision.revision_id is not None
+    assert RevisionBuildProfile(published["build_profile"]) is CHAT
+
+
+def test_retry_endpoints_queue_through_revision_allocator():
+    """Every superadmin retry endpoint publishes a revision-aware payload.
+
+    The endpoints live in ``app/api/workers.py`` (imports FastAPI, not
+    available in this bench venv), so this asserts the source-level contract:
+    each of the three recovery endpoints queues through the revision-aware
+    helper, and no ``EXCHANGE_PARSE`` publish in the module is a raw
+    revision-less dict.
+    """
+    source = (
+        Path(__file__).resolve().parents[2] / "app" / "api" / "workers.py"
+    ).read_text(encoding="utf-8")
+
+    for endpoint in (
+        "retry_all_failed",
+        "retry_single_failed",
+        "retry_stuck_documents",
+    ):
+        body = _function_source(source, endpoint)
+        assert "_reset_and_queue_document_retry(" in body, endpoint
+        assert "EXCHANGE_PARSE" not in body, endpoint
+
+    offenders: list[str] = []
+    for match in re.finditer(r"(?<![\w.])publish\(", source):
+        call = _balanced_call(source, match.end() - 1)
+        if "EXCHANGE_PARSE" in call and "revision_id" not in call:
+            line_no = source.count("\n", 0, match.start()) + 1
+            offenders.append(f"app/api/workers.py:{line_no}")
+    assert not offenders, (
+        "EXCHANGE_PARSE publish without revision_id: " + ", ".join(offenders)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Document mirror vs revision outcome — never INDEXED with a failed revision
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_finalize_failure_mirrors_document_failed_not_indexed(
+    async_engine, document_factory, monkeypatch
+):
+    """A revision terminalized by verify must NOT leave its Document INDEXED.
+
+    The parse-only worker path used to set ``INDEXED`` unconditionally right
+    after the finalize call, so a build whose artifacts were incomplete ended
+    up reported indexed while its revision was terminal ``failed``.
+    """
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        revision, profile, _created = await allocate_ingest_revision(
+            db,
+            doc_id,
+            object_key=_doc_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256="c" * 64,
+            version_id="v-1",
+            parse_only=True,
+        )
+        await db.commit()
+        revision_id = revision.revision_id
+    assert profile is PARSE_ONLY
+
+    # No artifacts recorded → verify fails when completion is asserted.
+    result = await finalize_revision_if_complete(revision_id, expect_complete=True)
+    assert result.outcome is FinalizeOutcome.FAILED
+    assert result.failure_stage == "verify"
+    await apply_finalize_outcome(doc_id, result)
+
+    async with maker() as db:
+        document = await db.get(Document, doc_id)
+        row = await db.get(DocumentRevision, revision_id)
+    assert row.status == "failed"
+    assert document.status == DocumentStatus.FAILED
+    assert document.status != DocumentStatus.INDEXED
+    assert "revision_failed" in document.error_message
+
+
+@pytest.mark.asyncio
+async def test_finalize_success_mirrors_document_indexed(
+    async_engine, document_factory, monkeypatch
+):
+    """A published revision still promotes the Document mirror to INDEXED."""
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        revision, profile, _created = await allocate_ingest_revision(
+            db,
+            doc_id,
+            object_key=_doc_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256="d" * 64,
+            version_id="v-1",
+            parse_only=True,
+        )
+        await _record_complete_artifacts(db, revision, profile)
+        await db.commit()
+        revision_id = revision.revision_id
+
+    result = await finalize_revision_if_complete(revision_id, expect_complete=True)
+    assert result.outcome is FinalizeOutcome.PUBLISHED
+    await apply_finalize_outcome(doc_id, result)
+
+    async with maker() as db:
+        document = await db.get(Document, doc_id)
+        row = await db.get(DocumentRevision, revision_id)
+    assert row.status == "published"
+    assert document.status == DocumentStatus.INDEXED
+    assert document.current_revision_id == revision_id
+
+
+@pytest.mark.asyncio
+async def test_check_and_finalize_never_indexes_a_failed_revision(
+    async_engine, document_factory, monkeypatch
+):
+    """The multi-stage choke point commits INDEXED only for a published revision.
+
+    The mirror flags reach completion (chat upload: ``embed_done``) while the
+    revision has no vector manifest, so ``verify_draft`` fails. The Document
+    must end up FAILED, never INDEXED.
+    """
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    doc_id = document_factory(is_chat_upload=True)
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        document = await db.get(Document, doc_id)
+        document.embed_done = True
+        revision, profile, _created = await allocate_ingest_revision(
+            db,
+            doc_id,
+            object_key=_chat_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256="e" * 64,
+            version_id="v-1",
+        )
+        await db.commit()
+        revision_id = revision.revision_id
+    assert profile is CHAT
+
+    async with maker() as db:
+        document = await db.get(Document, doc_id)
+        await check_and_finalize(document, db, revision_id=revision_id)
+
+    async with maker() as db:
+        fresh = await db.get(Document, doc_id)
+        row = await db.get(DocumentRevision, revision_id)
+    assert row.status == "failed"
+    assert fresh.status == DocumentStatus.FAILED
+    assert fresh.status != DocumentStatus.INDEXED
+
+
+@pytest.mark.asyncio
+async def test_check_and_finalize_indexes_a_published_revision(
+    async_engine, document_factory, monkeypatch
+):
+    """The success path is unchanged: mirror complete + publishable → INDEXED."""
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    doc_id = document_factory(is_chat_upload=True)
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        document = await db.get(Document, doc_id)
+        document.embed_done = True
+        revision, profile, _created = await allocate_ingest_revision(
+            db,
+            doc_id,
+            object_key=_chat_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256="f" * 64,
+            version_id="v-1",
+        )
+        await _record_complete_artifacts(db, revision, profile)
+        await db.commit()
+        revision_id = revision.revision_id
+
+    async with maker() as db:
+        document = await db.get(Document, doc_id)
+        await check_and_finalize(document, db, revision_id=revision_id)
+
+    async with maker() as db:
+        fresh = await db.get(Document, doc_id)
+        row = await db.get(DocumentRevision, revision_id)
+    assert row.status == "published"
+    assert fresh.status == DocumentStatus.INDEXED
+    assert fresh.current_revision_id == revision_id

@@ -34,6 +34,8 @@ from app.services.agents.v2.persistence.source_identity import (
 from app.services.parsing.deep_document_parser import DeepDocumentParser
 from app.services.storage_service import get_storage_service
 from app.workers.utils import (
+    FinalizeOutcome,
+    apply_finalize_outcome,
     delete_stage_children,
     finalize_revision_if_complete,
     load_revision_execution,
@@ -333,15 +335,23 @@ async def handle_parse(payload: dict) -> None:
                 # final one for the profile, so incomplete artifacts are a real
                 # failure (verified with expect_complete).
                 await db.commit()
-                await finalize_revision_if_complete(
+                result = await finalize_revision_if_complete(
                     msg.revision_id, expect_complete=True
                 )
-                document.status = DocumentStatus.INDEXED
-                await db.commit()
-                logger.info(
-                    f"[parse_worker] doc={msg.document_id} rev={msg.revision_id} "
-                    f"parse-only — published in {int((time.time() - start) * 1000)}ms"
-                )
+                # The document must never read INDEXED unless the revision
+                # actually published; a verify failure mirrors FAILED.
+                await apply_finalize_outcome(msg.document_id, result)
+                if result.outcome is FinalizeOutcome.PUBLISHED:
+                    logger.info(
+                        f"[parse_worker] doc={msg.document_id} rev={msg.revision_id} "
+                        f"parse-only — published in {int((time.time() - start) * 1000)}ms"
+                    )
+                else:
+                    logger.error(
+                        f"[parse_worker] doc={msg.document_id} rev={msg.revision_id} "
+                        f"parse-only — finalize outcome={result.outcome.value} "
+                        f"({result.failure_stage}:{result.failure_class})"
+                    )
             elif profile is RevisionBuildProfile.CHAT_UPLOAD:
                 # Chat-upload: parse → embed (skip KG and caption for speed)
                 await mq.publish(

@@ -605,6 +605,19 @@ async def retry_dead_letter_messages(
 
                 if original_exchange:
                     payload = json.loads(payload_str)
+                    if (
+                        original_exchange == EXCHANGE_PARSE
+                        and not payload.get("revision_id")
+                    ):
+                        # ParseMessage requires a revision UUID with no default,
+                        # so replaying a pre-revision payload would dead-letter
+                        # straight back here. Skip it (logged) instead of
+                        # ping-ponging an unprocessable message.
+                        logger.warning(
+                            "Skipping DLQ parse message without revision_id "
+                            f"(routing_key={original_routing_key})"
+                        )
+                        continue
                     # Reset retry count
                     await publish(original_exchange, original_routing_key, payload)
                     retried += 1
@@ -745,13 +758,80 @@ async def purge_queue(queue_name: str, user: User = Depends(require_superadmin))
         raise HTTPException(status_code=503, detail=f"Failed to purge queue: {exc}")
 
 
+async def _reset_and_queue_document_retry(
+    db: AsyncSession, doc: Document, *, error_message: str | None
+) -> bool:
+    """Reset a document's v1/UI mirror and queue a NEW revision generation.
+
+    An operator retry is an explicit user action, so it never resumes or
+    mutates the document's prior revision: it allocates a higher generation
+    through :func:`allocate_commit_and_publish_retry` (which commits the
+    allocation before publishing a revision-aware ``ParseMessage``). The
+    ``Document`` completion flags are only the v1/UI mirror — the revision is
+    what the workers execute — but they are still reset so the UI does not show
+    stale progress.
+
+    Returns True when a parse task was queued. A document with no
+    ``upload_s3_key`` has no MinIO object to re-parse and is skipped (leaving
+    its status untouched), as is a document whose publish failed (left FAILED
+    so the operator can retry again).
+    """
+    if not doc.upload_s3_key:
+        logger.warning(
+            f"[workers] retry: doc={doc.id} has no upload_s3_key — skipped"
+        )
+        return False
+
+    doc.status = DocumentStatus.PENDING
+    doc.error_message = error_message
+    doc.embed_done = False
+    doc.captions_done = False
+    doc.kg_done = False
+    await db.commit()
+
+    from app.api.documents import _parse_only_mode
+    from app.queue.publisher import allocate_commit_and_publish_retry
+
+    try:
+        revision, profile = await allocate_commit_and_publish_retry(
+            db,
+            doc.id,
+            workspace_id=doc.workspace_id,
+            object_key=doc.upload_s3_key,
+            original_filename=doc.original_filename or doc.filename,
+            size_bytes=doc.file_size or 0,
+            content_sha256=doc.content_hash or "",
+            etag=doc.content_hash or doc.upload_s3_key,
+            previous_revision_id=doc.current_revision_id,
+            parse_only=_parse_only_mode(),
+        )
+    except Exception as exc:
+        logger.error(
+            f"[workers] retry: failed to queue doc={doc.id}: {exc}",
+            exc_info=True,
+        )
+        # The helper already terminalized the committed draft; mirror FAILED so
+        # the document is not left PENDING with no message queued.
+        await db.rollback()
+        doc.status = DocumentStatus.FAILED
+        doc.error_message = f"retry_publish_failed: {str(exc)[:400]}"
+        await db.commit()
+        return False
+
+    logger.info(
+        f"[workers] retry: doc={doc.id} queued rev={revision.revision_id} "
+        f"gen={revision.generation} profile={profile.value}"
+    )
+    return True
+
+
 @router.post("/retry-failed")
 async def retry_all_failed(
     workspace_id: uuid.UUID | None = None,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_superadmin),
 ):
-    """Reset all FAILED documents to PENDING and republish ParseMessage."""
+    """Reset all FAILED documents to PENDING and queue a new revision each."""
     query = select(Document).where(Document.status == DocumentStatus.FAILED)
     if workspace_id is not None:
         query = query.where(Document.workspace_id == workspace_id)
@@ -761,26 +841,8 @@ async def retry_all_failed(
 
     count = 0
     for doc in failed_docs:
-        doc.status = DocumentStatus.PENDING
-        doc.error_message = None
-        doc.embed_done = False
-        doc.captions_done = False
-        doc.kg_done = False
-        await db.commit()
-
-        # Republish parse task
-        await publish(
-            EXCHANGE_PARSE,
-            "parse",
-            {
-                "document_id": doc.id,
-                "workspace_id": doc.workspace_id,
-                "minio_key": doc.upload_s3_key or doc.filename,
-                "original_filename": doc.original_filename or doc.filename,
-                "is_chat_upload": doc.is_chat_upload,
-            },
-        )
-        count += 1
+        if await _reset_and_queue_document_retry(db, doc, error_message=None):
+            count += 1
 
     return {"status": "ok", "retried_count": count}
 
@@ -791,7 +853,7 @@ async def retry_single_failed(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(require_superadmin),
 ):
-    """Reset a single FAILED document to PENDING and republish ParseMessage."""
+    """Reset a single FAILED document to PENDING and queue a new revision."""
     result = await db.execute(select(Document).where(Document.id == document_id))
     doc = result.scalar_one_or_none()
     if doc is None:
@@ -799,24 +861,16 @@ async def retry_single_failed(
     if doc.status != DocumentStatus.FAILED:
         raise HTTPException(status_code=400, detail="Document is not in FAILED status")
 
-    doc.status = DocumentStatus.PENDING
-    doc.error_message = None
-    doc.embed_done = False
-    doc.captions_done = False
-    doc.kg_done = False
-    await db.commit()
-
-    await publish(
-        EXCHANGE_PARSE,
-        "parse",
-        {
-            "document_id": doc.id,
-            "workspace_id": doc.workspace_id,
-            "minio_key": doc.upload_s3_key or doc.filename,
-            "original_filename": doc.original_filename or doc.filename,
-            "is_chat_upload": doc.is_chat_upload,
-        },
-    )
+    queued = await _reset_and_queue_document_retry(db, doc, error_message=None)
+    if not queued:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to queue document retry: the document has no uploaded "
+                "source object, or the parse task could not be published — "
+                "see server logs"
+            ),
+        )
 
     return {"status": "ok", "document_id": document_id}
 
@@ -896,26 +950,21 @@ async def retry_stuck_documents(
     stuck_docs = result.scalars().all()
 
     retried = 0
+    previous_statuses: dict[uuid.UUID, str] = {}
     for doc in stuck_docs:
-        doc.status = DocumentStatus.PENDING
-        doc.error_message = f"stuck_retry: was {doc.status.value}, reset at {time.strftime('%Y-%m-%d %H:%M:%S')}"
-        doc.embed_done = False
-        doc.captions_done = False
-        doc.kg_done = False
-        await db.commit()
-
-        await publish(
-            EXCHANGE_PARSE,
-            "parse",
-            {
-                "document_id": doc.id,
-                "workspace_id": doc.workspace_id,
-                "minio_key": doc.upload_s3_key or doc.filename,
-                "original_filename": doc.original_filename or doc.filename,
-                "is_chat_upload": doc.is_chat_upload,
-            },
+        previous_status = (
+            doc.status.value if hasattr(doc.status, "value") else doc.status
         )
-        retried += 1
+        previous_statuses[doc.id] = previous_status
+        if await _reset_and_queue_document_retry(
+            db,
+            doc,
+            error_message=(
+                f"stuck_retry: was {previous_status}, "
+                f"reset at {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            ),
+        ):
+            retried += 1
 
     return {
         "status": "ok",
@@ -924,7 +973,7 @@ async def retry_stuck_documents(
             {
                 "id": str(doc.id),
                 "filename": doc.original_filename or doc.filename,
-                "previous_status": doc.status.value if hasattr(doc.status, "value") else doc.status,
+                "previous_status": previous_statuses.get(doc.id),
             }
             for doc in stuck_docs
         ],

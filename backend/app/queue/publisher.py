@@ -252,45 +252,28 @@ async def publish_parse_task(
     )
 
 
-async def allocate_commit_and_publish_parse(
+async def _commit_and_publish_parse(
     db: AsyncSession,
-    document_id: uuid.UUID,
+    revision: DocumentRevision,
+    profile: RevisionBuildProfile,
     *,
+    document_id: uuid.UUID,
     workspace_id: uuid.UUID,
     object_key: str,
     original_filename: str,
-    size_bytes: int,
-    content_sha256: str,
-    bucket: str | None = None,
-    version_id: str | None = None,
-    etag: str | None = None,
-    parse_only: bool = False,
-) -> tuple[DocumentRevision, RevisionBuildProfile, bool]:
-    """Allocate → COMMIT → publish the parse task for one ingest event.
+) -> None:
+    """Committing publish of an already-allocated parse revision.
 
-    The allocation is idempotent (``get_or_create_ingestion_attempt``), so a
-    duplicate ``/confirm`` / direct upload racing a webhook-derived caller
-    converges on the same draft. The commit is NOT optional: ``AsyncSession``
-    is not autocommit and the request unit-of-work rolls back on return, so a
-    merely-flushed revision would vanish and the worker would dead-letter the
-    published message as ``unknown_revision``. Committing first also makes the
-    draft durable before another connection (the worker) can observe it.
+    The commit is NOT optional: ``AsyncSession`` is not autocommit and the
+    request unit-of-work rolls back on return, so a merely-flushed revision
+    would vanish and the worker would dead-letter the published message as
+    ``unknown_revision``. Committing first also makes the draft durable before
+    another connection (the worker) can observe it.
 
     On publish failure the committed draft is marked ``failed`` (terminal) and
     the exception is re-raised, so the caller can mirror the failure onto the
-    ``Document`` row. Returns ``(revision, build_profile, created)``.
+    ``Document`` row.
     """
-    revision, profile, created = await allocate_ingest_revision(
-        db,
-        document_id,
-        object_key=object_key,
-        size_bytes=size_bytes,
-        content_sha256=content_sha256,
-        bucket=bucket,
-        version_id=version_id,
-        etag=etag,
-        parse_only=parse_only,
-    )
     await db.commit()
     try:
         await publish_parse_task(
@@ -315,7 +298,105 @@ async def allocate_commit_and_publish_parse(
         except Exception:
             await db.rollback()
         raise
+
+
+async def allocate_commit_and_publish_parse(
+    db: AsyncSession,
+    document_id: uuid.UUID,
+    *,
+    workspace_id: uuid.UUID,
+    object_key: str,
+    original_filename: str,
+    size_bytes: int,
+    content_sha256: str,
+    bucket: str | None = None,
+    version_id: str | None = None,
+    etag: str | None = None,
+    parse_only: bool = False,
+) -> tuple[DocumentRevision, RevisionBuildProfile, bool]:
+    """Allocate → COMMIT → publish the parse task for one ingest event.
+
+    The allocation is idempotent (``get_or_create_ingestion_attempt``), so a
+    duplicate ``/confirm`` / direct upload racing a webhook-derived caller
+    converges on the same draft. See :func:`_commit_and_publish_parse` for the
+    commit/publish/failure contract. Returns
+    ``(revision, build_profile, created)``.
+    """
+    revision, profile, created = await allocate_ingest_revision(
+        db,
+        document_id,
+        object_key=object_key,
+        size_bytes=size_bytes,
+        content_sha256=content_sha256,
+        bucket=bucket,
+        version_id=version_id,
+        etag=etag,
+        parse_only=parse_only,
+    )
+    await _commit_and_publish_parse(
+        db,
+        revision,
+        profile,
+        document_id=document_id,
+        workspace_id=workspace_id,
+        object_key=object_key,
+        original_filename=original_filename,
+    )
     return revision, profile, created
+
+
+async def allocate_commit_and_publish_retry(
+    db: AsyncSession,
+    document_id: uuid.UUID,
+    *,
+    workspace_id: uuid.UUID,
+    object_key: str,
+    original_filename: str,
+    size_bytes: int,
+    content_sha256: str,
+    bucket: str | None = None,
+    version_id: str | None = None,
+    etag: str | None = None,
+    previous_revision_id: uuid.UUID | None = None,
+    parse_only: bool = False,
+) -> tuple[DocumentRevision, RevisionBuildProfile]:
+    """Operator retry: allocate a NEW generation → COMMIT → publish parse.
+
+    The superadmin recovery endpoints (``retry_all_failed`` /
+    ``retry_single_failed`` / ``retry_stuck_documents``) are explicit user
+    actions, so — like a reindex — they never resume or mutate the document's
+    prior revision: they allocate a higher generation with
+    ``reindex_of_revision_id`` provenance. Unlike the bounded automatic retry
+    (``retry_ingestion_attempt``) this path is not capped by
+    ``MAX_REVISION_RETRIES``.
+
+    The allocation is committed before the parse publish and a publish failure
+    terminalizes only the new draft (see
+    :func:`_commit_and_publish_parse`). Returns the new revision and its
+    profile.
+    """
+    revision, profile = await allocate_reindex_revision(
+        db,
+        document_id,
+        object_key=object_key,
+        size_bytes=size_bytes,
+        content_sha256=content_sha256,
+        bucket=bucket,
+        version_id=version_id,
+        etag=etag,
+        reindex_of_revision_id=previous_revision_id,
+        parse_only=parse_only,
+    )
+    await _commit_and_publish_parse(
+        db,
+        revision,
+        profile,
+        document_id=document_id,
+        workspace_id=workspace_id,
+        object_key=object_key,
+        original_filename=original_filename,
+    )
+    return revision, profile
 
 
 async def publish_memory_save_task(
