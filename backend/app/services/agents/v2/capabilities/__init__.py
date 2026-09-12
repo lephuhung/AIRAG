@@ -27,7 +27,19 @@ from ..contracts.capability import (
     CapabilityOutput,
     CapabilityRuntimeContext,
 )
-from ..contracts.execution import AgentRequest, AgentResult
+from ..contracts.evidence import (
+    EvidencePurpose,
+    EvidenceSourceIdentity,
+    EvidenceUseRef,
+    Provenance,
+)
+from ..contracts.execution import (
+    AgentError,
+    AgentErrorCode,
+    AgentRequest,
+    AgentResult,
+)
+from ..contracts.binding import ScopedDocument
 
 __all__ = [
     "Capability",
@@ -42,6 +54,24 @@ __all__ = [
     "CapabilityUnavailable",
     "CapabilityNotRegistered",
     "build_capability_registry",
+    "EvidenceBuilder",
+    "PinnedTargetResolver",
+    "denied_result",
+    "error_result",
+    "PeopleCapability",
+    "PeopleLookupService",
+    "DocumentSearchCapability",
+    "DocumentSearchService",
+    "DocumentReadCapability",
+    "DocumentContentReader",
+    "SectionReadCapability",
+    "SectionContentReader",
+    "KnowledgeGraphCapability",
+    "KnowledgeGraphClient",
+    "MemoryCapability",
+    "MemoryStore",
+    "AbbreviationCapability",
+    "AbbreviationResolverService",
 ]
 
 
@@ -209,3 +239,95 @@ def build_capability_registry(
             continue
         permitted[name] = registration.capability
     return CapabilityRegistry(permitted, runtime=runtime, excluded=excluded)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 request-scoped capability dependencies (Task 2)
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class EvidenceBuilder(Protocol):
+    """Request-scoped evidence sink owned by the Evidence Store boundary.
+
+    Capability instances are constructed with an ``EvidenceBuilder`` (wired by
+    T6/T7) and call it to persist minimized content plus mint the governed
+    ``EvidenceUse`` the returned ``AgentResult`` references. The builder owns
+    ``EvidenceRecord``/``EvidenceUse`` persistence; the capability only ever
+    sees the resulting ``EvidenceUseRef``.
+    """
+
+    async def persist_use(
+        self,
+        *,
+        source: EvidenceSourceIdentity,
+        content: str,
+        provenance: Provenance,
+        task_id: str,
+        purpose: EvidencePurpose,
+        target_id: str | None,
+    ) -> EvidenceUseRef: ...
+
+
+@runtime_checkable
+class PinnedTargetResolver(Protocol):
+    """Request-scoped plan/binding resolver for read capabilities.
+
+    The resolver is constructed with (fed) the authoritative checkpointed
+    plan/bindings by T6/T7 and maps a planned ``target_id`` to its pinned,
+    currently-authorized ``ScopedDocument`` identity. ``None`` means the target
+    is unknown, unpinned, or no longer authorized, and the capability fails
+    closed. The resolver never reads supervisor/graph state and is never fed
+    from ``AgentRequest`` or ``CapabilityRuntimeContext``.
+    """
+
+    def resolve(self, target_id: str) -> ScopedDocument | None: ...
+
+
+def denied_result(
+    task_id: str, *, code: AgentErrorCode, message: str
+) -> AgentResult:
+    """A typed denial: the capability exists but may not run here."""
+    from ..contracts.base import CONTRACT_VERSION
+
+    return AgentResult(
+        contract_version=CONTRACT_VERSION,
+        task_id=task_id,
+        status="denied",
+        data=None,
+        evidence_uses=(),
+        coverage_observations=(),
+        error=AgentError(code=code, message=message, retryable=False),
+    )
+
+
+def error_result(
+    task_id: str, *, code: AgentErrorCode, message: str
+) -> AgentResult:
+    """A typed execution error: the capability ran but could not produce facts."""
+    from ..contracts.base import CONTRACT_VERSION
+
+    return AgentResult(
+        contract_version=CONTRACT_VERSION,
+        task_id=task_id,
+        status="error",
+        data=None,
+        evidence_uses=(),
+        coverage_observations=(),
+        error=AgentError(code=code, message=message, retryable=False),
+    )
+
+
+# Re-exported after the protocols above so capability modules can import the
+# request-scoped dependencies from this package without a partial-init cycle.
+from .abbreviation import AbbreviationCapability, AbbreviationResolverService
+from .document import (
+    DocumentContentReader,
+    DocumentReadCapability,
+    DocumentSearchCapability,
+    DocumentSearchService,
+)
+from .knowledge_graph import KnowledgeGraphCapability, KnowledgeGraphClient
+from .memory import MemoryCapability, MemoryStore
+from .people import PeopleCapability, PeopleLookupService
+from .section import SectionContentReader, SectionReadCapability

@@ -880,3 +880,167 @@ def test_adapter_outputs_are_typed_models_not_dictionaries() -> None:
     for value in (draft, context, snapshot, result):
         assert isinstance(value, BaseModel)
         assert not isinstance(value, dict)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 Task 2 (appended) — shared atomic capabilities, no registry rewrite
+# ---------------------------------------------------------------------------
+
+
+def _task2_evidence_builder():
+    from uuid import uuid4
+
+    from app.services.agents.v2.contracts.evidence import EvidenceUseRef
+
+    class _Evidence:
+        async def persist_use(self, **kwargs) -> EvidenceUseRef:
+            return EvidenceUseRef(use_id=uuid4())
+
+    return _Evidence()
+
+
+def _task2_resolver(bindings=None):
+    class _Resolver:
+        def __init__(self) -> None:
+            self._bindings = dict(bindings or {})
+
+        def resolve(self, target_id: str):
+            return self._bindings.get(target_id)
+
+    return _Resolver()
+
+
+def _task2_capabilities() -> list:
+    from uuid import UUID as _UUID
+
+    from app.services.agents.v2.capabilities import (
+        AbbreviationCapability,
+        DocumentReadCapability,
+        DocumentSearchCapability,
+        KnowledgeGraphCapability,
+        MemoryCapability,
+        PeopleCapability,
+        SectionReadCapability,
+    )
+
+    class _People:
+        async def lookup(self, query: str):
+            return {"name": "Nguyen Van A"}
+
+    class _Search:
+        async def search(self, query: str, workspace_ids):
+            return ()
+
+    class _Reader:
+        async def read(self, binding):
+            return "text"
+
+    class _SectionReader:
+        async def read_section(self, binding, target_id: str):
+            return ("text", "node-1")
+
+    class _Kg:
+        async def query(self, query: str):
+            return ()
+
+    class _Memory:
+        async def lookup(self, query: str):
+            return ()
+
+    class _Abbreviations:
+        def resolve(self, token: str):
+            return None
+
+    evidence = _task2_evidence_builder()
+    resolver = _task2_resolver()
+    return [
+        PeopleCapability(
+            service=_People(), evidence=evidence, required_fields=("name",)
+        ),
+        DocumentSearchCapability(service=_Search()),
+        DocumentReadCapability(
+            reader=_Reader(), evidence=evidence, resolver=resolver
+        ),
+        SectionReadCapability(
+            reader=_SectionReader(), evidence=evidence, resolver=resolver
+        ),
+        KnowledgeGraphCapability(client=_Kg(), evidence=evidence),
+        MemoryCapability(store=_Memory(), evidence=evidence),
+        AbbreviationCapability(service=_Abbreviations()),
+    ]
+
+
+def test_task2_real_capabilities_satisfy_the_capability_protocol() -> None:
+    from app.services.agents.v2.capabilities import (
+        EvidenceBuilder,
+        PinnedTargetResolver,
+    )
+
+    for capability in _task2_capabilities():
+        assert isinstance(capability, Capability)
+        assert isinstance(_task2_evidence_builder(), EvidenceBuilder)
+        assert isinstance(_task2_resolver(), PinnedTargetResolver)
+        assert set(inspect.signature(type(capability).execute).parameters) == {
+            "self",
+            "request",
+            "runtime",
+        }
+        assert inspect.iscoroutinefunction(capability.execute)
+
+
+def test_task2_capability_modules_reuse_the_frozen_contracts() -> None:
+    import app.services.agents.v2.capabilities as capabilities_package
+
+    assert capabilities_package.CapabilityDescriptor is capability_contracts.CapabilityDescriptor
+    assert capabilities_package.CapabilityInput is capability_contracts.CapabilityInput
+    assert capabilities_package.CapabilityOutput is capability_contracts.CapabilityOutput
+    assert capabilities_package.CapabilityRuntimeContext is capability_contracts.CapabilityRuntimeContext
+    expected_names = {
+        "people.lookup",
+        "document.search",
+        "document.read",
+        "section.read",
+        "knowledge_graph.query",
+        "memory.lookup",
+        "abbreviation.resolve",
+    }
+    assert {c.descriptor.name for c in _task2_capabilities()} == expected_names
+
+
+def test_task2_capability_modules_have_no_dict_or_any_annotations() -> None:
+    import app.services.agents.v2.capabilities as capabilities_package
+
+    package_dir = Path(capabilities_package.__file__).parent
+    for path in sorted(package_dir.glob("*.py")):
+        if path.name == "__init__.py":
+            continue
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id == "Any":
+                raise AssertionError(f"{path.name} references typing.Any")
+            if isinstance(node, ast.Subscript):
+                base = node.value
+                name = (
+                    base.id
+                    if isinstance(base, ast.Name)
+                    else base.attr
+                    if isinstance(base, ast.Attribute)
+                    else ""
+                )
+                if name in {"dict", "Dict"}:
+                    raise AssertionError(f"{path.name} annotates a dict")
+
+
+def test_task2_registry_serves_the_real_capabilities() -> None:
+    capabilities = _task2_capabilities()
+    by_name = {c.descriptor.name: c for c in capabilities}
+    registry = build_capability_registry(
+        [CapabilityRegistration(capability=c) for c in capabilities],
+        runtime_context(
+            allowed=frozenset(c.descriptor.name for c in capabilities)
+        ),
+        active_feature_flags=frozenset(),
+        available_services=frozenset(),
+    )
+    assert registry.get("people.lookup") is by_name["people.lookup"]
+    assert registry.get("abbreviation.resolve") is by_name["abbreviation.resolve"]
