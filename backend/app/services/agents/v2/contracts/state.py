@@ -47,11 +47,27 @@ class RuntimeServices(RuntimeModel):
     with a typed error when the service they need is absent and never fall back
     to a silent default. Typed ``Any`` for the same framework-free reason as
     ``retention_leases``.
+
+    ``capability_registry`` is the single request-scoped capability registry
+    (Phase 2, Task 3): the shared ``TaskScheduler`` is the only consumer that
+    dispatches through it, and Phase 3 reuses the scheduler rather than
+    resolving capabilities itself. ``chat_messages``, ``authorization``, and
+    ``evidence_hydrator`` are request-scoped Phase-2 services wired by T6/T7.
+    All default to ``None``.
+
+    The bag deliberately excludes ``plan_checkpoint`` (plan persistence is
+    LangGraph state plus the supervisor checkpointer — no service) and any
+    ``EvidenceEvaluator`` service (evidence evaluation is the shared
+    ``evaluate_evidence(...)`` function in ``nodes/evaluate.py``).
     """
 
     retention_leases: Any = None
     semantic_adapter: Any = None
     binding_resolver: Any = None
+    capability_registry: Any = None
+    chat_messages: Any = None
+    authorization: Any = None
+    evidence_hydrator: Any = None
 
 
 class GraphRuntimeContext(ContractModel):
