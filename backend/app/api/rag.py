@@ -259,14 +259,30 @@ async def process_document(
     await db.commit()
 
     if document.upload_s3_key:
-        # New flow: re-publish parse task so workers pick it up from MinIO
+        # Explicit user retry: allocate a NEW monotonic revision generation and
+        # re-publish so workers build that revision from MinIO.
         try:
-            from app.queue.publisher import publish_parse_task
+            from app.queue.publisher import (
+                allocate_reindex_revision,
+                publish_parse_task,
+            )
+            revision, profile = await allocate_reindex_revision(
+                db,
+                document_id,
+                object_key=document.upload_s3_key,
+                size_bytes=document.file_size or 0,
+                content_sha256=document.content_hash or "",
+                etag=document.content_hash or document.upload_s3_key,
+                reindex_of_revision_id=document.current_revision_id,
+            )
+            await db.commit()
             await publish_parse_task(
                 document_id=document_id,
                 workspace_id=document.workspace_id,
                 minio_key=document.upload_s3_key,
                 original_filename=document.original_filename,
+                revision_id=revision.revision_id,
+                build_profile=profile,
             )
         except Exception as e:
             raise HTTPException(
@@ -323,22 +339,56 @@ async def process_batch(
         doc.embed_done = False
         doc.captions_done = False
         doc.kg_done = False
-        accepted_ids.append((doc_id, doc.upload_s3_key, doc.workspace_id, doc.original_filename))
+        accepted_ids.append(
+            (
+                doc_id,
+                doc.upload_s3_key,
+                doc.workspace_id,
+                doc.original_filename,
+                doc.file_size or 0,
+                doc.content_hash or "",
+                doc.current_revision_id,
+            )
+        )
 
     await db.commit()
 
     if accepted_ids:
-        from app.queue.publisher import publish_parse_task
-        for doc_id, minio_key, workspace_id, original_filename in accepted_ids:
+        from app.queue.publisher import (
+            allocate_reindex_revision,
+            publish_parse_task,
+        )
+        for (
+            doc_id,
+            minio_key,
+            workspace_id,
+            original_filename,
+            file_size,
+            content_hash,
+            previous_revision_id,
+        ) in accepted_ids:
             try:
+                revision, profile = await allocate_reindex_revision(
+                    db,
+                    doc_id,
+                    object_key=minio_key,
+                    size_bytes=file_size,
+                    content_sha256=content_hash,
+                    etag=content_hash or minio_key,
+                    reindex_of_revision_id=previous_revision_id,
+                )
                 await publish_parse_task(
                     document_id=doc_id,
                     workspace_id=workspace_id,
                     minio_key=minio_key,
                     original_filename=original_filename,
+                    revision_id=revision.revision_id,
+                    build_profile=profile,
                 )
+                await db.commit()
             except Exception as e:
                 logger.error(f"[process_batch] Failed to queue doc {doc_id}: {e}")
+                await db.rollback()
 
     return {
         "message": f"Processing {len(accepted_ids)} document(s)",
@@ -403,14 +453,31 @@ async def reindex_document(
     document.error_message = None
     await db.commit()
 
-    # Re-publish to parse queue — worker will download from MinIO
+    # Explicit reindex: allocate a NEW monotonic generation even though
+    # ``upload_s3_key`` is unchanged, recording ``reindex_of_revision_id``
+    # provenance. (Removing the destructive pre-delete/purge is Task 5.)
     try:
-        from app.queue.publisher import publish_parse_task
+        from app.queue.publisher import (
+            allocate_reindex_revision,
+            publish_parse_task,
+        )
+        revision, profile = await allocate_reindex_revision(
+            db,
+            document_id,
+            object_key=document.upload_s3_key,
+            size_bytes=document.file_size or 0,
+            content_sha256=document.content_hash or "",
+            etag=document.content_hash or document.upload_s3_key,
+            reindex_of_revision_id=document.current_revision_id,
+        )
+        await db.commit()
         await publish_parse_task(
             document_id=document_id,
             workspace_id=document.workspace_id,
             minio_key=document.upload_s3_key,
             original_filename=document.original_filename,
+            revision_id=revision.revision_id,
+            build_profile=profile,
         )
     except Exception as e:
         raise HTTPException(
@@ -465,7 +532,6 @@ async def reindex_workspace(
     async def _reindex_all(doc_ids: list[uuid.UUID], ws_id: uuid.UUID):
         """Background task: reindex each document sequentially via RabbitMQ."""
         from app.core.database import AsyncSessionLocal
-        from app.queue.publisher import publish_parse_task as _publish
         async with AsyncSessionLocal() as session:
             rag_service = get_rag_service(session, ws_id)
             for did in doc_ids:
@@ -497,12 +563,28 @@ async def reindex_workspace(
                     doc.error_message = None
                     await session.commit()
 
-                    # Publish to parse queue — worker downloads from MinIO
-                    await _publish(
+                    # Explicit reindex: allocate a new generation + publish.
+                    from app.queue.publisher import (
+                        allocate_reindex_revision,
+                        publish_parse_task as _publish_revision,
+                    )
+                    revision, profile = await allocate_reindex_revision(
+                        session,
+                        did,
+                        object_key=doc.upload_s3_key,
+                        size_bytes=doc.file_size or 0,
+                        content_sha256=doc.content_hash or "",
+                        etag=doc.content_hash or doc.upload_s3_key,
+                        reindex_of_revision_id=doc.current_revision_id,
+                    )
+                    await session.commit()
+                    await _publish_revision(
                         document_id=did,
                         workspace_id=ws_id,
                         minio_key=doc.upload_s3_key,
                         original_filename=doc.original_filename,
+                        revision_id=revision.revision_id,
+                        build_profile=profile,
                     )
                     logger.info(f"Reindex queued for document {did} in workspace {ws_id}")
                 except Exception as e:

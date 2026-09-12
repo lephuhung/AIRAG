@@ -33,7 +33,7 @@ from app.services.embedding.embedder import get_embedding_service
 from app.services.models.parsed_document import ExtractedImage, ExtractedTable
 from app.services.storage_service import get_storage_service
 from app.services.embedding.vector_store import get_vector_store
-from app.workers.utils import check_and_finalize
+from app.workers.utils import check_and_finalize, load_revision_execution
 
 logger = logging.getLogger(__name__)
 
@@ -49,16 +49,20 @@ async def handle_caption(payload: dict) -> None:
     await ensure_fresh_config()
 
     msg = CaptionMessage(**payload)
-    logger.info(f"[caption_worker] doc={msg.document_id}")
+    logger.info(
+        f"[caption_worker] doc={msg.document_id} rev={msg.revision_id} "
+        f"profile={msg.build_profile}"
+    )
 
     async with async_session_maker() as db:
         # NOTE: no SELECT ... FOR UPDATE here. Captioning issues many (slow)
         # vision-LLM calls; holding a row lock across them would block the
         # embed/kg workers' final UPDATE on the same Document row until
         # captioning finishes, serialising the "parallel" pipeline and causing
-        # spurious embed/kg timeouts. Like kg_worker, we rely on the captions_done
-        # idempotency check instead — captioning is idempotent (already-captioned
-        # images/tables are skipped) and check_and_finalize serialises promotion.
+        # spurious embed/kg timeouts. Like kg_worker, we rely on the
+        # revision-scoped idempotency check instead — captioning is idempotent
+        # (already-captioned images/tables are skipped) and check_and_finalize
+        # serialises promotion.
         result = await db.execute(
             select(Document).where(Document.id == msg.document_id)
         )
@@ -67,10 +71,16 @@ async def handle_caption(payload: dict) -> None:
             logger.error(f"[caption_worker] doc={msg.document_id} not found")
             return
 
-        # Idempotency: if captions_done=True the message was already processed
-        # (e.g. redelivered after a crash-before-ack). Skip silently.
-        if document.captions_done:
-            logger.info(f"[caption_worker] doc={msg.document_id} already has captions_done=True — skipping")
+        # Revision-owned execution decision: a terminal revision or a
+        # tombstoned source is a no-op dead-letter.
+        execution = await load_revision_execution(
+            db, revision_id=msg.revision_id, document_id=msg.document_id
+        )
+        if not execution.run:
+            logger.info(
+                f"[caption_worker] doc={msg.document_id} rev={msg.revision_id} "
+                f"no-op ({execution.reason})"
+            )
             return
 
         has_images  = settings.HRAG_ENABLE_IMAGE_CAPTIONING
@@ -92,7 +102,9 @@ async def handle_caption(payload: dict) -> None:
                 logger.info(f"[caption_worker] doc={msg.document_id} no images/tables — done")
                 document.captions_done = True
                 await db.commit()
-                await check_and_finalize(document, db)
+                await check_and_finalize(
+                    document, db, revision_id=msg.revision_id
+                )
                 return
 
             # ── Caption images concurrently ─────────────────────────────────
@@ -185,7 +197,9 @@ async def handle_caption(payload: dict) -> None:
             document.captions_done = True
             await db.commit()
             logger.info(f"[caption_worker] doc={msg.document_id} captions done")
-            await check_and_finalize(document, db)
+            await check_and_finalize(
+                    document, db, revision_id=msg.revision_id
+                )
 
         except Exception as e:
             logger.error(
@@ -198,7 +212,9 @@ async def handle_caption(payload: dict) -> None:
             document.captions_done = True   # mark done to unblock INDEXED transition
             document.error_message = f"caption_warning: {str(e)[:400]}"
             await db.commit()
-            await check_and_finalize(document, db)
+            await check_and_finalize(
+                    document, db, revision_id=msg.revision_id
+                )
 
 
 async def _caption_images_concurrent(images: list[ExtractedImage]) -> None:

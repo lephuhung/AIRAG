@@ -24,7 +24,10 @@ from app.core.database import async_session_maker
 from app.models.document import Document
 from app.queue.messages import KGMessage
 from app.services.kg.knowledge_graph_service import get_kg_service
-from app.workers.utils import check_and_finalize
+from app.workers.utils import (
+    check_and_finalize,
+    load_revision_execution,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +41,8 @@ async def handle_kg(payload: dict) -> None:
 
     msg = KGMessage(**payload)
     logger.info(
-        f"[kg_worker] doc={msg.document_id} workspace={msg.workspace_id} "
+        f"[kg_worker] doc={msg.document_id} rev={msg.revision_id} "
+        f"workspace={msg.workspace_id} "
         f"markdown_s3_key={msg.markdown_s3_key or '-'}"
     )
 
@@ -49,10 +53,16 @@ async def handle_kg(payload: dict) -> None:
             logger.error(f"[kg_worker] doc={msg.document_id} not found")
             return
 
-        # Idempotency: if kg_done=True the message was already processed
-        # (e.g. redelivered after a crash-before-ack). Skip silently.
-        if document.kg_done:
-            logger.info(f"[kg_worker] doc={msg.document_id} already has kg_done=True — skipping")
+        # Revision-owned execution decision: a terminal revision or a
+        # tombstoned source is a no-op dead-letter.
+        execution = await load_revision_execution(
+            db, revision_id=msg.revision_id, document_id=msg.document_id
+        )
+        if not execution.run:
+            logger.info(
+                f"[kg_worker] doc={msg.document_id} rev={msg.revision_id} "
+                f"no-op ({execution.reason})"
+            )
             return
 
         try:
@@ -79,7 +89,9 @@ async def handle_kg(payload: dict) -> None:
                 logger.warning(f"[kg_worker] doc={msg.document_id} empty markdown — skipping KG")
                 document.kg_done = True
                 await db.commit()
-                await check_and_finalize(document, db)
+                await check_and_finalize(
+                    document, db, revision_id=msg.revision_id
+                )
                 return
 
             kg_service = get_kg_service(workspace_id=msg.workspace_id)
@@ -98,7 +110,9 @@ async def handle_kg(payload: dict) -> None:
                 document.error_message = None
             await db.commit()
             logger.info(f"[kg_worker] doc={msg.document_id} KG ingest done")
-            await check_and_finalize(document, db)
+            await check_and_finalize(
+                document, db, revision_id=msg.revision_id
+            )
 
         except Exception as e:
             # NOTE: a handler-level timeout from connection.py arrives here as
@@ -122,7 +136,9 @@ async def handle_kg(payload: dict) -> None:
                 else f"kg_warning: {str(e)[:400]}"
             )
             await db.commit()
-            await check_and_finalize(document, db)
+            await check_and_finalize(
+                document, db, revision_id=msg.revision_id
+            )
         finally:
             # Release cached GPU memory after each document so other workers
             # (or the next document in this worker) can reclaim the blocks.

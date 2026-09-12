@@ -4,7 +4,6 @@ import os
 import io
 import re
 import uuid
-import asyncio
 import hashlib
 import logging
 from pathlib import Path
@@ -130,125 +129,50 @@ async def _public_duplicate_response(
     )
 
 
-def _copy_vector_chunks(
-    source_workspace_id: uuid.UUID,
-    source_document_id: uuid.UUID,
-    target_workspace_id: uuid.UUID,
-    new_document_id: uuid.UUID,
-) -> int:
-    """Copy a document's vector chunks from one workspace collection to another.
-
-    Re-keys ids to the new document and rewrites document_id / workspace_id in
-    the metadata. Image URLs in the metadata are intentionally LEFT UNCHANGED —
-    they keep pointing at the source workspace's static path, which resolves for
-    same-tenant users (the static mount is shared, unauthenticated), so figures
-    render without copying any image files.
-
-    Runs synchronously (ChromaDB client is blocking) — call via asyncio.to_thread.
-    Returns the number of chunks copied.
-    """
-    from app.services.embedding.vector_store import get_vector_store
-
-    src = get_vector_store(source_workspace_id)
-    data = src.get_document_chunks(source_document_id, include_embeddings=True)
-    ids = data["ids"]
-    if not ids:
-        return 0
-
-    embeddings = data["embeddings"]
-    documents = data["documents"]
-    metadatas = data["metadatas"]
-
-    new_ids: list[str] = []
-    new_metas: list[dict] = []
-    for meta in metadatas:
-        m = dict(meta)
-        chunk_index = m.get("chunk_index")
-        new_ids.append(f"doc_{new_document_id}_chunk_{chunk_index}")
-        m["document_id"] = str(new_document_id)
-        m["workspace_id"] = str(target_workspace_id)
-        new_metas.append(m)
-
-    tgt = get_vector_store(target_workspace_id)
-    tgt.add_documents(
-        ids=new_ids,
-        embeddings=[list(e) for e in embeddings],
-        documents=documents,
-        metadatas=new_metas,
-    )
-
-    # The BM25 index for the target workspace is built from ChromaDB and cached;
-    # force a rebuild so the freshly copied chunks become lexically searchable.
-    try:
-        from app.services.retrieval.bm25_index import invalidate_cache
-
-        invalidate_cache(target_workspace_id)
-    except Exception as e:
-        logger.warning(f"[clone] BM25 invalidate failed for {target_workspace_id}: {e}")
-
-    return len(new_ids)
-
-
 async def _clone_document_to_workspace(
     db: AsyncSession,
     source_doc: Document,
     new_doc: Document,
 ) -> None:
-    """Populate ``new_doc`` (already created in the target workspace) by reusing
-    the parsed artifacts of ``source_doc`` instead of re-running the pipeline.
+    """Allocate a target-workspace revision for a cloned document and queue it.
 
-    Reuses: parsed markdown (copied to the new doc's key) + vector chunks
-    (copied across collections with their existing embeddings). Skips parse,
-    embed, caption and KG entirely. The new document is marked INDEXED.
+    A clone reuses the source document's raw object/hash ONLY: it never
+    copies markdown or vector chunks (the target builds its own revision-
+    owned artifacts) and never marks the target ``Document`` indexed. The
+    new revision records explicit ``cloned_from_revision_id`` provenance, so
+    the target binding revision is never another workspace's revision
+    identity. The allocation is committed before the parse task is published
+    so the worker can load the revision.
     """
-    from app.services.storage_service import get_storage_service
+    from app.queue.publisher import allocate_clone_revision, publish_parse_task
 
-    storage = get_storage_service()
-
-    # 1. Copy parsed markdown to the new doc's key (best-effort).
-    if source_doc.markdown_s3_key:
-        try:
-            md = await storage.download_markdown(source_doc.markdown_s3_key)
-            new_doc.markdown_s3_key = await storage.upload_markdown(
-                new_doc.workspace_id, new_doc.id, md
-            )
-        except Exception as e:
-            logger.warning(
-                f"[clone] markdown copy failed src={source_doc.id} "
-                f"new={new_doc.id}: {e}"
-            )
-
-    # 2. Copy vector chunks (with embeddings) into the target collection.
-    chunk_count = await asyncio.to_thread(
-        _copy_vector_chunks,
-        source_doc.workspace_id,
-        source_doc.id,
-        new_doc.workspace_id,
+    if not new_doc.upload_s3_key:
+        raise ValueError(
+            f"clone target {new_doc.id} has no uploaded source object"
+        )
+    revision, profile = await allocate_clone_revision(
+        db,
         new_doc.id,
+        object_key=new_doc.upload_s3_key,
+        size_bytes=new_doc.file_size or 0,
+        content_sha256=new_doc.content_hash or "",
+        etag=new_doc.content_hash or new_doc.upload_s3_key,
+        cloned_from_revision_id=source_doc.current_revision_id,
+        parse_only=_parse_only_mode(),
     )
-
-    # 3. Carry over parsed counts/metadata and mark the doc fully indexed.
-    new_doc.chunk_count = chunk_count or source_doc.chunk_count
-    new_doc.page_count = source_doc.page_count
-    new_doc.image_count = source_doc.image_count
-    new_doc.table_count = source_doc.table_count
-    new_doc.parser_version = source_doc.parser_version
-    new_doc.document_type_id = source_doc.document_type_id
-    new_doc.document_number = source_doc.document_number
-    new_doc.document_title = source_doc.document_title
-    new_doc.location = source_doc.location
-    new_doc.issuing_agency = source_doc.issuing_agency
-    new_doc.parent_agency = source_doc.parent_agency
-    new_doc.published_date = source_doc.published_date
-    new_doc.digital_signatures = source_doc.digital_signatures
-    new_doc.embed_done = True
-    new_doc.captions_done = True
-    new_doc.kg_done = True
-    new_doc.status = DocumentStatus.INDEXED
     await db.commit()
+    await publish_parse_task(
+        document_id=new_doc.id,
+        workspace_id=new_doc.workspace_id,
+        minio_key=new_doc.upload_s3_key,
+        original_filename=new_doc.original_filename,
+        revision_id=revision.revision_id,
+        build_profile=profile,
+    )
     logger.info(
-        f"[clone] new doc={new_doc.id} in ws={new_doc.workspace_id} cloned from "
-        f"src={source_doc.id} (ws={source_doc.workspace_id}), {new_doc.chunk_count} chunks"
+        f"[clone] new doc={new_doc.id} ws={new_doc.workspace_id} "
+        f"rev={revision.revision_id} cloned_from="
+        f"{source_doc.current_revision_id} src_doc={source_doc.id}"
     )
 
 
@@ -284,6 +208,22 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".docx", ".pptx"}
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+
+
+def _parse_only_mode() -> bool:
+    """True when the deployment forces parse-only builds for every ingest."""
+    return bool(settings.HRAG_PARSE_ONLY_MODE or settings.NEXUSRAG_PARSE_ONLY_MODE)
+
+
+def _content_etag(content: bytes) -> str:
+    """Version selector for a freshly-uploaded object.
+
+    A single-part S3/MinIO PUT uses the MD5 of the bytes as its etag, so
+    computing it locally is the exact version surrogate ``/confirm`` and the
+    webhook would observe — ``content_sha256`` remains the content
+    discriminator in the canonical attempt identity.
+    """
+    return hashlib.md5(content).hexdigest()
 
 # MIME type mapping for common extensions
 _EXT_TO_MIME: dict[str, str] = {
@@ -475,33 +415,61 @@ async def upload_document(
             document.kg_done = False
             await db.commit()
 
-    # Publish parse task (immediate if webhook disabled, else MinIO event fires)
-    if not settings.MINIO_WEBHOOK_ENABLED:
-        try:
-            from app.queue.publisher import publish_parse_task
+    # Publish parse task. The MinIO webhook is metadata-only (``source_arrivals``
+    # staging) and never creates a revision, so the API is the only trigger here.
+    from app.queue.publisher import (
+        allocate_ingest_revision,
+        publish_parse_task,
+    )
 
-            await publish_parse_task(
-                document_id=document.id,
-                workspace_id=workspace_id,
-                minio_key=upload_key,
-                original_filename=file.filename,
-            )
-            logger.info(
-                f"Document {document.id} queued for processing (direct publish)"
-            )
-        except Exception as e:
-            logger.error(
-                f"Failed to publish parse task for doc {document.id}: {e}. "
-                f"Rolling back document to FAILED."
-            )
-            document.status = DocumentStatus.FAILED
-            document.error_message = f"Publish failed: {e}"
-            await db.commit()
-    else:
-        logger.info(
-            f"Document {document.id} uploaded to MinIO — "
-            f"waiting for webhook event to trigger parse"
+    revision = None
+    try:
+        revision, profile, _created = await allocate_ingest_revision(
+            db,
+            document.id,
+            object_key=upload_key,
+            size_bytes=len(content),
+            content_sha256=content_hash,
+            etag=_content_etag(content),
+            parse_only=_parse_only_mode(),
         )
+        await publish_parse_task(
+            document_id=document.id,
+            workspace_id=workspace_id,
+            minio_key=upload_key,
+            original_filename=file.filename,
+            revision_id=revision.revision_id,
+            build_profile=profile,
+        )
+        logger.info(
+            f"Document {document.id} queued for processing "
+            f"(rev={revision.revision_id}, profile={profile.value})"
+        )
+    except Exception as e:
+        logger.error(
+            f"Failed to queue parse task for doc {document.id}: {e}. "
+            f"Rolling back document to FAILED."
+        )
+        await db.rollback()
+        if revision is not None:
+            # Failure marks only THIS draft failed; no other revision changes.
+            try:
+                from app.services.agents.v2.persistence.document_revisions import (
+                    DocumentRevisionsRepository,
+                )
+
+                repo = DocumentRevisionsRepository(db)
+                await repo.mark_failed(
+                    revision.revision_id,
+                    stage="publish",
+                    error_class=type(e).__name__,
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+        document.status = DocumentStatus.FAILED
+        document.error_message = f"Publish failed: {e}"
+        await db.commit()
 
     return DocumentUploadResponse(
         id=document.id,
@@ -668,6 +636,7 @@ async def confirm_upload(
     # go straight to MinIO), so hash them here. If the same content already lives
     # in this workspace, drop the freshly uploaded object + pending record and
     # return the existing document.
+    raw_bytes: bytes | None = None
     try:
         raw_bytes = await storage.download_file(minio_key)
         content_hash = hashlib.sha256(raw_bytes).hexdigest()
@@ -751,41 +720,76 @@ async def confirm_upload(
             document.kg_done = False
             await db.commit()
 
-    if not settings.MINIO_WEBHOOK_ENABLED:
-        try:
-            from app.queue.publisher import publish_parse_task
+    # Allocate the revision (idempotent — a duplicate ``/confirm`` or a racing
+    # webhook-derived caller converges on the same draft) and publish. The
+    # webhook is metadata-only and never creates a revision, so the confirm
+    # callback is the authoritative producer for the presigned flow.
+    from app.queue.publisher import (
+        allocate_ingest_revision,
+        publish_parse_task,
+    )
 
-            await publish_parse_task(
-                document_id=document.id,
-                workspace_id=workspace_id,
-                minio_key=minio_key,
-                original_filename=document.original_filename,
-            )
-            logger.info(
-                f"Document {document.id} queued for processing (presign confirm)"
-            )
-        except Exception as e:
-            logger.error(
-                f"Failed to publish parse task for doc {document.id}: {e}. "
-                f"Rolling back document to FAILED."
-            )
-            document.status = DocumentStatus.FAILED
-            document.error_message = f"Publish failed: {e}"
-            await db.commit()
-            # Clean up MinIO file so it doesn't become orphaned
-            try:
-                await storage.delete_file(minio_key)
-                logger.info(f"[confirm_upload] Cleaned up orphaned MinIO file: {minio_key}")
-            except Exception as del_err:
-                logger.warning(
-                    f"[confirm_upload] Failed to delete MinIO file after publish failure: "
-                    f"{del_err} (doc={document.id}, key={minio_key})"
-                )
-    else:
-        logger.info(
-            f"Document {document.id} confirmed in MinIO — "
-            "waiting for webhook event to trigger parse"
+    revision = None
+    try:
+        revision, profile, _created = await allocate_ingest_revision(
+            db,
+            document.id,
+            object_key=minio_key,
+            size_bytes=document.file_size or 0,
+            content_sha256=content_hash or "",
+            etag=(
+                _content_etag(raw_bytes)
+                if raw_bytes is not None
+                else (content_hash or minio_key)
+            ),
+            parse_only=_parse_only_mode(),
         )
+        await publish_parse_task(
+            document_id=document.id,
+            workspace_id=workspace_id,
+            minio_key=minio_key,
+            original_filename=document.original_filename,
+            revision_id=revision.revision_id,
+            build_profile=profile,
+        )
+        logger.info(
+            f"Document {document.id} queued for processing (presign confirm, "
+            f"rev={revision.revision_id}, profile={profile.value})"
+        )
+    except Exception as e:
+        logger.error(
+            f"Failed to publish parse task for doc {document.id}: {e}. "
+            f"Rolling back document to FAILED."
+        )
+        await db.rollback()
+        if revision is not None:
+            # Failure marks only THIS draft failed.
+            try:
+                from app.services.agents.v2.persistence.document_revisions import (
+                    DocumentRevisionsRepository,
+                )
+
+                repo = DocumentRevisionsRepository(db)
+                await repo.mark_failed(
+                    revision.revision_id,
+                    stage="publish",
+                    error_class=type(e).__name__,
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+        document.status = DocumentStatus.FAILED
+        document.error_message = f"Publish failed: {e}"
+        await db.commit()
+        # Clean up MinIO file so it doesn't become orphaned
+        try:
+            await storage.delete_file(minio_key)
+            logger.info(f"[confirm_upload] Cleaned up orphaned MinIO file: {minio_key}")
+        except Exception as del_err:
+            logger.warning(
+                f"[confirm_upload] Failed to delete MinIO file after publish failure: "
+                f"{del_err} (doc={document.id}, key={minio_key})"
+            )
 
     return DocumentUploadResponse(
         id=document.id,

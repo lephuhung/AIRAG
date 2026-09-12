@@ -71,6 +71,21 @@ class DocumentRevision(Base):
         ForeignKey("document_revisions.revision_id"),
         nullable=True,
     )
+    # Explicit-reindex provenance: the prior revision this one was
+    # reindexed from (copy-on-write). Never set by an automatic retry.
+    reindex_of_revision_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("document_revisions.revision_id"),
+        nullable=True,
+    )
+    # Clone provenance: the source-workspace revision whose raw
+    # content/hash this new-workspace revision was built from. The
+    # target binding revision is never another workspace's identity.
+    cloned_from_revision_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("document_revisions.revision_id"),
+        nullable=True,
+    )
 
     # Lifecycle state (free-form TEXT — see module docstring).
     status: Mapped[str] = mapped_column(Text, nullable=False)

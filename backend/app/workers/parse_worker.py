@@ -21,24 +21,37 @@ import tempfile
 import time
 from pathlib import Path
 
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
 from app.core.database import async_session_maker
-from app.core.config import settings
 from app.models.document_type import DocumentType as _DocumentType  # noqa: F401 — ensures SQLAlchemy mapper resolves "DocumentType" relationship
 from app.models.document import Document, DocumentImage, DocumentStatus, DocumentTable
 from app.queue import connection as mq
 from app.queue.messages import CaptionMessage, EmbedMessage, KGMessage, ParseMessage
+from app.services.agents.v2.persistence.source_identity import (
+    RevisionBuildProfile,
+)
 from app.services.parsing.deep_document_parser import DeepDocumentParser
 from app.services.storage_service import get_storage_service
+from app.workers.utils import (
+    delete_stage_children,
+    finalize_revision_if_complete,
+    load_revision_execution,
+    mark_revision_building,
+    record_parse_artifacts,
+)
 
 logger = logging.getLogger(__name__)
 
 
 async def handle_parse(payload: dict) -> None:
     msg = ParseMessage(**payload)
-    logger.info(f"[parse_worker] doc={msg.document_id} file={msg.original_filename}")
+    logger.info(
+        f"[parse_worker] doc={msg.document_id} rev={msg.revision_id} "
+        f"profile={msg.build_profile} file={msg.original_filename}"
+    )
     start = time.time()
+    profile = RevisionBuildProfile(msg.build_profile)
 
     async with async_session_maker() as db:
         result = await db.execute(
@@ -49,6 +62,19 @@ async def handle_parse(payload: dict) -> None:
             logger.error(f"[parse_worker] doc={msg.document_id} not found — skipping")
             return
 
+        # Revision-owned execution decision: a terminal revision or a
+        # tombstoned source is a no-op dead-letter (never re-run).
+        execution = await load_revision_execution(
+            db, revision_id=msg.revision_id, document_id=msg.document_id
+        )
+        if not execution.run:
+            logger.info(
+                f"[parse_worker] doc={msg.document_id} rev={msg.revision_id} "
+                f"no-op ({execution.reason})"
+            )
+            return
+
+        await mark_revision_building(db, msg.revision_id)
         document.is_chat_upload = msg.is_chat_upload
         await db.commit()
 
@@ -123,6 +149,15 @@ async def handle_parse(payload: dict) -> None:
             # Reflect the pipeline that ACTUALLY ran (ocr / docling / legacy),
             # not merely whether the format is Docling-capable.
             document.parser_version = parsed.parser
+            await db.commit()
+
+            # ── Record the parse-stage artifacts on the REVISION manifest ──
+            await record_parse_artifacts(
+                db,
+                msg.revision_id,
+                profile,
+                markdown_artifact_key=s3_key,
+            )
             await db.commit()
 
             # ── Classify document type & extract rich header ────────────────────────
@@ -212,16 +247,21 @@ async def handle_parse(payload: dict) -> None:
                 )
 
             # ── Persist images (no captions yet) ───────────────────────────
-            await db.execute(
-                delete(DocumentImage).where(
-                    DocumentImage.document_id == msg.document_id
-                )
+            # Scope replacement to THIS revision: a prior revision's (or a
+            # legacy NULL-revision) image rows stay readable.
+            await delete_stage_children(
+                db,
+                document_id=msg.document_id,
+                revision_id=msg.revision_id,
+                images=True,
+                tables=True,
             )
             await db.commit()
             for img in parsed.images:
                 db.add(
                     DocumentImage(
                         document_id=msg.document_id,
+                        revision_id=msg.revision_id,
                         image_id=img.image_id,
                         page_no=img.page_no,
                         file_path=img.file_path,
@@ -236,16 +276,11 @@ async def handle_parse(payload: dict) -> None:
                 await db.commit()
 
             # ── Persist tables (no captions yet) ───────────────────────────
-            await db.execute(
-                delete(DocumentTable).where(
-                    DocumentTable.document_id == msg.document_id
-                )
-            )
-            await db.commit()
             for tbl in parsed.tables:
                 db.add(
                     DocumentTable(
                         document_id=msg.document_id,
+                        revision_id=msg.revision_id,
                         table_id=tbl.table_id,
                         page_no=tbl.page_no,
                         content_markdown=tbl.content_markdown,
@@ -290,32 +325,35 @@ async def handle_parse(payload: dict) -> None:
                 f"{len(parsed.images)} images, {parsed.tables_count} tables"
             )
 
-            # ── Dispatch sub-tasks OR mark INDEXED (parse-only / chat-upload mode) ─────
-            parse_only = (
-                settings.HRAG_PARSE_ONLY_MODE
-                or settings.NEXUSRAG_PARSE_ONLY_MODE
-            )
-            if parse_only:
-                # Full parse-only mode (settings flag): skip embed + caption + KG → INDEXED
+            # ── Dispatch sub-tasks OR publish (parse-only / chat-upload mode) ─────
+            if profile is RevisionBuildProfile.PARSE_ONLY:
+                # Parse-only: no embed/caption/KG child stages. Verify + publish
+                # the revision from its recorded manifest (finalize is a no-op
+                # while artifacts are incomplete).
+                await db.commit()
+                await finalize_revision_if_complete(msg.revision_id)
                 document.status = DocumentStatus.INDEXED
                 await db.commit()
                 logger.info(
-                    f"[parse_worker] doc={msg.document_id} parse-only — "
-                    f"marked INDEXED in {int((time.time() - start) * 1000)}ms"
+                    f"[parse_worker] doc={msg.document_id} rev={msg.revision_id} "
+                    f"parse-only — published in {int((time.time() - start) * 1000)}ms"
                 )
-            elif msg.is_chat_upload:
-                # Chat-upload: parse → embed → INDEXED (skip KG and caption for speed)
+            elif profile is RevisionBuildProfile.CHAT_UPLOAD:
+                # Chat-upload: parse → embed (skip KG and caption for speed)
                 await mq.publish(
                     mq.EXCHANGE_EMBED,
                     "embed",
                     EmbedMessage(
                         document_id=msg.document_id,
                         workspace_id=msg.workspace_id,
+                        revision_id=msg.revision_id,
+                        build_profile=msg.build_profile,
                     ).model_dump(mode="json"),
                 )
                 logger.info(
-                    f"[parse_worker] doc={msg.document_id} chat-upload — "
-                    f"dispatched embed (skip caption+kg) in {int((time.time() - start) * 1000)}ms"
+                    f"[parse_worker] doc={msg.document_id} rev={msg.revision_id} "
+                    f"chat-upload — dispatched embed (skip caption+kg) in "
+                    f"{int((time.time() - start) * 1000)}ms"
                 )
             else:
                 # Full pipeline: embed + caption + KG
@@ -325,6 +363,8 @@ async def handle_parse(payload: dict) -> None:
                     EmbedMessage(
                         document_id=msg.document_id,
                         workspace_id=msg.workspace_id,
+                        revision_id=msg.revision_id,
+                        build_profile=msg.build_profile,
                     ).model_dump(mode="json"),
                 )
                 await mq.publish(
@@ -333,6 +373,8 @@ async def handle_parse(payload: dict) -> None:
                     CaptionMessage(
                         document_id=msg.document_id,
                         workspace_id=msg.workspace_id,
+                        revision_id=msg.revision_id,
+                        build_profile=msg.build_profile,
                     ).model_dump(mode="json"),
                 )
                 # New workspace → its KG queue may not exist yet (the kg
@@ -345,12 +387,14 @@ async def handle_parse(payload: dict) -> None:
                     KGMessage(
                         document_id=msg.document_id,
                         workspace_id=msg.workspace_id,
+                        revision_id=msg.revision_id,
+                        build_profile=msg.build_profile,
                         markdown_s3_key=s3_key,
                     ).model_dump(mode="json"),
                 )
                 logger.info(
-                    f"[parse_worker] doc={msg.document_id} dispatched "
-                    f"embed + caption + kg messages"
+                    f"[parse_worker] doc={msg.document_id} rev={msg.revision_id} "
+                    f"dispatched embed + caption + kg messages"
                 )
 
         except Exception as e:

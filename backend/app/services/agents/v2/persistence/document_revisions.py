@@ -354,6 +354,8 @@ class DocumentRevisionsRepository:
         build_profile: RevisionBuildProfile,
         *,
         retry_of_revision_id: Optional[uuid.UUID] = None,
+        reindex_of_revision_id: Optional[uuid.UUID] = None,
+        cloned_from_revision_id: Optional[uuid.UUID] = None,
     ) -> DocumentRevision:
         """Create a fresh ``draft`` revision with a monotonic ``generation``.
 
@@ -363,6 +365,15 @@ class DocumentRevisionsRepository:
         The attempt components (bucket, key, version, etag, size, sha)
         are NOT stored on the revision — they live on the attempt row
         (one attempt per identity).
+
+        Explicit provenance:
+        - ``retry_of_revision_id`` — this revision is a bounded automatic
+          retry of that terminal failed revision.
+        - ``reindex_of_revision_id`` — this revision was explicitly
+          reindexed from that prior revision (copy-on-write; the source
+          object may be byte-identical).
+        - ``cloned_from_revision_id`` — this revision is a workspace
+          clone that reuses that prior revision's raw content/hash.
         """
         # Compute the next generation: MAX(generation) + 1.
         result = await self.session.execute(
@@ -376,6 +387,8 @@ class DocumentRevisionsRepository:
             document_id=document_id,
             generation=next_gen,
             retry_of_revision_id=retry_of_revision_id,
+            reindex_of_revision_id=reindex_of_revision_id,
+            cloned_from_revision_id=cloned_from_revision_id,
             status="draft",
             failed_at=None,
             failure_stage=None,
@@ -388,6 +401,79 @@ class DocumentRevisionsRepository:
             created_at=_now(),
         )
         self.session.add(revision)
+        await self.session.flush()
+        return revision
+
+    async def allocate_draft(
+        self,
+        document_id: uuid.UUID,
+        source_object_identity: str,
+        build_profile: RevisionBuildProfile,
+        *,
+        reindex_of_revision_id: Optional[uuid.UUID] = None,
+        cloned_from_revision_id: Optional[uuid.UUID] = None,
+    ) -> DocumentRevision:
+        """Explicitly allocate a NEW monotonic generation (never idempotent).
+
+        This is the explicit-reindex / clone / user-retry path: unlike
+        :meth:`get_or_create_ingestion_attempt` it never converges on an
+        existing attempt revision, so reindexing an unchanged
+        ``upload_s3_key`` still produces a higher generation.
+
+        Takes the document lock first so generation allocation is
+        monotonic and serialized against concurrent allocate/publish.
+
+        The (document, identity, profile) attempt row is upserted to point
+        at the new revision (bumping ``attempt_generation``) so that (a)
+        ``get_or_create_ingestion_attempt`` / queue redelivery for the same
+        ingest event converges on this explicit revision, and (b)
+        ``verify_draft`` can resolve the immutable allocation profile it
+        requires. Unlike :meth:`retry_ingestion_attempt` this path is an
+        explicit user action and is not bounded by
+        :data:`MAX_REVISION_RETRIES`.
+
+        :raises DocumentNotFound: if the document row is absent.
+        """
+        await self.lock_document_for_update(document_id)
+        revision = await self._new_draft(
+            document_id,
+            source_object_identity,
+            build_profile,
+            reindex_of_revision_id=reindex_of_revision_id,
+            cloned_from_revision_id=cloned_from_revision_id,
+        )
+        attempt = await self.get_attempt_for_update(
+            document_id, source_object_identity, build_profile
+        )
+        if attempt is not None:
+            attempt.revision_id = revision.revision_id
+            attempt.attempt_generation += 1
+            # An explicit reindex is a new user action, never a permanently
+            # exhausted attempt; clear the exhaustion stamp if one was set.
+            attempt.exhausted_at = None
+            await self.session.flush()
+            return revision
+        scheme, bucket, key, version_id, etag, size, sha = (
+            _identity_to_components(source_object_identity)
+        )
+        await self.session.execute(
+            pg_insert(DocumentIngestionAttempt).values(
+                attempt_id=uuid.uuid4(),
+                document_id=document_id,
+                source_object_identity=source_object_identity,
+                source_scheme=scheme,
+                source_bucket=bucket,
+                source_object_key=key,
+                source_version_id=version_id,
+                source_etag=etag,
+                source_size=size,
+                source_sha256=sha,
+                attempt_generation=1,
+                exhausted_at=None,
+                build_profile=build_profile.value,
+                revision_id=revision.revision_id,
+            )
+        )
         await self.session.flush()
         return revision
 

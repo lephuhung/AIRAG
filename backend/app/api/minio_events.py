@@ -2,7 +2,14 @@
 MinIO Events Webhook
 ====================
 Receives S3 event notifications from MinIO when a file is PUT into the
- hrag-uploads bucket and publishes a ParseMessage to RabbitMQ.
+hrag-uploads bucket and records the object's arrival metadata.
+
+**The webhook is metadata-only.** It issues no body read, allocates no
+revision, and publishes no parse task: for the presigned flow ``/confirm``
+is the authoritative producer, and the direct-upload API publishes after
+its own MinIO write. This handler exists to stage
+``source_arrivals.arrival_identity`` so an arrival can be matched to the
+``/confirm`` callback for the same storage event.
 
 MinIO must be configured with:
   MINIO_NOTIFY_WEBHOOK_ENABLE_HRAG=on
@@ -15,24 +22,29 @@ from __future__ import annotations
 
 import logging
 import re
-import urllib.parse
 import uuid
 
 from fastapi import APIRouter, Depends, Request
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.deps import get_db
-from app.models.document import Document, DocumentStatus
-from app.queue.publisher import publish_parse_task
+from app.queue.publisher import record_source_arrival
+from app.services.agents.v2.persistence.source_identity import (
+    InvalidSourceObjectKey,
+    MissingObjectVersion,
+    object_key_from_s3_event,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/minio", tags=["minio-events"])
 
-# Key format: kb_{workspace_id}/doc_{document_id}.{ext}
-_KEY_RE = re.compile(r"^kb_([0-9a-f-]+)/doc_([0-9a-f-]+)\.\w+$")
+# Key shapes: kb_{workspace_id}/doc_{document_id}.{ext} and the chat-upload
+# form kb_{workspace_id}/chat_file_{document_id}.{ext}.
+_KEY_RE = re.compile(
+    r"^kb_([0-9a-f-]+)/(?:doc|chat_file)_([0-9a-f-]+)\.\w+$"
+)
 
 
 @router.post("/events")
@@ -40,12 +52,10 @@ async def handle_minio_event(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Receive S3 event notification from MinIO.
+    """Record each ``ObjectCreated`` arrival; never allocate or publish.
 
-    For each ObjectCreated event in hrag-uploads, look up the matching
-    Document record and publish a ParseMessage to RabbitMQ (idempotent —
-    duplicate events for already-processing documents are silently ignored).
+    Duplicate deliveries collapse on the ``source_arrivals.arrival_identity``
+    unique key, so redelivery is idempotent.
     """
     try:
         payload = await request.json()
@@ -63,13 +73,23 @@ async def handle_minio_event(
             continue
 
         bucket = record.get("s3", {}).get("bucket", {}).get("name", "")
-        key_raw = record.get("s3", {}).get("object", {}).get("key", "")
-        key = urllib.parse.unquote(key_raw)
-
         if bucket != settings.MINIO_BUCKET_UPLOADS:
             logger.debug(
                 f"[minio_events] ignoring event for bucket '{bucket}' "
                 f"(expected '{settings.MINIO_BUCKET_UPLOADS}')"
+            )
+            continue
+
+        obj = record.get("s3", {}).get("object", {})
+        key_raw = obj.get("key", "")
+        # S3/MinIO event keys are form-encoded; decode exactly once, then
+        # normalize. Storage keys are NOT encoded, so this is the only
+        # trigger that form-decodes.
+        try:
+            key = object_key_from_s3_event(key_raw)
+        except InvalidSourceObjectKey as e:
+            logger.warning(
+                f"[minio_events] invalid object key {key_raw!r}: {e} — skipping"
             )
             continue
 
@@ -83,36 +103,41 @@ async def handle_minio_event(
         workspace_id = uuid.UUID(match.group(1))
         document_id = uuid.UUID(match.group(2))
 
-        result = await db.execute(select(Document).where(Document.id == document_id))
-        document = result.scalar_one_or_none()
-
-        if document is None:
-            logger.warning(
-                f"[minio_events] doc={document_id} not found in DB — skipping"
-            )
-            continue
-
-        if document.status != DocumentStatus.PENDING:
-            logger.debug(
-                f"[minio_events] doc={document_id} status={document.status.value} "
-                f"— skipping (not PENDING, idempotent)"
-            )
-            continue
+        version_id = obj.get("versionId") or None
+        etag = obj.get("eTag") or None
+        size_raw = obj.get("size")
+        try:
+            size_bytes = int(size_raw) if size_raw is not None else None
+        except (TypeError, ValueError):
+            size_bytes = None
 
         try:
-            await publish_parse_task(
-                document_id=document_id,
-                workspace_id=workspace_id,
-                minio_key=key,
-                original_filename=document.original_filename,
+            arrival_identity = await record_source_arrival(
+                db,
+                bucket=bucket,
+                object_key=key,
+                version_id=version_id,
+                etag=etag,
+                size_bytes=size_bytes,
             )
-            logger.info(
-                f"[minio_events] doc={document_id} workspace={workspace_id} "
-                f"queued for parsing via webhook"
+            await db.commit()
+        except MissingObjectVersion as e:
+            logger.warning(
+                f"[minio_events] doc={document_id} key={key} has no version "
+                f"selector ({e}) — arrival not recorded"
             )
+            continue
         except Exception as e:
+            await db.rollback()
             logger.error(
-                f"[minio_events] Failed to publish parse task for doc {document_id}: {e}"
+                f"[minio_events] failed to record arrival for doc={document_id} "
+                f"key={key}: {e}"
             )
+            continue
+
+        logger.info(
+            f"[minio_events] recorded arrival ws={workspace_id} doc={document_id} "
+            f"key={key} identity={arrival_identity}"
+        )
 
     return {"status": "ok"}

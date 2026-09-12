@@ -249,6 +249,8 @@ _CREATE_DDL: tuple[str, ...] = (
         document_id                    UUID        NOT NULL,
         generation                     BIGINT      NOT NULL,
         retry_of_revision_id           UUID        NULL,
+        reindex_of_revision_id         UUID        NULL,
+        cloned_from_revision_id        UUID        NULL,
         status                         TEXT        NOT NULL,
         published_at                   TIMESTAMPTZ NULL,
         failed_at                      TIMESTAMPTZ NULL,
@@ -264,6 +266,8 @@ _CREATE_DDL: tuple[str, ...] = (
         UNIQUE (document_id, generation),
         FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE RESTRICT,
         FOREIGN KEY (retry_of_revision_id) REFERENCES document_revisions(revision_id),
+        FOREIGN KEY (reindex_of_revision_id) REFERENCES document_revisions(revision_id),
+        FOREIGN KEY (cloned_from_revision_id) REFERENCES document_revisions(revision_id),
         FOREIGN KEY (superseded_by) REFERENCES document_revisions(revision_id)
     )
     """,
@@ -429,6 +433,10 @@ _CREATE_INDEXES: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS ix_revisions_status ON document_revisions(status)",
     "CREATE INDEX IF NOT EXISTS ix_revisions_retry_of "
     "ON document_revisions(retry_of_revision_id)",
+    "CREATE INDEX IF NOT EXISTS ix_revisions_reindex_of "
+    "ON document_revisions(reindex_of_revision_id)",
+    "CREATE INDEX IF NOT EXISTS ix_revisions_cloned_from "
+    "ON document_revisions(cloned_from_revision_id)",
     "CREATE INDEX IF NOT EXISTS ix_attempts_doc "
     "ON revision_ingestion_attempts(document_id)",
     "CREATE INDEX IF NOT EXISTS ix_attempts_revision "
@@ -678,7 +686,14 @@ def _verify_legacy_unchanged(
 #: ``check_v2_schema`` fail closed instead of reporting ``is_clean=True``.
 _EXPECTED_SHAPE_COLUMNS: dict[str, frozenset[str]] = {
     "revision_ingestion_attempts": frozenset({"source_object_identity"}),
-    "document_revisions": frozenset({"published_at", "superseded_by"}),
+    "document_revisions": frozenset(
+        {
+            "published_at",
+            "superseded_by",
+            "reindex_of_revision_id",
+            "cloned_from_revision_id",
+        }
+    ),
     "document_revision_builds": frozenset(
         {
             "markdown_artifact_key",

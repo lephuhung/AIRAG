@@ -2,7 +2,15 @@
 Queue Message Schemas
 =====================
 Pydantic models for every message type passed through RabbitMQ.
-All messages carry document_id + workspace_id as primary keys.
+All document-pipeline messages carry document_id + workspace_id as
+primary keys AND the required ``revision_id`` that owns the work.
+
+``revision_id`` is required with no default: a message that does not
+name a revision cannot be executed, because revision state (not the
+mutable ``Document`` row) is authoritative for processing. Child
+messages published by a worker preserve the same ``revision_id`` and
+``build_profile`` so every stage of one ingest event executes against
+exactly one revision.
 """
 
 from __future__ import annotations
@@ -17,6 +25,8 @@ class ParseMessage(BaseModel):
 
     document_id: uuid.UUID
     workspace_id: uuid.UUID
+    revision_id: uuid.UUID
+    build_profile: str
     minio_key: str  # key in hrag-uploads bucket
     original_filename: str
     is_chat_upload: bool = False  # True → skip embed/caption/kg workers
@@ -27,6 +37,8 @@ class EmbedMessage(BaseModel):
 
     document_id: uuid.UUID
     workspace_id: uuid.UUID
+    revision_id: uuid.UUID
+    build_profile: str
 
 
 class CaptionMessage(BaseModel):
@@ -34,6 +46,8 @@ class CaptionMessage(BaseModel):
 
     document_id: uuid.UUID
     workspace_id: uuid.UUID
+    revision_id: uuid.UUID
+    build_profile: str
 
 
 class KGMessage(BaseModel):
@@ -46,6 +60,8 @@ class KGMessage(BaseModel):
 
     document_id: uuid.UUID
     workspace_id: uuid.UUID
+    revision_id: uuid.UUID
+    build_profile: str
     # Prefer markdown_s3_key: kg_worker downloads the markdown from MinIO so the
     # broker message stays small (and retry copies stay cheap). The inline
     # `markdown` field remains only for backward compatibility with in-flight /

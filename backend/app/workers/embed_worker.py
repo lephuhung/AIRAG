@@ -16,6 +16,7 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 
@@ -25,13 +26,24 @@ from app.core.config import settings
 from app.core.database import async_session_maker
 from app.models.document_type import DocumentType as _DocumentType  # noqa: F401
 from app.models.document import Document, DocumentStatus
+from app.models.document_revision_build import DocumentRevisionBuild
 from app.queue.messages import EmbedMessage
+from app.services.agents.v2.persistence.source_identity import (
+    RevisionBuildProfile,
+)
 from app.services.embedding.embedder import get_embedding_service
 from app.services.parsing.heading_path import extract_article_nos
 from app.services.embedding.vector_store import get_vector_store
-from app.workers.utils import check_and_finalize
+from app.workers.utils import (
+    load_revision_execution,
+    record_embed_artifacts,
+)
 
 logger = logging.getLogger(__name__)
+
+#: Schema version of the persisted vector artifact (Task 5 owns the
+#: revision-qualified namespace scheme; this pins the manifest for now).
+_VECTOR_ARTIFACT_VERSION = "v1"
 
 
 async def handle_embed(payload: dict) -> None:
@@ -42,7 +54,11 @@ async def handle_embed(payload: dict) -> None:
     await ensure_fresh_config()
 
     msg = EmbedMessage(**payload)
-    logger.info(f"[embed_worker] doc={msg.document_id}")
+    logger.info(
+        f"[embed_worker] doc={msg.document_id} rev={msg.revision_id} "
+        f"profile={msg.build_profile}"
+    )
+    profile = RevisionBuildProfile(msg.build_profile)
 
     async with async_session_maker() as db:
         result = await db.execute(
@@ -55,10 +71,37 @@ async def handle_embed(payload: dict) -> None:
             logger.error(f"[embed_worker] doc={msg.document_id} not found")
             return
 
-        # Idempotency: if embed_done=True the message was already processed
-        # (e.g. redelivered after a crash-before-ack). Skip silently.
-        if document.embed_done:
-            logger.info(f"[embed_worker] doc={msg.document_id} already has embed_done=True — skipping")
+        # Revision-owned execution decision: terminal revision or tombstoned
+        # source is a no-op dead-letter.
+        execution = await load_revision_execution(
+            db, revision_id=msg.revision_id, document_id=msg.document_id
+        )
+        if not execution.run:
+            logger.info(
+                f"[embed_worker] doc={msg.document_id} rev={msg.revision_id} "
+                f"no-op ({execution.reason})"
+            )
+            return
+
+        # Idempotency is revision-scoped: a redelivered message re-runs only
+        # its incomplete stage. The build manifest, not Document.embed_done,
+        # proves whether THIS revision's vectors already exist.
+        already = await db.scalar(
+            select(DocumentRevisionBuild.build_id).where(
+                DocumentRevisionBuild.revision_id == msg.revision_id,
+                DocumentRevisionBuild.build_profile == profile.value,
+                DocumentRevisionBuild.embedding_namespace.is_not(None),
+                DocumentRevisionBuild.vector_artifact_version.is_not(None),
+            )
+        )
+        if already is not None:
+            logger.info(
+                f"[embed_worker] doc={msg.document_id} rev={msg.revision_id} "
+                f"already has a vector manifest — skipping"
+            )
+            await check_and_finalize(
+                document, db, revision_id=msg.revision_id
+            )
             return
 
         try:
@@ -71,7 +114,9 @@ async def handle_embed(payload: dict) -> None:
                 logger.warning(f"[embed_worker] doc={msg.document_id} has no raw_chunks_json — skipping embed")
                 document.embed_done = True
                 await db.commit()
-                await check_and_finalize(document, db)
+                await check_and_finalize(
+                    document, db, revision_id=msg.revision_id
+                )
                 return
 
             chunks_data: list[dict] = json.loads(raw)
@@ -79,7 +124,9 @@ async def handle_embed(payload: dict) -> None:
                 document.embed_done = True
                 document.chunk_count = 0
                 await db.commit()
-                await check_and_finalize(document, db)
+                await check_and_finalize(
+                    document, db, revision_id=msg.revision_id
+                )
                 return
 
             # ── Strip OCR layout markup before vectorising ──────────────────
@@ -206,7 +253,25 @@ async def handle_embed(payload: dict) -> None:
                 )
                 raise
 
-            # ── Mark searchable ─────────────────────────────────────────────
+            # ── Record the revision's vector manifest ────────────────────────
+            await record_embed_artifacts(
+                db,
+                msg.revision_id,
+                profile,
+                embedding_namespace=vector_store.collection_name,
+                embedding_model_hash=hashlib.sha256(
+                    embedder.model_name.encode("utf-8")
+                ).hexdigest()[:16],
+                embedding_dimension=int(embedder.dimension),
+                vector_artifact_version=_VECTOR_ARTIFACT_VERSION,
+            )
+            await db.commit()
+            logger.info(
+                f"[embed_worker] doc={msg.document_id} rev={msg.revision_id} "
+                f"recorded vector manifest for {vector_store.collection_name}"
+            )
+
+            # ── Mark searchable (v1/UI mirror only) ────────────────────────
             document.embed_done  = True
             document.chunk_count = len(chunks_data)
             if document.is_chat_upload:
@@ -232,7 +297,9 @@ async def handle_embed(payload: dict) -> None:
                 f"[embed_worker] doc={msg.document_id} embedded "
                 f"{len(chunks_data)} chunks → embed_done"
             )
-            await check_and_finalize(document, db)
+            await check_and_finalize(
+                document, db, revision_id=msg.revision_id
+            )
 
         except Exception as e:
             logger.error(f"[embed_worker] doc={msg.document_id} FAILED: {e}", exc_info=True)
