@@ -49,7 +49,7 @@ cannot be enforced on legacy rows that legitimately lack a revision ID
    ``document_tables``) gets a ``BEFORE UPDATE OF <revision_col>``
    trigger that fires *only* when the ``current_revision_id`` (or
    ``revision_id`` for image/table) column is in the SET clause.
-2. The trigger's ``WHEN`` clause is
+2. The trigger's ``WHEN`` clause is the brief's invariant:
    ``OLD.<revision_col> IS NOT NULL AND NEW.<revision_col> IS NULL``.
    This catches the only invariant the brief is protecting: a row that
    already carries a revision pointer cannot silently lose it.
@@ -59,13 +59,57 @@ cannot be enforced on legacy rows that legitimately lack a revision ID
    are unaffected because the trigger is ``BEFORE UPDATE OF``, not
    ``BEFORE INSERT OR UPDATE``.
 
-**Why no INSERT-side trigger:** any INSERT-time check that requires a
-revision ID would also reject v1-style INSERTs during the transition
-window, which the brief explicitly prohibits. The FK from
-``documents.current_revision_id`` (and the matching image/table
-columns) to ``document_revisions(revision_id)`` (installed by the
-``_LEGACY_FK_STATEMENTS`` step) already enforces revision existence
-when the v2 pipeline populates the column.
+**Tombstone carve-out (asymmetry between ``documents`` and the child
+tables):** the ``documents`` trigger has a tombstone exemption because
+the plan-mandated ``mark_source_deleted`` path (plan §207–212, Final
+Gate #35) is exactly ``UPDATE documents SET current_revision_id = NULL,
+source_deleted_at = NOW()``. Without an exemption that UPDATE would
+raise the no-unset trigger and block the Phase 1C tombstone. So the
+``documents`` trigger's WHEN clause additionally requires
+``NEW.source_deleted_at IS NULL``:
+
+  ``WHEN (OLD.current_revision_id IS NOT NULL
+          AND NEW.current_revision_id IS NULL
+          AND NEW.source_deleted_at IS NULL)``
+
+Semantics:
+- Accidental unset (``UPDATE documents SET current_revision_id = NULL``
+  with no ``source_deleted_at``) — ``NEW.source_deleted_at IS NULL`` →
+  WHEN fires → UPDATE rejected. The brief invariant is preserved.
+- Tombstone (``UPDATE documents SET current_revision_id = NULL,
+  source_deleted_at = NOW()``) — ``NEW.source_deleted_at IS NOT NULL``
+  → WHEN is FALSE → trigger does NOT fire → UPDATE allowed.
+
+The ``document_images`` and ``document_tables`` triggers do NOT have
+this carve-out. Those child tables have no ``source_deleted_at``
+column; the tombstone model is owned at the ``documents`` row level
+(the document itself is tombstoned via ``source_deleted_at``, and the
+associated child images/tables are likewise considered tombstoned via
+the parent-tombstone + FK-cascade-review that Phase 1C will install).
+There is no in-table UNSET of ``document_images.revision_id`` or
+``document_tables.revision_id`` in the tombstone path, so the
+child-table triggers keep the original no-unset invariant unchanged.
+This asymmetry is intentional and is asserted by
+``test_tombstone_carve_out_is_documents_only``.
+
+**Why no INSERT-side trigger (brief item 4 INSERT branch — parked):**
+the brief's literal reading would require a CHECK or INSERT-side
+trigger that rejects any INSERT that omits ``current_revision_id`` /
+``revision_id``. That literal reading breaks v1 during the transition
+window (forbidden by the brief and by Phase 1's "v1 production
+default" rule). A sentinel-column-based INSERT-side trigger was
+attempted in fix round 1 and regressed v1 writes (the trigger fired on
+every INSERT because ``migrated_at IS NULL`` was true for every
+post-migration row), so it was removed in fix round 2. Without a
+sentinel, the DB cannot distinguish v1 vs v2 INSERTs. **Parked:**
+INSERT-side enforcement is application responsibility — Phase 1C
+ingestion code MUST populate ``current_revision_id`` (and the
+matching image/table ``revision_id`` columns) when publishing. The DB
+only enforces (a) the FK on the revision pointer (I3) catches a
+non-existent revision; (b) the no-unset guard rejects a row that
+already carries a revision pointer being silently unset; and (c) the
+tombstone carve-out on ``documents`` allows the plan-mandated
+``mark_source_deleted`` path.
 
 **Why no DELETE-side trigger:** brief Step 2 item (3) requires that
 cascading deletes from ``documents`` cannot orphan or destroy
@@ -77,7 +121,8 @@ silently cascade, and we block it there.
 
 Net effect: v1 INSERT/UPDATE paths are completely unaffected; the v2
 invariants are enforced by the FK (existence) plus the stable-pointer
-trigger (no losing the pointer once set).
+trigger (no losing the pointer once set) plus the tombstone carve-out
+on ``documents`` (plan-mandated).
 
 Brief item (5) — legacy-unchanged verification
 ----------------------------------------------
@@ -465,6 +510,15 @@ _TRIGGER_FUNCTIONS: tuple[str, ...] = (
 # ``embed_done``, ...) never fire the trigger because ``UPDATE OF``
 # skips them. v1 INSERTs are unaffected because the trigger is
 # UPDATE-only.
+#
+# Tombstone carve-out: the ``documents`` trigger's WHEN clause
+# additionally requires ``NEW.source_deleted_at IS NULL``. This means
+# an accidental unset (``UPDATE documents SET current_revision_id =
+# NULL`` without setting ``source_deleted_at``) is still rejected, but
+# the plan-mandated tombstone (``UPDATE documents SET
+# current_revision_id = NULL, source_deleted_at = NOW()``) is allowed.
+# See the module docstring's "Brief item (4) — revision-ID enforcement"
+# section for the rationale and asymmetry with the child tables.
 _TRIGGERS: tuple[str, ...] = (
     """
     DROP TRIGGER IF EXISTS trg_documents_revision_id_stable ON documents
@@ -473,7 +527,9 @@ _TRIGGERS: tuple[str, ...] = (
     CREATE TRIGGER trg_documents_revision_id_stable
         BEFORE UPDATE OF current_revision_id ON documents
         FOR EACH ROW
-        WHEN (OLD.current_revision_id IS NOT NULL AND NEW.current_revision_id IS NULL)
+        WHEN (OLD.current_revision_id IS NOT NULL
+              AND NEW.current_revision_id IS NULL
+              AND NEW.source_deleted_at IS NULL)
         EXECUTE FUNCTION raise_documents_revision_id_loss()
     """,
     """

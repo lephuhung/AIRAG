@@ -702,11 +702,22 @@ def test_v1_style_writes_allowed(migrated_db: Engine) -> None:
 
 
 def test_revision_id_stable_pointer_rejects_unset(migrated_db: Engine) -> None:
-    """Round-2 fix: stable-pointer trigger fires on non-null → null transition.
+    """Round-2 + round-3 fix: stable-pointer trigger fires on accidental unset.
 
     Once a row carries a revision pointer, the trigger must reject any
-    UPDATE that sets it back to NULL. This is the actual invariant
-    brief item (4) is protecting.
+    UPDATE that sets it back to NULL *without simultaneously tombstoning*
+    the document (i.e. setting ``source_deleted_at``). This is the
+    actual invariant brief item (4) is protecting. The round-3 fix
+    carves out the tombstone path (``UPDATE documents SET
+    current_revision_id = NULL, source_deleted_at = NOW()``) but the
+    accidental unset (no ``source_deleted_at``) MUST still raise.
+
+    This test deliberately omits ``source_deleted_at`` from the SET
+    clause so the WHEN clause
+    ``OLD.current_revision_id IS NOT NULL
+      AND NEW.current_revision_id IS NULL
+      AND NEW.source_deleted_at IS NULL``
+    evaluates to TRUE — the trigger fires and the UPDATE is rejected.
     """
     doc_id = uuid.uuid4()
     revision_id = uuid.uuid4()
@@ -764,6 +775,10 @@ def test_revision_id_stable_pointer_rejects_unset(migrated_db: Engine) -> None:
 
     with pytest.raises(DBAPIError) as excinfo:
         with migrated_db.connect() as conn:
+            # Accidental unset: ``current_revision_id = NULL`` with no
+            # simultaneous ``source_deleted_at`` set. The trigger MUST
+            # fire (because ``NEW.source_deleted_at IS NULL`` makes the
+            # WHEN clause TRUE) and the UPDATE MUST be rejected.
             conn.execute(
                 text(
                     "UPDATE documents SET current_revision_id = NULL "
@@ -778,16 +793,283 @@ def test_revision_id_stable_pointer_rejects_unset(migrated_db: Engine) -> None:
     )
 
     # The row is still intact (the transaction raised; conn.rollback in
-    # the inner block prevents partial application).
+    # the inner block prevents partial application). The
+    # ``current_revision_id`` column is unchanged.
     with migrated_db.connect() as conn:
         row = conn.execute(
             text(
-                "SELECT current_revision_id FROM documents WHERE id = :id"
+                "SELECT current_revision_id, source_deleted_at "
+                "FROM documents WHERE id = :id"
             ),
             {"id": str(doc_id)},
         ).first()
     assert row is not None
     assert str(row[0]) == str(revision_id), (
         f"stable-pointer trigger must leave current_revision_id intact, "
+        f"got {row[0]!r}"
+    )
+    assert row[1] is None, (
+        f"stable-pointer trigger must not set source_deleted_at, "
+        f"got {row[1]!r}"
+    )
+
+
+def test_tombstone_clears_current_revision_pointer(migrated_db: Engine) -> None:
+    """Round-3 fix: the plan-mandated tombstone path is allowed.
+
+    Phase 1C's ``mark_source_deleted`` path (plan §207–212, Final Gate
+    #35 — ``test_tombstone_clears_current_revision_pointer``) is exactly
+    ``UPDATE documents SET current_revision_id = NULL, source_deleted_at
+    = NOW()``. The round-3 fix narrows the trigger WHEN clause to add
+    ``AND NEW.source_deleted_at IS NULL``, which makes that UPDATE
+    pass the trigger (because ``NEW.source_deleted_at IS NOT NULL``
+    makes the WHEN clause FALSE) while still rejecting the accidental
+    unset (``test_revision_id_stable_pointer_rejects_unset`` covers the
+    other shape).
+    """
+    doc_id = uuid.uuid4()
+    revision_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+
+    with _psycopg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO tenants (id, name, slug, is_active, created_at, updated_at) "
+                "VALUES (%s, %s, %s, true, NOW(), NOW())",
+                (str(tenant_id), f"t-{tenant_id}", f"slug-{tenant_id}"),
+            )
+            cur.execute(
+                "INSERT INTO users (id, email, password_hash, full_name, is_active, "
+                "is_superadmin, settings, totp_enabled, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, true, false, '{}', false, NOW(), NOW())",
+                (str(user_id), f"u-{user_id}@example.com", "x", "x"),
+            )
+            cur.execute(
+                "INSERT INTO knowledge_bases (id, name, description, system_prompt, "
+                "visibility, owner_id, tenant_id, is_default, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, 'private', %s, %s, false, NOW(), NOW())",
+                (str(workspace_id), f"kb-{workspace_id}", "d", "p",
+                 str(user_id), str(tenant_id)),
+            )
+            cur.execute(
+                "INSERT INTO documents (id, workspace_id, filename, original_filename, "
+                "file_type, file_size, status, chunk_count, page_count, image_count, "
+                "table_count, processing_time_ms, embed_done, captions_done, kg_done, "
+                "is_chat_upload, created_at, updated_at, current_revision_id) "
+                "VALUES (%s, %s, %s, %s, 'pdf', 1, 'indexed', 0, 0, 0, 0, 0, "
+                "false, false, false, false, NOW(), NOW(), NULL)",
+                (str(doc_id), str(workspace_id), f"f-{doc_id}", f"o-{doc_id}.pdf"),
+            )
+            cur.execute(
+                "INSERT INTO document_revisions (revision_id, document_id, "
+                "generation, status) VALUES (%s, %s, 1, 'active')",
+                (str(revision_id), str(doc_id)),
+            )
+            cur.execute(
+                "UPDATE documents SET current_revision_id = %s WHERE id = %s",
+                (str(revision_id), str(doc_id)),
+            )
+        conn.commit()
+
+    # Tombstone: SET both ``current_revision_id = NULL`` AND
+    # ``source_deleted_at = NOW()``. The trigger's WHEN clause
+    # ``OLD.current_revision_id IS NOT NULL
+    #   AND NEW.current_revision_id IS NULL
+    #   AND NEW.source_deleted_at IS NULL``
+    # evaluates to FALSE (the third conjunct is FALSE), so the trigger
+    # does NOT fire and the UPDATE is allowed.
+    with migrated_db.connect() as conn:
+        result = conn.execute(
+            text(
+                "UPDATE documents SET current_revision_id = NULL, "
+                "source_deleted_at = NOW() WHERE id = :id"
+            ),
+            {"id": str(doc_id)},
+        )
+        conn.commit()
+        assert result.rowcount == 1, (
+            f"tombstone UPDATE must affect 1 row, got {result.rowcount}"
+        )
+
+    # Verify the post-tombstone state: pointer cleared, tombstone set.
+    with migrated_db.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT current_revision_id, source_deleted_at "
+                "FROM documents WHERE id = :id"
+            ),
+            {"id": str(doc_id)},
+        ).first()
+    assert row is not None
+    assert row[0] is None, (
+        f"tombstone must clear current_revision_id, got {row[0]!r}"
+    )
+    assert row[1] is not None, (
+        f"tombstone must set source_deleted_at, got None"
+    )
+
+
+def test_tombstone_carve_out_is_documents_only(migrated_db: Engine) -> None:
+    """Round-3 fix: tombstone carve-out applies to ``documents`` only.
+
+    The ``document_images`` and ``document_tables`` triggers do NOT
+    have a ``source_deleted_at`` carve-out because those child tables
+    have no ``source_deleted_at`` column. The asymmetry is intentional
+    (see module docstring's "Tombstone carve-out" subsection) and is
+    asserted here at three levels:
+
+    1. Source-level: the SQL DDL for the child triggers does not mention
+       ``source_deleted_at`` in the WHEN clause (only the documents
+       trigger does).
+    2. Trigger-function-level: the child trigger-function error
+       messages do not reference ``source_deleted_at``.
+    3. Behavior-level: the child-table triggers still raise on a
+       non-null → null transition of ``revision_id`` (no carve-out
+       path exists for them because the parent tombstone governs
+       their tombstoned state via the parent-row tombstone + Phase 1C
+       FK cascade review).
+    """
+    import re
+    from pathlib import Path
+
+    src_path = (
+        Path(__file__).resolve().parents[3]
+        / "app"
+        / "services"
+        / "agents"
+        / "v2"
+        / "persistence"
+        / "migrate.py"
+    )
+    src = src_path.read_text(encoding="utf-8")
+    # Strip ONLY the module docstring and # comments. Triple-quoted SQL
+    # blocks are preserved.
+    code = re.sub(r'^\s*""".*?"""', "", src, count=1, flags=re.DOTALL)
+    code = re.sub(r"#[^\n]*", "", code)
+
+    # Pull the SQL block of each trigger from the source. We use a
+    # simple "find the trigger CREATE, then capture until the
+    # EXECUTE FUNCTION line" approach.
+    def _trigger_block(trigger_name: str) -> str:
+        # Find the CREATE TRIGGER line (after the DROP TRIGGER).
+        marker = f"CREATE TRIGGER {trigger_name}"
+        i = code.find(marker)
+        assert i != -1, f"trigger {trigger_name} not found in migrate.py"
+        # Capture up to the EXECUTE FUNCTION terminator.
+        j = code.find("EXECUTE FUNCTION", i)
+        assert j != -1, f"trigger {trigger_name} has no EXECUTE FUNCTION"
+        return code[i : j + 1]
+
+    docs_block = _trigger_block("trg_documents_revision_id_stable")
+    imgs_block = _trigger_block("trg_document_images_revision_id_stable")
+    tbls_block = _trigger_block("trg_document_tables_revision_id_stable")
+
+    # The documents trigger must mention ``source_deleted_at`` in its
+    # WHEN clause; the child triggers MUST NOT.
+    assert "source_deleted_at" in docs_block, (
+        "documents trigger WHEN clause must include the "
+        "source_deleted_at tombstone carve-out"
+    )
+    assert "source_deleted_at" not in imgs_block, (
+        "document_images trigger WHEN clause must NOT mention "
+        "source_deleted_at (carve-out is documents-only)"
+    )
+    assert "source_deleted_at" not in tbls_block, (
+        "document_tables trigger WHEN clause must NOT mention "
+        "source_deleted_at (carve-out is documents-only)"
+    )
+
+    # Behavior-level: a non-null → null transition on
+    # ``document_images.revision_id`` is still rejected by the trigger
+    # even when the row was inserted with the column set (no carve-out
+    # applies). This proves the child triggers keep the original
+    # no-unset invariant unchanged.
+    doc_id = uuid.uuid4()
+    image_id = uuid.uuid4()
+    revision_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+
+    with _psycopg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO tenants (id, name, slug, is_active, created_at, updated_at) "
+                "VALUES (%s, %s, %s, true, NOW(), NOW())",
+                (str(tenant_id), f"t-{tenant_id}", f"slug-{tenant_id}"),
+            )
+            cur.execute(
+                "INSERT INTO users (id, email, password_hash, full_name, is_active, "
+                "is_superadmin, settings, totp_enabled, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, true, false, '{}', false, NOW(), NOW())",
+                (str(user_id), f"u-{user_id}@example.com", "x", "x"),
+            )
+            cur.execute(
+                "INSERT INTO knowledge_bases (id, name, description, system_prompt, "
+                "visibility, owner_id, tenant_id, is_default, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, 'private', %s, %s, false, NOW(), NOW())",
+                (str(workspace_id), f"kb-{workspace_id}", "d", "p",
+                 str(user_id), str(tenant_id)),
+            )
+            cur.execute(
+                "INSERT INTO documents (id, workspace_id, filename, original_filename, "
+                "file_type, file_size, status, chunk_count, page_count, image_count, "
+                "table_count, processing_time_ms, embed_done, captions_done, kg_done, "
+                "is_chat_upload, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, 'pdf', 1, 'indexed', 0, 0, 0, 0, 0, "
+                "false, false, false, false, NOW(), NOW())",
+                (str(doc_id), str(workspace_id), f"f-{doc_id}", f"o-{doc_id}.pdf"),
+            )
+            cur.execute(
+                "INSERT INTO document_revisions (revision_id, document_id, "
+                "generation, status) VALUES (%s, %s, 1, 'active')",
+                (str(revision_id), str(doc_id)),
+            )
+            cur.execute(
+                "INSERT INTO document_images (id, document_id, image_id, "
+                "page_no, file_path, caption, width, height, mime_type, "
+                "created_at, revision_id) VALUES (%s, %s, %s, 1, "
+                "'/tmp/x.png', 'cap', 10, 10, 'image/png', NOW(), %s)",
+                (str(image_id), str(doc_id), f"img-{doc_id}", str(revision_id)),
+            )
+        conn.commit()
+
+    from sqlalchemy.exc import DBAPIError
+
+    # A non-null → null on ``document_images.revision_id`` MUST raise
+    # (the child trigger has no carve-out). Note the SET clause also
+    # tries ``source_deleted_at = NOW()`` (which is a documents-only
+    # column), but PG would reject that on a child table before the
+    # trigger fires; so we deliberately do NOT include
+    # ``source_deleted_at`` here — the carve-out is documents-only.
+    with pytest.raises(DBAPIError) as excinfo:
+        with migrated_db.connect() as conn:
+            conn.execute(
+                text(
+                    "UPDATE document_images SET revision_id = NULL "
+                    "WHERE id = :id"
+                ),
+                {"id": str(image_id)},
+            )
+            conn.commit()
+    msg = str(excinfo.value).lower()
+    assert "revision_id" in msg or "cannot be unset" in msg, (
+        f"document_images trigger must still reject non-null → null "
+        f"unset (no carve-out), got: {excinfo.value}"
+    )
+
+    # The image row's revision_id is unchanged.
+    with migrated_db.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT revision_id FROM document_images WHERE id = :id"
+            ),
+            {"id": str(image_id)},
+        ).first()
+    assert row is not None
+    assert str(row[0]) == str(revision_id), (
+        f"document_images trigger must leave revision_id intact, "
         f"got {row[0]!r}"
     )
