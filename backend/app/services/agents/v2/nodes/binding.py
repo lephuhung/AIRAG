@@ -32,7 +32,7 @@ from typing import Any
 from langgraph.runtime import Runtime
 
 from ..contracts.binding import DocumentBindingSet
-from ..contracts.semantic import SemanticDraft
+from ..contracts.semantic import DocumentReference, SemanticDraft
 from ..contracts.state import GraphRuntimeContext, SupervisorV2State
 from .context import _context_of, build_semantic_draft
 
@@ -109,6 +109,30 @@ def _merge_binding_sets(
     )
 
 
+def _prune_stale_relations(
+    merged: DocumentBindingSet,
+    document_refs: tuple[DocumentReference, ...],
+) -> DocumentBindingSet:
+    """Drop relations whose ref is absent from the current draft (NEW-3).
+
+    Pins are retained for continuity; only the relation is pruned, because the
+    frozen aggregate validator resolves every relation's ``ref_id`` against
+    the current semantic. Extends the ``_merge_binding_sets`` precedent, which
+    already drops relations for replaced binding IDs.
+    """
+    current_ref_ids = {reference.ref_id for reference in document_refs}
+    relations = tuple(
+        relation
+        for relation in merged.revision_requirement_refs
+        if relation.ref_id in current_ref_ids
+    )
+    if len(relations) == len(merged.revision_requirement_refs):
+        return merged
+    return DocumentBindingSet(
+        bindings=merged.bindings, revision_requirement_refs=relations
+    )
+
+
 async def _commit_lease_session(repo: Any) -> None:
     session = getattr(repo, "session", None)
     commit = getattr(session, "commit", None)
@@ -133,7 +157,10 @@ async def binding_node(
         state["request"], state["conversation"], context
     )
     binding_set = await resolve_bindings(draft, context)
-    merged = _merge_binding_sets(state["bindings"], binding_set)
+    merged = _prune_stale_relations(
+        _merge_binding_sets(state["bindings"], binding_set),
+        draft.document_refs,
+    )
     new_pins = binding_set.bindings
     if new_pins:
         repo = context.services.retention_leases

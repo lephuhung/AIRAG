@@ -189,7 +189,7 @@ def finalize_semantic(
         section_refs=draft.section_refs,
         blocking_ambiguities=finalize_blocking_ambiguities(
             draft.preliminary_ambiguities,
-            bindings,
+            current,
         ),
     )
     validate_semantic_context(context)

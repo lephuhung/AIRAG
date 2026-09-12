@@ -298,6 +298,7 @@ def draft_with_refs(
     refs: tuple[DocumentReference, ...],
     *,
     provisional: str = "Xem Nghị định 12/2020",
+    ambiguities: tuple[BlockingAmbiguity, ...] = (),
 ) -> SemanticDraft:
     return SemanticDraft(
         provisional_contextualized_query=provisional,
@@ -306,7 +307,7 @@ def draft_with_refs(
         document_refs=refs,
         person_refs=(),
         section_refs=(),
-        preliminary_ambiguities=(),
+        preliminary_ambiguities=ambiguities,
     )
 
 
@@ -1340,6 +1341,114 @@ async def test_multi_turn_carried_pin_survives_fresh_query() -> None:
     assert [b.binding_id for b in turn2["bindings"].bindings] == ["b_r1"]
     # No lease refresh for the now-stale pin on the unrelated turn.
     assert events == [f"acquire:{REVISION_ID}", "commit"]
+
+
+def test_stale_pin_does_not_discharge_current_ambiguity() -> None:
+    stale = DocumentBindingSet(
+        bindings=(
+            scoped_binding(
+                binding_id="b_r1",
+                document_id=OTHER_DOCUMENT_ID,
+                revision=OTHER_REVISION_ID,
+            ),
+        ),
+        revision_requirement_refs=(),
+    )
+    ambiguity = BlockingAmbiguity(
+        ambiguity_id="r1", description="Tài liệu nào được đề cập?"
+    )
+    finalized = finalize_semantic(
+        draft_with_refs(
+            (), provisional="Xem nghị định 12", ambiguities=(ambiguity,)
+        ),
+        stale,
+    )
+    # The carried stale pin id collides with the live ambiguity id, but the
+    # ref is absent from this turn: the ambiguity must survive (clarify).
+    assert finalized.blocking_ambiguities == (ambiguity,)
+    decision = decide_route(
+        analyze_query(finalized),
+        finalized,
+        stale,
+        allowed_capabilities=FULL_CAPABILITIES,
+    )
+    assert decision.route == "clarify"
+    assert decision.reason_code == "essential_ambiguity"
+
+
+@pytest.mark.asyncio
+async def test_multi_turn_current_requirement_prunes_relation_keeps_pin() -> None:
+    """Composed-graph multi-turn with a CurrentRevisionRequirement (NEW-3).
+
+    Turn 1 mints a revision_requirement relation; turn 2 carries the bindings
+    with a fresh query. Turn 2 must complete, retain the pin, drop the stale
+    relation, and pass the frozen aggregate validator on both resting states.
+    """
+    from app.services.agents.v2.contracts.validation import (
+        validate_supervisor_state,
+    )
+
+    graph = StateGraph(SupervisorV2State, context_schema=GraphRuntimeContext)
+    graph.add_node("context", context_node)
+    graph.add_node("binding", binding_node)
+    graph.add_node("semantic_finalizer", semantic_finalizer_node)
+    graph.add_node("route", route_node)
+    graph.add_edge("context", "binding")
+    graph.add_edge("binding", "semantic_finalizer")
+    graph.add_edge("semantic_finalizer", "route")
+    graph.set_entry_point("context")
+    graph.set_finish_point("route")
+    compiled = graph.compile()
+
+    current_ref = resolved_ref(
+        ref_id="r1",
+        revision_requirement=CurrentRevisionRequirement(kind="current"),
+    )
+    relation = BindingRevisionRequirement(binding_id="b_r1", ref_id="r1")
+
+    def adapter_for(
+        request: RequestContext, conversation: ConversationContext
+    ) -> SemanticDraft:
+        if "bản mới nhất" in request.original_query:
+            return draft_with_refs(
+                (current_ref,), provisional=request.original_query
+            )
+        return greeting_draft()
+
+    def resolver_for(refs: Any, capability_runtime: Any) -> DocumentBindingSet:
+        if any(ref.resolution_status == "resolved" for ref in refs):
+            return DocumentBindingSet(
+                bindings=(scoped_binding(),),
+                revision_requirement_refs=(relation,),
+            )
+        return empty_binding_set()
+
+    events: list[str] = []
+    ctx = make_runtime_context(
+        retention_leases=FakeLeaseRepo(events),
+        semantic_adapter=FakeSemanticAdapter(adapter_for),
+        binding_resolver=FakeBindingResolver(resolver_for),
+    )
+    turn1 = await compiled.ainvoke(
+        make_state(request=make_request("Xem bản mới nhất của Nghị định 12/2020")),
+        context=ctx,
+    )
+    assert [b.binding_id for b in turn1["bindings"].bindings] == ["b_r1"]
+    assert turn1["bindings"].revision_requirement_refs == (relation,)
+    validate_supervisor_state(turn1)
+
+    turn2 = await compiled.ainvoke(
+        make_state(
+            request=make_request("Xin chào"),
+            conversation=turn1["conversation"],
+            bindings=turn1["bindings"],
+        ),
+        context=ctx,
+    )
+    assert turn2["route_decision"].route == "direct"
+    assert [b.binding_id for b in turn2["bindings"].bindings] == ["b_r1"]
+    assert turn2["bindings"].revision_requirement_refs == ()
+    validate_supervisor_state(turn2)
 
 
 @pytest.mark.asyncio
