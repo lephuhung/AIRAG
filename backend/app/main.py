@@ -909,8 +909,34 @@ async def lifespan(app: FastAPI):
     except Exception as _rc_err:
         logger.warning(f"[runtime_config] startup refresh failed (using .env): {_rc_err}")
 
+    # ── Supervisor v2 (Phase 2, Task 6) ──────────────────────────────────
+    # Owns exactly ONE opened AsyncPostgresSaver context for this worker and
+    # compiles the node-based v2 graph against it. Web startup NEVER calls
+    # saver setup/migration here (schema is owned by the migration runner).
+    # v1 remains the production default: any failure below only marks v2
+    # unavailable (``app.state.supervisor_v2_ready``) and never breaks v1.
+    _v2_lifespan_cm = None
+    try:
+        from app.services.agents.supervisor_v2 import supervisor_v2_lifespan
+
+        _v2_lifespan_cm = supervisor_v2_lifespan(settings.CHECKPOINT_DATABASE_URL)
+        await _v2_lifespan_cm.__aenter__()
+        app.state.supervisor_v2_ready = True
+        logger.info("[supervisor_v2] graph compiled on the shared checkpointer")
+    except Exception as _v2_err:
+        _v2_lifespan_cm = None
+        app.state.supervisor_v2_ready = False
+        logger.warning(
+            f"[supervisor_v2] unavailable, v1 default unaffected: {_v2_err}"
+        )
+
     yield
     logger.info("Shutting down...")
+    if _v2_lifespan_cm is not None:
+        try:
+            await _v2_lifespan_cm.__aexit__(None, None, None)
+        except Exception as _v2_exit_err:
+            logger.warning(f"[supervisor_v2] shutdown release failed: {_v2_exit_err}")
     await engine.dispose()
     try:
         from app.services.people.mongo_client import close_mongo_client
