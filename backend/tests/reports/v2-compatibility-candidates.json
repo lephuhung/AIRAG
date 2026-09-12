@@ -1,0 +1,154 @@
+{
+  "candidates": [
+    {
+      "id": "langgraph==0.3.34,langgraph-checkpoint-postgres==2.0.25",
+      "passed": false,
+      "reason": "StateGraph.context_schema not exposed",
+      "result": {
+        "async_postgres_saver_imported": true,
+        "context_schema_supported": false,
+        "notes": "StateGraph.context_schema not exposed",
+        "packages": {
+          "deepagents": "not-installed",
+          "langgraph": "0.3.34",
+          "langgraph-checkpoint": "2.1.2",
+          "langgraph-checkpoint-postgres": "2.0.25",
+          "psycopg": "3.2.3",
+          "psycopg-binary": "not-installed",
+          "pydantic": "2.9.2"
+        },
+        "psycopg_dsn_opened": true,
+        "python_version": "3.12.3"
+      }
+    },
+    {
+      "id": "langgraph==0.3.34,langgraph-checkpoint-postgres==3.0.5",
+      "passed": false,
+      "reason": "StateGraph.context_schema not exposed",
+      "result": {
+        "async_postgres_saver_imported": true,
+        "context_schema_supported": false,
+        "notes": "StateGraph.context_schema not exposed",
+        "packages": {
+          "deepagents": "not-installed",
+          "langgraph": "0.3.34",
+          "langgraph-checkpoint": "2.1.2",
+          "langgraph-checkpoint-postgres": "3.0.5",
+          "psycopg": "3.2.3",
+          "psycopg-binary": "not-installed",
+          "pydantic": "2.9.2"
+        },
+        "psycopg_dsn_opened": true,
+        "python_version": "3.12.3"
+      }
+    },
+    {
+      "id": "langgraph==0.3.34,langgraph-checkpoint-postgres==3.1.2",
+      "passed": false,
+      "reason": "pip install failed: ERROR: Cannot install langgraph-checkpoint-postgres==3.1.2 and langgraph==0.3.34 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit https://pip.pypa.io/en/latest/topics/dependency-resolution/#dealing-with-dependency-conflicts",
+      "result": null
+    },
+    {
+      "id": "langgraph==1.0.0,langgraph-checkpoint-postgres==2.0.25",
+      "passed": true,
+      "reason": "",
+      "result": {
+        "async_postgres_saver_imported": true,
+        "context_schema_supported": true,
+        "notes": "ok",
+        "packages": {
+          "deepagents": "not-installed",
+          "langgraph": "1.0.0",
+          "langgraph-checkpoint": "2.1.2",
+          "langgraph-checkpoint-postgres": "2.0.25",
+          "psycopg": "3.2.3",
+          "psycopg-binary": "not-installed",
+          "pydantic": "2.9.2"
+        },
+        "psycopg_dsn_opened": true,
+        "python_version": "3.12.3"
+      }
+    },
+    {
+      "id": "langgraph==1.0.0,langgraph-checkpoint-postgres==3.0.5",
+      "passed": true,
+      "reason": "",
+      "result": {
+        "async_postgres_saver_imported": true,
+        "context_schema_supported": true,
+        "notes": "ok",
+        "packages": {
+          "deepagents": "not-installed",
+          "langgraph": "1.0.0",
+          "langgraph-checkpoint": "2.1.2",
+          "langgraph-checkpoint-postgres": "3.0.5",
+          "psycopg": "3.2.3",
+          "psycopg-binary": "not-installed",
+          "pydantic": "2.9.2"
+        },
+        "psycopg_dsn_opened": true,
+        "python_version": "3.12.3"
+      }
+    },
+    {
+      "id": "langgraph==1.0.0,langgraph-checkpoint-postgres==3.1.2",
+      "passed": false,
+      "reason": "pip install failed: ERROR: Cannot install langgraph-checkpoint-postgres==3.1.2 and langgraph==1.0.0 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit https://pip.pypa.io/en/latest/topics/dependency-resolution/#dealing-with-dependency-conflicts",
+      "result": null
+    },
+    {
+      "id": "langgraph==1.2.11,langgraph-checkpoint-postgres==2.0.25",
+      "passed": false,
+      "reason": "pip install failed: ERROR: Cannot install langgraph-checkpoint-postgres==2.0.25 and langgraph==1.2.11 because these package versions have conflicting dependencies.\nERROR: ResolutionImpossible: for help visit https://pip.pypa.io/en/latest/topics/dependency-resolution/#dealing-with-dependency-conflicts",
+      "result": null
+    },
+    {
+      "id": "langgraph==1.2.11,langgraph-checkpoint-postgres==3.0.5",
+      "passed": true,
+      "reason": "",
+      "result": {
+        "async_postgres_saver_imported": true,
+        "context_schema_supported": true,
+        "notes": "ok",
+        "packages": {
+          "deepagents": "not-installed",
+          "langgraph": "1.2.11",
+          "langgraph-checkpoint": "4.2.0",
+          "langgraph-checkpoint-postgres": "3.0.5",
+          "psycopg": "3.2.3",
+          "psycopg-binary": "not-installed",
+          "pydantic": "2.9.2"
+        },
+        "psycopg_dsn_opened": true,
+        "python_version": "3.12.3"
+      }
+    },
+    {
+      "id": "langgraph==1.2.11,langgraph-checkpoint-postgres==3.1.2",
+      "passed": true,
+      "reason": "",
+      "result": {
+        "async_postgres_saver_imported": true,
+        "context_schema_supported": true,
+        "notes": "ok",
+        "packages": {
+          "deepagents": "not-installed",
+          "langgraph": "1.2.11",
+          "langgraph-checkpoint": "4.2.0",
+          "langgraph-checkpoint-postgres": "3.1.2",
+          "psycopg": "3.2.3",
+          "psycopg-binary": "not-installed",
+          "pydantic": "2.9.2"
+        },
+        "psycopg_dsn_opened": true,
+        "python_version": "3.12.3"
+      }
+    }
+  ],
+  "checkpoint_dsn": "postgresql://postgres:postgres@localhost:5433/hrag_test",
+  "common_pins": {
+    "psycopg": "3.2.3",
+    "pydantic": "2.9.2"
+  },
+  "python": "/home/AIRAG/.worktrees/langgraph-v2/backend/.venv-v2-benchmark/bin/python"
+}
