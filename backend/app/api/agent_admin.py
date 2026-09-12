@@ -114,7 +114,6 @@ async def run_admin_evaluation(
         V2NotReadyError,
         resolve_agent_graph,
         resolve_request_version,
-        resolve_runtime_scope,
     )
 
     selected = resolve_request_version(user=user, admin_override=version)
@@ -208,10 +207,20 @@ async def _run_v2_eval(
 ) -> list[dict]:
     from langgraph.errors import GraphInterrupt
 
-    from app.services.agent.runtime_selector import build_v2_ingress
+    from app.services.agent.runtime_selector import (
+        build_v2_ingress,
+        resolve_runtime_scope,
+    )
     from app.services.agents.v2.events import terminal_event_for_response
 
     authenticated = await _accessible_scope(db, user)
+    if not resolve_runtime_scope(
+        authenticated_ids=authenticated, requested_ids=workspace_ids
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No accessible workspaces in the requested scope.",
+        )
     thread_id = f"admin-eval-{uuid.uuid4().hex[:12]}"
     async with build_v2_ingress(
         user_id=user.id,

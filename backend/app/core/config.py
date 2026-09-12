@@ -648,9 +648,19 @@ class Settings(BaseSettings):
         validate_checkpoint_dsn(
             self.CHECKPOINT_DATABASE_URL, database_url=self.DATABASE_URL
         )
-        from app.services.agent.runtime_selector import normalize_agent_version
-
-        normalize_agent_version(self.NEXUSRAG_AGENT_GRAPH_VERSION)
+        # Local literal check (deliberately NOT importing
+        # app.services.agent.runtime_selector here): validating a config value
+        # must never pull the agent package into worker/migration/CLI
+        # processes. The canonical v1|v2 rule lives in
+        # runtime_selector.normalize_agent_version; keep both in sync.
+        if (self.NEXUSRAG_AGENT_GRAPH_VERSION or "").strip().lower() not in (
+            "v1",
+            "v2",
+        ):
+            raise ValueError(
+                "NEXUSRAG_AGENT_GRAPH_VERSION must be one of ('v1', 'v2'); "
+                f"got {self.NEXUSRAG_AGENT_GRAPH_VERSION!r}"
+            )
         return self
 
     model_config = {

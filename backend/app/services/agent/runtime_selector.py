@@ -48,9 +48,9 @@ import json
 import logging
 import uuid
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from uuid import UUID
 
@@ -155,26 +155,69 @@ async def require_v2_schema_ready(
     (the test seam). Anything but a fully clean schema and a fully present
     checkpointer raises ``V2NotReadyError`` — selection fails closed.
     """
-    if schema_check is None:
-        schema_check = await asyncio.to_thread(_real_schema_check)
-    if checkpoint_check is None:
-        checkpoint_check = await _real_checkpoint_check()
+    # Connection/IO failures of the live probes fail closed with the typed
+    # gate error (never a raw driver traceback to the caller).
+    try:
+        if schema_check is None:
+            schema_check = await asyncio.to_thread(_real_schema_check)
+        if checkpoint_check is None:
+            checkpoint_check = await _real_checkpoint_check()
+    except V2NotReadyError:
+        raise
+    except Exception as exc:
+        raise V2NotReadyError(
+            f"supervisor v2 readiness probe failed: {exc}; keeping v1"
+        ) from exc
     problems: list[str] = []
-    if not bool(getattr(schema_check, "applied", False)):
-        problems.append("v2 schema is not applied")
-    else:
-        missing = getattr(schema_check, "missing_tables", frozenset()) or frozenset()
-        extra = getattr(schema_check, "extra_tables", frozenset()) or frozenset()
-        shape = getattr(schema_check, "shape_errors", frozenset()) or frozenset()
-        if missing:
-            problems.append(f"v2 schema missing tables: {sorted(missing)}")
-        if extra:
-            problems.append(f"v2 schema extra tables: {sorted(extra)}")
-        if shape:
-            problems.append(f"v2 schema shape errors: {sorted(shape)}")
-    missing_cp = getattr(checkpoint_check, "missing", frozenset()) or frozenset()
-    if missing_cp:
-        problems.append(f"v2 checkpointer missing tables: {sorted(missing_cp)}")
+    # Canonical verdicts live on the Phase-1 result types
+    # (SchemaCheck.is_clean, CheckpointCheck.is_ready); the field-level
+    # detail below only shapes the error message and must not drift from them.
+    schema_clean = getattr(schema_check, "is_clean", None)
+    if schema_clean is None:
+        schema_clean = bool(
+            getattr(schema_check, "applied", False)
+        ) and not (
+            getattr(schema_check, "missing_tables", frozenset())
+            or getattr(schema_check, "extra_tables", frozenset())
+            or getattr(schema_check, "shape_errors", frozenset())
+        )
+    if not schema_clean:
+        if not bool(getattr(schema_check, "applied", False)):
+            problems.append("v2 schema is not applied")
+        else:
+            missing = (
+                getattr(schema_check, "missing_tables", frozenset())
+                or frozenset()
+            )
+            extra = (
+                getattr(schema_check, "extra_tables", frozenset())
+                or frozenset()
+            )
+            shape = (
+                getattr(schema_check, "shape_errors", frozenset())
+                or frozenset()
+            )
+            if missing:
+                problems.append(f"v2 schema missing tables: {sorted(missing)}")
+            if extra:
+                problems.append(f"v2 schema extra tables: {sorted(extra)}")
+            if shape:
+                problems.append(f"v2 schema shape errors: {sorted(shape)}")
+            if not (missing or extra or shape):
+                problems.append("v2 schema check is not clean")
+    checkpoint_ready = getattr(checkpoint_check, "is_ready", None)
+    if checkpoint_ready is None:
+        checkpoint_ready = not (
+            getattr(checkpoint_check, "missing", frozenset()) or frozenset()
+        )
+    if not checkpoint_ready:
+        missing_cp = getattr(checkpoint_check, "missing", frozenset()) or frozenset()
+        if missing_cp:
+            problems.append(
+                f"v2 checkpointer missing tables: {sorted(missing_cp)}"
+            )
+        else:
+            problems.append("v2 checkpointer is not ready")
     if problems:
         raise V2NotReadyError(
             "supervisor v2 is not ready (" + "; ".join(problems) + "); "
@@ -205,7 +248,7 @@ async def _real_checkpoint_check() -> Any:
     return await check_v2_checkpointer(settings.CHECKPOINT_DATABASE_URL)
 
 
-async def resolve_agent_graph(version: str) -> Any:
+async def resolve_agent_graph(version: AgentGraphVersion) -> Any:
     """Return the compiled supervisor graph for ``version`` (lazy factories).
 
     No graph is constructed at import time: the v1/v2 getters are imported
@@ -220,16 +263,22 @@ async def resolve_agent_graph(version: str) -> Any:
 
         return get_supervisor_graph()
     await require_v2_schema_ready()
+    # Both names import up front (still function-local, still lazy): if the
+    # import itself fails we raise the typed gate error instead of letting
+    # an ImportError mask the original failure inside the handler below.
     try:
-        from app.services.agents.supervisor_v2 import get_supervisor_v2_graph
-
+        from app.services.agents.supervisor_v2 import (
+            SupervisorV2Error,
+            get_supervisor_v2_graph,
+        )
+    except ImportError as exc:
+        raise V2NotReadyError(
+            f"supervisor v2 module is not importable: {exc}"
+        ) from exc
+    try:
         return get_supervisor_v2_graph()
-    except Exception as exc:
-        from app.services.agents.supervisor_v2 import SupervisorV2Error
-
-        if isinstance(exc, SupervisorV2Error):
-            raise V2NotReadyError(str(exc)) from exc
-        raise
+    except SupervisorV2Error as exc:
+        raise V2NotReadyError(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -491,16 +540,18 @@ def terminal_state_is_error(state: Any) -> bool:
 def undispatched_tasks(plan: Any, results: Any) -> tuple[str, ...]:
     """Task ids in the checkpointed plan with no result yet (T3-N2 recipe).
 
-    ``DispatchReport.truncated`` is deliberately never checkpointed (the
-    frozen ``ExecutionState`` has no slot), so the outer runner calls this at
-    the terminal boundary: a non-empty remainder with no active run means an
-    incomplete dispatch — raise rollback/error from it, never present partial
-    results as complete. Pure function of frozen contracts.
+    Single source of truth is T6's ``supervisor_v2.undispatched_tasks``
+    (imported function-locally to keep this module graph-free at import
+    time); see its docstring for the deliberate-loss record. The outer
+    runner calls this at the terminal boundary: a non-empty remainder with
+    no active run means an incomplete dispatch — raise rollback/error from
+    it, never present partial results as complete.
     """
-    done = {getattr(result, "task_id", None) for result in (results or ())}
-    return tuple(
-        task.task_id for task in (plan.tasks or ()) if task.task_id not in done
+    from app.services.agents.supervisor_v2 import (
+        undispatched_tasks as _t6_undispatched_tasks,
     )
+
+    return _t6_undispatched_tasks(plan, results)
 
 
 def make_v1_preprocess_closure(
@@ -704,9 +755,6 @@ async def build_v2_ingress(
         GovernorEvidenceHydrator,
     )
     from app.services.agents.v2.nodes.evaluate import AnswerDraftChannel
-    from app.services.agents.v2.persistence.retention_leases import (
-        RevisionRetentionLeaseRepository,
-    )
     from app.services.agents.supervisor_v2 import build_initial_v2_state
 
     if session_factory is None:
@@ -725,12 +773,24 @@ async def build_v2_ingress(
     request_id = request_id or f"req_{uuid.uuid4().hex[:12]}"
     run_id = run_id or f"run_{uuid.uuid4().hex[:12]}"
 
-    lease_session = lease_session_factory()
-    evidence_session = session_factory()
+    # M4a via T6's dedicated_retention_leases: the lease repository owns a
+    # session used for nothing else for the whole request; the evidence
+    # session below is a different session. The lease CM must span the
+    # `yield`, so it is entered through an AsyncExitStack whose close runs
+    # in the `finally` below — deterministic on every path (normal, raise,
+    # cancellation), unlike a hand-rolled __aenter__/__aexit__ pair.
+    from app.services.agents.supervisor_v2 import dedicated_retention_leases
+
+    stack = AsyncExitStack()
+    lease_session = None
+    evidence_session = None
     ingress = None
     try:
-        from datetime import timedelta
-
+        leases = await stack.enter_async_context(
+            dedicated_retention_leases(lease_session_factory)
+        )
+        lease_session = leases.session
+        evidence_session = session_factory()
         capability_runtime = CapabilityRuntimeContext(
             request_id=request_id,
             run_id=run_id,
@@ -760,7 +820,8 @@ async def build_v2_ingress(
         evidence_builder = GovernorEvidenceBuilder(governor, run_id=run_id)
         plan_resolver = PlanBindingResolver()
         hydrator = GovernorEvidenceHydrator(governor)
-        leases = RevisionRetentionLeaseRepository(lease_session)
+        # `leases` is T6's dedicated_retention_leases repository: its
+        # session is used for nothing else for the whole request (M4a).
 
         semantic_adapter = DeterministicSemanticAdapter(
             preprocess=preprocess
@@ -828,14 +889,17 @@ async def build_v2_ingress(
     finally:
         if ingress is not None:
             await ingress.aclose()
-        else:
-            for session in (lease_session, evidence_session):
-                try:
-                    await session.close()
-                except Exception:  # noqa: BLE001 — close-path best effort
-                    logger.warning(
-                        "v2 ingress session close failed", exc_info=True
-                    )
+        elif evidence_session is not None:
+            # Pre-yield failure: the evidence session never reached the
+            # ingress; close it here (the lease session closes via the
+            # stack below).
+            try:
+                await evidence_session.close()
+            except Exception:  # noqa: BLE001 — close-path best effort
+                logger.warning(
+                    "v2 ingress session close failed", exc_info=True
+                )
+        await stack.aclose()
 
 
 async def run_v2_turn_sse(

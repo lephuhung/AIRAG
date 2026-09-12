@@ -169,6 +169,9 @@ def test_resolve_v2_runs_readiness_gate_first(monkeypatch):
         order.append("gate")
 
     class _FakeV2Module:
+        class SupervisorV2Error(RuntimeError):
+            pass
+
         @staticmethod
         def get_supervisor_v2_graph():
             order.append("graph")
@@ -402,3 +405,31 @@ def test_entrypoint_uses_resolver_not_direct_construction(relative):
     assert "get_supervisor_v2_graph(" not in source, (
         f"{relative} still constructs the v2 graph directly"
     )
+
+
+def test_config_import_pulls_no_agent_stack():
+    """M5: constructing Settings must not import the agent package.
+
+    The config validator checks the graph-version literal locally, so worker
+    / migration / CLI processes never hard-depend on the agent stack for a
+    value check (and no graph is constructed either way).
+    """
+    code = (
+        "import sys; "
+        "from app.core.config import Settings; "
+        "Settings(); "
+        "assert 'app.services.agent' not in sys.modules, "
+        "'config validation pulled the agent package'; "
+        "assert 'app.services.agents.supervisor' not in sys.modules, "
+        "'config validation pulled the v1 supervisor'; "
+        "print('config-isolated-ok')"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(_backend_root()),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert "config-isolated-ok" in proc.stdout

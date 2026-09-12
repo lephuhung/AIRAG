@@ -86,7 +86,10 @@ def test_session_entrypoint_persists_raw_text():
 
 def test_telegram_entrypoint_persists_raw_text():
     source = _read("app/services/integrations/telegram_service.py")
-    assert "persist_raw_user_message" in source or "content=question" in source
+    # Pinned to the helper call with the verbatim question (a bare
+    # `"content=question" in source` check would also pass on pre-change code).
+    assert "persist_raw_user_message" in source
+    assert "raw_text=question" in source
 
 
 # ---------------------------------------------------------------------------
@@ -386,3 +389,159 @@ def test_single_runtime_services_definition():
     matches = [line for line in proc.stdout.splitlines() if line.strip()]
     assert len(matches) == 1, matches
     assert "v2/contracts/state.py" in matches[0]
+
+
+# ---------------------------------------------------------------------------
+# I1 — session v2 cleanup: raising/cancelled streams still close sessions
+# and roll back the partial evidence transaction (v1 unaffected)
+# ---------------------------------------------------------------------------
+
+
+def _fake_session_factory(recorder, name):
+    class _FakeSession:
+        async def commit(self):
+            recorder.append((name, "commit"))
+
+        async def rollback(self):
+            recorder.append((name, "rollback"))
+
+        async def close(self):
+            recorder.append((name, "close"))
+
+    def _factory():
+        return _FakeSession()
+
+    return _factory
+
+
+class _BoomGraph:
+    """Fake v2 graph whose turn raises mid-stream (I1 error path)."""
+
+    async def ainvoke(self, state, config, context=None):
+        raise RuntimeError("stream blew up")
+
+
+def _session_v2_kwargs(recorder, **overrides):
+    from uuid import uuid4
+
+    async def _fake_preprocess(raw_query: str):
+        return SimpleNamespace(normalized_query=raw_query)
+
+    kwargs = {
+        "graph": _BoomGraph(),
+        "raw_message": "halo?",
+        "workspace_ids": [uuid4()],
+        "document_ids": (),
+        "user_id": uuid4(),
+        "can_read_people": False,
+        "thread_id": "thread-i1",
+        "session_factory": _fake_session_factory(recorder, "evidence"),
+        "lease_session_factory": _fake_session_factory(recorder, "lease"),
+        "preprocess": _fake_preprocess,
+        "available_services": frozenset(),
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_session_v2_run_rolls_back_and_closes_on_error():
+    import asyncio
+
+    from app.api.chat_session import _session_v2_run
+
+    recorder: list = []
+
+    async def _boom(agen):
+        async for _ in agen:
+            pass
+        raise RuntimeError("stream blew up")
+
+    async def _main():
+        with pytest.raises(RuntimeError, match="stream blew up"):
+            async with _session_v2_run(**_session_v2_kwargs(recorder)) as (
+                _ingress,
+                agen,
+            ):
+                await _boom(agen)
+
+    asyncio.run(_main())
+    # Partial evidence work is rolled back, and BOTH sessions close.
+    assert ("evidence", "rollback") in recorder
+    assert ("evidence", "commit") not in recorder
+    assert ("evidence", "close") in recorder
+    assert ("lease", "close") in recorder
+
+
+def test_session_v2_run_closes_without_commit_on_cancel():
+    import asyncio
+
+    from app.api.chat_session import _session_v2_run
+
+    recorder: list = []
+    entered = asyncio.Event()
+
+    async def _hang(agen):
+        entered.set()
+        await asyncio.sleep(3600)
+
+    async def _victim():
+        async with _session_v2_run(**_session_v2_kwargs(recorder)) as (
+            _ingress,
+            agen,
+        ):
+            await _hang(agen)
+
+    async def _main():
+        task = asyncio.create_task(_victim())
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert task.cancelled() or task.done()
+
+    asyncio.run(_main())
+    # Cancellation skips the commit (session close rolls the partial turn
+    # back), but both sessions still close deterministically — no GC wait.
+    assert ("evidence", "commit") not in recorder
+    assert ("evidence", "close") in recorder
+    assert ("lease", "close") in recorder
+
+
+def test_session_v2_run_commits_on_success():
+    import asyncio
+
+    from app.api.chat_session import _session_v2_run
+    from app.services.agents.v2.contracts.base import CONTRACT_VERSION
+    from app.services.agents.v2.contracts.response import FinalResponse
+
+    recorder: list = []
+    seen: list = []
+
+    class _Graph:
+        async def ainvoke(self, state, config, context=None):
+            return {
+                "final_response": FinalResponse(
+                    contract_version=CONTRACT_VERSION,
+                    status="success",
+                    content="done",
+                    citations=(),
+                )
+            }
+
+    async def _drain(agen):
+        async for sse in agen:
+            seen.append(sse)
+
+    async def _main():
+        async with _session_v2_run(
+            **_session_v2_kwargs(recorder, graph=_Graph())
+        ) as (_ingress, agen):
+            await _drain(agen)
+
+    asyncio.run(_main())
+    assert ("evidence", "commit") in recorder
+    assert ("evidence", "close") in recorder
+    assert ("lease", "close") in recorder
+    assert any(s.startswith("event: complete") for s in seen)

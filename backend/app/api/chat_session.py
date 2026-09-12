@@ -21,6 +21,7 @@ from app.schemas.rag import (
 import asyncio
 import logging
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
@@ -588,6 +589,76 @@ async def _authorize_delete(
     return deletable
 
 
+@asynccontextmanager
+async def _session_v2_run(
+    *,
+    graph,
+    raw_message: str,
+    workspace_ids,
+    document_ids,
+    user_id,
+    can_read_people: bool,
+    thread_id: str,
+    session_factory=None,
+    lease_session_factory=None,
+    preprocess=None,
+    available_services=None,
+):
+    """Run one session turn's v2 ingress with unconditional cleanup (I1).
+
+    Yields ``(ingress, agen)`` where ``agen`` streams v1-wire SSE strings.
+    The evidence unit of work commits after the consumer drains the stream;
+    any raise rolls it back; cancellation skips the commit (the session
+    close rolls the partial turn back). The ingress sessions close on EVERY
+    path through ``async with`` — cleanup never depends on GC. Terminal
+    lease release stays with the T8 outer runner (never here).
+    """
+    from app.services.agent.runtime_selector import (
+        build_v2_ingress,
+        run_v2_turn_sse,
+    )
+    from app.services.agents.v2.contracts.request import KnownDocumentResource
+
+    extra = {}
+    if session_factory is not None:
+        extra["session_factory"] = session_factory
+    if lease_session_factory is not None:
+        extra["lease_session_factory"] = lease_session_factory
+    if preprocess is not None:
+        extra["preprocess"] = preprocess
+    if available_services is not None:
+        extra["available_services"] = available_services
+    async with build_v2_ingress(
+        user_id=user_id,
+        authenticated_workspace_ids=workspace_ids,
+        requested_workspace_ids=None,
+        raw_query=raw_message,
+        thread_id=thread_id,
+        can_read_people=bool(can_read_people),
+        known_documents=tuple(
+            KnownDocumentResource(
+                resource_id=str(document_id),
+                document_id=document_id,
+                source="api_explicit",
+            )
+            for document_id in (document_ids or ())
+        ),
+        document_ids=tuple(document_ids or ()),
+        **extra,
+    ) as ingress:
+        try:
+            yield ingress, run_v2_turn_sse(
+                graph=graph,
+                initial_state=ingress.initial_state,
+                runtime_context=ingress.runtime_context,
+                thread_id=thread_id,
+            )
+            await ingress.commit_evidence()
+        except Exception:
+            await ingress.rollback_evidence()
+            raise
+
+
 @router.post("/{session_id}/stream")
 async def chat_stream_session(
     session_id: str,
@@ -942,11 +1013,9 @@ async def chat_stream_session(
     async def _run_and_persist():
         from app.core.database import async_session_maker
         from app.services.agent.runtime_selector import (
-            build_v2_ingress,
             configured_agent_version,
             resolve_agent_graph,
             resolve_runtime_scope,
-            run_v2_turn_sse,
         )
         from app.services.agent.streaming import (
             stream_agent_to_sse,
@@ -984,6 +1053,74 @@ async def chat_stream_session(
                 ai_msg_id=ai_msg_id,
             )
             saved = True
+
+        async def _drain(agen) -> None:
+            """Relay one arm's SSE stream while collecting persist data.
+
+            Shared by the v1 and v2 arms so both persist identically; the
+            generator always closes (cancellation throws GeneratorExit in,
+            stopping the run promptly).
+            """
+            nonlocal accumulated_text, accumulated_thinking
+            nonlocal final_sources, final_images
+            nonlocal final_potential_abbreviations, final_people_data
+            try:
+                async for sse_str in agen:
+                    await _collect_and_relay(sse_str)
+            finally:
+                await agen.aclose()
+
+        async def _collect_and_relay(sse_str: str) -> None:
+            # Collect data for DB persistence while relaying
+            nonlocal accumulated_text, accumulated_thinking
+            nonlocal final_sources, final_images
+            nonlocal final_potential_abbreviations, final_people_data
+            try:
+                if sse_str.startswith("event:"):
+                    lines = sse_str.strip().split("\n")
+                    ev_type = lines[0].replace("event: ", "").strip()
+                    data_line = next(
+                        (l for l in lines if l.startswith("data:")), None
+                    )
+                    if data_line:
+                        ev_data = _json.loads(data_line[5:].strip())
+                        if ev_type == "token":
+                            accumulated_text += ev_data.get("text", "")
+                        elif ev_type == "thinking":
+                            accumulated_thinking += ev_data.get("text", "")
+                        elif ev_type == "sources":
+                            final_sources = ev_data.get("sources", [])
+                        elif ev_type == "images":
+                            final_images = ev_data.get(
+                                "image_refs", ev_data.get("images", [])
+                            )
+                        elif ev_type == "status":
+                            final_steps.append(ev_data)
+                        elif ev_type == "complete":
+                            if "answer" in ev_data:
+                                accumulated_text = ev_data["answer"]
+                        elif ev_type == "token_rollback":
+                            # The streaming core reset final_answer
+                            # + sources + images on rollback; mirror
+                            # the same clearing here so the inline
+                            # / background persistence rows do NOT
+                            # persist the pre-rollback draft.
+                            # Per B5: clear all final fields
+                            accumulated_text = ""
+                            final_sources = []
+                            final_images = []
+                            final_potential_abbreviations = []
+                            final_people_data = []
+                        elif ev_type == "potential_abbreviations":
+                            final_potential_abbreviations = ev_data.get(
+                                "abbreviations", []
+                            )
+                        elif ev_type == "people_data":
+                            final_people_data = ev_data.get("people", [])
+            except Exception:
+                pass
+
+            relay.put_nowait(sse_str)
 
         try:
             history = []
@@ -1033,109 +1170,24 @@ async def chat_stream_session(
                 # Resolve the serving arm through the lazy selector (no
                 # direct graph construction on any entrypoint).
                 graph = await resolve_agent_graph(version)
-                v2_ingress_cm = None
-                v2_ingress = None
                 if version == "v2":
-                    from app.services.agents.v2.contracts.request import (
-                        KnownDocumentResource,
-                    )
-
-                    v2_ingress_cm = build_v2_ingress(
-                        user_id=user.id,
-                        authenticated_workspace_ids=runtime_workspace_ids,
-                        requested_workspace_ids=None,
-                        raw_query=request.message,
-                        thread_id=session_id,
-                        can_read_people=bool(user.is_superadmin),
-                        known_documents=tuple(
-                            KnownDocumentResource(
-                                resource_id=str(document_id),
-                                document_id=document_id,
-                                source="api_explicit",
-                            )
-                            for document_id in (filtered_doc_ids or ())
-                        ),
-                        document_ids=tuple(filtered_doc_ids or ()),
-                    )
-                    v2_ingress = await v2_ingress_cm.__aenter__()
-                    agen = run_v2_turn_sse(
+                    # I1: the ingress CM scopes the whole stream — evidence
+                    # commit/rollback and BOTH session closes run on EVERY
+                    # path (normal, raise, cancellation) via `async with`,
+                    # never via GC. Terminal lease release stays with the T8
+                    # outer runner (never here, never in the finalizer).
+                    async with _session_v2_run(
                         graph=graph,
-                        initial_state=v2_ingress.initial_state,
-                        runtime_context=v2_ingress.runtime_context,
+                        raw_message=request.message,
+                        workspace_ids=runtime_workspace_ids,
+                        document_ids=filtered_doc_ids,
+                        user_id=user.id,
+                        can_read_people=bool(user.is_superadmin),
                         thread_id=session_id,
-                    )
+                    ) as (_v2_ingress, _v2_agen):
+                        await _drain(_v2_agen)
                 else:
-                    agen = stream_agent_to_sse(graph, initial_state)
-                try:
-                    async for sse_str in agen:
-                        # Collect data for DB persistence while relaying
-                        try:
-                            if sse_str.startswith("event:"):
-                                lines = sse_str.strip().split("\n")
-                                ev_type = lines[0].replace("event: ", "").strip()
-                                data_line = next(
-                                    (l for l in lines if l.startswith("data:")), None
-                                )
-                                if data_line:
-                                    ev_data = _json.loads(data_line[5:].strip())
-                                    if ev_type == "token":
-                                        accumulated_text += ev_data.get("text", "")
-                                    elif ev_type == "thinking":
-                                        accumulated_thinking += ev_data.get("text", "")
-                                    elif ev_type == "sources":
-                                        final_sources = ev_data.get("sources", [])
-                                    elif ev_type == "images":
-                                        final_images = ev_data.get(
-                                            "image_refs", ev_data.get("images", [])
-                                        )
-                                    elif ev_type == "status":
-                                        final_steps.append(ev_data)
-                                    elif ev_type == "complete":
-                                        if "answer" in ev_data:
-                                            accumulated_text = ev_data["answer"]
-                                    elif ev_type == "token_rollback":
-                                        # The streaming core reset final_answer
-                                        # + sources + images on rollback; mirror
-                                        # the same clearing here so the inline
-                                        # / background persistence rows do NOT
-                                        # persist the pre-rollback draft.
-                                        # Per B5: clear all final fields
-                                        accumulated_text = ""
-                                        final_sources = []
-                                        final_images = []
-                                        final_potential_abbreviations = []
-                                        final_people_data = []
-                                    elif ev_type == "potential_abbreviations":
-                                        final_potential_abbreviations = ev_data.get(
-                                            "abbreviations", []
-                                        )
-                                    elif ev_type == "people_data":
-                                        final_people_data = ev_data.get("people", [])
-                        except Exception:
-                            pass
-
-                        relay.put_nowait(sse_str)
-                finally:
-                    # Deterministic close: on cancellation this throws
-                    # GeneratorExit into stream_agent_to_sse, whose finally
-                    # cancels the LangGraph task — the run stops promptly.
-                    await agen.aclose()
-
-                # v2: the evidence unit of work commits only after the
-                # terminal response is produced; the ingress sessions always
-                # close here (terminal lease release stays with the T8
-                # outer runner — never here, never in the finalizer).
-                if v2_ingress is not None:
-                    try:
-                        try:
-                            await v2_ingress.commit_evidence()
-                        except Exception:
-                            await v2_ingress.rollback_evidence()
-                            raise
-                    finally:
-                        # Always close (cancellation skips the commit: the
-                        # session close rolls the partial turn back).
-                        await v2_ingress_cm.__aexit__(None, None, None)
+                    await _drain(stream_agent_to_sse(graph, initial_state))
 
             # Generate the title now (first exchange) and push it immediately so
             # the client updates without a refresh; reuse the summary downstream.
