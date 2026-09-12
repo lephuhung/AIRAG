@@ -568,7 +568,13 @@ async def resume_clarification(
         candidate.document_id,
         runtime.capability_runtime,
     )
-    return Command(resume=resolution.model_dump(mode="json"), goto="binding")
+    # Navigation is owned by the composed graph: return the resume payload only.
+    # An outer `goto="binding"` schedules `binding` in the same super-step as the
+    # resumed clarify wait node, which resolves the pre-update draft (stale read),
+    # pins nothing, and then hard-fails / poisons the thread. T8 must call
+    # `graph.ainvoke(Command(resume=<resolution>), config, context=runtime)` and let
+    # the node's own returned Command(goto="binding") navigate on the next tick.
+    return Command(resume=resolution.model_dump(mode="json"))
 ```
 
 - [ ] **Step 3: Test and commit**
