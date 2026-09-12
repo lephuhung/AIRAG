@@ -44,7 +44,7 @@ class EvidenceUse(Base):
     )
     task_id: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=datetime.utcnow
     )
 
     __table_args__ = (

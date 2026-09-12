@@ -26,11 +26,13 @@ from app.core.database import engine, Base
 #
 # Phase 1B: importing ``app.models`` also triggers ``v2_registry`` which
 # adds the 11 v2 ORM classes to ``Base.metadata``. The lifespan below
-# still uses ``Base.metadata.create_all(tables=LEGACY_STARTUP_TABLES)``
-# (allowlist excludes every v2 table), so v2 DDL can never leak into
-# startup. The lifespan additionally calls ``check_v2_schema`` +
-# ``assert_v2_readiness`` before declaring readiness, so a database that
-# has not been migrated refuses to start.
+# uses ``Base.metadata.create_all(tables=...)`` with the resolved
+# ``Table`` objects from ``LEGACY_STARTUP_TABLES`` (allowlist excludes
+# every v2 table), so v2 DDL can never leak into startup. The lifespan
+# *unconditionally* calls ``check_v2_schema`` + ``assert_v2_readiness``
+# before declaring readiness (regardless of ``AUTO_CREATE_TABLES``), so
+# a database that has not been migrated refuses to start whether or not
+# the legacy create_all pass runs.
 import app.models  # noqa: F401
 from app.models.v2_registry import (  # noqa: E402
     LEGACY_STARTUP_TABLES,
@@ -82,28 +84,58 @@ async def lifespan(app: FastAPI):
             web_concurrency,
         )
 
+    # ── Phase 1B — v2 readiness gate (ALWAYS RUNS) ────────────────────────────
+    # Refuse to start the app if the live database is not at v2 schema
+    # version 1. This gate is *unconditional* — it runs whether
+    # ``AUTO_CREATE_TABLES`` is true or false. In production we deploy
+    # with ``AUTO_CREATE_TABLES=false`` (migrations are owned by the
+    # Release-1A runner), so the gate is the only line of defence
+    # against booting the app on an un-migrated database.
+    #
+    # ``check_v2_schema`` is a sync function that takes a sync
+    # ``Engine``. We cannot use ``engine.sync_engine`` here because
+    # the async engine is backed by ``asyncpg`` (an async-only
+    # driver); calling ``engine.connect()`` on that sync engine from
+    # inside an async function raises ``MissingGreenlet``. We build a
+    # fresh sync engine from the same DSN via ``make_engine`` (which
+    # normalizes the driver to ``psycopg`` and creates a brand-new
+    # pool — the gate is a one-shot startup check, so the extra pool
+    # is acceptable).
+    from app.services.agents.v2.persistence.migrate import (
+        check_v2_schema,
+        make_engine,
+    )
+
+    migration_dsn = engine.url.render_as_string(hide_password=False).replace(
+        "postgresql+asyncpg://", "postgresql+psycopg://", 1
+    )
+    migration_sync_engine = make_engine(migration_dsn)
+    try:
+        check = check_v2_schema(migration_sync_engine)
+    finally:
+        migration_sync_engine.dispose()
+    assert_v2_readiness(check)
+
     if auto_create:
-        # ── Phase 1B — pre-create v2 readiness gate ────────────────────────────
-        # Refuse to start the app if the live database is not at v2
-        # schema version 1. ``check_v2_schema`` runs against a sync
-        # engine (the migration API is sync-only); we expose the
-        # sync engine of the async ``engine`` via ``engine.sync_engine``
-        # so we reuse the same connection pool configuration.
-        from app.services.agents.v2.persistence.migrate import (
-            check_v2_schema,
-        )
-
-        check = check_v2_schema(engine.sync_engine)
-        assert_v2_readiness(check)
-
         async with engine.begin() as conn:
             # Phase 1B: ``create_all`` is restricted to the legacy
             # allowlist — every v2 table is excluded from the
             # metadata create_all pass. The v2 schema is owned by the
             # migration runner (``apply_v2_schema``), not by startup.
+            #
+            # C1 fix: SQLAlchemy's ``MetaData.create_all`` requires
+            # ``Sequence[Table]``; passing table *names* (strings)
+            # raises ``AttributeError: 'str' object has no attribute
+            # 'name'`` because the implementation iterates ``tables``
+            # calling ``.name`` on each element. Resolve to
+            # ``Table`` objects first via ``Base.metadata.tables``.
+            legacy_table_objs = [
+                Base.metadata.tables[name]
+                for name in LEGACY_STARTUP_TABLES
+            ]
             await conn.run_sync(
                 Base.metadata.create_all,
-                tables=list(LEGACY_STARTUP_TABLES),
+                tables=legacy_table_objs,
             )
             await conn.execute(
                 text(

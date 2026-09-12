@@ -74,7 +74,7 @@ class DocumentRevision(Base):
 
     # Terminal-failure metadata. Populated only when status='failed'.
     failed_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, nullable=True
+        DateTime(timezone=True), nullable=True
     )
     failure_stage: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True
@@ -85,7 +85,7 @@ class DocumentRevision(Base):
 
     # Terminal-abandon metadata. Populated only when status='abandoned'.
     abandoned_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, nullable=True
+        DateTime(timezone=True), nullable=True
     )
     abandon_reason: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True
@@ -94,28 +94,31 @@ class DocumentRevision(Base):
     # The single GC retention anchor: when the artifact retention clock
     # starts (typically the publish time). NULL while in draft/building.
     artifact_retention_starts_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, nullable=True
+        DateTime(timezone=True), nullable=True
     )
 
     # Independent GC lifecycle metadata.
     superseded_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, nullable=True
+        DateTime(timezone=True), nullable=True
     )
     artifacts_purged_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, nullable=True
+        DateTime(timezone=True), nullable=True
     )
 
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=datetime.utcnow
     )
 
     __table_args__ = (
         # Mirrors the SQL UNIQUE (document_id, generation) installed by
-        # the migration. The application never allocates two revisions
-        # with the same ``generation`` for the same document.
-        UniqueConstraint(
-            "document_id", "generation", name="uq_document_revisions_doc_gen"
-        ),
+        # the migration as an *anonymous* UNIQUE constraint (no name).
+        # The application never allocates two revisions with the same
+        # ``generation`` for the same document. We deliberately omit a
+        # constraint ``name`` so that a future ``create_all`` on a
+        # fresh DB issues an auto-named UNIQUE that matches the
+        # migration's anonymous UNIQUE — naming it would invent a
+        # constraint the migration never created.
+        UniqueConstraint("document_id", "generation"),
         # The retry_of_revision_id FK is naturally nullable; we do not
         # add a CHECK that constrains it to failed revisions because
         # the application owns that rule and the DB cannot distinguish

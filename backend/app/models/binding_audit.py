@@ -30,5 +30,5 @@ class BindingAudit(Base):
     )
     thread_id: Mapped[str] = mapped_column(Text, nullable=False)
     recorded_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=datetime.utcnow
     )

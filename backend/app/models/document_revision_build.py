@@ -71,20 +71,21 @@ class DocumentRevisionBuild(Base):
     )
 
     started_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=datetime.utcnow
     )
     finished_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, nullable=True
+        DateTime(timezone=True), nullable=True
     )
 
     __table_args__ = (
         # Mirrors the SQL UNIQUE (revision_id, build_profile) installed
-        # by the migration. The migration also installs the
-        # ``ix_revisions_*`` index family on ``document_revisions`` but
-        # the builds table only needs the composite UNIQUE for the
-        # ON CONFLICT arbiter in Phase 1C's build-pipeline code.
-        UniqueConstraint(
-            "revision_id", "build_profile",
-            name="uq_document_revision_builds_rev_profile",
-        ),
+        # by the migration as an *anonymous* UNIQUE constraint (no
+        # name). The migration also installs the ``ix_revisions_*``
+        # index family on ``document_revisions`` but the builds table
+        # only needs the composite UNIQUE for the ON CONFLICT arbiter
+        # in Phase 1C's build-pipeline code. We deliberately omit a
+        # constraint ``name`` so that a future ``create_all`` on a
+        # fresh DB issues an auto-named UNIQUE that matches the
+        # migration's anonymous UNIQUE.
+        UniqueConstraint("revision_id", "build_profile"),
     )

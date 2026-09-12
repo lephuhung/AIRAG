@@ -84,7 +84,7 @@ class DocumentIngestionAttempt(Base):
         Integer, nullable=False, default=1
     )
     exhausted_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, nullable=True
+        DateTime(timezone=True), nullable=True
     )
 
     build_profile: Mapped[str] = mapped_column(Text, nullable=False)
@@ -98,10 +98,10 @@ class DocumentIngestionAttempt(Base):
     )
 
     started_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=datetime.utcnow
     )
     finished_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, nullable=True
+        DateTime(timezone=True), nullable=True
     )
 
     __table_args__ = (

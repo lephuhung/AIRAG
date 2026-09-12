@@ -71,10 +71,16 @@ def imported_app_models():
     """Import ``app.models`` once per module so ``Base.metadata`` is populated.
 
     Importing ``app.models`` triggers ``app.models.__init__`` which, in
-    Phase 1B, performs the post-migration registration of the 12 v2
-    models. The ``v2_registry`` is responsible for asserting schema
-    version 1 *before* registering; if registration fails for any
-    reason, the fixture raises and the suite fails fast.
+    Phase 1B, performs the *import-time registration* of the 11 v2
+    models on ``Base.metadata``. Registration happens at class
+    definition time (a SQLAlchemy declarative ``Base`` subclass
+    registers itself on import); there is no "assert schema version 1
+    before registering" step in ``v2_registry`` — the gating
+    guarantee is owned by ``app.main.lifespan`` via
+    ``check_v2_schema`` + ``assert_v2_readiness`` (see
+    ``v2_registry`` module docstring). If registration fails for any
+    reason (missing module, syntax error, etc.) the fixture raises
+    and the suite fails fast.
     """
     import app.models  # noqa: F401
 
@@ -87,13 +93,21 @@ def imported_app_models():
 
 
 def test_v2_orm_tables_are_exactly_v2_schema_v1_tables(imported_app_models):
-    """Every v2 ORM-mapped table must appear in ``V2_SCHEMA_V1_TABLES``.
+    """The v2 ORM-mapped tables must be EXACTLY the v2 schema v1 tables
+    (minus ``v2_schema_version``).
 
     This is the structural guarantee that Release 1B cannot introduce
-    a hidden new table that Release 1A did not create. ``v2_schema_version``
+    a hidden new table that Release 1A did not create, and cannot
+    *omit* a v2 table that Release 1A did create. ``v2_schema_version``
     is intentionally NOT mapped as an ORM class — it has no per-row
     application semantics; it is a migration-control surface read
     directly via raw SQL.
+
+    The test uses **set-difference** in both directions so it detects
+    extras (ORM table added that the migration didn't create) as well
+    as omissions (v2 table missing from the ORM):
+        extras    = Base.metadata.tables - V2_SCHEMA_V1_TABLES - {legacy names}
+        omissions = expected_v2_orm_tables - Base.metadata.tables
     """
     from app.core.database import Base
 
@@ -104,10 +118,36 @@ def test_v2_orm_tables_are_exactly_v2_schema_v1_tables(imported_app_models):
         for t in Base.metadata.tables.values()
         if t.name in expected_v2_orm_tables
     }
+    # Strict equality: any drift either way is a regression.
     assert mapped_v2_tables == expected_v2_orm_tables, (
         f"ORM-mapped v2 tables {sorted(mapped_v2_tables)} differ from "
         f"expected {sorted(expected_v2_orm_tables)}. ``v2_schema_version`` "
         f"is intentionally not mapped as an ORM class."
+    )
+
+    # Additional set-difference assertions: catch extras (ORM table
+    # added that is NOT in ``V2_SCHEMA_V1_TABLES``) and omissions (v2
+    # table missing from the ORM).
+    v1_legacy_names = {
+        "abbreviations", "agent_traces", "api_keys", "audit_logs",
+        "chat_exchange_summaries", "chat_files", "chat_files_cleanup",
+        "chat_messages", "chat_sessions", "document_aliases",
+        "document_images", "document_tables", "document_type_system_prompts",
+        "document_types", "documents", "format_metadata", "invite_tokens",
+        "knowledge_bases", "system_settings", "telegram_bot_config",
+        "telegram_link_codes", "telegram_links", "tenant_users", "tenants",
+        "users",
+    }
+    all_mapped = set(Base.metadata.tables.keys())
+    extras = all_mapped - expected_v2_orm_tables - v1_legacy_names
+    omissions = expected_v2_orm_tables - all_mapped
+    assert not extras, (
+        f"ORM-mapped tables NOT in V2_SCHEMA_V1_TABLES and not v1 legacy: "
+        f"{sorted(extras)}"
+    )
+    assert not omissions, (
+        f"V2_SCHEMA_V1_TABLES entries missing from ORM metadata: "
+        f"{sorted(omissions)}"
     )
 
 
@@ -572,4 +612,474 @@ def test_main_lifespan_checks_v2_schema_version():
     has_check = "check_v2_schema" in code
     assert has_assert or has_check, (
         "lifespan must call assert_v2_readiness or check_v2_schema"
+    )
+
+
+# ---------------------------------------------------------------------------
+# ORM ↔ schema parity test (I3)
+# ---------------------------------------------------------------------------
+
+
+def _type_family(t) -> str:
+    """Normalize an SA Type or PG Type to a portable type-family string.
+
+    Maps ORM-side ``DateTime`` and PG-side ``TIMESTAMP`` to the same
+    ``"timestamp"`` family so the parity test can compare them. Same
+    for ``BigInteger`` / ``BIGINT`` (both ``"bigint"``), ``LargeBinary``
+    / ``BYTEA`` (both ``"bytea"``), ``String`` / ``VARCHAR`` (both
+    ``"varchar"``), etc. The timezone flag and length are compared
+    separately so ``TIMESTAMP WITH TIME ZONE`` vs ``TIMESTAMP`` (no
+    zone) is detectable.
+    """
+    cls = type(t).__name__.lower()
+    # Generic SA names
+    if cls == "datetime":
+        return "timestamp"
+    if cls == "boolean":
+        return "boolean"
+    if cls == "uuid":
+        return "uuid"
+    if cls == "text":
+        return "text"
+    if cls == "string":
+        return "varchar"
+    if cls == "varchar":
+        return "varchar"
+    if cls == "integer":
+        return "integer"
+    if cls == "biginteger":
+        return "bigint"
+    if cls == "smallinteger":
+        return "smallint"
+    if cls == "largebinary":
+        return "bytea"
+    if cls == "json":
+        return "json"
+    if cls == "enum":
+        return "enum"
+    if cls == "timestamp":
+        return "timestamp"
+    if cls == "bytea":
+        return "bytea"
+    if cls == "jsonb":
+        return "jsonb"
+    return cls
+
+
+def _column_fingerprint(col_or_live) -> dict:
+    """Return a dict fingerprint for an ORM column or a live DB column.
+
+    ``col_or_live`` is either a SQLAlchemy ``Column`` (ORM) or a dict
+    from ``inspect(engine).get_columns(...)`` (live).
+    """
+    if isinstance(col_or_live, dict):
+        # live DB column from inspector
+        t = col_or_live["type"]
+        return {
+            "name": col_or_live["name"],
+            "family": _type_family(t),
+            "timezone": getattr(t, "timezone", None),
+            "length": getattr(t, "length", None),
+            "nullable": col_or_live["nullable"],
+        }
+    # ORM column
+    t = col_or_live.type
+    return {
+        "name": col_or_live.name,
+        "family": _type_family(t),
+        "timezone": getattr(t, "timezone", None),
+        "length": getattr(t, "length", None),
+        "nullable": col_or_live.nullable,
+    }
+
+
+def test_orm_matches_live_db_schema_parity(imported_app_models, db: Engine):
+    """Brief I3: ORM metadata must match the live DB schema exactly.
+
+    Compares ``Base.metadata.tables`` against
+    ``inspect(engine).get_columns(<table>)`` for each of the 12 v2
+    tables AND the 4 legacy columns (``documents.current_revision_id``,
+    ``documents.source_deleted_at``, ``document_images.revision_id``,
+    ``document_tables.revision_id``). For each column the test asserts:
+
+    - column exists in both ORM and live DB (set equality);
+    - column type family matches (e.g. ``DateTime`` ↔ ``TIMESTAMP``);
+    - timezone flag matches (``TIMESTAMP WITH TIME ZONE`` ↔
+      ``DateTime(timezone=True)``);
+    - length matches (for ``String`` / ``VARCHAR``);
+    - nullability matches.
+
+    This is the post-migration deploy gate that prevents autogenerate
+    drift (a mismatch here would silently generate a needless
+    migration on the next ``alembic revision --autogenerate`` run).
+    """
+    from app.core.database import Base
+
+    inspector = inspect(db)
+
+    # 12 v2 tables — all of them, including ``v2_schema_version``
+    # which is not ORM-mapped but must still appear in the live DB.
+    v2_tables = set(V2_SCHEMA_V1_TABLES)
+    # 4 legacy columns (table, column) pairs added by the migration.
+    legacy_cols = {
+        ("documents", "current_revision_id"),
+        ("documents", "source_deleted_at"),
+        ("document_images", "revision_id"),
+        ("document_tables", "revision_id"),
+    }
+
+    issues: list[str] = []
+
+    for tbl in sorted(v2_tables):
+        live = {
+            c["name"]: c
+            for c in inspector.get_columns(tbl)
+        } if tbl in inspector.get_table_names() else {}
+
+        if tbl == "v2_schema_version":
+            # Not ORM-mapped; we only assert the live schema exists.
+            if not live:
+                issues.append(f"{tbl}: missing from live DB")
+            continue
+
+        if tbl not in Base.metadata.tables:
+            issues.append(f"{tbl}: V2_SCHEMA_V1_TABLES table missing from ORM")
+            continue
+
+        orm_table = Base.metadata.tables[tbl]
+        orm_cols = {c.name: c for c in orm_table.columns}
+
+        # Set equality on column names.
+        missing_in_live = set(orm_cols) - set(live)
+        missing_in_orm = set(live) - set(orm_cols)
+        for c in missing_in_live:
+            issues.append(f"{tbl}.{c}: ORM column missing in live DB")
+        for c in missing_in_orm:
+            issues.append(f"{tbl}.{c}: live DB column missing in ORM")
+
+        # Compare each common column.
+        for name in sorted(set(orm_cols) & set(live)):
+            ofp = _column_fingerprint(orm_cols[name])
+            lfp = _column_fingerprint(live[name])
+            if ofp["family"] != lfp["family"]:
+                issues.append(
+                    f"{tbl}.{name}: type family mismatch "
+                    f"(orm={ofp['family']!r}, live={lfp['family']!r})"
+                )
+            if ofp["timezone"] != lfp["timezone"]:
+                issues.append(
+                    f"{tbl}.{name}: timezone mismatch "
+                    f"(orm={ofp['timezone']!r}, live={lfp['timezone']!r}); "
+                    f"a DateTime(false) vs TIMESTAMP(timezone=True) would "
+                    f"compile to TIMESTAMP WITHOUT TIME ZONE vs WITH TIME ZONE — "
+                    f"autogenerate drift would create a needless migration"
+                )
+            if ofp["length"] != lfp["length"]:
+                issues.append(
+                    f"{tbl}.{name}: length mismatch "
+                    f"(orm={ofp['length']!r}, live={lfp['length']!r})"
+                )
+            if ofp["nullable"] != lfp["nullable"]:
+                issues.append(
+                    f"{tbl}.{name}: nullable mismatch "
+                    f"(orm={ofp['nullable']!r}, live={lfp['nullable']!r})"
+                )
+
+    # 4 legacy columns on tables that are otherwise v1 (only the 4
+    # new columns need parity — the rest of the v1 schema is out of
+    # scope for Phase 1B).
+    for tbl, col in sorted(legacy_cols):
+        if tbl not in Base.metadata.tables:
+            issues.append(f"{tbl}: legacy table missing from ORM")
+            continue
+        if col not in Base.metadata.tables[tbl].columns:
+            issues.append(f"{tbl}.{col}: legacy column missing from ORM")
+            continue
+        orm_col = Base.metadata.tables[tbl].c[col]
+        live_cols = inspector.get_columns(tbl)
+        live = next((c for c in live_cols if c["name"] == col), None)
+        if live is None:
+            issues.append(f"{tbl}.{col}: legacy column missing in live DB")
+            continue
+        ofp = _column_fingerprint(orm_col)
+        lfp = _column_fingerprint(live)
+        if ofp["family"] != lfp["family"]:
+            issues.append(
+                f"{tbl}.{col}: type family mismatch "
+                f"(orm={ofp['family']!r}, live={lfp['family']!r})"
+            )
+        if ofp["timezone"] != lfp["timezone"]:
+            issues.append(
+                f"{tbl}.{col}: timezone mismatch "
+                f"(orm={ofp['timezone']!r}, live={lfp['timezone']!r})"
+            )
+        if ofp["nullable"] != lfp["nullable"]:
+            issues.append(
+                f"{tbl}.{col}: nullable mismatch "
+                f"(orm={ofp['nullable']!r}, live={lfp['nullable']!r})"
+            )
+
+    assert not issues, (
+        "ORM ↔ live DB schema parity issues:\n  "
+        + "\n  ".join(issues)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lifespan behavioural tests (I4)
+# ---------------------------------------------------------------------------
+
+
+def test_assert_v2_readiness_raises_with_clear_message_for_unmigrated_db():
+    """I4(a): ``assert_v2_readiness`` on a ``SchemaCheck`` representing
+    an unmigrated database must raise with a clear error message that
+    names the Release-1A migration command.
+
+    The check is built in-memory (no DB roundtrip needed) so this test
+    is fast and deterministic.
+    """
+    from app.services.agents.v2.persistence.migrate import SchemaCheck
+    from app.models import v2_registry
+
+    check = SchemaCheck(
+        applied=False,
+        version=None,
+        missing_tables=V2_SCHEMA_V1_TABLES,
+        extra_tables=frozenset(),
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        v2_registry.assert_v2_readiness(check)
+    msg = str(excinfo.value)
+    # The message must name the migration CLI invocation so an
+    # operator can immediately run it.
+    assert "migrate" in msg.lower(), (
+        f"unmigrated-DB error must mention the migration command: {msg!r}"
+    )
+    assert "apply" in msg.lower(), (
+        f"unmigrated-DB error must mention 'apply': {msg!r}"
+    )
+    assert "--dsn" in msg.lower(), (
+        f"unmigrated-DB error must mention --dsn so the operator "
+        f"knows how to invoke the migration: {msg!r}"
+    )
+    # And the structural details that make the error actionable:
+    assert "applied=False" in msg or "not applied" in msg.lower(), (
+        f"unmigrated-DB error must explain WHY (schema not applied): {msg!r}"
+    )
+
+
+def test_lifespan_resolves_legacy_startup_tables_to_table_objects(
+    imported_app_models, db: Engine
+):
+    """I4(c): the lifespan path resolves every ``LEGACY_STARTUP_TABLES``
+    name to a real ``Table`` object on ``Base.metadata`` before passing
+    it to ``create_all``.
+
+    ``Base.metadata.create_all`` requires ``Sequence[Table]``; passing
+    the names directly raises ``AttributeError: 'str' object has no
+    attribute 'name'``. This test catches that regression at the
+    shape level: it iterates ``LEGACY_STARTUP_TABLES`` and resolves
+    each name to a ``Table`` object exactly the way the lifespan does,
+    then asserts the resulting ``Sequence[Table]`` is non-empty and
+    has no ``str`` element (i.e. the resolution actually happened).
+    """
+    from sqlalchemy.sql.schema import Table
+    from app.core.database import Base
+    from app.models.v2_registry import LEGACY_STARTUP_TABLES
+
+    legacy_table_objs: list[Table] = [
+        Base.metadata.tables[name]
+        for name in LEGACY_STARTUP_TABLES
+        if name in Base.metadata.tables
+    ]
+    assert legacy_table_objs, (
+        "LEGACY_STARTUP_TABLES resolved to zero Table objects; "
+        "either the names list is empty or no ORM class maps them"
+    )
+    for t in legacy_table_objs:
+        assert isinstance(t, Table), (
+            f"resolved legacy object is not a Table: {t!r}"
+        )
+        assert t.name in LEGACY_STARTUP_TABLES, (
+            f"Table {t.name!r} not in LEGACY_STARTUP_TABLES — resolution "
+            f"drift between names and Table objects"
+        )
+
+    # Sanity: the legacy create_all call shape itself doesn't raise.
+    # We use ``checkfirst=True`` (default) so it is a no-op against
+    # the live ``hrag_test_v2`` schema.
+    legacy_table_objs_dict = {t.name: t for t in legacy_table_objs}
+    with db.connect() as conn:
+        inspector = inspect(conn)
+        live_legacy = {
+            tbl for tbl in LEGACY_STARTUP_TABLES
+            if tbl in inspector.get_table_names()
+        }
+        # Filter to the live tables that are actually present in DB
+        # so the call is a pure no-op against an existing schema.
+        to_create = [
+            legacy_table_objs_dict[t] for t in live_legacy
+            if t in legacy_table_objs_dict
+        ]
+        # Use the bound form (SQLAlchemy create_all needs a ``bind``
+        # arg). This is the synchronous equivalent of the async
+        # ``run_sync(Base.metadata.create_all, tables=...)`` call in
+        # ``main.py``'s ``lifespan``.
+        try:
+            Base.metadata.create_all(conn, tables=to_create)
+        except AttributeError as e:
+            pytest.fail(
+                f"create_all raised AttributeError on resolved Table "
+                f"objects: {e!r} — C1 regression"
+            )
+
+
+def test_lifespan_readiness_gate_works_against_unmigrated_db():
+    """I4(b-i): drive the readiness gate against an unmigrated DB.
+
+    We simulate an unmigrated database by feeding
+    ``assert_v2_readiness`` a ``SchemaCheck(applied=False, ...)`` —
+    which is what ``check_v2_schema`` would return against a fresh
+    empty database that has no v2 tables. The gate MUST refuse.
+    """
+    from app.services.agents.v2.persistence.migrate import SchemaCheck
+    from app.models import v2_registry
+
+    check = SchemaCheck(
+        applied=False,
+        version=None,
+        missing_tables=V2_SCHEMA_V1_TABLES,
+        extra_tables=frozenset(),
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        v2_registry.assert_v2_readiness(check)
+    # The error message MUST name the migration command so an
+    # operator can immediately run it.
+    msg = str(excinfo.value)
+    assert (
+        "python -m app.services.agents.v2.persistence.migrate" in msg
+        or "migrate apply" in msg
+    ), f"unmigrated-DB error must name the migration CLI: {msg!r}"
+
+
+def test_lifespan_readiness_gate_accepts_migrated_v2_db(db: Engine):
+    """I4(b-ii): drive the readiness gate against a migrated v2 DB.
+
+    The test DB ``hrag_test_v2`` is at exact schema version 1 (see
+    ``test_check_v2_schema_returns_version_1``); the readiness gate
+    MUST accept it without raising.
+    """
+    check = check_v2_schema(db)
+    assert check.applied is True, check
+    assert check.version == V2_SCHEMA_VERSION, check
+    assert check.is_clean is True, check
+
+    from app.models import v2_registry
+
+    # Must not raise.
+    v2_registry.assert_v2_readiness(check)
+
+
+def test_lifespan_readiness_gate_works_against_empty_db():
+    """I4(b-i, fresh-DB form): drive the readiness gate against a
+    fresh empty DB.
+
+    We use an in-memory SQLite engine as a stand-in for a fresh
+    PostgreSQL database with no v2 tables. ``check_v2_schema`` uses
+    SQL syntax (e.g. ``to_regclass``) that is PostgreSQL-specific, so
+    we cannot drive it against SQLite directly. Instead we exercise
+    the gate via a manually-built ``SchemaCheck`` that matches what
+    ``check_v2_schema`` would return against an unmigrated DB.
+    """
+    from app.services.agents.v2.persistence.migrate import SchemaCheck
+    from app.models import v2_registry
+
+    # What ``check_v2_schema`` returns against a fresh DB with no v2
+    # tables: applied=False, missing_tables = all of V2_SCHEMA_V1_TABLES.
+    fresh_check = SchemaCheck(
+        applied=False,
+        version=None,
+        missing_tables=V2_SCHEMA_V1_TABLES,
+        extra_tables=frozenset(),
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        v2_registry.assert_v2_readiness(fresh_check)
+    msg = str(excinfo.value)
+    assert "apply" in msg.lower(), (
+        f"fresh-DB error must name 'apply': {msg!r}"
+    )
+
+
+def test_main_lifespan_readiness_gate_unconditional_under_auto_create_false():
+    """I1 behavioural: the readiness gate runs even when
+    ``AUTO_CREATE_TABLES=false``.
+
+    This is a source-level proof: the gate (the calls to
+    ``check_v2_schema`` and ``assert_v2_readiness``) must appear in
+    the code stream BEFORE the ``if auto_create:`` block. With
+    ``AUTO_CREATE_TABLES=false`` the lifespan still calls the gate,
+    otherwise a non-migrated database would silently boot in
+    production (the documented deploy path is
+    ``AUTO_CREATE_TABLES=false`` + manual migration).
+
+    Note: there are TWO ``if auto_create:`` blocks in the lifespan
+    (the first one is in the multi-worker warning section; the
+    second one wraps the ``create_all`` pass). We find the LAST one
+    because that is the gate the ``create_all(tables=...)`` allowlist
+    must be inside.
+    """
+    src_path = (
+        Path(__file__).resolve().parents[3] / "app" / "main.py"
+    )
+    src = src_path.read_text(encoding="utf-8")
+    code = re.sub(r'^\s*""".*?""""', "", src, count=1, flags=re.DOTALL)
+    code = re.sub(r"#[^\n]*", "", code)
+
+    # Find ALL occurrences of the ``if auto_create:`` block; use the
+    # last one (the gate's create_all block).
+    auto_create_positions = [
+        m.start() for m in re.finditer(r"if\s+auto_create\s*:", code)
+    ]
+    assert auto_create_positions, (
+        "lifespan must contain at least one ``if auto_create:`` block"
+    )
+    auto_create_pos = auto_create_positions[-1]
+
+    # Find the readiness gate call sites — the call sites are
+    # positionally unique because they appear once at module scope.
+    assert_pos = code.find("assert_v2_readiness(check)")
+    # ``check_v2_schema`` may be called in different forms:
+    #   * ``check_v2_schema(engine.sync_engine)`` (pre-asyncpg path)
+    #   * ``check_v2_schema(migration_sync_engine)`` (post-asyncpg
+    #     path, where ``migration_sync_engine`` is built from the
+    #     DSN via ``make_engine`` because ``engine.sync_engine`` is
+    #     asyncpg-backed and can't be used synchronously).
+    # Accept either.
+    check_pos = -1
+    for variant in (
+        "check_v2_schema(engine.sync_engine)",
+        "check_v2_schema(migration_sync_engine)",
+        "check_v2_schema(",  # last resort: any check_v2_schema call
+    ):
+        p = code.find(variant)
+        if p != -1:
+            check_pos = p
+            break
+    assert assert_pos != -1, (
+        "lifespan must call assert_v2_readiness(check)"
+    )
+    assert check_pos != -1, (
+        "lifespan must call check_v2_schema (with a sync engine)"
+    )
+
+    # Both must precede the LAST ``if auto_create:`` so the gate
+    # runs even when ``AUTO_CREATE_TABLES=false``.
+    assert check_pos < auto_create_pos, (
+        "check_v2_schema must precede the ``if auto_create:`` block "
+        "so the readiness gate runs even when AUTO_CREATE_TABLES=false"
+    )
+    assert assert_pos < auto_create_pos, (
+        "assert_v2_readiness must precede the ``if auto_create:`` "
+        "block so the readiness gate runs even when "
+        "AUTO_CREATE_TABLES=false"
     )

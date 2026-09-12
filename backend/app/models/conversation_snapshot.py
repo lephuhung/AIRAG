@@ -25,12 +25,14 @@ class ConversationSnapshot(Base):
     )
     thread_id: Mapped[str] = mapped_column(Text, nullable=False)
     taken_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=datetime.utcnow
     )
 
     __table_args__ = (
-        UniqueConstraint(
-            "thread_id", "taken_at",
-            name="uq_conversation_snapshots_thread_taken",
-        ),
+        # Mirrors the SQL UNIQUE (thread_id, taken_at) installed by
+        # the migration as an *anonymous* UNIQUE constraint (no name).
+        # We deliberately omit a constraint ``name`` so that a future
+        # ``create_all`` on a fresh DB issues an auto-named UNIQUE
+        # that matches the migration's anonymous UNIQUE.
+        UniqueConstraint("thread_id", "taken_at"),
     )

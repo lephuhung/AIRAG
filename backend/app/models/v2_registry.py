@@ -38,13 +38,35 @@ We cannot avoid this without ugly ``__init_subclass__`` tricks, and
 the brief's gating requirement is fully satisfied by:
 
 1. ``assert_v2_readiness`` runs before any v2 service starts work.
+   ``app.main.lifespan`` builds a sync engine from the DSN via
+   ``make_engine``, calls ``check_v2_schema(...)``, and then calls
+   ``assert_v2_readiness(check)`` *unconditionally* — it does NOT
+   gate on ``AUTO_CREATE_TABLES``. With ``AUTO_CREATE_TABLES=false``
+   (the recommended production config), this is the only line of
+   defence against booting the app on an un-migrated database.
 2. ``create_all(tables=LEGACY_STARTUP_TABLES)`` restricts the startup
-   legacy-table allowlist to v1 tables only, so even if the v2 models
-   are mapped on ``Base.metadata``, ``create_all`` will not create or
-   alter any v2 table.
+   legacy-table allowlist to v1 tables only. ``app.main.lifespan``
+   resolves each name in ``LEGACY_STARTUP_TABLES`` to the
+   corresponding ``Table`` object via ``Base.metadata.tables[...]`` so
+   that ``MetaData.create_all`` receives a ``Sequence[Table]`` (not a
+   ``Sequence[str]``, which would raise ``AttributeError: 'str' object
+   has no attribute 'name'`` because ``create_all`` calls ``.name`` on
+   each element). Even if the v2 models are mapped on
+   ``Base.metadata``, ``create_all`` will not create or alter any v2
+   table.
 3. ``check_v2_schema`` is the single source of truth for "is v2
    actually applied?", and ``lifespan`` refuses to start the app
    without ``applied=True, version=1, missing=∅``.
+
+Note on ``register_v2_models``: this function is an idempotent
+marker, not an actual registration step. SQLAlchemy declarative
+``Base`` subclasses register themselves on ``Base.metadata`` at
+class-definition time (i.e. at module-import time), so importing
+``app.models.v2_registry`` already registers the v2 ORM classes
+on ``Base.metadata``. ``register_v2_models()`` returns ``None`` so
+callers can prove registration has run (e.g. from a test); it does
+NOT assert schema version 1 before registering — that gate is owned
+by ``app.main.lifespan`` (see point 1 above).
 
 This module never opens a DB connection, never issues DDL, and never
 calls ``Base.metadata.create_all``. The brief forbids all of these
@@ -90,18 +112,23 @@ from app.services.agents.v2.persistence.migrate import (
 # them are nullable per Task 1 brief Step 2).
 LEGACY_STARTUP_TABLES: frozenset[str] = frozenset(
     {
-        # Legacy v1 tables — these are the only tables ``create_all``
-        # may create/alter. Mirrors the legacy whitelist in
+        # Legacy v1 tables that are mapped by an ORM class on
+        # ``Base.metadata`` — these are the only tables
+        # ``create_all`` may create/alter. Tables created exclusively
+        # by raw SQL DDL (e.g. ``chat_files_cleanup``) are NOT listed
+        # here because ``create_all`` cannot touch them anyway (no
+        # ORM class maps them) and the raw-SQL path is owned by the
+        # lifespan. Mirrors the legacy whitelist in
         # ``app.services.agents.v2.persistence.migrate.check_v2_schema``
-        # (which subtracts this same set when computing ``extra_tables``)
-        # so the two stay in sync.
+        # (which subtracts this same set when computing
+        # ``extra_tables``) so the two stay in sync — if a v1 legacy
+        # table gains an ORM mapping it must be added to both lists.
         "abbreviations",
         "agent_traces",
         "api_keys",
         "audit_logs",
         "chat_exchange_summaries",
         "chat_files",
-        "chat_files_cleanup",
         "chat_messages",
         "chat_sessions",
         "document_aliases",
@@ -165,13 +192,21 @@ LEGACY_STARTUP_TABLES: frozenset[str] = frozenset(
 def register_v2_models() -> None:
     """Idempotent marker that v2 model imports have already run.
 
-    The v2 model classes register themselves on
-    ``app.core.database.Base.metadata`` at class-definition time (i.e.
-    at module import). Importing ``app.models.v2_registry`` therefore
-    registers them automatically; calling ``register_v2_models()`` is
-    a no-op that lets callers prove the registration ran.
+    SQLAlchemy declarative ``Base`` subclasses register themselves
+    on ``app.core.database.Base.metadata`` at *class-definition*
+    time (i.e. at module import). Importing ``app.models.v2_registry``
+    therefore registers the 11 v2 model classes on ``Base.metadata``
+    automatically; calling ``register_v2_models()`` is a no-op that
+    lets callers prove the registration ran.
 
-    Never opens a DB connection, never issues DDL.
+    This function does NOT assert that schema version 1 is applied
+    before registering — the gating guarantee comes from
+    ``assert_v2_readiness`` (called by ``app.main.lifespan``) plus
+    the ``create_all(tables=LEGACY_STARTUP_TABLES)`` allowlist in
+    ``lifespan``. Importing this module never opens a DB connection
+    or issues DDL; the no-op return is preserved so callers that
+    rely on a side-effect marker have a deterministic function
+    reference.
     """
     return None
 
@@ -273,11 +308,16 @@ def assert_v2_readiness(check: SchemaCheck) -> None:
 
 
 def legacy_startup_tables() -> Iterable[str]:
-    """Return the ``create_all(tables=...)`` allowlist.
+    """Return the ``create_all(tables=...)`` allowlist as table names.
 
-    Returned as an iterable (the frozen set itself is iterable) so
-    callers can pass it straight into ``Base.metadata.create_all(tables=
-    ...)``.
+    Returned as a frozen set of table *names* (strings). Callers
+    (specifically ``app.main.lifespan``) must resolve each name to
+    the corresponding ``Table`` object via
+    ``Base.metadata.tables[name]`` before passing it to
+    ``Base.metadata.create_all(tables=...)`` — SQLAlchemy's
+    ``MetaData.create_all`` requires a ``Sequence[Table]``, not a
+    ``Sequence[str]`` (passing strings raises ``AttributeError: 'str'
+    object has no attribute 'name'``).
     """
     return LEGACY_STARTUP_TABLES
 

@@ -49,18 +49,20 @@ class SourceArrival(Base):
     arrival_identity: Mapped[str] = mapped_column(Text, nullable=False)
 
     received_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=datetime.utcnow
     )
     processed_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, nullable=True
+        DateTime(timezone=True), nullable=True
     )
 
     __table_args__ = (
         # Mirrors the SQL UNIQUE (arrival_identity) installed by the
-        # migration. Webhook delivery dedup keys off this.
-        UniqueConstraint(
-            "arrival_identity", name="uq_source_arrivals_identity"
-        ),
+        # migration as an *anonymous* UNIQUE constraint (no name).
+        # Webhook delivery dedup keys off this. We deliberately omit
+        # a constraint ``name`` so that a future ``create_all`` on a
+        # fresh DB issues an auto-named UNIQUE that matches the
+        # migration's anonymous UNIQUE.
+        UniqueConstraint("arrival_identity"),
         # Mirrors the ``ix_arrivals_received`` index installed by the
         # migration.
         Index("ix_arrivals_received", "received_at"),

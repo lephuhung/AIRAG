@@ -29,6 +29,7 @@ from sqlalchemy import (
     Index,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -57,13 +58,13 @@ class RevisionRetentionLease(Base):
     )
 
     acquired_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=datetime.utcnow
     )
     expires_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False
+        DateTime(timezone=True), nullable=False
     )
     released_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, nullable=True
+        DateTime(timezone=True), nullable=True
     )
     release_reason: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True
@@ -87,11 +88,19 @@ class RevisionRetentionLease(Base):
         ),
         # Mirrors the ``ix_leases_run`` index.
         Index("ix_leases_run", "run_id"),
-        # The ``ix_leases_active`` partial index is reproduced as a
-        # plain index here for the same reason — SQLAlchemy does not
-        # expose partial-index DDL through the declarative API for
-        # arbitrary backends; the migration owns the partial form. We
-        # keep the index so the metadata model is consistent if the
-        # application ever needs to introspect it.
-        Index("ix_leases_active", "revision_id", "expires_at"),
+        # The ``ix_leases_active`` partial index is reproduced here
+        # with the ``postgresql_where`` predicate so a ``create_all``
+        # on a fresh DB issues the same DDL as the migration. SQLAlchemy
+        # 2.0's ``Index(..., postgresql_where=...)`` emits
+        # ``CREATE INDEX ... WHERE <predicate>`` for the PostgreSQL
+        # dialect; the predicate is otherwise ignored, but
+        # ``create_all`` is restricted to v2 tables via the
+        # ``LEGACY_STARTUP_TABLES`` allowlist so this index never fires
+        # at startup — the migration owns the partial form.
+        Index(
+            "ix_leases_active",
+            "revision_id",
+            "expires_at",
+            postgresql_where=text("released_at IS NULL"),
+        ),
     )

@@ -61,9 +61,9 @@ class EvidenceRecord(Base):
     # GC tombstone: when set, the row's ciphertext is logically gone
     # even though the row is retained for binding-audit history.
     payload_purged_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, nullable=True
+        DateTime(timezone=True), nullable=True
     )
 
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=datetime.utcnow
     )

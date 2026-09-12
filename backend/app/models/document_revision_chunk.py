@@ -40,11 +40,12 @@ class DocumentRevisionChunk(Base):
 
     __table_args__ = (
         # Mirrors the SQL UNIQUE (revision_id, ordinal) installed by
-        # the migration. The chunk_id remains the PK so individual
-        # rows can be referenced by retrieval callers; ordinal is the
-        # position, chunk_id is the identity.
-        UniqueConstraint(
-            "revision_id", "ordinal",
-            name="uq_document_revision_chunks_rev_ordinal",
-        ),
+        # the migration as an *anonymous* UNIQUE constraint (no name).
+        # The chunk_id remains the PK so individual rows can be
+        # referenced by retrieval callers; ordinal is the position,
+        # chunk_id is the identity. We deliberately omit a constraint
+        # ``name`` so that a future ``create_all`` on a fresh DB issues
+        # an auto-named UNIQUE that matches the migration's anonymous
+        # UNIQUE.
+        UniqueConstraint("revision_id", "ordinal"),
     )

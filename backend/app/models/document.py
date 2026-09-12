@@ -138,9 +138,13 @@ class Document(Base):
     # Tombstone column: set when the source object is deleted in
     # MinIO. The plan-mandated ``mark_source_deleted`` path sets this
     # together with clearing ``current_revision_id``. A partial
-    # index on this column is installed by the migration.
+    # index on this column is installed by the migration. Must be
+    # mapped as ``DateTime(timezone=True)`` to match the migration's
+    # ``TIMESTAMPTZ NULL`` DDL — the legacy ``created_at`` /
+    # ``updated_at`` columns above are pre-existing legacy columns
+    # and are not touched by this change.
     source_deleted_at: Mapped[datetime | None] = mapped_column(
-        DateTime, nullable=True
+        DateTime(timezone=True), nullable=True
     )
 
     # Relationships
