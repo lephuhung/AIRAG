@@ -16,13 +16,13 @@ by T6/T7) with the whole trusted ``CapabilityRuntimeContext`` — the resolver
 service owns multi-workspace iteration and is never collapsed to one workspace
 here. When the service is absent the node fails closed.
 
+The lease set is exactly the resolver's output for THIS turn
+(``binding_set.bindings``): every returned pin is validated and leased before
+any acquire is issued, so a pin can never be checkpointed without a lease.
 Stale merged pins from prior turns are kept in the checkpoint (continuity) but
-are NOT lease-refreshed and do NOT count toward fast-path gates: only pins
-referenced by the current draft's document references are current. Every
-revision is validated before the first lease call is issued, and the lease
-session is expected to be a dedicated unit of work (T6 owns the session
-wiring; committing a shared session would also commit unrelated pending
-writes).
+are NOT lease-refreshed. The lease session is expected to be a dedicated unit
+of work (T6 owns the session wiring; committing a shared session would also
+commit unrelated pending writes).
 """
 from __future__ import annotations
 
@@ -31,9 +31,8 @@ from typing import Any
 
 from langgraph.runtime import Runtime
 
-from ..adapters.document import binding_id_for_ref
 from ..contracts.binding import DocumentBindingSet
-from ..contracts.semantic import DocumentReference, SemanticDraft
+from ..contracts.semantic import SemanticDraft
 from ..contracts.state import GraphRuntimeContext, SupervisorV2State
 from .context import _context_of, build_semantic_draft
 
@@ -70,11 +69,6 @@ async def resolve_bindings(
             "not DocumentBindingSet"
         )
     return resolved
-
-
-def _current_binding_ids(document_refs: tuple[DocumentReference, ...]) -> set[str]:
-    """Binding IDs referenced by the current semantic projection."""
-    return {binding_id_for_ref(reference.ref_id) for reference in document_refs}
 
 
 def _merge_binding_sets(
@@ -140,24 +134,21 @@ async def binding_node(
     )
     binding_set = await resolve_bindings(draft, context)
     merged = _merge_binding_sets(state["bindings"], binding_set)
-    current_ids = _current_binding_ids(draft.document_refs)
-    current = tuple(
-        binding for binding in merged.bindings if binding.binding_id in current_ids
-    )
-    if current:
+    new_pins = binding_set.bindings
+    if new_pins:
         repo = context.services.retention_leases
         if repo is None:
             raise BindingNodeError(
                 "bindings pin revisions but no retention-lease service is wired"
             )
-        for binding in current:
+        for binding in new_pins:
             revision = binding.document_revision
             if not isinstance(revision, str) or not revision.strip():
                 raise BindingNodeError(
                     f"binding {binding.binding_id} pins a blank revision; "
                     "no lease was issued"
                 )
-        for binding in current:
+        for binding in new_pins:
             acquired = repo.acquire_or_refresh(run_id, binding.document_revision)
             if inspect.isawaitable(acquired):
                 await acquired

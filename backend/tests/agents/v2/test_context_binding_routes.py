@@ -23,6 +23,7 @@ from typing import Any
 from uuid import UUID
 
 import pytest
+from langgraph.graph import StateGraph
 from langgraph.runtime import Runtime
 
 from app.services.agents.v2.adapters.document import binding_id_for_ref
@@ -94,7 +95,7 @@ FULL_CAPABILITIES = frozenset(
 class FakeSemanticAdapter:
     """Stand-in for the T6/T7-wired semantic adapter service."""
 
-    def __init__(self, draft: SemanticDraft) -> None:
+    def __init__(self, draft: Any) -> None:
         self._draft = draft
         self.calls: list[tuple[RequestContext, ConversationContext]] = []
 
@@ -102,6 +103,8 @@ class FakeSemanticAdapter:
         self, request: RequestContext, conversation: ConversationContext
     ) -> SemanticDraft:
         self.calls.append((request, conversation))
+        if callable(self._draft):
+            return self._draft(request, conversation)
         return self._draft
 
 
@@ -109,7 +112,7 @@ class FakeBindingResolver:
     """Stand-in for the T6/T7-wired binding resolver service."""
 
     def __init__(
-        self, binding_set: DocumentBindingSet, *, error: Exception | None = None
+        self, binding_set: Any, *, error: Exception | None = None
     ) -> None:
         self._binding_set = binding_set
         self._error = error
@@ -121,6 +124,8 @@ class FakeBindingResolver:
         self.calls.append((document_refs, capability_runtime))
         if self._error is not None:
             raise self._error
+        if callable(self._binding_set):
+            return self._binding_set(document_refs, capability_runtime)
         return self._binding_set
 
 
@@ -1229,6 +1234,112 @@ async def test_semantic_finalizer_node_returns_validated_semantic() -> None:
     ).strip()
     assert "original_query" not in type(update["semantic"]).model_fields
     assert handle.adapter.calls == [(state["request"], state["conversation"])]
+
+
+def test_finalizer_skips_stale_prior_turn_pins() -> None:
+    stale = DocumentBindingSet(
+        bindings=(
+            scoped_binding(
+                binding_id="b_rX",
+                document_id=OTHER_DOCUMENT_ID,
+                revision=OTHER_REVISION_ID,
+            ),
+        ),
+        revision_requirement_refs=(),
+    )
+    finalized = finalize_semantic(greeting_draft(), stale)
+    assert finalized.document_refs == ()
+
+
+def test_resolved_ref_without_pin_fails_finalizer() -> None:
+    with pytest.raises(ContextNodeError, match="has no pinned binding"):
+        finalize_semantic(draft_with_refs((resolved_ref(),)), empty_binding_set())
+
+
+@pytest.mark.asyncio
+async def test_nonconventional_resolver_binding_gets_lease() -> None:
+    # The lease set equals the resolver output even when a pin id does not
+    # derive from a draft ref: no pin is checkpointed without a lease.
+    custom = ScopedDocument(
+        binding_id="b_custom",
+        document_id=OTHER_DOCUMENT_ID,
+        document_revision=str(OTHER_REVISION_ID),
+        role="target",
+    )
+    state = make_state(request=make_request("Xem Nghị định 12/2020"))
+    handle = wired(
+        draft=draft_with_refs((resolved_ref(),)),
+        binding_set=DocumentBindingSet(
+            bindings=(custom,), revision_requirement_refs=()
+        ),
+    )
+    update = await binding_node(state, handle.runtime)
+    assert update["bindings"].bindings == (custom,)
+    assert handle.events == [f"acquire:{OTHER_REVISION_ID}", "commit"]
+
+
+@pytest.mark.asyncio
+async def test_multi_turn_carried_pin_survives_fresh_query() -> None:
+    """Composed-graph multi-turn regression (exact T6 registration shape).
+
+    Turn 1 pins a binding; turn 2 carries the checkpointed pin with a fresh
+    unrelated query. The graph must complete without raising and must not
+    lose the checkpointed pin.
+    """
+    graph = StateGraph(SupervisorV2State, context_schema=GraphRuntimeContext)
+    graph.add_node("context", context_node)
+    graph.add_node("binding", binding_node)
+    graph.add_node("semantic_finalizer", semantic_finalizer_node)
+    graph.add_node("route", route_node)
+    graph.add_edge("context", "binding")
+    graph.add_edge("binding", "semantic_finalizer")
+    graph.add_edge("semantic_finalizer", "route")
+    graph.set_entry_point("context")
+    graph.set_finish_point("route")
+    compiled = graph.compile()
+
+    def adapter_for(
+        request: RequestContext, conversation: ConversationContext
+    ) -> SemanticDraft:
+        if "12/2020" in request.original_query:
+            return draft_with_refs(
+                (resolved_ref(),), provisional=request.original_query
+            )
+        return greeting_draft()
+
+    def resolver_for(refs: Any, capability_runtime: Any) -> DocumentBindingSet:
+        pins = tuple(
+            scoped_binding(binding_id=binding_id_for_ref(ref.ref_id))
+            for ref in refs
+            if ref.resolution_status == "resolved"
+        )
+        return DocumentBindingSet(bindings=pins, revision_requirement_refs=())
+
+    events: list[str] = []
+    ctx = make_runtime_context(
+        retention_leases=FakeLeaseRepo(events),
+        semantic_adapter=FakeSemanticAdapter(adapter_for),
+        binding_resolver=FakeBindingResolver(resolver_for),
+    )
+    turn1 = await compiled.ainvoke(
+        make_state(request=make_request("Xem Nghị định 12/2020")), context=ctx
+    )
+    assert [b.binding_id for b in turn1["bindings"].bindings] == ["b_r1"]
+    assert turn1["route_decision"].route == "fast_domain"
+    assert events == [f"acquire:{REVISION_ID}", "commit"]
+
+    turn2 = await compiled.ainvoke(
+        make_state(
+            request=make_request("Xin chào"),
+            conversation=turn1["conversation"],
+            bindings=turn1["bindings"],
+        ),
+        context=ctx,
+    )
+    assert turn2["route_decision"].route == "direct"
+    assert [b.binding_id for b in turn2["bindings"].bindings] == ["b_r1"]
+    # No lease refresh for the now-stale pin on the unrelated turn.
+    assert events == [f"acquire:{REVISION_ID}", "commit"]
 
 
 @pytest.mark.asyncio

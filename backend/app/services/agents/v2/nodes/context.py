@@ -127,21 +127,21 @@ def _apply_resolution(
 ) -> tuple[DocumentReference, ...]:
     """Project the binding outcome onto the canonical document references.
 
-    Fail-closed: a binding for an unresolved/unknown reference (which the real
-    Binding Resolver can never produce) raises instead of checkpointing a
-    contradictory semantic/binding pair.
+    A checkpointed binding whose ref is absent from the current draft is a
+    stale prior-turn pin: it is SKIPPED here (continuity lives in the merged
+    binding set, which this projection never prunes). Fail-closed only for a
+    current draft ref: resolved yet unpinned, non-resolved yet pinned, or
+    pinning a different document than the resolution.
     """
     by_binding_id = {binding.binding_id: binding for binding in bindings.bindings}
-    known_ids = {binding_id_for_ref(reference.ref_id) for reference in document_refs}
-    for binding_id in by_binding_id:
-        if binding_id not in known_ids:
-            raise ContextNodeError(
-                f"binding {binding_id} has no matching semantic document reference"
-            )
     projected: list[DocumentReference] = []
     for reference in document_refs:
         binding = by_binding_id.get(binding_id_for_ref(reference.ref_id))
         if binding is None:
+            if reference.resolution_status == "resolved":
+                raise ContextNodeError(
+                    f"resolved reference {reference.ref_id} has no pinned binding"
+                )
             projected.append(reference)
             continue
         if reference.resolution_status != "resolved":
@@ -162,7 +162,23 @@ def finalize_semantic(
     draft: SemanticDraft,
     bindings: DocumentBindingSet,
 ) -> SemanticContext:
-    """Finalize the persisted query meaning from a draft plus bindings."""
+    """Finalize the persisted query meaning from a draft plus bindings.
+
+    Cross-validation runs against the current projection only: stale
+    prior-turn pins (and their relations) were validated on their own turn
+    and must not fail this turn's finalizer.
+    """
+    current_ids = {binding_id_for_ref(reference.ref_id) for reference in draft.document_refs}
+    current = DocumentBindingSet(
+        bindings=tuple(
+            binding for binding in bindings.bindings if binding.binding_id in current_ids
+        ),
+        revision_requirement_refs=tuple(
+            relation
+            for relation in bindings.revision_requirement_refs
+            if relation.binding_id in current_ids
+        ),
+    )
     context = SemanticContext(
         contextualized_query=draft.provisional_contextualized_query,
         normalized_query=_normalize_validated(draft),
@@ -177,7 +193,7 @@ def finalize_semantic(
         ),
     )
     validate_semantic_context(context)
-    validate_binding_set(bindings, context)
+    validate_binding_set(current, context)
     return context
 
 
