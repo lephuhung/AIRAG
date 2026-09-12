@@ -269,6 +269,52 @@ def test_all_v2_tables_exist(migrated_db: Engine) -> None:
     assert not missing, f"missing v2 tables: {sorted(missing)}"
 
 
+def test_snapshot_and_audit_tables_persist_the_frozen_contracts(
+    migrated_db: Engine,
+) -> None:
+    """Task 7 amendment: the snapshot / binding-audit tables carry the
+    columns that persist the frozen conversation / semantic / audit
+    contracts (version + payload + CAS/audit metadata)."""
+    expected_not_null = {
+        "conversation_snapshots": {
+            "contract_version",
+            "summary_version",
+            "context",
+        },
+        "semantic_snapshots": {"contract_version", "semantic"},
+        "binding_audit": {"contract_version", "provenance_kind", "provenance"},
+    }
+    nullable = {
+        ("conversation_snapshots", "built_through_message_id"),
+    }
+    with migrated_db.connect() as conn:
+        for table, required in expected_not_null.items():
+            rows = conn.execute(
+                text(
+                    "SELECT column_name, is_nullable FROM "
+                    "information_schema.columns WHERE table_name = :t"
+                ),
+                {"t": table},
+            ).fetchall()
+            present = {r[0] for r in rows}
+            missing = required - present
+            assert not missing, f"{table} missing columns: {sorted(missing)}"
+            nullability = {r[0]: r[1] for r in rows}
+            for column in required:
+                assert nullability[column] == "NO", (
+                    f"{table}.{column} must be NOT NULL"
+                )
+        for table, column in nullable:
+            value = conn.execute(
+                text(
+                    "SELECT is_nullable FROM information_schema.columns "
+                    "WHERE table_name = :t AND column_name = :c"
+                ),
+                {"t": table, "c": column},
+            ).scalar()
+            assert value == "YES", f"{table}.{column} must be nullable"
+
+
 def test_legacy_rows_unchanged(migrated_db: Engine) -> None:
     """Every legacy row remains untouched and v1-readable."""
     with migrated_db.connect() as conn:

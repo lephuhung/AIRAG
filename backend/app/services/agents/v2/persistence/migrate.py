@@ -378,29 +378,51 @@ _CREATE_DDL: tuple[str, ...] = (
     )
     """,
     # 8. conversation_snapshots — checkpointed chat truth projection.
+    # Task 7 amendment: the frozen ConversationSnapshot contract is persisted
+    # here (contract_version + CAS metadata + JSONB conversation context).
+    # UNIQUE(thread_id) because rolling-summary persistence holds exactly one
+    # current snapshot per thread and advances it in place via an optimistic
+    # CAS on summary_version; the unique key is also the CAS arbiter.
     """
     CREATE TABLE IF NOT EXISTS conversation_snapshots (
-        snapshot_id   UUID        PRIMARY KEY,
-        thread_id     TEXT        NOT NULL,
-        taken_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE (thread_id, taken_at)
+        snapshot_id                UUID        PRIMARY KEY,
+        thread_id                  TEXT        NOT NULL,
+        contract_version           TEXT        NOT NULL,
+        summary_version            INTEGER     NOT NULL,
+        built_through_message_id   TEXT        NULL,
+        context                    JSONB       NOT NULL,
+        taken_at                   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (thread_id)
     )
     """,
     # 9. semantic_snapshots — semantic context projection.
+    # Task 7 amendment: the frozen SemanticSnapshot contract is persisted here
+    # (contract_version + JSONB SemanticContext). One current semantic
+    # projection per thread (the contract itself carries no thread_id, so the
+    # persistence key is supplied by the caller).
     """
     CREATE TABLE IF NOT EXISTS semantic_snapshots (
-        snapshot_id   UUID        PRIMARY KEY,
-        thread_id     TEXT        NOT NULL,
-        taken_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        UNIQUE (thread_id, taken_at)
+        snapshot_id       UUID        PRIMARY KEY,
+        thread_id         TEXT        NOT NULL,
+        contract_version  TEXT        NOT NULL,
+        semantic          JSONB       NOT NULL,
+        taken_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (thread_id)
     )
     """,
     # 10. binding_audit — every binding decision is recorded here.
+    # Task 7 amendment: the frozen BindingAuditRow boundary is persisted as its
+    # discriminated provenance plus the discriminator for indexed audit
+    # queries. Append-only: no unique key, because two identical binding
+    # decisions are two audit facts, not a deduplicated row.
     """
     CREATE TABLE IF NOT EXISTS binding_audit (
-        audit_id     UUID        PRIMARY KEY,
-        thread_id    TEXT        NOT NULL,
-        recorded_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        audit_id          UUID        PRIMARY KEY,
+        thread_id         TEXT        NOT NULL,
+        contract_version  TEXT        NOT NULL,
+        provenance_kind   TEXT        NOT NULL,
+        provenance        JSONB       NOT NULL,
+        recorded_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
     """,
     # 11. evidence_records — encrypted evidence payloads.
@@ -449,6 +471,10 @@ _CREATE_INDEXES: tuple[str, ...] = (
     "ON revision_retention_leases(revision_id, expires_at) "
     "WHERE released_at IS NULL",
     "CREATE INDEX IF NOT EXISTS ix_evidence_uses_task ON evidence_uses(task_id)",
+    # Binding audit is read per thread in recorded order for security / audit
+    # investigation.
+    "CREATE INDEX IF NOT EXISTS ix_binding_audit_thread_recorded "
+    "ON binding_audit(thread_id, recorded_at)",
 )
 
 
@@ -702,6 +728,22 @@ _EXPECTED_SHAPE_COLUMNS: dict[str, frozenset[str]] = {
             "kg_skipped",
             "embed_skipped",
         }
+    ),
+    # Task 7 amendment: a database that applied the pre-Task-7 shape keeps the
+    # bare (snapshot_id, thread_id, taken_at) tables while reporting version 1,
+    # so these guards fail closed instead of accepting a schema that cannot
+    # persist the frozen snapshot / audit contracts.
+    "conversation_snapshots": frozenset(
+        {
+            "contract_version",
+            "summary_version",
+            "built_through_message_id",
+            "context",
+        }
+    ),
+    "semantic_snapshots": frozenset({"contract_version", "semantic"}),
+    "binding_audit": frozenset(
+        {"contract_version", "provenance", "provenance_kind"}
     ),
 }
 

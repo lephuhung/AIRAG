@@ -248,6 +248,74 @@ def test_evidence_use_null_safe_uniqueness(imported_app_models):
     )
 
 
+def test_snapshot_and_audit_orm_map_the_persisted_contract_columns(
+    imported_app_models,
+):
+    """Task 7 amendment: the snapshot / binding-audit ORM mappings must
+    expose exactly the columns that persist the frozen contracts."""
+    from app.core.database import Base
+
+    expected = {
+        "conversation_snapshots": {
+            "snapshot_id",
+            "thread_id",
+            "contract_version",
+            "summary_version",
+            "built_through_message_id",
+            "context",
+            "taken_at",
+        },
+        "semantic_snapshots": {
+            "snapshot_id",
+            "thread_id",
+            "contract_version",
+            "semantic",
+            "taken_at",
+        },
+        "binding_audit": {
+            "audit_id",
+            "thread_id",
+            "contract_version",
+            "provenance_kind",
+            "provenance",
+            "recorded_at",
+        },
+    }
+    for table, columns in expected.items():
+        actual = set(Base.metadata.tables[table].columns.keys())
+        assert actual == columns, (
+            f"{table} ORM columns {sorted(actual)} != expected {sorted(columns)}"
+        )
+
+
+def test_check_v2_schema_detects_stale_pre_task7_snapshot_shape(db: Engine):
+    """Task 7: a DB that applied the pre-Task-7 snapshot shape (no payload
+    columns) while reporting version 1 must fail closed."""
+    with db.begin() as conn:
+        conn.execute(text("ALTER TABLE conversation_snapshots DROP COLUMN context"))
+    try:
+        check = check_v2_schema(db)
+        assert check.applied is True
+        assert check.is_clean is False, check
+        assert any(
+            "conversation_snapshots" in e for e in check.shape_errors
+        ), check.shape_errors
+    finally:
+        with db.begin() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE conversation_snapshots ADD COLUMN context JSONB "
+                    "NOT NULL DEFAULT '{}'::jsonb"
+                )
+            )
+            conn.execute(
+                text(
+                    "ALTER TABLE conversation_snapshots "
+                    "ALTER COLUMN context DROP DEFAULT"
+                )
+            )
+
+
 def test_evidence_record_exposes_no_plaintext_column(imported_app_models):
     """``EvidenceRecord`` maps ``ciphertext``/``encryption_key_id``/
     ``nonce``/``encryption_algorithm``/``payload_purged_at`` and
