@@ -642,3 +642,171 @@ class TestDuplicateWebhookArrival:
         assert str(committed_id) == arrival_id, (
             "the surviving row is the FIRST insert, not the loser's"
         )
+
+
+# ---------------------------------------------------------------------------
+# Brief-named canonical-identity checklist (Phase 1C Task 3)
+#
+# The brief enumerates these test names explicitly. Several concepts are
+# also covered by the focused classes above; these named tests keep a 1:1
+# brief-item -> test mapping for review.
+# ---------------------------------------------------------------------------
+
+
+class TestBriefNamedCanonicalIdentity:
+    def test_source_object_identity_is_canonical(self):
+        """The storage key is used verbatim; the user filename and case
+        never change the identity; an S3 event key is form-decoded exactly
+        once before normalization."""
+        canonical = compute_source_object_identity(
+            bucket="bkt",
+            object_key="dir/Doc 1.pdf",
+            version_id="v-1",
+            etag=None,
+            size_bytes=10,
+            content_sha256="a" * 64,
+        )
+        # Storage key verbatim (case-sensitive, no folding).
+        assert "|dir/Doc 1.pdf|" in canonical
+        assert compute_source_object_identity(
+            bucket="bkt", object_key="dir/doc 1.pdf", version_id="v-1",
+            etag=None, size_bytes=10, content_sha256="a" * 64,
+        ) != canonical
+        # One leading slash is stripped; the identity is unchanged.
+        assert compute_source_object_identity(
+            bucket="bkt", object_key="/dir/Doc 1.pdf", version_id="v-1",
+            etag=None, size_bytes=10, content_sha256="a" * 64,
+        ) == canonical
+        # S3 event key is form-decoded exactly once and converges.
+        from_event = object_key_from_s3_event("dir/Doc+1.pdf")
+        assert from_event == "dir/Doc 1.pdf"
+        assert compute_source_object_identity(
+            bucket="bkt", object_key=from_event, version_id="v-1",
+            etag=None, size_bytes=10, content_sha256="a" * 64,
+        ) == canonical
+
+    def test_multipart_etag_is_not_a_content_hash(self):
+        """Same etag/size but different sha256 yields different attempt
+        identities while sharing one arrival key."""
+        multipart_etag = "d41d8cd98f00b204e9800998ecf8427e-3"
+        attempt_a = compute_source_object_identity(
+            bucket="bkt", object_key="k.zip", version_id=None,
+            etag=multipart_etag, size_bytes=100, content_sha256="1" * 64,
+        )
+        attempt_b = compute_source_object_identity(
+            bucket="bkt", object_key="k.zip", version_id=None,
+            etag=multipart_etag, size_bytes=100, content_sha256="2" * 64,
+        )
+        arrival_a = arrival_identity(
+            bucket="bkt", object_key="k.zip", version_id=None,
+            etag=multipart_etag, size_bytes=100,
+        )
+        arrival_b = arrival_identity(
+            bucket="bkt", object_key="k.zip", version_id=None,
+            etag=multipart_etag, size_bytes=100,
+        )
+        assert attempt_a != attempt_b, (
+            "different sha256 must separate attempt identities even when "
+            "a multipart etag is reused"
+        )
+        assert arrival_a == arrival_b
+        # The multipart etag is preserved verbatim as the version selector.
+        assert multipart_etag in attempt_a
+
+    def test_s3_event_key_is_decoded_once_and_matches_storage_key(self):
+        """``doc+1%20b.pdf`` from the event canonicalizes to the same key as
+        the storage-reported ``doc 1 b.pdf``."""
+        assert object_key_from_s3_event("doc+1%20b.pdf") == "doc 1 b.pdf"
+        assert object_key_from_s3_event(
+            "doc+1%20b.pdf"
+        ) == normalize_object_key("doc 1 b.pdf")
+
+    def test_etag_is_a_version_selector_not_content_identity(self):
+        """Identity and arrival strings are stable across callers and
+        sha256 is the only content discriminator."""
+        a = compute_source_object_identity(
+            bucket="bkt", object_key="x.pdf", version_id=None, etag="abc123",
+            size_bytes=7, content_sha256="f" * 64,
+        )
+        b = compute_source_object_identity(
+            bucket="bkt", object_key="x.pdf", version_id=None, etag="abc123",
+            size_bytes=7, content_sha256="f" * 64,
+        )
+        assert a == b, "identity must be stable across identical callers"
+        # etag is case-insensitive metadata: 'ABC123' == 'abc123'.
+        c = compute_source_object_identity(
+            bucket="bkt", object_key="x.pdf", version_id=None, etag="ABC123",
+            size_bytes=7, content_sha256="f" * 64,
+        )
+        assert a == c
+        # sha256 is the ONLY content discriminator.
+        d = compute_source_object_identity(
+            bucket="bkt", object_key="x.pdf", version_id=None, etag="abc123",
+            size_bytes=7, content_sha256="e" * 64,
+        )
+        assert a != d
+
+    @pytest.mark.asyncio
+    async def test_overwrite_same_key_changes_identity_and_creates_new_attempt(
+        self, async_db: AsyncSession, document_factory
+    ):
+        """A new version/etag/sha on the same key is a NEW identity and MUST
+        allocate a new attempt/revision generation (not converge on the old
+        one) — the R1 arbiter-scope guarantee."""
+        from app.services.agents.v2.persistence.document_revisions import (
+            DocumentRevisionsRepository,
+        )
+
+        repo = DocumentRevisionsRepository(async_db)
+        document_id = document_factory()
+        old = compute_source_object_identity(
+            bucket="bkt", object_key="k.pdf", version_id="v-1", etag=None,
+            size_bytes=10, content_sha256="1" * 64,
+        )
+        new = compute_source_object_identity(
+            bucket="bkt", object_key="k.pdf", version_id="v-2", etag=None,
+            size_bytes=11, content_sha256="2" * 64,
+        )
+        assert old != new
+        r_old, created_old = await repo.get_or_create_ingestion_attempt(
+            document_id=document_id,
+            source_object_identity=old,
+            build_profile=RevisionBuildProfile.FULL,
+        )
+        r_new, created_new = await repo.get_or_create_ingestion_attempt(
+            document_id=document_id,
+            source_object_identity=new,
+            build_profile=RevisionBuildProfile.FULL,
+        )
+        assert created_old is True
+        assert created_new is True
+        assert r_old.revision_id != r_new.revision_id
+        assert r_new.generation > r_old.generation
+
+    def test_build_profile_resolution_is_deterministic(self):
+        """``doc_*`` -> ``FULL``, ``chat_file_*`` -> ``CHAT_UPLOAD``, explicit
+        parse-only flag overrides."""
+        assert (
+            resolve_build_profile("doc_2024/report.pdf", IngestFlags())
+            is RevisionBuildProfile.FULL
+        )
+        assert (
+            resolve_build_profile("chat_file_abc.pdf", IngestFlags())
+            is RevisionBuildProfile.CHAT_UPLOAD
+        )
+        assert (
+            resolve_build_profile(
+                "doc_2024/report.pdf", IngestFlags(parse_only=True)
+            )
+            is RevisionBuildProfile.PARSE_ONLY
+        )
+        assert (
+            resolve_build_profile(
+                "chat_file_abc.pdf", IngestFlags(parse_only=True)
+            )
+            is RevisionBuildProfile.PARSE_ONLY
+        )
+        for key in ("doc_x.pdf", "chat_file_y.pdf", "other/z.pdf"):
+            assert resolve_build_profile(
+                key, IngestFlags()
+            ) == resolve_build_profile(key, IngestFlags())
