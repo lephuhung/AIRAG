@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
-from . import EvidenceBuilder, denied_result, error_result
+from . import EvidenceBuilder, denied_result, dependency_error, error_result
 from ..contracts.base import CONTRACT_VERSION
 from ..contracts.capability import (
     CapabilityDescriptor,
@@ -70,8 +70,21 @@ class MemoryCapability:
                 code="INVALID_INPUT",
                 message="memory.lookup requires a memory.lookup input",
             )
-        matches = await self._store.lookup(request.input.query)
-        if not matches:
+        try:
+            matches = await self._store.lookup(request.input.query)
+        except Exception as exc:
+            return dependency_error(
+                request.task_id, capability="memory.lookup", exc=exc
+            )
+        # Dedupe while preserving order (see KnowledgeGraphCapability).
+        seen: set[tuple[str, str]] = set()
+        distinct: list[tuple[str, str]] = []
+        for memory_id, content in matches:
+            key = (memory_id, content)
+            if key not in seen:
+                seen.add(key)
+                distinct.append(key)
+        if not distinct:
             return AgentResult(
                 contract_version=CONTRACT_VERSION,
                 task_id=request.task_id,
@@ -83,30 +96,39 @@ class MemoryCapability:
                 coverage_observations=(),
                 error=None,
             )
+        # One acquisition id for every record produced by this execute call.
+        acquisition_id = uuid4()
+        fetched_at = datetime.now(timezone.utc)
         uses: list[EvidenceUseRef] = []
-        for memory_id, content in matches:
-            uses.append(
-                await self._evidence.persist_use(
-                    source=MemorySourceIdentity(
-                        kind="memory", memory_id=memory_id
-                    ),
-                    content=content,
-                    provenance=Provenance(
-                        acquisition_id=uuid4(),
-                        fetcher="memory.lookup",
-                        fetched_at=datetime.now(timezone.utc),
-                    ),
-                    task_id=request.task_id,
-                    purpose="supporting",
-                    target_id=None,
+        try:
+            for memory_id, content in distinct:
+                uses.append(
+                    await self._evidence.persist_use(
+                        source=MemorySourceIdentity(
+                            kind="memory", memory_id=memory_id
+                        ),
+                        content=content,
+                        provenance=Provenance(
+                            acquisition_id=acquisition_id,
+                            fetcher="memory.lookup",
+                            fetched_at=fetched_at,
+                        ),
+                        task_id=request.task_id,
+                        purpose="supporting",
+                        target_id=None,
+                    )
                 )
+        except Exception as exc:
+            return dependency_error(
+                request.task_id, capability="memory.lookup", exc=exc
             )
+        matched = len({use.use_id for use in uses})
         return AgentResult(
             contract_version=CONTRACT_VERSION,
             task_id=request.task_id,
             status="success",
             data=MemoryLookupOutput(
-                kind="memory.lookup", matched_count=len(uses)
+                kind="memory.lookup", matched_count=matched
             ),
             evidence_uses=tuple(uses),
             coverage_observations=(),

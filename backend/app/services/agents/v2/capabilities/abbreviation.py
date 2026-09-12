@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from . import denied_result, error_result
+from . import denied_result, dependency_error, error_result
 from ..contracts.base import CONTRACT_VERSION
 from ..contracts.capability import (
     AbbreviationResolveInput,
@@ -64,12 +64,17 @@ class AbbreviationCapability:
                 code="INVALID_INPUT",
                 message="abbreviation.resolve requires an abbreviation.resolve input",
             )
-        resolutions = tuple(
-            AbbreviationResolution(
-                abbreviation=token, expansion=self._service.resolve(token)
+        try:
+            resolutions = tuple(
+                AbbreviationResolution(
+                    abbreviation=token, expansion=self._service.resolve(token)
+                )
+                for token in request.input.tokens
             )
-            for token in request.input.tokens
-        )
+        except Exception as exc:
+            return dependency_error(
+                request.task_id, capability="abbreviation.resolve", exc=exc
+            )
         return AgentResult(
             contract_version=CONTRACT_VERSION,
             task_id=request.task_id,

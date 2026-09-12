@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
 
-from . import EvidenceBuilder, denied_result, error_result
+from . import EvidenceBuilder, denied_result, dependency_error, error_result
 from ..contracts.base import CONTRACT_VERSION
 from ..contracts.capability import (
     CapabilityDescriptor,
@@ -81,7 +81,12 @@ class PeopleCapability:
                 code="INVALID_INPUT",
                 message="people.lookup requires a people.lookup input",
             )
-        raw = await self._service.lookup(request.input.query)
+        try:
+            raw = await self._service.lookup(request.input.query)
+        except Exception as exc:
+            return dependency_error(
+                request.task_id, capability="people.lookup", exc=exc
+            )
         if raw is None:
             return AgentResult(
                 contract_version=CONTRACT_VERSION,
@@ -100,21 +105,34 @@ class PeopleCapability:
             return error_result(
                 request.task_id, code="CONTRACT_MISMATCH", message=str(exc)
             )
-        record_id = raw.get("record_id", raw.get("id", "unknown"))
-        use = await self._evidence.persist_use(
-            source=PeopleSourceIdentity(
-                kind="people", record_id=str(record_id)
-            ),
-            content=minimized.content,
-            provenance=Provenance(
-                acquisition_id=uuid4(),
-                fetcher="people.lookup",
-                fetched_at=datetime.now(timezone.utc),
-            ),
-            task_id=request.task_id,
-            purpose="supporting",
-            target_id=None,
-        )
+        record_id = raw.get("record_id", raw.get("id"))
+        if record_id is None or str(record_id).strip() == "":
+            # No resolvable record handle: fail this record closed rather
+            # than minting an unattributable 'unknown' identity.
+            return error_result(
+                request.task_id,
+                code="CONTRACT_MISMATCH",
+                message="people.lookup record carries no resolvable record_id",
+            )
+        try:
+            use = await self._evidence.persist_use(
+                source=PeopleSourceIdentity(
+                    kind="people", record_id=str(record_id)
+                ),
+                content=minimized.content,
+                provenance=Provenance(
+                    acquisition_id=uuid4(),
+                    fetcher="people.lookup",
+                    fetched_at=datetime.now(timezone.utc),
+                ),
+                task_id=request.task_id,
+                purpose="supporting",
+                target_id=None,
+            )
+        except Exception as exc:
+            return dependency_error(
+                request.task_id, capability="people.lookup", exc=exc
+            )
         return AgentResult(
             contract_version=CONTRACT_VERSION,
             task_id=request.task_id,

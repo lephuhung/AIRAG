@@ -925,19 +925,27 @@ def _task2_capabilities() -> list:
 
     class _People:
         async def lookup(self, query: str):
-            return {"name": "Nguyen Van A"}
+            return {"record_id": "p-1", "name": "Nguyen Van A"}
 
     class _Search:
-        async def search(self, query: str, workspace_ids):
+        async def search(self, query: str, person_identifier, workspace_ids):
             return ()
 
     class _Reader:
-        async def read(self, binding):
-            return "text"
+        async def read(self, binding, locator):
+            from app.services.agents.v2.capabilities import LocatedContent
+
+            return LocatedContent(
+                outcome="read", observed_locator=locator, content="text"
+            )
 
     class _SectionReader:
-        async def read_section(self, binding, target_id: str):
-            return ("text", "node-1")
+        async def read_section(self, binding, locator):
+            from app.services.agents.v2.capabilities import LocatedContent
+
+            return LocatedContent(
+                outcome="read", observed_locator=locator, content="text"
+            )
 
     class _Kg:
         async def query(self, query: str):

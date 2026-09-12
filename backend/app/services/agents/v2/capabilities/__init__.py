@@ -40,6 +40,9 @@ from ..contracts.execution import (
     AgentResult,
 )
 from ..contracts.binding import ScopedDocument
+from ..contracts.evaluation import CoverageOutcome
+from ..contracts.locators import ContentLocator
+from ..contracts.planning import TargetUnit
 
 __all__ = [
     "Capability",
@@ -56,8 +59,11 @@ __all__ = [
     "build_capability_registry",
     "EvidenceBuilder",
     "PinnedTargetResolver",
+    "ResolvedTarget",
+    "LocatedContent",
     "denied_result",
     "error_result",
+    "dependency_error",
     "PeopleCapability",
     "PeopleLookupService",
     "DocumentSearchCapability",
@@ -269,19 +275,50 @@ class EvidenceBuilder(Protocol):
     ) -> EvidenceUseRef: ...
 
 
+@dataclass(frozen=True)
+class ResolvedTarget:
+    """One planned target with its authoritative coordinate and pinned identity.
+
+    ``target_unit`` is the plan's authoritative requirement (its
+    ``requested_locator`` is the canonical coordinate read coverage is
+    measured against); ``document`` is the pinned, currently-authorized
+    revision identity. The resolver (fed the checkpointed plan/bindings by
+    T6/T7) is the only producer of this pair.
+    """
+
+    target_unit: TargetUnit
+    document: ScopedDocument
+
+
+@dataclass(frozen=True)
+class LocatedContent:
+    """A typed content-reader outcome for one planned locator.
+
+    ``outcome`` distinguishes ``read`` / ``missing`` / ``unreadable`` /
+    ``truncated`` (spec §14); ``observed_locator`` is the coordinate the
+    dependency actually read (``None`` when nothing was observed); ``content``
+    carries text only on paths where the capability persists evidence.
+    """
+
+    outcome: CoverageOutcome
+    observed_locator: ContentLocator | None
+    content: str | None
+
+
 @runtime_checkable
 class PinnedTargetResolver(Protocol):
     """Request-scoped plan/binding resolver for read capabilities.
 
     The resolver is constructed with (fed) the authoritative checkpointed
-    plan/bindings by T6/T7 and maps a planned ``target_id`` to its pinned,
-    currently-authorized ``ScopedDocument`` identity. ``None`` means the target
-    is unknown, unpinned, or no longer authorized, and the capability fails
-    closed. The resolver never reads supervisor/graph state and is never fed
-    from ``AgentRequest`` or ``CapabilityRuntimeContext``.
+    plan/bindings by T6/T7 and maps a planned ``target_id`` to its
+    ``ResolvedTarget`` (planned ``TargetUnit`` + pinned currently-authorized
+    ``ScopedDocument``). ``None`` means the target is unknown, unpinned, or no
+    longer authorized, and the capability fails closed. The resolver never
+    reads supervisor/graph state and is never fed from ``AgentRequest`` or
+    ``CapabilityRuntimeContext``.
     """
 
-    def resolve(self, target_id: str) -> ScopedDocument | None: ...
+    def resolve(self, target_id: str) -> ResolvedTarget | None: ...
 
 
 def denied_result(
@@ -298,6 +335,44 @@ def denied_result(
         evidence_uses=(),
         coverage_observations=(),
         error=AgentError(code=code, message=message, retryable=False),
+    )
+
+
+def dependency_error(task_id: str, *, capability: str, exc: BaseException) -> AgentResult:
+    """Map an escaped dependency failure onto a typed execution error.
+
+    Dependency exceptions must never escape ``execute``: a timeout maps to
+    ``TIMEOUT`` (retryable), a connection/OS failure to
+    ``DEPENDENCY_UNAVAILABLE`` (retryable), and anything else to
+    ``INTERNAL_ERROR`` (not retryable). Only the exception class name enters
+    the message so dependency internals never leak into the checkpoint.
+    ``asyncio.CancelledError`` is a ``BaseException`` and is never caught by
+    callers of this helper — cancellation keeps propagating to the T3
+    dispatch boundary.
+    """
+    from ..contracts.base import CONTRACT_VERSION
+
+    if isinstance(exc, TimeoutError):
+        code: AgentErrorCode = "TIMEOUT"
+        retryable = True
+    elif isinstance(exc, (ConnectionError, OSError)):
+        code = "DEPENDENCY_UNAVAILABLE"
+        retryable = True
+    else:
+        code = "INTERNAL_ERROR"
+        retryable = False
+    return AgentResult(
+        contract_version=CONTRACT_VERSION,
+        task_id=task_id,
+        status="error",
+        data=None,
+        evidence_uses=(),
+        coverage_observations=(),
+        error=AgentError(
+            code=code,
+            message=f"{capability} dependency failed ({type(exc).__name__})",
+            retryable=retryable,
+        ),
     )
 
 

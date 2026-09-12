@@ -1,15 +1,24 @@
-"""Document search/read capabilities (Phase 2, Task 2; spec §11, §13.4).
+"""Document search/read capabilities (Phase 2, Task 2; spec §11, §13.4, §14).
 
 - ``DocumentSearchCapability`` (``document.search``) adapts the v1
   document-search service over the current authorized workspace scope taken
   only from ``CapabilityRuntimeContext``. It returns opaque discovery
-  candidates (``DocumentSearchOutput``) and never reports read coverage.
+  candidates (``DocumentSearchOutput``) and never reports read coverage. The
+  governed People→Document dependency scalar (``person_identifier``) is
+  threaded into the search port; until a real v1 search supports it, a present
+  scalar fails closed instead of being silently ignored.
 - ``DocumentReadCapability`` (``document.read``) reads planned targets. Each
-  ``target_id`` resolves to its pinned, currently-authorized ``ScopedDocument``
-  through the constructor-injected ``PinnedTargetResolver`` (fed the
-  authoritative checkpointed plan/bindings by T6/T7); an unknown, unpinned, or
-  no-longer-authorized target fails closed. Read content is persisted as
-  governed document evidence and represented by ``EvidenceUseRef``.
+  distinct ``target_id`` resolves to its ``ResolvedTarget`` (planned
+  ``TargetUnit`` + pinned, currently-authorized ``ScopedDocument``) through the
+  constructor-injected ``PinnedTargetResolver`` (fed the authoritative
+  checkpointed plan/bindings by T6/T7); an unknown, unpinned, or
+  no-longer-authorized target fails closed. The reader receives the planned
+  ``requested_locator`` and returns a typed ``LocatedContent``; ``read``
+  coverage is reported only when the observed locator matches the requested
+  one — a ``document.read`` whose target asks for the whole document reports
+  ``read`` only when the reader truly returned the whole document. Read
+  content is persisted as governed document evidence and represented by
+  ``EvidenceUseRef``.
 
 Neither capability receives ``GraphRuntimeContext`` or reads supervisor state.
 """
@@ -20,7 +29,15 @@ from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
-from . import EvidenceBuilder, PinnedTargetResolver, denied_result, error_result
+from . import (
+    EvidenceBuilder,
+    LocatedContent,
+    PinnedTargetResolver,
+    ResolvedTarget,
+    denied_result,
+    dependency_error,
+    error_result,
+)
 from ..contracts.base import CONTRACT_VERSION
 from ..contracts.binding import DocumentDiscoveryCandidate, ScopedDocument
 from ..contracts.capability import (
@@ -38,7 +55,7 @@ from ..contracts.evidence import (
     Provenance,
 )
 from ..contracts.execution import AgentRequest, AgentResult, AgentStatus
-from ..contracts.locators import DocumentLocator
+from ..contracts.locators import ContentLocator
 
 
 @runtime_checkable
@@ -46,18 +63,28 @@ class DocumentSearchService(Protocol):
     """The adapted v1 document-search service (server-side dependency)."""
 
     async def search(
-        self, query: str, workspace_ids: tuple[UUID, ...]
+        self,
+        query: str,
+        person_identifier: str | None,
+        workspace_ids: tuple[UUID, ...],
     ) -> Sequence[DocumentDiscoveryCandidate]:
-        """Search the current authorized workspace scope for ``query``."""
+        """Search the current authorized workspace scope for ``query``.
+
+        ``person_identifier`` is the governed People→Document dependency scalar
+        materialized server-side after a successful ``people.lookup``; the
+        planner never supplies it directly.
+        """
         ...
 
 
 @runtime_checkable
 class DocumentContentReader(Protocol):
-    """Reads one pinned revision's content (server-side dependency)."""
+    """Reads one pinned revision's content at a planned locator."""
 
-    async def read(self, binding: ScopedDocument) -> str | None:
-        """Return the document text for ``binding`` or ``None`` when missing."""
+    async def read(
+        self, binding: ScopedDocument, locator: ContentLocator
+    ) -> LocatedContent:
+        """Read ``locator`` from ``binding`` with a typed read outcome."""
         ...
 
 
@@ -89,12 +116,25 @@ class DocumentSearchCapability:
                 code="INVALID_INPUT",
                 message="document.search requires a document.search input",
             )
-        # The governed People→Document dependency scalar (``person_identifier``)
-        # is enforced at planning/validation time, not here: the search runs
-        # over the current authorized workspace scope from the trusted runtime.
-        candidates = await self._service.search(
-            request.input.query, runtime.workspace_ids
-        )
+        if request.input.person_identifier is not None:
+            # The governed People→Document scalar is threaded into the port
+            # but no v1 search backs it yet: fail closed rather than silently
+            # running a plain query search that drops the people dependency.
+            return error_result(
+                request.task_id,
+                code="DEPENDENCY_UNAVAILABLE",
+                message=(
+                    "document.search with a people dependency is not supported"
+                ),
+            )
+        try:
+            candidates = await self._service.search(
+                request.input.query, None, runtime.workspace_ids
+            )
+        except Exception as exc:
+            return dependency_error(
+                request.task_id, capability="document.search", exc=exc
+            )
         if not candidates:
             return AgentResult(
                 contract_version=CONTRACT_VERSION,
@@ -156,10 +196,19 @@ class DocumentReadCapability:
                 code="INVALID_INPUT",
                 message="document.read requires a document.read input",
             )
-        bindings: list[tuple[str, ScopedDocument]] = []
+        # Dedupe while preserving order: a duplicate target must not mint a
+        # second EvidenceUse (the frozen validator rejects duplicate use_ids)
+        # and must not inflate read_unit_count.
+        seen: set[str] = set()
+        distinct_ids: list[str] = []
         for target_id in request.input.target_ids:
-            binding = self._resolver.resolve(target_id)
-            if binding is None:
+            if target_id not in seen:
+                seen.add(target_id)
+                distinct_ids.append(target_id)
+        resolved: list[tuple[str, ResolvedTarget]] = []
+        for target_id in distinct_ids:
+            target = self._resolver.resolve(target_id)
+            if target is None:
                 return denied_result(
                     request.task_id,
                     code="SCOPE_VIOLATION",
@@ -167,13 +216,43 @@ class DocumentReadCapability:
                         f"target {target_id!r} has no pinned authorized revision"
                     ),
                 )
-            bindings.append((target_id, binding))
+            resolved.append((target_id, target))
+        # One acquisition id for every record produced by this execute call.
+        acquisition_id = uuid4()
+        fetched_at = datetime.now(timezone.utc)
         uses: list[EvidenceUseRef] = []
         observations: list[CoverageObservation] = []
         read_count = 0
-        for target_id, binding in bindings:
-            content = await self._reader.read(binding)
-            if content is None:
+        for target_id, target in resolved:
+            requested = target.target_unit.requested_locator
+            try:
+                outcome = await self._reader.read(target.document, requested)
+            except Exception as exc:
+                return dependency_error(
+                    request.task_id, capability="document.read", exc=exc
+                )
+            if outcome.outcome != "read" or outcome.content is None:
+                observations.append(
+                    CoverageObservation(
+                        target_id=target_id,
+                        observed_locators=(
+                            ()
+                            if outcome.observed_locator is None
+                            else (outcome.observed_locator,)
+                        ),
+                        outcome=(
+                            "missing"
+                            if outcome.outcome == "read"
+                            else outcome.outcome
+                        ),
+                    )
+                )
+                continue
+            if outcome.observed_locator != requested:
+                # Fail closed: the dependency did not verifiably read what the
+                # plan requested (e.g. a partial/chunked read against a
+                # whole-document target), so no read coverage is reported and
+                # no evidence is attributed to this target.
                 observations.append(
                     CoverageObservation(
                         target_id=target_id,
@@ -182,35 +261,40 @@ class DocumentReadCapability:
                     )
                 )
                 continue
-            use = await self._evidence.persist_use(
-                source=DocumentSourceIdentity(
-                    kind="document",
-                    document_id=binding.document_id,
-                    document_revision=binding.document_revision,
-                    locator=DocumentLocator(kind="document"),
-                ),
-                content=content,
-                provenance=Provenance(
-                    acquisition_id=uuid4(),
-                    fetcher="document.read",
-                    fetched_at=datetime.now(timezone.utc),
-                ),
-                task_id=request.task_id,
-                purpose="coverage",
-                target_id=target_id,
-            )
+            try:
+                use = await self._evidence.persist_use(
+                    source=DocumentSourceIdentity(
+                        kind="document",
+                        document_id=target.document.document_id,
+                        document_revision=target.document.document_revision,
+                        locator=requested,
+                    ),
+                    content=outcome.content,
+                    provenance=Provenance(
+                        acquisition_id=acquisition_id,
+                        fetcher="document.read",
+                        fetched_at=fetched_at,
+                    ),
+                    task_id=request.task_id,
+                    purpose="coverage",
+                    target_id=target_id,
+                )
+            except Exception as exc:
+                return dependency_error(
+                    request.task_id, capability="document.read", exc=exc
+                )
             uses.append(use)
             observations.append(
                 CoverageObservation(
                     target_id=target_id,
-                    observed_locators=(DocumentLocator(kind="document"),),
+                    observed_locators=(requested,),
                     outcome="read",
                 )
             )
             read_count += 1
         status: AgentStatus = (
             "success"
-            if read_count == len(bindings)
+            if read_count == len(resolved)
             else "partial"
             if read_count
             else "not_found"
