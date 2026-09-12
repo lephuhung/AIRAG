@@ -415,9 +415,10 @@ def _wrap_node(name: str, fn: Callable) -> Callable:
       expected transient invalidity with their update, so they validate the
       MERGED state instead (conversion on failure).
     - Conversions are STICKY (except ``finalizer``/``clarify_wait``): the
-      error marker navigates straight to the finalizer with the route
-      cleared, so no downstream node overwrites it and no capability
-      dispatches after a failure. ``clarify_wait``/``finalizer`` have no
+      error marker converges to the finalizer through state (route cleared
+      plus the route branch sending marker-states to the finalizer), so no
+      downstream node overwrites it and no capability dispatches after a
+      failure. ``clarify_wait``/``finalizer`` have no
       static outgoing edge (own ``Command`` navigation / already terminal),
       so their plain-dict conversions terminate in place.
     - The finalizer wrapper never emits success from an invalid aggregate:
@@ -963,8 +964,9 @@ def _route_branch(state: SupervisorV2State) -> str:
     route fails closed instead of falling through to a default topology.
     Returns the ROUTE key (``add_conditional_edges`` maps it to the node
     via ``_ROUTE_BRANCHES``) — never a node name — except the converted
-    marker, which navigates straight to the finalizer (``"error"`` branch)
-    so a converted failure can never resurrect through re-derivation.
+    marker, which this branch sends straight to the finalizer (``"error"``
+    branch) so a converted failure can never resurrect through
+    re-derivation.
     """
     if _has_terminal_marker(state):
         return "error"

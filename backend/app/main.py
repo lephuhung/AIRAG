@@ -916,38 +916,58 @@ async def lifespan(app: FastAPI):
     # v1 remains the production default: the v2 imports AND the saver
     # startup below are BOTH guarded, so any v2 failure only marks v2
     # unavailable (``app.state.supervisor_v2_ready``) and never breaks v1.
-    # The stack is a real context manager around the yield, so a
+    # The ``yield`` below is at lifespan scope — never inside a branch — so
+    # it is reached whether or not the v2 import/saver startup succeeded; a
+    # v2 import failure must still serve v1 (an ``else:``-scoped yield would
+    # skip on import failure and abort startup with "generator didn't
+    # yield"). The stack is closed in a ``finally`` around the yield, so a
     # cancellation at the yield still closes the saver context; a
     # saver-close failure is contained so the remaining shutdown steps
     # (engine dispose, redis/mongo teardown below) still run.
     app.state.supervisor_v2_ready = False
+    _v2_startup = None
     try:
         from contextlib import AsyncExitStack
 
         from app.services.agents.supervisor_v2 import supervisor_v2_lifespan
+
+        _v2_startup = (AsyncExitStack, supervisor_v2_lifespan)
     except Exception as _v2_import_err:
         logger.warning(
             f"[supervisor_v2] unavailable, v1 default unaffected: {_v2_import_err}"
         )
-    else:
+    _v2_stack = None
+    if _v2_startup is not None:
+        _V2ExitStack, _v2_lifespan_fn = _v2_startup
+        _v2_stack = _V2ExitStack()
         try:
-            async with AsyncExitStack() as _v2_exit_stack:
-                try:
-                    await _v2_exit_stack.enter_async_context(
-                        supervisor_v2_lifespan(settings.CHECKPOINT_DATABASE_URL)
-                    )
-                except Exception as _v2_err:
-                    logger.warning(
-                        f"[supervisor_v2] unavailable, v1 default unaffected: {_v2_err}"
-                    )
-                else:
-                    app.state.supervisor_v2_ready = True
-                    logger.info("[supervisor_v2] graph compiled on the shared checkpointer")
-                yield
-        except Exception as _v2_scope_err:
-            # The v2 scope itself failed outside guarded startup (e.g. the
-            # saver close at shutdown): contain it so teardown continues.
-            logger.warning(f"[supervisor_v2] scope teardown failed: {_v2_scope_err}")
+            await _v2_stack.enter_async_context(
+                _v2_lifespan_fn(settings.CHECKPOINT_DATABASE_URL)
+            )
+        except Exception as _v2_err:
+            logger.warning(
+                f"[supervisor_v2] unavailable, v1 default unaffected: {_v2_err}"
+            )
+            try:
+                await _v2_stack.aclose()
+            except Exception as _v2_discard_err:
+                logger.warning(
+                    f"[supervisor_v2] scope teardown failed: {_v2_discard_err}"
+                )
+            _v2_stack = None
+        else:
+            app.state.supervisor_v2_ready = True
+            logger.info("[supervisor_v2] graph compiled on the shared checkpointer")
+    try:
+        yield
+    finally:
+        if _v2_stack is not None:
+            try:
+                await _v2_stack.aclose()
+            except Exception as _v2_scope_err:
+                # The v2 scope itself failed at shutdown (e.g. the saver
+                # close): contain it so teardown continues.
+                logger.warning(f"[supervisor_v2] scope teardown failed: {_v2_scope_err}")
     logger.info("Shutting down...")
     await engine.dispose()
     try:
