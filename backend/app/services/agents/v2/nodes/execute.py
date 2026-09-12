@@ -73,7 +73,7 @@ def execution_update(
     }
 
 
-def reset_execution(state: SupervisorV2State, plan: TaskPlan) -> dict:
+def reset_execution(plan: TaskPlan) -> dict:
     """Return a full frozen ExecutionState partial for a brand-new plan.
 
     Used at a turn boundary (``fast_plan_node``): the new plan owns fresh

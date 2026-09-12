@@ -6,7 +6,7 @@ agents.v2.persistence.migrate``) created. This module is the
 v2 model classes (which register themselves on
 ``app.core.database.Base.metadata``) and exposes the runtime gates
 that the application uses to refuse startup on a database that has not
-been migrated to schema version 1.
+been migrated to the current v2 schema version.
 
 Public surface
 --------------
@@ -56,7 +56,7 @@ the brief's gating requirement is fully satisfied by:
    table.
 3. ``check_v2_schema`` is the single source of truth for "is v2
    actually applied?", and ``lifespan`` refuses to start the app
-   without ``applied=True, version=1, missing=∅``.
+   without ``applied=True, version=<current>, missing=∅``.
 
 Note on ``register_v2_models``: this function is an idempotent
 marker, not an actual registration step. SQLAlchemy declarative
@@ -65,7 +65,7 @@ class-definition time (i.e. at module-import time), so importing
 ``app.models.v2_registry`` already registers the v2 ORM classes
 on ``Base.metadata``. ``register_v2_models()`` returns ``None`` so
 callers can prove registration has run (e.g. from a test); it does
-NOT assert schema version 1 before registering — that gate is owned
+NOT assert the current schema version before registering — that gate is owned
 by ``app.main.lifespan`` (see point 1 above).
 
 This module never opens a DB connection, never issues DDL, and never
@@ -256,7 +256,7 @@ from app.models.evidence_use import (  # noqa: E402,F401
 
 
 def assert_v2_readiness(check: SchemaCheck) -> None:
-    """Refuse startup if the v2 schema is not at exact version 1.
+    """Refuse startup if the v2 schema is not at the exact current version.
 
     Called by ``app.main.lifespan`` after ``check_v2_schema(engine)``.
     Raises ``RuntimeError`` with a message that names the Release-1A
@@ -269,7 +269,7 @@ def assert_v2_readiness(check: SchemaCheck) -> None:
     - ``applied=False``: the database has no ``v2_schema_version``
       row. The error message names the migration command.
     - ``applied=True, version != V2_SCHEMA_VERSION``: a future schema
-      version is installed but the application is pinned to v1. The
+      version is installed but the application is pinned to the current one. The
       error message references both the installed version and the
       required version.
     - ``applied=True, version == V2_SCHEMA_VERSION, missing_tables

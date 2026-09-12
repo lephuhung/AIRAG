@@ -32,7 +32,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from app.services.agents.v2.persistence.migrate import make_engine
+from app.services.agents.v2.persistence.migrate import V2_SCHEMA_VERSION, make_engine
 
 # ---------------------------------------------------------------------------
 # Constants and fixtures
@@ -264,7 +264,7 @@ def test_v2_schema_version_row_exists(migrated_db: Engine) -> None:
             text("SELECT version, applied_at FROM v2_schema_version")
         ).fetchone()
     assert row is not None, "v2_schema_version row missing"
-    assert row[0] == 1, f"expected version 1, got {row[0]}"
+    assert row[0] == V2_SCHEMA_VERSION, f"expected version {V2_SCHEMA_VERSION}, got {row[0]}"
 
 
 def test_all_v2_tables_exist(migrated_db: Engine) -> None:

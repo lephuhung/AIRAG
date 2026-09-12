@@ -570,11 +570,11 @@ def test_orm_fks_resolve(imported_app_models, db: Engine):
     assert orm_declared, "ORM metadata declares no FKs (mismatch with SQL schema)"
 
 
-def test_check_v2_schema_returns_version_1(db: Engine):
-    """Sanity: the test DB is at exact v2 schema version 1."""
+def test_check_v2_schema_returns_version_2(db: Engine):
+    """Sanity: the test DB is at exact v2 schema version 2."""
     check = check_v2_schema(db)
     assert check.applied is True, check
-    assert check.version == 1, check
+    assert check.version == 2, check
     assert check.is_clean is True, check
 
 
@@ -1281,8 +1281,8 @@ def test_lifespan_readiness_gate_works_against_unmigrated_db():
 def test_lifespan_readiness_gate_accepts_migrated_v2_db(db: Engine):
     """I4(b-ii): drive the readiness gate against a migrated v2 DB.
 
-    The test DB ``hrag_test_v2`` is at exact schema version 1 (see
-    ``test_check_v2_schema_returns_version_1``); the readiness gate
+    The test DB ``hrag_test_v2`` is at the current v2 schema version (see
+    ``test_check_v2_schema_returns_version_2``); the readiness gate
     MUST accept it without raising.
     """
     check = check_v2_schema(db)

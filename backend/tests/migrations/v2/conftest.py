@@ -2,7 +2,7 @@
 
 The R2 amendment changes the Release 1A shape (new ``published_at`` /
 ``superseded_by`` / artifact columns + a re-keyed attempt arbiter) under
-the **same** ``V2_SCHEMA_VERSION = 1``. Because the DDL uses
+the **same** ``V2_SCHEMA_VERSION = 2``. Because the DDL uses
 ``CREATE TABLE IF NOT EXISTS`` and ``apply_v2_schema`` short-circuits on
 the version row, a database that applied the pre-R2 schema is never
 upgraded in place — it would keep the stale shape while the version row

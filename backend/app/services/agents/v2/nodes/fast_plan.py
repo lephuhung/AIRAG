@@ -231,4 +231,4 @@ async def fast_plan_node(
             "fast plan requires the checkpointed query analysis and route decision"
         )
     plan = build_fast_plan(state["semantic"], state["bindings"], analysis, route)
-    return reset_execution(state, plan)
+    return reset_execution(plan)

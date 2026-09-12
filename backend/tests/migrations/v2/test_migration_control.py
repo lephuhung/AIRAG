@@ -16,6 +16,7 @@ from sqlalchemy.engine import Engine
 
 from app.services.agents.v2.persistence.migrate import (
     V2_SCHEMA_V1_TABLES,
+    V2_SCHEMA_VERSION,
     apply_v2_schema,
     make_engine,
 )
@@ -148,6 +149,7 @@ def test_schema_delta_is_exactly_v2_tables(db: Engine) -> None:
 def test_schema_version_row_present(db: Engine) -> None:
     with db.connect() as conn:
         n = conn.execute(
-            text("SELECT count(*) FROM v2_schema_version WHERE version = 1")
+            text("SELECT count(*) FROM v2_schema_version WHERE version = :v"),
+            {"v": V2_SCHEMA_VERSION},
         ).scalar()
     assert n == 1

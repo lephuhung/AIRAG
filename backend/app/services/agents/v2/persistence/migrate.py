@@ -137,11 +137,11 @@ grow ``pg_relation_size``) but never raises.
 
 Module layout::
 
-    V2_SCHEMA_VERSION = 1
+    V2_SCHEMA_VERSION = 2
     V2_SCHEMA_V1_TABLES = frozenset({...})  # the 12 tables of Release 1A
     SchemaCheck = dataclass(frozen=True)
     check_v2_schema(engine) -> SchemaCheck
-    apply_v2_schema(engine) -> None
+    apply_v2_schema(engine) -> None  # fresh create, or 1 -> 2 upgrade
     main()  # CLI entrypoint
 """
 
@@ -159,7 +159,11 @@ from sqlalchemy.engine import Engine
 # Public constants
 # ---------------------------------------------------------------------------
 
-V2_SCHEMA_VERSION: int = 1
+V2_SCHEMA_VERSION: int = 2
+# Version history: 1 = Release 1A foundation (lease revision_id NOT NULL);
+# 2 = T3 evidence-only leases (revision_retention_leases.revision_id nullable
+# via the idempotent _LEASE_EVIDENCE_ONLY_ALTER upgrade step). Fresh creates
+# land directly on 2.
 
 # The exact 12 tables created by Release 1A. Order is preserved for documentation;
 # creation order is enforced separately to honour FK dependencies.
@@ -684,18 +688,17 @@ def _table_names(conn) -> frozenset[str]:
     return frozenset(row[0] for row in rows)
 
 
-def _applied(conn) -> bool:
-    """True if and only if a v2_schema_version row exists for the current version."""
+def _recorded_version(conn) -> int | None:
+    """The recorded v2 schema version, or None when never migrated."""
     exists_row = conn.execute(
         text("SELECT to_regclass('public.v2_schema_version') IS NOT NULL")
     ).fetchone()
     if not exists_row or not exists_row[0]:
-        return False
-    count_row = conn.execute(
-        text("SELECT count(*) FROM v2_schema_version WHERE version = :v"),
-        {"v": V2_SCHEMA_VERSION},
+        return None
+    row = conn.execute(
+        text("SELECT version FROM v2_schema_version ORDER BY version DESC LIMIT 1")
     ).fetchone()
-    return bool(count_row and count_row[0] > 0)
+    return int(row[0]) if row else None
 
 
 def _capture_legacy_baseline(conn) -> dict[str, tuple[int, int]]:
@@ -838,7 +841,7 @@ _EXPECTED_EVIDENCE_RECORD_UNIQUE_COLUMNS: frozenset[str] = frozenset(
 def _shape_errors(conn) -> frozenset[str]:
     """Return human-readable shape mismatches for an applied schema.
 
-    Only called when ``_applied(conn)`` is true; a missing table is
+    Only called when a version row is recorded; a missing table is
     reported separately via ``missing_tables``.
     """
     errors: set[str] = set()
@@ -905,6 +908,28 @@ def _shape_errors(conn) -> frozenset[str]:
                 f"{_EVIDENCE_RECORD_IDENTITY_INDEX} missing columns "
                 f"{sorted(missing_columns)}: {definition}"
             )
+    # T3 round 2 (N1): evidence-only leases need a nullable
+    # revision_retention_leases.revision_id. Column presence alone reports a
+    # pre-C1 database clean, so check nullability explicitly and fail closed.
+    lease_row = conn.execute(
+        text(
+            "SELECT is_nullable FROM information_schema.columns "
+            "WHERE table_schema = 'public' "
+            "AND table_name = 'revision_retention_leases' "
+            "AND column_name = 'revision_id'"
+        )
+    ).fetchone()
+    if lease_row is None:
+        table_present = conn.execute(
+            text("SELECT to_regclass('public.revision_retention_leases') IS NOT NULL")
+        ).fetchone()
+        if table_present and table_present[0]:
+            errors.add("revision_retention_leases.revision_id column is missing")
+    elif lease_row[0] != "YES":
+        errors.add(
+            "revision_retention_leases.revision_id must be nullable for "
+            "evidence-only leases (pre-C1 schema: run migrate apply to upgrade)"
+        )
     return frozenset(errors)
 
 
@@ -915,18 +940,15 @@ def check_v2_schema(engine: Engine) -> SchemaCheck:
     ``is_clean`` to gate Release 1B deployment.
     """
     with engine.connect() as conn:
-        applied = _applied(conn)
-        if not applied:
+        recorded = _recorded_version(conn)
+        if recorded is None:
             return SchemaCheck(
                 applied=False,
                 version=None,
                 missing_tables=V2_SCHEMA_V1_TABLES,
                 extra_tables=frozenset(),
             )
-        version_row = conn.execute(
-            text("SELECT version FROM v2_schema_version LIMIT 1")
-        ).fetchone()
-        version = version_row[0] if version_row else None
+        version_row = recorded
         tables = _table_names(conn)
         missing = V2_SCHEMA_V1_TABLES - tables
         shape_errors = _shape_errors(conn)
@@ -960,7 +982,7 @@ def check_v2_schema(engine: Engine) -> SchemaCheck:
         }
     return SchemaCheck(
         applied=True,
-        version=version,
+        version=version_row,
         missing_tables=missing,
         extra_tables=extra,
         shape_errors=shape_errors,
@@ -968,9 +990,14 @@ def check_v2_schema(engine: Engine) -> SchemaCheck:
 
 
 def apply_v2_schema(engine: Engine) -> None:
-    """Apply Release 1A: create the 12 v2 tables, add nullable columns to legacy
-    tables, install FKs to ``document_revisions``, install the stable-pointer
-    triggers, verify legacy rows are untouched, and record the schema version.
+    """Apply the v2 schema: fresh create, or the version-1 -> 2 upgrade.
+
+    Fresh databases get the full Release 1A shape (with the nullable lease
+    revision) and a version-2 row. Databases that recorded version 1 get the
+    idempotent evidence-only lease upgrade (``_LEASE_EVIDENCE_ONLY_ALTER``)
+    and their version row advanced to 2. Already-current (or newer)
+    databases are a no-op. Legacy-row verification (brief item 5) runs on
+    the fresh path, which is the only path that mutates legacy tables.
 
     Idempotent: a second call with the schema already applied is a no-op.
     The transaction commits (or rolls back) when ``engine.begin()`` exits.
@@ -986,8 +1013,27 @@ def apply_v2_schema(engine: Engine) -> None:
             {"key": V2_MIGRATION_ADVISORY_LOCK_KEY},
         )
 
-        if _applied(conn):
-            # Already at version 1 — nothing to do. Idempotent.
+        current = _recorded_version(conn)
+        if current is not None and current >= V2_SCHEMA_VERSION:
+            # Already current (or newer) — nothing to do. Idempotent.
+            return
+
+        if current == 1:
+            # Version-1 -> 2 upgrade: evidence-only leases (T3 round 2, N1).
+            # Only the lease column changes; legacy tables are untouched, so
+            # no baseline verification is needed on this path.
+            for stmt in _LEASE_EVIDENCE_ONLY_ALTER:
+                conn.execute(text(stmt))
+            conn.execute(
+                text(
+                    "UPDATE v2_schema_version SET version = :v, description = :d "
+                    "WHERE version = 1"
+                ),
+                {
+                    "v": V2_SCHEMA_VERSION,
+                    "d": "v2 evidence-only leases: revision_id nullable",
+                },
+            )
             return
 
         # 1. Capture the legacy-row baseline BEFORE any DDL mutates the
@@ -1040,7 +1086,7 @@ def apply_v2_schema(engine: Engine) -> None:
             ),
             {
                 "v": V2_SCHEMA_VERSION,
-                "d": "Release 1A: revision storage foundation",
+                "d": "Release 1A foundation + v2 evidence-only leases (revision_id nullable)",
             },
         )
 
