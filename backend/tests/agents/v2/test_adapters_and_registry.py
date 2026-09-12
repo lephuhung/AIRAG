@@ -432,6 +432,54 @@ async def test_explicit_pinned_revision_uses_the_workspace_guard(monkeypatch) ->
 
 
 @pytest.mark.asyncio
+async def test_pinned_revision_of_the_resolved_document_is_bound(monkeypatch) -> None:
+    async def fake_workspace(db, revision_id, workspace_id, *, require_vectors=False):
+        return revision_identity(revision_id=revision_id, document_id=DOCUMENT_ID)
+
+    monkeypatch.setattr(
+        document_views, "load_revision_identity_for_workspace", fake_workspace
+    )
+
+    reference = resolved_reference(
+        revision_requirement=PinnedRevisionRequirement(
+            kind="pinned", document_revision=str(PINNED_REVISION_ID)
+        )
+    )
+    resolution = await resolve_document_binding(
+        object(), reference, workspace_id=WORKSPACE_ID
+    )
+
+    assert resolution.binding == ScopedDocument(
+        binding_id="b_r1",
+        document_id=DOCUMENT_ID,
+        document_revision=str(PINNED_REVISION_ID),
+        role="target",
+    )
+
+
+@pytest.mark.asyncio
+async def test_pinned_revision_belonging_to_another_document_is_rejected(monkeypatch) -> None:
+    async def fake_workspace(db, revision_id, workspace_id, *, require_vectors=False):
+        return revision_identity(
+            revision_id=revision_id, document_id=OTHER_DOCUMENT_ID
+        )
+
+    monkeypatch.setattr(
+        document_views, "load_revision_identity_for_workspace", fake_workspace
+    )
+
+    reference = resolved_reference(
+        revision_requirement=PinnedRevisionRequirement(
+            kind="pinned", document_revision=str(PINNED_REVISION_ID)
+        )
+    )
+    with pytest.raises(DocumentAdapterError):
+        await resolve_document_binding(
+            object(), reference, workspace_id=WORKSPACE_ID
+        )
+
+
+@pytest.mark.asyncio
 async def test_unresolved_reference_binds_nothing() -> None:
     reference = DocumentReference(
         ref_id="r1",

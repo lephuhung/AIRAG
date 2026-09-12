@@ -19,6 +19,11 @@ Immutable revision lookup always goes through
 The adapter never reads the mutable document-view artifacts (``markdown_s3_key``,
 ``chunk_count``, ``raw_chunks_json``). A legacy document with no current revision
 cannot be bound and is rejected with ``RevisionNotReady``.
+
+``ScopedDocument.document_revision`` is the **string form of the revision UUID**
+(``str(RevisionArtifactIdentity.revision_id)``), not a generation or an opaque
+handle. Phase 2's ``DocumentSourceIdentity.document_revision`` must use the same
+string form so a checkpointed binding and a source identity name one revision.
 """
 from __future__ import annotations
 
@@ -124,6 +129,13 @@ async def resolve_document_binding(
                 "document has no current revision (legacy document); reindex it "
                 "to publish a revision before v2 binding",
             )
+
+    if identity.document_id != document_id:
+        raise DocumentAdapterError(
+            f"revision {identity.revision_id} for reference {reference.ref_id!r} "
+            f"belongs to document {identity.document_id}, not the resolved "
+            f"document {document_id}"
+        )
 
     binding = ScopedDocument(
         binding_id=f"b_{reference.ref_id}",
