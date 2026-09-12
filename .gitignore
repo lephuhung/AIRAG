@@ -10,6 +10,8 @@ backend/data/lightrag/
 backend/uploads/
 venv/
 .venv/
+.venv-v2-benchmark/
+backend/.venv-v2-benchmark/
 *.egg-info/
 .DS_Store
 screenlog/
