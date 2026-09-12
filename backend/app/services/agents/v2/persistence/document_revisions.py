@@ -108,8 +108,12 @@ class RevisionNotAbandonable(Exception):
 
 
 class RevisionNotPublishable(Exception):
-    """``publish`` was called on a revision that is not in ``verified``
-    state (or the document was tombstoned before the CAS)."""
+    """``publish`` was called on a revision that is not publishable: a
+    state other than ``verified``, or an ``abandoned`` revision whose
+    document is still live. An ``abandoned`` revision on a tombstoned
+    document instead yields ``ABANDONED_SOURCE_DELETED`` (idempotent
+    tombstone error), as does a ``verified`` revision whose source was
+    tombstoned."""
 
 
 class RevisionRetriesExhausted(Exception):

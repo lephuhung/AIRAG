@@ -1426,13 +1426,11 @@ class TestTombstoneRaceDuringPublish:
     async def test_publish_with_concurrent_tombstone_returns_abandoned(
         self, repo: DocumentRevisionsRepository, document_factory
     ):
-        """The repository's CAS path checks ``is_source_deleted`` after
-        a CAS miss. We simulate the race by tombstoning the document
-        just before publish, then asserting the publish returns
-        ``ABANDONED_SOURCE_DELETED`` and the revision becomes abandoned.
+        """A verified revision whose source was tombstoned before publish is
+        abandoned durably and yields ``ABANDONED_SOURCE_DELETED``.
 
-        This is the 'concurrent tombstone that commits between verify
-        and CAS' scenario from the brief."""
+        (``publish`` locks the document before the revision, so a tombstone
+        cannot commit between the lock and the CAS.)"""
         document_id = document_factory()
         id1 = _source_identity(content_sha256="1" * 64)
         r1, _ = await repo.get_or_create_ingestion_attempt(
@@ -2075,46 +2073,53 @@ class TestRound2RegressionGuards:
             await setup.commit()
             rid = r.revision_id
 
-        holder = maker()
-        await holder.begin()
-        await holder.execute(
-            text("SELECT id FROM documents WHERE id = :d FOR UPDATE"),
-            {"d": str(document_id)},
-        )
-
         async def _pub():
             async with maker() as s:
                 local = DocumentRevisionsRepository(s)
                 await local.publish(rid)
                 await s.commit()
 
-        task = asyncio.create_task(_pub())
-        try:
-            # Wait until the publish task is blocked on a lock.
-            for _ in range(300):
-                await asyncio.sleep(0.01)
-                with raw_connection.cursor() as cur:
-                    cur.execute(
-                        "SELECT count(*) FROM pg_stat_activity "
-                        "WHERE datname = current_database() "
-                        "AND wait_event_type = 'Lock'"
-                    )
-                    if cur.fetchone()[0] > 0:
-                        break
+        async with maker() as holder:
+            await holder.begin()
+            await holder.execute(
+                text("SELECT id FROM documents WHERE id = :d FOR UPDATE"),
+                {"d": str(document_id)},
+            )
+            task = asyncio.create_task(_pub())
+            observed_block = False
             try:
-                with raw_connection.cursor() as cur:
-                    cur.execute(
-                        "SELECT revision_id FROM document_revisions "
-                        "WHERE revision_id = %s FOR UPDATE NOWAIT",
-                        (str(rid),),
-                    )
-            except psycopg.errors.LockNotAvailable as exc:
-                raise AssertionError(
-                    "publish() holds the revision lock while blocked on the "
-                    "document lock - revision-first order regression (C1)"
-                ) from exc
-        finally:
-            await holder.rollback()
-            await task
+                # Wait until the publish task is blocked on a lock.
+                for _ in range(300):
+                    await asyncio.sleep(0.01)
+                    with raw_connection.cursor() as cur:
+                        cur.execute(
+                            "SELECT count(*) FROM pg_stat_activity "
+                            "WHERE datname = current_database() "
+                            "AND wait_event_type = 'Lock'"
+                        )
+                        if cur.fetchone()[0] > 0:
+                            observed_block = True
+                            break
+                # The probe runs before rollback so a poll miss still fails
+                # the ordering violation (no vacuous pass).
+                try:
+                    with raw_connection.cursor() as cur:
+                        cur.execute(
+                            "SELECT revision_id FROM document_revisions "
+                            "WHERE revision_id = %s FOR UPDATE NOWAIT",
+                            (str(rid),),
+                        )
+                except psycopg.errors.LockNotAvailable as exc:
+                    raise AssertionError(
+                        "publish() holds the revision lock while blocked on "
+                        "the document lock - revision-first regression (C1)"
+                    ) from exc
+                assert observed_block, (
+                    "publish never blocked on the document lock - it may not "
+                    "be acquiring it at all"
+                )
+            finally:
+                await holder.rollback()
+                await task
 
         assert task.exception() is None
