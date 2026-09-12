@@ -286,6 +286,7 @@ def test_snapshot_and_audit_tables_persist_the_frozen_contracts(
     }
     nullable = {
         ("conversation_snapshots", "built_through_message_id"),
+        ("conversation_snapshots", "built_through_ordinal"),
     }
     with migrated_db.connect() as conn:
         for table, required in expected_not_null.items():

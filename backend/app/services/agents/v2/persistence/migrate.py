@@ -383,6 +383,10 @@ _CREATE_DDL: tuple[str, ...] = (
     # UNIQUE(thread_id) because rolling-summary persistence holds exactly one
     # current snapshot per thread and advances it in place via an optimistic
     # CAS on summary_version; the unique key is also the CAS arbiter.
+    # built_through_ordinal (finding #2) is the persistence-only monotonic
+    # ordinal the caller derives from the authoritative raw chat messages; it
+    # makes "the built-through pointer moved backwards" decidable, which the
+    # opaque message id cannot.
     """
     CREATE TABLE IF NOT EXISTS conversation_snapshots (
         snapshot_id                UUID        PRIMARY KEY,
@@ -390,6 +394,7 @@ _CREATE_DDL: tuple[str, ...] = (
         contract_version           TEXT        NOT NULL,
         summary_version            INTEGER     NOT NULL,
         built_through_message_id   TEXT        NULL,
+        built_through_ordinal      BIGINT      NULL,
         context                    JSONB       NOT NULL,
         taken_at                   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         UNIQUE (thread_id)
@@ -738,6 +743,7 @@ _EXPECTED_SHAPE_COLUMNS: dict[str, frozenset[str]] = {
             "contract_version",
             "summary_version",
             "built_through_message_id",
+            "built_through_ordinal",
             "context",
         }
     ),

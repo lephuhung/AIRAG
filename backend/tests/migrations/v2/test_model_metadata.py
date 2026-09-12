@@ -262,6 +262,7 @@ def test_snapshot_and_audit_orm_map_the_persisted_contract_columns(
             "contract_version",
             "summary_version",
             "built_through_message_id",
+            "built_through_ordinal",
             "context",
             "taken_at",
         },

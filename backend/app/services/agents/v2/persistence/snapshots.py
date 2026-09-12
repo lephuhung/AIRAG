@@ -5,7 +5,8 @@ Spec §8.2 / §8.3 / §24: the raw chat history (``chat_messages``) is
 :class:`SemanticSnapshot` are derived projections persisted at the v2
 checkpoint boundary. Rolling-summary persistence — not semantic context — owns
 optimistic locking through ``summary_version`` and the monotonic
-``built_through_message_id``.
+``built_through_message_id`` and the persistence-only
+``built_through_ordinal``.
 
 This module is the persistence owner for those projections. Like every v2
 repository it only mutates and ``flush`` es; the caller / unit of work owns
@@ -62,6 +63,11 @@ class StaleSummaryVersion(SnapshotPersistenceError):
 class BuiltThroughMessageRegression(SnapshotPersistenceError):
     """A stale writer tried to clear ``built_through_message_id`` once it had
     advanced; the pointer is monotonic and can never move backwards to NULL."""
+
+
+class BuiltThroughOrdinalRegression(SnapshotPersistenceError):
+    """The caller-supplied ``built_through_ordinal`` would move the built-through
+    pointer backwards or clear it; the pointer only ever advances."""
 
 
 class SnapshotNotFound(SnapshotPersistenceError):
@@ -121,8 +127,17 @@ class ConversationSnapshotRepository:
             return None
         return self._deserialize(row)
 
-    async def save_first(self, snapshot: ConversationSnapshot) -> ConversationSnapshot:
+    async def save_first(
+        self,
+        snapshot: ConversationSnapshot,
+        *,
+        built_through_ordinal: Optional[int] = None,
+    ) -> ConversationSnapshot:
         """Insert the first snapshot for ``snapshot.thread_id``.
+
+        ``built_through_ordinal`` is the persistence-only monotonic ordinal the
+        caller (the rolling-summary writer) derives from the authoritative raw
+        chat messages; it is not part of the frozen contract.
 
         Insert-arbitrated by ``UNIQUE(thread_id)``: when another writer already
         created the thread's snapshot the insert is a no-op and
@@ -138,6 +153,7 @@ class ConversationSnapshotRepository:
                 contract_version=snapshot.contract_version,
                 summary_version=snapshot.summary_version,
                 built_through_message_id=snapshot.built_through_message_id,
+                built_through_ordinal=built_through_ordinal,
                 context=snapshot.context.model_dump(mode="json"),
                 taken_at=_now(),
             )
@@ -157,15 +173,24 @@ class ConversationSnapshotRepository:
         snapshot: ConversationSnapshot,
         *,
         expected_summary_version: int,
+        built_through_ordinal: Optional[int] = None,
     ) -> ConversationSnapshot:
         """Advance the thread's snapshot iff it is still at the expected version.
 
-        The ``summary_version`` must strictly advance and the monotonic
-        ``built_through_message_id`` may never regress to ``NULL``.
+        The ``summary_version`` must strictly advance and both monotonic
+        built-through pointers may only move forward: the
+        ``built_through_message_id`` may never regress to ``NULL`` and
+        ``built_through_ordinal`` must strictly exceed the stored ordinal (and
+        may never be cleared once set). The caller — the rolling-summary
+        writer — owns ordinal derivation from the authoritative raw chat
+        messages, so the persisted ordinal is the ordering authority the opaque
+        message id cannot provide.
 
         :raises StaleSummaryVersion: the stored version moved on (the CAS
           affected zero rows, or the stored version already differed).
         :raises SnapshotNotFound: no snapshot exists for the thread.
+        :raises BuiltThroughOrdinalRegression: the new ordinal is not strictly
+          greater than the stored ordinal, or it clears a stored ordinal.
         """
         self._validate_for_write(snapshot)
         if snapshot.summary_version <= expected_summary_version:
@@ -201,6 +226,19 @@ class ConversationSnapshotRepository:
                 f"thread {snapshot.thread_id!r} already built through "
                 f"{current.built_through_message_id!r}; it cannot be cleared"
             )
+        if current.built_through_ordinal is not None:
+            if built_through_ordinal is None:
+                raise BuiltThroughOrdinalRegression(
+                    f"thread {snapshot.thread_id!r} already built through "
+                    f"ordinal {current.built_through_ordinal}; it cannot be "
+                    "cleared"
+                )
+            if built_through_ordinal <= current.built_through_ordinal:
+                raise BuiltThroughOrdinalRegression(
+                    f"thread {snapshot.thread_id!r} already built through "
+                    f"ordinal {current.built_through_ordinal}; the new ordinal "
+                    f"{built_through_ordinal} must strictly advance"
+                )
         stmt = (
             update(ConversationSnapshotRow)
             .where(
@@ -211,6 +249,7 @@ class ConversationSnapshotRepository:
                 contract_version=snapshot.contract_version,
                 summary_version=snapshot.summary_version,
                 built_through_message_id=snapshot.built_through_message_id,
+                built_through_ordinal=built_through_ordinal,
                 context=snapshot.context.model_dump(mode="json"),
                 taken_at=_now(),
             )
@@ -266,7 +305,8 @@ class SemanticSnapshotRepository:
 
     ``SemanticSnapshot`` carries no ``thread_id`` (spec §8.3), so the caller
     supplies the persistence key. There is no version field to lock against;
-    a save overwrites the thread's current semantic projection.
+    a save overwrites the thread's current semantic projection — but only one
+    whose persisted ``contract_version`` this code can also load.
     """
 
     def __init__(self, session: AsyncSession) -> None:
@@ -286,30 +326,59 @@ class SemanticSnapshotRepository:
     async def save(
         self, thread_id: str, snapshot: SemanticSnapshot
     ) -> SemanticSnapshot:
-        """Upsert the thread's current semantic projection."""
+        """Upsert the thread's current semantic projection.
+
+        Fail closed on an incompatible persisted row: the conflict update is
+        gated on ``contract_version``, so a row this code would refuse to
+        ``load`` is never silently overwritten. When the gate refuses the
+        update the stored row is re-read and
+        :class:`IncompatibleSnapshotVersion` is raised.
+        """
         _require_supported_version(
             snapshot.contract_version, where="SemanticSnapshot"
         )
         validate_semantic_context(snapshot.semantic)
+        payload = snapshot.semantic.model_dump(mode="json")
         stmt = (
             pg_insert(SemanticSnapshotRow)
             .values(
                 snapshot_id=uuid.uuid4(),
                 thread_id=thread_id,
                 contract_version=snapshot.contract_version,
-                semantic=snapshot.semantic.model_dump(mode="json"),
+                semantic=payload,
                 taken_at=_now(),
             )
             .on_conflict_do_update(
                 index_elements=["thread_id"],
                 set_={
                     "contract_version": snapshot.contract_version,
-                    "semantic": snapshot.semantic.model_dump(mode="json"),
+                    "semantic": payload,
                     "taken_at": _now(),
                 },
+                # Only overwrite a row whose declared version this code supports.
+                where=(SemanticSnapshotRow.contract_version == CONTRACT_VERSION),
             )
+            .returning(SemanticSnapshotRow.snapshot_id)
         )
-        await self.session.execute(stmt)
+        written = (await self.session.execute(stmt)).scalar_one_or_none()
+        if written is None:
+            # The insert conflicted and the gated update declined: the existing
+            # row declares a version this code must not clobber.
+            stored_version = await self.session.scalar(
+                select(SemanticSnapshotRow.contract_version).where(
+                    SemanticSnapshotRow.thread_id == thread_id
+                )
+            )
+            if stored_version is None:
+                raise SnapshotPersistenceError(
+                    f"semantic_snapshots upsert for thread {thread_id!r} neither "
+                    "inserted nor updated a row"
+                )
+            _require_supported_version(stored_version, where="semantic_snapshots")
+            raise SnapshotPersistenceError(
+                f"semantic_snapshots row for thread {thread_id!r} was not "
+                "overwritten although it declares a supported contract_version"
+            )
         await self.session.flush()
         return snapshot
 

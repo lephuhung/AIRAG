@@ -26,7 +26,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import Update, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.binding_audit import BindingAudit
@@ -59,6 +59,7 @@ from app.services.agents.v2.persistence.binding_audit import (
 )
 from app.services.agents.v2.persistence.snapshots import (
     BuiltThroughMessageRegression,
+    BuiltThroughOrdinalRegression,
     ConversationSnapshotAlreadyExists,
     ConversationSnapshotRepository,
     IncompatibleSnapshotVersion,
@@ -147,6 +148,34 @@ async def _row_count(session: AsyncSession, table: str) -> int:
     return int(
         (await session.execute(text(f"SELECT count(*) FROM {table}"))).scalar()
     )
+
+
+async def _stored_ordinal(session: AsyncSession, thread_id: str) -> int | None:
+    """Read the persistence-only built-through ordinal straight from the row."""
+    return await session.scalar(
+        select(ConversationSnapshotRow.built_through_ordinal).where(
+            ConversationSnapshotRow.thread_id == thread_id
+        )
+    )
+
+
+async def _semantic_row_state(session: AsyncSession, thread_id: str):
+    """Every persisted semantic-snapshot column, read as raw column values.
+
+    A column-level ``SELECT`` deliberately bypasses the identity map so the
+    assertion observes the database row, not a cached ORM instance.
+    """
+    return (
+        await session.execute(
+            select(
+                SemanticSnapshotRow.snapshot_id,
+                SemanticSnapshotRow.thread_id,
+                SemanticSnapshotRow.contract_version,
+                SemanticSnapshotRow.semantic,
+                SemanticSnapshotRow.taken_at,
+            ).where(SemanticSnapshotRow.thread_id == thread_id)
+        )
+    ).one()
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +368,229 @@ class TestConversationSnapshotCAS:
         assert stored == "1.0"
 
 
+class TestBuiltThroughOrdinalMonotonicity:
+    """Finding #2: the monotonic built-through pointer is enforced on the
+    persistence-only ``built_through_ordinal`` column.
+
+    ``built_through_ordinal`` is not part of the frozen contract: the caller
+    (the rolling-summary writer) derives it from the **authoritative** raw
+    ``chat_messages`` rows and supplies it on every write. The repository
+    refuses any write that would move the pointer backwards or clear it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_forward_ordinal_move_is_allowed(
+        self, conversation_repo: ConversationSnapshotRepository, async_db: AsyncSession
+    ):
+        thread_id = f"t-{uuid.uuid4()}"
+        await conversation_repo.save_first(
+            _conversation_snapshot(
+                thread_id, summary_version=1, built_through_message_id="m10"
+            ),
+            built_through_ordinal=10,
+        )
+        assert await _stored_ordinal(async_db, thread_id) == 10
+
+        await conversation_repo.cas_update(
+            _conversation_snapshot(
+                thread_id, summary_version=2, built_through_message_id="m11"
+            ),
+            expected_summary_version=1,
+            built_through_ordinal=11,
+        )
+        assert await _stored_ordinal(async_db, thread_id) == 11
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("rewind_to", [9, 10])
+    async def test_same_or_earlier_ordinal_rewind_is_rejected(
+        self,
+        conversation_repo: ConversationSnapshotRepository,
+        async_db: AsyncSession,
+        rewind_to: int,
+    ):
+        """A matching-version writer cannot rewind the built-through pointer."""
+        thread_id = f"t-{uuid.uuid4()}"
+        await conversation_repo.save_first(
+            _conversation_snapshot(
+                thread_id, summary_version=1, built_through_message_id="m10"
+            ),
+            built_through_ordinal=10,
+        )
+
+        with pytest.raises(BuiltThroughOrdinalRegression):
+            await conversation_repo.cas_update(
+                _conversation_snapshot(
+                    thread_id, summary_version=2, built_through_message_id="m-rewind"
+                ),
+                expected_summary_version=1,
+                built_through_ordinal=rewind_to,
+            )
+
+        # The refused write changed nothing.
+        assert await _stored_ordinal(async_db, thread_id) == 10
+        stored_version = await async_db.scalar(
+            select(ConversationSnapshotRow.summary_version).where(
+                ConversationSnapshotRow.thread_id == thread_id
+            )
+        )
+        assert stored_version == 1
+
+    @pytest.mark.asyncio
+    async def test_stored_null_ordinal_accepts_a_first_value(
+        self, conversation_repo: ConversationSnapshotRepository, async_db: AsyncSession
+    ):
+        thread_id = f"t-{uuid.uuid4()}"
+        await conversation_repo.save_first(
+            _conversation_snapshot(
+                thread_id, summary_version=1, built_through_message_id=None
+            )
+        )
+        assert await _stored_ordinal(async_db, thread_id) is None
+
+        await conversation_repo.cas_update(
+            _conversation_snapshot(
+                thread_id, summary_version=2, built_through_message_id="m7"
+            ),
+            expected_summary_version=1,
+            built_through_ordinal=7,
+        )
+        assert await _stored_ordinal(async_db, thread_id) == 7
+
+    @pytest.mark.asyncio
+    async def test_stored_ordinal_cannot_be_cleared(
+        self, conversation_repo: ConversationSnapshotRepository, async_db: AsyncSession
+    ):
+        thread_id = f"t-{uuid.uuid4()}"
+        await conversation_repo.save_first(
+            _conversation_snapshot(
+                thread_id, summary_version=1, built_through_message_id="m5"
+            ),
+            built_through_ordinal=5,
+        )
+
+        with pytest.raises(BuiltThroughOrdinalRegression):
+            await conversation_repo.cas_update(
+                _conversation_snapshot(
+                    thread_id, summary_version=2, built_through_message_id="m5"
+                ),
+                expected_summary_version=1,
+                built_through_ordinal=None,
+            )
+
+        assert await _stored_ordinal(async_db, thread_id) == 5
+
+    @pytest.mark.asyncio
+    async def test_message_id_cannot_be_cleared_while_ordinal_advances(
+        self, conversation_repo: ConversationSnapshotRepository, async_db: AsyncSession
+    ):
+        """The existing non-NULL -> NULL ``message_id`` rule is unchanged."""
+        thread_id = f"t-{uuid.uuid4()}"
+        await conversation_repo.save_first(
+            _conversation_snapshot(
+                thread_id, summary_version=1, built_through_message_id="m6"
+            ),
+            built_through_ordinal=6,
+        )
+
+        with pytest.raises(BuiltThroughMessageRegression):
+            await conversation_repo.cas_update(
+                _conversation_snapshot(
+                    thread_id, summary_version=2, built_through_message_id=None
+                ),
+                expected_summary_version=1,
+                built_through_ordinal=7,
+            )
+
+        assert await _stored_ordinal(async_db, thread_id) == 6
+
+
+class TestCasRowcountArbiter:
+    """Finding #3: the conditional UPDATE's zero-row branch is the CAS arbiter.
+
+    Every other stale test fails earlier in the Python pre-read, so only a test
+    that interleaves a *committed* advance between the pre-read and the UPDATE
+    exercises the ``rowcount == 0`` branch.
+    """
+
+    @pytest.mark.asyncio
+    async def test_zero_row_update_raises_stale_summary_version(
+        self,
+        conversation_repo: ConversationSnapshotRepository,
+        async_db: AsyncSession,
+        raw_connection,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        thread_id = f"t-{uuid.uuid4()}"
+        # A *committed* row, so a second (autocommit) writer can advance it
+        # while the repository's SAVEPOINT transaction is still open.
+        with raw_connection.cursor() as cur:
+            cur.execute(
+                "INSERT INTO conversation_snapshots ("
+                "snapshot_id, thread_id, contract_version, summary_version, "
+                "built_through_message_id, built_through_ordinal, context) "
+                "VALUES (%s, %s, %s, %s, %s, %s, '{}'::jsonb)",
+                (str(uuid.uuid4()), thread_id, "2.0", 1, "m1", 1),
+            )
+
+        try:
+            real_execute = async_db.execute
+
+            async def execute_with_interleaved_advance(stmt, *args, **kwargs):
+                # Interleave a committed advance exactly between the
+                # repository's pre-read and its conditional UPDATE.
+                if (
+                    isinstance(stmt, Update)
+                    and stmt.table.name == "conversation_snapshots"
+                ):
+                    with raw_connection.cursor() as cur:
+                        cur.execute(
+                            "UPDATE conversation_snapshots SET "
+                            "summary_version = 2, "
+                            "built_through_message_id = 'winner', "
+                            "built_through_ordinal = 2 "
+                            "WHERE thread_id = %s",
+                            (thread_id,),
+                        )
+                return await real_execute(stmt, *args, **kwargs)
+
+            monkeypatch.setattr(
+                async_db, "execute", execute_with_interleaved_advance
+            )
+
+            with pytest.raises(StaleSummaryVersion):
+                await conversation_repo.cas_update(
+                    _conversation_snapshot(
+                        thread_id,
+                        summary_version=2,
+                        built_through_message_id="m2",
+                    ),
+                    expected_summary_version=1,
+                    built_through_ordinal=2,
+                )
+
+            # The interleaved winner's row is intact — the loser wrote nothing.
+            stored = (
+                await async_db.execute(
+                    select(
+                        ConversationSnapshotRow.summary_version,
+                        ConversationSnapshotRow.built_through_message_id,
+                        ConversationSnapshotRow.built_through_ordinal,
+                    ).where(ConversationSnapshotRow.thread_id == thread_id)
+                )
+            ).one()
+            assert tuple(stored) == (2, "winner", 2)
+        finally:
+            # Roll the SAVEPOINT transaction back first: if the repository ever
+            # regressed and did apply the UPDATE, the test would otherwise
+            # block forever on the row lock the async session still holds.
+            await async_db.rollback()
+            with raw_connection.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM conversation_snapshots WHERE thread_id = %s",
+                    (thread_id,),
+                )
+
+
 # ---------------------------------------------------------------------------
 # Step 1 — SemanticSnapshot persistence / version gate
 # ---------------------------------------------------------------------------
@@ -403,6 +655,43 @@ class TestSemanticSnapshotPersistence:
             )
         )
         assert stored == "1.0"
+
+    @pytest.mark.asyncio
+    async def test_save_cannot_overwrite_a_foreign_version_row(
+        self, semantic_repo: SemanticSnapshotRepository, async_db: AsyncSession
+    ):
+        """Finding #1: the semantic upsert must fail closed on a row that
+        declares a contract version this code cannot load."""
+        thread_id = f"t-{uuid.uuid4()}"
+        foreign_version = "1.0"
+        async_db.add(
+            SemanticSnapshotRow(
+                snapshot_id=uuid.uuid4(),
+                thread_id=thread_id,
+                contract_version=foreign_version,
+                semantic=_semantic_context().model_dump(mode="json"),
+            )
+        )
+        await async_db.flush()
+        before = await _semantic_row_state(async_db, thread_id)
+
+        with pytest.raises(IncompatibleSnapshotVersion):
+            await semantic_repo.save(
+                thread_id,
+                SemanticSnapshot(
+                    contract_version="2.0",
+                    semantic=_semantic_context().model_copy(
+                        update={"normalized_query": "replacement"}
+                    ),
+                ),
+            )
+
+        # Fail closed: the foreign row is byte-identical — same snapshot_id,
+        # contract_version, payload, and taken_at. Never silently overwritten.
+        after = await _semantic_row_state(async_db, thread_id)
+        assert after == before
+        assert after.contract_version == foreign_version
+        assert after.semantic["normalized_query"] != "replacement"
 
     @pytest.mark.asyncio
     async def test_binding_audit_not_needed_to_resolve_hot_path_revision_policy(
