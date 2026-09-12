@@ -167,14 +167,17 @@ def test_cli_accepts_top_level_discover_flag(tmp_path) -> None:
     """Brief Step 4 documents `probe_v2_compatibility --discover ...`.
 
     The CLI must accept top-level flags (not just subcommands) so the
-    plan's documented invocations run unchanged. This test mocks the
-    discovery handler to verify argparse shape only.
+    plan's documented invocations run unchanged. This test asserts the
+    shape-only translation done by ``_dispatch_top_level`` — it does NOT
+    run the real ``discover`` handler (which would mutate the shared
+    ``backend/.venv-v2-benchmark`` venv via 9 network ``pip install``s).
     """
-    from probe_v2_compatibility import main
+    from probe_v2_compatibility import _dispatch_top_level
 
     dsn = "postgresql://u:p@localhost:5433/hrag_test"
     output = tmp_path / "report.json"
-    rc = main(
+    req = tmp_path / "req.txt"
+    translated = _dispatch_top_level(
         [
             "--discover",
             "--checkpoint-dsn",
@@ -182,15 +185,18 @@ def test_cli_accepts_top_level_discover_flag(tmp_path) -> None:
             "--output",
             str(output),
             "--write-requirements",
-            str(tmp_path / "req.txt"),
+            str(req),
         ]
     )
-    # Discovery will actually run (and either succeed or fail gracefully);
-    # the contract is that argparse did NOT reject the invocation with
-    # rc=2 "invalid choice". A rc != 2 from other failures is acceptable.
-    assert rc != 2 or output.exists(), (
-        "top-level --discover invocation was rejected by argparse"
-    )
+    assert translated == [
+        "discover",
+        "--checkpoint-dsn",
+        dsn,
+        "--output",
+        str(output),
+        "--write-requirements",
+        str(req),
+    ], "top-level --discover invocation was rejected by _dispatch_top_level"
 
 
 def test_cli_accepts_top_level_reemit_flags(tmp_path) -> None:
