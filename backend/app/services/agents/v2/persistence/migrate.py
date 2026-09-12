@@ -726,6 +726,7 @@ def _shape_errors(conn) -> frozenset[str]:
               JOIN pg_attribute a
                 ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
              WHERE c.conname = 'uq_revision_ingestion_attempt_key'
+               AND c.connamespace = 'public'::regnamespace
             """
         )
     ).fetchall()

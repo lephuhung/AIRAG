@@ -29,7 +29,6 @@ import asyncio
 import uuid
 
 import pytest
-import pytest_asyncio
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,7 +39,6 @@ from app.models.document_revision_build import DocumentRevisionBuild
 from app.services.agents.v2.persistence.document_revisions import (  # type: ignore[import-not-found]
     DocumentNotFound,
     DocumentRevisionsRepository,
-    DocumentTombstoned,
     PublishOutcome,
     RevisionArtifactsIncomplete,
     RevisionBuildProfile,
@@ -50,7 +48,6 @@ from app.services.agents.v2.persistence.document_revisions import (  # type: ign
     RevisionRetriesExhausted,
 )
 from app.services.agents.v2.persistence.source_identity import (  # type: ignore[import-not-found]
-    SOURCE_SCHEME,
     compute_source_object_identity,
 )
 
@@ -1859,3 +1856,265 @@ class TestArtifactContractAndAnchors:
         assert r2_after.artifact_retention_starts_at is not None
         assert r3_after.status == "published"
         assert r3_after.artifact_retention_starts_at is None  # new current
+
+
+# ---------------------------------------------------------------------------
+# Fix round 3 — regression guards for the round-2 semantics
+# ---------------------------------------------------------------------------
+
+
+class TestRound2RegressionGuards:
+    @pytest.mark.asyncio
+    async def test_abandoned_tombstone_reason_on_live_document_cannot_publish(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        """I-B: an abandoned revision on a NON-tombstoned document must raise,
+        never flip back to published via the CAS."""
+        document_id = document_factory()
+        r, _ = await repo.get_or_create_ingestion_attempt(
+            document_id=document_id,
+            source_object_identity=_source_identity(content_sha256="ga" * 32),
+            build_profile=RevisionBuildProfile.FULL,
+        )
+        await repo.abandon_revision(r, reason="document_tombstoned")
+        with pytest.raises(RevisionNotPublishable):
+            await repo.publish(r.revision_id)
+        assert (await repo.get(r.revision_id)).status == "abandoned"
+
+    @pytest.mark.asyncio
+    async def test_verified_revision_on_already_tombstoned_document_becomes_abandoned(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        """I-B: the verified + tombstoned branch — tombstone first, then a
+        fresh verified revision publishes as ABANDONED_SOURCE_DELETED."""
+        document_id = document_factory()
+        r1, _ = await repo.get_or_create_ingestion_attempt(
+            document_id=document_id,
+            source_object_identity=_source_identity(content_sha256="gb" * 32),
+            build_profile=RevisionBuildProfile.FULL,
+        )
+        r1.status = "building"
+        await repo.record_artifacts(
+            revision_id=r1.revision_id,
+            build_profile=RevisionBuildProfile.FULL,
+            embedding_namespace="ns",
+            embedding_model_hash="h",
+            embedding_dimension=8,
+            vector_artifact_version="v1",
+            markdown_artifact_key="md/1",
+            structure_artifact_key="st/1",
+        )
+        await repo.verify_draft(revision_id=r1.revision_id)
+        await repo.publish(r1.revision_id)
+        await repo.mark_source_deleted(document_id=document_id)
+
+        r2, created = await repo.get_or_create_ingestion_attempt(
+            document_id=document_id,
+            source_object_identity=_source_identity(content_sha256="gc" * 32),
+            build_profile=RevisionBuildProfile.FULL,
+        )
+        assert created is True
+        r2.status = "building"
+        await repo.record_artifacts(
+            revision_id=r2.revision_id,
+            build_profile=RevisionBuildProfile.FULL,
+            embedding_namespace="ns",
+            embedding_model_hash="h",
+            embedding_dimension=8,
+            vector_artifact_version="v1",
+            markdown_artifact_key="md/2",
+            structure_artifact_key="st/2",
+        )
+        await repo.verify_draft(revision_id=r2.revision_id)
+        _, outcome = await repo.publish(r2.revision_id)
+        assert outcome == PublishOutcome.ABANDONED_SOURCE_DELETED
+        assert (await repo.get(r2.revision_id)).status == "abandoned"
+
+    @pytest.mark.asyncio
+    async def test_record_artifacts_redelivery_coalesces_and_keeps_skips(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        """M1: a partial redelivery must not null previously recorded fields,
+        and a skip flag must be sticky."""
+        document_id = document_factory()
+        r, _ = await repo.get_or_create_ingestion_attempt(
+            document_id=document_id,
+            source_object_identity=_source_identity(content_sha256="gd" * 32),
+            build_profile=RevisionBuildProfile.FULL,
+        )
+        r.status = "building"
+        await repo.record_artifacts(
+            revision_id=r.revision_id,
+            build_profile=RevisionBuildProfile.FULL,
+            markdown_artifact_key="md/keep",
+            structure_artifact_key="st/keep",
+        )
+        await repo.record_artifacts(
+            revision_id=r.revision_id,
+            build_profile=RevisionBuildProfile.FULL,
+            embedding_namespace="ns",
+            embedding_model_hash="h",
+            embedding_dimension=8,
+            vector_artifact_version="v1",
+        )
+        build = await repo.session.scalar(
+            select(DocumentRevisionBuild).where(
+                DocumentRevisionBuild.revision_id == r.revision_id
+            )
+        )
+        assert build.markdown_artifact_key == "md/keep"
+        assert build.structure_artifact_key == "st/keep"
+        assert build.embedding_namespace == "ns"
+        # Verify succeeds only because coalesce preserved the keys.
+        await repo.verify_draft(revision_id=r.revision_id)
+        # Skip is sticky: a later delivery with False must not un-skip.
+        await repo.record_artifacts(
+            revision_id=r.revision_id,
+            build_profile=RevisionBuildProfile.FULL,
+            captions_skipped=True,
+        )
+        await repo.record_artifacts(
+            revision_id=r.revision_id,
+            build_profile=RevisionBuildProfile.FULL,
+        )
+        build2 = await repo.session.scalar(
+            select(DocumentRevisionBuild).where(
+                DocumentRevisionBuild.revision_id == r.revision_id
+            )
+        )
+        await repo.session.refresh(build2)
+        assert build2.captions_skipped is True
+
+    @pytest.mark.asyncio
+    async def test_verify_fails_closed_without_allocated_profile(
+        self, repo: DocumentRevisionsRepository, document_factory, monkeypatch
+    ):
+        """I-A: an unknown allocation profile must fail closed."""
+        document_id = document_factory()
+        r, _ = await repo.get_or_create_ingestion_attempt(
+            document_id=document_id,
+            source_object_identity=_source_identity(content_sha256="ge" * 32),
+            build_profile=RevisionBuildProfile.FULL,
+        )
+        r.status = "building"
+
+        async def _none(_rid):
+            return None
+
+        monkeypatch.setattr(repo, "_allocated_profile", _none)
+        with pytest.raises(RevisionArtifactsIncomplete):
+            await repo.verify_draft(revision_id=r.revision_id)
+
+    @pytest.mark.asyncio
+    async def test_forged_build_profile_row_is_invisible(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        """I-A: a build row recorded under a different profile than the
+        allocated one must not satisfy verify_draft."""
+        document_id = document_factory()
+        r, _ = await repo.get_or_create_ingestion_attempt(
+            document_id=document_id,
+            source_object_identity=_source_identity(content_sha256="gf" * 32),
+            build_profile=RevisionBuildProfile.FULL,
+        )
+        r.status = "building"
+        await repo.record_artifacts(
+            revision_id=r.revision_id,
+            build_profile=RevisionBuildProfile.CHAT_UPLOAD,
+            embedding_namespace="ns",
+            embedding_model_hash="h",
+            embedding_dimension=8,
+            vector_artifact_version="v1",
+            markdown_artifact_key="md",
+            structure_artifact_key="st",
+            captions_skipped=True,
+            kg_skipped=True,
+        )
+        with pytest.raises(RevisionArtifactsIncomplete):
+            await repo.verify_draft(revision_id=r.revision_id)
+
+    @pytest.mark.asyncio
+    async def test_publish_locks_document_before_revision(
+        self, async_engine, document_factory, raw_connection
+    ):
+        """C1 deterministic guard: publish() takes the document lock BEFORE
+        the revision lock.
+
+        A holder session keeps an uncommitted ``FOR UPDATE`` on the document,
+        so the publish task must block on the document row. While it blocks,
+        the revision row must still be lockable (``FOR UPDATE NOWAIT``).
+        Under the pre-fix revision-first order the publish task already holds
+        the revision lock and the probe raises ``LockNotAvailable`` (55P03).
+        """
+        import psycopg
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        document_id = document_factory()
+        maker = async_sessionmaker(
+            async_engine, class_=AsyncSession, expire_on_commit=False
+        )
+        async with maker() as setup:
+            repo = DocumentRevisionsRepository(setup)
+            r, _ = await repo.get_or_create_ingestion_attempt(
+                document_id=document_id,
+                source_object_identity=_source_identity(content_sha256="gg" * 32),
+                build_profile=RevisionBuildProfile.FULL,
+            )
+            r.status = "building"
+            await repo.record_artifacts(
+                revision_id=r.revision_id,
+                build_profile=RevisionBuildProfile.FULL,
+                embedding_namespace="ns",
+                embedding_model_hash="h",
+                embedding_dimension=8,
+                vector_artifact_version="v1",
+                markdown_artifact_key="md",
+                structure_artifact_key="st",
+            )
+            await repo.verify_draft(revision_id=r.revision_id)
+            await setup.commit()
+            rid = r.revision_id
+
+        holder = maker()
+        await holder.begin()
+        await holder.execute(
+            text("SELECT id FROM documents WHERE id = :d FOR UPDATE"),
+            {"d": str(document_id)},
+        )
+
+        async def _pub():
+            async with maker() as s:
+                local = DocumentRevisionsRepository(s)
+                await local.publish(rid)
+                await s.commit()
+
+        task = asyncio.create_task(_pub())
+        try:
+            # Wait until the publish task is blocked on a lock.
+            for _ in range(300):
+                await asyncio.sleep(0.01)
+                with raw_connection.cursor() as cur:
+                    cur.execute(
+                        "SELECT count(*) FROM pg_stat_activity "
+                        "WHERE datname = current_database() "
+                        "AND wait_event_type = 'Lock'"
+                    )
+                    if cur.fetchone()[0] > 0:
+                        break
+            try:
+                with raw_connection.cursor() as cur:
+                    cur.execute(
+                        "SELECT revision_id FROM document_revisions "
+                        "WHERE revision_id = %s FOR UPDATE NOWAIT",
+                        (str(rid),),
+                    )
+            except psycopg.errors.LockNotAvailable as exc:
+                raise AssertionError(
+                    "publish() holds the revision lock while blocked on the "
+                    "document lock - revision-first order regression (C1)"
+                ) from exc
+        finally:
+            await holder.rollback()
+            await task
+
+        assert task.exception() is None

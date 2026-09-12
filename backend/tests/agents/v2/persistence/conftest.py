@@ -20,6 +20,7 @@ a SAVEPOINT-wrapped async session that auto-rolls back on teardown.
 from __future__ import annotations
 
 import os
+import sys
 import uuid
 from typing import AsyncIterator
 
@@ -213,8 +214,9 @@ def _reset_legacy_schema(conn) -> None:
         try:
             with conn.begin_nested() as sp:
                 conn.execute(text(stmt))
-        except Exception:
-            pass  # already rolled back via sp context manager
+        except Exception as exc:  # object does not exist / already dropped
+            # Surface the failure instead of hiding a broken reset.
+            print(f"warn: savepoint DDL failed: {exc}", file=sys.stderr)
 
     # Drop v2 tables (cascades remove FKs pointing at them from legacy tables).
     for tbl in (

@@ -35,7 +35,6 @@ from typing import Optional
 
 from sqlalchemy import (
     BigInteger,
-    CheckConstraint,
     DateTime,
     ForeignKey,
     String,

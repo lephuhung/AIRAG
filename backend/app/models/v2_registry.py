@@ -302,8 +302,7 @@ def assert_v2_readiness(check: SchemaCheck) -> None:
             f"v2 schema version {V2_SCHEMA_VERSION} is recorded but the "
             f"following tables are missing: {sorted(check.missing_tables)}. "
             f"This is a divergent / partial migration environment; "
-            f"re-run 'python -m app.services.agents.v2.persistence.migrate "
-            f"apply --dsn <DSN>' to repair."
+            f"drop and re-apply the v2 schema (rebuild) to repair."
         )
     # The version row alone is NOT proof of the current shape: a database
     # that applied the pre-R2 Release 1A keeps its old columns/constraint

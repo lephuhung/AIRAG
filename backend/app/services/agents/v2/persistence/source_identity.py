@@ -301,9 +301,9 @@ def resolve_build_profile(
 
     1. ``flags.parse_only`` ALWAYS wins — even over the ``chat_file_``
        prefix. ``parse_only`` is an explicit operator/reindex action.
-    2. ``chat_file_*`` keys → ``CHAT_UPLOAD`` (skip embed/captions/KG
-       after parse; required artifacts = markdown + structure + vectors,
-       but vectors are recorded as "skipped" not "absent").
+    2. ``chat_file_*`` keys → ``CHAT_UPLOAD`` (skip caption/KG after
+       parse; vectors are still REQUIRED — ``embed_skipped`` stays false,
+       while ``captions_skipped`` and ``kg_skipped`` must be true).
     3. Anything else → ``FULL``.
 
     :raises InvalidSourceObjectKey: if the key fails normalization.

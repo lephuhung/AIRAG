@@ -564,7 +564,14 @@ class DocumentRevisionsRepository:
                 DocumentIngestionAttempt.revision_id == revision_id
             )
         )
-        return RevisionBuildProfile(value) if value is not None else None
+        if value is None:
+            return None
+        try:
+            return RevisionBuildProfile(value)
+        except ValueError:
+            # A non-enum / legacy profile value must fail closed, not raise a
+            # bare ValueError out of verify_draft.
+            return None
 
     @staticmethod
     def _assert_required_artifacts(
@@ -827,14 +834,12 @@ class DocumentRevisionsRepository:
         # revision abandoned for a non-tombstone reason is never silently
         # converted into ``DocumentTombstoned``.
         if revision.status == "abandoned":
-            # ``abandoned`` is terminal. Only a tombstone-abandoned revision
-            # on an actually tombstoned document may report
-            # ABANDONED_SOURCE_DELETED, and it must NEVER fall through to the
-            # CAS (which would flip the terminal state back to published).
-            if (
-                revision.abandon_reason != "document_tombstoned"
-                or document.source_deleted_at is None
-            ):
+            # ``abandoned`` is terminal. A tombstoned document always reports
+            # ABANDONED_SOURCE_DELETED; an abandoned revision on a live
+            # document is not a tombstone outcome and must raise. Never fall
+            # through to the CAS (that would flip the terminal state back to
+            # published).
+            if document.source_deleted_at is None:
                 raise RevisionNotPublishable(
                     f"revision {revision_id} cannot be published from state "
                     f"'abandoned' (reason={revision.abandon_reason!r})"
