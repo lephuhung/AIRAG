@@ -834,7 +834,13 @@ async def build_v2_ingress(
                 session_factory=session_factory,
             )
         )
-        binding_resolver = V1BindingResolver(session_factory=session_factory)
+        # F1 role policy: the production semantic adapter emits
+        # ``requested_role=None`` for every user reference, so the wired
+        # resolver supplies the ``"target"`` default — otherwise every
+        # resolved reference fails closed before any DB access.
+        binding_resolver = V1BindingResolver(
+            session_factory=session_factory, default_role="target"
+        )
         bundle = V1ServiceBundle(
             session_factory=session_factory,
             evidence=evidence_builder,
@@ -902,51 +908,8 @@ async def build_v2_ingress(
         await stack.aclose()
 
 
-async def run_v2_turn_sse(
-    *,
-    graph: Any,
-    initial_state: Any,
-    runtime_context: Any,
-    thread_id: str,
-) -> AsyncIterator[str]:
-    """Interim T7 v2 turn runner emitting v1-wire SSE (T8 owns the adapter).
-
-    Invokes the compiled v2 graph once with the request-scoped
-    ``GraphRuntimeContext`` on an isolated thread id, then emits the
-    terminal ``FinalResponse`` through ``terminal_event_for_response``.
-    Interrupts (clarify suspend) surface as a ``status`` event naming the
-    pending clarification so the runner layer can resume with T5's
-    ``resume_clarification`` verbatim artifact; ``ClarificationUnsatisfiable``
-    replies are the caller's fresh-turn signal (see
-    ``clarification_reply_is_fresh_turn``). Non-success terminals keep the
-    ingress placeholder semantic and are surfaced, never validated.
-    """
-    from langgraph.errors import GraphInterrupt
-
-    from app.services.agents.v2.events import (
-        format_sse_event as _format_v2_sse,
-    )
-    from app.services.agents.v2.events import (
-        terminal_event_for_response as _terminal_event,
-    )
-
-    config = {"configurable": {"thread_id": thread_id}}
-    yield _format_v2_sse("status", {"step": "v2", "detail": "Running v2 graph..."})
-    try:
-        result = await graph.ainvoke(
-            initial_state, config, context=runtime_context
-        )
-    except GraphInterrupt as exc:
-        yield _format_v2_sse(
-            "status",
-            {"step": "clarify", "detail": f"clarification pending: {exc!r}"},
-        )
-        return
-    final = result.get("final_response") if isinstance(result, dict) else None
-    if final is None:
-        yield _format_v2_sse(
-            "error", {"message": "v2 turn ended without a terminal response"}
-        )
-        return
-    event, data = _terminal_event(final)
-    yield _format_v2_sse(event, data)
+# F8: the interim T7 ``run_v2_turn_sse`` runner was removed — it had no
+# production caller (all entrypoints stream through the reviewed
+# ``stream_v2_turn_events``/``stream_v2_turn_to_sse`` adapter) and shared
+# the pre-F4 suspend-detection gap. No unreferenced helpers remain with
+# it (its imports were function-local).

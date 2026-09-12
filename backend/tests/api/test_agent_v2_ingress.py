@@ -545,3 +545,270 @@ def test_session_v2_run_commits_on_success():
     assert ("evidence", "close") in recorder
     assert ("lease", "close") in recorder
     assert any(s.startswith("event: complete") for s in seen)
+
+
+# ---------------------------------------------------------------------------
+# Final-review fix wave (F1/F2/F4/F8)
+# ---------------------------------------------------------------------------
+
+
+def test_production_binding_resolver_pins_role_less_reference(monkeypatch):
+    """F1: the PRODUCTION resolver wiring pins a role-less resolved ref.
+
+    Goes through ``build_v2_ingress`` services (not a hand-built resolver):
+    the production semantic adapter emits ``requested_role=None`` for every
+    reference, so the wired ``V1BindingResolver`` must supply the role
+    policy itself (``default_role="target"``).
+    """
+    import asyncio
+    from types import SimpleNamespace as _NS
+    from uuid import uuid4
+
+    import app.services.agent.runtime_selector as selector
+    from app.services.agents.v2.contracts.semantic import DocumentReference
+    from app.services.agents.v2.persistence import document_views
+
+    workspace_id = uuid4()
+    document_id = uuid4()
+    revision_id = uuid4()
+
+    async def _fake_current(db, document_id_arg, *, require_vectors=False):
+        assert document_id_arg == document_id
+        return document_views.RevisionArtifactIdentity(
+            revision_id=revision_id,
+            document_id=document_id,
+            generation=1,
+            build_profile="FULL",
+            markdown_artifact_key="markdown.md",
+            structure_artifact_key="structure.json",
+            embedding_namespace=None,
+            embedding_model_hash=None,
+            embedding_dimension=None,
+            vector_artifact_version=None,
+        )
+
+    monkeypatch.setattr(
+        document_views, "load_current_revision_identity", _fake_current
+    )
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def commit(self):
+            return None
+
+        async def rollback(self):
+            return None
+
+        async def close(self):
+            return None
+
+    async def _fake_preprocess(raw_query: str):
+        return _NS(normalized_query=raw_query)
+
+    async def _main():
+        async with selector.build_v2_ingress(
+            user_id=uuid4(),
+            authenticated_workspace_ids=[workspace_id],
+            requested_workspace_ids=None,
+            raw_query="quyết định 13 là gì?",
+            thread_id=f"thread-{uuid4().hex[:8]}",
+            session_factory=lambda: _FakeSession(),
+            lease_session_factory=lambda: _FakeSession(),
+            preprocess=_fake_preprocess,
+        ) as ingress:
+            resolver = ingress.runtime_context.services.binding_resolver
+            ref = DocumentReference(
+                ref_id="r1",
+                original_span="quyết định 13",
+                normalized_reference="quyết định 13",
+                requested_role=None,
+                resolution_status="resolved",
+                resolved_document_id=document_id,
+            )
+            return await resolver.resolve(
+                (ref,), ingress.runtime_context.capability_runtime
+            )
+
+    binding_set = asyncio.run(_main())
+    assert len(binding_set.bindings) == 1
+    assert binding_set.bindings[0].binding_id == "b_r1"
+    assert binding_set.bindings[0].document_revision == str(revision_id)
+    assert binding_set.bindings[0].role == "target"
+
+
+def _final_fix_clarification_request():
+    from datetime import datetime, timedelta, timezone
+
+    from app.services.agents.v2.contracts.base import CONTRACT_VERSION
+    from app.services.agents.v2.contracts.clarification import ClarificationRequest
+
+    return ClarificationRequest(
+        contract_version=CONTRACT_VERSION,
+        clarification_id="clr-admin-1",
+        reason="required_document_ambiguous",
+        question="Which document?",
+        unresolved_ref_ids=("r1",),
+        candidates=(),
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+
+
+class _FinalFixLeaseRepo:
+    """Stand-in for the retention-lease repository (records releases)."""
+
+    def __init__(self, run_id: str) -> None:
+        self._run_id = run_id
+        self.released: list[tuple[str, str]] = []
+        self.commits = 0
+        self.session = self
+
+    async def release_run(self, run_id: str, reason: str = "terminal") -> int:
+        self.released.append((run_id, reason))
+        return 1
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+
+class _FinalFixGraph:
+    """Scripted v2 graph with a checkpoint snapshot (suspend-aware)."""
+
+    def __init__(self, result: dict, *, checkpoint: dict, next_nodes: tuple = ()) -> None:
+        self._result = result
+        self._checkpoint = dict(checkpoint)
+        self._next_nodes = tuple(next_nodes)
+
+    async def aget_state(self, config: Any = None) -> Any:
+        from types import SimpleNamespace as _NS
+
+        return _NS(values=dict(self._checkpoint), next=tuple(self._next_nodes))
+
+    async def ainvoke(self, payload: Any, config: Any, context: Any = None) -> Any:
+        return self._result
+
+
+class _FinalFixIngress:
+    """Minimal ``build_v2_ingress`` stand-in for the admin eval path."""
+
+    def __init__(self, runtime_context: Any, plan_resolver: Any) -> None:
+        self.runtime_context = runtime_context
+        self.initial_state = {"request": "admin eval"}
+        self.plan_resolver = plan_resolver
+        self.committed = 0
+        self.rolled_back = 0
+
+    async def __aenter__(self) -> "_FinalFixIngress":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+    async def commit_evidence(self) -> None:
+        self.committed += 1
+
+    async def rollback_evidence(self) -> None:
+        self.rolled_back += 1
+
+
+def _run_admin_v2_eval_with_graph(monkeypatch, graph):
+    import asyncio
+    from types import SimpleNamespace as _NS
+    from uuid import uuid4
+
+    import app.api.agent_admin as agent_admin
+    import app.services.agent.runtime_selector as selector
+
+    workspace_id = uuid4()
+    leases = _FinalFixLeaseRepo(run_id="run-admin-eval")
+    runtime_context = _NS(
+        capability_runtime=_NS(
+            run_id="run-admin-eval",
+            workspace_ids=(workspace_id,),
+            deadline_at=None,
+        ),
+        services=_NS(retention_leases=leases),
+    )
+
+    class _Resolver:
+        def feed(self, *args: Any) -> None:
+            return None
+
+    ingress = _FinalFixIngress(runtime_context, _Resolver())
+
+    async def _scope(db: Any, user: Any) -> list:
+        return [workspace_id]
+
+    def _fake_ingress(**kwargs: Any) -> _FinalFixIngress:
+        return ingress
+
+    monkeypatch.setattr(agent_admin, "_accessible_scope", _scope)
+    monkeypatch.setattr(selector, "build_v2_ingress", _fake_ingress)
+    user = _NS(id=uuid4(), is_superadmin=True)
+    events = asyncio.run(
+        agent_admin._run_v2_eval(graph, object(), user, "quyết định nào?", None)
+    )
+    return events, ingress, leases
+
+
+def test_admin_v2_eval_surfaces_clarify_without_502(monkeypatch):
+    """F4: a top-level suspend (RETURNED ``__interrupt__``) is a question."""
+    request = _final_fix_clarification_request()
+    graph = _FinalFixGraph(
+        {"__interrupt__": ({"clarify": True},), "clarification": request},
+        checkpoint={"clarification": request},
+        next_nodes=("clarify_wait",),
+    )
+    events, ingress, leases = _run_admin_v2_eval_with_graph(monkeypatch, graph)
+    terminals = [ev for ev in events if ev["event"] in ("complete", "error")]
+    assert len(terminals) == 1
+    assert terminals[0]["event"] == "complete"
+    assert terminals[0]["data"]["answer"] == "Which document?"
+    # Suspension keeps leases active: never released on interrupt.
+    assert leases.released == []
+    assert ingress.committed == 1
+
+
+def test_admin_v2_eval_releases_leases_on_terminal(monkeypatch):
+    """F4: a terminal admin turn releases the run's leases (no linger)."""
+    import asyncio
+
+    from app.services.agents.v2.contracts.base import CONTRACT_VERSION
+    from app.services.agents.v2.contracts.response import FinalResponse
+
+    graph = _FinalFixGraph(
+        {
+            "final_response": FinalResponse(
+                contract_version=CONTRACT_VERSION,
+                status="success",
+                content="Verified answer.",
+                citations=(),
+            )
+        },
+        checkpoint={},
+        next_nodes=(),
+    )
+    events, ingress, leases = _run_admin_v2_eval_with_graph(monkeypatch, graph)
+    terminals = [ev for ev in events if ev["event"] in ("complete", "error")]
+    assert len(terminals) == 1
+    assert terminals[0]["event"] == "complete"
+    assert leases.released == [("run-admin-eval", "terminal")]
+    assert ingress.committed == 1
+
+
+def test_standalone_stream_has_no_dead_scope_override():
+    """F2: /agent-lg/stream serves the authenticated scope (no dead read)."""
+    source = _read("app/api/chat_agent_lg.py")
+    assert 'getattr(request, "workspace_ids"' not in source
+    assert 'hasattr(request, "workspace_ids")' not in source
+
+
+def test_dead_v2_turn_runner_removed():
+    """F8: the uncalled interim ``run_v2_turn_sse`` runner is gone."""
+    import app.services.agent.runtime_selector as selector
+
+    assert not hasattr(selector, "run_v2_turn_sse")

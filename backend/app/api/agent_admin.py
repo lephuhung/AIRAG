@@ -205,13 +205,22 @@ async def _run_v2_eval(
     message: str,
     workspace_ids: Optional[list[UUID]],
 ) -> list[dict]:
-    from langgraph.errors import GraphInterrupt
+    """Run one admin evaluation turn through the reviewed v2 adapter.
 
+    F4: this surface used to ``ainvoke`` the graph directly, catch only
+    ``GraphInterrupt``, and 502 on a clarify route (a top-level suspend is
+    RETURNED via ``__interrupt__``, not raised) while never releasing
+    leases after a terminal. It now streams the turn through
+    ``stream_v2_turn_events`` — the same suspension detection, one-terminal
+    rule, and terminal lease release the user entrypoints use — and
+    commits the evidence unit of work after the terminal event, rolling
+    back when the stream itself raises (mirroring ``chat_agent_lg``).
+    """
     from app.services.agent.runtime_selector import (
         build_v2_ingress,
         resolve_runtime_scope,
     )
-    from app.services.agents.v2.events import terminal_event_for_response
+    from app.services.agent.streaming import stream_v2_turn_events
 
     authenticated = await _accessible_scope(db, user)
     if not resolve_runtime_scope(
@@ -230,27 +239,19 @@ async def _run_v2_eval(
         thread_id=thread_id,
         can_read_people=bool(user.is_superadmin),
     ) as ingress:
-        config = {"configurable": {"thread_id": thread_id}}
         try:
-            result = await graph.ainvoke(
-                ingress.initial_state, config, context=ingress.runtime_context
-            )
-        except GraphInterrupt as exc:
-            return [
-                {
-                    "event": "status",
-                    "data": {
-                        "step": "clarify",
-                        "detail": f"clarification pending: {exc!r}",
-                    },
-                }
+            events = [
+                event
+                async for event in stream_v2_turn_events(
+                    graph=graph,
+                    runtime_context=ingress.runtime_context,
+                    thread_id=thread_id,
+                    initial_state=ingress.initial_state,
+                    plan_resolver=ingress.plan_resolver,
+                )
             ]
-        final = result.get("final_response") if isinstance(result, dict) else None
-        if final is None:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="v2 turn ended without a terminal response",
-            )
+        except Exception:
+            await ingress.rollback_evidence()
+            raise
         await ingress.commit_evidence()
-        event, data = terminal_event_for_response(final)
-        return [{"event": event, "data": data}]
+        return events

@@ -236,13 +236,13 @@ async def langgraph_chat_stream(
     )
     from app.services.agent.streaming import stream_agent_to_sse, build_initial_state
 
-    # Current runtime scope = authenticated scope ∩ requested scope (never
-    # widened by request input).
-    requested_scope = getattr(request, "workspace_ids", None)
+    # F2: the runtime scope is the authenticated scope, full stop.
+    # ``ChatRequest`` carries no ``workspace_ids`` field, so there is no
+    # request-supplied scope to intersect here (never widened by input).
     workspace_ids = list(
         resolve_runtime_scope(
             authenticated_ids=workspace_ids,
-            requested_ids=requested_scope,
+            requested_ids=None,
         )
     )
 
@@ -456,9 +456,9 @@ async def chat_stream_langgraph(
             detail="No accessible workspaces found.",
         )
 
-    # Override if request specifies workspace IDs
-    if hasattr(request, "workspace_ids") and request.workspace_ids:
-        workspace_ids = request.workspace_ids
+    # F2: no per-request workspace override exists — ``ChatRequest`` has
+    # no ``workspace_ids`` field, so the authenticated scope above stays
+    # the source of truth (never widened by request input).
 
     # Capture user.id early — accessing it inside the streaming generator causes
     # SQLAlchemy greenlet errors (lazy loading fails in async context)
