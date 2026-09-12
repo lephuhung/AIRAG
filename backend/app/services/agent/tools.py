@@ -1417,6 +1417,7 @@ async def search_document_section(
     if document_ids:
         from app.core.database import async_session_maker
         from app.services.agents.v2.persistence.document_views import (
+            RevisionNotReady,
             resolve_document_targets,
         )
 
@@ -1426,8 +1427,15 @@ async def search_document_section(
             doc_uuids = []
         targets = []
         if doc_uuids:
-            async with async_session_maker() as _target_db:
-                targets = await resolve_document_targets(_target_db, doc_uuids)
+            try:
+                async with async_session_maker() as _target_db:
+                    targets = await resolve_document_targets(_target_db, doc_uuids)
+            except RevisionNotReady:
+                # A current pointer that is not published/artifact-complete is a
+                # typed REVISION_NOT_READY, not a server error. Fail closed:
+                # never fall back to the document-scoped legacy store, which
+                # could still hold the superseded revision's chunks.
+                targets = []
         for ws_id in workspace_ids:
             for target in targets:
                 if not target.eligible:

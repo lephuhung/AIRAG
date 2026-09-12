@@ -137,9 +137,19 @@ async def query_documents(
     )
 
     if request.document_ids:
-        targets = await resolve_document_targets(
-            db, request.document_ids, workspace_id=workspace_id
-        )
+        # A current pointer that is not published/artifact-complete (or a
+        # current revision whose manifest is incomplete) is a typed
+        # REVISION_NOT_READY, exactly as in the caller-supplied revision_ids
+        # branch below — never a generic 500.
+        try:
+            targets = await resolve_document_targets(
+                db, request.document_ids, workspace_id=workspace_id
+            )
+        except RevisionNotReady as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": exc.code, "message": str(exc)},
+            )
         ineligible = [t.document_id for t in targets if not t.eligible]
         if ineligible:
             raise HTTPException(

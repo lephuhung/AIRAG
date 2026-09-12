@@ -405,22 +405,55 @@ def _list_prop_append(var: str, prop: str, singular: str, id_param: str) -> str:
     )
 
 
+# Separator inside one ``revision_facts`` entry. Neo4j property values must be
+# primitives or arrays thereof, so entries are the primitive string
+# ``"<revision_id>|<description>"`` rather than ``{revision_id, description}``
+# maps (a list of maps is rejected at runtime with
+# ``Neo.ClientError.Statement.TypeError: Property values can only be of
+# primitive types or arrays thereof``). Revision ids are UUIDs and never
+# contain the separator, so decoding with ``partition`` is unambiguous even
+# when the description does.
+_REVISION_FACT_SEP = "|"
+
+
+def _split_revision_fact(entry: str) -> tuple[str, str]:
+    """Decode one ``revision_facts`` entry into ``(revision_id, description)``."""
+    revision_id, _, description = entry.partition(_REVISION_FACT_SEP)
+    return revision_id, description
+
+
+def _revision_facts_init(id_param: str, desc_param: str) -> str:
+    """The ``ON CREATE`` seed for ``revision_facts``: one entry for the writer.
+
+    A freshly created row has no prior entry, so the producing revision owns
+    exactly one fact string. Kept beside :func:`_revision_facts_append` so the
+    string encoding has a single definition.
+    """
+    sep = f"'{_REVISION_FACT_SEP}'"
+    return (
+        f"CASE WHEN ${id_param} IS NULL THEN [] "
+        f"ELSE [${id_param} + {sep} + ${desc_param}] END"
+    )
+
+
 def _revision_facts_append(var: str, id_param: str, desc_param: str) -> str:
     """Per-revision document-derived fact text for a shared ``var`` row.
 
-    ``revision_facts`` is a list of ``{revision_id, description}`` maps — one
-    entry per producing revision. A canonical entity/relationship stays shared
+    ``revision_facts`` is a list of primitive strings — one entry per
+    producing revision, ``"<revision_id>|<description>"`` (see
+    :data:`_REVISION_FACT_SEP`). A canonical entity/relationship stays shared
     across revisions, but its fact text does not: writing R2's description must
     not overwrite R1's, because an R1-scoped read of a shared node would then
     return R2's fact (last-writer-wins leak). An empty description leaves the
     prior entry for that revision intact; re-ingesting the same revision
     replaces only its own entry.
     """
+    sep = f"'{_REVISION_FACT_SEP}'"
     seed = f"coalesce({var}.revision_facts, [])"
-    kept = f"[f IN {seed} WHERE f.revision_id <> ${id_param} | f]"
+    kept = f"[f IN {seed} WHERE head(split(f, {sep})) <> ${id_param} | f]"
     return (
         f"CASE WHEN ${id_param} IS NULL OR ${desc_param} = '' THEN {seed} "
-        f"ELSE {kept} + [{{revision_id: ${id_param}, description: ${desc_param}}}] END"
+        f"ELSE {kept} + [${id_param} + {sep} + ${desc_param}] END"
     )
 
 
@@ -429,8 +462,8 @@ def _pick_scoped_fact(
 ) -> str:
     """The document-derived fact text owned by an in-scope revision.
 
-    ``facts`` is a KG row's ``revision_facts`` list of
-    ``{revision_id, description}`` maps. Without a scope (the v1 read) the
+    ``facts`` is a KG row's ``revision_facts`` list of primitive strings
+    (``"<revision_id>|<description>"``). Without a scope (the v1 read) the
     canonical description is returned unchanged. Under a scope only an entry
     produced by an in-scope revision is eligible; a shared entity whose
     canonical description was last written by another revision yields no text
@@ -439,10 +472,11 @@ def _pick_scoped_fact(
     if scope is None:
         return canonical or ""
     for fact in facts or []:
-        if not isinstance(fact, dict):
+        if not isinstance(fact, str):
             continue
-        if str(fact.get("revision_id") or "") in scope:
-            return fact.get("description") or ""
+        revision_id, description = _split_revision_fact(fact)
+        if revision_id in scope:
+            return description
     return ""
 
 
@@ -1817,7 +1851,7 @@ class LegalKGService:
                       n.document_ids = CASE WHEN $document_id IS NULL THEN [] ELSE [$document_id] END,
                       n.revision_id  = $revision_id,
                       n.revision_ids = CASE WHEN $revision_id IS NULL THEN [] ELSE [$revision_id] END,
-                      n.revision_facts = CASE WHEN $revision_id IS NULL THEN [] ELSE [{{revision_id: $revision_id, description: $description}}] END,
+                      n.revision_facts = {_revision_facts_init("revision_id", "description")},
                       n.created_at   = datetime()
         ON MATCH SET  n.entity_type  = 'Document',
                       n.display_name = $display_name,
@@ -1872,7 +1906,7 @@ class LegalKGService:
                       n.document_ids = CASE WHEN $document_id IS NULL THEN [] ELSE [$document_id] END,
                       n.revision_id  = $revision_id,
                       n.revision_ids = CASE WHEN $revision_id IS NULL THEN [] ELSE [$revision_id] END,
-                      n.revision_facts = CASE WHEN $revision_id IS NULL THEN [] ELSE [{{revision_id: $revision_id, description: $description}}] END,
+                      n.revision_facts = {_revision_facts_init("revision_id", "description")},
                       n.created_at   = datetime()
         ON MATCH SET  n.description  = CASE WHEN $description <> '' THEN $description ELSE n.description END,
                       n.document_ids = {_doc_ids_append("n", "document_id")},
@@ -1932,7 +1966,7 @@ class LegalKGService:
         MERGE (a)-[r:{relation_type}]->(b)
         ON CREATE SET r.document_ids = CASE WHEN $doc_id IS NULL THEN [] ELSE [$doc_id] END,
                       r.revision_ids = CASE WHEN $revision_id IS NULL THEN [] ELSE [$revision_id] END,
-                      r.revision_facts = CASE WHEN $revision_id IS NULL THEN [] ELSE [{{revision_id: $revision_id, description: $desc}}] END
+                      r.revision_facts = {_revision_facts_init("revision_id", "desc")}
         ON MATCH SET  r.document_ids = {_doc_ids_append("r", "doc_id")},
                       r.revision_ids = {_list_prop_append("r", "revision_ids", "revision_id", "revision_id")},
                       r.revision_facts = {_revision_facts_append("r", "revision_id", "desc")}

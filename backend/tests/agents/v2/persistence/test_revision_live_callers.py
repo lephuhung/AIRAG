@@ -516,16 +516,10 @@ def _kg_fact_row(r1: uuid.UUID, r2: uuid.UUID, **overrides) -> dict:
         "entity_name": "Cục Thuế",
         "entity_type": "Organization",
         "entity_desc": "R1 fact",  # canonical = last writer (R1)
-        "entity_facts": [
-            {"revision_id": str(r1), "description": "R1 fact"},
-            {"revision_id": str(r2), "description": "R2 fact"},
-        ],
+        "entity_facts": [_fact(r1, "R1 fact"), _fact(r2, "R2 fact")],
         "rel_type": "BAN_HANH",
         "rel_desc": "R1 edge fact",
-        "rel_facts": [
-            {"revision_id": str(r1), "description": "R1 edge fact"},
-            {"revision_id": str(r2), "description": "R2 edge fact"},
-        ],
+        "rel_facts": [_fact(r1, "R1 edge fact"), _fact(r2, "R2 edge fact")],
         "rel_src": "Cục Thuế",
         "rel_tgt": "Nghị định 53/2022",
     }
@@ -563,9 +557,7 @@ async def test_revision_kg_scoped_read_does_not_leak_last_writer_fact():
             _kg_fact_row(
                 r1,
                 r2,
-                entity_facts=[
-                    {"revision_id": str(r1), "description": "R1 fact"}
-                ],
+                entity_facts=[_fact(r1, "R1 fact")],
                 rel_type=None,
                 rel_desc=None,
                 rel_facts=None,
@@ -583,6 +575,18 @@ async def test_revision_kg_scoped_read_does_not_leak_last_writer_fact():
     assert "R1 fact" in out_v1
 
 
+def _fact(revision_id, text) -> str:
+    """Encode one revision fact the way the KG writer stores it.
+
+    Neo4j property values must be primitives or arrays thereof, so a
+    ``revision_facts`` entry is the primitive string
+    ``"<revision_id><sep><description>"``.
+    """
+    from app.services.kg.legal_kg_service import _REVISION_FACT_SEP
+
+    return f"{revision_id}{_REVISION_FACT_SEP}{text}"
+
+
 @pytest.mark.asyncio
 async def test_revision_kg_writes_store_fact_text_per_revision():
     """Each ingest stores its fact text under its own revision entry."""
@@ -591,6 +595,7 @@ async def test_revision_kg_writes_store_fact_text_per_revision():
     service = kg.LegalKGService(uuid.uuid4())
     r1 = uuid.uuid4()
     doc = uuid.uuid4()
+    sep = kg._REVISION_FACT_SEP
 
     driver = _CapturingDriver()
     await service._upsert_node(
@@ -602,11 +607,131 @@ async def test_revision_kg_writes_store_fact_text_per_revision():
         "R1 edge fact", str(doc),
         source_type="Organization", target_type="Document", revision_id=str(r1),
     )
-    assert "revision_facts" in driver.calls[0][0]
-    assert "revision_facts" in driver.calls[1][0]
+    node_cypher = driver.calls[0][0]
+    rel_cypher = driver.calls[1][0]
+    assert "revision_facts" in node_cypher
+    assert "revision_facts" in rel_cypher
     # The append is revision-keyed and never overwrites another revision's entry.
-    assert "f.revision_id <> $revision_id" in driver.calls[0][0]
-    assert "f.revision_id <> $revision_id" in driver.calls[1][0]
+    assert f"head(split(f, '{sep}')) <> $revision_id" in node_cypher
+    assert f"head(split(f, '{sep}')) <> $revision_id" in rel_cypher
+    # Primitive-string encoding on BOTH branches (CREATE and MATCH).
+    assert f"[$revision_id + '{sep}' + $description]" in node_cypher
+    assert f"[$revision_id + '{sep}' + $desc]" in rel_cypher
+
+
+@pytest.mark.asyncio
+async def test_revision_kg_write_cypher_uses_only_primitive_property_values():
+    """Neo4j rejects a map property value — a list of maps made EVERY
+    revision-scoped KG write fail at runtime, and ``kg_worker`` swallows an
+    ingest failure, so the v2 graph was silently empty while the document
+    still reached INDEXED. Every generated write must encode per-revision fact
+    text as a primitive string.
+    """
+    from app.services.kg import legal_kg_service as kg
+
+    service = kg.LegalKGService(uuid.uuid4())
+    doc = uuid.uuid4()
+    sep = kg._REVISION_FACT_SEP
+    driver = _CapturingDriver()
+    await service._upsert_document_root(
+        driver.session(), "Nghị định 53/2022", "Nghị định 53/2022",
+        str(doc), "root fact", revision_id=str(uuid.uuid4()),
+    )
+    await service._upsert_node(
+        driver.session(), "Cục Thuế", "Organization", "fact", str(doc),
+        revision_id=str(uuid.uuid4()),
+    )
+    await service._upsert_relation(
+        driver.session(), "Cục Thuế", "BAN_HANH", "Nghị định 53/2022",
+        "edge fact", str(doc),
+        source_type="Organization", target_type="Document",
+        revision_id=str(uuid.uuid4()),
+    )
+
+    for cypher, _params in driver.calls:
+        assert "revision_facts" in cypher
+        # A map literal is not a legal Neo4j property value.
+        assert "{revision_id:" not in cypher
+        assert "revision_id:" not in cypher
+        # The primitive string encoding is used on both branches.
+        assert f"[$revision_id + '{sep}' +" in cypher
+        assert f"head(split(f, '{sep}')) <> $revision_id" in cypher
+
+
+@pytest.mark.asyncio
+async def test_revision_kg_fact_round_trip_against_live_neo4j():
+    """Live Neo4j: the primitive encoder is written and read back per revision.
+
+    This is the test that catches the class of error the ``revision_facts``
+    list-of-maps property had: Neo4j rejects it at *statement execution*, so
+    only a real write can prove the encoding is accepted. Runs on an isolated
+    random workspace label (no interference with real graphs) and skips when
+    Neo4j is unreachable (e.g. the benchmark venv).
+    """
+    from app.services.kg import legal_kg_service as kg
+
+    ws = uuid.uuid4()
+    r1, r2 = uuid.uuid4(), uuid.uuid4()
+    doc = uuid.uuid4()
+    service = kg.LegalKGService(ws)
+    driver = None
+    try:
+        try:
+            probe = await service._get_driver()
+            await probe.verify_connectivity()
+        except Exception as exc:  # pragma: no cover - env dependent
+            # Nothing to clean up: the probe never connected (and the driver
+            # is lazy, so no session was opened).
+            await service.cleanup()
+            pytest.skip(f"Neo4j unreachable: {exc}")
+        driver = probe
+
+        async def _write(revision_id, fact, edge_fact):
+            # Same ContextVar wiring ingest() uses.
+            token = kg._kg_revision_ctx.set(str(revision_id))
+            try:
+                async with driver.session() as session:
+                    await service._upsert_document_root(
+                        session, "Nghị định 9999/2099", "Nghị định 9999/2099",
+                        str(doc), "root fact",
+                    )
+                    await service._upsert_node(
+                        session, "Cục Thuế Live Probe", "Organization", fact,
+                        str(doc),
+                    )
+                    await service._upsert_relation(
+                        session, "Cục Thuế Live Probe", "BAN_HANH",
+                        "Nghị định 9999/2099", edge_fact, str(doc),
+                        source_type="Organization", target_type="Document",
+                    )
+            finally:
+                kg._kg_revision_ctx.reset(token)
+
+        await _write(r1, "R1 live fact", "R1 live edge")
+        await _write(r2, "R2 live fact", "R2 live edge")
+
+        out_r1 = await service.get_relevant_context(
+            "cục thuế live probe", revision_ids=[r1]
+        )
+        out_r2 = await service.get_relevant_context(
+            "cục thuế live probe", revision_ids=[r2]
+        )
+        assert "R1 live fact" in out_r1
+        assert "R2 live fact" not in out_r1
+        assert "R2 live fact" in out_r2
+        assert "R1 live fact" not in out_r2
+        assert "R1 live edge" in out_r1
+        assert "R2 live edge" not in out_r1
+        assert "R2 live edge" in out_r2
+    finally:
+        if driver is not None:
+            try:
+                async with driver.session() as session:
+                    await session.run(
+                        f"MATCH (n:`{service._label}`) DETACH DELETE n"
+                    )
+            finally:
+                await service.cleanup()
 
 
 # ---------------------------------------------------------------------------
@@ -977,3 +1102,65 @@ async def test_search_document_section_uses_the_current_revision(
     assert created[0].queries == [
         {"$and": [{"document_id": str(doc_id)}, {"revision_id": str(rid)}]}
     ]
+
+
+@pytest.mark.asyncio
+async def test_search_document_section_fails_closed_on_unready_revision(
+    async_db, document_factory, monkeypatch
+):
+    """A current pointer that is not published must not fall back to the
+    legacy document-scoped store (nor raise): the section search returns no
+    sources."""
+    from sqlalchemy import text
+
+    from app.core import database as db_module
+    from app.models.document import Document
+    from app.services.agent import tools
+    from app.services.agents.v2.persistence.document_revisions import (
+        DocumentRevisionsRepository,
+    )
+    from app.services.agents.v2.persistence.source_identity import (
+        RevisionBuildProfile,
+        compute_source_object_identity,
+    )
+
+    doc_id = document_factory()
+    ws = await async_db.scalar(
+        select(Document.workspace_id).where(Document.id == doc_id)
+    )
+    draft = await DocumentRevisionsRepository(async_db).allocate_draft(
+        doc_id,
+        compute_source_object_identity(
+            bucket="b",
+            object_key=f"kb_{ws}/doc_{doc_id}.pdf",
+            version_id=None,
+            etag="draft-etag",
+            size_bytes=1,
+            content_sha256="b" * 64,
+        ),
+        RevisionBuildProfile.FULL,
+    )
+    await async_db.execute(
+        text("UPDATE documents SET current_revision_id = :r WHERE id = :d"),
+        {"r": str(draft.revision_id), "d": str(doc_id)},
+    )
+    await async_db.commit()
+
+    class _SessionCtx:
+        def __init__(self, session):
+            self._session = session
+
+        async def __aenter__(self):
+            return self._session
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        db_module, "async_session_maker", lambda: _SessionCtx(async_db)
+    )
+
+    result = await tools.search_document_section(
+        "Điều 1", [str(ws)], [str(doc_id)]
+    )
+    assert result["sources"] == []
