@@ -98,6 +98,77 @@ async def mark_revision_building(db: AsyncSession, revision_id) -> None:
         await db.flush()
 
 
+async def mark_revision_failed(
+    db: AsyncSession,
+    revision_id,
+    *,
+    stage: str,
+    error_class: str,
+) -> None:
+    """Terminalize a revision after a hard stage failure.
+
+    A failed revision is immutable and never resumed: the stage messages still
+    in flight dead-letter on :func:`load_revision_execution`, and only a bounded
+    automatic retry or an explicit reindex allocates a new generation.
+
+    Best-effort by design: the caller is already unwinding an exception, so a
+    failure here is logged and swallowed (it must not mask the original error).
+    Already-terminal revisions are left untouched.
+    """
+    try:
+        repo = DocumentRevisionsRepository(db)
+        revision = await repo.get(revision_id)
+        if revision is None or revision.status in TERMINAL_REVISION_STATUSES:
+            return
+        await repo.mark_failed(revision_id, stage=stage, error_class=error_class)
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001 - must not mask the stage error
+        logger.warning(
+            "[revision] could not mark revision %s failed (stage=%s): %s",
+            revision_id,
+            stage,
+            exc,
+        )
+        await db.rollback()
+
+
+async def load_revision_caption_targets(
+    db: AsyncSession,
+    *,
+    document_id,
+    revision_id,
+) -> tuple[list[DocumentImage], list[DocumentTable]]:
+    """Load the image/table rows owned by ``(document_id, revision_id)``.
+
+    Captioning a published R1 must never consume R2's rows (or vice versa):
+    the stage operates on exactly the revision its message names. Legacy
+    ``revision_id IS NULL`` rows are intentionally excluded — a revision-aware
+    build owns its own children, and re-captioning a legacy row would mutate
+    another revision's artifact.
+    """
+    images = list(
+        (
+            await db.scalars(
+                select(DocumentImage).where(
+                    DocumentImage.document_id == document_id,
+                    DocumentImage.revision_id == revision_id,
+                )
+            )
+        ).all()
+    )
+    tables = list(
+        (
+            await db.scalars(
+                select(DocumentTable).where(
+                    DocumentTable.document_id == document_id,
+                    DocumentTable.revision_id == revision_id,
+                )
+            )
+        ).all()
+    )
+    return images, tables
+
+
 async def delete_stage_children(
     db: AsyncSession,
     *,
@@ -191,7 +262,9 @@ async def record_embed_artifacts(
     )
 
 
-async def finalize_revision_if_complete(revision_id) -> None:
+async def finalize_revision_if_complete(
+    revision_id, *, expect_complete: bool = False
+) -> None:
     """Opportunistically verify + publish a revision whose artifacts are complete.
 
     Safe to call from every worker stage: it is a no-op when the build is
@@ -199,11 +272,19 @@ async def finalize_revision_if_complete(revision_id) -> None:
     tombstoned. ``verify_draft`` and ``publish`` intentionally run in
     SEPARATE transactions (the Task-3 residual ABBA is avoided), and a
     failed draft is marked only for its own revision.
+
+    ``expect_complete`` is the caller's assertion that every stage the build
+    profile requires has reported done (the v1/UI mirror reached completion).
+    In that case a ``RevisionArtifactsIncomplete`` is NOT "not ready yet": no
+    later stage will arrive, so the revision would otherwise stay ``building``
+    forever. It is logged at error and terminalized via ``mark_failed`` so the
+    failure is visible and the revision is never resumed.
     """
     from app.core.database import async_session_maker
 
     # Transaction 1: verify (draft|building -> verified) when not already
-    # verified. A missing required artifact is "not ready yet", not a failure.
+    # verified. A missing required artifact is "not ready yet", not a failure —
+    # UNLESS the caller has asserted completion.
     async with async_session_maker() as db:
         repo = DocumentRevisionsRepository(db)
         revision = await repo.get(revision_id)
@@ -213,7 +294,23 @@ async def finalize_revision_if_complete(revision_id) -> None:
             try:
                 await repo.verify_draft(revision_id)
                 await db.commit()
-            except RevisionArtifactsIncomplete:
+            except RevisionArtifactsIncomplete as exc:
+                if expect_complete:
+                    logger.error(
+                        "[finalize] revision %s reached document completion but "
+                        "its artifacts are incomplete — marking failed: %s",
+                        revision_id,
+                        exc,
+                    )
+                    try:
+                        await repo.mark_failed(
+                            revision_id,
+                            stage="verify",
+                            error_class=type(exc).__name__,
+                        )
+                        await db.commit()
+                    except Exception:
+                        await db.rollback()
                 return
             except ValueError:
                 # Non-verifiable state (e.g. raced to abandoned) — stop.
@@ -333,6 +430,8 @@ async def check_and_finalize(
 
     # Finalise the revision OUTSIDE the mirror session: verify_draft and
     # publish take their own document/revision locks and must not nest inside
-    # the FOR UPDATE transaction above.
+    # the FOR UPDATE transaction above. Reaching ``completed`` means every
+    # required stage reported done, so an incomplete artifact set is a real
+    # failure (not "not ready yet").
     if completed and revision_id is not None:
-        await finalize_revision_if_complete(revision_id)
+        await finalize_revision_if_complete(revision_id, expect_complete=True)

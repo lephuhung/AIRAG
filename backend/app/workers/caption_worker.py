@@ -33,7 +33,11 @@ from app.services.embedding.embedder import get_embedding_service
 from app.services.models.parsed_document import ExtractedImage, ExtractedTable
 from app.services.storage_service import get_storage_service
 from app.services.embedding.vector_store import get_vector_store
-from app.workers.utils import check_and_finalize, load_revision_execution
+from app.workers.utils import (
+    check_and_finalize,
+    load_revision_caption_targets,
+    load_revision_execution,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,16 +91,12 @@ async def handle_caption(payload: dict) -> None:
         has_tables  = settings.HRAG_ENABLE_TABLE_CAPTIONING
 
         try:
-            # ── Load images and tables from DB ──────────────────────────────
-            img_result = await db.execute(
-                select(DocumentImage).where(DocumentImage.document_id == msg.document_id)
+            # ── Load images and tables from DB ─────────────────────────────
+            # Scoped to THIS revision: captioning a published R1 must never
+            # touch R2's (or a legacy NULL-revision) image/table rows.
+            db_images, db_tables = await load_revision_caption_targets(
+                db, document_id=msg.document_id, revision_id=msg.revision_id
             )
-            db_images: list[DocumentImage] = img_result.scalars().all()
-
-            tbl_result = await db.execute(
-                select(DocumentTable).where(DocumentTable.document_id == msg.document_id)
-            )
-            db_tables: list[DocumentTable] = tbl_result.scalars().all()
 
             if not db_images and not db_tables:
                 logger.info(f"[caption_worker] doc={msg.document_id} no images/tables — done")
@@ -191,7 +191,13 @@ async def handle_caption(payload: dict) -> None:
             # ── Re-embed chunks enriched with captions ──────────────────────
             # Only if there were actual captions generated
             if (has_images and db_images) or (has_tables and db_tables):
-                await _reenrich_embeddings(msg.document_id, msg.workspace_id, db_images, db_tables)
+                await _reenrich_embeddings(
+                    msg.document_id,
+                    msg.revision_id,
+                    msg.workspace_id,
+                    db_images,
+                    db_tables,
+                )
 
             # ── Done ────────────────────────────────────────────────────────
             document.captions_done = True
@@ -312,6 +318,7 @@ _REENRICH_WAIT_SECONDS = 5.0
 
 async def _reenrich_embeddings(
     document_id: uuid.UUID,
+    revision_id: uuid.UUID,
     workspace_id: uuid.UUID,
     db_images: list[DocumentImage],
     db_tables: list[DocumentTable],
@@ -319,6 +326,12 @@ async def _reenrich_embeddings(
     """
     Re-embed chunks that now have image/table caption descriptions.
     Only re-embeds chunks whose image_refs or table_refs have captions.
+
+    ``db_images`` / ``db_tables`` are the caption targets scoped to
+    ``revision_id`` by the caller, so the enrichment inputs never span two
+    revisions' rows. (The raw chunk payload is still the document-level
+    ``raw_chunks_json`` mirror; a revision-qualified chunk store is Task 5's
+    artifact-identity work.)
 
     Reads the document FRESH from the DB (not the snapshot loaded when the
     caption run started): the embed worker runs in parallel and writes the

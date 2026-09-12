@@ -38,36 +38,6 @@ from app.services.agents.v2.persistence.source_identity import (
 )
 
 
-def _is_chat_upload_key(minio_key: str) -> bool:
-    """True when the object's file-name segment carries the ``chat_file_`` prefix.
-
-    Chat files are namespaced as ``kb_{workspace_id}/chat_file_{uuid}.{ext}``
-    while regular uploads are ``kb_{workspace_id}/doc_{document_id}.{ext}``.
-    """
-    return normalize_object_key(minio_key).rsplit("/", 1)[-1].startswith(
-        "chat_file_"
-    )
-
-
-def resolve_ingest_profile(
-    object_key: str, *, parse_only: bool = False
-) -> RevisionBuildProfile:
-    """Canonical build profile for a storage object key.
-
-    Delegates to :func:`resolve_build_profile` and additionally
-    recognizes the namespaced ``kb_{workspace}/chat_file_{document}``
-    shape: storage keys always carry the workspace prefix, so the
-    ``chat_file_`` rule must match the file-name segment, not the start
-    of the full key.
-    """
-    flags = IngestFlags(parse_only=parse_only)
-    profile = resolve_build_profile(object_key, flags)
-    if profile is RevisionBuildProfile.FULL and not parse_only:
-        if _is_chat_upload_key(object_key):
-            return RevisionBuildProfile.CHAT_UPLOAD
-    return profile
-
-
 def _profile_value(build_profile: RevisionBuildProfile | str) -> str:
     return (
         build_profile.value
@@ -145,7 +115,7 @@ async def allocate_ingest_revision(
     identity = compute_source_object_identity(
         bucket, object_key, version_id, etag, size_bytes, content_sha256
     )
-    profile = resolve_ingest_profile(object_key, parse_only=parse_only)
+    profile = resolve_build_profile(object_key, IngestFlags(parse_only=parse_only))
     repo = DocumentRevisionsRepository(db)
     revision, created = await repo.get_or_create_ingestion_attempt(
         document_id, identity, profile
@@ -171,7 +141,7 @@ async def _allocate_explicit_revision(
     identity = compute_source_object_identity(
         bucket, object_key, version_id, etag, size_bytes, content_sha256
     )
-    profile = resolve_ingest_profile(object_key, parse_only=parse_only)
+    profile = resolve_build_profile(object_key, IngestFlags(parse_only=parse_only))
     repo = DocumentRevisionsRepository(db)
     revision = await repo.allocate_draft(
         document_id,
@@ -280,6 +250,72 @@ async def publish_parse_task(
             is_chat_upload=is_chat_upload,
         ).model_dump(mode="json"),
     )
+
+
+async def allocate_commit_and_publish_parse(
+    db: AsyncSession,
+    document_id: uuid.UUID,
+    *,
+    workspace_id: uuid.UUID,
+    object_key: str,
+    original_filename: str,
+    size_bytes: int,
+    content_sha256: str,
+    bucket: str | None = None,
+    version_id: str | None = None,
+    etag: str | None = None,
+    parse_only: bool = False,
+) -> tuple[DocumentRevision, RevisionBuildProfile, bool]:
+    """Allocate → COMMIT → publish the parse task for one ingest event.
+
+    The allocation is idempotent (``get_or_create_ingestion_attempt``), so a
+    duplicate ``/confirm`` / direct upload racing a webhook-derived caller
+    converges on the same draft. The commit is NOT optional: ``AsyncSession``
+    is not autocommit and the request unit-of-work rolls back on return, so a
+    merely-flushed revision would vanish and the worker would dead-letter the
+    published message as ``unknown_revision``. Committing first also makes the
+    draft durable before another connection (the worker) can observe it.
+
+    On publish failure the committed draft is marked ``failed`` (terminal) and
+    the exception is re-raised, so the caller can mirror the failure onto the
+    ``Document`` row. Returns ``(revision, build_profile, created)``.
+    """
+    revision, profile, created = await allocate_ingest_revision(
+        db,
+        document_id,
+        object_key=object_key,
+        size_bytes=size_bytes,
+        content_sha256=content_sha256,
+        bucket=bucket,
+        version_id=version_id,
+        etag=etag,
+        parse_only=parse_only,
+    )
+    await db.commit()
+    try:
+        await publish_parse_task(
+            document_id=document_id,
+            workspace_id=workspace_id,
+            minio_key=object_key,
+            original_filename=original_filename,
+            revision_id=revision.revision_id,
+            build_profile=profile,
+        )
+    except Exception as exc:
+        # The draft is already committed: terminalize ONLY this revision so it
+        # is never resumed, then let the caller mirror Document FAILED.
+        try:
+            repo = DocumentRevisionsRepository(db)
+            await repo.mark_failed(
+                revision.revision_id,
+                stage="publish",
+                error_class=type(exc).__name__,
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+        raise
+    return revision, profile, created
 
 
 async def publish_memory_save_task(

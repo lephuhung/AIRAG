@@ -36,6 +36,7 @@ from app.services.parsing.heading_path import extract_article_nos
 from app.services.embedding.vector_store import get_vector_store
 from app.workers.utils import (
     load_revision_execution,
+    mark_revision_failed,
     record_embed_artifacts,
 )
 
@@ -309,6 +310,11 @@ async def handle_embed(payload: dict) -> None:
             document.status = DocumentStatus.FAILED
             document.error_message = str(e)[:500]
             await db.commit()
+            # Terminalize the revision too: a failed revision is immutable and
+            # never resumed, so parallel caption/kg messages dead-letter.
+            await mark_revision_failed(
+                db, msg.revision_id, stage="embed", error_class=type(e).__name__
+            )
             raise
         finally:
             # Return cached GPU memory to PyTorch's allocator so the next

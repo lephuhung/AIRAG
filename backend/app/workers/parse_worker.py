@@ -38,6 +38,7 @@ from app.workers.utils import (
     finalize_revision_if_complete,
     load_revision_execution,
     mark_revision_building,
+    mark_revision_failed,
     record_parse_artifacts,
 )
 
@@ -328,10 +329,13 @@ async def handle_parse(payload: dict) -> None:
             # ── Dispatch sub-tasks OR publish (parse-only / chat-upload mode) ─────
             if profile is RevisionBuildProfile.PARSE_ONLY:
                 # Parse-only: no embed/caption/KG child stages. Verify + publish
-                # the revision from its recorded manifest (finalize is a no-op
-                # while artifacts are incomplete).
+                # the revision from its recorded manifest. This call IS the
+                # final one for the profile, so incomplete artifacts are a real
+                # failure (verified with expect_complete).
                 await db.commit()
-                await finalize_revision_if_complete(msg.revision_id)
+                await finalize_revision_if_complete(
+                    msg.revision_id, expect_complete=True
+                )
                 document.status = DocumentStatus.INDEXED
                 await db.commit()
                 logger.info(
@@ -407,6 +411,12 @@ async def handle_parse(payload: dict) -> None:
             document.status = DocumentStatus.FAILED
             document.error_message = str(e)[:500]
             await db.commit()
+            # Terminalize the revision too: it is immutable and never resumed,
+            # so the child stage messages still in flight dead-letter instead of
+            # rebuilding a failed revision.
+            await mark_revision_failed(
+                db, msg.revision_id, stage="parse", error_class=type(e).__name__
+            )
             raise
         finally:
             # Always clean up temp file

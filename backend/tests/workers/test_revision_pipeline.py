@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models.document import Document, DocumentImage, DocumentTable
 from app.models.document_ingestion_attempt import DocumentIngestionAttempt
@@ -30,10 +31,10 @@ from app.models.source_arrival import SourceArrival
 from app.queue.messages import CaptionMessage, EmbedMessage, KGMessage, ParseMessage
 from app.queue.publisher import (
     allocate_clone_revision,
+    allocate_commit_and_publish_parse,
     allocate_ingest_revision,
     allocate_reindex_revision,
     record_source_arrival,
-    resolve_ingest_profile,
 )
 from app.services.agents.v2.persistence.document_revisions import (
     DocumentRevisionsRepository,
@@ -47,7 +48,10 @@ from app.services.agents.v2.persistence.source_identity import (
 )
 from app.workers.utils import (
     delete_stage_children,
+    finalize_revision_if_complete,
+    load_revision_caption_targets,
     load_revision_execution,
+    mark_revision_failed,
     profile_skip_flags,
     record_embed_artifacts,
     record_parse_artifacts,
@@ -297,14 +301,14 @@ async def test_chat_upload_webhook_profile_is_preserved(async_db, document_facto
     """A ``chat_file_<document_id>`` object yields ``CHAT_UPLOAD``, never ``FULL``.
 
     Real storage keys are namespaced ``kb_<workspace>/chat_file_<document>``;
-    the producer must derive ``CHAT_UPLOAD`` from the file-name segment even
-    though the raw ``resolve_build_profile`` rule keys off the key start.
+    the canonical resolver matches the ``chat_file_`` prefix on the file-name
+    segment of the key.
     """
     doc_id = document_factory()
     ws = await _workspace_id(async_db, doc_id)
     key = _chat_key(ws, doc_id)
 
-    assert resolve_ingest_profile(key) is CHAT
+    assert resolve_build_profile(key, IngestFlags()) is CHAT
 
     revision, profile, _created = await allocate_ingest_revision(
         async_db,
@@ -340,7 +344,7 @@ async def test_parse_only_entrypoint_yields_parse_only_profile(async_db, documen
     )
     assert profile is PARSE_ONLY
     # parse_only wins even over the chat prefix.
-    assert resolve_ingest_profile(key, parse_only=True) is PARSE_ONLY
+    assert resolve_build_profile(key, IngestFlags(parse_only=True)) is PARSE_ONLY
 
 
 # ---------------------------------------------------------------------------
@@ -679,7 +683,307 @@ async def test_same_content_same_version_converges_but_overwrite_does_not(
         BUCKET, key, "v-1", None, 11, "5" * 64
     )
     assert identity_a != identity_b
-    # The raw ``resolve_build_profile`` keys off the file-name segment only,
-    # so namespaced storage keys need the Task-4 producer helper.
+    # The canonical resolver keys off the file-name segment, so a namespaced
+    # ``doc_`` key is FULL regardless of the workspace prefix.
     assert resolve_build_profile(key, IngestFlags()) is FULL
-    assert resolve_ingest_profile(key) is FULL
+
+
+# ---------------------------------------------------------------------------
+# Producer ordering — allocation is COMMITTED before the parse publish
+# ---------------------------------------------------------------------------
+
+
+def _session_maker(engine):
+    """A real (non-SAVEPOINT) sessionmaker for cross-connection assertions."""
+    return async_sessionmaker(
+        engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        autocommit=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_allocation_committed_before_parse_publish(
+    async_engine, document_factory, monkeypatch
+):
+    """The ingest revision is committed BEFORE ``publish_parse_task`` runs.
+
+    The worker loads the revision from its own connection. A merely-flushed
+    allocation rolls back when the request unit-of-work returns, so the
+    published message dead-letters as ``unknown_revision``. A *separate*
+    session must therefore see the revision at the moment the publish happens.
+    """
+    maker = _session_maker(async_engine)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+    key = _doc_key(ws, doc_id)
+    observed: dict = {}
+
+    async def spy_publish_parse_task(
+        *, document_id, workspace_id, minio_key, original_filename,
+        revision_id, build_profile,
+    ):
+        # A fresh connection — proves the allocation was COMMITTED, not just
+        # flushed on the caller's open transaction.
+        async with maker() as observer:
+            observed["revision"] = await observer.get(DocumentRevision, revision_id)
+        observed["profile"] = build_profile
+
+    monkeypatch.setattr(
+        "app.queue.publisher.publish_parse_task", spy_publish_parse_task
+    )
+
+    async with maker() as db:
+        revision, profile, created = await allocate_commit_and_publish_parse(
+            db,
+            doc_id,
+            workspace_id=ws,
+            object_key=key,
+            original_filename="doc.pdf",
+            size_bytes=11,
+            content_sha256="a" * 64,
+            version_id="v-1",
+        )
+        assert created is True
+
+    assert observed.get("revision") is not None, (
+        "revision must be committed before publish_parse_task is invoked"
+    )
+    assert observed["revision"].status == "draft"
+    assert observed["profile"] is profile
+
+
+@pytest.mark.asyncio
+async def test_publish_failure_terminalizes_committed_draft(
+    async_engine, document_factory, monkeypatch
+):
+    """A publish failure marks the already-committed draft ``failed``.
+
+    The draft must not be left resumable, and the failure must be visible
+    from a separate connection (it was committed before the exception was
+    surfaced to the caller).
+    """
+    maker = _session_maker(async_engine)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+    key = _doc_key(ws, doc_id)
+    captured: dict = {}
+
+    async def boom_publish_parse_task(
+        *, document_id, workspace_id, minio_key, original_filename,
+        revision_id, build_profile,
+    ):
+        captured["revision_id"] = revision_id
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr(
+        "app.queue.publisher.publish_parse_task", boom_publish_parse_task
+    )
+
+    async with maker() as db:
+        with pytest.raises(RuntimeError):
+            await allocate_commit_and_publish_parse(
+                db,
+                doc_id,
+                workspace_id=ws,
+                object_key=key,
+                original_filename="doc.pdf",
+                size_bytes=11,
+                content_sha256="a" * 64,
+                version_id="v-1",
+            )
+
+    async with maker() as db:
+        row = await db.get(DocumentRevision, captured["revision_id"])
+    assert row.status == "failed"
+    assert row.failure_stage == "publish"
+    assert row.failure_class == "RuntimeError"
+
+
+# ---------------------------------------------------------------------------
+# Caption worker — reads are scoped to the message's revision
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_caption_targets_scoped_to_revision(async_db, document_factory):
+    """Captioning R2 loads only R2's image/table rows, never R1's or legacy rows."""
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+
+    r1, _ = await _allocate_full(async_db, doc_id, key=key, sha="9" * 64)
+    r2, _profile = await allocate_reindex_revision(
+        async_db,
+        doc_id,
+        object_key=key,
+        size_bytes=11,
+        content_sha256="9" * 64,
+        version_id="v-1",
+        reindex_of_revision_id=r1.revision_id,
+    )
+    for revision_id in (r1.revision_id, r2.revision_id, None):
+        async_db.add(
+            DocumentImage(
+                document_id=doc_id,
+                revision_id=revision_id,
+                image_id=f"img-{revision_id}",
+                page_no=1,
+            )
+        )
+        async_db.add(
+            DocumentTable(
+                document_id=doc_id,
+                revision_id=revision_id,
+                table_id=f"tbl-{revision_id}",
+                page_no=1,
+                content_markdown="| a |",
+            )
+        )
+    await async_db.flush()
+
+    images, tables = await load_revision_caption_targets(
+        async_db, document_id=doc_id, revision_id=r2.revision_id
+    )
+    assert {img.revision_id for img in images} == {r2.revision_id}
+    assert {tbl.revision_id for tbl in tables} == {r2.revision_id}
+
+
+# ---------------------------------------------------------------------------
+# Terminal failure — failed revisions are immutable dead-letters
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mark_revision_failed_terminalizes_and_dead_letters(
+    async_db, document_factory
+):
+    """A worker terminal failure marks only that revision and dead-letters it."""
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+    revision, _ = await _allocate_full(async_db, doc_id, key=key, sha="a" * 64)
+
+    await mark_revision_failed(
+        async_db, revision.revision_id, stage="embed", error_class="Boom"
+    )
+
+    fresh = await async_db.get(DocumentRevision, revision.revision_id)
+    assert fresh.status == "failed"
+    assert fresh.failure_stage == "embed"
+    assert fresh.failure_class == "Boom"
+
+    decision = await load_revision_execution(
+        async_db, revision_id=revision.revision_id, document_id=doc_id
+    )
+    assert decision.run is False
+    assert decision.reason == "terminal:failed"
+
+    # Idempotent: re-terminalizing a terminal revision is a silent no-op.
+    await mark_revision_failed(
+        async_db, revision.revision_id, stage="embed", error_class="Boom"
+    )
+    assert (await async_db.get(DocumentRevision, revision.revision_id)).status == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Finalization — mirror complete + incomplete artifacts is a real failure
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_finalize_with_expect_complete_fails_incomplete_revision(
+    async_engine, document_factory, monkeypatch
+):
+    """Mirror-complete + ``RevisionArtifactsIncomplete`` terminalizes the draft.
+
+    Without this, a message whose stage can never record its artifact (e.g. an
+    embed message with empty ``raw_chunks_json`` for a FULL/CHAT_UPLOAD build)
+    leaves the revision ``building`` forever.
+    """
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        revision, profile, _created = await allocate_ingest_revision(
+            db,
+            doc_id,
+            object_key=_doc_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256="d" * 64,
+            version_id="v-1",
+        )
+        await db.commit()
+        revision_id = revision.revision_id
+    assert profile is FULL
+
+    await finalize_revision_if_complete(revision_id, expect_complete=True)
+
+    async with maker() as db:
+        row = await db.get(DocumentRevision, revision_id)
+    assert row.status == "failed"
+    assert row.failure_stage == "verify"
+    assert row.failure_class == "RevisionArtifactsIncomplete"
+
+
+@pytest.mark.asyncio
+async def test_finalize_without_expect_complete_leaves_incomplete_draft(
+    async_engine, document_factory, monkeypatch
+):
+    """The opportunistic path still treats incomplete artifacts as "not ready"."""
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        revision, _profile, _created = await allocate_ingest_revision(
+            db,
+            doc_id,
+            object_key=_doc_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256="e" * 64,
+            version_id="v-1",
+        )
+        await db.commit()
+        revision_id = revision.revision_id
+
+    await finalize_revision_if_complete(revision_id)
+
+    async with maker() as db:
+        row = await db.get(DocumentRevision, revision_id)
+    assert row.status == "draft"
+
+
+@pytest.mark.asyncio
+async def test_finalize_with_expect_complete_publishes_complete_revision(
+    async_engine, document_factory, monkeypatch
+):
+    """A complete revision still verifies + publishes when expect_complete is set."""
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        revision, profile, _created = await allocate_ingest_revision(
+            db,
+            doc_id,
+            object_key=_doc_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256="f" * 64,
+            version_id="v-1",
+        )
+        await _record_complete_artifacts(db, revision, profile)
+        await db.commit()
+        revision_id = revision.revision_id
+
+    await finalize_revision_if_complete(revision_id, expect_complete=True)
+
+    async with maker() as db:
+        row = await db.get(DocumentRevision, revision_id)
+        document = await db.get(Document, doc_id)
+    assert row.status == "published"
+    assert document.current_revision_id == revision_id

@@ -301,9 +301,13 @@ def resolve_build_profile(
 
     1. ``flags.parse_only`` ALWAYS wins — even over the ``chat_file_``
        prefix. ``parse_only`` is an explicit operator/reindex action.
-    2. ``chat_file_*`` keys → ``CHAT_UPLOAD`` (skip caption/KG after
-       parse; vectors are still REQUIRED — ``embed_skipped`` stays false,
-       while ``captions_skipped`` and ``kg_skipped`` must be true).
+    2. The FILE-NAME segment (last ``/``-delimited segment) starts with
+       ``chat_file_`` → ``CHAT_UPLOAD`` (skip caption/KG after parse;
+       vectors are still REQUIRED — ``embed_skipped`` stays false, while
+       ``captions_skipped`` and ``kg_skipped`` must be true). Real storage
+       keys are namespaced ``kb_{workspace_id}/chat_file_{document_id}{ext}``
+       (see ``StorageService._make_upload_key``), so the prefix must be
+       matched on the file-name segment rather than the whole key.
     3. Anything else → ``FULL``.
 
     :raises InvalidSourceObjectKey: if the key fails normalization.
@@ -311,6 +315,6 @@ def resolve_build_profile(
     if flags.parse_only:
         return RevisionBuildProfile.PARSE_ONLY
     key = normalize_object_key(object_key)
-    if key.startswith("chat_file_"):
+    if key.rsplit("/", 1)[-1].startswith("chat_file_"):
         return RevisionBuildProfile.CHAT_UPLOAD
     return RevisionBuildProfile.FULL

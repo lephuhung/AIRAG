@@ -588,12 +588,19 @@ async def _consume_on_channel(
                         retry_count = int(headers.get("x-retry-count", 0))
                         document_id = "unknown"
                         minio_key = "unknown"
+                        revision_id = None
 
                         start_time = time.monotonic()
                         try:
                             payload = json.loads(message.body)
                             document_id = str(payload.get("document_id", "unknown"))
                             minio_key = payload.get("minio_key", "unknown")
+                            raw_revision_id = payload.get("revision_id")
+                            if raw_revision_id:
+                                try:
+                                    revision_id = uuid.UUID(str(raw_revision_id))
+                                except (TypeError, ValueError):
+                                    revision_id = None
 
                             async with asyncio.timeout(handler_timeout):
                                 await handler(payload)
@@ -690,7 +697,11 @@ async def _consume_on_channel(
                                                 f"kg_done={'reset for retry' if will_retry else 'True (KG skipped)'}"
                                             )
                                             if not will_retry:
-                                                await check_and_finalize(doc, rollback_db)
+                                                await check_and_finalize(
+                                                    doc,
+                                                    rollback_db,
+                                                    revision_id=revision_id,
+                                                )
                                 except Exception as rollback_err:
                                     logger.warning(
                                         f"[timeout_rollback] KG failed for doc={document_id}: {rollback_err}"

@@ -377,6 +377,10 @@ async def process_batch(
                     etag=content_hash or minio_key,
                     reindex_of_revision_id=previous_revision_id,
                 )
+                # Commit the new generation BEFORE publishing: the worker reads
+                # it from its own connection, so a flushed-only revision would
+                # be rolled back and the message dead-lettered.
+                await db.commit()
                 await publish_parse_task(
                     document_id=doc_id,
                     workspace_id=workspace_id,
@@ -385,7 +389,6 @@ async def process_batch(
                     revision_id=revision.revision_id,
                     build_profile=profile,
                 )
-                await db.commit()
             except Exception as e:
                 logger.error(f"[process_batch] Failed to queue doc {doc_id}: {e}")
                 await db.rollback()

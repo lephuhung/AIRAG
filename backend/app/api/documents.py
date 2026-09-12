@@ -417,29 +417,19 @@ async def upload_document(
 
     # Publish parse task. The MinIO webhook is metadata-only (``source_arrivals``
     # staging) and never creates a revision, so the API is the only trigger here.
-    from app.queue.publisher import (
-        allocate_ingest_revision,
-        publish_parse_task,
-    )
+    from app.queue.publisher import allocate_commit_and_publish_parse
 
-    revision = None
     try:
-        revision, profile, _created = await allocate_ingest_revision(
+        revision, profile, _created = await allocate_commit_and_publish_parse(
             db,
             document.id,
+            workspace_id=workspace_id,
             object_key=upload_key,
+            original_filename=file.filename,
             size_bytes=len(content),
             content_sha256=content_hash,
             etag=_content_etag(content),
             parse_only=_parse_only_mode(),
-        )
-        await publish_parse_task(
-            document_id=document.id,
-            workspace_id=workspace_id,
-            minio_key=upload_key,
-            original_filename=file.filename,
-            revision_id=revision.revision_id,
-            build_profile=profile,
         )
         logger.info(
             f"Document {document.id} queued for processing "
@@ -450,23 +440,8 @@ async def upload_document(
             f"Failed to queue parse task for doc {document.id}: {e}. "
             f"Rolling back document to FAILED."
         )
+        # The helper already terminalized the committed draft; mirror FAILED.
         await db.rollback()
-        if revision is not None:
-            # Failure marks only THIS draft failed; no other revision changes.
-            try:
-                from app.services.agents.v2.persistence.document_revisions import (
-                    DocumentRevisionsRepository,
-                )
-
-                repo = DocumentRevisionsRepository(db)
-                await repo.mark_failed(
-                    revision.revision_id,
-                    stage="publish",
-                    error_class=type(e).__name__,
-                )
-                await db.commit()
-            except Exception:
-                await db.rollback()
         document.status = DocumentStatus.FAILED
         document.error_message = f"Publish failed: {e}"
         await db.commit()
@@ -721,20 +696,18 @@ async def confirm_upload(
             await db.commit()
 
     # Allocate the revision (idempotent — a duplicate ``/confirm`` or a racing
-    # webhook-derived caller converges on the same draft) and publish. The
-    # webhook is metadata-only and never creates a revision, so the confirm
-    # callback is the authoritative producer for the presigned flow.
-    from app.queue.publisher import (
-        allocate_ingest_revision,
-        publish_parse_task,
-    )
+    # webhook-derived caller converges on the same draft), commit it, then
+    # publish. The webhook is metadata-only and never creates a revision, so the
+    # confirm callback is the authoritative producer for the presigned flow.
+    from app.queue.publisher import allocate_commit_and_publish_parse
 
-    revision = None
     try:
-        revision, profile, _created = await allocate_ingest_revision(
+        revision, profile, _created = await allocate_commit_and_publish_parse(
             db,
             document.id,
+            workspace_id=workspace_id,
             object_key=minio_key,
+            original_filename=document.original_filename,
             size_bytes=document.file_size or 0,
             content_sha256=content_hash or "",
             etag=(
@@ -743,14 +716,6 @@ async def confirm_upload(
                 else (content_hash or minio_key)
             ),
             parse_only=_parse_only_mode(),
-        )
-        await publish_parse_task(
-            document_id=document.id,
-            workspace_id=workspace_id,
-            minio_key=minio_key,
-            original_filename=document.original_filename,
-            revision_id=revision.revision_id,
-            build_profile=profile,
         )
         logger.info(
             f"Document {document.id} queued for processing (presign confirm, "
@@ -761,23 +726,8 @@ async def confirm_upload(
             f"Failed to publish parse task for doc {document.id}: {e}. "
             f"Rolling back document to FAILED."
         )
+        # The helper already terminalized the committed draft; mirror FAILED.
         await db.rollback()
-        if revision is not None:
-            # Failure marks only THIS draft failed.
-            try:
-                from app.services.agents.v2.persistence.document_revisions import (
-                    DocumentRevisionsRepository,
-                )
-
-                repo = DocumentRevisionsRepository(db)
-                await repo.mark_failed(
-                    revision.revision_id,
-                    stage="publish",
-                    error_class=type(e).__name__,
-                )
-                await db.commit()
-            except Exception:
-                await db.rollback()
         document.status = DocumentStatus.FAILED
         document.error_message = f"Publish failed: {e}"
         await db.commit()

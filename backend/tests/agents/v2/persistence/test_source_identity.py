@@ -547,6 +547,34 @@ class TestBuildProfileResolution:
             == RevisionBuildProfile.CHAT_UPLOAD
         )
 
+    def test_namespaced_chat_key_yields_CHAT_UPLOAD(self):
+        """Real storage keys are ``kb_<ws>/chat_file_<doc><ext>``.
+
+        The ``chat_file_`` prefix must be matched on the FILE-NAME segment,
+        otherwise the canonical resolver returns ``FULL`` for an actual chat
+        upload key.
+        """
+        assert (
+            resolve_build_profile(
+                "kb_3f9a/chat_file_2c1b.pdf", IngestFlags(parse_only=False)
+            )
+            == RevisionBuildProfile.CHAT_UPLOAD
+        )
+        # A namespaced regular upload stays FULL.
+        assert (
+            resolve_build_profile(
+                "kb_3f9a/doc_2c1b.pdf", IngestFlags(parse_only=False)
+            )
+            == RevisionBuildProfile.FULL
+        )
+        # A directory that merely starts with the prefix is not a chat file.
+        assert (
+            resolve_build_profile(
+                "chat_file_dir/report.pdf", IngestFlags(parse_only=False)
+            )
+            == RevisionBuildProfile.FULL
+        )
+
 
 # ---------------------------------------------------------------------------
 # Webhook idempotency — SourceArrival UNIQUE(arrival_identity)
