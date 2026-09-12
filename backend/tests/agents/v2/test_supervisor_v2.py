@@ -9,6 +9,7 @@ layer plus the T1–T5 node functions being composed.
 from __future__ import annotations
 
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -443,6 +444,18 @@ def test_graph_has_no_domain_agent_or_subgraph() -> None:
     assert found == [], f"domain-agent modules present: {found}"
     domain_graphs = list(v2_root.glob("domain/*_graph.py"))
     assert domain_graphs == []
+    # M7: symbol-level guard mirroring the Phase-2 acceptance gate — an
+    # innocuously named wrapper module would pass the filename/name checks.
+    agent_pattern = re.compile(
+        r"class\s+(People|Summary|Comparison|Document|Section|KG|Evaluation|Grounding).*Agent"
+        r"|\b(People|Summary|Comparison|Document|Section|KG)Agent\b"
+    )
+    hits = [
+        str(path)
+        for path in sorted(v2_root.rglob("*.py"))
+        if agent_pattern.search(path.read_text())
+    ]
+    assert hits == [], f"domain-agent symbols present: {hits}"
 
 
 # ---------------------------------------------------------------------------
@@ -949,3 +962,507 @@ def test_terminal_event_mapping() -> None:
     )
     event, _ = terminal_event_for_response(denied)
     assert event == SSE_ERROR
+
+    # M2: clarify is a terminal answer to its turn (the question), so it
+    # streams as a complete event carrying the clarify status.
+    clarify = FinalResponse(
+        contract_version=CONTRACT_VERSION,
+        status="clarify",
+        content="which document?",
+        citations=(),
+    )
+    event, data = terminal_event_for_response(clarify)
+    assert event == SSE_COMPLETE
+    assert data["status"] == "clarify"
+
+
+def test_events_payload_is_additive_over_v1() -> None:
+    # M1: wire-identical, payload-additive. Every v1 complete key survives;
+    # status/citations are documented extras T8 must tolerate, not identity.
+    from app.services.agents.v2.contracts.response import FinalResponse
+
+    payload = final_response_payload(
+        FinalResponse(
+            contract_version=CONTRACT_VERSION,
+            status="success",
+            content="answer",
+            citations=(),
+        )
+    )
+    for key in (
+        "answer",
+        "sources",
+        "images",
+        "potential_abbreviations",
+        "people_data",
+    ):
+        assert key in payload, f"v1 complete key missing: {key}"
+    assert payload["answer"] == "answer"
+
+
+def test_probe_excludes_unwired_gates() -> None:
+    # M6: the probe opens only gates whose adapter default is complete
+    # without per-request scope. Scoped/unwired backings stay closed until
+    # T7 enables them explicitly via available_services.
+    from app.services.agents.supervisor_v2 import probe_v1_services
+
+    probed = probe_v1_services()
+    assert "v1-abbreviation" not in probed
+    assert "v1-document-content" not in probed
+    assert "v1-section-content" not in probed
+    assert "v1-knowledge-graph" not in probed
+    assert "v1-memory" not in probed
+
+
+@pytest.mark.asyncio
+async def test_dedicated_retention_leases_owns_its_session() -> None:
+    # I3/M4(a): the lease repo must own a dedicated unit of work — the
+    # helper opens a session used for nothing else and closes it on exit.
+    from app.services.agents.supervisor_v2 import dedicated_retention_leases
+
+    closed: list[str] = []
+
+    class FakeLeaseSession:
+        async def close(self) -> None:
+            closed.append("close")
+
+    made: list[str] = []
+
+    def factory() -> FakeLeaseSession:
+        made.append("open")
+        return FakeLeaseSession()
+
+    async with dedicated_retention_leases(factory) as repo:  # type: ignore[arg-type]
+        assert made == ["open"]
+        assert repo.session is not None
+        assert closed == []
+    assert closed == ["close"]
+
+
+def test_undispatched_tasks_recipe() -> None:
+    # I1: the T8 terminal-boundary recipe for detecting a truncated
+    # dispatch whose DispatchReport.truncated flag was never checkpointed.
+    from app.services.agents.supervisor_v2 import undispatched_tasks
+    from app.services.agents.v2.nodes.context import finalize_semantic
+    from app.services.agents.v2.nodes.fast_plan import build_fast_plan
+    from app.services.agents.v2.nodes.routing import analyze_query, decide_route
+
+    empty = DocumentBindingSet(bindings=(), revision_requirement_refs=())
+    semantic = finalize_semantic(people_draft(), empty)
+    analysis = analyze_query(semantic)
+    decision = decide_route(
+        analysis, semantic, empty, allowed_capabilities=FULL_CAPABILITIES
+    )
+    plan = build_fast_plan(semantic, empty, analysis, decision)
+    (task_id,) = [task.task_id for task in plan.tasks]
+    assert undispatched_tasks(plan, ()) == (task_id,)
+    assert undispatched_tasks(plan, (people_success(task_id),)) == ()
+
+
+def test_direct_node_clears_stale_plan() -> None:
+    # M3: the commented behavior, now exercised — a stale factual plan
+    # from a prior turn never rides alongside a direct success.
+    import asyncio
+
+    from app.services.agents import supervisor_v2 as sv2
+    from app.services.agents.v2.contracts.routing import RouteDecision
+    from app.services.agents.v2.nodes.context import finalize_semantic
+    from app.services.agents.v2.nodes.fast_plan import build_fast_plan
+    from app.services.agents.v2.nodes.routing import analyze_query, decide_route
+
+    empty = DocumentBindingSet(bindings=(), revision_requirement_refs=())
+    semantic = finalize_semantic(people_draft(), empty)
+    analysis = analyze_query(semantic)
+    decision = decide_route(
+        analysis, semantic, empty, allowed_capabilities=FULL_CAPABILITIES
+    )
+    stale_plan = build_fast_plan(semantic, empty, analysis, decision)
+    greeting = SemanticContext(
+        contextualized_query="xin chào",
+        normalized_query="xin chào",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(),
+        person_refs=(),
+        section_refs=(),
+        blocking_ambiguities=(),
+    )
+    state = SupervisorV2State(
+        **{
+            **make_state(semantic=greeting),
+            "route_decision": RouteDecision(
+                route="direct", reason_code="direct_greeting"
+            ),
+            "execution": ExecutionState(
+                plan=stale_plan, task_results=(), evidence_evaluation=None
+            ),
+        }
+    )
+    update = asyncio.run(
+        sv2.SUPERVISOR_V2_NODES["direct"](
+            state, Runtime(context=make_runtime_context())
+        )
+    )
+    assert update["execution"].plan is None
+    validate_supervisor_state({**normalize_checkpoint_state(dict(state)), **update})
+
+
+def test_stale_clarification_retires_before_direct() -> None:
+    # C1 Proofs 2/3: a clarification orphaned by a turn change retires at
+    # the owned boundary instead of crashing it. The suspended request
+    # named r1; the new turn's projection has no r1 — direct proceeds with
+    # clarification=None and a valid aggregate.
+    import asyncio
+
+    from app.services.agents import supervisor_v2 as sv2
+    from app.services.agents.v2.contracts.routing import RouteDecision
+    from app.services.agents.v2.nodes.clarification import build_clarification
+
+    old_semantic = SemanticContext(
+        contextualized_query="mở nghị định 12/2020",
+        normalized_query="mở nghị định 12/2020",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(unresolved_ref(),),
+        person_refs=(),
+        section_refs=(),
+        blocking_ambiguities=(),
+    )
+    stale_request = build_clarification(old_semantic)
+    greeting = SemanticContext(
+        contextualized_query="cảm ơn",
+        normalized_query="cảm ơn",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(),
+        person_refs=(),
+        section_refs=(),
+        blocking_ambiguities=(),
+    )
+    state = SupervisorV2State(
+        **{
+            **make_state(semantic=greeting),
+            "route_decision": RouteDecision(
+                route="direct", reason_code="direct_conversation"
+            ),
+            "clarification": stale_request,
+        }
+    )
+    update = asyncio.run(
+        sv2.SUPERVISOR_V2_NODES["direct"](
+            state, Runtime(context=make_runtime_context())
+        )
+    )
+    assert update["clarification"] is None
+    assert update["execution"].plan is None
+    validate_supervisor_state({**normalize_checkpoint_state(dict(state)), **update})
+
+
+# ---------------------------------------------------------------------------
+# C1: clarify selection-resume advances (T5 contract, graph level)
+# ---------------------------------------------------------------------------
+
+
+def _ambiguous_preprocessing(doc_a: UUID, doc_b: UUID):
+    from app.services.agents.semantic_preprocessor import (
+        DocumentCandidate as LegacyCandidate,
+        DocumentRefEntry,
+        PreprocessingResult,
+    )
+
+    return PreprocessingResult(
+        original_query="Mở Nghị định 12",
+        normalized_query="mở nghị định 12",
+        abbreviations=[],
+        document_refs=[
+            DocumentRefEntry(
+                ref_id="r1",
+                original_span="Nghị định 12",
+                span_offset=(3, 15),
+                reference="nghị định 12",
+                candidates=[
+                    LegacyCandidate(
+                        document_id=doc_a,
+                        match_basis="exact_number",
+                        confidence=0.9,
+                    ),
+                    LegacyCandidate(
+                        document_id=doc_b,
+                        match_basis="exact_number",
+                        confidence=0.8,
+                    ),
+                ],
+                resolution_status="ambiguous",
+            )
+        ],
+        blocking_ambiguities=[],
+        preprocessing_status="ok",
+        preprocessor_trace=[],
+    )
+
+
+class _EchoBindingResolver:
+    """Pins whatever resolved refs it is given (selection-aware stand-in)."""
+
+    def __init__(self, revision: UUID) -> None:
+        self._revision = revision
+        self.calls: list[tuple[Any, CapabilityRuntimeContext]] = []
+
+    async def resolve(
+        self, document_refs: Any, capability_runtime: CapabilityRuntimeContext
+    ) -> DocumentBindingSet:
+        self.calls.append((tuple(document_refs), capability_runtime))
+        pins = tuple(
+            ScopedDocument(
+                binding_id=f"b_{ref.ref_id}",
+                document_id=ref.resolved_document_id,
+                document_revision=str(self._revision),
+                role="target",
+            )
+            for ref in document_refs
+            if ref.resolution_status == "resolved"
+            and ref.resolved_document_id is not None
+        )
+        return DocumentBindingSet(bindings=pins, revision_requirement_refs=())
+
+
+class _FakeChatMessages:
+    def __init__(self, contents: dict[UUID, str]) -> None:
+        self.contents = dict(contents)
+
+    async def get_user_message(self, message_id: UUID) -> SimpleNamespace:
+        return SimpleNamespace(id=message_id, content=self.contents[message_id])
+
+
+class _FakeAuthorization:
+    def __init__(self, grants: dict[UUID, set[UUID]] | None = None) -> None:
+        self.grants = grants
+        self.calls: list[tuple[UUID, CapabilityRuntimeContext]] = []
+
+    async def require_document(
+        self, document_id: UUID, capability_runtime: CapabilityRuntimeContext
+    ) -> None:
+        self.calls.append((document_id, capability_runtime))
+        if self.grants is not None:
+            allowed = any(
+                document_id in self.grants.get(workspace, set())
+                for workspace in capability_runtime.workspace_ids
+            )
+            if not allowed:
+                raise PermissionError(f"document {document_id} is not authorized")
+
+
+def _doc_success(task_id: str, target_id: str, use_id: UUID) -> AgentResult:
+    from app.services.agents.v2.contracts.capability import DocumentReadOutput
+    from app.services.agents.v2.contracts.evaluation import CoverageObservation
+    from app.services.agents.v2.contracts.locators import DocumentLocator
+
+    return AgentResult(
+        contract_version="2.0",
+        task_id=task_id,
+        status="success",
+        data=DocumentReadOutput(kind="document.read", read_unit_count=1),
+        evidence_uses=(EvidenceUseRef(use_id=use_id),),
+        coverage_observations=(
+            CoverageObservation(
+                target_id=target_id,
+                observed_locators=(DocumentLocator(kind="document"),),
+                outcome="read",
+            ),
+        ),
+        error=None,
+    )
+
+
+async def _suspend_ambiguous(shared: dict) -> tuple[Any, Any, UUID]:
+    """Turn 1 with the REAL adapter: ambiguous r1 suspends with 2 options."""
+    from app.services.agents.supervisor_v2 import DeterministicSemanticAdapter
+
+    doc_a = uuid4()
+    doc_b = uuid4()
+    revision = uuid4()
+    adapter = DeterministicSemanticAdapter(
+        preprocess=lambda query: _ambiguous_preprocessing(doc_a, doc_b)
+    )
+    runtime = make_runtime_context(
+        semantic_adapter=adapter,
+        binding_resolver=_EchoBindingResolver(revision),
+        evidence_hydrator=FakeHydrator(),
+        retention_leases=FakeLeaseRepo(shared.setdefault("events", [])),
+        answer_draft_channel=AnswerDraftChannel(),
+    )
+    graph, config = compile_graph(runtime, thread_id=shared.setdefault("tid", "resume-1"))
+    result = await graph.ainvoke(
+        make_state(request=make_request("Mở Nghị định 12")), config, context=runtime
+    )
+    assert len(result.get("__interrupt__", ())) == 1
+    stored = graph.get_state(config)
+    suspended = normalize_checkpoint_state(dict(stored.values))
+    assert suspended["clarification"] is not None
+    assert len(suspended["clarification"].candidates) == 2
+    validate_supervisor_state(suspended)
+    shared.update(
+        graph=graph, config=config, runtime=runtime,
+        suspended=suspended, revision=revision,
+    )
+    return graph, runtime, suspended["clarification"].candidates[0].document_id
+
+
+@pytest.mark.asyncio
+async def test_clarify_selection_resume_advances_to_binding() -> None:
+    from langgraph.types import Command
+
+    from app.services.agents.v2.nodes.clarification import resume_clarification
+
+    shared: dict = {}
+    graph, runtime, _ = await _suspend_ambiguous(shared)
+    suspended = shared["suspended"]
+    revision = shared["revision"]
+    config = shared["config"]
+    selected_doc = suspended["clarification"].candidates[0].document_id
+
+    history_before = [entry async for entry in graph.aget_state_history(config)]
+    message_id = uuid4()
+    runtime.services.chat_messages = _FakeChatMessages({message_id: "1"})
+    runtime.services.authorization = _FakeAuthorization(
+        grants={WORKSPACE_ID: {c.document_id for c in suspended["clarification"].candidates}}
+    )
+    # The resumed turn dispatches document.read through the shared registry.
+    from app.services.agents.v2.nodes.context import finalize_semantic
+    from app.services.agents.v2.nodes.fast_plan import build_fast_plan
+    from app.services.agents.v2.nodes.routing import analyze_query, decide_route
+
+    resolved_ref = unresolved_ref().model_copy(
+        update={
+            "resolution_status": "resolved",
+            "resolved_document_id": selected_doc,
+            "candidate_document_ids": (),
+        }
+    )
+    doc_semantic = SemanticContext(
+        contextualized_query="mở nghị định 12",
+        normalized_query="mở nghị định 12",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(resolved_ref,),
+        person_refs=(),
+        section_refs=(),
+        blocking_ambiguities=(),
+    )
+    doc_bindings = DocumentBindingSet(
+        bindings=(pin_for("r1", selected_doc, revision),),
+        revision_requirement_refs=(),
+    )
+    analysis = analyze_query(doc_semantic)
+    decision = decide_route(
+        analysis, doc_semantic, doc_bindings,
+        allowed_capabilities=FULL_CAPABILITIES,
+    )
+    assert decision.route == "fast_domain"
+    plan = build_fast_plan(doc_semantic, doc_bindings, analysis, decision)
+    (doc_task_id,) = [task.task_id for task in plan.tasks]
+    capability = FakeCapability(
+        name="document.read",
+        domain="document",
+        result=_doc_success(doc_task_id, "t_b_r1", USE_ID),
+    )
+    runtime.services.capability_registry = build_capability_registry(
+        [CapabilityRegistration(capability=capability)],
+        runtime.capability_runtime,
+    )
+
+    command = await resume_clarification(message_id, suspended["clarification"], runtime)
+    assert command.goto == "binding"
+    # Plain resume (no outer goto): the node's own Command navigates to
+    # binding on the NEXT tick with this update applied. An outer
+    # goto="binding" pre-schedules binding into the SAME tick as the
+    # resumed wait, which then reads pre-update state (no attachment yet)
+    # and never pins — verified stale-read concurrency. T8 must resume
+    # selections with a plain Command(resume=…) and let node navigation
+    # drive (see report).
+    result = await graph.ainvoke(Command(resume=command.resume), config, context=runtime)
+    assert not result.get("__interrupt__", ()), "resume must not re-suspend"
+    resumed = normalize_checkpoint_state(dict(result))
+    # The route ADVANCES: no re-ask, request retired, selection recorded.
+    assert resumed["route_decision"].route == "fast_domain"
+    assert resumed["clarification"] is None
+    selections = [
+        known
+        for known in resumed["request"].known_documents
+        if known.source == "ui_selection"
+    ]
+    assert len(selections) == 1
+    assert selections[0].resource_id == "r1"
+    assert selections[0].document_id == selected_doc
+    pins = {binding.binding_id: binding for binding in resumed["bindings"].bindings}
+    assert pins["b_r1"].document_id == selected_doc
+    assert len(capability.calls) == 1
+    assert resumed["final_response"] is not None
+    assert resumed["final_response"].status == "insufficient"
+    validate_supervisor_state(resumed)
+    # EVERY post-resume owned checkpoint validates (no silent invalid write).
+    history_after = [entry async for entry in graph.aget_state_history(config)]
+    new_entries = history_after[: len(history_after) - len(history_before)]
+    assert new_entries, "resume must checkpoint owned boundaries"
+    for entry in new_entries:
+        values = entry.values or {}
+        if "execution" not in values:
+            continue
+        validate_supervisor_state(normalize_checkpoint_state(dict(values)))
+    # The selection pin was leased before it could be checkpointed.
+    assert any(str(revision) in event for event in shared["events"])
+
+
+@pytest.mark.asyncio
+async def test_clarify_forged_selection_converts_to_typed_error() -> None:
+    from langgraph.types import Command
+
+    shared: dict = {"tid": "resume-forged"}
+    graph, runtime, _ = await _suspend_ambiguous(shared)
+    config = shared["config"]
+    runtime.services.authorization = _FakeAuthorization(grants={WORKSPACE_ID: set()})
+    forged = {
+        "contract_version": "2.0",
+        "clarification_id": shared["suspended"]["clarification"].clarification_id,
+        "selected_candidate_id": "not-an-offered-candidate",
+    }
+    # Plain resume (no outer goto): the node's own navigation drives the
+    # conversion to the finalizer for a terminal typed error. (With an
+    # outer goto="binding" the runner explicitly continues the turn and
+    # the flow re-derives instead — verified navigation precedence.)
+    result = await graph.ainvoke(Command(resume=forged), config, context=runtime)
+    assert not result.get("__interrupt__", ())
+    resumed = normalize_checkpoint_state(dict(result))
+    assert resumed["clarification"] is None
+    assert resumed["final_response"] is not None
+    assert resumed["final_response"].status == "error"
+
+
+@pytest.mark.asyncio
+async def test_clarify_denied_selection_converts_to_typed_denied() -> None:
+    from langgraph.types import Command
+
+    from app.services.agents.v2.nodes.clarification import resume_clarification
+
+    shared: dict = {"tid": "resume-denied"}
+    graph, runtime, _ = await _suspend_ambiguous(shared)
+    suspended = shared["suspended"]
+    config = shared["config"]
+    message_id = uuid4()
+    runtime.services.chat_messages = _FakeChatMessages({message_id: "1"})
+    # Mint the command while authorized, then revoke: the CURRENT
+    # (resume-time) ACL — not the mint-time one — must decide.
+    runtime.services.authorization = _FakeAuthorization(
+        grants={WORKSPACE_ID: {c.document_id for c in suspended["clarification"].candidates}}
+    )
+    command = await resume_clarification(message_id, suspended["clarification"], runtime)
+    runtime.services.authorization = _FakeAuthorization(grants={WORKSPACE_ID: set()})
+    # Plain resume: the node's own navigation drives the conversion to the
+    # finalizer for a terminal typed denial (see forged test re precedence).
+    result = await graph.ainvoke(
+        Command(resume=command.resume), config, context=runtime
+    )
+    resumed = normalize_checkpoint_state(dict(result))
+    assert resumed["clarification"] is None
+    assert resumed["final_response"] is not None
+    assert resumed["final_response"].status == "denied"

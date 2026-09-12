@@ -29,11 +29,18 @@ contracts (``semantic``, ``bindings``, ``query_analysis``,
 ``direct_node``, the clarify persist+interrupt composition, and the initial
 state envelope — so an invalid aggregate is never written by T6-owned code.
 
-``DispatchReport.truncated`` (T3-N2) stays runtime-only ON PURPOSE: the
-frozen ``ExecutionState`` has no slot for it, and persisting dispatch
-metadata would need a contract change owned by the frozen Phase-1 schema.
-``execute_node`` persists results only; truncation is visible to the live
-runner via the scheduler report, never via checkpoint state.
+``DispatchReport.truncated`` (T3-N2) stays runtime-only ON PURPOSE — and,
+to be precise, it is NOT visible to any outer runner today: ``execute_node``
+builds the scheduler locally and persists results only, discarding the
+report. The frozen ``ExecutionState`` has no slot for dispatch metadata,
+and adding one would need a contract change owned by the frozen Phase-1
+schema. The deliberate-loss record: after a deadline-truncated dispatch the
+run can end in a normal typed response with no checkpointed truncation
+signal. The T8 outer runner MUST therefore detect incomplete dispatch
+itself at the terminal boundary by diffing the checkpointed plan against
+its results (``undispatched_tasks`` below): a non-empty remainder with no
+active run means the plan was not fully executed — raise rollback/error
+from it, never present partial results as complete.
 
 Lease ordering: binding pins acquire/commit retention leases inside the
 nodes (T1/T3-owned); terminal release (``release_run``) belongs to the OUTER
@@ -51,10 +58,13 @@ import functools
 import importlib
 import inspect
 import json
+import logging
 import threading
+import warnings
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4, uuid5
 
@@ -81,9 +91,11 @@ from .v2.capabilities import (
 )
 from .v2.contracts.base import CONTRACT_VERSION
 from .v2.contracts.binding import DocumentBindingSet, DocumentDiscoveryCandidate
-from .v2.contracts.clarification import ClarificationRequest
+from .v2.contracts.clarification import ClarificationRequest, ClarificationResolution
 from .v2.contracts.conversation import ConversationContext
-from .v2.contracts.request import RequestContext
+from .v2.contracts.execution import AgentResult
+from .v2.contracts.planning import TaskPlan
+from .v2.contracts.request import KnownDocumentResource, RequestContext
 from .v2.contracts.response import FinalResponse
 from .v2.contracts.routing import QueryAnalysis, RouteDecision
 from .v2.contracts.semantic import SemanticContext, SemanticDraft
@@ -94,6 +106,7 @@ from .v2.contracts.state import (
     SupervisorV2State,
 )
 from .v2.contracts.validation import (
+    ContractValidationError,
     IncompatibleCheckpointError,
     validate_checkpoint_payload,
     validate_supervisor_state,
@@ -101,13 +114,17 @@ from .v2.contracts.validation import (
 from .v2.nodes.binding import binding_node
 from .v2.nodes.clarification import clarify_node as _persist_clarification
 from .v2.nodes.clarification import (
+    ClarificationError,
+    ClarificationExpired,
+    ClarificationInvalidSelection,
+    ClarificationUnauthorized,
     interrupt_for_clarification,
     resume_clarification,  # noqa: F401 (re-exported for the T7/T8 runner)
 )
 from .v2.nodes.context import context_node, node_context, semantic_finalizer_node
 from .v2.nodes.evaluate import AnswerDraftChannel, evaluate_node
 from .v2.nodes.execute import execute_node
-from .v2.nodes.finalizer import finalizer_node
+from .v2.nodes.finalizer import FinalizerError, finalizer_node
 from .v2.nodes.fast_plan import fast_plan_node
 from .v2.nodes.grounding import ground_node
 from .v2.nodes.routing import route_node
@@ -124,6 +141,8 @@ __all__ = [
     "complex_unavailable_node",
     "clarify_persist_node",
     "clarify_wait_node",
+    "undispatched_tasks",
+    "dedicated_retention_leases",
     "create_supervisor_v2_graph",
     "get_supervisor_v2_graph",
     "set_supervisor_v2_graph",
@@ -146,6 +165,9 @@ __all__ = [
     "build_runtime_services",
     "build_graph_runtime_context",
 ]
+
+
+logger = logging.getLogger(__name__)
 
 
 class SupervisorV2Error(RuntimeError):
@@ -206,13 +228,22 @@ def _coerce_slot(value: Any, model: type, *, slot: str) -> Any:
     envelope while leaving nested values as ``list``/``dict`` (verified:
     ``ConversationContext`` revives with plain-dict ``recent_turns``), so
     every model round-trips through JSON validation to rebuild the full
-    tree before any node walks it.
+    tree before any node walks it. The round-trip is expected to meet
+    serde-shaped values (lists for tuples, ISO strings), so serializer
+    warnings from that shape are suppressed narrowly here — genuine
+    validation failures still raise. Note the ``default=str`` fallback is
+    permissive by construction (an arbitrary object becomes a string and
+    can then satisfy a ``str`` field); it is reachable only for mapping
+    slots arriving outside checkpoint serde, and the re-validated model is
+    still fully checked before use.
     """
     if value is None:
         return None
     if isinstance(value, model):
         try:
-            return model.model_validate_json(value.model_dump_json())
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                return model.model_validate_json(value.model_dump_json())
         except (ValidationError, TypeError, ValueError) as exc:
             raise IncompatibleCheckpointError(
                 f"checkpoint {slot} does not re-validate as "
@@ -222,7 +253,9 @@ def _coerce_slot(value: Any, model: type, *, slot: str) -> Any:
         payload = dict(value)
         try:
             candidate = model.model_validate(payload)
-            return model.model_validate_json(candidate.model_dump_json())
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                return model.model_validate_json(candidate.model_dump_json())
         except ValidationError:
             pass
         try:
@@ -261,12 +294,167 @@ def normalize_checkpoint_state(state: Mapping[str, Any]) -> SupervisorV2State:
     return SupervisorV2State(**coerced)  # type: ignore[typeddict-unknown-key]
 
 
+#: User-safe content for owned-boundary validation failures. Internal
+#: target/criterion/lease identifiers never reach user-facing responses.
+_BOUNDARY_ERROR_CONTENT = "Đã xảy ra lỗi trong quá trình xử lý yêu cầu."
+
+#: Nodes that own clarification semantics and must see the raw persisted
+#: request (the T5 idempotence guard handles staleness itself). Every other
+#: node gets turn hygiene: a clarification that no longer validates against
+#: the current semantic is retired before the node walks the state.
+_CLARIFICATION_OWNERS = frozenset({"clarify_persist", "clarify_wait"})
+
+#: Nodes whose entries run before semantics are finalized (or that always
+#: overwrite the route decision): normalization + hygiene only, never full
+#: aggregate validation at entry.
+_UNVALIDATED_ENTRIES = frozenset(
+    {"context", "binding", "semantic_finalizer", "route"}
+)
+
+
+def _typed_boundary_error(detail: str) -> dict:
+    """Convert an owned-boundary validation failure into a typed error.
+
+    Returns a terminal ``error`` ``FinalResponse`` update instead of letting
+    a ``ContractValidationError`` escape the graph. The detail is logged
+    (operators) but never surfaced (users). Downstream owned boundaries
+    short-circuit on the still-invalid aggregate and the finalizer wrapper
+    returns this marker, so the turn converges to a typed error — never a
+    success, never an exception.
+    """
+    logger.warning("supervisor_v2 boundary validation failed: %s", detail)
+    return {
+        "final_response": FinalResponse(
+            contract_version=CONTRACT_VERSION,
+            status="error",
+            content=_BOUNDARY_ERROR_CONTENT,
+            citations=(),
+        )
+    }
+
+
+def _retire_stale_clarification(view: SupervisorV2State) -> bool:
+    """Drop a clarification that no longer validates against the semantic.
+
+    Across turns the persisted request can outlive the projection it was
+    built from (reply-driven resume, fresh turn over a suspended thread):
+    the frozen validator then rejects the whole aggregate. Retiring the
+    orphan before any non-clarify node walks the state keeps every later
+    owned boundary valid. Returns True when the view was retired (the
+    caller propagates ``clarification=None`` into the returned update).
+    Failure-open by design: anything un-coercible stays for entry
+    validation to fail closed on.
+    """
+    from .v2.contracts.validation import validate_clarification_request
+
+    clarification = view.get("clarification")
+    if clarification is None:
+        return False
+    try:
+        request = _coerce_slot(
+            clarification, ClarificationRequest, slot="clarification"
+        )
+        semantic = _coerce_slot(view.get("semantic"), SemanticContext, slot="semantic")
+        validate_clarification_request(request, semantic)
+    except Exception:  # noqa: BLE001 - any staleness retires; validity is enforced later
+        return True
+    return False
+
+
 def _wrap_node(name: str, fn: Callable) -> Callable:
-    """Normalize checkpoint state before the node walks any nested value."""
+    """Normalize, hygienize, and boundary-validate around every node.
+
+    - Every entry normalizes checkpoint state (T5 D-1) and — except on the
+      two clarify nodes, which own clarification semantics — retires a
+      clarification orphaned by a turn change (C1 Proof 2/3).
+    - Post-finalization entries (everything past ``route``) fully validate
+      the aggregate: entry failures short-circuit to a typed error update
+      WITHOUT running the node, so no capability ever dispatches on an
+      invalid aggregate and no ``ContractValidationError`` escapes.
+    - ``direct``/``clarify``/``clarify_wait``/``fast_plan`` fix an
+      expected transient invalidity with their update, so they validate the
+      MERGED state instead (conversion on failure).
+    - The finalizer wrapper never emits success from an invalid aggregate:
+      entry failure returns the already-checkpointed marker (unless it is a
+      stale success) or a fresh typed error, without running the node.
+    """
+
+    sme_merge_nodes = name in ("direct", "clarify", "clarify_wait", "fast_plan")
 
     @functools.wraps(fn)
     async def _node(state: SupervisorV2State, runtime: Any) -> dict:
-        return await fn(normalize_checkpoint_state(state), runtime)
+        try:
+            view = normalize_checkpoint_state(state)
+        except ContractValidationError as exc:
+            return _typed_boundary_error(f"{name} normalize: {exc}")
+        retired = False
+        if name not in _CLARIFICATION_OWNERS:
+            retired = _retire_stale_clarification(view)
+            if retired:
+                view = SupervisorV2State(**{**view, "clarification": None})  # type: ignore[typeddict-unknown-key]
+        if name == "finalizer":
+            try:
+                validate_supervisor_state(view)
+            except ContractValidationError as exc:
+                marker = view.get("final_response")
+                if (
+                    isinstance(marker, FinalResponse)
+                    and marker.status != "success"
+                ):
+                    logger.warning(
+                        "supervisor_v2 finalizer short-circuit: %s", exc
+                    )
+                    return {"final_response": marker}
+                return _typed_boundary_error(f"finalizer entry: {exc}")
+            marker = view.get("final_response")
+            if (
+                isinstance(marker, FinalResponse)
+                and marker.status != "success"
+                and view.get("route_decision") is None
+            ):
+                # Conversion marker with nothing left to finalize (an owned
+                # boundary retired the route with the request): terminal
+                # as-is instead of recomputing. Valid states WITH a route
+                # always recompute below (e.g. ground's insufficient).
+                logger.warning("supervisor_v2 finalizer returning routed-away marker")
+                return {"final_response": marker}
+            try:
+                return await fn(view, runtime)
+            except (ContractValidationError, FinalizerError) as exc:
+                # FinalizerError is T4's fail-closed ("the run must fail,
+                # not succeed"); at the graph boundary it becomes the same
+                # typed error response instead of an escaped exception.
+                return _typed_boundary_error(f"finalizer: {exc}")
+        if name not in _UNVALIDATED_ENTRIES and not sme_merge_nodes:
+            try:
+                validate_supervisor_state(view)
+            except ContractValidationError as exc:
+                return _typed_boundary_error(f"{name} entry: {exc}")
+        try:
+            update = await fn(view, runtime)
+        except ContractValidationError as exc:
+            return _typed_boundary_error(f"{name}: {exc}")
+        if isinstance(update, Command):
+            # Navigation-carrying return (clarify_wait resume paths): apply
+            # hygiene + merged validation to the payload, preserving goto.
+            payload = dict(update.update or {}) if isinstance(update.update, dict) else {}
+            if retired and "clarification" not in payload:
+                payload = {**payload, "clarification": None}
+            try:
+                validate_supervisor_state({**view, **payload})  # type: ignore[typeddict-unknown-key]
+            except ContractValidationError as exc:
+                payload = _typed_boundary_error(f"{name} merged: {exc}")
+            return Command(update=payload, goto=update.goto)
+        if not isinstance(update, dict):
+            return update
+        if retired and "clarification" not in update:
+            update = {**update, "clarification": None}
+        if sme_merge_nodes or name not in _UNVALIDATED_ENTRIES:
+            try:
+                validate_supervisor_state({**view, **update})  # type: ignore[typeddict-unknown-key]
+            except ContractValidationError as exc:
+                return _typed_boundary_error(f"{name} merged: {exc}")
+        return update
 
     _node.__v2_origin__ = fn  # type: ignore[attr-defined]
     _node.__v2_node__ = name  # type: ignore[attr-defined]
@@ -398,30 +586,226 @@ async def clarify_persist_node(state: SupervisorV2State, runtime: Any) -> dict:
 
 
 async def clarify_wait_node(state: SupervisorV2State, runtime: Any) -> dict:
-    """Suspend the clarify turn on the already-checkpointed request.
+    """Suspend on the checkpointed request; on resume, apply the answer.
 
     Runs strictly after ``clarify_persist_node`` completes AND checkpoints,
     so the suspension checkpoint always carries the persisted
     ``ClarificationRequest`` D6 requires. First pass raises the LangGraph
-    interrupt with that payload; on resume the interrupt delivers the outer
-    runner's ``Command(resume=...)`` value and the turn falls through to
-    ``finalizer`` unless the runner overrode navigation with
-    ``goto="binding"`` (the ``resume_clarification`` path). A missing
-    request here fails closed — this node never invents one.
+    interrupt with that payload.
+
+    RESUMED pass (``interrupt()`` returns the outer runner's
+    ``Command(resume=...)`` value, byte-for-byte T5's
+    ``resume_clarification`` output): the value is treated as the answer —
+    coerced to a ``ClarificationResolution`` (JSON-mode aware), checked for
+    expiry, membership-validated against the persisted request with the
+    frozen validator, and authorized under the CURRENT runtime ACL (T5 typed
+    errors throughout). The answered request is then RETIRED
+    (``clarification=None``) and the selection is recorded as a
+    ``ui_selection`` attachment on the request plus a resolved document
+    reference in the semantic state. This node writes NO binding pins
+    itself — the re-driven ``binding`` node rebuilds the draft (the
+    selection-aware adapter resolves the answered ref from the attachment),
+    pins through the resolver, and leases before checkpointing, so every
+    key keeps a single writer per step and the standard lease ordering
+    holds. Navigation after this update is driven by the RETURNED
+    ``Command`` (``goto="binding"`` on success, ``goto="finalizer"`` on
+    fallthrough or conversion) — there is deliberately NO static edge out
+    of ``clarify_wait``. Verified empirically: (a) an outer resume
+    ``Command``'s ``goto`` is NOT suppressed by anything (a static edge
+    would double-fire, so none exists — onward navigation originates here,
+    exactly once); (b) when the runner supplies its own outer ``goto`` it
+    takes precedence over the returned one, so a T5-style outer
+    ``goto="binding"`` converges with the success path, while a resumed
+    conversion under an outer ``goto="binding"`` re-derives the turn
+    (re-ask) instead of terminating. Runners resume selections with the
+    T5 ``Command`` (outer ``goto="binding"``); plain ``Command(resume=…)``
+    lets the node's own navigation terminate conversions at the finalizer.
+
+    Resume failures (expired/forged/unauthorized/unusable selection,
+    un-pinnable document) retire the request and convert to a typed
+    ``denied``/``error`` response — never an escape, never a re-ask loop.
+    A missing persisted request (runner cleared it) is a typed error: the
+    runner can neither keep a stale request nor clear it silently.
     """
-    node_context(runtime)
-    request = _coerce_slot(
-        normalize_checkpoint_state(state).get("clarification"),
-        ClarificationRequest,
-        slot="clarification",
+    context = node_context(runtime)
+    view = normalize_checkpoint_state(state)
+    persisted = _coerce_slot(
+        view.get("clarification"), ClarificationRequest, slot="clarification"
     )
-    if request is None:
-        raise SupervisorV2Error(
-            "clarify_wait requires the persisted ClarificationRequest; "
-            "refusing to suspend without one"
+    if persisted is None:
+        return _typed_boundary_error("clarify_wait without persisted request")
+    resume_value = await interrupt_for_clarification(persisted)
+    if resume_value is None:
+        # Defensive: the interrupt resolved without a payload. Fall through
+        # to the finalizer, which re-emits the clarify question.
+        return Command(update={}, goto="finalizer")
+    try:
+        update = await _apply_clarification_resolution(
+            view, persisted, resume_value, context
         )
-    await interrupt_for_clarification(request)
-    return {}
+        return Command(update=update, goto="binding")
+    except ClarificationUnauthorized as exc:
+        logger.warning("supervisor_v2 resume denied: %s", exc)
+        return Command(
+            update={
+                "clarification": None,
+                "route_decision": None,
+                "query_analysis": None,
+                "final_response": FinalResponse(
+                    contract_version=CONTRACT_VERSION,
+                    status="denied",
+                    content="Yêu cầu bị từ chối quyền truy cập.",
+                    citations=(),
+                ),
+            },
+            goto="finalizer",
+        )
+    except ClarificationError as exc:
+        logger.warning("supervisor_v2 resume failed: %s", exc)
+        return Command(
+            update={
+                "clarification": None,
+                "route_decision": None,
+                "query_analysis": None,
+                **_typed_boundary_error(f"clarify_wait resume: {exc}"),
+            },
+            goto="finalizer",
+        )
+
+
+def _resolution_from_mapping(value: Any) -> ClarificationResolution | None:
+    """Coerce a resume payload into the frozen selection (JSON-mode aware).
+
+    Mirrors T5's ``_request_from_mapping``: the runner's ``Command(resume=…)``
+    carries ``model_dump(mode="json")`` output, which strict Python-mode
+    validation can reject — so mappings validate in Python mode first, then
+    through a JSON round-trip. Garbage yields ``None`` (invalid selection).
+    """
+    if isinstance(value, ClarificationResolution):
+        return value
+    if isinstance(value, Mapping):
+        payload = dict(value)
+        try:
+            return ClarificationResolution.model_validate(payload)
+        except ValidationError:
+            pass
+        try:
+            return ClarificationResolution.model_validate_json(
+                json.dumps(payload, default=str)
+            )
+        except (ValidationError, TypeError, ValueError):
+            return None
+    return None
+
+
+def _expires_aware(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+async def _apply_clarification_resolution(
+    view: SupervisorV2State,
+    persisted: ClarificationRequest,
+    resume_value: Any,
+    context: GraphRuntimeContext,
+) -> dict:
+    """Validate a resumed selection and fold it into checkpointable state."""
+    from .v2.contracts.validation import validate_clarification_resolution
+
+    resolution = _resolution_from_mapping(resume_value)
+    if resolution is None:
+        raise ClarificationInvalidSelection(
+            f"clarification {persisted.clarification_id!r} resume carries "
+            "no usable selection"
+        )
+    if datetime.now(timezone.utc) >= _expires_aware(persisted.expires_at):
+        raise ClarificationExpired(persisted.clarification_id)
+    try:
+        validate_clarification_resolution(persisted, resolution)
+    except ContractValidationError as exc:
+        # Membership/identity failures are invalid selections: retire the
+        # request with the other resume failures instead of crashing.
+        raise ClarificationInvalidSelection(
+            f"clarification {persisted.clarification_id!r} resume selects "
+            f"nothing offered: {exc}"
+        ) from exc
+    if resolution.selected_candidate_id is None:
+        raise ClarificationInvalidSelection(
+            f"clarification {persisted.clarification_id!r} has no selected "
+            "candidate"
+        )
+    candidate = next(
+        (
+            item
+            for item in persisted.candidates
+            if item.candidate_id == resolution.selected_candidate_id
+        ),
+        None,
+    )
+    if candidate is None:  # pragma: no cover - membership proven above
+        raise ClarificationInvalidSelection(
+            f"selected candidate {resolution.selected_candidate_id!r} is not "
+            f"part of clarification {persisted.clarification_id!r}"
+        )
+    authorization = context.services.authorization
+    if authorization is None:
+        raise ClarificationError(
+            "no authorization service wired on runtime.services; "
+            "the selected candidate cannot be authorized"
+        )
+    try:
+        await _maybe_await(
+            authorization.require_document(
+                candidate.document_id, context.capability_runtime
+            )
+        )
+    except ClarificationError:
+        raise
+    except PermissionError as error:
+        raise ClarificationUnauthorized(
+            persisted.clarification_id, candidate.document_id
+        ) from error
+    request = view["request"]
+    known = tuple(request.known_documents)
+    if not any(item.resource_id == candidate.ref_id for item in known):
+        known = known + (
+            KnownDocumentResource(
+                resource_id=candidate.ref_id,
+                document_id=candidate.document_id,
+                source="ui_selection",
+            ),
+        )
+    patched_refs = tuple(
+        reference.model_copy(
+            update={
+                "resolution_status": "resolved",
+                "resolved_document_id": candidate.document_id,
+                "candidate_document_ids": (),
+            }
+        )
+        if reference.ref_id == candidate.ref_id
+        and reference.resolution_status != "resolved"
+        else reference
+        for reference in view["semantic"].document_refs
+    )
+    # NOTE: no binding pins are written here (single writer per key per
+    # step — the outer ``goto="binding"`` runs the binding node in the
+    # same tick as this resumed pass). The re-driven binding node rebuilds
+    # the draft through the selection-aware adapter (``ui_selection``
+    # reconciliation), pins the answered ref, and leases before
+    # checkpointing; the transient semantic patch above documents the
+    # resolution and keeps this update self-consistent until the
+    # finalizer rebuilds semantics from the pinned draft.
+    return {
+        "clarification": None,
+        "route_decision": None,
+        "query_analysis": None,
+        "request": request.model_copy(update={"known_documents": known}),
+        "semantic": view["semantic"].model_copy(
+            update={"document_refs": patched_refs}
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -433,9 +817,9 @@ SUPERVISOR_V2_NODES: dict[str, Callable] = {
     "binding": _wrap_node("binding", binding_node),
     "semantic_finalizer": _wrap_node("semantic_finalizer", semantic_finalizer_node),
     "route": _wrap_node("route", route_node),
-    "direct": direct_node,
-    "clarify": clarify_persist_node,
-    "clarify_wait": clarify_wait_node,
+    "direct": _wrap_node("direct", direct_node),
+    "clarify": _wrap_node("clarify", clarify_persist_node),
+    "clarify_wait": _wrap_node("clarify_wait", clarify_wait_node),
     "fast_plan": _wrap_node("fast_plan", fast_plan_node),
     "execute": _wrap_node("execute", execute_node),
     "evaluate": _wrap_node("evaluate", evaluate_node),
@@ -446,7 +830,7 @@ SUPERVISOR_V2_NODES: dict[str, Callable] = {
     # subgraph. The subgraph is compiled without a checkpointer so it
     # inherits `checkpointer` (and therefore the shadow run's isolated
     # saver) rather than opening its own.
-    "complex_boundary": complex_unavailable_node,
+    "complex_boundary": _wrap_node("complex_boundary", complex_unavailable_node),
 }
 
 _ROUTE_BRANCHES = {
@@ -489,7 +873,10 @@ def _add_supervisor_edges(graph: StateGraph) -> None:
     graph.add_conditional_edges("route", _route_branch, _ROUTE_BRANCHES)
     graph.add_edge("direct", "finalizer")
     graph.add_edge("clarify", "clarify_wait")
-    graph.add_edge("clarify_wait", "finalizer")
+    # No static edge out of clarify_wait: every pass either suspends
+    # (first pass) or returns a Command carrying its own goto (resume
+    # paths), so onward navigation originates exactly once (see
+    # clarify_wait_node).
     graph.add_edge("fast_plan", "execute")
     graph.add_edge("execute", "evaluate")
     graph.add_edge("evaluate", "synthesize")
@@ -625,10 +1012,49 @@ class DeterministicSemanticAdapter:
     The discourse-contextualized form comes from ``conversation.summary``
     (when set), else the preprocessor's normalized query; when neither
     exists the adapter refuses rather than copying the raw query.
+
+    ``ui_selection`` reconciliation: the clarify resume path records an
+    answered selection as a ``KnownDocumentResource`` with
+    ``source="ui_selection"`` and ``resource_id`` naming the answered
+    semantic ``ref_id`` (see ``clarify_wait_node``). After preprocessing,
+    every still-unresolved draft ref answered this way is projected to
+    ``resolved`` with the selected canonical document id (candidates
+    cleared). Only ``ui_selection`` sources reconcile — ``attachment`` /
+    ``conversation`` / ``api_explicit`` resources are never auto-bound
+    (T1 attachment exclusion), and an already-resolved ref is never
+    overridden. Deterministic and read-only like the rest of the build.
     """
 
     def __init__(self, *, preprocess: Callable[[str], Any]) -> None:
         self._preprocess = preprocess
+
+    @staticmethod
+    def reconcile_ui_selections(
+        draft: SemanticDraft, request: RequestContext
+    ) -> SemanticDraft:
+        """Project answered ``ui_selection`` attachments onto draft refs."""
+        selections: dict[str, UUID] = {}
+        for known in request.known_documents:
+            if known.source == "ui_selection":
+                selections.setdefault(known.resource_id, known.document_id)
+        if not selections:
+            return draft
+        refs = tuple(
+            reference.model_copy(
+                update={
+                    "resolution_status": "resolved",
+                    "resolved_document_id": selections[reference.ref_id],
+                    "candidate_document_ids": (),
+                }
+            )
+            if reference.resolution_status != "resolved"
+            and reference.ref_id in selections
+            else reference
+            for reference in draft.document_refs
+        )
+        if refs == draft.document_refs:
+            return draft
+        return draft.model_copy(update={"document_refs": refs})
 
     async def build_draft(
         self, request: RequestContext, conversation: ConversationContext
@@ -638,13 +1064,14 @@ class DeterministicSemanticAdapter:
         result = await _maybe_await(self._preprocess(request.original_query))
         summary = conversation.summary.strip() if conversation.summary else ""
         try:
-            return draft_from_preprocessing(
+            draft = draft_from_preprocessing(
                 result, contextualized_query=summary or None
             )
         except Exception as exc:
             raise SemanticAdapterError(
                 f"v1 preprocessing output cannot become a v2 draft: {exc}"
             ) from exc
+        return self.reconcile_ui_selections(draft, request)
 
 
 class V1BindingResolver:
@@ -1032,13 +1459,16 @@ def probe_v1_services() -> frozenset[str]:
     ``dependency_error`` results.
     """
     probes = {
+        # Default-usable without per-request scope: the adapter's lazy v1
+        # default is complete (no user/workspace-scoped construction arg).
         "v1-people": ("app.services.people.mongo_people_service", "search_by_name"),
         "v1-document-search": ("app.services.agent.tools", "search_documents"),
-        "v1-document-content": ("app.services.agents.v2.persistence.document_views", "load_current_revision_identity"),
-        "v1-section-content": ("app.services.agent.tools", "search_document_section"),
-        "v1-knowledge-graph": ("app.services.kg.knowledge_graph_service", "KnowledgeGraphService"),
-        "v1-memory": ("app.services.memory.graphiti_client", "search_user_memory"),
-        "v1-abbreviation": ("app.models.abbreviation", "Abbreviation"),
+        # Conservative by design (review M6): KG/memory need a scoped id
+        # (workspace_id/user_id) that only per-request ingress knows;
+        # abbreviation has no v1 default at all; content readers have no
+        # verified pinned-revision v1 source. T7 enables these explicitly
+        # via ``available_services`` once wired — the probe never opens a
+        # gate the default adapter cannot serve.
     }
     available: set[str] = set()
     for gate, (module_name, attr) in probes.items():
@@ -1195,3 +1625,52 @@ def build_graph_runtime_context(
         if services is not None
         else build_runtime_services(**service_kwargs),
     )
+
+
+def undispatched_tasks(plan: TaskPlan, results: tuple[AgentResult, ...]) -> tuple[str, ...]:
+    """Task ids in the checkpointed plan with no result yet (T3-N2 recipe).
+
+    The T8 outer runner calls this at the terminal boundary: a non-empty
+    remainder with no active run means a deadline-truncated (or otherwise
+    incomplete) dispatch whose ``DispatchReport.truncated`` flag was
+    deliberately never checkpointed. Pure function of frozen contracts.
+    """
+    done = {result.task_id for result in results}
+    return tuple(task.task_id for task in plan.tasks if task.task_id not in done)
+
+
+@asynccontextmanager
+async def dedicated_retention_leases(
+    session_factory: Callable[[], Any] | None = None,
+    *,
+    ttl: Any = None,
+) -> AsyncIterator[Any]:
+    """Yield a lease repo owning a DEDICATED unit of work (M4(a)/I3).
+
+    ``binding_node`` (and the clarify resume path) commit
+    ``repo.session`` before the checkpointable update may be written. If
+    that session were shared with unrelated application work, the commit
+    would also commit that work mid-turn. T7 ingress MUST therefore back
+    the request-scoped lease repository with a session used for NOTHING
+    else for the whole request: this helper opens exactly such a session
+    (default: one fresh ``async_session_maker()`` session — a factory call
+    is already an independent session, but it must not be reused or shared
+    afterwards) and closes it on exit. Never inject a long-lived or shared
+    session here.
+    """
+    from .v2.persistence.retention_leases import RevisionRetentionLeaseRepository
+
+    if session_factory is None:
+        from app.core.database import async_session_maker
+
+        session_factory = async_session_maker
+    session = session_factory()
+    try:
+        if ttl is None:
+            yield RevisionRetentionLeaseRepository(session)
+        else:
+            yield RevisionRetentionLeaseRepository(session, ttl=ttl)
+    finally:
+        close = getattr(session, "close", None)
+        if callable(close):
+            await _maybe_await(close())

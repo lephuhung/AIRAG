@@ -915,16 +915,27 @@ async def lifespan(app: FastAPI):
     # saver setup/migration here (schema is owned by the migration runner).
     # v1 remains the production default: any failure below only marks v2
     # unavailable (``app.state.supervisor_v2_ready``) and never breaks v1.
-    _v2_lifespan_cm = None
+    _v2_exit_stack = None
     try:
+        from contextlib import AsyncExitStack
+
         from app.services.agents.supervisor_v2 import supervisor_v2_lifespan
 
-        _v2_lifespan_cm = supervisor_v2_lifespan(settings.CHECKPOINT_DATABASE_URL)
-        await _v2_lifespan_cm.__aenter__()
+        _v2_exit_stack = AsyncExitStack()
+        await _v2_exit_stack.enter_async_context(
+            supervisor_v2_lifespan(settings.CHECKPOINT_DATABASE_URL)
+        )
         app.state.supervisor_v2_ready = True
         logger.info("[supervisor_v2] graph compiled on the shared checkpointer")
     except Exception as _v2_err:
-        _v2_lifespan_cm = None
+        if _v2_exit_stack is not None:
+            try:
+                await _v2_exit_stack.aclose()
+            except Exception as _v2_abort_err:
+                logger.warning(
+                    f"[supervisor_v2] setup teardown failed: {_v2_abort_err}"
+                )
+        _v2_exit_stack = None
         app.state.supervisor_v2_ready = False
         logger.warning(
             f"[supervisor_v2] unavailable, v1 default unaffected: {_v2_err}"
@@ -932,9 +943,9 @@ async def lifespan(app: FastAPI):
 
     yield
     logger.info("Shutting down...")
-    if _v2_lifespan_cm is not None:
+    if _v2_exit_stack is not None:
         try:
-            await _v2_lifespan_cm.__aexit__(None, None, None)
+            await _v2_exit_stack.aclose()
         except Exception as _v2_exit_err:
             logger.warning(f"[supervisor_v2] shutdown release failed: {_v2_exit_err}")
     await engine.dispose()

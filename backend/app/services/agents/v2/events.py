@@ -1,10 +1,15 @@
 """SSE/event helpers for the v2 outer adapter (Phase 2, Task 6).
 
 Pure presentation helpers consumed by the T8 streaming/runner layer; this
-module owns no graph, no checkpointer, and no domain business. Wire format
-and ``complete``/``error`` payload shapes mirror the v1 contracts in
-``app.services.agent.streaming`` (``event: {event}\\ndata: {json}\\n\\n``)
-so the existing frontend hook keeps working without changes:
+module owns no graph, no checkpointer, and no domain business. The SSE wire
+format is identical to v1 (``event: {event}\\ndata: {json}\\n\\n``) and every
+v1 ``complete``/``error`` key is preserved (``answer``, ``sources``,
+``images``, ``potential_abbreviations``, ``people_data``, ``message``), so
+the existing frontend hook keeps working without changes. Payloads are
+ADDITIVE, not identical: ``complete`` additionally carries ``status`` and a
+``citations`` projection (``citation_id`` + ``label`` only — no evidence
+internals). T8's contract test must assert additive compatibility (v1 keys
+present), not byte identity.
 
 - ``complete`` carries ``answer``/``sources``/``images``/
   ``potential_abbreviations``/``people_data`` (all default to empty);

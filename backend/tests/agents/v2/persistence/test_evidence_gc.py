@@ -1044,6 +1044,42 @@ class TestRetentionLeases:
         assert record.payload_purged_at is not None
 
     @pytest.mark.asyncio
+    async def test_expired_unleased_targetless_payload_purged_despite_active_use_lease_elsewhere(
+        self, async_db, document_factory
+    ):
+        # T3-N3: the use-id subquery in ``active_evidence_lease_exists`` must
+        # correlate the outer evidence row. Without the correlation the
+        # IN-list degrades to every use id in the database, so ANY active
+        # use-bearing lease blocks EVERY payload purge.
+        db = async_db
+        document_id = document_factory()
+        revision = await _make_revision(db, document_id=document_id, anchor=_dt(-48))
+        pinned = await _make_evidence(
+            db, revision_id=revision.revision_id, expires_at=_dt(-1)
+        )
+        pinned_use = await _make_use(db, evidence_id=pinned.evidence_id)
+        await _make_lease(
+            db,
+            run_id=RUN_ID,
+            revision_id=revision.revision_id,
+            evidence_use_id=pinned_use.use_id,
+            expires_at=_dt(+1),
+        )
+        orphan = await _make_evidence(db, revision_id=None, expires_at=_dt(-2))
+        await _make_use(db, evidence_id=orphan.evidence_id)  # targetless, unleased
+
+        result = await run_evidence_payload_gc_batch(db, now=BASE)
+
+        assert orphan.evidence_id in result.purged_ids
+        assert pinned.evidence_id not in result.purged_ids
+        await db.refresh(orphan)
+        await db.refresh(pinned)
+        assert orphan.payload_purged_at is not None
+        assert orphan.ciphertext == b""
+        assert pinned.payload_purged_at is None
+        assert pinned.ciphertext == b"secret-payload"
+
+    @pytest.mark.asyncio
     async def test_has_active_evidence_lease_matches_use_or_revision(
         self, async_db, document_factory
     ):

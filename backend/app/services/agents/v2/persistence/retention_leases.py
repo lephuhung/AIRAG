@@ -43,6 +43,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.models.evidence_record import EvidenceRecord
 from app.models.evidence_use import EvidenceUse
 from app.models.revision_retention_lease import RevisionRetentionLease
 
@@ -218,8 +219,16 @@ class RevisionRetentionLeaseRepository:
         the payload), so both are checked.
         """
         ts = now or _now()
-        use_ids = select(EvidenceUse.use_id).where(
-            EvidenceUse.evidence_id == evidence_id_column
+        # Correlate the outer evidence row explicitly: without this the
+        # use-id subquery pulls ``evidence_records`` into its own FROM
+        # (cartesian against the outer row), so the IN-list degrades to
+        # every use id in the database and ANY active use-bearing lease
+        # blocks EVERY payload purge (T3-N3). With the correlation the
+        # subquery sees only this row's uses.
+        use_ids = (
+            select(EvidenceUse.use_id)
+            .where(EvidenceUse.evidence_id == evidence_id_column)
+            .correlate(EvidenceRecord)
         )
         return exists().where(
             RevisionRetentionLease.released_at.is_(None),
