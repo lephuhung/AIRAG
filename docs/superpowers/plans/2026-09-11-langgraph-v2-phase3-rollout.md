@@ -162,7 +162,7 @@ git commit -m "test: add session SSE v2 evaluation harness"
 - Test: `backend/tests/agents/v2/complex/test_tool_gateway.py`
 
 **Interfaces:**
-- Produces: `CapabilityInvocationProposal`, `AgentToolGateway`, request-scoped framework adapters, `AgentToolObservation`, sensitive observation projectors, and the request-scoped `DiscoveryCandidateRegistry` that resolves an opaque `candidate_id` into an authorized document identity before the Binding Resolver pins a revision.
+- Produces: `CapabilityInvocationProposal`, `AgentToolGateway`, request-scoped framework adapters, `AgentToolObservation`, sensitive observation projectors, and the request-scoped `DiscoveryCandidateRegistry` that indexes checkpointed `DocumentDiscoveryCandidate`s from the originating `AgentResult` (`candidate_id -> DocumentDiscoveryCandidate`) before the Binding Resolver creates the binding.
 
 - [ ] **Step 1: Write failing governance tests**
 
@@ -181,8 +181,12 @@ test_observation_projection_is_typed_no_mapping
 test_unknown_result_kind_projection_fails_closed
 test_document_search_observation_exposes_candidate_ids_only
 test_planner_cannot_select_document_revision_directly
-test_discovery_candidate_registry_reconstructs_after_resume
-test_candidate_ids_survive_checkpoint_interrupt
+test_candidate_registry_reconstructs_from_checkpointed_agent_result
+test_candidate_ids_survive_interrupt_and_process_restart
+test_candidate_registry_does_not_require_persistence_table
+test_candidate_revision_remains_stable_if_newer_revision_publishes_before_resume
+test_model_observation_never_exposes_candidate_revision
+test_binding_resolver_revalidates_candidate_acl_before_binding
 ```
 
 - [ ] **Step 2: Implement proposal + observation gateway (no execution)**
@@ -242,7 +246,7 @@ ToolObservationProjection = Annotated[
 ]
 ```
 
-`ToolObservationProjection` is a discriminated union of typed per-capability projections owned by `tools/observations.py` (implementation-only). No `Mapping`/dict escape hatch and no free-form string metadata: adding an observable field requires a typed model change, and an unknown `result_kind` fails closed with `ObservationProjectionUnavailable`. `DocumentSearchObservation` exposes only opaque `candidate_ids`: the request-scoped `DiscoveryCandidateRegistry` (`tools/discovery_candidates.py`) maps a `candidate_id` to an authorized `document_id` only, and the **Binding Resolver remains the sole owner that pins a revision**. If the planner never needs to select a specific candidate, drop `candidate_ids` and keep only `candidate_count`.
+`ToolObservationProjection` is a discriminated union of typed per-capability projections owned by `tools/observations.py` (implementation-only). No `Mapping`/dict escape hatch and no free-form string metadata: adding an observable field requires a typed model change, and an unknown `result_kind` fails closed with `ObservationProjectionUnavailable`. `DocumentSearchObservation` exposes only opaque `candidate_ids`; the model observation never exposes `document_revision`, and the Binding Resolver remains the sole owner that creates/pins the binding using the candidate's immutable discovered revision. If the planner never needs to select a specific candidate, drop `candidate_ids` and keep only `candidate_count`.
 
 `AgentToolGateway.propose(...)` must perform only:
 
@@ -265,7 +269,7 @@ base capability registry
 = agent-visible tool catalog
 ```
 
-The framework-facing schema contains only allowed `CapabilityInput`; runtime authority is injected server-side. People/memory/sensitive projectors return status/use IDs/safe metadata only. `DiscoveryCandidateRegistry` is a request-scoped cache over **server-side persisted candidate records** written together with the checkpointed `AgentResult`/governed EvidenceUse (`(run_id, task_id, candidate_id) -> authorized document_id`). Start and resume both reconstruct it from those rows, so `candidate_ids` survive LangGraph checkpoint/interrupt and a process restart; it must never depend on an in-memory request object. It maps only to an authorized `document_id`, and the Binding Resolver remains the sole owner that pins a revision. If the planner never needs to choose a specific candidate, drop `candidate_ids` and expose only `candidate_count`.
+The framework-facing schema contains only allowed `CapabilityInput`; runtime authority is injected server-side. People/memory/sensitive projectors return status/use IDs/safe metadata only. `DiscoveryCandidateRegistry` (`tools/discovery_candidates.py`) is an **ephemeral request/resume index over checkpointed originating `AgentResult`s**, not a separate persistent store: the `document.search` capability creates a frozen `DocumentDiscoveryCandidate(candidate_id, document_id, document_revision)`, the capability's `AgentResult.data` owns it, and LangGraph checkpoints that result. On start, resume, restart, or interrupt it is reconstructed from the checkpointed `AgentResult.data`, mapping `candidate_id -> DocumentDiscoveryCandidate` (revision included), so no candidate table/model/migration is added. The model observation exposes `candidate_id` only and never `document_revision`. The Binding Resolver accepts the selected server-side candidate, revalidates current ACL/scope, and creates the `ScopedDocument` with the candidate's immutable discovered revision; it remains the sole owner that creates/pins the binding.
 
 - [ ] **Step 4: Run and commit**
 
