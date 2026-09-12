@@ -61,9 +61,15 @@ class PeopleLookupInput(ContractModel):
 class DocumentSearchInput(ContractModel):
     """Discovery search over the current authorized workspace scope.
 
-    ``person_identifier`` is the deterministic People→Document dependency scalar
-    materialized server-side by the dependency node before the task is appended;
-    it is never model-supplied and never appears in planner observations.
+    ``person_identifier`` is the governed People→Document dependency scalar that
+    ``PeopleDocumentDependencyAdapter`` materializes server-side after a
+    successful ``people.lookup`` task; the planner never supplies it, and
+    validation requires any search task carrying it to depend on that
+    ``people.lookup`` task. It *is* planner-visible through
+    ``ResearchPlanningInput.current_plan`` (the whole ``TaskPlan``, including
+    ``TaskSpec.input``, is handed to the replanner), so it is checkpointed
+    personal data and needs the §13.3 retention/ACL/encryption/audit controls in
+    later phases.
     """
 
     kind: Literal["document.search"]

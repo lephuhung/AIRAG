@@ -3,7 +3,10 @@
 Covers the brief's Step 1 items "ID/DAG/relation integrity" and "criteria
 uniqueness", plus the §26 revision-requirement relation rules: exactly one
 relation for every current-required binding, none for ordinary/pinned/
-discovered bindings, and rejection of dangling or mismatched binding/ref IDs.
+discovered bindings, rejection of dangling or mismatched binding/ref IDs, and a
+relation whose binding pins a different document than its reference resolved to.
+Also guards the materialized People→Document scalar: a ``document.search`` task
+carrying ``person_identifier`` must depend on a ``people.lookup`` task.
 """
 from __future__ import annotations
 
@@ -36,10 +39,12 @@ from app.services.agents.v2.contracts.validation import (
 
 from .factories import (
     DOCUMENT_ID,
+    OTHER_DOCUMENT_ID,
     OTHER_REVISION,
     binding_set,
     document_reference,
     people_plan,
+    person_search_task,
     read_plan,
     read_task,
     scoped_document,
@@ -118,6 +123,25 @@ def test_dangling_relation_ids_are_rejected() -> None:
             binding_set(revision_requirement_refs=(BindingRevisionRequirement(binding_id="b1", ref_id="rX"),)),
             semantic,
         )
+
+
+def test_relation_with_a_mismatched_binding_document_is_rejected() -> None:
+    semantic = semantic_context(
+        document_refs=(document_reference(revision_requirement=CurrentRevisionRequirement(kind="current")),)
+    )
+    mismatched = binding_set(
+        bindings=(scoped_document(document_id=OTHER_DOCUMENT_ID),),
+        revision_requirement_refs=(BindingRevisionRequirement(binding_id="b1", ref_id="r1"),),
+    )
+    with pytest.raises(ContractValidationError, match="document"):
+        validate_binding_set(mismatched, semantic)
+
+    validate_binding_set(
+        binding_set(
+            revision_requirement_refs=(BindingRevisionRequirement(binding_id="b1", ref_id="r1"),)
+        ),
+        semantic,
+    )
 
 
 def test_relation_without_semantic_context_is_rejected() -> None:
@@ -285,6 +309,29 @@ def test_fast_plan_target_units_match_the_read_input() -> None:
             ),
             binding_set(),
         )
+
+
+def test_person_identifier_search_task_requires_a_people_lookup_dependency() -> None:
+    people = people_plan()
+    guarded = people.model_copy(update={"tasks": people.tasks + (person_search_task(),)})
+    validate_task_plan(guarded, binding_set(bindings=()))
+
+    unguarded = people.model_copy(
+        update={"tasks": people.tasks + (person_search_task(depends_on=()),)}
+    )
+    with pytest.raises(ContractValidationError, match="people.lookup"):
+        validate_task_plan(unguarded, binding_set(bindings=()))
+
+
+def test_person_identifier_without_any_people_lookup_task_is_rejected() -> None:
+    plan = read_plan(tasks=(read_task("T1"), person_search_task(depends_on=("T1",))))
+    with pytest.raises(ContractValidationError, match="people.lookup"):
+        validate_task_plan(plan, binding_set())
+
+
+def test_search_task_without_a_materialized_scalar_needs_no_people_dependency() -> None:
+    plan = read_plan(tasks=(read_task("T1"), person_search_task(person_identifier=None, depends_on=())))
+    validate_task_plan(plan, binding_set())
 
 
 def test_plan_id_and_goal_must_be_present() -> None:

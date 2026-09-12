@@ -25,6 +25,7 @@ from .binding import (
 )
 from .capability import (
     DocumentReadInput,
+    DocumentSearchInput,
     SectionReadInput,
     WriteInput,
 )
@@ -72,6 +73,12 @@ class IncompatibleCheckpointError(ContractValidationError):
 
 _READ_CAPABILITIES = frozenset({"document.read", "section.read"})
 
+# Spec §13.4 + agent-tool amendment: only the deterministic People→Document
+# materializer may put a governed people scalar into a document.search input, and
+# it only runs after its people.lookup task produced a usable result.
+_PEOPLE_LOOKUP_CAPABILITY = "people.lookup"
+_MATERIALIZED_SCALAR_STATUSES = frozenset({"success"})
+
 # Spec §13.4: only these input variants reference logical targets.
 _TARGET_BEARING_INPUTS = (DocumentReadInput, SectionReadInput, WriteInput)
 
@@ -117,6 +124,49 @@ def _input_target_ids(capability_input: object) -> tuple[str, ...]:
     if isinstance(capability_input, _TARGET_BEARING_INPUTS):
         return capability_input.target_ids
     return ()
+
+
+def _carries_materialized_person_identifier(capability_input: object) -> bool:
+    return (
+        isinstance(capability_input, DocumentSearchInput)
+        and capability_input.person_identifier is not None
+    )
+
+
+def _validate_materialized_person_dependency(
+    task: TaskSpec,
+    capability_by_task: Mapping[str, str],
+    outcome_by_task: Mapping[str, TaskExecutionSummary] | None = None,
+) -> None:
+    """Spec §26 + agent-tool amendment: a people scalar cannot be fabricated.
+
+    The People→Document dependency scalar is materialized server-side from a
+    governed ``people.lookup`` result, so a ``document.search`` task carrying it
+    must depend on the ``people.lookup`` task that produced it. When the call site
+    also has the replan outcomes, that dependency must additionally have a usable
+    success outcome: a failed or absent People task cannot supply the scalar.
+    """
+
+    if not _carries_materialized_person_identifier(task.input):
+        return
+    people_dependencies = [
+        dependency
+        for dependency in task.depends_on
+        if capability_by_task.get(dependency) == _PEOPLE_LOOKUP_CAPABILITY
+    ]
+    if not people_dependencies:
+        _fail(
+            f"task {task.task_id} carries a materialized person_identifier and must depend on a people.lookup task"
+        )
+    if outcome_by_task is None:
+        return
+    for dependency in people_dependencies:
+        outcome = outcome_by_task.get(dependency)
+        if outcome is None or outcome.status not in _MATERIALIZED_SCALAR_STATUSES:
+            _fail(
+                f"task {task.task_id} carries a materialized person_identifier but its "
+                f"people.lookup dependency {dependency} has no usable success outcome"
+            )
 
 
 def _task_by_id(plan: TaskPlan, task_id: str) -> TaskSpec:
@@ -311,6 +361,16 @@ def validate_binding_set(
             _fail(
                 f"revision-requirement relation for reference {relation.ref_id} requires a current revision requirement"
             )
+        binding = _binding_by_id(bindings, relation.binding_id)
+        if (
+            reference.resolved_document_id is not None
+            and binding.document_id != reference.resolved_document_id
+        ):
+            _fail(
+                f"revision-requirement relation pins binding {binding.binding_id} to document "
+                f"{binding.document_id}, but reference {relation.ref_id} resolved to document "
+                f"{reference.resolved_document_id}"
+            )
 
     if semantic is None:
         return
@@ -421,6 +481,10 @@ def validate_replan(
         if not isinstance(task.origin, ReplanTaskOrigin):
             _fail(f"task {task.task_id} appended by a replan must have a ReplanTaskOrigin")
     validate_task_outcomes(outcomes, current)
+    outcome_by_task = {outcome.task_id: outcome for outcome in outcomes}
+    capability_by_task = {task.task_id: task.capability for task in proposed.tasks}
+    for task in new_tasks:
+        _validate_materialized_person_dependency(task, capability_by_task, outcome_by_task)
     if budget.max_replans_remaining < 1:
         _fail("no replan budget remaining")
     if len(new_tasks) > budget.max_tasks_remaining:
@@ -481,6 +545,7 @@ def _validate_plan_structure(plan: TaskPlan) -> None:
 
     target_ids = {unit.target_id for unit in plan.target_units}
     task_ids = {task.task_id for task in plan.tasks}
+    capability_by_task = {task.task_id: task.capability for task in plan.tasks}
     for task in plan.tasks:
         if task.capability != task.input.kind:
             _fail(
@@ -496,6 +561,7 @@ def _validate_plan_structure(plan: TaskPlan) -> None:
             if target_id not in target_ids:
                 _fail(f"task {task.task_id} references unknown target {target_id}")
         _validate_task_origin(task, task_ids)
+        _validate_materialized_person_dependency(task, capability_by_task)
     _require_acyclic(plan.tasks)
 
 

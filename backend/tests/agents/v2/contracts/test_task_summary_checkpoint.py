@@ -3,7 +3,8 @@
 Covers the brief's Step 1 items "TaskExecutionSummary/replan context" and
 "incompatible checkpoint rejection", plus the §26 facts: a People→Document
 replan sees the current plan and ``T1=not_found`` even when T1 produced no
-EvidenceUse, ``T1=error``/``error_code=TIMEOUT`` stays distinguishable, and
+EvidenceUse, ``T1=error``/``error_code=TIMEOUT`` stays distinguishable, a failed
+or absent People task cannot supply the materialized ``person_identifier``, and
 incompatible pre-release fixtures/checkpoints are rejected rather than migrated.
 """
 from __future__ import annotations
@@ -47,6 +48,7 @@ from .factories import (
     conversation_context,
     kg_task,
     people_plan,
+    person_search_task,
     read_plan,
     request_context,
     semantic_context,
@@ -82,6 +84,19 @@ def _replan_task(task_id: str = "T2") -> TaskSpec:
 
 def _append(current: TaskPlan, *tasks: TaskSpec) -> TaskPlan:
     return current.model_copy(update={"tasks": current.tasks + tasks})
+
+
+def _person_search_replan_task(*, depends_on: tuple[str, ...] = ("T1",)) -> TaskSpec:
+    return person_search_task(depends_on=depends_on).model_copy(
+        update={
+            "origin": ReplanTaskOrigin(
+                kind="replan",
+                reason="People scalar available",
+                task_ids=("T1",),
+                evidence_use_ids=(),
+            )
+        }
+    )
 
 
 def _planning_input(*, current_plan: TaskPlan | None, with_outcomes: bool) -> ResearchPlanningInput:
@@ -287,6 +302,30 @@ def test_replan_respects_discovery_policy() -> None:
     with pytest.raises(ContractValidationError, match="discovery"):
         validate_replan(current, _append(current, search_task), (), disabled, BUDGET)
     validate_replan(current, _append(current, search_task), (), POLICY, BUDGET)
+
+
+def test_replan_cannot_materialize_a_person_identifier_from_a_failed_people_task() -> None:
+    current = people_plan()
+    proposed = _append(current, _person_search_replan_task())
+    timeout = (TaskExecutionSummary(task_id="T1", status="error", error_code="TIMEOUT"),)
+    with pytest.raises(ContractValidationError, match="person_identifier"):
+        validate_replan(current, proposed, timeout, POLICY, BUDGET)
+
+    succeeded = (TaskExecutionSummary(task_id="T1", status="success"),)
+    assert validate_replan(current, proposed, succeeded, POLICY, BUDGET) is proposed
+
+
+def test_replan_cannot_materialize_a_person_identifier_without_a_people_task() -> None:
+    current = read_plan()
+    proposed = _append(current, _person_search_replan_task(depends_on=()))
+    with pytest.raises(ContractValidationError, match="person_identifier"):
+        validate_replan(
+            current,
+            proposed,
+            (TaskExecutionSummary(task_id="T1", status="success"),),
+            POLICY,
+            BUDGET,
+        )
 
 
 def test_checkpoint_payload_rejects_missing_or_foreign_versions() -> None:

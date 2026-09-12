@@ -12,6 +12,7 @@ from uuid import UUID
 from app.services.agents.v2.contracts.binding import DocumentBindingSet, ScopedDocument
 from app.services.agents.v2.contracts.capability import (
     DocumentReadInput,
+    DocumentSearchInput,
     KnowledgeGraphInput,
     PeopleLookupInput,
 )
@@ -38,6 +39,7 @@ EVIDENCE_ID = UUID("33333333-3333-3333-3333-333333333333")
 USE_ID = UUID("44444444-4444-4444-4444-444444444444")
 REVISION = "rev-1"
 OTHER_REVISION = "rev-2"
+PERSON_IDENTIFIER = "012345678901"
 
 
 def request_context() -> RequestContext:
@@ -188,6 +190,26 @@ def people_plan(*, task_id: str = "T1") -> TaskPlan:
                 origin=InitialTaskOrigin(kind="initial"),
             ),
         ),
+    )
+
+
+def person_search_task(
+    task_id: str = "T2",
+    *,
+    person_identifier: str | None = PERSON_IDENTIFIER,
+    depends_on: tuple[str, ...] = ("T1",),
+) -> TaskSpec:
+    return TaskSpec(
+        task_id=task_id,
+        capability="document.search",
+        task_objective="Tìm nghị định chứa CCCD của A",
+        input=DocumentSearchInput(
+            kind="document.search",
+            query="CCCD",
+            person_identifier=person_identifier,
+        ),
+        depends_on=depends_on,
+        origin=InitialTaskOrigin(kind="initial"),
     )
 
 
