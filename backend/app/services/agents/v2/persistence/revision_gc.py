@@ -20,7 +20,9 @@ payload predicate (:mod:`app.services.agents.v2.evidence_store.gc`):
 5. no active retention lease pins the revision.
 
 Action: delete external artifacts idempotently — object/markdown via
-``StorageService.delete_revision_artifacts``, vectors via
+``StorageService.delete_revision_artifacts`` (the deterministic
+revision-scoped keys unioned with every key any build manifest row records, so
+an object uploaded before its manifest commit is not leaked), vectors via
 ``VectorStore.delete_revision``, revision-scoped KG via
 ``LegalKGService.delete_revision_artifacts`` — then set ``artifacts_purged_at``.
 The ``DocumentRevision`` row is retained as lineage and is never ``DELETE``d
@@ -52,6 +54,11 @@ from app.models.document import Document
 from app.models.document_revision import DocumentRevision
 from app.models.document_revision_build import DocumentRevisionBuild
 from app.models.evidence_record import EvidenceRecord
+from app.services.agents.v2.persistence.document_views import (
+    load_revision_vector_manifest,
+    revision_markdown_key,
+    revision_structure_key,
+)
 from app.services.agents.v2.persistence.retention_leases import (
     RevisionRetentionLeaseRepository,
 )
@@ -143,44 +150,59 @@ async def _delete_revision_external_artifacts(
     kg_service_factory,
     kg_services: dict,
 ) -> None:
-    """Delete one revision's object/vector/KG artifacts (idempotent)."""
-    build = await session.scalar(
-        select(DocumentRevisionBuild)
-        .where(DocumentRevisionBuild.revision_id == revision.revision_id)
-        .order_by(DocumentRevisionBuild.finished_at.desc().nullslast())
-        .limit(1)
-    )
+    """Delete one revision's object/vector/KG artifacts (idempotent).
 
-    # Objects/markdown: delete the keys this revision's own build manifest
-    # records (never guess from current config — Task 5 rule). No manifest =>
-    # no recorded object artifacts.
-    artifact_keys: list[str] = []
-    if build is not None:
+    Object keys are the UNION of the deterministic revision-scoped keys
+    (``document_views.revision_markdown_key`` / ``revision_structure_key``,
+    derived from the revision's own workspace and ids — R9) and every key
+    recorded by ANY build manifest row of this revision. The deterministic keys
+    come first and are always deleted: a crash between the artifact upload and
+    the manifest commit (``parse_worker``) leaves the objects with no recorded
+    key, and the tombstone this batch writes would otherwise make the leak
+    permanent. A build row whose key differs from the canonical one (e.g. a
+    different build profile) is reclaimed too, which is why ALL rows are read
+    rather than only the latest.
+    """
+    builds = (
+        await session.scalars(
+            select(DocumentRevisionBuild)
+            .where(DocumentRevisionBuild.revision_id == revision.revision_id)
+            .order_by(DocumentRevisionBuild.finished_at.desc().nullslast())
+        )
+    ).all()
+
+    artifact_keys: list[str] = [
+        revision_markdown_key(
+            workspace_id, revision.document_id, revision.revision_id
+        ),
+        revision_structure_key(
+            workspace_id, revision.document_id, revision.revision_id
+        ),
+    ]
+    for build in builds:
         for key in (
             build.markdown_artifact_key,
             build.structure_artifact_key,
         ):
             if key and key not in artifact_keys:
                 artifact_keys.append(key)
-    if artifact_keys:
-        await storage.delete_revision_artifacts(
-            revision.document_id,
-            revision.revision_id,
-            artifact_keys=artifact_keys,
-        )
+    await storage.delete_revision_artifacts(
+        revision.document_id,
+        revision.revision_id,
+        workspace_id=workspace_id,
+        artifact_keys=artifact_keys,
+    )
 
     # Vectors: only inside the revision's own recorded embedding namespace. A
     # manifest without a complete vector identity has no known namespace to
-    # delete from.
-    if build is not None and (
-        build.embedding_namespace
-        and build.embedding_model_hash
-        and build.embedding_dimension
-        and build.vector_artifact_version
-    ):
-        vector_store = vector_store_factory(
-            workspace_id, namespace=build.embedding_namespace
-        )
+    # delete from; ``load_revision_vector_manifest`` owns that completeness
+    # check (``RevisionArtifactIdentity.vectors_available`` is the same rule).
+    vector_manifest = await load_revision_vector_manifest(
+        session, revision.revision_id
+    )
+    if vector_manifest is not None:
+        namespace = vector_manifest[0]
+        vector_store = vector_store_factory(workspace_id, namespace=namespace)
         vector_store.delete_revision(
             revision.document_id, revision.revision_id
         )
@@ -188,7 +210,8 @@ async def _delete_revision_external_artifacts(
     # Revision-scoped KG: delete only rows carrying this revision id. A manifest
     # that explicitly recorded KG as skipped never produced KG rows; absent
     # manifest => attempt the delete (safe/idempotent) rather than leak rows.
-    if build is None or not build.kg_skipped:
+    latest_build = builds[0] if builds else None
+    if latest_build is None or not latest_build.kg_skipped:
         kg = kg_services.get(workspace_id)
         if kg is None:
             kg = kg_service_factory(workspace_id)

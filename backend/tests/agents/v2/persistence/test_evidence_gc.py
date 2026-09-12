@@ -87,6 +87,7 @@ class FakeArtifactStore:
         self.fail_on = fail_on
         self.deleted: list[str] = []
         self.calls: list[tuple[uuid.UUID, uuid.UUID, tuple[str, ...]]] = []
+        self.workspaces: list[uuid.UUID | None] = []
 
     async def delete_revision_artifacts(
         self,
@@ -98,6 +99,7 @@ class FakeArtifactStore:
     ) -> int:
         keys = tuple(artifact_keys or ())
         self.calls.append((document_id, revision_id, keys))
+        self.workspaces.append(workspace_id)
         for key in keys:
             if self.fail_on is not None and key == self.fail_on:
                 raise RuntimeError(f"object store down deleting {key}")
@@ -194,11 +196,13 @@ async def _make_build(
     dimension: int | None = 768,
     version: str | None = "v1",
     kg_skipped: bool = False,
+    finished_at: datetime = BASE,
+    profile: RevisionBuildProfile = RevisionBuildProfile.FULL,
 ) -> DocumentRevisionBuild:
     build = DocumentRevisionBuild(
         build_id=uuid.uuid4(),
         revision_id=revision_id,
-        build_profile=RevisionBuildProfile.FULL.value,
+        build_profile=profile.value,
         embedding_namespace=namespace,
         embedding_model_hash=model_hash,
         embedding_dimension=dimension,
@@ -206,7 +210,7 @@ async def _make_build(
         markdown_artifact_key=markdown_key,
         structure_artifact_key=structure_key,
         kg_skipped=kg_skipped,
-        finished_at=BASE,
+        finished_at=finished_at,
     )
     db.add(build)
     await db.flush()
@@ -744,6 +748,125 @@ class TestRevisionArtifactGc:
         stored = await db.get(DocumentRevision, revision.revision_id)
         await db.refresh(stored)
         assert stored.artifacts_purged_at is not None
+
+    @pytest.mark.asyncio
+    async def test_revision_without_build_manifest_reclaims_deterministic_objects(
+        self, async_db, document_factory
+    ):
+        """A crash between the object upload and the manifest commit leaves a
+        reclaimable revision with no build row; its deterministic
+        revision-scoped objects must still be deleted before the tombstone."""
+        db = async_db
+        document_id = document_factory()
+        workspace_id = await _workspace_id(db, document_id)
+        revision = await _make_revision(db, document_id=document_id, anchor=_dt(-48))
+
+        storage = FakeArtifactStore()
+        result = await run_revision_artifact_gc_batch(
+            db,
+            now=BASE,
+            retention_window=WINDOW,
+            storage=storage,
+            vector_store_factory=_vector_factory([]),
+            kg_service_factory=_kg_factory([]),
+        )
+
+        deterministic = _artifact_keys(document_id, revision.revision_id, workspace_id)
+        assert result.reclaimed == 1
+        assert storage.workspaces == [workspace_id]
+        assert set(storage.deleted) == set(deterministic)
+        stored = await db.get(DocumentRevision, revision.revision_id)
+        await db.refresh(stored)
+        assert stored.artifacts_purged_at is not None
+
+    @pytest.mark.asyncio
+    async def test_revision_without_build_manifest_delete_failure_skips_tombstone(
+        self, async_db, document_factory
+    ):
+        """When the deterministic object delete fails the tombstone must NOT be
+        written, so the next run retries instead of leaking the objects."""
+        db = async_db
+        document_id = document_factory()
+        workspace_id = await _workspace_id(db, document_id)
+        revision = await _make_revision(db, document_id=document_id, anchor=_dt(-48))
+        markdown_key, _structure_key = _artifact_keys(
+            document_id, revision.revision_id, workspace_id
+        )
+
+        with pytest.raises(RuntimeError):
+            await run_revision_artifact_gc_batch(
+                db,
+                now=BASE,
+                retention_window=WINDOW,
+                storage=FakeArtifactStore(fail_on=markdown_key),
+                vector_store_factory=_vector_factory([]),
+                kg_service_factory=_kg_factory([]),
+            )
+        stored = await db.get(DocumentRevision, revision.revision_id)
+        await db.refresh(stored)
+        assert stored.artifacts_purged_at is None
+
+        # Retry converges once the object store is reachable again.
+        healthy = FakeArtifactStore()
+        retry = await run_revision_artifact_gc_batch(
+            db,
+            now=BASE,
+            retention_window=WINDOW,
+            storage=healthy,
+            vector_store_factory=_vector_factory([]),
+            kg_service_factory=_kg_factory([]),
+        )
+        assert retry.reclaimed == 1
+        assert set(healthy.deleted) == {
+            markdown_key,
+            _structure_key,
+        }
+        await db.refresh(stored)
+        assert stored.artifacts_purged_at is not None
+
+    @pytest.mark.asyncio
+    async def test_artifact_keys_are_unioned_across_all_build_rows(
+        self, async_db, document_factory
+    ):
+        """Keys recorded by an *older* build row of the same revision are
+        reclaimed too — only the latest row is not authoritative by itself."""
+        db = async_db
+        document_id = document_factory()
+        workspace_id = await _workspace_id(db, document_id)
+        revision = await _make_revision(db, document_id=document_id, anchor=_dt(-48))
+        legacy_key = (
+            f"kb_{workspace_id}/revisions/{document_id}/{revision.revision_id}"
+            "/legacy-profile.md"
+        )
+        await _make_build(
+            db,
+            revision_id=revision.revision_id,
+            markdown_key=legacy_key,
+            finished_at=BASE,
+            profile=RevisionBuildProfile.PARSE_ONLY,
+        )
+        await _make_build(
+            db,
+            revision_id=revision.revision_id,
+            markdown_key=None,
+            structure_key=None,
+            finished_at=BASE + timedelta(hours=1),
+        )
+
+        storage = FakeArtifactStore()
+        result = await run_revision_artifact_gc_batch(
+            db,
+            now=BASE,
+            retention_window=WINDOW,
+            storage=storage,
+            vector_store_factory=_vector_factory([]),
+            kg_service_factory=_kg_factory([]),
+        )
+
+        deterministic = _artifact_keys(document_id, revision.revision_id, workspace_id)
+        assert result.reclaimed == 1
+        assert legacy_key in storage.deleted
+        assert set(deterministic).issubset(storage.deleted)
 
 
 # ---------------------------------------------------------------------------

@@ -183,7 +183,9 @@ class StorageService:
         carries the keys recorded on that revision's own build manifest (the
         authoritative source — never guessed from current config). When omitted,
         the two canonical keys are derived from ``workspace_id``; without
-        either, there is nothing to derive and the call is a no-op.
+        either, there is nothing to derive and the call is a no-op. A caller
+        that passes ``artifact_keys`` is authoritative: include the canonical
+        keys in that list when they must be reclaimed too.
 
         A revision id without its workspace cannot produce a key, which is why
         the workspace is an explicit (optional) input here. Deletion is
