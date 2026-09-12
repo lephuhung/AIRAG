@@ -1,0 +1,123 @@
+"""DocumentRevision ORM — Phase 1B.
+
+Maps the ``document_revisions`` table created by Release 1A
+(``app.services.agents.v2.persistence.migrate``). Phase 1B only
+*maps* the schema; it never creates or alters the table.
+
+A document revision is an immutable, monotonic per-document
+allocation row that captures the full pipeline state for one
+attempt to publish a build. Every retry increments ``generation``
+(unique per ``document_id``); every published revision becomes the
+document's ``current_revision_id`` (legacy pointer).
+
+Status values (column is ``TEXT``, not an enum, because the brief treats
+the enum as application-level state and the migration set the column
+to free-form TEXT):
+
+- ``draft``      — building, not yet verified
+- ``verified``   — verify_draft succeeded, awaiting publish CAS
+- ``published``  — terminal, atomic publication succeeded
+- ``failed``     — terminal, ``failure_class`` recorded
+- ``abandoned``  — terminal, ``abandon_reason`` recorded (GC-blocked)
+- ``superseded`` — earlier published revision, no longer current
+- ``purged``     — artifacts_purged_at set; row retained for evidence lineage
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime
+from typing import Optional
+
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.core.database import Base
+
+
+class DocumentRevision(Base):
+    __tablename__ = "document_revisions"
+
+    revision_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    # Per-document monotonic allocation counter; unique per document.
+    # Application code allocates via SELECT ... FOR UPDATE on the
+    # ``documents`` row.
+    generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False
+    )
+    # Retry provenance: if this revision is a retry of an earlier
+    # terminal revision, ``retry_of_revision_id`` points at it.
+    retry_of_revision_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("document_revisions.revision_id"),
+        nullable=True,
+    )
+
+    # Lifecycle state (free-form TEXT — see module docstring).
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Terminal-failure metadata. Populated only when status='failed'.
+    failed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    failure_stage: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+    failure_class: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+
+    # Terminal-abandon metadata. Populated only when status='abandoned'.
+    abandoned_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    abandon_reason: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+
+    # The single GC retention anchor: when the artifact retention clock
+    # starts (typically the publish time). NULL while in draft/building.
+    artifact_retention_starts_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+
+    # Independent GC lifecycle metadata.
+    superseded_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    artifacts_purged_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+
+    __table_args__ = (
+        # Mirrors the SQL UNIQUE (document_id, generation) installed by
+        # the migration. The application never allocates two revisions
+        # with the same ``generation`` for the same document.
+        UniqueConstraint(
+            "document_id", "generation", name="uq_document_revisions_doc_gen"
+        ),
+        # The retry_of_revision_id FK is naturally nullable; we do not
+        # add a CHECK that constrains it to failed revisions because
+        # the application owns that rule and the DB cannot distinguish
+        # the writer phase.
+    )

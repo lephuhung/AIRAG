@@ -23,7 +23,19 @@ from app.core.database import engine, Base
 # integration, audit_log, exchange_summary, …); importing the package here is
 # the single source of truth and avoids relying on transitive imports from the
 # API router to register tables like audit_logs / telegram_* / api_keys.
+#
+# Phase 1B: importing ``app.models`` also triggers ``v2_registry`` which
+# adds the 11 v2 ORM classes to ``Base.metadata``. The lifespan below
+# still uses ``Base.metadata.create_all(tables=LEGACY_STARTUP_TABLES)``
+# (allowlist excludes every v2 table), so v2 DDL can never leak into
+# startup. The lifespan additionally calls ``check_v2_schema`` +
+# ``assert_v2_readiness`` before declaring readiness, so a database that
+# has not been migrated refuses to start.
 import app.models  # noqa: F401
+from app.models.v2_registry import (  # noqa: E402
+    LEGACY_STARTUP_TABLES,
+    assert_v2_readiness,
+)
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("neo4j.notifications").setLevel(logging.WARNING)
@@ -71,9 +83,28 @@ async def lifespan(app: FastAPI):
         )
 
     if auto_create:
+        # ── Phase 1B — pre-create v2 readiness gate ────────────────────────────
+        # Refuse to start the app if the live database is not at v2
+        # schema version 1. ``check_v2_schema`` runs against a sync
+        # engine (the migration API is sync-only); we expose the
+        # sync engine of the async ``engine`` via ``engine.sync_engine``
+        # so we reuse the same connection pool configuration.
+        from app.services.agents.v2.persistence.migrate import (
+            check_v2_schema,
+        )
+
+        check = check_v2_schema(engine.sync_engine)
+        assert_v2_readiness(check)
+
         async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-            # Auto-migrate: add new columns if missing
+            # Phase 1B: ``create_all`` is restricted to the legacy
+            # allowlist — every v2 table is excluded from the
+            # metadata create_all pass. The v2 schema is owned by the
+            # migration runner (``apply_v2_schema``), not by startup.
+            await conn.run_sync(
+                Base.metadata.create_all,
+                tables=list(LEGACY_STARTUP_TABLES),
+            )
             await conn.execute(
                 text(
                     "ALTER TABLE knowledge_bases ADD COLUMN IF NOT EXISTS system_prompt TEXT"

@@ -123,6 +123,26 @@ class Document(Base):
     # True = uploaded via chat → skip embed/caption/kg workers after parse
     is_chat_upload: Mapped[bool] = mapped_column(default=False)
 
+    # ── Phase 1B — v2 revision pointer (legacy column added by the
+    #    Release-1A migration). NULL on every pre-migration row; v2
+    #    publishes set it to the published ``document_revisions
+    #    .revision_id``. The tombstone path
+    #    (``mark_source_deleted``) clears it together with
+    #    ``source_deleted_at``. The stable-pointer trigger guards
+    #    against accidental unset (Task 1 brief item 4). ─────────────
+    current_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("document_revisions.revision_id"),
+        nullable=True,
+    )
+    # Tombstone column: set when the source object is deleted in
+    # MinIO. The plan-mandated ``mark_source_deleted`` path sets this
+    # together with clearing ``current_revision_id``. A partial
+    # index on this column is installed by the migration.
+    source_deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+
     # Relationships
     workspace: Mapped["KnowledgeBase"] = relationship(back_populates="documents")
     document_type: Mapped["DocumentType | None"] = relationship(  # type: ignore[name-defined]
@@ -154,6 +174,17 @@ class DocumentImage(Base):
     mime_type: Mapped[str] = mapped_column(String(50), default="image/png")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
+    # ── Phase 1B — v2 revision pointer (legacy column added by the
+    #    Release-1A migration). NULL on every pre-migration row; v2
+    #    publish paths set it to the owning ``document_revisions
+    #    .revision_id``. Stable-pointer trigger guards against
+    #    accidental unset. ────────────────────────────────────────────
+    revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("document_revisions.revision_id"),
+        nullable=True,
+    )
+
     # Relationships
     document: Mapped["Document"] = relationship(back_populates="images")
 
@@ -174,6 +205,17 @@ class DocumentTable(Base):
     num_rows: Mapped[int] = mapped_column(Integer, default=0)
     num_cols: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    # ── Phase 1B — v2 revision pointer (legacy column added by the
+    #    Release-1A migration). NULL on every pre-migration row; v2
+    #    publish paths set it to the owning ``document_revisions
+    #    .revision_id``. Stable-pointer trigger guards against
+    #    accidental unset. ────────────────────────────────────────────
+    revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("document_revisions.revision_id"),
+        nullable=True,
+    )
 
     # Relationships
     document: Mapped["Document"] = relationship(back_populates="tables")
