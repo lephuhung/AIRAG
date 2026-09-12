@@ -64,6 +64,7 @@ __all__ = [
     "SchedulerError",
     "TaskScheduler",
     "execute_ready_tasks",
+    "refresh_pairs_for_checkpoint",
 ]
 
 
@@ -219,6 +220,143 @@ async def _lease_new_uses(
                 repo.acquire_or_refresh(run_id, None, ref.use_id)
             )
     return True
+
+
+def _use_id_of(use: Any) -> UUID | None:
+    """Coerce one evidence-use identity (live model or serde mapping)."""
+    raw = use.get("use_id") if isinstance(use, dict) else getattr(use, "use_id", None)
+    if raw is None:
+        return None
+    if isinstance(raw, UUID):
+        return raw
+    try:
+        return UUID(str(raw))
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _slot(value: Any, name: str) -> Any:
+    """Read one slot from a live model or its checkpoint-serde mapping."""
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _refresh_task_revisions(task: Any, plan: Any, bindings: Any) -> tuple[UUID, ...]:
+    """Pinned revisions for one task, tolerant of checkpoint-serde mappings.
+
+    Same target → binding → revision-UUID recipe as :func:`_task_target_revisions`
+    (the dispatch owner), but duck-typed so real ``get_state`` values — whose
+    nested contracts revive as ``list``/``dict`` — resolve identically to live
+    models. Unresolvable targets yield no revisions (the caller falls back to
+    evidence-only pairs); malformed revision pins raise ``SchedulerError`` just
+    like dispatch, so a corrupt pin can never look refreshed.
+    """
+    task_input = _slot(task, "input") or {}
+    target_ids = tuple(_slot(task_input, "target_ids") or ())
+    if not target_ids:
+        return ()
+    raw_bindings = _slot(bindings, "bindings")
+    if raw_bindings is None:
+        raise SchedulerError(
+            "checkpoint supplies no bindings for targeted tasks; "
+            "refusing to refresh unleashed uses"
+        )
+    binding_by_id = {
+        _slot(binding, "binding_id"): binding for binding in (raw_bindings or ())
+    }
+    raw_units = _slot(plan, "target_units") or ()
+    target_by_id = {_slot(unit, "target_id"): unit for unit in raw_units}
+    revisions: list[UUID] = []
+    for target_id in target_ids:
+        unit = target_by_id.get(target_id)
+        if unit is None:
+            return ()
+        binding = binding_by_id.get(_slot(unit, "binding_id"))
+        if binding is None:
+            return ()
+        try:
+            revision = UUID(str(_slot(binding, "document_revision")))
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise SchedulerError(
+                "checkpoint binding pins a non-UUID revision; refusing to "
+                "refresh a corrupt pin"
+            ) from exc
+        if revision not in revisions:
+            revisions.append(revision)
+    return tuple(revisions)
+
+
+def refresh_pairs_for_checkpoint(
+    plan: Any,
+    bindings: Any,
+    results: Any,
+) -> tuple[tuple[UUID | None, UUID], ...]:
+    """``(revision_id, use_id)`` lease pairs for a checkpointed execution.
+
+    Shared recipe (T8-I2) mirroring :func:`_lease_new_uses` anchoring: every
+    checkpointed use re-acquires the SAME ``(run, revision, use)`` rows the
+    scheduler leased at dispatch — revision-anchored when the owning task
+    resolves to pinned revisions, evidence-only (``revision_id=None``)
+    otherwise. Deduplicated, order-stable. Tasks whose targets no longer
+    resolve (stale checkpoint) contribute no pairs; uses without a coercible
+    identity are skipped. Total function: never raises on shape drift.
+    """
+    try:
+        items = tuple(results or ())
+    except TypeError:
+        return ()
+    tasks: dict[Any, Any] = {}
+    try:
+        plan_tasks = (
+            plan.get("tasks", ())
+            if isinstance(plan, dict)
+            else getattr(plan, "tasks", None) or ()
+        )
+        for task in plan_tasks:
+            task_id = (
+                task.get("task_id")
+                if isinstance(task, dict)
+                else getattr(task, "task_id", None)
+            )
+            if task_id is not None:
+                tasks.setdefault(task_id, task)
+    except Exception:
+        return ()
+    pairs: list[tuple[UUID | None, UUID]] = []
+    seen: set[tuple[Any, Any]] = set()
+    for item in items:
+        try:
+            if isinstance(item, dict):
+                item_task_id = item.get("task_id")
+                uses = item.get("evidence_uses") or ()
+            else:
+                item_task_id = getattr(item, "task_id", None)
+                uses = getattr(item, "evidence_uses", None) or ()
+            use_ids = []
+            for use in uses:
+                uid = _use_id_of(use)
+                if uid is not None:
+                    use_ids.append(uid)
+            if not use_ids:
+                continue
+            revisions: tuple[UUID, ...] = ()
+            task = tasks.get(item_task_id)
+            if task is not None:
+                try:
+                    revisions = _refresh_task_revisions(task, plan, bindings)
+                except Exception:
+                    revisions = ()
+            anchors = revisions or (None,)
+            for uid in use_ids:
+                for revision in anchors:
+                    key = (revision, uid)
+                    if key not in seen:
+                        seen.add(key)
+                        pairs.append((revision, uid))
+        except Exception:
+            continue
+    return tuple(pairs)
 
 
 async def _dispatch_one(

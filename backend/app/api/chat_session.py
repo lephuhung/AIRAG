@@ -603,19 +603,25 @@ async def _session_v2_run(
     lease_session_factory=None,
     preprocess=None,
     available_services=None,
+    resume_message_id=None,
 ):
     """Run one session turn's v2 ingress with unconditional cleanup (I1).
 
-    Yields ``(ingress, agen)`` where ``agen`` streams v1-wire SSE strings.
+    Yields ``(ingress, agen)`` where ``agen`` streams v1-wire SSE strings
+    through the T8 production adapter (one terminal event, truncation →
+    rollback/error, terminal lease release after the terminal checkpoint).
+    When ``resume_message_id`` answers a suspended clarification on this
+    thread, the turn resumes from the checkpoint instead of starting fresh.
     The evidence unit of work commits after the consumer drains the stream;
     any raise rolls it back; cancellation skips the commit (the session
     close rolls the partial turn back). The ingress sessions close on EVERY
     path through ``async with`` — cleanup never depends on GC. Terminal
     lease release stays with the T8 outer runner (never here).
     """
-    from app.services.agent.runtime_selector import (
-        build_v2_ingress,
-        run_v2_turn_sse,
+    from app.services.agent.runtime_selector import build_v2_ingress
+    from app.services.agent.streaming import (
+        resolve_v2_resume_command,
+        stream_v2_turn_to_sse,
     )
     from app.services.agents.v2.contracts.request import KnownDocumentResource
 
@@ -647,11 +653,22 @@ async def _session_v2_run(
         **extra,
     ) as ingress:
         try:
-            yield ingress, run_v2_turn_sse(
+            resume_command = await resolve_v2_resume_command(
                 graph=graph,
-                initial_state=ingress.initial_state,
+                thread_id=thread_id,
+                message_id=resume_message_id,
+                runtime_context=ingress.runtime_context,
+            )
+            yield ingress, stream_v2_turn_to_sse(
+                graph=graph,
+                initial_state=(
+                    None if resume_command is not None
+                    else ingress.initial_state
+                ),
+                resume_command=resume_command,
                 runtime_context=ingress.runtime_context,
                 thread_id=thread_id,
+                plan_resolver=ingress.plan_resolver,
             )
             await ingress.commit_evidence()
         except Exception:
@@ -697,9 +714,12 @@ async def chat_stream_session(
         [str(d) for d in accessible_doc_ids] if accessible_doc_ids else None
     )
     # Persist the RAW user text BEFORE any normalization/semantic work.
-    from app.services.agent.runtime_selector import persist_raw_user_message
+    from app.services.agent.runtime_selector import (
+        configured_agent_version,
+        persist_raw_user_message,
+    )
 
-    await persist_raw_user_message(
+    raw_user_row = await persist_raw_user_message(
         db,
         session_id=session_id,
         user_id=user.id,
@@ -707,6 +727,13 @@ async def chat_stream_session(
         message_id=user_msg_id,
         document_ids=doc_ids_json,
     )
+    # v2 resume needs the persisted row's UUID (loaded only on the v2 arm
+    # so the v1 path is untouched).
+    raw_message_uuid = None
+    if configured_agent_version() == "v2" and raw_user_row is not None:
+        from app.services.agent.streaming import persisted_message_uuid
+
+        raw_message_uuid = await persisted_message_uuid(db, raw_user_row)
 
     # Get system prompt
     from app.prompts.chat import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
@@ -1184,6 +1211,7 @@ async def chat_stream_session(
                         user_id=user.id,
                         can_read_people=bool(user.is_superadmin),
                         thread_id=session_id,
+                        resume_message_id=raw_message_uuid,
                     ) as (_v2_ingress, _v2_agen):
                         await _drain(_v2_agen)
                 else:

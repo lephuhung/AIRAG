@@ -140,19 +140,24 @@ async def _stream_v2_standalone(
     user_id: uuid.UUID,
     user_is_superadmin: bool,
     session_id: Optional[str],
+    resume_message_id=None,
 ) -> AsyncGenerator[str, None]:
     """Run one turn on the v2 arm and yield v1-wire SSE strings.
 
     Builds the real request-scoped v2 ingress (scope ∩, raw query,
-    RuntimeServices/registry, dedicated lease session) and streams the
-    terminal response through the interim T7 runner (T8 owns the production
-    streaming adapter). The raw user text was already persisted by the
-    caller before normalization; the evidence unit of work commits after
-    the terminal response is produced.
+    RuntimeServices/registry, dedicated lease session) and streams the turn
+    through the T8 production adapter (``stream_v2_turn_to_sse``): one
+    terminal event, truncation → rollback/error, terminal lease release
+    after the terminal checkpoint. When ``resume_message_id`` answers a
+    suspended clarification on this thread, the turn resumes from the
+    checkpoint instead of starting fresh. The raw user text was already
+    persisted by the caller before normalization; the evidence unit of work
+    commits after the terminal response is produced.
     """
-    from app.services.agent.runtime_selector import (
-        build_v2_ingress,
-        run_v2_turn_sse,
+    from app.services.agent.runtime_selector import build_v2_ingress
+    from app.services.agent.streaming import (
+        resolve_v2_resume_command,
+        stream_v2_turn_to_sse,
     )
 
     known_documents: tuple = ()
@@ -179,11 +184,22 @@ async def _stream_v2_standalone(
         document_ids=tuple(document_ids or ()),
     ) as ingress:
         try:
-            async for sse_str in run_v2_turn_sse(
+            resume_command = await resolve_v2_resume_command(
                 graph=graph,
-                initial_state=ingress.initial_state,
+                thread_id=thread_id,
+                message_id=resume_message_id,
+                runtime_context=ingress.runtime_context,
+            )
+            async for sse_str in stream_v2_turn_to_sse(
+                graph=graph,
+                initial_state=(
+                    None if resume_command is not None
+                    else ingress.initial_state
+                ),
+                resume_command=resume_command,
                 runtime_context=ingress.runtime_context,
                 thread_id=thread_id,
+                plan_resolver=ingress.plan_resolver,
             ):
                 yield sse_str
             await ingress.commit_evidence()
@@ -259,8 +275,9 @@ async def langgraph_chat_stream(
 
     # Persist the RAW user text BEFORE any normalization/semantic work, so
     # chat history owns exactly what the user sent.
+    raw_user_row = None
     try:
-        await persist_raw_user_message(
+        raw_user_row = await persist_raw_user_message(
             db,
             session_id=session_id,
             user_id=user_id,
@@ -269,6 +286,14 @@ async def langgraph_chat_stream(
     except Exception as e:
         logger.warning(f"[lg_endpoint] Failed to persist user message: {e}")
         await db.rollback()
+
+    # v2 resume needs the persisted row's UUID (loaded only on the v2 arm
+    # so the v1 path stays byte-identical).
+    raw_message_uuid = None
+    if version == "v2" and raw_user_row is not None:
+        from app.services.agent.streaming import persisted_message_uuid
+
+        raw_message_uuid = await persisted_message_uuid(db, raw_user_row)
 
     # Expand abbreviations in the incoming message (graph input only — the
     # persisted row above keeps the raw text).
@@ -338,6 +363,7 @@ async def langgraph_chat_stream(
             user_id=user_id,
             user_is_superadmin=user_is_superadmin,
             session_id=session_id,
+            resume_message_id=raw_message_uuid,
         ):
             yield sse_str
             _collect_terminal(sse_str)

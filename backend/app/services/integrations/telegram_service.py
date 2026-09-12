@@ -357,20 +357,23 @@ async def _collect_v2_telegram_events(
     workspace_ids,
     user,
     session_id: str,
+    resume_message_id=None,
 ) -> list[dict]:
     """Run one turn on the v2 arm and collect v1-shaped event dicts.
 
     Builds the real request-scoped v2 ingress (scope ∩, raw query,
-    RuntimeServices/registry, dedicated lease session) and maps the
-    terminal response through the interim T7 runner. The raw user turn was
+    RuntimeServices/registry, dedicated lease session) and streams the turn
+    through the T8 production adapter (one terminal event, truncation →
+    rollback/error, terminal lease release after the terminal checkpoint).
+    When ``resume_message_id`` answers a suspended clarification on this
+    thread, the turn resumes from the checkpoint. The raw user turn was
     already persisted by the caller; the evidence unit of work commits
     after the terminal response is produced.
     """
-    import json as _json
-
-    from app.services.agent.runtime_selector import (
-        build_v2_ingress,
-        run_v2_turn_sse,
+    from app.services.agent.runtime_selector import build_v2_ingress
+    from app.services.agent.streaming import (
+        resolve_v2_resume_command,
+        stream_v2_turn_events,
     )
 
     collected: list[dict] = []
@@ -383,22 +386,24 @@ async def _collect_v2_telegram_events(
         can_read_people=bool(user.is_superadmin),
     ) as ingress:
         try:
-            async for sse_str in run_v2_turn_sse(
+            resume_command = await resolve_v2_resume_command(
                 graph=graph,
-                initial_state=ingress.initial_state,
+                thread_id=session_id,
+                message_id=resume_message_id,
+                runtime_context=ingress.runtime_context,
+            )
+            async for ev in stream_v2_turn_events(
+                graph=graph,
+                initial_state=(
+                    None if resume_command is not None
+                    else ingress.initial_state
+                ),
+                resume_command=resume_command,
                 runtime_context=ingress.runtime_context,
                 thread_id=session_id,
+                plan_resolver=ingress.plan_resolver,
             ):
-                try:
-                    lines = sse_str.strip().split("\n")
-                    etype = lines[0].replace("event: ", "").strip()
-                    data_line = next(
-                        (line for line in lines if line.startswith("data:")), None
-                    )
-                    data = _json.loads(data_line[5:].strip()) if data_line else {}
-                except Exception:  # noqa: BLE001 — malformed SSE never breaks eval
-                    continue
-                collected.append({"event": etype, "data": data})
+                collected.append({"event": ev["event"], "data": ev["data"]})
             await ingress.commit_evidence()
         except Exception:
             await ingress.rollback_evidence()
@@ -469,12 +474,19 @@ async def _handle_question(db, chat_id: str, question: str, tg_user_id: str | No
     history = await _load_history(db, session.id, limit=10)
 
     # Persist the RAW user turn BEFORE any normalization/semantic work.
-    await persist_raw_user_message(
+    raw_user_row = await persist_raw_user_message(
         db,
         session_id=session.id,
         user_id=user.id,
         raw_text=question,
     )
+    # v2 resume needs the persisted row's UUID (loaded only on the v2 arm
+    # so the v1 path is untouched).
+    raw_message_uuid = None
+    if version == "v2" and raw_user_row is not None:
+        from app.services.agent.streaming import persisted_message_uuid
+
+        raw_message_uuid = await persisted_message_uuid(db, raw_user_row)
 
     # Placeholder message we'll keep editing as tokens stream in.
     await send_chat_action(chat_id, "typing")
@@ -514,6 +526,7 @@ async def _handle_question(db, chat_id: str, question: str, tg_user_id: str | No
                 workspace_ids=workspace_ids,
                 user=user,
                 session_id=str(session.id),
+                resume_message_id=raw_message_uuid,
             )
 
         async def _event_source():

@@ -15,7 +15,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, waitFor, act } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { parseSSEEvents, mockSSEResponse } from '../../../test-utils/mockSSE';
+import { parseSSEEvents } from '../../../test-utils/mockSSE';
 import { useRAGChatStream } from '../../../hooks/useRAGChatStream';
 import { useAuthStore } from '../../../stores/authStore';
 

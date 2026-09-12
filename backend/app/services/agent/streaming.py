@@ -542,10 +542,14 @@ def build_initial_state(
 # ---------------------------------------------------------------------------
 #
 # Preserves the EXISTING SSE contract used by the frontend
-# (``frontend/src/hooks/useRAGChatStream.ts``): status / thinking / sources /
-# images / token / token_rollback / potential_abbreviations / people_data /
-# error / complete. Payloads stay additive (v2 ``complete`` additionally
-# carries ``status`` + ``citations``); the hook needs no change.
+# (``frontend/src/hooks/useRAGChatStream.ts``). Events this adapter EMITS:
+# status / token / token_rollback / potential_abbreviations (projected from
+# the checkpointed semantic abbreviations unknown to the DB) / error /
+# complete. ``sources`` / ``images`` / ``people_data`` have NO v2 projection
+# yet (the v2 terminal carries citations only; fabricating sources from
+# citations would be dishonest) — Phase-3-owned evidence→source projection.
+# Payloads stay additive (v2 ``complete`` additionally carries ``status`` +
+# ``citations``); the hook needs no change.
 #
 # Rules (controller rulings):
 #
@@ -553,13 +557,20 @@ def build_initial_state(
 #   ``FinalResponse.content`` is chunked into ``token`` events here. v2
 #   nodes never push token events (pinned by test).
 # - Exactly ONE terminal event per run: ``complete`` for success/clarify,
-#   ``error`` for denied/insufficient/error.
+#   ``error`` for denied/insufficient/error AND for unexpected graph
+#   failures (a raw exception never escapes the SSE stream; leases still
+#   release as terminal).
 # - ``token_rollback`` clears every accumulator. A deadline-truncated
 #   dispatch (checkpointed plan with undispatched tasks — the T6 runtime-only
 #   truncation channel, deliberately never checkpointed) surfaces as
 #   token_rollback + error, never a normal success.
 # - Disconnect/cancel prevents success: ``CancelledError``/``GeneratorExit``
 #   propagate, no terminal event is emitted, leases release as ``cancelled``.
+# - Suspension is detected from the RETURNED state (pinned langgraph
+#   1.0.0 suppresses top-level interrupts and returns values carrying
+#   ``__interrupt__``; a ``GraphInterrupt`` catch is kept for nested uses):
+#   a suspended clarify turn surfaces the question as the single terminal
+#   ``complete`` and NEVER releases leases (suspension keeps them active).
 # - Stable thread id resumes from the checkpoint. Resume call form (the
 #   graph owns navigation; never pass an outer destination along):
 #
@@ -572,11 +583,13 @@ def build_initial_state(
 #   CURRENT runtime ACL (checkpointed scope is never trusted).
 # - Terminal lease release (``release_run``) happens HERE, only AFTER the
 #   terminal checkpoint succeeds — never inside the finalizer, never on
-#   interrupt (suspension keeps leases active).
+#   suspension (a release-once guard also covers racing disconnects).
 # - ``ClarificationUnsatisfiable`` means the reply is a fresh turn, never a
-#   resume retry (``V2FreshTurnRequired``).
-# - Never run ``validate_supervisor_state`` here: non-success terminals over
-#   the ingress placeholder semantic surface as errors, not corruption.
+#   resume retry (``V2FreshTurnRequired``, decided by T7's
+#   ``clarification_reply_is_fresh_turn`` — the single owner).
+# - Non-success terminals over the ingress placeholder semantic surface as
+#   errors via T7's ``terminal_state_is_error`` (the single owner) —
+#   ``validate_supervisor_state`` is never run here.
 #
 # All v2-only imports are function-local so this module (imported by every
 # entrypoint) stays light and can never create an import cycle with the v2
@@ -594,6 +607,8 @@ _V2_MISSING_TERMINAL_MESSAGE = "v2 turn ended without a terminal response"
 _V2_MISSING_CLARIFICATION_MESSAGE = (
     "clarification is pending but no request was checkpointed"
 )
+
+_V2_UNEXPECTED_ERROR_MESSAGE = "Đã xảy ra lỗi khi xử lý yêu cầu."
 
 
 class V2FreshTurnRequired(ValueError):
@@ -677,51 +692,179 @@ def _v2_terminal_event(response) -> tuple[str, dict]:
 
 
 def _coerce_final_response(value):
-    """Accept the live model or its checkpoint-serde mapping form."""
+    """Re-validate a terminal response via the T6 checkpoint recipe.
+
+    Accepts the live model or its checkpoint-serde mapping form; nested
+    values revive as ``list``/``dict`` on real round-trips, so delegation
+    to ``_coerce_slot`` (JSON round-trip rebuild) is the single owner.
+    Raises ``TypeError`` when no terminal response is carried.
+    """
+    from app.services.agents.supervisor_v2 import _coerce_slot
     from app.services.agents.v2.contracts.response import FinalResponse
 
-    if isinstance(value, FinalResponse):
-        return value
-    if isinstance(value, dict):
-        data = dict(value)
-        # Checkpoint serde revives tuples as lists; the frozen model is
-        # strict, so restore the container form before validating.
-        if isinstance(data.get("citations"), list):
-            data["citations"] = tuple(data["citations"])
-        return FinalResponse.model_validate(data)
-    raise TypeError(
-        f"terminal state carries no FinalResponse (got {type(value).__name__})"
-    )
+    try:
+        coerced = _coerce_slot(value, FinalResponse, slot="final_response")
+    except Exception as exc:
+        raise TypeError(
+            "terminal state carries no FinalResponse "
+            f"(got {type(value).__name__}: {exc})"
+        ) from exc
+    if not isinstance(coerced, FinalResponse):
+        raise TypeError(
+            "terminal state carries no FinalResponse "
+            f"(got {type(value).__name__})"
+        )
+    return coerced
 
 
 def _coerce_clarification_request(value):
-    """Accept the live request or its checkpoint-serde mapping form."""
+    """Re-validate a persisted request via the T6 checkpoint recipe.
+
+    Accepts the live request or its checkpoint-serde mapping form (see
+    :func:`_coerce_final_response`); unparseable values resolve to ``None``
+    so the caller surfaces a typed error instead of walking a corrupt
+    request.
+    """
+    from app.services.agents.supervisor_v2 import _coerce_slot
     from app.services.agents.v2.contracts.clarification import ClarificationRequest
 
     if value is None:
         return None
-    if isinstance(value, ClarificationRequest):
-        return value
-    if isinstance(value, dict):
-        data = dict(value)
-        # Checkpoint serde revives tuples as lists; restore them first.
-        for key in ("candidates", "unresolved_ref_ids"):
-            if isinstance(data.get(key), list):
-                data[key] = tuple(data[key])
-        try:
-            return ClarificationRequest.model_validate(data)
-        except Exception:
-            logger.warning("[v2stream] clarification coerce failed", exc_info=True)
+    try:
+        coerced = _coerce_slot(value, ClarificationRequest, slot="clarification")
+    except Exception:
+        logger.warning("[v2stream] clarification coerce failed", exc_info=True)
+        return None
+    return coerced if isinstance(coerced, ClarificationRequest) else None
+
+
+async def _v2_checkpoint_snapshot(graph, config: dict):
+    """Load the latest checkpoint snapshot for ``config`` (or ``None``).
+
+    langgraph 1.0.0 exposes sync ``get_state`` and async ``aget_state``;
+    both shapes (plus awaitable ``get_state`` fakes) are accepted. Only
+    operational load failures resolve to ``None`` — the caller decides.
+    """
+    import inspect
+
+    try:
+        aget_state = getattr(graph, "aget_state", None)
+        if callable(aget_state):
+            return await aget_state(config)
+        get_state = getattr(graph, "get_state", None)
+        if not callable(get_state):
             return None
-    return None
+        snapshot = get_state(config)
+        if inspect.isawaitable(snapshot):
+            return await snapshot
+        return snapshot
+    except Exception:
+        logger.warning("[v2stream] checkpoint load failed", exc_info=True)
+        return None
+
+
+async def _v2_suspend_request(graph, config: dict, state: dict):
+    """Detect a suspend turn and load its persisted request (or ``None``).
+
+    Returns ``(suspended, request)``. Suspension is read from the RETURNED
+    state (``__interrupt__`` present — the pinned stack suppresses top-level
+    interrupts instead of raising) backed by the checkpoint (``next``
+    carrying ``clarify_wait`` with a persisted request). A suspended turn is
+    NOT terminal: no success/error terminal and no lease release follow.
+    """
+    values = state if isinstance(state, dict) else {}
+    interrupts = values.get("__interrupt__") or ()
+    try:
+        has_interrupt = len(interrupts) > 0
+    except TypeError:
+        has_interrupt = bool(interrupts)
+    snapshot = await _v2_checkpoint_snapshot(graph, config)
+    snapshot_values: dict = {}
+    next_nodes: tuple = ()
+    if snapshot is not None:
+        raw_values = getattr(snapshot, "values", None)
+        if isinstance(raw_values, dict):
+            snapshot_values = raw_values
+        try:
+            next_nodes = tuple(getattr(snapshot, "next", None) or ())
+        except TypeError:
+            next_nodes = ()
+    checkpoint_request = _coerce_clarification_request(
+        snapshot_values.get("clarification")
+    )
+    suspended = has_interrupt or (
+        "clarify_wait" in next_nodes and checkpoint_request is not None
+    )
+    if not suspended:
+        return False, None
+    request = _coerce_clarification_request(values.get("clarification"))
+    return True, request if request is not None else checkpoint_request
+
+
+def _v2_potential_abbreviations(state: dict) -> list:
+    """Project unknown abbreviation tokens from checkpointed semantics.
+
+    Mirrors the v1 ``potential_abbreviations`` meaning (backend-identified
+    tokens missing from the DB): finalized semantic abbreviations whose
+    ``expansion`` is ``None``. Live models and serde mappings both accepted.
+    """
+    try:
+        semantic = (state or {}).get("semantic")
+        if semantic is None:
+            return []
+        if isinstance(semantic, dict):
+            items = semantic.get("abbreviations") or ()
+        else:
+            items = getattr(semantic, "abbreviations", None) or ()
+        out = []
+        for item in items:
+            if isinstance(item, dict):
+                token, expansion = item.get("abbreviation"), item.get("expansion")
+            else:
+                token, expansion = (
+                    getattr(item, "abbreviation", None),
+                    getattr(item, "expansion", None),
+                )
+            if token and expansion is None and token not in out:
+                out.append(token)
+        return out
+    except Exception:
+        logger.warning("[v2stream] abbreviation projection failed", exc_info=True)
+        return []
+
+
+def _v2_terminal_is_error(state: dict) -> bool:
+    """True when the turn already ended non-success (T7-owned rule).
+
+    Decided by ``terminal_state_is_error`` (single owner); a state it cannot
+    read falls back to the terminal-response status, never to validation.
+    """
+    try:
+        from app.services.agent.runtime_selector import (
+            terminal_state_is_error as _t7_terminal_is_error,
+        )
+
+        return bool(_t7_terminal_is_error(state))
+    except Exception:
+        logger.warning("[v2stream] terminal-error check failed", exc_info=True)
+    try:
+        final = (state or {}).get("final_response")
+        if final is None:
+            return True
+        status = (
+            final.get("status")
+            if isinstance(final, dict)
+            else getattr(final, "status", None)
+        )
+        return status != "success" and status != "clarify"
+    except Exception:
+        return True
 
 
 async def _v2_checkpoint_values(graph, config: dict) -> dict:
     """Load the latest checkpoint values for ``config`` (mapping form)."""
-    try:
-        snapshot = await graph.get_state(config)
-    except Exception:
-        logger.warning("[v2stream] checkpoint load failed", exc_info=True)
+    snapshot = await _v2_checkpoint_snapshot(graph, config)
+    if snapshot is None:
         return {}
     values = getattr(snapshot, "values", None)
     if isinstance(values, dict):
@@ -803,10 +946,18 @@ def _feed_plan_resolver_from_checkpoint(plan_resolver, checkpoint_state: dict) -
     if plan_resolver is None:
         return
     try:
+        from app.services.agents.supervisor_v2 import _coerce_slot
+        from app.services.agents.v2.contracts.binding import DocumentBindingSet
+        from app.services.agents.v2.contracts.planning import TaskPlan
+
         plan, _ = _v2_execution_slots(checkpoint_state or {})
         bindings = (checkpoint_state or {}).get("bindings")
         if plan is None or bindings is None:
             return
+        # Real round-trips revive nested contracts as list/dict: rebuild
+        # the live tree before feeding (T6 recipe, single owner).
+        plan = _coerce_slot(plan, TaskPlan, slot="plan")
+        bindings = _coerce_slot(bindings, DocumentBindingSet, slot="bindings")
         feed = getattr(plan_resolver, "feed", None)
         if callable(feed):
             feed(plan, bindings)
@@ -817,10 +968,11 @@ def _feed_plan_resolver_from_checkpoint(plan_resolver, checkpoint_state: dict) -
 async def _refresh_v2_resume_leases(*, runtime_context, checkpoint_state: dict) -> int:
     """Refresh existing run leases BEFORE the resume dispatch continues.
 
-    Re-acquires every evidence use pinned in the checkpoint so the resumed
-    run's artifacts stay under an active lease (expiry extended, release
-    cleared). Best-effort hygiene: failures are logged, never fatal — the
-    nodes fail closed on the leases they need.
+    Re-acquires the SAME ``(revision, use)`` rows the scheduler leased at
+    dispatch (shared ``refresh_pairs_for_checkpoint`` recipe — no second
+    lease logic here): expiry extended, release cleared. Best-effort
+    hygiene: failures are logged, never fatal — the nodes fail closed on
+    the leases they need.
     """
     try:
         services = getattr(runtime_context, "services", None)
@@ -831,28 +983,21 @@ async def _refresh_v2_resume_leases(*, runtime_context, checkpoint_state: dict) 
     except Exception:
         logger.warning("[v2stream] lease refresh setup failed", exc_info=True)
         return 0
-    _, results = _v2_execution_slots(checkpoint_state or {})
-    use_ids: set = set()
     try:
-        for item in results or ():
-            if isinstance(item, dict):
-                uses = item.get("evidence_uses") or ()
-            else:
-                uses = getattr(item, "evidence_uses", None) or ()
-            for use in uses:
-                if isinstance(use, dict):
-                    uid = use.get("use_id")
-                else:
-                    uid = getattr(use, "use_id", None)
-                if uid is not None:
-                    use_ids.add(uid)
+        from app.services.agents.v2.execution.scheduler import (
+            refresh_pairs_for_checkpoint as _pairs_for_checkpoint,
+        )
+
+        plan, results = _v2_execution_slots(checkpoint_state or {})
+        bindings = (checkpoint_state or {}).get("bindings")
+        pairs = _pairs_for_checkpoint(plan, bindings, results)
     except Exception:
-        logger.warning("[v2stream] lease refresh scan failed", exc_info=True)
+        logger.warning("[v2stream] lease refresh pairs failed", exc_info=True)
         return 0
     refreshed = 0
-    for uid in sorted(use_ids, key=repr):
+    for revision_id, use_id in pairs:
         try:
-            await repo.acquire_or_refresh(run_id, None, uid)
+            await repo.acquire_or_refresh(run_id, revision_id, use_id)
             refreshed += 1
         except Exception:
             logger.warning("[v2stream] lease refresh failed", exc_info=True)
@@ -898,22 +1043,116 @@ async def prepare_v2_resume_command(
     """Build the verbatim resume ``Command`` for a clarification reply.
 
     Loads T5's ``resume_clarification`` output and returns it untouched —
-    the graph owns navigation. A candidate-free request raises
-    ``V2FreshTurnRequired``: the caller must treat the reply as a new turn,
-    never retry the resume.
+    the graph owns navigation. Whether the reply is answerable is decided
+    by T7's ``clarification_reply_is_fresh_turn`` (single owner): a
+    candidate-free request raises ``V2FreshTurnRequired`` and the caller
+    must treat the reply as a new turn, never retry the resume.
     """
-    from app.services.agents.v2.nodes.clarification import (
-        ClarificationUnsatisfiable,
-        resume_clarification,
+    from app.services.agent.runtime_selector import (
+        clarification_reply_is_fresh_turn as _is_fresh_turn,
     )
+    from app.services.agents.v2.nodes.clarification import resume_clarification
 
+    request = _coerce_clarification_request(request)
+    if request is None:
+        from app.services.agents.v2.nodes.clarification import ClarificationError
+
+        raise ClarificationError(
+            "persisted clarification request does not re-validate; "
+            "refusing to resume from it"
+        )
     try:
         return await resume_clarification(message_id, request, runtime_context)
-    except ClarificationUnsatisfiable as exc:
-        raise V2FreshTurnRequired(
-            "clarification offers no selectable candidate; "
-            "treat the reply as a new turn, do not retry the resume"
-        ) from exc
+    except Exception as exc:
+        if _is_fresh_turn(exc):
+            raise V2FreshTurnRequired(
+                "clarification offers no selectable candidate; "
+                "treat the reply as a new turn, do not retry the resume"
+            ) from exc
+        raise
+
+
+async def load_v2_pending_clarification(graph, thread_id: str):
+    """Return the suspended ``ClarificationRequest`` for ``thread_id``.
+
+    ``None`` when the thread is not suspended in ``clarify_wait`` (fresh
+    turn, terminal thread, or missing checkpoint). Entrypoints call this
+    BEFORE persisting-driven resume so the reply path is explicit.
+    """
+    snapshot = await _v2_checkpoint_snapshot(graph, _v2_config(thread_id))
+    if snapshot is None:
+        return None
+    try:
+        next_nodes = tuple(getattr(snapshot, "next", None) or ())
+    except TypeError:
+        return None
+    if "clarify_wait" not in next_nodes:
+        return None
+    values = getattr(snapshot, "values", None)
+    if not isinstance(values, dict):
+        return None
+    return _coerce_clarification_request(values.get("clarification"))
+
+
+async def resolve_v2_resume_command(
+    *,
+    graph,
+    thread_id: str,
+    message_id,
+    runtime_context,
+):
+    """Resolve this turn's resume ``Command`` (or ``None`` for a fresh turn).
+
+    ``None`` when no clarification is pending, when no reply message id is
+    available, or when the reply must start a fresh turn
+    (``V2FreshTurnRequired``). Any other clarification failure also falls
+    back to a fresh turn (logged): the new turn always emits its own
+    terminal, so the stream keeps the one-terminal guarantee instead of
+    surfacing a resume-plumbing error for a user message.
+    """
+    from app.services.agents.v2.nodes.clarification import ClarificationError
+
+    if message_id is None:
+        return None
+    pending = await load_v2_pending_clarification(graph, thread_id)
+    if pending is None:
+        return None
+    try:
+        return await prepare_v2_resume_command(
+            message_id=message_id,
+            request=pending,
+            runtime_context=runtime_context,
+        )
+    except V2FreshTurnRequired:
+        logger.info(
+            "[v2stream] clarification reply starts a fresh turn "
+            "(thread %s)",
+            thread_id,
+        )
+        return None
+    except ClarificationError as exc:
+        logger.warning(
+            "[v2stream] clarification resume unusable (%s); fresh turn",
+            exc,
+        )
+        return None
+
+
+async def persisted_message_uuid(db, row):
+    """Return a just-persisted chat row's UUID primary key (or ``None``).
+
+    ``persist_raw_user_message`` commits (expiring attributes), so refresh
+    explicitly on the same session before reading ``row.id`` — the resume
+    path needs the ``ChatMessage.id`` form, never the client message id.
+    """
+    if row is None:
+        return None
+    try:
+        await db.refresh(row)
+        return row.id
+    except Exception:
+        logger.warning("[v2stream] message id refresh failed", exc_info=True)
+        return None
 
 
 async def stream_v2_turn_events(
@@ -932,7 +1171,11 @@ async def stream_v2_turn_events(
     verbatim :func:`prepare_v2_resume_command` ``Command``) is required.
     ``config`` binds the stable ``thread_id``; ``context`` always carries
     the caller-supplied ``runtime_context`` so the CURRENT ACL replaces
-    historical values on resume. Emits exactly one terminal event.
+    historical values on resume. Emits exactly one terminal event:
+    ``complete`` for success/clarify suspensions and successes, ``error``
+    otherwise (including unexpected graph failures — a raw exception never
+    escapes). Suspension (``__interrupt__`` / ``clarify_wait``) is NOT
+    terminal: the question surfaces as ``complete`` with leases kept.
     """
     from langgraph.errors import GraphInterrupt
 
@@ -941,9 +1184,38 @@ async def stream_v2_turn_events(
     config = _v2_config(thread_id)
     acc = _V2StreamAccumulators()
     invoke_task = None
+    released = False
+
+    async def _release_once(reason: str) -> int:
+        nonlocal released
+        if released:
+            return 0
+        released = True
+        return await _release_v2_run_leases(
+            runtime_context=runtime_context, reason=reason
+        )
+
+    async def _emit_suspend_turn(pending) -> AsyncGenerator[dict, None]:
+        # Shared by the returned-state and nested-raise suspend paths:
+        # the question arrives whole in the single terminal ``complete``
+        # (tokens stream for success terminals only — see below); leases
+        # stay active.
+        yield {"event": "status", "data": {"step": "generating", "detail": "clarification pending"}}
+        event, data = _v2_terminal_event(
+            _coerce_final_response(
+                {
+                    "contract_version": pending.contract_version,
+                    "status": "clarify",
+                    "content": pending.question,
+                    "citations": (),
+                }
+            )
+        )
+        yield {"event": event, "data": data}
+
     try:
         if resume_command is not None:
-            yield {"event": "status", "data": {"step": "v2", "detail": "Resuming v2 graph..."}}
+            yield {"event": "status", "data": {"step": "analyzing", "detail": "Resuming v2 graph..."}}
             checkpoint_state = await _v2_checkpoint_values(graph, config)
             await _refresh_v2_resume_leases(
                 runtime_context=runtime_context,
@@ -952,7 +1224,7 @@ async def stream_v2_turn_events(
             _feed_plan_resolver_from_checkpoint(plan_resolver, checkpoint_state)
             payload = resume_command
         else:
-            yield {"event": "status", "data": {"step": "v2", "detail": "Running v2 graph..."}}
+            yield {"event": "status", "data": {"step": "analyzing", "detail": "Running v2 graph..."}}
             payload = initial_state
         invoke_task = asyncio.create_task(
             graph.ainvoke(payload, config, context=runtime_context)
@@ -960,34 +1232,21 @@ async def stream_v2_turn_events(
         try:
             result = await invoke_task
         except GraphInterrupt:
+            # Nested-graph compat: top-level suspends RETURN ``__interrupt__``
+            # (handled below); a raise only escapes from nested graphs.
+            result = {"__interrupt__": (True,)}
+        state = result if isinstance(result, dict) else {}
+        suspended, pending = await _v2_suspend_request(graph, config, state)
+        if suspended:
             # Clarify suspend: the suspension checkpoint keeps the persisted
             # request AND the active leases (never released here). Surface
             # the question as the turn's single terminal ``complete``.
-            checkpoint_state = await _v2_checkpoint_values(graph, config)
-            pending = _coerce_clarification_request(
-                (checkpoint_state or {}).get("clarification")
-            )
             if pending is None:
                 yield {"event": "error", "data": {"message": _V2_MISSING_CLARIFICATION_MESSAGE}}
                 return
-            question = pending.question
-            yield {"event": "status", "data": {"step": "clarify", "detail": "clarification pending"}}
-            for chunk in _chunk_prose(question, token_chunk_size):
-                acc.on_token(chunk)
-                yield {"event": "token", "data": {"text": chunk}}
-            event, data = _v2_terminal_event(
-                _coerce_final_response(
-                    {
-                        "contract_version": pending.contract_version,
-                        "status": "clarify",
-                        "content": question,
-                        "citations": (),
-                    }
-                )
-            )
-            yield {"event": event, "data": data}
+            async for ev in _emit_suspend_turn(pending):
+                yield ev
             return
-        state = result if isinstance(result, dict) else {}
         remaining = _v2_undispatched(state)
         if remaining:
             # Deadline-truncated dispatch: never present partial results as
@@ -998,41 +1257,62 @@ async def stream_v2_turn_events(
             )
             yield acc.on_rollback()
             yield {"event": "error", "data": {"message": _V2_TRUNCATION_MESSAGE}}
-            await _release_v2_run_leases(runtime_context=runtime_context, reason="terminal")
+            await _release_once("terminal")
             return
         try:
             final = _coerce_final_response(state.get("final_response"))
         except (TypeError, ValueError):
             logger.error("[v2stream] turn ended without a terminal response")
             yield {"event": "error", "data": {"message": _V2_MISSING_TERMINAL_MESSAGE}}
-            await _release_v2_run_leases(runtime_context=runtime_context, reason="terminal")
+            await _release_once("terminal")
             return
         event, data = _v2_terminal_event(final)
-        if event == "complete":
-            # Only the outer adapter streams prose: chunk the terminal
-            # content into ``token`` events, then emit the single terminal.
+        if event == "complete" and not _v2_terminal_is_error(state):
+            # Success only (T7-owned rule): chunk the terminal content into
+            # ``token`` events, then emit the single terminal. Clarify
+            # terminals (non-success ``complete``) carry the question in the
+            # payload itself — no speculative prose precedes them.
             yield {"event": "status", "data": {"step": "generating", "detail": "Streaming v2 answer..."}}
             for chunk in _chunk_prose(data.get("answer", ""), token_chunk_size):
                 acc.on_token(chunk)
                 yield {"event": "token", "data": {"text": chunk}}
-            await _release_v2_run_leases(runtime_context=runtime_context, reason="terminal")
+            for abbreviation in _v2_potential_abbreviations(state):
+                acc.on_potential_abbreviations([*acc.potential_abbreviations, abbreviation])
+            if acc.potential_abbreviations:
+                yield {
+                    "event": "potential_abbreviations",
+                    "data": {"abbreviations": list(acc.potential_abbreviations)},
+                }
+            await _release_once("terminal")
             yield {"event": event, "data": data}
             return
-        await _release_v2_run_leases(runtime_context=runtime_context, reason="terminal")
+        await _release_once("terminal")
         yield {"event": event, "data": data}
     except GeneratorExit:
         # Client disconnect mid-run: stop the graph task, never succeed.
         if invoke_task is not None and not invoke_task.done():
             invoke_task.cancel()
-        await _release_v2_run_leases(runtime_context=runtime_context, reason="cancelled")
+        await _release_once("cancelled")
         raise
     except asyncio.CancelledError:
         # Cancellation prevents all later dispatch and any factual success:
         # no terminal event, leases released as cancelled, error propagates.
         if invoke_task is not None and not invoke_task.done():
             invoke_task.cancel()
-        await _release_v2_run_leases(runtime_context=runtime_context, reason="cancelled")
+        await _release_once("cancelled")
         raise
+    except Exception as exc:
+        # Unexpected graph failure (I1): like v1, convert to a terminal
+        # ``error`` instead of letting a raw exception escape the SSE
+        # stream — the frontend would otherwise render a silent partial
+        # answer. Leases still release (the run is over), exactly once.
+        logger.error("[v2stream] unexpected v2 turn failure: %s", exc, exc_info=True)
+        if invoke_task is not None and not invoke_task.done():
+            invoke_task.cancel()
+        yield acc.on_rollback()
+        yield {"event": "error", "data": {"message": _V2_UNEXPECTED_ERROR_MESSAGE}}
+        await _release_once("terminal")
+        return
 
 
 async def stream_v2_turn_to_sse(
