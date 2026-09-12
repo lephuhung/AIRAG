@@ -25,6 +25,7 @@ __all__ = [
     "MissingCheckpointedPlan",
     "require_checkpointed_plan",
     "execution_update",
+    "reset_execution",
     "execute_node",
 ]
 
@@ -55,6 +56,8 @@ def execution_update(
 
     Uses the frozen field name ``evidence_evaluation`` (never an alias
     ``evaluation``); unset slots keep the current checkpointed values.
+    A new turn boundary that must CLEAR slots uses ``reset_execution``
+    instead — passing None here never clears.
     """
     current = state["execution"]
     return {
@@ -70,6 +73,24 @@ def execution_update(
     }
 
 
+def reset_execution(state: SupervisorV2State, plan: TaskPlan) -> dict:
+    """Return a full frozen ExecutionState partial for a brand-new plan.
+
+    Used at a turn boundary (``fast_plan_node``): the new plan owns fresh
+    results and evaluation, so stale ``task_results`` and
+    ``evidence_evaluation`` from the previous turn are cleared rather than
+    carried into an aggregate the frozen validator would reject. Prefer
+    ``execution_update`` (None-means-keep) when the plan is unchanged.
+    """
+    return {
+        "execution": ExecutionState(
+            plan=plan,
+            task_results=(),
+            evidence_evaluation=None,
+        )
+    }
+
+
 async def execute_node(
     state: SupervisorV2State,
     runtime: "Runtime[GraphRuntimeContext]",
@@ -78,10 +99,10 @@ async def execute_node(
     context = _context_of(runtime)
     plan = require_checkpointed_plan(state)
     scheduler = TaskScheduler(context.services.capability_registry)
-    results = await scheduler.execute(
+    report = await scheduler.execute(
         plan=plan,
         runtime=context,
         prior_results=state["execution"].task_results,
         bindings=state["bindings"],
     )
-    return execution_update(state, task_results=results)
+    return execution_update(state, task_results=report.results)

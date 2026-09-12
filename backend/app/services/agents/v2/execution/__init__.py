@@ -10,9 +10,10 @@ and evidence evaluation is the shared ``evaluate_evidence(...)`` function in
 from __future__ import annotations
 
 from ..contracts.state import RuntimeServices
-from .scheduler import SchedulerError, TaskScheduler, execute_ready_tasks
+from .scheduler import DispatchReport, SchedulerError, TaskScheduler, execute_ready_tasks
 
 __all__ = [
+    "DispatchReport",
     "RuntimeServices",
     "SchedulerError",
     "TaskScheduler",

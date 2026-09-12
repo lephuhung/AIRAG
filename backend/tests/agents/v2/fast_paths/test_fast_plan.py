@@ -344,6 +344,32 @@ async def test_fast_plan_node_checkpoints_plan_before_dispatch() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fast_plan_node_clears_stale_results_and_evaluation() -> None:
+    """C2: a turn-2 fast plan resets results AND a non-None prior evaluation."""
+    from app.services.agents.v2.contracts.evaluation import Coverage, EvidenceEvaluation
+    from app.services.agents.v2.contracts.state import ExecutionState
+    from app.services.agents.v2.nodes.fast_plan import fast_plan_node
+
+    stale_evaluation = EvidenceEvaluation(
+        status="insufficient",
+        coverage=Coverage(items=()),
+        missing=(),
+        contradictions=(),
+    )
+    state = _node_state()
+    state["execution"] = ExecutionState(
+        plan=None,
+        task_results=state["execution"].task_results,
+        evidence_evaluation=stale_evaluation,
+    )
+    update = await fast_plan_node(state, _node_runtime())  # type: ignore[arg-type]
+    execution = update["execution"]
+    assert execution.plan is not None
+    assert execution.task_results == ()
+    assert execution.evidence_evaluation is None
+
+
+@pytest.mark.asyncio
 async def test_fast_plan_node_fails_closed_without_fast_route() -> None:
     from app.services.agents.v2.nodes.fast_plan import FastPlanError, fast_plan_node
 

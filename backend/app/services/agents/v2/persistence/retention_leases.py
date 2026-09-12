@@ -81,19 +81,27 @@ class RevisionRetentionLeaseRepository:
     async def acquire_or_refresh(
         self,
         run_id: str,
-        revision_id: uuid.UUID,
+        revision_id: Optional[uuid.UUID] = None,
         evidence_use_id: Optional[uuid.UUID] = None,
         *,
         now: Optional[datetime] = None,
     ) -> RevisionRetentionLease:
         """Acquire the run's lease on ``revision_id``, or refresh its expiry.
 
-        The null-safe unique ``uq_revision_lease_run_revision_use`` on
-        ``(run_id, revision_id, evidence_use_id)`` is the arbiter: a re-delivered
-        / resumed node converges on the SAME lease row (``lease_id`` preserved),
-        extends ``expires_at`` to ``now + ttl``, and clears any release so the
-        pin is active again. ``acquired_at`` is preserved — it records the first
-        acquisition.
+        Pass ``revision_id=None`` with an ``evidence_use_id`` for an
+        evidence-only (targetless) lease: People/KG/memory evidence has no
+        document revision to pin, so the lease anchors on the run + use
+        identity alone. The null-safe unique
+        ``uq_revision_lease_run_revision_use`` on
+        ``(run_id, revision_id, evidence_use_id)`` is the arbiter in both
+        cases: a re-delivered / resumed node converges on the SAME lease row
+        (``lease_id`` preserved), extends ``expires_at`` to ``now + ttl``,
+        and clears any release so the pin is active again.
+        ``acquired_at`` is preserved — it records the first acquisition.
+
+        At least one of ``revision_id`` / ``evidence_use_id`` should identify
+        the retained artifact; a fully anonymous lease retains nothing and
+        is only useful as a run keep-alive.
 
         The caller MUST commit after this call and before emitting the
         checkpointable state update (see the module docstring).

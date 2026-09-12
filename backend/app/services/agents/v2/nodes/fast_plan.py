@@ -5,10 +5,10 @@
 and knowledge-graph lookups carry zero target units; document/section reads
 carry one target unit per required pin (document) or per named section on the
 single pin (section), and the single task input references exactly those
-targets. ``fast_plan_node`` checkpoints that plan (clearing stale results and
-evaluation: a fast plan is initial planning, which receives no outcomes)
-before any capability is dispatched. Follows the Task-1 node-injection
-convention via ``_context_of``.
+targets. ``fast_plan_node`` checkpoints that plan via ``reset_execution``
+(clearing stale results and evaluation: a fast plan is initial planning,
+which receives no outcomes) before any capability is dispatched. Follows the
+Task-1 node-injection convention via ``_context_of``.
 """
 from __future__ import annotations
 
@@ -37,9 +37,9 @@ from ..contracts.planning import (
 from ..contracts.routing import QueryAnalysis, RouteDecision
 from ..contracts.semantic import SemanticContext
 from ..contracts.state import GraphRuntimeContext, SupervisorV2State
-from ..contracts.validation import validate_task_plan
+from ..contracts.validation import validate_fast_plan, validate_task_plan
 from .context import _context_of
-from .execute import execution_update
+from .execute import reset_execution
 
 __all__ = [
     "FastPlanError",
@@ -214,6 +214,7 @@ def build_fast_plan(
         tasks=(task,),
     )
     validate_task_plan(plan, bindings)
+    validate_fast_plan(plan, bindings)
     return plan
 
 
@@ -230,6 +231,4 @@ async def fast_plan_node(
             "fast plan requires the checkpointed query analysis and route decision"
         )
     plan = build_fast_plan(state["semantic"], state["bindings"], analysis, route)
-    return execution_update(
-        state, plan=plan, task_results=(), evidence_evaluation=None
-    )
+    return reset_execution(state, plan)

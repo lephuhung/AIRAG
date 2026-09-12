@@ -116,16 +116,18 @@ class FakeLeaseRepo:
 
     def __init__(self, events: list[str]) -> None:
         self.events = events
+        self.calls: list[tuple[Any, Any, Any]] = []
         self.session = FakeLeaseSession(events)
 
     async def acquire_or_refresh(
         self,
         run_id: str,
-        revision_id: Any,
+        revision_id: Any = None,
         evidence_use_id: Any = None,
         *,
         now: Any = None,
     ) -> Any:
+        self.calls.append((run_id, revision_id, evidence_use_id))
         self.events.append(f"acquire:{evidence_use_id}")
         return None
 
@@ -379,7 +381,12 @@ async def test_fast_people_uses_shared_capability_registry() -> None:
     stub = StubCapability("people.lookup", "people", people_result(task_id))
     registry = registry_for(stub)
     scheduler = TaskScheduler(registry)
-    results = await scheduler.execute(plan, graph_runtime(registry=registry))
+    events: list[str] = []
+    report = await scheduler.execute(
+        plan, graph_runtime(registry=registry, leases=FakeLeaseRepo(events))
+    )
+    assert report.truncated is False
+    results = report.results
     assert len(results) == 1
     assert results[0].task_id == task_id
     assert results[0].status == "success"
@@ -429,11 +436,13 @@ async def test_fast_document_read_uses_shared_capability_registry() -> None:
     stub = StubCapability("document.read", "document", read_result(task_id))
     registry = registry_for(stub)
     events: list[str] = []
-    results = await TaskScheduler(registry).execute(
+    report = await TaskScheduler(registry).execute(
         plan,
         graph_runtime(registry=registry, leases=FakeLeaseRepo(events)),
         bindings=binding_set(),
     )
+    assert report.truncated is False
+    results = report.results
     assert len(results) == 1
     assert results[0].coverage_observations[0].target_id == "t_b_r1"
     assert registry.get("document.read") is stub
@@ -510,6 +519,32 @@ async def test_scheduler_never_rewrites_task_input() -> None:
     assert sent is task.input
 
 
+@pytest.mark.asyncio
+async def test_execute_leases_targetless_people_use_with_evidence_only_lease() -> None:
+    """C1: a fresh targetless use is leased with revision_id None (never skipped)."""
+    from app.services.agents.v2.execution.scheduler import TaskScheduler
+
+    plan = people_plan()
+    use_id = uuid4()
+    stub = StubCapability(
+        "people.lookup", "people", people_result(plan.tasks[0].task_id, use_id)
+    )
+    registry = registry_for(stub)
+    events: list[str] = []
+    repo = FakeLeaseRepo(events)
+    report = await TaskScheduler(registry).execute(
+        plan,
+        graph_runtime(registry=registry, leases=repo),
+    )
+    assert report.truncated is False
+    assert len(report.results) == 1
+    assert report.results[0].evidence_uses[0].use_id == use_id
+    assert repo.calls == [("run-1", None, use_id)]
+    assert f"acquire:{use_id}" in events
+    assert "commit" in events
+    assert events.index(f"acquire:{use_id}") < events.index("commit")
+
+
 # ---------------------------------------------------------------------------
 # Leases: every new use leased before results are returned; never re-leased
 # ---------------------------------------------------------------------------
@@ -526,11 +561,13 @@ async def test_execute_leases_new_evidence_uses_before_checkpoint() -> None:
     )
     registry = registry_for(stub)
     events: list[str] = []
-    results = await TaskScheduler(registry).execute(
+    report = await TaskScheduler(registry).execute(
         plan,
         graph_runtime(registry=registry, leases=FakeLeaseRepo(events)),
         bindings=binding_set(),
     )
+    assert report.truncated is False
+    results = report.results
     assert len(results) == 1
     assert results[0].evidence_uses[0].use_id == use_id
     assert f"acquire:{use_id}" in events
@@ -544,7 +581,8 @@ async def test_execute_leases_new_evidence_uses_before_checkpoint() -> None:
         prior_results=results,
         bindings=binding_set(),
     )
-    assert rerun == results
+    assert rerun.results == results
+    assert rerun.truncated is False
     assert stub.calls and len(stub.calls) == 1
     assert events.count(f"acquire:{use_id}") == 1
 
@@ -584,11 +622,13 @@ async def test_every_result_use_and_coverage_resolves_to_checkpointed_ids() -> N
     )
     registry = registry_for(stub)
     events: list[str] = []
-    results = await TaskScheduler(registry).execute(
+    report = await TaskScheduler(registry).execute(
         plan,
         graph_runtime(registry=registry, leases=FakeLeaseRepo(events)),
         bindings=binding_set(),
     )
+    assert report.truncated is False
+    results = report.results
     assert len(results) == 1
     validate_agent_result(results[0], plan)
     assert results[0].task_id in {task.task_id for task in plan.tasks}
@@ -612,7 +652,7 @@ async def test_scheduler_stops_before_dispatch_on_deadline() -> None:
     )
     registry = registry_for(stub)
     events: list[str] = []
-    results = await TaskScheduler(registry).execute(
+    report = await TaskScheduler(registry).execute(
         plan,
         graph_runtime(
             registry=registry,
@@ -621,9 +661,38 @@ async def test_scheduler_stops_before_dispatch_on_deadline() -> None:
         ),
         bindings=binding_set(),
     )
-    assert results == ()
+    assert report.results == ()
+    assert report.truncated is True
     assert stub.calls == []
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_fails_closed_when_tasks_never_ready() -> None:
+    """M5: unknown dependencies/cycles are a typed failure, never a silent partial."""
+    from app.services.agents.v2.execution.scheduler import SchedulerError, TaskScheduler
+
+    ghost = TaskSpec(
+        task_id="G1",
+        capability="people.lookup",
+        task_objective="ghost dependency",
+        input=PeopleLookupInput(kind="people.lookup", query="A"),
+        depends_on=("no-such-task",),
+        origin=InitialTaskOrigin(kind="initial"),
+    )
+    plan = TaskPlan(
+        contract_version="2.0",
+        plan_id="plan-ghost",
+        goal="ghost",
+        target_units=(),
+        tasks=(ghost,),
+    )
+    stub = StubCapability("people.lookup", "people", people_result("G1"))
+    with pytest.raises(SchedulerError):
+        await TaskScheduler(registry_for(stub)).execute(
+            plan, graph_runtime(registry=registry_for(stub))
+        )
+    assert stub.calls == []
 
 
 @pytest.mark.asyncio
@@ -686,9 +755,11 @@ async def test_registry_denial_returns_typed_denied_result() -> None:
     registry = registry_for(
         excluded_read, other, allowed=frozenset({"people.lookup"})
     )
-    results = await TaskScheduler(registry).execute(
+    report = await TaskScheduler(registry).execute(
         plan, graph_runtime(registry=registry), bindings=binding_set()
     )
+    assert report.truncated is False
+    results = report.results
     assert len(results) == 1
     assert results[0].task_id == plan.tasks[0].task_id
     assert results[0].status == "denied"
@@ -712,8 +783,9 @@ async def test_execute_node_returns_frozen_execution_partial() -> None:
         "people.lookup", "people", people_result(plan.tasks[0].task_id)
     )
     registry = registry_for(stub)
+    events: list[str] = []
     update = await execute_node(
-        make_state(plan=plan), graph_runtime(registry=registry)
+        make_state(plan=plan), graph_runtime(registry=registry, leases=FakeLeaseRepo(events))
     )
     assert set(update) == {"execution"}
     execution = update["execution"]

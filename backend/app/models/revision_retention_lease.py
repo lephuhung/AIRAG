@@ -8,10 +8,17 @@ worker runs.
 null-safe unique key ``uq_revision_lease_run_revision_use``:
 
 - ``NULLS NOT DISTINCT`` semantics (PG15+) means two rows with NULL
-  ``evidence_use_id`` still collide on ``(run_id, revision_id)``.
+  ``evidence_use_id`` still collide on ``(run_id, revision_id)`` — and two
+  evidence-only rows with NULL ``revision_id`` still collide on
+  ``(run_id, evidence_use_id)``.
 - ``evidence_use_id`` is NULL when no evidence use is bound to the
   lease (the typical case for a worker holding a revision for
   vector / caption / KG work).
+- ``revision_id`` is NULL for evidence-only (targetless) leases: a
+  People/KG/memory evidence payload has no document revision to pin, so the
+  lease anchors on the run + use identity alone. GC matches such leases
+  through ``active_evidence_lease_exists`` (use-id branch), never through
+  the revision branch.
 - The partial index ``ix_leases_active`` on
   ``(revision_id, expires_at) WHERE released_at IS NULL`` is the
   fast lookup path for "is there an active lease for this revision?".
@@ -44,10 +51,14 @@ class RevisionRetentionLease(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     run_id: Mapped[str] = mapped_column(Text, nullable=False)
-    revision_id: Mapped[uuid.UUID] = mapped_column(
+    revision_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("document_revisions.revision_id", ondelete="RESTRICT"),
-        nullable=False,
+        # NULL for evidence-only (targetless) leases: People/KG/memory
+        # evidence has no document revision to pin (nullable FK is fine —
+        # NULL never matches the parent side, and GC reads such leases
+        # only through the evidence_use_id branch).
+        nullable=True,
     )
     # NULL when the lease is bound to a revision but not to a
     # specific evidence use. The null-safe UNIQUE lets multiple such

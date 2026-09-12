@@ -361,11 +361,15 @@ _CREATE_DDL: tuple[str, ...] = (
     # The null-safe unique constraint is required by gate #39 (checkpoint
     # retention lease protocol). PG15+ syntax: NULLS NOT DISTINCT so two
     # rows with NULL evidence_use_id would still collide.
+    # revision_id is NULL for evidence-only (targetless) leases: People/KG/
+    # memory evidence has no document revision to pin (T3 round 1, C1 — the
+    # nullable FK still guards non-null values; GC matches such leases only
+    # through the evidence_use_id branch of active_evidence_lease_exists).
     """
     CREATE TABLE IF NOT EXISTS revision_retention_leases (
         lease_id         UUID        PRIMARY KEY,
         run_id           TEXT        NOT NULL,
-        revision_id      UUID        NOT NULL,
+        revision_id      UUID        NULL,
         evidence_use_id  UUID        NULL,
         acquired_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         expires_at       TIMESTAMPTZ NOT NULL,
@@ -525,6 +529,14 @@ _NULLABILITY_COLUMNS: tuple[str, ...] = (
     "ALTER TABLE documents ADD COLUMN IF NOT EXISTS source_deleted_at TIMESTAMPTZ NULL",
     "ALTER TABLE document_images ADD COLUMN IF NOT EXISTS revision_id UUID NULL",
     "ALTER TABLE document_tables ADD COLUMN IF NOT EXISTS revision_id UUID NULL",
+)
+
+
+# T3 round 1 (C1): evidence-only leases need a nullable revision_id on
+# databases the pre-C1 DDL already created. Idempotent: DROP NOT NULL on an
+# already-nullable column is a no-op.
+_LEASE_EVIDENCE_ONLY_ALTER: tuple[str, ...] = (
+    "ALTER TABLE revision_retention_leases ALTER COLUMN revision_id DROP NOT NULL",
 )
 
 
@@ -987,6 +999,11 @@ def apply_v2_schema(engine: Engine) -> None:
 
         # 2. Create the v2 tables in dependency order.
         for stmt in _CREATE_DDL:
+            conn.execute(text(stmt))
+
+        # 2b. Repair pre-C1 lease tables whose revision_id is still NOT NULL
+        # (fresh CREATEs already declare it NULL; the ALTER is a no-op there).
+        for stmt in _LEASE_EVIDENCE_ONLY_ALTER:
             conn.execute(text(stmt))
 
         # 3. Add nullable columns to legacy tables (no NOT NULL, no backfill).

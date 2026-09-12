@@ -20,25 +20,27 @@ under ``asyncio.wait_for`` with the remaining budget. Incomplete work is never
 turned into success — cancellation and timeout propagate, and no synthetic
 result is fabricated.
 
-Leases: the Phase-1 lease schema is revision-anchored
-(``acquire_or_refresh(run_id, revision_id, evidence_use_id)`` with a non-null
-revision FK), so a new use is leasable only when it resolves to a pinned
-document revision. The scheduler resolves each executed task's target
+Leases: every newly created EvidenceUse is leased before results are
+returned so checkpointed uses sit under an active lease (T3 round 1, C1).
+The single owner of lease SQL stays
+``persistence.retention_leases.RevisionRetentionLeaseRepository``:
+``acquire_or_refresh(run_id, revision_id, evidence_use_id)`` with a nullable
+``revision_id``. The scheduler resolves each executed task's target
 revisions through the checkpointed plan plus the checkpointed bindings
 (threaded explicitly from ``execute_node`` — never supervisor/graph state)
-and leases every (new use × task revision) pair before results are returned,
-so the checkpointed uses sit under an active lease. Targetless tasks
-(People/KG/memory supporting uses) resolve to no revision and are returned
-without a document-revision lease — their payloads rely on store TTL/expiry,
-not active leases (residual risk, recorded for T6). The lease session is
-committed once, after all acquisitions and before returning, mirroring the
-``binding_node`` safe ordering; a missing lease service fails closed only
-when a leasable use actually needs it.
+and leases every (new use × task revision) pair; a use that resolves to no
+revision (targetless People/KG/memory uses) is leased evidence-only
+(``revision_id=None`` bound to the use id), which the GC predicate matches
+through its ``evidence_use_id`` branch. Nothing is silently skipped: a
+missing lease service fails closed whenever a fresh use needs it. The lease
+session is committed once, after all acquisitions and before returning,
+mirroring the ``binding_node`` safe ordering.
 """
 from __future__ import annotations
 
 import asyncio
 import inspect
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
@@ -58,6 +60,7 @@ from ..contracts.state import GraphRuntimeContext
 from ..contracts.validation import ContractValidationError, validate_agent_result
 
 __all__ = [
+    "DispatchReport",
     "SchedulerError",
     "TaskScheduler",
     "execute_ready_tasks",
@@ -66,6 +69,22 @@ __all__ = [
 
 class SchedulerError(ValueError):
     """Dispatch-boundary failure: the task must not be checkpointed."""
+
+
+@dataclass(frozen=True)
+class DispatchReport:
+    """The typed outcome of one scheduler run (T3 round 1, M3).
+
+    ``results`` are the prior plus newly appended immutable results.
+    ``truncated`` is True when the deadline stopped dispatch while tasks
+    remained undispatched, so T4/T6 can distinguish a truncated dispatch
+    from a complete one. Incomplete work is never reported as complete:
+    truncation carries no synthetic results, and cancellation/timeout raise
+    instead of returning a report at all.
+    """
+
+    results: tuple[AgentResult, ...]
+    truncated: bool = False
 
 
 def _now() -> datetime:
@@ -165,7 +184,11 @@ async def _lease_new_uses(
     runtime: GraphRuntimeContext,
     known_use_ids: set[UUID],
 ) -> bool:
-    """Lease every newly created use of one result. Returns True if acquired."""
+    """Lease every newly created use of one result. Returns True if acquired.
+
+    Revision-anchored when the use resolves to a pinned document revision;
+    evidence-only (``revision_id=None``) otherwise — never silently skipped.
+    """
     fresh = [
         ref
         for ref in result.evidence_uses
@@ -176,11 +199,6 @@ async def _lease_new_uses(
     revisions = _task_target_revisions(task, plan, bindings)
     for ref in fresh:
         known_use_ids.add(ref.use_id)
-    if not revisions:
-        # Targetless task (People/KG/memory supporting uses): the revision
-        # anchored lease schema has nothing to pin; the uses are returned
-        # without a document-revision lease (see module docstring).
-        return False
     repo = runtime.services.retention_leases
     if repo is None:
         raise SchedulerError(
@@ -189,10 +207,16 @@ async def _lease_new_uses(
             "unleashed uses"
         )
     run_id = runtime.capability_runtime.run_id
-    for ref in fresh:
-        for revision in revisions:
+    if revisions:
+        for ref in fresh:
+            for revision in revisions:
+                await _maybe_await(
+                    repo.acquire_or_refresh(run_id, revision, ref.use_id)
+                )
+    else:
+        for ref in fresh:
             await _maybe_await(
-                repo.acquire_or_refresh(run_id, revision, ref.use_id)
+                repo.acquire_or_refresh(run_id, None, ref.use_id)
             )
     return True
 
@@ -242,15 +266,18 @@ async def execute_ready_tasks(
     registry: CapabilityRegistry | None,
     runtime: GraphRuntimeContext,
     bindings: DocumentBindingSet | None = None,
-) -> tuple[AgentResult, ...]:
-    """Execute every ready plan task in plan order; return all results.
+) -> DispatchReport:
+    """Execute every ready plan task in plan order; report all results.
 
     ``plan`` is the authoritative checkpointed plan: prior results that do not
     resolve to its tasks fail closed, and only its tasks are ever dispatched.
     ``bindings`` are the checkpointed bindings used solely to resolve lease
     revisions (never supervisor/graph state). Ready means all ``depends_on``
     tasks already have results; dispatch is sequential in plan order so
-    dependencies complete before dependents.
+    dependencies complete before dependents. Tasks that can never
+    become ready (unknown dependency or cycle — the frozen validator should
+    have rejected the plan at checkpoint time) raise ``SchedulerError``
+    instead of silently returning a partial set.
     """
     task_by_id = {task.task_id: task for task in plan.tasks}
     for result in results:
@@ -266,6 +293,7 @@ async def execute_ready_tasks(
         ref.use_id for result in completed for ref in result.evidence_uses
     }
     leased_any = False
+    truncated = False
     while True:
         ready = next(
             (
@@ -277,9 +305,20 @@ async def execute_ready_tasks(
             None,
         )
         if ready is None:
+            if any(task.task_id not in done for task in plan.tasks):
+                remaining = sorted(
+                    task.task_id
+                    for task in plan.tasks
+                    if task.task_id not in done
+                )
+                raise SchedulerError(
+                    f"tasks {remaining} can never become ready (unknown "
+                    "dependency or cycle); refusing to return a silent partial"
+                )
             break
         _raise_if_cancelled()
         if not _dispatch_allowed(runtime):
+            truncated = True
             break
         result = await _dispatch_one(ready, registry=registry, runtime=runtime)
         if result.task_id != ready.task_id:
@@ -306,7 +345,7 @@ async def execute_ready_tasks(
                 "leases were acquired but the retention-lease service is gone"
             )
         await _commit_lease_session(repo)
-    return tuple(completed)
+    return DispatchReport(results=tuple(completed), truncated=truncated)
 
 
 class TaskScheduler:
@@ -321,13 +360,14 @@ class TaskScheduler:
         runtime: GraphRuntimeContext,
         prior_results: tuple[AgentResult, ...] = (),
         bindings: DocumentBindingSet | None = None,
-    ) -> tuple[AgentResult, ...]:
-        """Execute the plan's ready tasks; return prior plus new results.
+    ) -> DispatchReport:
+        """Execute the plan's ready tasks; report prior plus new results.
 
         ``plan`` must be the checkpointed plan (``execute_node`` enforces
         ownership via ``require_checkpointed_plan``); ``bindings`` are the
         checkpointed bindings for lease resolution. Cancellation and deadline
-        stop dispatch without fabricating success.
+        stop dispatch without fabricating success; a deadline stop is
+        recorded on the returned ``DispatchReport.truncated`` flag.
         """
         return await execute_ready_tasks(
             plan=plan,
