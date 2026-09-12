@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from typing import AsyncIterator
 
 import pytest
 import pytest_asyncio
@@ -39,7 +38,6 @@ from app.models.document_ingestion_attempt import DocumentIngestionAttempt
 from app.models.document_revision import DocumentRevision
 from app.models.document_revision_build import DocumentRevisionBuild
 from app.services.agents.v2.persistence.document_revisions import (  # type: ignore[import-not-found]
-    AttemptAlreadyClaimed,
     DocumentNotFound,
     DocumentRevisionsRepository,
     DocumentTombstoned,
@@ -94,52 +92,6 @@ def _source_identity(
     )
 
 
-def _identity_components(identity: str) -> tuple[str, str, str]:
-    """Parse ``compute_source_object_identity`` into
-    ``(scheme, bucket|key|..., sha256)`` for column population."""
-    parts = identity.split("|")
-    # s3v1|bucket|key|version:v1|1024|sha256
-    return parts[0], "|".join(parts[1:-1]), parts[-1]
-
-
-async def _seed_attempt(
-    session: AsyncSession,
-    document_id: uuid.UUID,
-    identity: str,
-    build_profile: RevisionBuildProfile,
-    *,
-    revision_id: uuid.UUID,
-) -> DocumentIngestionAttempt:
-    """Insert a DocumentIngestionAttempt matching the source identity.
-
-    Helper for tests that bypass ``get_or_create_ingestion_attempt`` (e.g.
-    when exercising the CAS publish path with a pre-existing attempt row).
-    """
-    scheme, _, sha = _identity_components(identity)
-    # We bucket-parse from the identity string for convenience; the
-    # actual key fields are not consulted by the repository CAS — only
-    # ``revision_id`` / ``attempt_generation`` / ``exhausted_at``.
-    attempt = DocumentIngestionAttempt(
-        attempt_id=uuid.uuid4(),
-        document_id=document_id,
-        source_object_identity=identity,
-        source_scheme=scheme,
-        source_bucket="bkt",
-        source_object_key="uploads/x.pdf",
-        source_version_id="v-1",
-        source_etag=None,
-        source_size=1024,
-        source_sha256=sha,
-        attempt_generation=1,
-        exhausted_at=None,
-        build_profile=build_profile.value,
-        revision_id=revision_id,
-    )
-    session.add(attempt)
-    await session.flush()
-    return attempt
-
-
 # ---------------------------------------------------------------------------
 # Step 1 — Allocate / publish lifecycle (FULL profile)
 # ---------------------------------------------------------------------------
@@ -173,6 +125,8 @@ class TestAllocatePublishLifecycle:
         # 3. Record the embedding manifest
         await repo.record_artifacts(
             revision_id=revision.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns_default",
             embedding_model_hash="mdl_hash_1",
@@ -220,6 +174,8 @@ class TestAllocatePublishLifecycle:
         revision.status = "building"
         await repo.record_artifacts(
             revision_id=revision.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -271,6 +227,8 @@ class TestAllocatePublishLifecycle:
         rev1.status = "building"
         await repo.record_artifacts(
             revision_id=rev1.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -328,6 +286,8 @@ class TestProfileRequiredArtifacts:
         revision.status = "building"
         await repo.record_artifacts(
             revision_id=revision.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.CHAT_UPLOAD,
             embedding_namespace="ns_chat",
             embedding_model_hash="h",
@@ -358,6 +318,8 @@ class TestProfileRequiredArtifacts:
         revision.status = "building"
         await repo.record_artifacts(
             revision_id=revision.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.PARSE_ONLY,
             embed_skipped=True,
             captions_skipped=True,
@@ -385,6 +347,8 @@ class TestProfileRequiredArtifacts:
         revision.status = "building"
         await repo.record_artifacts(
             revision_id=revision.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns_main",
             embedding_model_hash="model_hash_v3",
@@ -421,6 +385,8 @@ class TestProfileRequiredArtifacts:
         r1.status = "building"
         await repo.record_artifacts(
             revision_id=r1.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -501,22 +467,15 @@ class TestIngestionAttemptIdempotency:
     async def test_concurrent_get_or_create_ingestion_attempt_is_atomic(
         self, async_engine, document_factory, raw_connection
     ):
-        """Two concurrent sessions racing the same attempt key produce
-        exactly ONE revision_ingestion_attempts row, exactly ONE draft
-        revision, and both callers receive the same revision_id.
+        """Two concurrent sessions racing the same attempt key converge on
+        exactly ONE attempt row and ONE draft revision, and both callers
+        receive the same ``revision_id``.
 
-        We force the race deterministically by:
-
-        1. Documenting the document row with its legacy FK parent.
-        2. Opening two ``AsyncSession``s.
-        3. Running ``get_or_create_ingestion_attempt`` on each in
-           ``asyncio.gather``.
-        4. Asserting both got the same ``revision_id``, exactly one
-           revision row, exactly one attempt row.
-
-        The implementation relies on the ``uq_revision_ingestion_attempt_key``
-        UNIQUE constraint installed by the migration as the arbiter (the
-        brief's "the unique index is the arbiter, not a SELECT" rule)."""
+        Both sessions run ``get_or_create_ingestion_attempt`` under
+        ``asyncio.gather``. The ``documents`` row lock serializes them (the
+        allocator's atomicity mechanism); the
+        ``uq_revision_ingestion_attempt_key`` UNIQUE constraint is the
+        DB-level backstop."""
         from sqlalchemy.ext.asyncio import async_sessionmaker
 
         document_id = document_factory()
@@ -535,20 +494,17 @@ class TestIngestionAttemptIdempotency:
                         source_object_identity=identity,
                         build_profile=RevisionBuildProfile.FULL,
                     )
-                    # Capture state before the tx ends.
                     return r.revision_id, created
 
-        # First race serializes: only the winner creates.
-        winner_id, winner_created = await race()
-        assert winner_created is True
+        results = await asyncio.gather(race(), race(), return_exceptions=True)
+        errors = [r for r in results if isinstance(r, BaseException)]
+        assert not errors, f"concurrent allocation raised: {errors!r}"
+        ids = {r[0] for r in results}
+        created_flags = [r[1] for r in results]
+        assert len(ids) == 1, f"both callers must get one revision_id, got {ids}"
+        assert created_flags.count(True) == 1, created_flags
+        assert created_flags.count(False) == 1, created_flags
 
-        # Second caller (concurrent) sees the existing attempt — no new
-        # revision, same id.
-        loser_id, loser_created = await race()
-        assert loser_created is False
-        assert loser_id == winner_id
-
-        # Exactly one attempt row + one revision row.
         with raw_connection.cursor() as cur:
             cur.execute(
                 "SELECT count(*) FROM revision_ingestion_attempts WHERE document_id = %s",
@@ -567,55 +523,41 @@ class TestIngestionAttemptIdempotency:
     async def test_loser_savepoint_leaves_no_orphan_revision(
         self, async_engine, document_factory, raw_connection
     ):
-        """If two concurrent sessions both attempt to claim the key, the
-        loser's savepoint MUST roll back any draft it inserted — there
-        must be NO orphan drafts left over.
+        """A second allocation for an existing key converges on the winner
+        and leaves no orphan draft revision.
 
-        Simulated by:
+        The document-row lock prevents two creators from reaching the
+        savepoint-loser branch through this API, so ``ON CONFLICT`` is a
+        DB-level backstop; this test asserts the observable invariant (one
+        revision, no orphan) for the converging caller."""
+        from sqlalchemy.ext.asyncio import async_sessionmaker
 
-        1. Pre-creating a winning attempt row.
-        2. Running ``get_or_create_ingestion_attempt`` — this must hit
-           the existing-attempt branch (not the create branch), so no
-           orphan draft is created.
-        3. Asserting revisions == 1."""
         document_id = document_factory()
         identity = _source_identity(content_sha256="o" * 64)
+        maker = async_sessionmaker(
+            async_engine, class_=AsyncSession, expire_on_commit=False,
+        )
+        async with maker() as s1:
+            async with s1.begin():
+                r1 = DocumentRevisionsRepository(s1)
+                winner, created = await r1.get_or_create_ingestion_attempt(
+                    document_id=document_id,
+                    source_object_identity=identity,
+                    build_profile=RevisionBuildProfile.FULL,
+                )
+                assert created is True
+                winner_id = winner.revision_id
 
-        # Pre-seed a winning attempt + revision via the repository.
-        repo_factory = DocumentRevisionsRepository
-        async with async_engine.connect() as conn:
-            # Use a fresh session so the SAVEPOINT machinery is exercised.
-            from sqlalchemy.ext.asyncio import async_sessionmaker
-            maker = async_sessionmaker(
-                async_engine, class_=AsyncSession, expire_on_commit=False,
-            )
-            async with maker() as s1:
-                async with s1.begin():
-                    r1 = repo_factory(s1)
-                    r1_rev, _ = await r1.get_or_create_ingestion_attempt(
-                        document_id=document_id,
-                        source_object_identity=identity,
-                        build_profile=RevisionBuildProfile.FULL,
-                    )
-                    winner_id = r1_rev.revision_id
-
-        # Now a fresh session must observe the winner via the existing-attempt
-        # branch (NOT create a new draft). Confirm exactly one revision.
-        async with async_engine.connect() as conn2:
-            from sqlalchemy.ext.asyncio import async_sessionmaker
-            maker2 = async_sessionmaker(
-                async_engine, class_=AsyncSession, expire_on_commit=False,
-            )
-            async with maker2() as s2:
-                async with s2.begin():
-                    r2 = repo_factory(s2)
-                    r2_rev, created = await r2.get_or_create_ingestion_attempt(
-                        document_id=document_id,
-                        source_object_identity=identity,
-                        build_profile=RevisionBuildProfile.FULL,
-                    )
-                    assert created is False
-                    assert r2_rev.revision_id == winner_id
+        async with maker() as s2:
+            async with s2.begin():
+                r2 = DocumentRevisionsRepository(s2)
+                converged, created = await r2.get_or_create_ingestion_attempt(
+                    document_id=document_id,
+                    source_object_identity=identity,
+                    build_profile=RevisionBuildProfile.FULL,
+                )
+                assert created is False
+                assert converged.revision_id == winner_id
 
         with raw_connection.cursor() as cur:
             cur.execute(
@@ -661,6 +603,8 @@ class TestConcurrentRevisionPublish:
             r.status = "building"
             await repo.record_artifacts(
                 revision_id=r.revision_id,
+                markdown_artifact_key="md/artifact",
+                structure_artifact_key="st/artifact",
                 build_profile=RevisionBuildProfile.FULL,
                 embedding_namespace="ns",
                 embedding_model_hash="h",
@@ -713,6 +657,8 @@ class TestConcurrentRevisionPublish:
             r.status = "building"
             await repo.record_artifacts(
                 revision_id=r.revision_id,
+                markdown_artifact_key="md/artifact",
+                structure_artifact_key="st/artifact",
                 build_profile=RevisionBuildProfile.FULL,
                 embedding_namespace="ns",
                 embedding_model_hash="h",
@@ -755,6 +701,8 @@ class TestTombstoneBehavior:
         r.status = "building"
         await repo.record_artifacts(
             revision_id=r.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -789,6 +737,8 @@ class TestTombstoneBehavior:
         r1.status = "building"
         await repo.record_artifacts(
             revision_id=r1.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -813,6 +763,8 @@ class TestTombstoneBehavior:
         r2.status = "building"
         await repo.record_artifacts(
             revision_id=r2.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -851,6 +803,8 @@ class TestTombstoneBehavior:
         r1.status = "building"
         await repo.record_artifacts(
             revision_id=r1.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -870,6 +824,8 @@ class TestTombstoneBehavior:
         r2.status = "building"
         await repo.record_artifacts(
             revision_id=r2.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -906,6 +862,8 @@ class TestTombstoneBehavior:
         r1.status = "building"
         await repo.record_artifacts(
             revision_id=r1.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -943,6 +901,8 @@ class TestTombstoneBehavior:
         r4.status = "building"
         await repo.record_artifacts(
             revision_id=r4.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -981,6 +941,8 @@ class TestTombstoneBehavior:
         r1.status = "building"
         await repo.record_artifacts(
             revision_id=r1.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -1021,6 +983,8 @@ class TestTombstoneBehavior:
         r1.status = "building"
         await repo.record_artifacts(
             revision_id=r1.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -1061,6 +1025,8 @@ class TestTombstoneBehavior:
         r1.status = "building"
         await repo.record_artifacts(
             revision_id=r1.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -1100,6 +1066,8 @@ class TestTombstoneBehavior:
         r1.status = "building"
         await repo.record_artifacts(
             revision_id=r1.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -1119,6 +1087,8 @@ class TestTombstoneBehavior:
         r2.status = "building"
         await repo.record_artifacts(
             revision_id=r2.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -1203,6 +1173,8 @@ class TestTerminalStateImmutability:
         r.status = "building"
         await repo.record_artifacts(
             revision_id=r.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -1278,6 +1250,8 @@ class TestFailureAndRetry:
         r1.status = "building"
         await repo.record_artifacts(
             revision_id=r1.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -1472,6 +1446,8 @@ class TestTombstoneRaceDuringPublish:
         r1.status = "building"
         await repo.record_artifacts(
             revision_id=r1.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -1568,6 +1544,8 @@ class TestRequiredArtifactEnforcement:
         revision.status = "building"
         await repo.record_artifacts(
             revision_id=revision.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -1594,6 +1572,8 @@ class TestRequiredArtifactEnforcement:
         revision.status = "building"
         await repo.record_artifacts(
             revision_id=revision.revision_id,
+            markdown_artifact_key="md/artifact",
+            structure_artifact_key="st/artifact",
             build_profile=RevisionBuildProfile.FULL,
             embedding_namespace="ns",
             embedding_model_hash="h",
@@ -1662,6 +1642,8 @@ class TestRealConcurrentSessions:
                 r.status = "building"
                 await repo.record_artifacts(
                     revision_id=r.revision_id,
+                    markdown_artifact_key="md/artifact",
+                    structure_artifact_key="st/artifact",
                     build_profile=RevisionBuildProfile.FULL,
                     embedding_namespace="ns",
                     embedding_model_hash="h",
@@ -1688,9 +1670,192 @@ class TestRealConcurrentSessions:
         )
         errors = [r for r in results if isinstance(r, BaseException)]
         assert not errors, f"publish raised (deadlock?): {errors!r}"
+        assert len(results) == 2, results
         assert PublishOutcome.BECAME_CURRENT in results, results
         assert all(
             r
             in (PublishOutcome.BECAME_CURRENT, PublishOutcome.PUBLISHED_HISTORICAL)
             for r in results
         ), results
+
+    @pytest.mark.asyncio
+    async def test_concurrent_publish_and_tombstone_do_not_deadlock(
+        self, async_engine, document_factory
+    ):
+        """C1 smoke test: a concurrent ``publish`` and
+        ``mark_source_deleted`` complete without a deadlock.
+
+        The tombstone is started first (with a short head start) to bias
+        toward the interleaving the pre-fix revision-first order deadlocked
+        on: publish holds the verified revision while the tombstone holds the
+        document and wants that same revision. Document-first ordering
+        serializes the two. This is a timing-based smoke test, not a
+        deterministic proof.
+        """
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        document_id = document_factory()
+        maker = async_sessionmaker(
+            async_engine, class_=AsyncSession, expire_on_commit=False
+        )
+
+        async with maker() as setup:
+            repo = DocumentRevisionsRepository(setup)
+            r1, _ = await repo.get_or_create_ingestion_attempt(
+                document_id=document_id,
+                source_object_identity=_source_identity(content_sha256="ea" * 32),
+                build_profile=RevisionBuildProfile.FULL,
+            )
+            r1.status = "building"
+            await repo.record_artifacts(
+                revision_id=r1.revision_id,
+                build_profile=RevisionBuildProfile.FULL,
+                embedding_namespace="ns",
+                embedding_model_hash="h",
+                embedding_dimension=8,
+                vector_artifact_version="v1",
+                markdown_artifact_key="md/1",
+                structure_artifact_key="st/1",
+            )
+            await repo.verify_draft(revision_id=r1.revision_id)
+            await repo.publish(r1.revision_id)
+
+            r2, _ = await repo.get_or_create_ingestion_attempt(
+                document_id=document_id,
+                source_object_identity=_source_identity(content_sha256="eb" * 32),
+                build_profile=RevisionBuildProfile.FULL,
+            )
+            r2.status = "building"
+            await repo.record_artifacts(
+                revision_id=r2.revision_id,
+                build_profile=RevisionBuildProfile.FULL,
+                embedding_namespace="ns",
+                embedding_model_hash="h",
+                embedding_dimension=8,
+                vector_artifact_version="v1",
+                markdown_artifact_key="md/2",
+                structure_artifact_key="st/2",
+            )
+            await repo.verify_draft(revision_id=r2.revision_id)
+            await setup.commit()
+            r2_id = r2.revision_id
+
+        async def _publish():
+            async with maker() as s:
+                local = DocumentRevisionsRepository(s)
+                try:
+                    await local.publish(r2_id)
+                    await s.commit()
+                except BaseException:
+                    await s.rollback()
+                    raise
+
+        async def _tombstone():
+            async with maker() as s:
+                local = DocumentRevisionsRepository(s)
+                try:
+                    await local.mark_source_deleted(document_id=document_id)
+                    await s.commit()
+                except BaseException:
+                    await s.rollback()
+                    raise
+
+        tombstone_task = asyncio.create_task(_tombstone())
+        # Give the tombstone a head start so it holds the document lock when
+        # the publisher starts. With the pre-fix revision-first order this
+        # deadlocks deterministically (publisher holds R2 and wants D;
+        # tombstone holds D and wants R2).
+        await asyncio.sleep(0.05)
+        publish_task = asyncio.create_task(_publish())
+        results = await asyncio.gather(
+            tombstone_task, publish_task, return_exceptions=True
+        )
+        errors = [r for r in results if isinstance(r, BaseException)]
+        assert not errors, f"publish/tombstone raised (deadlock?): {errors!r}"
+
+        # Consistency: the tombstone always wins eventually; current must be
+        # unset and no revision is left non-terminal in a way that resurrects
+        # the document.
+        async with maker() as check:
+            doc = await check.get(Document, document_id)
+            assert doc.source_deleted_at is not None
+            assert doc.current_revision_id is None
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2 — artifact contract + supersession anchor
+# ---------------------------------------------------------------------------
+
+
+class TestArtifactContractAndAnchors:
+    @pytest.mark.asyncio
+    async def test_full_profile_cannot_verify_without_markdown_or_structure(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        """I-A: markdown + structure are required for every profile, not
+        just the vector manifest."""
+        document_id = document_factory()
+        identity = _source_identity(content_sha256="ba" * 32)
+        revision, _ = await repo.get_or_create_ingestion_attempt(
+            document_id=document_id,
+            source_object_identity=identity,
+            build_profile=RevisionBuildProfile.FULL,
+        )
+        revision.status = "building"
+        # Complete embedding manifest and explicitly NO markdown/structure.
+        await repo.record_artifacts(
+            revision_id=revision.revision_id,
+            build_profile=RevisionBuildProfile.FULL,
+            embedding_namespace="ns",
+            embedding_model_hash="h",
+            embedding_dimension=8,
+            vector_artifact_version="v1",
+        )
+        with pytest.raises(RevisionArtifactsIncomplete):
+            await repo.verify_draft(revision_id=revision.revision_id)
+        still = await repo.get(revision.revision_id)
+        assert still.status == "building"
+
+    @pytest.mark.asyncio
+    async def test_supersession_starts_retention_for_former_current_only(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        """M4: publishing a newer revision anchors the former current, while
+        the new current keeps no anchor."""
+        document_id = document_factory()
+        r2, _ = await repo.get_or_create_ingestion_attempt(
+            document_id=document_id,
+            source_object_identity=_source_identity(content_sha256="bb" * 32),
+            build_profile=RevisionBuildProfile.FULL,
+        )
+        r3, _ = await repo.get_or_create_ingestion_attempt(
+            document_id=document_id,
+            source_object_identity=_source_identity(content_sha256="bc" * 32),
+            build_profile=RevisionBuildProfile.FULL,
+        )
+        for r in (r2, r3):
+            r.status = "building"
+            await repo.record_artifacts(
+                revision_id=r.revision_id,
+                build_profile=RevisionBuildProfile.FULL,
+                embedding_namespace="ns",
+                embedding_model_hash="h",
+                embedding_dimension=8,
+                vector_artifact_version="v1",
+                markdown_artifact_key="md/a",
+                structure_artifact_key="st/a",
+            )
+            await repo.verify_draft(revision_id=r.revision_id)
+
+        await repo.publish(r2.revision_id)
+        r2_now = await repo.get(r2.revision_id)
+        assert r2_now.artifact_retention_starts_at is None  # still current
+
+        await repo.publish(r3.revision_id)
+        r2_after = await repo.get(r2.revision_id)
+        r3_after = await repo.get(r3.revision_id)
+        assert r2_after.superseded_at is not None
+        assert r2_after.superseded_by == r3.revision_id
+        assert r2_after.artifact_retention_starts_at is not None
+        assert r3_after.status == "published"
+        assert r3_after.artifact_retention_starts_at is None  # new current

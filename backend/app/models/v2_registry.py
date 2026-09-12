@@ -305,6 +305,19 @@ def assert_v2_readiness(check: SchemaCheck) -> None:
             f"re-run 'python -m app.services.agents.v2.persistence.migrate "
             f"apply --dsn <DSN>' to repair."
         )
+    # The version row alone is NOT proof of the current shape: a database
+    # that applied the pre-R2 Release 1A keeps its old columns/constraint
+    # while still reporting version 1 (CREATE TABLE IF NOT EXISTS never
+    # upgrades; apply_v2_schema short-circuits on the version row). Fail
+    # closed at boot rather than serving against a stale shape.
+    if check.shape_errors:
+        raise RuntimeError(
+            f"v2 schema version {V2_SCHEMA_VERSION} is recorded but the "
+            f"schema shape is stale: {sorted(check.shape_errors)}. "
+            f"This database applied an older (pre-R2) schema; rebuild the "
+            f"v2 schema before deploying (the version row is not proof of "
+            f"shape)."
+        )
 
 
 def legacy_startup_tables() -> Iterable[str]:

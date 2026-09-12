@@ -442,36 +442,61 @@ class DocumentRevisionsRepository:
         allocates a duplicate build row.
         """
         now = _now()
+        insert_stmt = pg_insert(DocumentRevisionBuild).values(
+            build_id=uuid.uuid4(),
+            revision_id=revision_id,
+            build_profile=build_profile.value,
+            embedding_namespace=embedding_namespace,
+            embedding_model_hash=embedding_model_hash,
+            embedding_dimension=embedding_dimension,
+            vector_artifact_version=vector_artifact_version,
+            markdown_artifact_key=markdown_artifact_key,
+            structure_artifact_key=structure_artifact_key,
+            captions_skipped=captions_skipped,
+            kg_skipped=kg_skipped,
+            embed_skipped=embed_skipped,
+            started_at=now,
+            finished_at=now,
+        )
+        excluded = insert_stmt.excluded
         stmt = (
-            pg_insert(DocumentRevisionBuild)
-            .values(
-                build_id=uuid.uuid4(),
-                revision_id=revision_id,
-                build_profile=build_profile.value,
-                embedding_namespace=embedding_namespace,
-                embedding_model_hash=embedding_model_hash,
-                embedding_dimension=embedding_dimension,
-                vector_artifact_version=vector_artifact_version,
-                markdown_artifact_key=markdown_artifact_key,
-                structure_artifact_key=structure_artifact_key,
-                captions_skipped=captions_skipped,
-                kg_skipped=kg_skipped,
-                embed_skipped=embed_skipped,
-                started_at=now,
-                finished_at=now,
-            )
-            .on_conflict_do_update(
+            insert_stmt.on_conflict_do_update(
                 index_elements=["revision_id", "build_profile"],
                 set_={
-                    "embedding_namespace": embedding_namespace,
-                    "embedding_model_hash": embedding_model_hash,
-                    "embedding_dimension": embedding_dimension,
-                    "vector_artifact_version": vector_artifact_version,
-                    "markdown_artifact_key": markdown_artifact_key,
-                    "structure_artifact_key": structure_artifact_key,
-                    "captions_skipped": captions_skipped,
-                    "kg_skipped": kg_skipped,
-                    "embed_skipped": embed_skipped,
+                    # A redelivered *partial* stage must not null out fields
+                    # a previous delivery already recorded.
+                    "embedding_namespace": func.coalesce(
+                        excluded.embedding_namespace,
+                        DocumentRevisionBuild.embedding_namespace,
+                    ),
+                    "embedding_model_hash": func.coalesce(
+                        excluded.embedding_model_hash,
+                        DocumentRevisionBuild.embedding_model_hash,
+                    ),
+                    "embedding_dimension": func.coalesce(
+                        excluded.embedding_dimension,
+                        DocumentRevisionBuild.embedding_dimension,
+                    ),
+                    "vector_artifact_version": func.coalesce(
+                        excluded.vector_artifact_version,
+                        DocumentRevisionBuild.vector_artifact_version,
+                    ),
+                    "markdown_artifact_key": func.coalesce(
+                        excluded.markdown_artifact_key,
+                        DocumentRevisionBuild.markdown_artifact_key,
+                    ),
+                    "structure_artifact_key": func.coalesce(
+                        excluded.structure_artifact_key,
+                        DocumentRevisionBuild.structure_artifact_key,
+                    ),
+                    # Skip flags are sticky: a stage recorded as skipped is
+                    # not un-skipped by a later delivery.
+                    "captions_skipped": DocumentRevisionBuild.captions_skipped
+                    | excluded.captions_skipped,
+                    "kg_skipped": DocumentRevisionBuild.kg_skipped
+                    | excluded.kg_skipped,
+                    "embed_skipped": DocumentRevisionBuild.embed_skipped
+                    | excluded.embed_skipped,
                     "finished_at": now,
                 },
             )
@@ -511,13 +536,18 @@ class DocumentRevisionsRepository:
                 f"state {revision.status!r}"
             )
         profile = await self._allocated_profile(revision_id)
+        if profile is None:
+            # Fail closed: without the immutable allocation profile we cannot
+            # know which artifacts are required.
+            raise RevisionArtifactsIncomplete(
+                f"revision {revision_id} has no allocated build profile"
+            )
         build = await self.session.scalar(
             select(DocumentRevisionBuild).where(
-                DocumentRevisionBuild.revision_id == revision_id
+                DocumentRevisionBuild.revision_id == revision_id,
+                DocumentRevisionBuild.build_profile == profile.value,
             )
         )
-        if profile is None and build is not None:
-            profile = RevisionBuildProfile(build.build_profile)
         self._assert_required_artifacts(revision_id, profile, build)
         revision.status = "verified"
         await self.session.flush()
@@ -547,12 +577,20 @@ class DocumentRevisionsRepository:
             raise RevisionArtifactsIncomplete(
                 f"revision {revision_id} has no allocated build profile"
             )
+        if build is None:
+            raise RevisionArtifactsIncomplete(
+                f"{profile.value} revision {revision_id} requires a build "
+                "manifest (markdown + structure artifacts)"
+            )
+        if (
+            build.markdown_artifact_key is None
+            or build.structure_artifact_key is None
+        ):
+            raise RevisionArtifactsIncomplete(
+                f"{profile.value} revision {revision_id} requires both "
+                "markdown and structure artifacts"
+            )
         if profile is RevisionBuildProfile.PARSE_ONLY:
-            if build is None:
-                raise RevisionArtifactsIncomplete(
-                    f"PARSE_ONLY revision {revision_id} must record its "
-                    "skipped vector/caption/KG stages"
-                )
             if not (
                 build.embed_skipped
                 and build.captions_skipped
@@ -564,11 +602,6 @@ class DocumentRevisionsRepository:
                 )
             return
         # FULL / CHAT_UPLOAD require the vector manifest.
-        if build is None:
-            raise RevisionArtifactsIncomplete(
-                f"{profile.value} revision {revision_id} requires a build "
-                "manifest (markdown/structure/vectors)"
-            )
         manifest_complete = (
             build.embedding_namespace is not None
             and build.embedding_model_hash is not None
@@ -673,7 +706,7 @@ class DocumentRevisionsRepository:
     async def mark_source_deleted(
         self,
         document_id: uuid.UUID,
-        reason: str = "user_deleted",
+        reason: str = "document_tombstoned",
     ) -> Document:
         """Tombstone the document and abandon every non-published revision
         in one transaction.
@@ -694,7 +727,7 @@ class DocumentRevisionsRepository:
         previous_current_id = document.current_revision_id
         document.current_revision_id = None
         for revision in await self.list_non_published_for_update(document_id):
-            await self.abandon_revision(revision, reason="document_tombstoned")
+            await self.abandon_revision(revision, reason=reason)
         if previous_current_id is not None:
             # The former current revision is now permanently non-current;
             # start its retention clock if it has none yet.
@@ -794,25 +827,28 @@ class DocumentRevisionsRepository:
         # revision abandoned for a non-tombstone reason is never silently
         # converted into ``DocumentTombstoned``.
         if revision.status == "abandoned":
-            if revision.abandon_reason != "document_tombstoned":
+            # ``abandoned`` is terminal. Only a tombstone-abandoned revision
+            # on an actually tombstoned document may report
+            # ABANDONED_SOURCE_DELETED, and it must NEVER fall through to the
+            # CAS (which would flip the terminal state back to published).
+            if (
+                revision.abandon_reason != "document_tombstoned"
+                or document.source_deleted_at is None
+            ):
                 raise RevisionNotPublishable(
                     f"revision {revision_id} cannot be published from state "
                     f"'abandoned' (reason={revision.abandon_reason!r})"
                 )
-        elif revision.status != "verified":
+            return revision, PublishOutcome.ABANDONED_SOURCE_DELETED
+        if revision.status != "verified":
             raise RevisionNotPublishable(
                 f"revision {revision_id} cannot be published from "
                 f"state {revision.status!r}"
             )
         if document.source_deleted_at is not None:
-            # Tombstone outcome is idempotent: a still-verified revision is
-            # abandoned here; a revision already abandoned by
-            # ``mark_source_deleted`` is returned as-is. Both surface
-            # ``ABANDONED_SOURCE_DELETED`` so the caller raises
-            # ``DocumentTombstoned`` deterministically without the repository
-            # ever resurrecting a deleted document.
-            if revision.status == "verified":
-                await self.abandon_revision(revision, reason="document_tombstoned")
+            # Verified revision whose source was tombstoned before we locked
+            # the document: abandon it durably and report the tombstone.
+            await self.abandon_revision(revision, reason="document_tombstoned")
             return revision, PublishOutcome.ABANDONED_SOURCE_DELETED
         previous_current_id = document.current_revision_id
         advanced = await self.cas_advance_current(

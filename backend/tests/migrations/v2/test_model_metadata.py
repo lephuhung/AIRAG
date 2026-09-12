@@ -397,6 +397,58 @@ def test_schema_check_is_clean_requires_no_shape_errors():
     assert healthy.shape_errors == frozenset()
 
 
+def test_check_v2_schema_detects_real_stale_shape(db: Engine):
+    """I3: a genuinely stale shape (a dropped R2 column) must be detected.
+
+    Drops ``document_revision_builds.markdown_artifact_key`` (committed DDL),
+    asserts ``check_v2_schema`` fails closed, then restores the column.
+    """
+    with db.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE document_revision_builds "
+                "DROP COLUMN markdown_artifact_key"
+            )
+        )
+    try:
+        check = check_v2_schema(db)
+        assert check.applied is True
+        assert check.is_clean is False, check
+        assert any(
+            "document_revision_builds" in e for e in check.shape_errors
+        ), check.shape_errors
+    finally:
+        with db.begin() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE document_revision_builds "
+                    "ADD COLUMN markdown_artifact_key TEXT"
+                )
+            )
+
+
+def test_assert_v2_readiness_rejects_shape_drift():
+    """I-C: the boot gate (``assert_v2_readiness``) must consume
+    ``shape_errors``, not just ``applied``/``version``/``missing_tables``."""
+    from app.models.v2_registry import assert_v2_readiness
+    from app.services.agents.v2.persistence.migrate import SchemaCheck
+
+    stale = SchemaCheck(
+        applied=True,
+        version=1,
+        missing_tables=frozenset(),
+        extra_tables=frozenset(),
+        shape_errors=frozenset(
+            {
+                "document_revision_builds: missing columns "
+                "['markdown_artifact_key']"
+            }
+        ),
+    )
+    with pytest.raises(RuntimeError):
+        assert_v2_readiness(stale)
+
+
 def test_v2_models_module_has_no_db_writes_at_import(imported_app_models):
     """Importing ``app.models`` (and therefore ``v2_registry``) must not
     issue DDL or open a transaction. This is the post-migration deploy

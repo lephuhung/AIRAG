@@ -14,13 +14,17 @@ Status values (column is ``TEXT``, not an enum, because the brief treats
 the enum as application-level state and the migration set the column
 to free-form TEXT):
 
-- ``draft``      — building, not yet verified
+- ``draft``      — allocated, no worker stage has run yet
+- ``building``   — a worker stage is in progress
 - ``verified``   — verify_draft succeeded, awaiting publish CAS
-- ``published``  — terminal, atomic publication succeeded
+- ``published``  — terminal, atomic publication succeeded (current or historical)
 - ``failed``     — terminal, ``failure_class`` recorded
 - ``abandoned``  — terminal, ``abandon_reason`` recorded (GC-blocked)
-- ``superseded`` — earlier published revision, no longer current
-- ``purged``     — artifacts_purged_at set; row retained for evidence lineage
+
+Supersession is tracked via ``superseded_at`` / ``superseded_by`` and does
+NOT change ``status``: a superseded revision stays ``published`` so
+Predicate B can still see it. There is deliberately no ``superseded`` or
+``purged`` status (the repository never writes one).
 """
 
 from __future__ import annotations

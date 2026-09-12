@@ -707,7 +707,7 @@ def _shape_errors(conn) -> frozenset[str]:
         rows = conn.execute(
             text(
                 "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name = :t"
+                "WHERE table_name = :t AND table_schema = 'public'"
             ),
             {"t": table},
         ).fetchall()
@@ -940,7 +940,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"applied={check.applied} version={check.version} "
             f"missing={sorted(check.missing_tables)} "
-            f"extra={sorted(check.extra_tables)}"
+            f"extra={sorted(check.extra_tables)} "
+            f"shape={sorted(check.shape_errors)}"
         )
         return 0 if check.is_clean else 1
 
@@ -953,7 +954,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             f"applied={check.applied} version={check.version} "
             f"missing={sorted(check.missing_tables)} "
-            f"extra={sorted(check.extra_tables)}"
+            f"extra={sorted(check.extra_tables)} "
+            f"shape={sorted(check.shape_errors)}"
         )
         return 0 if check.is_clean else 1
 
