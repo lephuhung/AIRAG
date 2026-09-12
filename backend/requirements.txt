@@ -83,6 +83,16 @@ rank-bm25>=0.2.2
 langgraph>=0.2.0
 langchain-core>=0.3.0
 
+# v2 (Phase 1): promoted from Phase 0 Task 0 discovery
+# Phase 1 Task 2's readiness gate calls make_engine(dsn) from
+# backend/app/services/agents/v2/persistence/migrate.py, which is psycopg3-backed.
+# Without these exact pins, the backend container crashes at startup with
+# ModuleNotFoundError: No module named 'psycopg'. Phase 0 Task 2 was going to
+# promote these pins; promoting here to unblock Phase 1 Task 2's now-unconditional
+# readiness gate. Pins are exact because they were proven by Phase 0 Task 0.
+psycopg[binary]==3.2.3
+langgraph-checkpoint-postgres==2.0.25
+
 # Langfuse tracing for LangGraph debug (SDK v3+ OTEL API: get_client,
 # start_observation, propagate_attributes, langfuse.langchain.CallbackHandler)
 langfuse>=3.0.0
