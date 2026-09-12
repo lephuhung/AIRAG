@@ -114,6 +114,13 @@ class TestNormalizeObjectKey:
         with pytest.raises(InvalidSourceObjectKey):
             normalize_object_key("dir/../../etc/passwd")
 
+    def test_pipe_separator_key_rejected(self):
+        """Minor-1: ``|`` is the canonical identity field separator; a key
+        containing it would corrupt the positional identity parse and
+        permanently block ingestion of that object."""
+        with pytest.raises(InvalidSourceObjectKey):
+            normalize_object_key("dir/a|b.pdf")
+
     def test_absolute_key_after_strip_still_rejected(self):
         """A key that becomes ``/...`` after stripping the leading ``/``
         is rejected (defense-in-depth — only one leading ``/`` is stripped)."""

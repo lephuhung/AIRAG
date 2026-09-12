@@ -455,8 +455,23 @@ def document_factory(raw_connection):
     # cleanup
     with raw_connection.cursor() as cur:
         for did in created:
+            # Clear the current pointer first: ``fk_documents_current_revision``
+            # blocks deleting a revision row a document still points at. Both
+            # columns must move in one statement — the stable-pointer trigger's
+            # carve-out only fires when ``source_deleted_at`` becomes non-null.
+            cur.execute(
+                "UPDATE documents SET current_revision_id = NULL, "
+                "source_deleted_at = NOW() WHERE id = %s",
+                (did,),
+            )
             cur.execute(
                 "DELETE FROM revision_ingestion_attempts WHERE document_id = %s",
+                (did,),
+            )
+            # Build rows FK-RESTRICT their revision; delete them first.
+            cur.execute(
+                "DELETE FROM document_revision_builds WHERE revision_id IN "
+                "(SELECT revision_id FROM document_revisions WHERE document_id = %s)",
                 (did,),
             )
             cur.execute(

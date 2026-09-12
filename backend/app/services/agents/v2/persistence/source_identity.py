@@ -137,6 +137,11 @@ def normalize_object_key(raw_key: str) -> str:
     for segment in key.split("/"):
         if segment == "..":
             raise InvalidSourceObjectKey(f"key escapes bucket via '..': {raw_key!r}")
+    # ``|`` is the canonical identity field separator; a key containing it
+    # would corrupt the positional identity parse (and permanently block
+    # ingestion of that object).
+    if "|" in key:
+        raise InvalidSourceObjectKey(f"key contains reserved '|': {raw_key!r}")
     return key
 
 

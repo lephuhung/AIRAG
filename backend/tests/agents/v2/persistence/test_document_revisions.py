@@ -44,6 +44,7 @@ from app.services.agents.v2.persistence.document_revisions import (  # type: ign
     DocumentRevisionsRepository,
     DocumentTombstoned,
     PublishOutcome,
+    RevisionArtifactsIncomplete,
     RevisionBuildProfile,
     RevisionNotAbandonable,
     RevisionNotFailable,
@@ -355,6 +356,13 @@ class TestProfileRequiredArtifacts:
             build_profile=RevisionBuildProfile.PARSE_ONLY,
         )
         revision.status = "building"
+        await repo.record_artifacts(
+            revision_id=revision.revision_id,
+            build_profile=RevisionBuildProfile.PARSE_ONLY,
+            embed_skipped=True,
+            captions_skipped=True,
+            kg_skipped=True,
+        )
         await repo.verify_draft(revision_id=revision.revision_id)
         v = await repo.get(revision.revision_id)
         assert v.status == "verified", (
@@ -1022,9 +1030,11 @@ class TestTombstoneBehavior:
         await repo.verify_draft(revision_id=r1.revision_id)
         await repo.publish(r1.revision_id)
 
-        # After publish, artifact_retention_starts_at is set
+        # A currently-published revision has NO retention anchor: the clock
+        # starts only when the revision becomes permanently non-current.
         r1_pub = await repo.get(r1.revision_id)
-        assert r1_pub.artifact_retention_starts_at is not None
+        assert r1_pub.artifact_retention_starts_at is None
+        assert r1_pub.published_at is not None
 
         # After tombstone, the former current is still present with its
         # retention anchor (Predicate B uses the artifact_retention_starts_at
@@ -1363,8 +1373,10 @@ class TestFailureAndRetry:
         assert r2.retry_of_revision_id == r1.revision_id
 
         r1_after = await repo.get(r1.revision_id)
-        # Failed revision becomes superseded via retry path; its
-        # artifact_retention_starts_at is set by mark_superseded.
+        # The failed revision is superseded by the retry (provenance) and its
+        # retention anchor stays at the failure time (mark_failed), not the
+        # supersession time.
+        assert r1_after.superseded_at is not None
         assert r1_after.artifact_retention_starts_at is not None
 
         # Attempt counter bumped
@@ -1496,3 +1508,189 @@ class TestLockDocumentForUpdate:
         nonexistent = uuid.uuid4()
         with pytest.raises(DocumentNotFound):
             await repo.lock_document_for_update(nonexistent)
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1 — I4 required-artifact enforcement (negative paths)
+# ---------------------------------------------------------------------------
+
+
+class TestRequiredArtifactEnforcement:
+    @pytest.mark.asyncio
+    async def test_record_artifacts_persists_keys_and_skip_flags(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        """I4: ``record_artifacts`` must persist the artifact identity and
+        skip flags instead of silently dropping them."""
+        document_id = document_factory()
+        identity = _source_identity(content_sha256="aa" * 32)
+        revision, _ = await repo.get_or_create_ingestion_attempt(
+            document_id=document_id,
+            source_object_identity=identity,
+            build_profile=RevisionBuildProfile.CHAT_UPLOAD,
+        )
+        revision.status = "building"
+        await repo.record_artifacts(
+            revision_id=revision.revision_id,
+            build_profile=RevisionBuildProfile.CHAT_UPLOAD,
+            embedding_namespace="ns",
+            embedding_model_hash="h",
+            embedding_dimension=8,
+            vector_artifact_version="v1",
+            markdown_artifact_key="revisions/x/markdown.md",
+            structure_artifact_key="revisions/x/structure.json",
+            captions_skipped=True,
+            kg_skipped=True,
+        )
+        build = await repo.session.scalar(
+            select(DocumentRevisionBuild).where(
+                DocumentRevisionBuild.revision_id == revision.revision_id
+            )
+        )
+        assert build.markdown_artifact_key == "revisions/x/markdown.md"
+        assert build.structure_artifact_key == "revisions/x/structure.json"
+        assert build.captions_skipped is True
+        assert build.kg_skipped is True
+        assert build.embed_skipped is False
+
+    @pytest.mark.asyncio
+    async def test_full_profile_cannot_verify_without_complete_manifest(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        """I4: a FULL revision missing vectors cannot verify."""
+        document_id = document_factory()
+        identity = _source_identity(content_sha256="ab" * 32)
+        revision, _ = await repo.get_or_create_ingestion_attempt(
+            document_id=document_id,
+            source_object_identity=identity,
+            build_profile=RevisionBuildProfile.FULL,
+        )
+        revision.status = "building"
+        await repo.record_artifacts(
+            revision_id=revision.revision_id,
+            build_profile=RevisionBuildProfile.FULL,
+            embedding_namespace="ns",
+            embedding_model_hash="h",
+            embedding_dimension=None,  # incomplete manifest
+            vector_artifact_version="v1",
+        )
+        with pytest.raises(RevisionArtifactsIncomplete):
+            await repo.verify_draft(revision_id=revision.revision_id)
+        still = await repo.get(revision.revision_id)
+        assert still.status == "building"
+
+    @pytest.mark.asyncio
+    async def test_full_profile_cannot_verify_with_skips(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        """I4: FULL must not record caption/KG as skipped."""
+        document_id = document_factory()
+        identity = _source_identity(content_sha256="ac" * 32)
+        revision, _ = await repo.get_or_create_ingestion_attempt(
+            document_id=document_id,
+            source_object_identity=identity,
+            build_profile=RevisionBuildProfile.FULL,
+        )
+        revision.status = "building"
+        await repo.record_artifacts(
+            revision_id=revision.revision_id,
+            build_profile=RevisionBuildProfile.FULL,
+            embedding_namespace="ns",
+            embedding_model_hash="h",
+            embedding_dimension=8,
+            vector_artifact_version="v1",
+            captions_skipped=True,
+        )
+        with pytest.raises(RevisionArtifactsIncomplete):
+            await repo.verify_draft(revision_id=revision.revision_id)
+
+    @pytest.mark.asyncio
+    async def test_parse_only_cannot_verify_without_skip_records(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        """I4: PARSE_ONLY must record that vector/caption/KG were skipped."""
+        document_id = document_factory()
+        identity = _source_identity(content_sha256="ad" * 32)
+        revision, _ = await repo.get_or_create_ingestion_attempt(
+            document_id=document_id,
+            source_object_identity=identity,
+            build_profile=RevisionBuildProfile.PARSE_ONLY,
+        )
+        revision.status = "building"
+        with pytest.raises(RevisionArtifactsIncomplete):
+            await repo.verify_draft(revision_id=revision.revision_id)
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1 — C1/I6 real concurrent sessions
+# ---------------------------------------------------------------------------
+
+
+class TestRealConcurrentSessions:
+    @pytest.mark.asyncio
+    async def test_concurrent_publish_same_document_does_not_deadlock(
+        self, async_engine, document_factory
+    ):
+        """C1/I6: two independent sessions publish two verified revisions of
+        the same document under ``asyncio.gather``.
+
+        Under the pre-fix revision-first lock order this surfaced
+        ``DeadlockDetected`` (SQLSTATE 40P01). Document-first ordering must
+        serialize cleanly: no exception, and exactly one winner.
+        """
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        document_id = document_factory()
+        maker = async_sessionmaker(
+            async_engine, class_=AsyncSession, expire_on_commit=False
+        )
+        id2 = _source_identity(content_sha256="ca" * 32)
+        id3 = _source_identity(content_sha256="cb" * 32)
+        async with maker() as setup:
+            repo = DocumentRevisionsRepository(setup)
+            r2, _ = await repo.get_or_create_ingestion_attempt(
+                document_id=document_id,
+                source_object_identity=id2,
+                build_profile=RevisionBuildProfile.FULL,
+            )
+            r3, _ = await repo.get_or_create_ingestion_attempt(
+                document_id=document_id,
+                source_object_identity=id3,
+                build_profile=RevisionBuildProfile.FULL,
+            )
+            for r in (r2, r3):
+                r.status = "building"
+                await repo.record_artifacts(
+                    revision_id=r.revision_id,
+                    build_profile=RevisionBuildProfile.FULL,
+                    embedding_namespace="ns",
+                    embedding_model_hash="h",
+                    embedding_dimension=8,
+                    vector_artifact_version="v1",
+                )
+                await repo.verify_draft(revision_id=r.revision_id)
+            await setup.commit()
+            r2_id, r3_id = r2.revision_id, r3.revision_id
+
+        async def _publish(rid: uuid.UUID) -> PublishOutcome:
+            async with maker() as session:
+                local = DocumentRevisionsRepository(session)
+                try:
+                    _, outcome = await local.publish(rid)
+                    await session.commit()
+                    return outcome
+                except BaseException:
+                    await session.rollback()
+                    raise
+
+        results = await asyncio.gather(
+            _publish(r2_id), _publish(r3_id), return_exceptions=True
+        )
+        errors = [r for r in results if isinstance(r, BaseException)]
+        assert not errors, f"publish raised (deadlock?): {errors!r}"
+        assert PublishOutcome.BECAME_CURRENT in results, results
+        assert all(
+            r
+            in (PublishOutcome.BECAME_CURRENT, PublishOutcome.PUBLISHED_HISTORICAL)
+            for r in results
+        ), results

@@ -42,10 +42,9 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
-from sqlalchemy import func, select, text, update
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import flag_modified
 
 from app.models.document import Document
 from app.models.document_ingestion_attempt import DocumentIngestionAttempt
@@ -115,6 +114,14 @@ class RevisionNotPublishable(Exception):
 
 class RevisionRetriesExhausted(Exception):
     """Terminal failure retry budget for an ingest attempt is exhausted."""
+
+
+class RevisionNotFound(Exception):
+    """An attempt points at a revision row that no longer exists."""
+
+
+class RevisionArtifactsIncomplete(Exception):
+    """``verify_draft`` found the profile's required artifacts missing."""
 
 
 # ---------------------------------------------------------------------------
@@ -411,10 +418,10 @@ class DocumentRevisionsRepository:
         revision_id: uuid.UUID,
         build_profile: RevisionBuildProfile,
         *,
-        embedding_namespace: str,
-        embedding_model_hash: str,
-        embedding_dimension: int,
-        vector_artifact_version: str,
+        embedding_namespace: str | None = None,
+        embedding_model_hash: str | None = None,
+        embedding_dimension: int | None = None,
+        vector_artifact_version: str | None = None,
         markdown_artifact_key: str | None = None,
         structure_artifact_key: str | None = None,
         captions_skipped: bool = False,
@@ -445,6 +452,11 @@ class DocumentRevisionsRepository:
                 embedding_model_hash=embedding_model_hash,
                 embedding_dimension=embedding_dimension,
                 vector_artifact_version=vector_artifact_version,
+                markdown_artifact_key=markdown_artifact_key,
+                structure_artifact_key=structure_artifact_key,
+                captions_skipped=captions_skipped,
+                kg_skipped=kg_skipped,
+                embed_skipped=embed_skipped,
                 started_at=now,
                 finished_at=now,
             )
@@ -455,6 +467,11 @@ class DocumentRevisionsRepository:
                     "embedding_model_hash": embedding_model_hash,
                     "embedding_dimension": embedding_dimension,
                     "vector_artifact_version": vector_artifact_version,
+                    "markdown_artifact_key": markdown_artifact_key,
+                    "structure_artifact_key": structure_artifact_key,
+                    "captions_skipped": captions_skipped,
+                    "kg_skipped": kg_skipped,
+                    "embed_skipped": embed_skipped,
                     "finished_at": now,
                 },
             )
@@ -475,31 +492,110 @@ class DocumentRevisionsRepository:
 
         The brief defines the per-profile required artifacts:
 
-        - ``FULL``: requires markdown + structure + vectors (and
-          caption/KG results when configured).
-        - ``CHAT_UPLOAD``: requires markdown + structure + vectors.
-          caption/KG are recorded as intentionally skipped.
-        - ``PARSE_ONLY``: requires markdown + structure. Vectors /
-          caption / KG are recorded as intentionally skipped.
+        - ``FULL``: markdown + structure + vectors; caption/KG required
+          (no skips).
+        - ``CHAT_UPLOAD``: markdown + structure + vectors; caption/KG
+          recorded as intentionally skipped.
+        - ``PARSE_ONLY``: markdown + structure; vectors/caption/KG
+          recorded as intentionally skipped.
 
-        Phase 1C does NOT yet have separate ``markdown_artifact_key`` /
-        ``structure_artifact_key`` columns on the revision (those are
-        recorded in artifact storage, not in DB columns). The verify
-        transition therefore relies on the caller to have invoked
-        ``record_artifacts`` (for FULL/CHAT_UPLOAD) or to have
-        completed the parse step (for PARSE_ONLY). The presence of a
-        ``document_revision_builds`` row is the build-side
-        evidence; for PARSE_ONLY it is intentionally absent, so
-        verify_draft accepts both paths."""
+        The profile is the immutable one selected at allocation (read
+        from the attempt row); the recorded artifact row is the
+        ``document_revision_builds`` manifest. A profile that requires a
+        vector manifest cannot verify without one, and a profile's skip
+        contract must be honoured (skips are recorded, not failures)."""
         revision = await self.get_for_update(revision_id)
         if revision.status not in ("draft", "building"):
             raise ValueError(
                 f"revision {revision_id} cannot be verified from "
                 f"state {revision.status!r}"
             )
+        profile = await self._allocated_profile(revision_id)
+        build = await self.session.scalar(
+            select(DocumentRevisionBuild).where(
+                DocumentRevisionBuild.revision_id == revision_id
+            )
+        )
+        if profile is None and build is not None:
+            profile = RevisionBuildProfile(build.build_profile)
+        self._assert_required_artifacts(revision_id, profile, build)
         revision.status = "verified"
         await self.session.flush()
         return revision
+
+    async def _allocated_profile(
+        self, revision_id: uuid.UUID
+    ) -> Optional[RevisionBuildProfile]:
+        """The immutable build profile selected when the revision was
+        allocated (read from the attempt row that owns it), or ``None``
+        when no attempt currently points at this revision."""
+        value = await self.session.scalar(
+            select(DocumentIngestionAttempt.build_profile).where(
+                DocumentIngestionAttempt.revision_id == revision_id
+            )
+        )
+        return RevisionBuildProfile(value) if value is not None else None
+
+    @staticmethod
+    def _assert_required_artifacts(
+        revision_id: uuid.UUID,
+        profile: Optional[RevisionBuildProfile],
+        build: Optional[DocumentRevisionBuild],
+    ) -> None:
+        """Enforce the brief's per-profile required-artifact contract."""
+        if profile is None:
+            raise RevisionArtifactsIncomplete(
+                f"revision {revision_id} has no allocated build profile"
+            )
+        if profile is RevisionBuildProfile.PARSE_ONLY:
+            if build is None:
+                raise RevisionArtifactsIncomplete(
+                    f"PARSE_ONLY revision {revision_id} must record its "
+                    "skipped vector/caption/KG stages"
+                )
+            if not (
+                build.embed_skipped
+                and build.captions_skipped
+                and build.kg_skipped
+            ):
+                raise RevisionArtifactsIncomplete(
+                    f"PARSE_ONLY revision {revision_id} must record "
+                    "embed/caption/KG as intentionally skipped"
+                )
+            return
+        # FULL / CHAT_UPLOAD require the vector manifest.
+        if build is None:
+            raise RevisionArtifactsIncomplete(
+                f"{profile.value} revision {revision_id} requires a build "
+                "manifest (markdown/structure/vectors)"
+            )
+        manifest_complete = (
+            build.embedding_namespace is not None
+            and build.embedding_model_hash is not None
+            and build.embedding_dimension is not None
+            and build.vector_artifact_version is not None
+        )
+        if not manifest_complete:
+            raise RevisionArtifactsIncomplete(
+                f"{profile.value} revision {revision_id} requires a complete "
+                "embedding manifest (namespace/model_hash/dimension/version)"
+            )
+        if profile is RevisionBuildProfile.FULL:
+            if build.embed_skipped or build.captions_skipped or build.kg_skipped:
+                raise RevisionArtifactsIncomplete(
+                    f"FULL revision {revision_id} may not skip "
+                    "embed/caption/KG stages"
+                )
+        else:  # CHAT_UPLOAD
+            if build.embed_skipped:
+                raise RevisionArtifactsIncomplete(
+                    f"CHAT_UPLOAD revision {revision_id} requires vectors"
+                )
+            if not (build.captions_skipped and build.kg_skipped):
+                raise RevisionArtifactsIncomplete(
+                    f"CHAT_UPLOAD revision {revision_id} must record "
+                    "caption/KG as intentionally skipped"
+                )
 
     async def mark_failed(
         self,
@@ -539,7 +635,12 @@ class DocumentRevisionsRepository:
         revision = await self.get_for_update(revision_id)
         ts = at or _now()
         revision.superseded_at = ts
-        if revision.artifact_retention_starts_at is None:
+        if superseded_by is not None:
+            revision.superseded_by = superseded_by
+        if revision.status == "published":
+            # The retention clock starts when a *published* revision stops
+            # being current. A currently-published revision has no anchor
+            # (plan: anchor set only when permanently non-current).
             revision.artifact_retention_starts_at = ts
         await self.session.flush()
         return revision
@@ -584,14 +685,22 @@ class DocumentRevisionsRepository:
         so a tombstoned document's last revision would otherwise
         never be GC-eligible."""
         document = await self.lock_document_for_update(document_id)
+        now = _now()
         if document.source_deleted_at is None:
-            document.source_deleted_at = _now()
+            document.source_deleted_at = now
         # Clearing the current pointer is required: Predicate B
         # excludes the current revision, so a tombstoned document's
         # last revision would otherwise never be GC-eligible.
+        previous_current_id = document.current_revision_id
         document.current_revision_id = None
         for revision in await self.list_non_published_for_update(document_id):
             await self.abandon_revision(revision, reason="document_tombstoned")
+        if previous_current_id is not None:
+            # The former current revision is now permanently non-current;
+            # start its retention clock if it has none yet.
+            former = await self.get_for_update(previous_current_id)
+            if former.artifact_retention_starts_at is None:
+                former.artifact_retention_starts_at = now
         await self.session.flush()
         return document
 
@@ -665,13 +774,36 @@ class DocumentRevisionsRepository:
 
         The CAS is the arbiter, not a read-then-write. The repository
         classifies the outcome BEFORE setting any terminal state."""
+        # Lock the document BEFORE the revision to match the ordering used
+        # by every other mutating path (mark_source_deleted, the allocator).
+        # Locking the revision first here caused an ABBA deadlock against a
+        # concurrent tombstone / publish. The revision's document_id is read
+        # with a non-locking SELECT.
+        document_id = await self.session.scalar(
+            select(DocumentRevision.document_id).where(
+                DocumentRevision.revision_id == revision_id
+            )
+        )
+        if document_id is None:
+            raise RevisionNotPublishable(
+                f"revision {revision_id} does not exist"
+            )
+        document = await self.get_document_for_update(document_id)
         revision = await self.get_for_update(revision_id)
-        if revision.status not in ("verified", "abandoned"):
+        # Validate the terminal state BEFORE consulting the tombstone so a
+        # revision abandoned for a non-tombstone reason is never silently
+        # converted into ``DocumentTombstoned``.
+        if revision.status == "abandoned":
+            if revision.abandon_reason != "document_tombstoned":
+                raise RevisionNotPublishable(
+                    f"revision {revision_id} cannot be published from state "
+                    f"'abandoned' (reason={revision.abandon_reason!r})"
+                )
+        elif revision.status != "verified":
             raise RevisionNotPublishable(
                 f"revision {revision_id} cannot be published from "
                 f"state {revision.status!r}"
             )
-        document = await self.get_document_for_update(revision.document_id)
         if document.source_deleted_at is not None:
             # Tombstone outcome is idempotent: a still-verified revision is
             # abandoned here; a revision already abandoned by
@@ -682,12 +814,6 @@ class DocumentRevisionsRepository:
             if revision.status == "verified":
                 await self.abandon_revision(revision, reason="document_tombstoned")
             return revision, PublishOutcome.ABANDONED_SOURCE_DELETED
-        if revision.status == "abandoned":
-            # Abandoned for a reason other than a source tombstone — never
-            # publishable.
-            raise RevisionNotPublishable(
-                f"revision {revision_id} cannot be published from state 'abandoned'"
-            )
         previous_current_id = document.current_revision_id
         advanced = await self.cas_advance_current(
             document_id=document.id,
@@ -698,23 +824,19 @@ class DocumentRevisionsRepository:
         if advanced == 1:
             revision.status = "published"
             revision.published_at = now
-            # Start the artifact-retention clock at publication. Predicate B
-            # additionally excludes the *current* revision, so a live current
-            # revision is never GC-eligible even though its anchor is set; the
-            # anchor becomes effective the moment the revision stops being
-            # current (superseded, or tombstoned and its pointer cleared).
-            revision.artifact_retention_starts_at = now
+            # No retention anchor while current: the anchor starts when the
+            # revision becomes permanently non-current (see
+            # ``mark_superseded`` / ``mark_source_deleted``).
             if previous_current_id:
                 await self.mark_superseded(
                     previous_current_id, superseded_by=revision.revision_id, at=now
                 )
             await self.session.flush()
             return revision, PublishOutcome.BECAME_CURRENT
-        # CAS lost. Discriminate: tombstoned vs newer generation.
-        if await self.is_source_deleted(document.id):
-            await self.abandon_revision(revision, reason="document_tombstoned")
-            return revision, PublishOutcome.ABANDONED_SOURCE_DELETED
-        # CAS lost to a newer generation: published but never current.
+        # CAS lost to a newer generation: published but never current, so
+        # its retention clock starts now. (A concurrent tombstone is not
+        # possible here: the document row lock is held, so `mark_source_deleted`
+        # cannot have committed between our lock and the CAS.)
         revision.status = "published"
         revision.published_at = now
         revision.artifact_retention_starts_at = now
@@ -758,6 +880,11 @@ class DocumentRevisionsRepository:
             if active is not None and active.status == "failed":
                 # Terminal failed → new generation via bounded retry.
                 return await self.retry_ingestion_attempt(attempt, build_profile)
+            if active is None:
+                raise RevisionNotFound(
+                    f"attempt {attempt.attempt_id} points at missing "
+                    f"revision {attempt.revision_id}"
+                )
             return active, False
 
         # 3. First attempt: create the candidate revision in a savepoint
@@ -822,6 +949,11 @@ class DocumentRevisionsRepository:
         active = await self.get(attempt.revision_id)
         if active is not None and active.status == "failed":
             return await self.retry_ingestion_attempt(attempt, build_profile)
+        if active is None:
+            raise RevisionNotFound(
+                f"attempt {attempt.attempt_id} points at missing "
+                f"revision {attempt.revision_id}"
+            )
         return active, False
 
     async def retry_ingestion_attempt(
