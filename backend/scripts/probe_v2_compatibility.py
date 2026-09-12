@@ -204,10 +204,24 @@ async def _psycopg_round_trip(dsn: str) -> bool:
         # `metadata.items()`.
         metadata = {"source": "v2-compat-probe"}
         new_versions = {"probe": 1}
-        await saver.aput(config, checkpoint, metadata, new_versions)
-        read_back = await saver.aget_tuple(config)
-        if read_back is None or read_back.checkpoint.get("id") != "v2-probe-checkpoint-id":
-            return False
+        try:
+            await saver.aput(config, checkpoint, metadata, new_versions)
+            read_back = await saver.aget_tuple(config)
+            if read_back is None or read_back.checkpoint.get("id") != "v2-probe-checkpoint-id":
+                return False
+        finally:
+            # Clean up the disposable thread so probes don't leak rows into
+            # the `checkpoints` table on every run. A missing thread (race
+            # or already-deleted) is not an error — `adelete_thread` raises
+            # if the thread has any checkpoints associated, but the probe
+            # never associates one with another; the row was inserted by
+            # `aput` and is exactly what we want to remove.
+            try:
+                await saver.adelete_thread(thread_id)
+            except Exception:
+                # Thread may already be absent (idempotent deletion);
+                # never let cleanup mask the actual round-trip verdict.
+                pass
     return True
 
 
@@ -449,6 +463,20 @@ def _emit_requirements(report: dict[str, Any], path: pathlib.Path) -> int:
     return 0
 
 
+# Top-level flags the plan's documented invocations use (Brief Step 4,
+# Task 2 Step 3). These are accepted at the top level so the documented
+# flag-form commands run unchanged; if a subcommand is also given, the
+# subcommand wins. Routing is performed by :func:`_dispatch_top_level`.
+_TOP_LEVEL_FLAGS: tuple[str, ...] = (
+    "--discover",
+    "--input",
+    "--checkpoint-dsn",
+    "--write-requirements",
+    "--output",
+    "--python",
+)
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="probe_v2_compatibility",
@@ -513,7 +541,83 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _build_top_level_flag_parser() -> argparse.ArgumentParser:
+    """Parser that accepts the brief-documented top-level flag forms.
+
+    ``--discover`` → route to ``discover`` handler.
+    ``--input`` → route to ``reemit`` handler (which requires
+    ``--write-requirements`` too).
+
+    Any combination of ``--discover``, ``--checkpoint-dsn``, ``--output``,
+    ``--write-requirements``, ``--python`` is accepted; ``--discover`` is
+    the signal to invoke the discover handler. The handler validates
+    the required flags.
+    """
+    p = argparse.ArgumentParser(
+        prog="probe_v2_compatibility (top-level flags)",
+        add_help=False,
+    )
+    p.add_argument("--discover", action="store_true")
+    p.add_argument("--input", type=pathlib.Path, default=None)
+    p.add_argument("--checkpoint-dsn", default=None)
+    p.add_argument("--output", type=pathlib.Path, default=None)
+    p.add_argument("--write-requirements", type=pathlib.Path, default=None)
+    p.add_argument("--python", type=pathlib.Path, default=None)
+    return p
+
+
+def _dispatch_top_level(argv: list[str]) -> list[str] | None:
+    """If ``argv`` matches a top-level flag invocation, translate it to a
+    subcommand invocation and return the new argv; otherwise return None.
+
+    Contract:
+      * any top-level flag from :data:`_TOP_LEVEL_FLAGS` plus no
+        positional subcommand → routed form
+      * subcommand present → return None (let the regular parser handle it)
+    """
+    if not argv:
+        return None
+    # First positional token is the subcommand (if any). If it does not
+    # start with '-', a subcommand was named and the regular parser wins.
+    if not argv[0].startswith("-"):
+        return None
+    # If none of the documented top-level flags appear, return None so the
+    # regular parser prints its own usage (the user passed something else).
+    if not any(flag in argv for flag in _TOP_LEVEL_FLAGS):
+        return None
+    top = _build_top_level_flag_parser().parse_args(argv)
+    if top.input is not None:
+        # reemit path: --input + --write-requirements
+        new_argv = ["reemit", "--input", str(top.input)]
+        if top.write_requirements is not None:
+            new_argv.extend(
+                ["--write-requirements", str(top.write_requirements)]
+            )
+        else:
+            # reemit requires --write-requirements; fall back to the
+            # regular parser to print the missing-required error.
+            return None
+        return new_argv
+    if top.discover or top.checkpoint_dsn or top.output or top.write_requirements or top.python:
+        new_argv = ["discover"]
+        if top.checkpoint_dsn is not None:
+            new_argv.extend(["--checkpoint-dsn", top.checkpoint_dsn])
+        if top.output is not None:
+            new_argv.extend(["--output", str(top.output)])
+        if top.write_requirements is not None:
+            new_argv.extend(["--write-requirements", str(top.write_requirements)])
+        if top.python is not None:
+            new_argv.extend(["--python", str(top.python)])
+        return new_argv
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    translated = _dispatch_top_level(argv)
+    if translated is not None:
+        argv = translated
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
 
