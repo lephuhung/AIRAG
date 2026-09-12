@@ -631,6 +631,12 @@ class Settings(BaseSettings):
     # No trailing slash.
     FRONTEND_BASE_URL: str = Field(default="")
 
+    # ── LangGraph agent runtime selector (Phase 2, Task 7) ───────────────────
+    # Which supervisor arm serves chat traffic: "v1" (default, unchanged
+    # behavior) or "v2" (node-based supervisor behind the schema/checkpoint
+    # readiness gate). Any other value fails fast at config validation.
+    NEXUSRAG_AGENT_GRAPH_VERSION: str = Field(default="v1")
+
     # ── Phase 1A: Semantic preprocessor atomic enable (B.11 0.5) ─────────────
     # When True, semantic_preprocessor_node runs before supervisor_node;
     # legacy abbreviation expansion is suppressed via _preprocessor_marker.
@@ -642,6 +648,9 @@ class Settings(BaseSettings):
         validate_checkpoint_dsn(
             self.CHECKPOINT_DATABASE_URL, database_url=self.DATABASE_URL
         )
+        from app.services.agent.runtime_selector import normalize_agent_version
+
+        normalize_agent_version(self.NEXUSRAG_AGENT_GRAPH_VERSION)
         return self
 
     model_config = {

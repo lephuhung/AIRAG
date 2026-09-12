@@ -350,11 +350,66 @@ async def _cmd_workspace(db, chat_id: str, link, arg: str) -> None:
     await send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
 
 
+async def _collect_v2_telegram_events(
+    *,
+    graph,
+    raw_question: str,
+    workspace_ids,
+    user,
+    session_id: str,
+) -> list[dict]:
+    """Run one turn on the v2 arm and collect v1-shaped event dicts.
+
+    Builds the real request-scoped v2 ingress (scope ∩, raw query,
+    RuntimeServices/registry, dedicated lease session) and maps the
+    terminal response through the interim T7 runner. The raw user turn was
+    already persisted by the caller; the evidence unit of work commits
+    after the terminal response is produced.
+    """
+    import json as _json
+
+    from app.services.agent.runtime_selector import (
+        build_v2_ingress,
+        run_v2_turn_sse,
+    )
+
+    collected: list[dict] = []
+    async with build_v2_ingress(
+        user_id=user.id,
+        authenticated_workspace_ids=workspace_ids,
+        requested_workspace_ids=None,
+        raw_query=raw_question,
+        thread_id=session_id,
+        can_read_people=bool(user.is_superadmin),
+    ) as ingress:
+        try:
+            async for sse_str in run_v2_turn_sse(
+                graph=graph,
+                initial_state=ingress.initial_state,
+                runtime_context=ingress.runtime_context,
+                thread_id=session_id,
+            ):
+                try:
+                    lines = sse_str.strip().split("\n")
+                    etype = lines[0].replace("event: ", "").strip()
+                    data_line = next(
+                        (line for line in lines if line.startswith("data:")), None
+                    )
+                    data = _json.loads(data_line[5:].strip()) if data_line else {}
+                except Exception:  # noqa: BLE001 — malformed SSE never breaks eval
+                    continue
+                collected.append({"event": etype, "data": data})
+            await ingress.commit_evidence()
+        except Exception:
+            await ingress.rollback_evidence()
+            raise
+    return collected
+
+
 # ──────────────────────────────── Q&A flow ─────────────────────────────────────
 
 async def _handle_question(db, chat_id: str, question: str, tg_user_id: str | None = None) -> None:
     from app.api.chat_agent import _get_accessible_workspaces
-    from app.services.agents.supervisor import get_supervisor_graph
     from app.services.agent.streaming import build_initial_state, stream_agent_events
     from app.models.chat_message import ChatMessage
     from app.models.user import User
@@ -378,11 +433,27 @@ async def _handle_question(db, chat_id: str, question: str, tg_user_id: str | No
         await send_message(chat_id, "❌ Tài khoản liên kết không còn hợp lệ. Hãy /link lại.")
         return
 
-    # Resolve workspace scope (single active, or all accessible).
+    # Resolve workspace scope through the lazy selector: current runtime
+    # scope = authenticated scope ∩ requested scope (never widened). A
+    # revoked active workspace now fails closed instead of being trusted.
+    from app.services.agent.runtime_selector import (
+        configured_agent_version,
+        persist_raw_user_message,
+        resolve_agent_graph,
+        resolve_runtime_scope,
+    )
+
+    version = configured_agent_version()
+    authenticated_ids = await _get_accessible_workspaces(db, user)
     if link.active_workspace_id:
-        workspace_ids = [link.active_workspace_id]
+        workspace_ids = list(
+            resolve_runtime_scope(
+                authenticated_ids=authenticated_ids,
+                requested_ids=[link.active_workspace_id],
+            )
+        )
     else:
-        workspace_ids = await _get_accessible_workspaces(db, user)
+        workspace_ids = list(authenticated_ids)
     if not workspace_ids:
         await send_message(chat_id, "Bạn chưa có quyền truy cập không gian nào để tìm kiếm.")
         return
@@ -397,17 +468,13 @@ async def _handle_question(db, chat_id: str, question: str, tg_user_id: str | No
     # Load short history for the agent (last few turns of this session).
     history = await _load_history(db, session.id, limit=10)
 
-    # Persist the user turn.
-    db.add(
-        ChatMessage(
-            session_id=session.id,
-            message_id=f"msg_{uuid.uuid4().hex[:8]}",
-            role="user",
-            content=question,
-            user_id=user.id,
-        )
+    # Persist the RAW user turn BEFORE any normalization/semantic work.
+    await persist_raw_user_message(
+        db,
+        session_id=session.id,
+        user_id=user.id,
+        raw_text=question,
     )
-    await db.commit()
 
     # Placeholder message we'll keep editing as tokens stream in.
     await send_chat_action(chat_id, "typing")
@@ -433,8 +500,33 @@ async def _handle_question(db, chat_id: str, question: str, tg_user_id: str | No
             document_ids=None,
             user_can_use_people=user.is_superadmin,
         )
-        graph = get_supervisor_graph()
-        async for ev in stream_agent_events(graph, initial_state, channel="telegram"):
+        # Resolve the serving arm through the lazy selector (no direct
+        # graph construction on any entrypoint).
+        graph = await resolve_agent_graph(version)
+        # v2 turns emit no token stream (single terminal response), so the
+        # events are collected up front; v1 streams token-by-token below.
+        # Both arms then share the same delivery body.
+        v2_events: list[dict] | None = None
+        if version == "v2":
+            v2_events = await _collect_v2_telegram_events(
+                graph=graph,
+                raw_question=question,
+                workspace_ids=workspace_ids,
+                user=user,
+                session_id=str(session.id),
+            )
+
+        async def _event_source():
+            if v2_events is not None:
+                for collected in v2_events:
+                    yield collected
+            else:
+                async for ev in stream_agent_events(
+                    graph, initial_state, channel="telegram"
+                ):
+                    yield ev
+
+        async for ev in _event_source():
             etype = ev.get("event")
             data = ev.get("data") or {}
             if etype == "token":

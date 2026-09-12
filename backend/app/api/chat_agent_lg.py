@@ -131,6 +131,67 @@ def _format_sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, default=json_serial, ensure_ascii=False)}\n\n"
 
 
+async def _stream_v2_standalone(
+    *,
+    graph,
+    raw_message: str,
+    workspace_ids: list[uuid.UUID],
+    document_ids,
+    user_id: uuid.UUID,
+    user_is_superadmin: bool,
+    session_id: Optional[str],
+) -> AsyncGenerator[str, None]:
+    """Run one turn on the v2 arm and yield v1-wire SSE strings.
+
+    Builds the real request-scoped v2 ingress (scope ∩, raw query,
+    RuntimeServices/registry, dedicated lease session) and streams the
+    terminal response through the interim T7 runner (T8 owns the production
+    streaming adapter). The raw user text was already persisted by the
+    caller before normalization; the evidence unit of work commits after
+    the terminal response is produced.
+    """
+    from app.services.agent.runtime_selector import (
+        build_v2_ingress,
+        run_v2_turn_sse,
+    )
+
+    known_documents: tuple = ()
+    if document_ids:
+        from app.services.agents.v2.contracts.request import KnownDocumentResource
+
+        known_documents = tuple(
+            KnownDocumentResource(
+                resource_id=str(document_id),
+                document_id=document_id,
+                source="api_explicit",
+            )
+            for document_id in (document_ids or ())
+        )
+    thread_id = session_id or f"standalone-{uuid.uuid4().hex[:12]}"
+    async with build_v2_ingress(
+        user_id=user_id,
+        authenticated_workspace_ids=workspace_ids,
+        requested_workspace_ids=None,
+        raw_query=raw_message,
+        thread_id=thread_id,
+        can_read_people=bool(user_is_superadmin),
+        known_documents=known_documents,
+        document_ids=tuple(document_ids or ()),
+    ) as ingress:
+        try:
+            async for sse_str in run_v2_turn_sse(
+                graph=graph,
+                initial_state=ingress.initial_state,
+                runtime_context=ingress.runtime_context,
+                thread_id=thread_id,
+            ):
+                yield sse_str
+            await ingress.commit_evidence()
+        except Exception:
+            await ingress.rollback_evidence()
+            raise
+
+
 # ---------------------------------------------------------------------------
 # Core LangGraph streaming generator
 # ---------------------------------------------------------------------------
@@ -151,8 +212,23 @@ async def langgraph_chat_stream(
     Produces identical SSE output — frontend needs no changes.
     """
     from app.core.config import settings
-    from app.services.agents.supervisor import get_supervisor_graph
+    from app.services.agent.runtime_selector import (
+        configured_agent_version,
+        persist_raw_user_message,
+        resolve_agent_graph,
+        resolve_runtime_scope,
+    )
     from app.services.agent.streaming import stream_agent_to_sse, build_initial_state
+
+    # Current runtime scope = authenticated scope ∩ requested scope (never
+    # widened by request input).
+    requested_scope = getattr(request, "workspace_ids", None)
+    workspace_ids = list(
+        resolve_runtime_scope(
+            authenticated_ids=workspace_ids,
+            requested_ids=requested_scope,
+        )
+    )
 
     primary_id = workspace_ids[0] if workspace_ids else None
     if not primary_id:
@@ -176,24 +252,27 @@ async def langgraph_chat_stream(
         content = m.content if hasattr(m, "content") else m.get("content", "")
         history.append({"role": role, "content": content})
 
-    # Expand abbreviations in the incoming message
-    message = await AbbreviationService.expand_ab_in_text(db, request.message)
+    # Public chat takes no per-request arm override (the admin evaluation
+    # surface is the only override, and it is admin-only): serve the
+    # configured default.
+    version = configured_agent_version()
 
-    # Persist user message
+    # Persist the RAW user text BEFORE any normalization/semantic work, so
+    # chat history owns exactly what the user sent.
     try:
-        from app.models.chat_message import ChatMessage as ChatMessageModel
-        user_row = ChatMessageModel(
-            message_id=str(uuid.uuid4()),
-            role="user",
-            content=message,
-            user_id=user_id,
+        await persist_raw_user_message(
+            db,
             session_id=session_id,
+            user_id=user_id,
+            raw_text=request.message,
         )
-        db.add(user_row)
-        await db.commit()
     except Exception as e:
         logger.warning(f"[lg_endpoint] Failed to persist user message: {e}")
         await db.rollback()
+
+    # Expand abbreviations in the incoming message (graph input only — the
+    # persisted row above keeps the raw text).
+    message = await AbbreviationService.expand_ab_in_text(db, request.message)
 
     # Build initial LangGraph state
     initial_state = build_initial_state(
@@ -217,12 +296,10 @@ async def langgraph_chat_stream(
     collected_steps: list[dict] = []
     step_counter = 0
 
-    graph = get_supervisor_graph()
-
-    async for sse_str in stream_agent_to_sse(graph, initial_state):
-        yield sse_str
-
-        # Parse emitted events to collect data for DB persistence
+    def _collect_terminal(sse_str: str) -> None:
+        """Parse emitted events to collect data for DB persistence."""
+        nonlocal final_answer, step_counter
+        nonlocal final_sources, final_images, final_people_data
         try:
             if sse_str.startswith("event:"):
                 lines = sse_str.strip().split("\n")
@@ -247,6 +324,27 @@ async def langgraph_chat_stream(
                         })
         except Exception:
             pass  # parsing errors on SSE string are non-fatal
+
+    # Resolve the serving arm through the lazy selector (no direct graph
+    # construction on any entrypoint).
+    graph = await resolve_agent_graph(version)
+
+    if version == "v2":
+        async for sse_str in _stream_v2_standalone(
+            graph=graph,
+            raw_message=request.message,
+            workspace_ids=workspace_ids,
+            document_ids=getattr(request, "document_ids", None),
+            user_id=user_id,
+            user_is_superadmin=user_is_superadmin,
+            session_id=session_id,
+        ):
+            yield sse_str
+            _collect_terminal(sse_str)
+    else:
+        async for sse_str in stream_agent_to_sse(graph, initial_state):
+            yield sse_str
+            _collect_terminal(sse_str)
 
     # Persist assistant message + thinking steps
     try:

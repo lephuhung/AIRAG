@@ -625,16 +625,17 @@ async def chat_stream_session(
     doc_ids_json = (
         [str(d) for d in accessible_doc_ids] if accessible_doc_ids else None
     )
-    user_msg = ChatMessage(
+    # Persist the RAW user text BEFORE any normalization/semantic work.
+    from app.services.agent.runtime_selector import persist_raw_user_message
+
+    await persist_raw_user_message(
+        db,
         session_id=session_id,
-        message_id=user_msg_id,
-        role="user",
-        content=request.message,
         user_id=user.id,
+        raw_text=request.message,
+        message_id=user_msg_id,
         document_ids=doc_ids_json,
     )
-    db.add(user_msg)
-    await db.commit()
 
     # Get system prompt
     from app.prompts.chat import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
@@ -940,12 +941,22 @@ async def chat_stream_session(
 
     async def _run_and_persist():
         from app.core.database import async_session_maker
-        from app.services.agents.supervisor import get_supervisor_graph as get_agent_graph
+        from app.services.agent.runtime_selector import (
+            build_v2_ingress,
+            configured_agent_version,
+            resolve_agent_graph,
+            resolve_runtime_scope,
+            run_v2_turn_sse,
+        )
         from app.services.agent.streaming import (
             stream_agent_to_sse,
             build_initial_state,
         )
         import json as _json
+
+        # Public chat takes no per-request arm override (the admin
+        # evaluation surface is the only override, and it is admin-only).
+        version = configured_agent_version()
 
         accumulated_text = ""
         accumulated_thinking = ""
@@ -990,11 +1001,18 @@ async def chat_stream_session(
                 # workspaces BEFORE passing to graph state. The attacker-controlled
                 # request.document_ids is filtered here; only accessible docs reach
                 # the supervisor graph. This closes the ACL ingress vulnerability.
+                # Current runtime scope = authenticated scope ∩ requested scope.
+                runtime_workspace_ids = list(
+                    resolve_runtime_scope(
+                        authenticated_ids=workspace_ids,
+                        requested_ids=None,
+                    )
+                )
                 filtered_doc_ids = await _filter_accessible_document_ids(
-                    run_db, user, workspace_ids, request.document_ids
+                    run_db, user, runtime_workspace_ids, request.document_ids
                 )
                 initial_state = build_initial_state(
-                    workspace_ids=workspace_ids,
+                    workspace_ids=runtime_workspace_ids,
                     message=request.message,
                     history=history,
                     system_prompt=system_prompt_to_use,
@@ -1012,8 +1030,42 @@ async def chat_stream_session(
                     f"force_search={getattr(request, 'force_search', False)}"
                 )
 
-                graph = get_agent_graph()
-                agen = stream_agent_to_sse(graph, initial_state)
+                # Resolve the serving arm through the lazy selector (no
+                # direct graph construction on any entrypoint).
+                graph = await resolve_agent_graph(version)
+                v2_ingress_cm = None
+                v2_ingress = None
+                if version == "v2":
+                    from app.services.agents.v2.contracts.request import (
+                        KnownDocumentResource,
+                    )
+
+                    v2_ingress_cm = build_v2_ingress(
+                        user_id=user.id,
+                        authenticated_workspace_ids=runtime_workspace_ids,
+                        requested_workspace_ids=None,
+                        raw_query=request.message,
+                        thread_id=session_id,
+                        can_read_people=bool(user.is_superadmin),
+                        known_documents=tuple(
+                            KnownDocumentResource(
+                                resource_id=str(document_id),
+                                document_id=document_id,
+                                source="api_explicit",
+                            )
+                            for document_id in (filtered_doc_ids or ())
+                        ),
+                        document_ids=tuple(filtered_doc_ids or ()),
+                    )
+                    v2_ingress = await v2_ingress_cm.__aenter__()
+                    agen = run_v2_turn_sse(
+                        graph=graph,
+                        initial_state=v2_ingress.initial_state,
+                        runtime_context=v2_ingress.runtime_context,
+                        thread_id=session_id,
+                    )
+                else:
+                    agen = stream_agent_to_sse(graph, initial_state)
                 try:
                     async for sse_str in agen:
                         # Collect data for DB persistence while relaying
@@ -1068,6 +1120,22 @@ async def chat_stream_session(
                     # GeneratorExit into stream_agent_to_sse, whose finally
                     # cancels the LangGraph task — the run stops promptly.
                     await agen.aclose()
+
+                # v2: the evidence unit of work commits only after the
+                # terminal response is produced; the ingress sessions always
+                # close here (terminal lease release stays with the T8
+                # outer runner — never here, never in the finalizer).
+                if v2_ingress is not None:
+                    try:
+                        try:
+                            await v2_ingress.commit_evidence()
+                        except Exception:
+                            await v2_ingress.rollback_evidence()
+                            raise
+                    finally:
+                        # Always close (cancellation skips the commit: the
+                        # session close rolls the partial turn back).
+                        await v2_ingress_cm.__aexit__(None, None, None)
 
             # Generate the title now (first exchange) and push it immediately so
             # the client updates without a refresh; reuse the summary downstream.
