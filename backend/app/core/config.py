@@ -1,10 +1,55 @@
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import Field, model_validator
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlparse
 
 _candidate = Path(__file__).resolve().parent.parent.parent.parent / ".env"
 ENV_FILE = str(_candidate) if _candidate.exists() else ".env"
+
+
+def _canonical_postgres_dsn(dsn: str) -> str:
+    """Strip a ``+driver`` from a PostgreSQL DSN scheme so two DSNs that name
+    the same database compare equal regardless of the SQLAlchemy driver."""
+    scheme, separator, remainder = dsn.partition("://")
+    if not separator:
+        return dsn
+    return f"{scheme.split('+', 1)[0].lower()}://{remainder}"
+
+
+def validate_checkpoint_dsn(checkpoint_dsn: str, *, database_url: str) -> None:
+    """Reject a ``CHECKPOINT_DATABASE_URL`` that psycopg / AsyncPostgresSaver
+    cannot use.
+
+    Single owner of the rule, shared by the ``Settings`` validator and
+    ``persistence.checkpoint.validate_psycopg_dsn``. ``AsyncPostgresSaver``
+    connects through psycopg3, which only accepts a libpq ``postgresql://``
+    DSN with explicit credentials — never the SQLAlchemy ``postgresql+asyncpg://``
+    application DSN. The checkpoint store must also be a *separate* database
+    from the application database, so reusing ``DATABASE_URL`` is rejected.
+    """
+    if not checkpoint_dsn or not checkpoint_dsn.strip():
+        raise ValueError(
+            "CHECKPOINT_DATABASE_URL must be set to a non-empty postgresql:// DSN"
+        )
+    if _canonical_postgres_dsn(checkpoint_dsn) == _canonical_postgres_dsn(
+        database_url
+    ):
+        raise ValueError(
+            "CHECKPOINT_DATABASE_URL must not reuse DATABASE_URL; checkpointing "
+            "requires a separate PostgreSQL database"
+        )
+    parsed = urlparse(checkpoint_dsn)
+    if parsed.scheme != "postgresql":
+        raise ValueError(
+            "CHECKPOINT_DATABASE_URL must use the psycopg-compatible 'postgresql://' "
+            f"scheme (got {parsed.scheme or 'no'} scheme); the asyncpg driver "
+            "'postgresql+asyncpg://' is not accepted"
+        )
+    if not parsed.username or not parsed.password:
+        raise ValueError(
+            "CHECKPOINT_DATABASE_URL must include both a username and password"
+        )
 
 
 class Settings(BaseSettings):
@@ -16,6 +61,17 @@ class Settings(BaseSettings):
     # Infrastructure
     DATABASE_URL: str = Field(
         default="postgresql+asyncpg://postgres:postgres@localhost:5433/hrag"
+    )
+    # ── LangGraph v2 checkpoint store (Phase 1D, task 10) ────────────────────
+    # AsyncPostgresSaver connects with psycopg3, which accepts only a libpq
+    # ``postgresql://`` DSN — NOT the SQLAlchemy ``postgresql+asyncpg://`` DSN
+    # used for the application database. It must point at its own database
+    # (separate tables/lifecycle from the app schema), so reuse of DATABASE_URL
+    # is rejected. The default keeps local imports and the stack bootable
+    # without a .env; production MUST set CHECKPOINT_DATABASE_URL explicitly
+    # (see .env.example).
+    CHECKPOINT_DATABASE_URL: str = Field(
+        default="postgresql://postgres:postgres@localhost:5433/hrag_checkpoints"
     )
     CHROMA_HOST: str = Field(default="localhost")
     CHROMA_PORT: int = Field(default=8002)
@@ -580,6 +636,13 @@ class Settings(BaseSettings):
     # legacy abbreviation expansion is suppressed via _preprocessor_marker.
     # Default False. Atomic single-env-change enable per Phase 1A plan.
     NEXUSRAG_SEMANTIC_PREPROCESSOR: bool = Field(default=False)
+
+    @model_validator(mode="after")
+    def _validate_checkpoint_database_url(self) -> "Settings":
+        validate_checkpoint_dsn(
+            self.CHECKPOINT_DATABASE_URL, database_url=self.DATABASE_URL
+        )
+        return self
 
     model_config = {
         "env_file": str(ENV_FILE),
