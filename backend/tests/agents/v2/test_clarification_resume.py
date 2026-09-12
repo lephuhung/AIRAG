@@ -46,8 +46,11 @@ from app.services.agents.v2.contracts.validation import (
     validate_supervisor_state,
 )
 from app.services.agents.v2.nodes.clarification import (
+    ClarificationError,
     ClarificationExpired,
     ClarificationInvalidSelection,
+    ClarificationUnauthorized,
+    ClarificationUnsatisfiable,
     build_clarification,
     clarify_node,
     interrupt_for_clarification,
@@ -81,16 +84,36 @@ class FakeChatMessages:
 
 
 class FakeAuthorization:
-    """Stand-in for the document authorization service (current ACL)."""
+    """Stand-in for the document authorization service (current ACL).
 
-    def __init__(self, denied: set[UUID] | None = None) -> None:
+    ``denied`` is a static blocklist. ``grants`` maps a workspace id to the
+    document ids authorized there, so a test can prove the resume-time
+    runtime (not the build-time one) decides the outcome.
+    """
+
+    def __init__(
+        self,
+        denied: set[UUID] | None = None,
+        grants: dict[UUID, set[UUID]] | None = None,
+    ) -> None:
         self.denied = set(denied or set())
+        self.grants = grants
         self.calls: list[tuple[UUID, CapabilityRuntimeContext]] = []
 
     async def require_document(
         self, document_id: UUID, capability_runtime: CapabilityRuntimeContext
     ) -> None:
         self.calls.append((document_id, capability_runtime))
+        if self.grants is not None:
+            allowed = any(
+                document_id in self.grants.get(workspace, set())
+                for workspace in capability_runtime.workspace_ids
+            )
+            if not allowed:
+                raise PermissionError(
+                    f"document {document_id} is not authorized in this workspace"
+                )
+            return
         if document_id in self.denied:
             raise PermissionError(f"document {document_id} is not authorized")
 
@@ -177,8 +200,54 @@ def make_graph_context(
 
 
 def live_request_for(semantic: SemanticContext) -> ClarificationRequest:
-    return build_clarification(
-        semantic, now=datetime(2030, 1, 1, tzinfo=UTC) - timedelta(minutes=1)
+    # Wall-clock-relative so the suite does not expire on a fixed date.
+    return build_clarification(semantic, now=datetime.now(UTC))
+
+
+def unresolved_ref(*, ref_id: str = "r9") -> DocumentReference:
+    return DocumentReference(
+        ref_id=ref_id,
+        original_span="nghị định 99",
+        normalized_reference="nghị định 99",
+        requested_role="target",
+        revision_requirement=None,
+        resolution_status="unresolved",
+        resolved_document_id=None,
+    )
+
+
+def unresolved_semantic() -> SemanticContext:
+    return SemanticContext(
+        contextualized_query="Xem nghị định 99",
+        normalized_query="xem nghị định 99",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(unresolved_ref(),),
+        person_refs=(),
+        section_refs=(),
+        blocking_ambiguities=(
+            BlockingAmbiguity(
+                ambiguity_id="r9", description="Không tìm thấy nghị định 99."
+            ),
+        ),
+    )
+
+
+def stale_ambiguity_semantic() -> SemanticContext:
+    """A blocking ambiguity naming an already-resolved ref (M1/M2 case)."""
+    return SemanticContext(
+        contextualized_query="Xem Nghị định 15/2021",
+        normalized_query="xem nghị định 15/2021",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(resolved_ref(),),
+        person_refs=(),
+        section_refs=(),
+        blocking_ambiguities=(
+            BlockingAmbiguity(
+                ambiguity_id="r0", description="Ý nào của nghị định được hỏi?"
+            ),
+        ),
     )
 
 
@@ -186,11 +255,12 @@ def resume_setup(
     *,
     reply: str,
     denied: set[UUID] | None = None,
+    grants: dict[UUID, set[UUID]] | None = None,
     workspace_id: UUID = WORKSPACE_ID,
 ) -> SimpleNamespace:
     message_id = uuid4()
     chat = FakeChatMessages({message_id: reply})
-    auth = FakeAuthorization(denied=denied)
+    auth = FakeAuthorization(denied=denied, grants=grants)
     ctx = make_graph_context(chat=chat, auth=auth, workspace_id=workspace_id)
     return SimpleNamespace(
         message_id=message_id, chat=chat, auth=auth, ctx=ctx
@@ -357,8 +427,8 @@ async def test_resume_restarts_resolved_flow_at_binding() -> None:
     # the resolution stores only the deterministic selection, no user text.
     assert handle.chat.calls == [handle.message_id]
     assert set(command.resume) == {"contract_version", "clarification_id", "selected_candidate_id"}
-    # The raw reply text lives only in chat persistence, never in the resume.
-    assert handle.chat.contents[handle.message_id] == "1"
+    # The resolution envelope carries no ChatMessage field and only an
+    # offered candidate id — the raw reply never enters the checkpoint.
     assert "content" not in command.resume
     assert command.resume["selected_candidate_id"] in {
         c.candidate_id for c in request.candidates
@@ -408,8 +478,7 @@ async def test_resume_rejects_out_of_range_ordinal() -> None:
         await resume_clarification(handle.message_id, request, handle.ctx)
 
 
-@pytest.mark.asyncio
-async def test_resume_rejects_forged_candidate() -> None:
+def test_resume_rejects_forged_candidate() -> None:
     request = live_request_for(blocking_semantic())
     forged = ClarificationResolution(
         contract_version="2.0",
@@ -428,8 +497,12 @@ async def test_resume_rejects_no_longer_authorized_candidate() -> None:
     request = live_request_for(blocking_semantic())
     target = request.candidates[0]
     handle = resume_setup(reply="1", denied={target.document_id})
-    with pytest.raises(PermissionError):
+    with pytest.raises(ClarificationUnauthorized) as exc_info:
         await resume_clarification(handle.message_id, request, handle.ctx)
+    assert exc_info.value.document_id == target.document_id
+    assert exc_info.value.clarification_id == request.clarification_id
+    assert isinstance(exc_info.value.__cause__, PermissionError)
+    assert isinstance(exc_info.value, ClarificationError)
 
 
 @pytest.mark.asyncio
@@ -462,3 +535,150 @@ def test_resolution_carries_no_user_text() -> None:
     )
     assert resolution.selected_candidate_id == request.candidates[1].candidate_id
     assert CONTRACT_VERSION == resolution.contract_version
+
+
+def test_resolved_ref_named_by_ambiguity_is_not_unresolved() -> None:
+    # M1/M2: a resolved ref stays out of unresolved_ref_ids even when a
+    # blocking ambiguity names it; the reason must not claim not_found.
+    request = build_clarification(stale_ambiguity_semantic())
+    assert request.unresolved_ref_ids == ()
+    assert request.reason == "semantic_ambiguity"
+    assert request.candidates == ()
+    assert "Ý nào" in request.question
+
+
+def test_candidate_order_stable_under_permuted_input() -> None:
+    # M7: the sorted-document normalization is exercised, not just asserted.
+    forward = build_clarification(blocking_semantic())
+    reversed_semantic = SemanticContext(
+        contextualized_query="Xem nghị định 12",
+        normalized_query="xem nghị định 12",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(
+            resolved_ref(),
+            ambiguous_ref(candidates=(OTHER_DOCUMENT_ID, DOCUMENT_ID)),
+        ),
+        person_refs=(),
+        section_refs=(),
+        blocking_ambiguities=(
+            BlockingAmbiguity(
+                ambiguity_id="r1", description="Hai văn bản cùng số 12."
+            ),
+        ),
+    )
+    permuted = build_clarification(reversed_semantic)
+    assert [c.candidate_id for c in permuted.candidates] == [
+        c.candidate_id for c in forward.candidates
+    ]
+    assert [c.document_id for c in permuted.candidates] == [
+        c.document_id for c in forward.candidates
+    ]
+
+
+def test_candidate_free_request_is_unsatisfiable() -> None:
+    # I1: an unresolved-only question offers nothing selectable.
+    request = build_clarification(unresolved_semantic())
+    assert request.reason == "required_document_not_found"
+    assert request.candidates == ()
+    assert request.unresolved_ref_ids == ("r9",)
+    with pytest.raises(ClarificationUnsatisfiable):
+        parse_clarification_resolution("nghị định 99 bản mới nhất", request)
+    with pytest.raises(ClarificationUnsatisfiable):
+        parse_clarification_resolution("không", request)
+
+
+@pytest.mark.asyncio
+async def test_resume_candidate_free_request_never_resumes() -> None:
+    # I1: every reply to a candidate-free request raises the distinct typed
+    # error (no ACL call, no Command) so the runner can treat it as a new
+    # turn instead of a bad reply.
+    request = build_clarification(unresolved_semantic())
+    handle = resume_setup(reply="1")
+    with pytest.raises(ClarificationUnsatisfiable) as exc_info:
+        await resume_clarification(handle.message_id, request, handle.ctx)
+    assert exc_info.value.clarification_id == request.clarification_id
+    assert isinstance(exc_info.value, ClarificationError)
+    assert handle.auth.calls == []
+
+
+@pytest.mark.asyncio
+async def test_clarify_node_preserves_live_request() -> None:
+    # I2: re-execution (LangGraph re-runs the interrupting node from the top
+    # on resume) must not silently extend the per-request deadline.
+    semantic = blocking_semantic()
+    live = build_clarification(semantic, now=datetime.now(UTC))
+    state = make_state(semantic=semantic, clarification=live)
+    ctx = make_graph_context()
+    first = await clarify_node(state, Runtime(context=ctx))
+    assert first["clarification"] is live
+    second = await clarify_node(
+        make_state(semantic=semantic, clarification=first["clarification"]),
+        Runtime(context=ctx),
+    )
+    assert second["clarification"] is live
+    assert second["clarification"].expires_at == live.expires_at
+
+
+@pytest.mark.asyncio
+async def test_clarify_node_rebuilds_expired_or_stale_request() -> None:
+    # I2: an expired (or question-mismatched) persisted request is replaced.
+    semantic = blocking_semantic()
+    expired = build_clarification(
+        semantic, now=datetime.now(UTC) - timedelta(hours=2)
+    )
+    assert expired.expires_at < datetime.now(UTC)
+    ctx = make_graph_context()
+    rebuilt = await clarify_node(
+        make_state(semantic=semantic, clarification=expired),
+        Runtime(context=ctx),
+    )
+    assert rebuilt["clarification"].clarification_id == expired.clarification_id
+    assert rebuilt["clarification"].expires_at > expired.expires_at
+    other = await clarify_node(
+        make_state(semantic=unresolved_semantic(), clarification=expired),
+        Runtime(context=ctx),
+    )
+    assert other["clarification"].clarification_id != expired.clarification_id
+
+
+@pytest.mark.asyncio
+async def test_resume_acl_decision_follows_resume_workspace() -> None:
+    # M8: the resume-time workspace behaviorally decides, not just travels.
+    request = live_request_for(blocking_semantic())
+    target = request.candidates[0]
+    grants = {WORKSPACE_ID: {target.document_id}, NEW_WORKSPACE_ID: set()}
+    old = resume_setup(reply="1", grants=grants, workspace_id=WORKSPACE_ID)
+    command = await resume_clarification(old.message_id, request, old.ctx)
+    assert command.goto == "binding"
+    new = resume_setup(reply="1", grants=grants, workspace_id=NEW_WORKSPACE_ID)
+    with pytest.raises(ClarificationUnauthorized):
+        await resume_clarification(new.message_id, request, new.ctx)
+
+
+@pytest.mark.asyncio
+async def test_resume_fails_closed_without_services() -> None:
+    request = live_request_for(blocking_semantic())
+    message_id = uuid4()
+    with pytest.raises(ClarificationError, match="no chat_messages"):
+        await resume_clarification(
+            message_id, request, make_graph_context(chat=None, auth=None)
+        )
+    chat = FakeChatMessages({message_id: "1"})
+    with pytest.raises(ClarificationError, match="no authorization"):
+        await resume_clarification(
+            message_id, request, make_graph_context(chat=chat, auth=None)
+        )
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_empty_or_non_string_reply() -> None:
+    request = live_request_for(blocking_semantic())
+    message_id = uuid4()
+    chat = FakeChatMessages({message_id: "   "})
+    ctx = make_graph_context(chat=chat, auth=FakeAuthorization())
+    with pytest.raises(ClarificationInvalidSelection):
+        await resume_clarification(message_id, request, ctx)
+    chat.contents[message_id] = None  # type: ignore[dict-item]
+    with pytest.raises(ClarificationInvalidSelection):
+        await resume_clarification(message_id, request, ctx)

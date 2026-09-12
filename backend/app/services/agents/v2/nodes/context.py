@@ -44,6 +44,7 @@ __all__ = [
     "finalize_semantic",
     "finalize_blocking_ambiguities",
     "context_node",
+    "node_context",
     "semantic_finalizer_node",
 ]
 
@@ -66,6 +67,16 @@ def _context_of(runtime: Any) -> GraphRuntimeContext:
     raise ContextNodeError(
         f"node runtime carries no GraphRuntimeContext (got {type(runtime).__name__})"
     )
+
+
+def node_context(runtime: Any) -> GraphRuntimeContext:
+    """Public runtime-unwrap shared by v2 nodes (added in Task 5 round 1).
+
+    Same fail-closed behavior as ``_context_of`` without binding callers to
+    a private symbol: accepts the injected ``Runtime[GraphRuntimeContext]``
+    or, for unit tests, the context itself.
+    """
+    return _context_of(runtime)
 
 
 def _normalize_validated(draft: SemanticDraft) -> str:

@@ -25,6 +25,21 @@ closed with a typed error and never reaches the router. On success resume
 returns ``Command(resume=..., goto="binding")`` so the resolved flow restarts
 at the Binding Resolver.
 
+Candidate-free requests (``required_document_not_found`` /
+``semantic_ambiguity`` with ``candidates == ()``) can never resume via
+selection: every reply raises ``ClarificationUnsatisfiable``. The T6/T7
+runner MUST treat that error as a fresh user turn (re-run
+context → binding on the reply) instead of a bad reply, and MUST NOT retry
+``resume_clarification`` on the same request.
+
+Service error contract (T6/T7 wiring): ``chat_messages.get_user_message``
+returns an object with a string ``content`` attribute (may be awaitable);
+``authorization.require_document`` returns ``None`` on success (may be
+awaitable) and raises *any* ``Exception`` subclass on denial — the denial is
+wrapped in ``ClarificationUnauthorized`` (the original error chains as
+``__cause__``) so T8 streaming can catch one known type. ``BaseException``
+(cancellation) is never swallowed.
+
 ``interrupt``/``Command`` come from ``langgraph.types``. Capabilities receive
 ``AgentRequest`` + ``CapabilityRuntimeContext`` and never supervisor/graph
 state; this node likewise receives only the semantic slice (build) or the
@@ -35,12 +50,14 @@ from __future__ import annotations
 
 import inspect
 import re
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID, uuid5
 
 from langgraph.runtime import Runtime
 from langgraph.types import Command, interrupt
+from pydantic import ValidationError
 
 from ..contracts.base import CONTRACT_VERSION
 from ..contracts.clarification import (
@@ -52,15 +69,18 @@ from ..contracts.clarification import (
 from ..contracts.semantic import DocumentReference, SemanticContext
 from ..contracts.state import GraphRuntimeContext, SupervisorV2State
 from ..contracts.validation import (
+    ContractValidationError,
     validate_clarification_request,
     validate_clarification_resolution,
 )
-from .context import _context_of
+from .context import node_context
 
 __all__ = [
     "ClarificationError",
     "ClarificationExpired",
     "ClarificationInvalidSelection",
+    "ClarificationUnauthorized",
+    "ClarificationUnsatisfiable",
     "DEFAULT_CLARIFICATION_TTL",
     "build_clarification",
     "clarify_node",
@@ -87,6 +107,48 @@ class ClarificationExpired(ClarificationError):
 
 class ClarificationInvalidSelection(ClarificationError):
     """The reply selects no offered candidate (unparseable, out of range, or dismissed)."""
+
+
+class ClarificationUnsatisfiable(ClarificationError):
+    """The persisted request offers no selectable candidate.
+
+    Raised for every reply to a candidate-free request
+    (``required_document_not_found`` / ``semantic_ambiguity`` with
+    ``candidates == ()``): such a request can never resume via selection,
+    so the runner must treat the reply as a fresh user turn instead of a
+    bad reply (see the module docstring). Distinct from
+    ``ClarificationInvalidSelection`` precisely so the runner can tell
+    "nothing was offered" apart from "the reply was bad".
+    """
+
+    def __init__(self, clarification_id: str, reason: str) -> None:
+        super().__init__(
+            f"clarification {clarification_id!r} offers no selectable candidate "
+            f"(reason {reason!r}); treat the reply as a fresh user turn"
+        )
+        self.clarification_id = clarification_id
+        self.reason = reason
+
+
+class ClarificationUnauthorized(ClarificationError):
+    """The selected candidate is not authorized under the CURRENT ACL.
+
+    Wraps whatever ``authorization.require_document`` raised (chained as
+    ``__cause__``): the v2 service slot is ``Any``-typed, so the concrete
+    denial type is a T6/T7 wiring detail, but resume always surfaces this
+    one known type for T8 streaming to catch. Fail-closed: no ``Command``
+    is produced.
+    """
+
+    def __init__(
+        self, clarification_id: str, document_id: UUID,
+    ) -> None:
+        super().__init__(
+            f"selected document {document_id} of clarification "
+            f"{clarification_id!r} is not authorized under the current runtime"
+        )
+        self.clarification_id = clarification_id
+        self.document_id = document_id
 
 
 #: Stable namespace for the deterministic clarification/candidate UUIDs.
@@ -119,21 +181,27 @@ def _blocking_refs(
 ) -> tuple[DocumentReference, ...]:
     """Refs this question must clarify, in semantic order (stale pins excluded).
 
-    A ref blocks when it is not resolved, or when a blocking ambiguity names
-    it even though resolution already produced an id (the ambiguity still owns
-    the question). ``SemanticContext`` is the current-turn projection, so the
-    result is question-specific by construction.
+    Only genuinely unresolved refs block: a resolved ref is never listed,
+    even when a blocking ambiguity names it (the ambiguity text still enters
+    the persisted ``question``). ``SemanticContext`` is the current-turn
+    projection, so the result is question-specific by construction.
     """
-    known = {reference.ref_id for reference in semantic.document_refs}
-    ambiguity_refs = {
-        ambiguity.ambiguity_id
-        for ambiguity in semantic.blocking_ambiguities
-    } & known
     return tuple(
         reference
         for reference in semantic.document_refs
         if reference.resolution_status != "resolved"
-        or reference.ref_id in ambiguity_refs
+    )
+
+
+def _stable_request_id(
+    semantic: SemanticContext, unresolved_ref_ids: tuple[str, ...]
+) -> str:
+    """The deterministic identity ``build_clarification`` would mint."""
+    return str(
+        uuid5(
+            _CLARIFICATION_NAMESPACE,
+            f"{semantic.normalized_query}|{','.join(unresolved_ref_ids)}",
+        )
     )
 
 
@@ -186,12 +254,7 @@ def build_clarification(
     at = _now_aware(now)
     refs = _blocking_refs(semantic)
     unresolved_ref_ids = tuple(reference.ref_id for reference in refs)
-    clarification_id = str(
-        uuid5(
-            _CLARIFICATION_NAMESPACE,
-            f"{semantic.normalized_query}|{','.join(unresolved_ref_ids)}",
-        )
-    )
+    clarification_id = _stable_request_id(semantic, unresolved_ref_ids)
     candidates: list[DocumentCandidate] = []
     for reference in refs:
         if reference.resolution_status != "ambiguous":
@@ -225,12 +288,56 @@ def build_clarification(
     return request
 
 
+def _live_persisted_request(
+    state: SupervisorV2State,
+) -> ClarificationRequest | None:
+    """The already-checkpointed request when it is still usable, else None.
+
+    A persisted request survives only when it is live (not past its stable
+    per-request deadline), still identifies this question (deterministic id
+    over the current semantic projection), and still validates against the
+    current semantic. Checkpoint round-trips may deliver plain mappings, so
+    those are re-validated into the contract before comparison.
+    """
+    semantic = state["semantic"]
+    existing = state.get("clarification")
+    if isinstance(existing, Mapping):
+        try:
+            existing = ClarificationRequest.model_validate(existing)
+        except ValidationError:
+            return None
+    if not isinstance(existing, ClarificationRequest):
+        return None
+    if datetime.now(timezone.utc) >= _now_aware(existing.expires_at):
+        return None
+    current_ids = tuple(
+        reference.ref_id for reference in _blocking_refs(semantic)
+    )
+    if existing.clarification_id != _stable_request_id(semantic, current_ids):
+        return None
+    try:
+        validate_clarification_request(existing, semantic)
+    except ContractValidationError:
+        return None
+    return existing
+
+
 async def clarify_node(
     state: SupervisorV2State,
     runtime: "Runtime[GraphRuntimeContext]",
 ) -> dict:
-    """Persist the stable clarification request so the clarify state checkpoints."""
-    _context_of(runtime)
+    """Persist the stable clarification request so the clarify state checkpoints.
+
+    Idempotent: LangGraph re-executes the interrupting node from the top on
+    resume, so a live request already persisted in state is returned
+    unchanged (the stable per-request deadline is never silently extended).
+    Only the runtime shape is validated here — this node needs no services.
+    """
+    # Fail closed on a malformed runtime even though no service is consumed.
+    node_context(runtime)
+    live = _live_persisted_request(state)
+    if live is not None:
+        return {"clarification": live}
     return {"clarification": build_clarification(state["semantic"])}
 
 
@@ -254,8 +361,14 @@ def parse_clarification_resolution(
     (case-insensitive), or a 1-based display number (``"2"``, ``"option 2"``,
     ``"lựa chọn 2"``, ``"#2"``) over the ordinal display order. Explicit
     dismissal tokens resolve to no selection. Anything else raises
-    ``ClarificationInvalidSelection``.
+    ``ClarificationInvalidSelection``. A request that offers no candidates
+    raises ``ClarificationUnsatisfiable`` for every reply — even past its
+    deadline — so the runner never mistakes it for a bad reply.
     """
+    if not request.candidates:
+        raise ClarificationUnsatisfiable(
+            request.clarification_id, request.reason
+        )
     text = content.strip()
     lowered = text.casefold()
     if lowered in _DISMISSAL_TOKENS:
@@ -313,19 +426,20 @@ async def _maybe_await(value: Any) -> Any:
 async def resume_clarification(
     message_id: UUID,
     request: ClarificationRequest,
-    runtime: GraphRuntimeContext,
+    runtime: GraphRuntimeContext | "Runtime[GraphRuntimeContext]",
 ) -> Command:
     """Resume a clarification from the raw user reply and restart at binding.
 
+    ``runtime`` is the request-scoped ``GraphRuntimeContext`` or, for graph
+    wiring, the framework ``Runtime`` wrapper carrying it (both accepted).
     The reply is loaded by ``ChatMessage.id`` and stays authoritative in chat
     persistence. Expiry uses the stable per-request deadline; membership uses
     the frozen request; authorization uses the CURRENT runtime
     (``require_document`` with the resume-time ``capability_runtime``), so a
-    selected candidate that is no longer authorized fails closed. Service
-    authorization errors propagate unchanged — nothing unauthorized is
-    accepted.
+    selected candidate that is no longer authorized fails closed with
+    ``ClarificationUnauthorized``. Nothing unauthorized is accepted.
     """
-    context = _context_of(runtime)
+    context = node_context(runtime)
     chat_messages = context.services.chat_messages
     if chat_messages is None:
         raise ClarificationError(
@@ -348,9 +462,16 @@ async def resume_clarification(
             "no authorization service wired on runtime.services; "
             "the selected candidate cannot be authorized"
         )
-    await _maybe_await(
-        authorization.require_document(
-            candidate.document_id, context.capability_runtime
+    try:
+        await _maybe_await(
+            authorization.require_document(
+                candidate.document_id, context.capability_runtime
+            )
         )
-    )
+    except ClarificationError:
+        raise
+    except Exception as error:
+        raise ClarificationUnauthorized(
+            request.clarification_id, candidate.document_id
+        ) from error
     return Command(resume=resolution.model_dump(mode="json"), goto="binding")
