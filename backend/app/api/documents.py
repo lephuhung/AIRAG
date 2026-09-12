@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import io
 import re
 import uuid
@@ -250,7 +249,10 @@ async def list_documents(
 
     result = await db.execute(
         select(Document)
-        .where(Document.workspace_id == workspace_id)
+        .where(
+            Document.workspace_id == workspace_id,
+            Document.source_deleted_at.is_(None),
+        )
         .order_by(Document.created_at.desc())
     )
     return result.scalars().all()
@@ -764,6 +766,11 @@ async def get_chunk_context(
     Instead of loading the full document markdown, this returns only the
     target chunk and its immediate neighbors (context_window chunks before
     and after).  Used by the frontend for lightweight source viewing.
+
+    A document with a current revision is served by
+    :class:`CurrentDocumentViewAdapter` from that revision's own chunks — never
+    from the legacy ``Document.chunk_count`` / ``doc_<document>_chunk_<index>``
+    vectors. Documents with no revision keep the unchanged v1 path.
     """
     result = await db.execute(select(Document).where(Document.id == document_id))
     document = result.scalar_one_or_none()
@@ -772,6 +779,21 @@ async def get_chunk_context(
         raise NotFoundError("Document", document_id)
 
     await verify_workspace_access(document.workspace_id, user, db)
+
+    from app.services.agents.v2.persistence.document_views import (
+        CurrentDocumentViewAdapter,
+    )
+
+    adapter = CurrentDocumentViewAdapter(db)
+    identity = await adapter.current_identity(document_id)
+    if identity is not None:
+        return await adapter.load_chunk_context(
+            document_id,
+            chunk_index=chunk_index,
+            page_no=page_no,
+            heading_path=heading_path,
+            context_window=context_window,
+        )
 
     if document.status not in (DocumentStatus.INDEXED, DocumentStatus.BUILDING_KG):
         raise HTTPException(
@@ -891,7 +913,12 @@ async def get_document_markdown(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
-    """Get the full structured markdown content of a document (HRAG parsed)."""
+    """Get the full structured markdown content of a document (HRAG parsed).
+
+    A document with a current revision is served from that revision's markdown
+    artifact; the legacy ``Document.markdown_s3_key`` is used only when the
+    document has no revision at all.
+    """
     result = await db.execute(select(Document).where(Document.id == document_id))
     document = result.scalar_one_or_none()
 
@@ -899,6 +926,37 @@ async def get_document_markdown(
         raise NotFoundError("Document", document_id)
 
     await verify_workspace_access(document.workspace_id, user, db)
+
+    from app.services.agents.v2.persistence.document_views import (
+        CurrentDocumentViewAdapter,
+        RevisionNotReady,
+    )
+
+    adapter = CurrentDocumentViewAdapter(db)
+    identity = await adapter.current_identity(document_id)
+    if identity is not None:
+        try:
+            markdown = await adapter.load_markdown(document_id)
+        except RevisionNotReady:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No markdown content available for the current revision.",
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to fetch revision markdown for doc {document_id}: {e}"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Markdown storage is temporarily unavailable.",
+            )
+        if "<!-- image" in markdown:
+            images = await adapter.load_images(document_id)
+            if images:
+                markdown = _inject_images_from_db(
+                    markdown, images, document.workspace_id
+                )
+        return PlainTextResponse(content=markdown, media_type="text/markdown")
 
     if not document.markdown_s3_key:
         raise HTTPException(
@@ -944,7 +1002,12 @@ async def get_document_images(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
-    """List all extracted images for a document."""
+    """List all extracted images for a document.
+
+    A document with a current revision lists exactly that revision's image
+    rows; the legacy document-scoped query is used only when there is no
+    revision.
+    """
     result = await db.execute(select(Document).where(Document.id == document_id))
     document = result.scalar_one_or_none()
 
@@ -953,12 +1016,12 @@ async def get_document_images(
 
     await verify_workspace_access(document.workspace_id, user, db)
 
-    result = await db.execute(
-        select(DocumentImage)
-        .where(DocumentImage.document_id == document_id)
-        .order_by(DocumentImage.page_no)
+    from app.services.agents.v2.persistence.document_views import (
+        CurrentDocumentViewAdapter,
     )
-    images = result.scalars().all()
+
+    adapter = CurrentDocumentViewAdapter(db)
+    images = await adapter.load_images(document_id)
 
     return [
         DocumentImageResponse(
@@ -1027,8 +1090,13 @@ async def get_document(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
-    """Get document by ID"""
-    result = await db.execute(select(Document).where(Document.id == document_id))
+    """Get document by ID (tombstoned documents are not found)."""
+    result = await db.execute(
+        select(Document).where(
+            Document.id == document_id,
+            Document.source_deleted_at.is_(None),
+        )
+    )
     document = result.scalar_one_or_none()
 
     if document is None:
@@ -1114,64 +1182,39 @@ async def delete_document(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
-    """Delete a document and its chunks from vector store"""
+    """Tombstone a document — the only physical reclamation is Task 9's GC.
+
+    Tombstone-first (controller ruling R8): the source is stamped deleted
+    (``mark_source_deleted``) and the current pointer is cleared atomically, so
+    new bindings and retrieval are denied and the document disappears from
+    normal/current lookup. Every revision and artifact referenced by a retained
+    ``EvidenceRecord`` is preserved; the vectors/KG/objects are NOT deleted
+    here. Evidence expiry alone never releases revision artifacts — only the
+    independent revision-artifact predicate (Task 9) reclaims them.
+
+    The legacy path physically deleted ChromaDB chunks, Neo4j nodes, MinIO
+    objects and the ``documents`` row. That would cascade-destroy revision-owned
+    children and invalidate retained evidence, so it is gone.
+    """
     result = await db.execute(select(Document).where(Document.id == document_id))
     document = result.scalar_one_or_none()
 
-    if document is None:
+    if document is None or document.source_deleted_at is not None:
         raise NotFoundError("Document", document_id)
 
     # Only the owner, a tenant admin (tenant-visible), or a superadmin may delete.
     kb = await verify_workspace_access(document.workspace_id, user, db)
     await verify_workspace_manage_access(kb, user, db)
 
-    # Always clean up vector store + KG, regardless of status. Chunks/KG nodes
-    # can exist whenever the document was (partially) processed — e.g. embed_done
-    # while still BUILDING_KG, or a FAILED doc that already embedded. Gating this
-    # on status == INDEXED left orphaned chunks in ChromaDB on delete.
-    try:
-        from app.services.retrieval.rag_service import get_rag_service
+    from app.services.agents.v2.persistence.document_revisions import (
+        DocumentRevisionsRepository,
+    )
 
-        rag_service = get_rag_service(db, document.workspace_id)
-        await rag_service.delete_document(document_id)
-    except Exception as e:
-        logger.warning(f"Failed to delete chunks from vector store: {e}")
-
-    # Also delete from LegalKG (Neo4j) if KG was built
-    try:
-        from app.services.kg.legal_kg_service import LegalKGService
-
-        kg_service = LegalKGService(document.workspace_id)
-        await kg_service.delete_document(document_id)
-    except Exception as e:
-        logger.warning(f"Failed to delete document from LegalKG (Neo4j): {e}")
-
-    # Delete local file if it still exists (legacy / backward compat)
-    file_path = UPLOAD_DIR / document.filename
-    if file_path.exists():
-        os.remove(file_path)
-
-    from app.services.storage_service import get_storage_service
-
-    storage = get_storage_service()
-
-    # Delete raw upload from MinIO
-    if document.upload_s3_key:
-        try:
-            await storage.delete_file(document.upload_s3_key)
-        except Exception as e:
-            logger.warning(
-                f"Failed to delete upload MinIO object for doc {document_id}: {e}"
-            )
-
-    # Delete markdown object from MinIO
-    if document.markdown_s3_key:
-        try:
-            await storage.delete_markdown(document.markdown_s3_key)
-        except Exception as e:
-            logger.warning(
-                f"Failed to delete markdown MinIO object for doc {document_id}: {e}"
-            )
-
-    await db.delete(document)
+    repo = DocumentRevisionsRepository(db)
+    await repo.mark_source_deleted(document_id, reason="document_deleted")
     await db.commit()
+
+    logger.info(
+        f"Tombstoned document {document_id} (workspace {document.workspace_id}); "
+        f"revisions and artifacts retained for GC"
+    )

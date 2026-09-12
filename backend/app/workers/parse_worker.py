@@ -31,6 +31,13 @@ from app.queue.messages import CaptionMessage, EmbedMessage, KGMessage, ParseMes
 from app.services.agents.v2.persistence.source_identity import (
     RevisionBuildProfile,
 )
+from app.services.agents.v2.persistence.document_views import (
+    ChunkRecord,
+    build_structure_artifact,
+    record_revision_chunk_rows,
+    revision_markdown_key,
+    revision_structure_key,
+)
 from app.services.parsing.deep_document_parser import DeepDocumentParser
 from app.services.storage_service import get_storage_service
 from app.workers.utils import (
@@ -141,10 +148,17 @@ async def handle_parse(payload: dict) -> None:
             )
 
             # ── Persist markdown + counts ───────────────────────────────────
+            # The markdown object is keyed by THIS revision (copy-on-write): a
+            # reindex uploads a new object and never overwrites a published
+            # revision's markdown. ``Document.markdown_s3_key`` is kept as the
+            # v1/UI projection only — it never decides v2 retrieval.
             s3_key = await storage.upload_markdown(
                 workspace_id=msg.workspace_id,
                 document_id=msg.document_id,
                 content=parsed.markdown,
+                key=revision_markdown_key(
+                    msg.workspace_id, msg.document_id, msg.revision_id
+                ),
             )
             document.markdown_s3_key = s3_key
             document.page_count = parsed.page_count
@@ -154,12 +168,50 @@ async def handle_parse(payload: dict) -> None:
             document.parser_version = parsed.parser
             await db.commit()
 
+            # ── Structure artifact + stable chunk locators ──────────────────
+            # ``document_revision_chunks`` holds the stable locator rows and the
+            # structure artifact holds the payloads, so a viewer can rebuild a
+            # locator from a stored id without reading mutable document state.
+            non_empty_chunks = [
+                c for c in parsed.chunks if c.content and c.content.strip()
+            ]
+            chunk_records = [
+                ChunkRecord(
+                    chunk_id="",
+                    ordinal=c.chunk_index,
+                    content=c.content,
+                    page_no=c.page_no,
+                    heading_path=list(c.heading_path),
+                    source_file=c.source_file,
+                    image_refs=list(c.image_refs),
+                    table_refs=list(c.table_refs),
+                    has_table=c.has_table,
+                    has_code=c.has_code,
+                )
+                for c in non_empty_chunks
+            ]
+            chunk_records = await record_revision_chunk_rows(
+                db, msg.revision_id, chunk_records
+            )
+            structure_key = revision_structure_key(
+                msg.workspace_id, msg.document_id, msg.revision_id
+            )
+            await storage.upload_artifact(
+                structure_key,
+                build_structure_artifact(
+                    msg.revision_id, msg.document_id, chunk_records
+                ),
+                "application/json",
+            )
+            await db.commit()
+
             # ── Record the parse-stage artifacts on the REVISION manifest ──
             await record_parse_artifacts(
                 db,
                 msg.revision_id,
                 profile,
                 markdown_artifact_key=s3_key,
+                structure_artifact_key=structure_key,
             )
             await db.commit()
 
@@ -296,15 +348,19 @@ async def handle_parse(payload: dict) -> None:
                 await db.commit()
 
             # ── Store raw chunks in ChromaDB (via EmbedMessage) ────────────
-            # Attach chunk data into a JSON column for the embed worker
-            # so we don't need to re-parse the file
+            # ``raw_chunks_json`` is the document-level v1/UI mirror only; the
+            # authoritative revision-qualified payload is the structure
+            # artifact written above. The embed worker prefers the revision's
+            # own structure artifact and falls back to this column for legacy
+            # in-flight messages.
             import json
 
             document.raw_chunks_json = json.dumps(
                 [
                     {
+                        "chunk_id": c.chunk_id,
                         "content": c.content,
-                        "chunk_index": c.chunk_index,
+                        "chunk_index": c.ordinal,
                         "source_file": c.source_file,
                         "page_no": c.page_no,
                         "heading_path": c.heading_path,
@@ -314,8 +370,7 @@ async def handle_parse(payload: dict) -> None:
                         "has_code": c.has_code,
                         "document_number": document.document_number or "",
                     }
-                    for c in parsed.chunks
-                    if c.content and c.content.strip()  # filter empty/whitespace chunks
+                    for c in chunk_records
                 ]
             )
             document.status = DocumentStatus.CHUNKING
@@ -324,7 +379,7 @@ async def handle_parse(payload: dict) -> None:
             await db.commit()
             logger.info(
                 f"[parse_worker] doc={msg.document_id} parsed in {elapsed_ms}ms "
-                f"— {len(parsed.chunks)} chunks (filtered {sum(1 for c in parsed.chunks if not (c.content and c.content.strip()))} empty), "
+                f"— {len(chunk_records)} chunks (filtered {len(parsed.chunks) - len(chunk_records)} empty), "
                 f"{len(parsed.images)} images, {parsed.tables_count} tables"
             )
 

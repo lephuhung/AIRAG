@@ -117,6 +117,29 @@ async def query_documents(
     from app.services.retrieval.query_expander import expand_legal_terms
     request.question = expand_legal_terms(request.question)
 
+    # Revision-selected (v2) retrieval: the caller names revisions explicitly.
+    # Each revision's identity (embedding namespace/model/dimension/vector
+    # artifact version) is resolved from ITS OWN build manifest, never from
+    # current config. An unpublishable/unready revision fails the request with
+    # REVISION_NOT_READY instead of silently falling back to legacy chunks.
+    revision_identities = None
+    if request.revision_ids:
+        from app.services.agents.v2.persistence.document_views import (
+            RevisionNotReady,
+            load_revision_identity,
+        )
+
+        try:
+            revision_identities = [
+                await load_revision_identity(db, rid, require_vectors=True)
+                for rid in request.revision_ids
+            ]
+        except RevisionNotReady as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": exc.code, "message": str(exc)},
+            )
+
     # Try deep query if available
     from app.services.retrieval.hrag_service import HRAGService
     if isinstance(rag_service, HRAGService) and request.mode != "vector_only":
@@ -125,6 +148,7 @@ async def query_documents(
             top_k=request.top_k,
             document_ids=request.document_ids,
             mode=request.mode,
+            revision_identities=revision_identities,
         )
 
         chunks_response = []
@@ -141,12 +165,17 @@ async def query_documents(
                 )
             chunks_response.append(RetrievedChunkResponse(
                 content=chunk.content,
-                chunk_id=f"doc_{chunk.document_id}_chunk_{chunk.chunk_index}",
-                score=0.0,
+                chunk_id=(
+                    chunk.vector_id
+                    or f"doc_{chunk.document_id}_chunk_{chunk.chunk_index}"
+                ),
+                score=chunk.score,
                 metadata={
                     "source": chunk.source_file,
                     "page_no": chunk.page_no,
                     "heading_path": " > ".join(chunk.heading_path),
+                    "revision_id": chunk.revision_id,
+                    "chunk_id": chunk.chunk_id,
                 },
                 citation=citation_resp,
             ))
@@ -185,11 +214,12 @@ async def query_documents(
             image_refs=image_refs,
         )
 
-    # Fallback: legacy sync query
+    # Fallback: legacy sync query (revision-selected when revisions were named)
     result = rag_service.query(
         question=request.question,
         top_k=request.top_k,
-        document_ids=request.document_ids
+        document_ids=request.document_ids,
+        revision_identities=revision_identities,
     )
 
     return RAGQueryResponse(
@@ -425,40 +455,15 @@ async def reindex_document(
             detail="Original file not found in MinIO — cannot reindex"
         )
 
-    rag_service = get_rag_service(db, document.workspace_id)
-
-    # Delete existing data first
-    try:
-        await rag_service.delete_document(document_id)
-    except Exception as e:
-        logging.getLogger(__name__).warning(f"Failed to delete old data for reindex: {e}")
-
-    # Delete old markdown object from MinIO
-    if document.markdown_s3_key:
-        try:
-            from app.services.storage_service import get_storage_service
-            await get_storage_service().delete_markdown(document.markdown_s3_key)
-        except Exception as e:
-            logging.getLogger(__name__).warning(
-                f"Failed to delete MinIO object for reindex of doc {document_id}: {e}"
-            )
-
-    # Reset document metadata
-    document.status = DocumentStatus.PENDING
-    document.chunk_count = 0
-    document.markdown_s3_key = None
-    document.image_count = 0
-    document.table_count = 0
-    document.embed_done = False
-    document.captions_done = False
-    document.kg_done = False
-    document.parser_version = None
-    document.error_message = None
-    await db.commit()
+    # Copy-on-write reindex: NOTHING belonging to the currently published
+    # revision is deleted, and no Document completion flag is reset. The old
+    # revision stays current and fully readable until the replacement revision
+    # publishes and atomically advances Document.current_revision_id. Physical
+    # reclamation is Task 9's GC, never reindex.
 
     # Explicit reindex: allocate a NEW monotonic generation even though
     # ``upload_s3_key`` is unchanged, recording ``reindex_of_revision_id``
-    # provenance. (Removing the destructive pre-delete/purge is Task 5.)
+    # provenance.
     try:
         from app.queue.publisher import (
             allocate_reindex_revision,
@@ -505,9 +510,15 @@ async def reindex_workspace(
 ):
     """
     Reindex ALL documents in a workspace.
-    Deletes the old vector collection (handles embedding dimension changes)
-    and re-processes every document through the HRAG pipeline.
+    Allocates a new draft revision per document and publishes it atomically;
+    the currently published revisions stay current and readable until then.
     Runs in background — returns immediately with document count.
+
+    The old destructive pre-delete (collection drop + per-document purge +
+    completion-flag reset) is gone: dropping the collection would destroy every
+    published revision's vectors, and resetting the mirror flags would report a
+    document unindexed while its published revision is still current. Physical
+    reclamation is Task 9's GC.
     """
     await verify_workspace_access(workspace_id, db, user)
 
@@ -523,20 +534,10 @@ async def reindex_workspace(
     if not documents:
         return {"message": "No documents to reindex", "document_count": 0}
 
-    # Delete old vector collection (required when embedding dimensions change)
-    try:
-        from app.services.embedding.vector_store import get_vector_store
-        vs = get_vector_store(workspace_id)
-        vs.delete_collection()
-        logger.info(f"Deleted old vector collection for workspace {workspace_id}")
-    except Exception as e:
-        logger.warning(f"Failed to delete old collection: {e}")
-
     async def _reindex_all(doc_ids: list[uuid.UUID], ws_id: uuid.UUID):
         """Background task: reindex each document sequentially via RabbitMQ."""
         from app.core.database import AsyncSessionLocal
         async with AsyncSessionLocal() as session:
-            rag_service = get_rag_service(session, ws_id)
             for did in doc_ids:
                 try:
                     res = await session.execute(
@@ -550,23 +551,8 @@ async def reindex_workspace(
                         logger.warning(f"Skipping doc {did}: no upload_s3_key in MinIO")
                         continue
 
-                    # Delete old chunk data for this document
-                    try:
-                        await rag_service.delete_document(did)
-                    except Exception:
-                        pass
-
-                    # Reset metadata
-                    doc.status = DocumentStatus.PENDING
-                    doc.chunk_count = 0
-                    doc.image_count = 0
-                    doc.embed_done = False
-                    doc.captions_done = False
-                    doc.kg_done = False
-                    doc.error_message = None
-                    await session.commit()
-
                     # Explicit reindex: allocate a new generation + publish.
+                    # No purge, no mirror reset (see the endpoint docstring).
                     from app.queue.publisher import (
                         allocate_reindex_revision,
                         publish_parse_task as _publish_revision,

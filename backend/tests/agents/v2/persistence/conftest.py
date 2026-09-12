@@ -476,6 +476,19 @@ def document_factory(raw_connection):
                 "(SELECT revision_id FROM document_revisions WHERE document_id = %s)",
                 (did,),
             )
+            # Revision-owned chunk locator rows also FK-RESTRICT their revision.
+            cur.execute(
+                "DELETE FROM document_revision_chunks WHERE revision_id IN "
+                "(SELECT revision_id FROM document_revisions WHERE document_id = %s)",
+                (did,),
+            )
+            # Image/table rows carry a revision FK too.
+            cur.execute(
+                "DELETE FROM document_images WHERE document_id = %s", (did,)
+            )
+            cur.execute(
+                "DELETE FROM document_tables WHERE document_id = %s", (did,)
+            )
             cur.execute(
                 "DELETE FROM document_revisions WHERE document_id = %s",
                 (did,),

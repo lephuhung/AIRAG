@@ -25,6 +25,7 @@ from app.models.document import (
     DocumentTable,
 )
 from app.models.document_revision import DocumentRevision
+from app.models.document_revision_build import DocumentRevisionBuild
 from app.models.document_type import DocumentType as _DocumentType  # noqa: F401
 from app.services.agents.v2.persistence.document_revisions import (
     DocumentRevisionsRepository,
@@ -200,6 +201,51 @@ async def load_revision_caption_targets(
         ).all()
     )
     return images, tables
+
+
+async def load_revision_chunk_payloads(
+    db: AsyncSession, revision_id
+) -> list[dict] | None:
+    """Load the revision's OWN chunk payloads from its structure artifact.
+
+    The structure artifact is the authoritative revision-qualified chunk
+    store; ``Document.raw_chunks_json`` is only a v1/UI mirror. Returns
+    ``None`` when the revision has no structure artifact (a legacy in-flight
+    message, or a parse stage that predates the artifact) so the caller can
+    fall back to the mirror.
+    """
+    from app.services.agents.v2.persistence.document_views import (
+        parse_structure_artifact,
+    )
+
+    build = await db.scalar(
+        select(DocumentRevisionBuild)
+        .where(DocumentRevisionBuild.revision_id == revision_id)
+        .order_by(DocumentRevisionBuild.finished_at.desc().nullslast())
+        .limit(1)
+    )
+    if build is None or not build.structure_artifact_key:
+        return None
+    from app.services.storage_service import get_storage_service
+
+    raw = await get_storage_service().download_markdown(
+        build.structure_artifact_key
+    )
+    return [
+        {
+            "chunk_id": record.chunk_id,
+            "content": record.content,
+            "chunk_index": record.ordinal,
+            "source_file": record.source_file,
+            "page_no": record.page_no,
+            "heading_path": list(record.heading_path),
+            "image_refs": list(record.image_refs),
+            "table_refs": list(record.table_refs),
+            "has_table": record.has_table,
+            "has_code": record.has_code,
+        }
+        for record in parse_structure_artifact(raw)
+    ]
 
 
 async def delete_stage_children(

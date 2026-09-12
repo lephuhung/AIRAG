@@ -31,10 +31,16 @@ from app.queue.messages import EmbedMessage
 from app.services.agents.v2.persistence.source_identity import (
     RevisionBuildProfile,
 )
+from app.services.agents.v2.persistence.document_views import (
+    VECTOR_ARTIFACT_VERSION,
+    embedding_namespace,
+    revision_vector_id,
+)
 from app.services.embedding.embedder import get_embedding_service
 from app.services.parsing.heading_path import extract_article_nos
 from app.services.embedding.vector_store import get_vector_store
 from app.workers.utils import (
+    load_revision_chunk_payloads,
     load_revision_execution,
     mark_revision_failed,
     record_embed_artifacts,
@@ -42,9 +48,9 @@ from app.workers.utils import (
 
 logger = logging.getLogger(__name__)
 
-#: Schema version of the persisted vector artifact (Task 5 owns the
-#: revision-qualified namespace scheme; this pins the manifest for now).
-_VECTOR_ARTIFACT_VERSION = "v1"
+#: Schema version of the persisted vector artifact — owned by the revision
+#: artifact identity module so every producer/consumer agrees on one spelling.
+_VECTOR_ARTIFACT_VERSION = VECTOR_ARTIFACT_VERSION
 
 
 async def handle_embed(payload: dict) -> None:
@@ -111,19 +117,17 @@ async def handle_embed(payload: dict) -> None:
             await db.commit()
 
             raw = document.raw_chunks_json
-            if not raw:
+            # Prefer the revision's own structure artifact: ``raw_chunks_json``
+            # is a document-level mirror that two overlapping revisions would
+            # clobber, while the artifact is owned by this revision alone.
+            chunks_data: list[dict] | None = await load_revision_chunk_payloads(
+                db, msg.revision_id
+            )
+            if chunks_data is None:
+                chunks_data = json.loads(raw) if raw else None
+            if not chunks_data:
                 logger.warning(f"[embed_worker] doc={msg.document_id} has no raw_chunks_json — skipping embed")
                 document.embed_done = True
-                await db.commit()
-                await check_and_finalize(
-                    document, db, revision_id=msg.revision_id
-                )
-                return
-
-            chunks_data: list[dict] = json.loads(raw)
-            if not chunks_data:
-                document.embed_done = True
-                document.chunk_count = 0
                 await db.commit()
                 await check_and_finalize(
                     document, db, revision_id=msg.revision_id
@@ -194,7 +198,18 @@ async def handle_embed(payload: dict) -> None:
 
             # ── Embed ───────────────────────────────────────────────────────
             embedder     = get_embedding_service()
-            vector_store = get_vector_store(msg.workspace_id)
+            model_hash = hashlib.sha256(
+                embedder.model_name.encode("utf-8")
+            ).hexdigest()[:16]
+            dimension = int(embedder.dimension)
+            # The collection namespace is qualified by the embedding model hash
+            # and dimension: a build under a new model/dimension writes a NEW
+            # collection instead of deleting/recreating the one holding
+            # published revisions' vectors.
+            namespace = embedding_namespace(
+                msg.workspace_id, model_hash, dimension
+            )
+            vector_store = get_vector_store(msg.workspace_id, namespace=namespace)
 
             # Pass ONLY non-empty texts to the embedder so the returned list is
             # aligned with valid_indices by construction (the embedder silently
@@ -212,12 +227,16 @@ async def handle_embed(payload: dict) -> None:
             metadatas = []
             for i in valid_indices:
                 c = chunks_data[i]
-                ids.append(f"doc_{msg.document_id}_chunk_{c['chunk_index']}")
+                ordinal = c["chunk_index"]
+                ids.append(revision_vector_id(msg.revision_id, ordinal))
                 documents.append(c["content"])
                 metadatas.append({
                     "document_id":     str(msg.document_id),
                     "workspace_id":   ws_id,
-                    "chunk_index":     c["chunk_index"],
+                    "revision_id":    str(msg.revision_id),
+                    "chunk_id":       str(c.get("chunk_id") or ""),
+                    "ordinal":        ordinal,
+                    "chunk_index":     ordinal,
                     "source":          c["source_file"],
                     "file_type":       document.file_type,
                     "page_no":         c["page_no"],
@@ -231,7 +250,7 @@ async def handle_embed(payload: dict) -> None:
                     "image_urls":      "|".join(
                         f"{img_url_prefix}/{iid}.png" for iid in c["image_refs"]
                     ) if c["image_refs"] else "",
-                    "document_number": c.get("document_number", ""),
+                    "document_number": c.get("document_number", document.document_number or ""),
                 })
 
             try:
@@ -260,10 +279,8 @@ async def handle_embed(payload: dict) -> None:
                 msg.revision_id,
                 profile,
                 embedding_namespace=vector_store.collection_name,
-                embedding_model_hash=hashlib.sha256(
-                    embedder.model_name.encode("utf-8")
-                ).hexdigest()[:16],
-                embedding_dimension=int(embedder.dimension),
+                embedding_model_hash=model_hash,
+                embedding_dimension=dimension,
                 vector_artifact_version=_VECTOR_ARTIFACT_VERSION,
             )
             await db.commit()

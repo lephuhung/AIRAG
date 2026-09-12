@@ -29,6 +29,10 @@ from app.services.embedding.vector_store import VectorStore, get_vector_store
 from app.services.retrieval.reranker import get_reranker_service
 from app.services.retrieval.rag_service import RAGQueryResult, RetrievedChunk
 from app.services.models.parsed_document import DeepRetrievalResult
+from app.services.agents.v2.persistence.document_views import (
+    RevisionArtifactIdentity,
+    RevisionNotReady,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -282,12 +286,75 @@ class HRAGService:
         question: str,
         top_k: int = 5,
         document_ids: Optional[list[uuid.UUID]] = None,
+        revision_identities: Optional[list[RevisionArtifactIdentity]] = None,
     ) -> RAGQueryResult:
         """
         Backward-compatible sync query (vector-only).
         Returns same RAGQueryResult as legacy RAGService.
+
+        With ``revision_identities`` the search is revision-selected: each
+        revision's own recorded namespace is queried with an exact
+        ``revision_id`` filter, so a current revision's answer can never be
+        built from another revision's vectors.
         """
         query_embedding = self.embedder.embed_query(question)
+
+        if revision_identities:
+            chunks = []
+            seen: set[str] = set()
+            for identity in revision_identities:
+                if not identity.embedding_namespace:
+                    raise RevisionNotReady(
+                        identity.document_id,
+                        "revision has no vector manifest for retrieval",
+                        revision_id=identity.revision_id,
+                    )
+                store = get_vector_store(
+                    self.workspace_id, namespace=identity.embedding_namespace
+                )
+                where: dict = {"revision_id": str(identity.revision_id)}
+                if document_ids:
+                    where = {
+                        "$and": [
+                            where,
+                            {
+                                "document_id": {
+                                    "$in": [str(d) for d in document_ids]
+                                }
+                            },
+                        ]
+                    }
+                results = store.query(
+                    query_embedding=query_embedding,
+                    n_results=top_k,
+                    where=where,
+                )
+                for i, doc in enumerate(results.get("documents", [])):
+                    chunk_id = results["ids"][i] if results.get("ids") else ""
+                    if chunk_id in seen:
+                        continue
+                    seen.add(chunk_id)
+                    chunks.append(RetrievedChunk(
+                        content=doc,
+                        metadata=(
+                            results["metadatas"][i]
+                            if results.get("metadatas")
+                            else {}
+                        ),
+                        score=(
+                            results["distances"][i]
+                            if results.get("distances")
+                            else 0.0
+                        ),
+                        chunk_id=chunk_id,
+                    ))
+            chunks.sort(key=lambda x: x.score)
+            chunks = chunks[:top_k]
+            return RAGQueryResult(
+                chunks=chunks,
+                context=self._assemble_sync_context(chunks),
+                query=question,
+            )
 
         where = None
         if document_ids:
@@ -310,8 +377,15 @@ class HRAGService:
             ))
 
         chunks.sort(key=lambda x: x.score)
+        return RAGQueryResult(
+            chunks=chunks,
+            context=self._assemble_sync_context(chunks),
+            query=question,
+        )
 
-        # Assemble context with citations
+    @staticmethod
+    def _assemble_sync_context(chunks: list[RetrievedChunk]) -> str:
+        """Citation-prefixed context body shared by both sync query paths."""
         context_parts = []
         for i, chunk in enumerate(chunks):
             source = chunk.metadata.get("source", "Unknown")
@@ -323,14 +397,7 @@ class HRAGService:
             if heading:
                 citation += f" | {heading}"
             context_parts.append(f"[{i + 1}] {citation}\n{chunk.content}")
-
-        context = "\n\n---\n\n".join(context_parts)
-
-        return RAGQueryResult(
-            chunks=chunks,
-            context=context,
-            query=question,
-        )
+        return "\n\n---\n\n".join(context_parts)
 
     async def query_deep(
         self,
@@ -339,9 +406,13 @@ class HRAGService:
         document_ids: Optional[list[uuid.UUID]] = None,
         mode: str = "hybrid",
         include_images: bool = True,
+        revision_identities: Optional[list[RevisionArtifactIdentity]] = None,
     ) -> DeepRetrievalResult:
         """
         Full async hybrid retrieval with KG + vector + images + citations.
+
+        ``revision_identities`` selects exact revisions (the v2 path). Without
+        it the unchanged v1 document-scoped adapter path runs.
         """
         return await self.retriever.query(
             question=question,
@@ -349,6 +420,7 @@ class HRAGService:
             top_k=top_k,
             document_ids=document_ids,
             include_images=include_images,
+            revision_identities=revision_identities,
         )
 
     # ------------------------------------------------------------------
@@ -356,7 +428,16 @@ class HRAGService:
     # ------------------------------------------------------------------
 
     async def delete_document(self, document_id: uuid.UUID) -> None:
-        """Delete a document's data from vector store and KG."""
+        """Physical purge of a document's vector + KG data (v1/legacy only).
+
+        This is the **legacy** purge used by chat-temp cleanup and the admin
+        cancel path. It is deliberately NOT called by the tombstone-first
+        ``DELETE /documents/{id}`` endpoint or by reindex: tombstoning keeps
+        every revision and artifact, and only Task 9's GC reclaims them. A
+        revision-aware caller must use
+        ``vector_store.delete_by_document_id(..., revision_id=...)`` per
+        revision instead of this document-scoped purge.
+        """
         # Delete from ChromaDB
         self.vector_store.delete_by_document_id(document_id)
 

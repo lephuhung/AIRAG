@@ -11,6 +11,9 @@ import chromadb
 from chromadb.config import Settings as ChromaSettings
 
 from app.core.config import settings
+from app.services.agents.v2.persistence.document_views import (
+    EmbeddingMigrationRequired,
+)
 
 if TYPE_CHECKING:
     pass
@@ -44,14 +47,20 @@ def get_chroma_client() -> chromadb.HttpClient:
 class VectorStore:
     """
     Vector store service for managing document embeddings in ChromaDB.
-    Each knowledge base has its own collection for namespace isolation.
+
+    Each knowledge base has its own collection for namespace isolation. A
+    revision-aware build passes an explicit ``namespace``
+    (``document_views.embedding_namespace``), which is qualified by the
+    embedding model hash and dimension so a build under a different
+    model/dimension never has to destroy the collection holding published
+    vectors.
     """
 
     COLLECTION_PREFIX = "kb_"
 
-    def __init__(self, workspace_id: uuid.UUID):
+    def __init__(self, workspace_id: uuid.UUID, namespace: str | None = None):
         self.workspace_id = workspace_id
-        self.collection_name = f"{self.COLLECTION_PREFIX}{workspace_id}"
+        self.collection_name = namespace or f"{self.COLLECTION_PREFIX}{workspace_id}"
         self._collection = None
 
     @property
@@ -64,18 +73,6 @@ class VectorStore:
                 metadata={"hnsw:space": "cosine"},
             )
         return self._collection
-
-    def _recreate_collection(self) -> None:
-        """Delete and recreate the collection (resets cached reference)."""
-        client = get_chroma_client()
-        try:
-            client.delete_collection(self.collection_name)
-            logger.info(f"Deleted collection {self.collection_name} for dimension migration")
-        except Exception:
-            pass
-        self._collection = None
-        # Force re-creation
-        _ = self.collection
 
     @staticmethod
     def _is_stale_collection_error(exc: Exception) -> bool:
@@ -125,8 +122,14 @@ class VectorStore:
     ) -> None:
         """
         Add documents with their embeddings to the collection.
-        Auto-handles dimension mismatch: if the collection was created with
-        a different embedding dimension, it is deleted and recreated.
+
+        A dimension mismatch NEVER deletes/recreates the collection: it may
+        hold published revisions' vectors, and destroying it would break
+        revision-selected retrieval for revisions that are still current or
+        retained by evidence. The caller must write into a
+        ``document_views.embedding_namespace`` qualified by the new model hash
+        and dimension instead; if the namespace still mismatches, this raises
+        :class:`EmbeddingMigrationRequired` so the failure is explicit.
         """
         if not ids:
             return
@@ -149,21 +152,17 @@ class VectorStore:
         except Exception as e:
             error_msg = str(e).lower()
             if "dimension" in error_msg:
-                # Dimension mismatch — collection was created with old embedding model
-                logger.warning(
-                    f"Dimension mismatch in {self.collection_name}: {e}. "
-                    f"Recreating collection for new embedding model."
-                )
-                self._recreate_collection()
-                # Retry with fresh collection
-                self.collection.add(
-                    ids=list(ids),
-                    embeddings=list(embeddings),
-                    documents=list(documents),
-                    metadatas=list(metadatas) if metadatas else None
-                )
-            else:
-                raise
+                # Dimension mismatch — the collection was created with a
+                # different embedding model. Never delete it: select/allocate a
+                # dimension-qualified namespace instead.
+                raise EmbeddingMigrationRequired(
+                    f"collection {self.collection_name} was written with a "
+                    f"different embedding dimension ({e}). Write into a "
+                    f"namespace qualified by the new model hash and dimension "
+                    f"(document_views.embedding_namespace); published vectors "
+                    f"are never deleted or recreated in place."
+                ) from e
+            raise
 
         logger.info(f"Added {len(ids)} documents to collection {self.collection_name}")
 
@@ -204,21 +203,38 @@ class VectorStore:
             "distances": results["distances"][0] if results.get("distances") else []
         }
 
-    def delete_by_document_id(self, document_id: uuid.UUID) -> None:
-        """Delete all chunks belonging to a specific document."""
+    def delete_by_document_id(
+        self, document_id: uuid.UUID, *, revision_id: uuid.UUID | None = None
+    ) -> None:
+        """Delete chunks belonging to a specific document (or one revision).
+
+        ``revision_id`` narrows the delete to a single revision's vectors — the
+        only safe form once a document has more than one published revision.
+        """
+        where: dict
+        if revision_id is None:
+            where = {"document_id": str(document_id)}
+        else:
+            where = {
+                "$and": [
+                    {"document_id": str(document_id)},
+                    {"revision_id": str(revision_id)},
+                ]
+            }
         try:
-            self.collection.delete(
-                where={"document_id": str(document_id)}
-            )
+            self.collection.delete(where=where)
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             logger.error(
                 f"[vector_store] ChromaDB delete FAILED "
                 f"({type(e).__name__}): collection={self.collection_name} "
-                f"document_id={document_id} — {e}",
+                f"document_id={document_id} revision_id={revision_id} — {e}",
                 exc_info=True,
             )
             raise
-        logger.info(f"Deleted chunks for document {document_id} from collection {self.collection_name}")
+        logger.info(
+            f"Deleted chunks for document {document_id} "
+            f"revision {revision_id or '*'} from collection {self.collection_name}"
+        )
 
     def delete_collection(self) -> None:
         """Delete the entire collection for this knowledge base."""
@@ -242,19 +258,32 @@ class VectorStore:
         ))
 
     def get_document_chunks(
-        self, document_id: uuid.UUID, include_embeddings: bool = True
+        self,
+        document_id: uuid.UUID,
+        include_embeddings: bool = True,
+        *,
+        revision_id: uuid.UUID | None = None,
     ) -> dict:
         """Return all chunks of a document, optionally with their embeddings.
 
-        Used to clone an already-indexed document into another workspace's
-        collection without re-embedding (see documents._clone_document_to_workspace).
+        ``revision_id`` narrows the read to one revision's vectors.
         """
         include = ["documents", "metadatas"]
         if include_embeddings:
             include = ["documents", "metadatas", "embeddings"]
+        where: dict
+        if revision_id is None:
+            where = {"document_id": str(document_id)}
+        else:
+            where = {
+                "$and": [
+                    {"document_id": str(document_id)},
+                    {"revision_id": str(revision_id)},
+                ]
+            }
         try:
             res = self._run(lambda col: col.get(
-                where={"document_id": str(document_id)},
+                where=where,
                 include=include,
             ))
         except Exception as e:
@@ -322,6 +351,13 @@ class VectorStore:
         )
 
 
-def get_vector_store(workspace_id: uuid.UUID) -> VectorStore:
-    """Factory function to create a VectorStore for a knowledge base."""
-    return VectorStore(workspace_id)
+def get_vector_store(
+    workspace_id: uuid.UUID, namespace: str | None = None
+) -> VectorStore:
+    """Factory function to create a VectorStore for a knowledge base.
+
+    ``namespace`` selects a revision-qualified collection
+    (``document_views.embedding_namespace``); the legacy
+    ``kb_{workspace}`` collection is used when omitted.
+    """
+    return VectorStore(workspace_id, namespace=namespace)

@@ -20,6 +20,13 @@ class RAGQueryRequest(BaseModel):
     document_ids: list[uuid.UUID] | None = Field(
         default=None, description="Filter to specific document IDs"
     )
+    revision_ids: list[uuid.UUID] | None = Field(
+        default=None,
+        description=(
+            "Revision-selected (v2) retrieval: answer only from these published "
+            "revisions' artifacts. Omit for the legacy document-scoped path."
+        ),
+    )
     mode: str = Field(
         default="hybrid",
         description="Search mode: hybrid (default), vector_only, naive, local, global",

@@ -101,9 +101,19 @@ class StorageService:
         workspace_id: uuid.UUID,
         document_id: uuid.UUID,
         content: str,
+        *,
+        key: str | None = None,
     ) -> str:
-        """Upload markdown text to MinIO. Returns the object key."""
-        key = self._make_key(workspace_id, document_id)
+        """Upload markdown text to MinIO. Returns the object key.
+
+        ``key`` overrides the legacy ``kb_{workspace}/doc_{document}.md`` key so
+        a revision-aware build can write its own copy-on-write artifact (see
+        ``agents.v2.persistence.document_views.revision_markdown_key``). The
+        legacy key is used when ``key`` is omitted, which is the v1 adapter's
+        unchanged behaviour.
+        """
+        if key is None:
+            key = self._make_key(workspace_id, document_id)
         body = content.encode("utf-8")
         async with self._client() as s3:
             await s3.put_object(
@@ -122,6 +132,28 @@ class StorageService:
             response = await s3.get_object(Bucket=self._bucket, Key=key)
             body = await response["Body"].read()
         return body.decode("utf-8")
+
+    async def upload_artifact(
+        self, key: str, content: str, content_type: str
+    ) -> str:
+        """Upload an arbitrary revision artifact to the markdown bucket.
+
+        Used for revision-qualified artifacts (markdown, structure JSON) whose
+        key is derived by
+        ``agents.v2.persistence.document_views`` rather than by the legacy
+        ``kb_{workspace}/doc_{document}.md`` scheme.
+        """
+        body = content.encode("utf-8")
+        async with self._client() as s3:
+            await s3.put_object(
+                Bucket=self._bucket,
+                Key=key,
+                Body=BytesIO(body),
+                ContentType=content_type,
+                ContentLength=len(body),
+            )
+        logger.debug(f"[storage] uploaded artifact {key} ({len(body)} bytes)")
+        return key
 
     async def delete_markdown(self, key: str) -> None:
         """Delete a markdown object from MinIO (no-op if not found)."""

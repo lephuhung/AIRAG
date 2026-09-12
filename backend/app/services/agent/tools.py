@@ -262,7 +262,6 @@ async def summarize_document(
     """
     from sqlalchemy import select
     from app.models.document import Document, DocumentStatus
-    from app.services.storage_service import get_storage_service
     from app.services.llm import get_llm_provider
     from app.services.llm.types import LLMMessage
 
@@ -292,20 +291,26 @@ async def summarize_document(
                 "document_id": document_id,
             }
 
-        # Load markdown from MinIO
-        if not doc.markdown_s3_key:
+        # Load markdown from the document's CURRENT revision (never the legacy
+        # Document.markdown_s3_key when a revision exists).
+        from app.services.agents.v2.persistence.document_views import (
+            CurrentDocumentViewAdapter,
+            RevisionNotReady,
+        )
+
+        try:
+            markdown_text = await CurrentDocumentViewAdapter(db).load_markdown(
+                document_id
+            )
+        except RevisionNotReady:
             return {
                 "text": f"Tài liệu '{doc.original_filename}' không có nội dung đã phân tích.",
                 "document_name": doc.original_filename,
                 "document_id": document_id,
             }
-
-        storage = get_storage_service()
-        try:
-            markdown_text = await storage.download_markdown(doc.markdown_s3_key)
         except Exception as e:
             return {
-                "text": f"Lỗi tải markdown từ S3: {e}",
+                "text": f"Lỗi tải markdown: {e}",
                 "document_name": doc.original_filename,
                 "document_id": document_id,
             }
@@ -379,8 +384,6 @@ async def get_documents_content(
     """
     from sqlalchemy import select
     from app.models.document import Document, DocumentStatus
-    from app.services.storage_service import get_storage_service
-
     MAX_CHARS_PER_DOC = 48000  # ~12k tokens, leave room for prompt
 
     results = []
@@ -400,8 +403,6 @@ async def get_documents_content(
 
         # Create a map for quick lookup (keys are UUID objects)
         doc_map = {doc.id: doc for doc in docs}
-
-        storage = get_storage_service()
 
         for doc_id in document_ids:
             # Convert string UUIDs to UUID objects for lookup (doc_map keys are UUIDs)
@@ -441,20 +442,14 @@ async def get_documents_content(
                 )
                 continue
 
-            if not doc.markdown_s3_key:
-                errors.append(f"Tài liệu '{doc.original_filename}' không có nội dung")
-                results.append(
-                    {
-                        "id": str(doc_id),
-                        "filename": doc.original_filename,
-                        "content": None,
-                        "error": "Không có nội dung markdown",
-                    }
-                )
-                continue
-
             try:
-                markdown_text = await storage.download_markdown(doc.markdown_s3_key)
+                from app.services.agents.v2.persistence.document_views import (
+                    CurrentDocumentViewAdapter,
+                )
+
+                markdown_text = await CurrentDocumentViewAdapter(db).load_markdown(
+                    doc_id
+                )
 
                 # Truncate if too long
                 truncated = markdown_text[:MAX_CHARS_PER_DOC]
@@ -1400,22 +1395,55 @@ async def search_document_section(
     from app.schemas.rag import ChatSourceChunk
     
     all_chunks = []
-    
-    # Metadata filter: if we have document_ids, fetch all their chunks first.
-    # Python-side filtering is more robust than ChromaDB's limited metadata operators.
+
+    # Build the (vector store, metadata filter) pairs to search.
+    # Revision-selected: a document with a current revision is read from THAT
+    # revision's recorded embedding namespace with an exact ``revision_id``
+    # filter, so a current revision's section can never be assembled from
+    # another revision's chunks. A document with no revision keeps the
+    # unchanged v1 document-scoped store.
+    queries: list[tuple[object, dict | None]] = []
     if document_ids:
-        if len(document_ids) == 1:
-            where_filter = {"document_id": str(document_ids[0])}
-        else:
-            where_filter = {"document_id": {"$in": [str(d) for d in document_ids]}}
+        from app.core.database import async_session_maker
+        from app.services.agents.v2.persistence.document_views import (
+            resolve_document_targets,
+        )
+
+        try:
+            doc_uuids = [uuid.UUID(str(d)) for d in document_ids]
+        except Exception:
+            doc_uuids = []
+        targets = []
+        if doc_uuids:
+            async with async_session_maker() as _target_db:
+                targets = await resolve_document_targets(_target_db, doc_uuids)
+        for ws_id in workspace_ids:
+            for target in targets:
+                if target.identity is not None:
+                    queries.append((
+                        get_vector_store(
+                            ws_id, namespace=target.identity.embedding_namespace
+                        ),
+                        {
+                            "$and": [
+                                {"document_id": str(target.document_id)},
+                                {"revision_id": str(target.identity.revision_id)},
+                            ]
+                        },
+                    ))
+                else:
+                    queries.append((
+                        get_vector_store(ws_id),
+                        {"document_id": str(target.document_id)},
+                    ))
     else:
         # Fallback to broad search if no specific document is resolved
-        where_filter = None
+        for ws_id in workspace_ids:
+            queries.append((get_vector_store(ws_id), None))
 
-    for ws_id in workspace_ids:
+    for vstore, where_filter in queries:
         try:
-            vstore = get_vector_store(ws_id)
-            
+
             # 1. Try structural lookup via metadata
             res = vstore.get_by_metadata(where=where_filter) if where_filter else {"documents": [], "metadatas": []}
             
@@ -1467,7 +1495,10 @@ async def search_document_section(
                         all_chunks.append({"content": doc, "metadata": meta})
                         
         except Exception as e:
-            logger.error(f"[tool:search_document_section] Error fetching from workspace {ws_id}: {e}")
+            logger.error(
+                f"[tool:search_document_section] Error fetching from "
+                f"collection {vstore.collection_name}: {e}"
+            )
             
     if not all_chunks:
         return {

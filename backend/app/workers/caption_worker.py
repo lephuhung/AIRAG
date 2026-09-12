@@ -32,6 +32,10 @@ from app.services.parsing.deep_document_parser import DeepDocumentParser
 from app.services.embedding.embedder import get_embedding_service
 from app.services.models.parsed_document import ExtractedImage, ExtractedTable
 from app.services.storage_service import get_storage_service
+from app.services.agents.v2.persistence.document_views import (
+    load_revision_vector_manifest,
+    revision_vector_id,
+)
 from app.services.embedding.vector_store import get_vector_store
 from app.workers.utils import (
     check_and_finalize,
@@ -329,9 +333,11 @@ async def _reenrich_embeddings(
 
     ``db_images`` / ``db_tables`` are the caption targets scoped to
     ``revision_id`` by the caller, so the enrichment inputs never span two
-    revisions' rows. (The raw chunk payload is still the document-level
-    ``raw_chunks_json`` mirror; a revision-qualified chunk store is Task 5's
-    artifact-identity work.)
+    revisions' rows. The re-embed writes revision-qualified vector ids into the
+    collection recorded in THIS revision's build manifest. (The raw chunk
+    payload — including the contextual sentence the embed worker wrote back —
+    is still the document-level ``raw_chunks_json`` mirror; the revision-owned
+    structure artifact carries the payload without the context field.)
 
     Reads the document FRESH from the DB (not the snapshot loaded when the
     caption run started): the embed worker runs in parallel and writes the
@@ -404,14 +410,28 @@ async def _reenrich_embeddings(
             display = c["content"] + "\n\n" + "\n".join(extra)
             context = c.get("context") or ""
             embed_text = f"{context}\n{display}" if context else display
-            chunk_id = f"doc_{document_id}_chunk_{c['chunk_index']}"
+            chunk_id = revision_vector_id(revision_id, c["chunk_index"])
             updated_texts[chunk_id] = (display, embed_text)
 
     if not updated_texts:
         return
 
+    # The collection is the one THIS revision's embed stage wrote into: the
+    # namespace is read from the revision's own build manifest (never from
+    # current config), so a re-embed under a changed embedding model can never
+    # write into — or upsert over — another revision's vectors.
+    async with async_session_maker() as manifest_db:
+        manifest = await load_revision_vector_manifest(manifest_db, revision_id)
+    if manifest is None:
+        logger.warning(
+            f"[caption_worker] doc={document_id} rev={revision_id} has no "
+            f"vector manifest — skipping re-embed"
+        )
+        return
+    namespace = manifest[0]
+
     embedder     = get_embedding_service()
-    vector_store = get_vector_store(workspace_id)
+    vector_store = get_vector_store(workspace_id, namespace=namespace)
 
     ids           = list(updated_texts.keys())
     display_texts = [v[0] for v in updated_texts.values()]

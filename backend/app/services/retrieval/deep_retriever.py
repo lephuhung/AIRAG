@@ -34,8 +34,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.models.document import Document, DocumentImage, DocumentTable
+from app.services.agents.v2.persistence.document_views import (
+    MixedRevisionMerge,
+    RevisionArtifactIdentity,
+    RevisionNotReady,
+    legacy_vector_id,
+)
 from app.services.embedding.embedder import EmbeddingService
-from app.services.embedding.vector_store import VectorStore
+from app.services.embedding.vector_store import VectorStore, get_vector_store
 from app.services.kg.knowledge_graph_service import KnowledgeGraphService
 from app.services.retrieval.reranker import RerankerService, get_reranker_service
 from app.services.models.parsed_document import (
@@ -66,10 +72,16 @@ def _retrieval_cache_key(
     top_k: int,
     mode: str,
     document_ids: Optional[list[uuid.UUID]],
+    revision_ids: Optional[list[uuid.UUID]] = None,
 ) -> str:
-    """Build a cache key from retrieval parameters."""
+    """Build a cache key from retrieval parameters.
+
+    ``revision_ids`` is part of the key: a revision-selected answer must never
+    be served from a cache entry produced by the legacy (unscoped) path.
+    """
     doc_ids_str = "|".join(sorted(str(d) for d in (document_ids or [])))
-    raw = f"{workspace_id}:{question}:{top_k}:{mode}:{doc_ids_str}"
+    rev_ids_str = "|".join(sorted(str(r) for r in (revision_ids or [])))
+    raw = f"{workspace_id}:{question}:{top_k}:{mode}:{doc_ids_str}:{rev_ids_str}"
     return hashlib.sha256(raw.encode()).hexdigest()[:40]
 
 
@@ -100,6 +112,23 @@ def _decode_result(raw: str) -> DeepRetrievalResult:
         ],
         table_refs=[ExtractedTable(**t) for t in d.get("table_refs", [])],
     )
+
+
+def _assert_revision_in_scope(
+    revision_id: str, scope: set[str], locator: str
+) -> None:
+    """Fail a revision-selected merge when a hit is owned by another revision.
+
+    ``revision_id`` empty means the hit carries no revision provenance (a
+    legacy document-scoped chunk). Under an explicit revision scope that is
+    exactly the leak this guard exists to prevent.
+    """
+    if not revision_id or revision_id not in scope:
+        raise MixedRevisionMerge(
+            f"retrieval hit {locator!r} belongs to revision "
+            f"{revision_id or '(legacy/none)'}, outside the selected scope "
+            f"{sorted(scope)}"
+        )
 
 
 async def _get_cached_result(cache_key: str) -> Optional[DeepRetrievalResult]:
@@ -227,6 +256,7 @@ class DeepRetriever:
         top_k: Optional[int] = None,
         document_ids: Optional[list[uuid.UUID]] = None,
         include_images: bool = True,
+        revision_identities: Optional[list[RevisionArtifactIdentity]] = None,
     ) -> DeepRetrievalResult:
         """
         Execute hybrid retrieval with reranking.
@@ -245,6 +275,13 @@ class DeepRetriever:
             top_k: Number of final chunks to return (after reranking)
             document_ids: Optional filter to specific documents
             include_images: Whether to find related images
+            revision_identities: When supplied, retrieval is **revision-selected**:
+                the vector/BM25/KG legs are restricted to exactly these
+                revisions and each leg reads the embedding namespace recorded
+                in that revision's own build manifest. A hit outside the scope
+                fails the merge (:class:`MixedRevisionMerge`) instead of
+                leaking into the answer. When ``None`` the unchanged v1
+                (document-scoped) adapter path runs.
 
         Returns:
             DeepRetrievalResult with chunks, citations, context, and optional images
@@ -255,8 +292,19 @@ class DeepRetriever:
         if top_k is None:
             top_k = settings.HRAG_RERANKER_TOP_K
 
+        revision_ids: Optional[list[uuid.UUID]] = None
+        if revision_identities is not None:
+            if not revision_identities:
+                # An explicit empty scope is a programming error, not "all".
+                raise RevisionNotReady(
+                    "workspace", "empty revision scope for revision-selected retrieval"
+                )
+            revision_ids = [i.revision_id for i in revision_identities]
+
         # ── Retrieval result cache ───────────────────────────────────────────
-        cache_key = _retrieval_cache_key(self.workspace_id, question, top_k, mode, document_ids)
+        cache_key = _retrieval_cache_key(
+            self.workspace_id, question, top_k, mode, document_ids, revision_ids
+        )
         cached = await _get_cached_result(cache_key)
         if cached is not None:
             return cached
@@ -265,14 +313,18 @@ class DeepRetriever:
         kg_task = None
         if self.kg_service and mode != "vector_only":
             kg_task = asyncio.create_task(
-                self._kg_query(question, mode)
+                self._kg_query(question, mode, revision_ids)
             )
 
         # Over-fetch from vector DB for reranking
         prefetch_k = max(settings.HRAG_VECTOR_PREFETCH, top_k * 3)
         vector_task = asyncio.create_task(
             asyncio.to_thread(
-                self._vector_query, question, prefetch_k, document_ids
+                self._vector_query,
+                question,
+                prefetch_k,
+                document_ids,
+                revision_identities,
             )
         )
 
@@ -281,7 +333,11 @@ class DeepRetriever:
         if settings.HRAG_ENABLE_BM25:
             bm25_task = asyncio.create_task(
                 asyncio.to_thread(
-                    self._bm25_query, question, settings.HRAG_BM25_PREFETCH, document_ids
+                    self._bm25_query,
+                    question,
+                    settings.HRAG_BM25_PREFETCH,
+                    document_ids,
+                    revision_identities,
                 )
             )
 
@@ -302,10 +358,11 @@ class DeepRetriever:
             except Exception as e:
                 logger.warning(f"[deep_retriever] BM25 search failed (non-fatal): {e}")
 
-        # Merge vector + BM25 via RRF, then rerank
+        # Merge vector + BM25 via RRF, then rerank. With a revision scope the
+        # merge is exact: a hit owned by another revision fails the merge.
         if bm25_results:
             raw_chunks, raw_citations = self._rrf_merge(
-                raw_chunks, raw_citations, bm25_results
+                raw_chunks, raw_citations, bm25_results, revision_ids=revision_ids
             )
 
         # Post-RRF recency boost: favor newer documents when relevance is similar
@@ -343,7 +400,11 @@ class DeepRetriever:
         image_refs = []
         table_refs = []
         if include_images and self.db and chunks:
-            page_nos = {(str(c.document_id), c.page_no) for c in chunks if c.page_no > 0}
+            page_nos = {
+                (str(c.document_id), c.page_no, c.revision_id or None)
+                for c in chunks
+                if c.page_no > 0
+            }
             if page_nos:
                 # Sequential on purpose: both share self.db, and one AsyncSession
                 # must never run two statements concurrently (raises
@@ -368,17 +429,26 @@ class DeepRetriever:
         await _set_cached_result(cache_key, result, self.workspace_id)
         return result
 
-    async def _kg_query(self, question: str, mode: str) -> str:
+    async def _kg_query(
+        self,
+        question: str,
+        mode: str,
+        revision_ids: Optional[list[uuid.UUID]] = None,
+    ) -> str:
         """Get raw KG context (entities + relationships) relevant to the question.
 
         Uses factual graph data instead of LLM-generated narrative to avoid
-        hallucination from LightRAG's aquery().
+        hallucination from LightRAG's aquery(). With ``revision_ids`` the graph
+        read is scoped to those revisions' provenance, so a fact that exists
+        only in another revision can never appear in this answer.
         """
         if not self.kg_service:
             return ""
         try:
             return await asyncio.wait_for(
-                self.kg_service.get_relevant_context(question),
+                self.kg_service.get_relevant_context(
+                    question, revision_ids=revision_ids
+                ),
                 timeout=settings.HRAG_KG_QUERY_TIMEOUT,
             )
         except asyncio.TimeoutError:
@@ -393,12 +463,35 @@ class DeepRetriever:
         question: str,
         top_n: int,
         document_ids: Optional[list[uuid.UUID]],
+        revision_identities: Optional[list[RevisionArtifactIdentity]] = None,
     ) -> list[dict]:
         """
         BM25 lexical search (synchronous, CPU-bound — run in thread).
         Returns list of dicts with id, metadata, document, bm25_rank.
         """
         from app.services.retrieval.bm25_index import bm25_search
+
+        if revision_identities:
+            # The BM25 corpus is loaded from ChromaDB, so a revision-selected
+            # search must read the revision's own namespace (and only its
+            # vectors) — never the whole legacy collection.
+            revision_ids = [i.revision_id for i in revision_identities]
+            results: list[dict] = []
+            for namespace in sorted(
+                {i.embedding_namespace for i in revision_identities if i.embedding_namespace}
+            ):
+                store = get_vector_store(self.workspace_id, namespace=namespace)
+                results.extend(
+                    bm25_search(
+                        vector_store=store,
+                        query=question,
+                        top_n=top_n,
+                        document_ids=document_ids,
+                        revision_ids=revision_ids,
+                    )
+                )
+            results.sort(key=lambda r: r.get("bm25_score", 0.0), reverse=True)
+            return results[:top_n]
         return bm25_search(
             vector_store=self.vector_store,
             query=question,
@@ -412,6 +505,7 @@ class DeepRetriever:
         vector_citations: list[Citation],
         bm25_results: list[dict],
         k: int | None = None,
+        revision_ids: Optional[list[uuid.UUID]] = None,
     ) -> tuple[list[EnrichedChunk], list[Citation]]:
         """
         Reciprocal Rank Fusion: merge vector search and BM25 results.
@@ -422,18 +516,34 @@ class DeepRetriever:
         Returns deduplicated list sorted by RRF score descending, preserving
         EnrichedChunk / Citation objects from the vector results when available
         (BM25-only hits are added from bm25_results metadata).
+
+        With ``revision_ids`` the merge is **exact**: every merged hit must be
+        owned by one of those revisions. A hit outside the scope raises
+        :class:`MixedRevisionMerge` — merging it would answer with another
+        revision's fact.
         """
         rrf_k = k or settings.HRAG_RRF_K
+        scope = {str(r) for r in revision_ids} if revision_ids else None
 
         # Map chunk_id → (EnrichedChunk, Citation, vector_rank 1-indexed)
         vector_map: dict[str, tuple[EnrichedChunk, Citation, int]] = {}
         for rank, (chunk, citation) in enumerate(zip(vector_chunks, vector_citations), start=1):
-            chunk_id = f"doc_{chunk.document_id}_chunk_{chunk.chunk_index}"
+            chunk_id = chunk.vector_id or legacy_vector_id(
+                chunk.document_id, chunk.chunk_index
+            )
+            if scope is not None:
+                _assert_revision_in_scope(chunk.revision_id, scope, chunk_id)
             vector_map[chunk_id] = (chunk, citation, rank)
 
         # Map chunk_id → bm25_rank 1-indexed
         bm25_map: dict[str, tuple[dict, int]] = {}
         for rank, result in enumerate(bm25_results, start=1):
+            if scope is not None:
+                _assert_revision_in_scope(
+                    (result.get("metadata") or {}).get("revision_id", ""),
+                    scope,
+                    result["id"],
+                )
             bm25_map[result["id"]] = (result, rank)
 
         # Collect all unique IDs
@@ -479,6 +589,9 @@ class DeepRetriever:
                     table_refs=table_refs,
                     has_table=meta.get("has_table", False),
                     has_code=meta.get("has_code", False),
+                    revision_id=str(meta.get("revision_id", "") or ""),
+                    vector_id=cid,
+                    chunk_id=str(meta.get("chunk_id", "") or ""),
                 )
                 merged_chunks.append(chunk)
                 merged_citations.append(Citation(
@@ -557,9 +670,12 @@ class DeepRetriever:
         boost_factor = settings.HRAG_RECENTNESS_BOOST
 
         # Batch-fetch published_date for ALL chunks in a single ChromaDB call
-        # instead of one .get() per chunk (was N round-trips per query).
+        # instead of one .get() per chunk (was N round-trips per query). The
+        # chunk's own vector_id is authoritative: once vector ids are
+        # revision-qualified it is not reconstructible from document+index.
         chunk_ids = [
-            f"doc_{chunk.document_id}_chunk_{chunk.chunk_index}" for chunk in chunks
+            chunk.vector_id or legacy_vector_id(chunk.document_id, chunk.chunk_index)
+            for chunk in chunks
         ]
         date_by_id: dict[str, str] = {}
         if chunk_ids:
@@ -590,9 +706,55 @@ class DeepRetriever:
         question: str,
         top_k: int,
         document_ids: Optional[list[uuid.UUID]],
+        revision_identities: Optional[list[RevisionArtifactIdentity]] = None,
     ) -> tuple[list[EnrichedChunk], list[Citation]]:
-        """Synchronous vector search via ChromaDB (over-fetch stage)."""
+        """Synchronous vector search via ChromaDB (over-fetch stage).
+
+        With ``revision_identities`` the search reads exactly those revisions:
+        one query per embedding namespace **recorded in that revision's build
+        manifest** (never the current config), filtered by ``revision_id``.
+        Without them the unchanged legacy document-scoped search runs.
+        """
         query_embedding = self.embedder.embed_query(question)
+
+        if revision_identities:
+            stores: dict[str, list[uuid.UUID]] = {}
+            for identity in revision_identities:
+                if not identity.embedding_namespace:
+                    raise RevisionNotReady(
+                        identity.document_id,
+                        "revision has no vector manifest for retrieval",
+                        revision_id=identity.revision_id,
+                    )
+                stores.setdefault(identity.embedding_namespace, []).append(
+                    identity.revision_id
+                )
+            results_list = []
+            for namespace, rev_ids in sorted(stores.items()):
+                store = get_vector_store(self.workspace_id, namespace=namespace)
+                where = {"revision_id": {"$in": [str(r) for r in rev_ids]}}
+                if document_ids:
+                    where = {
+                        "$and": [
+                            where,
+                            {
+                                "document_id": {
+                                    "$in": [str(d) for d in document_ids]
+                                }
+                            },
+                        ]
+                    }
+                res = store.query(
+                    query_embedding=query_embedding,
+                    n_results=top_k,
+                    where=where,
+                )
+                for i, doc_text in enumerate(res.get("documents", [])):
+                    meta = res["metadatas"][i] if res.get("metadatas") else {}
+                    results_list.append(
+                        (res["ids"][i] if res.get("ids") else "", doc_text, meta)
+                    )
+            return self._chunks_from_hits(results_list)
 
         where = None
         if document_ids:
@@ -603,17 +765,30 @@ class DeepRetriever:
             n_results=top_k,
             where=where,
         )
+        hits = [
+            (
+                results["ids"][i] if results.get("ids") else "",
+                doc_text,
+                results["metadatas"][i] if results.get("metadatas") else {},
+            )
+            for i, doc_text in enumerate(results.get("documents", []))
+        ]
+        return self._chunks_from_hits(hits)
 
-        chunks = []
-        citations = []
-
-        for i, doc_text in enumerate(results.get("documents", [])):
-            meta = results["metadatas"][i] if results.get("metadatas") else {}
-
+    @staticmethod
+    def _chunks_from_hits(
+        hits: list[tuple[str, str, dict]],
+    ) -> tuple[list[EnrichedChunk], list[Citation]]:
+        """Build (chunks, citations) from (vector_id, text, metadata) hits."""
+        chunks: list[EnrichedChunk] = []
+        citations: list[Citation] = []
+        for i, (vector_id, doc_text, meta) in enumerate(hits):
             heading_path = []
             heading_str = meta.get("heading_path", "")
             if heading_str:
-                heading_path = heading_str.split(" > ") if isinstance(heading_str, str) else []
+                heading_path = (
+                    heading_str.split(" > ") if isinstance(heading_str, str) else []
+                )
 
             image_refs = []
             image_ids_str = meta.get("image_ids", "")
@@ -625,7 +800,7 @@ class DeepRetriever:
             if table_ids_str and isinstance(table_ids_str, str):
                 table_refs = [tid for tid in table_ids_str.split("|") if tid]
 
-            chunk = EnrichedChunk(
+            chunks.append(EnrichedChunk(
                 content=doc_text,
                 chunk_index=meta.get("chunk_index", i),
                 source_file=meta.get("source", ""),
@@ -636,8 +811,10 @@ class DeepRetriever:
                 table_refs=table_refs,
                 has_table=meta.get("has_table", False),
                 has_code=meta.get("has_code", False),
-            )
-            chunks.append(chunk)
+                revision_id=str(meta.get("revision_id", "") or ""),
+                vector_id=vector_id,
+                chunk_id=str(meta.get("chunk_id", "") or ""),
+            ))
 
             citations.append(Citation(
                 source_file=meta.get("source", "Unknown"),
@@ -750,20 +927,25 @@ class DeepRetriever:
 
     async def _find_related_images(
         self,
-        page_refs: set[tuple[uuid.UUID, int]],  # (document_id, page_no)
+        page_refs: set[tuple[str, int, Optional[str]]],  # (document_id, page_no, revision_id)
     ) -> list[ExtractedImage]:
-        """Find images on the exact same pages as retrieved chunks."""
+        """Find images on the exact same pages as retrieved chunks.
+
+        When a chunk is revision-owned the lookup is scoped to that revision's
+        image rows, so a viewer never shows another revision's images.
+        """
         if not self.db:
             return []
 
         images = []
-        for doc_id, page_no in page_refs:
-            result = await self.db.execute(
-                select(DocumentImage).where(
-                    DocumentImage.document_id == doc_id,
-                    DocumentImage.page_no == page_no,
-                )
+        for doc_id, page_no, revision_id in page_refs:
+            stmt = select(DocumentImage).where(
+                DocumentImage.document_id == doc_id,
+                DocumentImage.page_no == page_no,
             )
+            if revision_id is not None:
+                stmt = stmt.where(DocumentImage.revision_id == revision_id)
+            result = await self.db.execute(stmt)
             for img in result.scalars().all():
                 images.append(ExtractedImage(
                     image_id=img.image_id,
@@ -788,20 +970,21 @@ class DeepRetriever:
 
     async def _find_related_tables(
         self,
-        page_refs: set[tuple[uuid.UUID, int]],
+        page_refs: set[tuple[str, int, Optional[str]]],
     ) -> list[ExtractedTable]:
-        """Find tables on the exact same pages as retrieved chunks."""
+        """Find tables on the exact same pages as retrieved chunks (revision-scoped)."""
         if not self.db:
             return []
 
         tables = []
-        for doc_id, page_no in page_refs:
-            result = await self.db.execute(
-                select(DocumentTable).where(
-                    DocumentTable.document_id == doc_id,
-                    DocumentTable.page_no == page_no,
-                )
+        for doc_id, page_no, revision_id in page_refs:
+            stmt = select(DocumentTable).where(
+                DocumentTable.document_id == doc_id,
+                DocumentTable.page_no == page_no,
             )
+            if revision_id is not None:
+                stmt = stmt.where(DocumentTable.revision_id == revision_id)
+            result = await self.db.execute(stmt)
             for tbl in result.scalars().all():
                 tables.append(ExtractedTable(
                     table_id=tbl.table_id,

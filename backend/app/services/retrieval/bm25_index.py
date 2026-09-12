@@ -142,17 +142,21 @@ def _tokenize(text: str) -> list[str]:
 
 @dataclass
 class _IndexState:
-    """Holds one built BM25 index for a workspace."""
+    """Holds one built BM25 index for a workspace collection."""
     bm25: object                   # rank_bm25.BM25Okapi instance
     ids: list[str]                 # ChromaDB chunk IDs (same order as corpus)
     metadatas: list[dict]          # metadata parallel to ids
     documents: list[str]           # raw texts parallel to ids
     doc_count: int                 # snapshot of collection.count() at build time
+    collection_name: str = ""      # the namespace the corpus was read from
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
-# Module-level cache: workspace_id → _IndexState
-_index_cache: dict[uuid.UUID, _IndexState] = {}
+# Module-level cache: (workspace_id, collection_name) → _IndexState.
+# The collection name is part of the key: a revision-aware workspace has one
+# collection per embedding model/dimension namespace, and an index built from
+# one namespace must never answer a query against another.
+_index_cache: dict[tuple[uuid.UUID, str], _IndexState] = {}
 _cache_lock = threading.Lock()
 
 # Bump when the on-disk format or tokenisation logic changes, to invalidate
@@ -160,10 +164,13 @@ _cache_lock = threading.Lock()
 _PERSIST_VERSION = 1
 
 
-def _persist_path(workspace_id: uuid.UUID) -> Path:
+def _persist_path(workspace_id: uuid.UUID, collection_name: str) -> Path:
     from app.core.config import settings
 
-    return Path(settings.BASE_DIR) / "data" / "bm25" / f"{workspace_id}.pkl"
+    # Namespaced collections must not share a pickle file.
+    stem = collection_name or str(workspace_id)
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", stem)
+    return Path(settings.BASE_DIR) / "data" / "bm25" / f"{workspace_id}__{safe}.pkl"
 
 
 def _save_index(workspace_id: uuid.UUID, state: _IndexState) -> None:
@@ -172,7 +179,7 @@ def _save_index(workspace_id: uuid.UUID, state: _IndexState) -> None:
 
     if not settings.HRAG_BM25_PERSIST:
         return
-    path = _persist_path(workspace_id)
+    path = _persist_path(workspace_id, state.collection_name)
     payload = {
         "version": _PERSIST_VERSION,
         "word_segment": settings.HRAG_BM25_WORD_SEGMENT,
@@ -193,7 +200,9 @@ def _save_index(workspace_id: uuid.UUID, state: _IndexState) -> None:
         logger.warning(f"[bm25] Failed to persist index for {workspace_id}: {e}")
 
 
-def _load_index(workspace_id: uuid.UUID, expected_count: int) -> _IndexState | None:
+def _load_index(
+    workspace_id: uuid.UUID, collection_name: str, expected_count: int
+) -> _IndexState | None:
     """
     Load a persisted index from disk if it matches the current corpus size,
     persist version, and tokenisation setting. Returns None on any mismatch/error.
@@ -202,7 +211,7 @@ def _load_index(workspace_id: uuid.UUID, expected_count: int) -> _IndexState | N
 
     if not settings.HRAG_BM25_PERSIST:
         return None
-    path = _persist_path(workspace_id)
+    path = _persist_path(workspace_id, collection_name)
     if not path.exists():
         return None
     try:
@@ -227,6 +236,7 @@ def _load_index(workspace_id: uuid.UUID, expected_count: int) -> _IndexState | N
         metadatas=payload["metadatas"],
         documents=payload["documents"],
         doc_count=payload["doc_count"],
+        collection_name=collection_name,
     )
 
 
@@ -255,7 +265,14 @@ def _build_index(vector_store: VectorStore) -> _IndexState:
         # on an empty list. Return an empty state instead; the search path's
         # `if not state.ids` guard short-circuits before touching `bm25`.
         logger.warning(f"[bm25] Collection '{vector_store.collection_name}' is empty — BM25 index will be empty")
-        return _IndexState(bm25=None, ids=[], metadatas=[], documents=[], doc_count=0)
+        return _IndexState(
+            bm25=None,
+            ids=[],
+            metadatas=[],
+            documents=[],
+            doc_count=0,
+            collection_name=vector_store.collection_name,
+        )
 
     corpus_tokenized = [_tokenize(doc) for doc in documents]
 
@@ -270,30 +287,33 @@ def _build_index(vector_store: VectorStore) -> _IndexState:
         metadatas=metadatas,
         documents=documents,
         doc_count=doc_count,
+        collection_name=vector_store.collection_name,
     )
 
 
 def get_or_build_index(vector_store: VectorStore) -> _IndexState:
     """
-    Return the cached BM25 index for this workspace, rebuilding if stale.
+    Return the cached BM25 index for this collection, rebuilding if stale.
     Staleness check: compare doc_count in cache vs collection.count().
 
     Call inside asyncio.to_thread() — this is a blocking operation.
     """
     workspace_id = vector_store.workspace_id
+    collection_name = vector_store.collection_name
+    cache_key = (workspace_id, collection_name)
     current_count = vector_store.count()
 
     with _cache_lock:
-        cached = _index_cache.get(workspace_id)
+        cached = _index_cache.get(cache_key)
 
     if cached is not None and cached.doc_count == current_count:
         return cached  # fresh — reuse
 
     # Try a persisted index from disk before rebuilding from ChromaDB.
-    loaded = _load_index(workspace_id, current_count)
+    loaded = _load_index(workspace_id, collection_name, current_count)
     if loaded is not None:
         with _cache_lock:
-            _index_cache[workspace_id] = loaded
+            _index_cache[cache_key] = loaded
         return loaded
 
     # Build (or rebuild) index, then persist for future cold starts.
@@ -301,7 +321,7 @@ def get_or_build_index(vector_store: VectorStore) -> _IndexState:
     _save_index(workspace_id, new_state)
 
     with _cache_lock:
-        _index_cache[workspace_id] = new_state
+        _index_cache[cache_key] = new_state
 
     return new_state
 
@@ -311,6 +331,7 @@ def bm25_search(
     query: str,
     top_n: int,
     document_ids: list[uuid.UUID] | None = None,
+    revision_ids: list[uuid.UUID] | None = None,
 ) -> list[dict]:
     """
     Run BM25 search and return top-N results as a list of dicts:
@@ -321,6 +342,9 @@ def bm25_search(
         query:         Natural language query string.
         top_n:         Maximum number of results to return.
         document_ids:  Optional filter — only keep chunks from these document IDs.
+        revision_ids:  Optional filter — only keep chunks owned by these
+                       revisions. The caller must have loaded the corpus from
+                       the matching embedding namespace.
 
     Note: call this inside asyncio.to_thread() — it is CPU-bound and blocking.
     """
@@ -341,13 +365,16 @@ def bm25_search(
     # recency for BM25-only hits. Keep raw BM25 scores so the rank reflects pure lexical
     # relevance.
 
-    # Pair scores with indices, apply optional document_id filter
+    # Pair scores with indices, apply optional document_id/revision_id filter
+    revision_strs = {str(r) for r in revision_ids} if revision_ids else None
     scored = []
     for idx, score in enumerate(scores):
         if score <= 0:
             continue
         meta = state.metadatas[idx] if idx < len(state.metadatas) else {}
         if document_ids and meta.get("document_id") not in [str(doc_id) for doc_id in document_ids]:
+            continue
+        if revision_strs is not None and str(meta.get("revision_id", "")) not in revision_strs:
             continue
         scored.append((idx, score))
 
@@ -368,17 +395,37 @@ def bm25_search(
     return results
 
 
-def invalidate_cache(workspace_id: uuid.UUID) -> None:
+def invalidate_cache(workspace_id: uuid.UUID, collection_name: str | None = None) -> None:
     """
     Force the next query to rebuild the BM25 index for this workspace.
     Call after adding/deleting documents if you need immediate consistency
     (normally the doc_count staleness check handles this automatically).
+
+    ``collection_name`` narrows the invalidation to one namespace; all
+    namespaces for the workspace are dropped when omitted.
     """
     with _cache_lock:
-        _index_cache.pop(workspace_id, None)
+        keys = [
+            key
+            for key in _index_cache
+            if key[0] == workspace_id
+            and (collection_name is None or key[1] == collection_name)
+        ]
+        for key in keys:
+            _index_cache.pop(key, None)
     # Also drop the persisted copy so the next query rebuilds from scratch.
-    try:
-        _persist_path(workspace_id).unlink(missing_ok=True)
-    except Exception:
-        pass
-    logger.debug(f"[bm25] Cache invalidated for workspace {workspace_id}")
+    for name in (collection_name,) if collection_name else (None,):
+        try:
+            if name is None:
+                for stale in _persist_path(workspace_id, "").parent.glob(
+                    f"{workspace_id}__*.pkl"
+                ):
+                    stale.unlink(missing_ok=True)
+            else:
+                _persist_path(workspace_id, name).unlink(missing_ok=True)
+        except Exception:
+            pass
+    logger.debug(
+        f"[bm25] Cache invalidated for workspace {workspace_id} "
+        f"(collection={collection_name or '*'})"
+    )

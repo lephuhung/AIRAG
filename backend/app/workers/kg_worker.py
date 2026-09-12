@@ -99,7 +99,11 @@ async def handle_kg(payload: dict) -> None:
                 f"[kg_worker] doc={msg.document_id} starting KG ingest "
                 f"(markdown_len={len(markdown)})..."
             )
-            await kg_service.ingest(markdown, document_id=msg.document_id)
+            await kg_service.ingest(
+                markdown,
+                document_id=msg.document_id,
+                revision_id=msg.revision_id,
+            )
 
             document.kg_done = True
             # A successful ingest supersedes any stale KG/timeout warning left

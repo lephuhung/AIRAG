@@ -52,6 +52,15 @@ class EnrichedChunk:
     has_code: bool = False
     contextualized: str = ""  # heading_path joined for context
     score: float = 0.0
+    # Revision-selected retrieval: the owning revision (empty for a legacy v1
+    # chunk) and the vector id it was stored under. Both are carried so a
+    # merged result can be proven to come from exactly one revision and so a
+    # locator survives RRF/rerank (the legacy id is NOT reconstructible from
+    # document_id + chunk_index once vector ids are revision-qualified).
+    revision_id: str = ""
+    vector_id: str = ""
+    # Stable revision chunk locator (document_revision_chunks.chunk_id).
+    chunk_id: str = ""
     # Hiệu lực pháp lý của văn bản chứa chunk, tra từ DB lúc retrieval
     # (không lưu vào metadata Chroma — trạng thái đổi khi có văn bản mới):
     # "" | "unknown" | "effective" | "partially_amended" | "superseded"

@@ -62,6 +62,22 @@ _kg_log_ctx: ContextVar[Optional[MinIOLoggerService]] = ContextVar(
     "_kg_log_ctx", default=None
 )
 
+# Per-ingest revision scope (Phase 1C Task 5). Every document-derived fact,
+# edge, membership and provenance row written by an ingest is stamped with the
+# producing revision, so a revision-scoped read can never return a fact that
+# only another revision contains. Canonical entity nodes stay shared: their
+# ``revision_ids`` ownership list accumulates instead of forking the node.
+# Set by ingest() and read by the _upsert_* helpers, so no call site has to
+# thread the revision through. Same gather-inheritance property as above.
+_kg_revision_ctx: ContextVar[Optional[str]] = ContextVar(
+    "_kg_revision_ctx", default=None
+)
+
+
+def _active_revision_id(explicit: Optional[str] = None) -> Optional[str]:
+    """The revision a KG write belongs to (explicit wins, else the ingest scope)."""
+    return explicit if explicit is not None else _kg_revision_ctx.get()
+
 # ---------------------------------------------------------------------------
 # Date normalization utilities
 # ---------------------------------------------------------------------------
@@ -363,6 +379,25 @@ def _doc_ids_seed(var: str) -> str:
 def _doc_ids_append(var: str, id_param: str) -> str:
     """Append ``$id_param`` to ``var.document_ids`` (idempotent, null-safe)."""
     seed = _doc_ids_seed(var)
+    return (
+        f"CASE WHEN ${id_param} IS NULL THEN {seed} "
+        f"WHEN ${id_param} IN {seed} THEN {seed} "
+        f"ELSE {seed} + ${id_param} END"
+    )
+
+
+def _list_prop_seed(var: str, prop: str, singular: str) -> str:
+    """Seed expr for a generic ownership list: existing list, else
+    ``[<singular>]``, else ``[]``."""
+    return (
+        f"coalesce({var}.{prop}, "
+        f"CASE WHEN {var}.{singular} IS NULL THEN [] ELSE [{var}.{singular}] END)"
+    )
+
+
+def _list_prop_append(var: str, prop: str, singular: str, id_param: str) -> str:
+    """Append ``$id_param`` to ``var.<prop>`` (idempotent, null-safe)."""
+    seed = _list_prop_seed(var, prop, singular)
     return (
         f"CASE WHEN ${id_param} IS NULL THEN {seed} "
         f"WHEN ${id_param} IN {seed} THEN {seed} "
@@ -840,8 +875,18 @@ class LegalKGService:
     # Ingestion pipeline
     # ------------------------------------------------------------------
 
-    async def ingest(self, markdown_content: str, document_id: Optional[uuid.UUID] = None) -> None:
+    async def ingest(
+        self,
+        markdown_content: str,
+        document_id: Optional[uuid.UUID] = None,
+        revision_id: Optional[uuid.UUID] = None,
+    ) -> None:
         """Public ingest entrypoint.
+
+        ``revision_id`` scopes every document-derived fact/edge/membership/
+        provenance row this ingest writes to the producing revision. It is set
+        as a ContextVar for the duration of the ingest so the ``_upsert_*``
+        helpers stamp it without threading it through every call site.
 
         When HRAG_KG_LOG_EXTRACTION is on, set up the extraction-logging context
         around the real pipeline so every KG LLM call (article extract, preamble,
@@ -850,29 +895,36 @@ class LegalKGService:
         contextvar reset run in `finally` so a failed ingest never leaks the
         logger into the worker's context or loses partial data.
         """
-        if not settings.HRAG_KG_LOG_EXTRACTION:
-            await self._ingest_impl(markdown_content, document_id)
-            return
-
-        base_meta = {
-            "kg_mode": "legal",
-            "workspace_id": str(self.workspace_id),
-            "document_id": str(document_id) if document_id else None,
-        }
-        ext_logger = MinIOLoggerService(
-            dataset_prefix="legal_kg_extraction", base_meta=base_meta
+        rev_token = _kg_revision_ctx.set(
+            str(revision_id) if revision_id is not None else None
         )
-        token = _kg_log_ctx.set(ext_logger)
         try:
-            await self._ingest_impl(
-                markdown_content, document_id, log_base_meta=base_meta
+            if not settings.HRAG_KG_LOG_EXTRACTION:
+                await self._ingest_impl(markdown_content, document_id)
+                return
+
+            base_meta = {
+                "kg_mode": "legal",
+                "workspace_id": str(self.workspace_id),
+                "document_id": str(document_id) if document_id else None,
+                "revision_id": str(revision_id) if revision_id else None,
+            }
+            ext_logger = MinIOLoggerService(
+                dataset_prefix="legal_kg_extraction", base_meta=base_meta
             )
-        finally:
-            _kg_log_ctx.reset(token)
-            if document_id is not None:
-                await ext_logger.flush_to_minio(
-                    workspace_id=self.workspace_id, document_id=document_id
+            token = _kg_log_ctx.set(ext_logger)
+            try:
+                await self._ingest_impl(
+                    markdown_content, document_id, log_base_meta=base_meta
                 )
+            finally:
+                _kg_log_ctx.reset(token)
+                if document_id is not None:
+                    await ext_logger.flush_to_minio(
+                        workspace_id=self.workspace_id, document_id=document_id
+                    )
+        finally:
+            _kg_revision_ctx.reset(rev_token)
 
     async def _ingest_impl(
         self,
@@ -1692,6 +1744,7 @@ class LegalKGService:
         display_name: str = "",
         document_id: Optional[str] = None,
         description: str = "",
+        revision_id: Optional[str] = None,
     ) -> str:
         """
         Create or update the root Document node and return its Neo4j internal <id>.
@@ -1712,6 +1765,7 @@ class LegalKGService:
         label = self._label
         canonical_id = normalize_entity_id(entity_name, "Document")
         disp = (display_name or entity_name).replace("#", "").strip()
+        rev = _active_revision_id(revision_id)
 
         cypher = f"""
         MERGE (n:`{label}`:`Document` {{entity_id: $entity_id}})
@@ -1720,12 +1774,15 @@ class LegalKGService:
                       n.description  = $description,
                       n.document_id  = $document_id,
                       n.document_ids = CASE WHEN $document_id IS NULL THEN [] ELSE [$document_id] END,
+                      n.revision_id  = $revision_id,
+                      n.revision_ids = CASE WHEN $revision_id IS NULL THEN [] ELSE [$revision_id] END,
                       n.created_at   = datetime()
         ON MATCH SET  n.entity_type  = 'Document',
                       n.display_name = $display_name,
                       n.document_id  = CASE WHEN $document_id IS NOT NULL
                                             THEN $document_id ELSE n.document_id END,
                       n.document_ids = {_doc_ids_append("n", "document_id")},
+                      n.revision_ids = {_list_prop_append("n", "revision_ids", "revision_id", "revision_id")},
                       n.description  = CASE WHEN $description <> '' THEN $description ELSE n.description END,
                       n.updated_at   = datetime()
         RETURN id(n) as node_id
@@ -1736,6 +1793,7 @@ class LegalKGService:
             display_name=disp,
             description=description,
             document_id=str(document_id) if document_id else None,
+            revision_id=rev,
         )
         record = await result.single()
         if record:
@@ -1749,6 +1807,7 @@ class LegalKGService:
         entity_type: str,
         description: str = "",
         document_id: Optional[str] = None,
+        revision_id: Optional[str] = None,
     ) -> None:
         if not entity_id or not entity_id.strip():
             return
@@ -1759,6 +1818,7 @@ class LegalKGService:
         # Keep original as display_name only on CREATE (human-readable)
         # Clean noise characters specifically for display consistency
         display_name = entity_id.replace("#", "").strip()
+        rev = _active_revision_id(revision_id)
 
         cypher = f"""
         MERGE (n:`{label}`:`{entity_type}` {{entity_id: $entity_id}})
@@ -1767,9 +1827,12 @@ class LegalKGService:
                       n.description  = $description,
                       n.document_id  = $document_id,
                       n.document_ids = CASE WHEN $document_id IS NULL THEN [] ELSE [$document_id] END,
+                      n.revision_id  = $revision_id,
+                      n.revision_ids = CASE WHEN $revision_id IS NULL THEN [] ELSE [$revision_id] END,
                       n.created_at   = datetime()
         ON MATCH SET  n.description  = CASE WHEN $description <> '' THEN $description ELSE n.description END,
-                      n.document_ids = {_doc_ids_append("n", "document_id")}
+                      n.document_ids = {_doc_ids_append("n", "document_id")},
+                      n.revision_ids = {_list_prop_append("n", "revision_ids", "revision_id", "revision_id")}
         """
         await session.run(
             cypher,
@@ -1778,6 +1841,7 @@ class LegalKGService:
             display_name=display_name,
             description=description,
             document_id=str(document_id) if document_id else None,
+            revision_id=rev,
         )
         return canonical_id  # caller may need canonical id for relation lookup
 
@@ -1793,6 +1857,7 @@ class LegalKGService:
         extra_props: Optional[dict] = None,
         source_type: str = "Organization",
         target_type: str = "Organization",
+        revision_id: Optional[str] = None,
     ) -> None:
         if not source or not target or not relation_type:
             return
@@ -1803,9 +1868,11 @@ class LegalKGService:
         # Build extra properties SET clause
         extra_props = extra_props or {}
         prop_sets: list[str] = []
+        rev = _active_revision_id(revision_id)
         params: dict[str, Any] = {
             "src": source_canonical, "tgt": target_canonical,
             "desc": description, "doc_id": str(document_id) if document_id else None, "art_ref": article_ref,
+            "revision_id": rev,
         }
         for k, v in extra_props.items():
             safe_key = re.sub(r"\W", "_", k)
@@ -1818,10 +1885,13 @@ class LegalKGService:
         MATCH (a:`{label}` {{entity_id: $src}})
         MATCH (b:`{label}` {{entity_id: $tgt}})
         MERGE (a)-[r:{relation_type}]->(b)
-        ON CREATE SET r.document_ids = CASE WHEN $doc_id IS NULL THEN [] ELSE [$doc_id] END
-        ON MATCH SET  r.document_ids = {_doc_ids_append("r", "doc_id")}
+        ON CREATE SET r.document_ids = CASE WHEN $doc_id IS NULL THEN [] ELSE [$doc_id] END,
+                      r.revision_ids = CASE WHEN $revision_id IS NULL THEN [] ELSE [$revision_id] END
+        ON MATCH SET  r.document_ids = {_doc_ids_append("r", "doc_id")},
+                      r.revision_ids = {_list_prop_append("r", "revision_ids", "revision_id", "revision_id")}
         SET r.description  = $desc,
             r.document_id  = $doc_id,
+            r.revision_id  = $revision_id,
             r.article_ref  = $art_ref,
             r.updated_at   = datetime(){extra_set}
         RETURN count(r) AS c
@@ -2110,10 +2180,18 @@ class LegalKGService:
         question: str,
         max_entities: int = 20,
         max_relationships: int = 30,
+        revision_ids: Optional[list[uuid.UUID] | list[str]] = None,
     ) -> str:
         """
         Retrieve relevant KG context for a RAG query.
         Uses CONTAINS (case-insensitive) to handle Composite Keys and abbreviated names.
+
+        ``revision_ids`` scopes the read to those revisions' provenance: a
+        document-derived fact/edge is returned only when the revision that
+        produced it is in scope, so one revision's query can never leak a fact
+        that only another revision contains. Rows with no revision provenance
+        (legacy pre-Task-5 ingests) are excluded under a scope — fail closed,
+        never guess an owner.
         """
         # Extract keywords from question
         tokens = re.split(r"[\s,\.;:!?]+", question.lower())
@@ -2134,11 +2212,27 @@ class LegalKGService:
 
         where_clause = " OR ".join(where_parts)
 
+        node_scope = ""
+        rel_scope = ""
+        if revision_ids:
+            params["revision_ids"] = [str(r) for r in revision_ids]
+            node_scope = (
+                "AND n.revision_ids IS NOT NULL "
+                "AND any(rid IN n.revision_ids WHERE rid IN $revision_ids)"
+            )
+            rel_scope = (
+                "r.revision_ids IS NOT NULL "
+                "AND any(rid IN r.revision_ids WHERE rid IN $revision_ids)"
+            )
+        else:
+            rel_scope = "true"
+
         cypher = f"""
         MATCH (n:`{label}`)
-        WHERE {where_clause}
+        WHERE ({where_clause}) {node_scope}
         WITH n LIMIT {max_entities}
         OPTIONAL MATCH (n)-[r]-(m:`{label}`)
+        WHERE {rel_scope}
         RETURN
             n.entity_id     AS entity_name,
             n.entity_type   AS entity_type,

@@ -164,6 +164,12 @@ class RAGService:
         """
         Delete a document's chunks from the vector store.
 
+        This is the **legacy v1** document-scoped purge. Tombstone-first
+        deletion and reindex never call it: they keep every revision's
+        artifacts, and only Task 9's GC reclaims them. A revision-aware caller
+        deletes one revision's vectors with
+        ``delete_by_document_id(document_id, revision_id=...)`` instead.
+
         Args:
             document_id: Database document ID
         """
@@ -174,7 +180,8 @@ class RAGService:
         self,
         question: str,
         top_k: int = 5,
-        document_ids: list[uuid_lib.UUID] | None = None
+        document_ids: list[uuid_lib.UUID] | None = None,
+        revision_identities: "list | None" = None,
     ) -> RAGQueryResult:
         """
         Query the vector store for relevant chunks.
@@ -183,12 +190,84 @@ class RAGService:
             question: The query question
             top_k: Number of chunks to retrieve
             document_ids: Optional filter to specific documents
+            revision_identities: Optional
+                ``document_views.RevisionArtifactIdentity`` list. When given,
+                each revision's recorded embedding namespace is queried with an
+                exact ``revision_id`` filter (the v2 path); when omitted the
+                unchanged v1 document-scoped query runs.
 
         Returns:
             RAGQueryResult with retrieved chunks and assembled context
         """
         # Generate query embedding
         query_embedding = self.embedder.embed_query(question)
+
+        if revision_identities:
+            from app.services.agents.v2.persistence.document_views import (
+                RevisionNotReady,
+            )
+
+            chunks = []
+            seen: set[str] = set()
+            for identity in revision_identities:
+                if not identity.embedding_namespace:
+                    raise RevisionNotReady(
+                        identity.document_id,
+                        "revision has no vector manifest for retrieval",
+                        revision_id=identity.revision_id,
+                    )
+                store = get_vector_store(
+                    self.workspace_id, namespace=identity.embedding_namespace
+                )
+                where: dict = {"revision_id": str(identity.revision_id)}
+                if document_ids:
+                    where = {
+                        "$and": [
+                            where,
+                            {
+                                "document_id": {
+                                    "$in": [str(d) for d in document_ids]
+                                }
+                            },
+                        ]
+                    }
+                results = store.query(
+                    query_embedding=query_embedding,
+                    n_results=top_k,
+                    where=where,
+                )
+                for i, doc in enumerate(results.get("documents", [])):
+                    chunk_id = results["ids"][i] if results.get("ids") else ""
+                    if chunk_id in seen:
+                        continue
+                    seen.add(chunk_id)
+                    chunks.append(RetrievedChunk(
+                        content=doc,
+                        metadata=(
+                            results["metadatas"][i]
+                            if results.get("metadatas")
+                            else {}
+                        ),
+                        score=(
+                            results["distances"][i]
+                            if results.get("distances")
+                            else 0.0
+                        ),
+                        chunk_id=chunk_id,
+                    ))
+            chunks.sort(key=lambda x: x.score)
+            chunks = chunks[:top_k]
+            context_parts = []
+            for i, chunk in enumerate(chunks):
+                source = chunk.metadata.get("source", "Unknown")
+                context_parts.append(
+                    f"[Source: {source}, Chunk {i + 1}]\n{chunk.content}"
+                )
+            return RAGQueryResult(
+                chunks=chunks,
+                context="\n\n---\n\n".join(context_parts),
+                query=question,
+            )
 
         # Build filter
         where = None
