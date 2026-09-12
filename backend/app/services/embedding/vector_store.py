@@ -236,6 +236,40 @@ class VectorStore:
             f"revision {revision_id or '*'} from collection {self.collection_name}"
         )
 
+    def delete_revision(
+        self, document_id: uuid.UUID, revision_id: uuid.UUID
+    ) -> None:
+        """Delete one revision's vectors from this namespace-qualified collection.
+
+        Revision-qualified by metadata: only vectors whose ``revision_id``
+        metadata equals ``revision_id`` (and whose ``document_id`` matches) are
+        removed, inside the collection selected by the revision's own recorded
+        embedding namespace (``document_views.embedding_namespace``). It NEVER
+        deletes or recreates the collection, because the collection may still
+        hold another (current / retained) revision's vectors under the same
+        model hash and dimension.
+        """
+        where = {
+            "$and": [
+                {"document_id": str(document_id)},
+                {"revision_id": str(revision_id)},
+            ]
+        }
+        try:
+            self.collection.delete(where=where)
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            logger.error(
+                f"[vector_store] ChromaDB revision delete FAILED "
+                f"({type(e).__name__}): collection={self.collection_name} "
+                f"document_id={document_id} revision_id={revision_id} — {e}",
+                exc_info=True,
+            )
+            raise
+        logger.info(
+            f"Deleted revision {revision_id} chunks for document {document_id} "
+            f"from collection {self.collection_name}"
+        )
+
     def delete_collection(self) -> None:
         """Delete the entire collection for this knowledge base."""
         client = get_chroma_client()

@@ -405,6 +405,50 @@ def _list_prop_append(var: str, prop: str, singular: str, id_param: str) -> str:
     )
 
 
+def _revision_ids_seed(var: str) -> str:
+    """Seed expr for the revision-ownership list: ``var.revision_ids`` or ``[]``."""
+    return f"coalesce({var}.revision_ids, [])"
+
+
+def _revision_ids_trim(var: str, id_param: str = "revision_id") -> str:
+    """Remove one revision from ``var.revision_ids`` (reclaim a revision).
+
+    Used by :meth:`LegalKGService.delete_revision_artifacts`: a canonical
+    entity/relationship keeps the producing revisions that still reference it,
+    so a revision is dropped from the ownership list rather than forking the
+    row.
+    """
+    return (
+        f"[rid IN coalesce({var}.revision_ids, []) WHERE rid <> ${id_param}]"
+    )
+
+
+def _revision_facts_trim(var: str, id_param: str = "revision_id") -> str:
+    """Remove one revision's ``revision_facts`` entries (see
+    :data:`_REVISION_FACT_SEP`). Entries are primitive strings
+    ``\"<revision_id>|<description>\"``.
+    """
+    sep = f"'{_REVISION_FACT_SEP}'"
+    return (
+        f"[f IN coalesce({var}.revision_facts, []) "
+        f"WHERE head(split(f, {sep})) <> ${id_param}]"
+    )
+
+
+def _other_document_ids(var: str, doc_id_param: str = "document_id") -> str:
+    """``var.document_ids`` excluding the document the reclaimed revision
+    belongs to (with the legacy singular ``document_id`` fallback).
+
+    A canonical entity is pruned only when it has no remaining revision
+    membership AND no remaining *other-document* ownership — a shared entity a
+    legacy (v1) document still references must not be destroyed by one v2
+    revision's GC.
+    """
+    return (
+        f"[d IN {_doc_ids_seed(var)} WHERE d <> ${doc_id_param}]"
+    )
+
+
 # Separator inside one ``revision_facts`` entry. Neo4j property values must be
 # primitives or arrays thereof, so entries are the primitive string
 # ``"<revision_id>|<description>"`` rather than ``{revision_id, description}``
@@ -818,6 +862,82 @@ class LegalKGService:
         except Exception as e:
             logger.error(
                 f"LegalKG delete_document({document_id}) failed: {e}",
+                exc_info=True,
+            )
+            raise
+
+    async def delete_revision_artifacts(
+        self, document_id: uuid.UUID, revision_id: uuid.UUID
+    ) -> int:
+        """Reclaim one revision's contribution to the workspace graph.
+
+        Deletes only rows that carry the producing ``revision_id``: a
+        relationship's/node's ``revision_ids`` list loses the reclaimed revision
+        and its ``revision_facts`` entry is dropped. A row is deleted only when
+        it has NO remaining membership in another revision (and no remaining
+        other-document ownership, so a MERGE-shared canonical entity a legacy
+        document still references survives). It never blind-``DETACH DELETE``s a
+        shared canonical entity, and it is idempotent: a second call for the
+        same revision returns 0.
+
+        Returns the number of deleted nodes + relationships.
+        """
+        driver = await self._get_driver()
+        label = self._label
+        doc_id_str = str(document_id)
+        rev_id_str = str(revision_id)
+        try:
+            async with driver.session() as session:
+                rel_res = await (await session.run(
+                    f"""
+                    MATCH (:`{label}`)-[r]->(:`{label}`)
+                    WHERE $revision_id IN {_revision_ids_seed('r')}
+                    WITH r, {_revision_ids_trim('r')} AS remaining,
+                         {_revision_facts_trim('r')} AS facts
+                    SET r.revision_ids = remaining,
+                        r.revision_facts = facts
+                    WITH r, remaining WHERE size(remaining) = 0
+                    DELETE r
+                    """,
+                    revision_id=rev_id_str,
+                    document_id=doc_id_str,
+                )).consume()
+
+                node_res = await (await session.run(
+                    f"""
+                    MATCH (n:`{label}`)
+                    WHERE $revision_id IN {_revision_ids_seed('n')}
+                    WITH n, {_revision_ids_trim('n')} AS remaining,
+                         {_revision_facts_trim('n')} AS facts,
+                         {_other_document_ids('n')} AS other_docs
+                    SET n.revision_ids = remaining,
+                        n.revision_facts = facts,
+                        n.document_ids = CASE WHEN size(remaining) = 0
+                                              THEN other_docs
+                                              ELSE n.document_ids END
+                    WITH n, remaining, other_docs
+                    WHERE size(remaining) = 0 AND size(other_docs) = 0
+                    DETACH DELETE n
+                    """,
+                    revision_id=rev_id_str,
+                    document_id=doc_id_str,
+                )).consume()
+
+                deleted = int(
+                    (rel_res.counters.relationships_deleted or 0)
+                    + (node_res.counters.nodes_deleted or 0)
+                )
+                logger.info(
+                    f"LegalKG delete_revision_artifacts({revision_id}) on "
+                    f"document {document_id}: {node_res.counters.nodes_deleted} "
+                    f"nodes deleted, "
+                    f"{rel_res.counters.relationships_deleted} rels deleted "
+                    f"for workspace {self.workspace_id}"
+                )
+                return deleted
+        except Exception as e:
+            logger.error(
+                f"LegalKG delete_revision_artifacts({revision_id}) failed: {e}",
                 exc_info=True,
             )
             raise

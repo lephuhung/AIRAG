@@ -9,7 +9,7 @@ historical values on resume.
 """
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from .base import ContractModel, ContractVersion, RuntimeModel
 from .binding import DocumentBindingSet
@@ -31,7 +31,17 @@ class RuntimeServices(RuntimeModel):
     The container is runtime-only and mutable so the runtime can inject the
     services a phase needs (the capability registry in Phase 2, retention leases
     in Task 9). It is never serialized into ``SupervisorV2State``.
+
+    ``retention_leases`` is the single owner of revision retention-lease SQL
+    (Task 9 / R12): the supervisor, complex subgraph, and every checkpoint
+    writer consume ``persistence.retention_leases.RevisionRetentionLeaseRepository``
+    and none duplicates lease SQL. It is typed ``Any`` because the contracts
+    package deliberately imports no runtime-framework/application module (see
+    ``test_contracts_package_imports_no_runtime_frameworks``); the repository is
+    a request-scoped service, not a business contract.
     """
+
+    retention_leases: Any = None
 
 
 class GraphRuntimeContext(ContractModel):

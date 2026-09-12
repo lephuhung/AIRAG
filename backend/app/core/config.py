@@ -385,6 +385,24 @@ class Settings(BaseSettings):
     #   "none"   — no checkpointer
     NEXUSRAG_LG_CHECKPOINTER: str = Field(default="memory")
 
+    # ── Checkpoint revision retention lease (LangGraph v2 Phase 1D, task 9) ──
+    # TTL of a ``revision_retention_leases`` row. Before a graph node emits a
+    # state update that introduces/retains a revision pin it acquires/refreshes
+    # a lease (application DB) and commits it; ``expires_at = now + TTL``. The
+    # TTL MUST be at least the longest possible run duration plus a resume
+    # grace, otherwise a still-resumable run loses its GC anchor and its
+    # revision artifacts can be reclaimed underneath it. GC never reclaims a
+    # revision or evidence payload while an unexpired lease is active.
+    CHECKPOINT_RETENTION_LEASE_TTL_HOURS: int = Field(default=24)
+
+    # ── Revision artifact GC retention window (LangGraph v2 Phase 1D, task 9) ─
+    # How long a permanently-non-current revision's external artifacts are kept
+    # after ``document_revisions.artifact_retention_starts_at`` before Predicate
+    # B may reclaim them. A tombstoned source (``documents.source_deleted_at``)
+    # short-circuits this window. An unexpired retained evidence reference
+    # always blocks reclamation regardless of the window.
+    REVISION_ARTIFACT_RETENTION_HOURS: int = Field(default=24)
+
     # Toggle LangGraph internal debug logging (prints node execution/state to console)
     NEXUSRAG_LG_DEBUG: bool = Field(default=False)
 

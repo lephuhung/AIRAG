@@ -544,6 +544,59 @@ services:
       com.hrag.service: worker-memory
       com.hrag.stack: hrag
 
+  # ── Evidence / revision artifact GC worker (LangGraph v2 Phase 1D task 9) ───
+  # Periodic one-shot GC. Each pass runs Predicate A (expired evidence payloads)
+  # then Predicate B (reclaimable revision artifacts) as SEPARATE transactions;
+  # a failure in one does not abort the other. No GPU model loaded.
+  #
+  # Interval: every hour (`--interval 3600`). Each batch takes a transaction-
+  # scoped advisory lock and locks rows FOR UPDATE SKIP LOCKED, so overlapping
+  # runs / replicas never double-delete.
+  # Migration dependency: like the backend, this service needs the v2 schema
+  # (`storage/agents/v2/persistence/migrate.py`, schema version 1) applied
+  # before it can run. Deploy the same way as the backend — with
+  # AUTO_CREATE_TABLES=true on first boot (the lifespan migration runner), or
+  # run the Release-1A migration runner explicitly — then it starts.
+  # Reclaimer: reuse `backend` env file; DATABASE_URL/NEO4J/CHROMA point at the
+  # in-stack services.
+  evidence-gc:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/hrag
+      CHROMA_HOST: chromadb
+      CHROMA_PORT: 8000
+      MINIO_ENDPOINT: http://minio:9000
+      NEO4J_URI: bolt://neo4j:7687
+      AUTO_CREATE_TABLES: "false"
+    volumes:
+      - ./backend:/app/backend:rw   # live source — `restart` picks up code changes, no rebuild
+    networks:
+      - hrag_network
+    stop_grace_period: 30s
+    command:
+      - "python"
+      - "-m"
+      - "app.workers.evidence_gc_worker"
+      - "--batch-size"
+      - "100"
+      - "--interval"
+      - "3600"
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      com.hrag.service: evidence-gc
+      com.hrag.stack: hrag
+
   # ── Backend API server ─────────────────────────────────────────────────────
   # ── OmniVoice (Text-to-Speech) ────────────────────────────────────────────
   # Port: 8880, GPU 0 (shared, ~few GB VRAM). OpenAI-compatible /v1/audio/speech.

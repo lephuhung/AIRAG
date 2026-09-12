@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import uuid
 from io import BytesIO
+from typing import Sequence
 
 import aioboto3
 from botocore.exceptions import ClientError
@@ -165,6 +166,48 @@ class StorageService:
                 code = e.response["Error"]["Code"]
                 if code not in ("404", "NoSuchKey"):
                     raise
+
+    async def delete_revision_artifacts(
+        self,
+        document_id: uuid.UUID,
+        revision_id: uuid.UUID,
+        *,
+        workspace_id: uuid.UUID | None = None,
+        artifact_keys: Sequence[str] | None = None,
+    ) -> int:
+        """Delete one revision's object artifacts (idempotent). Returns the count.
+
+        Revision artifact identity is owned by
+        ``agents.v2.persistence.document_views`` (R9): a revision owns
+        ``kb_<workspace>/revisions/<document>/<revision>/…``. ``artifact_keys``
+        carries the keys recorded on that revision's own build manifest (the
+        authoritative source — never guessed from current config). When omitted,
+        the two canonical keys are derived from ``workspace_id``; without
+        either, there is nothing to derive and the call is a no-op.
+
+        A revision id without its workspace cannot produce a key, which is why
+        the workspace is an explicit (optional) input here. Deletion is
+        idempotent: a missing object is a no-op, so a retry after a partial
+        failure converges.
+        """
+        keys: list[str] = [k for k in (artifact_keys or ()) if k]
+        if not keys and workspace_id is not None:
+            from app.services.agents.v2.persistence.document_views import (
+                revision_markdown_key,
+                revision_structure_key,
+            )
+
+            keys = [
+                revision_markdown_key(workspace_id, document_id, revision_id),
+                revision_structure_key(workspace_id, document_id, revision_id),
+            ]
+        for key in dict.fromkeys(keys):
+            await self.delete_markdown(key)
+        logger.info(
+            f"[storage] deleted {len(keys)} revision artifact(s) for "
+            f"document {document_id} revision {revision_id}"
+        )
+        return len(keys)
 
     # ------------------------------------------------------------------
     # Raw file methods (hrag-uploads bucket)
