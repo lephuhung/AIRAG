@@ -289,6 +289,15 @@ _CREATE_DDL: tuple[str, ...] = (
     # 5. revision_ingestion_attempts — one row per (document, source identity, build).
     # The named constraint ``uq_revision_ingestion_attempt_key`` is the
     # ON CONFLICT arbiter for the ingestion pipeline (brief requirement).
+    #
+    # The arbiter key is the FULL canonical ``source_object_identity``
+    # string (scheme|bucket|key|version|size|sha256), NOT the decomposed
+    # bucket/key components: two objects that share a storage key but
+    # differ in version/etag/size/sha256 are distinct ingest identities
+    # and MUST allocate separate attempts (brief: "compute_source_object_identity
+    # is the ONLY attempt key"). The component columns below are retained
+    # for audit/query convenience only.
+    #
     # revision_id is left as default NO ACTION — Phase 1C tombstones own
     # retention; an accidental parent delete must not silently orphan
     # ingestion attempt history.
@@ -296,6 +305,7 @@ _CREATE_DDL: tuple[str, ...] = (
     CREATE TABLE IF NOT EXISTS revision_ingestion_attempts (
         attempt_id              UUID        PRIMARY KEY,
         document_id             UUID        NOT NULL,
+        source_object_identity  TEXT        NOT NULL,
         source_scheme           TEXT        NOT NULL,
         source_bucket           TEXT        NOT NULL,
         source_object_key       TEXT        NOT NULL,
@@ -310,7 +320,7 @@ _CREATE_DDL: tuple[str, ...] = (
         started_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         finished_at             TIMESTAMPTZ NULL,
         CONSTRAINT uq_revision_ingestion_attempt_key UNIQUE
-            (document_id, source_scheme, source_bucket, source_object_key, build_profile),
+            (document_id, source_object_identity, build_profile),
         FOREIGN KEY (revision_id) REFERENCES document_revisions(revision_id)
     )
     """,

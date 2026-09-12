@@ -191,20 +191,33 @@ def test_document_ingestion_attempt_maps_unique_attempt_key(
     imported_app_models,
 ):
     """``DocumentIngestionAttempt`` maps the unique
-    ``(document_id, source_scheme, source_bucket, source_object_key,
-    build_profile)`` key. The migration installs this as a NAMED
-    constraint ``uq_revision_ingestion_attempt_key``; the ORM mapping
-    must reflect the same key.
+    ``(document_id, source_object_identity, build_profile)`` key. The
+    migration installs this as a NAMED constraint
+    ``uq_revision_ingestion_attempt_key``; the ORM mapping must reflect
+    the same key.
+
+    The arbiter is the FULL canonical ``source_object_identity`` string
+    (scheme|bucket|key|version|size|sha256) — NOT the decomposed
+    bucket/key components, which are retained only for audit/query
+    convenience.
     """
     from sqlalchemy import UniqueConstraint
 
     from app.models.document_ingestion_attempt import DocumentIngestionAttempt
 
     table = DocumentIngestionAttempt.__table__
-    cols = {"document_id", "source_scheme", "source_bucket",
-            "source_object_key", "build_profile"}
-    assert cols.issubset(set(table.c.keys())), (
-        f"missing columns: {sorted(cols - set(table.c.keys()))}"
+    cols = {"document_id", "source_object_identity", "build_profile"}
+    audit_cols = {
+        "source_scheme",
+        "source_bucket",
+        "source_object_key",
+        "source_version_id",
+        "source_etag",
+        "source_size",
+        "source_sha256",
+    }
+    assert (cols | audit_cols).issubset(set(table.c.keys())), (
+        f"missing columns: {sorted((cols | audit_cols) - set(table.c.keys()))}"
     )
     uq = next(
         (c for c in table.constraints if isinstance(c, UniqueConstraint)),

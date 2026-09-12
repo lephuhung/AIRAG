@@ -6,17 +6,20 @@ even though the underlying table is ``revision_ingestion_attempts``
 (because attempts are owned by a revision once one exists).
 
 The unique constraint ``uq_revision_ingestion_attempt_key`` on
-``(document_id, source_scheme, source_bucket, source_object_key,
-build_profile)`` is the ``ON CONFLICT`` arbiter for the ingestion
-pipeline. Phase 1C's ``get_or_create_ingestion_attempt`` uses this
-key as the idempotency boundary — re-delivery of the same webhook
-returns the existing ``revision_id`` instead of allocating a new
-generation.
+``(document_id, source_object_identity, build_profile)`` is the
+``ON CONFLICT`` arbiter for the ingestion pipeline. Phase 1C's
+``get_or_create_ingestion_attempt`` uses this key as the idempotency
+boundary — re-delivery of the same webhook returns the existing
+``revision_id`` instead of allocating a new generation. The arbiter is
+the FULL canonical identity string (see
+:func:`app.services.agents.v2.persistence.source_identity.compute_source_object_identity`),
+so two objects that share a bucket/key but differ in version, etag, size
+or sha256 are distinct attempts.
 
 Canonical source component columns (``source_scheme``,
 ``source_bucket``, ``source_object_key``, ``source_version_id``,
-``source_etag``, ``source_size``, ``source_sha256``) capture every
-selector used to identify the storage object:
+``source_etag``, ``source_size``, ``source_sha256``) are retained for
+audit/query convenience only — they are NOT the arbiter.
 
 - ``source_scheme``     — protocol (e.g. ``s3v1``)
 - ``source_bucket``     — bucket name
@@ -60,6 +63,11 @@ class DocumentIngestionAttempt(Base):
     )
     document_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), nullable=False
+    )
+
+    # Canonical source identity — the FULL attempt key (arbiter).
+    source_object_identity: Mapped[str] = mapped_column(
+        Text, nullable=False
     )
 
     # Canonical source component columns (see module docstring).
@@ -107,15 +115,13 @@ class DocumentIngestionAttempt(Base):
     __table_args__ = (
         # Mirrors the named SQL constraint
         # ``uq_revision_ingestion_attempt_key UNIQUE
-        # (document_id, source_scheme, source_bucket, source_object_key,
-        # build_profile)`` installed by the migration. The name is
-        # preserved so any DDL emitted by ``create_all`` on a fresh
-        # DB matches the migration's expectation.
+        # (document_id, source_object_identity, build_profile)``
+        # installed by the migration. The name is preserved so any DDL
+        # emitted by ``create_all`` on a fresh DB matches the
+        # migration's expectation.
         UniqueConstraint(
             "document_id",
-            "source_scheme",
-            "source_bucket",
-            "source_object_key",
+            "source_object_identity",
             "build_profile",
             name="uq_revision_ingestion_attempt_key",
         ),
