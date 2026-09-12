@@ -34,6 +34,7 @@ from app.services.models.parsed_document import ExtractedImage, ExtractedTable
 from app.services.storage_service import get_storage_service
 from app.services.agents.v2.persistence.document_views import (
     load_revision_vector_manifest,
+    revision_markdown_key,
     revision_vector_id,
 )
 from app.services.embedding.vector_store import get_vector_store
@@ -168,7 +169,7 @@ async def handle_caption(payload: dict) -> None:
                     )
 
             # ── Update markdown in MinIO with table captions injected ───────
-            if has_tables and db_tables and document.markdown_s3_key:
+            if has_tables and db_tables:
                 all_ext_tables = [
                     ExtractedTable(
                         table_id=tbl.table_id,
@@ -181,16 +182,27 @@ async def handle_caption(payload: dict) -> None:
                     )
                     for tbl in db_tables
                 ]
+                # Read AND write THIS revision's own markdown artifact. Using
+                # the legacy document-level key here wrote the enriched copy
+                # to ``kb_<ws>/doc_<doc>.md`` and left the served revision
+                # artifact stale (and the legacy key must never be touched by
+                # a v2 build). ``revision_markdown_key`` is deterministic and
+                # matches what ``parse_worker`` uploaded for this revision.
+                revision_md_key = revision_markdown_key(
+                    msg.workspace_id, msg.document_id, msg.revision_id
+                )
                 storage = get_storage_service()
-                current_md = await storage.download_markdown(document.markdown_s3_key)
+                current_md = await storage.download_markdown(revision_md_key)
                 parser = DeepDocumentParser(workspace_id=msg.workspace_id)
                 updated_md = parser._inject_table_captions(current_md, all_ext_tables)
                 await storage.upload_markdown(
                     workspace_id=msg.workspace_id,
                     document_id=msg.document_id,
                     content=updated_md,
+                    key=revision_md_key,
                 )
-                # key unchanged — no DB update needed
+                # Key unchanged (same revision-qualified artifact, replaced in
+                # place) — no DB update needed.
 
             # ── Re-embed chunks enriched with captions ──────────────────────
             # Only if there were actual captions generated

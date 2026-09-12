@@ -496,3 +496,73 @@ async def test_markdown_endpoint_serves_the_current_revision(
     assert context["total_chunks"] == 2
     assert context["revision_id"] is not None
     assert [c["content"] for c in context["chunks"]] == ["c0", "c1"]
+
+
+# ---------------------------------------------------------------------------
+# M3 — no draft allocation on a tombstoned document
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_process_and_reindex_reject_tombstoned_document(
+    async_db, document_factory
+):
+    """A soft-deleted document must never be reprocessed.
+
+    Allocating a draft revision here would revive the pipeline (and publish new
+    artifacts) for a document every read path treats as gone. Typed 409 so the
+    caller can distinguish it from a plain 404.
+    """
+    from fastapi import HTTPException
+
+    from app.api import rag as rag_api
+
+    doc_id = document_factory()
+    repo = DocumentRevisionsRepository(async_db)
+    await repo.mark_source_deleted(doc_id, reason="document_deleted")
+    await async_db.commit()
+
+    for endpoint in (rag_api.process_document, rag_api.reindex_document):
+        with pytest.raises(HTTPException) as exc:
+            await endpoint(document_id=doc_id, db=async_db, user=None)
+        assert exc.value.status_code == 409
+        assert exc.value.detail["code"] == "DOCUMENT_TOMBSTONED"
+
+
+@pytest.mark.asyncio
+async def test_reindex_workspace_skips_tombstoned_documents(
+    async_db, document_factory, monkeypatch
+):
+    from fastapi import BackgroundTasks
+
+    from app.api import rag as rag_api
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(rag_api, "verify_workspace_access", _noop)
+
+    ws_live = uuid.uuid4()
+    live = document_factory(workspace_id=ws_live)
+    ws_dead = uuid.uuid4()
+    dead = document_factory(workspace_id=ws_dead)
+    repo = DocumentRevisionsRepository(async_db)
+    await repo.mark_source_deleted(dead, reason="document_deleted")
+    await async_db.commit()
+
+    dead_resp = await rag_api.reindex_workspace(
+        workspace_id=ws_dead,
+        background_tasks=BackgroundTasks(),
+        db=async_db,
+        user=None,
+    )
+    assert dead_resp["document_count"] == 0
+
+    live_resp = await rag_api.reindex_workspace(
+        workspace_id=ws_live,
+        background_tasks=BackgroundTasks(),
+        db=async_db,
+        user=None,
+    )
+    assert live_resp["document_count"] == 1
+    assert live_resp["document_ids"] == [live]

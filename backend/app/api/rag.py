@@ -66,6 +66,24 @@ _IN_PROGRESS = (
 _CITATION_ID_CHARS = string.ascii_lowercase + string.digits
 
 
+def _reject_tombstoned_document(document: Document) -> None:
+    """Refuse to reprocess a soft-deleted (tombstoned) document.
+
+    Tombstoning (``DELETE /documents/{id}``) must be terminal for the pipeline:
+    allocating a draft revision here would revive the document's pipeline and
+    publish new artifacts even though every read path treats it as gone. Typed
+    ``409 DOCUMENT_TOMBSTONED`` so callers can tell it apart from a plain 404.
+    """
+    if document.source_deleted_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "DOCUMENT_TOMBSTONED",
+                "message": f"Document {document.id} is deleted",
+            },
+        )
+
+
 def _generate_citation_id(existing: set[str]) -> str:
     """Generate a unique 4-char alphanumeric citation ID.
 
@@ -287,6 +305,8 @@ async def process_document(
     if document is None:
         raise NotFoundError("Document", document_id)
 
+    _reject_tombstoned_document(document)
+
     if document.status in _IN_PROGRESS:
         # Allow re-trigger if embed never ran (e.g. message was dropped by RabbitMQ).
         # A truly in-progress document will have embed_done or captions_done progressing.
@@ -479,6 +499,8 @@ async def reindex_document(
     if document is None:
         raise NotFoundError("Document", document_id)
 
+    _reject_tombstoned_document(document)
+
     if document.status in _IN_PROGRESS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -562,6 +584,7 @@ async def reindex_workspace(
     result = await db.execute(
         select(Document).where(
             Document.workspace_id == workspace_id,
+            Document.source_deleted_at.is_(None),
             Document.status.notin_(list(_IN_PROGRESS)),
         )
     )
@@ -580,7 +603,9 @@ async def reindex_workspace(
                         select(Document).where(Document.id == did)
                     )
                     doc = res.scalar_one_or_none()
-                    if not doc:
+                    if not doc or doc.source_deleted_at is not None:
+                        # Tombstoned after the endpoint's filter: skip rather
+                        # than allocate a draft on a deleted document.
                         continue
 
                     if not doc.upload_s3_key:

@@ -1425,19 +1425,34 @@ async def search_document_section(
             doc_uuids = [uuid.UUID(str(d)) for d in document_ids]
         except Exception:
             doc_uuids = []
-        targets = []
+        # Resolve per workspace: a document is only eligible in the workspace
+        # that owns it (the same tenancy check ``api/rag.py`` applies), so a
+        # caller-named document id can never bind a vector store to another
+        # workspace's revision.
+        targets_by_workspace: dict[str, list] = {}
         if doc_uuids:
-            try:
-                async with async_session_maker() as _target_db:
-                    targets = await resolve_document_targets(_target_db, doc_uuids)
-            except RevisionNotReady:
-                # A current pointer that is not published/artifact-complete is a
-                # typed REVISION_NOT_READY, not a server error. Fail closed:
-                # never fall back to the document-scoped legacy store, which
-                # could still hold the superseded revision's chunks.
-                targets = []
+            async with async_session_maker() as _target_db:
+                for ws_id in workspace_ids:
+                    try:
+                        ws_uuid = uuid.UUID(str(ws_id))
+                    except Exception:
+                        targets_by_workspace[str(ws_id)] = []
+                        continue
+                    try:
+                        targets_by_workspace[str(ws_id)] = (
+                            await resolve_document_targets(
+                                _target_db, doc_uuids, workspace_id=ws_uuid
+                            )
+                        )
+                    except RevisionNotReady:
+                        # A current pointer that is not published/artifact-
+                        # complete is a typed REVISION_NOT_READY, not a server
+                        # error. Fail closed: never fall back to the document-
+                        # scoped legacy store, which could still hold the
+                        # superseded revision's chunks.
+                        targets_by_workspace[str(ws_id)] = []
         for ws_id in workspace_ids:
-            for target in targets:
+            for target in targets_by_workspace.get(str(ws_id), []):
                 if not target.eligible:
                     # Tombstoned / outside the requested workspace: skip rather
                     # than fall back to the document-scoped legacy store, which

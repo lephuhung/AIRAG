@@ -50,6 +50,8 @@ class GcRunSummary:
 
     evidence: Optional[EvidencePayloadGcResult] = None
     revision: Optional[RevisionArtifactGcResult] = None
+    #: Expired retention leases marked released by this pass.
+    leases_released: int = 0
     #: ``"<batch>: <exception repr>"`` for every batch that failed.
     failures: tuple[str, ...] = ()
 
@@ -58,25 +60,44 @@ class GcRunSummary:
         return not self.failures
 
 
+async def sweep_expired_leases(session) -> int:
+    """Release expired retention leases; the caller owns the transaction.
+
+    Expiry already unblocks GC (the predicate requires ``expires_at > now()``),
+    so this is the hygiene sweep that also gives an orphan lease (lease commit
+    succeeded, checkpoint failed) a terminal ``expired`` release reason. Without
+    a production caller such leases would stay ``released_at IS NULL`` forever.
+    """
+    from app.services.agents.v2.persistence.retention_leases import (
+        RevisionRetentionLeaseRepository,
+    )
+
+    return await RevisionRetentionLeaseRepository(session).sweep_expired()
+
+
 async def run_both_batches(
     batch_size: int = DEFAULT_BATCH_SIZE,
     *,
     session_factory: Optional[Callable] = None,
     evidence_batcher: Optional[Callable] = None,
     revision_batcher: Optional[Callable] = None,
+    lease_sweeper: Optional[Callable] = None,
 ) -> GcRunSummary:
-    """Run Predicate A then Predicate B, each in its own transaction.
+    """Run Predicate A then Predicate B then the lease sweep, each in its own
+    transaction.
 
-    ``session_factory``/``evidence_batcher``/``revision_batcher`` are injectable
-    so the worker's transaction separation and failure isolation are testable
-    without external services.
+    ``session_factory``/``evidence_batcher``/``revision_batcher``/
+    ``lease_sweeper`` are injectable so the worker's transaction separation and
+    failure isolation are testable without external services.
     """
     factory = session_factory or AsyncSessionLocal
     evidence_batcher = evidence_batcher or run_evidence_payload_gc_batch
     revision_batcher = revision_batcher or run_revision_artifact_gc_batch
+    lease_sweeper = lease_sweeper or sweep_expired_leases
 
     evidence_result: Optional[EvidencePayloadGcResult] = None
     revision_result: Optional[RevisionArtifactGcResult] = None
+    leases_released = 0
     failures: list[str] = []
 
     # A then B as SEPARATE transactions: a failure in A must not abort B (and
@@ -98,9 +119,20 @@ async def run_both_batches(
         else:
             revision_result = result
 
+    # Retention-lease hygiene sweep — its own transaction so a lease-table
+    # problem cannot abort either artifact batch (and vice versa).
+    try:
+        async with factory() as session:
+            async with session.begin():
+                leases_released = await lease_sweeper(session)
+    except Exception as exc:  # noqa: BLE001 — must not kill the artifact batches
+        logger.exception("[evidence_gc] lease sweep failed (continuing)")
+        failures.append(f"leases: {exc!r}")
+
     return GcRunSummary(
         evidence=evidence_result,
         revision=revision_result,
+        leases_released=leases_released,
         failures=tuple(failures),
     )
 
@@ -110,9 +142,10 @@ def _log_summary(summary: GcRunSummary) -> None:
     revision = summary.revision
     logger.info(
         "[evidence_gc] pass complete: evidence_purged=%s revision_reclaimed=%s "
-        "failures=%s",
+        "leases_released=%s failures=%s",
         evidence.purged if evidence else "-",
         revision.reclaimed if revision else "-",
+        summary.leases_released,
         list(summary.failures),
     )
 

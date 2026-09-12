@@ -1334,3 +1334,66 @@ async def test_check_and_finalize_indexes_a_published_revision(
     assert row.status == "published"
     assert fresh.status == DocumentStatus.INDEXED
     assert fresh.current_revision_id == revision_id
+
+
+@pytest.mark.asyncio
+async def test_stale_revision_failure_does_not_fail_a_live_document(
+    async_engine, document_factory, monkeypatch
+):
+    """A superseded revision's late failure must not touch the live mirror.
+
+    The document's current pointer names a newer published revision; the older
+    revision then terminalizes ``failed`` (e.g. its own finalize finds the
+    artifact set incomplete). Without the generation guard the mirror would be
+    rewritten to FAILED, permanently reporting a healthy, indexed document as
+    failed.
+    """
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        stale, _stale_profile = await allocate_reindex_revision(
+            db,
+            doc_id,
+            object_key=_doc_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256="1" * 64,
+            version_id="v-1",
+        )
+        current, current_profile = await allocate_reindex_revision(
+            db,
+            doc_id,
+            object_key=_doc_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256="1" * 64,
+            version_id="v-2",
+        )
+        await _record_complete_artifacts(db, current, current_profile)
+        await db.commit()
+        stale_id = stale.revision_id
+        current_id = current.revision_id
+
+    # The newer revision publishes and becomes the document's current pointer.
+    result = await finalize_revision_if_complete(current_id, expect_complete=True)
+    assert result.outcome is FinalizeOutcome.PUBLISHED
+    await apply_finalize_outcome(doc_id, result, revision_id=current_id)
+
+    async with maker() as db:
+        document = await db.get(Document, doc_id)
+    assert document.status == DocumentStatus.INDEXED
+    assert document.current_revision_id == current_id
+
+    # The stale revision's late finalize failure arrives afterwards.
+    stale_result = await finalize_revision_if_complete(
+        stale_id, expect_complete=True
+    )
+    assert stale_result.outcome is FinalizeOutcome.FAILED
+    await apply_finalize_outcome(doc_id, stale_result, revision_id=stale_id)
+
+    async with maker() as db:
+        fresh = await db.get(Document, doc_id)
+        stale_row = await db.get(DocumentRevision, stale_id)
+    assert stale_row.status == "failed"
+    assert fresh.status == DocumentStatus.INDEXED
+    assert fresh.status != DocumentStatus.FAILED

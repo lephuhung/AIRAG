@@ -394,8 +394,12 @@ async def handle_parse(payload: dict) -> None:
                     msg.revision_id, expect_complete=True
                 )
                 # The document must never read INDEXED unless the revision
-                # actually published; a verify failure mirrors FAILED.
-                await apply_finalize_outcome(msg.document_id, result)
+                # actually published; a verify failure mirrors FAILED — but only
+                # while THIS revision is still the document's current pointer
+                # (a superseded build's late failure must not fail a live one).
+                await apply_finalize_outcome(
+                    msg.document_id, result, revision_id=msg.revision_id
+                )
                 if result.outcome is FinalizeOutcome.PUBLISHED:
                     logger.info(
                         f"[parse_worker] doc={msg.document_id} rev={msg.revision_id} "

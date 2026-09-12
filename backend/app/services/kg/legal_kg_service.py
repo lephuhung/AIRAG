@@ -470,13 +470,17 @@ def _revision_facts_init(id_param: str, desc_param: str) -> str:
     """The ``ON CREATE`` seed for ``revision_facts``: one entry for the writer.
 
     A freshly created row has no prior entry, so the producing revision owns
-    exactly one fact string. Kept beside :func:`_revision_facts_append` so the
-    string encoding has a single definition.
+    exactly one fact string. A ``None`` description is coalesced to ``''``:
+    Neo4j rejects a property array containing null
+    (``Collections containing null values can not be stored in properties``),
+    and an ingest failure is swallowed, which would silently empty the graph.
+    Kept beside :func:`_revision_facts_append` so the string encoding has a
+    single definition.
     """
     sep = f"'{_REVISION_FACT_SEP}'"
     return (
         f"CASE WHEN ${id_param} IS NULL THEN [] "
-        f"ELSE [${id_param} + {sep} + ${desc_param}] END"
+        f"ELSE [${id_param} + {sep} + coalesce(${desc_param}, '')] END"
     )
 
 
@@ -488,16 +492,17 @@ def _revision_facts_append(var: str, id_param: str, desc_param: str) -> str:
     :data:`_REVISION_FACT_SEP`). A canonical entity/relationship stays shared
     across revisions, but its fact text does not: writing R2's description must
     not overwrite R1's, because an R1-scoped read of a shared node would then
-    return R2's fact (last-writer-wins leak). An empty description leaves the
-    prior entry for that revision intact; re-ingesting the same revision
-    replaces only its own entry.
+    return R2's fact (last-writer-wins leak). An empty (or ``None``-coalesced)
+    description leaves the prior entry for that revision intact; re-ingesting
+    the same revision replaces only its own entry.
     """
     sep = f"'{_REVISION_FACT_SEP}'"
     seed = f"coalesce({var}.revision_facts, [])"
     kept = f"[f IN {seed} WHERE head(split(f, {sep})) <> ${id_param} | f]"
     return (
-        f"CASE WHEN ${id_param} IS NULL OR ${desc_param} = '' THEN {seed} "
-        f"ELSE {kept} + [${id_param} + {sep} + ${desc_param}] END"
+        f"CASE WHEN ${id_param} IS NULL "
+        f"OR coalesce(${desc_param}, '') = '' THEN {seed} "
+        f"ELSE {kept} + [${id_param} + {sep} + coalesce(${desc_param}, '')] END"
     )
 
 

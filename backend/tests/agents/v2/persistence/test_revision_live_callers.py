@@ -614,9 +614,52 @@ async def test_revision_kg_writes_store_fact_text_per_revision():
     # The append is revision-keyed and never overwrites another revision's entry.
     assert f"head(split(f, '{sep}')) <> $revision_id" in node_cypher
     assert f"head(split(f, '{sep}')) <> $revision_id" in rel_cypher
-    # Primitive-string encoding on BOTH branches (CREATE and MATCH).
-    assert f"[$revision_id + '{sep}' + $description]" in node_cypher
-    assert f"[$revision_id + '{sep}' + $desc]" in rel_cypher
+    # Primitive-string encoding on BOTH branches (CREATE and MATCH), with a
+    # null-coalesced description so a ``None`` fact text cannot put a null
+    # element in the property array (Neo4j rejects that).
+    assert f"[$revision_id + '{sep}' + coalesce($description, '')]" in node_cypher
+    assert f"[$revision_id + '{sep}' + coalesce($desc, '')]" in rel_cypher
+
+
+@pytest.mark.asyncio
+async def test_revision_kg_fact_cypher_coalesces_null_description():
+    """A ``None`` description must never produce a null array element.
+
+    Neo4j rejects a property array containing null
+    (``Collections containing null values can not be stored in properties``),
+    and ``kg_worker`` swallows an ingest failure — a resolved-entity path that
+    emits ``"description": null`` would silently empty the v2 graph. Every
+    generated fact expression must coalesce the description to ``''``.
+    """
+    from app.services.kg import legal_kg_service as kg
+
+    service = kg.LegalKGService(uuid.uuid4())
+    doc = uuid.uuid4()
+    rev = uuid.uuid4()
+    driver = _CapturingDriver()
+    await service._upsert_document_root(
+        driver.session(), "Nghị định 53/2022", "Nghị định 53/2022",
+        str(doc), None, revision_id=str(rev),
+    )
+    await service._upsert_node(
+        driver.session(), "Cục Thuế", "Organization", None, str(doc),
+        revision_id=str(rev),
+    )
+    await service._upsert_relation(
+        driver.session(), "Cục Thuế", "BAN_HANH", "Nghị định 53/2022",
+        None, str(doc),
+        source_type="Organization", target_type="Document", revision_id=str(rev),
+    )
+
+    for cypher, _params in driver.calls:
+        assert "revision_facts" in cypher
+        assert (
+            "coalesce($description, '')" in cypher
+            or "coalesce($desc, '')" in cypher
+        )
+        # The bare (nullable) interpolation must be gone from every fact expr.
+        assert " + $description]" not in cypher
+        assert " + $desc]" not in cypher
 
 
 @pytest.mark.asyncio
@@ -653,8 +696,9 @@ async def test_revision_kg_write_cypher_uses_only_primitive_property_values():
         # A map literal is not a legal Neo4j property value.
         assert "{revision_id:" not in cypher
         assert "revision_id:" not in cypher
-        # The primitive string encoding is used on both branches.
-        assert f"[$revision_id + '{sep}' +" in cypher
+        # The primitive string encoding is used on both branches, with a
+        # coalesced description (never a nullable interpolation).
+        assert f"[$revision_id + '{sep}' + coalesce(" in cypher
         assert f"head(split(f, '{sep}')) <> $revision_id" in cypher
 
 

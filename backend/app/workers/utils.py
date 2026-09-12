@@ -445,7 +445,9 @@ async def finalize_revision_if_complete(
         return FinalizeResult(FinalizeOutcome.PUBLISHED)
 
 
-async def apply_finalize_outcome(document_id, result: FinalizeResult) -> None:
+async def apply_finalize_outcome(
+    document_id, result: FinalizeResult, *, revision_id=None
+) -> None:
     """Mirror a finalization outcome onto the ``Document`` row (v1/UI mirror).
 
     The revision is authoritative: ``INDEXED`` is written ONLY for
@@ -453,6 +455,13 @@ async def apply_finalize_outcome(document_id, result: FinalizeResult) -> None:
     with the failure stage/class — so a document is never reported indexed
     while its revision failed. ``NOT_READY`` / ``ABANDONED`` / ``NO_REVISION``
     leave the mirror untouched (the pipeline outcome is not final).
+
+    ``revision_id`` is the generation guard: once the document's stable
+    pointer (``current_revision_id``) names a different revision, this
+    revision's late outcome no longer describes the document. A superseded
+    build's failure must never mark a live, newer document permanently
+    ``FAILED`` (nor a losing ``PUBLISHED`` rewrite the pointer's status), so
+    the mirror is left untouched in that case.
     """
     from app.core.database import async_session_maker
 
@@ -462,6 +471,17 @@ async def apply_finalize_outcome(document_id, result: FinalizeResult) -> None:
         )
         fresh = row.scalar_one_or_none()
         if fresh is None:
+            return
+        if (
+            revision_id is not None
+            and fresh.current_revision_id is not None
+            and fresh.current_revision_id != revision_id
+        ):
+            logger.info(
+                f"[finalize] doc={document_id} ignoring {result.outcome.value} "
+                f"from superseded revision {revision_id} "
+                f"(current={fresh.current_revision_id})"
+            )
             return
         # FAILED is terminal — only an admin retry clears it, and its error
         # message (the original stage failure) is more useful than ours.
@@ -598,4 +618,4 @@ async def check_and_finalize(
         outcome = await finalize_revision_if_complete(
             revision_id, expect_complete=True
         )
-        await apply_finalize_outcome(document.id, outcome)
+        await apply_finalize_outcome(document.id, outcome, revision_id=revision_id)

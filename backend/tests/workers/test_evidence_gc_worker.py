@@ -110,6 +110,71 @@ async def test_revision_failure_does_not_abort_evidence_batch(async_engine):
 
 
 @pytest.mark.asyncio
+async def test_worker_sweeps_expired_leases_in_a_separate_transaction(async_engine):
+    """``sweep_expired`` has a production caller and its own transaction.
+
+    Without this pass an orphan lease (lease commit succeeded, checkpoint
+    failed) would stay ``released_at IS NULL`` forever.
+    """
+    session_factory = _session_factory(async_engine)
+    seen: list[tuple[str, object, bool]] = []
+
+    async def evidence_batcher(session, *, batch_size):
+        seen.append(("evidence", session, session.in_transaction()))
+        return EvidencePayloadGcResult(purged=1)
+
+    async def revision_batcher(session, *, batch_size):
+        seen.append(("revision", session, session.in_transaction()))
+        return RevisionArtifactGcResult(reclaimed=2)
+
+    async def lease_sweeper(session):
+        seen.append(("leases", session, session.in_transaction()))
+        return 3
+
+    summary = await worker.run_both_batches(
+        session_factory=session_factory,
+        evidence_batcher=evidence_batcher,
+        revision_batcher=revision_batcher,
+        lease_sweeper=lease_sweeper,
+    )
+
+    assert [entry[0] for entry in seen] == ["evidence", "revision", "leases"]
+    assert seen[0][1] is not seen[2][1]  # separate session => separate tx
+    assert seen[2][2]
+    assert summary.leases_released == 3
+    assert summary.ok
+
+
+@pytest.mark.asyncio
+async def test_lease_sweep_failure_does_not_abort_the_artifact_batches(
+    async_engine,
+):
+    session_factory = _session_factory(async_engine)
+
+    async def evidence_batcher(session, *, batch_size):
+        return EvidencePayloadGcResult(purged=1)
+
+    async def revision_batcher(session, *, batch_size):
+        return RevisionArtifactGcResult(reclaimed=2)
+
+    async def lease_sweeper(session):
+        raise RuntimeError("lease table down")
+
+    summary = await worker.run_both_batches(
+        session_factory=session_factory,
+        evidence_batcher=evidence_batcher,
+        revision_batcher=revision_batcher,
+        lease_sweeper=lease_sweeper,
+    )
+
+    assert summary.evidence == EvidencePayloadGcResult(purged=1)
+    assert summary.revision == RevisionArtifactGcResult(reclaimed=2)
+    assert summary.leases_released == 0
+    assert any(failure.startswith("leases:") for failure in summary.failures)
+    assert not summary.ok
+
+
+@pytest.mark.asyncio
 async def test_worker_purges_expired_evidence_with_the_real_batcher(
     async_engine, committed_evidence
 ):

@@ -43,6 +43,27 @@ from app.services.llm.types import LLMMessage
 
 logger = logging.getLogger(__name__)
 
+# lightrag keeps ONE workspace-level graph (LightRAG tracks no per-document or
+# per-revision provenance), so the v2 revision-scoped KG isolation contract
+# cannot be honoured in this mode: a fact produced by revision R1 is not
+# distinguishable from one produced by R2. The revision kwargs are therefore
+# accepted for interface parity with ``LegalKGService`` and ignored. Warn once
+# per operation kind rather than on every ingest/query/GC call.
+_revision_kwargs_warned: set[str] = set()
+
+
+def _warn_revision_kwargs_ignored(operation: str) -> None:
+    """One-time warning that lightrag cannot honour revision-scoped KG."""
+    if operation in _revision_kwargs_warned:
+        return
+    _revision_kwargs_warned.add(operation)
+    logger.warning(
+        "lightrag KG mode does not support v2 revision-scoped KG isolation; "
+        "%s ignores the revision kwarg(s) and the workspace-level graph is "
+        "used instead. Use HRAG_KG_MODE=legal for per-revision provenance.",
+        operation,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Provider-based adapters for LightRAG
@@ -69,6 +90,13 @@ class KnowledgeGraphService:
     Storage backend is selected by HRAG_KG_GRAPH_BACKEND:
       - "networkx" (default): file-based per-workspace storage
       - "neo4j": shared Neo4j instance with per-workspace node labels
+
+    **v2 revision-scoped KG is unsupported in this mode.** The graph is keyed by
+    workspace only; LightRAG offers no per-revision provenance, so the v2
+    ``revision_id`` / ``revision_ids`` kwargs are accepted for interface parity
+    with :class:`~app.services.kg.legal_kg_service.LegalKGService` and ignored
+    (one warning per operation). Use ``HRAG_KG_MODE=legal`` when revision-scoped
+    KG isolation is required.
     """
 
     def __init__(self, workspace_id: uuid.UUID):
@@ -263,12 +291,24 @@ class KnowledgeGraphService:
         )
         return self._rag
 
-    async def ingest(self, markdown_content: str, document_id: Optional[uuid.UUID] = None) -> None:
+    async def ingest(
+        self,
+        markdown_content: str,
+        document_id: Optional[uuid.UUID] = None,
+        revision_id: Optional[uuid.UUID] = None,
+    ) -> None:
         """
         Ingest markdown content into the knowledge graph.
         LightRAG extracts entities and relationships automatically.
         If document_id is provided, flush the LLM extraction logs to MinIO.
+
+        ``revision_id`` is accepted for interface parity with
+        :class:`LegalKGService` but ignored — this backend has no per-revision
+        provenance (see the class docstring). Facts land in the workspace-level
+        graph shared by every revision.
         """
+        if revision_id is not None:
+            _warn_revision_kwargs_ignored("ingest")
         rag = await self._get_rag()
 
         if not markdown_content.strip():
@@ -455,6 +495,26 @@ class KnowledgeGraphService:
                 f"Workspace={self.workspace_id}. "
                 f"Consider using delete_project_data() for full workspace wipe."
             )
+
+    async def delete_revision_artifacts(
+        self, document_id: uuid.UUID, revision_id: uuid.UUID
+    ) -> int:
+        """Best-effort no-op: lightrag cannot reclaim one revision's KG rows.
+
+        Interface parity with :class:`LegalKGService` so revision GC does not
+        raise ``TypeError`` in lightrag mode. Returns 0 (nothing deleted): the
+        workspace-level graph carries no per-revision provenance to filter on,
+        so no row can be attributed to this revision. A warning is logged once;
+        per-workspace reclamation is ``delete_project_data()``.
+        """
+        _warn_revision_kwargs_ignored("delete_revision_artifacts")
+        logger.warning(
+            f"KnowledgeGraphService.delete_revision_artifacts({revision_id}) on "
+            f"document {document_id}: lightrag cannot reclaim a single "
+            f"revision's KG rows (workspace-scoped graph); returning 0. "
+            f"Use delete_project_data() for a full workspace wipe."
+        )
+        return 0
 
     # ------------------------------------------------------------------
     # Knowledge Graph exploration (Phase 9)
@@ -734,6 +794,7 @@ class KnowledgeGraphService:
         question: str,
         max_entities: int = 20,
         max_relationships: int = 30,
+        revision_ids: Optional[list[uuid.UUID] | list[str]] = None,
     ) -> str:
         """
         Build RAG context from raw KG data (no LLM generation).
@@ -742,9 +803,15 @@ class KnowledgeGraphService:
           - Neo4j backend: single Cypher query filters server-side.
           - NetworkX backend: fast in-memory keyword match with index.
 
+        ``revision_ids`` is accepted for interface parity with
+        :class:`LegalKGService` but ignored — the workspace-level graph carries
+        no revision provenance (see the class docstring).
+
         Returns:
             Structured string of entities + relationships, or "" if nothing found.
         """
+        if revision_ids:
+            _warn_revision_kwargs_ignored("get_relevant_context")
         # -- 1. Extract keywords from question --
         raw_tokens = question.lower().split()
         keywords = set()
