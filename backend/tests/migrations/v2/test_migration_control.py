@@ -11,10 +11,13 @@ import os
 
 import psycopg
 import pytest
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 
 from app.services.agents.v2.persistence.migrate import (
     V2_SCHEMA_V1_TABLES,
     apply_v2_schema,
+    make_engine,
 )
 
 V2_DSN = os.environ.get(
@@ -23,23 +26,38 @@ V2_DSN = os.environ.get(
 )
 
 
-def _table_names(conn: psycopg.Connection) -> frozenset[str]:
-    with conn.cursor() as cur:
-        cur.execute(
+def _table_names(conn) -> frozenset[str]:
+    rows = conn.execute(
+        text(
             "SELECT table_name FROM information_schema.tables "
             "WHERE table_schema = 'public'"
         )
-        return frozenset(row[0] for row in cur.fetchall())
+    ).fetchall()
+    return frozenset(row[0] for row in rows)
 
 
 @pytest.fixture
-def db() -> psycopg.Connection:
-    conn = psycopg.connect(V2_DSN, autocommit=False)
+def db() -> Engine:
+    """A SQLAlchemy ``Engine`` pointed at the v2 test database.
+
+    The migration runner takes an ``Engine``; tests that need raw
+    connection access call ``engine.connect()`` inside the test.
+    """
+    engine = make_engine(V2_DSN)
     try:
-        yield conn
+        yield engine
     finally:
-        conn.rollback()
-        conn.close()
+        engine.dispose()
+
+
+def _psycopg_connect() -> psycopg.Connection:
+    """Legacy psycopg connection used only for setup/teardown DDL.
+
+    The migration runner is sync-SQLAlchemy-only; setup helpers may use
+    psycopg for brevity, but the migration itself is always driven via
+    the ``Engine`` API.
+    """
+    return psycopg.connect(V2_DSN, autocommit=False)
 
 
 def test_v2_schema_v1_tables_constant_is_frozen_set() -> None:
@@ -47,22 +65,36 @@ def test_v2_schema_v1_tables_constant_is_frozen_set() -> None:
     assert len(V2_SCHEMA_V1_TABLES) == 12
 
 
-def test_schema_delta_is_exactly_v2_tables(db: psycopg.Connection) -> None:
+def test_schema_delta_is_exactly_v2_tables(db: Engine) -> None:
     """Capture before, apply migration, capture after, assert exact delta."""
     # Drop any prior v2 state so the test starts from a clean baseline.
-    with db.cursor() as cur:
-        for tbl in V2_SCHEMA_V1_TABLES:
-            cur.execute(f'DROP TABLE IF EXISTS "{tbl}" CASCADE')
-        cur.execute("ALTER TABLE documents DROP COLUMN IF EXISTS current_revision_id")
-        cur.execute("ALTER TABLE documents DROP COLUMN IF EXISTS source_deleted_at")
-        cur.execute("ALTER TABLE document_images DROP COLUMN IF EXISTS revision_id")
-        cur.execute("ALTER TABLE document_tables DROP COLUMN IF EXISTS revision_id")
-    db.commit()
+    # Setup uses a raw psycopg connection because it predates the migration
+    # API; the migration itself runs through the public Engine contract.
+    with _psycopg_connect() as setup:
+        with setup.cursor() as cur:
+            for tbl in V2_SCHEMA_V1_TABLES:
+                cur.execute(f'DROP TABLE IF EXISTS "{tbl}" CASCADE')
+            cur.execute(
+                "ALTER TABLE documents DROP COLUMN IF EXISTS current_revision_id"
+            )
+            cur.execute(
+                "ALTER TABLE documents DROP COLUMN IF EXISTS source_deleted_at"
+            )
+            cur.execute(
+                "ALTER TABLE document_images DROP COLUMN IF EXISTS revision_id"
+            )
+            cur.execute(
+                "ALTER TABLE document_tables DROP COLUMN IF EXISTS revision_id"
+            )
+        setup.commit()
 
-    before = _table_names(db)
+    with db.connect() as conn:
+        before = _table_names(conn)
+
     apply_v2_schema(db)
-    db.commit()
-    after = _table_names(db)
+
+    with db.connect() as conn:
+        after = _table_names(conn)
 
     added = after - before
     removed = before - after
@@ -75,7 +107,9 @@ def test_schema_delta_is_exactly_v2_tables(db: psycopg.Connection) -> None:
     )
 
 
-def test_schema_version_row_present(db: psycopg.Connection) -> None:
-    with db.cursor() as cur:
-        cur.execute("SELECT count(*) FROM v2_schema_version WHERE version = 1")
-        assert cur.fetchone()[0] == 1
+def test_schema_version_row_present(db: Engine) -> None:
+    with db.connect() as conn:
+        n = conn.execute(
+            text("SELECT count(*) FROM v2_schema_version WHERE version = 1")
+        ).scalar()
+    assert n == 1

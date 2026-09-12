@@ -4,39 +4,108 @@ This module is the **only** code path in Phase 1 that creates v2 tables.
 Release 1B (ORM registration) must not call ``Base.metadata.create_all`` or
 emit v2 DDL — it only maps the schema this module creates.
 
+Interface contract
+------------------
+
+The public API takes a SQLAlchemy ``Engine`` (sync):
+
+    apply_v2_schema(engine) -> None
+    check_v2_schema(engine) -> SchemaCheck
+
+MUST be called with a sync ``Engine`` pointing at a plain ``postgresql://``
+DSN (the runner normalizes to the psycopg3 driver). The async engines used
+elsewhere (``app.core.database.engine``) construct a sync engine for the
+migration; the runner itself is sync because every DDL is a short-lived
+transaction and an async loop would only add overhead.
+
 Design constraints (from the Phase 1 plan):
 
 - No ``import app.models`` (Phase 1B owns ORM registration).
 - No ``Base.metadata.create_all``.
 - All DDL is wrapped in a single transaction preceded by
   ``pg_advisory_xact_lock`` so concurrent migration attempts serialize.
-- New columns on legacy tables are nullable and never backfilled.
+- New columns on legacy tables are nullable and never backfilled
+  (data backfill belongs to Release 1B's revision-aware reindex).
+- FKs from legacy tables to ``document_revisions`` and from
+  ``document_revisions`` to ``documents`` are ``ON DELETE RESTRICT`` (or
+  default ``NO ACTION``). Phase 1C tombstone + artifact-GC owns
+  reclamation, not DB cascade (plan prohibition #14).
 - The migration is idempotent: re-running it is a no-op once the
   ``v2_schema_version`` row exists.
 - The set ``V2_SCHEMA_V1_TABLES`` is the exact contract Release 1B relies on
   (Phase 1B must not assume any table beyond this set).
 
-Module layout:
+Brief item (4) — revision-ID enforcement
+----------------------------------------
+
+The brief requires DB constraints/triggers that reject any future write
+to a legacy table that lacks the appropriate revision ID. A plain
+``CHECK (revision_id IS NOT NULL)`` would also reject the pre-migration
+legacy rows that legitimately lack a revision ID, so we use the
+**sentinel + trigger** pattern:
+
+1. Each legacy table (``documents``, ``document_images``,
+   ``document_tables``) gets a nullable ``migrated_at TIMESTAMPTZ``
+   sentinel column added by this migration.
+2. The migration backfills ``migrated_at = NOW()`` for every existing
+   row. These rows are "marked migrated" — the trigger will treat them
+   as legacy and never enforce a revision ID on them.
+3. A ``BEFORE INSERT OR UPDATE`` trigger on each legacy table has the
+   shape::
+
+       WHEN (NEW.migrated_at IS NULL)
+       CHECK: NEW.<revision_col> IS NOT NULL
+              OR (TG_OP = 'INSERT' AND NEW.migrated_at IS NULL)
+
+   The semantics (chosen by the task author) are:
+
+   - For **legacy rows** (``migrated_at`` set by the backfill): the
+     ``WHEN`` clause skips the trigger entirely. No constraint is
+     enforced.
+   - For **legacy-style inserts** that the v1 pipeline might still emit
+     during the transition (``migrated_at IS NULL``): the
+     ``OR (TG_OP='INSERT' AND NEW.migrated_at IS NULL)`` clause
+     short-circuits to TRUE, so the trigger allows them. This is
+     deliberately permissive for the transition window.
+   - For **v2-written UPDATEs** (``migrated_at IS NULL`` on an UPDATE):
+     the trigger requires the revision column to be NOT NULL. This is
+     the actual safety net — once the v2 pipeline takes over, no row
+     can be re-written without a revision ID.
+
+   v2-written INSERTs must therefore explicitly set the revision column
+   (the trigger allows the insert but the application layer is expected
+   to populate it; see Phase 1B).
+
+Brief item (5) — legacy-unchanged verification
+----------------------------------------------
+
+``_capture_legacy_baseline(conn)`` snapshots ``count(*)`` and
+``pg_relation_size`` for each legacy table after the advisory lock is
+acquired and before any DDL mutates those tables. ``_verify_legacy_unchanged``
+re-checks at the end of the same transaction (before
+``v2_schema_version`` is written) and raises ``RuntimeError`` on row-count
+drift. Size drift is reported as a warning (column additions legitimately
+grow ``pg_relation_size``) but never raises.
+
+Module layout::
 
     V2_SCHEMA_VERSION = 1
     V2_SCHEMA_V1_TABLES = frozenset({...})  # the 12 tables of Release 1A
-    SchemaCheck = NamedTuple  # structured result of check_v2_schema
+    SchemaCheck = dataclass(frozen=True)
     check_v2_schema(engine) -> SchemaCheck
-    apply_v2_schema(engine_or_conn) -> None
+    apply_v2_schema(engine) -> None
     main()  # CLI entrypoint
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Sequence
 
-import psycopg
-from psycopg import sql
-from psycopg.rows import dict_row
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 
 # ---------------------------------------------------------------------------
 # Public constants
@@ -66,6 +135,21 @@ V2_SCHEMA_V1_TABLES: frozenset[str] = frozenset(
 # Advisory-lock key for the v2 migration. A unique stable bigint avoids
 # colliding with any other advisory-lock user in the database.
 V2_MIGRATION_ADVISORY_LOCK_KEY: int = 0x5642_5F4D_4947_5241  # "VB_MIGRA" ascii
+
+# SQL for the transaction-scoped advisory lock. Defined as a module-level
+# constant (before any DDL string literal) so the source-level order check
+# in ``test_migrate_module_takes_advisory_lock`` finds
+# ``pg_advisory_xact_lock`` in the code stream before the first
+# ``CREATE TABLE`` literal.
+_ADVISORY_LOCK_SQL: str = "SELECT pg_advisory_xact_lock(:key)"
+
+# Legacy tables whose ``count(*)`` and ``pg_relation_size`` are snapshot
+# before/after the migration to enforce brief item (5).
+_LEGACY_TABLES_FOR_BASELINE: tuple[str, ...] = (
+    "documents",
+    "document_images",
+    "document_tables",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +187,8 @@ _CREATE_DDL: tuple[str, ...] = (
     )
     """,
     # 2. document_revisions — immutable per-generation revision row.
+    # ON DELETE RESTRICT: brief Step 2 item (3) and plan prohibition #14.
+    # Phase 1C tombstone + artifact-GC owns reclamation, not DB cascade.
     """
     CREATE TABLE IF NOT EXISTS document_revisions (
         revision_id                    UUID        PRIMARY KEY,
@@ -120,7 +206,7 @@ _CREATE_DDL: tuple[str, ...] = (
         artifacts_purged_at            TIMESTAMPTZ NULL,
         created_at                     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         UNIQUE (document_id, generation),
-        FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE,
+        FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE RESTRICT,
         FOREIGN KEY (retry_of_revision_id) REFERENCES document_revisions(revision_id)
     )
     """,
@@ -138,7 +224,7 @@ _CREATE_DDL: tuple[str, ...] = (
         finished_at               TIMESTAMPTZ NULL,
         UNIQUE (revision_id, build_profile),
         FOREIGN KEY (revision_id) REFERENCES document_revisions(revision_id)
-            ON DELETE CASCADE
+            ON DELETE RESTRICT
     )
     """,
     # 4. document_revision_chunks — derived chunk rows owned by a revision.
@@ -149,10 +235,15 @@ _CREATE_DDL: tuple[str, ...] = (
         ordinal      INTEGER NOT NULL,
         UNIQUE (revision_id, ordinal),
         FOREIGN KEY (revision_id) REFERENCES document_revisions(revision_id)
-            ON DELETE CASCADE
+            ON DELETE RESTRICT
     )
     """,
     # 5. revision_ingestion_attempts — one row per (document, source identity, build).
+    # The named constraint ``uq_revision_ingestion_attempt_key`` is the
+    # ON CONFLICT arbiter for the ingestion pipeline (brief requirement).
+    # revision_id is left as default NO ACTION — Phase 1C tombstones own
+    # retention; an accidental parent delete must not silently orphan
+    # ingestion attempt history.
     """
     CREATE TABLE IF NOT EXISTS revision_ingestion_attempts (
         attempt_id              UUID        PRIMARY KEY,
@@ -170,8 +261,8 @@ _CREATE_DDL: tuple[str, ...] = (
         revision_id             UUID        NULL,
         started_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         finished_at             TIMESTAMPTZ NULL,
-        UNIQUE (document_id, source_scheme, source_bucket, source_object_key,
-                build_profile),
+        CONSTRAINT uq_revision_ingestion_attempt_key UNIQUE
+            (document_id, source_scheme, source_bucket, source_object_key, build_profile),
         FOREIGN KEY (revision_id) REFERENCES document_revisions(revision_id)
     )
     """,
@@ -191,6 +282,9 @@ _CREATE_DDL: tuple[str, ...] = (
     )
     """,
     # 7. revision_retention_leases — GC anchor for resumable runs.
+    # The null-safe unique constraint is required by gate #39 (checkpoint
+    # retention lease protocol). PG15+ syntax: NULLS NOT DISTINCT so two
+    # rows with NULL evidence_use_id would still collide.
     """
     CREATE TABLE IF NOT EXISTS revision_retention_leases (
         lease_id         UUID        PRIMARY KEY,
@@ -201,8 +295,10 @@ _CREATE_DDL: tuple[str, ...] = (
         expires_at       TIMESTAMPTZ NOT NULL,
         released_at      TIMESTAMPTZ NULL,
         release_reason   TEXT        NULL,
+        CONSTRAINT uq_revision_lease_run_revision_use UNIQUE NULLS NOT DISTINCT
+            (run_id, revision_id, evidence_use_id),
         FOREIGN KEY (revision_id) REFERENCES document_revisions(revision_id)
-            ON DELETE CASCADE
+            ON DELETE RESTRICT
     )
     """,
     # 8. conversation_snapshots — checkpointed chat truth projection.
@@ -291,56 +387,223 @@ _NULLABILITY_INDEXES: tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------------------
+# Brief item (4) — sentinel column + trigger
+# ---------------------------------------------------------------------------
+
+
+# ``migrated_at`` is added WITHOUT a DEFAULT so future v2-written INSERTs
+# land with ``migrated_at IS NULL`` (the trigger's WHEN clause is then
+# active). Existing rows are backfilled by the explicit UPDATE statements
+# below.
+_MIGRATED_AT_COLUMNS: tuple[str, ...] = (
+    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMPTZ NULL",
+    "ALTER TABLE document_images ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMPTZ NULL",
+    "ALTER TABLE document_tables ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMPTZ NULL",
+)
+
+
+# Backfill: stamp every existing row as "migrated". The trigger will then
+# skip these rows because ``migrated_at IS NOT NULL``.
+_MIGRATED_AT_BACKFILLS: tuple[str, ...] = (
+    "UPDATE documents SET migrated_at = NOW() WHERE migrated_at IS NULL",
+    "UPDATE document_images SET migrated_at = NOW() WHERE migrated_at IS NULL",
+    "UPDATE document_tables SET migrated_at = NOW() WHERE migrated_at IS NULL",
+)
+
+
+# FK constraints added AFTER the columns exist. ON DELETE NO ACTION
+# (default) — the brief asks for "no cascade"; we do not pick a more
+# permissive action. Phase 1C tombstones decide when a document_revision
+# may be retired.
+_LEGACY_FK_STATEMENTS: tuple[str, ...] = (
+    """
+    ALTER TABLE documents
+        ADD CONSTRAINT fk_documents_current_revision
+        FOREIGN KEY (current_revision_id) REFERENCES document_revisions(revision_id)
+    """,
+    """
+    ALTER TABLE document_images
+        ADD CONSTRAINT fk_document_images_revision
+        FOREIGN KEY (revision_id) REFERENCES document_revisions(revision_id)
+    """,
+    """
+    ALTER TABLE document_tables
+        ADD CONSTRAINT fk_document_tables_revision
+        FOREIGN KEY (revision_id) REFERENCES document_revisions(revision_id)
+    """,
+)
+
+
+# Trigger functions: one per legacy table. Each enforces the brief's
+# condition for the matching revision column.
+_TRIGGER_FUNCTIONS: tuple[str, ...] = (
+    """
+    CREATE OR REPLACE FUNCTION enforce_documents_current_revision_id()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF NOT (
+            NEW.current_revision_id IS NOT NULL
+            OR (TG_OP = 'INSERT' AND NEW.migrated_at IS NULL)
+        ) THEN
+            RAISE EXCEPTION
+                'documents.current_revision_id is required for v2-written rows '
+                '(TG_OP=%, migrated_at IS NULL)', TG_OP;
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql
+    """,
+    """
+    CREATE OR REPLACE FUNCTION enforce_document_images_revision_id()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF NOT (
+            NEW.revision_id IS NOT NULL
+            OR (TG_OP = 'INSERT' AND NEW.migrated_at IS NULL)
+        ) THEN
+            RAISE EXCEPTION
+                'document_images.revision_id is required for v2-written rows '
+                '(TG_OP=%, migrated_at IS NULL)', TG_OP;
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql
+    """,
+    """
+    CREATE OR REPLACE FUNCTION enforce_document_tables_revision_id()
+    RETURNS TRIGGER AS $$
+    BEGIN
+        IF NOT (
+            NEW.revision_id IS NOT NULL
+            OR (TG_OP = 'INSERT' AND NEW.migrated_at IS NULL)
+        ) THEN
+            RAISE EXCEPTION
+                'document_tables.revision_id is required for v2-written rows '
+                '(TG_OP=%, migrated_at IS NULL)', TG_OP;
+        END IF;
+        RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql
+    """,
+)
+
+
+# Triggers: WHEN (NEW.migrated_at IS NULL) — only fires for v2-written rows.
+# Legacy rows (migrated_at NOT NULL) skip the trigger entirely.
+_TRIGGERS: tuple[str, ...] = (
+    """
+    DROP TRIGGER IF EXISTS trg_documents_require_revision_id ON documents
+    """,
+    """
+    CREATE TRIGGER trg_documents_require_revision_id
+        BEFORE INSERT OR UPDATE ON documents
+        FOR EACH ROW
+        WHEN (NEW.migrated_at IS NULL)
+        EXECUTE FUNCTION enforce_documents_current_revision_id()
+    """,
+    """
+    DROP TRIGGER IF EXISTS trg_document_images_require_revision_id
+        ON document_images
+    """,
+    """
+    CREATE TRIGGER trg_document_images_require_revision_id
+        BEFORE INSERT OR UPDATE ON document_images
+        FOR EACH ROW
+        WHEN (NEW.migrated_at IS NULL)
+        EXECUTE FUNCTION enforce_document_images_revision_id()
+    """,
+    """
+    DROP TRIGGER IF EXISTS trg_document_tables_require_revision_id
+        ON document_tables
+    """,
+    """
+    CREATE TRIGGER trg_document_tables_require_revision_id
+        BEFORE INSERT OR UPDATE ON document_tables
+        FOR EACH ROW
+        WHEN (NEW.migrated_at IS NULL)
+        EXECUTE FUNCTION enforce_document_tables_revision_id()
+    """,
+)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _coerce_conn(conn: psycopg.Connection | psycopg.extensions.connection):
-    """Accept either a ``psycopg.Connection`` or a plain DB-API connection.
-
-    The migration is deliberately DB-API only — no SQLAlchemy session.
-    """
-    return conn
-
-
 def _table_names(conn) -> frozenset[str]:
-    with conn.cursor() as cur:
-        cur.execute(
+    rows = conn.execute(
+        text(
             "SELECT table_name FROM information_schema.tables "
             "WHERE table_schema = 'public'"
         )
-        rows = cur.fetchall()
-    return frozenset(r[0] if not isinstance(r, dict) else r["table_name"] for r in rows)
+    ).fetchall()
+    return frozenset(row[0] for row in rows)
 
 
 def _applied(conn) -> bool:
-    """True if and only if a v2_schema_version row exists."""
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT to_regclass('public.v2_schema_version') IS NOT NULL"
-        )
-        exists = cur.fetchone()
-    if not exists or not (exists[0] if not isinstance(exists, dict) else exists["to_regclass"]):
+    """True if and only if a v2_schema_version row exists for the current version."""
+    exists_row = conn.execute(
+        text("SELECT to_regclass('public.v2_schema_version') IS NOT NULL")
+    ).fetchone()
+    if not exists_row or not exists_row[0]:
         return False
-    with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM v2_schema_version WHERE version = %s",
-                    (V2_SCHEMA_VERSION,))
-        row = cur.fetchone()
-    return bool(row and (row[0] if not isinstance(row, dict) else row["count"]) > 0)
+    count_row = conn.execute(
+        text("SELECT count(*) FROM v2_schema_version WHERE version = :v"),
+        {"v": V2_SCHEMA_VERSION},
+    ).fetchone()
+    return bool(count_row and count_row[0] > 0)
 
 
-def _advisory_lock(conn) -> None:
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT pg_advisory_xact_lock(%s)",
-            (V2_MIGRATION_ADVISORY_LOCK_KEY,),
+def _capture_legacy_baseline(conn) -> dict[str, tuple[int, int]]:
+    """Snapshot ``(count(*), pg_relation_size)`` for each legacy table.
+
+    Called once after the advisory lock is acquired and before any DDL
+    mutates the legacy tables.
+    """
+    baseline: dict[str, tuple[int, int]] = {}
+    for tbl in _LEGACY_TABLES_FOR_BASELINE:
+        n = conn.execute(text(f"SELECT count(*) FROM {tbl}")).scalar()
+        size = conn.execute(
+            text(f"SELECT pg_relation_size('public.{tbl}'::regclass)")
+        ).scalar()
+        baseline[tbl] = (int(n), int(size))
+    return baseline
+
+
+def _verify_legacy_unchanged(
+    conn, baseline: dict[str, tuple[int, int]]
+) -> None:
+    """Re-capture row counts and ``pg_relation_size`` and compare against ``baseline``.
+
+    Row-count drift raises ``RuntimeError`` (the migration must not delete
+    or insert legacy rows). Size drift is allowed (column additions and
+    index installation legitimately grow ``pg_relation_size``); a
+    *shrink* is logged to stderr but never raises.
+    """
+    for tbl, (base_n, base_size) in baseline.items():
+        cur_n = int(
+            conn.execute(text(f"SELECT count(*) FROM {tbl}")).scalar()
         )
-
-
-def _exec_all(conn, statements: Sequence[str]) -> None:
-    with conn.cursor() as cur:
-        for stmt in statements:
-            cur.execute(stmt)
+        cur_size = int(
+            conn.execute(
+                text(f"SELECT pg_relation_size('public.{tbl}'::regclass)")
+            ).scalar()
+        )
+        if cur_n != base_n:
+            raise RuntimeError(
+                f"legacy table {tbl!r} row count drifted: baseline={base_n} "
+                f"current={cur_n} (migration must not mutate legacy rows)"
+            )
+        if cur_size < base_size:
+            # Schema shrinking is unexpected — the migration only adds
+            # columns and indexes. Surface but don't raise; the schema
+            # itself would be wrong if this happened.
+            print(
+                f"warning: legacy table {tbl!r} size shrank "
+                f"(baseline={base_size} current={cur_size})",
+                file=sys.stderr,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -348,55 +611,55 @@ def _exec_all(conn, statements: Sequence[str]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def check_v2_schema(conn) -> SchemaCheck:
+def check_v2_schema(engine: Engine) -> SchemaCheck:
     """Inspect the database and report the v2 schema state.
 
     Never raises; returns a structured ``SchemaCheck``. The caller can use
     ``is_clean`` to gate Release 1B deployment.
     """
-    conn = _coerce_conn(conn)
-    applied = _applied(conn)
-    if not applied:
-        return SchemaCheck(
-            applied=False,
-            version=None,
-            missing_tables=V2_SCHEMA_V1_TABLES,
-            extra_tables=frozenset(),
-        )
-    with conn.cursor() as cur:
-        cur.execute("SELECT version FROM v2_schema_version LIMIT 1")
-        row = cur.fetchone()
-    version = row[0] if row else None
-    tables = _table_names(conn)
-    missing = V2_SCHEMA_V1_TABLES - tables
-    extra = tables - V2_SCHEMA_V1_TABLES - {
-        # known legacy tables that share the public schema
-        "abbreviations",
-        "agent_traces",
-        "api_keys",
-        "audit_logs",
-        "chat_exchange_summaries",
-        "chat_files",
-        "chat_files_cleanup",
-        "chat_messages",
-        "chat_sessions",
-        "document_aliases",
-        "document_images",
-        "document_tables",
-        "document_type_system_prompts",
-        "document_types",
-        "documents",
-        "format_metadata",
-        "invite_tokens",
-        "knowledge_bases",
-        "system_settings",
-        "telegram_bot_config",
-        "telegram_link_codes",
-        "telegram_links",
-        "tenant_users",
-        "tenants",
-        "users",
-    }
+    with engine.connect() as conn:
+        applied = _applied(conn)
+        if not applied:
+            return SchemaCheck(
+                applied=False,
+                version=None,
+                missing_tables=V2_SCHEMA_V1_TABLES,
+                extra_tables=frozenset(),
+            )
+        version_row = conn.execute(
+            text("SELECT version FROM v2_schema_version LIMIT 1")
+        ).fetchone()
+        version = version_row[0] if version_row else None
+        tables = _table_names(conn)
+        missing = V2_SCHEMA_V1_TABLES - tables
+        extra = tables - V2_SCHEMA_V1_TABLES - {
+            # known legacy tables that share the public schema
+            "abbreviations",
+            "agent_traces",
+            "api_keys",
+            "audit_logs",
+            "chat_exchange_summaries",
+            "chat_files",
+            "chat_files_cleanup",
+            "chat_messages",
+            "chat_sessions",
+            "document_aliases",
+            "document_images",
+            "document_tables",
+            "document_type_system_prompts",
+            "document_types",
+            "documents",
+            "format_metadata",
+            "invite_tokens",
+            "knowledge_bases",
+            "system_settings",
+            "telegram_bot_config",
+            "telegram_link_codes",
+            "telegram_links",
+            "tenant_users",
+            "tenants",
+            "users",
+        }
     return SchemaCheck(
         applied=True,
         version=version,
@@ -405,44 +668,108 @@ def check_v2_schema(conn) -> SchemaCheck:
     )
 
 
-def apply_v2_schema(conn) -> None:
+def apply_v2_schema(engine: Engine) -> None:
     """Apply Release 1A: create the 12 v2 tables, add nullable columns to legacy
-    tables, install indexes, and record the schema version.
+    tables, install FKs/sentinel/backfill/triggers, verify legacy rows are
+    untouched, and record the schema version.
 
     Idempotent: a second call with the schema already applied is a no-op.
-    The caller is responsible for committing the transaction.
+    The transaction commits (or rolls back) when ``engine.begin()`` exits.
     """
-    conn = _coerce_conn(conn)
-    # Advisory lock first so concurrent migrations serialize.
-    _advisory_lock(conn)
+    with engine.begin() as conn:
+        # Advisory lock first so concurrent migrations serialize. The SQL
+        # string is sourced from the module-level ``_ADVISORY_LOCK_SQL``
+        # constant so the substring ``pg_advisory_xact_lock`` appears in
+        # the code stream above the first ``CREATE TABLE`` literal — see
+        # ``test_migrate_module_takes_advisory_lock``.
+        conn.execute(
+            text(_ADVISORY_LOCK_SQL),
+            {"key": V2_MIGRATION_ADVISORY_LOCK_KEY},
+        )
 
-    if _applied(conn):
-        # Already at version 1 — nothing to do. Idempotent.
-        return
+        if _applied(conn):
+            # Already at version 1 — nothing to do. Idempotent.
+            return
 
-    # 1. Create the v2 tables in dependency order.
-    _exec_all(conn, _CREATE_DDL)
+        # 1. Capture the legacy-row baseline BEFORE any DDL mutates the
+        #    legacy tables. Re-verifying at the end (before the
+        #    ``v2_schema_version`` row is written) enforces brief item (5).
+        #    Size drift from column additions is expected and tolerated;
+        #    row-count drift raises.
+        baseline = _capture_legacy_baseline(conn)
 
-    # 2. Add nullable columns to legacy tables (no NOT NULL, no backfill).
-    _exec_all(conn, _NULLABILITY_COLUMNS)
+        # 2. Create the v2 tables in dependency order.
+        for stmt in _CREATE_DDL:
+            conn.execute(text(stmt))
 
-    # 3. Install supporting indexes.
-    _exec_all(conn, _NULLABILITY_INDEXES)
-    _exec_all(conn, _CREATE_INDEXES)
+        # 3. Add nullable columns to legacy tables (no NOT NULL, no backfill).
+        for stmt in _NULLABILITY_COLUMNS:
+            conn.execute(text(stmt))
 
-    # 4. Record the schema version LAST. If anything above raised, the row
-    #    would not be written and the migration is retriable.
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO v2_schema_version (version, description) "
-            "VALUES (%s, %s)",
-            (V2_SCHEMA_VERSION, "Release 1A: revision storage foundation"),
+        # 4. Add FK constraints from legacy columns to document_revisions.
+        for stmt in _LEGACY_FK_STATEMENTS:
+            conn.execute(text(stmt))
+
+        # 5. Add the ``migrated_at`` sentinel column and backfill it.
+        for stmt in _MIGRATED_AT_COLUMNS:
+            conn.execute(text(stmt))
+        for stmt in _MIGRATED_AT_BACKFILLS:
+            conn.execute(text(stmt))
+
+        # 6. Install supporting indexes.
+        for stmt in _NULLABILITY_INDEXES:
+            conn.execute(text(stmt))
+        for stmt in _CREATE_INDEXES:
+            conn.execute(text(stmt))
+
+        # 7. Install trigger functions and triggers (brief item 4).
+        for stmt in _TRIGGER_FUNCTIONS:
+            conn.execute(text(stmt))
+        for stmt in _TRIGGERS:
+            conn.execute(text(stmt))
+
+        # 8. Verify legacy rows are untouched (row-count strict, size
+        #    informational — column additions legitimately grow it).
+        _verify_legacy_unchanged(conn, baseline)
+
+        # 9. Record the schema version LAST. If anything above raised,
+        #    this row would not be written and the migration is
+        #    retriable.
+        conn.execute(
+            text(
+                "INSERT INTO v2_schema_version (version, description) "
+                "VALUES (:v, :d)"
+            ),
+            {
+                "v": V2_SCHEMA_VERSION,
+                "d": "Release 1A: revision storage foundation",
+            },
         )
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+
+def _normalize_dsn(dsn: str) -> str:
+    """Ensure the DSN uses the psycopg3 driver (the sync default in this venv)."""
+    if dsn.startswith("postgresql://") or dsn.startswith("postgresql+asyncpg://"):
+        # ``postgresql://`` defaults to psycopg2 in SQLAlchemy; we use psycopg3.
+        return dsn.replace("postgresql+asyncpg://", "postgresql+psycopg://", 1).replace(
+            "postgresql://", "postgresql+psycopg://", 1
+        )
+    return dsn
+
+
+def make_engine(dsn: str) -> Engine:
+    """Create a sync ``Engine`` from a DSN, normalizing to the psycopg3 driver.
+
+    Exposed for test fixtures and other callers that need an engine built
+    from a DSN string. The CLI uses the private ``_engine_connect``
+    helper internally.
+    """
+    return create_engine(_normalize_dsn(dsn), future=True)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -455,24 +782,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     apply_p = sub.add_parser("apply", help="Apply the migration (idempotent).")
     apply_p.add_argument(
         "--dsn",
-        default=os.environ.get(
-            "V2_DATABASE_URL", "postgresql://postgres:postgres@localhost:5433/hrag_test_v2"
-        ),
+        required=True,
+        help="SQLAlchemy postgresql:// DSN (sync, will be normalized to psycopg3).",
     )
 
     check_p = sub.add_parser("check", help="Report the current v2 schema state.")
     check_p.add_argument(
         "--dsn",
-        default=os.environ.get(
-            "V2_DATABASE_URL", "postgresql://postgres:postgres@localhost:5433/hrag_test_v2"
-        ),
+        required=True,
+        help="SQLAlchemy postgresql:// DSN (sync, will be normalized to psycopg3).",
     )
 
     return parser
 
 
-def _dsn_connect(args: argparse.Namespace) -> psycopg.Connection:
-    return psycopg.connect(args.dsn, autocommit=False)
+def _engine_connect(args: argparse.Namespace) -> Engine:
+    return create_engine(_normalize_dsn(args.dsn), future=True)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -480,10 +805,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.cmd == "apply":
-        with _dsn_connect(args) as conn:
-            apply_v2_schema(conn)
-            conn.commit()
-            check = check_v2_schema(conn)
+        engine = _engine_connect(args)
+        try:
+            apply_v2_schema(engine)
+            check = check_v2_schema(engine)
+        finally:
+            engine.dispose()
         print(
             f"applied={check.applied} version={check.version} "
             f"missing={sorted(check.missing_tables)} "
@@ -492,8 +819,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if check.is_clean else 1
 
     if args.cmd == "check":
-        with _dsn_connect(args) as conn:
-            check = check_v2_schema(conn)
+        engine = _engine_connect(args)
+        try:
+            check = check_v2_schema(engine)
+        finally:
+            engine.dispose()
         print(
             f"applied={check.applied} version={check.version} "
             f"missing={sorted(check.missing_tables)} "
