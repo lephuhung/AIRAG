@@ -509,6 +509,17 @@ class Settings(BaseSettings):
     # fixed info string. Rotating/losing this key invalidates stored API keys —
     # decrypt failures fail-open to the .env defaults (see runtime_config.py).
     SETTING_ENCRYPTION_KEY: str = Field(default="")
+
+    # ── Evidence Store encryption (LangGraph v2 Phase 1D, task 8) ────────────
+    # AES-256-GCM keyring for evidence encrypted at rest. JSON object mapping a
+    # key id to a base64-encoded 32-byte key, e.g.
+    #   EVIDENCE_ENCRYPTION_KEYS={"k2024-11": "<base64 32 bytes>"}
+    # New evidence writes use EVIDENCE_ENCRYPTION_ACTIVE_KEY_ID; reads use the
+    # key id recorded on the row. Rotation = add a new active key id and retain
+    # the prior ones (no in-place re-encryption). An empty keyring / missing
+    # active key id fails closed (no plaintext is ever returned).
+    EVIDENCE_ENCRYPTION_KEYS: str = Field(default="")
+    EVIDENCE_ENCRYPTION_ACTIVE_KEY_ID: str = Field(default="")
     JWT_ALGORITHM: str = Field(default="HS256")
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = Field(default=30)
     JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = Field(default=7)

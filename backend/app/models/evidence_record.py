@@ -1,35 +1,42 @@
-"""EvidenceRecord ORM — Phase 1B.
+"""EvidenceRecord ORM — Phase 1B (Task 8 amendment).
 
 Maps the ``evidence_records`` table. One row per encrypted evidence
-payload. The table is the encrypted-at-rest storage layer for every
-piece of evidence the v2 pipeline binds to a response — Chroma
-chunks, KG facts, source quotes, etc. — so that:
+payload plus the immutable evidence identity and the Evidence Store
+storage policy:
 
-1. The plaintext never lives in this table.
-2. The encryption key id, nonce, and algorithm are pinned to the
-   ciphertext so the decryption path is fully reproducible.
-3. ``payload_purged_at`` is the GC tombstone for evidence that has
-   aged out; the row is retained so the binding audit history
-   remains queryable but the underlying ciphertext is logically
-   gone.
+1. The plaintext never lives in this table — only ``ciphertext`` (AES-256-GCM),
+   ``encryption_key_id``, ``nonce`` and ``encryption_algorithm``.
+2. ``source`` / ``provenance`` persist the typed frozen-contract JSONB payloads
+   (``EvidenceSourceIdentity`` / ``Provenance``) and ``content_hash`` is the
+   identity half of the idempotency key (source identity + content hash).
+3. ``classification`` / ``expires_at`` are the §15.3 storage policy; the
+   classification is computed deterministically at insertion and ``expires_at``
+   is the stable deletion deadline selected once.
+4. ``revision_id`` is the authoritative document revision the evidence was read
+   from. Workspace/ACL membership is deliberately NOT copied onto the record
+   (spec §24) — it resolves through that immutable revision row.
+5. ``payload_purged_at`` is the GC tombstone for evidence that has aged out;
+   the row is retained so the binding audit history stays queryable but the
+   underlying ciphertext is logically gone.
 
-Phase 1D will read these rows via the binding-decision code. The
-encryption layer lives in ``app.services.agents.v2.contracts``;
-this module deliberately does not expose any plaintext column.
+The encryption/minimization/hydration policy lives in
+``app.services.agents.v2.evidence_store.governance``; this module is the
+persistence mapping only.
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import (
     DateTime,
+    ForeignKey,
     LargeBinary,
     Text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
@@ -42,20 +49,43 @@ class EvidenceRecord(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
 
+    contract_version: Mapped[str] = mapped_column(Text, nullable=False)
+
     # Encrypted payload (never plaintext).
     ciphertext: Mapped[bytes] = mapped_column(
         LargeBinary, nullable=False
     )
-    # Identifier of the key used to encrypt this row (e.g. KMS key id).
+    # Identifier of the key used to encrypt this row (keyring key id).
     encryption_key_id: Mapped[str] = mapped_column(
         Text, nullable=False
     )
-    # AES-GCM nonce (or equivalent for the chosen algorithm).
+    # AES-GCM nonce.
     nonce: Mapped[bytes] = mapped_column(
         LargeBinary, nullable=False
     )
     encryption_algorithm: Mapped[str] = mapped_column(
         Text, nullable=False
+    )
+
+    # Immutable evidence identity (spec §15.1).
+    content_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    provenance: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+
+    # Storage policy (spec §15.3) — never semantic evidence.
+    classification: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Derived-evidence validation state; NULL for non-derived evidence.
+    validation_state: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Authoritative document revision for document evidence; NULL for
+    # People/KG/Memory/Derived evidence. Workspace resolves through it.
+    revision_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("document_revisions.revision_id"),
+        nullable=True,
     )
 
     # GC tombstone: when set, the row's ciphertext is logically gone

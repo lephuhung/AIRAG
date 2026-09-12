@@ -35,7 +35,18 @@ V2_DSN = os.environ.get(
 
 
 def _drop_v2_state() -> None:
-    """Drop v2 tables, legacy-column additions, and stable-pointer triggers."""
+    """Drop v2 tables, the legacy FKs, and the stable-pointer triggers.
+
+    The migration-owned legacy **columns** (``documents.current_revision_id``
+    / ``source_deleted_at``, ``document_images.revision_id``,
+    ``document_tables.revision_id``) are deliberately left in place. Dropping
+    and re-adding a column consumes a fresh Postgres attribute slot on every
+    cycle and the 1600-column limit is reached after a few dozen suite runs;
+    dropping only the FK constraints (which ``apply_v2_schema`` re-adds via
+    ``ADD CONSTRAINT``) keeps this bootstrap idempotent and churn-free.
+    ``apply_v2_schema``'s ``ADD COLUMN IF NOT EXISTS`` is then a no-op for the
+    retained columns.
+    """
     with psycopg.connect(V2_DSN, autocommit=False) as conn:
         with conn.cursor() as cur:
             # v2 tables first — CASCADE removes FKs pointing at them.
@@ -53,13 +64,29 @@ def _drop_v2_state() -> None:
                 "raise_document_tables_revision_id_loss()",
             ):
                 cur.execute(f"DROP FUNCTION IF EXISTS {fn}")
-            for stmt in (
-                "ALTER TABLE documents DROP COLUMN IF EXISTS current_revision_id",
-                "ALTER TABLE documents DROP COLUMN IF EXISTS source_deleted_at",
-                "ALTER TABLE document_images DROP COLUMN IF EXISTS revision_id",
-                "ALTER TABLE document_tables DROP COLUMN IF EXISTS revision_id",
-            ):
-                cur.execute(stmt)
+            # The migration re-adds these named constraints (it does not use
+            # IF NOT EXISTS for ADD CONSTRAINT), so drop them explicitly.
+            cur.execute(
+                "ALTER TABLE documents DROP CONSTRAINT IF EXISTS "
+                "fk_documents_current_revision"
+            )
+            cur.execute(
+                "ALTER TABLE document_images DROP CONSTRAINT IF EXISTS "
+                "fk_document_images_revision"
+            )
+            cur.execute(
+                "ALTER TABLE document_tables DROP CONSTRAINT IF EXISTS "
+                "fk_document_tables_revision"
+            )
+            # The retained revision-pointer columns may still hold pointers
+            # into revisions that the DROP above removed; clear them so the
+            # migration's ADD CONSTRAINT can be re-installed.
+            cur.execute(
+                "UPDATE documents SET current_revision_id = NULL, "
+                "source_deleted_at = NULL"
+            )
+            cur.execute("UPDATE document_images SET revision_id = NULL")
+            cur.execute("UPDATE document_tables SET revision_id = NULL")
         conn.commit()
 
 

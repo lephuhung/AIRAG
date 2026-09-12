@@ -122,6 +122,16 @@ def _drop_v2_state() -> None:
     cleanup is defensive — the current migration does not add that
     column, but a previous test run with the round-1 sentinel-based
     trigger may have left it behind.
+
+    Task 8 note: the migration-owned legacy **columns**
+    (``documents.current_revision_id`` / ``source_deleted_at``,
+    ``document_images.revision_id``, ``document_tables.revision_id``)
+    are deliberately NOT dropped here. Dropping and re-adding a column
+    consumes a fresh Postgres attribute slot on every cycle, and this
+    fixture runs once per test — that exhausts the 1600-column limit
+    after roughly fifteen suite runs. Dropping only the FK constraints
+    (which the migration re-adds) plus leaving ``ADD COLUMN IF NOT
+    EXISTS`` to be the no-op it is keeps the fixture idempotent.
     """
     with _psycopg_connect() as conn:
         with conn.cursor() as cur:
@@ -144,27 +154,22 @@ def _drop_v2_state() -> None:
                 "raise_document_tables_revision_id_loss()",
             ):
                 cur.execute(f"DROP FUNCTION IF EXISTS {fn}")
-            # Drop the column additions to legacy tables.
+            # Drop the FKs the migration installs (the columns stay put).
             cur.execute(
-                "ALTER TABLE documents DROP COLUMN IF EXISTS current_revision_id"
+                "ALTER TABLE documents DROP CONSTRAINT IF EXISTS "
+                "fk_documents_current_revision"
             )
             cur.execute(
-                "ALTER TABLE documents DROP COLUMN IF EXISTS source_deleted_at"
+                "ALTER TABLE document_images DROP CONSTRAINT IF EXISTS "
+                "fk_document_images_revision"
             )
+            cur.execute(
+                "ALTER TABLE document_tables DROP CONSTRAINT IF EXISTS "
+                "fk_document_tables_revision"
+            )
+            # Defensive: a previous round-1 run may have left this behind.
             cur.execute(
                 "ALTER TABLE documents DROP COLUMN IF EXISTS migrated_at"
-            )
-            cur.execute(
-                "ALTER TABLE document_images DROP COLUMN IF EXISTS revision_id"
-            )
-            cur.execute(
-                "ALTER TABLE document_images DROP COLUMN IF EXISTS migrated_at"
-            )
-            cur.execute(
-                "ALTER TABLE document_tables DROP COLUMN IF EXISTS revision_id"
-            )
-            cur.execute(
-                "ALTER TABLE document_tables DROP COLUMN IF EXISTS migrated_at"
             )
         conn.commit()
 
@@ -314,6 +319,126 @@ def test_snapshot_and_audit_tables_persist_the_frozen_contracts(
                 {"t": table, "c": column},
             ).scalar()
             assert value == "YES", f"{table}.{column} must be nullable"
+
+
+def test_evidence_tables_persist_the_governance_contracts(
+    migrated_db: Engine,
+) -> None:
+    """Task 8 amendment: the evidence tables carry the columns that persist the
+    frozen ``EvidenceStoreRow`` (identity + storage policy + encrypted payload)
+    and ``EvidenceUseEnvelope`` (run/task/purpose/target) contracts."""
+    expected_not_null = {
+        "evidence_records": {
+            "evidence_id",
+            "contract_version",
+            "ciphertext",
+            "encryption_key_id",
+            "nonce",
+            "encryption_algorithm",
+            "content_hash",
+            "classification",
+            "source",
+            "provenance",
+        },
+        "evidence_uses": {
+            "use_id",
+            "run_id",
+            "evidence_id",
+            "task_id",
+            "purpose",
+        },
+    }
+    nullable = {
+        ("evidence_records", "expires_at"),
+        ("evidence_records", "revision_id"),
+        ("evidence_records", "validation_state"),
+        ("evidence_records", "payload_purged_at"),
+        ("evidence_uses", "target_id"),
+    }
+    with migrated_db.connect() as conn:
+        for table, required in expected_not_null.items():
+            rows = conn.execute(
+                text(
+                    "SELECT column_name, is_nullable FROM "
+                    "information_schema.columns WHERE table_name = :t"
+                ),
+                {"t": table},
+            ).fetchall()
+            present = {r[0] for r in rows}
+            missing = required - present
+            assert not missing, f"{table} missing columns: {sorted(missing)}"
+            nullability = {r[0]: r[1] for r in rows}
+            for column in required:
+                assert nullability[column] == "NO", (
+                    f"{table}.{column} must be NOT NULL"
+                )
+        for table, column in nullable:
+            value = conn.execute(
+                text(
+                    "SELECT is_nullable FROM information_schema.columns "
+                    "WHERE table_name = :t AND column_name = :c"
+                ),
+                {"t": table, "c": column},
+            ).scalar()
+            assert value == "YES", f"{table}.{column} must be nullable"
+        # No plaintext column anywhere on the record.
+        record_columns = {
+            r[0]
+            for r in conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'evidence_records'"
+                )
+            ).fetchall()
+        }
+        assert not ({"plaintext", "payload", "content", "raw"} & record_columns)
+
+
+def test_evidence_record_revision_fk_points_at_document_revisions(
+    migrated_db: Engine,
+) -> None:
+    """Workspace resolves through the immutable revision (spec §24), so the
+    record's ``revision_id`` must FK ``document_revisions``."""
+    with migrated_db.connect() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT c.conname
+                  FROM pg_constraint c
+                  JOIN pg_attribute a
+                    ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+                 WHERE c.conrelid = 'evidence_records'::regclass
+                   AND c.contype = 'f'
+                   AND a.attname = 'revision_id'
+                   AND c.confrelid = 'document_revisions'::regclass
+                """
+            )
+        ).fetchall()
+    assert row, "evidence_records.revision_id must FK document_revisions"
+
+
+def test_evidence_use_null_safe_unique_index_exists(migrated_db: Engine) -> None:
+    """The ``ON CONFLICT (run_id, task_id, evidence_id, purpose, target_id)``
+    arbiter is a unique index with ``NULLS NOT DISTINCT`` so targetless uses
+    collide instead of duplicating."""
+    with migrated_db.connect() as conn:
+        definition = conn.execute(
+            text(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE indexname = 'uq_evidence_use_key'"
+            )
+        ).scalar()
+    assert definition is not None, "uq_evidence_use_key missing"
+    assert definition.startswith("CREATE UNIQUE INDEX"), definition
+    assert "NULLS NOT DISTINCT" in definition, definition
+    for column in (
+        "run_id",
+        "task_id",
+        "evidence_id",
+        "purpose",
+        "target_id",
+    ):
+        assert column in definition, definition
 
 
 def test_legacy_rows_unchanged(migrated_db: Engine) -> None:

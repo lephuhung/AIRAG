@@ -431,23 +431,47 @@ _CREATE_DDL: tuple[str, ...] = (
     )
     """,
     # 11. evidence_records — encrypted evidence payloads.
+    # Task 8 amendment: the frozen ``EvidenceStoreRow`` boundary is persisted
+    # here — the encrypted payload (ciphertext/key id/nonce/algorithm) plus the
+    # immutable evidence identity (contract_version, typed source, typed
+    # provenance, content_hash) and the §15.3 storage-policy metadata
+    # (classification, expires_at, validation_state). There is deliberately NO
+    # plaintext column and NO copied workspace/ACL column: workspace membership
+    # resolves from ``revision_id`` (spec §24), which is the authoritative
+    # document revision this evidence was read from.
     """
     CREATE TABLE IF NOT EXISTS evidence_records (
         evidence_id            UUID        PRIMARY KEY,
+        contract_version       TEXT        NOT NULL,
         ciphertext             BYTEA       NOT NULL,
         encryption_key_id      TEXT        NOT NULL,
         nonce                  BYTEA       NOT NULL,
         encryption_algorithm   TEXT        NOT NULL,
+        content_hash           TEXT        NOT NULL,
+        classification         TEXT        NOT NULL,
+        expires_at             TIMESTAMPTZ NULL,
+        revision_id            UUID        NULL,
+        source                 JSONB       NOT NULL,
+        provenance             JSONB       NOT NULL,
+        validation_state       TEXT        NULL,
         payload_purged_at      TIMESTAMPTZ NULL,
-        created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        FOREIGN KEY (revision_id) REFERENCES document_revisions(revision_id)
     )
     """,
     # 12. evidence_uses — link between a TaskSpec and an EvidenceRecord.
+    # Task 8 amendment: ``EvidenceUseEnvelope``/``EvidenceUse`` are persisted in
+    # full (run key + task/purpose/target) so a retry can be arbitered by the
+    # null-safe unique index ``uq_evidence_use_key`` (created below) and the
+    # existing row's UUID returned. ``run_id`` stays envelope-level (§15.2).
     """
     CREATE TABLE IF NOT EXISTS evidence_uses (
         use_id        UUID    PRIMARY KEY,
+        run_id        TEXT    NOT NULL,
         evidence_id   UUID    NOT NULL,
         task_id       TEXT    NOT NULL,
+        purpose       TEXT    NOT NULL,
+        target_id     TEXT    NULL,
         created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         FOREIGN KEY (evidence_id) REFERENCES evidence_records(evidence_id)
     )
@@ -476,6 +500,13 @@ _CREATE_INDEXES: tuple[str, ...] = (
     "ON revision_retention_leases(revision_id, expires_at) "
     "WHERE released_at IS NULL",
     "CREATE INDEX IF NOT EXISTS ix_evidence_uses_task ON evidence_uses(task_id)",
+    # Task 8: the ``ON CONFLICT (run_id, task_id, evidence_id, purpose,
+    # target_id)`` arbiter. NULLS NOT DISTINCT so two targetless uses (target_id
+    # IS NULL) still collide — PostgreSQL infers this index for the conflict
+    # clause, including the targetless case.
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_evidence_use_key "
+    "ON evidence_uses (run_id, task_id, evidence_id, purpose, target_id) "
+    "NULLS NOT DISTINCT",
     # Binding audit is read per thread in recorded order for security / audit
     # investigation.
     "CREATE INDEX IF NOT EXISTS ix_binding_audit_thread_recorded "
@@ -751,6 +782,23 @@ _EXPECTED_SHAPE_COLUMNS: dict[str, frozenset[str]] = {
     "binding_audit": frozenset(
         {"contract_version", "provenance", "provenance_kind"}
     ),
+    # Task 8 amendment: a database that applied the pre-Task-8 evidence shape
+    # keeps the bare (evidence_id, ciphertext, ...) tables while reporting
+    # version 1, so these guards fail closed instead of accepting a schema that
+    # cannot persist the frozen EvidenceStoreRow / EvidenceUse contracts.
+    "evidence_records": frozenset(
+        {
+            "contract_version",
+            "content_hash",
+            "classification",
+            "expires_at",
+            "revision_id",
+            "source",
+            "provenance",
+            "validation_state",
+        }
+    ),
+    "evidence_uses": frozenset({"run_id", "purpose", "target_id"}),
 }
 
 #: The R1 arbiter must be the full canonical identity, not decomposed keys.

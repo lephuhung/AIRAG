@@ -346,6 +346,97 @@ def test_evidence_record_exposes_no_plaintext_column(imported_app_models):
     )
 
 
+def test_evidence_tables_map_the_task8_governance_columns(imported_app_models):
+    """Task 8 amendment: the evidence ORM mappings expose exactly the columns
+    that persist the frozen ``EvidenceStoreRow``/``EvidenceUseEnvelope``
+    contracts plus the §15.3 storage policy."""
+    from app.core.database import Base
+
+    expected = {
+        "evidence_records": {
+            "evidence_id",
+            "contract_version",
+            "ciphertext",
+            "encryption_key_id",
+            "nonce",
+            "encryption_algorithm",
+            "content_hash",
+            "classification",
+            "expires_at",
+            "revision_id",
+            "source",
+            "provenance",
+            "validation_state",
+            "payload_purged_at",
+            "created_at",
+        },
+        "evidence_uses": {
+            "use_id",
+            "run_id",
+            "evidence_id",
+            "task_id",
+            "purpose",
+            "target_id",
+            "created_at",
+        },
+    }
+    for table, columns in expected.items():
+        actual = set(Base.metadata.tables[table].columns.keys())
+        assert actual == columns, (
+            f"{table} ORM columns {sorted(actual)} != expected {sorted(columns)}"
+        )
+    # Workspace/ACL must never be copied onto the record (spec §24).
+    record_columns = set(Base.metadata.tables["evidence_records"].columns.keys())
+    assert not {"workspace_id", "allowed_workspace_ids", "acl"} & record_columns
+
+
+def test_evidence_use_unique_arbiter_matches_the_migration(
+    imported_app_models, db: Engine
+):
+    """The ``ON CONFLICT`` arbiter is a NULLS NOT DISTINCT unique index over
+    the five-key use identity, in both the ORM metadata and the live DB."""
+    from app.models.evidence_use import EvidenceUse
+
+    index = next(
+        (
+            ix
+            for ix in EvidenceUse.__table__.indexes
+            if ix.name == "uq_evidence_use_key"
+        ),
+        None,
+    )
+    assert index is not None, "EvidenceUse must map uq_evidence_use_key"
+    assert index.unique is True
+    assert index.dialect_options["postgresql"].get("nulls_not_distinct") is True
+    assert [c.name for c in index.columns] == [
+        "run_id",
+        "task_id",
+        "evidence_id",
+        "purpose",
+        "target_id",
+    ]
+
+    with db.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE indexname = 'uq_evidence_use_key'"
+            )
+        ).fetchone()
+    assert row is not None, "uq_evidence_use_key missing from the live DB"
+    definition = row[0]
+    assert definition.startswith("CREATE UNIQUE INDEX"), definition
+    assert "NULLS NOT DISTINCT" in definition, definition
+    for column in (
+        "run_id",
+        "task_id",
+        "evidence_id",
+        "purpose",
+        "target_id",
+    ):
+        assert column in definition, definition
+
+
 def test_v2_orm_mapped_tables_exist_in_database(
     imported_app_models, db: Engine
 ):

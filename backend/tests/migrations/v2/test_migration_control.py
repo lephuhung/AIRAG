@@ -99,27 +99,31 @@ def test_schema_delta_is_exactly_v2_tables(db: Engine) -> None:
                 "enforce_document_tables_revision_id()",
             ):
                 cur.execute(f"DROP FUNCTION IF EXISTS {fn}")
+            # The migration re-adds these named FK constraints (ADD CONSTRAINT
+            # is not IF NOT EXISTS), so drop them explicitly instead of
+            # dropping the legacy revision-pointer columns. Dropping and
+            # re-adding a column consumes a fresh Postgres attribute slot per
+            # run and exhausts the 1600-column limit after a few dozen runs.
             cur.execute(
-                "ALTER TABLE documents DROP COLUMN IF EXISTS current_revision_id"
+                "ALTER TABLE documents DROP CONSTRAINT IF EXISTS "
+                "fk_documents_current_revision"
             )
             cur.execute(
-                "ALTER TABLE documents DROP COLUMN IF EXISTS source_deleted_at"
+                "ALTER TABLE document_images DROP CONSTRAINT IF EXISTS "
+                "fk_document_images_revision"
             )
             cur.execute(
-                "ALTER TABLE documents DROP COLUMN IF EXISTS migrated_at"
+                "ALTER TABLE document_tables DROP CONSTRAINT IF EXISTS "
+                "fk_document_tables_revision"
             )
+            # Clear any pointers into revisions the DROP above removed so the
+            # migration's ADD CONSTRAINT can be re-installed.
             cur.execute(
-                "ALTER TABLE document_images DROP COLUMN IF EXISTS revision_id"
+                "UPDATE documents SET current_revision_id = NULL, "
+                "source_deleted_at = NULL"
             )
-            cur.execute(
-                "ALTER TABLE document_images DROP COLUMN IF EXISTS migrated_at"
-            )
-            cur.execute(
-                "ALTER TABLE document_tables DROP COLUMN IF EXISTS revision_id"
-            )
-            cur.execute(
-                "ALTER TABLE document_tables DROP COLUMN IF EXISTS migrated_at"
-            )
+            cur.execute("UPDATE document_images SET revision_id = NULL")
+            cur.execute("UPDATE document_tables SET revision_id = NULL")
         setup.commit()
 
     with db.connect() as conn:
