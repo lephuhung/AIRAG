@@ -15,12 +15,18 @@ Routing table::
     two-target comparison     -> complex_research
     cross-domain dependency   -> complex_research
     multi-goal/iterative RAG  -> complex_research
-    Write                     -> typed unavailable (WriteUnavailableError)
+    Write                     -> complex_research/simple_write_operation
+
+Write (and any other work with no Phase-2 capability, e.g. compliance
+evaluation) is a typed-unavailable OUTCOME, never a raise: unsupported work
+routes to ``complex_research`` with an explicit reason code so T6's
+``complex_boundary`` returns the typed unavailable response. Unsupported work
+is never silently routed to ``fast_domain``.
 
 Routing may inspect request-scoped capability availability (via the injected
-``allowed_capabilities``); availability never reaches business state. Write has
-no Phase-2 capability module, so it always raises the typed unavailable error —
-a dedicated ``CapabilityUnavailable`` subtype, never a route string.
+``allowed_capabilities``); availability never reaches business state. Fast-path
+gates count only pins referenced by the current semantic projection, never
+stale merged pins from prior turns.
 """
 from __future__ import annotations
 
@@ -29,7 +35,7 @@ from typing import Any
 
 from langgraph.runtime import Runtime
 
-from ..capabilities import CapabilityUnavailable
+from ..adapters.document import binding_id_for_ref
 from ..contracts.binding import DocumentBindingSet
 from ..contracts.routing import QueryAnalysis, RouteDecision, SemanticDependencyHint
 from ..contracts.semantic import SemanticContext
@@ -38,16 +44,10 @@ from ..contracts.validation import validate_query_analysis
 from .context import _context_of
 
 __all__ = [
-    "WriteUnavailableError",
     "analyze_query",
     "decide_route",
     "route_node",
 ]
-
-
-class WriteUnavailableError(CapabilityUnavailable):
-    """Write is requested but no Write capability exists in Phase 2."""
-
 
 _GREETING_RE = re.compile(
     r"^(xin chào|chào|hello|hi|hey|good morning|good afternoon)\b"
@@ -112,9 +112,7 @@ def _write_intent(text: str) -> bool:
     return any(pattern.search(text) for pattern in _WRITE_RES)
 
 
-def analyze_query(
-    semantic: SemanticContext, bindings: DocumentBindingSet
-) -> QueryAnalysis:
+def analyze_query(semantic: SemanticContext) -> QueryAnalysis:
     """Deterministic-first analysis of the finalized query meaning."""
     text = semantic.normalized_query.casefold()
     domains: set[str] = set()
@@ -124,14 +122,28 @@ def analyze_query(
         domains.add("document")
     if semantic.section_refs:
         domains.add("section")
-    write = _write_intent(text)
-    if write:
+    if _write_intent(text):
         domains.add("write")
+    if _contains(text, _KG_RES):
+        domains.add("knowledge_graph")
+
+    if not domains:
+        if _is_conversational(text):
+            # Conversational turns consult discourse memory only; they are not
+            # lookups and must never read as a memory.lookup fast path.
+            analysis = QueryAnalysis(
+                work_type="explain",
+                domains=("memory",),
+                dependency_hints=(),
+            )
+            validate_query_analysis(analysis)
+            return analysis
+        # A ref-less factual query can only proceed via discovery.
+        domains = {"document"}
+
     compare = _contains(text, _COMPARE_RES) or len(semantic.document_refs) >= 2
     summary = _contains(text, _SUMMARY_RES)
     evaluate = _contains(text, _EVALUATE_RES)
-    if _contains(text, _KG_RES):
-        domains.add("knowledge_graph")
 
     families = {_FAMILY.get(domain, domain) for domain in domains}
     dependency_families = sorted(set(_DEPENDENCY_FAMILIES) & families)
@@ -156,15 +168,10 @@ def analyze_query(
         work_type = "evaluate"
     elif summary:
         work_type = "summarize"
-    elif domains <= {"people"} or domains == {"knowledge_graph"} or not domains:
+    elif domains <= {"people"} or domains == {"knowledge_graph"}:
         work_type = "lookup"
     else:
         work_type = "retrieve"
-
-    if not domains:
-        # No semantic signal at all: conversational greeting or a ref-less
-        # factual query that later stages resolve via discovery.
-        domains = {"memory"} if _is_conversational(text) else {"document"}
 
     analysis = QueryAnalysis(
         work_type=work_type,  # type: ignore[arg-type]
@@ -190,6 +197,14 @@ def _has_open_required_reference(semantic: SemanticContext) -> bool:
     )
 
 
+def _current_bound_count(
+    semantic: SemanticContext, bindings: DocumentBindingSet
+) -> int:
+    """Pins referenced by the current semantic projection (stale pins excluded)."""
+    current_ids = {binding_id_for_ref(reference.ref_id) for reference in semantic.document_refs}
+    return sum(1 for binding in bindings.bindings if binding.binding_id in current_ids)
+
+
 def _fast_or_runtime_dependency(
     domain: str, allowed_capabilities: frozenset[str], reason_code: Any
 ) -> RouteDecision:
@@ -205,10 +220,11 @@ def decide_route(
     *,
     allowed_capabilities: frozenset[str] = frozenset(),
 ) -> RouteDecision:
-    """Map deterministic analysis facts to one frozen route."""
+    """Map deterministic analysis facts to one frozen route (never raises)."""
     if "write" in analysis.domains:
-        raise WriteUnavailableError(
-            "write is unavailable: Phase 2 ships no Write capability module"
+        # Typed-unavailable outcome: T6's complex_boundary owns the response.
+        return RouteDecision(
+            route="complex_research", reason_code="simple_write_operation"
         )
     if semantic.blocking_ambiguities:
         return RouteDecision(route="clarify", reason_code="essential_ambiguity")
@@ -221,7 +237,7 @@ def decide_route(
         reason = "direct_greeting" if _is_greeting(text) else "direct_conversation"
         return RouteDecision(route="direct", reason_code=reason)  # type: ignore[arg-type]
 
-    bound_count = len(bindings.bindings)
+    bound_count = _current_bound_count(semantic, bindings)
     if analysis.work_type == "lookup" and analysis.domains == ("people",):
         return _fast_or_runtime_dependency("people", allowed_capabilities, "simple_people_lookup")
     if (
@@ -268,7 +284,7 @@ async def route_node(
 ) -> dict:
     """Analyze the finalized query and decide the execution topology."""
     context = _context_of(runtime)
-    analysis = analyze_query(state["semantic"], state["bindings"])
+    analysis = analyze_query(state["semantic"])
     decision = decide_route(
         analysis,
         state["semantic"],

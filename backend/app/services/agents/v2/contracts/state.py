@@ -39,9 +39,19 @@ class RuntimeServices(RuntimeModel):
     package deliberately imports no runtime-framework/application module (see
     ``test_contracts_package_imports_no_runtime_frameworks``); the repository is
     a request-scoped service, not a business contract.
+
+    ``semantic_adapter`` exposes ``build_draft(request, conversation)`` and
+    ``binding_resolver`` exposes ``resolve(document_refs, capability_runtime)``
+    (Phase 2, Task 1 production injection path; concrete implementations are
+    wired by T6/T7). Both default to ``None``; the Task 1 nodes fail closed
+    with a typed error when the service they need is absent and never fall back
+    to a silent default. Typed ``Any`` for the same framework-free reason as
+    ``retention_leases``.
     """
 
     retention_leases: Any = None
+    semantic_adapter: Any = None
+    binding_resolver: Any = None
 
 
 class GraphRuntimeContext(ContractModel):

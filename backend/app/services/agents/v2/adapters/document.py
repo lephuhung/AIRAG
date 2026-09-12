@@ -51,6 +51,17 @@ class DocumentAdapterError(ValueError):
     """A legacy/resolved reference cannot be translated into a v2 binding."""
 
 
+def binding_id_for_ref(ref_id: str) -> str:
+    """Canonical binding ID for a user-reference binding of ``ref_id``.
+
+    Single owner of the ``b_{ref_id}`` convention: the resolver mints binding
+    IDs with it, and the supervisor finalizer/router match checkpointed pins
+    back to semantic references with it. No other module may re-derive the
+    convention.
+    """
+    return f"b_{ref_id}"
+
+
 @dataclass(frozen=True)
 class DocumentBindingResolution:
     """One reference's binding outcome.
@@ -138,7 +149,7 @@ async def resolve_document_binding(
         )
 
     binding = ScopedDocument(
-        binding_id=f"b_{reference.ref_id}",
+        binding_id=binding_id_for_ref(reference.ref_id),
         document_id=document_id,
         document_revision=str(identity.revision_id),
         role=role,
