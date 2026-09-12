@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-10-langgraph-v2-contract-first-design.md`
 
+**Plan status:** FROZEN for implementation. Changes require a new amendment review; do not edit these plans while executing Phase 0–3 without one.
+
 ## Global Constraints
 
 - Architecture remains **Approved design** with contract freeze active; plans do not add/change frozen business-contract fields.
@@ -172,11 +174,12 @@ The implementation suite is ready only when all are proven:
 | 33 | Parent/child states are connected by explicit adapters and exactly one ownership chain exists | Phase 3 `test_complex_boundary_maps_parent_to_child_state`, `test_complex_boundary_maps_child_result_back_to_execution_state`, `test_complex_subgraph_does_not_require_root_state_schema` |
 | 34 | People→Document input is materialized before T2 checkpoint; scheduler never mutates `TaskSpec.input` | Phase 3 `test_people_document_materializes_before_task_append`, `test_t2_checkpoint_contains_final_document_search_input`, `test_scheduler_never_rewrites_task_input` |
 | 35 | Phase 1A creates every schema-v1 table mapped in 1B (`after - before == V2_SCHEMA_V1_TABLES`); tombstone clears the current pointer; one GC retention anchor | Phase 1 migration control test, `test_tombstone_clears_current_revision_pointer`, `test_failed_revision_has_gc_retention_anchor` |
-| 36 | Document search observation exposes opaque `candidate_ids` resolved by a request-scoped `DiscoveryCandidateRegistry` | Phase 3 `test_document_search_observation_exposes_candidate_ids_only`, `test_planner_cannot_select_document_revision_directly` |
+| 36 | Document search observation exposes opaque `candidate_ids` resolved by a request-scoped `DiscoveryCandidateRegistry` that reconstructs from persisted candidate records after resume | Phase 3 `test_document_search_observation_exposes_candidate_ids_only`, `test_planner_cannot_select_document_revision_directly`, `test_discovery_candidate_registry_reconstructs_after_resume`, `test_candidate_ids_survive_checkpoint_interrupt` |
 | 37 | 100% rollout means 100% of v2-eligible traffic (`write` is a Domain, selector is not a second classifier) | Phase 3 `test_rollout_100_percent_still_routes_write_to_v1`, `test_rollout_100_percent_still_routes_evaluate_to_v1`, `test_supported_compare_uses_v2_at_100_percent_eligible_rollout` |
 | 38 | `ResearchPlanningInput` is an ephemeral projection, never checkpointed | Phase 3 `test_planning_input_is_ephemeral_never_checkpointed` |
 | 39 | Binding pin and every new EvidenceUse acquire a lease before checkpoint; resume refreshes and only the outer runner releases after the terminal checkpoint | Phase 2 `test_binding_pin_acquires_lease_before_checkpoint`, `test_resume_refreshes_lease_before_continuing`, `test_execute_leases_new_evidence_uses_before_checkpoint` |
 | 40 | Repositories mutate+flush only; the service/UoW owns the transaction | Phase 1 publish tests (`test_tombstone_race_commits_abandoned_before_error`) |
+| 41 | Budget view derives from current execution state (ephemeral) and TypedDict states use mapping access | Phase 3 `build_research_budget_view(state, runtime)` + Phase 2/3 mapping-access snippets |
 
 ## Whole-Suite Validation
 

@@ -427,6 +427,32 @@ This is the only definition of the service bag referenced by `GraphRuntimeContex
 - [ ] **Step 5: Implement execute node**
 
 ```python
+def require_checkpointed_plan(state: SupervisorV2State) -> TaskPlan:
+    plan = state["execution"].plan
+    if plan is None:
+        raise MissingCheckpointedPlan()
+    return plan
+
+
+def execution_update(
+    state: SupervisorV2State,
+    *,
+    plan: TaskPlan | None = None,
+    task_results: tuple[AgentResult, ...] | None = None,
+    evidence_evaluation: EvidenceEvaluation | None = None,
+) -> dict:
+    """Return a full frozen ExecutionState partial using the frozen field name
+    `evidence_evaluation` (never an alias `evaluation`)."""
+    current = state["execution"]
+    return {"execution": ExecutionState(
+        plan=plan if plan is not None else current.plan,
+        task_results=task_results if task_results is not None else current.task_results,
+        evidence_evaluation=(
+            evidence_evaluation if evidence_evaluation is not None else current.evidence_evaluation
+        ),
+    )}
+
+
 async def execute_node(
     state: SupervisorV2State,
     runtime: GraphRuntimeContext,
@@ -436,9 +462,9 @@ async def execute_node(
     results = await scheduler.execute(
         plan=plan,
         runtime=runtime,
-        prior_results=state.execution.task_results,
+        prior_results=state["execution"].task_results,
     )
-    return execution_update(results)
+    return execution_update(state, task_results=results)
 ```
 
 - [ ] **Step 6: Test and commit**

@@ -181,6 +181,8 @@ test_observation_projection_is_typed_no_mapping
 test_unknown_result_kind_projection_fails_closed
 test_document_search_observation_exposes_candidate_ids_only
 test_planner_cannot_select_document_revision_directly
+test_discovery_candidate_registry_reconstructs_after_resume
+test_candidate_ids_survive_checkpoint_interrupt
 ```
 
 - [ ] **Step 2: Implement proposal + observation gateway (no execution)**
@@ -263,7 +265,7 @@ base capability registry
 = agent-visible tool catalog
 ```
 
-The framework-facing schema contains only allowed `CapabilityInput`; runtime authority is injected server-side. People/memory/sensitive projectors return status/use IDs/safe metadata only.
+The framework-facing schema contains only allowed `CapabilityInput`; runtime authority is injected server-side. People/memory/sensitive projectors return status/use IDs/safe metadata only. `DiscoveryCandidateRegistry` is a request-scoped cache over **server-side persisted candidate records** written together with the checkpointed `AgentResult`/governed EvidenceUse (`(run_id, task_id, candidate_id) -> authorized document_id`). Start and resume both reconstruct it from those rows, so `candidate_ids` survive LangGraph checkpoint/interrupt and a process restart; it must never depend on an in-memory request object. It maps only to an authorized `document_id`, and the Binding Resolver remains the sole owner that pins a revision. If the planner never needs to choose a specific candidate, drop `candidate_ids` and expose only `candidate_count`.
 
 - [ ] **Step 4: Run and commit**
 
@@ -340,17 +342,37 @@ def build_planning_input(
     config/counters, not new runtime fields. Never returned into checkpointed state.
     """
     return ResearchPlanningInput(
-        semantic=state.semantic,
-        bindings=state.bindings,
+        semantic=state["semantic"],
+        bindings=state["bindings"],
         query_analysis=require_query_analysis(state),   # non-null before complex planning
         capability_catalog=tuple(runtime.services.capability_registry.descriptors()),
         discovery_policy=build_discovery_policy(runtime),
-        budget=build_research_budget_view(runtime),
+        budget=build_research_budget_view(state, runtime),
         current_plan=state.get("plan"),                  # None on the initial call
         task_outcomes=build_task_execution_summaries(state.get("task_results", ())),
         prior_evidence_uses=collect_evidence_use_refs(state.get("task_results", ())),
         prior_evaluation=state.get("evaluation"),
     )
+
+
+def build_research_budget_view(state: ComplexResearchState, runtime: GraphRuntimeContext) -> ResearchBudgetView:
+    """Ephemeral budget derived from the CURRENT execution state, not runtime config alone.
+
+    Never persisted; rebuilt on each planner/replanner call.
+    """
+    limits = V2ResearchLimits.from_settings(get_settings())   # implementation config, not a runtime field
+    plan = state.get("plan")
+    used_tasks = len(plan.tasks) if plan else 0
+    return ResearchBudgetView(
+        max_tasks_remaining=max(0, limits.max_tasks - used_tasks),
+        max_replans_remaining=max(0, min(state.get("replans_remaining", 0), limits.max_replans)),
+        max_parallel_branches=limits.max_parallel_branches,
+    )
+
+
+def build_discovery_policy(runtime: GraphRuntimeContext) -> DiscoveryPolicy:
+    """Runtime-only policy: depends on current authorization, registry, and config."""
+    ...
 
 
 def build_complex_research_subgraph() -> CompiledStateGraph:
@@ -380,24 +402,28 @@ The planner may choose capabilities only by placing them into `TaskSpec`. No fra
 
 ```python
 def build_complex_research_state(state: SupervisorV2State) -> ComplexResearchState:
-    """Explicit parent -> child mapping. Only checkpointed supervisor fields move;
-    runtime-derived planning input is built ephemerally inside the subgraph."""
+    """Explicit parent -> child mapping (TypedDict mapping access on the parent).
+    Only checkpointed supervisor fields move; runtime-derived planning input is
+    built ephemerally inside the subgraph. Nested frozen Pydantic values keep
+    attribute access."""
+    execution = state["execution"]
     return ComplexResearchState(
-        contract_version=state.contract_version,
-        semantic=state.semantic,
-        bindings=state.bindings,
-        query_analysis=state.query_analysis,
-        plan=state.execution.plan,
-        task_results=state.execution.task_results,
-        evaluation=state.execution.evidence_evaluation,   # frozen ExecutionState field name
+        contract_version=state["contract_version"],
+        semantic=state["semantic"],
+        bindings=state["bindings"],
+        query_analysis=state["query_analysis"],
+        plan=execution.plan,
+        task_results=execution.task_results,
+        evaluation=execution.evidence_evaluation,   # frozen ExecutionState field name
         replans_remaining=MAX_REPLANS,
     )
 
 def merge_complex_result_into_supervisor(state: SupervisorV2State, child: ComplexResearchState) -> dict:
     return execution_update(
-        plan=child.plan,
-        task_results=child.task_results,
-        evaluation=child.evaluation,
+        state,
+        plan=child.get("plan"),
+        task_results=child.get("task_results", ()),
+        evidence_evaluation=child.get("evaluation"),
     )
 
 def make_complex_boundary_node(complex_subgraph: CompiledStateGraph):
@@ -419,7 +445,7 @@ complex_subgraph = build_complex_research_subgraph()      # compiled WITHOUT a c
 full_graph.add_node("complex_boundary", make_complex_boundary_node(complex_subgraph))
 ```
 
-`config` carries the parent `thread_id`/checkpoint namespace, so the subgraph writes its checkpoints under the parent saver and a shadow run's isolated `InMemorySaver` is inherited. The adapter maps only the fields the child needs and merges only the execution result back; the child never reads root state and never needs `SupervisorV2State`. `ResearchPlanningInput` is never part of `ComplexResearchState` or `SupervisorV2State` checkpoint bytes: it is rebuilt from the request-scoped registry, implementation policy/budget helpers, and validated `AgentResult`s on every planner/replanner call, and no frozen state field is added. `require_query_analysis(state)` asserts a non-null `query_analysis` before any complex planning, and `plan` is `None` on the initial call.
+`config` carries the parent `thread_id`/checkpoint namespace, so the subgraph writes its checkpoints under the parent saver and a shadow run's isolated `InMemorySaver` is inherited. The adapter maps only the fields the child needs and merges only the execution result back; the child never reads root state and never needs `SupervisorV2State`. `ResearchPlanningInput` is never part of `ComplexResearchState` or `SupervisorV2State` checkpoint bytes: it is rebuilt from the request-scoped registry, implementation policy/budget helpers, and validated `AgentResult`s on every planner/replanner call, and no frozen state field is added. `require_query_analysis(state)` asserts a non-null `query_analysis` before any complex planning, and `plan` is `None` on the initial call. All TypedDict reads/writes use mapping access (`state["semantic"]`, `state.get("plan")`, `child.get("plan")`); only nested frozen Pydantic values use attribute access (`state["execution"].task_results`).
 
 - [ ] **Step 4: Test and commit**
 
