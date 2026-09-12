@@ -535,3 +535,524 @@ def build_initial_state(
         # → nodes phải dùng get_current_db() thay vì state.get("_db")
         "_db": db,
     }
+
+
+# ---------------------------------------------------------------------------
+# v2 outer runner / streaming adapter (Phase 2, Task 8)
+# ---------------------------------------------------------------------------
+#
+# Preserves the EXISTING SSE contract used by the frontend
+# (``frontend/src/hooks/useRAGChatStream.ts``): status / thinking / sources /
+# images / token / token_rollback / potential_abbreviations / people_data /
+# error / complete. Payloads stay additive (v2 ``complete`` additionally
+# carries ``status`` + ``citations``); the hook needs no change.
+#
+# Rules (controller rulings):
+#
+# - Only this OUTER adapter streams user-facing prose: the terminal
+#   ``FinalResponse.content`` is chunked into ``token`` events here. v2
+#   nodes never push token events (pinned by test).
+# - Exactly ONE terminal event per run: ``complete`` for success/clarify,
+#   ``error`` for denied/insufficient/error.
+# - ``token_rollback`` clears every accumulator. A deadline-truncated
+#   dispatch (checkpointed plan with undispatched tasks — the T6 runtime-only
+#   truncation channel, deliberately never checkpointed) surfaces as
+#   token_rollback + error, never a normal success.
+# - Disconnect/cancel prevents success: ``CancelledError``/``GeneratorExit``
+#   propagate, no terminal event is emitted, leases release as ``cancelled``.
+# - Stable thread id resumes from the checkpoint. Resume call form (the
+#   graph owns navigation; never pass an outer destination along):
+#
+#       command = await resume_clarification(message_id, request, runtime)
+#       await graph.ainvoke(Command(resume=<resolution>), config,
+#                           context=runtime_context)
+#
+#   On resume the runner refreshes existing leases BEFORE continuing, feeds
+#   the plan resolver from the checkpointed plan/bindings, and reinjects the
+#   CURRENT runtime ACL (checkpointed scope is never trusted).
+# - Terminal lease release (``release_run``) happens HERE, only AFTER the
+#   terminal checkpoint succeeds — never inside the finalizer, never on
+#   interrupt (suspension keeps leases active).
+# - ``ClarificationUnsatisfiable`` means the reply is a fresh turn, never a
+#   resume retry (``V2FreshTurnRequired``).
+# - Never run ``validate_supervisor_state`` here: non-success terminals over
+#   the ingress placeholder semantic surface as errors, not corruption.
+#
+# All v2-only imports are function-local so this module (imported by every
+# entrypoint) stays light and can never create an import cycle with the v2
+# package (``v2/events.py`` itself imports ``json_serial`` from here).
+
+_V2_TOKEN_CHUNK_DEFAULT = 120
+
+_V2_TRUNCATION_MESSAGE = (
+    "Quá trình thu thập bằng chứng chưa hoàn tất (hết thời gian). "
+    "Vui lòng thử lại với phạm vi hẹp hơn."
+)
+
+_V2_MISSING_TERMINAL_MESSAGE = "v2 turn ended without a terminal response"
+
+_V2_MISSING_CLARIFICATION_MESSAGE = (
+    "clarification is pending but no request was checkpointed"
+)
+
+
+class V2FreshTurnRequired(ValueError):
+    """A clarification reply that can never satisfy its request.
+
+    Raised by :func:`prepare_v2_resume_command` when the reply targets a
+    candidate-free request (``ClarificationUnsatisfiable``): the caller MUST
+    treat the reply as a brand-new user turn instead of retrying the resume
+    (re-ask loops can never resolve it).
+    """
+
+
+class _V2StreamAccumulators:
+    """Answer/artifact accumulators for one v2 stream.
+
+    Mirrors the v1 ``stream_agent_events`` accumulator contract so the SSE
+    vocabulary stays identical: ``token`` appends prose, artifact events
+    replace their snapshot, and ``token_rollback`` clears EVERYTHING (the
+    terminal ``complete`` must never carry pre-rollback artifacts).
+    """
+
+    def __init__(self) -> None:
+        self.answer_text = ""
+        self.sources: list = []
+        self.images: list = []
+        self.people_data: list = []
+        self.potential_abbreviations: list = []
+
+    def on_token(self, text: str) -> None:
+        self.answer_text += text or ""
+
+    def on_sources(self, sources: list) -> None:
+        self.sources = list(sources or [])
+
+    def on_images(self, images: list) -> None:
+        self.images = list(images or [])
+
+    def on_people_data(self, people: list) -> None:
+        self.people_data = list(people or [])
+
+    def on_potential_abbreviations(self, abbreviations: list) -> None:
+        self.potential_abbreviations = list(abbreviations or [])
+
+    def on_rollback(self) -> dict:
+        """Clear every accumulator; returns the ``token_rollback`` event."""
+        self.answer_text = ""
+        self.sources = []
+        self.images = []
+        self.people_data = []
+        self.potential_abbreviations = []
+        return {"event": "token_rollback", "data": {}}
+
+
+def _v2_config(thread_id: str) -> dict:
+    """LangGraph config binding the run to its stable checkpoint thread."""
+    return {"configurable": {"thread_id": thread_id}}
+
+
+def _chunk_prose(text: str, size: int) -> list[str]:
+    """Deterministically chunk prose for ``token`` events (no tokenizer)."""
+    try:
+        chunk_size = max(1, int(size or _V2_TOKEN_CHUNK_DEFAULT))
+    except (TypeError, ValueError):
+        chunk_size = _V2_TOKEN_CHUNK_DEFAULT
+    if not text:
+        return []
+    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+
+def _v2_terminal_event(response) -> tuple[str, dict]:
+    """Map a terminal ``FinalResponse`` onto one ``(event, data)`` pair.
+
+    Single funnel for the one-terminal rule (success/clarify -> ``complete``,
+    denied/insufficient/error -> ``error``); see ``v2/events.py``.
+    """
+    from app.services.agents.v2.events import (
+        terminal_event_for_response as _terminal_event,
+    )
+
+    return _terminal_event(_coerce_final_response(response))
+
+
+def _coerce_final_response(value):
+    """Accept the live model or its checkpoint-serde mapping form."""
+    from app.services.agents.v2.contracts.response import FinalResponse
+
+    if isinstance(value, FinalResponse):
+        return value
+    if isinstance(value, dict):
+        data = dict(value)
+        # Checkpoint serde revives tuples as lists; the frozen model is
+        # strict, so restore the container form before validating.
+        if isinstance(data.get("citations"), list):
+            data["citations"] = tuple(data["citations"])
+        return FinalResponse.model_validate(data)
+    raise TypeError(
+        f"terminal state carries no FinalResponse (got {type(value).__name__})"
+    )
+
+
+def _coerce_clarification_request(value):
+    """Accept the live request or its checkpoint-serde mapping form."""
+    from app.services.agents.v2.contracts.clarification import ClarificationRequest
+
+    if value is None:
+        return None
+    if isinstance(value, ClarificationRequest):
+        return value
+    if isinstance(value, dict):
+        data = dict(value)
+        # Checkpoint serde revives tuples as lists; restore them first.
+        for key in ("candidates", "unresolved_ref_ids"):
+            if isinstance(data.get(key), list):
+                data[key] = tuple(data[key])
+        try:
+            return ClarificationRequest.model_validate(data)
+        except Exception:
+            logger.warning("[v2stream] clarification coerce failed", exc_info=True)
+            return None
+    return None
+
+
+async def _v2_checkpoint_values(graph, config: dict) -> dict:
+    """Load the latest checkpoint values for ``config`` (mapping form)."""
+    try:
+        snapshot = await graph.get_state(config)
+    except Exception:
+        logger.warning("[v2stream] checkpoint load failed", exc_info=True)
+        return {}
+    values = getattr(snapshot, "values", None)
+    if isinstance(values, dict):
+        return values
+    if isinstance(snapshot, dict):
+        inner = snapshot.get("values", snapshot)
+        if isinstance(inner, dict):
+            return inner
+    return {}
+
+
+def _v2_execution_slots(state: dict) -> tuple:
+    """Return ``(plan, task_results)`` from live or checkpoint-serde state."""
+    execution = (state or {}).get("execution")
+    if execution is None:
+        return None, ()
+    if isinstance(execution, dict):
+        return execution.get("plan"), tuple(execution.get("task_results") or ())
+    return getattr(execution, "plan", None), tuple(
+        getattr(execution, "task_results", None) or ()
+    )
+
+
+def _v2_undispatched(state: dict) -> tuple:
+    """Task ids in the checkpointed plan with no result yet (T3-N2 recipe).
+
+    The T6 runtime-only truncation channel (``DispatchReport.truncated``) is
+    deliberately never checkpointed, so the outer runner re-derives
+    incompleteness here: a non-empty remainder means the plan was not fully
+    executed and the turn must not present partial results as complete.
+    """
+    plan, results = _v2_execution_slots(state)
+    if plan is None:
+        return ()
+    try:
+        from app.services.agents.supervisor_v2 import (
+            undispatched_tasks as _t6_undispatched_tasks,
+        )
+
+        return tuple(_t6_undispatched_tasks(plan, tuple(results or ())))
+    except Exception:
+        logger.warning("[v2stream] undispatched diff failed", exc_info=True)
+    try:
+        done = set()
+        for item in results or ():
+            task_id = (
+                item.get("task_id")
+                if isinstance(item, dict)
+                else getattr(item, "task_id", None)
+            )
+            if task_id is not None:
+                done.add(task_id)
+        tasks = (
+            plan.get("tasks", ())
+            if isinstance(plan, dict)
+            else getattr(plan, "tasks", None) or ()
+        )
+        remainder = []
+        for task in tasks:
+            task_id = (
+                task.get("task_id")
+                if isinstance(task, dict)
+                else getattr(task, "task_id", None)
+            )
+            if task_id is not None and task_id not in done:
+                remainder.append(task_id)
+        return tuple(remainder)
+    except Exception:
+        logger.warning("[v2stream] fallback undispatched diff failed", exc_info=True)
+        return ()
+
+
+def _feed_plan_resolver_from_checkpoint(plan_resolver, checkpoint_state: dict) -> None:
+    """Feed the resolver from the checkpointed plan/bindings (T7 seam).
+
+    The resolver is never fed from request input or graph state — only the
+    authoritative checkpointed plan plus its binding set.
+    """
+    if plan_resolver is None:
+        return
+    try:
+        plan, _ = _v2_execution_slots(checkpoint_state or {})
+        bindings = (checkpoint_state or {}).get("bindings")
+        if plan is None or bindings is None:
+            return
+        feed = getattr(plan_resolver, "feed", None)
+        if callable(feed):
+            feed(plan, bindings)
+    except Exception:
+        logger.warning("[v2stream] plan resolver feed failed", exc_info=True)
+
+
+async def _refresh_v2_resume_leases(*, runtime_context, checkpoint_state: dict) -> int:
+    """Refresh existing run leases BEFORE the resume dispatch continues.
+
+    Re-acquires every evidence use pinned in the checkpoint so the resumed
+    run's artifacts stay under an active lease (expiry extended, release
+    cleared). Best-effort hygiene: failures are logged, never fatal — the
+    nodes fail closed on the leases they need.
+    """
+    try:
+        services = getattr(runtime_context, "services", None)
+        repo = getattr(services, "retention_leases", None)
+        if repo is None:
+            return 0
+        run_id = runtime_context.capability_runtime.run_id
+    except Exception:
+        logger.warning("[v2stream] lease refresh setup failed", exc_info=True)
+        return 0
+    _, results = _v2_execution_slots(checkpoint_state or {})
+    use_ids: set = set()
+    try:
+        for item in results or ():
+            if isinstance(item, dict):
+                uses = item.get("evidence_uses") or ()
+            else:
+                uses = getattr(item, "evidence_uses", None) or ()
+            for use in uses:
+                if isinstance(use, dict):
+                    uid = use.get("use_id")
+                else:
+                    uid = getattr(use, "use_id", None)
+                if uid is not None:
+                    use_ids.add(uid)
+    except Exception:
+        logger.warning("[v2stream] lease refresh scan failed", exc_info=True)
+        return 0
+    refreshed = 0
+    for uid in sorted(use_ids, key=repr):
+        try:
+            await repo.acquire_or_refresh(run_id, None, uid)
+            refreshed += 1
+        except Exception:
+            logger.warning("[v2stream] lease refresh failed", exc_info=True)
+    if refreshed:
+        try:
+            session = getattr(repo, "session", None)
+            commit = getattr(session, "commit", None)
+            if callable(commit):
+                await commit()
+        except Exception:
+            logger.warning("[v2stream] lease refresh commit failed", exc_info=True)
+    return refreshed
+
+
+async def _release_v2_run_leases(*, runtime_context, reason: str) -> int:
+    """Release the run's leases (terminal boundary only; never raises)."""
+    try:
+        services = getattr(runtime_context, "services", None)
+        repo = getattr(services, "retention_leases", None)
+        if repo is None:
+            return 0
+        run_id = runtime_context.capability_runtime.run_id
+        rowcount = await repo.release_run(run_id, reason)
+        try:
+            session = getattr(repo, "session", None)
+            commit = getattr(session, "commit", None)
+            if callable(commit):
+                await commit()
+        except Exception:
+            logger.warning("[v2stream] lease release commit failed", exc_info=True)
+        return int(rowcount or 0)
+    except Exception:
+        logger.warning("[v2stream] lease release failed", exc_info=True)
+        return 0
+
+
+async def prepare_v2_resume_command(
+    *,
+    message_id,
+    request,
+    runtime_context,
+):
+    """Build the verbatim resume ``Command`` for a clarification reply.
+
+    Loads T5's ``resume_clarification`` output and returns it untouched —
+    the graph owns navigation. A candidate-free request raises
+    ``V2FreshTurnRequired``: the caller must treat the reply as a new turn,
+    never retry the resume.
+    """
+    from app.services.agents.v2.nodes.clarification import (
+        ClarificationUnsatisfiable,
+        resume_clarification,
+    )
+
+    try:
+        return await resume_clarification(message_id, request, runtime_context)
+    except ClarificationUnsatisfiable as exc:
+        raise V2FreshTurnRequired(
+            "clarification offers no selectable candidate; "
+            "treat the reply as a new turn, do not retry the resume"
+        ) from exc
+
+
+async def stream_v2_turn_events(
+    *,
+    graph,
+    runtime_context,
+    thread_id: str,
+    initial_state: dict | None = None,
+    resume_command=None,
+    plan_resolver=None,
+    token_chunk_size: int = _V2_TOKEN_CHUNK_DEFAULT,
+):
+    """Run one v2 turn and yield SSE-compatible dict events (see module note).
+
+    Exactly one of ``initial_state`` (first turn) or ``resume_command`` (a
+    verbatim :func:`prepare_v2_resume_command` ``Command``) is required.
+    ``config`` binds the stable ``thread_id``; ``context`` always carries
+    the caller-supplied ``runtime_context`` so the CURRENT ACL replaces
+    historical values on resume. Emits exactly one terminal event.
+    """
+    from langgraph.errors import GraphInterrupt
+
+    if (initial_state is None) == (resume_command is None):
+        raise ValueError("exactly one of initial_state/resume_command is required")
+    config = _v2_config(thread_id)
+    acc = _V2StreamAccumulators()
+    invoke_task = None
+    try:
+        if resume_command is not None:
+            yield {"event": "status", "data": {"step": "v2", "detail": "Resuming v2 graph..."}}
+            checkpoint_state = await _v2_checkpoint_values(graph, config)
+            await _refresh_v2_resume_leases(
+                runtime_context=runtime_context,
+                checkpoint_state=checkpoint_state,
+            )
+            _feed_plan_resolver_from_checkpoint(plan_resolver, checkpoint_state)
+            payload = resume_command
+        else:
+            yield {"event": "status", "data": {"step": "v2", "detail": "Running v2 graph..."}}
+            payload = initial_state
+        invoke_task = asyncio.create_task(
+            graph.ainvoke(payload, config, context=runtime_context)
+        )
+        try:
+            result = await invoke_task
+        except GraphInterrupt:
+            # Clarify suspend: the suspension checkpoint keeps the persisted
+            # request AND the active leases (never released here). Surface
+            # the question as the turn's single terminal ``complete``.
+            checkpoint_state = await _v2_checkpoint_values(graph, config)
+            pending = _coerce_clarification_request(
+                (checkpoint_state or {}).get("clarification")
+            )
+            if pending is None:
+                yield {"event": "error", "data": {"message": _V2_MISSING_CLARIFICATION_MESSAGE}}
+                return
+            question = pending.question
+            yield {"event": "status", "data": {"step": "clarify", "detail": "clarification pending"}}
+            for chunk in _chunk_prose(question, token_chunk_size):
+                acc.on_token(chunk)
+                yield {"event": "token", "data": {"text": chunk}}
+            event, data = _v2_terminal_event(
+                _coerce_final_response(
+                    {
+                        "contract_version": pending.contract_version,
+                        "status": "clarify",
+                        "content": question,
+                        "citations": (),
+                    }
+                )
+            )
+            yield {"event": event, "data": data}
+            return
+        state = result if isinstance(result, dict) else {}
+        remaining = _v2_undispatched(state)
+        if remaining:
+            # Deadline-truncated dispatch: never present partial results as
+            # complete — clear speculative state, then surface the error.
+            logger.warning(
+                "[v2stream] truncated dispatch: %d task(s) undispatched",
+                len(remaining),
+            )
+            yield acc.on_rollback()
+            yield {"event": "error", "data": {"message": _V2_TRUNCATION_MESSAGE}}
+            await _release_v2_run_leases(runtime_context=runtime_context, reason="terminal")
+            return
+        try:
+            final = _coerce_final_response(state.get("final_response"))
+        except (TypeError, ValueError):
+            logger.error("[v2stream] turn ended without a terminal response")
+            yield {"event": "error", "data": {"message": _V2_MISSING_TERMINAL_MESSAGE}}
+            await _release_v2_run_leases(runtime_context=runtime_context, reason="terminal")
+            return
+        event, data = _v2_terminal_event(final)
+        if event == "complete":
+            # Only the outer adapter streams prose: chunk the terminal
+            # content into ``token`` events, then emit the single terminal.
+            yield {"event": "status", "data": {"step": "generating", "detail": "Streaming v2 answer..."}}
+            for chunk in _chunk_prose(data.get("answer", ""), token_chunk_size):
+                acc.on_token(chunk)
+                yield {"event": "token", "data": {"text": chunk}}
+            await _release_v2_run_leases(runtime_context=runtime_context, reason="terminal")
+            yield {"event": event, "data": data}
+            return
+        await _release_v2_run_leases(runtime_context=runtime_context, reason="terminal")
+        yield {"event": event, "data": data}
+    except GeneratorExit:
+        # Client disconnect mid-run: stop the graph task, never succeed.
+        if invoke_task is not None and not invoke_task.done():
+            invoke_task.cancel()
+        await _release_v2_run_leases(runtime_context=runtime_context, reason="cancelled")
+        raise
+    except asyncio.CancelledError:
+        # Cancellation prevents all later dispatch and any factual success:
+        # no terminal event, leases released as cancelled, error propagates.
+        if invoke_task is not None and not invoke_task.done():
+            invoke_task.cancel()
+        await _release_v2_run_leases(runtime_context=runtime_context, reason="cancelled")
+        raise
+
+
+async def stream_v2_turn_to_sse(
+    *,
+    graph,
+    runtime_context,
+    thread_id: str,
+    initial_state: dict | None = None,
+    resume_command=None,
+    plan_resolver=None,
+    token_chunk_size: int = _V2_TOKEN_CHUNK_DEFAULT,
+):
+    """SSE wrapper around :func:`stream_v2_turn_events` (v1 wire format)."""
+    async for ev in stream_v2_turn_events(
+        graph=graph,
+        runtime_context=runtime_context,
+        thread_id=thread_id,
+        initial_state=initial_state,
+        resume_command=resume_command,
+        plan_resolver=plan_resolver,
+        token_chunk_size=token_chunk_size,
+    ):
+        yield _sse(ev["event"], ev["data"])

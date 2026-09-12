@@ -15,7 +15,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, waitFor, act } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { parseSSEEvents } from '../../../test-utils/mockSSE';
+import { parseSSEEvents, mockSSEResponse } from '../../../test-utils/mockSSE';
 import { useRAGChatStream } from '../../../hooks/useRAGChatStream';
 import { useAuthStore } from '../../../stores/authStore';
 
@@ -202,6 +202,69 @@ describe('ChatPanel rollback (B5)', () => {
             expect(result.current.potentialAbbreviations).toHaveLength(0);
             expect(result.current.streamingContent).toBe('');
             expect(result.current.status).toBe('idle');
+
+            queryClient.clear();
+        });
+    });
+
+    // --- v2 additive complete fields (T8): no hook change needed ---
+
+    describe('v2 additive complete compatibility (no hook change)', () => {
+        it('complete with additive status/citations resolves the turn', async () => {
+            // v2 terminal payload: every v1 key the hook reads PLUS additive
+            // v2 fields (status, citations). The hook must resolve the turn
+            // from the v1 keys and ignore the additive fields.
+            // NOTE: happy-dom Response has no working body.getReader, so the
+            // fetch mock serves a fake reader (the hook only uses ok/body).
+            const frames = [
+                'event: status\ndata: {"step":"generating","detail":"Streaming v2 answer..."}\n\n',
+                'event: token\ndata: {"type":"token","text":"hello"}\n\n',
+                'event: complete\ndata: {"type":"complete","answer":"hello","sources":[],"images":[],"potential_abbreviations":[],"people_data":[],"status":"success","citations":[{"citation_id":"c1","label":"[1]"}]}\n\n',
+            ];
+            const encoder = new TextEncoder();
+            const chunks = frames.map((f) => encoder.encode(f));
+            let readIndex = 0;
+            (global.fetch as any) = vi.fn(() =>
+                Promise.resolve({
+                    ok: true,
+                    body: {
+                        getReader: () => ({
+                            read: async () => {
+                                if (readIndex >= chunks.length) {
+                                    return { done: true, value: undefined };
+                                }
+                                return { done: false, value: chunks[readIndex++] };
+                            },
+                            cancel: async () => {},
+                        }),
+                    },
+                })
+            );
+
+            const queryClient = new QueryClient();
+
+            const { result } = renderHook(
+                () => useRAGChatStream('test-session-v2'),
+                {
+                    wrapper: ({ children }) => (
+                        <QueryClientProvider client={queryClient}>
+                            {children}
+                        </QueryClientProvider>
+                    ),
+                }
+            );
+
+            let final: unknown = null;
+            await act(async () => {
+                final = await result.current.sendMessage('hello', [], false);
+                await vi.advanceTimersByTimeAsync(500);
+            });
+
+            await waitFor(() => {
+                expect(result.current.isStreaming).toBe(false);
+            }, { timeout: 3000 });
+            expect((final as { content?: string } | null)?.content).toBe('hello');
+            expect(result.current.error).toBeNull();
 
             queryClient.clear();
         });
