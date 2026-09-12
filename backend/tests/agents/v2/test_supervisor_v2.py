@@ -962,7 +962,8 @@ async def test_context_node_error_converts_to_typed_error() -> None:
 
 @pytest.mark.asyncio
 async def test_scheduler_error_converts_to_typed_error() -> None:
-    # NEW-C1: execute with no registry wired converts instead of escaping.
+    # NEW-C1/NEW-I1: execute with no registry wired converts to a STICKY
+    # typed error (never masked downstream) and dispatches nothing.
     runtime = make_runtime_context(
         semantic_adapter=FakeSemanticAdapter(people_draft()),
         binding_resolver=FakeBindingResolver(
@@ -979,10 +980,133 @@ async def test_scheduler_error_converts_to_typed_error() -> None:
     )
     resumed = normalize_checkpoint_state(dict(result))
     assert resumed["final_response"] is not None
-    assert resumed["final_response"].status in ("insufficient", "error")
+    assert resumed["final_response"].status == "error"
     validate_supervisor_state(resumed)
     stored = graph.get_state(config)
     assert stored.next == ()
+    # Zero dispatches: no checkpoint ever holds a task result.
+    history = [entry async for entry in graph.aget_state_history(config)]
+    assert history, "expected owned checkpoints"
+    for entry in history:
+        values = entry.values or {}
+        execution = values.get("execution")
+        results = (
+            execution.get("task_results", ())
+            if isinstance(execution, dict)
+            else getattr(execution, "task_results", ())
+        )
+        assert tuple(results) == ()
+
+
+@pytest.mark.asyncio
+async def test_binding_failure_is_sticky_no_dispatch() -> None:
+    # NEW-I1 (review P8/P9a): a fail-closed binding/lease failure ends the
+    # turn in typed error with ZERO capability dispatches — the marker is
+    # never overwritten downstream and the thread stays continuable.
+    events: list[str] = []
+    draft = SemanticDraft(
+        provisional_contextualized_query="so sánh tài liệu một và tài liệu hai",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(resolved_ref("r1", DOCUMENT_ID), resolved_ref("r2", OTHER_DOCUMENT_ID)),
+        person_refs=(),
+        section_refs=(),
+        preliminary_ambiguities=(),
+    )
+
+    class _FailingResolver:
+        async def resolve(self, document_refs: Any, capability_runtime: Any) -> Any:
+            from app.services.agents.v2.nodes.binding import BindingNodeError
+
+            raise BindingNodeError("lease backend unreachable")
+
+    capability = FakeCapability(
+        name="people.lookup",
+        domain="people",
+        result=people_success("never-dispatched"),
+    )
+    runtime = make_runtime_context(
+        semantic_adapter=FakeSemanticAdapter(draft),
+        binding_resolver=_FailingResolver(),
+        retention_leases=FakeLeaseRepo(events),
+        answer_draft_channel=AnswerDraftChannel(),
+    )
+    runtime.services.capability_registry = build_capability_registry(
+        [CapabilityRegistration(capability=capability)],
+        runtime.capability_runtime,
+    )
+    graph, config = compile_graph(runtime, thread_id="bind-fail-1")
+    result = await graph.ainvoke(
+        make_state(request=make_request("So sánh hai tài liệu")), config, context=runtime
+    )
+    resumed = normalize_checkpoint_state(dict(result))
+    assert resumed["final_response"] is not None
+    assert resumed["final_response"].status == "error"
+    assert capability.calls == []
+    stored = graph.get_state(config)
+    assert stored.next == ()
+    again = await graph.ainvoke(None, config, context=runtime)
+    assert normalize_checkpoint_state(dict(again))["final_response"].status == "error"
+
+
+@pytest.mark.asyncio
+async def test_lease_backend_failure_is_sticky_no_dispatch() -> None:
+    # NEW-I1 (review P8): resolver pins, but the lease write fails — the
+    # pin must not be checkpointed and nothing may dispatch afterwards.
+    events: list[str] = []
+    draft = SemanticDraft(
+        provisional_contextualized_query="so sánh tài liệu một và tài liệu hai",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(resolved_ref("r1", DOCUMENT_ID), resolved_ref("r2", OTHER_DOCUMENT_ID)),
+        person_refs=(),
+        section_refs=(),
+        preliminary_ambiguities=(),
+    )
+    pins = DocumentBindingSet(
+        bindings=(
+            pin_for("r1", DOCUMENT_ID, REVISION_ID),
+            pin_for("r2", OTHER_DOCUMENT_ID, OTHER_REVISION_ID),
+        ),
+        revision_requirement_refs=(),
+    )
+
+    class _FailingLeaseRepo(FakeLeaseRepo):
+        async def acquire_or_refresh(
+            self, run_id: str, revision_id: Any, evidence_use_id: Any = None, **kwargs: Any
+        ) -> Any:
+            self.events.append(f"acquire:{revision_id}:{evidence_use_id}")
+            raise RuntimeError("lease backend down")
+
+    capability = FakeCapability(
+        name="people.lookup",
+        domain="people",
+        result=people_success("never-dispatched"),
+    )
+    runtime = make_runtime_context(
+        semantic_adapter=FakeSemanticAdapter(draft),
+        binding_resolver=FakeBindingResolver(pins),
+        retention_leases=_FailingLeaseRepo(events),
+        answer_draft_channel=AnswerDraftChannel(),
+    )
+    runtime.services.capability_registry = build_capability_registry(
+        [CapabilityRegistration(capability=capability)],
+        runtime.capability_runtime,
+    )
+    graph, config = compile_graph(runtime, thread_id="lease-fail-1")
+    result = await graph.ainvoke(
+        make_state(request=make_request("So sánh hai tài liệu")), config, context=runtime
+    )
+    resumed = normalize_checkpoint_state(dict(result))
+    assert resumed["final_response"] is not None
+    assert resumed["final_response"].status == "error"
+    assert capability.calls == []
+    # The failed pin never reached checkpoint state.
+    assert resumed["bindings"].bindings == ()
+    stored = graph.get_state(config)
+    assert stored.next == ()
+    again = await graph.ainvoke(None, config, context=runtime)
+    assert normalize_checkpoint_state(dict(again))["final_response"].status == "error"
 
 
 def test_model_input_cannot_supply_workspace_or_acl() -> None:
@@ -1489,6 +1613,12 @@ async def test_clarify_selection_resume_advances_to_binding() -> None:
     assert resumed["final_response"] is not None
     assert resumed["final_response"].status == "insufficient"
     validate_supervisor_state(resumed)
+    # The thread is clean and terminal (re-review minor 3): no re-suspend
+    # above, next == () here, and a continue re-ends on the same terminal.
+    stored = graph.get_state(config)
+    assert stored.next == ()
+    again = await graph.ainvoke(None, config, context=runtime)
+    assert normalize_checkpoint_state(dict(again))["final_response"].status == "insufficient"
     # EVERY post-resume owned checkpoint validates (no silent invalid write).
     history_after = [entry async for entry in graph.aget_state_history(config)]
     new_entries = history_after[: len(history_after) - len(history_before)]

@@ -42,6 +42,14 @@ its results (``undispatched_tasks`` below): a non-empty remainder with no
 active run means the plan was not fully executed — raise rollback/error
 from it, never present partial results as complete.
 
+Recorded T7/T8 prerequisite: once conversions are sticky, the common shape
+of an early-conversion terminal is an error marker over the INGRESS
+placeholder semantic (blank ``contextualized_query``), which the frozen
+validator rejects. A terminal checkpoint whose ``final_response.status``
+is not ``"success"`` and whose semantic is still the ingress placeholder
+must be treated as terminal-errored, not corrupt — never run
+``validate_supervisor_state`` on it as a health check.
+
 Lease ordering: binding pins acquire/commit retention leases inside the
 nodes (T1/T3-owned); terminal release (``release_run``) belongs to the OUTER
 runner (T8) after the terminal checkpoint succeeds — never inside the
@@ -313,38 +321,31 @@ _UNVALIDATED_ENTRIES = frozenset(
 )
 
 
-def _typed_boundary_error(detail: str, view: SupervisorV2State | None = None) -> dict:
+def _typed_boundary_error(detail: str) -> dict:
     """Convert an owned-boundary failure into a typed error.
 
     Returns a terminal ``error`` ``FinalResponse`` update instead of letting
     the failure escape the graph. The detail is logged (operators) but never
-    surfaced (users). When the converted aggregate sits on the clarify
-    route, ``route_decision`` (and its ``query_analysis`` evidence) is
-    cleared alongside the retired request, so the error checkpoint stays
-    D6-valid instead of stranding ``route=clarify`` with no request.
-    Downstream owned boundaries short-circuit on the still-invalid aggregate
-    and the finalizer wrapper returns this marker, so the turn converges to
-    a typed error — never a success, never an exception, never a thread
-    that re-raises on continue.
+    surfaced (users). ``route_decision`` (and its ``query_analysis``
+    evidence) is ALWAYS cleared: a converted failure has no validated
+    topology left to execute, and a stale route would let the finalizer
+    recompute over the marker (masking the error as success) or strand a
+    clarify route with no request. Downstream owned boundaries short-circuit
+    on the still-invalid aggregate and the finalizer wrapper returns this
+    marker, so the turn converges to a typed error — never a success, never
+    an exception, never a thread that re-raises on continue.
     """
     logger.warning("supervisor_v2 boundary validation failed: %s", detail)
-    update: dict[str, Any] = {
+    return {
         "final_response": FinalResponse(
             contract_version=CONTRACT_VERSION,
             status="error",
             content=_BOUNDARY_ERROR_CONTENT,
             citations=(),
-        )
+        ),
+        "route_decision": None,
+        "query_analysis": None,
     }
-    if view is not None:
-        route = view.get("route_decision")
-        route_name = getattr(route, "route", None)
-        if route_name is None and isinstance(route, Mapping):
-            route_name = route.get("route")
-        if route_name == "clarify":
-            update["route_decision"] = None
-            update["query_analysis"] = None
-    return update
 
 
 def _retire_stale_clarification(view: SupervisorV2State) -> bool:
@@ -383,6 +384,23 @@ def _retire_stale_clarification(view: SupervisorV2State) -> bool:
     return False
 
 
+def _has_terminal_marker(state: Mapping[str, Any]) -> bool:
+    """True when the state carries a non-success terminal response.
+
+    Accepts the live model and the checkpoint-serde mapping form. Only
+    owned conversions and ground's failure path write non-success markers
+    mid-flow, so at the route boundary this means an owned failure already
+    converted this turn (success markers always re-derive normally).
+    """
+    marker = state.get("final_response")
+    if marker is None:
+        return False
+    status = getattr(marker, "status", None)
+    if status is None and isinstance(marker, Mapping):
+        status = marker.get("status")
+    return status is not None and status != "success"
+
+
 def _wrap_node(name: str, fn: Callable) -> Callable:
     """Normalize, hygienize, and boundary-validate around every node.
 
@@ -390,28 +408,52 @@ def _wrap_node(name: str, fn: Callable) -> Callable:
       two clarify nodes, which own clarification semantics — retires a
       clarification orphaned by a turn change (C1 Proof 2/3).
     - Post-finalization entries (everything past ``route``) fully validate
-      the aggregate: entry failures short-circuit to a typed error update
-      WITHOUT running the node, so no capability ever dispatches on an
-      invalid aggregate and no ``ContractValidationError`` escapes.
+      the aggregate: entry failures convert WITHOUT running the node, so no
+      capability ever dispatches on an invalid aggregate and no exception
+      escapes.
     - ``direct``/``clarify``/``clarify_wait``/``fast_plan`` fix an
       expected transient invalidity with their update, so they validate the
       MERGED state instead (conversion on failure).
+    - Conversions are STICKY (except ``finalizer``/``clarify_wait``): the
+      error marker navigates straight to the finalizer with the route
+      cleared, so no downstream node overwrites it and no capability
+      dispatches after a failure. ``clarify_wait``/``finalizer`` have no
+      static outgoing edge (own ``Command`` navigation / already terminal),
+      so their plain-dict conversions terminate in place.
     - The finalizer wrapper never emits success from an invalid aggregate:
       entry failure returns the already-checkpointed marker (unless it is a
       stale success) or a fresh typed error, without running the node.
     """
 
     sme_merge_nodes = name in ("direct", "clarify", "clarify_wait", "fast_plan")
+    # Sticky conversions: a converted failure becomes a route-cleared error
+    # marker that NO downstream node overwrites. Stickiness is STATE-based,
+    # not navigation-based: a node-returned Command goto UNIONS with static
+    # edges on this stack (verified: both targets run), so navigation cannot
+    # carry it. Instead (a) every conversion clears route/analysis, (b) the
+    # route wrapper skips re-derivation while a non-success marker stands,
+    # (c) the route branch sends marker-states straight to the finalizer,
+    # (d) context clears stale markers at every turn start, and (e) the
+    # finalizer returns a routeless marker as-is. Exempt from NOTHING here:
+    # finalizer/clarify_wait conversions are plain dicts that terminate in
+    # place (no static edge out of clarify_wait; finalizer is terminal).
+    # clarify_wait's own navigation Commands (resume paths) pass through
+    # the Command branch below untouched.
 
     @functools.wraps(fn)
     async def _node(state: SupervisorV2State, runtime: Any) -> dict:
-        # Every failure below converts to a typed terminal response —
+        # Every failure below converts to a STICKY typed terminal response —
         # GraphInterrupt (suspension) is the sole exception and always
         # re-raises; cancellation (BaseException, not Exception) never
-        # matches by construction. Converted turns checkpoint the error
-        # marker and terminate at the finalizer instead of raising mid-chain
-        # (a mid-chain raise strands `next=(node,)` on a state that
-        # re-raises on continue — a poisoned thread).
+        # matches by construction. Stickiness is STATE-based: the error
+        # marker always travels with a cleared route, the route wrapper
+        # never re-derives over a marker, the route branch sends
+        # marker-states straight to the finalizer, and context clears stale
+        # markers at every turn start — so no downstream node overwrites the
+        # marker and no capability dispatches after a failure. (Navigation
+        # cannot carry stickiness: node-returned Command gotos UNION with
+        # static edges on this stack.) A mid-chain raise would strand
+        # `next=(node,)` on a state that re-raises on continue (poisoned).
         try:
             view = normalize_checkpoint_state(state)
         except GraphInterrupt:
@@ -438,7 +480,7 @@ def _wrap_node(name: str, fn: Callable) -> Callable:
                         "supervisor_v2 finalizer short-circuit: %s", exc
                     )
                     return {"final_response": marker}
-                return _typed_boundary_error(f"finalizer entry: {exc}", view)
+                return _typed_boundary_error(f"finalizer entry: {exc}")
             marker = view.get("final_response")
             if (
                 isinstance(marker, FinalResponse)
@@ -458,20 +500,39 @@ def _wrap_node(name: str, fn: Callable) -> Callable:
             except Exception as exc:
                 # T4 FinalizerError included: "the run must fail, not
                 # succeed" becomes the same typed error response.
-                return _typed_boundary_error(f"finalizer: {exc}", view)
+                return _typed_boundary_error(f"finalizer: {exc}")
+        if name == "route" and _has_terminal_marker(view):
+            # An owned boundary already converted this turn (conversions
+            # always clear the route): never re-derive a topology over the
+            # failure. The branch below sends marker-states to the finalizer.
+            return {}
+        if name in ("direct", "fast_plan", "execute", "evaluate", "synthesize", "ground", "complex_boundary") and _has_terminal_marker(view):
+            # Same stickiness downstream: a conversion marker must reach the
+            # finalizer untouched — running here would overwrite it (ground
+            # re-derives insufficiency over errors; execute could dispatch
+            # after a fail-closed failure) and resurrect the turn. Ground's
+            # own failure marker is set by ground itself, so it is never
+            # skipped into existence: only the finalizer consumes markers.
+            return {}
         if name not in _UNVALIDATED_ENTRIES and not sme_merge_nodes:
             try:
                 validate_supervisor_state(view)
             except GraphInterrupt:
                 raise
             except Exception as exc:
-                return _typed_boundary_error(f"{name} entry: {exc}", view)
+                return _typed_boundary_error(f"{name} entry: {exc}")
         try:
             update = await fn(view, runtime)
         except GraphInterrupt:
             raise
         except Exception as exc:
-            return _typed_boundary_error(f"{name}: {exc}", view)
+            return _typed_boundary_error(f"{name}: {exc}")
+        if name == "context" and isinstance(update, dict):
+            # Fresh turn, fresh response: stale terminal markers from a
+            # prior turn must not survive into this turn's flow (they would
+            # trip the route skip + branch-error below and stick the new
+            # turn in the old error). The finalizer recomputes every turn.
+            update = {**update, "final_response": None}
         try:
             if isinstance(update, Command):
                 # Navigation-carrying return (clarify_wait resume paths):
@@ -501,12 +562,12 @@ def _wrap_node(name: str, fn: Callable) -> Callable:
         except GraphInterrupt:
             raise
         except Exception as exc:
-            if isinstance(update, Command):
-                return Command(
-                    update=_typed_boundary_error(f"{name} merged: {exc}", view),
-                    goto=update.goto,
-                )
-            return _typed_boundary_error(f"{name} merged: {exc}", view)
+            # Wrapper-level corruption of a navigation-carrying return can
+            # never continue the planned navigation: force the finalizer.
+            return Command(
+                update=_typed_boundary_error(f"{name} merged: {exc}"),
+                goto="finalizer",
+            )
 
     _node.__v2_origin__ = fn  # type: ignore[attr-defined]
     _node.__v2_node__ = name  # type: ignore[attr-defined]
@@ -666,10 +727,10 @@ async def clarify_wait_node(state: SupervisorV2State, runtime: Any) -> dict:
     output through VERBATIM (``Command(resume=...)`` with NO outer ``goto``
     — the graph owns navigation per the T5 round-2 contract). Verified
     empirically: an outer ``goto="binding"`` pre-schedules ``binding``
-    into the SAME super-step as the resumed wait, which then reads
-    pre-update state, pins nothing, and strands a resolved ref without a
-    pin (then a ``ContextNodeError`` escape and a poisoned thread) — so an
-    outer ``goto`` must never be added. Required T8 call form::
+    into the SAME super-step as the resumed wait (stale-read pin loss),
+    and with the universal conversion in place the corrupted shape now
+    terminates typed instead of escaping — but the turn is still destroyed,
+    so an outer ``goto`` must never be added. Required T8 call form::
 
         command = await resume_clarification(message_id, request, runtime)
         await graph.ainvoke(command, config, context=runtime)
@@ -686,7 +747,7 @@ async def clarify_wait_node(state: SupervisorV2State, runtime: Any) -> dict:
         view.get("clarification"), ClarificationRequest, slot="clarification"
     )
     if persisted is None:
-        return _typed_boundary_error("clarify_wait without persisted request", view)
+        return _typed_boundary_error("clarify_wait without persisted request")
     resume_value = await interrupt_for_clarification(persisted)
     if resume_value is None:
         # Defensive: the interrupt resolved without a payload. Fall through
@@ -718,7 +779,7 @@ async def clarify_wait_node(state: SupervisorV2State, runtime: Any) -> dict:
         return Command(
             update={
                 "clarification": None,
-                **_typed_boundary_error(f"clarify_wait resume: {exc}", view),
+                **_typed_boundary_error(f"clarify_wait resume: {exc}"),
             },
             goto="finalizer",
         )
@@ -840,9 +901,11 @@ async def _apply_clarification_resolution(
         else reference
         for reference in view["semantic"].document_refs
     )
-    # NOTE: no binding pins are written here (single writer per key per
-    # step — the outer ``goto="binding"`` runs the binding node in the
-    # same tick as this resumed pass). The re-driven binding node rebuilds
+    # NOTE: no binding pins are written here — key separation across ticks
+    # is what keeps every channel single-writer: this update carries
+    # request/semantic/clarification/route/analysis, and the re-driven
+    # binding node (next tick, via this node's returned Command) carries
+    # bindings. The re-driven binding node rebuilds
     # the draft through the selection-aware adapter (``ui_selection``
     # reconciliation), pins the answered ref, and leases before
     # checkpointing; the transient semantic patch above documents the
@@ -899,8 +962,12 @@ def _route_branch(state: SupervisorV2State) -> str:
     real round-trip is re-validated before branching; a missing or foreign
     route fails closed instead of falling through to a default topology.
     Returns the ROUTE key (``add_conditional_edges`` maps it to the node
-    via ``_ROUTE_BRANCHES``) — never a node name.
+    via ``_ROUTE_BRANCHES``) — never a node name — except the converted
+    marker, which navigates straight to the finalizer (``"error"`` branch)
+    so a converted failure can never resurrect through re-derivation.
     """
+    if _has_terminal_marker(state):
+        return "error"
     decision = state.get("route_decision")
     if isinstance(decision, Mapping):
         decision = _coerce_slot(decision, RouteDecision, slot="route_decision")
@@ -921,7 +988,9 @@ def _add_supervisor_edges(graph: StateGraph) -> None:
     graph.add_edge("context", "binding")
     graph.add_edge("binding", "semantic_finalizer")
     graph.add_edge("semantic_finalizer", "route")
-    graph.add_conditional_edges("route", _route_branch, _ROUTE_BRANCHES)
+    graph.add_conditional_edges(
+        "route", _route_branch, {**_ROUTE_BRANCHES, "error": "finalizer"}
+    )
     graph.add_edge("direct", "finalizer")
     graph.add_edge("clarify", "clarify_wait")
     # No static edge out of clarify_wait: every pass either suspends

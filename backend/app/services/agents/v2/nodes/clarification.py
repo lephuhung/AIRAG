@@ -486,15 +486,16 @@ async def resume_clarification(
     ``ClarificationUnauthorized``. Nothing unauthorized is accepted.
 
     Returns ``Command(resume=<resolution>)`` with NO ``goto``: the composed
-graph owns navigation (``clarify_wait`` continues with the resume value
-and returns its own ``Command(update=..., goto="binding")`` on the next
-tick). Required T8 call form is verbatim passthrough::
+    graph owns navigation (``clarify_wait`` continues with the resume value
+    and returns its own ``Command(update=..., goto="binding")`` on the next
+    tick). Required T8 call form is verbatim passthrough::
 
         command = await resume_clarification(message_id, request, runtime)
         await graph.ainvoke(command, config, context=runtime)
 
     Never add an outer ``goto``: it pre-schedules ``binding`` into the same
-super-step as the resumed wait (stale-read loss, then a poisoned thread).
+    super-step as the resumed wait (stale-read pin loss, then a corrupted
+    turn).
     """
     context = node_context(runtime)
     chat_messages = context.services.chat_messages
