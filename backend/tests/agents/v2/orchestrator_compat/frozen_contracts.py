@@ -1,17 +1,24 @@
 """Typed benchmark contracts for the LangGraph v2 Phase 0 parity scenarios.
 
-These classes reproduce the **minimum subset** of contract shapes from the
-binding spec (`docs/superpowers/specs/2026-09-10-langgraph-v2-contract-first-design.md`)
-needed to build parity scenarios. They are test fixtures only — production
-v2 code imports from `backend/app/services/agents/contracts/` once Phase 1D
-introduces them. The spec is the binding authority; this file's structure
-follows it verbatim.
+These classes reproduce contract shapes from the binding spec
+(`docs/superpowers/specs/2026-09-10-langgraph-v2-contract-first-design.md`).
+They are TEST FIXTURES ONLY. Production v2 code imports these from
+`backend/app/services/agents/contracts/` once Phase 1D introduces the real
+contracts module.
 
-Each class header documents the spec section it derives from. All models use
-`ConfigDict(extra="forbid", frozen=True, strict=True)` so:
-- unknown fields are rejected (typed surface),
-- instances are immutable (frozen state),
-- `model_validate`/`__init__` reject coercions (strict mode).
+Architectural rules (binding — see plan `2026-09-11-langgraph-v2-implementation.md`
+prohibition #30):
+
+- `CapabilityDescriptor`, `CapabilityInput`, `CapabilityOutput`, and the runtime-only
+  `CapabilityRuntimeContext` are FROZEN contracts OWNED BY the contracts layer. They
+  are NOT redefined or field-extended in this fixture file. Phase 0 references a
+  clearly-named placeholder (`_Phase0CapabilityStandIn`) so different code paths can
+  type-check without importing the real types. **Phase 1D REPLACES this placeholder
+  with the contract-layer types from `contracts/capability.py`.**
+- All `ContractModel`-derived families use
+  `ConfigDict(extra="forbid", frozen=True, strict=True)`. The forbidden dict escape
+  hatch of `dict[str, Any]` is absent from every locator and I/O contract.
+- Every class header carries the spec section it derives from.
 """
 from __future__ import annotations
 
@@ -22,84 +29,67 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 
-class _PlaceholderCapabilityInput(BaseModel):
-    """Phase 0 placeholder for CapabilityInput. The discriminated union is
-    defined in the contracts module added by Phase 1D; until then a single
-    model variant keeps the schema valid (a typed union of `dict` is not
-    permitted by Pydantic v2).
-    """
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-    kind: Literal["placeholder"]
-    payload: dict[str, Any] = Field(default_factory=dict)
-
-
-class _PlaceholderCapabilityOutput(BaseModel):
-    """Phase 0 placeholder for CapabilityOutput. Same rationale as the input."""
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-    kind: Literal["placeholder"]
-    payload: dict[str, Any] = Field(default_factory=dict)
-
-
 # ---------------------------------------------------------------------------
-# Root base — ContractModel is the spec's frozen Pydantic envelope base.
+# Spec §3 — base envelope.
 # ---------------------------------------------------------------------------
 
 class ContractModel(BaseModel):
-    """Spec §4: every persisted business contract inherits this base."""
+    """Spec §3: every persisted business contract inherits this base."""
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
 # ---------------------------------------------------------------------------
-# Capacities & I/O — spec §13.4, only the minimum needed to wire TaskSpec.input.
-# We use simple placeholders here because Phase 0 fixtures only carry the
-# discriminated-union shape, never real capability data.
+# Spec §11 — CapabilityRuntimeContext (forbidden to redefine).
+# Spec §13.4 — CapabilityInput/Output (forbidden to redefine).
+# Spec §16 — CapabilityDescriptor (forbidden to redefine).
+# ---------------------------------------------------------------------------
+#
+# Per plan prohibition #30 these four are owned by `contracts/capability.py` and
+# must NEVER be redefined or field-extended outside that module. Phase 0 fixtures
+# therefore use a single, clearly-named placeholder and rely on the union
+# annotation to keep `CapabilityInput`/`CapabilityOutput` width open for Phase 1D.
+
+class _Phase0CapabilityStandIn(ContractModel):
+    """Phase 0 placeholder so `GraphRuntimeContext.capability_runtime` and the
+    `CapabilityInput` / `CapabilityOutput` unions compile.
+
+    **Phase 1D replaces this with the real types from `contracts/capability.py`.
+    Do not import from this fixture file in production code.**
+    """
+    kind: Literal["phase0_placeholder"]
+
+
+# Spec §11: request-scoped runtime authorization/scope. Never checkpointed.
+# We type the field as the placeholder so the file is self-consistent, but we
+# do NOT restate the spec's fields here. Phase 1D swaps in the real contract.
+CapabilityRuntimeContext = _Phase0CapabilityStandIn
+
+# Spec §13.4: discriminated unions of capability-specific models. Phase 0
+# uses a single-variant placeholder union; Phase 1D expands to the real variants.
+CapabilityInput = Annotated[_Phase0CapabilityStandIn, Field(discriminator="kind")]
+CapabilityOutput = Annotated[_Phase0CapabilityStandIn, Field(discriminator="kind")]
+
+# Spec §16: registry descriptor. Never redefined here.
+CapabilityDescriptor = _Phase0CapabilityStandIn
+
+
+# ---------------------------------------------------------------------------
+# Spec §16 — RuntimeServices (request-scoped, never checkpointed).
 # ---------------------------------------------------------------------------
 
-#: Discriminated-union placeholder for capability input variants.
-#: Real variants live in the contracts module added by Phase 1D.
-CapabilityInput = Annotated[
-    _PlaceholderCapabilityInput,
-    Field(discriminator="kind"),
-]
-
-#: Discriminated-union placeholder for capability output variants.
-CapabilityOutput = Annotated[
-    _PlaceholderCapabilityOutput,
-    Field(discriminator="kind"),
-]
-
-#: Spec §18.1 — runtime authorization/scope. Never checkpointed.
-class CapabilityRuntimeContext(ContractModel):
-    user_id: str
-    workspace_ids: tuple[str, ...]
-    deadline: datetime | None = None
-    feature_flags: tuple[str, ...] = ()
-
-
-#: Spec §18 — service clients. Never checkpointed.
 class RuntimeServices(ContractModel):
+    """Spec §16 / §18: ephemeral service clients, never serialized into checkpoint."""
     capabilities_registry_id: str  # identity only; the registry itself is ephemeral
 
 
-#: Spec §7 — request-scoped graph runtime. Never serialized into checkpoint.
 class GraphRuntimeContext(ContractModel):
+    """Spec §7: request-scoped graph runtime. Never serialized into checkpoint."""
     capability_runtime: CapabilityRuntimeContext
     services: RuntimeServices
 
 
 # ---------------------------------------------------------------------------
-# Capability descriptor — spec §17.2 (referenced as a frozen contract).
-# ---------------------------------------------------------------------------
-
-class CapabilityDescriptor(ContractModel):
-    name: str
-    version: str
-    input_model: str  # schema reference, not a Python type
-    output_model: str
-
-
-# ---------------------------------------------------------------------------
-# §8 — Request / conversation / semantic contracts.
+# Spec §8.1 — Request contracts.
 # ---------------------------------------------------------------------------
 
 class KnownDocumentResource(ContractModel):
@@ -113,115 +103,210 @@ class RequestContext(ContractModel):
     request_id: str
     thread_id: str
     original_query: str
-    known_documents: tuple[KnownDocumentResource, ...] = ()
+    known_documents: tuple[KnownDocumentResource, ...]
 
 
-class ActiveEntity(ContractModel):
+# ---------------------------------------------------------------------------
+# Spec §8.2 — Conversation.
+#
+# Spec references `ActiveEntity`, `EntityReference`, `ConversationTurn` but
+# never defines them; they are spec-internal helpers. Phase 0 fixtures use
+# minimal `_Placeholder` shapes named to make their provisional nature obvious.
+# Phase 1D either defines them in spec or eliminates the dependency.
+# ---------------------------------------------------------------------------
+
+class _ActiveEntityPlaceholder(ContractModel):
+    """Spec §8.2 references `ActiveEntity` but does not define it; placeholder."""
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
     entity_ref: str
     label: str
 
 
-class EntityReference(ContractModel):
+class _EntityReferencePlaceholder(ContractModel):
+    """Spec §8.2 / §8.3 references `EntityReference` but does not define it."""
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
     ref_id: str
     kind: Literal["document", "person", "section", "concept"]
     label: str
 
 
-class ConversationTurn(ContractModel):
+class _ConversationTurnPlaceholder(ContractModel):
+    """Spec §8.2 references `ConversationTurn` but does not define it."""
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
     role: Literal["user", "assistant", "system"]
     content: str
 
 
 class ConversationContext(ContractModel):
     summary: str
-    active_entities: tuple[ActiveEntity, ...] = ()
-    last_focus: EntityReference | None = None
-    recent_turns: tuple[ConversationTurn, ...] = ()
+    active_entities: tuple[_ActiveEntityPlaceholder, ...]
+    last_focus: _EntityReferencePlaceholder | None
+    recent_turns: tuple[_ConversationTurnPlaceholder, ...]
+
+
+# ---------------------------------------------------------------------------
+# Spec §8.3 — Semantic lifecycle.
+#
+# `AbbreviationResolution`, `CoreferenceResolution`, `SectionReference`,
+# `BlockingAmbiguity`, `SemanticDependencyHint` are all referenced but not
+# defined in the spec. Phase 0 uses placeholders with a `_Placeholder` suffix.
+# ---------------------------------------------------------------------------
+
+class _AbbreviationResolutionPlaceholder(ContractModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    abbreviation: str
+    resolution: str
+
+
+class _CoreferenceResolutionPlaceholder(ContractModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    mention: str
+    resolution: str
+
+
+class _SectionReferencePlaceholder(ContractModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    ref_id: str
+    label: str
+
+
+class _BlockingAmbiguityPlaceholder(ContractModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    ambiguity_id: str
+    description: str
+
+
+class DocumentRole_Placeholder(ContractModel):
+    """Spec §9: `DocumentRole` is a Literal in the spec; preserved as Literal here."""
+    role: Literal["target", "reference", "supporting", "discovered"]
+
+
+class CurrentRevisionRequirement(ContractModel):
+    kind: Literal["current"]
+
+
+class PinnedRevisionRequirement(ContractModel):
+    kind: Literal["pinned"]
+    document_revision: str
+
+
+RevisionRequirement = Annotated[
+    CurrentRevisionRequirement | PinnedRevisionRequirement,
+    Field(discriminator="kind"),
+]
 
 
 class DocumentReference(ContractModel):
     ref_id: str
-    locator_summary: str
+    original_span: str
+    normalized_reference: str
+    requested_role: Literal["target", "reference", "supporting", "discovered"] | None
+    revision_requirement: RevisionRequirement | None = None
+    resolution_status: Literal["unresolved", "resolved", "ambiguous", "not_found", "error"]
+    resolved_document_id: UUID | None
+    candidate_document_ids: tuple[UUID, ...] = ()
 
 
 class SemanticContext(ContractModel):
-    summary: str
-    document_refs: tuple[DocumentReference, ...] = ()
+    contextualized_query: str
+    normalized_query: str
+    abbreviations: tuple[_AbbreviationResolutionPlaceholder, ...]
+    coreferences: tuple[_CoreferenceResolutionPlaceholder, ...]
+    document_refs: tuple[DocumentReference, ...]
+    person_refs: tuple[_EntityReferencePlaceholder, ...]
+    section_refs: tuple[_SectionReferencePlaceholder, ...]
+    blocking_ambiguities: tuple[_BlockingAmbiguityPlaceholder, ...]
 
 
 # ---------------------------------------------------------------------------
-# §10 — Bindings (minimal shape for fixtures; full body is Phase 1D scope).
+# Spec §9 — Document identity / binding / target units.
 # ---------------------------------------------------------------------------
 
 class ScopedDocument(ContractModel):
+    binding_id: str
     document_id: UUID
     document_revision: str
-    role: Literal["primary", "supporting", "discovered"]
+    role: Literal["target", "reference", "supporting", "discovered"]
+
+
+class BindingRevisionRequirement(ContractModel):
+    binding_id: str
+    ref_id: str
 
 
 class DocumentBindingSet(ContractModel):
-    bindings: tuple[ScopedDocument, ...] = ()
+    bindings: tuple[ScopedDocument, ...]
+    revision_requirement_refs: tuple[BindingRevisionRequirement, ...]
 
 
 # ---------------------------------------------------------------------------
-# §12 — QueryAnalysis & RouteDecision (typed literals, minimal fields).
+# Spec §10 — Structured content locators (discriminated union, no dict escape).
 # ---------------------------------------------------------------------------
 
-WorkType = Literal[
-    "people_lookup", "document_search", "section_read",
-    "document_read", "write", "kg_query", "memory_lookup",
-    "abbreviation_resolve", "compare", "summarize",
-    "evaluate", "compliance", "legal_analysis",
+class DocumentLocator(ContractModel):
+    kind: Literal["document"]
+
+
+class SectionLocator(ContractModel):
+    kind: Literal["section"]
+    structure_node_id: str
+
+
+class ArticleLocator(ContractModel):
+    kind: Literal["article"]
+    structure_node_id: str
+    article_id: str
+
+
+class PageRangeLocator(ContractModel):
+    kind: Literal["page_range"]
+    start: int
+    end: int
+
+
+class ChunkRangeLocator(ContractModel):
+    kind: Literal["chunk_range"]
+    start: str
+    end: str
+
+
+ContentLocator = Annotated[
+    DocumentLocator | SectionLocator | ArticleLocator | PageRangeLocator | ChunkRangeLocator,
+    Field(discriminator="kind"),
 ]
 
-Domain = Literal[
-    "people", "document", "section", "kg", "memory", "write", "abbreviation",
-]
-
-Route = Literal["direct", "clarify", "fast_domain", "complex_research"]
-RouteReason = Literal[
-    "direct_greeting", "direct_conversation", "essential_ambiguity",
-    "unresolved_required_binding", "simple_people_lookup",
-    "exact_document_metadata", "exact_section_retrieval",
-    "simple_write_operation", "simple_kg_lookup",
-    "multi_document_research", "cross_domain_dependency", "comparison",
-    "compliance_evaluation", "multi_goal", "runtime_dependency",
-    "evidence_replanning_required",
-]
-
-
-class QueryAnalysis(ContractModel):
-    contract_version: Literal["2.0"]
-    work_type: WorkType
-    domains: tuple[Domain, ...]
-    dependency_hints: tuple[str, ...] = ()
-
-
-class RouteDecision(ContractModel):
-    contract_version: Literal["2.0"]
-    route: Route
-    reason: RouteReason
-
 
 # ---------------------------------------------------------------------------
-# §13 — Minimal task contracts.
+# Spec §13.1 — CompletionCriterion (discriminated union).
 # ---------------------------------------------------------------------------
 
-class ContentLocator(ContractModel):
-    kind: str  # discriminator lives in the Phase 1D contracts module
-    locator: dict[str, Any] = Field(default_factory=dict)
+class CoverageCriterion(ContractModel):
+    kind: Literal["coverage"]
+    minimum_status: Literal["read_partial", "read_complete"] = "read_complete"
+    allow_partial_reason: str | None = None
 
 
-class CompletionCriterion(ContractModel):
-    kind: str  # spec §13.1 — CoverageCriterion | SemanticCriterion
+class SemanticCriterion(ContractModel):
+    kind: Literal["semantic"]
+    criterion_id: str
     description: str
 
+
+CompletionCriterion = Annotated[
+    CoverageCriterion | SemanticCriterion,
+    Field(discriminator="kind"),
+]
+
+
+# ---------------------------------------------------------------------------
+# Spec §9 (TargetUnit), §13.2 (TaskPlan / TaskSpec / TaskOrigin).
+# ---------------------------------------------------------------------------
 
 class TargetUnit(ContractModel):
     target_id: str
     binding_id: str
     requested_locator: ContentLocator
-    completion_criteria: tuple[CompletionCriterion, ...] = ()
+    completion_criteria: tuple[CompletionCriterion, ...]
 
 
 class InitialTaskOrigin(ContractModel):
@@ -235,7 +320,10 @@ class ReplanTaskOrigin(ContractModel):
     evidence_use_ids: tuple[UUID, ...]
 
 
-TaskOrigin = Annotated[InitialTaskOrigin | ReplanTaskOrigin, Field(discriminator="kind")]
+TaskOrigin = Annotated[
+    InitialTaskOrigin | ReplanTaskOrigin,
+    Field(discriminator="kind"),
+]
 
 
 class TaskSpec(ContractModel):
@@ -251,17 +339,55 @@ class TaskPlan(ContractModel):
     contract_version: Literal["2.0"]
     plan_id: str
     goal: str
-    target_units: tuple[TargetUnit, ...] = ()
-    tasks: tuple[TaskSpec, ...] = ()
+    target_units: tuple[TargetUnit, ...]
+    tasks: tuple[TaskSpec, ...]
 
 
 # ---------------------------------------------------------------------------
-# §13.3 — Agent request/result types.
+# Spec §12 — QueryAnalysis / RouteDecision.
+# ---------------------------------------------------------------------------
+
+WorkType = Literal[
+    "direct", "lookup", "retrieve", "explain", "summarize",
+    "compare", "evaluate", "cross_domain", "multi_goal",
+]
+Domain = Literal["people", "document", "section", "write", "knowledge_graph", "memory"]
+Route = Literal["direct", "clarify", "fast_domain", "complex_research"]
+RouteReason = Literal[
+    "direct_greeting", "direct_conversation", "essential_ambiguity",
+    "unresolved_required_binding", "simple_people_lookup",
+    "exact_document_metadata", "exact_section_retrieval",
+    "simple_write_operation", "simple_kg_lookup",
+    "multi_document_research", "cross_domain_dependency", "comparison",
+    "compliance_evaluation", "multi_goal", "runtime_dependency",
+    "evidence_replanning_required",
+]
+
+
+class _SemanticDependencyHintPlaceholder(ContractModel):
+    """Spec §12 references `SemanticDependencyHint` but does not define it."""
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    hint_id: str
+    description: str
+
+
+class QueryAnalysis(ContractModel):
+    work_type: WorkType
+    domains: tuple[Domain, ...]
+    dependency_hints: tuple[_SemanticDependencyHintPlaceholder, ...] = ()
+
+
+class RouteDecision(ContractModel):
+    route: Route
+    reason_code: RouteReason
+
+
+# ---------------------------------------------------------------------------
+# Spec §13.3 — Agent request / result / execution summary.
 # ---------------------------------------------------------------------------
 
 AgentStatus = Literal[
-    "success", "partial", "not_found", "needs_input",
-    "denied", "error",
+    "success", "partial", "not_found", "needs_input", "denied", "error",
 ]
 AgentErrorCode = Literal[
     "INVALID_INPUT", "SCOPE_VIOLATION", "PERMISSION_DENIED",
@@ -283,24 +409,29 @@ class AgentRequest(ContractModel):
     input: CapabilityInput
 
 
+# Spec §15.2 — EvidenceUseRef is the only graph reference chain.
 class EvidenceUseRef(ContractModel):
-    evidence_use_id: UUID
+    use_id: UUID
+
+
+# Spec §14 — CoverageObservation.
+CoverageOutcome = Literal["read", "missing", "unreadable", "truncated"]
 
 
 class CoverageObservation(ContractModel):
     target_id: str
-    status: Literal["covered", "partial", "missing"]
-    note: str = ""
+    observed_locators: tuple[ContentLocator, ...]
+    outcome: CoverageOutcome
 
 
 class AgentResult(ContractModel):
     contract_version: Literal["2.0"]
     task_id: str
     status: AgentStatus
-    data: CapabilityOutput | None = None
-    evidence_uses: tuple[EvidenceUseRef, ...] = ()
-    coverage_observations: tuple[CoverageObservation, ...] = ()
-    error: AgentError | None = None
+    data: CapabilityOutput | None
+    evidence_uses: tuple[EvidenceUseRef, ...]
+    coverage_observations: tuple[CoverageObservation, ...]
+    error: AgentError | None
 
 
 class TaskExecutionSummary(ContractModel):
@@ -310,20 +441,52 @@ class TaskExecutionSummary(ContractModel):
 
 
 # ---------------------------------------------------------------------------
-# §13.1 (truncated) and §15 (evidence) — minimal placeholders for fixtures.
+# Spec §18 — Minimal evaluation contract.
 # ---------------------------------------------------------------------------
+
+class Contradiction(ContractModel):
+    contradiction_id: str
+    claim_a: str
+    claim_b: str
+    evidence_use_ids: tuple[UUID, ...]
+
+
+class MissingRequirement(ContractModel):
+    target_id: str
+    criterion_kind: Literal["coverage", "semantic"]
+    semantic_criterion_id: str | None = None
+    description: str
+
+
+CoverageStatus = Literal[
+    "read_complete", "read_partial", "missing", "unreadable", "truncated",
+]
+
+
+class CoverageItem(ContractModel):
+    target_id: str
+    observed_locators: tuple[ContentLocator, ...]
+    status: CoverageStatus
+
+
+class Coverage(ContractModel):
+    items: tuple[CoverageItem, ...]
+
 
 class EvidenceEvaluation(ContractModel):
-    status: Literal["sufficient", "partial", "insufficient"]
-    missing: tuple[str, ...] = ()
+    status: Literal["sufficient", "insufficient", "contradictory", "needs_input"]
+    coverage: Coverage
+    missing: tuple[MissingRequirement, ...]
+    contradictions: tuple[Contradiction, ...]
 
 
 # ---------------------------------------------------------------------------
-# §18 — Final response.
+# Spec §19 — Synthesis and grounding boundary.
 # ---------------------------------------------------------------------------
 
 class RenderedCitation(ContractModel):
-    ref_id: str
+    citation_id: str
+    evidence_id: UUID
     label: str
 
 
@@ -335,11 +498,13 @@ class FinalResponse(ContractModel):
 
 
 # ---------------------------------------------------------------------------
-# §17 — Clarification contract.
+# Spec §20 — Clarification.
 # ---------------------------------------------------------------------------
 
 class DocumentCandidate(ContractModel):
     candidate_id: str
+    ordinal: int
+    ref_id: str
     document_id: UUID
     label: str
 
@@ -353,26 +518,23 @@ class ClarificationRequest(ContractModel):
     ]
     question: str
     unresolved_ref_ids: tuple[str, ...]
-    candidates: tuple[DocumentCandidate, ...] = ()
+    candidates: tuple[DocumentCandidate, ...]
     expires_at: datetime
 
 
 # ---------------------------------------------------------------------------
-# §21 — ExecutionState and §7 — SupervisorV2State (the checkpointable aggregate).
+# Spec §21 — ExecutionState; §7 — SupervisorV2State (the checkpointable aggregate).
 # ---------------------------------------------------------------------------
 
 class ExecutionState(ContractModel):
-    plan: TaskPlan | None = None
-    task_results: tuple[AgentResult, ...] = ()
-    evidence_evaluation: EvidenceEvaluation | None = None
+    plan: TaskPlan | None
+    task_results: tuple[AgentResult, ...]
+    evidence_evaluation: EvidenceEvaluation | None
 
 
-class SupervisorV2State(TypedDict, total=False):
-    """Spec §7: the mutable checkpoint aggregate, NOT a frozen Pydantic model.
-
-    LangGraph's `TypedDict` reducer-mutable aggregate; nested business values
-    remain `ContractModel` and are replaced rather than mutated. Frozen here
-    means its **schema** is fixed, not the dict instance.
+class SupervisorV2State(TypedDict, total=True):
+    """Spec §7: mutable checkpoint aggregate. `total=True` (spec default) — every
+    key is required by the schema; values may still be replaced at runtime.
     """
     contract_version: Literal["2.0"]
     request: RequestContext
