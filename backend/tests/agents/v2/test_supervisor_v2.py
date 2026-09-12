@@ -890,6 +890,101 @@ async def test_registry_construction_gates_and_dispatches() -> None:
         registry.get("document.read")
 
 
+@pytest.mark.asyncio
+async def test_clarify_misuse_clears_clarify_route() -> None:
+    # Review minor 3: a runner that clears the persisted request (the old
+    # Proof-4 misuse) gets a terminal typed error on a D6-valid checkpoint
+    # — route retired with the request — never a raise, never a stranding.
+    from langgraph.types import Command
+
+    shared: dict = {"tid": "resume-misuse"}
+    graph, runtime, _ = await _suspend_ambiguous(shared)
+    config = shared["config"]
+    result = await graph.ainvoke(
+        Command(
+            resume={
+                "contract_version": "2.0",
+                "clarification_id": "x",
+                "selected_candidate_id": None,
+            },
+            update={"clarification": None},
+        ),
+        config,
+        context=runtime,
+    )
+    assert not result.get("__interrupt__", ())
+    resumed = normalize_checkpoint_state(dict(result))
+    assert resumed["clarification"] is None
+    assert resumed["route_decision"] is None
+    assert resumed["final_response"] is not None
+    assert resumed["final_response"].status == "error"
+    validate_supervisor_state(resumed)
+    stored = graph.get_state(config)
+    assert stored.next == ()
+
+
+@pytest.mark.asyncio
+async def test_context_node_error_converts_to_typed_error() -> None:
+    # NEW-C1: a resolved ref with no pin (outer-goto stale-read shape)
+    # converts at the owned boundary instead of escaping and poisoning.
+    adapter_draft = SemanticDraft(
+        provisional_contextualized_query="mở nghị định 12",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(resolved_ref("r1", DOCUMENT_ID),),
+        person_refs=(),
+        section_refs=(),
+        preliminary_ambiguities=(),
+    )
+    runtime = make_runtime_context(
+        semantic_adapter=FakeSemanticAdapter(adapter_draft),
+        binding_resolver=FakeBindingResolver(
+            DocumentBindingSet(bindings=(), revision_requirement_refs=())
+        ),
+    )
+    graph, config = compile_graph(runtime, thread_id="ctx-err-1")
+    result = await graph.ainvoke(
+        make_state(request=make_request("Mở Nghị định 12")), config, context=runtime
+    )
+    resumed = normalize_checkpoint_state(dict(result))
+    assert resumed["final_response"] is not None
+    assert resumed["final_response"].status == "error"
+    # Pre-finalization failure: semantics were never finalized (blank
+    # placeholder), so the frozen aggregate check cannot pass by
+    # construction — the guarantee here is typed-error terminal, no escape,
+    # no poisoned thread.
+    stored = graph.get_state(config)
+    assert stored.next == ()
+    # The thread is not poisoned: continuing ends cleanly on the same error.
+    again = await graph.ainvoke(None, config, context=runtime)
+    assert normalize_checkpoint_state(dict(again))["final_response"].status == "error"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_error_converts_to_typed_error() -> None:
+    # NEW-C1: execute with no registry wired converts instead of escaping.
+    runtime = make_runtime_context(
+        semantic_adapter=FakeSemanticAdapter(people_draft()),
+        binding_resolver=FakeBindingResolver(
+            DocumentBindingSet(bindings=(), revision_requirement_refs=())
+        ),
+        evidence_hydrator=FakeHydrator(),
+        retention_leases=FakeLeaseRepo([]),
+        answer_draft_channel=AnswerDraftChannel(),
+        capability_registry=None,
+    )
+    graph, config = compile_graph(runtime, thread_id="sched-err-1")
+    result = await graph.ainvoke(
+        make_state(request=make_request("Tìm Nguyễn Văn A")), config, context=runtime
+    )
+    resumed = normalize_checkpoint_state(dict(result))
+    assert resumed["final_response"] is not None
+    assert resumed["final_response"].status in ("insufficient", "error")
+    validate_supervisor_state(resumed)
+    stored = graph.get_state(config)
+    assert stored.next == ()
+
+
 def test_model_input_cannot_supply_workspace_or_acl() -> None:
     from app.services.agents.v2.contracts.capability import PeopleLookupInput
 
@@ -1372,15 +1467,9 @@ async def test_clarify_selection_resume_advances_to_binding() -> None:
     )
 
     command = await resume_clarification(message_id, suspended["clarification"], runtime)
-    assert command.goto == "binding"
-    # Plain resume (no outer goto): the node's own Command navigates to
-    # binding on the NEXT tick with this update applied. An outer
-    # goto="binding" pre-schedules binding into the SAME tick as the
-    # resumed wait, which then reads pre-update state (no attachment yet)
-    # and never pins — verified stale-read concurrency. T8 must resume
-    # selections with a plain Command(resume=…) and let node navigation
-    # drive (see report).
-    result = await graph.ainvoke(Command(resume=command.resume), config, context=runtime)
+    # Verbatim T5 artifact (no outer goto — the graph owns navigation).
+    assert not command.goto
+    result = await graph.ainvoke(command, config, context=runtime)
     assert not result.get("__interrupt__", ()), "resume must not re-suspend"
     resumed = normalize_checkpoint_state(dict(result))
     # The route ADVANCES: no re-ask, request retired, selection recorded.
@@ -1426,10 +1515,9 @@ async def test_clarify_forged_selection_converts_to_typed_error() -> None:
         "clarification_id": shared["suspended"]["clarification"].clarification_id,
         "selected_candidate_id": "not-an-offered-candidate",
     }
-    # Plain resume (no outer goto): the node's own navigation drives the
-    # conversion to the finalizer for a terminal typed error. (With an
-    # outer goto="binding" the runner explicitly continues the turn and
-    # the flow re-derives instead — verified navigation precedence.)
+    # Plain resume (no outer goto exists anymore): the node's own
+    # navigation drives the conversion to the finalizer for a terminal
+    # typed error.
     result = await graph.ainvoke(Command(resume=forged), config, context=runtime)
     assert not result.get("__interrupt__", ())
     resumed = normalize_checkpoint_state(dict(result))
@@ -1457,11 +1545,9 @@ async def test_clarify_denied_selection_converts_to_typed_denied() -> None:
     )
     command = await resume_clarification(message_id, suspended["clarification"], runtime)
     runtime.services.authorization = _FakeAuthorization(grants={WORKSPACE_ID: set()})
-    # Plain resume: the node's own navigation drives the conversion to the
-    # finalizer for a terminal typed denial (see forged test re precedence).
-    result = await graph.ainvoke(
-        Command(resume=command.resume), config, context=runtime
-    )
+    # Verbatim T5 artifact: the node's own navigation drives the conversion
+    # to the finalizer for a terminal typed denial.
+    result = await graph.ainvoke(command, config, context=runtime)
     resumed = normalize_checkpoint_state(dict(result))
     assert resumed["clarification"] is None
     assert resumed["final_response"] is not None

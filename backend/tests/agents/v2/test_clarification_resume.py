@@ -423,7 +423,7 @@ async def test_resume_restarts_resolved_flow_at_binding() -> None:
     first = request.candidates[0]
     handle = resume_setup(reply="1")
     command = await resume_clarification(handle.message_id, request, handle.ctx)
-    assert command.goto == "binding"
+    assert not command.goto  # graph owns navigation (T6 round 2)
     resolution = ClarificationResolution.model_validate(command.resume)
     assert resolution.clarification_id == request.clarification_id
     assert resolution.selected_candidate_id == first.candidate_id
@@ -516,7 +516,7 @@ async def test_resume_uses_current_acl_not_build_time_acl() -> None:
     target = request.candidates[0]
     handle = resume_setup(reply="1", workspace_id=NEW_WORKSPACE_ID)
     command = await resume_clarification(handle.message_id, request, handle.ctx)
-    assert command.goto == "binding"
+    assert not command.goto  # graph owns navigation (T6 round 2)
     (document_id, runtime) = handle.auth.calls[0]
     assert document_id == target.document_id
     assert runtime is handle.ctx.capability_runtime
@@ -723,7 +723,7 @@ async def test_resume_acl_decision_follows_resume_workspace() -> None:
     grants = {WORKSPACE_ID: {target.document_id}, NEW_WORKSPACE_ID: set()}
     old = resume_setup(reply="1", grants=grants, workspace_id=WORKSPACE_ID)
     command = await resume_clarification(old.message_id, request, old.ctx)
-    assert command.goto == "binding"
+    assert not command.goto  # graph owns navigation (T6 round 2)
     new = resume_setup(reply="1", grants=grants, workspace_id=NEW_WORKSPACE_ID)
     with pytest.raises(ClarificationUnauthorized):
         await resume_clarification(new.message_id, request, new.ctx)

@@ -22,8 +22,12 @@ deadline), candidate membership, and the CURRENT ACL
 (``authorization.require_document(candidate.document_id,
 capability_runtime)``) — an unauthorized/expired/invalid selection fails
 closed with a typed error and never reaches the router. On success resume
-returns ``Command(resume=..., goto="binding")`` so the resolved flow restarts
-at the Binding Resolver.
+returns ``Command(resume=...)`` WITHOUT a ``goto``: the composed graph owns
+navigation (its ``clarify_wait`` node returns ``Command(update=...,
+goto="binding")`` on the next tick, after the resume update is
+checkpointed). An outer ``goto`` would pre-schedule ``binding`` into the
+same super-step as the resumed wait, which then reads pre-update state —
+so runners must pass this Command through VERBATIM and never add a goto.
 
 Candidate-free requests (``required_document_not_found`` /
 ``semantic_ambiguity`` with ``candidates == ()``) can never resume via
@@ -470,7 +474,7 @@ async def resume_clarification(
     request: ClarificationRequest,
     runtime: GraphRuntimeContext | "Runtime[GraphRuntimeContext]",
 ) -> Command:
-    """Resume a clarification from the raw user reply and restart at binding.
+    """Resume a clarification from the raw user reply (graph navigates).
 
     ``runtime`` is the request-scoped ``GraphRuntimeContext`` or, for graph
     wiring, the framework ``Runtime`` wrapper carrying it (both accepted).
@@ -480,6 +484,17 @@ async def resume_clarification(
     (``require_document`` with the resume-time ``capability_runtime``), so a
     selected candidate that is no longer authorized fails closed with
     ``ClarificationUnauthorized``. Nothing unauthorized is accepted.
+
+    Returns ``Command(resume=<resolution>)`` with NO ``goto``: the composed
+graph owns navigation (``clarify_wait`` continues with the resume value
+and returns its own ``Command(update=..., goto="binding")`` on the next
+tick). Required T8 call form is verbatim passthrough::
+
+        command = await resume_clarification(message_id, request, runtime)
+        await graph.ainvoke(command, config, context=runtime)
+
+    Never add an outer ``goto``: it pre-schedules ``binding`` into the same
+super-step as the resumed wait (stale-read loss, then a poisoned thread).
     """
     context = node_context(runtime)
     chat_messages = context.services.chat_messages
@@ -516,4 +531,4 @@ async def resume_clarification(
         raise ClarificationUnauthorized(
             request.clarification_id, candidate.document_id
         ) from error
-    return Command(resume=resolution.model_dump(mode="json"), goto="binding")
+    return Command(resume=resolution.model_dump(mode="json"))

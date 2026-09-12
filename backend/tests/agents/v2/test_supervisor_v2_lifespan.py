@@ -129,3 +129,6 @@ def test_main_lifespan_wiring_pins() -> None:
     assert "setup_v2_checkpointer" not in source
     assert "saver.setup" not in source
     assert source.count("create_v2_checkpointer") <= 1
+    # M5 (round 2): the stack is a real context manager around the yield,
+    # so cancellation at the yield still closes the saver context.
+    assert "AsyncExitStack" in source
