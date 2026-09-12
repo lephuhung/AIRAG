@@ -95,7 +95,6 @@ from app.services.agents.v2.nodes.grounding import (
     render_citations,
 )
 from app.services.agents.v2.nodes.synthesize import (
-    SynthesisError,
     apply_budget_split,
     estimate_tokens_for_chars,
     hydrate_for_synthesis,
@@ -1566,7 +1565,8 @@ async def test_budget_overflow_persisted_as_validated_derived_evidence() -> None
             ),
         },
     )
-    runtime = graph_runtime(hydrator)
+    events: list[str] = []
+    runtime = graph_runtime(hydrator, FakeLeaseRepo(events))
     result = await synthesize_answer(
         synthesis_input=_sufficient_input(u1, u2),
         runtime=runtime,
@@ -1579,6 +1579,7 @@ async def test_budget_overflow_persisted_as_validated_derived_evidence() -> None
         ),
     )
     assert len(hydrator.persisted_records) == 1
+    assert "commit" in events
     record = hydrator.persisted_records[0]
     assert isinstance(record.source, DerivedSourceIdentity)
     assert record.source.source_evidence_ids == (e2,)
@@ -1713,10 +1714,18 @@ async def test_synthesis_reuse_revalidates_current_uses() -> None:
 
 
 @pytest.mark.asyncio
-async def test_synthesize_node_rejects_missing_evaluation() -> None:
+async def test_synthesize_node_defers_failure_to_finalizer() -> None:
+    """R1: SynthesisError never escapes the node; the failure is channeled."""
     state = make_state(plan=read_plan(), bindings=binding_set())
-    with pytest.raises(SynthesisError, match="sufficient"):
-        await synthesize_node(state, graph_runtime())
+    channel = AnswerDraftChannel()
+    update = await synthesize_node(
+        state, graph_runtime(FakeHydrator({}), FakeLeaseRepo([]), channel)
+    )
+    assert update == {}
+    entry = channel.get("run-1")
+    assert entry is not None
+    assert entry.synthesis_error is not None
+    assert entry.draft is None
 
 
 @pytest.mark.asyncio
@@ -1931,7 +1940,7 @@ async def test_empty_budget_head_drafts_from_derived_only() -> None:
     )
     result = await synthesize_answer(
         synthesis_input=_sufficient_input(u1),
-        runtime=graph_runtime(hydrator),
+        runtime=graph_runtime(hydrator, FakeLeaseRepo([])),
         plan=plan,
         bindings=binding_set(),
         budget=SynthesisRuntimeContext(
@@ -1941,6 +1950,40 @@ async def test_empty_budget_head_drafts_from_derived_only() -> None:
     assert len(hydrator.persisted_records) == 1
     derived_use = hydrator.minted_uses[0].use_id
     assert result.draft.claims[0].evidence_use_ids == (derived_use,)
+
+
+@pytest.mark.asyncio
+async def test_exported_hydrate_for_synthesis_leases_overflow() -> None:
+    """R2: the exported hydrate entry point leaves no minted use unleased."""
+    plan = read_plan()
+    u1, u2 = uuid4(), uuid4()
+    content1 = "Điều 5 quy định mức phạt."
+    hydrator = FakeHydrator(
+        {
+            u1: store_coverage_use(use_id=u1, evidence_id=uuid4(), content=content1),
+            u2: store_coverage_use(
+                use_id=u2, evidence_id=uuid4(), content="Điều 6 quy định."
+            ),
+        },
+    )
+    events: list[str] = []
+    runtime = graph_runtime(hydrator, FakeLeaseRepo(events))
+    projected = await hydrate_for_synthesis(
+        (EvidenceUseRef(use_id=u1), EvidenceUseRef(use_id=u2)),
+        runtime,
+        plan=plan,
+        bindings=binding_set(),
+        budget=SynthesisRuntimeContext(
+            max_evidence_items=10,
+            max_total_chars=len(content1),
+            max_total_tokens=10_000,
+        ),
+    )
+    # Projection carries head + derived; the derived item is leased below.
+    assert [e.use_id for e in projected][0] == u1
+    assert len(hydrator.minted_uses) == 1
+    assert [e.use_id for e in projected][1] == hydrator.minted_uses[0].use_id
+    assert "commit" in events
 
 
 @pytest.mark.asyncio
@@ -2010,6 +2053,49 @@ def channel_grounded(runtime: GraphRuntimeContext) -> Any:
     channel = runtime.services.answer_draft_channel
     assert channel is not None
     return channel.get("run-1").grounded_draft  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_composed_chain_types_insufficient_without_exception() -> None:
+    """R1: evaluate → synthesize → ground → finalizer as a real graph.
+
+    The evaluation is not sufficient and the synthesize node IS entered:
+    no node raises, synthesis never hydrates, and the terminal response is
+    typed (denied for the denied People task).
+    """
+    from langgraph.graph import StateGraph
+
+    plan = people_plan()
+    route = RouteDecision(route="fast_domain", reason_code="simple_people_lookup")
+    state = make_state(
+        plan=plan,
+        bindings=binding_set(),
+        results=(people_result(status="denied"),),
+        evaluation=None,
+        route=route,
+    )
+    hydrator = FakeHydrator({})
+    channel = AnswerDraftChannel()
+    runtime = graph_runtime(hydrator, FakeLeaseRepo([]), channel)
+    graph = StateGraph(SupervisorV2State)
+    graph.add_node("evaluate", evaluate_node)
+    graph.add_node("synthesize", synthesize_node)
+    graph.add_node("ground", ground_node)
+    graph.add_node("finalizer", finalizer_node)
+    graph.set_entry_point("evaluate")
+    graph.add_edge("evaluate", "synthesize")
+    graph.add_edge("synthesize", "ground")
+    graph.add_edge("ground", "finalizer")
+    graph.set_finish_point("finalizer")
+    out = await graph.compile().ainvoke(state, context=runtime)
+    assert out["execution"].evidence_evaluation.status == "insufficient"
+    assert out["final_response"].status == "denied"
+    assert out["final_response"].content.strip() != ""
+    assert [call[0] for call in hydrator.hydrate_calls] == ["evaluation"]
+    entry = channel.get("run-1")
+    assert entry is not None
+    assert entry.synthesis_error is not None
+    assert entry.grounded_draft is None
 
 
 @pytest.mark.asyncio

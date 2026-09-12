@@ -299,6 +299,8 @@ async def ground_node(
     run_id = context.capability_runtime.run_id
     channel = _channel_of(context)
     entry = channel.get(run_id) if channel is not None else None
+    if entry is not None and entry.synthesis_error is not None:
+        return {"final_response": _insufficient_response()}
     if entry is not None and entry.draft is not None:
         draft, evidence = entry.draft, entry.evidence
     else:

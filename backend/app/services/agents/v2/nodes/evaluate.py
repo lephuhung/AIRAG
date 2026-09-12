@@ -147,6 +147,7 @@ class ChannelEntry:
     evidence: tuple[HydratedEvidence, ...] = ()
     grounded_draft: AnswerDraft | None = None
     citations: tuple[RenderedCitation, ...] = ()
+    synthesis_error: str | None = None
 
 
 class AnswerDraftChannel:
@@ -189,6 +190,23 @@ class AnswerDraftChannel:
             evidence=current.evidence,
             grounded_draft=draft,
             citations=citations,
+        )
+
+    def store_failure(self, run_id: str, *, reason: str) -> None:
+        """Record a synthesis failure so downstream nodes type it, not redo it.
+
+        The drafted result stays absent; the ground node checkpoints its
+        owned ``insufficient`` without re-deriving, and the finalizer emits
+        the denied/insufficient/error response from the checkpointed task
+        outcomes. Nothing re-synthesizes on this entry.
+        """
+        current = self._entries.get(run_id) or ChannelEntry()
+        self._entries[run_id] = ChannelEntry(
+            draft=current.draft,
+            evidence=current.evidence,
+            grounded_draft=current.grounded_draft,
+            citations=current.citations,
+            synthesis_error=reason,
         )
 
     def get(self, run_id: str) -> ChannelEntry | None:

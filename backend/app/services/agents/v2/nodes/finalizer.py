@@ -223,6 +223,8 @@ async def _finalize_factual(
                 citations=entry.citations,
             )
         )
+    if entry is not None and entry.synthesis_error is not None:
+        return _typed_synthesis_failure(state)
     # Channel miss: single deterministic re-derivation (synthesize + lease +
     # ground, no reviser); failures become typed responses, never raises.
     plan = require_checkpointed_plan(state)

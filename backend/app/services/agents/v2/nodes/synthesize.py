@@ -204,7 +204,9 @@ async def hydrate_for_synthesis(
     ACL/expiry/revision checks against the explicit plan/bindings plus the
     synthesis budget (persisting an overflow tail as derived evidence); this
     function projects the admitted rich items to the model-facing
-    ``SynthesisEvidence`` shape.
+    ``SynthesisEvidence`` shape. Freshly minted overflow uses are leased
+    (evidence-only) and committed before returning, so this exported entry
+    point never leaves uses unleased.
     """
     hydrator = _require_hydrator(runtime)
     hydrated = await hydrator.hydrate_for_synthesis(
@@ -214,7 +216,7 @@ async def hydrate_for_synthesis(
         bindings=bindings,
         budget=budget,
     )
-    projected: list[SynthesisEvidence] = []
+    admitted: list[HydratedEvidence] = []
     for item in hydrated:
         if not isinstance(item, HydratedEvidence):
             raise SynthesisError(
@@ -223,8 +225,11 @@ async def hydrate_for_synthesis(
             )
         if item.purpose == "discovery":
             continue
-        projected.append(_project(item))
-    return tuple(projected)
+        admitted.append(item)
+    await _lease_fresh_uses(
+        {ref.use_id for ref in use_refs}, tuple(admitted), runtime
+    )
+    return tuple(_project(item) for item in admitted)
 
 
 def build_extractive_draft(
@@ -322,6 +327,7 @@ async def synthesize_answer(
             )
     admitted_ids = frozenset(item.use_id for item in admitted)
     validate_answer_draft(draft, admitted_ids)
+    await _lease_fresh_uses(input_ids, admitted, runtime)
     return SynthesisResult(
         draft=draft, evidence=admitted, admitted_use_ids=admitted_ids
     )
@@ -367,21 +373,21 @@ async def _commit_lease_session(runtime: GraphRuntimeContext) -> None:
         await result
 
 
-async def _lease_new_uses(
-    synthesis_input: SynthesisInput,
-    result: SynthesisResult,
+async def _lease_fresh_uses(
+    input_ids: set[UUID],
+    admitted: tuple[HydratedEvidence, ...],
     runtime: GraphRuntimeContext,
 ) -> None:
     """Lease overflow-derived uses (evidence-only) and commit before returning.
 
-    New use ids are exactly the admitted ids minus the input refs: the
+    Fresh use ids are exactly the admitted ids minus the input refs: the
     scheduler already leased every dispatch-created use, so only the
     hydrator-persisted overflow uses need a lease here. Re-derivation
     converges (record insert and use append are both idempotent), so a repeat
-    call refreshes the same lease row instead of duplicating it.
+    call refreshes the same lease row instead of duplicating it. Called by
+    every exported synthesize path, so no minting path leaves uses unleased.
     """
-    known = {ref.use_id for ref in synthesis_input.evidence_uses}
-    fresh = [item for item in result.evidence if item.use_id not in known]
+    fresh = [item for item in admitted if item.use_id not in input_ids]
     if not fresh:
         return
     repo = runtime.services.retention_leases
@@ -407,12 +413,14 @@ async def synthesize_and_lease(
     budget: SynthesisRuntimeContext,
     draft_builder: DraftBuilder | None = None,
 ) -> SynthesisResult:
-    """The single shared synthesize path: draft, then lease fresh uses.
+    """The single shared node-facing synthesize path.
 
     Every node path that synthesizes (synthesize, ground resume, finalizer
-    resume) goes through this helper, so no path mints uses unleased.
+    resume) goes through this helper; leasing itself lives in
+    ``synthesize_answer``, so direct callers of the exported entry point
+    are covered too.
     """
-    result = await synthesize_answer(
+    return await synthesize_answer(
         synthesis_input=synthesis_input,
         runtime=runtime,
         plan=plan,
@@ -420,8 +428,6 @@ async def synthesize_and_lease(
         budget=budget,
         draft_builder=draft_builder,
     )
-    await _lease_new_uses(synthesis_input, result, runtime)
-    return result
 
 
 async def synthesize_node(
@@ -437,22 +443,31 @@ async def synthesize_node(
     effect (overflow derived evidence persisted and leased before the
     checkpoint barrier) plus fail-fast validation of the synthesis boundary.
     Without a wired channel the node still synthesizes and leases (the
-    downstream consumer re-derives once on the miss).
+    downstream consumer re-derives once on the miss). A ``SynthesisError``
+    (empty admission, non-sufficient evaluation) never escapes: it is stored
+    as a typed channel failure so the ground node checkpoints its owned
+    ``insufficient`` without re-deriving and the finalizer emits the
+    denied/insufficient/error response from the checkpointed task outcomes.
     """
     context = _context_of(runtime)
     plan = require_checkpointed_plan(state)
-    synthesis_input = _synthesis_input_of(state)
-    result = await synthesize_and_lease(
-        synthesis_input=synthesis_input,
-        runtime=context,
-        plan=plan,
-        bindings=state["bindings"],
-        budget=DEFAULT_SYNTHESIS_BUDGET,
-    )
+    run_id = context.capability_runtime.run_id
     channel: AnswerDraftChannel | None = _channel_of(context)
+    try:
+        result = await synthesize_and_lease(
+            synthesis_input=_synthesis_input_of(state),
+            runtime=context,
+            plan=plan,
+            bindings=state["bindings"],
+            budget=DEFAULT_SYNTHESIS_BUDGET,
+        )
+    except SynthesisError as exc:
+        if channel is not None:
+            channel.store_failure(run_id, reason=str(exc))
+        return {}
     if channel is not None:
         channel.store_draft(
-            context.capability_runtime.run_id,
+            run_id,
             draft=result.draft,
             evidence=result.evidence,
         )
