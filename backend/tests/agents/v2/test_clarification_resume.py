@@ -95,15 +95,19 @@ class FakeAuthorization:
         self,
         denied: set[UUID] | None = None,
         grants: dict[UUID, set[UUID]] | None = None,
+        service_error: Exception | None = None,
     ) -> None:
         self.denied = set(denied or set())
         self.grants = grants
+        self.service_error = service_error
         self.calls: list[tuple[UUID, CapabilityRuntimeContext]] = []
 
     async def require_document(
         self, document_id: UUID, capability_runtime: CapabilityRuntimeContext
     ) -> None:
         self.calls.append((document_id, capability_runtime))
+        if self.service_error is not None:
+            raise self.service_error
         if self.grants is not None:
             allowed = any(
                 document_id in self.grants.get(workspace, set())
@@ -586,6 +590,13 @@ def test_candidate_free_request_is_unsatisfiable() -> None:
         parse_clarification_resolution("nghị định 99 bản mới nhất", request)
     with pytest.raises(ClarificationUnsatisfiable):
         parse_clarification_resolution("không", request)
+    # M-NEW-3: unsatisfiable precedes expiry — documented, now pinned.
+    expired_free = build_clarification(
+        unresolved_semantic(), now=datetime.now(UTC) - timedelta(hours=2)
+    )
+    assert expired_free.expires_at < datetime.now(UTC)
+    with pytest.raises(ClarificationUnsatisfiable):
+        parse_clarification_resolution("1", expired_free)
 
 
 @pytest.mark.asyncio
@@ -640,6 +651,68 @@ async def test_clarify_node_rebuilds_expired_or_stale_request() -> None:
         Runtime(context=ctx),
     )
     assert other["clarification"].clarification_id != expired.clarification_id
+
+
+@pytest.mark.asyncio
+async def test_clarify_node_preserves_json_mapping_request() -> None:
+    # I-NEW-1: the guard must accept the exact JSON shape the module itself
+    # emits (interrupt payload / checkpoint mapping), not just live objects.
+    semantic = blocking_semantic()
+    live = build_clarification(semantic, now=datetime.now(UTC) - timedelta(minutes=5))
+    payload = live.model_dump(mode="json")
+    assert isinstance(payload["candidates"], list)
+    assert isinstance(payload["expires_at"], str)
+    ctx = make_graph_context()
+    # Mypy aside: checkpoint round-trips deliver plain mappings here.
+    state = make_state(semantic=semantic, clarification=payload)  # type: ignore[arg-type]
+    update = await clarify_node(state, Runtime(context=ctx))
+    preserved = update["clarification"]
+    assert isinstance(preserved, ClarificationRequest)
+    # Guard path taken: a rebuild would mint a fresh deadline minutes later.
+    assert preserved.expires_at == live.expires_at
+    assert preserved.clarification_id == live.clarification_id
+    assert preserved.candidates == live.candidates
+
+
+@pytest.mark.asyncio
+async def test_clarify_node_rebuilds_on_stale_candidate_set() -> None:
+    # M-NEW-1: same question identity but a changed candidate projection
+    # must not carry the stale options forward.
+    semantic = blocking_semantic()
+    persisted = build_clarification(semantic, now=datetime.now(UTC))
+    narrowed = SemanticContext(
+        contextualized_query="Xem nghị định 12",
+        normalized_query="xem nghị định 12",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(resolved_ref(), ambiguous_ref(candidates=(DOCUMENT_ID,))),
+        person_refs=(),
+        section_refs=(),
+        blocking_ambiguities=(
+            BlockingAmbiguity(
+                ambiguity_id="r1", description="Hai văn bản cùng số 12."
+            ),
+        ),
+    )
+    ctx = make_graph_context()
+    update = await clarify_node(
+        make_state(semantic=narrowed, clarification=persisted),
+        Runtime(context=ctx),
+    )
+    rebuilt = update["clarification"]
+    assert [c.document_id for c in rebuilt.candidates] == [DOCUMENT_ID]
+
+
+@pytest.mark.asyncio
+async def test_resume_propagates_non_denial_service_error() -> None:
+    # M-NEW-2: a service bug is not misclassified as an authorization denial.
+    request = live_request_for(blocking_semantic())
+    message_id = uuid4()
+    chat = FakeChatMessages({message_id: "1"})
+    auth = FakeAuthorization(service_error=RuntimeError("boom"))
+    ctx = make_graph_context(chat=chat, auth=auth)
+    with pytest.raises(RuntimeError, match="boom"):
+        await resume_clarification(message_id, request, ctx)
 
 
 @pytest.mark.asyncio

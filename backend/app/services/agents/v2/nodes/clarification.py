@@ -35,10 +35,12 @@ context → binding on the reply) instead of a bad reply, and MUST NOT retry
 Service error contract (T6/T7 wiring): ``chat_messages.get_user_message``
 returns an object with a string ``content`` attribute (may be awaitable);
 ``authorization.require_document`` returns ``None`` on success (may be
-awaitable) and raises *any* ``Exception`` subclass on denial — the denial is
-wrapped in ``ClarificationUnauthorized`` (the original error chains as
-``__cause__``) so T8 streaming can catch one known type. ``BaseException``
-(cancellation) is never swallowed.
+awaitable) and raises ``PermissionError`` (or a subclass) on denial — the
+denial is wrapped in ``ClarificationUnauthorized`` (the original error chains
+as ``__cause__``) so T8 streaming can catch one known type. Any other service
+exception is a non-denial infrastructure failure and propagates unchanged
+(never misclassified as unauthorized); ``BaseException`` (cancellation) is
+never swallowed.
 
 ``interrupt``/``Command`` come from ``langgraph.types``. Capabilities receive
 ``AgentRequest`` + ``CapabilityRuntimeContext`` and never supervisor/graph
@@ -49,6 +51,7 @@ is given.
 from __future__ import annotations
 
 import inspect
+import json
 import re
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
@@ -121,7 +124,7 @@ class ClarificationUnsatisfiable(ClarificationError):
     "nothing was offered" apart from "the reply was bad".
     """
 
-    def __init__(self, clarification_id: str, reason: str) -> None:
+    def __init__(self, clarification_id: str, reason: ClarificationReason) -> None:
         super().__init__(
             f"clarification {clarification_id!r} offers no selectable candidate "
             f"(reason {reason!r}); treat the reply as a fresh user turn"
@@ -288,6 +291,39 @@ def build_clarification(
     return request
 
 
+def _request_from_mapping(value: Mapping[str, Any]) -> ClarificationRequest | None:
+    """Re-validate a checkpoint/interrupt mapping into the contract.
+
+    The module's own interrupt payload is JSON-mode
+    (``model_dump(mode="json")``: lists for tuples, ISO strings for
+    datetimes), which strict Python-mode validation rejects — so a mapping
+    is validated in Python mode first and, failing that, through a JSON
+    round-trip (both fully validated; never ``model_construct``). Garbage in
+    either shape yields ``None`` and the caller rebuilds.
+    """
+    try:
+        return ClarificationRequest.model_validate(dict(value))
+    except ValidationError:
+        pass
+    try:
+        return ClarificationRequest.model_validate_json(
+            json.dumps(dict(value), default=str)
+        )
+    except (ValidationError, TypeError, ValueError):
+        return None
+
+
+def _current_candidate_sets(
+    semantic: SemanticContext,
+) -> dict[str, set[UUID]]:
+    """Offered candidate documents per ref in the current projection."""
+    return {
+        reference.ref_id: set(reference.candidate_document_ids)
+        for reference in semantic.document_refs
+        if reference.resolution_status == "ambiguous"
+    }
+
+
 def _live_persisted_request(
     state: SupervisorV2State,
 ) -> ClarificationRequest | None:
@@ -295,17 +331,17 @@ def _live_persisted_request(
 
     A persisted request survives only when it is live (not past its stable
     per-request deadline), still identifies this question (deterministic id
-    over the current semantic projection), and still validates against the
-    current semantic. Checkpoint round-trips may deliver plain mappings, so
-    those are re-validated into the contract before comparison.
+    over the current semantic projection), still offers the current
+    candidate set per ref (a narrowed projection rebuilds instead of
+    carrying stale options forward), and still validates against the
+    current semantic. Checkpoint round-trips may deliver plain mappings
+    (including the module's own JSON-mode interrupt payload), so those are
+    re-validated into the contract before comparison.
     """
     semantic = state["semantic"]
     existing = state.get("clarification")
     if isinstance(existing, Mapping):
-        try:
-            existing = ClarificationRequest.model_validate(existing)
-        except ValidationError:
-            return None
+        existing = _request_from_mapping(existing)
     if not isinstance(existing, ClarificationRequest):
         return None
     if datetime.now(timezone.utc) >= _now_aware(existing.expires_at):
@@ -314,6 +350,12 @@ def _live_persisted_request(
         reference.ref_id for reference in _blocking_refs(semantic)
     )
     if existing.clarification_id != _stable_request_id(semantic, current_ids):
+        return None
+    persisted_sets = {
+        ref_id: {candidate.document_id for candidate in existing.candidates if candidate.ref_id == ref_id}
+        for ref_id in {candidate.ref_id for candidate in existing.candidates}
+    }
+    if persisted_sets != _current_candidate_sets(semantic):
         return None
     try:
         validate_clarification_request(existing, semantic)
@@ -470,7 +512,7 @@ async def resume_clarification(
         )
     except ClarificationError:
         raise
-    except Exception as error:
+    except PermissionError as error:
         raise ClarificationUnauthorized(
             request.clarification_id, candidate.document_id
         ) from error
