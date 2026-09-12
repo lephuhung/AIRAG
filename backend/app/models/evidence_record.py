@@ -8,7 +8,9 @@ storage policy:
    ``encryption_key_id``, ``nonce`` and ``encryption_algorithm``.
 2. ``source`` / ``provenance`` persist the typed frozen-contract JSONB payloads
    (``EvidenceSourceIdentity`` / ``Provenance``) and ``content_hash`` is the
-   identity half of the idempotency key (source identity + content hash).
+   identity half of the idempotency key (source identity + content hash). The
+   ``uq_evidence_record_identity`` unique index over ``(content_hash, source)``
+   is that key's arbiter (spec §15.3).
 3. ``classification`` / ``expires_at`` are the §15.3 storage policy; the
    classification is computed deterministically at insertion and ``expires_at``
    is the stable deletion deadline selected once.
@@ -33,6 +35,7 @@ from typing import Any, Optional
 from sqlalchemy import (
     DateTime,
     ForeignKey,
+    Index,
     LargeBinary,
     Text,
 )
@@ -96,4 +99,17 @@ class EvidenceRecord(Base):
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=datetime.utcnow
+    )
+
+    __table_args__ = (
+        # The record idempotency arbiter (spec §15.3): the repository's
+        # ``ON CONFLICT (content_hash, source) DO NOTHING`` infers this unique
+        # index, so a retry or concurrent identical write collides instead of
+        # duplicating. Mirrors ``uq_evidence_record_identity`` in the migration.
+        Index(
+            "uq_evidence_record_identity",
+            "content_hash",
+            "source",
+            unique=True,
+        ),
     )

@@ -437,6 +437,62 @@ def test_evidence_use_unique_arbiter_matches_the_migration(
         assert column in definition, definition
 
 
+def test_evidence_record_identity_unique_arbiter_matches_the_migration(
+    imported_app_models, db: Engine
+):
+    """The record idempotency arbiter is a unique index over
+    ``(content_hash, source)`` in both the ORM metadata and the live DB, so the
+    repository's ``ON CONFLICT (content_hash, source)`` can be inferred."""
+    from app.models.evidence_record import EvidenceRecord
+
+    index = next(
+        (
+            ix
+            for ix in EvidenceRecord.__table__.indexes
+            if ix.name == "uq_evidence_record_identity"
+        ),
+        None,
+    )
+    assert index is not None, "EvidenceRecord must map uq_evidence_record_identity"
+    assert index.unique is True
+    assert [c.name for c in index.columns] == ["content_hash", "source"]
+
+    with db.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE indexname = 'uq_evidence_record_identity'"
+            )
+        ).fetchone()
+    assert row is not None, "uq_evidence_record_identity missing from the live DB"
+    definition = row[0]
+    assert definition.startswith("CREATE UNIQUE INDEX"), definition
+    assert "content_hash" in definition and "source" in definition, definition
+
+
+def test_check_v2_schema_detects_missing_evidence_identity_index(db: Engine):
+    """Task 8: a DB without the ``(content_hash, source)`` record arbiter must
+    fail closed (the repository cannot compile its ON CONFLICT target)."""
+    with db.begin() as conn:
+        conn.execute(text("DROP INDEX uq_evidence_record_identity"))
+    try:
+        check = check_v2_schema(db)
+        assert check.applied is True
+        assert check.is_clean is False, check
+        assert any(
+            "uq_evidence_record_identity" in e for e in check.shape_errors
+        ), check.shape_errors
+    finally:
+        with db.begin() as conn:
+            conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "uq_evidence_record_identity "
+                    "ON evidence_records (content_hash, source)"
+                )
+            )
+
+
 def test_v2_orm_mapped_tables_exist_in_database(
     imported_app_models, db: Engine
 ):

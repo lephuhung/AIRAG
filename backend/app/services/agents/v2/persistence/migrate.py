@@ -150,7 +150,7 @@ from __future__ import annotations
 import argparse
 import sys
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Final, Sequence
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -500,6 +500,12 @@ _CREATE_INDEXES: tuple[str, ...] = (
     "ON revision_retention_leases(revision_id, expires_at) "
     "WHERE released_at IS NULL",
     "CREATE INDEX IF NOT EXISTS ix_evidence_uses_task ON evidence_uses(task_id)",
+    # Task 8: the record idempotency arbiter (spec §15.3 "evidence insertion is
+    # idempotent by source identity + content hash"). The repository's
+    # ``ON CONFLICT (content_hash, source) DO NOTHING`` infers this index, so
+    # concurrent identical writes collide instead of duplicating.
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_evidence_record_identity "
+    "ON evidence_records (content_hash, source)",
     # Task 8: the ``ON CONFLICT (run_id, task_id, evidence_id, purpose,
     # target_id)`` arbiter. NULLS NOT DISTINCT so two targetless uses (target_id
     # IS NULL) still collide — PostgreSQL infers this index for the conflict
@@ -806,6 +812,16 @@ _EXPECTED_ATTEMPT_UNIQUE_COLUMNS: frozenset[str] = frozenset(
     {"document_id", "source_object_identity", "build_profile"}
 )
 
+#: Task 8: the record idempotency arbiter must be the ``(content_hash, source)``
+#: unique index. A database that applied the pre-Task-8 evidence shape has no
+#: such index, so ``check_v2_schema`` fails closed instead of accepting a schema
+#: whose repository ``ON CONFLICT (content_hash, source)`` insert cannot
+#: compile.
+_EVIDENCE_RECORD_IDENTITY_INDEX: Final[str] = "uq_evidence_record_identity"
+_EXPECTED_EVIDENCE_RECORD_UNIQUE_COLUMNS: frozenset[str] = frozenset(
+    {"content_hash", "source"}
+)
+
 
 def _shape_errors(conn) -> frozenset[str]:
     """Return human-readable shape mismatches for an applied schema.
@@ -850,6 +866,33 @@ def _shape_errors(conn) -> frozenset[str]:
             f"{sorted(present_cols)}, expected "
             f"{sorted(_EXPECTED_ATTEMPT_UNIQUE_COLUMNS)}"
         )
+    # Task 8: the record idempotency arbiter must exist and be unique over
+    # ``(content_hash, source)`` (the repository's ON CONFLICT target).
+    definition = conn.execute(
+        text(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE schemaname = 'public' AND indexname = :n"
+        ),
+        {"n": _EVIDENCE_RECORD_IDENTITY_INDEX},
+    ).scalar()
+    if definition is None:
+        errors.add(f"missing index {_EVIDENCE_RECORD_IDENTITY_INDEX}")
+    elif not str(definition).startswith("CREATE UNIQUE INDEX"):
+        errors.add(
+            f"{_EVIDENCE_RECORD_IDENTITY_INDEX} must be a UNIQUE index: "
+            f"{definition}"
+        )
+    else:
+        missing_columns = {
+            column
+            for column in _EXPECTED_EVIDENCE_RECORD_UNIQUE_COLUMNS
+            if column not in str(definition)
+        }
+        if missing_columns:
+            errors.add(
+                f"{_EVIDENCE_RECORD_IDENTITY_INDEX} missing columns "
+                f"{sorted(missing_columns)}: {definition}"
+            )
     return frozenset(errors)
 
 

@@ -35,11 +35,16 @@ from app.services.agents.v2.contracts.evidence import (
     DocumentSourceIdentity,
     EvidenceUse,
     EvidenceUseEnvelope,
+    KnowledgeGraphSourceIdentity,
+    MemorySourceIdentity,
     PeopleSourceIdentity,
     Provenance,
 )
 from app.services.agents.v2.contracts.locators import SectionLocator
-from app.services.agents.v2.persistence.evidence import EvidenceRepository
+from app.services.agents.v2.persistence.evidence import (
+    EvidencePersistenceError,
+    EvidenceRepository,
+)
 from app.services.agents.v2.evidence_store.governance import (
     ENCRYPTION_ALGORITHM,
     EvidenceAccessAuditor,
@@ -54,6 +59,7 @@ from app.services.agents.v2.evidence_store.governance import (
     EvidenceValidationError,
     classify_evidence,
     minimize_people_record,
+    sha256_content_hash,
 )
 
 KEY_1 = bytes([1]) * 32
@@ -136,6 +142,16 @@ def _document_source(
 
 def _people_source(record_id: str = "p-1") -> PeopleSourceIdentity:
     return PeopleSourceIdentity(kind="people", record_id=record_id)
+
+
+def _memory_source(memory_id: str = "m-1") -> MemorySourceIdentity:
+    return MemorySourceIdentity(kind="memory", memory_id=memory_id)
+
+
+def _kg_source(entity_id: str = "e-1") -> KnowledgeGraphSourceIdentity:
+    return KnowledgeGraphSourceIdentity(
+        kind="knowledge_graph", entity_or_relation_id=entity_id
+    )
 
 
 @pytest.fixture
@@ -243,7 +259,7 @@ class TestEvidencePersistence:
         self, make_governor, async_db: AsyncSession
     ):
         governor = make_governor()
-        source = _people_source()
+        source = _memory_source()
         first = await governor.persist_record(
             source=source, content="same-bytes", provenance=_provenance()
         )
@@ -266,19 +282,94 @@ class TestEvidencePersistence:
 
         # A different source identity with the same content is a different record.
         other_source = await governor.persist_record(
-            source=_people_source("p-2"),
+            source=_memory_source("p-2"),
             content="same-bytes",
             provenance=_provenance(),
         )
         assert other_source != first
 
     @pytest.mark.asyncio
+    async def test_record_identity_arbiter_handles_a_lost_precheck_race(
+        self, make_governor, async_db: AsyncSession
+    ):
+        """A concurrent identical write that minted a different ``evidence_id``
+        must collide on ``uq_evidence_record_identity`` and reuse the existing
+        UUID instead of inserting a duplicate.
+
+        The race is simulated by making the pre-check miss once (as it would if
+        the concurrent writer's row were not yet visible), so the INSERT's
+        ``ON CONFLICT (content_hash, source) DO NOTHING`` is what arbitrates.
+        """
+        governor = make_governor()
+        source = _memory_source()
+        first = await governor.persist_record(
+            source=source,
+            content="same-bytes",
+            provenance=_provenance(),
+            evidence_id=uuid.uuid4(),
+        )
+
+        repository = governor.repository
+        original = repository.find_record_id_by_identity
+        calls = {"n": 0}
+
+        async def racing(*, source, content_hash):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # The pre-check ran before the concurrent row was visible.
+                return None
+            return await original(source=source, content_hash=content_hash)
+
+        repository.find_record_id_by_identity = racing  # type: ignore[method-assign]
+        second = await governor.persist_record(
+            source=source,
+            content="same-bytes",
+            provenance=_provenance(),
+            evidence_id=uuid.uuid4(),
+        )
+        assert second == first
+        total = await async_db.scalar(
+            select(func.count()).select_from(EvidenceRecordRow)
+        )
+        assert total == 1
+
+    @pytest.mark.asyncio
+    async def test_pk_collision_with_different_content_fails_closed(
+        self, make_governor, async_db: AsyncSession
+    ):
+        """A reused ``evidence_id`` with a different identity is NOT an
+        idempotent retry: it must raise ``EvidencePersistenceError`` instead of
+        silently returning the existing row."""
+        governor = make_governor()
+        evidence_id = uuid.uuid4()
+        await governor.persist_record(
+            source=_memory_source(),
+            content="original",
+            provenance=_provenance(),
+            evidence_id=evidence_id,
+        )
+        with pytest.raises(EvidencePersistenceError):
+            await governor.persist_record(
+                source=_memory_source(),
+                content="different",
+                provenance=_provenance(),
+                evidence_id=evidence_id,
+            )
+        # The failure left the original row intact and the session usable.
+        row = await async_db.get(EvidenceRecordRow, evidence_id)
+        assert row is not None
+        assert row.content_hash == sha256_content_hash("original")
+        total = await async_db.scalar(
+            select(func.count()).select_from(EvidenceRecordRow)
+        )
+        assert total == 1
+    @pytest.mark.asyncio
     async def test_append_use_is_idempotent_and_null_safe_for_targetless_uses(
         self, make_governor, async_db: AsyncSession
     ):
         governor = make_governor()
         evidence_id = await governor.persist_record(
-            source=_people_source(), content="p", provenance=_provenance()
+            source=_memory_source(), content="p", provenance=_provenance()
         )
         repo = EvidenceRepository(async_db)
 
@@ -322,7 +413,7 @@ class TestEvidencePersistence:
     ):
         governor = make_governor()
         evidence_id = await governor.persist_record(
-            source=_people_source(), content="p", provenance=_provenance()
+            source=_memory_source(), content="p", provenance=_provenance()
         )
         repo = EvidenceRepository(async_db)
 
@@ -373,7 +464,7 @@ class TestEvidencePersistence:
     ):
         governor = make_governor()
         evidence_id = await governor.persist_record(
-            source=_people_source(), content="p", provenance=_provenance()
+            source=_memory_source(), content="p", provenance=_provenance()
         )
         repo = EvidenceRepository(async_db)
         use = EvidenceUse(
@@ -401,7 +492,7 @@ class TestEvidencePersistence:
     ):
         governor = make_governor()
         evidence_id = await governor.persist_record(
-            source=_people_source(), content="p", provenance=_provenance()
+            source=_memory_source(), content="p", provenance=_provenance()
         )
         use = await _append_use(
             async_db, evidence_id, purpose="coverage", target_id="target-9"
@@ -532,7 +623,7 @@ class TestEncryption:
         governor = make_governor()
         secret = "SECRET-PLAINTEXT-VALUE"
         evidence_id = await governor.persist_record(
-            source=_people_source(), content=secret, provenance=_provenance()
+            source=_memory_source(), content=secret, provenance=_provenance()
         )
         row = await async_db.get(EvidenceRecordRow, evidence_id)
         assert row.ciphertext != secret.encode()
@@ -555,7 +646,7 @@ class TestEncryption:
         empty = make_governor(keyring=_keyring(active_key_id=None, keys={}))
         with pytest.raises(EvidenceKeyUnavailable):
             await empty.persist_record(
-                source=_people_source(),
+                source=_memory_source(),
                 content="must-not-persist",
                 provenance=_provenance(),
             )
@@ -572,7 +663,7 @@ class TestEncryption:
         )
         with pytest.raises(EvidenceKeyUnavailable):
             await missing_active.persist_record(
-                source=_people_source(),
+                source=_memory_source(),
                 content="must-not-persist",
                 provenance=_provenance(),
             )
@@ -580,7 +671,7 @@ class TestEncryption:
         # 3) A record whose recorded key id is unavailable is never decrypted.
         governor = make_governor()
         evidence_id = await governor.persist_record(
-            source=_people_source(), content="secret", provenance=_provenance()
+            source=_memory_source(), content="secret", provenance=_provenance()
         )
         use = await _append_use(async_db, evidence_id)
         unavailable = make_governor(
@@ -596,7 +687,7 @@ class TestEncryption:
     ):
         governor = make_governor()
         evidence_id = await governor.persist_record(
-            source=_people_source(), content="secret-value", provenance=_provenance()
+            source=_memory_source(), content="secret-value", provenance=_provenance()
         )
         # Simulate a tampered / mismatched key id: the ring has key id "k2"
         # pointing at a different key, but the row claims it was written with
@@ -621,7 +712,7 @@ class TestEncryption:
         # Phase 1: key id "k1" is active.
         before = make_governor(keyring=_keyring(active_key_id="k1"))
         old_id = await before.persist_record(
-            source=_people_source("old"),
+            source=_memory_source("old"),
             content="old-secret",
             provenance=_provenance(),
         )
@@ -634,7 +725,7 @@ class TestEncryption:
             keyring=_keyring(active_key_id="k2", keys={"k1": KEY_1, "k2": KEY_2})
         )
         new_id = await after.persist_record(
-            source=_people_source("new"),
+            source=_memory_source("new"),
             content="new-secret",
             provenance=_provenance(),
         )
@@ -681,7 +772,7 @@ class TestHydrationGate:
         governor = make_governor()
         now = _now()
         expired_id = await governor.persist_record(
-            source=_people_source("expired"),
+            source=_memory_source("expired"),
             content="expired",
             provenance=_provenance(),
             expires_at=now - timedelta(minutes=1),
@@ -691,7 +782,7 @@ class TestHydrationGate:
             await _hydrate(governor, expired_use)
 
         live_id = await governor.persist_record(
-            source=_people_source("live"),
+            source=_memory_source("live"),
             content="live",
             provenance=_provenance(),
             expires_at=now + timedelta(hours=1),
@@ -700,7 +791,7 @@ class TestHydrationGate:
         assert await _hydrate(governor, live_use) == "live"
 
         forever_id = await governor.persist_record(
-            source=_people_source("forever"),
+            source=_memory_source("forever"),
             content="forever",
             provenance=_provenance(),
             expires_at=None,
@@ -747,18 +838,20 @@ class TestHydrationGate:
         self, make_governor, async_db: AsyncSession
     ):
         governor = make_governor()
-        evidence_id = await governor.persist_record(
-            source=_people_source(), content="person", provenance=_provenance()
+        evidence_id = await governor.persist_people_evidence(
+            record_id="p-1",
+            raw_record={"full_name": "person", "salary": "not-required"},
+            required_fields=("full_name",),
+            provenance=_provenance("people.lookup"),
         )
         use = await _append_use(async_db, evidence_id)
         with pytest.raises(EvidenceAccessDenied):
             await _hydrate(governor, use, runtime=_runtime(can_read_people=False))
-        assert (
+        assert json.loads(
             await _hydrate(
                 governor, use, runtime=_runtime(can_read_people=True)
             )
-            == "person"
-        )
+        ) == {"full_name": "person"}
 
     @pytest.mark.asyncio
     async def test_tombstoned_evidence_record_is_denied(
@@ -766,7 +859,7 @@ class TestHydrationGate:
     ):
         governor = make_governor()
         evidence_id = await governor.persist_record(
-            source=_people_source(), content="gone", provenance=_provenance()
+            source=_memory_source(), content="gone", provenance=_provenance()
         )
         use = await _append_use(async_db, evidence_id)
         assert await _hydrate(governor, use) == "gone"
@@ -866,7 +959,7 @@ class TestHydrationGate:
         # A non-document source must not carry a copied revision id.
         with pytest.raises(EvidenceValidationError):
             await governor.persist_record(
-                source=_people_source(),
+                source=_memory_source(),
                 content="person",
                 provenance=_provenance(),
                 revision_id=uuid.uuid4(),
@@ -898,7 +991,7 @@ class TestHydrationGate:
     ):
         governor = make_governor()
         source_id = await governor.persist_record(
-            source=_people_source("source"),
+            source=_memory_source("source"),
             content="source",
             provenance=_provenance(),
         )
@@ -988,7 +1081,7 @@ class TestHydrationGate:
     ):
         governor = make_governor()
         evidence_id = await governor.persist_record(
-            source=_people_source(), content="p", provenance=_provenance()
+            source=_memory_source(), content="p", provenance=_provenance()
         )
         use = await _append_use(async_db, evidence_id, run_id="run-1")
         with pytest.raises(EvidenceAccessDenied):
@@ -1001,7 +1094,7 @@ class TestHydrationGate:
     ):
         governor = make_governor()
         evidence_id = await governor.persist_record(
-            source=_people_source(), content="p", provenance=_provenance()
+            source=_memory_source(), content="p", provenance=_provenance()
         )
         use = await _append_use(
             async_db, evidence_id, purpose="discovery", target_id=None
@@ -1091,4 +1184,250 @@ class TestHydrationGate:
         with pytest.raises(EvidenceAccessDenied):
             await _hydrate(
                 governor, use, runtime=_runtime(workspace_ids=(workspace_id,))
+            )
+
+
+# ---------------------------------------------------------------------------
+# Derived ancestor payload authorization (finding #1)
+# ---------------------------------------------------------------------------
+
+
+class TestDerivedAncestorAuthorization:
+    @pytest.mark.asyncio
+    async def test_derived_with_unauthorized_people_ancestor_is_denied(
+        self, make_governor, async_db: AsyncSession, audit_log
+    ):
+        """A derived summary must not hydrate when its People ancestor is not
+        readable under the runtime (the ancestor ACL is applied recursively)."""
+        governor = make_governor()
+        ancestor_id = await governor.persist_people_evidence(
+            record_id="p-1",
+            raw_record={"full_name": "person"},
+            required_fields=("full_name",),
+            provenance=_provenance("people.lookup"),
+        )
+        derived_id = await governor.persist_record(
+            source=DerivedSourceIdentity(
+                kind="derived", source_evidence_ids=(ancestor_id,)
+            ),
+            content="summary-derives-people",
+            provenance=_provenance(),
+            validation_state="validated",
+        )
+        use = await _append_use(async_db, derived_id)
+
+        # With People permission the authorized chain hydrates.
+        assert await _hydrate(governor, use) == "summary-derives-people"
+        # Without it, the ancestor's missing permission denies the derived row.
+        with pytest.raises(EvidenceAccessDenied):
+            await _hydrate(
+                governor, use, runtime=_runtime(can_read_people=False)
+            )
+        assert "derived_source_unauthorized" in {
+            d.reason for d in audit_log.denied
+        }
+
+    @pytest.mark.asyncio
+    async def test_derived_with_expired_ancestor_is_denied(
+        self, make_governor, async_db: AsyncSession, audit_log
+    ):
+        governor = make_governor()
+        ancestor_id = await governor.persist_record(
+            source=_memory_source("expired-ancestor"),
+            content="ancestor",
+            provenance=_provenance(),
+            expires_at=_now() - timedelta(minutes=1),
+        )
+        derived_id = await governor.persist_record(
+            source=DerivedSourceIdentity(
+                kind="derived", source_evidence_ids=(ancestor_id,)
+            ),
+            content="summary-of-expired",
+            provenance=_provenance(),
+            validation_state="validated",
+        )
+        use = await _append_use(async_db, derived_id)
+        with pytest.raises(EvidenceAccessDenied):
+            await _hydrate(governor, use)
+        assert "derived_source_expired" in {d.reason for d in audit_log.denied}
+
+    @pytest.mark.asyncio
+    async def test_derived_with_tombstoned_ancestor_is_denied(
+        self, make_governor, async_db: AsyncSession, audit_log
+    ):
+        governor = make_governor()
+        ancestor_id = await governor.persist_record(
+            source=_memory_source("tombstoned-ancestor"),
+            content="ancestor",
+            provenance=_provenance(),
+        )
+        await async_db.execute(
+            update(EvidenceRecordRow)
+            .where(EvidenceRecordRow.evidence_id == ancestor_id)
+            .values(payload_purged_at=_now())
+        )
+        derived_id = await governor.persist_record(
+            source=DerivedSourceIdentity(
+                kind="derived", source_evidence_ids=(ancestor_id,)
+            ),
+            content="summary-of-tombstoned",
+            provenance=_provenance(),
+            validation_state="validated",
+        )
+        use = await _append_use(async_db, derived_id)
+        with pytest.raises(EvidenceAccessDenied):
+            await _hydrate(governor, use)
+        assert "derived_source_tombstoned" in {
+            d.reason for d in audit_log.denied
+        }
+
+    @pytest.mark.asyncio
+    async def test_derived_with_unauthorized_document_ancestor_is_denied(
+        self, make_governor, async_db: AsyncSession, document_factory, audit_log
+    ):
+        governor = make_governor()
+        document_id, revision_id, workspace_id = await _seed_document(
+            async_db, document_factory
+        )
+        ancestor_id = await governor.persist_record(
+            source=_document_source(document_id),
+            content="document body",
+            provenance=_provenance(),
+            revision_id=revision_id,
+        )
+        derived_id = await governor.persist_record(
+            source=DerivedSourceIdentity(
+                kind="derived", source_evidence_ids=(ancestor_id,)
+            ),
+            content="summary-of-document",
+            provenance=_provenance(),
+            validation_state="validated",
+        )
+        use = await _append_use(async_db, derived_id)
+
+        with pytest.raises(EvidenceAccessDenied):
+            await _hydrate(
+                governor, use, runtime=_runtime(workspace_ids=(uuid.uuid4(),))
+            )
+        assert "derived_source_unauthorized" in {
+            d.reason for d in audit_log.denied
+        }
+        # Authorized workspace resolves the ancestor and hydrates the chain.
+        assert (
+            await _hydrate(
+                governor,
+                use,
+                runtime=_runtime(workspace_ids=(workspace_id,)),
+            )
+            == "summary-of-document"
+        )
+
+    @pytest.mark.asyncio
+    async def test_fully_authorized_derived_chain_hydrates(
+        self, make_governor, async_db: AsyncSession, document_factory
+    ):
+        """A derived-of-derived chain whose every ancestor is readable and
+        validated hydrates (the recursive walk still descends)."""
+        governor = make_governor()
+        document_id, revision_id, workspace_id = await _seed_document(
+            async_db, document_factory
+        )
+        leaf_id = await governor.persist_record(
+            source=_document_source(document_id),
+            content="leaf",
+            provenance=_provenance(),
+            revision_id=revision_id,
+        )
+        middle_id = await governor.persist_record(
+            source=DerivedSourceIdentity(
+                kind="derived", source_evidence_ids=(leaf_id,)
+            ),
+            content="middle",
+            provenance=_provenance(),
+            validation_state="validated",
+        )
+        top_id = await governor.persist_record(
+            source=DerivedSourceIdentity(
+                kind="derived", source_evidence_ids=(middle_id,)
+            ),
+            content="top",
+            provenance=_provenance(),
+            validation_state="validated",
+        )
+        use = await _append_use(async_db, top_id)
+        assert (
+            await _hydrate(
+                governor,
+                use,
+                runtime=_runtime(workspace_ids=(workspace_id,)),
+            )
+            == "top"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Ownerless KnowledgeGraph/Memory authorization (finding #2)
+# ---------------------------------------------------------------------------
+
+
+class TestOwnerlessSourceAuthorization:
+    @pytest.mark.asyncio
+    async def test_ownerless_knowledge_graph_and_memory_hydrate_in_the_run(
+        self, make_governor, async_db: AsyncSession
+    ):
+        """KG/Memory identities are ownerless by design; the admitted
+        current-run EvidenceUse run scope is their authorization (spec §24)."""
+        governor = make_governor()
+        kg_id = await governor.persist_record(
+            source=_kg_source(), content="graph-fact", provenance=_provenance()
+        )
+        memory_id = await governor.persist_record(
+            source=_memory_source(), content="memory-fact", provenance=_provenance()
+        )
+        kg_use = await _append_use(async_db, kg_id)
+        memory_use = await _append_use(async_db, memory_id)
+        assert await _hydrate(governor, kg_use) == "graph-fact"
+        assert await _hydrate(governor, memory_use) == "memory-fact"
+
+    @pytest.mark.asyncio
+    async def test_ownerless_use_from_another_run_is_denied(
+        self, make_governor, async_db: AsyncSession, audit_log
+    ):
+        governor = make_governor()
+        for source in (_kg_source(), _memory_source()):
+            evidence_id = await governor.persist_record(
+                source=source, content=source.kind, provenance=_provenance()
+            )
+            use = await _append_use(async_db, evidence_id, run_id="run-other")
+            with pytest.raises(EvidenceAccessDenied):
+                await _hydrate(
+                    governor, use, runtime=_runtime(run_id=RUN_ID)
+                )
+        assert {"cross_run"} <= {d.reason for d in audit_log.denied}
+
+
+# ---------------------------------------------------------------------------
+# People minimization boundary (finding #4)
+# ---------------------------------------------------------------------------
+
+
+class TestPeopleMinimizationBoundary:
+    @pytest.mark.asyncio
+    async def test_persist_record_rejects_a_people_source(self, make_governor):
+        """The generic boundary cannot prove People content is minimized, so it
+        refuses it and directs the caller to ``persist_people_evidence``."""
+        governor = make_governor()
+        with pytest.raises(EvidenceValidationError):
+            await governor.persist_record(
+                source=_people_source(),
+                content='{"full_name":"A","salary":"must-not-store"}',
+                provenance=_provenance("people.lookup"),
+            )
+        # Declaring field names is not a substitute for the minimizer.
+        with pytest.raises(EvidenceValidationError):
+            await governor.persist_record(
+                source=_people_source(),
+                content='{"full_name":"A","salary":"must-not-store"}',
+                field_names=("full_name",),
+                provenance=_provenance("people.lookup"),
             )

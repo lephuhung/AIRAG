@@ -441,6 +441,23 @@ def test_evidence_use_null_safe_unique_index_exists(migrated_db: Engine) -> None
         assert column in definition, definition
 
 
+def test_evidence_record_identity_unique_index_exists(migrated_db: Engine) -> None:
+    """The record idempotency arbiter is the unique
+    ``uq_evidence_record_identity`` index over ``(content_hash, source)`` (the
+    repository's ``ON CONFLICT (content_hash, source)`` target)."""
+    with migrated_db.connect() as conn:
+        definition = conn.execute(
+            text(
+                "SELECT indexdef FROM pg_indexes "
+                "WHERE indexname = 'uq_evidence_record_identity'"
+            )
+        ).scalar()
+    assert definition is not None, "uq_evidence_record_identity missing"
+    assert definition.startswith("CREATE UNIQUE INDEX"), definition
+    assert "content_hash" in definition, definition
+    assert "source" in definition, definition
+
+
 def test_legacy_rows_unchanged(migrated_db: Engine) -> None:
     """Every legacy row remains untouched and v1-readable."""
     with migrated_db.connect() as conn:

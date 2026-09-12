@@ -30,6 +30,15 @@ This module owns that pipeline and the governed hydration gate:
   authoritative revision, expiry, tombstone, revision requirement, recursive
   derived validation) pass, decrypting last. Every allow/deny read is audited.
 
+Ownerless sources (KnowledgeGraph/Memory): their ``*SourceIdentity`` contracts
+carry no workspace/revision, so the store has no per-record owner to resolve an
+ACL against. They are authorized *transitively* by the admitted ``EvidenceUse``
+run scope: a use belongs to exactly one run (``EvidenceUseEnvelope.run_id``),
+:meth:`EvidenceGovernor.hydrate_use` denies a use whose envelope run differs
+from the trusted runtime run (``cross_run``), and the KG is per-workspace, so
+the run's workspace is the effective scope. This is the documented §24 boundary
+for ownerless kinds; no workspace/ACL copy is added to those identities.
+
 Runtime/security metadata never enters a semantic contract: the governor reads
 trusted authorization from the request-scoped ``CapabilityRuntimeContext`` and
 resolves workspace ownership from the immutable revision row, never from copied
@@ -69,6 +78,8 @@ from app.services.agents.v2.contracts.evidence import (
     EvidenceRecord,
     EvidenceSourceIdentity,
     EvidenceStoreRow,
+    KnowledgeGraphSourceIdentity,
+    MemorySourceIdentity,
     PeopleSourceIdentity,
     Provenance,
     StoragePolicy,
@@ -102,6 +113,22 @@ DERIVED_VALIDATED: Final[str] = "validated"
 DERIVED_VALIDATION_STATES: frozenset[str] = frozenset(
     {"validated", "unvalidated", "failed"}
 )
+
+#: Map an ancestor's per-record payload-access failure onto the derived
+#: record's deny reason. An unauthorized ancestor (workspace ACL or People
+#: permission) stays distinct from an expired/tombstoned one and from an
+#: unresolved/invalid one, so the audit trail says *why* the derived record
+#: was refused.
+_ANCESTOR_FAILURE_REASONS: Final[dict[str, str]] = {
+    "workspace_not_authorized": "derived_source_unauthorized",
+    "people_not_authorized": "derived_source_unauthorized",
+    "expired": "derived_source_expired",
+    "purged": "derived_source_tombstoned",
+    "document_tombstoned": "derived_source_tombstoned",
+    "revision_unresolved": "derived_source_unresolved",
+    "revision_mismatch": "derived_source_unresolved",
+    "derived_not_validated": "derived_source_unresolved",
+}
 
 #: Lexical (deterministic) names that raise a People record to
 #: ``sensitive_personal``. The rule is deliberately lexical: classification is
@@ -531,6 +558,50 @@ class EvidenceGovernor:
 
         Returns the persisted ``evidence_id`` (the existing one when the same
         source identity + content hash is already stored).
+
+        People evidence is refused here: this generic boundary stores the
+        caller-supplied ``content`` verbatim and cannot prove it contains only
+        the task-required fields, so it would bypass §15.3 minimization. Use
+        :meth:`persist_people_evidence` instead.
+        """
+        if isinstance(source, PeopleSourceIdentity):
+            raise EvidenceValidationError(
+                "People evidence must be persisted through "
+                "persist_people_evidence so only task-required fields are "
+                "stored (spec §15.3 minimization); persist_record stores "
+                "caller-supplied content verbatim and cannot prove it is "
+                "minimized"
+            )
+        return await self._persist_record(
+            source=source,
+            content=content,
+            provenance=provenance,
+            field_names=field_names,
+            expires_at=expires_at,
+            revision_id=revision_id,
+            validation_state=validation_state,
+            evidence_id=evidence_id,
+            detected_classification=detected_classification,
+        )
+
+    async def _persist_record(
+        self,
+        *,
+        source: EvidenceSourceIdentity,
+        content: str,
+        provenance: Provenance,
+        field_names: Collection[str] = (),
+        expires_at: Optional[datetime] = None,
+        revision_id: Optional[uuid.UUID] = None,
+        validation_state: Optional[str] = None,
+        evidence_id: Optional[uuid.UUID] = None,
+        detected_classification: Optional[EvidenceClassification] = None,
+    ) -> uuid.UUID:
+        """The persist pipeline shared by both public entry points.
+
+        Only :meth:`persist_people_evidence` may pass a People source (it has
+        already minimized the raw record), which is why the People refusal
+        lives on the public :meth:`persist_record`.
         """
         self._require_valid_governance_fields(
             source=source,
@@ -593,7 +664,7 @@ class EvidenceGovernor:
         minimized = minimize_people_record(
             raw_record, required_fields=required_fields
         )
-        return await self.persist_record(
+        return await self._persist_record(
             source=PeopleSourceIdentity(kind="people", record_id=record_id),
             content=minimized.content,
             field_names=minimized.field_names,
@@ -664,26 +735,14 @@ class EvidenceGovernor:
                 reason="unknown_evidence",
                 occurred_at=occurred_at,
             )
-        if record.payload_purged_at is not None:
-            self._deny(
-                use_id=use.use_id,
-                evidence_id=use.evidence_id,
-                run_id=runtime.run_id,
-                reason="purged",
-                occurred_at=occurred_at,
-            )
-        if record.expires_at is not None and record.expires_at <= occurred_at:
-            self._deny(
-                use_id=use.use_id,
-                evidence_id=use.evidence_id,
-                run_id=runtime.run_id,
-                reason="expired",
-                occurred_at=occurred_at,
-            )
 
-        failure = self._revision_requirement_failure(record, request)
+        # Shared per-record payload-access check (tombstone, expiry, source
+        # ACL/permission, derived validation + recursive ancestor walk).
+        failure = await self._payload_access_failure(
+            record, runtime, occurred_at
+        )
         if failure is None:
-            failure = await self._authorization_failure(record, runtime)
+            failure = self._revision_requirement_failure(record, request)
         if failure is not None:
             self._deny(
                 use_id=use.use_id,
@@ -778,11 +837,48 @@ class EvidenceGovernor:
             return "revision_mismatch"
         return None
 
-    async def _authorization_failure(
+    async def _payload_access_failure(
         self,
         record: EncryptedEvidenceRecord,
         runtime: CapabilityRuntimeContext,
+        occurred_at: datetime,
     ) -> Optional[str]:
+        """Payload-access check for the admitted record and its derived lineage.
+
+        The per-record rule is the shared :meth:`_record_access_failure`; when
+        the record is derived, every recursively resolved ancestor is subjected
+        to the same rule by :meth:`_recursive_source_failure`.
+        """
+        failure = await self._record_access_failure(
+            record, runtime, occurred_at
+        )
+        if failure is not None:
+            return failure
+        source = record.source
+        if isinstance(source, DerivedSourceIdentity):
+            return await self._recursive_source_failure(
+                source, runtime=runtime, occurred_at=occurred_at
+            )
+        return None
+
+    async def _record_access_failure(
+        self,
+        record: EncryptedEvidenceRecord,
+        runtime: CapabilityRuntimeContext,
+        occurred_at: datetime,
+    ) -> Optional[str]:
+        """Tombstone, expiry, and source authorization for one stored record.
+
+        Document workspace/ACL resolves through the record's authoritative
+        immutable revision and additionally requires a live document (spec §24);
+        People requires the runtime ``can_read_people`` permission. Derived
+        validation state is checked here, but a derived record's ancestors are
+        walked separately by :meth:`_recursive_source_failure`.
+        """
+        if record.payload_purged_at is not None:
+            return "purged"
+        if record.expires_at is not None and record.expires_at <= occurred_at:
+            return "expired"
         source = record.source
         if isinstance(source, DocumentSourceIdentity):
             if record.revision_id is None:
@@ -806,13 +902,40 @@ class EvidenceGovernor:
         if isinstance(source, DerivedSourceIdentity):
             if record.validation_state != DERIVED_VALIDATED:
                 return "derived_not_validated"
-            return await self._recursive_source_failure(source)
+            return None
+        if isinstance(
+            source,
+            (KnowledgeGraphSourceIdentity, MemorySourceIdentity),
+        ):
+            # Ownerless by design: these identities carry no workspace/revision
+            # and therefore no per-record owner to resolve an ACL against. They
+            # are authorized transitively by the admitted use's run scope —
+            # ``hydrate_use`` already denied a use whose envelope run differs
+            # from the trusted runtime run (``cross_run``), the use belongs to
+            # exactly one run, and the KG is per-workspace, so the run's
+            # workspace is the effective scope (spec §24).
+            return None
         return None
 
     async def _recursive_source_failure(
-        self, source: DerivedSourceIdentity
+        self,
+        source: DerivedSourceIdentity,
+        *,
+        runtime: CapabilityRuntimeContext,
+        occurred_at: datetime,
     ) -> Optional[str]:
-        """Every recursively resolved source must exist, be live, and be validated."""
+        """Every recursively resolved ancestor must be readable and validated.
+
+        Each ancestor is checked with the same shared payload-access rule as
+        the admitted record (authoritative-revision workspace ACL, People
+        permission, record expiry, record/document tombstone), so a derived
+        summary cannot hydrate around an unauthorized, expired, or tombstoned
+        ancestor. A derived ancestor must itself be ``validated`` and its
+        lineage is walked too. The reason is mapped through
+        :data:`_ANCESTOR_FAILURE_REASONS` so an unauthorized ancestor
+        (``derived_source_unauthorized``) is distinguishable in the audit trail
+        from an expired/tombstoned/unresolved one.
+        """
         pending = list(source.source_evidence_ids)
         visited: set[uuid.UUID] = set()
         while pending:
@@ -821,11 +944,16 @@ class EvidenceGovernor:
                 continue
             visited.add(evidence_id)
             row = await self._repository.load_record(evidence_id)
-            if row is None or row.payload_purged_at is not None:
+            if row is None:
                 return "derived_source_unresolved"
+            ancestor_failure = await self._record_access_failure(
+                row, runtime, occurred_at
+            )
+            if ancestor_failure is not None:
+                return _ANCESTOR_FAILURE_REASONS.get(
+                    ancestor_failure, "derived_source_unresolved"
+                )
             if isinstance(row.source, DerivedSourceIdentity):
-                if row.validation_state != DERIVED_VALIDATED:
-                    return "derived_source_unresolved"
                 pending.extend(row.source.source_evidence_ids)
         return None
 

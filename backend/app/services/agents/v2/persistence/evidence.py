@@ -3,9 +3,11 @@
 This module owns the two Evidence Store tables:
 
 - :class:`EvidenceRepository` — idempotent insertion of the **already
-  encrypted** evidence row (source identity + content hash is the record
-  idempotency key) and the idempotent ``EvidenceUse`` append arbitrated by the
-  null-safe unique index ``uq_evidence_use_key``.
+  encrypted** evidence row (the ``uq_evidence_record_identity`` unique index
+  over ``(content_hash, source)`` is the record idempotency arbiter, so
+  concurrent identical writes cannot duplicate) and the idempotent
+  ``EvidenceUse`` append arbitrated by the null-safe unique index
+  ``uq_evidence_use_key``.
 - :class:`EncryptedEvidenceRecord` — the storage transfer object. It carries no
   plaintext by construction (only ``ciphertext``/``nonce``/``key id``/
   ``algorithm`` plus the identity and storage-policy metadata), so the
@@ -33,6 +35,7 @@ from typing import Optional
 from pydantic import TypeAdapter
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.document import Document
@@ -127,9 +130,17 @@ class EvidenceRepository:
     ) -> uuid.UUID:
         """Insert the encrypted record, idempotently.
 
-        Returns the existing row's UUID when a record with the same source
-        identity + content hash is already stored, so a retried capability
-        execution cannot create an uncontrolled duplicate.
+        ``(content_hash, source)`` is the idempotency arbiter (the
+        ``uq_evidence_record_identity`` unique index, spec §15.3 "evidence
+        insertion is idempotent by source identity + content hash"), so a
+        retry — or a concurrent identical write that minted a different
+        ``evidence_id`` — collides and the existing row's UUID is returned
+        instead of duplicating.
+
+        A primary-key collision with a *different* identity is not an
+        idempotent retry: the existing row is re-read and, because its
+        ``content_hash``/``source`` differ from the requested values, the
+        insert fails closed with :class:`EvidencePersistenceError`.
         """
         existing = await self.find_record_id_by_identity(
             source=record.source, content_hash=record.content_hash
@@ -155,25 +166,52 @@ class EvidenceRepository:
                 validation_state=record.validation_state,
                 payload_purged_at=record.payload_purged_at,
             )
-            .on_conflict_do_nothing(index_elements=["evidence_id"])
+            .on_conflict_do_nothing(index_elements=["content_hash", "source"])
             .returning(EvidenceRecordRow.evidence_id)
         )
-        inserted = (await self.session.execute(stmt)).scalar_one_or_none()
-        await self.session.flush()
+        inserted: Optional[uuid.UUID] = None
+        try:
+            # A primary-key collision is raised by PostgreSQL (the conflict
+            # clause only targets the identity arbiter), so the failed insert
+            # runs inside a SAVEPOINT to keep the outer transaction usable.
+            async with self.session.begin_nested():
+                inserted = (
+                    await self.session.execute(stmt)
+                ).scalar_one_or_none()
+        except IntegrityError:
+            inserted = None
         if inserted is not None:
+            await self.session.flush()
             return inserted
-        # The primary key already exists — return that immutable row's UUID.
-        stored = await self.session.scalar(
-            select(EvidenceRecordRow.evidence_id).where(
-                EvidenceRecordRow.evidence_id == record.evidence_id
-            )
+
+        # Nothing was inserted: either the (content_hash, source) arbiter
+        # matched an existing row (retry / concurrent duplicate) or the primary
+        # key already exists with a different identity.
+        existing = await self.find_record_id_by_identity(
+            source=record.source, content_hash=record.content_hash
         )
-        if stored is None:
-            raise EvidencePersistenceError(
-                f"evidence_records insert for {record.evidence_id} neither "
-                "inserted nor resolved an existing row"
+        if existing is not None:
+            return existing
+        stored = (
+            await self.session.execute(
+                select(
+                    EvidenceRecordRow.content_hash,
+                    EvidenceRecordRow.source,
+                ).where(
+                    EvidenceRecordRow.evidence_id == record.evidence_id
+                )
             )
-        return stored
+        ).first()
+        if stored is not None:
+            raise EvidencePersistenceError(
+                f"evidence_records.evidence_id {record.evidence_id} already "
+                "exists with a different content_hash/source identity; a "
+                "primary-key collision is not an idempotent retry"
+            )
+        raise EvidencePersistenceError(
+            f"evidence_records insert for {record.evidence_id} neither "
+            "inserted nor resolved an existing row"
+        )
 
     async def load_record(
         self, evidence_id: uuid.UUID
