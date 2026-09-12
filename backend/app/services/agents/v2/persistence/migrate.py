@@ -39,42 +39,45 @@ Brief item (4) — revision-ID enforcement
 ----------------------------------------
 
 The brief requires DB constraints/triggers that reject any future write
-to a legacy table that lacks the appropriate revision ID. A plain
-``CHECK (revision_id IS NOT NULL)`` would also reject the pre-migration
-legacy rows that legitimately lack a revision ID, so we use the
-**sentinel + trigger** pattern:
+to a legacy table that lacks the appropriate revision ID. The
+``CHECK (revision_id IS NOT NULL)`` we might be tempted to install
+cannot be enforced on legacy rows that legitimately lack a revision ID
+— and v1 must keep working during the transition window — so we use a
+**stable-pointer trigger** instead:
 
 1. Each legacy table (``documents``, ``document_images``,
-   ``document_tables``) gets a nullable ``migrated_at TIMESTAMPTZ``
-   sentinel column added by this migration.
-2. The migration backfills ``migrated_at = NOW()`` for every existing
-   row. These rows are "marked migrated" — the trigger will treat them
-   as legacy and never enforce a revision ID on them.
-3. A ``BEFORE INSERT OR UPDATE`` trigger on each legacy table has the
-   shape::
+   ``document_tables``) gets a ``BEFORE UPDATE OF <revision_col>``
+   trigger that fires *only* when the ``current_revision_id`` (or
+   ``revision_id`` for image/table) column is in the SET clause.
+2. The trigger's ``WHEN`` clause is
+   ``OLD.<revision_col> IS NOT NULL AND NEW.<revision_col> IS NULL``.
+   This catches the only invariant the brief is protecting: a row that
+   already carries a revision pointer cannot silently lose it.
+3. PG's ``UPDATE OF <column>`` trigger scoping means v1 UPDATEs that
+   touch *other* columns (``status``, ``markdown_s3_key``, ``embed_done``,
+   ``raw_chunks_json``, ...) never fire the trigger at all. v1 INSERTs
+   are unaffected because the trigger is ``BEFORE UPDATE OF``, not
+   ``BEFORE INSERT OR UPDATE``.
 
-       WHEN (NEW.migrated_at IS NULL)
-       CHECK: NEW.<revision_col> IS NOT NULL
-              OR (TG_OP = 'INSERT' AND NEW.migrated_at IS NULL)
+**Why no INSERT-side trigger:** any INSERT-time check that requires a
+revision ID would also reject v1-style INSERTs during the transition
+window, which the brief explicitly prohibits. The FK from
+``documents.current_revision_id`` (and the matching image/table
+columns) to ``document_revisions(revision_id)`` (installed by the
+``_LEGACY_FK_STATEMENTS`` step) already enforces revision existence
+when the v2 pipeline populates the column.
 
-   The semantics (chosen by the task author) are:
+**Why no DELETE-side trigger:** brief Step 2 item (3) requires that
+cascading deletes from ``documents`` cannot orphan or destroy
+``document_revisions``; this is enforced by the ``ON DELETE RESTRICT``
+FKs on ``document_revisions.document_id``. A DELETE-side trigger on
+legacy child tables is not needed because the ``ON DELETE RESTRICT``
+on ``document_revisions`` is the only place a DELETE could otherwise
+silently cascade, and we block it there.
 
-   - For **legacy rows** (``migrated_at`` set by the backfill): the
-     ``WHEN`` clause skips the trigger entirely. No constraint is
-     enforced.
-   - For **legacy-style inserts** that the v1 pipeline might still emit
-     during the transition (``migrated_at IS NULL``): the
-     ``OR (TG_OP='INSERT' AND NEW.migrated_at IS NULL)`` clause
-     short-circuits to TRUE, so the trigger allows them. This is
-     deliberately permissive for the transition window.
-   - For **v2-written UPDATEs** (``migrated_at IS NULL`` on an UPDATE):
-     the trigger requires the revision column to be NOT NULL. This is
-     the actual safety net — once the v2 pipeline takes over, no row
-     can be re-written without a revision ID.
-
-   v2-written INSERTs must therefore explicitly set the revision column
-   (the trigger allows the insert but the application layer is expected
-   to populate it; see Phase 1B).
+Net effect: v1 INSERT/UPDATE paths are completely unaffected; the v2
+invariants are enforced by the FK (existence) plus the stable-pointer
+trigger (no losing the pointer once set).
 
 Brief item (5) — legacy-unchanged verification
 ----------------------------------------------
@@ -387,28 +390,8 @@ _NULLABILITY_INDEXES: tuple[str, ...] = (
 
 
 # ---------------------------------------------------------------------------
-# Brief item (4) — sentinel column + trigger
+# Brief item (4) — stable-pointer triggers
 # ---------------------------------------------------------------------------
-
-
-# ``migrated_at`` is added WITHOUT a DEFAULT so future v2-written INSERTs
-# land with ``migrated_at IS NULL`` (the trigger's WHEN clause is then
-# active). Existing rows are backfilled by the explicit UPDATE statements
-# below.
-_MIGRATED_AT_COLUMNS: tuple[str, ...] = (
-    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMPTZ NULL",
-    "ALTER TABLE document_images ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMPTZ NULL",
-    "ALTER TABLE document_tables ADD COLUMN IF NOT EXISTS migrated_at TIMESTAMPTZ NULL",
-)
-
-
-# Backfill: stamp every existing row as "migrated". The trigger will then
-# skip these rows because ``migrated_at IS NOT NULL``.
-_MIGRATED_AT_BACKFILLS: tuple[str, ...] = (
-    "UPDATE documents SET migrated_at = NOW() WHERE migrated_at IS NULL",
-    "UPDATE document_images SET migrated_at = NOW() WHERE migrated_at IS NULL",
-    "UPDATE document_tables SET migrated_at = NOW() WHERE migrated_at IS NULL",
-)
 
 
 # FK constraints added AFTER the columns exist. ON DELETE NO ACTION
@@ -434,94 +417,86 @@ _LEGACY_FK_STATEMENTS: tuple[str, ...] = (
 )
 
 
-# Trigger functions: one per legacy table. Each enforces the brief's
-# condition for the matching revision column.
+# Trigger functions: one per legacy table. Each raises an exception when
+# a row's revision pointer is being un-set by an UPDATE. The functions
+# never fire on INSERTs and never fire on UPDATEs that leave the
+# revision column alone — that scoping is enforced by PG's
+# ``BEFORE UPDATE OF <column>`` trigger syntax.
 _TRIGGER_FUNCTIONS: tuple[str, ...] = (
     """
-    CREATE OR REPLACE FUNCTION enforce_documents_current_revision_id()
+    CREATE OR REPLACE FUNCTION raise_documents_revision_id_loss()
     RETURNS TRIGGER AS $$
     BEGIN
-        IF NOT (
-            NEW.current_revision_id IS NOT NULL
-            OR (TG_OP = 'INSERT' AND NEW.migrated_at IS NULL)
-        ) THEN
-            RAISE EXCEPTION
-                'documents.current_revision_id is required for v2-written rows '
-                '(TG_OP=%, migrated_at IS NULL)', TG_OP;
-        END IF;
-        RETURN NEW;
+        RAISE EXCEPTION
+            'documents.current_revision_id cannot be unset once assigned '
+            '(TG_OP=%, OLD.current_revision_id=%, NEW.current_revision_id=NULL)',
+            TG_OP, OLD.current_revision_id;
     END;
     $$ LANGUAGE plpgsql
     """,
     """
-    CREATE OR REPLACE FUNCTION enforce_document_images_revision_id()
+    CREATE OR REPLACE FUNCTION raise_document_images_revision_id_loss()
     RETURNS TRIGGER AS $$
     BEGIN
-        IF NOT (
-            NEW.revision_id IS NOT NULL
-            OR (TG_OP = 'INSERT' AND NEW.migrated_at IS NULL)
-        ) THEN
-            RAISE EXCEPTION
-                'document_images.revision_id is required for v2-written rows '
-                '(TG_OP=%, migrated_at IS NULL)', TG_OP;
-        END IF;
-        RETURN NEW;
+        RAISE EXCEPTION
+            'document_images.revision_id cannot be unset once assigned '
+            '(TG_OP=%, OLD.revision_id=%, NEW.revision_id=NULL)',
+            TG_OP, OLD.revision_id;
     END;
     $$ LANGUAGE plpgsql
     """,
     """
-    CREATE OR REPLACE FUNCTION enforce_document_tables_revision_id()
+    CREATE OR REPLACE FUNCTION raise_document_tables_revision_id_loss()
     RETURNS TRIGGER AS $$
     BEGIN
-        IF NOT (
-            NEW.revision_id IS NOT NULL
-            OR (TG_OP = 'INSERT' AND NEW.migrated_at IS NULL)
-        ) THEN
-            RAISE EXCEPTION
-                'document_tables.revision_id is required for v2-written rows '
-                '(TG_OP=%, migrated_at IS NULL)', TG_OP;
-        END IF;
-        RETURN NEW;
+        RAISE EXCEPTION
+            'document_tables.revision_id cannot be unset once assigned '
+            '(TG_OP=%, OLD.revision_id=%, NEW.revision_id=NULL)',
+            TG_OP, OLD.revision_id;
     END;
     $$ LANGUAGE plpgsql
     """,
 )
 
 
-# Triggers: WHEN (NEW.migrated_at IS NULL) — only fires for v2-written rows.
-# Legacy rows (migrated_at NOT NULL) skip the trigger entirely.
+# Triggers: ``BEFORE UPDATE OF <revision_col>`` scoped to a single column
+# and gated by ``OLD.<col> IS NOT NULL AND NEW.<col> IS NULL``. v1 UPDATEs
+# that touch any other column (``status``, ``markdown_s3_key``,
+# ``embed_done``, ...) never fire the trigger because ``UPDATE OF``
+# skips them. v1 INSERTs are unaffected because the trigger is
+# UPDATE-only.
 _TRIGGERS: tuple[str, ...] = (
     """
-    DROP TRIGGER IF EXISTS trg_documents_require_revision_id ON documents
+    DROP TRIGGER IF EXISTS trg_documents_revision_id_stable ON documents
     """,
     """
-    CREATE TRIGGER trg_documents_require_revision_id
-        BEFORE INSERT OR UPDATE ON documents
+    CREATE TRIGGER trg_documents_revision_id_stable
+        BEFORE UPDATE OF current_revision_id ON documents
         FOR EACH ROW
-        WHEN (NEW.migrated_at IS NULL)
-        EXECUTE FUNCTION enforce_documents_current_revision_id()
+        WHEN (OLD.current_revision_id IS NOT NULL AND NEW.current_revision_id IS NULL)
+        EXECUTE FUNCTION raise_documents_revision_id_loss()
     """,
     """
-    DROP TRIGGER IF EXISTS trg_document_images_require_revision_id
+    DROP TRIGGER IF EXISTS trg_document_images_revision_id_stable
         ON document_images
     """,
     """
-    CREATE TRIGGER trg_document_images_require_revision_id
-        BEFORE INSERT OR UPDATE ON document_images
+    CREATE TRIGGER trg_document_images_revision_id_stable
+        BEFORE UPDATE OF revision_id ON document_images
         FOR EACH ROW
-        WHEN (NEW.migrated_at IS NULL)
-        EXECUTE FUNCTION enforce_document_images_revision_id()
+        WHEN (OLD.revision_id IS NOT NULL AND NEW.revision_id IS NULL)
+        EXECUTE FUNCTION raise_document_images_revision_id_loss()
     """,
     """
-    DROP TRIGGER IF EXISTS trg_document_tables_require_revision_id
+    DROP TRIGGER IF EXISTS trg_document_tables_revision_id_stable
         ON document_tables
     """,
     """
-    CREATE TRIGGER trg_document_tables_require_revision_id
-        BEFORE INSERT OR UPDATE ON document_tables
+    CREATE TRIGGER trg_document_tables_revision_id_stable
+        BEFORE UPDATE OF revision_id ON document_tables
         FOR EACH ROW
-        WHEN (NEW.migrated_at IS NULL)
-        EXECUTE FUNCTION enforce_document_tables_revision_id()
+        WHEN (OLD.revision_id IS NOT NULL AND NEW.revision_id IS NULL)
+        EXECUTE FUNCTION raise_document_tables_revision_id_loss()
     """,
 )
 
@@ -670,8 +645,8 @@ def check_v2_schema(engine: Engine) -> SchemaCheck:
 
 def apply_v2_schema(engine: Engine) -> None:
     """Apply Release 1A: create the 12 v2 tables, add nullable columns to legacy
-    tables, install FKs/sentinel/backfill/triggers, verify legacy rows are
-    untouched, and record the schema version.
+    tables, install FKs to ``document_revisions``, install the stable-pointer
+    triggers, verify legacy rows are untouched, and record the schema version.
 
     Idempotent: a second call with the schema already applied is a no-op.
     The transaction commits (or rolls back) when ``engine.begin()`` exits.
@@ -710,29 +685,23 @@ def apply_v2_schema(engine: Engine) -> None:
         for stmt in _LEGACY_FK_STATEMENTS:
             conn.execute(text(stmt))
 
-        # 5. Add the ``migrated_at`` sentinel column and backfill it.
-        for stmt in _MIGRATED_AT_COLUMNS:
-            conn.execute(text(stmt))
-        for stmt in _MIGRATED_AT_BACKFILLS:
-            conn.execute(text(stmt))
-
-        # 6. Install supporting indexes.
+        # 5. Install supporting indexes.
         for stmt in _NULLABILITY_INDEXES:
             conn.execute(text(stmt))
         for stmt in _CREATE_INDEXES:
             conn.execute(text(stmt))
 
-        # 7. Install trigger functions and triggers (brief item 4).
+        # 6. Install trigger functions and triggers (brief item 4).
         for stmt in _TRIGGER_FUNCTIONS:
             conn.execute(text(stmt))
         for stmt in _TRIGGERS:
             conn.execute(text(stmt))
 
-        # 8. Verify legacy rows are untouched (row-count strict, size
+        # 7. Verify legacy rows are untouched (row-count strict, size
         #    informational — column additions legitimately grow it).
         _verify_legacy_unchanged(conn, baseline)
 
-        # 9. Record the schema version LAST. If anything above raised,
+        # 8. Record the schema version LAST. If anything above raised,
         #    this row would not be written and the migration is
         #    retriable.
         conn.execute(

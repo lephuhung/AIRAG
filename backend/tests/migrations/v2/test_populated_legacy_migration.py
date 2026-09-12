@@ -116,31 +116,32 @@ def migrated_db(db: Engine):
 def _drop_v2_state() -> None:
     """Drop any v2 tables that may exist from a previous test run.
 
-    Order matters: drop the triggers that reference ``migrated_at``
-    before dropping the column itself. FK constraints from legacy
-    columns (``documents.current_revision_id`` etc.) are pulled in by
-    the ``DROP TABLE ... CASCADE`` of the v2 tables they reference
-    (``document_revisions``), so we drop the v2 tables first.
+    Order matters: drop triggers on legacy tables before any column
+    removal they could reference; drop v2 tables first (cascades remove
+    FKs pointing at them from legacy columns). The ``migrated_at``
+    cleanup is defensive — the current migration does not add that
+    column, but a previous test run with the round-1 sentinel-based
+    trigger may have left it behind.
     """
     with _psycopg_connect() as conn:
         with conn.cursor() as cur:
             # Drop v2 tables first (cascades remove FKs pointing at them).
             for tbl in EXPECTED_V2_TABLES:
                 cur.execute(f'DROP TABLE IF EXISTS "{tbl}" CASCADE')
-            # Drop triggers on legacy tables (depend on migrated_at).
+            # Drop the stable-pointer triggers on legacy tables.
             for trigger, table in (
-                ("trg_documents_require_revision_id", "documents"),
-                ("trg_document_images_require_revision_id", "document_images"),
-                ("trg_document_tables_require_revision_id", "document_tables"),
+                ("trg_documents_revision_id_stable", "documents"),
+                ("trg_document_images_revision_id_stable", "document_images"),
+                ("trg_document_tables_revision_id_stable", "document_tables"),
             ):
                 cur.execute(
                     f"DROP TRIGGER IF EXISTS {trigger} ON {table}"
                 )
             # Drop the trigger functions.
             for fn in (
-                "enforce_documents_current_revision_id()",
-                "enforce_document_images_revision_id()",
-                "enforce_document_tables_revision_id()",
+                "raise_documents_revision_id_loss()",
+                "raise_document_images_revision_id_loss()",
+                "raise_document_tables_revision_id_loss()",
             ):
                 cur.execute(f"DROP FUNCTION IF EXISTS {fn}")
             # Drop the column additions to legacy tables.
@@ -398,11 +399,12 @@ def test_migrate_module_takes_advisory_lock() -> None:
 def test_migration_does_not_mutate_legacy_data() -> None:
     """Source-level proof that the migration never mutates legacy data.
 
-    The only ``UPDATE`` statements allowed on legacy tables are the
-    ``migrated_at`` backfill (``UPDATE <table> SET migrated_at = NOW()
-    WHERE migrated_at IS NULL``), which only writes the sentinel
-    column added by the same migration. No ``DELETE FROM`` and no
-    UPDATE that touches any other column is permitted.
+    After the round-2 fix the migration is fully schema-only: no
+    ``DELETE FROM`` on legacy tables, and no ``UPDATE`` on legacy
+    tables (the prior ``migrated_at`` sentinel backfill is gone; the
+    brief item (4) invariant is enforced by a ``BEFORE UPDATE OF
+    <revision_col>`` trigger that fires only when the revision column
+    is in the SET clause, with no row-level mutation required).
     """
     src_path = (
         Path(__file__).resolve().parents[3]
@@ -427,30 +429,16 @@ def test_migration_does_not_mutate_legacy_data() -> None:
             f"forbidden legacy DELETE in migrate.py: {stmt!r}"
         )
 
-    # The only UPDATE on legacy tables allowed is the migrated_at
-    # backfill (``UPDATE <tbl> SET migrated_at = NOW() WHERE migrated_at
-    # IS NULL``). We assert that no UPDATE on a legacy table touches any
-    # other column.
+    # No UPDATE on legacy tables either (the round-1 sentinel backfill
+    # was removed because it broke v1 writes; the stable-pointer
+    # trigger is now schema-only).
     legacy_updates = re.findall(
         r"UPDATE\s+(documents|document_images|document_tables)\b",
         code,
     )
-    assert legacy_updates, (
-        "expected at least the migrated_at backfill UPDATE on legacy tables"
+    assert not legacy_updates, (
+        f"forbidden legacy UPDATE in migrate.py: {legacy_updates!r}"
     )
-    for tbl in set(legacy_updates):
-        # The pattern ``UPDATE <tbl> SET ...`` must only set ``migrated_at``.
-        pattern = re.compile(
-            rf"UPDATE\s+{tbl}\b[^\n]*SET\s+([^,\n]+(?:,[^,\n]+)*)",
-            re.IGNORECASE,
-        )
-        for cols in pattern.findall(code):
-            for col_assignment in cols.split(","):
-                col = col_assignment.strip().split("=", 1)[0].strip()
-                assert col == "migrated_at", (
-                    f"legacy UPDATE on {tbl!r} touches forbidden column "
-                    f"{col!r} (only migrated_at is permitted)"
-                )
 
 
 def test_legacy_fks_point_at_document_revisions(migrated_db: Engine) -> None:
@@ -528,26 +516,53 @@ def test_no_v2_cascade_fks_on_documents(migrated_db: Engine) -> None:
         )
 
 
-def test_legacy_migrated_at_sentinel_present(migrated_db: Engine) -> None:
-    """Brief item (4): ``migrated_at`` sentinel column is backfilled on legacy rows."""
-    for tbl in ("documents", "document_images", "document_tables"):
-        with migrated_db.connect() as conn:
-            col = conn.execute(
-                text(
-                    "SELECT is_nullable FROM information_schema.columns "
-                    "WHERE table_name = :t AND column_name = 'migrated_at'"
-                ),
-                {"t": tbl},
-            ).fetchone()
-            null_count = conn.execute(
-                text(
-                    f"SELECT count(*) FROM {tbl} WHERE migrated_at IS NULL"
-                )
-            ).scalar()
-        assert col is not None, f"{tbl}.migrated_at column missing"
-        assert col[0] == "YES", f"{tbl}.migrated_at must be nullable"
-        assert null_count == 0, (
-            f"all legacy {tbl} rows must have migrated_at backfilled"
+def test_revision_id_stable_pointer_triggers_exist(migrated_db: Engine) -> None:
+    """Brief item (4) — round-2 fix: stable-pointer triggers are installed.
+
+    The triggers fire only on ``UPDATE OF <revision_col>`` and only
+    reject the non-null → null transition (the actual invariant: a row
+    that already carries a revision pointer cannot silently lose it).
+    v1 writes (INSERT, and UPDATE that touches any other column) never
+    fire the trigger because of PG's ``UPDATE OF <col>`` scoping.
+    """
+    expected = (
+        ("documents", "trg_documents_revision_id_stable", "current_revision_id"),
+        ("document_images", "trg_document_images_revision_id_stable", "revision_id"),
+        ("document_tables", "trg_document_tables_revision_id_stable", "revision_id"),
+    )
+    with migrated_db.connect() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT
+                    c.relname::text            AS table_name,
+                    t.tgname                    AS trigger_name,
+                    (
+                        SELECT array_agg(a.attname ORDER BY a.attnum)
+                        FROM pg_catalog.pg_attribute a
+                        WHERE a.attrelid = t.tgrelid
+                          AND a.attnum = ANY(t.tgattr)
+                    ) AS update_columns
+                FROM pg_catalog.pg_trigger t
+                JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public'
+                  AND NOT t.tgisinternal
+                """
+            )
+        ).fetchall()
+    by_trigger = {r[1]: (r[0], list(r[2] or [])) for r in rows}
+    for tbl, trigger_name, col in expected:
+        assert trigger_name in by_trigger, (
+            f"missing trigger {trigger_name} (found: {sorted(by_trigger)})"
+        )
+        owner_tbl, cols = by_trigger[trigger_name]
+        assert owner_tbl == tbl, (
+            f"trigger {trigger_name} is on {owner_tbl}, expected {tbl}"
+        )
+        assert cols == [col], (
+            f"trigger {trigger_name} fires on columns {cols}, expected only "
+            f"{[col]} — extra columns would break v1 writes"
         )
 
 
@@ -590,12 +605,16 @@ def test_named_ingestion_attempt_unique_constraint(migrated_db: Engine) -> None:
     )
 
 
-def test_legacy_revision_id_trigger_enforces_update(migrated_db: Engine) -> None:
-    """I4: UPDATEs that null out revision_id on a v2-written row are rejected.
+def test_v1_style_writes_allowed(migrated_db: Engine) -> None:
+    """Round-2 fix: v1 INSERTs and UPDATEs must continue to work post-migration.
 
-    We insert a row with ``migrated_at IS NULL`` (v2-written marker) and no
-    ``revision_id``; the trigger must reject any UPDATE that does not first
-    populate ``revision_id``.
+    This is the regression test for the round-1 bug. The previous
+    sentinel-based trigger raised on every UPDATE on a row with
+    ``migrated_at IS NULL`` (which is every post-migration row because
+    the column had no DEFAULT). The new stable-pointer trigger only
+    fires on ``UPDATE OF <revision_col>``, so v1 UPDATEs that touch
+    other columns (``status``, ``markdown_s3_key``, ``embed_done``,
+    ...) are unaffected.
     """
     doc_id = uuid.uuid4()
     tenant_id = uuid.uuid4()
@@ -622,30 +641,153 @@ def test_legacy_revision_id_trigger_enforces_update(migrated_db: Engine) -> None
                 (str(workspace_id), f"kb-{workspace_id}", "d", "p",
                  str(user_id), str(tenant_id)),
             )
+            # v1-style INSERT: no current_revision_id, no migrated_at
+            # column (the new design does not add one).
             cur.execute(
                 "INSERT INTO documents (id, workspace_id, filename, original_filename, "
                 "file_type, file_size, status, chunk_count, page_count, image_count, "
                 "table_count, processing_time_ms, embed_done, captions_done, kg_done, "
-                "is_chat_upload, created_at, updated_at, migrated_at) "
+                "is_chat_upload, created_at, updated_at) "
                 "VALUES (%s, %s, %s, %s, 'pdf', 1, 'pending', 0, 0, 0, 0, 0, "
-                "false, false, false, false, NOW(), NOW(), NULL)",
+                "false, false, false, false, NOW(), NOW())",
                 (str(doc_id), str(workspace_id), f"f-{doc_id}", f"o-{doc_id}.pdf"),
             )
         conn.commit()
 
-    # The UPDATE on a migrated_at IS NULL row without setting
-    # current_revision_id must raise.
+    # v1-style UPDATEs that v1's parse_worker / embed_worker / kg_worker
+    # pipelines emit. None of them touch ``current_revision_id``, so
+    # the new ``UPDATE OF``-scoped trigger must NOT fire.
+    with migrated_db.connect() as conn:
+        conn.execute(
+            text(
+                "UPDATE documents SET status = 'indexed' WHERE id = :id"
+            ),
+            {"id": str(doc_id)},
+        )
+        conn.execute(
+            text(
+                "UPDATE documents SET markdown_s3_key = 'x/y.md' "
+                "WHERE id = :id"
+            ),
+            {"id": str(doc_id)},
+        )
+        conn.execute(
+            text(
+                "UPDATE documents SET embed_done = true, captions_done = true, "
+                "kg_done = true WHERE id = :id"
+            ),
+            {"id": str(doc_id)},
+        )
+        conn.commit()
+
+    # Sanity: the row actually carries the new values.
+    with migrated_db.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT status, markdown_s3_key, embed_done, captions_done, "
+                "kg_done, current_revision_id FROM documents WHERE id = :id"
+            ),
+            {"id": str(doc_id)},
+        ).first()
+    assert row is not None
+    assert row[0] == "indexed", f"status update was lost: {row[0]!r}"
+    assert row[1] == "x/y.md", f"markdown_s3_key update was lost: {row[1]!r}"
+    assert row[2] is True and row[3] is True and row[4] is True, (
+        f"embed/captions/kg flag updates were lost: {row[2:]!r}"
+    )
+    assert row[5] is None, (
+        "v1-style writes must not have set current_revision_id "
+        "(the v2 pipeline is the only place that does)"
+    )
+
+
+def test_revision_id_stable_pointer_rejects_unset(migrated_db: Engine) -> None:
+    """Round-2 fix: stable-pointer trigger fires on non-null → null transition.
+
+    Once a row carries a revision pointer, the trigger must reject any
+    UPDATE that sets it back to NULL. This is the actual invariant
+    brief item (4) is protecting.
+    """
+    doc_id = uuid.uuid4()
+    revision_id = uuid.uuid4()
+    tenant_id = uuid.uuid4()
+    user_id = uuid.uuid4()
+    workspace_id = uuid.uuid4()
+
+    with _psycopg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO tenants (id, name, slug, is_active, created_at, updated_at) "
+                "VALUES (%s, %s, %s, true, NOW(), NOW())",
+                (str(tenant_id), f"t-{tenant_id}", f"slug-{tenant_id}"),
+            )
+            cur.execute(
+                "INSERT INTO users (id, email, password_hash, full_name, is_active, "
+                "is_superadmin, settings, totp_enabled, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, true, false, '{}', false, NOW(), NOW())",
+                (str(user_id), f"u-{user_id}@example.com", "x", "x"),
+            )
+            cur.execute(
+                "INSERT INTO knowledge_bases (id, name, description, system_prompt, "
+                "visibility, owner_id, tenant_id, is_default, created_at, updated_at) "
+                "VALUES (%s, %s, %s, %s, 'private', %s, %s, false, NOW(), NOW())",
+                (str(workspace_id), f"kb-{workspace_id}", "d", "p",
+                 str(user_id), str(tenant_id)),
+            )
+            # Insert the document row BEFORE the document_revisions row:
+            # document_revisions.document_id has ON DELETE RESTRICT, so
+            # the parent document must exist first.
+            cur.execute(
+                "INSERT INTO documents (id, workspace_id, filename, original_filename, "
+                "file_type, file_size, status, chunk_count, page_count, image_count, "
+                "table_count, processing_time_ms, embed_done, captions_done, kg_done, "
+                "is_chat_upload, created_at, updated_at, current_revision_id) "
+                "VALUES (%s, %s, %s, %s, 'pdf', 1, 'indexed', 0, 0, 0, 0, 0, "
+                "false, false, false, false, NOW(), NOW(), NULL)",
+                (str(doc_id), str(workspace_id), f"f-{doc_id}", f"o-{doc_id}.pdf"),
+            )
+            cur.execute(
+                "INSERT INTO document_revisions (revision_id, document_id, "
+                "generation, status) VALUES (%s, %s, 1, 'active')",
+                (str(revision_id), str(doc_id)),
+            )
+            # Now set current_revision_id (a non-null value triggers the
+            # stable-pointer invariant; the FK still resolves because
+            # the revision row exists).
+            cur.execute(
+                "UPDATE documents SET current_revision_id = %s WHERE id = %s",
+                (str(revision_id), str(doc_id)),
+            )
+        conn.commit()
+
     from sqlalchemy.exc import DBAPIError
 
     with pytest.raises(DBAPIError) as excinfo:
         with migrated_db.connect() as conn:
             conn.execute(
-                text("UPDATE documents SET filename = 'x' WHERE id = :id"),
+                text(
+                    "UPDATE documents SET current_revision_id = NULL "
+                    "WHERE id = :id"
+                ),
                 {"id": str(doc_id)},
             )
             conn.commit()
-    # Sanity: it was indeed the trigger raising, not some other failure.
     msg = str(excinfo.value).lower()
-    assert "current_revision_id" in msg or "documents" in msg, (
-        f"unexpected DB error: {excinfo.value}"
+    assert "current_revision_id" in msg or "cannot be unset" in msg, (
+        f"unexpected DB error from stable-pointer trigger: {excinfo.value}"
+    )
+
+    # The row is still intact (the transaction raised; conn.rollback in
+    # the inner block prevents partial application).
+    with migrated_db.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT current_revision_id FROM documents WHERE id = :id"
+            ),
+            {"id": str(doc_id)},
+        ).first()
+    assert row is not None
+    assert str(row[0]) == str(revision_id), (
+        f"stable-pointer trigger must leave current_revision_id intact, "
+        f"got {row[0]!r}"
     )

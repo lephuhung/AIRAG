@@ -74,6 +74,31 @@ def test_schema_delta_is_exactly_v2_tables(db: Engine) -> None:
         with setup.cursor() as cur:
             for tbl in V2_SCHEMA_V1_TABLES:
                 cur.execute(f'DROP TABLE IF EXISTS "{tbl}" CASCADE')
+            # Defensive cleanup: drop the old trigger names (round-1)
+            # and the new ones (round-2) so cross-run residue cannot
+            # leak into the schema-delta measurement.
+            for trigger, table in (
+                ("trg_documents_revision_id_stable", "documents"),
+                ("trg_document_images_revision_id_stable", "document_images"),
+                ("trg_document_tables_revision_id_stable", "document_tables"),
+                # round-1 names (if a stale migration left them behind):
+                ("trg_documents_require_revision_id", "documents"),
+                ("trg_document_images_require_revision_id", "document_images"),
+                ("trg_document_tables_require_revision_id", "document_tables"),
+            ):
+                cur.execute(
+                    f"DROP TRIGGER IF EXISTS {trigger} ON {table}"
+                )
+            for fn in (
+                "raise_documents_revision_id_loss()",
+                "raise_document_images_revision_id_loss()",
+                "raise_document_tables_revision_id_loss()",
+                # round-1 names:
+                "enforce_documents_current_revision_id()",
+                "enforce_document_images_revision_id()",
+                "enforce_document_tables_revision_id()",
+            ):
+                cur.execute(f"DROP FUNCTION IF EXISTS {fn}")
             cur.execute(
                 "ALTER TABLE documents DROP COLUMN IF EXISTS current_revision_id"
             )
@@ -81,10 +106,19 @@ def test_schema_delta_is_exactly_v2_tables(db: Engine) -> None:
                 "ALTER TABLE documents DROP COLUMN IF EXISTS source_deleted_at"
             )
             cur.execute(
+                "ALTER TABLE documents DROP COLUMN IF EXISTS migrated_at"
+            )
+            cur.execute(
                 "ALTER TABLE document_images DROP COLUMN IF EXISTS revision_id"
             )
             cur.execute(
+                "ALTER TABLE document_images DROP COLUMN IF EXISTS migrated_at"
+            )
+            cur.execute(
                 "ALTER TABLE document_tables DROP COLUMN IF EXISTS revision_id"
+            )
+            cur.execute(
+                "ALTER TABLE document_tables DROP COLUMN IF EXISTS migrated_at"
             )
         setup.commit()
 
