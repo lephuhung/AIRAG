@@ -7,15 +7,23 @@ Only direct non-factual paths and grounded factual paths may emit success:
   Phase 2 uses the canned fallback — never a capability, never evidence).
 - ``clarify`` → the persisted clarification question (fail-closed when the
   route promises a question the checkpoint does not hold).
-- ``fast_domain`` factual → the re-derived grounded answer (synthesize +
-  ground from the same checkpointed inputs, no reviser wired in Phase 2);
-  ``sufficient`` but ungroundable emits ``insufficient``, other evaluation
-  statuses map to ``insufficient`` (or ``clarify`` for ``needs_input``).
+- ``fast_domain`` factual → the grounded result consumed from the
+  runtime-only channel (this node never synthesizes or grounds on the normal
+  path); ``sufficient`` but ungroundable, and every other evaluation status,
+  emits a typed non-success response. Synthesis failures become typed
+  responses (denied/insufficient/error from the checkpointed task outcomes),
+  never escaping exceptions. User-facing content carries no internal
+  target/criterion identifiers.
 - ``complex_research`` → never success here: Write (``simple_write_operation``)
   is typed unavailable (``denied`` — T1 already routes it here), and every
   other complex reason is owned by the Phase-3 ``complex_boundary`` (typed
   ``error`` if it ever reaches this node, so a wiring bug cannot look like an
   answer).
+
+On a channel miss (restart between ground and finalizer) the grounded result
+is re-derived deterministically ONCE through the shared
+``synthesize_and_lease`` helper plus ``ground_answer`` — which also leases
+any freshly minted overflow uses — rather than synthesizing on every node.
 
 Terminal lease release is NOT performed here: the outer runner releases the
 run's leases only after the terminal checkpoint succeeds (T6 ordering).
@@ -33,9 +41,16 @@ from ..contracts.semantic import SemanticContext
 from ..contracts.state import GraphRuntimeContext, SupervisorV2State
 from ..contracts.validation import validate_final_response
 from .context import _context_of
+from .evaluate import _channel_of
+from .execute import require_checkpointed_plan
 from .grounding import GroundingInsufficient
 from .grounding import ground_answer as _ground_answer
-from .synthesize import _synthesis_input_of, synthesize_answer
+from .synthesize import (
+    DEFAULT_SYNTHESIS_BUDGET,
+    SynthesisError,
+    _synthesis_input_of,
+    synthesize_and_lease,
+)
 
 __all__ = [
     "FinalizerError",
@@ -48,6 +63,11 @@ __all__ = [
 #: these once T7 wires it through ``build_direct_response``).
 _DIRECT_GREETING = "Xin chào! Tôi có thể giúp gì cho bạn?"
 _DIRECT_CONVERSATION = "Tôi đã ghi nhận. Tôi có thể giúp gì thêm cho bạn?"
+
+#: User-safe fallbacks: internal target/criterion identifiers never reach
+#: the user-facing response (diagnostics stay in logs and reports).
+_INSUFFICIENT_CONTENT = "Không đủ căn cứ đã xác minh."
+_NEEDS_INPUT_CONTENT = "Tôi cần thêm thông tin để trả lời."
 
 
 class FinalizerError(ValueError):
@@ -101,6 +121,33 @@ def _emit(response: FinalResponse) -> dict:
     return {"final_response": response}
 
 
+def _typed_synthesis_failure(state: SupervisorV2State) -> dict:
+    """Translate a synthesis failure into a typed response (never a raise).
+
+    A denied task outcome denies the response; an error outcome errors it;
+    anything else (``not_found``, decayed hydration, empty admission) is a
+    typed ``insufficient``. No internal identifiers reach the content.
+    """
+    results = state["execution"].task_results
+    if any(result.status == "denied" for result in results):
+        status = "denied"
+        content = "Yêu cầu bị từ chối quyền truy cập."
+    elif any(result.status == "error" for result in results):
+        status = "error"
+        content = "Đã xảy ra lỗi khi thu thập bằng chứng."
+    else:
+        status = "insufficient"
+        content = _INSUFFICIENT_CONTENT
+    return _emit(
+        FinalResponse(
+            contract_version=CONTRACT_VERSION,
+            status=status,  # type: ignore[arg-type]
+            content=content,
+            citations=(),
+        )
+    )
+
+
 async def _finalize_factual(
     state: SupervisorV2State, context: GraphRuntimeContext
 ) -> dict:
@@ -111,11 +158,12 @@ async def _finalize_factual(
             "refusing to emit a response without a verdict"
         )
     if evaluation.status == "needs_input":
-        details = [item.description for item in evaluation.missing]
-        for ambiguity in state["semantic"].blocking_ambiguities:
-            details.append(ambiguity.description)
-        content = "Tôi cần thêm thông tin: " + (
-            "; ".join(details) if details else "yêu cầu chưa rõ."
+        details = [
+            ambiguity.description
+            for ambiguity in state["semantic"].blocking_ambiguities
+        ]
+        content = _NEEDS_INPUT_CONTENT + (
+            " " + " ".join(details) if details else ""
         )
         return _emit(
             FinalResponse(
@@ -126,13 +174,34 @@ async def _finalize_factual(
             )
         )
     if evaluation.status in ("insufficient", "contradictory"):
-        details = [item.description for item in evaluation.missing]
-        for contradiction in evaluation.contradictions:
-            details.append(
-                f"mâu thuẫn: {contradiction.claim_a} <-> {contradiction.claim_b}"
+        # A denied/errored task outcome owns the typed response: the verdict
+        # is insufficient because evidence never arrived, and the reason is
+        # authorization or infrastructure — not a content gap.
+        results = state["execution"].task_results
+        if any(result.status == "denied" for result in results):
+            return _emit(
+                FinalResponse(
+                    contract_version=CONTRACT_VERSION,
+                    status="denied",
+                    content="Yêu cầu bị từ chối quyền truy cập.",
+                    citations=(),
+                )
             )
-        content = "Không đủ căn cứ đã xác minh" + (
-            ": " + "; ".join(details[:3]) if details else "."
+        if any(result.status == "error" for result in results):
+            return _emit(
+                FinalResponse(
+                    contract_version=CONTRACT_VERSION,
+                    status="error",
+                    content="Đã xảy ra lỗi khi thu thập bằng chứng.",
+                    citations=(),
+                )
+            )
+        details = [
+            f"{contradiction.claim_a} <-> {contradiction.claim_b}"
+            for contradiction in evaluation.contradictions
+        ]
+        content = _INSUFFICIENT_CONTENT + (
+            " " + " ".join(details[:2]) if details else ""
         )
         return _emit(
             FinalResponse(
@@ -142,27 +211,43 @@ async def _finalize_factual(
                 citations=(),
             )
         )
-    synthesis_input = _synthesis_input_of(state)
+    run_id = context.capability_runtime.run_id
+    channel = _channel_of(context)
+    entry = channel.get(run_id) if channel is not None else None
+    if entry is not None and entry.grounded_draft is not None:
+        return _emit(
+            FinalResponse(
+                contract_version=CONTRACT_VERSION,
+                status="success",
+                content=entry.grounded_draft.content,
+                citations=entry.citations,
+            )
+        )
+    # Channel miss: single deterministic re-derivation (synthesize + lease +
+    # ground, no reviser); failures become typed responses, never raises.
+    plan = require_checkpointed_plan(state)
     try:
-        synthesized = await synthesize_answer(
-            synthesis_input=synthesis_input, runtime=context
+        derived = await synthesize_and_lease(
+            synthesis_input=_synthesis_input_of(state),
+            runtime=context,
+            plan=plan,
+            bindings=state["bindings"],
+            budget=DEFAULT_SYNTHESIS_BUDGET,
         )
         grounded = await _ground_answer(
-            draft=synthesized.draft, evidence=synthesized.evidence
+            draft=derived.draft, evidence=derived.evidence
         )
-    except GroundingInsufficient as exc:
-        details = list(exc.report.unmapped_assertions) + [
-            assertion for assertion, _ in exc.report.ambiguous_assertions
-        ]
+    except GroundingInsufficient:
         return _emit(
             FinalResponse(
                 contract_version=CONTRACT_VERSION,
                 status="insufficient",
-                content="Không đủ căn cứ đã xác minh cho các nội dung: "
-                + "; ".join(details[:3]),
+                content=_INSUFFICIENT_CONTENT,
                 citations=(),
             )
         )
+    except SynthesisError:
+        return _typed_synthesis_failure(state)
     return _emit(
         FinalResponse(
             contract_version=CONTRACT_VERSION,

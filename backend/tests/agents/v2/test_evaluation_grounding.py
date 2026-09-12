@@ -5,13 +5,16 @@ section; revision mismatch; targetless supporting use; discovery exclusion;
 tombstone; expiry; People minimization; same record/two uses; derived
 faithfulness; all four evaluation statuses plus precedence; revise-once
 grounding; deterministic citations; budget-overflow derived persistence;
-synthesis-only reuse revalidation.
+synthesis-only reuse revalidation. Round 1 adds: targetless sufficiency
+coupled to evidence (denied/error/not_found/zero-task), contradiction
+admission, judge-invoked self-certification refusal, single-sided
+contradictions, and the runtime-only draft channel.
 """
 from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
@@ -29,7 +32,6 @@ from app.services.agents.v2.contracts.conversation import ConversationContext
 from app.services.agents.v2.contracts.evaluation import (
     Contradiction,
     Coverage,
-    CoverageItem,
     EvidenceEvaluation,
 )
 from app.services.agents.v2.contracts.evidence import (
@@ -42,7 +44,7 @@ from app.services.agents.v2.contracts.evidence import (
     PeopleSourceIdentity,
     Provenance,
 )
-from app.services.agents.v2.contracts.execution import AgentResult
+from app.services.agents.v2.contracts.execution import AgentError, AgentResult
 from app.services.agents.v2.contracts.locators import DocumentLocator, SectionLocator
 from app.services.agents.v2.contracts.planning import (
     CoverageCriterion,
@@ -73,18 +75,23 @@ from app.services.agents.v2.contracts.synthesis import (
 )
 from app.services.agents.v2.contracts.validation import ContractValidationError
 from app.services.agents.v2.nodes.evaluate import (
+    AnswerDraftChannel,
+    EvaluationError,
     EvidenceHydrator,
     HydratedEvidence,
     SemanticJudge,
     build_coverage,
+    every_expecting_task_has_evidence,
     evaluate_evidence,
     evaluate_node,
     find_missing_requirements,
 )
 from app.services.agents.v2.nodes.execute import MissingCheckpointedPlan
+from app.services.agents.v2.nodes.finalizer import finalizer_node
 from app.services.agents.v2.nodes.grounding import (
     GroundingInsufficient,
     ground_answer,
+    ground_node,
     render_citations,
 )
 from app.services.agents.v2.nodes.synthesize import (
@@ -133,41 +140,42 @@ class FakeHydrator:
     """In-memory EvidenceHydrator: admission mirrors the governed gate.
 
     Denials are SKIPPED (never raised) and recorded on ``denied`` so tests can
-    prove no silent drop: every exclusion has an audited reason.
+    prove no silent drop: every exclusion has an audited reason. The current
+    plan/bindings/budget arrive explicitly per call (execute_node precedent).
     """
 
     def __init__(
         self,
-        plan: TaskPlan,
-        bindings: DocumentBindingSet,
         store: dict[UUID, StoredUse],
-        budget: SynthesisRuntimeContext,
     ) -> None:
-        self.plan = plan
-        self.bindings = bindings
         self.store = dict(store)
-        self.budget = budget
         self.denied: list[tuple[UUID, str]] = []
         self.persisted_records: list[EvidenceRecord] = []
         self.minted_uses: list[EvidenceUse] = []
         self.hydrate_calls: list[tuple[str, tuple[UUID, ...]]] = []
 
     # -- admission ------------------------------------------------------
-    def _binding_for(self, target_id: str | None) -> ScopedDocument | None:
+    def _binding_for(
+        self, plan: TaskPlan, bindings: DocumentBindingSet, target_id: str | None
+    ) -> ScopedDocument | None:
         if target_id is None:
             return None
         unit = next(
-            (u for u in self.plan.target_units if u.target_id == target_id), None
+            (u for u in plan.target_units if u.target_id == target_id), None
         )
         if unit is None:
             return None
         return next(
-            (b for b in self.bindings.bindings if b.binding_id == unit.binding_id),
+            (b for b in bindings.bindings if b.binding_id == unit.binding_id),
             None,
         )
 
     def _admit(
-        self, ref: EvidenceUseRef, runtime: GraphRuntimeContext
+        self,
+        ref: EvidenceUseRef,
+        runtime: GraphRuntimeContext,
+        plan: TaskPlan,
+        bindings: DocumentBindingSet,
     ) -> HydratedEvidence | None:
         item = self.store.get(ref.use_id)
         if item is None:
@@ -186,7 +194,13 @@ class FakeHydrator:
         if item.tombstoned:
             self.denied.append((use.use_id, "document_tombstoned"))
             return None
-        binding = self._binding_for(use.target_id)
+        binding = self._binding_for(plan, bindings, use.target_id)
+        if item.source_kind == "derived" and use.target_id is not None:
+            # Mirrors the governor's revision gate: a target-bound
+            # non-document use hydrates denied. Overflow-derived items are
+            # returned directly at persist time and never re-hydrated.
+            self.denied.append((use.use_id, "revision_mismatch"))
+            return None
         if item.source_kind == "document":
             if (
                 binding is None
@@ -227,6 +241,7 @@ class FakeHydrator:
             source_label=label,
             classification=item.classification,
             locator=item.locator,
+            document_revision=item.document_revision,
         )
 
     def store_by_evidence(self, evidence_id: UUID) -> StoredUse | None:
@@ -238,14 +253,17 @@ class FakeHydrator:
     async def hydrate_for_evaluation(
         self,
         use_refs: tuple[EvidenceUseRef, ...],
+        *,
         runtime: GraphRuntimeContext,
+        plan: TaskPlan,
+        bindings: DocumentBindingSet,
     ) -> tuple[HydratedEvidence, ...]:
         self.hydrate_calls.append(
             ("evaluation", tuple(r.use_id for r in use_refs))
         )
         admitted: list[HydratedEvidence] = []
         for ref in use_refs:
-            item = self._admit(ref, runtime)
+            item = self._admit(ref, runtime, plan, bindings)
             if item is not None:
                 admitted.append(item)
         return tuple(admitted)
@@ -253,17 +271,21 @@ class FakeHydrator:
     async def hydrate_for_synthesis(
         self,
         use_refs: tuple[EvidenceUseRef, ...],
+        *,
         runtime: GraphRuntimeContext,
+        plan: TaskPlan,
+        bindings: DocumentBindingSet,
+        budget: SynthesisRuntimeContext,
     ) -> tuple[HydratedEvidence, ...]:
         self.hydrate_calls.append(
             ("synthesis", tuple(r.use_id for r in use_refs))
         )
         admitted: list[HydratedEvidence] = []
         for ref in use_refs:
-            item = self._admit(ref, runtime)
+            item = self._admit(ref, runtime, plan, bindings)
             if item is not None:
                 admitted.append(item)
-        head, tail = apply_budget_split(tuple(admitted), self.budget)
+        head, tail = apply_budget_split(tuple(admitted), budget)
         if not tail:
             return tuple(head)
         derived = await self.persist_derived_summary(
@@ -277,6 +299,9 @@ class FakeHydrator:
                 fetched_at=datetime.now(UTC),
             ),
             classification=_max_classification(t.classification for t in tail),
+            run_id=runtime.capability_runtime.run_id,
+            plan=plan,
+            bindings=bindings,
         )
         return tuple(head) + (derived,)
 
@@ -289,6 +314,9 @@ class FakeHydrator:
         target_id: str | None,
         provenance: Provenance,
         classification: EvidenceClassification,
+        run_id: str,
+        plan: TaskPlan,
+        bindings: DocumentBindingSet,
     ) -> HydratedEvidence:
         from app.services.agents.v2.contracts.validation import (
             validate_derived_evidence_faithfulness,
@@ -296,6 +324,7 @@ class FakeHydrator:
             validate_evidence_use,
         )
 
+        del run_id, plan, bindings
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         for record in self.persisted_records:
             if (
@@ -337,7 +366,6 @@ class FakeHydrator:
         validate_evidence_use(use)
         self.persisted_records.append(record)
         self.minted_uses.append(use)
-        binding = self._binding_for(target_id)
         self.store[use.use_id] = StoredUse(
             use=use,
             source_kind="derived",
@@ -346,18 +374,7 @@ class FakeHydrator:
             derived_validated=True,
             lineage=source_evidence_ids,
         )
-        return HydratedEvidence(
-            use_id=use.use_id,
-            evidence_id=record.evidence_id,
-            task_id=task_id,
-            purpose="supporting",
-            target_id=target_id,
-            content=content,
-            role=_role_for(binding),
-            source_label="derived",
-            classification=classification,
-            locator=None,
-        )
+        return self._hydrated_of(use)
 
     def _record_of(self, evidence_id: UUID) -> EvidenceRecord | None:
         for record in self.persisted_records:
@@ -391,7 +408,6 @@ class FakeHydrator:
 
     def _hydrated_of(self, use: EvidenceUse) -> HydratedEvidence:
         item = self.store[use.use_id]
-        binding = self._binding_for(use.target_id)
         return HydratedEvidence(
             use_id=use.use_id,
             evidence_id=use.evidence_id,
@@ -399,10 +415,11 @@ class FakeHydrator:
             purpose=use.purpose,
             target_id=use.target_id,
             content=item.content,
-            role=_role_for(binding),
+            role=None,
             source_label="derived",
             classification=item.classification,
             locator=None,
+            document_revision=None,
         )
 
 
@@ -490,11 +507,14 @@ def capability_runtime(
 def graph_runtime(
     hydrator: FakeHydrator | None = None,
     leases: FakeLeaseRepo | None = None,
+    channel: AnswerDraftChannel | None = None,
 ) -> GraphRuntimeContext:
     return GraphRuntimeContext(
         capability_runtime=capability_runtime(),
         services=RuntimeServices(
-            retention_leases=leases, evidence_hydrator=hydrator
+            retention_leases=leases,
+            evidence_hydrator=hydrator,
+            answer_draft_channel=channel,
         ),
     )
 
@@ -626,6 +646,24 @@ def read_result(
     )
 
 
+def people_result(
+    task_id: str = "T1", *, status: str = "success", use_id: UUID | None = None
+) -> AgentResult:
+    return AgentResult(
+        contract_version=CONTRACT_VERSION,
+        task_id=task_id,
+        status=status,  # type: ignore[arg-type]
+        data=PeopleLookupOutput(kind="people.lookup", matched=True)
+        if status == "success"
+        else None,
+        evidence_uses=(EvidenceUseRef(use_id=use_id),) if use_id else (),
+        coverage_observations=(),
+        error=AgentError(code="PERMISSION_DENIED", message=status, retryable=False)
+        if status in ("denied", "error")
+        else None,
+    )
+
+
 def store_coverage_use(
     *,
     use_id: UUID,
@@ -724,7 +762,7 @@ async def test_search_results_never_complete_coverage() -> None:
         coverage_observations=(),
         error=None,
     )
-    hydrator = FakeHydrator(plan, bindings, {}, generous_budget())
+    hydrator = FakeHydrator({})
     runtime = graph_runtime(hydrator)
     evaluation = await evaluate_evidence(
         plan=plan,
@@ -748,8 +786,6 @@ async def test_wrong_section_read_is_missing() -> None:
     bindings = binding_set()
     use_id, evidence_id = uuid4(), uuid4()
     hydrator = FakeHydrator(
-        plan,
-        bindings,
         {
             use_id: store_coverage_use(
                 use_id=use_id,
@@ -758,7 +794,6 @@ async def test_wrong_section_read_is_missing() -> None:
                 content="Nội dung mục 2.",
             )
         },
-        generous_budget(),
     )
     runtime = graph_runtime(hydrator)
     evaluation = await evaluate_evidence(
@@ -781,8 +816,6 @@ async def test_partial_document_read_needs_explicit_allowance() -> None:
     def setup(criteria: Any) -> tuple[TaskPlan, FakeHydrator]:
         plan = read_plan(locator=DocumentLocator(kind="document"), criteria=criteria)
         hydrator = FakeHydrator(
-            plan,
-            binding_set(),
             {
                 use_id: store_coverage_use(
                     use_id=use_id,
@@ -791,7 +824,6 @@ async def test_partial_document_read_needs_explicit_allowance() -> None:
                     content="Nội dung mục 1.",
                 )
             },
-            generous_budget(),
         )
         return plan, hydrator
 
@@ -832,14 +864,11 @@ async def test_revision_mismatch_excludes_use_from_coverage() -> None:
     bindings = binding_set()
     use_id, evidence_id = uuid4(), uuid4()
     hydrator = FakeHydrator(
-        plan,
-        bindings,
         {
             use_id: store_coverage_use(
                 use_id=use_id, evidence_id=evidence_id, revision=OTHER_REVISION
             )
         },
-        generous_budget(),
     )
     evaluation = await evaluate_evidence(
         plan=plan,
@@ -851,6 +880,31 @@ async def test_revision_mismatch_excludes_use_from_coverage() -> None:
     assert evaluation.status == "insufficient"
     assert hydrator.denied == [(use_id, "revision_mismatch")]
     assert evaluation.coverage.items[0].status == "missing"
+
+
+@pytest.mark.asyncio
+async def test_evaluator_rechecks_revision_even_when_hydration_admits() -> None:
+    """A use admitted with a drifted revision still cannot confirm coverage."""
+    plan = read_plan()
+    bindings = binding_set()
+    use_id = uuid4()
+    hydrated = (
+        HydratedEvidence(
+            use_id=use_id,
+            evidence_id=uuid4(),
+            task_id="T1",
+            purpose="coverage",
+            target_id="t1",
+            content="Điều 5.",
+            role="target",
+            source_label="doc",
+            classification="normal",
+            locator=DocumentLocator(kind="document"),
+            document_revision=OTHER_REVISION,
+        ),
+    )
+    coverage = build_coverage(plan, bindings, (read_result(use_id=use_id),), hydrated)
+    assert coverage.items[0].status == "missing"
 
 
 @pytest.mark.asyncio
@@ -872,7 +926,7 @@ async def test_targetless_supporting_use_succeeds_for_people_plan() -> None:
             classification="personal",
         )
     }
-    hydrator = FakeHydrator(plan, binding_set(), store, generous_budget())
+    hydrator = FakeHydrator(store)
     result = AgentResult(
         contract_version=CONTRACT_VERSION,
         task_id="T1",
@@ -894,13 +948,74 @@ async def test_targetless_supporting_use_succeeds_for_people_plan() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["denied", "error", "not_found"])
+async def test_targetless_task_without_evidence_is_insufficient(status: str) -> None:
+    """C1: a People task that produced nothing never certifies sufficient."""
+    plan = people_plan()
+    hydrator = FakeHydrator({})
+    evaluation = await evaluate_evidence(
+        plan=plan,
+        bindings=binding_set(),
+        results=(people_result(status=status),),
+        semantic=semantic(),
+        runtime=graph_runtime(hydrator),
+    )
+    assert evaluation.status == "insufficient"
+    assert not every_expecting_task_has_evidence(plan, ())
+
+
+@pytest.mark.asyncio
+async def test_zero_task_plan_is_insufficient() -> None:
+    """C1: a plan with no tasks (and no direct path) is never sufficient."""
+    plan = TaskPlan(
+        contract_version="2.0",
+        plan_id="p-empty",
+        goal="nothing planned",
+        target_units=(),
+        tasks=(),
+    )
+    evaluation = await evaluate_evidence(
+        plan=plan,
+        bindings=binding_set(),
+        results=(),
+        semantic=semantic(),
+        runtime=graph_runtime(FakeHydrator({})),
+    )
+    assert evaluation.status == "insufficient"
+
+
+@pytest.mark.asyncio
+async def test_denied_read_task_drives_insufficient() -> None:
+    """C1: a denied document.read names its target instead of certifying."""
+    plan = read_plan()
+    denied = AgentResult(
+        contract_version=CONTRACT_VERSION,
+        task_id="T1",
+        status="denied",
+        data=None,
+        evidence_uses=(),
+        coverage_observations=(),
+        error=AgentError(
+            code="PERMISSION_DENIED", message="no pin", retryable=False
+        ),
+    )
+    evaluation = await evaluate_evidence(
+        plan=plan,
+        bindings=binding_set(),
+        results=(denied,),
+        semantic=semantic(),
+        runtime=graph_runtime(FakeHydrator({})),
+    )
+    assert evaluation.status == "insufficient"
+    assert any(m.target_id == "t1" for m in evaluation.missing)
+
+
+@pytest.mark.asyncio
 async def test_tombstoned_and_expired_uses_are_excluded() -> None:
     plan = read_plan()
     bindings = binding_set()
     tomb_id, tomb_ev, exp_id, exp_ev = uuid4(), uuid4(), uuid4(), uuid4()
     hydrator = FakeHydrator(
-        plan,
-        bindings,
         {
             tomb_id: StoredUse(
                 use=EvidenceUse(
@@ -933,7 +1048,6 @@ async def test_tombstoned_and_expired_uses_are_excluded() -> None:
                 expired=True,
             ),
         },
-        generous_budget(),
     )
     evaluation = await evaluate_evidence(
         plan=plan,
@@ -954,8 +1068,6 @@ async def test_people_content_stays_minimized_through_hydration() -> None:
     use_id = uuid4()
     minimized = '{"name":"Nguyễn Văn A"}'
     hydrator = FakeHydrator(
-        plan,
-        binding_set(),
         {
             use_id: StoredUse(
                 use=EvidenceUse(
@@ -970,11 +1082,14 @@ async def test_people_content_stays_minimized_through_hydration() -> None:
                 classification="personal",
             )
         },
-        generous_budget(),
     )
     runtime = graph_runtime(hydrator)
     evidence = await hydrate_for_synthesis(
-        (EvidenceUseRef(use_id=use_id),), runtime
+        (EvidenceUseRef(use_id=use_id),),
+        runtime,
+        plan=plan,
+        bindings=binding_set(),
+        budget=generous_budget(),
     )
     assert len(evidence) == 1
     assert evidence[0].content == minimized
@@ -990,8 +1105,6 @@ async def test_same_record_two_uses_preserve_context() -> None:
     evidence_id = uuid4()
     coverage_id, supporting_id = uuid4(), uuid4()
     hydrator = FakeHydrator(
-        plan,
-        binding_set(),
         {
             coverage_id: store_coverage_use(
                 use_id=coverage_id,
@@ -1013,11 +1126,13 @@ async def test_same_record_two_uses_preserve_context() -> None:
                 content="Điều 5 quy định mức phạt.",
             ),
         },
-        generous_budget(),
     )
+    runtime = graph_runtime(hydrator)
     admitted = await hydrator.hydrate_for_evaluation(
         (EvidenceUseRef(use_id=coverage_id), EvidenceUseRef(use_id=supporting_id)),
-        graph_runtime(hydrator),
+        runtime=runtime,
+        plan=plan,
+        bindings=binding_set(),
     )
     assert len(admitted) == 2
     by_id = {h.use_id: h for h in admitted}
@@ -1061,18 +1176,24 @@ async def test_derived_use_requires_recursive_validation() -> None:
             lineage=(source_evidence,),
         ),
     }
-    hydrator = FakeHydrator(plan, binding_set(), store, generous_budget())
+    hydrator = FakeHydrator(store)
     runtime = graph_runtime(hydrator)
     assert (
         await hydrator.hydrate_for_evaluation(
-            (EvidenceUseRef(use_id=derived_use),), runtime
+            (EvidenceUseRef(use_id=derived_use),),
+            runtime=runtime,
+            plan=plan,
+            bindings=binding_set(),
         )
     ) == ()
     assert hydrator.denied == [(derived_use, "derived_not_validated")]
 
     store[derived_use].derived_validated = True
     admitted = await hydrator.hydrate_for_evaluation(
-        (EvidenceUseRef(use_id=derived_use),), runtime
+        (EvidenceUseRef(use_id=derived_use),),
+        runtime=runtime,
+        plan=plan,
+        bindings=binding_set(),
     )
     assert [h.use_id for h in admitted] == [derived_use]
 
@@ -1095,16 +1216,17 @@ def _contradiction(use_ids: tuple[UUID, ...]) -> Contradiction:
 async def test_all_four_statuses_and_precedence() -> None:
     plan = read_plan()
     bindings = binding_set()
+    other_use = uuid4()
     hydrator = FakeHydrator(
-        plan,
-        bindings,
         {
-            USE_ID: store_coverage_use(use_id=USE_ID, evidence_id=EVIDENCE_ID)
+            USE_ID: store_coverage_use(use_id=USE_ID, evidence_id=EVIDENCE_ID),
+            other_use: store_coverage_use(
+                use_id=other_use, evidence_id=uuid4(), content="Mức khác."
+            ),
         },
-        generous_budget(),
     )
     runtime = graph_runtime(hydrator)
-    good = (read_result(use_id=USE_ID),)
+    good = (read_result(use_id=USE_ID), read_result(use_id=other_use))
 
     sufficient = await evaluate_evidence(
         plan=plan, bindings=bindings, results=good, semantic=semantic(),
@@ -1118,10 +1240,11 @@ async def test_all_four_statuses_and_precedence() -> None:
     )
     assert insufficient.status == "insufficient"
 
+    clash = _contradiction((USE_ID, other_use))
     contradictory = await evaluate_evidence(
         plan=plan, bindings=bindings, results=good, semantic=semantic(),
         runtime=runtime,
-        semantic_judge=StubJudge(contradictions=(_contradiction((USE_ID,)),)),
+        semantic_judge=StubJudge(contradictions=(clash,)),
     )
     assert contradictory.status == "contradictory"
 
@@ -1133,15 +1256,24 @@ async def test_all_four_statuses_and_precedence() -> None:
             )
         ),
         runtime=runtime,
-        semantic_judge=StubJudge(contradictions=(_contradiction((USE_ID,)),)),
+        semantic_judge=StubJudge(contradictions=(clash,)),
     )
     assert needs_input.status == "needs_input"
 
     # Precedence: contradiction beats missing; needs_input beats contradiction.
+    # Missing coverage AND a valid two-sided contradiction → contradictory.
     contra_over_missing = await evaluate_evidence(
-        plan=plan, bindings=bindings, results=(read_result(),), semantic=semantic(),
+        plan=plan,
+        bindings=bindings,
+        results=(
+            read_result(use_id=USE_ID, outcome="missing"),
+            read_result(use_id=other_use, outcome="missing"),
+        ),
+        semantic=semantic(),
         runtime=runtime,
-        semantic_judge=StubJudge(contradictions=(_contradiction((USE_ID,)),)),
+        semantic_judge=StubJudge(
+            contradictions=(_contradiction((other_use, USE_ID)),)
+        ),
     )
     assert contra_over_missing.status == "contradictory"
 
@@ -1163,18 +1295,61 @@ async def test_all_four_statuses_and_precedence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_judge_cannot_self_certify_factual_success() -> None:
-    """A cooperative judge never overrides missing deterministic coverage."""
+async def test_contradiction_outside_admitted_set_is_rejected() -> None:
+    """M2: a conflict citing non-admitted uses cannot be certified."""
     plan = read_plan()
     bindings = binding_set()
-    hydrator = FakeHydrator(plan, bindings, {}, generous_budget())
-    judge = StubJudge(verdicts={"c1": True}, contradictions=())
+    hydrator = FakeHydrator(
+        {USE_ID: store_coverage_use(use_id=USE_ID, evidence_id=EVIDENCE_ID)},
+    )
+    with pytest.raises(EvaluationError, match="outside the admitted set"):
+        await evaluate_evidence(
+            plan=plan, bindings=bindings, results=(read_result(use_id=USE_ID),),
+            semantic=semantic(), runtime=graph_runtime(hydrator),
+            semantic_judge=StubJudge(
+                contradictions=(_contradiction((USE_ID, uuid4())),)
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_single_sided_contradiction_does_not_block() -> None:
+    """M6: a supported single-use contradiction may stand beside sufficient."""
+    plan = read_plan()
+    bindings = binding_set()
+    hydrator = FakeHydrator(
+        {USE_ID: store_coverage_use(use_id=USE_ID, evidence_id=EVIDENCE_ID)},
+    )
+    evaluation = await evaluate_evidence(
+        plan=plan, bindings=bindings, results=(read_result(use_id=USE_ID),),
+        semantic=semantic(), runtime=graph_runtime(hydrator),
+        semantic_judge=StubJudge(contradictions=(_contradiction((USE_ID,)),)),
+    )
+    assert evaluation.status == "sufficient"
+    assert len(evaluation.contradictions) == 1
+
+
+@pytest.mark.asyncio
+async def test_judge_cannot_self_certify_factual_success() -> None:
+    """A cooperative judge never overrides missing deterministic coverage."""
+    criteria = (
+        CoverageCriterion(kind="coverage"),
+        SemanticCriterion(
+            kind="semantic", criterion_id="c-rel", description="Trọng tâm."
+        ),
+    )
+    plan = read_plan(criteria=criteria)
+    bindings = binding_set()
+    hydrator = FakeHydrator({})
+    judge = StubJudge(verdicts={"c-rel": True}, contradictions=())
     evaluation = await evaluate_evidence(
         plan=plan, bindings=bindings, results=(read_result(),), semantic=semantic(),
         runtime=graph_runtime(hydrator), semantic_judge=judge,
     )
     assert evaluation.status == "insufficient"
-    assert judge.calls == []
+    # M4: the judge really ran — the verdict was refused, not skipped.
+    assert judge.calls != []
+    assert judge.calls[0][0] == "c-rel"
 
 
 @pytest.mark.asyncio
@@ -1188,10 +1363,7 @@ async def test_semantic_criterion_needs_a_judge_verdict() -> None:
     plan = read_plan(criteria=criteria)
     bindings = binding_set()
     hydrator = FakeHydrator(
-        plan,
-        bindings,
         {USE_ID: store_coverage_use(use_id=USE_ID, evidence_id=EVIDENCE_ID)},
-        generous_budget(),
     )
     runtime = graph_runtime(hydrator)
     without_judge = await evaluate_evidence(
@@ -1214,13 +1386,16 @@ async def test_semantic_criterion_needs_a_judge_verdict() -> None:
 async def test_build_coverage_and_missing_helpers_agree() -> None:
     plan = read_plan()
     bindings = binding_set()
-    hydrator = FakeHydrator(plan, bindings, {}, generous_budget())
-    hydrated = await hydrator.hydrate_for_evaluation((), graph_runtime(hydrator))
+    hydrator = FakeHydrator({})
+    hydrated = await hydrator.hydrate_for_evaluation(
+        (), runtime=graph_runtime(hydrator), plan=plan, bindings=bindings
+    )
     coverage = build_coverage(plan, bindings, (read_result(),), hydrated)
     assert coverage.items[0].target_id == "t1"
     missing = find_missing_requirements(plan, coverage, hydrated, {})
+    # One entry: the task-level rule does not duplicate a flagged target.
     assert len(missing) == 1
-    assert missing[0].criterion_kind == "coverage"
+    assert missing[0].target_id == "t1"
 
 
 @pytest.mark.asyncio
@@ -1228,10 +1403,7 @@ async def test_evaluate_node_checkpoints_evaluation() -> None:
     plan = read_plan()
     bindings = binding_set()
     hydrator = FakeHydrator(
-        plan,
-        bindings,
         {USE_ID: store_coverage_use(use_id=USE_ID, evidence_id=EVIDENCE_ID)},
-        generous_budget(),
     )
     state = make_state(
         plan=plan, bindings=bindings, results=(read_result(use_id=USE_ID),)
@@ -1266,6 +1438,29 @@ async def test_evaluate_fails_closed_without_hydrator() -> None:
         )
 
 
+def test_answer_draft_channel_stores_per_run() -> None:
+    """C2: the runtime-only handoff is keyed by run id and reports misses."""
+    from app.services.agents.v2.contracts.synthesis import SynthesisEvidence
+
+    channel = AnswerDraftChannel()
+    assert channel.get("run-1") is None
+    draft = AnswerDraft(
+        content="Điều 5.",
+        claims=(
+            AnswerClaim(
+                claim_id="claim-1",
+                text="Điều 5.",
+                evidence_use_ids=(USE_ID,),
+            ),
+        ),
+    )
+    channel.store_draft("run-1", draft=draft, evidence=())
+    assert channel.get("run-1") is not None
+    assert channel.get("run-1").draft == draft
+    assert channel.get("run-1").grounded_draft is None
+    assert channel.get("other-run") is None
+
+
 # ---------------------------------------------------------------------------
 # Synthesis hydration + budget overflow
 # ---------------------------------------------------------------------------
@@ -1291,8 +1486,6 @@ async def test_discovery_uses_excluded_from_synthesis() -> None:
     plan = read_plan()
     coverage_id, discovery_id = uuid4(), uuid4()
     hydrator = FakeHydrator(
-        plan,
-        binding_set(),
         {
             coverage_id: store_coverage_use(
                 use_id=coverage_id, evidence_id=uuid4()
@@ -1311,11 +1504,13 @@ async def test_discovery_uses_excluded_from_synthesis() -> None:
                 content="candidate",
             ),
         },
-        generous_budget(),
     )
     evidence = await hydrate_for_synthesis(
         (EvidenceUseRef(use_id=coverage_id), EvidenceUseRef(use_id=discovery_id)),
         graph_runtime(hydrator),
+        plan=plan,
+        bindings=binding_set(),
+        budget=generous_budget(),
     )
     assert [e.use_id for e in evidence] == [coverage_id]
     assert (discovery_id, "purpose_not_hydratable") in hydrator.denied
@@ -1332,7 +1527,7 @@ async def test_discovery_uses_excluded_from_synthesis() -> None:
 @pytest.mark.asyncio
 async def test_synthesis_requires_sufficient_evaluation() -> None:
     plan = read_plan()
-    hydrator = FakeHydrator(plan, binding_set(), {}, generous_budget())
+    hydrator = FakeHydrator({})
     bad = SynthesisInput(
         semantic=semantic(),
         evaluation=EvidenceEvaluation(
@@ -1345,7 +1540,11 @@ async def test_synthesis_requires_sufficient_evaluation() -> None:
     )
     with pytest.raises(ContractValidationError, match="sufficient"):
         await synthesize_answer(
-            synthesis_input=bad, runtime=graph_runtime(hydrator)
+            synthesis_input=bad,
+            runtime=graph_runtime(hydrator),
+            plan=plan,
+            bindings=binding_set(),
+            budget=generous_budget(),
         )
 
 
@@ -1358,8 +1557,6 @@ async def test_budget_overflow_persisted_as_validated_derived_evidence() -> None
     content1 = "Điều 5 quy định mức phạt."
     content2 = "Điều 6 quy định thẩm quyền."
     hydrator = FakeHydrator(
-        plan,
-        binding_set(),
         {
             u1: store_coverage_use(
                 use_id=u1, evidence_id=e1, content=content1
@@ -1368,15 +1565,18 @@ async def test_budget_overflow_persisted_as_validated_derived_evidence() -> None
                 use_id=u2, evidence_id=e2, content=content2
             ),
         },
-        SynthesisRuntimeContext(
+    )
+    runtime = graph_runtime(hydrator)
+    result = await synthesize_answer(
+        synthesis_input=_sufficient_input(u1, u2),
+        runtime=runtime,
+        plan=plan,
+        bindings=binding_set(),
+        budget=SynthesisRuntimeContext(
             max_evidence_items=10,
             max_total_chars=len(content1),
             max_total_tokens=10_000,
         ),
-    )
-    runtime = graph_runtime(hydrator)
-    result = await synthesize_answer(
-        synthesis_input=_sufficient_input(u1, u2), runtime=runtime
     )
     assert len(hydrator.persisted_records) == 1
     record = hydrator.persisted_records[0]
@@ -1398,23 +1598,21 @@ async def test_budget_overflow_persisted_as_validated_derived_evidence() -> None
 
 @pytest.mark.asyncio
 async def test_overflow_lease_acquired_and_committed_by_synthesize_node() -> None:
+    # The node passes the generous DEFAULT_SYNTHESIS_BUDGET, so the tail
+    # must exceed it for overflow to trigger on the node path.
+    from app.services.agents.v2.nodes.synthesize import DEFAULT_SYNTHESIS_BUDGET
+
     plan = read_plan()
     u1, u2 = uuid4(), uuid4()
     content1 = "Điều 5 quy định mức phạt."
+    content2 = "Điều 6 quy định. " * (
+        DEFAULT_SYNTHESIS_BUDGET.max_total_chars // len("Điều 6 quy định. ") + 1
+    )
     hydrator = FakeHydrator(
-        plan,
-        binding_set(),
         {
             u1: store_coverage_use(use_id=u1, evidence_id=uuid4(), content=content1),
-            u2: store_coverage_use(
-                use_id=u2, evidence_id=uuid4(), content="Điều 6 quy định."
-            ),
+            u2: store_coverage_use(use_id=u2, evidence_id=uuid4(), content=content2),
         },
-        SynthesisRuntimeContext(
-            max_evidence_items=10,
-            max_total_chars=len(content1),
-            max_total_tokens=10_000,
-        ),
     )
     events: list[str] = []
     leases = FakeLeaseRepo(events)
@@ -1429,6 +1627,45 @@ async def test_overflow_lease_acquired_and_committed_by_synthesize_node() -> Non
     )
     update = await synthesize_node(state, graph_runtime(hydrator, leases))
     assert update == {}
+    assert len(hydrator.persisted_records) == 1
+    assert "commit" in events
+    assert any(
+        call[0] == "run-1" and call[1] is None and call[2] is not None
+        for call in leases.calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_shared_synthesize_and_lease_leases_overflow() -> None:
+    """I3: every path through the shared helper leaves fresh uses leased."""
+    from app.services.agents.v2.nodes.synthesize import synthesize_and_lease
+
+    plan = read_plan()
+    u1, u2 = uuid4(), uuid4()
+    content1 = "Điều 5 quy định mức phạt."
+    hydrator = FakeHydrator(
+        {
+            u1: store_coverage_use(use_id=u1, evidence_id=uuid4(), content=content1),
+            u2: store_coverage_use(
+                use_id=u2, evidence_id=uuid4(), content="Điều 6 quy định."
+            ),
+        },
+    )
+    events: list[str] = []
+    leases = FakeLeaseRepo(events)
+    runtime = graph_runtime(hydrator, leases)
+    result = await synthesize_and_lease(
+        synthesis_input=_sufficient_input(u1, u2),
+        runtime=runtime,
+        plan=plan,
+        bindings=binding_set(),
+        budget=SynthesisRuntimeContext(
+            max_evidence_items=10,
+            max_total_chars=len(content1),
+            max_total_tokens=10_000,
+        ),
+    )
+    assert result.draft.content == content1
     assert "commit" in events
     assert any(
         call[0] == "run-1" and call[1] is None and call[2] is not None
@@ -1442,8 +1679,6 @@ async def test_synthesis_reuse_revalidates_current_uses() -> None:
     plan = read_plan()
     u1, u2 = uuid4(), uuid4()
     hydrator = FakeHydrator(
-        plan,
-        binding_set(),
         {
             u1: store_coverage_use(
                 use_id=u1, evidence_id=uuid4(), content="Điều 5 quy định."
@@ -1452,17 +1687,24 @@ async def test_synthesis_reuse_revalidates_current_uses() -> None:
                 use_id=u2, evidence_id=uuid4(), content="Điều 6 quy định."
             ),
         },
-        generous_budget(),
     )
     runtime = graph_runtime(hydrator)
     first = await synthesize_answer(
-        synthesis_input=_sufficient_input(u1, u2), runtime=runtime
+        synthesis_input=_sufficient_input(u1, u2),
+        runtime=runtime,
+        plan=plan,
+        bindings=binding_set(),
+        budget=generous_budget(),
     )
     assert first.admitted_use_ids == frozenset({u1, u2})
 
     hydrator.store[u2].expired = True
     second = await synthesize_answer(
-        synthesis_input=_sufficient_input(u1, u2), runtime=runtime
+        synthesis_input=_sufficient_input(u1, u2),
+        runtime=runtime,
+        plan=plan,
+        bindings=binding_set(),
+        budget=generous_budget(),
     )
     assert second.admitted_use_ids == frozenset({u1})
     assert (u2, "expired") in hydrator.denied
@@ -1535,6 +1777,7 @@ def _grounded_fixture() -> tuple[AnswerDraft, list[HydratedEvidence]]:
             role="target", source_label="doc-A",
             classification="normal",
             locator=DocumentLocator(kind="document"),
+            document_revision=REVISION,
         ),
         HydratedEvidence(
             use_id=u2, evidence_id=e2, task_id="T1", purpose="coverage",
@@ -1542,6 +1785,7 @@ def _grounded_fixture() -> tuple[AnswerDraft, list[HydratedEvidence]]:
             role="target", source_label="doc-A",
             classification="normal",
             locator=DocumentLocator(kind="document"),
+            document_revision=REVISION,
         ),
     ]
     return draft, evidence
@@ -1606,28 +1850,6 @@ async def test_successful_revision_grounds_answer() -> None:
     # Citations are per-evidence: the repaired claim reuses cite-1.
     assert [c.citation_id for c in grounded.citations] == ["cite-1", "cite-2"]
     assert grounded.draft.claims[-1].claim_id == "claim-3"
-
-
-@pytest.mark.asyncio
-async def test_empty_budget_head_drafts_from_derived_only() -> None:
-    """Nothing fits the budget: the draft falls back to the derived item."""
-    plan = read_plan()
-    u1 = uuid4()
-    hydrator = FakeHydrator(
-        plan,
-        binding_set(),
-        {u1: store_coverage_use(use_id=u1, evidence_id=uuid4())},
-        SynthesisRuntimeContext(
-            max_evidence_items=0, max_total_chars=0, max_total_tokens=0
-        ),
-    )
-    result = await synthesize_answer(
-        synthesis_input=_sufficient_input(u1),
-        runtime=graph_runtime(hydrator),
-    )
-    assert len(hydrator.persisted_records) == 1
-    derived_use = hydrator.minted_uses[0].use_id
-    assert result.draft.claims[0].evidence_use_ids == (derived_use,)
 
 
 @pytest.mark.asyncio
@@ -1697,3 +1919,116 @@ async def test_citations_are_deterministic_and_claim_free() -> None:
         "label",
     }
     assert [c.label for c in first] == ["doc-A", "doc-A"]
+
+
+@pytest.mark.asyncio
+async def test_empty_budget_head_drafts_from_derived_only() -> None:
+    """Nothing fits the budget: the draft falls back to the derived item."""
+    plan = read_plan()
+    u1 = uuid4()
+    hydrator = FakeHydrator(
+        {u1: store_coverage_use(use_id=u1, evidence_id=uuid4())},
+    )
+    result = await synthesize_answer(
+        synthesis_input=_sufficient_input(u1),
+        runtime=graph_runtime(hydrator),
+        plan=plan,
+        bindings=binding_set(),
+        budget=SynthesisRuntimeContext(
+            max_evidence_items=0, max_total_chars=0, max_total_tokens=0
+        ),
+    )
+    assert len(hydrator.persisted_records) == 1
+    derived_use = hydrator.minted_uses[0].use_id
+    assert result.draft.claims[0].evidence_use_ids == (derived_use,)
+
+
+@pytest.mark.asyncio
+async def test_ground_node_consumes_channel_without_resynthesis() -> None:
+    """C2: ground consumes the stored draft; the hydrator runs synthesis once."""
+    plan = read_plan()
+    u1 = uuid4()
+    hydrator = FakeHydrator(
+        {
+            u1: store_coverage_use(
+                use_id=u1, evidence_id=uuid4(), content="Điều 5 quy định."
+            )
+        },
+    )
+    channel = AnswerDraftChannel()
+    evaluation = EvidenceEvaluation(
+        status="sufficient", coverage=Coverage(items=()), missing=(), contradictions=()
+    )
+    state = make_state(
+        plan=plan,
+        bindings=binding_set(),
+        results=(read_result(use_id=u1),),
+        evaluation=evaluation,
+    )
+    runtime = graph_runtime(hydrator, FakeLeaseRepo([]), channel)
+    assert await synthesize_node(state, runtime) == {}
+    synth_calls = [
+        call for call in hydrator.hydrate_calls if call[0] == "synthesis"
+    ]
+    assert len(synth_calls) == 1
+    assert await ground_node(state, runtime) == {}
+    assert [
+        call for call in hydrator.hydrate_calls if call[0] == "synthesis"
+    ] == synth_calls
+    assert channel.get("run-1") is not None
+    assert channel.get("run-1").grounded_draft is not None
+
+
+@pytest.mark.asyncio
+async def test_ground_node_miss_rederives_once() -> None:
+    """C2: an empty channel re-derives exactly once (no per-node re-run)."""
+    plan = read_plan()
+    u1 = uuid4()
+    hydrator = FakeHydrator(
+        {
+            u1: store_coverage_use(
+                use_id=u1, evidence_id=uuid4(), content="Điều 5 quy định."
+            ),
+        },
+    )
+    evaluation = EvidenceEvaluation(
+        status="sufficient", coverage=Coverage(items=()), missing=(), contradictions=()
+    )
+    state = make_state(
+        plan=plan,
+        bindings=binding_set(),
+        results=(read_result(use_id=u1),),
+        evaluation=evaluation,
+    )
+    runtime = graph_runtime(hydrator, FakeLeaseRepo([]), AnswerDraftChannel())
+    assert await ground_node(state, runtime) == {}
+    assert len([c for c in hydrator.hydrate_calls if c[0] == "synthesis"]) == 1
+    assert channel_grounded(runtime) is not None
+
+
+def channel_grounded(runtime: GraphRuntimeContext) -> Any:
+    channel = runtime.services.answer_draft_channel
+    assert channel is not None
+    return channel.get("run-1").grounded_draft  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_finalizer_turns_synthesis_failure_into_typed_response() -> None:
+    """C1: sufficient verdict + empty admission → typed insufficient, no raise."""
+    plan = people_plan()
+    evaluation = EvidenceEvaluation(
+        status="sufficient", coverage=Coverage(items=()), missing=(), contradictions=()
+    )
+    route = RouteDecision(route="fast_domain", reason_code="simple_people_lookup")
+    state = make_state(
+        plan=plan,
+        bindings=binding_set(),
+        results=(people_result(status="success"),),
+        evaluation=evaluation,
+        route=route,
+    )
+    final = await finalizer_node(
+        state, graph_runtime(FakeHydrator({}), FakeLeaseRepo([]), AnswerDraftChannel())
+    )
+    assert final["final_response"].status == "insufficient"
+    assert "t1" not in final["final_response"].content

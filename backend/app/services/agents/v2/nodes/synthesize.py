@@ -4,21 +4,32 @@ Factual/domain synthesis requires ``EvidenceEvaluation.status ==
 'sufficient'`` — the boundary rejects every other status via
 ``validate_synthesis_input``. ``hydrate_for_synthesis`` resolves admitted
 ``EvidenceUseRef`` to ephemeral ``SynthesisEvidence`` under current
-ACL/expiry/revision checks (the hydrator enforces them with its fed canonical
-stores); discovery-only uses are excluded, and every ``AnswerClaim`` is later
-validated to cite only the admitted current-run use set.
+ACL/expiry/revision checks (the hydrator enforces them against the explicit
+plan/bindings passed on every call); discovery-only uses are excluded, and
+every ``AnswerClaim`` is validated to cite only the admitted current-run use
+set.
 
 Budget and overflow: the synthesis budget (``SynthesisRuntimeContext``) is
-runtime policy and stays with the Evidence Hydrator — hydration returns the
-within-budget head plus a persisted overflow-derived item. Overflow is never a
-silent truncation: the tail is persisted as a validated DERIVED
-``EvidenceRecord`` with source lineage plus a new supporting ``EvidenceUse``,
-and ``synthesize_node`` leases that use (evidence-only) and commits the lease
-before returning, mirroring the binding/scheduler safe ordering. Both the
-record insert (idempotent by content-hash + source identity) and the use
-append (idempotent by run/task/evidence/purpose/target) converge on retry, so
-the deterministic node re-derivation in ``ground_node``/``finalizer_node``
-never duplicates overflow artifacts.
+runtime policy supplied per call — Phase-2 nodes pass
+``DEFAULT_SYNTHESIS_BUDGET``. Hydration returns the within-budget head plus a
+persisted overflow-derived item. Overflow is never a silent truncation: the
+tail is persisted as a validated DERIVED ``EvidenceRecord`` with source
+lineage plus a new supporting ``EvidenceUse`` (supporting, so it never
+creates read coverage), and the single shared ``synthesize_and_lease``
+helper leases every freshly minted use (evidence-only) and commits the lease
+before returning — every node path that synthesizes (synthesize, ground
+resume, finalizer resume) goes through it, so no path mints uses unleased.
+Both the record insert (idempotent by content-hash + source identity) and
+the use append (idempotent by run/task/evidence/purpose/target) converge on
+retry, so deterministic re-derivation never duplicates overflow artifacts.
+
+Draft handoff: ``synthesize_node`` synthesizes exactly once per turn and
+stores the validated draft in the runtime-only ``AnswerDraftChannel``
+(``RuntimeServices.answer_draft_channel``, keyed by run id, never
+checkpointed). ``ground_node`` consumes it; the finalizer consumes the
+grounded result. On a channel miss (restart between nodes, unwired channel)
+the consumer re-derives deterministically ONCE from checkpointed state —
+never a silent re-run on every node.
 
 Drafting in Phase 2 is deterministic extractive composition (one claim per
 distinct content, duplicate contents merged into a single claim citing every
@@ -36,7 +47,9 @@ from uuid import UUID
 
 from langgraph.runtime import Runtime
 
+from ..contracts.binding import DocumentBindingSet
 from ..contracts.evidence import EvidenceUseRef
+from ..contracts.planning import TaskPlan
 from ..contracts.state import GraphRuntimeContext, SupervisorV2State
 from ..contracts.synthesis import (
     AnswerClaim,
@@ -50,10 +63,17 @@ from ..contracts.validation import (
     validate_synthesis_input,
 )
 from .context import _context_of
-from .evaluate import EvidenceHydrator, HydratedEvidence
+from .evaluate import (
+    AnswerDraftChannel,
+    EvidenceHydrator,
+    HydratedEvidence,
+    _channel_of,
+)
+from .execute import require_checkpointed_plan
 
 __all__ = [
     "SynthesisError",
+    "DEFAULT_SYNTHESIS_BUDGET",
     "DraftBuilder",
     "SynthesisResult",
     "estimate_tokens_for_chars",
@@ -61,12 +81,22 @@ __all__ = [
     "hydrate_for_synthesis",
     "build_extractive_draft",
     "synthesize_answer",
+    "synthesize_and_lease",
     "synthesize_node",
 ]
 
 
 class SynthesisError(ValueError):
     """Synthesis inputs are not synthesizable; nothing may be drafted."""
+
+
+#: Phase-2 node synthesis budget (runtime policy; T6/T7 may thread an
+#: explicit budget through ``synthesize_answer`` instead).
+DEFAULT_SYNTHESIS_BUDGET = SynthesisRuntimeContext(
+    max_evidence_items=20,
+    max_total_chars=200_000,
+    max_total_tokens=50_000,
+)
 
 
 @runtime_checkable
@@ -163,16 +193,27 @@ def _project(item: HydratedEvidence) -> SynthesisEvidence:
 async def hydrate_for_synthesis(
     use_refs: tuple[EvidenceUseRef, ...],
     runtime: GraphRuntimeContext,
+    *,
+    plan: TaskPlan,
+    bindings: DocumentBindingSet,
+    budget: SynthesisRuntimeContext,
 ) -> tuple[SynthesisEvidence, ...]:
     """Resolve admitted uses to ephemeral synthesis projections.
 
     Discovery-only uses are excluded. The hydrator enforces current
-    ACL/expiry/revision checks plus the synthesis budget (persisting an
-    overflow tail as derived evidence); this function projects the admitted
-    rich items to the model-facing ``SynthesisEvidence`` shape.
+    ACL/expiry/revision checks against the explicit plan/bindings plus the
+    synthesis budget (persisting an overflow tail as derived evidence); this
+    function projects the admitted rich items to the model-facing
+    ``SynthesisEvidence`` shape.
     """
     hydrator = _require_hydrator(runtime)
-    hydrated = await hydrator.hydrate_for_synthesis(tuple(use_refs), runtime)
+    hydrated = await hydrator.hydrate_for_synthesis(
+        tuple(use_refs),
+        runtime=runtime,
+        plan=plan,
+        bindings=bindings,
+        budget=budget,
+    )
     projected: list[SynthesisEvidence] = []
     for item in hydrated:
         if not isinstance(item, HydratedEvidence):
@@ -227,18 +268,29 @@ async def synthesize_answer(
     *,
     synthesis_input: SynthesisInput,
     runtime: GraphRuntimeContext,
+    plan: TaskPlan,
+    bindings: DocumentBindingSet,
+    budget: SynthesisRuntimeContext,
     draft_builder: DraftBuilder | None = None,
 ) -> SynthesisResult:
     """Validate the boundary, hydrate admitted evidence, and draft the answer.
 
     ``validate_synthesis_input`` rejects every non-``sufficient`` evaluation;
     the draft (extractive default or bounded ``draft_builder``) is validated
-    against the admitted current-run use set before it is returned.
+    against the admitted current-run use set before it is returned. The draft
+    covers the within-budget head only (hydrator-appended overflow items are
+    admitted for governance but would re-violate the budget if drafted),
+    except the empty-head edge, which drafts from the derived items so a
+    sufficient evaluation still yields an answer.
     """
     validate_synthesis_input(synthesis_input)
     hydrator = _require_hydrator(runtime)
     hydrated = await hydrator.hydrate_for_synthesis(
-        tuple(synthesis_input.evidence_uses), runtime
+        tuple(synthesis_input.evidence_uses),
+        runtime=runtime,
+        plan=plan,
+        bindings=bindings,
+        budget=budget,
     )
     admitted = tuple(
         item for item in hydrated if item.purpose != "discovery"
@@ -254,11 +306,6 @@ async def synthesize_answer(
             "no admitted synthesis evidence; a sufficient evaluation whose "
             "uses are all denied at synthesis time cannot be drafted"
         )
-    # The draft covers the within-budget head only: hydrator-appended
-    # overflow-derived items are admitted for governance (leased, citable)
-    # but drafting them would re-violate the budget the persist just
-    # honored. When nothing fits the budget at all, the draft falls back to
-    # the derived items so a sufficient evaluation still yields an answer.
     input_ids = {ref.use_id for ref in synthesis_input.evidence_uses}
     head_items = tuple(item for item in admitted if item.use_id in input_ids)
     draft_source = head_items or admitted
@@ -351,21 +398,62 @@ async def _lease_new_uses(
     await _commit_lease_session(runtime)
 
 
+async def synthesize_and_lease(
+    *,
+    synthesis_input: SynthesisInput,
+    runtime: GraphRuntimeContext,
+    plan: TaskPlan,
+    bindings: DocumentBindingSet,
+    budget: SynthesisRuntimeContext,
+    draft_builder: DraftBuilder | None = None,
+) -> SynthesisResult:
+    """The single shared synthesize path: draft, then lease fresh uses.
+
+    Every node path that synthesizes (synthesize, ground resume, finalizer
+    resume) goes through this helper, so no path mints uses unleased.
+    """
+    result = await synthesize_answer(
+        synthesis_input=synthesis_input,
+        runtime=runtime,
+        plan=plan,
+        bindings=bindings,
+        budget=budget,
+        draft_builder=draft_builder,
+    )
+    await _lease_new_uses(synthesis_input, result, runtime)
+    return result
+
+
 async def synthesize_node(
     state: SupervisorV2State,
     runtime: "Runtime[GraphRuntimeContext]",
 ) -> dict:
-    """Hydrate, enforce the budget (+overflow persist/lease), draft, validate.
+    """Synthesize exactly once: hydrate, draft, validate, lease, store.
 
-    The draft itself is ephemeral and has no frozen checkpoint slot by design:
-    downstream nodes re-derive it deterministically from the same checkpointed
-    inputs, so this node returns no state update. Its checkpointable value is
-    the governed side effect (overflow derived evidence persisted and leased
-    before the checkpoint barrier) plus fail-fast validation of the synthesis
-    boundary.
+    The validated draft plus its admitted evidence is stored in the
+    runtime-only ``AnswerDraftChannel`` (keyed by run id) for the ground
+    node; the finalizer later consumes the grounded result. This node
+    returns no state update — its checkpointable value is the governed side
+    effect (overflow derived evidence persisted and leased before the
+    checkpoint barrier) plus fail-fast validation of the synthesis boundary.
+    Without a wired channel the node still synthesizes and leases (the
+    downstream consumer re-derives once on the miss).
     """
     context = _context_of(runtime)
+    plan = require_checkpointed_plan(state)
     synthesis_input = _synthesis_input_of(state)
-    result = await synthesize_answer(synthesis_input=synthesis_input, runtime=context)
-    await _lease_new_uses(synthesis_input, result, context)
+    result = await synthesize_and_lease(
+        synthesis_input=synthesis_input,
+        runtime=context,
+        plan=plan,
+        bindings=state["bindings"],
+        budget=DEFAULT_SYNTHESIS_BUDGET,
+    )
+    channel: AnswerDraftChannel | None = _channel_of(context)
+    if channel is not None:
+        channel.store_draft(
+            context.capability_runtime.run_id,
+            draft=result.draft,
+            evidence=result.evidence,
+        )
     return {}

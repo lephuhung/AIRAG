@@ -3,9 +3,10 @@
 Proves the Phase-2 acceptance facts for the T4 side: fast people/document
 paths dispatch only through the shared `TaskScheduler`/registry (capabilities
 receive exactly `AgentRequest` + `CapabilityRuntimeContext`), the bounded
-summary performs read -> evaluate -> synthesize -> ground, a summary never
-touches a summary domain agent, comparison never takes the fast domain route,
-and Write stays typed-unavailable in the finalizer.
+summary performs read -> evaluate -> synthesize -> ground exactly once per
+stage, a summary never touches a summary domain agent, comparison never takes
+the fast domain route, and Write — plus denied/errored/not_found capability
+outcomes — stays typed in the finalizer (never an escaping exception).
 """
 from __future__ import annotations
 
@@ -26,32 +27,18 @@ from app.services.agents.v2.contracts.binding import DocumentBindingSet, ScopedD
 from app.services.agents.v2.contracts.capability import (
     CapabilityDescriptor,
     CapabilityRuntimeContext,
-    DocumentReadInput,
     DocumentReadOutput,
-    PeopleLookupInput,
     PeopleLookupOutput,
 )
 from app.services.agents.v2.contracts.conversation import ConversationContext
 from app.services.agents.v2.contracts.evaluation import CoverageObservation
-from app.services.agents.v2.contracts.evidence import (
-    EvidenceUse,
-    EvidenceUseRef,
-    PeopleSourceIdentity,
-)
-from app.services.agents.v2.contracts.execution import AgentRequest, AgentResult
+from app.services.agents.v2.contracts.evidence import EvidenceUseRef
+from app.services.agents.v2.contracts.execution import AgentError, AgentRequest, AgentResult
 from app.services.agents.v2.contracts.locators import DocumentLocator
-from app.services.agents.v2.contracts.planning import (
-    CoverageCriterion,
-    InitialTaskOrigin,
-    TargetUnit,
-    TaskPlan,
-    TaskSpec,
-)
 from app.services.agents.v2.contracts.request import RequestContext
 from app.services.agents.v2.contracts.routing import QueryAnalysis, RouteDecision
 from app.services.agents.v2.contracts.semantic import (
     DocumentReference,
-    SectionReference,
     SemanticContext,
 )
 from app.services.agents.v2.contracts.state import (
@@ -62,7 +49,7 @@ from app.services.agents.v2.contracts.state import (
 )
 from app.services.agents.v2.contracts.synthesis import SynthesisRuntimeContext
 from app.services.agents.v2.execution.scheduler import TaskScheduler
-from app.services.agents.v2.nodes.evaluate import HydratedEvidence
+from app.services.agents.v2.nodes.evaluate import AnswerDraftChannel, HydratedEvidence
 from app.services.agents.v2.nodes.evaluate import evaluate_node
 from app.services.agents.v2.nodes.finalizer import finalizer_node
 from app.services.agents.v2.nodes.fast_plan import build_fast_plan
@@ -77,6 +64,11 @@ USER_ID = UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
 WORKSPACE_ID = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
 DOCUMENT_ID = UUID("11111111-1111-1111-1111-111111111111")
 REVISION = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+#: This file's directory is backend/tests/agents/v2/fast_paths, so the
+#: backend root is four parents up regardless of the pytest cwd.
+BACKEND_ROOT = Path(__file__).resolve().parents[4]
+V2_ROOT = BACKEND_ROOT / "app" / "services" / "agents" / "v2"
 
 FULL_FAST_CAPABILITIES = frozenset(
     {
@@ -177,13 +169,19 @@ class FakeHydrator:
     ) -> None:
         self.items = dict(items)
         self.budget = budget
+        self.calls: list[str] = []
         self.persisted = 0
 
     async def hydrate_for_evaluation(
         self,
         use_refs: tuple[Any, ...],
+        *,
         runtime: GraphRuntimeContext,
+        plan: Any,
+        bindings: Any,
     ) -> tuple[HydratedEvidence, ...]:
+        del plan, bindings
+        self.calls.append("evaluation")
         return tuple(
             self.items[ref.use_id] for ref in use_refs if ref.use_id in self.items
         )
@@ -191,15 +189,19 @@ class FakeHydrator:
     async def hydrate_for_synthesis(
         self,
         use_refs: tuple[Any, ...],
+        *,
         runtime: GraphRuntimeContext,
+        plan: Any,
+        bindings: Any,
+        budget: SynthesisRuntimeContext,
     ) -> tuple[HydratedEvidence, ...]:
+        del plan, bindings
+        self.calls.append("synthesis")
         admitted = [
             self.items[ref.use_id] for ref in use_refs if ref.use_id in self.items
         ]
         admitted = [h for h in admitted if h.purpose != "discovery"]
-        if self.budget is None:
-            return tuple(admitted)
-        head, _ = apply_budget_split(tuple(admitted), self.budget)
+        head, _ = apply_budget_split(tuple(admitted), budget)
         return tuple(head)
 
     async def persist_derived_summary(self, **kwargs: Any) -> HydratedEvidence:
@@ -328,6 +330,30 @@ def hydrated_doc(
         source_label="doc-A",
         classification="normal",
         locator=DocumentLocator(kind="document"),
+        document_revision=REVISION,
+    )
+
+
+def full_context(
+    *,
+    registry: Any,
+    hydrator: FakeHydrator,
+    allowed: frozenset[str] = FULL_FAST_CAPABILITIES,
+) -> tuple[GraphRuntimeContext, FakeLeaseRepo, AnswerDraftChannel]:
+    leases = FakeLeaseRepo()
+    channel = AnswerDraftChannel()
+    return (
+        GraphRuntimeContext(
+            capability_runtime=capability_runtime(allowed=allowed),
+            services=RuntimeServices(
+                capability_registry=registry,
+                retention_leases=leases,
+                evidence_hydrator=hydrator,
+                answer_draft_channel=channel,
+            ),
+        ),
+        leases,
+        channel,
     )
 
 
@@ -355,16 +381,8 @@ async def test_fast_document_read_uses_shared_capability_registry() -> None:
     registry = build_capability_registry(
         [CapabilityRegistration(capability=stub)], runtime
     )
-    leases = FakeLeaseRepo()
     hydrator = FakeHydrator({use_id: hydrated_doc(use_id, evidence_id, plan.tasks[0].task_id, content)})
-    context = GraphRuntimeContext(
-        capability_runtime=runtime,
-        services=RuntimeServices(
-            capability_registry=registry,
-            retention_leases=leases,
-            evidence_hydrator=hydrator,
-        ),
-    )
+    context, _, channel = full_context(registry=registry, hydrator=hydrator)
 
     scheduler = TaskScheduler(registry)
     report = await scheduler.execute(
@@ -388,13 +406,21 @@ async def test_fast_document_read_uses_shared_capability_registry() -> None:
     evaluated = await evaluate_node(state, context)
     assert evaluated["execution"].evidence_evaluation.status == "sufficient"
     state["execution"] = evaluated["execution"]
+    # C2: one synthesize (channel store), one ground (channel consume).
     assert await synthesize_node(state, context) == {}
+    assert channel.get("run-1") is not None
+    assert channel.get("run-1").draft is not None
     assert await ground_node(state, context) == {}
+    assert channel.get("run-1").grounded_draft is not None
     final = await finalizer_node(state, context)
     assert final["final_response"].status == "success"
+    # The finalizer emits the grounded outcome verbatim — it grounds nothing.
+    assert final["final_response"].content == channel.get("run-1").grounded_draft.content
     assert content in final["final_response"].content
     assert [c.citation_id for c in final["final_response"].citations] == ["cite-1"]
     assert final["final_response"].citations[0].evidence_id == evidence_id
+    # Exactly one synthesis hydration across synthesize+ground+finalizer.
+    assert hydrator.calls == ["evaluation", "synthesis"]
 
 
 @pytest.mark.asyncio
@@ -458,14 +484,7 @@ async def test_fast_people_uses_shared_capability_registry() -> None:
             )
         }
     )
-    context = GraphRuntimeContext(
-        capability_runtime=runtime,
-        services=RuntimeServices(
-            capability_registry=registry,
-            retention_leases=FakeLeaseRepo(),
-            evidence_hydrator=hydrator,
-        ),
-    )
+    context, _, channel = full_context(registry=registry, hydrator=hydrator)
     report = await TaskScheduler(registry).execute(
         plan=plan, runtime=context, prior_results=(), bindings=bindings
     )
@@ -490,6 +509,7 @@ async def test_fast_people_uses_shared_capability_registry() -> None:
     assert await ground_node(state, context) == {}
     final = await finalizer_node(state, context)
     assert final["final_response"].status == "success"
+    assert hydrator.calls == ["evaluation", "synthesis"]
 
 
 @pytest.mark.asyncio
@@ -518,18 +538,10 @@ async def test_bounded_summary_is_read_evaluate_synthesize_ground() -> None:
         [CapabilityRegistration(capability=stub)], runtime
     )
     hydrator = FakeHydrator({use_id: hydrated_doc(use_id, evidence_id, plan.tasks[0].task_id, content)})
-    context = GraphRuntimeContext(
-        capability_runtime=runtime,
-        services=RuntimeServices(
-            capability_registry=registry,
-            retention_leases=FakeLeaseRepo(),
-            evidence_hydrator=hydrator,
-        ),
-    )
+    context, _, _ = full_context(registry=registry, hydrator=hydrator)
     report = await TaskScheduler(registry).execute(
         plan=plan, runtime=context, prior_results=(), bindings=bindings
     )
-    ordered: list[str] = ["read"]
     state = make_state(
         semantic=semantic,
         bindings=bindings,
@@ -541,15 +553,14 @@ async def test_bounded_summary_is_read_evaluate_synthesize_ground() -> None:
     )
     evaluated = await evaluate_node(state, context)
     assert evaluated["execution"].evidence_evaluation.status == "sufficient"
-    ordered.append("evaluate")
     state["execution"] = evaluated["execution"]
     assert await synthesize_node(state, context) == {}
-    ordered.append("synthesize")
     assert await ground_node(state, context) == {}
-    ordered.append("ground")
     final = await finalizer_node(state, context)
     assert final["final_response"].status == "success"
-    assert ordered == ["read", "evaluate", "synthesize", "ground"]
+    # M3: the ordering asserted is the hydrator's own call log, not a
+    # test-built list: one evaluation hydration, then one synthesis hydration.
+    assert hydrator.calls == ["evaluation", "synthesis"]
 
 
 def test_summary_is_skill_not_agent_route() -> None:
@@ -564,12 +575,11 @@ def test_summary_is_skill_not_agent_route() -> None:
     plan = build_fast_plan(semantic, bindings, analysis, route)
     assert plan.tasks[0].capability in ("document.read", "section.read")
 
-    v2_root = Path("app/services/agents/v2")
-    assert list(v2_root.glob("*summary_agent*")) == []
-    assert list(v2_root.glob("domain/*_graph.py")) == []
+    assert list(V2_ROOT.glob("*summary_agent*")) == []
+    assert list(V2_ROOT.glob("domain/*_graph.py")) == []
     sources = [
         path.read_text()
-        for path in v2_root.rglob("*.py")
+        for path in V2_ROOT.rglob("*.py")
         if "test" not in path.parts
     ]
     assert not any(re.search(r"\bSummaryAgent\b", source) for source in sources)
@@ -675,6 +685,174 @@ async def test_write_is_typed_unavailable_in_finalizer() -> None:
 
 
 @pytest.mark.asyncio
+async def test_denied_people_lookup_is_typed_denied_without_exception() -> None:
+    """C1: scheduler-denied People task → insufficient → typed denied."""
+    from app.services.agents.v2.contracts.capability import PeopleLookupInput
+    from app.services.agents.v2.contracts.planning import (
+        InitialTaskOrigin,
+        TaskPlan,
+        TaskSpec,
+    )
+
+    plan = TaskPlan(
+        contract_version="2.0",
+        plan_id="plan-people",
+        goal="CCCD của A là gì?",
+        target_units=(),
+        tasks=(
+            TaskSpec(
+                task_id="fast_simple_people_lookup_0",
+                capability="people.lookup",
+                task_objective="CCCD của A là gì?",
+                input=PeopleLookupInput(kind="people.lookup", query="A"),
+                depends_on=(),
+                origin=InitialTaskOrigin(kind="initial"),
+            ),
+        ),
+    )
+    stub = StubPeopleCapability(
+        AgentResult(
+            contract_version=CONTRACT_VERSION,
+            task_id="unused",
+            status="success",
+            data=None,
+            evidence_uses=(),
+            coverage_observations=(),
+            error=None,
+        )
+    )
+    # The request scope forbids people.lookup: the shared scheduler — the
+    # only dispatch path — returns the typed denial, raising nothing.
+    runtime = capability_runtime(
+        allowed=FULL_FAST_CAPABILITIES - {"people.lookup"}
+    )
+    registry = build_capability_registry(
+        [CapabilityRegistration(capability=stub)], runtime
+    )
+    hydrator = FakeHydrator({})
+    context, _, _ = full_context(
+        registry=registry, hydrator=hydrator, allowed=runtime.allowed_capabilities
+    )
+    bindings = DocumentBindingSet(bindings=(), revision_requirement_refs=())
+    report = await TaskScheduler(registry).execute(
+        plan=plan, runtime=context, prior_results=(), bindings=bindings
+    )
+    assert report.results[0].status == "denied"
+    assert stub.calls == []
+
+    semantic = SemanticContext(
+        contextualized_query="CCCD của A là gì?",
+        normalized_query="CCCD của A là gì?",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(),
+        person_refs=(),
+        section_refs=(),
+        blocking_ambiguities=(),
+    )
+    from app.services.agents.v2.contracts.routing import QueryAnalysis
+
+    state = make_state(
+        semantic=semantic,
+        bindings=bindings,
+        analysis=QueryAnalysis(work_type="lookup", domains=("people",)),
+        route=RouteDecision(
+            route="fast_domain", reason_code="simple_people_lookup"
+        ),
+        execution=ExecutionState(
+            plan=plan, task_results=report.results, evidence_evaluation=None
+        ),
+    )
+    evaluated = await evaluate_node(state, context)
+    assert evaluated["execution"].evidence_evaluation.status == "insufficient"
+    state["execution"] = evaluated["execution"]
+    # T6 gates synthesize/ground on sufficient; the finalizer answers directly.
+    final = await finalizer_node(state, context)
+    assert final["final_response"].status == "denied"
+    assert "t_b_r1" not in final["final_response"].content
+
+
+@pytest.mark.asyncio
+async def test_not_found_people_lookup_is_typed_insufficient() -> None:
+    """C1: ordinary no-record People outcome → insufficient, never a crash."""
+    from app.services.agents.v2.contracts.capability import PeopleLookupInput
+    from app.services.agents.v2.contracts.planning import (
+        InitialTaskOrigin,
+        TaskPlan,
+        TaskSpec,
+    )
+
+    task_id = "fast_simple_people_lookup_0"
+    plan = TaskPlan(
+        contract_version="2.0",
+        plan_id="plan-people",
+        goal="CCCD của A là gì?",
+        target_units=(),
+        tasks=(
+            TaskSpec(
+                task_id=task_id,
+                capability="people.lookup",
+                task_objective="CCCD của A là gì?",
+                input=PeopleLookupInput(kind="people.lookup", query="A"),
+                depends_on=(),
+                origin=InitialTaskOrigin(kind="initial"),
+            ),
+        ),
+    )
+    stub = StubPeopleCapability(
+        AgentResult(
+            contract_version=CONTRACT_VERSION,
+            task_id=task_id,
+            status="not_found",
+            data=PeopleLookupOutput(kind="people.lookup", matched=False),
+            evidence_uses=(),
+            coverage_observations=(),
+            error=None,
+        )
+    )
+    runtime = capability_runtime()
+    registry = build_capability_registry(
+        [CapabilityRegistration(capability=stub)], runtime
+    )
+    hydrator = FakeHydrator({})
+    context, _, _ = full_context(registry=registry, hydrator=hydrator)
+    bindings = DocumentBindingSet(bindings=(), revision_requirement_refs=())
+    report = await TaskScheduler(registry).execute(
+        plan=plan, runtime=context, prior_results=(), bindings=bindings
+    )
+    assert report.results[0].status == "not_found"
+
+    semantic = SemanticContext(
+        contextualized_query="CCCD của A là gì?",
+        normalized_query="CCCD của A là gì?",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(),
+        person_refs=(),
+        section_refs=(),
+        blocking_ambiguities=(),
+    )
+    from app.services.agents.v2.contracts.routing import QueryAnalysis
+
+    state = make_state(
+        semantic=semantic,
+        bindings=bindings,
+        analysis=QueryAnalysis(work_type="lookup", domains=("people",)),
+        route=RouteDecision(
+            route="fast_domain", reason_code="simple_people_lookup"
+        ),
+        execution=ExecutionState(
+            plan=plan, task_results=report.results, evidence_evaluation=None
+        ),
+    )
+    evaluated = await evaluate_node(state, context)
+    assert evaluated["execution"].evidence_evaluation.status == "insufficient"
+    state["execution"] = evaluated["execution"]
+    final = await finalizer_node(state, context)
+    assert final["final_response"].status == "insufficient"
+
+
+@pytest.mark.asyncio
 async def test_finalizer_direct_greeting_succeeds_without_capabilities() -> None:
     semantic = SemanticContext(
         contextualized_query="Xin chào.",
@@ -709,7 +887,6 @@ async def test_finalizer_direct_greeting_succeeds_without_capabilities() -> None
 
 
 def test_v2_has_no_domain_agent_or_domain_graph_wrappers() -> None:
-    v2_root = Path("app/services/agents/v2")
     forbidden_files = [
         "people_agent.py",
         "summary_agent.py",
@@ -719,15 +896,15 @@ def test_v2_has_no_domain_agent_or_domain_graph_wrappers() -> None:
         "kg_agent.py",
     ]
     for name in forbidden_files:
-        assert list(v2_root.rglob(name)) == [], name
-    assert list(v2_root.glob("domain/*_graph.py")) == []
+        assert list(V2_ROOT.rglob(name)) == [], name
+    assert list(V2_ROOT.glob("domain/*_graph.py")) == []
     pattern = re.compile(
         r"class\s+(People|Summary|Comparison|Document|Section|KG|Evaluation|Grounding).*Agent"
         r"|\b(People|Summary|Comparison|Document|Section|KG)Agent\b"
     )
     hits = [
         str(path)
-        for path in v2_root.rglob("*.py")
+        for path in V2_ROOT.rglob("*.py")
         if pattern.search(path.read_text())
     ]
     assert hits == []

@@ -14,10 +14,15 @@ assigns deterministic ``cite-{n}`` IDs in first-seen claim order over the
 admitted evidence, so repeated renders converge. ``RenderedCitation`` carries
 no claim ID by contract.
 
-``ground_node`` re-derives the deterministic draft from checkpointed state
-(the draft is ephemeral and has no frozen slot) and grounds it with no
-reviser wired in Phase 2: success returns no state update, while a grounding
-failure checkpoints the typed ``insufficient`` response this node owns.
+``ground_node`` consumes the draft from the runtime-only ``AnswerDraftChannel``
+(normal path: no re-synthesis) and grounds it with no reviser wired in
+Phase 2: success stores the grounded result back in the channel for the
+finalizer and returns no state update, while a grounding failure checkpoints
+the typed ``insufficient`` response this node owns (user-safe content: no
+internal target/criterion identifiers). On a channel miss (restart between
+nodes) it re-derives deterministically ONCE through the shared
+``synthesize_and_lease`` helper — which also leases any freshly minted
+overflow uses — instead of silently re-running on every node.
 """
 from __future__ import annotations
 
@@ -33,14 +38,20 @@ from langgraph.runtime import Runtime
 from ..contracts.base import CONTRACT_VERSION
 from ..contracts.response import FinalResponse, RenderedCitation
 from ..contracts.state import GraphRuntimeContext, SupervisorV2State
-from ..contracts.synthesis import AnswerClaim, AnswerDraft
+from ..contracts.synthesis import AnswerDraft
 from ..contracts.validation import (
     validate_answer_draft,
     validate_final_response,
 )
 from .context import _context_of
-from .evaluate import HydratedEvidence
-from .synthesize import _synthesis_input_of, synthesize_answer
+from .evaluate import HydratedEvidence, _channel_of
+from .execute import require_checkpointed_plan
+from .synthesize import (
+    DEFAULT_SYNTHESIS_BUDGET,
+    SynthesisError,
+    _synthesis_input_of,
+    synthesize_and_lease,
+)
 
 __all__ = [
     "GroundingError",
@@ -50,7 +61,6 @@ __all__ = [
     "GroundedAnswer",
     "split_assertions",
     "normalize_assertion",
-    "map_assertion",
     "ground_answer",
     "render_citations",
     "ground_node",
@@ -58,6 +68,10 @@ __all__ = [
 
 #: Split content into assertions on blank lines and sentence boundaries.
 _SENTENCE_SPLIT_RE = re.compile(r"\n+|(?<=[.!?…。？！])\s+")
+
+#: User-safe insufficient content: internal target/criterion identifiers
+#: never reach the user-facing response (diagnostics stay in logs/reports).
+_INSUFFICIENT_CONTENT = "Không đủ căn cứ đã xác minh."
 
 
 class GroundingError(ValueError):
@@ -115,7 +129,7 @@ def normalize_assertion(text: str) -> str:
     terminator still matches the claim text it came from.
     """
     collapsed = " ".join(unicodedata.normalize("NFC", text).split()).casefold()
-    return re.sub(r"[.!?\?…。？！]+$", "", collapsed)
+    return re.sub(r"[.!?…。？！]+$", "", collapsed)
 
 
 def split_assertions(content: str) -> tuple[str, ...]:
@@ -127,27 +141,6 @@ def split_assertions(content: str) -> tuple[str, ...]:
     parts = [part.strip() for part in _SENTENCE_SPLIT_RE.split(content)]
     assertions = tuple(part for part in parts if part)
     return assertions if assertions else (content.strip(),)
-
-
-def map_assertion(
-    assertion: str, claims: tuple[AnswerClaim, ...]
-) -> str | None:
-    """Map one assertion to exactly one claim id, or ``None``.
-
-    A claim is a candidate when the normalized assertion equals or is
-    contained in the normalized claim text. Exactly one candidate maps;
-    zero or several leave the assertion unmapped (unsupported or ambiguous).
-    """
-    normalized = normalize_assertion(assertion)
-    if not normalized:
-        return None
-    candidates = [
-        claim.claim_id
-        for claim in claims
-        if normalized == normalize_assertion(claim.text)
-        or normalized in normalize_assertion(claim.text)
-    ]
-    return candidates[0] if len(candidates) == 1 else None
 
 
 def _mapping_report(
@@ -276,18 +269,11 @@ def render_citations(
     return tuple(citations)
 
 
-def _insufficient_response(report: GroundingReport) -> FinalResponse:
-    details = list(report.unmapped_assertions) + [
-        assertion for assertion, _ in report.ambiguous_assertions
-    ]
-    content = (
-        "Không đủ căn cứ đã xác minh cho các nội dung: "
-        + "; ".join(details[:3])
-    )
+def _insufficient_response() -> FinalResponse:
     response = FinalResponse(
         contract_version=CONTRACT_VERSION,
         status="insufficient",
-        content=content,
+        content=_INSUFFICIENT_CONTENT,
         citations=(),
     )
     validate_final_response(response)
@@ -298,20 +284,42 @@ async def ground_node(
     state: SupervisorV2State,
     runtime: "Runtime[GraphRuntimeContext]",
 ) -> dict:
-    """Ground the re-derived draft; checkpoint typed insufficiency on failure.
+    """Ground the channeled draft; checkpoint typed insufficiency on failure.
 
-    The draft is ephemeral (no frozen slot): it is re-derived deterministically
-    from the same checkpointed inputs ``synthesize_node`` used, so this node
-    converges with it. No reviser is wired in Phase 2 — an unmapped draft
-    checkpoints ``insufficient`` here rather than emitting factual success.
+    Normal path consumes the draft ``synthesize_node`` stored in the
+    runtime-only channel (no re-synthesis) and stores the grounded result
+    back for the finalizer. No reviser is wired in Phase 2 — an unmapped
+    draft checkpoints ``insufficient`` here rather than emitting factual
+    success. On a channel miss the draft is re-derived deterministically
+    ONCE through the shared ``synthesize_and_lease`` helper (fresh overflow
+    uses leased before returning); a synthesis failure there also becomes a
+    typed ``insufficient`` rather than an escaping exception.
     """
     context = _context_of(runtime)
-    synthesis_input = _synthesis_input_of(state)
-    result = await synthesize_answer(
-        synthesis_input=synthesis_input, runtime=context
-    )
+    run_id = context.capability_runtime.run_id
+    channel = _channel_of(context)
+    entry = channel.get(run_id) if channel is not None else None
+    if entry is not None and entry.draft is not None:
+        draft, evidence = entry.draft, entry.evidence
+    else:
+        plan = require_checkpointed_plan(state)
+        try:
+            derived = await synthesize_and_lease(
+                synthesis_input=_synthesis_input_of(state),
+                runtime=context,
+                plan=plan,
+                bindings=state["bindings"],
+                budget=DEFAULT_SYNTHESIS_BUDGET,
+            )
+        except SynthesisError:
+            return {"final_response": _insufficient_response()}
+        draft, evidence = derived.draft, derived.evidence
     try:
-        await ground_answer(draft=result.draft, evidence=result.evidence)
-    except GroundingInsufficient as exc:
-        return {"final_response": _insufficient_response(exc.report)}
+        grounded = await ground_answer(draft=draft, evidence=evidence)
+    except GroundingInsufficient:
+        return {"final_response": _insufficient_response()}
+    if channel is not None:
+        channel.store_grounded(
+            run_id, draft=grounded.draft, citations=grounded.citations
+        )
     return {}

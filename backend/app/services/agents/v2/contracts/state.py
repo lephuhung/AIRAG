@@ -55,6 +55,14 @@ class RuntimeServices(RuntimeModel):
     ``evidence_hydrator`` are request-scoped Phase-2 services wired by T6/T7.
     All default to ``None``.
 
+    ``answer_draft_channel`` is the runtime-only ephemeral synthesize → ground
+    → finalizer handoff (Phase 2, Task 4): the synthesize node stores the
+    validated draft there keyed by run id, the ground node consumes it, and
+    the finalizer consumes the grounded result. It is never checkpointed, is
+    not a business contract, and defaults to ``None`` (consumers re-derive
+    deterministically once from checkpointed state on a miss, e.g. after a
+    restart between nodes).
+
     The bag deliberately excludes ``plan_checkpoint`` (plan persistence is
     LangGraph state plus the supervisor checkpointer — no service) and any
     ``EvidenceEvaluator`` service (evidence evaluation is the shared
@@ -68,6 +76,7 @@ class RuntimeServices(RuntimeModel):
     chat_messages: Any = None
     authorization: Any = None
     evidence_hydrator: Any = None
+    answer_draft_channel: Any = None
 
 
 class GraphRuntimeContext(ContractModel):
