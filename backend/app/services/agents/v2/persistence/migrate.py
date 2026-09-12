@@ -213,10 +213,16 @@ class SchemaCheck:
     version: int | None
     missing_tables: frozenset[str]
     extra_tables: frozenset[str]
+    shape_errors: frozenset[str] = frozenset()
 
     @property
     def is_clean(self) -> bool:
-        return self.applied and not self.missing_tables and not self.extra_tables
+        return (
+            self.applied
+            and not self.missing_tables
+            and not self.extra_tables
+            and not self.shape_errors
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +250,7 @@ _CREATE_DDL: tuple[str, ...] = (
         generation                     BIGINT      NOT NULL,
         retry_of_revision_id           UUID        NULL,
         status                         TEXT        NOT NULL,
+        published_at                   TIMESTAMPTZ NULL,
         failed_at                      TIMESTAMPTZ NULL,
         failure_stage                  TEXT        NULL,
         failure_class                  TEXT        NULL,
@@ -251,11 +258,13 @@ _CREATE_DDL: tuple[str, ...] = (
         abandon_reason                 TEXT        NULL,
         artifact_retention_starts_at   TIMESTAMPTZ NULL,
         superseded_at                  TIMESTAMPTZ NULL,
+        superseded_by                  UUID        NULL,
         artifacts_purged_at            TIMESTAMPTZ NULL,
         created_at                     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         UNIQUE (document_id, generation),
         FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE RESTRICT,
-        FOREIGN KEY (retry_of_revision_id) REFERENCES document_revisions(revision_id)
+        FOREIGN KEY (retry_of_revision_id) REFERENCES document_revisions(revision_id),
+        FOREIGN KEY (superseded_by) REFERENCES document_revisions(revision_id)
     )
     """,
     # 3. document_revision_builds — one row per immutable build profile attempt.
@@ -268,6 +277,11 @@ _CREATE_DDL: tuple[str, ...] = (
         embedding_model_hash      TEXT        NULL,
         embedding_dimension       INTEGER     NULL,
         vector_artifact_version   TEXT        NULL,
+        markdown_artifact_key     TEXT        NULL,
+        structure_artifact_key    TEXT        NULL,
+        captions_skipped          BOOLEAN     NOT NULL DEFAULT false,
+        kg_skipped                BOOLEAN     NOT NULL DEFAULT false,
+        embed_skipped             BOOLEAN     NOT NULL DEFAULT false,
         started_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         finished_at               TIMESTAMPTZ NULL,
         UNIQUE (revision_id, build_profile),
@@ -652,6 +666,81 @@ def _verify_legacy_unchanged(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Shape verification (R2 amendment fail-closed guard)
+# ---------------------------------------------------------------------------
+
+#: Columns the current Release 1A shape requires on specific v2 tables.
+#: A database that recorded version 1 *before* the R2 amendment keeps the
+#: old shape — ``CREATE TABLE IF NOT EXISTS`` never upgrades an existing
+#: table and ``apply_v2_schema`` short-circuits on the version row — so the
+#: version row alone is NOT proof the shape is current. These guards make
+#: ``check_v2_schema`` fail closed instead of reporting ``is_clean=True``.
+_EXPECTED_SHAPE_COLUMNS: dict[str, frozenset[str]] = {
+    "revision_ingestion_attempts": frozenset({"source_object_identity"}),
+    "document_revisions": frozenset({"published_at", "superseded_by"}),
+    "document_revision_builds": frozenset(
+        {
+            "markdown_artifact_key",
+            "structure_artifact_key",
+            "captions_skipped",
+            "kg_skipped",
+            "embed_skipped",
+        }
+    ),
+}
+
+#: The R1 arbiter must be the full canonical identity, not decomposed keys.
+_EXPECTED_ATTEMPT_UNIQUE_COLUMNS: frozenset[str] = frozenset(
+    {"document_id", "source_object_identity", "build_profile"}
+)
+
+
+def _shape_errors(conn) -> frozenset[str]:
+    """Return human-readable shape mismatches for an applied schema.
+
+    Only called when ``_applied(conn)`` is true; a missing table is
+    reported separately via ``missing_tables``.
+    """
+    errors: set[str] = set()
+    for table, required in _EXPECTED_SHAPE_COLUMNS.items():
+        rows = conn.execute(
+            text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = :t"
+            ),
+            {"t": table},
+        ).fetchall()
+        present = {r[0] for r in rows}
+        if not present:
+            continue
+        missing = required - present
+        if missing:
+            errors.add(f"{table}: missing columns {sorted(missing)}")
+    # The named attempt arbiter must cover the full canonical identity.
+    rows = conn.execute(
+        text(
+            """
+            SELECT a.attname
+              FROM pg_constraint c
+              JOIN pg_attribute a
+                ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+             WHERE c.conname = 'uq_revision_ingestion_attempt_key'
+            """
+        )
+    ).fetchall()
+    present_cols = {r[0] for r in rows}
+    if not present_cols:
+        errors.add("missing constraint uq_revision_ingestion_attempt_key")
+    elif present_cols != set(_EXPECTED_ATTEMPT_UNIQUE_COLUMNS):
+        errors.add(
+            "uq_revision_ingestion_attempt_key covers "
+            f"{sorted(present_cols)}, expected "
+            f"{sorted(_EXPECTED_ATTEMPT_UNIQUE_COLUMNS)}"
+        )
+    return frozenset(errors)
+
+
 def check_v2_schema(engine: Engine) -> SchemaCheck:
     """Inspect the database and report the v2 schema state.
 
@@ -673,6 +762,7 @@ def check_v2_schema(engine: Engine) -> SchemaCheck:
         version = version_row[0] if version_row else None
         tables = _table_names(conn)
         missing = V2_SCHEMA_V1_TABLES - tables
+        shape_errors = _shape_errors(conn)
         extra = tables - V2_SCHEMA_V1_TABLES - {
             # known legacy tables that share the public schema
             "abbreviations",
@@ -706,6 +796,7 @@ def check_v2_schema(engine: Engine) -> SchemaCheck:
         version=version,
         missing_tables=missing,
         extra_tables=extra,
+        shape_errors=shape_errors,
     )
 
 

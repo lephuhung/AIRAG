@@ -29,6 +29,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
@@ -68,6 +69,27 @@ class DocumentRevisionBuild(Base):
     )
     vector_artifact_version: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True
+    )
+
+    # Per-profile artifact contract. ``markdown_artifact_key`` /
+    # ``structure_artifact_key`` identify the parsed artifacts; the
+    # ``*_skipped`` flags record that a stage was intentionally skipped
+    # for the profile (a skip is NOT a failure). ``verify_draft``
+    # enforces the required set per :class:`RevisionBuildProfile`.
+    markdown_artifact_key: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+    structure_artifact_key: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+    captions_skipped: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    kg_skipped: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    embed_skipped: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
     )
 
     started_at: Mapped[datetime] = mapped_column(

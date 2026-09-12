@@ -72,6 +72,12 @@ class DocumentRevision(Base):
     # Lifecycle state (free-form TEXT — see module docstring).
     status: Mapped[str] = mapped_column(Text, nullable=False)
 
+    # Publication timestamp, set exactly when the revision wins its
+    # publish CAS (or is published historical). NULL until published.
+    published_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # Terminal-failure metadata. Populated only when status='failed'.
     failed_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -92,7 +98,10 @@ class DocumentRevision(Base):
     )
 
     # The single GC retention anchor: when the artifact retention clock
-    # starts (typically the publish time). NULL while in draft/building.
+    # starts. Set when the revision becomes *permanently non-current*
+    # (superseded, tombstoned, failed, or abandoned) — a currently
+    # published revision has NO anchor. NULL while draft/building and
+    # while it is the current revision.
     artifact_retention_starts_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -100,6 +109,13 @@ class DocumentRevision(Base):
     # Independent GC lifecycle metadata.
     superseded_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+    # Provenance: the revision that superseded this one (NULL unless
+    # this revision was current and lost the pointer to a newer one).
+    superseded_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("document_revisions.revision_id"),
+        nullable=True,
     )
     artifacts_purged_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime(timezone=True), nullable=True

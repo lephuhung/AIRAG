@@ -362,6 +362,41 @@ def test_check_v2_schema_returns_version_1(db: Engine):
     assert check.is_clean is True, check
 
 
+def test_check_v2_schema_reports_no_shape_errors_on_migrated_db(db: Engine):
+    """R2/I3: a freshly migrated DB reports no shape drift.
+
+    ``shape_errors`` is the fail-closed guard that detects a database
+    which recorded version 1 *before* the R2 amendment and therefore
+    still carries the stale columns / attempt arbiter.
+    """
+    check = check_v2_schema(db)
+    assert check.shape_errors == frozenset(), check.shape_errors
+
+
+def test_schema_check_is_clean_requires_no_shape_errors():
+    """R2/I3: ``is_clean`` must be False whenever ``shape_errors`` is set."""
+    from app.services.agents.v2.persistence.migrate import SchemaCheck
+
+    stale = SchemaCheck(
+        applied=True,
+        version=1,
+        missing_tables=frozenset(),
+        extra_tables=frozenset(),
+        shape_errors=frozenset(
+            {"revision_ingestion_attempts: missing columns ['source_object_identity']"}
+        ),
+    )
+    assert stale.is_clean is False
+    healthy = SchemaCheck(
+        applied=True,
+        version=1,
+        missing_tables=frozenset(),
+        extra_tables=frozenset(),
+    )
+    assert healthy.is_clean is True
+    assert healthy.shape_errors == frozenset()
+
+
 def test_v2_models_module_has_no_db_writes_at_import(imported_app_models):
     """Importing ``app.models`` (and therefore ``v2_registry``) must not
     issue DDL or open a transaction. This is the post-migration deploy

@@ -587,22 +587,43 @@ def test_null_safe_unique_constraint_on_leases(migrated_db: Engine) -> None:
 
 
 def test_named_ingestion_attempt_unique_constraint(migrated_db: Engine) -> None:
-    """I2: ``revision_ingestion_attempts`` has named ``uq_revision_ingestion_attempt_key``."""
+    """I2/R1: the named arbiter exists AND covers the full canonical identity."""
     with migrated_db.connect() as conn:
-        rows = conn.execute(
-            text(
-                """
-                SELECT conname
-                FROM pg_constraint
-                WHERE conrelid = 'revision_ingestion_attempts'::regclass
-                  AND contype = 'u'
-                """
-            )
-        ).fetchall()
-    names = {r[0] for r in rows}
-    assert "uq_revision_ingestion_attempt_key" in names, (
-        f"missing named unique constraint; found: {sorted(names)}"
-    )
+        names = {
+            r[0]
+            for r in conn.execute(
+                text(
+                    "SELECT conname FROM pg_constraint "
+                    "WHERE conrelid = 'revision_ingestion_attempts'::regclass "
+                    "AND contype = 'u'"
+                )
+            ).fetchall()
+        }
+        assert "uq_revision_ingestion_attempt_key" in names, (
+            f"missing named unique constraint; found: {sorted(names)}"
+        )
+        # R1: the arbiter must be the FULL canonical identity, not the
+        # decomposed bucket/key components.
+        cols = {
+            r[0]
+            for r in conn.execute(
+                text(
+                    """
+                    SELECT a.attname
+                      FROM pg_constraint c
+                      JOIN pg_attribute a
+                        ON a.attrelid = c.conrelid
+                       AND a.attnum = ANY(c.conkey)
+                     WHERE c.conname = 'uq_revision_ingestion_attempt_key'
+                    """
+                )
+            ).fetchall()
+        }
+    assert cols == {
+        "document_id",
+        "source_object_identity",
+        "build_profile",
+    }, f"R1 arbiter must cover the full identity; got {sorted(cols)}"
 
 
 def test_v1_style_writes_allowed(migrated_db: Engine) -> None:
