@@ -120,18 +120,44 @@ async def query_documents(
     # Revision-selected (v2) retrieval: the caller names revisions explicitly.
     # Each revision's identity (embedding namespace/model/dimension/vector
     # artifact version) is resolved from ITS OWN build manifest, never from
-    # current config. An unpublishable/unready revision fails the request with
-    # REVISION_NOT_READY instead of silently falling back to legacy chunks.
+    # current config. The revision is joined to its document and rejected
+    # unless the document is in THIS workspace and not tombstoned — Chroma
+    # collections are global, so a bare revision id must never authorize a
+    # cross-workspace read. An unowned/tombstoned/unready revision fails the
+    # request with REVISION_NOT_READY instead of silently falling back to
+    # legacy chunks.
+    #
+    # Caller-named ``document_ids`` are validated the same way before any
+    # legacy retrieval leg runs, so a tombstoned document's retained Chroma
+    # chunks can never be returned.
+    from app.services.agents.v2.persistence.document_views import (
+        RevisionNotReady,
+        load_revision_identity_for_workspace,
+        resolve_document_targets,
+    )
+
+    if request.document_ids:
+        targets = await resolve_document_targets(
+            db, request.document_ids, workspace_id=workspace_id
+        )
+        ineligible = [t.document_id for t in targets if not t.eligible]
+        if ineligible:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "code": "DOCUMENT_NOT_FOUND",
+                    "message": "Document not found in this workspace: "
+                    + ", ".join(str(d) for d in ineligible),
+                },
+            )
+
     revision_identities = None
     if request.revision_ids:
-        from app.services.agents.v2.persistence.document_views import (
-            RevisionNotReady,
-            load_revision_identity,
-        )
-
         try:
             revision_identities = [
-                await load_revision_identity(db, rid, require_vectors=True)
+                await load_revision_identity_for_workspace(
+                    db, rid, workspace_id, require_vectors=True
+                )
                 for rid in request.revision_ids
             ]
         except RevisionNotReady as exc:
@@ -650,8 +676,13 @@ async def get_document_chunks(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
-    """Get all chunks for a specific document."""
-    result = await db.execute(select(Document).where(Document.id == document_id))
+    """Get all chunks for a specific document (tombstoned documents are not found)."""
+    result = await db.execute(
+        select(Document).where(
+            Document.id == document_id,
+            Document.source_deleted_at.is_(None),
+        )
+    )
     document = result.scalar_one_or_none()
 
     if document is None:

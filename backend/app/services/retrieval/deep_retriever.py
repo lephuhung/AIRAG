@@ -369,7 +369,7 @@ class DeepRetriever:
         # This boosts both vector and BM25 results based on published_date
         if settings.HRAG_RECENTNESS_BOOST > 0:
             raw_chunks, raw_citations = self._apply_recency_boost(
-                raw_chunks, raw_citations
+                raw_chunks, raw_citations, revision_identities
             )
 
         # Hiệu lực pháp lý: tra DB (không phải metadata Chroma — trạng thái
@@ -620,11 +620,19 @@ class DeepRetriever:
         self,
         chunks: list[EnrichedChunk],
         citations: list[Citation],
+        revision_identities: Optional[list[RevisionArtifactIdentity]] = None,
     ) -> tuple[list[EnrichedChunk], list[Citation]]:
         """
         Apply recency boost to chunks based on published_date metadata.
         Boost factor = HRAG_RECENTNESS_BOOST * exp(-days_since / decay_days)
         Newer documents get higher boost.
+
+        With ``revision_identities`` the metadata read goes through each
+        revision's **recorded** embedding namespace (the same namespace
+        ``_vector_query`` read from): a revision-qualified vector id
+        (``rev_<rev>_chunk_<n>``) can never be found in the legacy
+        ``kb_<workspace>`` collection, so reading it there would always miss
+        (and would lazily create an empty legacy collection as a side effect).
         """
         import math
         from datetime import datetime
@@ -670,25 +678,50 @@ class DeepRetriever:
         boost_factor = settings.HRAG_RECENTNESS_BOOST
 
         # Batch-fetch published_date for ALL chunks in a single ChromaDB call
-        # instead of one .get() per chunk (was N round-trips per query). The
-        # chunk's own vector_id is authoritative: once vector ids are
-        # revision-qualified it is not reconstructible from document+index.
+        # per namespace instead of one .get() per chunk (was N round-trips per
+        # query). The chunk's own vector_id is authoritative: once vector ids
+        # are revision-qualified it is not reconstructible from
+        # document+index, and it lives in the revision's recorded namespace —
+        # never the legacy workspace collection.
         chunk_ids = [
             chunk.vector_id or legacy_vector_id(chunk.document_id, chunk.chunk_index)
             for chunk in chunks
         ]
         date_by_id: dict[str, str] = {}
         if chunk_ids:
-            try:
-                results = self.vector_store.collection.get(
-                    ids=chunk_ids, include=["metadatas"]
-                )
-                got_ids = results.get("ids") or []
-                got_metas = results.get("metadatas") or []
-                for cid, meta in zip(got_ids, got_metas):
-                    date_by_id[cid] = (meta or {}).get("published_date", "") or ""
-            except Exception:
-                date_by_id = {}
+            identity_by_revision = {
+                str(identity.revision_id): identity
+                for identity in (revision_identities or [])
+            }
+            ids_by_namespace: dict[Optional[str], list[str]] = {}
+            for chunk_id, chunk in zip(chunk_ids, chunks):
+                if revision_identities is None:
+                    ids_by_namespace.setdefault(None, []).append(chunk_id)
+                    continue
+                identity = identity_by_revision.get(chunk.revision_id or "")
+                if identity is None or not identity.embedding_namespace:
+                    # Unknown provenance under a revision scope: skip the
+                    # lookup rather than query the wrong collection.
+                    continue
+                ids_by_namespace.setdefault(
+                    identity.embedding_namespace, []
+                ).append(chunk_id)
+            for namespace, ids in ids_by_namespace.items():
+                try:
+                    store = (
+                        get_vector_store(self.workspace_id, namespace=namespace)
+                        if namespace is not None
+                        else self.vector_store
+                    )
+                    results = store.collection.get(
+                        ids=ids, include=["metadatas"]
+                    )
+                    got_ids = results.get("ids") or []
+                    got_metas = results.get("metadatas") or []
+                    for cid, meta in zip(got_ids, got_metas):
+                        date_by_id[cid] = (meta or {}).get("published_date", "") or ""
+                except Exception:
+                    continue
 
         for chunk_id, chunk, citation in zip(chunk_ids, chunks, citations):
             date_str = date_by_id.get(chunk_id, "")

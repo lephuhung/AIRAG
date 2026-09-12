@@ -277,6 +277,58 @@ async def _load_build(
     )
 
 
+async def _identity_from_revision(
+    db: AsyncSession,
+    revision: DocumentRevision,
+    *,
+    require_vectors: bool,
+) -> RevisionArtifactIdentity:
+    """Build the artifact identity for an already-loaded revision row.
+
+    Shared by :func:`load_revision_identity` (by id) and
+    :func:`load_revision_identity_for_workspace` (workspace-scoped), so both
+    enforce exactly the same published/artifact contract.
+    """
+    if revision.status != RETRIEVAL_READY_STATUS:
+        raise RevisionNotReady(
+            revision.document_id,
+            f"revision status is {revision.status!r}, not published",
+            revision_id=revision.revision_id,
+        )
+    build = await _load_build(db, revision.revision_id)
+    if build is None:
+        raise RevisionNotReady(
+            revision.document_id,
+            "published revision has no build manifest",
+            revision_id=revision.revision_id,
+        )
+    identity = RevisionArtifactIdentity(
+        revision_id=revision.revision_id,
+        document_id=revision.document_id,
+        generation=revision.generation,
+        build_profile=build.build_profile,
+        markdown_artifact_key=build.markdown_artifact_key,
+        structure_artifact_key=build.structure_artifact_key,
+        embedding_namespace=build.embedding_namespace,
+        embedding_model_hash=build.embedding_model_hash,
+        embedding_dimension=build.embedding_dimension,
+        vector_artifact_version=build.vector_artifact_version,
+    )
+    if identity.markdown_artifact_key is None:
+        raise RevisionNotReady(
+            revision.document_id,
+            "published revision has no markdown artifact",
+            revision_id=revision.revision_id,
+        )
+    if require_vectors and not identity.vectors_available:
+        raise RevisionNotReady(
+            revision.document_id,
+            "published revision has no complete vector manifest",
+            revision_id=revision.revision_id,
+        )
+    return identity
+
+
 async def load_revision_identity(
     db: AsyncSession,
     revision_id: uuid.UUID,
@@ -297,44 +349,54 @@ async def load_revision_identity(
         raise RevisionNotReady(
             "unknown", "revision does not exist", revision_id=revision_id
         )
-    if revision.status != RETRIEVAL_READY_STATUS:
-        raise RevisionNotReady(
-            revision.document_id,
-            f"revision status is {revision.status!r}, not published",
-            revision_id=revision_id,
-        )
-    build = await _load_build(db, revision_id)
-    if build is None:
-        raise RevisionNotReady(
-            revision.document_id,
-            "published revision has no build manifest",
-            revision_id=revision_id,
-        )
-    identity = RevisionArtifactIdentity(
-        revision_id=revision.revision_id,
-        document_id=revision.document_id,
-        generation=revision.generation,
-        build_profile=build.build_profile,
-        markdown_artifact_key=build.markdown_artifact_key,
-        structure_artifact_key=build.structure_artifact_key,
-        embedding_namespace=build.embedding_namespace,
-        embedding_model_hash=build.embedding_model_hash,
-        embedding_dimension=build.embedding_dimension,
-        vector_artifact_version=build.vector_artifact_version,
+    return await _identity_from_revision(
+        db, revision, require_vectors=require_vectors
     )
-    if identity.markdown_artifact_key is None:
+
+
+async def load_revision_identity_for_workspace(
+    db: AsyncSession,
+    revision_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    *,
+    require_vectors: bool = False,
+) -> RevisionArtifactIdentity:
+    """Resolve a revision only when it is owned by ``workspace_id``.
+
+    This is the guard for **caller-supplied** revision ids. Chroma
+    collections are global and the identity module derives a revision's
+    collection namespace from the revision alone, so a revision id that is
+    not joined to its document would let a caller authorized for workspace A
+    read workspace B's chunk text. The join also rejects a tombstoned
+    document (``source_deleted_at`` set), whose revisions must not be
+    selectable for new retrieval.
+
+    :raises RevisionNotReady: the revision does not exist, belongs to a
+        different workspace, its document is tombstoned, or it fails the
+        published/artifact contract.
+    """
+    row = (
+        await db.execute(
+            select(DocumentRevision, Document)
+            .join(Document, Document.id == DocumentRevision.document_id)
+            .where(
+                DocumentRevision.revision_id == revision_id,
+                Document.workspace_id == workspace_id,
+                Document.source_deleted_at.is_(None),
+            )
+        )
+    ).first()
+    if row is None:
         raise RevisionNotReady(
-            revision.document_id,
-            "published revision has no markdown artifact",
+            "unknown",
+            "revision does not exist, is not owned by this workspace, or its "
+            "document is tombstoned",
             revision_id=revision_id,
         )
-    if require_vectors and not identity.vectors_available:
-        raise RevisionNotReady(
-            revision.document_id,
-            "published revision has no complete vector manifest",
-            revision_id=revision_id,
-        )
-    return identity
+    revision, _document = row
+    return await _identity_from_revision(
+        db, revision, require_vectors=require_vectors
+    )
 
 
 async def load_revision_vector_manifest(
@@ -393,32 +455,65 @@ class DocumentRetrievalTarget:
     """One requested document's retrieval target.
 
     ``identity`` is ``None`` for a legacy document (no current revision): the
-    caller must use the unchanged v1 adapter for it.
+    caller must use the unchanged v1 adapter for it. ``eligible`` is ``False``
+    for a document that must not be retrieved at all (tombstoned, or outside
+    the requested workspace): the caller skips it instead of falling back to
+    the legacy adapter, because the tombstone cleared ``current_revision_id``
+    and a legacy fallback would serve deleted content.
     """
 
     document_id: uuid.UUID
     identity: Optional[RevisionArtifactIdentity]
+    eligible: bool = True
 
     @property
     def is_legacy(self) -> bool:
-        return self.identity is None
+        return self.eligible and self.identity is None
 
 
 async def resolve_document_targets(
-    db: AsyncSession, document_ids: Sequence[uuid.UUID]
+    db: AsyncSession,
+    document_ids: Sequence[uuid.UUID],
+    *,
+    workspace_id: Optional[uuid.UUID] = None,
 ) -> list[DocumentRetrievalTarget]:
     """Resolve each document to its current revision, or to ``None`` (legacy).
 
     Order follows ``document_ids``; duplicates are preserved so a caller can
-    zip the result back onto its request.
+    zip the result back onto its request. When ``workspace_id`` is supplied, a
+    document outside that workspace is marked ``eligible=False``; a tombstoned
+    document is always marked ineligible.
     """
     targets: list[DocumentRetrievalTarget] = []
     for document_id in document_ids:
-        targets.append(
-            DocumentRetrievalTarget(
-                document_id=document_id,
-                identity=await load_current_revision_identity(db, document_id),
+        conditions = [
+            Document.id == document_id,
+            Document.source_deleted_at.is_(None),
+        ]
+        if workspace_id is not None:
+            conditions.append(Document.workspace_id == workspace_id)
+        row = (
+            await db.execute(
+                select(Document.current_revision_id).where(*conditions)
             )
+        ).first()
+        if row is None:
+            targets.append(
+                DocumentRetrievalTarget(
+                    document_id=document_id,
+                    identity=None,
+                    eligible=False,
+                )
+            )
+            continue
+        current_revision_id = row[0]
+        identity = (
+            None
+            if current_revision_id is None
+            else await load_revision_identity(db, current_revision_id)
+        )
+        targets.append(
+            DocumentRetrievalTarget(document_id=document_id, identity=identity)
         )
     return targets
 

@@ -201,6 +201,7 @@ async def list_documents(
             .where(
                 Document.workspace_id.in_(workspace_ids),
                 Document.status == DocumentStatus.INDEXED,
+                Document.source_deleted_at.is_(None),
             )
             .order_by(Document.workspace_id, Document.created_at.desc())
         )
@@ -266,8 +267,13 @@ async def summarize_document(
     from app.services.llm.types import LLMMessage
 
     try:
-        # Fetch document
-        result = await db.execute(select(Document).where(Document.id == document_id))
+        # Fetch document (tombstoned documents are not readable)
+        result = await db.execute(
+            select(Document).where(
+                Document.id == document_id,
+                Document.source_deleted_at.is_(None),
+            )
+        )
         doc = result.scalar_one_or_none()
 
         if not doc:
@@ -397,8 +403,13 @@ async def get_documents_content(
         }
 
     try:
-        # Fetch all documents in one query
-        result = await db.execute(select(Document).where(Document.id.in_(document_ids)))
+        # Fetch all documents in one query (tombstoned documents are excluded)
+        result = await db.execute(
+            select(Document).where(
+                Document.id.in_(document_ids),
+                Document.source_deleted_at.is_(None),
+            )
+        )
         docs = result.scalars().all()
 
         # Create a map for quick lookup (keys are UUID objects)
@@ -1419,6 +1430,11 @@ async def search_document_section(
                 targets = await resolve_document_targets(_target_db, doc_uuids)
         for ws_id in workspace_ids:
             for target in targets:
+                if not target.eligible:
+                    # Tombstoned / outside the requested workspace: skip rather
+                    # than fall back to the document-scoped legacy store, which
+                    # would still hold the deleted document's retained chunks.
+                    continue
                 if target.identity is not None:
                     queries.append((
                         get_vector_store(

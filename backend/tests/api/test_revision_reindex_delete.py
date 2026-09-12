@@ -50,7 +50,15 @@ class _FakeStore:
         return self.objects[key]
 
 
-async def _publish(db, *, document_id, workspace_id, sha: str, chunk_count: int = 2):
+async def _publish(
+    db,
+    *,
+    document_id,
+    workspace_id,
+    sha: str,
+    chunk_count: int = 2,
+    store: "_FakeStore | None" = None,
+):
     repo = DocumentRevisionsRepository(db)
     identity = compute_source_object_identity(
         bucket="hrag-uploads",
@@ -64,7 +72,7 @@ async def _publish(db, *, document_id, workspace_id, sha: str, chunk_count: int 
         document_id, identity, RevisionBuildProfile.FULL
     )
     rid = revision.revision_id
-    store = _FakeStore()
+    store = store or _FakeStore()
     md = revision_markdown_key(workspace_id, document_id, rid)
     struct = revision_structure_key(workspace_id, document_id, rid)
     chunks = [
@@ -405,3 +413,86 @@ async def test_tombstoned_document_is_hidden_from_normal_lookup(
             )
         )
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# Sub-resource endpoints: tombstone blocks, current revision serves
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tombstoned_document_subresources_are_not_found(
+    async_db, document_factory
+):
+    """Tombstoning hides markdown/images/chunk-context/download too."""
+    from app.api import documents as documents_api
+    from app.core.exceptions import NotFoundError
+
+    doc_id = document_factory(content_hash="f" * 64)
+    ws = await async_db.scalar(
+        select(Document.workspace_id).where(Document.id == doc_id)
+    )
+    store = _FakeStore()
+    await _publish(
+        async_db, document_id=doc_id, workspace_id=ws, sha="f" * 64, store=store
+    )
+    await DocumentRevisionsRepository(async_db).mark_source_deleted(
+        doc_id, reason="document_deleted"
+    )
+    await async_db.commit()
+
+    for endpoint in (
+        documents_api.get_document_markdown,
+        documents_api.get_document_images,
+        documents_api.get_chunk_context,
+        documents_api.download_document,
+    ):
+        with pytest.raises(NotFoundError):
+            await endpoint(doc_id, db=async_db, user=None)
+
+
+@pytest.mark.asyncio
+async def test_markdown_endpoint_serves_the_current_revision(
+    async_db, document_factory, monkeypatch
+):
+    """The viewer endpoint reads the revision artifact, not the v1 mirror."""
+    from app.api import documents as documents_api
+    from app.services import storage_service
+
+    doc_id = document_factory()
+    ws = await async_db.scalar(
+        select(Document.workspace_id).where(Document.id == doc_id)
+    )
+    store = _FakeStore()
+    await _publish(
+        async_db, document_id=doc_id, workspace_id=ws, sha="i" * 64, store=store
+    )
+    # The legacy mirror points at DIFFERENT content; the endpoint must ignore it.
+    store.objects["kb_legacy/legacy.md"] = "# LEGACY MIRROR"
+    await async_db.execute(
+        text(
+            "UPDATE documents SET markdown_s3_key = :k, status = 'indexed' "
+            "WHERE id = :d"
+        ),
+        {"k": "kb_legacy/legacy.md", "d": str(doc_id)},
+    )
+    await async_db.commit()
+    monkeypatch.setattr(storage_service, "get_storage_service", lambda: store)
+
+    response = await documents_api.get_document_markdown(
+        doc_id, db=async_db, user=None
+    )
+    assert response.body.decode() == "# md"
+    assert "LEGACY" not in response.body.decode()
+
+    images = await documents_api.get_document_images(
+        doc_id, db=async_db, user=None
+    )
+    assert images == []
+
+    context = await documents_api.get_chunk_context(
+        doc_id, db=async_db, user=None
+    )
+    assert context["total_chunks"] == 2
+    assert context["revision_id"] is not None
+    assert [c["content"] for c in context["chunks"]] == ["c0", "c1"]

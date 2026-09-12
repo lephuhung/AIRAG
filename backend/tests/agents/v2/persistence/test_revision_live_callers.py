@@ -16,6 +16,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from sqlalchemy import select
 
 # Full-dependency suite: the retriever, the RAG services and the vector store
 # import chromadb/numpy. Skip cleanly in the benchmark venv (controller ruling
@@ -503,3 +504,476 @@ async def test_revision_kg_does_not_leak_old_fact():
     legacy_cypher, legacy_params = driver_legacy.calls[-1]
     assert "$revision_ids" not in legacy_cypher
     assert "revision_ids" not in legacy_params
+
+
+def _kg_fact_row(r1: uuid.UUID, r2: uuid.UUID, **overrides) -> dict:
+    """One fabricated ``get_relevant_context`` row for a shared fact pair.
+
+    ``entity_desc``/``rel_desc`` are the canonical (last-writer) descriptions,
+    while ``entity_facts``/``rel_facts`` hold the producing revision's text.
+    """
+    row = {
+        "entity_name": "Cục Thuế",
+        "entity_type": "Organization",
+        "entity_desc": "R1 fact",  # canonical = last writer (R1)
+        "entity_facts": [
+            {"revision_id": str(r1), "description": "R1 fact"},
+            {"revision_id": str(r2), "description": "R2 fact"},
+        ],
+        "rel_type": "BAN_HANH",
+        "rel_desc": "R1 edge fact",
+        "rel_facts": [
+            {"revision_id": str(r1), "description": "R1 edge fact"},
+            {"revision_id": str(r2), "description": "R2 edge fact"},
+        ],
+        "rel_src": "Cục Thuế",
+        "rel_tgt": "Nghị định 53/2022",
+    }
+    row.update(overrides)
+    return row
+
+
+@pytest.mark.asyncio
+async def test_revision_kg_scoped_read_does_not_leak_last_writer_fact():
+    """Fact TEXT must be per-revision, not last-writer-wins on the shared row.
+
+    A canonical entity/relationship is shared across revisions, so its
+    ``description`` is whatever revision wrote last. An R2-scoped read whose
+    membership set includes an R1-only fact would return it under the old
+    predicate-only implementation (which returned ``n.description`` /
+    ``r.description`` verbatim) — this test fails there.
+    """
+    from app.services.kg import legal_kg_service as kg
+
+    service = kg.LegalKGService(uuid.uuid4())
+    r1, r2 = uuid.uuid4(), uuid.uuid4()
+
+    # An R2-scoped read gets R2's fact text, never R1's.
+    service._driver = _CapturingDriver(rows=[_kg_fact_row(r1, r2)])
+    out_r2 = await service.get_relevant_context("cục thuế", revision_ids=[r2])
+    assert "R2 fact" in out_r2
+    assert "R1 fact" not in out_r2
+    assert "R2 edge fact" in out_r2
+    assert "R1 edge fact" not in out_r2
+
+    # A shared row with no in-scope fact yields no text (fail closed) instead
+    # of leaking the canonical description another revision wrote.
+    service._driver = _CapturingDriver(
+        rows=[
+            _kg_fact_row(
+                r1,
+                r2,
+                entity_facts=[
+                    {"revision_id": str(r1), "description": "R1 fact"}
+                ],
+                rel_type=None,
+                rel_desc=None,
+                rel_facts=None,
+                rel_src=None,
+                rel_tgt=None,
+            )
+        ]
+    )
+    out_other = await service.get_relevant_context("cục thuế", revision_ids=[r2])
+    assert "R1 fact" not in out_other
+
+    # The unscoped v1 read keeps the canonical description.
+    service._driver = _CapturingDriver(rows=[_kg_fact_row(r1, r2)])
+    out_v1 = await service.get_relevant_context("cục thuế")
+    assert "R1 fact" in out_v1
+
+
+@pytest.mark.asyncio
+async def test_revision_kg_writes_store_fact_text_per_revision():
+    """Each ingest stores its fact text under its own revision entry."""
+    from app.services.kg import legal_kg_service as kg
+
+    service = kg.LegalKGService(uuid.uuid4())
+    r1 = uuid.uuid4()
+    doc = uuid.uuid4()
+
+    driver = _CapturingDriver()
+    await service._upsert_node(
+        driver.session(), "Cục Thuế", "Organization", "R1 fact", str(doc),
+        revision_id=str(r1),
+    )
+    await service._upsert_relation(
+        driver.session(), "Cục Thuế", "BAN_HANH", "Nghị định 53/2022",
+        "R1 edge fact", str(doc),
+        source_type="Organization", target_type="Document", revision_id=str(r1),
+    )
+    assert "revision_facts" in driver.calls[0][0]
+    assert "revision_facts" in driver.calls[1][0]
+    # The append is revision-keyed and never overwrites another revision's entry.
+    assert "f.revision_id <> $revision_id" in driver.calls[0][0]
+    assert "f.revision_id <> $revision_id" in driver.calls[1][0]
+
+
+# ---------------------------------------------------------------------------
+# Recency boost reads the revision's recorded namespace
+# ---------------------------------------------------------------------------
+
+
+class _FakeChromaCollection:
+    def __init__(self) -> None:
+        self.get_calls: list[list[str]] = []
+
+    def get(self, ids, include=None):
+        self.get_calls.append(list(ids))
+        return {
+            "ids": list(ids),
+            "metadatas": [{"published_date": "01/01/2026"} for _ in ids],
+        }
+
+
+def test_recency_boost_reads_the_revision_namespace(monkeypatch):
+    """A revision-qualified chunk id must be resolved in its own namespace.
+
+    ``self.vector_store`` is the legacy ``kb_<workspace>`` collection; a
+    revision-qualified id (``rev_<rev>_chunk_<n>``) can never be found there,
+    so the boost would always miss (and lazily create an empty legacy
+    collection).
+    """
+    from app.services.models.parsed_document import Citation, EnrichedChunk
+    from app.services.retrieval import deep_retriever as dr
+
+    ws, doc, rev = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    ns = embedding_namespace(ws, "hashA", 768)
+    created: list[RecordingVectorStore] = []
+
+    def _factory(ws_id, namespace=None):
+        store = RecordingVectorStore(ws_id, namespace)
+        store.collection = _FakeChromaCollection()
+        created.append(store)
+        return store
+
+    class _ExplodingLegacyCollection:
+        def get(self, *args, **kwargs):  # pragma: no cover - must never run
+            raise AssertionError("legacy collection must not be read")
+
+    class _ExplodingLegacyStore:
+        def __init__(self):
+            self.collection = _ExplodingLegacyCollection()
+
+    monkeypatch.setattr(dr, "get_vector_store", _factory)
+    retriever = dr.DeepRetriever(
+        workspace_id=ws,
+        kg_service=None,
+        vector_store=_ExplodingLegacyStore(),
+        embedder=FakeEmbedder(),
+        db=None,
+        reranker=object(),
+    )
+    chunk = EnrichedChunk(
+        content="x",
+        chunk_index=0,
+        source_file="a.pdf",
+        document_id=doc,
+        revision_id=str(rev),
+        vector_id=revision_vector_id(rev, 0),
+        score=0.5,
+    )
+    citations = [Citation(source_file="a.pdf", document_id=doc)]
+    identity = _identity(rev, doc, namespace=ns)
+
+    boosted, _ = retriever._apply_recency_boost([chunk], citations, [identity])
+
+    assert [s.collection_name for s in created] == [ns]
+    assert created[0].collection.get_calls == [[revision_vector_id(rev, 0)]]
+    assert boosted[0].score >= 0.5
+
+
+# ---------------------------------------------------------------------------
+# Agent read tools are revision-selected
+# ---------------------------------------------------------------------------
+
+
+class _ToolFakeStore:
+    def __init__(self) -> None:
+        self.objects: dict[str, str] = {}
+
+    async def upload_artifact(self, key, content, content_type) -> str:
+        self.objects[key] = content
+        return key
+
+    async def download_markdown(self, key) -> str:
+        return self.objects[key]
+
+
+async def _publish_current_revision(async_db, document_id, workspace_id, storage):
+    """Publish one FULL revision whose markdown artifact is distinct from v1."""
+    from app.models.document import Document  # noqa: F401
+    from app.services.agents.v2.persistence.document_revisions import (
+        DocumentRevisionsRepository,
+    )
+    from app.services.agents.v2.persistence.document_views import (
+        ChunkRecord,
+        build_structure_artifact,
+        record_revision_chunk_rows,
+        revision_markdown_key,
+        revision_structure_key,
+    )
+    from app.services.agents.v2.persistence.source_identity import (
+        RevisionBuildProfile,
+        compute_source_object_identity,
+    )
+
+    repo = DocumentRevisionsRepository(async_db)
+    revision = await repo.allocate_draft(
+        document_id,
+        compute_source_object_identity(
+            bucket="b",
+            object_key=f"kb_{workspace_id}/doc_{document_id}.pdf",
+            version_id=None,
+            etag="tool-etag",
+            size_bytes=1,
+            content_sha256="a" * 64,
+        ),
+        RevisionBuildProfile.FULL,
+    )
+    rid = revision.revision_id
+    md_key = revision_markdown_key(workspace_id, document_id, rid)
+    struct_key = revision_structure_key(workspace_id, document_id, rid)
+    chunks = [
+        ChunkRecord(
+            chunk_id=str(uuid.uuid4()),
+            ordinal=0,
+            content="revision chunk",
+            page_no=1,
+            heading_path=["Điều 1"],
+        )
+    ]
+    await storage.upload_artifact(md_key, "# REVISION MARKDOWN", "text/markdown")
+    await storage.upload_artifact(
+        struct_key,
+        build_structure_artifact(rid, document_id, chunks),
+        "application/json",
+    )
+    await record_revision_chunk_rows(async_db, rid, chunks)
+    await repo.record_artifacts(
+        rid,
+        RevisionBuildProfile.FULL,
+        embedding_namespace=embedding_namespace(workspace_id, "hashA", 768),
+        embedding_model_hash="hashA",
+        embedding_dimension=768,
+        vector_artifact_version="v1",
+        markdown_artifact_key=md_key,
+        structure_artifact_key=struct_key,
+    )
+    await repo.verify_draft(rid)
+    await repo.publish(rid)
+    await async_db.commit()
+    return rid
+
+
+@pytest.mark.asyncio
+async def test_summarize_document_reads_the_current_revision(
+    async_db, document_factory, monkeypatch
+):
+    from sqlalchemy import text
+
+    from app.models.document import Document
+    from app.services import llm as llm_module
+    from app.services import storage_service
+    from app.services.agent import tools
+
+    doc_id = document_factory()
+    ws = await async_db.scalar(
+        select(Document.workspace_id).where(Document.id == doc_id)
+    )
+    storage = _ToolFakeStore()
+    await _publish_current_revision(async_db, doc_id, ws, storage)
+    storage.objects["kb_legacy/legacy.md"] = "# LEGACY MIRROR"
+    await async_db.execute(
+        text(
+            "UPDATE documents SET markdown_s3_key = :k, status = 'indexed' "
+            "WHERE id = :d"
+        ),
+        {"k": "kb_legacy/legacy.md", "d": str(doc_id)},
+    )
+    await async_db.commit()
+    monkeypatch.setattr(storage_service, "get_storage_service", lambda: storage)
+
+    captured: dict = {}
+
+    class _FakeLLM:
+        async def acomplete(self, messages, **kwargs):
+            captured["prompt"] = messages[0].content
+            return "TÓM TẮT"
+
+    monkeypatch.setattr(llm_module, "get_llm_provider", lambda: _FakeLLM())
+
+    result = await tools.summarize_document(doc_id, async_db)
+
+    assert result["text"] == "TÓM TẮT"
+    assert "REVISION MARKDOWN" in captured["prompt"]
+    assert "LEGACY MIRROR" not in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_get_documents_content_reads_the_current_revision(
+    async_db, document_factory, monkeypatch
+):
+    from sqlalchemy import text
+
+    from app.models.document import Document
+    from app.services import storage_service
+    from app.services.agent import tools
+
+    doc_id = document_factory()
+    ws = await async_db.scalar(
+        select(Document.workspace_id).where(Document.id == doc_id)
+    )
+    storage = _ToolFakeStore()
+    await _publish_current_revision(async_db, doc_id, ws, storage)
+    storage.objects["kb_legacy/legacy.md"] = "# LEGACY MIRROR"
+    await async_db.execute(
+        text(
+            "UPDATE documents SET markdown_s3_key = :k, status = 'indexed' "
+            "WHERE id = :d"
+        ),
+        {"k": "kb_legacy/legacy.md", "d": str(doc_id)},
+    )
+    await async_db.commit()
+    monkeypatch.setattr(storage_service, "get_storage_service", lambda: storage)
+
+    result = await tools.get_documents_content([doc_id], async_db)
+
+    assert result["documents"][0]["content"] == "# REVISION MARKDOWN"
+
+
+@pytest.mark.asyncio
+async def test_agent_read_tools_hide_tombstoned_documents(
+    async_db, document_factory, monkeypatch
+):
+    from app.models.document import Document
+    from app.services import storage_service
+    from app.services.agent import tools
+    from app.services.agents.v2.persistence.document_revisions import (
+        DocumentRevisionsRepository,
+    )
+
+    doc_id = document_factory()
+    ws = await async_db.scalar(
+        select(Document.workspace_id).where(Document.id == doc_id)
+    )
+    storage = _ToolFakeStore()
+    await _publish_current_revision(async_db, doc_id, ws, storage)
+    from sqlalchemy import text
+
+    await async_db.execute(
+        text("UPDATE documents SET status = 'indexed' WHERE id = :d"),
+        {"d": str(doc_id)},
+    )
+    await async_db.commit()
+    listed = await tools.list_documents([ws], async_db)
+    assert listed["document_count"] == 1
+
+    await DocumentRevisionsRepository(async_db).mark_source_deleted(
+        doc_id, reason="document_deleted"
+    )
+    await async_db.commit()
+    monkeypatch.setattr(storage_service, "get_storage_service", lambda: storage)
+
+    assert (await tools.list_documents([ws], async_db))["document_count"] == 0
+
+    summary = await tools.summarize_document(doc_id, async_db)
+    assert "Không tìm thấy" in summary["text"]
+
+    content = await tools.get_documents_content([doc_id], async_db)
+    assert content["documents"][0]["content"] is None
+    assert content["documents"][0]["error"] is not None
+
+    from app.core import database as db_module
+
+    class _SessionCtx:
+        def __init__(self, session):
+            self._session = session
+
+        async def __aenter__(self):
+            return self._session
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        db_module, "async_session_maker", lambda: _SessionCtx(async_db)
+    )
+    section = await tools.search_document_section(
+        "Điều 1", [str(ws)], [str(doc_id)]
+    )
+    assert section["sources"] == []
+
+
+@pytest.mark.asyncio
+async def test_search_document_section_uses_the_current_revision(
+    async_db, document_factory, monkeypatch
+):
+    from app.models.document import Document
+    from app.services.agent import tools
+    from app.core import database as db_module
+    from app.services.embedding import vector_store as vs_module
+
+    doc_id = document_factory()
+    ws = await async_db.scalar(
+        select(Document.workspace_id).where(Document.id == doc_id)
+    )
+    storage = _ToolFakeStore()
+    rid = await _publish_current_revision(async_db, doc_id, ws, storage)
+
+    created: list = []
+
+    class _FakeVStore:
+        def __init__(self, ws_id, namespace):
+            self.workspace_id = ws_id
+            self.collection_name = namespace or f"kb_{ws_id}"
+            self.queries: list = []
+
+        def get_by_metadata(self, where=None):
+            self.queries.append(where)
+            return {
+                "documents": ["nội dung Điều 1"],
+                "metadatas": [
+                    {
+                        "document_id": str(doc_id),
+                        "heading_path": "Điều 1",
+                        "page_no": 1,
+                        "chunk_index": 0,
+                        "revision_id": str(rid),
+                        "chunk_id": "chunk-1",
+                    }
+                ],
+            }
+
+        def query(self, **kwargs):  # pragma: no cover - metadata hit short-circuits
+            return {"documents": [], "metadatas": []}
+
+    def _factory(ws_id, namespace=None):
+        store = _FakeVStore(ws_id, namespace)
+        created.append(store)
+        return store
+
+    monkeypatch.setattr(vs_module, "get_vector_store", _factory)
+
+    class _SessionCtx:
+        def __init__(self, session):
+            self._session = session
+
+        async def __aenter__(self):
+            return self._session
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(db_module, "async_session_maker", lambda: _SessionCtx(async_db))
+
+    result = await tools.search_document_section(
+        "Điều 1", [str(ws)], [str(doc_id)]
+    )
+
+    assert result["sources"]
+    assert len(created) == 1
+    assert created[0].collection_name == embedding_namespace(ws, "hashA", 768)
+    assert created[0].queries == [
+        {"$and": [{"document_id": str(doc_id)}, {"revision_id": str(rid)}]}
+    ]

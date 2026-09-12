@@ -772,7 +772,12 @@ async def get_chunk_context(
     from the legacy ``Document.chunk_count`` / ``doc_<document>_chunk_<index>``
     vectors. Documents with no revision keep the unchanged v1 path.
     """
-    result = await db.execute(select(Document).where(Document.id == document_id))
+    result = await db.execute(
+        select(Document).where(
+            Document.id == document_id,
+            Document.source_deleted_at.is_(None),
+        )
+    )
     document = result.scalar_one_or_none()
 
     if document is None:
@@ -919,7 +924,12 @@ async def get_document_markdown(
     artifact; the legacy ``Document.markdown_s3_key`` is used only when the
     document has no revision at all.
     """
-    result = await db.execute(select(Document).where(Document.id == document_id))
+    result = await db.execute(
+        select(Document).where(
+            Document.id == document_id,
+            Document.source_deleted_at.is_(None),
+        )
+    )
     document = result.scalar_one_or_none()
 
     if document is None:
@@ -1008,7 +1018,12 @@ async def get_document_images(
     rows; the legacy document-scoped query is used only when there is no
     revision.
     """
-    result = await db.execute(select(Document).where(Document.id == document_id))
+    result = await db.execute(
+        select(Document).where(
+            Document.id == document_id,
+            Document.source_deleted_at.is_(None),
+        )
+    )
     document = result.scalar_one_or_none()
 
     if document is None:
@@ -1043,8 +1058,13 @@ async def download_document(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_active_user),
 ):
-    """Download the original uploaded file from MinIO."""
-    result = await db.execute(select(Document).where(Document.id == document_id))
+    """Download the original uploaded file from MinIO (tombstoned documents are not found)."""
+    result = await db.execute(
+        select(Document).where(
+            Document.id == document_id,
+            Document.source_deleted_at.is_(None),
+        )
+    )
     document = result.scalar_one_or_none()
 
     if document is None:

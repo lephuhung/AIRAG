@@ -40,6 +40,7 @@ from app.services.agents.v2.persistence.document_views import (
     load_current_revision_identity,
     load_revision_chunks,
     load_revision_identity,
+    load_revision_identity_for_workspace,
     parse_revision_vector_id,
     parse_structure_artifact,
     record_revision_chunk_rows,
@@ -662,4 +663,112 @@ async def test_parse_only_revision_has_no_vectors_and_fails_closed(
 def test_kg_revision_scope_is_the_revision_id():
     rev = uuid.uuid4()
     assert revision_kg_scope(rev) == str(rev)
+
+
+# ---------------------------------------------------------------------------
+# Workspace / tombstone guards on caller-supplied documents and revisions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_revision_identity_is_rejected_outside_its_workspace(
+    async_db, document_factory
+):
+    """A caller-supplied revision id must be joined to its document/workspace."""
+    doc_id = document_factory()
+    ws = await async_db.scalar(
+        select(Document.workspace_id).where(Document.id == doc_id)
+    )
+    storage = FakeArtifactStore()
+    rid = await _publish_revision(
+        async_db,
+        document_id=doc_id,
+        workspace_id=ws,
+        object_key=f"kb_{ws}/doc_{doc_id}.pdf",
+        sha="f" * 64,
+        chunks=_chunks("R1"),
+        storage=storage,
+        namespace=embedding_namespace(ws, "hashA", 768),
+    )
+
+    identity = await load_revision_identity_for_workspace(
+        async_db, rid, ws, require_vectors=True
+    )
+    assert identity.revision_id == rid
+
+    # Another workspace that merely learns the revision id must be rejected.
+    with pytest.raises(RevisionNotReady):
+        await load_revision_identity_for_workspace(
+            async_db, rid, uuid.uuid4(), require_vectors=True
+        )
+    # An unknown revision is rejected the same way.
+    with pytest.raises(RevisionNotReady):
+        await load_revision_identity_for_workspace(async_db, uuid.uuid4(), ws)
+
+
+@pytest.mark.asyncio
+async def test_tombstoned_document_has_no_retrievable_revision(
+    async_db, document_factory
+):
+    """A tombstoned document's published revision must not be selectable."""
+    doc_id = document_factory()
+    ws = await async_db.scalar(
+        select(Document.workspace_id).where(Document.id == doc_id)
+    )
+    storage = FakeArtifactStore()
+    rid = await _publish_revision(
+        async_db,
+        document_id=doc_id,
+        workspace_id=ws,
+        object_key=f"kb_{ws}/doc_{doc_id}.pdf",
+        sha="g" * 64,
+        chunks=_chunks("R1"),
+        storage=storage,
+        namespace=embedding_namespace(ws, "hashA", 768),
+    )
+
+    await DocumentRevisionsRepository(async_db).mark_source_deleted(
+        doc_id, reason="document_deleted"
+    )
+    await async_db.commit()
+
+    with pytest.raises(RevisionNotReady):
+        await load_revision_identity_for_workspace(async_db, rid, ws)
+
+    targets = await resolve_document_targets(async_db, [doc_id], workspace_id=ws)
+    assert targets[0].eligible is False
+    assert targets[0].identity is None
+    # A tombstoned document is NOT a legacy document to fall back on.
+    assert targets[0].is_legacy is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_document_targets_marks_foreign_documents_ineligible(
+    async_db, document_factory
+):
+    doc_id = document_factory()
+    ws = await async_db.scalar(
+        select(Document.workspace_id).where(Document.id == doc_id)
+    )
+    storage = FakeArtifactStore()
+    rid = await _publish_revision(
+        async_db,
+        document_id=doc_id,
+        workspace_id=ws,
+        object_key=f"kb_{ws}/doc_{doc_id}.pdf",
+        sha="h" * 64,
+        chunks=_chunks("R1"),
+        storage=storage,
+        namespace=embedding_namespace(ws, "hashA", 768),
+    )
+
+    own = await resolve_document_targets(async_db, [doc_id], workspace_id=ws)
+    assert own[0].eligible is True
+    assert own[0].identity is not None and own[0].identity.revision_id == rid
+
+    foreign = await resolve_document_targets(
+        async_db, [doc_id], workspace_id=uuid.uuid4()
+    )
+    assert foreign[0].eligible is False
+    assert foreign[0].is_legacy is False
 

@@ -405,6 +405,47 @@ def _list_prop_append(var: str, prop: str, singular: str, id_param: str) -> str:
     )
 
 
+def _revision_facts_append(var: str, id_param: str, desc_param: str) -> str:
+    """Per-revision document-derived fact text for a shared ``var`` row.
+
+    ``revision_facts`` is a list of ``{revision_id, description}`` maps — one
+    entry per producing revision. A canonical entity/relationship stays shared
+    across revisions, but its fact text does not: writing R2's description must
+    not overwrite R1's, because an R1-scoped read of a shared node would then
+    return R2's fact (last-writer-wins leak). An empty description leaves the
+    prior entry for that revision intact; re-ingesting the same revision
+    replaces only its own entry.
+    """
+    seed = f"coalesce({var}.revision_facts, [])"
+    kept = f"[f IN {seed} WHERE f.revision_id <> ${id_param} | f]"
+    return (
+        f"CASE WHEN ${id_param} IS NULL OR ${desc_param} = '' THEN {seed} "
+        f"ELSE {kept} + [{{revision_id: ${id_param}, description: ${desc_param}}}] END"
+    )
+
+
+def _pick_scoped_fact(
+    canonical: str, facts: Optional[list], scope: Optional[set[str]]
+) -> str:
+    """The document-derived fact text owned by an in-scope revision.
+
+    ``facts`` is a KG row's ``revision_facts`` list of
+    ``{revision_id, description}`` maps. Without a scope (the v1 read) the
+    canonical description is returned unchanged. Under a scope only an entry
+    produced by an in-scope revision is eligible; a shared entity whose
+    canonical description was last written by another revision yields no text
+    instead of leaking it (fail closed).
+    """
+    if scope is None:
+        return canonical or ""
+    for fact in facts or []:
+        if not isinstance(fact, dict):
+            continue
+        if str(fact.get("revision_id") or "") in scope:
+            return fact.get("description") or ""
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Structural document splitter
 # ---------------------------------------------------------------------------
@@ -1776,6 +1817,7 @@ class LegalKGService:
                       n.document_ids = CASE WHEN $document_id IS NULL THEN [] ELSE [$document_id] END,
                       n.revision_id  = $revision_id,
                       n.revision_ids = CASE WHEN $revision_id IS NULL THEN [] ELSE [$revision_id] END,
+                      n.revision_facts = CASE WHEN $revision_id IS NULL THEN [] ELSE [{{revision_id: $revision_id, description: $description}}] END,
                       n.created_at   = datetime()
         ON MATCH SET  n.entity_type  = 'Document',
                       n.display_name = $display_name,
@@ -1783,6 +1825,7 @@ class LegalKGService:
                                             THEN $document_id ELSE n.document_id END,
                       n.document_ids = {_doc_ids_append("n", "document_id")},
                       n.revision_ids = {_list_prop_append("n", "revision_ids", "revision_id", "revision_id")},
+                      n.revision_facts = {_revision_facts_append("n", "revision_id", "description")},
                       n.description  = CASE WHEN $description <> '' THEN $description ELSE n.description END,
                       n.updated_at   = datetime()
         RETURN id(n) as node_id
@@ -1829,10 +1872,12 @@ class LegalKGService:
                       n.document_ids = CASE WHEN $document_id IS NULL THEN [] ELSE [$document_id] END,
                       n.revision_id  = $revision_id,
                       n.revision_ids = CASE WHEN $revision_id IS NULL THEN [] ELSE [$revision_id] END,
+                      n.revision_facts = CASE WHEN $revision_id IS NULL THEN [] ELSE [{{revision_id: $revision_id, description: $description}}] END,
                       n.created_at   = datetime()
         ON MATCH SET  n.description  = CASE WHEN $description <> '' THEN $description ELSE n.description END,
                       n.document_ids = {_doc_ids_append("n", "document_id")},
-                      n.revision_ids = {_list_prop_append("n", "revision_ids", "revision_id", "revision_id")}
+                      n.revision_ids = {_list_prop_append("n", "revision_ids", "revision_id", "revision_id")},
+                      n.revision_facts = {_revision_facts_append("n", "revision_id", "description")}
         """
         await session.run(
             cypher,
@@ -1886,9 +1931,11 @@ class LegalKGService:
         MATCH (b:`{label}` {{entity_id: $tgt}})
         MERGE (a)-[r:{relation_type}]->(b)
         ON CREATE SET r.document_ids = CASE WHEN $doc_id IS NULL THEN [] ELSE [$doc_id] END,
-                      r.revision_ids = CASE WHEN $revision_id IS NULL THEN [] ELSE [$revision_id] END
+                      r.revision_ids = CASE WHEN $revision_id IS NULL THEN [] ELSE [$revision_id] END,
+                      r.revision_facts = CASE WHEN $revision_id IS NULL THEN [] ELSE [{{revision_id: $revision_id, description: $desc}}] END
         ON MATCH SET  r.document_ids = {_doc_ids_append("r", "doc_id")},
-                      r.revision_ids = {_list_prop_append("r", "revision_ids", "revision_id", "revision_id")}
+                      r.revision_ids = {_list_prop_append("r", "revision_ids", "revision_id", "revision_id")},
+                      r.revision_facts = {_revision_facts_append("r", "revision_id", "desc")}
         SET r.description  = $desc,
             r.document_id  = $doc_id,
             r.revision_id  = $revision_id,
@@ -2189,9 +2236,12 @@ class LegalKGService:
         ``revision_ids`` scopes the read to those revisions' provenance: a
         document-derived fact/edge is returned only when the revision that
         produced it is in scope, so one revision's query can never leak a fact
-        that only another revision contains. Rows with no revision provenance
-        (legacy pre-Task-5 ingests) are excluded under a scope — fail closed,
-        never guess an owner.
+        that only another revision contains. Fact *text* is selected from the
+        row's per-revision ``revision_facts`` entry (:func:`_pick_scoped_fact`),
+        never the shared canonical description another revision may have
+        written last. Rows with no revision provenance (legacy pre-Task-5
+        ingests) are excluded under a scope — fail closed, never guess an
+        owner.
         """
         # Extract keywords from question
         tokens = re.split(r"[\s,\.;:!?]+", question.lower())
@@ -2227,6 +2277,8 @@ class LegalKGService:
         else:
             rel_scope = "true"
 
+        scope = {str(r) for r in revision_ids} if revision_ids else None
+
         cypher = f"""
         MATCH (n:`{label}`)
         WHERE ({where_clause}) {node_scope}
@@ -2237,8 +2289,10 @@ class LegalKGService:
             n.entity_id     AS entity_name,
             n.entity_type   AS entity_type,
             n.description   AS entity_desc,
+            n.revision_facts AS entity_facts,
             type(r)          AS rel_type,
             r.description    AS rel_desc,
+            r.revision_facts AS rel_facts,
             startNode(r).entity_id AS rel_src,
             endNode(r).entity_id   AS rel_tgt
         LIMIT {max_entities + max_relationships}
@@ -2257,7 +2311,11 @@ class LegalKGService:
                 if ename and ename not in entity_info:
                     entity_info[ename] = {
                         "entity_type": rec.get("entity_type", "Unknown"),
-                        "description": rec.get("entity_desc", ""),
+                        "description": _pick_scoped_fact(
+                            rec.get("entity_desc", ""),
+                            rec.get("entity_facts"),
+                            scope,
+                        ),
                     }
                 src, tgt = rec.get("rel_src"), rec.get("rel_tgt")
                 if src and tgt and len(rels) < max_relationships:
@@ -2265,7 +2323,11 @@ class LegalKGService:
                         "source": src,
                         "target": tgt,
                         "relation": rec.get("rel_type", ""),
-                        "description": rec.get("rel_desc", ""),
+                        "description": _pick_scoped_fact(
+                            rec.get("rel_desc", ""),
+                            rec.get("rel_facts"),
+                            scope,
+                        ),
                     })
         except Exception as e:
             logger.error(f"LegalKG context retrieval failed for workspace {self.workspace_id}: {e}")
