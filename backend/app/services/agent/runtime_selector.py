@@ -61,6 +61,22 @@ AgentGraphVersion = Literal["v1", "v2"]
 VALID_AGENT_GRAPH_VERSIONS: tuple[str, ...] = ("v1", "v2")
 DEFAULT_AGENT_GRAPH_VERSION: str = "v1"
 
+#: The capability set a v2 ingress grants when the caller supplies none
+#: (``build_v2_ingress(allowed_capabilities=None)``). Single owner of the
+#: default so the primary ingress and the shadow hook (R64) derive the same
+#: granted set instead of duplicating the literal.
+DEFAULT_V2_ALLOWED_CAPABILITIES: frozenset[str] = frozenset(
+    {
+        "people.lookup",
+        "document.search",
+        "document.read",
+        "section.read",
+        "knowledge_graph.query",
+        "memory.lookup",
+        "abbreviation.resolve",
+    }
+)
+
 
 def normalize_agent_version(value: Any) -> str:
     """Validate a graph-version selection; fail fast on anything but v1|v2."""
@@ -800,17 +816,7 @@ async def build_v2_ingress(
             allowed_capabilities=(
                 frozenset(allowed_capabilities)
                 if allowed_capabilities is not None
-                else frozenset(
-                    {
-                        "people.lookup",
-                        "document.search",
-                        "document.read",
-                        "section.read",
-                        "knowledge_graph.query",
-                        "memory.lookup",
-                        "abbreviation.resolve",
-                    }
-                )
+                else DEFAULT_V2_ALLOWED_CAPABILITIES
             ),
             deadline_at=datetime.now(timezone.utc)
             + timedelta(seconds=deadline_seconds),

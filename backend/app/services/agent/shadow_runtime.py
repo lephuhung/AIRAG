@@ -21,9 +21,11 @@ Global constraints honored here:
 - Factual shadow queries reach the SHARED ``TaskScheduler`` and the REAL
   ``people.lookup`` capability (built by the real
   ``build_v2_capability_registry``); document/section reads stay gated out
-  and fail closed to typed outcomes. Cancellation follows the primary run
-  (``asyncio`` cancellation propagates; :func:`_stop_shadow_task` joins
-  the shadow to a bounded completion).
+  and fail closed to typed outcomes. Authorization is NEVER hardcoded:
+  ``can_read_people`` and ``allowed_capabilities`` are required caller
+  inputs mirroring the primary turn (R64). Cancellation follows the
+  primary run (``asyncio`` cancellation propagates; :func:`_stop_shadow_task`
+  cancels twice and enforces a terminal state, R65).
 - Output is discarded except redacted metrics (:class:`ShadowMetrics` —
   status/route/evaluation/counts/timing only, never response content).
 - Exactly one ownership chain: the shadow graph is the same
@@ -36,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -44,6 +47,7 @@ from typing import Any, Mapping
 from uuid import UUID, uuid4
 
 from app.services.agents.supervisor_v2 import (
+    V1PeopleLookupService,
     V1ServiceBundle,
     build_v2_capability_registry,
     create_supervisor_v2_graph,
@@ -90,6 +94,7 @@ __all__ = [
     "ReadOnlySourceAdapter",
     "IsolatedShadowStores",
     "ShadowPeopleDirectory",
+    "ReadOnlyProductionPeopleSource",
     "ShadowSemanticAdapter",
     "ShadowBindingResolver",
     "ShadowEvidenceBuilder",
@@ -250,6 +255,7 @@ class ShadowMetrics:
     task_count: int
     isolated_writes: int
     duration_ms: int
+    reason: str | None = None
 
     def redacted(self) -> dict[str, Any]:
         return {
@@ -259,6 +265,7 @@ class ShadowMetrics:
             "task_count": self.task_count,
             "isolated_writes": self.isolated_writes,
             "duration_ms": self.duration_ms,
+            "reason": self.reason,
         }
 
 
@@ -285,6 +292,67 @@ class ShadowPeopleDirectory:
         return None
 
 
+class ReadOnlyProductionPeopleSource:
+    """The production people lookup service used in read-only mode (R64).
+
+    Wraps :class:`V1PeopleLookupService` and exposes ONLY ``lookup`` — the
+    service itself performs reads (Mongo) and offers no write method, and
+    the wrapper adds no surface beyond ``lookup``/``candidate_names``.
+    ``candidate_names`` is empty (the production service has no listing
+    API); name confirmation happens per-span through ``lookup``.
+    """
+
+    def __init__(self, service: Any | None = None) -> None:
+        self._service = (
+            service if service is not None else V1PeopleLookupService()
+        )
+
+    @property
+    def read_only(self) -> bool:
+        return True
+
+    def candidate_names(self) -> tuple[str, ...]:
+        return ()
+
+    async def lookup(self, query: str) -> Mapping[str, object] | None:
+        """Delegate one read to the production people lookup."""
+        result = self._service.lookup(str(query))
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
+
+
+#: Runs of 2+ uppercase-initial words (Vietnamese-aware): candidate
+#: person-name spans for read-confirmed extraction. Each word MUST start
+#: uppercase (remaining letters any case); a span becomes a person
+#: reference ONLY after the read-only people source confirms a record.
+_PERSON_SPAN_RE = re.compile(
+    r"(?:[A-ZÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚÝĂĐÊÔƠƯ]["
+    r"A-Za-zÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚÝĂĐÊÔƠƯ"
+    r"a-zàáâãèéêìíòóôõùúýăđêôơưạ-ỹ]*\s*){2,}"
+)
+
+#: Cap on spans confirmed per draft (bounds read-only lookup fan-out).
+_MAX_PERSON_SPANS = 5
+
+
+def _looks_like_name(span: str) -> bool:
+    """Keep spans with at least one Titlecase word (len >= 2).
+
+    Rejects pure-acronym runs (``CCCD``) and lone initials (``A B``) that
+    the span regex self-splits into two uppercase-initial words — they
+    would only waste a read-only lookup that cannot confirm a person.
+    """
+    for word in span.split():
+        if (
+            len(word) >= 2
+            and word[0].isupper()
+            and any(char.islower() for char in word[1:])
+        ):
+            return True
+    return False
+
+
 class ShadowSemanticAdapter:
     """Deterministic read-only semantic adapter that PRESERVES references.
 
@@ -302,11 +370,60 @@ class ShadowSemanticAdapter:
         person_names: tuple[str, ...] = (),
         known_documents: tuple[UUID, ...] = (),
         document_view: Mapping[Any, Mapping[str, Any]] | None = None,
+        people_source: Any | None = None,
     ) -> None:
         self._query = raw_query
         self._person_names = tuple(person_names)
         self._known_documents = tuple(known_documents)
         self._view = dict(document_view or {})
+        self._people_source = people_source
+
+    async def _confirmed_person_names(self) -> tuple[str, ...]:
+        """Person names confirmed read-only against the people source.
+
+        Explicit ``person_names`` (bundle-level/test input) win. Otherwise
+        the read-only source is consulted without any write: a directory
+        source contributes substring matches over its isolated snapshot; a
+        production source confirms capitalized spans via ``lookup`` (capped).
+        Unconfirmed spans never become references.
+        """
+        if self._person_names:
+            return self._person_names
+        source = self._people_source
+        if source is None:
+            return ()
+        lowered = self._query.strip().lower()
+        candidates = getattr(source, "candidate_names", None)
+        if callable(candidates):
+            try:
+                names = tuple(candidates()) or ()
+            except Exception:  # noqa: BLE001 — read-only best effort
+                names = ()
+            if names:
+                return tuple(
+                    name for name in names if name and name.lower() in lowered
+                )
+        lookup = getattr(source, "lookup", None)
+        if not callable(lookup):
+            return ()
+        confirmed: list[str] = []
+        seen: set[str] = set()
+        for match in _PERSON_SPAN_RE.findall(self._query):
+            span = " ".join(match.split())
+            if span in seen or not _looks_like_name(span):
+                continue
+            seen.add(span)
+            if len(confirmed) >= _MAX_PERSON_SPANS:
+                break
+            try:
+                record = lookup(span)
+                if asyncio.iscoroutine(record):
+                    record = await record
+            except Exception:  # noqa: BLE001 — read miss, skip span
+                continue
+            if isinstance(record, Mapping) and record.get("name"):
+                confirmed.append(str(record["name"]))
+        return tuple(confirmed)
 
     def _document_ref(
         self, index: int, document_id: UUID
@@ -344,6 +461,7 @@ class ShadowSemanticAdapter:
         self, request: RequestContext, conversation: ConversationContext
     ) -> SemanticDraft:
         normalized = self._query.strip()
+        person_names = await self._confirmed_person_names()
         return SemanticDraft(
             provisional_contextualized_query=normalized.lower(),
             abbreviations=(),
@@ -354,7 +472,7 @@ class ShadowSemanticAdapter:
             ),
             person_refs=tuple(
                 EntityReference(ref_id=f"p{index}", kind="person", label=name)
-                for index, name in enumerate(self._person_names)
+                for index, name in enumerate(person_names)
             ),
             section_refs=(),
             preliminary_ambiguities=(),
@@ -691,10 +809,13 @@ def build_shadow_bundle(
     thread_id: str,
     user_id: UUID | None = None,
     workspace_ids: tuple[UUID, ...] = (),
+    can_read_people: bool,
+    allowed_capabilities: frozenset[str],
     person_names: tuple[str, ...] = (),
     known_documents: tuple[UUID, ...] = (),
     document_view: Mapping[Any, Mapping[str, Any]] | None = None,
     people_directory: Mapping[str, Mapping[str, object]] | None = None,
+    people_source: Any | None = None,
     history: tuple[tuple[str, str], ...] = (),
     deadline_seconds: float = 120.0,
 ) -> ShadowBundle:
@@ -716,18 +837,28 @@ def build_shadow_bundle(
     Document/section reads stay gated out and fail closed to typed
     outcomes. ``person_names``/``known_documents``/``history`` preserve the
     primary turn's references read-only instead of stripping them.
+    ``can_read_people`` and ``allowed_capabilities`` are REQUIRED caller
+    inputs mirroring the primary turn's runtime authorization (R64) — the
+    shadow never hardcodes them. ``people_source`` defaults to the
+    production people lookup wrapped read-only; an isolated directory
+    (bundle-level/test input) takes precedence when supplied.
     """
     saver = create_shadow_checkpointer()
     assert is_shadow_saver(saver)
     namespace = f"shadow-{uuid4().hex[:12]}"
     stores = IsolatedShadowStores()
     view = dict(document_view or {})
+    if people_source is None and people_directory is None:
+        people_source = ReadOnlyProductionPeopleSource()
     directory = ShadowPeopleDirectory(dict(people_directory or {}))
     semantic_adapter = ShadowSemanticAdapter(
         raw_query,
         person_names=tuple(person_names),
         known_documents=tuple(known_documents),
         document_view=view,
+        people_source=(
+            directory if people_directory is not None else people_source
+        ),
     )
     binding_resolver = ShadowBindingResolver(view)
     evidence_builder = ShadowEvidenceBuilder(stores)
@@ -745,20 +876,23 @@ def build_shadow_bundle(
         run_id=f"shadow-run-{uuid4().hex[:12]}",
         user_id=user_id or UUID("00000000-0000-0000-0000-000000000000"),
         workspace_ids=tuple(workspace_ids),
-        can_read_people=True,
-        # Route-admitting but dispatch-denying by design: document/section
-        # queries take the fast_domain topology (plan + shared scheduler +
-        # typed outcome) while only people.lookup is registry-backed, so
-        # document/section dispatch fails closed to DEPENDENCY_UNAVAILABLE.
-        allowed_capabilities=frozenset(
-            {"people.lookup", "document.read", "section.read"}
-        ),
+        # Mirrored from the primary turn by the caller (R64): the shadow
+        # never decides authorization itself.
+        can_read_people=bool(can_read_people),
+        allowed_capabilities=frozenset(allowed_capabilities),
         deadline_at=datetime.now(UTC) + timedelta(seconds=deadline_seconds),
+    )
+    # The capability backing mirrors the adapter's source choice so the
+    # confirmed reference and the dispatched lookup read the same source.
+    # Document/section reads stay registry-gated and fail closed to typed
+    # DEPENDENCY_UNAVAILABLE outcomes.
+    people_backing = (
+        directory if people_directory is not None else people_source
     )
     registry = build_v2_capability_registry(
         capability_runtime,
         bundle=V1ServiceBundle(
-            people_lookup=directory,
+            people_lookup=people_backing,
             evidence=evidence_builder,
         ),
         evidence=evidence_builder,
@@ -836,18 +970,34 @@ def build_shadow_bundle(
 
 
 async def _stop_shadow_task(task: asyncio.Task, *, timeout: float = 5.0) -> bool:
-    """Cancel (if pending) and join a shadow task to a bounded completion.
+    """Cancel and join a shadow task, enforcing a terminal state (R65).
 
-    Returns True when the task reached a terminal state within ``timeout``.
-    Swallows every outcome — callers use this in ``finally`` paths where
-    the primary turn's cleanup must proceed regardless. Cancellation of the
-    primary run therefore always stops its shadow before cleanup proceeds.
+    First cancel is delivered, then the task is awaited WITHOUT a shield
+    (a shielded wait only times out the waiter while the shadow keeps
+    running). On timeout the task is cancelled AGAIN and awaited until it
+    reaches a terminal state — a shadow that survives a double cancel via
+    shielding is pathological and documented, not silently abandoned.
+    Returns True only when the task is done. Every outcome is swallowed so
+    callers can use this in ``finally`` paths; callers MUST still act on a
+    False return (fail the shadow closed and log) before proceeding.
     """
+    if task.done():
+        return True
+    task.cancel()
+    try:
+        await asyncio.wait_for(task, timeout=timeout)
+        return True
+    except TimeoutError:
+        pass
+    except (asyncio.CancelledError, Exception):
+        return True
+    # The shadow resisted the first cancel: cancel again and enforce the
+    # terminal state instead of returning a live task.
     if not task.done():
         task.cancel()
     try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
-    except (asyncio.CancelledError, TimeoutError, Exception):
+        await task
+    except (asyncio.CancelledError, Exception):
         pass
     return task.done()
 

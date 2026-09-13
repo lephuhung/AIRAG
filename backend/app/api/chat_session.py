@@ -676,6 +676,95 @@ async def _session_v2_run(
             raise
 
 
+async def _latest_active_revision_id(db, document_id):
+    """Latest active revision row for a pointer-less document (read-only).
+
+    Production binding raises ``RevisionNotReady`` when the
+    ``current_revision_id`` pointer is unset; the shadow instead pins the
+    latest ACTIVE revision record so the topology is still exercised. The
+    pinned id is always a real revision record — never fabricated — and
+    the divergence is recorded in the fix report.
+    """
+    from sqlalchemy import select
+
+    from app.models.document_revision import DocumentRevision
+
+    return await db.scalar(
+        select(DocumentRevision.revision_id)
+        .where(
+            DocumentRevision.document_id == document_id,
+            DocumentRevision.status == "active",
+            DocumentRevision.failed_at.is_(None),
+        )
+        .order_by(DocumentRevision.created_at.desc())
+        .limit(1)
+    )
+
+
+async def resolve_shadow_document_view(
+    *,
+    document_ids,
+    workspace_ids,
+    session_factory=None,
+) -> dict:
+    """Resolve a READ-ONLY document view for the shadow run (R64).
+
+    Reuses the production revision-identity boundary
+    (``document_views.load_current_revision_identity``) per accessible
+    document id, falling back to the latest ACTIVE revision record when
+    the legacy pointer is unset. Workspace scope is enforced up front by
+    the ``documents`` filter. No object is mutated, nothing is committed,
+    and the session closes on every path — production READs, which the
+    shadow's read-only contract allows. Documents with no resolvable
+    revision stay out of the view (their refs clarify — typed, never
+    guessed). Failures propagate so the caller records a typed
+    dependency-gap outcome instead of running on an empty view.
+    """
+    from sqlalchemy import select
+
+    from app.models.document import Document
+    from app.services.agents.v2.persistence import document_views
+
+    if session_factory is None:
+        from app.core.database import async_session_maker
+
+        session_factory = async_session_maker
+    wanted = [d for d in (document_ids or ())]
+    scope = [w for w in (workspace_ids or ())]
+    if not wanted or not scope:
+        return {}
+    view: dict = {}
+    async with session_factory() as db:
+        rows = (
+            await db.execute(
+                select(Document.id, Document.workspace_id).where(
+                    Document.id.in_(wanted),
+                    Document.workspace_id.in_(scope),
+                )
+            )
+        ).all()
+        for document_id, workspace_id in rows:
+            try:
+                identity = await document_views.load_current_revision_identity(
+                    db, document_id
+                )
+            except document_views.RevisionNotReady:
+                continue
+            revision_id = (
+                identity.revision_id
+                if identity is not None
+                else await _latest_active_revision_id(db, document_id)
+            )
+            if revision_id is None:
+                continue
+            view[document_id] = {
+                "revision": str(revision_id),
+                "role": "target",
+                "workspace_id": workspace_id,
+            }
+    return view
+
+
 def _maybe_launch_shadow_turn(
     *,
     raw_message: str,
@@ -684,18 +773,25 @@ def _maybe_launch_shadow_turn(
     workspace_ids,
     document_ids=(),
     history=(),
+    can_read_people=False,
+    allowed_capabilities=None,
+    on_metrics=None,
+    session_factory=None,
 ) -> "asyncio.Task | None":
     """Launch a best-effort shadow v2 turn alongside the primary run.
 
     Returns the shadow task when this turn is sampled (shadow enabled +
     percent gate hit), else ``None``. The shadow replays the raw message
-    — with the SAME filtered document ids and conversation history the
-    primary used, preserved read-only — through its OWN isolated
-    graph/saver: it never writes production state and never emits outbound
-    events — only redacted metrics are logged. Any failure (including
-    sampling disabled) returns ``None`` so the primary turn is never
+    — with the SAME filtered document ids (resolved read-only into an
+    isolated view), conversation history, and runtime authorization
+    (``can_read_people``/``allowed_capabilities`` mirrored from the
+    primary, never hardcoded) — through its OWN isolated graph/saver: it
+    never writes production state and never emits outbound events — only
+    redacted metrics are logged (and handed to ``on_metrics`` when given).
+    Any sampling failure returns ``None`` so the primary turn is never
     affected. Cancellation follows the primary run: the caller joins the
-    task via ``_stop_shadow_task`` in its ``finally``.
+    task via ``_stop_shadow_task`` in its ``finally`` and MUST act on a
+    False return before proceeding with primary cleanup.
     """
     try:
         from app.core.config import settings
@@ -705,10 +801,7 @@ def _maybe_launch_shadow_turn(
         percent = float(
             getattr(settings, "NEXUSRAG_AGENT_V2_SHADOW_PERCENT", 0) or 0
         )
-        from app.services.agent.shadow_runtime import (
-            build_shadow_bundle,
-            should_run_shadow,
-        )
+        from app.services.agent.shadow_runtime import should_run_shadow
         import random as _random
 
         if not should_run_shadow(percent=percent, sample=_random.uniform(0, 100)):
@@ -718,17 +811,51 @@ def _maybe_launch_shadow_turn(
         return None
 
     async def _run_shadow_best_effort() -> None:
+        from app.services.agent.shadow_runtime import (
+            ShadowMetrics,
+            build_shadow_bundle,
+        )
+
+        def _report(metrics: ShadowMetrics) -> None:
+            logger.info("[shadow] turn complete: %s", metrics.redacted())
+            if callable(on_metrics):
+                try:
+                    on_metrics(metrics.redacted())
+                except Exception:  # noqa: BLE001 — observer must not break
+                    logger.warning("[shadow] on_metrics observer failed", exc_info=True)
+
         try:
+            try:
+                document_view = await resolve_shadow_document_view(
+                    document_ids=tuple(document_ids or ()),
+                    workspace_ids=tuple(workspace_ids or ()),
+                    session_factory=session_factory,
+                )
+            except Exception as exc:  # noqa: BLE001 — typed gap, R64.3
+                _report(
+                    ShadowMetrics(
+                        status="unavailable",
+                        route=None,
+                        evaluation=None,
+                        task_count=0,
+                        isolated_writes=0,
+                        duration_ms=0,
+                        reason=f"dependency-gap: document view unreadable: {exc}",
+                    )
+                )
+                return
             bundle = build_shadow_bundle(
                 raw_query=raw_message,
                 thread_id=thread_id,
                 user_id=user_id,
                 workspace_ids=tuple(workspace_ids or ()),
+                can_read_people=bool(can_read_people),
+                allowed_capabilities=frozenset(allowed_capabilities or ()),
                 known_documents=tuple(document_ids or ()),
+                document_view=document_view,
                 history=tuple(history or ()),
             )
-            metrics = await bundle.run()
-            logger.info("[shadow] turn complete: %s", metrics.redacted())
+            _report(await bundle.run())
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — best-effort by contract
@@ -1276,6 +1403,13 @@ async def chat_stream_session(
                 # ids and conversation history (preserved read-only).
                 # Cancellation follows the primary via the join below.
                 # Best-effort — a shadow failure never affects the primary.
+                # Shadow authorization mirrors the primary turn (R64):
+                # the same people flag and the same granted capability set
+                # the v2 ingress would receive — never shadow hardcoded.
+                from app.services.agent.runtime_selector import (
+                    DEFAULT_V2_ALLOWED_CAPABILITIES,
+                )
+
                 shadow_task = _maybe_launch_shadow_turn(
                     raw_message=request.message,
                     thread_id=session_id,
@@ -1285,6 +1419,8 @@ async def chat_stream_session(
                     history=tuple(
                         (item["role"], item["content"]) for item in history
                     ),
+                    can_read_people=bool(user.is_superadmin),
+                    allowed_capabilities=DEFAULT_V2_ALLOWED_CAPABILITIES,
                 )
                 try:
                     if version == "v2":
@@ -1308,15 +1444,25 @@ async def chat_stream_session(
                         await _drain(stream_agent_to_sse(graph, initial_state))
                 finally:
                     # Cancellation follows the primary run: the shadow is
-                    # cancelled (if pending) AND joined to a bounded
-                    # completion, so a stopped or finished primary never
-                    # leaves a shadow running past its own cleanup.
+                    # cancelled (if pending) AND joined to a terminal state
+                    # (R65). A False return means the shadow survived a
+                    # double cancel — fail it closed with an error log
+                    # BEFORE primary cleanup proceeds.
                     if shadow_task is not None:
                         from app.services.agent.shadow_runtime import (
                             _stop_shadow_task,
                         )
 
-                        await _stop_shadow_task(shadow_task, timeout=5.0)
+                        stopped = await _stop_shadow_task(
+                            shadow_task, timeout=5.0
+                        )
+                        if not stopped:
+                            logger.error(
+                                "[shadow] session=%s failed to reach a "
+                                "terminal state; failing closed — primary "
+                                "cleanup proceeds without shadow output",
+                                session_id,
+                            )
 
             # Generate the title now (first exchange) and push it immediately so
             # the client updates without a refresh; reuse the summary downstream.
