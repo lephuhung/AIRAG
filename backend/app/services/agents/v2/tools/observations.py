@@ -101,6 +101,44 @@ class ObservationProjectionUnavailable(ValueError):
     """No typed projector exists for a result kind; failing closed, never generic."""
 
 
+#: Raw People fields that must never appear in any planner observation.
+#: The governed scalar is materialized server-side; the planner sees only
+#: the ``dependency_scalar_available`` availability flag. Any leak of these
+#: tokens (scalar value included) fails the projection closed.
+RAW_PEOPLE_FIELD_TOKENS: tuple[str, ...] = (
+    "cccd",
+    "national_id",
+    "citizen_id",
+    "dob",
+    "birth",
+    "address",
+    "phone",
+    "email",
+    "personnel",
+    "health",
+    "religion",
+    "ethnicity",
+    "biometric",
+)
+
+
+def assert_no_raw_people_fields(observation: AgentToolObservation) -> None:
+    """Executable minimization invariant: no raw People field is observable.
+
+    Inspects the serialized observation for the governed scalar value and
+    every raw People field token. A match raises
+    ``ObservationProjectionUnavailable`` instead of exposing the field to the
+    planner.
+    """
+    dumped = observation.model_dump_json().lower()
+    for token in RAW_PEOPLE_FIELD_TOKENS:
+        if token in dumped:
+            raise ObservationProjectionUnavailable(
+                f"planner observation exposes raw People field {token!r}; "
+                "refusing to leak governed People data"
+            )
+
+
 class ObservationProjector:
     """Projects persisted capability results into minimized typed observations."""
 
@@ -151,7 +189,7 @@ class ObservationProjector:
             raise ObservationProjectionUnavailable(
                 f"no model observation projector for result kind {data.kind!r}"
             )
-        return AgentToolObservation(
+        observation = AgentToolObservation(
             task_id=result.task_id,
             status=result.status,
             evidence_use_ids=evidence_use_ids,
@@ -159,6 +197,13 @@ class ObservationProjector:
             result_kind=data.kind,
             projection=projection,
         )
+        # People→Document invariant: the scalar and every raw People field
+        # stay server-side; the planner sees the availability flag only.
+        # (Scoped to the People projection: other projections carry opaque
+        # UUIDs whose hex may coincidentally contain a short token.)
+        if isinstance(projection, PeopleLookupObservation):
+            assert_no_raw_people_fields(observation)
+        return observation
 
 
 # The embedded discriminated-union alias resolves explicitly (contracts §3 rule).

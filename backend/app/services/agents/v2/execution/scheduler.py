@@ -63,6 +63,7 @@ __all__ = [
     "DispatchReport",
     "SchedulerError",
     "TaskScheduler",
+    "assert_scheduler_input_passthrough",
     "execute_ready_tasks",
     "refresh_pairs_for_checkpoint",
     "shared_scheduler_for",
@@ -360,6 +361,33 @@ def refresh_pairs_for_checkpoint(
     return tuple(pairs)
 
 
+def assert_scheduler_input_passthrough(task: TaskSpec, request: AgentRequest) -> None:
+    """Executable People→Document invariant: the scheduler never rewrites input.
+
+    The deterministic dependency materializer builds the concrete
+    ``TaskSpec.input`` BEFORE the dependent task is appended/checkpointed, so
+    by dispatch time the input is final. The scheduler executes it exactly as
+    checkpointed: no mutation, no lazy materialization, no second scalar
+    source. Any drift between the checkpointed task and the dispatch request
+    fails closed instead of dispatching a rewritten input.
+    """
+    if request.task_id != task.task_id:
+        raise SchedulerError(
+            f"dispatch request targets task {request.task_id!r}, expected "
+            f"checkpointed task {task.task_id!r}; refusing a rewritten dispatch"
+        )
+    if request.input != task.input:
+        raise SchedulerError(
+            f"dispatch request input drifted from checkpointed task "
+            f"{task.task_id!r}; the scheduler never rewrites a task input"
+        )
+    if request.objective != task.task_objective:
+        raise SchedulerError(
+            f"dispatch request objective drifted from checkpointed task "
+            f"{task.task_id!r}; the scheduler never rewrites a task input"
+        )
+
+
 async def _dispatch_one(
     task: TaskSpec,
     *,
@@ -392,6 +420,9 @@ async def _dispatch_one(
         objective=task.task_objective,
         input=task.input,
     )
+    # People→Document invariant: the concrete input was materialized BEFORE
+    # this task was checkpointed, so it travels to the capability verbatim.
+    assert_scheduler_input_passthrough(task, request)
     return await asyncio.wait_for(
         capability.execute(request, runtime.capability_runtime),
         timeout=_seconds_until_deadline(runtime),

@@ -66,6 +66,11 @@ from .contracts.routing import QueryAnalysis
 from .contracts.semantic import SemanticContext
 from .contracts.state import GraphRuntimeContext, SupervisorV2State
 from .contracts.validation import ContractValidationError, validate_task_plan
+from .dependencies.people_document import (
+    MaterializationError,
+    append_materialized_dependent,
+    materialize_person_dependency,
+)
 from .execution.scheduler import refresh_pairs_for_checkpoint, shared_scheduler_for
 from .nodes.context import node_context
 from .nodes.evaluate import evaluate_evidence
@@ -93,6 +98,7 @@ __all__ = [
     "make_complex_boundary_node",
     "merge_complex_result_into_supervisor",
     "normalize_complex_state",
+    "people_document_materialize_node",
     "plan_node",
     "require_query_analysis",
     "validate_checkpoint_node",
@@ -578,6 +584,98 @@ async def complex_execute_node(
     return {"task_results": report.results}
 
 
+async def people_document_materialize_node(
+    state: ComplexResearchState,
+    runtime: "Runtime[GraphRuntimeContext]",
+) -> dict:
+    """Deterministic People→Document materialization (R23, Phase 3 Task 4).
+
+    Runs BETWEEN the T1 execute result and the append/validate/checkpoint of
+    T2::
+
+        T1 people.lookup result (checkpointed by the execute node)
+        -> governed hydration under current ACL/expiry (no connector call)
+        -> exact approved scalar -> concrete DocumentSearchInput
+        -> append T2 TaskSpec(input=<concrete input>)
+        -> validate_replan -> retention-lease commit -> checkpoint T2
+        -> TaskScheduler dispatches T2 unchanged (next execute pass)
+
+    This is a deterministic node, not a planner replan: it consumes no
+    planner replan budget and proposes no open discovery. The narrow
+    dependency-scoped policy authorizes exactly this governed dependent. Any
+    non-materializable outcome (``not_found``/denied/timeout/error, expired
+    or unauthorized use, missing/conflicting scalar) returns ``{}``: no T2
+    is appended and nothing is fabricated. Dormant (``{}``) when the plan
+    has no unanswered successful ``people.lookup``.
+    """
+    context = node_context(runtime)
+    state = normalize_complex_state(state)
+    plan = state.get("plan")
+    bindings = state.get("bindings")
+    if plan is None or bindings is None:
+        return {}
+    results = tuple(state.get("task_results", ()))
+    result_by_task = {result.task_id: result for result in results}
+    for task in plan.tasks:
+        if task.capability != "people.lookup":
+            continue
+        people_result = result_by_task.get(task.task_id)
+        if people_result is None:
+            continue
+        if any(
+            dependent.capability == "document.search"
+            and task.task_id in dependent.depends_on
+            for dependent in plan.tasks
+        ):
+            continue
+        try:
+            outcome = await materialize_person_dependency(
+                people_task_id=task.task_id,
+                people_result=people_result,
+                runtime=context,
+                plan=plan,
+                bindings=bindings,
+                query=plan.goal,
+            )
+        except MaterializationError:
+            return {}
+        if outcome.kind != "materialized":
+            return {}
+        taken = {existing.task_id for existing in plan.tasks}
+        index = len(plan.tasks) + 1
+        while f"T{index}" in taken:
+            index += 1
+        limits = V2ResearchLimits.from_settings()
+        try:
+            proposed = append_materialized_dependent(
+                current=plan,
+                outcomes=build_task_execution_summaries(results),
+                outcome=outcome,
+                query=plan.goal,
+                next_task_id=f"T{index}",
+                policy=DiscoveryPolicy(
+                    allow_reference_discovery=False,
+                    allow_supporting_discovery=True,
+                    max_discovered_documents=1,
+                ),
+                budget=ResearchBudgetView(
+                    max_tasks_remaining=max(0, limits.max_tasks - len(plan.tasks)),
+                    max_replans_remaining=1,
+                    max_parallel_branches=limits.max_parallel_branches,
+                ),
+            )
+        except (MaterializationError, ContractValidationError):
+            return {}
+        await _lease_pinned_state(
+            plan=proposed,
+            bindings=bindings,
+            results=results,
+            runtime=context,
+        )
+        return {"plan": proposed}
+    return {}
+
+
 async def complex_evaluate_node(
     state: ComplexResearchState,
     runtime: "Runtime[GraphRuntimeContext]",
@@ -666,7 +764,8 @@ def _add_complex_edges(graph: StateGraph) -> None:
     graph.set_entry_point("plan")
     graph.add_edge("plan", "validate_checkpoint")
     graph.add_edge("validate_checkpoint", "execute")
-    graph.add_edge("execute", "evaluate")
+    graph.add_edge("execute", "materialize")
+    graph.add_edge("materialize", "evaluate")
     graph.add_edge("evaluate", "decide")
     graph.add_conditional_edges("decide", _decide_branch, {"finalize": "finalize"})
     graph.add_edge("finalize", END)
@@ -684,6 +783,7 @@ def build_complex_research_subgraph() -> Any:
     graph.add_node("plan", plan_node)
     graph.add_node("validate_checkpoint", validate_checkpoint_node)
     graph.add_node("execute", complex_execute_node)
+    graph.add_node("materialize", people_document_materialize_node)
     graph.add_node("evaluate", complex_evaluate_node)
     graph.add_node("decide", decide_node)
     graph.add_node("finalize", finalize_node)
