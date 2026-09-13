@@ -2,7 +2,7 @@
 
 The R2 amendment changes the Release 1A shape (new ``published_at`` /
 ``superseded_by`` / artifact columns + a re-keyed attempt arbiter) under
-the **same** ``V2_SCHEMA_VERSION = 2``. Because the DDL uses
+the current ``V2_SCHEMA_VERSION``. Because the DDL uses
 ``CREATE TABLE IF NOT EXISTS`` and ``apply_v2_schema`` short-circuits on
 the version row, a database that applied the pre-R2 schema is never
 upgraded in place — it would keep the stale shape while the version row
@@ -23,7 +23,7 @@ import psycopg
 import pytest
 
 from app.services.agents.v2.persistence.migrate import (
-    V2_SCHEMA_V1_TABLES,
+    V2_SCHEMA_V3_TABLES,
     apply_v2_schema,
     make_engine,
 )
@@ -50,7 +50,8 @@ def _drop_v2_state() -> None:
     with psycopg.connect(V2_DSN, autocommit=False) as conn:
         with conn.cursor() as cur:
             # v2 tables first — CASCADE removes FKs pointing at them.
-            for tbl in V2_SCHEMA_V1_TABLES:
+            # Task 7A: the v3 set (V1 + rollout) so no residue survives.
+            for tbl in V2_SCHEMA_V3_TABLES:
                 cur.execute(f'DROP TABLE IF EXISTS "{tbl}" CASCADE')
             for trigger, table in (
                 ("trg_documents_revision_id_stable", "documents"),

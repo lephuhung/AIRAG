@@ -137,11 +137,13 @@ grow ``pg_relation_size``) but never raises.
 
 Module layout::
 
-    V2_SCHEMA_VERSION = 2
+    V2_SCHEMA_VERSION = 3
     V2_SCHEMA_V1_TABLES = frozenset({...})  # the 12 tables of Release 1A
+    V2_ROLLOUT_TABLES = frozenset({...})  # the 2 Task 7A rollout tables
+    V2_SCHEMA_V3_TABLES = V2_SCHEMA_V1_TABLES | V2_ROLLOUT_TABLES
     SchemaCheck = dataclass(frozen=True)
     check_v2_schema(engine) -> SchemaCheck
-    apply_v2_schema(engine) -> None  # fresh create, or 1 -> 2 upgrade
+    apply_v2_schema(engine) -> None  # fresh create, or stepwise 1 -> 2 -> 3
     main()  # CLI entrypoint
 """
 
@@ -159,14 +161,20 @@ from sqlalchemy.engine import Engine
 # Public constants
 # ---------------------------------------------------------------------------
 
-V2_SCHEMA_VERSION: int = 2
+V2_SCHEMA_VERSION: int = 3
 # Version history: 1 = Release 1A foundation (lease revision_id NOT NULL);
 # 2 = T3 evidence-only leases (revision_retention_leases.revision_id nullable
 # via the idempotent _LEASE_EVIDENCE_ONLY_ALTER upgrade step). Fresh creates
 # land directly on 2.
+# 3 = Task 7A rollout control (agent_rollout_control + agent_rollout_metrics
+# via the idempotent _ROLLOUT_DDL upgrade step, plus the seeded disabled
+# control row). Fresh creates land directly on 3. Upgrades are stepwise
+# (1 -> 2 -> 3) so a database at any older recorded version converges.
 
-# The exact 12 tables created by Release 1A. Order is preserved for documentation;
-# creation order is enforced separately to honour FK dependencies.
+# The exact 12 tables created by Release 1A. Frozen: Task 7A adds the
+# rollout tables as a separate V2_ROLLOUT_TABLES set, never by editing this.
+# Order is preserved for documentation; creation order is enforced
+# separately to honour FK dependencies.
 V2_SCHEMA_V1_TABLES: frozenset[str] = frozenset(
     {
         "v2_schema_version",
@@ -183,6 +191,19 @@ V2_SCHEMA_V1_TABLES: frozenset[str] = frozenset(
         "evidence_uses",
     }
 )
+
+# Task 7A (R7): the two rollout-control tables. ``V2_SCHEMA_V3_TABLES`` is
+# the version-aware expected set for a version-3 database
+# (V1 tables + rollout tables); ``check_v2_schema`` uses it so the new
+# tables are never reported as ``extra``.
+V2_ROLLOUT_TABLES: frozenset[str] = frozenset(
+    {
+        "agent_rollout_control",
+        "agent_rollout_metrics",
+    }
+)
+
+V2_SCHEMA_V3_TABLES: frozenset[str] = V2_SCHEMA_V1_TABLES | V2_ROLLOUT_TABLES
 
 # Advisory-lock key for the v2 migration. A unique stable bigint avoids
 # colliding with any other advisory-lock user in the database.
@@ -544,6 +565,57 @@ _LEASE_EVIDENCE_ONLY_ALTER: tuple[str, ...] = (
 )
 
 
+# Task 7A (R7 + R69 interface contract): rollout-control tables. T7A owns
+# this column set; T7B maps it — do not deviate without a ledger entry.
+# Extra nullable columns are allowed; these are the minimum T7B will map.
+_ROLLOUT_DDL: tuple[str, ...] = (
+    # agent_rollout_control — one seeded row (id = 1), disabled by default.
+    """
+    CREATE TABLE IF NOT EXISTS agent_rollout_control (
+        id                INTEGER     PRIMARY KEY,
+        enabled           BOOLEAN     NOT NULL DEFAULT false,
+        shadow_percent    INTEGER     NOT NULL DEFAULT 0,
+        canary_percent    INTEGER     NOT NULL DEFAULT 0,
+        canary_workspaces JSONB       NOT NULL DEFAULT '[]'::jsonb,
+        kill_switch       BOOLEAN     NOT NULL DEFAULT false,
+        updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_by        TEXT        NULL,
+        version           INTEGER     NOT NULL DEFAULT 1
+    )
+    """,
+    # agent_rollout_metrics — append-only (inserts only, no update path,
+    # no dedup arbiter: two identical metric rows are two facts).
+    """
+    CREATE TABLE IF NOT EXISTS agent_rollout_metrics (
+        id                                  BIGSERIAL   PRIMARY KEY,
+        arm                                 TEXT        NOT NULL
+            CHECK (arm IN ('v1', 'v2', 'shadow')),
+        request_id_hash                     TEXT        NOT NULL,
+        workspace_id_hash                   TEXT        NULL,
+        started_at                          TIMESTAMPTZ NOT NULL,
+        finished_at                         TIMESTAMPTZ NULL,
+        duration_ms                         INTEGER     NULL,
+        terminal_status                     TEXT        NOT NULL,
+        citation_count                      INTEGER     NOT NULL DEFAULT 0,
+        cancelled                           BOOLEAN     NOT NULL DEFAULT false,
+        security_checkpoint_secret          BOOLEAN     NOT NULL DEFAULT false,
+        security_ungrounded_factual_success BOOLEAN     NOT NULL DEFAULT false,
+        security_acl_leak                   BOOLEAN     NOT NULL DEFAULT false,
+        security_duplicate_production_write BOOLEAN     NOT NULL DEFAULT false,
+        created_at                          TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+)
+
+# The seeded disabled control row. Idempotent: ON CONFLICT DO NOTHING so a
+# re-run (or a fresh create racing the 2 -> 3 upgrade) never duplicates it
+# and never overwrites an operator-tuned row.
+_ROLLOUT_SEED: str = (
+    "INSERT INTO agent_rollout_control (id) VALUES (1) "
+    "ON CONFLICT (id) DO NOTHING"
+)
+
+
 _NULLABILITY_INDEXES: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS ix_documents_source_deleted_at "
     "ON documents(source_deleted_at) WHERE source_deleted_at IS NOT NULL",
@@ -820,6 +892,39 @@ _EXPECTED_SHAPE_COLUMNS: dict[str, frozenset[str]] = {
         }
     ),
     "evidence_uses": frozenset({"run_id", "purpose", "target_id"}),
+    # Task 7A: a database that recorded version 2 (or an interrupted 2 -> 3
+    # upgrade that left the version row behind) without the rollout tables
+    # fails closed instead of reporting clean.
+    "agent_rollout_control": frozenset(
+        {
+            "enabled",
+            "shadow_percent",
+            "canary_percent",
+            "canary_workspaces",
+            "kill_switch",
+            "updated_at",
+            "updated_by",
+            "version",
+        }
+    ),
+    "agent_rollout_metrics": frozenset(
+        {
+            "arm",
+            "request_id_hash",
+            "workspace_id_hash",
+            "started_at",
+            "finished_at",
+            "duration_ms",
+            "terminal_status",
+            "citation_count",
+            "cancelled",
+            "security_checkpoint_secret",
+            "security_ungrounded_factual_success",
+            "security_acl_leak",
+            "security_duplicate_production_write",
+            "created_at",
+        }
+    ),
 }
 
 #: The R1 arbiter must be the full canonical identity, not decomposed keys.
@@ -930,7 +1035,39 @@ def _shape_errors(conn) -> frozenset[str]:
             "revision_retention_leases.revision_id must be nullable for "
             "evidence-only leases (pre-C1 schema: run migrate apply to upgrade)"
         )
+    # Task 7A: the metrics arm domain CHECK must exist. Column presence
+    # alone would accept a table that stores arbitrary arm values, which
+    # T7B's rollout mapping must not silently accept.
+    metrics_present = conn.execute(
+        text("SELECT to_regclass('public.agent_rollout_metrics') IS NOT NULL")
+    ).fetchone()
+    if metrics_present and metrics_present[0]:
+        arm_check = conn.execute(
+            text(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conrelid = 'public.agent_rollout_metrics'::regclass "
+                "AND contype = 'c'"
+            )
+        ).fetchall()
+        arm_defs = [str(r[0]) for r in arm_check]
+        if not any(
+            "'v1'" in definition
+            and "'v2'" in definition
+            and "'shadow'" in definition
+            for definition in arm_defs
+        ):
+            errors.add(
+                "agent_rollout_metrics: missing CHECK (arm IN "
+                f"('v1', 'v2', 'shadow')): {sorted(arm_defs)}"
+            )
     return frozenset(errors)
+
+
+def _expected_tables(version: int) -> frozenset[str]:
+    """Version-aware expected-table set (R7)."""
+    if version >= 3:
+        return V2_SCHEMA_V3_TABLES
+    return V2_SCHEMA_V1_TABLES
 
 
 def check_v2_schema(engine: Engine) -> SchemaCheck:
@@ -945,14 +1082,14 @@ def check_v2_schema(engine: Engine) -> SchemaCheck:
             return SchemaCheck(
                 applied=False,
                 version=None,
-                missing_tables=V2_SCHEMA_V1_TABLES,
+                missing_tables=V2_SCHEMA_V3_TABLES,
                 extra_tables=frozenset(),
             )
         version_row = recorded
         tables = _table_names(conn)
-        missing = V2_SCHEMA_V1_TABLES - tables
+        missing = _expected_tables(version_row) - tables
         shape_errors = _shape_errors(conn)
-        extra = tables - V2_SCHEMA_V1_TABLES - {
+        extra = tables - V2_SCHEMA_V3_TABLES - {
             # known legacy tables that share the public schema
             "abbreviations",
             "agent_traces",
@@ -990,14 +1127,19 @@ def check_v2_schema(engine: Engine) -> SchemaCheck:
 
 
 def apply_v2_schema(engine: Engine) -> None:
-    """Apply the v2 schema: fresh create, or the version-1 -> 2 upgrade.
+    """Apply the v2 schema: fresh create, or stepwise 1 -> 2 -> 3 upgrades.
 
-    Fresh databases get the full Release 1A shape (with the nullable lease
-    revision) and a version-2 row. Databases that recorded version 1 get the
-    idempotent evidence-only lease upgrade (``_LEASE_EVIDENCE_ONLY_ALTER``)
-    and their version row advanced to 2. Already-current (or newer)
-    databases are a no-op. Legacy-row verification (brief item 5) runs on
-    the fresh path, which is the only path that mutates legacy tables.
+    Fresh databases get the full shape (Release 1A tables with the nullable
+    lease revision, plus the Task 7A rollout tables and the seeded disabled
+    control row) and a version-3 row. Databases that recorded version 1 get
+    the idempotent evidence-only lease upgrade (``_LEASE_EVIDENCE_ONLY_ALTER``)
+    advancing them to 2, then the rollout DDL (``_ROLLOUT_DDL`` + seed)
+    advancing them to 3. Databases at version 2 get the rollout step only.
+    Already-current (or newer) databases are a no-op. A recorded version
+    below 1 is an unsupported gap and raises ``RuntimeError`` instead of
+    writing a second version row. Legacy-row verification (brief item 5)
+    runs on the fresh path, which is the only path that mutates legacy
+    tables.
 
     Idempotent: a second call with the schema already applied is a no-op.
     The transaction commits (or rolls back) when ``engine.begin()`` exits.
@@ -1015,24 +1157,48 @@ def apply_v2_schema(engine: Engine) -> None:
 
         current = _recorded_version(conn)
         if current is not None and current >= V2_SCHEMA_VERSION:
-            # Already current (or newer) — nothing to do. Idempotent.
+            # Already current (or newer) — nothing to do. Idempotent;
+            # a newer version is never downgraded.
             return
+
+        if current is not None and current < 1:
+            # Unsupported gap (e.g. a hand-written version-0 row): refuse
+            # to stack another version row on top of an unknown history.
+            raise RuntimeError(
+                f"unsupported v2 schema version {current}: expected 1, 2, "
+                f"or {V2_SCHEMA_VERSION} (run a supported migration path)"
+            )
 
         if current == 1:
             # Version-1 -> 2 upgrade: evidence-only leases (T3 round 2, N1).
             # Only the lease column changes; legacy tables are untouched, so
-            # no baseline verification is needed on this path.
+            # no baseline verification is needed on this path. Falls through
+            # to the 2 -> 3 step below (stepwise, R7).
             for stmt in _LEASE_EVIDENCE_ONLY_ALTER:
                 conn.execute(text(stmt))
             conn.execute(
                 text(
-                    "UPDATE v2_schema_version SET version = :v, description = :d "
+                    "UPDATE v2_schema_version SET version = 2, description = :d "
                     "WHERE version = 1"
                 ),
-                {
-                    "v": V2_SCHEMA_VERSION,
-                    "d": "v2 evidence-only leases: revision_id nullable",
-                },
+                {"d": "v2 evidence-only leases: revision_id nullable"},
+            )
+            current = 2
+
+        if current == 2:
+            # Version-2 -> 3 upgrade: rollout control (Task 7A, R7).
+            # Creates both tables idempotently, seeds the disabled control
+            # row without overwriting operator tuning, and advances the
+            # version row. Legacy tables are untouched on this path.
+            for stmt in _ROLLOUT_DDL:
+                conn.execute(text(stmt))
+            conn.execute(text(_ROLLOUT_SEED))
+            conn.execute(
+                text(
+                    "UPDATE v2_schema_version SET version = 3, description = :d "
+                    "WHERE version = 2"
+                ),
+                {"d": "v2 rollout control: agent_rollout_control + metrics"},
             )
             return
 
@@ -1043,9 +1209,13 @@ def apply_v2_schema(engine: Engine) -> None:
         #    row-count drift raises.
         baseline = _capture_legacy_baseline(conn)
 
-        # 2. Create the v2 tables in dependency order.
+        # 2. Create the v2 tables in dependency order (Release 1A set),
+        # then the Task 7A rollout tables.
         for stmt in _CREATE_DDL:
             conn.execute(text(stmt))
+        for stmt in _ROLLOUT_DDL:
+            conn.execute(text(stmt))
+        conn.execute(text(_ROLLOUT_SEED))
 
         # 2b. Repair pre-C1 lease tables whose revision_id is still NOT NULL
         # (fresh CREATEs already declare it NULL; the ALTER is a no-op there).
@@ -1086,7 +1256,8 @@ def apply_v2_schema(engine: Engine) -> None:
             ),
             {
                 "v": V2_SCHEMA_VERSION,
-                "d": "Release 1A foundation + v2 evidence-only leases (revision_id nullable)",
+                "d": "Release 1A foundation + evidence-only leases + "
+                "rollout control (seeded disabled)",
             },
         )
 
@@ -1119,7 +1290,7 @@ def make_engine(dsn: str) -> Engine:
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m app.services.agents.v2.persistence.migrate",
-        description="Apply or inspect the Release 1A v2 migration.",
+        description="Apply or inspect the v2 schema migration (current version 3).",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 

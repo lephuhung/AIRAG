@@ -54,7 +54,12 @@ def _recorded_version(conn) -> int | None:
 
 
 def test_pre_c1_lease_table_upgrades_to_nullable_and_version_2(db: Engine) -> None:
-    """Simulate the pre-C1 shape, run apply, assert the upgrade sticks."""
+    """Simulate the pre-C1 shape, run apply, assert the upgrade sticks.
+
+    Task 7A extension: the 1 -> 2 lease repair now falls through to the
+    2 -> 3 rollout step (stepwise, R7), so a version-1 database lands at
+    ``V2_SCHEMA_VERSION`` (3) with the rollout tables and seed row present.
+    The lease nullability assertion is kept (never weakened)."""
     from app.services.agents.v2.persistence.migrate import V2_SCHEMA_VERSION
 
     with db.begin() as conn:
@@ -72,7 +77,18 @@ def test_pre_c1_lease_table_upgrades_to_nullable_and_version_2(db: Engine) -> No
 
     with db.connect() as conn:
         assert _lease_nullable(conn) == "YES"
-        assert _recorded_version(conn) == V2_SCHEMA_VERSION == 2
+        assert _recorded_version(conn) == V2_SCHEMA_VERSION == 3
+        # Stepwise fall-through: the 2 -> 3 rollout step also ran.
+        control_n = conn.execute(
+            text("SELECT count(*) FROM agent_rollout_control WHERE id = 1")
+        ).scalar()
+        assert control_n == 1
+        metrics_reg = conn.execute(
+            text(
+                "SELECT to_regclass('public.agent_rollout_metrics') IS NOT NULL"
+            )
+        ).scalar()
+        assert metrics_reg is True
     assert check_v2_schema(db).is_clean is True
 
 

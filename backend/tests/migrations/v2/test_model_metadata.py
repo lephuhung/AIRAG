@@ -571,10 +571,13 @@ def test_orm_fks_resolve(imported_app_models, db: Engine):
 
 
 def test_check_v2_schema_returns_version_2(db: Engine):
-    """Sanity: the test DB is at exact v2 schema version 2."""
+    """Sanity: the test DB is at the exact current v2 schema version.
+
+    Task 7A: the pinned version is now ``V2_SCHEMA_VERSION`` (3); the
+    literal 2 is replaced by the constant so the gate tracks the bump."""
     check = check_v2_schema(db)
     assert check.applied is True, check
-    assert check.version == 2, check
+    assert check.version == V2_SCHEMA_VERSION, check
     assert check.is_clean is True, check
 
 

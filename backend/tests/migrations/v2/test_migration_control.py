@@ -15,7 +15,9 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 from app.services.agents.v2.persistence.migrate import (
+    V2_ROLLOUT_TABLES,
     V2_SCHEMA_V1_TABLES,
+    V2_SCHEMA_V3_TABLES,
     V2_SCHEMA_VERSION,
     apply_v2_schema,
     make_engine,
@@ -66,14 +68,27 @@ def test_v2_schema_v1_tables_constant_is_frozen_set() -> None:
     assert len(V2_SCHEMA_V1_TABLES) == 12
 
 
+def test_rollout_tables_extend_but_do_not_alter_v1_set() -> None:
+    """Task 7A extension: the v3 expected set is exactly V1 + rollout."""
+    assert isinstance(V2_ROLLOUT_TABLES, frozenset)
+    assert V2_ROLLOUT_TABLES == frozenset(
+        {"agent_rollout_control", "agent_rollout_metrics"}
+    )
+    assert V2_SCHEMA_V3_TABLES == V2_SCHEMA_V1_TABLES | V2_ROLLOUT_TABLES
+    assert V2_SCHEMA_VERSION == 3
+
+
 def test_schema_delta_is_exactly_v2_tables(db: Engine) -> None:
-    """Capture before, apply migration, capture after, assert exact delta."""
+    """Capture before, apply migration, capture after, assert exact delta.
+
+    Task 7A extension: a fresh create lands at version 3, so the exact
+    delta is the v3 set (V1 tables + the two rollout tables)."""
     # Drop any prior v2 state so the test starts from a clean baseline.
     # Setup uses a raw psycopg connection because it predates the migration
     # API; the migration itself runs through the public Engine contract.
     with _psycopg_connect() as setup:
         with setup.cursor() as cur:
-            for tbl in V2_SCHEMA_V1_TABLES:
+            for tbl in V2_SCHEMA_V3_TABLES:
                 cur.execute(f'DROP TABLE IF EXISTS "{tbl}" CASCADE')
             # Defensive cleanup: drop the old trigger names (round-1)
             # and the new ones (round-2) so cross-run residue cannot
@@ -138,8 +153,8 @@ def test_schema_delta_is_exactly_v2_tables(db: Engine) -> None:
     added = after - before
     removed = before - after
 
-    assert added == V2_SCHEMA_V1_TABLES, (
-        f"schema delta mismatch: added={sorted(added)}, expected={sorted(V2_SCHEMA_V1_TABLES)}"
+    assert added == V2_SCHEMA_V3_TABLES, (
+        f"schema delta mismatch: added={sorted(added)}, expected={sorted(V2_SCHEMA_V3_TABLES)}"
     )
     assert not removed, (
         f"migration removed legacy tables (forbidden): {sorted(removed)}"
