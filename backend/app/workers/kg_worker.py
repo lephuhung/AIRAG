@@ -25,7 +25,6 @@ from app.models.document import Document
 from app.queue.messages import KGMessage
 from app.services.agents.v2.persistence.document_revisions import (
     DocumentRevisionsRepository,
-    InvalidStageTransition,
 )
 from app.services.kg.knowledge_graph_service import get_kg_service
 from app.workers.utils import (
@@ -69,17 +68,25 @@ async def handle_kg(payload: dict) -> None:
             )
             return
 
-        # Revision-owned stage report (P1 Task 3): pending → running BEFORE
-        # any work (unknown rows fail closed; a terminal stage converges at
-        # completion time below). Only this message's revision/stage.
+        # Revision-owned stage claim (P1 Task 3): atomically claim
+        # pending → running BEFORE any work. A duplicate/in-flight or
+        # terminal (completed/skipped/failed) delivery is a no-op return —
+        # no work, no artifact, no mirror write. Unknown rows (a pre-Task-2
+        # revision) fail closed — the claim raises before anything is
+        # touched. Only this message's revision/stage is reported.
         _stage_repo = DocumentRevisionsRepository(db)
-        try:
-            await _stage_repo.mark_stage_running(msg.revision_id, "kg")
-        except InvalidStageTransition:
-            logger.debug(
+        _claimed_row, _claimed = await _stage_repo.claim_stage_running(
+            msg.revision_id, "kg"
+        )
+        if not _claimed:
+            logger.info(
                 f"[kg_worker] doc={msg.document_id} rev={msg.revision_id} "
-                f"kg stage already terminal — converging"
+                f"kg stage already claimed ({_claimed_row.state}) — no-op"
             )
+            return
+        # Durably commit the running mark before the long KG work so a
+        # crash/timeout leaves running (retryable) evidence, not pending.
+        await db.commit()
 
         try:
             # ── Load markdown ────────────────────────────────────────────────

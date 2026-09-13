@@ -452,3 +452,160 @@ class TestStageRetryEdge:
         )
         assert dupe_after_retry.state == "running"
         assert dupe_after_retry.attempt_count == 2
+
+
+class TestClaimStageRunning:
+    """P1 Task 3 fix-1 — atomic worker stage claim.
+
+    ``claim_stage_running`` is the only edge workers use to enter
+    ``running``: it returns ``(row, True)`` exactly when this call moved
+    ``pending -> running`` (attempt bumped), and ``(row, False)`` for an
+    already-``running`` duplicate or a terminal
+    (``completed``/``skipped``/``failed``) stage — without mutating the
+    row. Unknown stages and missing rows fail closed with
+    :class:`UnknownRevisionStage`. :meth:`mark_stage_running` keeps its
+    exact contract (duplicate converges, terminal raises) for
+    compatibility.
+    """
+
+    @pytest.mark.asyncio
+    async def test_claim_moves_pending_to_running_once(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        document_id = document_factory()
+        revision = await _allocate(repo, document_id, "uploads/claim.pdf")
+        await repo.initialize_stages(
+            revision.revision_id, RevisionBuildProfile.FULL
+        )
+
+        row, claimed = await repo.claim_stage_running(
+            revision.revision_id, "parse"
+        )
+        assert claimed is True
+        assert row.state == "running"
+        assert row.attempt_count == 1
+
+    @pytest.mark.asyncio
+    async def test_claim_duplicate_running_returns_false_without_bump(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        document_id = document_factory()
+        revision = await _allocate(repo, document_id, "uploads/claimdupe.pdf")
+        await repo.initialize_stages(
+            revision.revision_id, RevisionBuildProfile.FULL
+        )
+
+        _, first = await repo.claim_stage_running(
+            revision.revision_id, "embed"
+        )
+        assert first is True
+        row, second = await repo.claim_stage_running(
+            revision.revision_id, "embed"
+        )
+        assert second is False
+        assert row.state == "running"
+        assert row.attempt_count == 1
+
+    @pytest.mark.asyncio
+    async def test_claim_terminal_stages_return_false_without_mutation(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        document_id = document_factory()
+        revision = await _allocate(
+            repo, document_id, "uploads/claimterm.pdf"
+        )
+        await repo.initialize_stages(
+            revision.revision_id, RevisionBuildProfile.FULL
+        )
+        await repo.mark_stage_completed(revision.revision_id, "parse")
+        await repo.mark_stage_failed(
+            revision.revision_id, "embed", failure_class="boom"
+        )
+        await repo.mark_stage_skipped(revision.revision_id, "caption")
+        # "kg" stays running: a duplicate claim must also refuse it.
+        await repo.mark_stage_running(revision.revision_id, "kg")
+
+        for stage, expected_state in (
+            ("parse", "completed"),
+            ("embed", "failed"),
+            ("caption", "skipped"),
+            ("kg", "running"),
+        ):
+            before = (await _stages_by_name(repo, revision.revision_id))[stage]
+            row, claimed = await repo.claim_stage_running(
+                revision.revision_id, stage
+            )
+            assert claimed is False, stage
+            assert row.state == expected_state, stage
+            assert row.attempt_count == before.attempt_count, stage
+        # The failure classification survives the refused claim.
+        stages = await _stages_by_name(repo, revision.revision_id)
+        assert stages["embed"].failure_class == "boom"
+
+    @pytest.mark.asyncio
+    async def test_claim_after_retry_pending_bumps_attempt(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        """The queue retry edge leaves the stage executable: the next
+        claim moves ``pending -> running`` and bumps the attempt."""
+        document_id = document_factory()
+        revision = await _allocate(repo, document_id, "uploads/claimretry.pdf")
+        await repo.initialize_stages(
+            revision.revision_id, RevisionBuildProfile.FULL
+        )
+
+        _, first = await repo.claim_stage_running(
+            revision.revision_id, "parse"
+        )
+        assert first is True
+        await repo.mark_stage_retry_pending(revision.revision_id, "parse")
+        row, second = await repo.claim_stage_running(
+            revision.revision_id, "parse"
+        )
+        assert second is True
+        assert row.state == "running"
+        assert row.attempt_count == 2
+
+    @pytest.mark.asyncio
+    async def test_claim_unknown_stage_or_row_fails_closed(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        import uuid
+
+        document_id = document_factory()
+        revision = await _allocate(repo, document_id, "uploads/claimbad.pdf")
+        await repo.initialize_stages(
+            revision.revision_id, RevisionBuildProfile.FULL
+        )
+        with pytest.raises(UnknownRevisionStage):
+            await repo.claim_stage_running(revision.revision_id, "frobnicate")
+        with pytest.raises(UnknownRevisionStage):
+            await repo.claim_stage_running(uuid.uuid4(), "parse")
+
+    @pytest.mark.asyncio
+    async def test_mark_stage_running_contract_preserved(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        """Compatibility: duplicate ``mark_stage_running`` still converges
+        and terminal stages still raise ``InvalidStageTransition``."""
+        document_id = document_factory()
+        revision = await _allocate(repo, document_id, "uploads/claimcompat.pdf")
+        await repo.initialize_stages(
+            revision.revision_id, RevisionBuildProfile.FULL
+        )
+
+        await repo.mark_stage_running(revision.revision_id, "parse")
+        dupe = await repo.mark_stage_running(revision.revision_id, "parse")
+        assert (dupe.state, dupe.attempt_count) == ("running", 1)
+        await repo.mark_stage_completed(revision.revision_id, "parse")
+        with pytest.raises(InvalidStageTransition):
+            await repo.mark_stage_running(revision.revision_id, "parse")
+        # The claim agrees with the compat surface afterwards.
+        row, claimed = await repo.claim_stage_running(
+            revision.revision_id, "parse"
+        )
+        assert (claimed, row.state, row.attempt_count) == (
+            False,
+            "completed",
+            1,
+        )

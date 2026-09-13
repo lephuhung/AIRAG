@@ -752,6 +752,56 @@ class DocumentRevisionsRepository:
             to_state="running",
         )
 
+    async def claim_stage_running(
+        self, revision_id: uuid.UUID, stage: str
+    ) -> tuple[DocumentRevisionStage, bool]:
+        """Atomically claim ``pending`` -> ``running`` for one worker delivery.
+
+        Returns ``(row, claimed)``: ``claimed`` is True exactly when this
+        call moved ``pending`` -> ``running`` (and bumped
+        ``attempt_count``). An already-``running`` duplicate or a terminal
+        (``completed`` / ``skipped`` / ``failed``) stage returns
+        ``(row, False)`` without mutating the row — the caller must return
+        before performing work or mutating mirrors. Unknown stages and
+        missing rows raise :class:`UnknownRevisionStage` (fail closed).
+
+        The single conditional UPDATE is the arbiter (never read-then-write);
+        the follow-up SELECT only classifies a lost race. ``failure_class``
+        is never touched here.
+        """
+        if stage not in REVISION_STAGES:
+            raise UnknownRevisionStage(f"unknown revision stage {stage!r}")
+        stmt = (
+            update(DocumentRevisionStage)
+            .where(
+                DocumentRevisionStage.revision_id == revision_id,
+                DocumentRevisionStage.stage == stage,
+                DocumentRevisionStage.state == "pending",
+            )
+            .values(
+                state="running",
+                attempt_count=DocumentRevisionStage.attempt_count + 1,
+                updated_at=_now(),
+            )
+            .returning(DocumentRevisionStage)
+        )
+        row = (await self.session.execute(stmt)).scalar_one_or_none()
+        await self.session.flush()
+        if row is not None:
+            return row, True
+        existing = await self.session.scalar(
+            select(DocumentRevisionStage).where(
+                DocumentRevisionStage.revision_id == revision_id,
+                DocumentRevisionStage.stage == stage,
+            )
+        )
+        if existing is None:
+            raise UnknownRevisionStage(
+                f"no stage row for revision {revision_id} stage {stage!r} "
+                "(call initialize_stages first)"
+            )
+        return existing, False
+
     async def mark_stage_retry_pending(
         self, revision_id: uuid.UUID, stage: str
     ) -> DocumentRevisionStage:

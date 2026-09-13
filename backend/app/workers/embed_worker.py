@@ -30,7 +30,6 @@ from app.models.document_revision_build import DocumentRevisionBuild
 from app.queue.messages import EmbedMessage
 from app.services.agents.v2.persistence.document_revisions import (
     DocumentRevisionsRepository,
-    InvalidStageTransition,
 )
 from app.services.agents.v2.persistence.source_identity import (
     RevisionBuildProfile,
@@ -47,7 +46,6 @@ from app.workers.utils import (
     check_and_finalize,
     load_revision_chunk_payloads,
     load_revision_execution,
-    mark_revision_failed,
     record_embed_artifacts,
 )
 
@@ -95,17 +93,25 @@ async def handle_embed(payload: dict) -> None:
             )
             return
 
-        # Revision-owned stage report (P1 Task 3): pending → running BEFORE
-        # any work (unknown rows fail closed; a terminal stage converges at
-        # completion time below). Only this message's revision/stage.
+        # Revision-owned stage claim (P1 Task 3): atomically claim
+        # pending → running BEFORE any work. A duplicate/in-flight or
+        # terminal (completed/skipped/failed) delivery is a no-op return —
+        # no work, no artifact, no mirror write. Unknown rows (a pre-Task-2
+        # revision) fail closed — the claim raises before anything is
+        # touched. Only this message's revision/stage is reported.
         _stage_repo = DocumentRevisionsRepository(db)
-        try:
-            await _stage_repo.mark_stage_running(msg.revision_id, "embed")
-        except InvalidStageTransition:
-            logger.debug(
+        _claimed_row, _claimed = await _stage_repo.claim_stage_running(
+            msg.revision_id, "embed"
+        )
+        if not _claimed:
+            logger.info(
                 f"[embed_worker] doc={msg.document_id} rev={msg.revision_id} "
-                f"embed stage already terminal — converging"
+                f"embed stage already claimed ({_claimed_row.state}) — no-op"
             )
+            return
+        # Durably commit the running mark before the long embed work so a
+        # crash/timeout leaves running (retryable) evidence, not pending.
+        await db.commit()
 
         # Idempotency is revision-scoped: a redelivered message re-runs only
         # its incomplete stage. The build manifest, not Document.embed_done,
@@ -352,11 +358,12 @@ async def handle_embed(payload: dict) -> None:
             document.status = DocumentStatus.FAILED
             document.error_message = str(e)[:500]
             await db.commit()
-            # Terminalize the revision too: a failed revision is immutable and
-            # never resumed, so parallel caption/kg messages dead-letter.
-            await mark_revision_failed(
-                db, msg.revision_id, stage="embed", error_class=type(e).__name__
-            )
+            # The revision is NOT terminalized here: retry/exhaustion is owned
+            # by the queue path, which moves this message's stage
+            # running → pending before requeue (the next delivery re-claims
+            # and bumps the attempt) or fails the stage and the revision
+            # atomically when retries are exhausted. Terminalizing now would
+            # dead-letter the retry and strand the stage pending.
             raise
         finally:
             # Return cached GPU memory to PyTorch's allocator so the next

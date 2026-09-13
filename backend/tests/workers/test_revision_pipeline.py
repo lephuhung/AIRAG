@@ -2116,6 +2116,11 @@ async def test_task3_queue_exhausted_note_marks_stage_failed_terminal(
         revision.revision_id, "kg", failure_class="TimeoutError", db=async_db
     ) is True
     assert (await _stage_states(async_db, revision.revision_id))["kg"] == "failed"
+    # Exhaustion terminalizes the revision in the same transaction.
+    failed_rev = await repo.get(revision.revision_id)
+    assert failed_rev.status == "failed"
+    assert failed_rev.failure_stage == "kg"
+    assert failed_rev.failure_class == "TimeoutError"
     with pytest.raises(InvalidStageTransition):
         await repo.mark_stage_completed(revision.revision_id, "kg")
     # A completed stage is immutable even to the exhausted path.
@@ -2128,15 +2133,25 @@ async def test_task3_queue_exhausted_note_marks_stage_failed_terminal(
 
 @pytest.mark.parametrize("stage", _TASK3_STAGES)
 def test_task3_workers_report_only_their_own_stage(stage):
-    """Each worker marks running/completed for exactly its message stage."""
+    """Each worker claims/completes exactly its message stage.
+
+    The running edge is owned by the atomic ``claim_stage_running`` claim
+    (which returns whether this delivery newly claimed pending → running);
+    workers never call ``mark_stage_running`` directly, so a swallowed
+    transition can no longer fall through into heavy work. Handler-level
+    tests below drive the real handlers — this pins the call sites.
+    """
     source = _task3_worker_source(stage)
-    assert f'mark_stage_running(msg.revision_id, "{stage}")' in source
-    assert f'mark_stage_completed(msg.revision_id, "{stage}")' in source
+    # The claim call spans lines; normalize whitespace before matching.
+    flat = re.sub(r"\s+", "", source)
+    assert f'claim_stage_running(msg.revision_id,"{stage}")' in flat
+    assert f'mark_stage_completed(msg.revision_id,"{stage}")' in flat
     for other in _TASK3_STAGES:
         if other == stage:
             continue
-        assert f'mark_stage_running(msg.revision_id, "{other}")' not in source
-        assert f'mark_stage_completed(msg.revision_id, "{other}")' not in source
+        assert f'claim_stage_running(msg.revision_id,"{other}")' not in flat
+        assert f'mark_stage_completed(msg.revision_id,"{other}")' not in flat
+    assert "mark_stage_running(" not in flat
     # Skips are initialized rows (Task 2), never guessed by workers; workers
     # never fail a stage directly — exhaustion is owned by the queue path.
     assert "mark_stage_skipped" not in source
@@ -2157,16 +2172,24 @@ def test_task3_worker_completed_only_after_artifact_transaction(
 ):
     """Running lands before work; completed lands after the artifact commit."""
     source = _task3_worker_source(stage)
-    running_call = f'mark_stage_running(msg.revision_id, "{stage}")'
-    completed_call = f'mark_stage_completed(msg.revision_id, "{stage}")'
+    flat = re.sub(r"\s+", "", source)
+    running_call = f'claim_stage_running(msg.revision_id,"{stage}")'
+    source = flat
+    completed_call = f'mark_stage_completed(msg.revision_id,"{stage}")'
     running_at = source.index(running_call)
     first_completed_at = source.index(completed_call)
     last_completed_at = source.rindex(completed_call)
     # ``await``-prefixed call anchors match the execution/call sites, never
     # the module import block; mirror-assignment anchors match as written.
-    await_anchor = artifact_anchor if "=" in artifact_anchor else f"await {artifact_anchor}"
+    # All needles are whitespace-normalized to match the flattened source.
+    if "=" in artifact_anchor:
+        # Mirror writes: scope to the Document assignment so the module
+        # docstring ("Set captions_done=True") never matches.
+        await_anchor = "document." + re.sub(r"\s+", "", artifact_anchor)
+    else:
+        await_anchor = f"await{artifact_anchor}"
     anchor_at = source.index(await_anchor)
-    gate_at = source.index("await load_revision_execution(")
+    gate_at = source.index("awaitload_revision_execution(")
     # Running lands after the execution gate and before any work; the main
     # artifact path completes after its transaction (early-return paths
     # complete after their own mirror commits, hence the last-site bound).
@@ -2182,3 +2205,1067 @@ def test_task3_queue_retry_branch_reports_stage_before_requeue():
     assert "note_stage_retry_pending" in source
     assert "note_stage_exhausted" in source
     assert "stage_for_queue" in source
+
+
+# ---------------------------------------------------------------------------
+# Task 3 fix-1 — handler-level claim/order/retry/exhaustion tests
+# ---------------------------------------------------------------------------
+# Source-string assertions above pin the call sites; the tests below drive
+# the REAL handlers (heavy work stubbed, DB real) so a behavioral mutation
+# — swallowed transition that keeps working, completion before the artifact
+# commit, a wrong queue→stage map, a worker-owned revision failure — fails.
+# Each handler gets: claim → work → artifact → completed ordering, duplicate
+# + terminal (completed/failed) no-op without work or mirror mutation, retry
+# re-claim with attempt bump, and stale-revision isolation.
+
+from app.models.document_revision_build import DocumentRevisionBuild
+from app.queue import connection as _conn
+from app.workers import caption_worker as _caption_worker
+from app.workers import embed_worker as _embed_worker
+from app.workers import kg_worker as _kg_worker
+from app.workers import parse_worker as _parse_worker
+
+
+def _handler_maker(async_engine):
+    return async_sessionmaker(
+        async_engine, class_=AsyncSession, expire_on_commit=False,
+        autocommit=False,
+    )
+
+
+async def _handler_setup_full(maker, doc_id, *, sha):
+    """Allocate a FULL revision with initialized stages; commit for handler."""
+    async with maker() as db:
+        ws = await db.scalar(
+            select(Document.workspace_id).where(Document.id == doc_id)
+        )
+        key = _doc_key(ws, doc_id)
+        revision, _created = await _allocate_full(db, doc_id, key=key, sha=sha)
+        await db.commit()
+        return ws, revision.revision_id
+
+
+async def _handler_stage_rows(maker, revision_id):
+    async with maker() as db:
+        repo = DocumentRevisionsRepository(db)
+        rows = await repo.get_stages(revision_id)
+        return {r.stage: (r.state, r.attempt_count) for r in rows}
+
+
+async def _handler_mirrors(maker, doc_id):
+    async with maker() as db:
+        doc = await db.get(Document, doc_id)
+        return (
+            doc.status, doc.embed_done, doc.captions_done, doc.kg_done,
+            doc.markdown_s3_key, doc.error_message,
+        )
+
+
+async def _handler_revision_status(maker, revision_id):
+    async with maker() as db:
+        return (await DocumentRevisionsRepository(db).get(revision_id)).status
+
+
+def _patch_config_watch(monkeypatch):
+    import app.workers.config_watch as config_watch
+
+    async def _fresh():
+        return None
+
+    monkeypatch.setattr(config_watch, "ensure_fresh_config", _fresh)
+
+
+def _patch_finalize_recorder(monkeypatch, module):
+    calls = []
+
+    async def _record(document, db, *, revision_id=None):
+        calls.append(revision_id)
+
+    monkeypatch.setattr(module, "check_and_finalize", _record)
+    return calls
+
+
+# -- parse stubs ------------------------------------------------------------
+
+class _FakeParseChunk:
+    def __init__(self, content="hello world"):
+        self.content = content
+        self.chunk_index = 0
+        self.page_no = 1
+        self.heading_path = []
+        self.source_file = "doc.pdf"
+        self.image_refs = []
+        self.table_refs = []
+        self.has_table = False
+        self.has_code = False
+
+
+class _FakeParsedDoc:
+    def __init__(self):
+        self.markdown = "# Title\n\nBody text."
+        self.page_count = 1
+        self.tables_count = 0
+        self.parser = "ocr"  # skips the page-1 re-OCR block
+        self.chunks = [_FakeParseChunk()]
+        self.images = []
+        self.tables = []
+
+
+class _FakeParseParser:
+    def __init__(self, workspace_id=None):
+        pass
+
+    async def parse_structure(self, **kwargs):
+        return _FakeParsedDoc()
+
+
+class _RecordingParseStore:
+    def __init__(self, fail_download=False):
+        self.downloads = []
+        self.uploads = {}
+        self.artifacts = {}
+        self.fail_download = fail_download
+
+    async def download_file(self, key):
+        self.downloads.append(key)
+        if self.fail_download:
+            raise RuntimeError("minio boom")
+        return b"fake-bytes"
+
+    async def upload_markdown(self, *, workspace_id, document_id, content, key=None):
+        self.uploads[key] = content
+        return key
+
+    async def upload_artifact(self, key, payload, content_type):
+        self.artifacts[key] = payload
+        return key
+
+    async def download_markdown(self, key):
+        return "# Title\n\nBody text for the knowledge graph."
+
+
+def _patch_parse(monkeypatch, maker, store):
+    monkeypatch.setattr(_parse_worker, "async_session_maker", maker)
+    monkeypatch.setattr(_parse_worker, "get_storage_service", lambda: store)
+    monkeypatch.setattr(_parse_worker, "DeepDocumentParser", _FakeParseParser)
+    import app.services.document_type_classifier as _dtc
+    import app.services.legal.validity_service as _val
+
+    async def _classify(text):
+        return {}
+
+    async def _validity(db, document, markdown):
+        return None
+
+    monkeypatch.setattr(_dtc, "classify_with_llm", _classify)
+    monkeypatch.setattr(_val, "apply_validity", _validity)
+    published = []
+
+    async def _publish(exchange, routing_key, payload):
+        published.append((exchange, routing_key))
+
+    async def _ensure_kg(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(_conn, "publish", _publish)
+    monkeypatch.setattr(_conn, "ensure_kg_queue", _ensure_kg)
+    return published
+
+
+def _parse_payload(doc_id, ws, rev_id):
+    return ParseMessage(
+        document_id=doc_id,
+        workspace_id=ws,
+        revision_id=rev_id,
+        build_profile=FULL.value,
+        minio_key="kb_x/doc.txt",
+        original_filename="doc.txt",
+    ).model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+async def test_task3_handle_parse_claims_runs_completes(
+    async_engine, document_factory, monkeypatch
+):
+    """Real parse handler: claim → work → artifact commit → completed."""
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="p" * 64)
+    store = _RecordingParseStore()
+    published = _patch_parse(monkeypatch, maker, store)
+
+    await _parse_worker.handle_parse(_parse_payload(doc_id, ws, rev_id))
+
+    rows = await _handler_stage_rows(maker, rev_id)
+    assert rows["parse"] == ("completed", 1)
+    assert rows["embed"] == ("pending", 0)
+    assert rows["caption"] == ("pending", 0)
+    assert rows["kg"] == ("pending", 0)
+    # Artifact work actually ran before completion: markdown uploaded at the
+    # revision key, structure artifact stored, manifest recorded.
+    assert len(store.downloads) == 1
+    assert len(store.uploads) == 1
+    assert len(store.artifacts) == 1
+    async with maker() as db:
+        build = await db.scalar(
+            select(DocumentRevisionBuild).where(
+                DocumentRevisionBuild.revision_id == rev_id
+            )
+        )
+        assert build is not None and build.markdown_artifact_key is not None
+    mirrors = await _handler_mirrors(maker, doc_id)
+    assert mirrors[4] is not None  # markdown_s3_key mirror written
+    # FULL profile dispatched all three child stages.
+    assert sorted(e for e, _ in published) == sorted(
+        [_conn.EXCHANGE_EMBED, _conn.EXCHANGE_CAPTION, _conn.EXCHANGE_KG]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preset", ["running", "completed", "failed"])
+async def test_task3_handle_parse_duplicate_and_terminal_noop(
+    async_engine, document_factory, monkeypatch, preset
+):
+    """Duplicate/terminal parse delivery: no work, no mirror mutation."""
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="q" * 64)
+    async with maker() as db:
+        repo = DocumentRevisionsRepository(db)
+        if preset == "running":
+            await repo.claim_stage_running(rev_id, "parse")
+        elif preset == "completed":
+            await repo.claim_stage_running(rev_id, "parse")
+            await repo.mark_stage_completed(rev_id, "parse")
+        else:
+            await repo.claim_stage_running(rev_id, "parse")
+            await repo.mark_stage_failed(rev_id, "parse", failure_class="E")
+        await db.commit()
+    before_rows = await _handler_stage_rows(maker, rev_id)
+    before_mirrors = await _handler_mirrors(maker, doc_id)
+    store = _RecordingParseStore()
+    _patch_parse(monkeypatch, maker, store)
+
+    await _parse_worker.handle_parse(_parse_payload(doc_id, ws, rev_id))
+
+    assert store.downloads == [] and store.uploads == {} and store.artifacts == {}
+    assert await _handler_stage_rows(maker, rev_id) == before_rows
+    assert await _handler_mirrors(maker, doc_id) == before_mirrors
+    assert await _handler_revision_status(maker, rev_id) == "draft"
+
+
+@pytest.mark.asyncio
+async def test_task3_handle_parse_retry_reclaims_attempt(
+    async_engine, document_factory, monkeypatch
+):
+    """Queue retry edge keeps parse executable: next claim bumps to 2."""
+    from app.queue.connection import note_stage_retry_pending
+
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="r" * 64)
+    async with maker() as db:
+        repo = DocumentRevisionsRepository(db)
+        _, claimed = await repo.claim_stage_running(rev_id, "parse")
+        assert claimed is True
+        await db.commit()
+    async with maker() as db:
+        assert await note_stage_retry_pending(rev_id, "parse", db=db) is True
+        await db.commit()
+    store = _RecordingParseStore()
+    _patch_parse(monkeypatch, maker, store)
+
+    await _parse_worker.handle_parse(_parse_payload(doc_id, ws, rev_id))
+
+    rows = await _handler_stage_rows(maker, rev_id)
+    assert rows["parse"] == ("completed", 2)
+    assert len(store.downloads) == 1
+
+
+@pytest.mark.asyncio
+async def test_task3_handle_parse_failure_leaves_revision_live(
+    async_engine, document_factory, monkeypatch
+):
+    """Retryable parse exception must NOT terminalize the revision (I3).
+
+    The stage stays running, the revision stays draft, and after the queue
+    retry edge the redelivery re-claims (attempt 2) and completes.
+    """
+    from app.queue.connection import note_stage_retry_pending
+
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="s" * 64)
+    store = _RecordingParseStore(fail_download=True)
+    _patch_parse(monkeypatch, maker, store)
+
+    with pytest.raises(RuntimeError, match="minio boom"):
+        await _parse_worker.handle_parse(_parse_payload(doc_id, ws, rev_id))
+
+    # Live (draft/building), never terminalized: the queue owns exhaustion.
+    assert await _handler_revision_status(maker, rev_id) in ("draft", "building")
+    rows = await _handler_stage_rows(maker, rev_id)
+    assert rows["parse"] == ("running", 1)
+
+    async with maker() as db:
+        assert await note_stage_retry_pending(rev_id, "parse", db=db) is True
+        await db.commit()
+    store.fail_download = False
+    await _parse_worker.handle_parse(_parse_payload(doc_id, ws, rev_id))
+
+    rows = await _handler_stage_rows(maker, rev_id)
+    assert rows["parse"] == ("completed", 2)
+
+
+# -- embed stubs ------------------------------------------------------------
+
+class _FakeEmbedder:
+    def __init__(self):
+        self.calls = []
+
+    model_name = "fake-model"
+    dimension = 4
+
+    def embed_texts(self, texts):
+        self.calls.append(list(texts))
+        return [[0.1] * 4 for _ in texts]
+
+
+class _FakeVectorStore:
+    def __init__(self):
+        self.collection_name = "ws_fake_collection"
+        self.added = []
+
+    def add_documents(self, *, ids, embeddings, documents, metadatas):
+        self.added.append((list(ids), list(documents)))
+
+
+_CHUNK = {
+    "chunk_id": "c1",
+    "content": "hello world",
+    "chunk_index": 0,
+    "source_file": "doc.pdf",
+    "page_no": 1,
+    "heading_path": [],
+    "image_refs": [],
+    "table_refs": [],
+    "has_table": False,
+    "has_code": False,
+}
+
+
+async def _seed_raw_chunks(maker, doc_id):
+    import json as _json
+
+    async with maker() as db:
+        doc = await db.get(Document, doc_id)
+        doc.raw_chunks_json = _json.dumps([dict(_CHUNK)])
+        await db.commit()
+
+
+def _patch_embed(monkeypatch, maker, embedder, store):
+    monkeypatch.setattr(_embed_worker, "async_session_maker", maker)
+    monkeypatch.setattr(
+        _embed_worker, "get_embedding_service", lambda: embedder
+    )
+    monkeypatch.setattr(
+        _embed_worker, "get_vector_store", lambda ws, namespace: store
+    )
+    _patch_config_watch(monkeypatch)
+
+
+def _embed_payload(doc_id, ws, rev_id):
+    return EmbedMessage(
+        document_id=doc_id,
+        workspace_id=ws,
+        revision_id=rev_id,
+        build_profile=FULL.value,
+    ).model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+async def test_task3_handle_embed_claims_runs_completes(
+    async_engine, document_factory, monkeypatch
+):
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="t" * 64)
+    await _seed_raw_chunks(maker, doc_id)
+    embedder, store = _FakeEmbedder(), _FakeVectorStore()
+    _patch_embed(monkeypatch, maker, embedder, store)
+    finalize_calls = _patch_finalize_recorder(monkeypatch, _embed_worker)
+
+    await _embed_worker.handle_embed(_embed_payload(doc_id, ws, rev_id))
+
+    rows = await _handler_stage_rows(maker, rev_id)
+    assert rows["embed"] == ("completed", 1)
+    assert rows["parse"] == ("pending", 0)
+    assert len(embedder.calls) == 1 and embedder.calls[0] == ["hello world"]
+    assert len(store.added) == 1
+    async with maker() as db:
+        ns = await db.scalar(
+            select(DocumentRevisionBuild.embedding_namespace).where(
+                DocumentRevisionBuild.revision_id == rev_id
+            )
+        )
+        assert ns == "ws_fake_collection"
+    mirrors = await _handler_mirrors(maker, doc_id)
+    assert mirrors[1] is True  # embed_done mirror
+    assert finalize_calls == [rev_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preset", ["running", "completed", "failed"])
+async def test_task3_handle_embed_duplicate_and_terminal_noop(
+    async_engine, document_factory, monkeypatch, preset
+):
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="u" * 64)
+    await _seed_raw_chunks(maker, doc_id)
+    async with maker() as db:
+        repo = DocumentRevisionsRepository(db)
+        await repo.claim_stage_running(rev_id, "embed")
+        if preset == "completed":
+            await repo.mark_stage_completed(rev_id, "embed")
+        elif preset == "failed":
+            await repo.mark_stage_failed(rev_id, "embed", failure_class="E")
+        await db.commit()
+    before_rows = await _handler_stage_rows(maker, rev_id)
+    before_mirrors = await _handler_mirrors(maker, doc_id)
+    embedder, store = _FakeEmbedder(), _FakeVectorStore()
+    _patch_embed(monkeypatch, maker, embedder, store)
+
+    await _embed_worker.handle_embed(_embed_payload(doc_id, ws, rev_id))
+
+    assert embedder.calls == [] and store.added == []
+    assert await _handler_stage_rows(maker, rev_id) == before_rows
+    assert await _handler_mirrors(maker, doc_id) == before_mirrors
+    assert await _handler_revision_status(maker, rev_id) == "draft"
+
+
+@pytest.mark.asyncio
+async def test_task3_handle_embed_retry_reclaims_attempt(
+    async_engine, document_factory, monkeypatch
+):
+    from app.queue.connection import note_stage_retry_pending
+
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="v" * 64)
+    await _seed_raw_chunks(maker, doc_id)
+    async with maker() as db:
+        repo = DocumentRevisionsRepository(db)
+        _, claimed = await repo.claim_stage_running(rev_id, "embed")
+        assert claimed is True
+        await db.commit()
+    async with maker() as db:
+        assert await note_stage_retry_pending(rev_id, "embed", db=db) is True
+        await db.commit()
+    embedder, store = _FakeEmbedder(), _FakeVectorStore()
+    _patch_embed(monkeypatch, maker, embedder, store)
+    _patch_finalize_recorder(monkeypatch, _embed_worker)
+
+    await _embed_worker.handle_embed(_embed_payload(doc_id, ws, rev_id))
+
+    rows = await _handler_stage_rows(maker, rev_id)
+    assert rows["embed"] == ("completed", 2)
+    assert len(embedder.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_task3_handle_embed_failure_leaves_revision_live(
+    async_engine, document_factory, monkeypatch
+):
+    """Retryable embed exception must NOT terminalize the revision (I3)."""
+    from app.queue.connection import note_stage_retry_pending
+
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="w" * 64)
+    await _seed_raw_chunks(maker, doc_id)
+
+    class _BoomEmbedder(_FakeEmbedder):
+        def embed_texts(self, texts):
+            raise RuntimeError("chroma boom")
+
+    _patch_embed(monkeypatch, maker, _BoomEmbedder(), _FakeVectorStore())
+    _patch_finalize_recorder(monkeypatch, _embed_worker)
+
+    with pytest.raises(RuntimeError, match="chroma boom"):
+        await _embed_worker.handle_embed(_embed_payload(doc_id, ws, rev_id))
+
+    # Live, never terminalized: the queue owns exhaustion.
+    assert await _handler_revision_status(maker, rev_id) in ("draft", "building")
+    rows = await _handler_stage_rows(maker, rev_id)
+    assert rows["embed"] == ("running", 1)
+
+    async with maker() as db:
+        assert await note_stage_retry_pending(rev_id, "embed", db=db) is True
+        await db.commit()
+    _patch_embed(monkeypatch, maker, _FakeEmbedder(), _FakeVectorStore())
+    await _embed_worker.handle_embed(_embed_payload(doc_id, ws, rev_id))
+
+    rows = await _handler_stage_rows(maker, rev_id)
+    assert rows["embed"] == ("completed", 2)
+
+
+# -- caption stubs ----------------------------------------------------------
+
+class _RecordingCaptionStore:
+    def __init__(self):
+        self.downloads = []
+        self.uploads = []
+
+    async def download_markdown(self, key):
+        self.downloads.append(key)
+        return "# tài liệu"
+
+    async def upload_markdown(self, *, workspace_id, document_id, content, key=None):
+        self.uploads.append(key)
+        return key
+
+
+class _FakeCaptionParser:
+    def __init__(self, workspace_id=None):
+        pass
+
+    def _inject_table_captions(self, markdown, tables):
+        return markdown + "\n<!-- injected -->"
+
+
+async def _seed_caption_table(maker, doc_id, rev_id):
+    async with maker() as db:
+        db.add(
+            DocumentTable(
+                document_id=doc_id,
+                revision_id=rev_id,
+                table_id="tbl-1",
+                page_no=1,
+                content_markdown="| a |",
+                num_rows=1,
+                num_cols=1,
+            )
+        )
+        await db.commit()
+
+
+def _patch_caption(monkeypatch, maker, store):
+    from app.services.agents.v2.persistence import document_views as _views
+
+    monkeypatch.setattr(_caption_worker, "async_session_maker", maker)
+
+    async def _caption_tables(tables):
+        for table in tables:
+            table.caption = "bảng đã chú thích"
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(_caption_worker, "_caption_tables_concurrent", _caption_tables)
+    monkeypatch.setattr(_caption_worker, "_reenrich_embeddings", _noop)
+    monkeypatch.setattr(_caption_worker, "get_storage_service", lambda: store)
+    monkeypatch.setattr(_caption_worker, "DeepDocumentParser", _FakeCaptionParser)
+    monkeypatch.setattr(
+        _caption_worker.settings, "HRAG_ENABLE_TABLE_CAPTIONING", True
+    )
+    monkeypatch.setattr(
+        _caption_worker.settings, "HRAG_ENABLE_IMAGE_CAPTIONING", False
+    )
+    _patch_config_watch(monkeypatch)
+    return _views
+
+
+def _caption_payload(doc_id, ws, rev_id):
+    return CaptionMessage(
+        document_id=doc_id,
+        workspace_id=ws,
+        revision_id=rev_id,
+        build_profile=FULL.value,
+    ).model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+async def test_task3_handle_caption_claims_runs_completes(
+    async_engine, document_factory, monkeypatch
+):
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="x" * 64)
+    await _seed_caption_table(maker, doc_id, rev_id)
+    store = _RecordingCaptionStore()
+    views = _patch_caption(monkeypatch, maker, store)
+    finalize_calls = _patch_finalize_recorder(monkeypatch, _caption_worker)
+
+    await _caption_worker.handle_caption(_caption_payload(doc_id, ws, rev_id))
+
+    rows = await _handler_stage_rows(maker, rev_id)
+    assert rows["caption"] == ("completed", 1)
+    assert rows["parse"] == ("pending", 0)
+    expected = views.revision_markdown_key(ws, doc_id, rev_id)
+    assert store.downloads == [expected]
+    assert store.uploads == [expected]
+    mirrors = await _handler_mirrors(maker, doc_id)
+    assert mirrors[2] is True  # captions_done mirror
+    assert finalize_calls == [rev_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preset", ["running", "completed", "failed"])
+async def test_task3_handle_caption_duplicate_and_terminal_noop(
+    async_engine, document_factory, monkeypatch, preset
+):
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="y" * 64)
+    await _seed_caption_table(maker, doc_id, rev_id)
+    async with maker() as db:
+        repo = DocumentRevisionsRepository(db)
+        await repo.claim_stage_running(rev_id, "caption")
+        if preset == "completed":
+            await repo.mark_stage_completed(rev_id, "caption")
+        elif preset == "failed":
+            await repo.mark_stage_failed(rev_id, "caption", failure_class="E")
+        await db.commit()
+    before_rows = await _handler_stage_rows(maker, rev_id)
+    before_mirrors = await _handler_mirrors(maker, doc_id)
+    store = _RecordingCaptionStore()
+    _patch_caption(monkeypatch, maker, store)
+
+    await _caption_worker.handle_caption(_caption_payload(doc_id, ws, rev_id))
+
+    assert store.downloads == [] and store.uploads == []
+    assert await _handler_stage_rows(maker, rev_id) == before_rows
+    assert await _handler_mirrors(maker, doc_id) == before_mirrors
+    assert await _handler_revision_status(maker, rev_id) == "draft"
+
+
+@pytest.mark.asyncio
+async def test_task3_handle_caption_retry_reclaims_attempt(
+    async_engine, document_factory, monkeypatch
+):
+    from app.queue.connection import note_stage_retry_pending
+
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="z" * 64)
+    await _seed_caption_table(maker, doc_id, rev_id)
+    async with maker() as db:
+        repo = DocumentRevisionsRepository(db)
+        _, claimed = await repo.claim_stage_running(rev_id, "caption")
+        assert claimed is True
+        await db.commit()
+    async with maker() as db:
+        assert await note_stage_retry_pending(rev_id, "caption", db=db) is True
+        await db.commit()
+    store = _RecordingCaptionStore()
+    _patch_caption(monkeypatch, maker, store)
+    _patch_finalize_recorder(monkeypatch, _caption_worker)
+
+    await _caption_worker.handle_caption(_caption_payload(doc_id, ws, rev_id))
+
+    rows = await _handler_stage_rows(maker, rev_id)
+    assert rows["caption"] == ("completed", 2)
+    assert len(store.downloads) == 1
+
+
+# -- kg stubs ---------------------------------------------------------------
+
+class _RecordingKGService:
+    def __init__(self):
+        self.ingests = []
+
+    async def ingest(self, markdown, *, document_id, revision_id):
+        self.ingests.append((markdown, revision_id))
+
+
+class _RecordingKGStore:
+    async def download_markdown(self, key):
+        return "# Title\n\nBody text for the knowledge graph."
+
+
+def _patch_kg(monkeypatch, maker, service, *, patch_store=True):
+    import app.services.storage_service as _storage
+
+    monkeypatch.setattr(_kg_worker, "async_session_maker", maker)
+    monkeypatch.setattr(_kg_worker, "get_kg_service", lambda workspace_id: service)
+    if patch_store:
+        monkeypatch.setattr(
+            _storage, "get_storage_service", lambda: _RecordingKGStore()
+        )
+    _patch_config_watch(monkeypatch)
+
+
+def _kg_payload(doc_id, ws, rev_id):
+    return KGMessage(
+        document_id=doc_id,
+        workspace_id=ws,
+        revision_id=rev_id,
+        build_profile=FULL.value,
+        markdown_s3_key="kb_x/rev/document.md",
+    ).model_dump(mode="json")
+
+
+@pytest.mark.asyncio
+async def test_task3_handle_kg_claims_runs_completes(
+    async_engine, document_factory, monkeypatch
+):
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="1" * 64)
+    service = _RecordingKGService()
+    _patch_kg(monkeypatch, maker, service)
+    finalize_calls = _patch_finalize_recorder(monkeypatch, _kg_worker)
+
+    await _kg_worker.handle_kg(_kg_payload(doc_id, ws, rev_id))
+
+    rows = await _handler_stage_rows(maker, rev_id)
+    assert rows["kg"] == ("completed", 1)
+    assert rows["parse"] == ("pending", 0)
+    assert len(service.ingests) == 1
+    assert service.ingests[0][1] == rev_id
+    mirrors = await _handler_mirrors(maker, doc_id)
+    assert mirrors[3] is True  # kg_done mirror
+    assert finalize_calls == [rev_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preset", ["running", "completed", "failed"])
+async def test_task3_handle_kg_duplicate_and_terminal_noop(
+    async_engine, document_factory, monkeypatch, preset
+):
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="2" * 64)
+    async with maker() as db:
+        repo = DocumentRevisionsRepository(db)
+        await repo.claim_stage_running(rev_id, "kg")
+        if preset == "completed":
+            await repo.mark_stage_completed(rev_id, "kg")
+        elif preset == "failed":
+            await repo.mark_stage_failed(rev_id, "kg", failure_class="E")
+        await db.commit()
+    before_rows = await _handler_stage_rows(maker, rev_id)
+    before_mirrors = await _handler_mirrors(maker, doc_id)
+    service = _RecordingKGService()
+    _patch_kg(monkeypatch, maker, service)
+
+    await _kg_worker.handle_kg(_kg_payload(doc_id, ws, rev_id))
+
+    assert service.ingests == []
+    assert await _handler_stage_rows(maker, rev_id) == before_rows
+    assert await _handler_mirrors(maker, doc_id) == before_mirrors
+    assert await _handler_revision_status(maker, rev_id) == "draft"
+
+
+@pytest.mark.asyncio
+async def test_task3_handle_kg_retry_reclaims_attempt(
+    async_engine, document_factory, monkeypatch
+):
+    from app.queue.connection import note_stage_retry_pending
+
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="3" * 64)
+    async with maker() as db:
+        repo = DocumentRevisionsRepository(db)
+        _, claimed = await repo.claim_stage_running(rev_id, "kg")
+        assert claimed is True
+        await db.commit()
+    async with maker() as db:
+        assert await note_stage_retry_pending(rev_id, "kg", db=db) is True
+        await db.commit()
+    service = _RecordingKGService()
+    _patch_kg(monkeypatch, maker, service)
+    _patch_finalize_recorder(monkeypatch, _kg_worker)
+
+    await _kg_worker.handle_kg(_kg_payload(doc_id, ws, rev_id))
+
+    rows = await _handler_stage_rows(maker, rev_id)
+    assert rows["kg"] == ("completed", 2)
+    assert len(service.ingests) == 1
+
+
+# -- stale-revision isolation across all four handlers ----------------------
+
+@pytest.mark.asyncio
+async def test_task3_handlers_isolate_stale_revision(
+    async_engine, document_factory, monkeypatch
+):
+    """R1 handlers touch only R1 rows after R2 is allocated."""
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, r1 = await _handler_setup_full(maker, doc_id, sha="4" * 64)
+    async with maker() as db:
+        key = _doc_key(ws, doc_id)
+        r2, _profile = await allocate_reindex_revision(
+            db,
+            doc_id,
+            object_key=key,
+            size_bytes=11,
+            content_sha256="5" * 64,
+            version_id="v-1",
+        )
+        r2_id = r2.revision_id
+        await db.commit()
+    assert r2_id != r1
+    await _seed_raw_chunks(maker, doc_id)
+    await _seed_caption_table(maker, doc_id, r1)
+
+    import app.services.storage_service as _storage_for_stale
+
+    class _StaleStore(_RecordingParseStore):
+        async def download_markdown(self, key):
+            if key.endswith("structure.json"):
+                import json as _json
+
+                return _json.dumps(
+                    {
+                        "chunks": [
+                            {
+                                "chunk_id": "c1",
+                                "ordinal": 0,
+                                "content": "hello world",
+                                "page_no": 1,
+                                "heading_path": [],
+                                "source_file": "doc.pdf",
+                                "image_refs": [],
+                                "table_refs": [],
+                                "has_table": False,
+                                "has_code": False,
+                            }
+                        ]
+                    }
+                )
+            return await super().download_markdown(key)
+
+    store = _StaleStore()
+    # One combined fake serves parse uploads AND the embed structure-artifact
+    # read (utils imports the getter from the storage module directly).
+    monkeypatch.setattr(
+        _storage_for_stale, "get_storage_service", lambda: store
+    )
+    _patch_parse(monkeypatch, maker, store)
+    await _parse_worker.handle_parse(_parse_payload(doc_id, ws, r1))
+
+    embedder = _FakeEmbedder()
+    _patch_embed(monkeypatch, maker, embedder, _FakeVectorStore())
+    _patch_finalize_recorder(monkeypatch, _embed_worker)
+    await _embed_worker.handle_embed(_embed_payload(doc_id, ws, r1))
+
+    _patch_caption(monkeypatch, maker, _RecordingCaptionStore())
+    _patch_finalize_recorder(monkeypatch, _caption_worker)
+    await _caption_worker.handle_caption(_caption_payload(doc_id, ws, r1))
+
+    service = _RecordingKGService()
+    _patch_kg(monkeypatch, maker, service, patch_store=False)
+    _patch_finalize_recorder(monkeypatch, _kg_worker)
+    await _kg_worker.handle_kg(_kg_payload(doc_id, ws, r1))
+
+    r1_rows = await _handler_stage_rows(maker, r1)
+    assert all(state == "completed" for state, _ in r1_rows.values())
+    # The newer generation is untouched: still pending, gate unsatisfied.
+    assert await _handler_stage_rows(maker, r2_id) == {
+        "parse": ("pending", 0),
+        "embed": ("pending", 0),
+        "caption": ("pending", 0),
+        "kg": ("pending", 0),
+    }
+    async with maker() as db:
+        repo = DocumentRevisionsRepository(db)
+        assert await repo.required_stages_complete(r2_id) is False
+
+
+# -- queue failure-note mapping + atomic exhaustion -------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "queue,exchange,stage",
+    [
+        ("hrag.parse", "hrag.parse", "parse"),
+        ("hrag.embed", "hrag.embed", "embed"),
+        ("hrag.caption", "hrag.caption", "caption"),
+        ("hrag.kg.00000000-0000-0000-0000-000000000001", "hrag.kg", "kg"),
+    ],
+)
+async def test_task3_note_failure_stage_retry_touches_only_mapped_stage(
+    async_db, document_factory, queue, exchange, stage
+):
+    """The consolidated failure note resolves the stage from the queue.
+
+    A hardcoded-stage mutation (e.g. always noting ``parse``) moves the
+    wrong row and fails here — the note helpers are never called with a
+    literal stage from the branch code.
+    """
+    from app.queue.connection import _note_failure_stage
+
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+    revision, _created = await _allocate_full(async_db, doc_id, key=key, sha="j" * 64)
+    repo = DocumentRevisionsRepository(async_db)
+    for s in ("parse", "embed", "caption", "kg"):
+        await repo.mark_stage_running(revision.revision_id, s)
+
+    resolved = await _note_failure_stage(
+        queue_name=queue,
+        exchange_name=exchange,
+        revision_id=revision.revision_id,
+        retry_count=0,
+        failure_class="ValueError",
+        db=async_db,
+    )
+
+    assert resolved == stage
+    states = await _stage_states(async_db, revision.revision_id)
+    for s in ("parse", "embed", "caption", "kg"):
+        assert states[s] == ("pending" if s == stage else "running"), s
+    rows = await repo.get_stages(revision.revision_id)
+    assert {r.stage: r.attempt_count for r in rows}[stage] == 1
+    # The revision stays live on retry so the redelivery can re-claim.
+    assert (await repo.get(revision.revision_id)).status == "draft"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "queue,exchange,stage",
+    [
+        ("hrag.parse", "hrag.parse", "parse"),
+        ("hrag.embed", "hrag.embed", "embed"),
+        ("hrag.caption", "hrag.caption", "caption"),
+        ("hrag.kg.00000000-0000-0000-0000-000000000001", "hrag.kg", "kg"),
+    ],
+)
+async def test_task3_note_failure_stage_exhaustion_fails_stage_and_revision(
+    async_db, document_factory, queue, exchange, stage
+):
+    """Exhaustion atomically fails the exact stage AND the revision."""
+    from app.queue.connection import _note_failure_stage
+
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+    revision, _created = await _allocate_full(async_db, doc_id, key=key, sha="k" * 64)
+    repo = DocumentRevisionsRepository(async_db)
+    await repo.mark_stage_running(revision.revision_id, stage)
+
+    resolved = await _note_failure_stage(
+        queue_name=queue,
+        exchange_name=exchange,
+        revision_id=revision.revision_id,
+        retry_count=_conn.MAX_RETRIES,
+        failure_class="TimeoutError",
+        db=async_db,
+    )
+
+    assert resolved == stage
+    assert (await _stage_states(async_db, revision.revision_id))[stage] == "failed"
+    failed_rev = await repo.get(revision.revision_id)
+    assert failed_rev.status == "failed"
+    assert failed_rev.failure_stage == stage
+    assert failed_rev.failure_class == "TimeoutError"
+    # Sibling stages of the same revision are untouched.
+    _final_states = await _stage_states(async_db, revision.revision_id)
+    for s in ("parse", "embed", "caption", "kg"):
+        if s != stage:
+            assert _final_states[s] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_task3_note_failure_stage_publish_failure_is_honest(
+    async_db, document_factory
+):
+    """A failed retry publish (no redelivery coming) exhausts honestly."""
+    from app.queue.connection import _note_failure_stage
+
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+    revision, _created = await _allocate_full(async_db, doc_id, key=key, sha="m" * 64)
+    repo = DocumentRevisionsRepository(async_db)
+    await repo.mark_stage_running(revision.revision_id, "embed")
+
+    resolved = await _note_failure_stage(
+        queue_name="hrag.embed",
+        exchange_name="hrag.embed",
+        revision_id=revision.revision_id,
+        retry_count=0,
+        failure_class="ValueError",
+        force_exhausted=True,
+        db=async_db,
+    )
+
+    assert resolved == "embed"
+    assert (await _stage_states(async_db, revision.revision_id))["embed"] == "failed"
+    assert (await repo.get(revision.revision_id)).status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_task3_note_failure_stage_ignores_non_pipeline(
+    async_db, document_factory
+):
+    """Memory queues and stageless messages resolve to None, untouched."""
+    from app.queue.connection import _note_failure_stage
+
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+    revision, _created = await _allocate_full(async_db, doc_id, key=key, sha="n" * 64)
+    repo = DocumentRevisionsRepository(async_db)
+    await repo.mark_stage_running(revision.revision_id, "parse")
+
+    assert await _note_failure_stage(
+        queue_name="hrag.memory",
+        exchange_name="hrag.memory",
+        revision_id=revision.revision_id,
+        retry_count=0,
+        failure_class="ValueError",
+        db=async_db,
+    ) is None
+    assert await _note_failure_stage(
+        queue_name="hrag.embed",
+        exchange_name="hrag.embed",
+        revision_id=None,
+        retry_count=0,
+        failure_class="ValueError",
+        db=async_db,
+    ) is None
+    assert await _stage_states(async_db, revision.revision_id) == {
+        "parse": "running",
+        "embed": "pending",
+        "caption": "pending",
+        "kg": "pending",
+    }
+    assert (await repo.get(revision.revision_id)).status == "draft"
+    assert (await repo.get(revision.revision_id)).status == "draft"
+
+
+@pytest.mark.asyncio
+async def test_task3_exhausted_note_commits_stage_and_revision_atomically(
+    async_engine, document_factory
+):
+    """Private-session exhaustion commits stage-failed + revision-failed."""
+    from app.queue.connection import note_stage_exhausted
+
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="p" * 64)
+    async with maker() as db:
+        repo = DocumentRevisionsRepository(db)
+        await repo.mark_stage_running(rev_id, "embed")
+        await db.commit()
+
+    import app.core.database as _dbmod
+
+    _real_maker = _dbmod.async_session_maker
+    _dbmod.async_session_maker = maker
+    try:
+        assert await note_stage_exhausted(
+            rev_id, "embed", failure_class="ValueError"
+        ) is True
+    finally:
+        _dbmod.async_session_maker = _real_maker
+
+    rows = await _handler_stage_rows(maker, rev_id)
+    assert rows["embed"][0] == "failed"
+    assert await _handler_revision_status(maker, rev_id) == "failed"
