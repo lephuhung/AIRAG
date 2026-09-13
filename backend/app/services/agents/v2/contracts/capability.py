@@ -77,6 +77,23 @@ class DocumentSearchInput(ContractModel):
     person_identifier: str | None = None
 
 
+class DocumentRetrieveInput(ContractModel):
+    """Revision-aware factual retrieval over authorized scope or pinned targets.
+
+    Empty ``target_ids`` means retrieval over the current authenticated
+    workspace scope. Non-empty ``target_ids`` reference planned target units
+    and resolve only through the authoritative checkpointed plan and bindings;
+    they never carry raw document or revision IDs. ``query`` is model-supplied
+    only through a governed proposal; output carries counts only, with content
+    persisted as governed Evidence records.
+    """
+
+    kind: Literal["document.retrieve"]
+    query: str = Field(min_length=1)
+    target_ids: tuple[str, ...] = ()
+    top_k: int = Field(default=8, ge=1, le=20)
+
+
 class DocumentReadInput(ContractModel):
     """Reads one or more planned targets; document identity resolves via the plan."""
 
@@ -113,6 +130,7 @@ class AbbreviationResolveInput(ContractModel):
 CapabilityInput = Annotated[
     PeopleLookupInput
     | DocumentSearchInput
+    | DocumentRetrieveInput
     | DocumentReadInput
     | SectionReadInput
     | WriteInput
@@ -135,6 +153,13 @@ class DocumentSearchOutput(ContractModel):
 
     kind: Literal["document.search"]
     candidates: tuple[DocumentDiscoveryCandidate, ...]
+
+
+class DocumentRetrieveOutput(ContractModel):
+    """Checkpoint-safe retrieval fact; retrieved content lives in evidence only."""
+
+    kind: Literal["document.retrieve"]
+    retrieved_unit_count: int = Field(ge=0)
 
 
 class DocumentReadOutput(ContractModel):
@@ -172,6 +197,7 @@ class AbbreviationResolveOutput(ContractModel):
 CapabilityOutput = Annotated[
     PeopleLookupOutput
     | DocumentSearchOutput
+    | DocumentRetrieveOutput
     | DocumentReadOutput
     | SectionReadOutput
     | WriteOutput

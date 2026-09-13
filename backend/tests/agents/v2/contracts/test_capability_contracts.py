@@ -24,6 +24,8 @@ from app.services.agents.v2.contracts.capability import (
     CapabilityRuntimeContext,
     DocumentReadInput,
     DocumentReadOutput,
+    DocumentRetrieveInput,
+    DocumentRetrieveOutput,
     DocumentSearchInput,
     DocumentSearchOutput,
     KnowledgeGraphInput,
@@ -42,6 +44,7 @@ from app.services.agents.v2.contracts.execution import AgentRequest, AgentResult
 EXPECTED_KINDS = [
     "people.lookup",
     "document.search",
+    "document.retrieve",
     "document.read",
     "section.read",
     "write",
@@ -53,6 +56,7 @@ EXPECTED_KINDS = [
 CAPABILITY_INPUT_VARIANTS = (
     PeopleLookupInput,
     DocumentSearchInput,
+    DocumentRetrieveInput,
     DocumentReadInput,
     SectionReadInput,
     WriteInput,
@@ -64,6 +68,7 @@ CAPABILITY_INPUT_VARIANTS = (
 CAPABILITY_OUTPUT_VARIANTS = (
     PeopleLookupOutput,
     DocumentSearchOutput,
+    DocumentRetrieveOutput,
     DocumentReadOutput,
     SectionReadOutput,
     WriteOutput,
@@ -83,7 +88,7 @@ def _union_variants(alias: object) -> tuple[type[object], ...]:
 @pytest.mark.parametrize("alias", [CapabilityInput, CapabilityOutput], ids=["input", "output"])
 def test_capability_unions_are_closed_discriminated_unions(alias: object) -> None:
     variants = _union_variants(alias)
-    assert len(variants) == 8
+    assert len(variants) == 9
     kinds = [get_args(variant.model_fields["kind"].annotation)[0] for variant in variants]
     assert kinds == EXPECTED_KINDS
     assert all(
@@ -193,6 +198,20 @@ def test_capability_descriptor_is_the_minimal_planner_catalog_entry() -> None:
     for forbidden in ("version", "description", "behavior_flags", "provider"):
         assert forbidden not in CapabilityDescriptor.model_fields
     assert descriptor.operation_type == "search"
+
+
+def test_document_retrieve_contract_is_strict_and_bounded() -> None:
+    value = DocumentRetrieveInput(
+        kind="document.retrieve", query="lan bmnn", target_ids=("t1",), top_k=8
+    )
+    assert value.target_ids == ("t1",)
+    with pytest.raises(ValidationError):
+        DocumentRetrieveInput(kind="document.retrieve", query="x", top_k=21)
+
+
+def test_old_capability_payloads_still_round_trip() -> None:
+    payload = DocumentReadInput(kind="document.read", target_ids=("t1",)).model_dump_json()
+    assert DocumentReadInput.model_validate_json(payload).kind == "document.read"
 
 
 def test_capability_runtime_context_carries_current_trusted_authority() -> None:

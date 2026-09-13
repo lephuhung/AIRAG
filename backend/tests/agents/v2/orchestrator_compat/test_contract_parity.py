@@ -320,3 +320,30 @@ def test_clarification_scenario_carries_candidates_and_expiry() -> None:
         assert isinstance(c.ordinal, int)
         assert c.ref_id
     assert clarification.expires_at.tzinfo is not None
+
+
+def test_old_capability_payloads_still_round_trip_after_retrieve_addition() -> None:
+    """P0 Task 1: adding `document.retrieve` keeps old variants readable."""
+    from pydantic import TypeAdapter
+
+    from app.services.agents.v2.contracts.capability import (
+        CapabilityInput,
+        CapabilityOutput,
+        DocumentReadInput,
+        DocumentReadOutput,
+    )
+
+    read_in = DocumentReadInput(kind="document.read", target_ids=("t1",))
+    assert (
+        TypeAdapter(CapabilityInput)
+        .validate_json(read_in.model_dump_json())
+        .kind
+        == "document.read"
+    )
+    read_out = DocumentReadOutput(kind="document.read", read_unit_count=1)
+    assert (
+        TypeAdapter(CapabilityOutput)
+        .validate_json(read_out.model_dump_json())
+        .kind
+        == "document.read"
+    )

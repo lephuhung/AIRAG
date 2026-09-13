@@ -2475,7 +2475,8 @@ def test_reduce_uses_framework_boundaries_not_agent_or_capability() -> None:
     policy_source = inspect.getsource(policy_module)
     assert "capability.execute(" not in policy_source
 
-    # No new frozen capability: the input union is exactly the frozen set.
+    # No new frozen capability beyond the P0 additive `document.retrieve`:
+    # the input union is exactly the frozen set plus the authorized addition.
     from typing import get_args
 
     members = get_args(get_args(CapabilityInput)[0])
@@ -2485,6 +2486,7 @@ def test_reduce_uses_framework_boundaries_not_agent_or_capability() -> None:
     assert kinds == {
         "people.lookup",
         "document.search",
+        "document.retrieve",
         "document.read",
         "section.read",
         "write",

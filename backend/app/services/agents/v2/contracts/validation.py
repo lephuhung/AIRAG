@@ -25,6 +25,7 @@ from .binding import (
 )
 from .capability import (
     DocumentReadInput,
+    DocumentRetrieveInput,
     DocumentSearchInput,
     SectionReadInput,
     WriteInput,
@@ -80,7 +81,13 @@ _PEOPLE_LOOKUP_CAPABILITY = "people.lookup"
 _MATERIALIZED_SCALAR_STATUSES = frozenset({"success"})
 
 # Spec §13.4: only these input variants reference logical targets.
-_TARGET_BEARING_INPUTS = (DocumentReadInput, SectionReadInput, WriteInput)
+# `document.retrieve` targets resolve through the checkpointed plan/bindings.
+_TARGET_BEARING_INPUTS = (
+    DocumentReadInput,
+    DocumentRetrieveInput,
+    SectionReadInput,
+    WriteInput,
+)
 
 # Spec §7: keys every v2 checkpoint aggregate must carry.
 _CHECKPOINT_REQUIRED_KEYS = (
