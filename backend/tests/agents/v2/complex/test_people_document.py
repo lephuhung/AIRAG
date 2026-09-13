@@ -1171,3 +1171,173 @@ async def test_full_materialization_appends_validated_t2() -> None:
     assert task.depends_on == ("T1",)
     assert isinstance(task.input, DocumentSearchInput)
     assert task.input.person_identifier == SCALAR
+
+
+# ---------------------------------------------------------------------------
+# R92 end-to-end production-capability proof: People evidence → deterministic
+# materialization → scalar-backed document.search → candidate settlement
+# ---------------------------------------------------------------------------
+
+
+class _StubSession:
+    """DB-session stand-in: the v1 search and revision pinning are stubbed."""
+
+    async def __aenter__(self) -> object:
+        return object()
+
+    async def __aexit__(self, *args: object) -> bool:
+        return False
+
+
+@pytest.mark.asyncio
+async def test_r92_scalar_backed_search_end_to_end_through_production_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R92 proof on the REAL production path (no capability doubles).
+
+    Governed People evidence → real ``materialize_person_dependency`` → real
+    ``DocumentSearchCapability`` wired with the real
+    ``V1DocumentSearchService`` (only the v1 retrieval + revision lookup are
+    stubbed) → candidates settle on the dispatched T2. Proves the scalar
+    reaches the service as an authorized refinement and the workspace scope
+    is never widened.
+    """
+    from types import SimpleNamespace
+
+    from app.services.agents.supervisor_v2 import V1DocumentSearchService
+    from app.services.agents.v2.capabilities import DocumentSearchCapability
+    from app.services.agents.v2.persistence import document_views
+
+    # 1. People evidence → deterministic materialization (real materializer).
+    plan = _people_plan()
+    runtime = _runtime(hydrator=FakeHydrator((_hydrated(_minimized_content(SCALAR)),)))
+    outcome = await materialize_person_dependency(
+        people_task_id="T1",
+        people_result=_people_success(),
+        runtime=runtime,
+        plan=plan,
+        bindings=_bindings(),
+        query="nghi dinh",
+    )
+    assert outcome.kind == "materialized"
+    task = build_dependent_search_task(
+        outcome, people_task_id="T1", query="nghi dinh", next_task_id="T2"
+    )
+    assert isinstance(task.input, DocumentSearchInput)
+    assert task.input.person_identifier == SCALAR
+
+    # 2. Real V1 service with stubbed v1 retrieval + revision pinning.
+    seen: dict[str, object] = {}
+    document_id = uuid4()
+    revision_id = uuid4()
+
+    async def fake_search(
+        query: str,
+        top_k: int,
+        workspace_ids: list[UUID],
+        exclusions: set[object],
+        db: object,
+    ) -> dict[str, object]:
+        seen["query"] = query
+        seen["workspace_ids"] = list(workspace_ids)
+        return {"sources": [{"document_id": str(document_id)}]}
+
+    async def fake_identity(db: object, doc_id: UUID, **kwargs: object) -> object:
+        seen["pinned"] = doc_id
+        return SimpleNamespace(revision_id=revision_id, document_id=doc_id)
+
+    monkeypatch.setattr(
+        document_views, "load_current_revision_identity", fake_identity
+    )
+    service = V1DocumentSearchService(
+        search=fake_search, session_factory=_StubSession
+    )
+    candidates = await service.search(
+        task.input.query, task.input.person_identifier, (WORKSPACE_ID,)
+    )
+    # The scalar reached the service as an authorized query refinement...
+    assert SCALAR in str(seen["query"])
+    assert "nghi dinh" in str(seen["query"])
+    # ...inside the UNCHANGED authorized workspace scope (no widening).
+    assert seen["workspace_ids"] == [WORKSPACE_ID]
+    assert seen["pinned"] == document_id
+    assert len(candidates) == 1
+    assert candidates[0].document_id == document_id
+    assert candidates[0].document_revision == str(revision_id)
+
+    # 3. Dispatched through the REAL production capability → settlement.
+    capability = DocumentSearchCapability(service=service)
+    result = await capability.execute(
+        AgentRequest(
+            contract_version=CONTRACT_VERSION,
+            task_id="T2",
+            objective=task.task_objective,
+            input=task.input,
+        ),
+        CapabilityRuntimeContext(
+            request_id="req-1",
+            run_id="run-1",
+            user_id=USER_ID,
+            workspace_ids=(WORKSPACE_ID,),
+            can_read_people=True,
+            allowed_capabilities=frozenset({"document.search"}),
+            deadline_at=datetime(2030, 1, 1, tzinfo=UTC),
+        ),
+    )
+    assert result.status == "success"
+    assert result.data is not None
+    assert isinstance(result.data, DocumentSearchOutput)
+    # Same settlement (candidate_ids are minted per search call, so compare
+    # the pinned identities, not the ephemeral ids).
+    assert [
+        (c.document_id, c.document_revision) for c in result.data.candidates
+    ] == [(c.document_id, c.document_revision) for c in candidates]
+    assert result.evidence_uses == ()
+
+
+@pytest.mark.asyncio
+async def test_r92_scalar_service_failure_stays_a_typed_error() -> None:
+    """A failing scalar-backed v1 search settles as a typed error (R92).
+
+    The capability keeps a typed error when the scalar path fails: no
+    candidates are fabricated and no exception escapes as checkpoint state.
+    """
+    from app.services.agents.supervisor_v2 import V1DocumentSearchService
+    from app.services.agents.v2.capabilities import DocumentSearchCapability
+
+    async def failing_search(
+        query: str,
+        top_k: int,
+        workspace_ids: list[UUID],
+        exclusions: set[object],
+        db: object,
+    ) -> dict[str, object]:
+        raise ConnectionError("v1 search down")
+
+    service = V1DocumentSearchService(
+        search=failing_search, session_factory=_StubSession
+    )
+    capability = DocumentSearchCapability(service=service)
+    result = await capability.execute(
+        AgentRequest(
+            contract_version=CONTRACT_VERSION,
+            task_id="T2",
+            objective="Search documents for the person resolved by T1",
+            input=DocumentSearchInput(
+                kind="document.search", query="nghi dinh", person_identifier=SCALAR
+            ),
+        ),
+        CapabilityRuntimeContext(
+            request_id="req-1",
+            run_id="run-1",
+            user_id=USER_ID,
+            workspace_ids=(WORKSPACE_ID,),
+            can_read_people=True,
+            allowed_capabilities=frozenset({"document.search"}),
+            deadline_at=datetime(2030, 1, 1, tzinfo=UTC),
+        ),
+    )
+    assert result.status == "error"
+    assert result.error is not None
+    assert result.error.code == "DEPENDENCY_UNAVAILABLE"
+    assert result.data is None

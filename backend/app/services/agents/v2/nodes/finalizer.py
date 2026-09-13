@@ -317,7 +317,7 @@ async def finalizer_node(
             contract_version=CONTRACT_VERSION,
             status="error",
             content=(
-                "Luồng complex_research chưa khả dụng trong Phase 2 "
+                "Yêu cầu này hiện chưa được hỗ trợ "
                 f"(lý do: {route.reason_code})."
             ),
             citations=(),

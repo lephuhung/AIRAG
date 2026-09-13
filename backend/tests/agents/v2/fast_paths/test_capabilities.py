@@ -896,7 +896,10 @@ async def test_section_read_unreadable_and_truncated_branches() -> None:
 
 
 @pytest.mark.asyncio
-async def test_document_search_person_identifier_fails_closed() -> None:
+async def test_document_search_passes_person_identifier_to_service() -> None:
+    # R92: the governed People→Document scalar is an authorized query
+    # refinement, not a refusal: the capability passes it through to the
+    # search port and returns opaque candidates only.
     from app.services.agents.v2.capabilities import DocumentSearchCapability
 
     service = FakeSearchService(())
@@ -911,11 +914,32 @@ async def test_document_search_person_identifier_fails_closed() -> None:
         ),
         runtime_context(),
     )
-    # The scalar is threaded into the port but unsupported: fail closed,
-    # never silently run a plain query search.
+    assert result.status == "not_found"
+    assert result.data is not None
+    assert service.calls == [("A", "p-1", runtime_context().workspace_ids)]
+
+
+@pytest.mark.asyncio
+async def test_document_search_blank_person_identifier_fails_closed() -> None:
+    # R92: a blank scalar can never be a governed refinement: fail closed
+    # instead of silently running a plain query search.
+    from app.services.agents.v2.capabilities import DocumentSearchCapability
+
+    service = FakeSearchService(())
+    capability = DocumentSearchCapability(service=service)
+    result = await capability.execute(
+        agent_request(
+            "T1",
+            "find docs for A",
+            DocumentSearchInput(
+                kind="document.search", query="A", person_identifier="   "
+            ),
+        ),
+        runtime_context(),
+    )
     assert result.status == "error"
     assert result.error is not None
-    assert result.error.code == "DEPENDENCY_UNAVAILABLE"
+    assert result.error.code == "INVALID_INPUT"
     assert result.data is None
     assert service.calls == []
 

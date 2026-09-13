@@ -1373,6 +1373,14 @@ class V1DocumentSearchService:
     this lookup would invent identity). Documents with no current revision
     are skipped; an empty search returns no candidates (typed ``not_found``
     downstream, never an error).
+
+    The governed People→Document scalar (``person_identifier``, R92) is
+    consumed as an authorized query refinement: the server-materialized
+    scalar is appended to the task query and the EXISTING workspace-scoped
+    hybrid search runs unchanged. ``workspace_ids`` are never widened, no
+    graph/supervisor state is read, and a blank/non-string scalar fails
+    closed (``V1ServiceUnavailable`` → typed capability error) instead of
+    silently running an unrefined search.
     """
 
     def __init__(
@@ -1394,6 +1402,23 @@ class V1DocumentSearchService:
     ) -> Any:
         from .v2.persistence import document_views
 
+        # R92: consume the governed scalar as an authorized refinement of
+        # the task query. The scalar is server-materialized after a
+        # successful people.lookup (never planner-supplied); combining it
+        # into the query text keeps the v1 retrieval call inside the
+        # UNCHANGED authorized workspace scope.
+        effective_query = query
+        if person_identifier is not None:
+            if not isinstance(person_identifier, str) or not person_identifier.strip():
+                raise V1ServiceUnavailable(
+                    "document.search carries a blank people dependency "
+                    "scalar; refusing to run an unrefined search"
+                )
+            scalar = person_identifier.strip()
+            effective_query = (
+                f"{query} {scalar}" if query and query.strip() else scalar
+            )
+
         search = self._search
         if search is None:
             search = _v1_attr("app.services.agent.tools", "search_documents")
@@ -1407,7 +1432,7 @@ class V1DocumentSearchService:
 
         async with open_session() as db:
             found = await search(
-                query,
+                effective_query,
                 self._top_k,
                 [workspace_id for workspace_id in workspace_ids],
                 set(),

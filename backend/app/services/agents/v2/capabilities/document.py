@@ -5,8 +5,8 @@
   only from ``CapabilityRuntimeContext``. It returns opaque discovery
   candidates (``DocumentSearchOutput``) and never reports read coverage. The
   governed People→Document dependency scalar (``person_identifier``) is
-  threaded into the search port; until a real v1 search supports it, a present
-  scalar fails closed instead of being silently ignored.
+  passed through to the search port as an authorized query refinement (R92):
+  a blank scalar fails closed instead of being silently dropped.
 - ``DocumentReadCapability`` (``document.read``) reads planned targets. Each
   distinct ``target_id`` resolves to its ``ResolvedTarget`` (planned
   ``TargetUnit`` + pinned, currently-authorized ``ScopedDocument``) through the
@@ -116,20 +116,24 @@ class DocumentSearchCapability:
                 code="INVALID_INPUT",
                 message="document.search requires a document.search input",
             )
-        if request.input.person_identifier is not None:
-            # The governed People→Document scalar is threaded into the port
-            # but no v1 search backs it yet: fail closed rather than silently
-            # running a plain query search that drops the people dependency.
+        scalar = request.input.person_identifier
+        if scalar is not None and (
+            not isinstance(scalar, str) or not scalar.strip()
+        ):
+            # R92: a blank scalar is never a governed refinement: fail
+            # closed rather than silently running a plain query search that
+            # drops the people dependency.
             return error_result(
                 request.task_id,
-                code="DEPENDENCY_UNAVAILABLE",
+                code="INVALID_INPUT",
                 message=(
-                    "document.search with a people dependency is not supported"
+                    "document.search carries a blank people dependency "
+                    "scalar; refusing to run an unrefined search"
                 ),
             )
         try:
             candidates = await self._service.search(
-                request.input.query, None, runtime.workspace_ids
+                request.input.query, scalar, runtime.workspace_ids
             )
         except Exception as exc:
             return dependency_error(
