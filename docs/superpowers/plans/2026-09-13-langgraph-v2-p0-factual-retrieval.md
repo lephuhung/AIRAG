@@ -127,7 +127,7 @@ class DocumentRetrievalService(Protocol):
     async def retrieve(self, query: str, *, top_k: int, allowed_targets: tuple[ResolvedTarget, ...], workspace_ids: tuple[UUID, ...]) -> Sequence[RevisionRetrievedChunk]: ...
 ```
 
-`DocumentRetrieveCapability.execute()` must resolve non-empty target IDs, call the service, reject mismatches, persist each accepted chunk with `DocumentSourceIdentity`, emit coverage only for matched explicit targets, and return `not_found` when none survive.
+`DocumentRetrieveCapability.execute()` must resolve non-empty target IDs, call the service, reject mismatches, persist each accepted chunk with `DocumentSourceIdentity`, emit target-bound coverage-purpose EvidenceUses only for matched explicit targets, and return `not_found` when none survive. It deliberately emits no read-only `CoverageObservation`; Task 4 owns evaluator integration for these uses.
 
 - [ ] **Step 4: Add count-only observation and run GREEN**
 
@@ -177,20 +177,22 @@ git add backend/app/services/agents/supervisor_v2.py backend/app/services/agents
 git commit -m "feat(v2): enforce explicit document hard scope"
 ```
 
-### Task 4: Add deterministic retrieve planning
+### Task 4: Add deterministic retrieve planning and evaluator integration
 
 **Files:**
 - Create: `backend/app/services/agents/v2/skills/retrieve/__init__.py`
 - Create: `backend/app/services/agents/v2/skills/retrieve/policy.py`
 - Modify: `backend/app/services/agents/v2/complex_research_graph.py`
+- Modify: `backend/app/services/agents/v2/nodes/evaluate.py`
 - Modify: `backend/tests/agents/v2/complex/test_retrieval.py`
+- Modify: `backend/tests/agents/v2/test_evaluate.py`
 
 **Interfaces:**
-- Produces: `build_retrieve_plan(ResearchPlanningInput) -> TaskPlan` and initial proposal selection for `retrieve`.
+- Produces: `build_retrieve_plan(ResearchPlanningInput) -> TaskPlan`, initial proposal selection for `retrieve`, and evaluator-owned sufficiency/coverage semantics for admitted retrieval evidence.
 
-- [ ] **Step 1: Write failing real-graph tests**
+- [ ] **Step 1: Write failing real-graph and evaluator tests**
 
-Assert reference-free retrieval checkpoints one targetless task before dispatch; explicit pins create target units and task target IDs; missing catalog entry produces typed unavailable; actual scheduler call count is one.
+Assert reference-free retrieval checkpoints one targetless task before dispatch; explicit pins create target units and task target IDs; missing catalog entry produces typed unavailable; actual scheduler call count is one. Prove an unscoped retrieve-only task with one admitted supporting use passes the every-expecting-task evidence gate. Prove a scoped document-level retrieve target with an admitted target-bound coverage use on the pinned revision produces `read_partial`, satisfies an explicit `minimum_status="read_partial"` criterion, and rejects wrong-target, wrong-revision, and locator-incompatible uses.
 
 - [ ] **Step 2: Run RED**
 
@@ -206,14 +208,14 @@ def build_retrieve_plan(input: ResearchPlanningInput) -> TaskPlan:
     # validate_task_plan before return
 ```
 
-Select it in `build_initial_proposal()` for `work_type == "retrieve"`; preserve compare/summarize/cross-domain branches.
+Select it in `build_initial_proposal()` for `work_type == "retrieve"`; preserve compare/summarize/cross-domain branches. Add `document.retrieve` to `_EVIDENCE_SUPPLYING_CAPABILITIES`. Extend `build_coverage()` so a governed, hydrated `coverage` use produced by a `document.retrieve` task establishes retrieval coverage without fabricating a read observation: a chunk from the pinned revision is `read_partial` for a document-level target, while locator-specific targets must satisfy `locator_covers`. The retrieve policy must set document-level target coverage criteria to `minimum_status="read_partial"`. Keep existing `document.read` coverage semantics unchanged.
 
 - [ ] **Step 4: Run GREEN and commit**
 
 ```bash
-cd backend && PYTHONPATH=. pytest tests/agents/v2/complex tests/agents/v2/fast_paths/test_scheduler.py -q
-git add backend/app/services/agents/v2/skills/retrieve backend/app/services/agents/v2/complex_research_graph.py backend/tests/agents/v2/complex/test_retrieval.py
-git commit -m "feat(v2): plan generic factual retrieval"
+cd backend && PYTHONPATH=. pytest tests/agents/v2/complex tests/agents/v2/test_evaluate.py tests/agents/v2/fast_paths/test_scheduler.py -q
+git add backend/app/services/agents/v2/skills/retrieve backend/app/services/agents/v2/complex_research_graph.py backend/app/services/agents/v2/nodes/evaluate.py backend/tests/agents/v2/complex/test_retrieval.py backend/tests/agents/v2/test_evaluate.py
+git commit -m "feat(v2): plan and evaluate factual retrieval"
 ```
 
 ### Task 5: Wire the live revision-manifest retrieval service

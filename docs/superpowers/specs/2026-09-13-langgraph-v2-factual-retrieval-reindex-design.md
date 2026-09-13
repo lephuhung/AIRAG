@@ -165,14 +165,16 @@ The retrieval service must:
 6. Persist accepted chunks through `EvidenceBuilder` as `DocumentSourceIdentity` records and return only `EvidenceUseRef` values plus `DocumentRetrieveOutput`.
 7. Report retrieval coverage only for explicit target IDs actually represented by admitted chunks. An unscoped targetless retrieval supplies evidence but does not fabricate target coverage.
 
+Retrieval coverage is evaluator-owned and is derived from admitted, target-bound `EvidenceUse(purpose="coverage")` records after governed hydration. `document.retrieve` does not emit the read-only `CoverageObservation` contract. The evaluator treats `document.retrieve` as an evidence-supplying capability. For an explicit document-level retrieval target, at least one admitted chunk on the pinned document revision establishes `read_partial`; the deterministic retrieve policy sets that target's `CoverageCriterion.minimum_status` to `read_partial`. Locator-specific targets retain the existing `locator_covers` compatibility rule and must not receive coverage from a mismatched locator. This rule preserves the frozen coverage contracts while making both scoped and targetless retrieve-only plans capable of reaching a sufficient verdict.
+
 The provider adapter may call the existing embed/rerank HTTP service, but it must not fall back to a current-config namespace when the revision manifest is absent or incompatible.
 
 ### 4.4 Evaluation and synthesis
 
 The shared evaluator remains authoritative:
 
-- A scoped plan is sufficient only when required target coverage and semantic evidence criteria pass.
-- An unscoped plan is sufficient only when at least one admitted EvidenceUse exists and the semantic judge finds the evidence adequate.
+- A scoped plan is sufficient only when required target coverage and semantic evidence criteria pass. For `document.retrieve`, target coverage is computed from admitted target-bound coverage uses under the retrieval rule in §4.3; it does not require a read-only `CoverageObservation`.
+- An unscoped plan is sufficient only when at least one admitted EvidenceUse exists and the semantic judge finds the evidence adequate. `document.retrieve` is included in the evaluator's evidence-supplying capability set so this gate is reachable.
 - Empty, denied, timed-out, stale-revision, or out-of-scope retrieval results cannot become success.
 
 The existing synthesis and grounding nodes hydrate EvidenceUses, enforce budgets, validate claims, and emit citations. No synthesis or grounding logic is added to the capability or complex subgraph.
