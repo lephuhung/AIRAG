@@ -28,6 +28,7 @@ from ..contracts.capability import (
     CapabilityDescriptor,
     CapabilityInput,
     DocumentReadInput,
+    DocumentRetrieveInput,
     DocumentSearchInput,
     KnowledgeGraphInput,
     MemoryLookupInput,
@@ -40,6 +41,7 @@ from .gateway import CapabilityInvocationProposal
 _TOOL_INPUT_TYPES: dict[str, type[ContractModel]] = {
     "people.lookup": PeopleLookupInput,
     "document.search": DocumentSearchInput,
+    "document.retrieve": DocumentRetrieveInput,
     "document.read": DocumentReadInput,
     "section.read": SectionReadInput,
     "write": WriteInput,

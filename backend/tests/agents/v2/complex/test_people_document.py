@@ -1242,12 +1242,17 @@ async def test_r92_scalar_backed_search_end_to_end_through_production_capability
         seen["workspace_ids"] = list(workspace_ids)
         return {"sources": [{"document_id": str(document_id)}]}
 
-    async def fake_identity(db: object, doc_id: UUID, **kwargs: object) -> object:
+    async def fake_identity(
+        db: object, doc_id: UUID, workspace_id: UUID, **kwargs: object
+    ) -> object:
         seen["pinned"] = doc_id
+        seen["pinned_workspace"] = workspace_id
         return SimpleNamespace(revision_id=revision_id, document_id=doc_id)
 
     monkeypatch.setattr(
-        document_views, "load_current_revision_identity", fake_identity
+        document_views,
+        "load_current_revision_identity_for_workspace",
+        fake_identity,
     )
     service = V1DocumentSearchService(
         search=fake_search, session_factory=_StubSession
@@ -1261,6 +1266,7 @@ async def test_r92_scalar_backed_search_end_to_end_through_production_capability
     # ...inside the UNCHANGED authorized workspace scope (no widening).
     assert seen["workspace_ids"] == [WORKSPACE_ID]
     assert seen["pinned"] == document_id
+    assert seen["pinned_workspace"] == WORKSPACE_ID
     assert len(candidates) == 1
     assert candidates[0].document_id == document_id
     assert candidates[0].document_revision == str(revision_id)

@@ -1518,3 +1518,73 @@ async def test_c2_real_resume_advances_feeds_resolver_and_anchored_refresh():
     # (expiry extended): the pair recurs after the snapshot.
     assert len(shared["leases"].acquired) > len(acquired_before)
     assert (shared["revision"], use_id) in shared["leases"].acquired
+
+
+def test_task5_v2_ingress_callers_construct_equivalent_trusted_scope():
+    """Task 5: standalone/session/admin/telegram build equivalent v2 scope.
+
+    Every production ``build_v2_ingress`` call site passes the authenticated
+    workspace scope as ``authenticated_workspace_ids``; only the
+    authenticated-admin evaluation surface may narrow it via
+    ``requested_workspace_ids`` (intersected inside, 403 when empty); and
+    ``api_explicit`` known-documents are built only from server-filtered
+    ``document_ids``.
+    """
+    import ast
+    from pathlib import Path
+
+    import app.services.agent.streaming as convert_streaming
+
+    root = Path(convert_streaming.__file__).resolve().parents[3]
+    files = {
+        "standalone": root / "app" / "api" / "chat_agent_lg.py",
+        "session": root / "app" / "api" / "chat_session.py",
+        "admin": root / "app" / "api" / "agent_admin.py",
+        "telegram": root
+        / "app"
+        / "services"
+        / "integrations"
+        / "telegram_service.py",
+    }
+    calls: dict[str, list[dict]] = {}
+    for name, path in files.items():
+        tree = ast.parse(path.read_text())
+        found = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                label = (
+                    func.attr
+                    if isinstance(func, ast.Attribute)
+                    else getattr(func, "id", "")
+                )
+                if label == "build_v2_ingress":
+                    found.append(
+                        {kw.arg: ast.unparse(kw.value) for kw in node.keywords}
+                    )
+        assert found, f"{name} ({path}) must build the v2 ingress"
+        calls[name] = found
+
+    for name, sites in calls.items():
+        for kw in sites:
+            assert "authenticated_workspace_ids" in kw, (
+                f"{name}: ingress must pass the authenticated scope"
+            )
+            assert "requested_workspace_ids" in kw or name != "admin", (
+                f"{name}: only admin may narrow scope; others default to full"
+            )
+    # Only the admin surface narrows by a caller-supplied workspace list.
+    narrowers = [
+        name
+        for name, sites in calls.items()
+        for kw in sites
+        if kw.get("requested_workspace_ids") not in (None, "None")
+    ]
+    assert narrowers == ["admin"], (
+        f"only admin may narrow scope, got {narrowers}"
+    )
+    # api_explicit resources are built only from server-filtered document_ids.
+    for name in ("standalone", "session"):
+        source = files[name].read_text()
+        assert 'source="api_explicit"' in source
+    assert 'source="api_explicit"' not in files["telegram"].read_text()

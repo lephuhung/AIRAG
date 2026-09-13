@@ -69,6 +69,10 @@ DEFAULT_V2_ALLOWED_CAPABILITIES: frozenset[str] = frozenset(
     {
         "people.lookup",
         "document.search",
+        # P0 Task 5: permitted by default; actual dispatch additionally
+        # requires the ``v1-revision-retrieval`` service gate (manifest +
+        # provider dependencies live) in the request-scoped registry.
+        "document.retrieve",
         "document.read",
         "section.read",
         "knowledge_graph.query",

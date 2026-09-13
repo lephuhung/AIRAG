@@ -62,6 +62,7 @@ saver) with its state, interrupt/resume, and checkpoint namespacing intact.
 """
 from __future__ import annotations
 
+import asyncio
 import functools
 import importlib
 import inspect
@@ -69,7 +70,7 @@ import json
 import logging
 import threading
 import warnings
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -88,6 +89,7 @@ from .v2.capabilities import (
     CapabilityRegistry,
     CapabilityRuntimeContext,
     DocumentReadCapability,
+    DocumentRetrieveCapability,
     DocumentSearchCapability,
     EvidenceBuilder,
     KnowledgeGraphCapability,
@@ -98,6 +100,7 @@ from .v2.capabilities import (
     SectionReadCapability,
     build_capability_registry,
 )
+from .v2.capabilities.document import RevisionRetrievedChunk
 from .v2.contracts.base import CONTRACT_VERSION
 from .v2.contracts.binding import DocumentBindingSet, DocumentDiscoveryCandidate
 from .v2.contracts.clarification import ClarificationRequest, ClarificationResolution
@@ -166,6 +169,7 @@ __all__ = [
     "V1BindingResolver",
     "V1PeopleLookupService",
     "V1DocumentSearchService",
+    "V1RevisionAwareRetrievalService",
     "V1DocumentContentReader",
     "V1SectionContentReader",
     "V1KnowledgeGraphClient",
@@ -1556,12 +1560,21 @@ class V1DocumentSearchService:
         candidates: list[DocumentDiscoveryCandidate] = []
         async with open_session() as db:
             for document_id in document_ids:
-                try:
-                    identity = await document_views.load_current_revision_identity(
-                        db, document_id
-                    )
-                except document_views.RevisionNotReady:
-                    continue
+                # Task 5: pin through the workspace-scoped lookup (union over
+                # the trusted runtime scope, first authorized match wins), so
+                # a foreign-workspace id or a tombstoned document can never be
+                # pinned even if the v1 search above returned it. The unscoped
+                # loader is deliberately not used here.
+                identity = None
+                for workspace_id in workspace_ids:
+                    try:
+                        identity = await document_views.load_current_revision_identity_for_workspace(
+                            db, document_id, workspace_id
+                        )
+                    except document_views.RevisionNotReady:
+                        continue
+                    if identity is not None:
+                        break
                 if identity is None:
                     continue
                 candidates.append(
@@ -1572,6 +1585,515 @@ class V1DocumentSearchService:
                     )
                 )
         return candidates
+
+
+class V1RevisionAwareRetrievalService:
+    """Live revision-manifest chunk retrieval over exact revision namespaces.
+
+    P0 Task 5 server-side dependency behind ``DocumentRetrieveCapability``
+    (implements the ``DocumentRetrievalService`` port: ``retrieve(query, *,
+    top_k, allowed_targets, workspace_ids)``). For every admitted revision it
+    loads the exact manifest identity via ``persistence.document_views``
+    (namespace, model hash, dimension, vector artifact version — read from
+    that revision's own build manifest, never from current configuration)
+    and queries ONLY that namespace with hard ``revision_id`` + ``document_id``
+    filters through the existing HTTP embed/rerank provider.
+
+    Fail-closed contract (never a current-config namespace fallback):
+
+    - scoped: each pinned target's revision is resolved workspace-scoped
+      (union over ``workspace_ids``, first authorized match wins). A missing
+      or unpublished manifest, a foreign-workspace or tombstoned document,
+      an incompatible vector artifact version, or a manifest that does not
+      match the pinned ``(document_id, document_revision)`` raises
+      ``V1ServiceUnavailable`` — the capability maps it to a typed
+      ``dependency_error``, never to success with wrong-revision chunks.
+    - unscoped: candidates come from the workspace-scoped discovery port and
+      each is pinned the same workspace-scoped way; unresolvable candidates
+      (foreign, tombstoned, legacy, unpublished, incompatible) are skipped.
+    - provider hits are re-verified per hit (revision, document, workspace,
+      vector-id shape, non-blank content); anything mismatched or malformed
+      is dropped.
+    - ``target_id`` hints are never minted here (always ``None``): the
+      capability matches hintless chunks by authoritative identity.
+
+    Ports (``discover`` / ``embed_query`` / ``query_namespace`` / ``rerank``)
+    are injectable for tests; the defaults are lazy v1/HTTP backings resolved
+    at call time so this module stays import-light. No graph/supervisor state
+    is read and no scope field is added to ``CapabilityRuntimeContext``.
+    """
+
+    def __init__(
+        self,
+        *,
+        session_factory: Callable[[], Any] | None = None,
+        discover: Any = None,
+        embed_query: Any = None,
+        query_namespace: Any = None,
+        rerank: Any = None,
+        discovery_top_k: int = 10,
+        over_fetch: int = 3,
+    ) -> None:
+        self._session_factory = session_factory
+        self._discover = discover
+        self._embed_query = embed_query
+        self._query_namespace = query_namespace
+        self._rerank = rerank
+        self._discovery_top_k = discovery_top_k
+        self._over_fetch = over_fetch
+
+    async def retrieve(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        allowed_targets: tuple[Any, ...],
+        workspace_ids: tuple[UUID, ...],
+    ) -> Sequence[RevisionRetrievedChunk]:
+        from .v2.contracts.locators import ChunkRangeLocator
+        from .v2.persistence import document_views
+
+        if not isinstance(query, str) or not query.strip():
+            raise V1ServiceUnavailable(
+                "revision retrieval needs a non-blank query"
+            )
+        workspaces = tuple(workspace_ids or ())
+        if not workspaces:
+            raise V1ServiceUnavailable(
+                "revision retrieval needs an authenticated workspace scope"
+            )
+        try:
+            limit = max(1, min(int(top_k), 20))
+        except (TypeError, ValueError) as exc:
+            raise V1ServiceUnavailable(
+                f"revision retrieval got an unusable top_k {top_k!r}"
+            ) from exc
+        async with self._open_session() as db:
+            if tuple(allowed_targets or ()):
+                admitted = await self._load_scoped_identities(
+                    db, document_views, tuple(allowed_targets), workspaces
+                )
+            else:
+                admitted = await self._discover_identities(
+                    db, document_views, query.strip(), workspaces
+                )
+        if not admitted:
+            return ()
+        embedding = await self._embed(query.strip())
+        scored: list[tuple[float, str, Any, str]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for identity in admitted:
+            for content, chunk_id, distance in await self._search_identity(
+                identity, embedding, limit, workspaces
+            ):
+                key = (
+                    str(identity.revision_id),
+                    str(identity.document_id),
+                    chunk_id,
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                scored.append((distance, content, identity, chunk_id))
+        if not scored:
+            return ()
+        order = await self._rank(query.strip(), [c for _, c, _, _ in scored])
+        chunks: list[RevisionRetrievedChunk] = []
+        for rank, (distance, content, identity, chunk_id) in enumerate(scored):
+            score = order.get(rank, -float(distance))
+            chunks.append(
+                RevisionRetrievedChunk(
+                    document_id=identity.document_id,
+                    document_revision=str(identity.revision_id),
+                    locator=ChunkRangeLocator(
+                        kind="chunk_range", start=chunk_id, end=chunk_id
+                    ),
+                    content=content,
+                    score=float(score),
+                    target_id=None,
+                )
+            )
+        if order:
+            chunks.sort(key=lambda c: c.score, reverse=True)
+        return tuple(chunks[:limit])
+
+    def _open_session(self) -> Any:
+        factory = self._session_factory
+        if factory is None:
+            from app.core.database import async_session_maker
+
+            factory = async_session_maker
+        return factory()
+
+    async def _load_scoped_identities(
+        self,
+        db: Any,
+        document_views: Any,
+        allowed_targets: tuple[Any, ...],
+        workspaces: tuple[UUID, ...],
+    ) -> list[Any]:
+        """Pin every planned target to its exact manifest; fail closed."""
+        admitted: list[Any] = []
+        for target in allowed_targets:
+            binding = target.document
+            try:
+                revision_id = (
+                    binding.document_revision
+                    if isinstance(binding.document_revision, UUID)
+                    else UUID(str(binding.document_revision))
+                )
+            except (ValueError, TypeError, AttributeError) as exc:
+                raise V1ServiceUnavailable(
+                    "pinned target carries an unparsable revision; "
+                    "refusing to retrieve"
+                ) from exc
+            identity = None
+            last_error: Exception | None = None
+            for workspace_id in workspaces:
+                try:
+                    identity = await document_views.load_revision_identity_for_workspace(
+                        db, revision_id, workspace_id, require_vectors=True
+                    )
+                except document_views.RevisionNotReady as exc:
+                    last_error = exc
+                    continue
+                break
+            if identity is None:
+                raise V1ServiceUnavailable(
+                    f"pinned revision {revision_id} has no usable manifest "
+                    f"in this workspace scope ({last_error}); refusing to "
+                    "retrieve"
+                )
+            if (
+                identity.document_id != binding.document_id
+                or str(identity.revision_id) != str(revision_id)
+            ):
+                raise V1ServiceUnavailable(
+                    "revision manifest does not match the pinned target "
+                    "(stale pin?); refusing to retrieve"
+                )
+            self._check_vector_manifest(document_views, identity)
+            admitted.append(identity)
+        return admitted
+
+    async def _discover_identities(
+        self,
+        db: Any,
+        document_views: Any,
+        query: str,
+        workspaces: tuple[UUID, ...],
+    ) -> list[Any]:
+        """Workspace-scoped discovery, then the same manifest pin per hit."""
+        discover = self._discover
+        if discover is None:
+            search_fn = _v1_attr(
+                "app.services.agent.tools", "search_documents"
+            )
+
+            async def discover(
+                found_query: str,
+                found_top_k: int,
+                found_workspaces: list,
+                found_db: Any,
+            ) -> list[UUID]:
+                found = await _maybe_await(
+                    search_fn(
+                        found_query,
+                        found_top_k,
+                        list(found_workspaces),
+                        set(),
+                        found_db,
+                    )
+                )
+                sources = (
+                    found.get("sources", ())
+                    if isinstance(found, Mapping)
+                    else ()
+                )
+                document_ids: list[UUID] = []
+                seen: set[UUID] = set()
+                for source in sources:
+                    raw_id = (
+                        source.get("document_id")
+                        if isinstance(source, Mapping)
+                        else getattr(source, "document_id", None)
+                    )
+                    try:
+                        document_id = (
+                            raw_id
+                            if isinstance(raw_id, UUID)
+                            else UUID(str(raw_id))
+                        )
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+                    if document_id not in seen:
+                        seen.add(document_id)
+                        document_ids.append(document_id)
+                return document_ids
+
+        try:
+            document_ids = await _maybe_await(
+                discover(query, self._discovery_top_k, list(workspaces), db)
+            )
+        except V1ServiceUnavailable:
+            raise
+        except Exception as exc:
+            raise V1ServiceUnavailable(
+                f"revision discovery is unavailable: {exc}"
+            ) from exc
+        admitted: list[Any] = []
+        seen_docs: set[UUID] = set()
+        for raw_id in document_ids or ():
+            try:
+                document_id = (
+                    raw_id if isinstance(raw_id, UUID) else UUID(str(raw_id))
+                )
+            except (ValueError, TypeError, AttributeError):
+                continue
+            if document_id in seen_docs:
+                continue
+            seen_docs.add(document_id)
+            identity = None
+            for workspace_id in workspaces:
+                try:
+                    identity = await document_views.load_current_revision_identity_for_workspace(
+                        db, document_id, workspace_id, require_vectors=True
+                    )
+                except document_views.RevisionNotReady:
+                    continue
+                if identity is not None:
+                    break
+            if identity is None:
+                continue
+            try:
+                self._check_vector_manifest(document_views, identity)
+            except V1ServiceUnavailable:
+                continue
+            admitted.append(identity)
+        return admitted
+
+    @staticmethod
+    def _check_vector_manifest(document_views: Any, identity: Any) -> None:
+        """The manifest must pin a complete, current vector identity."""
+        if not identity.vectors_available or not identity.embedding_namespace:
+            raise V1ServiceUnavailable(
+                "published revision has no complete vector manifest; "
+                "refusing to fall back to a current-config namespace"
+            )
+        if (
+            identity.vector_artifact_version
+            != document_views.VECTOR_ARTIFACT_VERSION
+        ):
+            raise V1ServiceUnavailable(
+                f"revision vector artifact "
+                f"{identity.vector_artifact_version!r} is incompatible; "
+                "refusing to retrieve"
+            )
+
+    async def _embed(self, query: str) -> list[float]:
+        embed = self._embed_query
+        if embed is None:
+            async def embed(text: str) -> list[float]:
+                def _run() -> list[float]:
+                    from app.services.embedding.embedder import (
+                        get_embedding_service,
+                    )
+
+                    return get_embedding_service().embed_query(text)
+
+                return await asyncio.to_thread(_run)
+
+        try:
+            vector = await _maybe_await(embed(query))
+        except V1ServiceUnavailable:
+            raise
+        except Exception as exc:
+            raise V1ServiceUnavailable(
+                f"query embedding is unavailable: {exc}"
+            ) from exc
+        if not isinstance(vector, (list, tuple)) or not vector:
+            raise V1ServiceUnavailable("query embedding returned no vector")
+        return list(vector)
+
+    async def _search_identity(
+        self,
+        identity: Any,
+        embedding: list[float],
+        limit: int,
+        workspaces: tuple[UUID, ...],
+    ) -> list[tuple[str, str, float]]:
+        """Query one exact manifest namespace with hard revision filters."""
+        from .v2.persistence import document_views
+
+        query_ns = self._query_namespace
+        if query_ns is None:
+            query_ns = _default_revision_namespace_query
+        where = {
+            "$and": [
+                {"revision_id": str(identity.revision_id)},
+                {"document_id": str(identity.document_id)},
+            ]
+        }
+        try:
+            raw = await _maybe_await(
+                query_ns(
+                    identity.embedding_namespace,
+                    embedding,
+                    limit * max(1, self._over_fetch),
+                    where,
+                )
+            )
+        except V1ServiceUnavailable:
+            raise
+        except Exception as exc:
+            raise V1ServiceUnavailable(
+                f"revision namespace query failed: {exc}"
+            ) from exc
+        if not isinstance(raw, Mapping):
+            raise V1ServiceUnavailable("revision query returned no mapping")
+        ids = raw.get("ids", []) or []
+        documents = raw.get("documents", []) or []
+        metadatas = raw.get("metadatas", []) or []
+        distances = raw.get("distances", []) or []
+        if not (
+            isinstance(ids, (list, tuple))
+            and isinstance(documents, (list, tuple))
+            and isinstance(metadatas, (list, tuple))
+        ) or len(ids) != len(documents):
+            raise V1ServiceUnavailable("revision query returned malformed hits")
+        admitted: list[tuple[str, str, float]] = []
+        for position, vector_id in enumerate(ids):
+            content = documents[position] if position < len(documents) else None
+            metadata = metadatas[position] if position < len(metadatas) else None
+            distance = (
+                distances[position] if position < len(distances) else 0.0
+            )
+            hit = self._coerce_hit(
+                document_views, identity, vector_id, content, metadata,
+                workspaces,
+            )
+            if hit is None:
+                continue
+            hit_content, chunk_id = hit
+            try:
+                score_distance = float(distance)
+            except (TypeError, ValueError):
+                score_distance = 0.0
+            admitted.append((hit_content, chunk_id, score_distance))
+        return admitted
+
+    def _coerce_hit(
+        self,
+        document_views: Any,
+        identity: Any,
+        vector_id: Any,
+        content: Any,
+        metadata: Any,
+        workspaces: tuple[UUID, ...],
+    ) -> tuple[str, str] | None:
+        """Admit one provider hit only on exact manifest agreement."""
+        if not isinstance(content, str) or not content.strip():
+            return None
+        if not isinstance(metadata, Mapping):
+            return None
+        if str(metadata.get("revision_id")) != str(identity.revision_id):
+            return None
+        if str(metadata.get("document_id")) != str(identity.document_id):
+            return None
+        if str(metadata.get("workspace_id")) not in {
+            str(item) for item in workspaces
+        }:
+            return None
+        parsed = document_views.parse_revision_vector_id(
+            vector_id if isinstance(vector_id, str) else ""
+        )
+        if parsed is None or parsed[0] != identity.revision_id:
+            return None
+        chunk_id = metadata.get("chunk_id")
+        if not isinstance(chunk_id, str) or not chunk_id.strip():
+            chunk_id = vector_id if isinstance(vector_id, str) else ""
+        if not chunk_id:
+            return None
+        return content, chunk_id
+
+    async def _rank(
+        self, query: str, texts: list[str]
+    ) -> dict[int, float]:
+        """Rerank texts; malformed output falls back to vector order."""
+        rerank = self._rerank
+        if rerank is None:
+            async def rerank(rerank_query: str, rerank_texts: list[str]) -> Any:
+                def _run() -> Any:
+                    from app.services.retrieval.reranker import (
+                        get_reranker_service,
+                    )
+
+                    return [
+                        (item.index, item.score)
+                        for item in get_reranker_service().rerank(
+                            rerank_query, list(rerank_texts), top_k=len(rerank_texts)
+                        )
+                    ]
+
+                return await asyncio.to_thread(_run)
+
+        try:
+            ranked = await _maybe_await(rerank(query, texts))
+        except Exception:
+            logger.warning(
+                "revision rerank unavailable; keeping vector order",
+                exc_info=True,
+            )
+            return {}
+        order: dict[int, float] = {}
+        try:
+            entries = list(ranked or ())
+        except TypeError:
+            return {}
+        for entry in entries:
+            try:
+                index, score = entry
+                index = int(index)
+                score = float(score)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < len(texts) and index not in order:
+                order[index] = score
+        return order
+
+
+async def _default_revision_namespace_query(
+    namespace: str,
+    embedding: list[float],
+    n_results: int,
+    where: dict,
+) -> dict:
+    """Query one revision-owned collection; never the legacy default.
+
+    The workspace comes from the manifest namespace itself
+    (``ws_<workspace>_embed_<hash>_d<dim>``): an unparseable namespace fails
+    closed instead of querying the legacy ``kb_<workspace>`` collection,
+    which would serve current-config vectors for a pinned revision.
+    """
+    try:
+        head, _, _ = str(namespace).partition("_embed_")
+        if not head.startswith("ws_"):
+            raise ValueError(f"unexpected namespace {namespace!r}")
+        workspace_id = UUID(head[len("ws_"):])
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise V1ServiceUnavailable(
+            f"revision namespace {namespace!r} is not workspace-qualified; "
+            "refusing to query"
+        ) from exc
+
+    def _run() -> dict:
+        from app.services.embedding.vector_store import get_vector_store
+
+        return get_vector_store(workspace_id, namespace=namespace).query(
+            query_embedding=embedding, n_results=n_results, where=where
+        )
+
+    return await asyncio.to_thread(_run)
 
 
 class V1DocumentContentReader:
@@ -1716,6 +2238,7 @@ class V1AbbreviationResolverService:
 V1_SERVICE_GATES: dict[str, str] = {
     "people.lookup": "v1-people",
     "document.search": "v1-document-search",
+    "document.retrieve": "v1-revision-retrieval",
     "document.read": "v1-document-content",
     "section.read": "v1-section-content",
     "knowledge_graph.query": "v1-knowledge-graph",
@@ -1737,6 +2260,7 @@ class V1ServiceBundle:
 
     people_lookup: Any = None
     document_search: Any = None
+    document_retrieval: Any = None
     document_reader: Any = None
     section_reader: Any = None
     knowledge_graph_client: Any = None
@@ -1762,6 +2286,14 @@ def probe_v1_services() -> frozenset[str]:
         # default is complete (no user/workspace-scoped construction arg).
         "v1-people": ("app.services.people.mongo_people_service", "search_by_name"),
         "v1-document-search": ("app.services.agent.tools", "search_documents"),
+        # Revision-manifest retrieval: the namespace query path exists when
+        # the vector store backing imports; the manifest loaders live in
+        # document_views (same package, always importable). Call-time
+        # failures still surface as typed ``V1ServiceUnavailable``.
+        "v1-revision-retrieval": (
+            "app.services.embedding.vector_store",
+            "get_vector_store",
+        ),
         # Conservative by design (review M6): KG/memory need a scoped id
         # (workspace_id/user_id) that only per-request ingress knows;
         # abbreviation has no v1 default at all; content readers have no
@@ -1789,11 +2321,12 @@ def build_v2_capability_registry(
 ) -> CapabilityRegistry:
     """Construct the request-scoped capability registry (T6 owns, T7 calls).
 
-    All seven Phase-2 capabilities are registered with their v1-backed
-    adapters; ``available_services`` (default: ``probe_v1_services()``)
-    intersects them. Capabilities whose backing is missing — or whose
-    persistence seams (``evidence``/``resolver``) T7 did not supply — are
-    gated OUT, so dispatch raises typed ``CapabilityUnavailable`` (mapped to
+    All seven Phase-2 capabilities plus the P0 ``document.retrieve`` revision
+    capability are registered with their v1-backed adapters;
+    ``available_services`` (default: ``probe_v1_services()``) intersects
+    them. Capabilities whose backing is missing — or whose persistence seams
+    (``evidence``/``resolver``) T7 did not supply — are gated OUT, so
+    dispatch raises typed ``CapabilityUnavailable`` (mapped to
     ``DEPENDENCY_UNAVAILABLE`` results) instead of silently degrading.
     """
     bundle = bundle if bundle is not None else V1ServiceBundle()
@@ -1811,9 +2344,16 @@ def build_v2_capability_registry(
             "v1-section-content",
             "v1-knowledge-graph",
             "v1-memory",
+            # Task 5: revision retrieval persists governed evidence per chunk.
+            "v1-revision-retrieval",
         }
     if resolver is None:
-        available -= {"v1-document-content", "v1-section-content"}
+        available -= {
+            "v1-document-content",
+            "v1-section-content",
+            # Task 5: scoped retrieval pins every target through the resolver.
+            "v1-revision-retrieval",
+        }
     session_factory = bundle.session_factory
     abbreviation_source = bundle.abbreviation_lookup
     if abbreviation_source is None or (
@@ -1838,6 +2378,17 @@ def build_v2_capability_registry(
                 or V1DocumentSearchService(session_factory=session_factory),
             ),
             service=V1_SERVICE_GATES["document.search"],
+        ),
+        CapabilityRegistration(
+            DocumentRetrieveCapability(
+                service=bundle.document_retrieval
+                or V1RevisionAwareRetrievalService(
+                    session_factory=session_factory
+                ),
+                evidence=evidence,
+                resolver=resolver,
+            ),
+            service=V1_SERVICE_GATES["document.retrieve"],
         ),
         CapabilityRegistration(
             DocumentReadCapability(

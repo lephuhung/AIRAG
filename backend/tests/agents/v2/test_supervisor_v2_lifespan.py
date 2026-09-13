@@ -371,3 +371,546 @@ async def test_main_lifespan_saver_close_failure_still_tears_down(
     assert events == ["open", "close"]
     assert "scope teardown failed" in caplog.text
     assert stubs["engine"].disposed is True
+
+
+# ── P0 Task 5: live revision-manifest retrieval wiring (RED phase) ──────────
+# Proves the request-scoped ``V1RevisionAwareRetrievalService`` loads the exact
+# per-revision manifest identity, queries only that manifest's namespace with
+# hard document/revision filters, and fails closed (never a current-config
+# namespace fallback) on missing/incompatible manifests, foreign workspaces,
+# tombstones, stale pins, and malformed provider output.
+
+
+TASK5_WS = __import__("uuid").UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+TASK5_OTHER_WS = __import__("uuid").UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
+TASK5_DOC = __import__("uuid").UUID("11111111-1111-1111-1111-111111111111")
+TASK5_FOREIGN_DOC = __import__("uuid").UUID("22222222-2222-2222-2222-222222222222")
+TASK5_REV = __import__("uuid").UUID("33333333-3333-3333-3333-333333333333")
+TASK5_NS = f"ws_{TASK5_WS}_embed_hashA_d768"
+
+
+def _task5_identity(**overrides: Any) -> Any:
+    from app.services.agents.v2.persistence import document_views as _dv
+
+    fields: dict[str, Any] = {
+        "revision_id": TASK5_REV,
+        "document_id": TASK5_DOC,
+        "generation": 1,
+        "build_profile": "FULL",
+        "markdown_artifact_key": "kb/rev/doc.md",
+        "structure_artifact_key": "kb/rev/structure.json",
+        "embedding_namespace": TASK5_NS,
+        "embedding_model_hash": "hashA",
+        "embedding_dimension": 768,
+        "vector_artifact_version": "v1",
+    }
+    fields.update(overrides)
+    return _dv.RevisionArtifactIdentity(**fields)
+
+
+def _task5_target(
+    document_id: Any = None, revision: str | None = None
+) -> Any:
+    from app.services.agents.v2.capabilities import ResolvedTarget
+    from app.services.agents.v2.contracts.binding import ScopedDocument
+    from app.services.agents.v2.contracts.locators import DocumentLocator
+    from app.services.agents.v2.contracts.planning import TargetUnit
+
+    return ResolvedTarget(
+        target_unit=TargetUnit(
+            target_id="t1",
+            binding_id="b1",
+            requested_locator=DocumentLocator(kind="document"),
+            completion_criteria=(),
+        ),
+        document=ScopedDocument(
+            binding_id="b1",
+            document_id=document_id or TASK5_DOC,
+            document_revision=revision or str(TASK5_REV),
+            role="target",
+        ),
+    )
+
+
+class _Task5Session:
+    """Stub async session context manager (manifest loaders are patched)."""
+
+    def __init__(self, db: Any) -> None:
+        self._db = db
+
+    async def __aenter__(self) -> Any:
+        return self._db
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+
+def _task5_session_factory(db: Any = None) -> Any:
+    sentinel: Any = object() if db is None else db
+
+    def _open() -> _Task5Session:
+        return _Task5Session(sentinel)
+
+    return _open
+
+
+class _Task5Provider:
+    """Injectable embed/namespace-query/rerank ports with call recording."""
+
+    def __init__(self, hits: list[dict] | None = None) -> None:
+        self._hits = hits if hits is not None else []
+        self.embed_calls: list[str] = []
+        self.query_calls: list[dict] = []
+        self.rerank_calls: list[str] = []
+
+    async def embed_query(self, text: str) -> list[float]:
+        self.embed_calls.append(text)
+        return [0.1, 0.2, 0.3]
+
+    async def query_namespace(
+        self,
+        namespace: str,
+        embedding: list[float],
+        n_results: int,
+        where: dict,
+    ) -> dict:
+        self.query_calls.append(
+            {"namespace": namespace, "n_results": n_results, "where": where}
+        )
+        return {
+            "ids": [h["id"] for h in self._hits],
+            "documents": [h["content"] for h in self._hits],
+            "metadatas": [h["metadata"] for h in self._hits],
+            "distances": [h.get("distance", 0.1) for h in self._hits],
+        }
+
+    async def rerank(
+        self, query: str, texts: list[str]
+    ) -> list[tuple[int, float]]:
+        self.rerank_calls.append(query)
+        return [(i, 0.9 - i * 0.01) for i in range(len(texts))]
+
+
+def _task5_hit(
+    *,
+    vector_id: str | None = None,
+    content: str = "pinned chunk text",
+    document_id: Any = None,
+    revision_id: Any = None,
+    workspace_id: Any = None,
+    chunk_id: str = "chunk-1",
+) -> dict:
+    revision_id = revision_id or TASK5_REV
+    return {
+        "id": vector_id or f"rev_{revision_id}_chunk_0",
+        "content": content,
+        "metadata": {
+            "document_id": str(document_id or TASK5_DOC),
+            "workspace_id": str(workspace_id or TASK5_WS),
+            "revision_id": str(revision_id),
+            "chunk_id": chunk_id,
+            "ordinal": 0,
+        },
+    }
+
+
+def _task5_service(provider: _Task5Provider, **kwargs: Any) -> Any:
+    return supervisor_v2.V1RevisionAwareRetrievalService(
+        session_factory=_task5_session_factory(),
+        embed_query=provider.embed_query,
+        query_namespace=provider.query_namespace,
+        rerank=provider.rerank,
+        **kwargs,
+    )
+
+
+def _patch_task5_manifests(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    scoped: Any = None,
+    scoped_error: BaseException | None = None,
+    current: Any = None,
+) -> dict:
+    """Patch the workspace-scoped manifest loaders; forbid the unscoped one."""
+    from app.services.agents.v2.persistence import document_views as _dv
+
+    calls: dict[str, list] = {"scoped": [], "current": [], "unscoped": []}
+
+    async def _scoped(
+        db: Any, revision_id: Any, workspace_id: Any, **kwargs: Any
+    ) -> Any:
+        calls["scoped"].append((revision_id, workspace_id))
+        if scoped_error is not None:
+            raise scoped_error
+        return scoped
+
+    async def _current(
+        db: Any, document_id: Any, workspace_id: Any, **kwargs: Any
+    ) -> Any:
+        calls["current"].append((document_id, workspace_id))
+        if isinstance(current, BaseException):
+            raise current
+        if callable(current):
+            return current(document_id, workspace_id)
+        return current
+
+    async def _unscoped(*args: Any, **kwargs: Any) -> Any:
+        calls["unscoped"].append(args)
+        raise AssertionError(
+            "unscoped manifest lookup must not be used by the live service"
+        )
+
+    monkeypatch.setattr(_dv, "load_revision_identity_for_workspace", _scoped)
+    monkeypatch.setattr(
+        _dv, "load_current_revision_identity_for_workspace", _current
+    )
+    monkeypatch.setattr(_dv, "load_revision_identity", _unscoped)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_task5_service_queries_exact_manifest_namespace_with_hard_filters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _Task5Provider(hits=[_task5_hit()])
+    service = _task5_service(provider)
+    _patch_task5_manifests(monkeypatch, scoped=_task5_identity())
+
+    chunks = await service.retrieve(
+        "what does the rule say",
+        top_k=8,
+        allowed_targets=(_task5_target(),),
+        workspace_ids=(TASK5_WS,),
+    )
+
+    assert provider.embed_calls == ["what does the rule say"]
+    assert len(provider.query_calls) == 1
+    call = provider.query_calls[0]
+    assert call["namespace"] == TASK5_NS
+    where = call["where"]
+    assert str(TASK5_REV) in str(where)
+    assert str(TASK5_DOC) in str(where)
+    assert len(chunks) == 1
+    assert chunks[0].document_id == TASK5_DOC
+    assert chunks[0].document_revision == str(TASK5_REV)
+    assert chunks[0].content == "pinned chunk text"
+
+
+@pytest.mark.asyncio
+async def test_task5_service_fail_closed_on_missing_manifest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.agents.v2.persistence import document_views as _dv
+
+    provider = _Task5Provider(hits=[_task5_hit()])
+    service = _task5_service(provider)
+    _patch_task5_manifests(
+        monkeypatch,
+        scoped_error=_dv.RevisionNotReady(TASK5_DOC, "no manifest"),
+    )
+
+    with pytest.raises(supervisor_v2.V1ServiceUnavailable):
+        await service.retrieve(
+            "query",
+            top_k=8,
+            allowed_targets=(_task5_target(),),
+            workspace_ids=(TASK5_WS,),
+        )
+    # No fallback to a current-config namespace: the provider is never touched.
+    assert provider.query_calls == []
+
+
+@pytest.mark.asyncio
+async def test_task5_service_fail_closed_on_incompatible_vector_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _Task5Provider(hits=[_task5_hit()])
+    service = _task5_service(provider)
+    _patch_task5_manifests(
+        monkeypatch, scoped=_task5_identity(vector_artifact_version="v0")
+    )
+
+    with pytest.raises(supervisor_v2.V1ServiceUnavailable):
+        await service.retrieve(
+            "query",
+            top_k=8,
+            allowed_targets=(_task5_target(),),
+            workspace_ids=(TASK5_WS,),
+        )
+    assert provider.query_calls == []
+
+
+@pytest.mark.asyncio
+async def test_task5_service_fail_closed_on_stale_revision_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _Task5Provider(hits=[_task5_hit()])
+    service = _task5_service(provider)
+    # Manifest belongs to a different document than the pinned target.
+    _patch_task5_manifests(
+        monkeypatch, scoped=_task5_identity(document_id=TASK5_FOREIGN_DOC)
+    )
+
+    with pytest.raises(supervisor_v2.V1ServiceUnavailable):
+        await service.retrieve(
+            "query",
+            top_k=8,
+            allowed_targets=(_task5_target(),),
+            workspace_ids=(TASK5_WS,),
+        )
+    assert provider.query_calls == []
+
+
+@pytest.mark.asyncio
+async def test_task5_service_drops_foreign_and_malformed_hits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from uuid import UUID as _UUID
+
+    other_rev = _UUID("44444444-4444-4444-4444-444444444444")
+    provider = _Task5Provider(
+        hits=[
+            _task5_hit(),  # admitted
+            _task5_hit(revision_id=other_rev),  # stale revision → drop
+            _task5_hit(document_id=TASK5_FOREIGN_DOC),  # foreign doc → drop
+            _task5_hit(workspace_id=TASK5_OTHER_WS),  # foreign ws → drop
+            _task5_hit(content="   "),  # blank → drop
+            {
+                "id": "not-a-vector-id",
+                "content": "garbage",
+                "metadata": {"nope": True},
+            },  # malformed → drop
+        ]
+    )
+    service = _task5_service(provider)
+    _patch_task5_manifests(monkeypatch, scoped=_task5_identity())
+
+    chunks = await service.retrieve(
+        "query",
+        top_k=8,
+        allowed_targets=(_task5_target(),),
+        workspace_ids=(TASK5_WS,),
+    )
+
+    assert [c.content for c in chunks] == ["pinned chunk text"]
+
+
+@pytest.mark.asyncio
+async def test_task5_service_unscoped_skips_unresolvable_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.agents.v2.persistence import document_views as _dv
+
+    async def _discover(
+        query: str, top_k: int, workspace_ids: tuple, db: Any
+    ) -> list:
+        assert list(workspace_ids) == [TASK5_WS]
+        return [TASK5_DOC, TASK5_FOREIGN_DOC]
+
+    provider = _Task5Provider(hits=[_task5_hit()])
+    service = _task5_service(provider, discover=_discover)
+
+    def _current(document_id: Any, workspace_id: Any) -> Any:
+        if document_id == TASK5_DOC:
+            return _task5_identity()
+        raise _dv.RevisionNotReady(document_id, "foreign workspace")
+
+    calls = _patch_task5_manifests(monkeypatch, current=_current)
+
+    chunks = await service.retrieve(
+        "open question", top_k=8, allowed_targets=(), workspace_ids=(TASK5_WS,)
+    )
+
+    assert [c.document_id for c in chunks] == [TASK5_DOC]
+    # Only the owned identity's namespace is ever queried.
+    assert [c["namespace"] for c in provider.query_calls] == [TASK5_NS]
+    assert calls["unscoped"] == []
+
+
+def test_task5_registry_includes_document_retrieve_only_when_service_live() -> None:
+    import uuid as _uuid_module
+    from datetime import datetime, timezone
+
+    from app.services.agents.v2.capabilities import CapabilityUnavailable
+    from app.services.agents.v2.contracts.capability import (
+        CapabilityRuntimeContext,
+    )
+
+    runtime = CapabilityRuntimeContext(
+        request_id="req-task5",
+        run_id="run-task5",
+        user_id=_uuid_module.uuid4(),
+        workspace_ids=(TASK5_WS,),
+        can_read_people=False,
+        allowed_capabilities=frozenset({"document.retrieve"}),
+        deadline_at=datetime.now(timezone.utc),
+    )
+
+    class _FakeRetrieval:
+        pass
+
+    live_bundle = supervisor_v2.V1ServiceBundle(
+        session_factory=_task5_session_factory(),
+        document_retrieval=_FakeRetrieval(),
+    )
+    live = supervisor_v2.build_v2_capability_registry(
+        runtime,
+        bundle=live_bundle,
+        evidence=object(),
+        resolver=object(),
+        available_services=frozenset({"v1-revision-retrieval"}),
+    )
+    assert "document.retrieve" in live.capability_names()
+
+    gated_out = supervisor_v2.build_v2_capability_registry(
+        runtime,
+        bundle=live_bundle,
+        evidence=object(),
+        resolver=object(),
+        available_services=frozenset(),
+    )
+    assert "document.retrieve" not in gated_out.capability_names()
+    with pytest.raises(CapabilityUnavailable):
+        gated_out.get("document.retrieve")
+
+    # Missing persistence seams gate the capability out even when flagged live.
+    no_seams = supervisor_v2.build_v2_capability_registry(
+        runtime,
+        bundle=live_bundle,
+        evidence=None,
+        resolver=None,
+        available_services=frozenset({"v1-revision-retrieval"}),
+    )
+    assert "document.retrieve" not in no_seams.capability_names()
+
+
+def test_task5_default_allowed_capabilities_include_document_retrieve() -> None:
+    from app.services.agent.runtime_selector import (
+        DEFAULT_V2_ALLOWED_CAPABILITIES,
+    )
+
+    assert "document.retrieve" in DEFAULT_V2_ALLOWED_CAPABILITIES
+
+
+@pytest.mark.asyncio
+async def test_task5_document_search_pins_manifests_in_workspace_scope_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.agents.v2.persistence import document_views as _dv
+
+    async def _search(
+        query: str,
+        top_k: int,
+        workspace_ids: list,
+        existing: set,
+        db: Any,
+    ) -> dict:
+        return {
+            "sources": [
+                {"document_id": str(TASK5_DOC)},
+                {"document_id": str(TASK5_FOREIGN_DOC)},
+            ]
+        }
+
+    service = supervisor_v2.V1DocumentSearchService(
+        search=_search, session_factory=_task5_session_factory()
+    )
+
+    seen: list[tuple] = []
+
+    async def _scoped_current(
+        db: Any, document_id: Any, workspace_id: Any, **kwargs: Any
+    ) -> Any:
+        seen.append((document_id, workspace_id))
+        if document_id == TASK5_DOC and workspace_id == TASK5_WS:
+            return _task5_identity()
+        raise _dv.RevisionNotReady(document_id, "not in workspace")
+
+    async def _forbid_unscoped(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("discovery must use the workspace-scoped lookup")
+
+    monkeypatch.setattr(
+        _dv,
+        "load_current_revision_identity_for_workspace",
+        _scoped_current,
+    )
+    monkeypatch.setattr(_dv, "load_current_revision_identity", _forbid_unscoped)
+
+    candidates = await service.search("query", None, (TASK5_WS,))
+
+    assert [c.document_id for c in candidates] == [TASK5_DOC]
+    assert (TASK5_FOREIGN_DOC, TASK5_WS) in seen
+
+
+@pytest.mark.asyncio
+async def test_task5_registry_capability_executes_through_real_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Registry → capability → live service executes with zero new dispatch."""
+    import uuid as _uuid_module
+    from datetime import datetime, timezone
+
+    from app.services.agents.v2.contracts.capability import (
+        CapabilityRuntimeContext,
+        DocumentRetrieveInput,
+    )
+    from app.services.agents.v2.contracts.evidence import EvidenceUseRef
+    from app.services.agents.v2.contracts.execution import AgentRequest
+
+    provider = _Task5Provider(hits=[_task5_hit()])
+    service = _task5_service(provider)
+    _patch_task5_manifests(monkeypatch, scoped=_task5_identity())
+
+    pinned = _task5_target()
+
+    class _Resolver:
+        def resolve(self, target_id: str) -> Any:
+            return pinned if target_id == "t1" else None
+
+    class _Evidence:
+        def __init__(self) -> None:
+            self.uses: list[dict] = []
+
+        async def persist_use(self, **kwargs: Any) -> Any:
+            self.uses.append(kwargs)
+            return EvidenceUseRef(use_id=_uuid_module.uuid4())
+
+    evidence = _Evidence()
+    runtime = CapabilityRuntimeContext(
+        request_id="req-task5-e2e",
+        run_id="run-task5-e2e",
+        user_id=_uuid_module.uuid4(),
+        workspace_ids=(TASK5_WS,),
+        can_read_people=False,
+        allowed_capabilities=frozenset({"document.retrieve"}),
+        deadline_at=datetime.now(timezone.utc),
+    )
+    registry = supervisor_v2.build_v2_capability_registry(
+        runtime,
+        bundle=supervisor_v2.V1ServiceBundle(
+            session_factory=_task5_session_factory(),
+            document_retrieval=service,
+        ),
+        evidence=evidence,
+        resolver=_Resolver(),
+        available_services=frozenset({"v1-revision-retrieval"}),
+    )
+    capability = registry.get("document.retrieve")
+    result = await capability.execute(
+        AgentRequest(
+            contract_version="2.0",
+            task_id="T1",
+            objective="answer the factual question",
+            input=DocumentRetrieveInput(
+                kind="document.retrieve", query="what changed", target_ids=("t1",)
+            ),
+        ),
+        runtime,
+    )
+
+    assert result.status == "success"
+    assert result.data.retrieved_unit_count == 1
+    assert len(result.evidence_uses) == 1
+    assert evidence.uses[0]["purpose"] == "coverage"
+    assert evidence.uses[0]["target_id"] == "t1"
+    assert "pinned chunk text" not in result.model_dump_json()

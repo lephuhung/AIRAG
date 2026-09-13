@@ -842,3 +842,71 @@ def test_document_retrieve_observation_is_count_only() -> None:
     payload = observation.model_dump_json()
     assert "secret chunk" not in payload
     assert "revision" not in payload.lower()
+
+
+# ---------------------------------------------------------------------------
+# P0 Task 5: document.retrieve model-facing schema through the real registry
+# ---------------------------------------------------------------------------
+
+
+def test_task5_document_retrieve_schema_projection_through_real_registry() -> None:
+    """The real request-scoped registry projects a governed retrieve schema."""
+    from datetime import datetime, timezone
+
+    from app.services.agents import supervisor_v2
+    from app.services.agents.v2.contracts.capability import (
+        CapabilityRuntimeContext,
+        DocumentRetrieveInput,
+    )
+    from app.services.agents.v2.tools.adapters import AgentToolAdapter
+
+    runtime = CapabilityRuntimeContext(
+        request_id="req-task5-gw",
+        run_id="run-task5-gw",
+        user_id=USER_ID,
+        workspace_ids=(WORKSPACE_ID,),
+        can_read_people=False,
+        allowed_capabilities=frozenset({"document.retrieve"}),
+        deadline_at=datetime.now(timezone.utc),
+    )
+
+    class _FakeRetrieval:
+        pass
+
+    class _StubSession:
+        async def __aenter__(self) -> object:
+            return object()
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+    registry = supervisor_v2.build_v2_capability_registry(
+        runtime,
+        bundle=supervisor_v2.V1ServiceBundle(
+            session_factory=lambda: _StubSession(),
+            document_retrieval=_FakeRetrieval(),
+        ),
+        evidence=object(),
+        resolver=object(),
+        available_services=frozenset({"v1-revision-retrieval"}),
+    )
+    adapter = AgentToolAdapter(registry)
+
+    assert adapter.is_visible("document.retrieve") is True
+    assert adapter.input_fields("document.retrieve") == tuple(
+        DocumentRetrieveInput.model_fields
+    )
+    proposal = adapter.to_proposal(
+        AgentToolCall(
+            capability="document.retrieve",
+            objective="answer the factual question",
+            input=DocumentRetrieveInput(
+                kind="document.retrieve", query="what changed", top_k=8
+            ),
+        )
+    )
+    assert proposal.capability == "document.retrieve"
+    assert isinstance(proposal.input, DocumentRetrieveInput)
+    # Runtime authority is never model-supplied: no scope/ACL field exists.
+    for forbidden in ("workspace_ids", "document_ids", "namespace"):
+        assert forbidden not in adapter.input_fields("document.retrieve")
