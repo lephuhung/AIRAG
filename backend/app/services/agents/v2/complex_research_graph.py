@@ -21,11 +21,12 @@ no subgraph-owned checkpointer, no ``plan_checkpoint`` service, no
 ``ResearchPlanningInput`` is ephemeral: rebuilt from checkpointed state plus
 the request-scoped registry on every planner call, never stored in
 ``ComplexResearchState`` or ``SupervisorV2State``. The unvalidated plan
-proposal is equally ephemeral (R17): ``plan_node`` computes it into a
-runtime-scoped scratch keyed by stable run id — never into checkpointed
-state — and ``validate_checkpoint_node`` validates, leases, and only then
-returns it into state, so no checkpoint ever carries an unvalidated or
-unleased plan. The binding ownership sequence holds end to end::
+proposal is equally ephemeral (R17/R21, single owner): ``plan_node`` is a
+deterministic entry marker that writes NO state, and ``validate_checkpoint_node``
+computes the proposal, validates it, acquires the leases, and only then returns
+it into state — there is NO cross-node proposal store at all, so no checkpoint
+ever carries an unvalidated or unleased plan and no proposal can leak between
+requests. The binding ownership sequence holds end to end::
 
     proposal -> validate -> lease -> checkpoint -> scheduler
 
@@ -138,19 +139,6 @@ class V2ResearchLimits:
             ),
             max_replans=int(getattr(settings, "V2_MAX_REPLANS", cls.max_replans)),
         )
-
-
-#: Ephemeral plan-proposal scratch, keyed by stable run id (R17).
-#
-# ``plan_node`` computes the proposal here WITHOUT writing it into
-# checkpointed state; ``validate_checkpoint_node`` consumes it — or
-# recomputes it via ``build_planning_input`` when absent (e.g. a fresh
-# process resuming mid-graph) — validates, leases, and ONLY THEN returns it
-# into state. The scratch is never a ``ComplexResearchState`` field and is
-# never serialized; ``finalize_node`` pops it at the terminal step (an entry
-# orphaned by a lost resume is overwritten by the next run or recomputed
-# around, never checkpointed).
-_PLAN_PROPOSALS: dict[str, TaskPlan] = {}
 
 
 class ComplexResearchError(ValueError):
@@ -383,28 +371,17 @@ async def plan_node(
     state: ComplexResearchState,
     runtime: "Runtime[GraphRuntimeContext]",
 ) -> dict:
-    """Compute the initial proposal into ephemeral scratch (R17, no checkpoint).
+    """Deterministic entry marker (R21 single-owner: writes NO state).
 
-    The proposal is carried through ``_PLAN_PROPOSALS`` keyed by stable run
-    id — never returned into ``ComplexResearchState`` — so the checkpoint
-    written after this node carries NO plan. ``validate_checkpoint_node``
-    validates, leases, and only then persists it. Unsupported work types
-    propose nothing: ``plan`` stays ``None`` so ``decide`` can return the
-    typed unavailable boundary.
+    The planner lives entirely inside ``validate_checkpoint_node``; this node
+    only fails closed when complex planning has no analysis yet, and returns
+    ``{}`` so the checkpoint written after it carries NO plan. Unsupported
+    work types pass through untouched: ``plan`` stays ``None`` so ``decide``
+    can return the typed unavailable boundary.
     """
-    context = node_context(runtime)
+    node_context(runtime)
     state = normalize_complex_state(state)
-    analysis = require_query_analysis(state)
-    if not compare_policy.supports_work_type(analysis.work_type):
-        return {}
-    planning_input = build_planning_input(state, context)
-    try:
-        proposal = compare_policy.build_compare_plan(planning_input)
-    except ContractValidationError as exc:
-        raise ComplexResearchError(
-            f"compare planning failed closed: {exc}"
-        ) from exc
-    _PLAN_PROPOSALS[context.capability_runtime.run_id] = proposal
+    require_query_analysis(state)
     return {}
 
 
@@ -423,6 +400,69 @@ async def _commit_lease_session(runtime: GraphRuntimeContext) -> None:
         await result
 
 
+def _pinned_pairs(
+    plan: TaskPlan,
+    bindings: DocumentBindingSet | None,
+    results: tuple[AgentResult, ...],
+) -> list[tuple[Any, Any]]:
+    """Ordered unique ``(revision_id, use_id)`` pairs the plan pins (R22).
+
+    The union of the scheduler's shared use-pair recipe (revision-anchored
+    when the owning task resolves to pinned revisions, evidence-only
+    otherwise) and the plan's own revision-only pins — the SAME rows
+    ``validate_checkpoint_node`` leases before the plan checkpoint, so a
+    resume re-acquires identical pairs instead of minting new ones.
+    """
+    pairs: list[tuple[Any, Any]] = list(
+        refresh_pairs_for_checkpoint(plan, bindings, results)
+    )
+    if bindings is not None:
+        binding_by_id = {binding.binding_id: binding for binding in bindings.bindings}
+        for unit in plan.target_units:
+            binding = binding_by_id.get(unit.binding_id)
+            if binding is None:
+                raise ComplexResearchError(
+                    f"target {unit.target_id} binds unknown binding "
+                    f"{unit.binding_id}; refusing to checkpoint an unresolvable pin"
+                )
+            try:
+                revision = UUID(str(binding.document_revision))
+            except (ValueError, AttributeError, TypeError) as exc:
+                raise ComplexResearchError(
+                    f"binding {binding.binding_id} pins revision "
+                    f"{binding.document_revision!r}, not a revision id; refusing "
+                    "to checkpoint an unleasable pin"
+                ) from exc
+            pairs.append((revision, None))
+    seen: set[tuple[Any, Any]] = set()
+    ordered: list[tuple[Any, Any]] = []
+    for pair in pairs:
+        if pair not in seen:
+            seen.add(pair)
+            ordered.append(pair)
+    return ordered
+
+
+async def _acquire_pairs(
+    pairs: list[tuple[Any, Any]],
+    *,
+    runtime: GraphRuntimeContext,
+    missing_message: str,
+) -> None:
+    """Acquire every pair for this run and commit before any checkpoint."""
+    if not pairs:
+        return
+    repo = runtime.services.retention_leases
+    if repo is None:
+        raise ComplexResearchError(missing_message)
+    run_id = runtime.capability_runtime.run_id
+    for revision_id, use_id in pairs:
+        result = repo.acquire_or_refresh(run_id, revision_id, use_id)
+        if inspect.isawaitable(result):
+            await result
+    await _commit_lease_session(runtime)
+
+
 async def _lease_pinned_state(
     *,
     plan: TaskPlan,
@@ -432,52 +472,17 @@ async def _lease_pinned_state(
 ) -> None:
     """Lease every revision/use the validated plan pins (before checkpoint).
 
-    Plan target revisions are pinned as revision-only leases; every
-    checkpointed use re-acquires the SAME ``(run, revision, use)`` rows the
-    scheduler leased at dispatch (shared ``refresh_pairs_for_checkpoint``
-    recipe), so an interrupt keeps them active and a resume refreshes them.
-    The subgraph never releases leases.
+    The subgraph never releases leases: an interrupt keeps them active and a
+    resume re-acquires the same rows via ``_refresh_existing_pairs``.
     """
-    run_id = runtime.capability_runtime.run_id
-    pairs: list[tuple[UUID | None, UUID | None]] = list(
-        refresh_pairs_for_checkpoint(plan, bindings, results)
-    )
-    binding_by_id = {binding.binding_id: binding for binding in bindings.bindings}
-    for unit in plan.target_units:
-        binding = binding_by_id.get(unit.binding_id)
-        if binding is None:
-            raise ComplexResearchError(
-                f"target {unit.target_id} binds unknown binding {unit.binding_id}; "
-                "refusing to checkpoint an unresolvable pin"
-            )
-        try:
-            revision = UUID(str(binding.document_revision))
-        except (ValueError, AttributeError, TypeError) as exc:
-            raise ComplexResearchError(
-                f"binding {binding.binding_id} pins revision "
-                f"{binding.document_revision!r}, not a revision id; refusing "
-                "to checkpoint an unleasable pin"
-            ) from exc
-        pairs.append((revision, None))
-    seen: set[tuple[Any, Any]] = set()
-    ordered: list[tuple[Any, Any]] = []
-    for pair in pairs:
-        if pair not in seen:
-            seen.add(pair)
-            ordered.append(pair)
-    if not ordered:
-        return
-    repo = runtime.services.retention_leases
-    if repo is None:
-        raise ComplexResearchError(
+    await _acquire_pairs(
+        _pinned_pairs(plan, bindings, results),
+        runtime=runtime,
+        missing_message=(
             "the validated plan pins revisions/uses but no retention-lease "
             "service is wired; refusing to checkpoint unleased pins"
-        )
-    for revision_id, use_id in ordered:
-        result = repo.acquire_or_refresh(run_id, revision_id, use_id)
-        if inspect.isawaitable(result):
-            await result
-    await _commit_lease_session(runtime)
+        ),
+    )
 
 
 async def _refresh_existing_pairs(
@@ -487,58 +492,49 @@ async def _refresh_existing_pairs(
     results: tuple[AgentResult, ...],
     runtime: GraphRuntimeContext,
 ) -> None:
-    """Refresh leases for already-checkpointed uses (resume path).
+    """Refresh the plan's pinned pairs on (re-)entry to ``execute`` (R22).
 
-    No-op when no prior results exist (first pass). On a resume that
-    re-enters ``execute`` with completed results, this re-acquires the SAME
-    ``(run, revision, use)`` rows so retained pins stay active without
-    waiting for new dispatches. New uses are still leased by the scheduler
-    itself before its results return.
+    Re-acquires the SAME ``(run, revision, use)`` rows ``validate`` leased —
+    including the revision-only plan pins, which need no prior results — so a
+    resume provably refreshes pre-interrupt leases instead of merely minting
+    new-use leases. New uses are still leased by the scheduler itself before
+    its results return.
     """
-    pairs = refresh_pairs_for_checkpoint(plan, bindings, results)
-    if not pairs:
-        return
-    repo = runtime.services.retention_leases
-    if repo is None:
-        raise ComplexResearchError(
-            "checkpointed uses exist but no retention-lease service is "
+    await _acquire_pairs(
+        _pinned_pairs(plan, bindings, results),
+        runtime=runtime,
+        missing_message=(
+            "checkpointed pins exist but no retention-lease service is "
             "wired; refusing to run with unrefreshable pins"
-        )
-    run_id = runtime.capability_runtime.run_id
-    for revision_id, use_id in pairs:
-        result = repo.acquire_or_refresh(run_id, revision_id, use_id)
-        if inspect.isawaitable(result):
-            await result
-    await _commit_lease_session(runtime)
+        ),
+    )
 
 
 async def validate_checkpoint_node(
     state: ComplexResearchState,
     runtime: "Runtime[GraphRuntimeContext]",
 ) -> dict:
-    """Validate the proposal and lease its pins; the saver checkpoints (R17).
+    """Own the proposal end to end: compute, validate, lease, persist (R21).
 
-    Consumes the ephemeral proposal from ``_PLAN_PROPOSALS`` — or recomputes
-    it via ``build_planning_input`` when absent (fresh-process resume,
-    unsupported path). Initial-plan-only: ``validate_task_plan`` is
+    Single-owner node (R17/R21): the planner invocation lives HERE, so there
+    is no cross-node proposal store that could go stale or leak between
+    requests — concurrent invocations sharing a run id compute from their own
+    checkpointed state. Initial-plan-only: ``validate_task_plan`` is
     authoritative (T5 adds the append-only ``validate_replan`` path). There
     is no ``plan_checkpoint`` service — the returned plan enters
     ``ComplexResearchState`` and the supervisor saver performs the
     checkpoint, so the checkpoint that first persists ``plan`` is written by
-    the SAME node that already acquired its leases. A recompute that still
-    cannot plan is the unsupported-work path: nothing to validate or pin.
+    the SAME node that already acquired its leases. An unplannable input is
+    the unsupported-work path: nothing is validated, leased, or persisted.
     """
     context = node_context(runtime)
     state = normalize_complex_state(state)
-    run_id = context.capability_runtime.run_id
-    proposal = _PLAN_PROPOSALS.get(run_id)
-    if proposal is None:
-        try:
-            proposal = compare_policy.build_compare_plan(
-                build_planning_input(state, context)
-            )
-        except ContractValidationError:
-            return {}
+    try:
+        proposal = compare_policy.build_compare_plan(
+            build_planning_input(state, context)
+        )
+    except ContractValidationError:
+        return {}
     bindings = state["bindings"]
     validate_task_plan(proposal, bindings)
     await _lease_pinned_state(
@@ -586,16 +582,28 @@ async def complex_evaluate_node(
     state: ComplexResearchState,
     runtime: "Runtime[GraphRuntimeContext]",
 ) -> dict:
-    """Evaluate through the shared ``evaluate_evidence`` function (no service)."""
+    """Evaluate through the shared ``evaluate_evidence`` function (no service).
+
+    Refreshes the pinned pairs on entry first, so a resume landing here
+    re-acquires the exact ``(run, revision, use)`` rows behind the
+    checkpointed results (R22) before the evaluation checkpoint is written.
+    """
     context = node_context(runtime)
     state = normalize_complex_state(state)
     plan = state.get("plan")
     if plan is None:
         return {}
+    results = tuple(state.get("task_results", ()))
+    await _refresh_existing_pairs(
+        plan=plan,
+        bindings=state.get("bindings"),
+        results=results,
+        runtime=context,
+    )
     evaluation = await evaluate_evidence(
         plan=plan,
         bindings=state["bindings"],
-        results=tuple(state.get("task_results", ())),
+        results=results,
         semantic=state["semantic"],
         runtime=context,
     )
@@ -642,9 +650,8 @@ async def finalize_node(
     state: ComplexResearchState,
     runtime: "Runtime[GraphRuntimeContext]",
 ) -> dict:
-    """Terminal subgraph step: drop the ephemeral proposal, keep the result."""
-    context = node_context(runtime)
-    _PLAN_PROPOSALS.pop(context.capability_runtime.run_id, None)
+    """Terminal subgraph step: state already carries plan/results/evaluation."""
+    node_context(runtime)
     _ = state
     return {}
 

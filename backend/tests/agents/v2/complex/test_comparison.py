@@ -603,25 +603,78 @@ def test_complex_subgraph_uses_shared_task_scheduler() -> None:
 
 
 @pytest.mark.asyncio
-async def test_plan_node_holds_proposal_out_of_checkpointed_state() -> None:
-    """R17 unit seam: `plan` computes but never returns `plan` into state."""
+async def test_plan_node_writes_no_state() -> None:
+    """R21 single-owner: `plan` is a marker; the proposal lives in validate."""
     from app.services.agents.v2.complex_research_graph import (
-        _PLAN_PROPOSALS,
         plan_node,
         validate_checkpoint_node,
     )
 
-    _, leases, context = _harness(run_id="run-plan-scratch")
-    update = await plan_node(_child_input(), context)
-    assert "plan" not in update
-    proposal = _PLAN_PROPOSALS.get("run-plan-scratch")
-    assert proposal is not None
-    assert [task.task_id for task in proposal.tasks] == ["T1", "T2"]
-
+    _, leases, context = _harness(run_id="run-plan-marker")
+    assert await plan_node(_child_input(), context) == {}
     decided = await validate_checkpoint_node(_child_input(), context)
-    assert decided["plan"] == proposal
+    assert [task.task_id for task in decided["plan"].tasks] == ["T1", "T2"]
     assert leases.acquired, "validate leases the pins before checkpointing the plan"
     assert leases.session.commits >= 1
+
+
+@pytest.mark.asyncio
+async def test_unsupported_request_never_consumes_prior_proposal() -> None:
+    """R21 regression (reviewer reproduction, exact): same run_id, no leak.
+
+    compare `plan_node` → unsupported `plan_node` (SAME run_id/bindings) →
+    `validate_checkpoint_node` for the unsupported request must yield no plan
+    and zero leases, and `decide` must return typed unavailable.
+    """
+    from app.services.agents.v2.complex_research_graph import (
+        decide_node,
+        plan_node,
+        validate_checkpoint_node,
+    )
+
+    _, leases, context = _harness(run_id="run-r21-same")
+    await plan_node(_child_input(), context)
+    unsupported = _child_input()
+    unsupported["query_analysis"] = _analysis("evaluate")
+    await plan_node(unsupported, context)
+    update = await validate_checkpoint_node(unsupported, context)
+    assert "plan" not in update
+    assert leases.acquired == []
+    assert leases.session.commits == 0
+    decision = await decide_node(unsupported, context)
+    assert decision["unavailable"].code == "COMPLEX_RESEARCH_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sequences_share_no_proposal_state() -> None:
+    """R21 isolation: interleaved and concurrent runs cannot exchange plans."""
+    import asyncio
+
+    from app.services.agents.v2.complex_research_graph import (
+        build_complex_research_subgraph,
+        validate_checkpoint_node,
+    )
+
+    _, leases, context = _harness(run_id="run-r21-shared")
+    supported = _child_input()
+    unsupported = _child_input()
+    unsupported["query_analysis"] = _analysis("evaluate")
+    first = await validate_checkpoint_node(supported, context)
+    second = await validate_checkpoint_node(unsupported, context)
+    third = await validate_checkpoint_node(supported, context)
+    assert first["plan"] is not None and third["plan"] is not None
+    assert "plan" not in second
+    assert first["plan"].goal == COMPARE_QUERY
+
+    subgraph = build_complex_research_subgraph()
+    compare_out, unsupported_out = await asyncio.gather(
+        subgraph.ainvoke(_child_input(), context=context),
+        subgraph.ainvoke(unsupported, context=context),
+    )
+    assert compare_out["evaluation"].status == "sufficient"
+    assert unsupported_out["plan"] is None
+    assert unsupported_out["unavailable"].code == "COMPLEX_RESEARCH_UNAVAILABLE"
+    assert unsupported_out["task_results"] == ()
 
 
 @pytest.mark.asyncio
@@ -768,11 +821,102 @@ async def test_complex_subgraph_resumes_from_interrupt() -> None:
         assert len(leases.acquired) > len(leases_after_interrupt), (
             "resume strictly refreshes the retained leases"
         )
+        # R22: the SAME revision-only pins from before the interrupt were
+        # re-acquired after resume (pair identity, not just a larger count).
+        pins_pre = {(revision, use) for (_, revision, use) in leases_after_interrupt}
+        pins_post = {
+            (revision, use) for (_, revision, use) in leases.acquired[len(leases_after_interrupt):]
+        }
+        assert pins_pre and pins_pre <= pins_post
         assert leases.session.commits > commits_after_interrupt
         assert leases.released == []
         assert {run for run, _, _ in leases.acquired} == {"run-resume-1"}
     finally:
         policy_module.build_compare_plan = original_plan  # type: ignore[method-assign]
+
+
+@pytest.mark.asyncio
+async def test_resume_refreshes_pre_interrupt_lease_pairs() -> None:
+    """R22: interrupt AFTER both reads exist; resume re-acquires SAME pairs.
+
+    The interrupt fires inside `evaluate`, so both evidence uses (and their
+    revision leases) already exist in checkpointed results. The resumed
+    `evaluate` refreshes the identical `(revision_id, evidence_use_id)`
+    tuples (pair identity with fresh acquisitions) — not merely a larger
+    total from new-use leasing.
+    """
+    from langgraph.types import Command, interrupt
+
+    import app.services.agents.v2.complex_research_graph as cx_module
+    from app.services.agents.v2.complex_research_graph import (
+        build_complex_research_subgraph,
+        make_complex_boundary_node,
+    )
+
+    (document_capability, _), leases, context = _harness(run_id="run-r22-pairs")
+    original_evaluate = cx_module.evaluate_evidence
+    struck = {"interrupted": False}
+
+    async def flaky_evaluate(**kwargs):  # type: ignore[no-untyped-def]
+        if not struck["interrupted"]:
+            struck["interrupted"] = True
+            interrupt("paused after reads")
+        return await original_evaluate(**kwargs)
+
+    cx_module.evaluate_evidence = flaky_evaluate  # type: ignore[method-assign]
+    try:
+        subgraph = build_complex_research_subgraph()
+        parent = StateGraph(SupervisorV2State)
+        parent.add_node("complex_boundary", make_complex_boundary_node(subgraph))
+        parent.set_entry_point("complex_boundary")
+        parent.set_finish_point("complex_boundary")
+        compiled = parent.compile(checkpointer=InMemorySaver())
+        config = {"configurable": {"thread_id": "thread-r22-pairs"}}
+
+        suspended = await compiled.ainvoke(_parent_state(), config=config, context=context)
+        assert struck["interrupted"] is True
+        assert "__interrupt__" in suspended
+        pre = list(leases.acquired)
+        use_ids = set(document_capability.uses.keys())
+        assert len(use_ids) == 2, "both reads dispatched and leased pre-interrupt"
+        pins_pre = {(revision, use) for (_, revision, use) in pre}
+        assert (REV_A, None) in pins_pre and (REV_B, None) in pins_pre
+        assert use_ids <= {use for (_, _, use) in pre if use is not None}, (
+            "both dispatched uses were leased before the interrupt"
+        )
+
+        resumed = await compiled.ainvoke(
+            Command(resume="continue"), config=config, context=context
+        )
+        execution = resumed["execution"]
+        assert execution.evidence_evaluation.status == "sufficient"
+        post = leases.acquired[len(pre):]
+        assert post, "resume re-acquired leases (not a silent no-op)"
+        pins_post = {(revision, use) for (_, revision, use) in post}
+        assert pins_pre <= pins_post, (
+            "every pre-interrupt pair was re-acquired after resume"
+        )
+        for pair in pins_pre:
+            total_before = sum(1 for entry in pre if (entry[1], entry[2]) == pair)
+            total_after = sum(1 for entry in leases.acquired if (entry[1], entry[2]) == pair)
+            assert total_after > total_before, f"pair {pair} was refreshed, not just kept"
+        assert leases.released == []
+        assert {run for run, _, _ in leases.acquired} == {"run-r22-pairs"}
+    finally:
+        cx_module.evaluate_evidence = original_evaluate  # type: ignore[method-assign]
+
+
+@pytest.mark.asyncio
+async def test_execute_without_plan_touches_no_leases() -> None:
+    """R22 explicit no-op: plan-less execute returns empty and leases nothing."""
+    from app.services.agents.v2.complex_research_graph import complex_execute_node
+
+    _, leases, context = _harness(run_id="run-noplan")
+    child = _child_input()
+    child["query_analysis"] = _analysis("evaluate")
+    assert await complex_execute_node(child, context) == {}
+    assert leases.acquired == []
+    assert leases.session.commits == 0
 
 
 @pytest.mark.asyncio
