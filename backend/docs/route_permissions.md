@@ -164,6 +164,21 @@ personal visibility → owner only
 | `DELETE /admin/users/{user_id}` | DELETE | Delete user (cannot delete self) |
 | `POST /admin/users/{user_id}/reset-password` | POST | Force reset password |
 
+### `/admin/agent` — LangGraph arm + v2 rollout (superadmin only)
+**All routes require `require_superadmin`**
+
+| Route | Method | Notes |
+|---|---|---|
+| `GET /admin/agent/status` | GET | Configured arm (`configured_version`); the A/B session-SSE smoke asserts it |
+| `POST /admin/agent/evaluate {version}` | POST | **Only server-owned per-request arm selector** (A/B driver). Never send client graph-version headers |
+| `GET /admin/agent/rollout` | GET | DB rollout control row + environment ceilings (no mutation); 404 until the v2 schema migration is applied |
+| `PUT /admin/agent/rollout` | PUT | Mutate control (enable, percent, workspaces, kill switch); kill switch routes new requests to v1 and cancels active v2 runs |
+| `POST /admin/agent/runs/{run_id}/cancel` | POST | Cancel one active v2 run |
+
+v1 is the default arm and the rollback path; `canary_percent=100` promotes
+100% of **v2-eligible** traffic only (Write/evaluate stay on v1). Ownership
+model and staged order: `CLAUDE.md` (canonical).
+
 ---
 
 ### `/workers` — Worker & Queue Management

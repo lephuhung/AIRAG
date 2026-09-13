@@ -69,3 +69,9 @@ re-derive of heading paths for section-by-Điều retrieval).
   collections become incompatible**; a reindex is required, not just a restart.
 - Embedder/reranker load lazily → the first query after a `hrag-backend` restart
   is slow (model load), not a retrieval regression.
+
+## LangGraph v2 (shared capabilities)
+
+The v2 fast and complex paths share the same capability implementations
+(document search, section, KG) over this retrieval read path — no separate
+retrieval stack. Ownership model: [`CLAUDE.md`](../CLAUDE.md) (canonical).

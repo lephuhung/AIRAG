@@ -133,6 +133,19 @@ Setting `NEXUSRAG_LG_RAG_REACT=true` routes RAG-group queries to a tool-calling 
 executor** instead of the fixed intent→tool chain: the model is given the RAG tool schemas
 (search / section / kg / resolve_doc / memory) and decides which to call.
 
+### LangGraph v2 (staged rollout, v1 default)
+
+A second-generation agent stack lives under `backend/app/services/agents/v2/`:
+Agent proposes → validated + checkpointed `TaskPlan` → shared `TaskScheduler` →
+capability. It serves only traffic the DB-backed canary control explicitly
+selects; **v1 remains the default and the rollback path** (every failure mode
+fails closed to v1, and the kill switch routes new requests to v1 and cancels
+active v2 runs). Staged order: shadow → internal workspace canary →
+5% → 25% → 50% → 100% of *v2-eligible* traffic (Write/evaluate stay on v1;
+global replacement of v1 is out of scope). 📖 **Ownership model, invariants,
+and runbook:** [`CLAUDE.md`](CLAUDE.md) (canonical); live preflight/canary
+commands: [`docs/harness.md`](docs/harness.md).
+
 ### Storage
 
 | Service | Purpose |

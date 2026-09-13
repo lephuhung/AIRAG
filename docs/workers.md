@@ -80,3 +80,10 @@ docker exec hrag-backend curl -s http://localhost:8080/api/v1/workers/overview \
 # worker health (from host, if 8081 published) or via `docker exec`:
 docker exec hrag-worker-embed curl -s http://localhost:8081/health
 ```
+
+## LangGraph v2 (no worker changes)
+
+The v2 rollout adds no worker roles, queues, or control-plane commands — it
+runs on the backend chat path only (supervisor entry → scheduler →
+capabilities). Ingestion workers are untouched. Ownership model:
+[`CLAUDE.md`](../CLAUDE.md) (canonical).

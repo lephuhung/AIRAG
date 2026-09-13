@@ -2,6 +2,11 @@
 
 This document shows the LangGraph supervisor-based multi-agent workflow for NexusRAG.
 
+> **Scope:** v1 supervisor. The v2 stack (`app/services/agents/v2/`) has **no
+domain agents** — no `people_agent.py` / `summary_agent.py` / `comparison_agent.py`
+/ `document_agent.py` / `section_agent.py` / `kg_agent.py` and no domain subgraphs.
+Its ownership model is canonical in [`CLAUDE.md`](../../../CLAUDE.md).
+
 ## Overview
 
 The agent uses a **Supervisor-Worker** architecture: a single LLM call classifies intent and

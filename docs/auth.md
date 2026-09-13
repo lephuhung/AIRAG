@@ -69,3 +69,16 @@ auto-login with `AB_USER` + `AB_PASSWORD` (+ `AB_TOTP`) against
 ```bash
 export AB_USER=admin@hrag.local AB_PASSWORD=...   # or export AB_TOKEN=<jwt>
 ```
+
+## LangGraph v2 rollout surfaces (all superadmin-only)
+
+- `POST /api/v1/admin/agent/evaluate {version}` — the only server-owned
+  per-request arm selector the A/B driver uses. Requires an authenticated
+  superadmin; client graph-version headers are never sent.
+- `GET /api/v1/admin/agent/rollout` / `PUT /api/v1/admin/agent/rollout` —
+  read / mutate the DB canary control (enable, percent, workspaces,
+  kill switch).
+- `POST /api/v1/admin/agent/runs/{run_id}/cancel` — cancel one active v2 run.
+- Shadow execution mirrors the caller's authorization
+  (`can_read_people = bool(user.is_superadmin)`), never a hardcoded grant.
+  Ownership model: [`CLAUDE.md`](../CLAUDE.md) (canonical).

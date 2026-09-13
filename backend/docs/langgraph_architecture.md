@@ -3,6 +3,13 @@
 Document version: 2026-04-01
 Branch: `KG-building`
 
+> **Scope:** this document describes the **v1** agent graph. The v2 stack
+> (`app/services/agents/v2/`) follows a different ownership model (Agent vs
+> Node vs Capability vs Skill, validated-checkpointed `TaskPlan` → shared
+> `TaskScheduler`, no domain agents) documented canonically in
+> [`CLAUDE.md`](../../CLAUDE.md). Do not mix the two; this file is not
+> updated to describe v2 beyond this pointer.
+
 ---
 
 ## Overview

@@ -154,6 +154,77 @@ Metrics per arm (all comparable, no judge needed): `latency_ms` (mean/p50/p95),
 (lower is better in-corpus), `refuse_rate_negative` (higher is better out-of-corpus).
 `ab-compare` exits non-zero if any in-corpus case regressed — usable as a gate.
 
+## Phase-3 golden preflight (live, operational)
+
+The rollout gate preflight is the `make ab` form above with the golden
+retrieval set, one report per arm, then a diff:
+
+```bash
+WS=<workspace-uuid-with-documents>
+make ab ARM=v1 QUERIES=tests/retrieval/datasets/golden_retrieval.yaml WORKSPACE=$WS OUTPUT=backend/tests/reports/v1-preflight.json
+make ab ARM=v2 QUERIES=tests/retrieval/datasets/golden_retrieval.yaml WORKSPACE=$WS OUTPUT=backend/tests/reports/v2-preflight.json
+make ab-compare A=backend/tests/reports/v1-preflight.json B=backend/tests/reports/v2-preflight.json
+```
+
+Needs the live Compose stack + providers + `AB_TOKEN` (or `AB_USER` +
+`AB_PASSWORD`); the v2 arm additionally needs the canary enabled for the
+target workspace (or an authenticated superadmin `--token` drive through
+`POST /api/v1/admin/agent/evaluate`). Not runnable offline — record the
+reports as gate evidence when run.
+
+## Operational hand-off (live steps not runnable from a worktree session)
+
+These require the live Compose stack (`hrag-backend` bind-mounts the main
+repo, so a worktree session cannot execute them) and, for canary, real
+traffic. Run them from a checkout that owns the stack:
+
+```bash
+# 0) one-time: apply the v2 schema migration against the live DB, then verify
+cd backend && python -m app.services.agents.v2.persistence.migrate apply --dsn <prod-dsn>
+cd backend && python -m app.services.agents.v2.persistence.migrate check --dsn <prod-dsn>
+# 1) golden preflight (see above), then ab-compare — must be green
+# 2) enable shadow first (no production effect), watch one window:
+#    NEXUSRAG_AGENT_V2_SHADOW_ENABLED=true NEXUSRAG_AGENT_V2_SHADOW_PERCENT=5
+# 3) staged canary via the superadmin API (each stage needs real
+#    agent_rollout_metrics traffic over the gate window):
+#    PUT /api/v1/admin/agent/rollout {enabled, canary_percent, workspaces}
+#    shadow 5% -> internal-workspace canary -> 5% -> 25% -> 50% -> 100%
+#    (100% = v2-eligible traffic only; Write/evaluate stay on v1)
+# 4) offline gate over collected metrics:
+cd backend && python scripts/collect_v2_rollout_report.py --dsn <prod-dsn> --out /tmp/v2-rollout.json
+cd backend && python scripts/check_v2_rollout_gate.py --report /tmp/v2-rollout.json
+# 5) emergency brake (any stage): PUT /api/v1/admin/agent/rollout {kill_switch: true}
+#    -> new requests go to v1, control revision increments, active v2 runs
+#    are cancelled without success.
+```
+
+`make` targets that need the live stack or the frontend toolchain and cannot
+run in the offline harness (`make test-recall`, `make test-section`,
+`make test-validity`, `make fe-lint`, `make fe-build`) are likewise
+executed here at promotion time; record their output with the gate evidence.
+
+## Offline validation (runnable here)
+
+```bash
+H=.superpowers/sdd/2026-09-11-langgraph-v2-phase3-rollout/harness.sh
+$H 'python -m pytest tests/agents/v2 tests/api tests/migrations/v2 tests/workers -q'
+# tests/agents/v2/orchestrator_compat hardcodes a localhost:5433 DSN and is
+# excluded from the harness run (validated from the host bench venv instead).
+```
+
+Static guards (must all pass — empty output — while v1 stays the
+default/rollback path):
+
+```bash
+! find backend/app/services/agents/v2 -type f \
+  \( -name 'people_agent.py' -o -name 'summary_agent.py' -o -name 'comparison_agent.py' \
+     -o -name 'document_agent.py' -o -name 'section_agent.py' -o -name 'kg_agent.py' \
+     -o -path '*/domain/*_graph.py' \) | grep .
+! rg -n 'capability\.execute\(' backend/app/services/agents/v2/tools
+! rg -n 'TaskScheduler|scheduler\.execute\(|checkpointer' backend/app/services/agents/v2/tools
+! rg -n 'safe_metadata|Mapping\[str' backend/app/services/agents/v2/tools
+```
+
 ## Notes / gotchas
 
 - **CI is offline by design.** Backend runtime deps (torch, docling) are too heavy

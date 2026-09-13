@@ -223,3 +223,12 @@ Raising `WEB_CONCURRENCY` scales the **chat/search API**. It does **not** addres
 - Memory `redis-scale-out` — phase-by-phase implementation notes.
 - Memory `search-cuda-oom-silent-fail` — why the GPU search cap exists.
 - Memory `vllm-memory GPU util` — the VRAM headroom math.
+
+## LangGraph v2 canary across workers
+
+Canary selection is deterministic per `(workspace_id, request_id, salt)` with
+no cross-worker coordination, so it is safe at any `WEB_CONCURRENCY` without
+Redis: each worker resolves the same arm independently. The Redis-distributed
+v2 active-run cancellation reuses the Stop-button pub/sub channel when
+`REDIS_ENABLED=true` and falls back to in-process cancellation otherwise.
+Ownership model and rollout order: [`CLAUDE.md`](../CLAUDE.md) (canonical).
