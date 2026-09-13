@@ -44,10 +44,8 @@ from app.services.agents.v2.persistence.document_views import (
 from app.services.parsing.deep_document_parser import DeepDocumentParser
 from app.services.storage_service import get_storage_service
 from app.workers.utils import (
-    FinalizeOutcome,
-    apply_finalize_outcome,
+    check_and_finalize,
     delete_stage_children,
-    finalize_revision_if_complete,
     load_revision_execution,
     mark_revision_building,
     record_parse_artifacts,
@@ -411,32 +409,23 @@ async def handle_parse(payload: dict) -> None:
 
             # ── Dispatch sub-tasks OR publish (parse-only / chat-upload mode) ─────
             if profile is RevisionBuildProfile.PARSE_ONLY:
-                # Parse-only: no embed/caption/KG child stages. Verify + publish
-                # the revision from its recorded manifest. This call IS the
-                # final one for the profile, so incomplete artifacts are a real
-                # failure (verified with expect_complete).
+                # Parse-only: no embed/caption/KG child stages. Finalize through
+                # the SAME authoritative stage gate as every other profile
+                # (required_stages_complete + verify/publish + guarded mirror):
+                # a mislabelled/stale parse message must never publish a
+                # revision whose required stages are still pending. For a
+                # correctly-labelled PARSE_ONLY message the gate holds by
+                # construction (only parse is required; the rest are
+                # profile-skipped), so the outcome is identical to the direct
+                # finalize this fast path used to call.
                 await db.commit()
-                result = await finalize_revision_if_complete(
-                    msg.revision_id, expect_complete=True
+                await check_and_finalize(
+                    document, db, revision_id=msg.revision_id
                 )
-                # The document must never read INDEXED unless the revision
-                # actually published; a verify failure mirrors FAILED — but only
-                # while THIS revision is still the document's current pointer
-                # (a superseded build's late failure must not fail a live one).
-                await apply_finalize_outcome(
-                    msg.document_id, result, revision_id=msg.revision_id
+                logger.info(
+                    f"[parse_worker] doc={msg.document_id} rev={msg.revision_id} "
+                    f"parse-only — consulted finalization gate in {int((time.time() - start) * 1000)}ms"
                 )
-                if result.outcome is FinalizeOutcome.PUBLISHED:
-                    logger.info(
-                        f"[parse_worker] doc={msg.document_id} rev={msg.revision_id} "
-                        f"parse-only — published in {int((time.time() - start) * 1000)}ms"
-                    )
-                else:
-                    logger.error(
-                        f"[parse_worker] doc={msg.document_id} rev={msg.revision_id} "
-                        f"parse-only — finalize outcome={result.outcome.value} "
-                        f"({result.failure_stage}:{result.failure_class})"
-                    )
             elif profile is RevisionBuildProfile.CHAT_UPLOAD:
                 # Chat-upload: parse → embed (skip KG and caption for speed)
                 await mq.publish(

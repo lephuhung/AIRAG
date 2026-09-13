@@ -764,6 +764,132 @@ async def consume(
             pass
 
 
+async def _rollback_kg_timeout(
+    *,
+    queue_name: str,
+    exchange_name: str,
+    document_id: str,
+    revision_id,
+    will_retry: bool,
+    elapsed: float,
+) -> None:
+    """Mirror one KG handler timeout onto the ``Document`` row (never raises).
+
+    A retryable timeout re-arms the mirror (``kg_done=False``,
+    ``BUILDING_KG``) so the redelivery can process again. An exhausted
+    timeout is a FAILURE, not a skip: the KG stage row is durably
+    ``running`` here with no redelivery coming, so the exact stage+revision
+    are failed atomically first (the authoritative transaction), and only
+    then is ``Document.status=FAILED`` mirrored — and only while this
+    revision still describes the active generation. A newer published
+    pointer/status is never overwritten by an older failed generation (the
+    same guard as ``apply_finalize_outcome``). When the authoritative
+    failure does not land, no terminal mirror is reported.
+
+    Called from the queue timeout branch only; the caller still reports the
+    revision-owned stage edge via :func:`_note_failure_stage` afterwards
+    (a no-op convergence once exhaustion already terminalized the rows).
+    """
+    from app.core.database import async_session_maker
+    from sqlalchemy import select
+    from app.models.document import Document, DocumentStatus
+
+    if will_retry:
+        try:
+            async with async_session_maker() as rollback_db:
+                result = await rollback_db.execute(
+                    select(Document).where(
+                        Document.id == uuid.UUID(document_id)
+                    )
+                )
+                doc = result.scalar_one_or_none()
+                if doc and doc.status not in (
+                    DocumentStatus.PENDING,
+                    DocumentStatus.INDEXED,
+                    DocumentStatus.FAILED,
+                ):
+                    doc.kg_done = False
+                    doc.status = DocumentStatus.BUILDING_KG
+                    doc.error_message = f"timeout_retry: KG handler timed out after {elapsed:.1f}s — will retry"
+                    await rollback_db.commit()
+                    logger.info(
+                        f"[timeout_rollback] doc={document_id} "
+                        f"kg_done reset for retry"
+                    )
+        except Exception as rollback_err:  # noqa: BLE001 - mirror must never break the queue path
+            logger.warning(
+                f"[timeout_rollback] KG failed for doc={document_id}: {rollback_err}"
+            )
+        return
+
+    # Exhausted: KG timeout exhaustion is failure, not skip. The stage row
+    # is durably ``running`` at this point, so a synthetic ``kg_done=True``
+    # skip plus finalization would either strand the document (the stage gate
+    # returns NOT_READY with no FAILED mirror) or publish a revision whose KG
+    # never ran. Fail the exact stage+revision atomically FIRST ...
+    kg_stage = stage_for_queue(queue_name, exchange_name)
+    failed_ok = (
+        revision_id is not None
+        and kg_stage is not None
+        and await note_stage_exhausted(
+            revision_id, kg_stage, failure_class="TimeoutError"
+        )
+    )
+    if not failed_ok:
+        # ... the authoritative failure did not land (already-terminal /
+        # unknown row, or a DB outage): never report a terminal mirror for a
+        # revision that is not terminally failed.
+        logger.warning(
+            f"[timeout_rollback] doc={document_id} KG retries exhausted but "
+            f"the stage/revision failure did not land — mirror left untouched"
+        )
+        return
+    # ... then mirror FAILED only while this revision still describes the
+    # active generation (guard equivalent to ``apply_finalize_outcome``).
+    try:
+        async with async_session_maker() as rollback_db:
+            result = await rollback_db.execute(
+                select(Document)
+                .where(Document.id == uuid.UUID(document_id))
+                .with_for_update()
+            )
+            doc = result.scalar_one_or_none()
+            if doc is None:
+                return
+            if doc.status in (
+                DocumentStatus.PENDING,
+                DocumentStatus.INDEXED,
+                DocumentStatus.FAILED,
+            ):
+                logger.info(
+                    f"[timeout_rollback] doc={document_id} KG exhausted — "
+                    f"mirror already {doc.status}, left untouched"
+                )
+                return
+            if (
+                revision_id is not None
+                and doc.current_revision_id is not None
+                and doc.current_revision_id != revision_id
+            ):
+                logger.info(
+                    f"[timeout_rollback] doc={document_id} ignoring exhausted "
+                    f"KG failure from superseded revision {revision_id} "
+                    f"(current={doc.current_revision_id})"
+                )
+                return
+            doc.status = DocumentStatus.FAILED
+            doc.error_message = f"revision_failed: {kg_stage}: TimeoutError"[:500]
+            await rollback_db.commit()
+            logger.error(
+                f"[timeout_rollback] doc={document_id} → FAILED "
+                f"(revision {kg_stage}:TimeoutError, KG retries exhausted)"
+            )
+    except Exception as rollback_err:  # noqa: BLE001 - mirror must never break the queue path
+        logger.warning(
+            f"[timeout_rollback] KG failed for doc={document_id}: {rollback_err}"
+        )
+
+
 async def _consume_on_channel(
     conn,
     channel,
@@ -943,52 +1069,22 @@ async def _consume_on_channel(
                                     logger.warning(
                                         f"[timeout_rollback] failed for doc={document_id}: {rollback_err}"
                                     )
-                            # For KG worker: reset kg_done=False so retry can process again.
-                            # When retries are exhausted, mark kg_done=True (KG skipped) so the
-                            # document is not stuck in BUILDING_KG forever.
+                            # KG timeout mirror (P1 Task 4 I1): a retryable timeout
+                            # re-arms the mirror for the redelivery; an exhausted
+                            # timeout fails the exact stage+revision first and
+                            # then mirrors FAILED while the revision still owns
+                            # the active generation (never the synthetic
+                            # kg_done=True skip, never finalization while the
+                            # stage is running/failed). Never raises.
                             if "kg" in queue_name and document_id != "unknown":
-                                try:
-                                    from app.core.database import async_session_maker
-                                    from sqlalchemy import select
-                                    from app.models.document import Document, DocumentStatus
-                                    from app.workers.utils import check_and_finalize
-
-                                    async with async_session_maker() as rollback_db:
-                                        result = await rollback_db.execute(
-                                            select(Document).where(
-                                                Document.id == uuid.UUID(document_id)
-                                            )
-                                        )
-                                        doc = result.scalar_one_or_none()
-                                        if doc and doc.status not in (
-                                            DocumentStatus.PENDING,
-                                            DocumentStatus.INDEXED,
-                                            DocumentStatus.FAILED,
-                                        ):
-                                            if will_retry:
-                                                doc.kg_done = False
-                                                doc.status = DocumentStatus.BUILDING_KG
-                                                doc.error_message = f"timeout_retry: KG handler timed out after {elapsed:.1f}s — will retry"
-                                            else:
-                                                doc.kg_done = True
-                                                doc.error_message = (
-                                                    "kg_timeout: retries exhausted — KG skipped"
-                                                )
-                                            await rollback_db.commit()
-                                            logger.info(
-                                                f"[timeout_rollback] doc={document_id} "
-                                                f"kg_done={'reset for retry' if will_retry else 'True (KG skipped)'}"
-                                            )
-                                            if not will_retry:
-                                                await check_and_finalize(
-                                                    doc,
-                                                    rollback_db,
-                                                    revision_id=revision_id,
-                                                )
-                                except Exception as rollback_err:
-                                    logger.warning(
-                                        f"[timeout_rollback] KG failed for doc={document_id}: {rollback_err}"
-                                    )
+                                await _rollback_kg_timeout(
+                                    queue_name=queue_name,
+                                    exchange_name=exchange_name,
+                                    document_id=document_id,
+                                    revision_id=revision_id,
+                                    will_retry=will_retry,
+                                    elapsed=elapsed,
+                                )
                             # Revision-owned stage retry (P1 Task 3): before
                             # requeueing, move ONLY this message's
                             # revision/stage running → pending (the attempt is

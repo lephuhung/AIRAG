@@ -21,7 +21,11 @@ profile (pending/running/incomplete stages return NOT_READY without
 finalizing). The artifact manifest (`verify_draft`), tombstone handling
 (`publish`), and the generation CAS/guard stay authoritative alongside the
 stage rows. `Document.embed_done/captions_done/kg_done` are v1/UI mirrors
-only. Legacy calls without a revision keep the mirror behavior.
+only. The PARSE_ONLY fast path finalizes through the same gate (never a
+direct finalize call). An exhausted KG timeout is a failure, not a skip: the
+queue fails the exact stage+revision atomically first, then mirrors
+`Document.status=FAILED` only while that revision still owns the active
+generation — a newer published pointer is never overwritten. Legacy calls without a revision keep the mirror behavior.
 
 | `WORKER_TYPE` | Container | Exchange / queue (`app/queue/connection.py`) | Prefetch env |
 |---------------|-----------|----------------------------------------------|--------------|

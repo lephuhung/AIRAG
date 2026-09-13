@@ -69,12 +69,22 @@ docker exec hrag-postgres psql -U postgres -d hrag -c \
 - Every published revision's stage rows are terminally complete for its
   profile (`completed` for required stages, `skipped` for profile-skipped
   ones) — finalization is stage-gated, so a published pointer implies the
-  gate passed:
+  gate passed. Scope the stage rows through the document pointer
+  (`current_revision_id`); there is no bare `$REV` placeholder — resolve one
+  document first if you need a single revision id:
 
 ```bash
 docker exec hrag-postgres psql -U postgres -d hrag -c \
-  "select revision_id, stage, state, attempt_count from document_revision_stages
-    where revision_id = '$REV' order by stage;"
+  "select d.id, s.stage, s.state, s.attempt_count from documents d
+    join document_revision_stages s on s.revision_id = d.current_revision_id
+   where d.workspace_id = '$WS' and d.source_deleted_at is null
+   order by d.id, s.stage;"
+```
+
+```bash
+# Single-document revision id (no placeholder):
+# REV=$(docker exec hrag-postgres psql -U postgres -d hrag -tAc \
+#   "select current_revision_id from documents where id = '$DOC_ID'")
 ```
 
 Boundary check (in-container, read-only):

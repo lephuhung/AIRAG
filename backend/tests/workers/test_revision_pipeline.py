@@ -3720,3 +3720,306 @@ async def test_task4_legacy_call_without_revision_retains_mirror_behavior(
         fresh_plain = await db.get(Document, plain_id)
     assert fresh_chat.status == DocumentStatus.INDEXED
     assert fresh_plain.status != DocumentStatus.INDEXED
+
+
+# ---------------------------------------------------------------------------
+# P1 Task 4 fix round 1 — exhausted KG timeout is failure, not skip (I1);
+# PARSE_ONLY finalizes through the stage gate (M1)
+# ---------------------------------------------------------------------------
+
+
+async def _fix1_full_revision_with_kg_running(maker, doc_id, *, sha):
+    """Allocate FULL, complete parse/embed/caption, leave kg running."""
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        revision, profile, _created = await allocate_ingest_revision(
+            db,
+            doc_id,
+            object_key=_doc_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256=sha,
+            version_id="v-1",
+        )
+        assert profile is FULL
+        repo = DocumentRevisionsRepository(db)
+        await repo.mark_stage_completed(revision.revision_id, "parse")
+        await repo.mark_stage_completed(revision.revision_id, "embed")
+        await repo.mark_stage_completed(revision.revision_id, "caption")
+        await repo.mark_stage_running(revision.revision_id, "kg")
+        document = await db.get(Document, doc_id)
+        document.status = DocumentStatus.BUILDING_KG
+        await db.commit()
+        return ws, revision.revision_id
+
+
+@pytest.mark.asyncio
+async def test_fix1_kg_timeout_exhaustion_fails_stage_revision_and_mirrors_failed(
+    async_engine, document_factory, monkeypatch
+):
+    """Exhausted KG timeout terminalizes stage+revision and mirrors FAILED.
+
+    Regression (review I1): the queue timeout branch used to write the
+    synthetic ``kg_done=True`` ("KG skipped") skip and call
+    ``check_and_finalize``, whose stage gate then returned NOT_READY — the
+    revision was failed by the later exhaustion note while the document was
+    stranded in non-terminal ``BUILDING_KG`` with no FAILED mirror and no
+    pointer ever published.
+    """
+    from app.queue import connection as conn
+
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    doc_id = document_factory()
+    ws, revision_id = await _fix1_full_revision_with_kg_running(
+        maker, doc_id, sha="f1x" + "0" * 61
+    )
+
+    await conn._rollback_kg_timeout(
+        queue_name=f"hrag.kg.{ws}",
+        exchange_name="hrag.kg",
+        document_id=str(doc_id),
+        revision_id=revision_id,
+        will_retry=False,
+        elapsed=5.0,
+    )
+
+    async with maker() as db:
+        repo = DocumentRevisionsRepository(db)
+        rows = {r.stage: r.state for r in await repo.get_stages(revision_id)}
+        row = await db.get(DocumentRevision, revision_id)
+        fresh = await db.get(Document, doc_id)
+    assert rows["kg"] == "failed"
+    assert rows["parse"] == "completed"
+    assert rows["embed"] == "completed"
+    assert rows["caption"] == "completed"
+    assert row.status == "failed"
+    assert row.failure_stage == "kg"
+    assert row.failure_class == "TimeoutError"
+    assert fresh.status == DocumentStatus.FAILED
+    assert fresh.error_message.startswith("revision_failed: kg:")
+    assert fresh.kg_done is False, "exhaustion is failure, never the skip"
+    assert fresh.current_revision_id is None, "no pointer publication"
+
+
+@pytest.mark.asyncio
+async def test_fix1_kg_timeout_retry_resets_mirror_without_terminalizing(
+    async_engine, document_factory, monkeypatch
+):
+    """A retryable KG timeout re-arms the mirror; stage+revision stay live."""
+    from app.queue import connection as conn
+
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    doc_id = document_factory()
+    ws, revision_id = await _fix1_full_revision_with_kg_running(
+        maker, doc_id, sha="f1y" + "0" * 61
+    )
+
+    await conn._rollback_kg_timeout(
+        queue_name=f"hrag.kg.{ws}",
+        exchange_name="hrag.kg",
+        document_id=str(doc_id),
+        revision_id=revision_id,
+        will_retry=True,
+        elapsed=5.0,
+    )
+
+    async with maker() as db:
+        repo = DocumentRevisionsRepository(db)
+        rows = {r.stage: r.state for r in await repo.get_stages(revision_id)}
+        row = await db.get(DocumentRevision, revision_id)
+        fresh = await db.get(Document, doc_id)
+    assert rows["kg"] == "running"
+    assert row.status in ("draft", "building")
+    assert fresh.status == DocumentStatus.BUILDING_KG
+    assert fresh.kg_done is False
+    assert fresh.error_message.startswith("timeout_retry:")
+    assert fresh.current_revision_id is None
+
+
+@pytest.mark.asyncio
+async def test_fix1_kg_timeout_exhaustion_leaves_newer_pointer_untouched(
+    async_engine, document_factory, monkeypatch
+):
+    """An older generation's exhausted KG never rewrites a newer pointer.
+
+    R1 (FULL, kg running) exhausts after R2 published: R1's own stage+revision
+    still terminalize, but the document mirror — status, error, pointer — is
+    left exactly as R2 published it (generation guard equivalent to
+    ``apply_finalize_outcome``).
+    """
+    from app.queue import connection as conn
+
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        key = _doc_key(ws, doc_id)
+        stale, stale_profile = await allocate_reindex_revision(
+            db,
+            doc_id,
+            object_key=key,
+            size_bytes=11,
+            content_sha256="f1z" + "0" * 61,
+            version_id="v-1",
+        )
+        assert stale_profile is FULL
+        repo = DocumentRevisionsRepository(db)
+        for stage in ("parse", "embed", "caption"):
+            await repo.mark_stage_completed(stale.revision_id, stage)
+        await repo.mark_stage_running(stale.revision_id, "kg")
+        document = await db.get(Document, doc_id)
+        document.status = DocumentStatus.BUILDING_KG
+        current, current_profile = await allocate_reindex_revision(
+            db,
+            doc_id,
+            object_key=key,
+            size_bytes=11,
+            content_sha256="f1z" + "0" * 61,
+            version_id="v-2",
+        )
+        await _task4_complete_stages(
+            db, current.revision_id, ("parse", "embed", "caption", "kg")
+        )
+        await _record_complete_artifacts(db, current, current_profile)
+        await db.commit()
+        stale_id = stale.revision_id
+        current_id = current.revision_id
+
+    async with maker() as db:
+        document = await db.get(Document, doc_id)
+        await check_and_finalize(document, db, revision_id=current_id)
+    async with maker() as db:
+        fresh = await db.get(Document, doc_id)
+    assert fresh.status == DocumentStatus.INDEXED
+    assert fresh.current_revision_id == current_id
+    published_error = fresh.error_message
+
+    # The older generation's KG exhausts late.
+    await conn._rollback_kg_timeout(
+        queue_name=f"hrag.kg.{ws}",
+        exchange_name="hrag.kg",
+        document_id=str(doc_id),
+        revision_id=stale_id,
+        will_retry=False,
+        elapsed=5.0,
+    )
+
+    async with maker() as db:
+        stale_row = await db.get(DocumentRevision, stale_id)
+        current_row = await db.get(DocumentRevision, current_id)
+        fresh = await db.get(Document, doc_id)
+    assert stale_row.status == "failed"
+    assert stale_row.failure_stage == "kg"
+    assert current_row.status == "published"
+    assert fresh.status == DocumentStatus.INDEXED
+    assert fresh.current_revision_id == current_id
+    assert fresh.error_message == published_error
+
+
+@pytest.mark.asyncio
+async def test_fix1_tombstoned_source_through_gate_abandons_without_mirror(
+    async_engine, document_factory, monkeypatch
+):
+    """A tombstoned source finalizes ABANDONED through the gate (M4).
+
+    The tombstone lands after the stages/artifacts are complete (simulated by
+    stamping ``source_deleted_at`` directly so the revision stays live for the
+    gate): verify succeeds, publish reports ``ABANDONED_SOURCE_DELETED``, and
+    the document mirror is left untouched — never INDEXED, never FAILED.
+    """
+    from datetime import datetime, timezone
+
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        revision, profile, _created = await allocate_ingest_revision(
+            db,
+            doc_id,
+            object_key=_doc_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256="f1w" + "0" * 61,
+            version_id="v-1",
+        )
+        assert profile is FULL
+        await _task4_complete_stages(
+            db, revision.revision_id, ("parse", "embed", "caption", "kg")
+        )
+        await _record_complete_artifacts(db, revision, profile)
+        document = await db.get(Document, doc_id)
+        document.status = DocumentStatus.BUILDING_KG
+        document.source_deleted_at = datetime.now(timezone.utc)
+        await db.commit()
+        revision_id = revision.revision_id
+
+    async with maker() as db:
+        document = await db.get(Document, doc_id)
+        await check_and_finalize(document, db, revision_id=revision_id)
+
+    async with maker() as db:
+        row = await db.get(DocumentRevision, revision_id)
+        fresh = await db.get(Document, doc_id)
+    assert row.status == "abandoned"
+    assert fresh.status == DocumentStatus.BUILDING_KG
+    assert fresh.current_revision_id is None
+
+
+@pytest.mark.asyncio
+async def test_fix1_mislabelled_parse_only_cannot_publish_full_revision(
+    async_engine, document_factory, monkeypatch
+):
+    """A FULL revision with only parse done never publishes (M1 behavior).
+
+    The manifest is satisfiable here, so an ungated
+    ``finalize_revision_if_complete(expect_complete=True)`` would publish a
+    revision whose embed/caption/kg stages are still pending (review probe 2).
+    Through the gate the same state is NOT_READY with no finalize call.
+    """
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    finalize_calls = _task4_patch_finalize_spy(monkeypatch)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        revision, profile, _created = await allocate_ingest_revision(
+            db,
+            doc_id,
+            object_key=_doc_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256="f1v" + "0" * 61,
+            version_id="v-1",
+        )
+        assert profile is FULL
+        await _task4_complete_stages(db, revision.revision_id, ("parse",))
+        await _record_complete_artifacts(db, revision, profile)
+        await db.commit()
+        revision_id = revision.revision_id
+
+    async with maker() as db:
+        document = await db.get(Document, doc_id)
+        await check_and_finalize(document, db, revision_id=revision_id)
+
+    assert finalize_calls == [], "gate must block a mislabelled fast path"
+    async with maker() as db:
+        row = await db.get(DocumentRevision, revision_id)
+        fresh = await db.get(Document, doc_id)
+    assert row.status in ("draft", "building")
+    assert fresh.status != DocumentStatus.INDEXED
+    assert fresh.current_revision_id is None
+
+
+def test_fix1_parse_only_fast_path_uses_stage_gate():
+    """PARSE_ONLY finalizes through ``check_and_finalize`` only (M1 wiring).
+
+    Pins the call site: the parse worker's fast path must consult the same
+    authoritative stage gate as every other profile — no direct
+    ``finalize_revision_if_complete`` / ``apply_finalize_outcome`` bypass.
+    """
+    func_source = _function_source(_task3_worker_source("parse"), "handle_parse")
+    flat = re.sub(r"\s+", "", func_source)
+    assert "awaitcheck_and_finalize(document,db,revision_id=msg.revision_id)" in flat
+    assert "finalize_revision_if_complete" not in func_source
+    assert "apply_finalize_outcome" not in func_source
