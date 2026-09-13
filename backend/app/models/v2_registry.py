@@ -182,7 +182,7 @@ LEGACY_STARTUP_TABLES: frozenset[str] = frozenset(
 # classes on ``Base.metadata``. This is the single source of truth
 # for "v2 models are present" — if any model file is renamed, removed,
 # or fails to import, ``Base.metadata.tables`` will reflect the change
-# and ``test_v2_orm_tables_are_exactly_v2_schema_v1_tables`` will
+# and ``test_v2_orm_tables_are_exactly_expected_v2_tables`` will
 # fail loudly.
 #
 # We import at module scope (not lazily inside ``register_v2_models``)

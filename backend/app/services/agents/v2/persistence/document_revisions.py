@@ -752,6 +752,62 @@ class DocumentRevisionsRepository:
             to_state="running",
         )
 
+    async def mark_stage_retry_pending(
+        self, revision_id: uuid.UUID, stage: str
+    ) -> DocumentRevisionStage:
+        """``running`` -> ``pending`` (the explicit retry edge).
+
+        Preserves ``attempt_count`` and ``failure_class`` untouched; the
+        next ``pending`` -> ``running`` (via :meth:`mark_stage_running`)
+        bumps ``attempt_count``. The queue retry path calls this exactly
+        once before requeueing a retryable message for that message's
+        revision/stage; exhausted retries instead call
+        :meth:`mark_stage_failed`, which stays terminal.
+
+        Only ``running`` -> ``pending`` changes state. A redelivered
+        retry mark converges (no-op) when the row already carries a
+        previous attempt (``pending`` with ``attempt_count > 0`` can only
+        arise from a genuine retry, since initialization writes 0 and
+        re-initialization never resets). A never-ran ``pending`` row and
+        every terminal state (``completed`` / ``skipped`` / ``failed``)
+        raise :class:`InvalidStageTransition`; unknown stages and missing
+        rows raise :class:`UnknownRevisionStage`.
+        """
+        if stage not in REVISION_STAGES:
+            raise UnknownRevisionStage(f"unknown revision stage {stage!r}")
+        stmt = (
+            update(DocumentRevisionStage)
+            .where(
+                DocumentRevisionStage.revision_id == revision_id,
+                DocumentRevisionStage.stage == stage,
+                DocumentRevisionStage.state == "running",
+            )
+            .values(state="pending", updated_at=_now())
+            .returning(DocumentRevisionStage)
+        )
+        row = (await self.session.execute(stmt)).scalar_one_or_none()
+        await self.session.flush()
+        if row is not None:
+            return row
+        existing = await self.session.scalar(
+            select(DocumentRevisionStage).where(
+                DocumentRevisionStage.revision_id == revision_id,
+                DocumentRevisionStage.stage == stage,
+            )
+        )
+        if existing is None:
+            raise UnknownRevisionStage(
+                f"no stage row for revision {revision_id} stage {stage!r} "
+                "(call initialize_stages first)"
+            )
+        if existing.state == "pending" and existing.attempt_count > 0:
+            return existing
+        raise InvalidStageTransition(
+            f"revision {revision_id} stage {stage!r} cannot transition "
+            f"from {existing.state!r} to 'pending' "
+            "(only running stages may be retried)"
+        )
+
     async def mark_stage_completed(
         self, revision_id: uuid.UUID, stage: str
     ) -> DocumentRevisionStage:

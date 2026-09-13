@@ -3,8 +3,8 @@
 These tests run against the *populated* legacy v1 database (``hrag_test_v2``).
 They exercise ``apply_v2_schema`` end-to-end and verify:
 
-- 12 v2 tables are created (the exact ``V2_SCHEMA_V1_TABLES`` set).
-- Schema version row exists with value 1.
+- 15 v2 tables are created (the exact ``V2_SCHEMA_V4_TABLES`` set).
+- Schema version row exists with value 4.
 - Nullable revision links / current-pointer columns exist.
 - Every legacy row remains untouched and v1-readable.
 - No legacy Chroma/KG/object/SQL artifact is marked revision-ready.

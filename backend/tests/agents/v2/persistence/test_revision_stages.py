@@ -346,3 +346,109 @@ class TestFailClosed:
             {"did": str(document_id)},
         )
         assert await repo.required_stages_complete(revision.revision_id) is False
+
+
+# ---------------------------------------------------------------------------
+# P1 Task 1 fix round 1 (I1) — explicit running -> pending retry edge
+# ---------------------------------------------------------------------------
+
+
+class TestStageRetryEdge:
+    @pytest.mark.asyncio
+    async def test_retry_pending_preserves_attempts_across_two_retries(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        """``running -> pending`` preserves ``attempt_count``; the next
+        ``pending -> running`` increments it (two full retry cycles)."""
+        document_id = document_factory()
+        revision = await _allocate(repo, document_id, "uploads/retry.pdf")
+        await repo.initialize_stages(
+            revision.revision_id, RevisionBuildProfile.FULL
+        )
+
+        first = await repo.mark_stage_running(revision.revision_id, "parse")
+        assert (first.state, first.attempt_count) == ("running", 1)
+
+        pending = await repo.mark_stage_retry_pending(
+            revision.revision_id, "parse"
+        )
+        assert pending.state == "pending"
+        assert pending.attempt_count == 1
+        assert pending.failure_class is None
+
+        second = await repo.mark_stage_running(revision.revision_id, "parse")
+        assert (second.state, second.attempt_count) == ("running", 2)
+
+        await repo.mark_stage_retry_pending(revision.revision_id, "parse")
+        third = await repo.mark_stage_running(revision.revision_id, "parse")
+        assert (third.state, third.attempt_count) == ("running", 3)
+
+        # The retried stage still completes normally afterwards.
+        completed = await repo.mark_stage_completed(
+            revision.revision_id, "parse"
+        )
+        assert completed.state == "completed"
+        assert completed.attempt_count == 3
+
+    @pytest.mark.asyncio
+    async def test_retry_pending_from_terminal_or_pending_is_illegal(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        """Only ``running -> pending`` is allowed: ``completed``,
+        ``skipped``, exhausted ``failed``, and never-ran ``pending`` all
+        raise; unknown stages/rows fail closed."""
+        document_id = document_factory()
+        revision = await _allocate(repo, document_id, "uploads/retrybad.pdf")
+        await repo.initialize_stages(
+            revision.revision_id, RevisionBuildProfile.FULL
+        )
+        await repo.mark_stage_completed(revision.revision_id, "parse")
+        await repo.mark_stage_failed(
+            revision.revision_id, "embed", failure_class="timeout"
+        )
+        await repo.mark_stage_skipped(revision.revision_id, "caption")
+
+        with pytest.raises(InvalidStageTransition):
+            await repo.mark_stage_retry_pending(revision.revision_id, "parse")
+        with pytest.raises(InvalidStageTransition):
+            await repo.mark_stage_retry_pending(revision.revision_id, "embed")
+        with pytest.raises(InvalidStageTransition):
+            await repo.mark_stage_retry_pending(
+                revision.revision_id, "caption"
+            )
+        # Never-ran pending (attempt_count == 0) is not a retry.
+        with pytest.raises(InvalidStageTransition):
+            await repo.mark_stage_retry_pending(revision.revision_id, "kg")
+        with pytest.raises(UnknownRevisionStage):
+            await repo.mark_stage_retry_pending(
+                revision.revision_id, "frobnicate"
+            )
+
+        # Terminal failure keeps its classification (no silent reset).
+        stages = await _stages_by_name(repo, revision.revision_id)
+        assert stages["embed"].failure_class == "timeout"
+        assert stages["embed"].state == "failed"
+
+    @pytest.mark.asyncio
+    async def test_retry_edge_does_not_break_duplicate_running_convergence(
+        self, repo: DocumentRevisionsRepository, document_factory
+    ):
+        """Redelivered ``running`` marks still converge without bumping,
+        both before and after a genuine retry cycle."""
+        document_id = document_factory()
+        revision = await _allocate(repo, document_id, "uploads/retrydupe.pdf")
+        await repo.initialize_stages(
+            revision.revision_id, RevisionBuildProfile.FULL
+        )
+
+        await repo.mark_stage_running(revision.revision_id, "parse")
+        dupe = await repo.mark_stage_running(revision.revision_id, "parse")
+        assert (dupe.state, dupe.attempt_count) == ("running", 1)
+
+        await repo.mark_stage_retry_pending(revision.revision_id, "parse")
+        await repo.mark_stage_running(revision.revision_id, "parse")
+        dupe_after_retry = await repo.mark_stage_running(
+            revision.revision_id, "parse"
+        )
+        assert dupe_after_retry.state == "running"
+        assert dupe_after_retry.attempt_count == 2

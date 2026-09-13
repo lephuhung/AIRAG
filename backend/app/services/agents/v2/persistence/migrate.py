@@ -152,6 +152,7 @@ Module layout::
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from dataclasses import dataclass
 from typing import Final, Sequence
@@ -1028,6 +1029,88 @@ _EXPECTED_EVIDENCE_RECORD_UNIQUE_COLUMNS: frozenset[str] = frozenset(
 )
 
 
+#: Exact stage/state literals the ``document_revision_stages`` CHECKs must
+#: pin (P1 Task 1, M2). Compared as an exact set so both a dropped literal
+#: and an added literal fail readiness closed.
+_EXPECTED_STAGE_CHECK_LITERALS: Final[frozenset[str]] = frozenset(
+    {"parse", "embed", "caption", "kg"}
+)
+_EXPECTED_STATE_CHECK_LITERALS: Final[frozenset[str]] = frozenset(
+    {"pending", "running", "completed", "skipped", "failed"}
+)
+
+
+def _stage_constraint_errors(conn) -> set[str]:
+    """Readiness errors for the stage table's PK / FK / CHECK shape.
+
+    Only called when ``document_revision_stages`` is present. Returns an
+    empty set on the exact DDL shape: ``PRIMARY KEY (revision_id, stage)``
+    (the ``ON CONFLICT`` arbiter), an FK to
+    ``document_revisions(revision_id)`` ``ON DELETE RESTRICT``, the exact
+    stage/state literal CHECKs, and the non-negative attempt CHECK.
+    """
+    table = "public.document_revision_stages"
+    found: set[str] = set()
+    pk_cols = [
+        str(r[0])
+        for r in conn.execute(
+            text(
+                "SELECT a.attname FROM pg_constraint c "
+                "JOIN pg_attribute a ON a.attrelid = c.conrelid "
+                "AND a.attnum = ANY(c.conkey) "
+                f"WHERE c.conrelid = '{table}'::regclass AND c.contype = 'p' "
+                "ORDER BY array_position(c.conkey, a.attnum)"
+            )
+        ).fetchall()
+    ]
+    if pk_cols != ["revision_id", "stage"]:
+        found.add(
+            "document_revision_stages: missing PRIMARY KEY "
+            f"(revision_id, stage) (found: {pk_cols or 'none'})"
+        )
+    fk_defs = [
+        str(r[0])
+        for r in conn.execute(
+            text(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                f"WHERE conrelid = '{table}'::regclass AND contype = 'f'"
+            )
+        ).fetchall()
+    ]
+    if not any(
+        "REFERENCES document_revisions(revision_id)" in definition
+        and "ON DELETE RESTRICT" in definition
+        for definition in fk_defs
+    ):
+        found.add(
+            "document_revision_stages: missing FOREIGN KEY (revision_id) "
+            "REFERENCES document_revisions(revision_id) ON DELETE RESTRICT "
+            f"(found: {sorted(fk_defs) or 'none'})"
+        )
+    check_defs = " ".join(
+        str(r[0])
+        for r in conn.execute(
+            text(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                f"WHERE conrelid = '{table}'::regclass AND contype = 'c'"
+            )
+        ).fetchall()
+    )
+    literals = set(re.findall(r"'([a-z_]+)'", check_defs))
+    expected = _EXPECTED_STAGE_CHECK_LITERALS | _EXPECTED_STATE_CHECK_LITERALS
+    if literals != expected:
+        found.add(
+            "document_revision_stages: CHECK literals must be exactly "
+            f"{sorted(expected)} (found: {sorted(literals) or 'none'})"
+        )
+    if "attempt_count >= 0" not in check_defs:
+        found.add(
+            "document_revision_stages: missing CHECK (attempt_count >= 0) "
+            f"(found: {[check_defs] if check_defs else 'none'})"
+        )
+    return found
+
+
 def _shape_errors(conn) -> frozenset[str]:
     """Return human-readable shape mismatches for an applied schema.
 
@@ -1145,6 +1228,20 @@ def _shape_errors(conn) -> frozenset[str]:
                 "agent_rollout_metrics: missing CHECK (arm IN "
                 f"('v1', 'v2', 'shadow')): {sorted(arm_defs)}"
             )
+    # P1 Task 1 fix round 1 (M2): the stage table's uniqueness arbiter,
+    # RESTRICT FK, and exact literal CHECKs are part of readiness. Column
+    # presence alone would report a version-4 database clean after a
+    # constraint was dropped or weakened (e.g. RESTRICT -> CASCADE), so
+    # fail closed like the lease-nullability and arm-CHECK guards above.
+    # Skipped only when the table itself is absent (reported separately
+    # via missing_tables).
+    stage_present = conn.execute(
+        text(
+            "SELECT to_regclass('public.document_revision_stages') IS NOT NULL"
+        )
+    ).scalar()
+    if stage_present:
+        errors.update(_stage_constraint_errors(conn))
     return frozenset(errors)
 
 

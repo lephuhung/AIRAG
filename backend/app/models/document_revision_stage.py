@@ -23,7 +23,7 @@ profile. ``Document.*_done`` mirror flags are never consulted.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import (
@@ -36,6 +36,15 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
+
+
+def _utcnow() -> datetime:
+    """Timezone-aware now() for the TIMESTAMPTZ column default.
+
+    The repository always passes an explicit timezone-aware timestamp;
+    this default only covers a future ORM insert that omits
+    ``updated_at`` (never a naive ``datetime.utcnow``)."""
+    return datetime.now(timezone.utc)
 
 
 class DocumentRevisionStage(Base):
@@ -63,7 +72,7 @@ class DocumentRevisionStage(Base):
     )
 
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=_utcnow
     )
 
     # Terminal-failure classification. Populated only when

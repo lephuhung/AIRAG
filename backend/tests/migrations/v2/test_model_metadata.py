@@ -93,9 +93,11 @@ def imported_app_models():
 # ---------------------------------------------------------------------------
 
 
-def test_v2_orm_tables_are_exactly_v2_schema_v1_tables(imported_app_models):
-    """The v2 ORM-mapped tables must be EXACTLY the v2 schema v1 tables
-    (minus ``v2_schema_version``).
+def test_v2_orm_tables_are_exactly_expected_v2_tables(imported_app_models):
+    """The v2 ORM-mapped tables must be EXACTLY the expected v2 tables:
+    the v2 schema v1 tables (minus ``v2_schema_version``) plus the
+    permitted migration-owned extras (``V2_ROLLOUT_TABLES`` +
+    ``V2_STAGE_TABLES``, mapped but never ``create_all``-created).
 
     This is the structural guarantee that Release 1B cannot introduce
     a hidden new table that Release 1A did not create, and cannot

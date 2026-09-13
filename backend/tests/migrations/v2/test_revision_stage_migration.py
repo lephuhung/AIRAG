@@ -259,7 +259,203 @@ def test_v3_to_v4_upgrade_creates_stage_table(db: Engine) -> None:
             ).scalar()
         assert present is True
     finally:
+        # Restore reliably even if the body failed midway (M1 pattern):
+        # a bare re-apply is a no-op at version 4, so force the
+        # stepwise 3 -> 4 upgrade only when the table is still absent.
+        with db.begin() as conn:
+            present = conn.execute(
+                text(
+                    "SELECT to_regclass('public.document_revision_stages')"
+                    " IS NOT NULL"
+                )
+            ).scalar()
+            if not present:
+                conn.execute(
+                    text(
+                        "UPDATE v2_schema_version SET version = 3 "
+                        "WHERE version = 4"
+                    )
+                )
         apply_v2_schema(db)
+
+
+def _stage_constraints(db: Engine) -> list[tuple[str, str, str]]:
+    """``(conname, contype, definition)`` for the live stage table."""
+    with db.connect() as conn:
+        return [
+            (str(r[0]), str(r[1]), str(r[2]))
+            for r in conn.execute(
+                text(
+                    "SELECT c.conname, c.contype, "
+                    "pg_get_constraintdef(c.oid) "
+                    "FROM pg_constraint c "
+                    "WHERE c.conrelid = "
+                    "'public.document_revision_stages'::regclass"
+                )
+            ).fetchall()
+        ]
+
+
+def _restore_stage_constraints(db: Engine) -> None:
+    """Re-add any missing stage PK / RESTRICT FK / literal CHECKs.
+
+    M2 teardown: ``apply_v2_schema`` only creates a missing *table*, so a
+    test that drops a single constraint must restore that constraint
+    itself (idempotent: only missing pieces are re-added)."""
+    existing = _stage_constraints(db)
+    kinds = {contype for _, contype, _ in existing}
+    names = {name for name, _, _ in existing}
+    stmts: list[str] = []
+    if "p" not in kinds:
+        stmts.append(
+            "ALTER TABLE document_revision_stages "
+            "ADD PRIMARY KEY (revision_id, stage)"
+        )
+    if "f" not in kinds:
+        stmts.append(
+            "ALTER TABLE document_revision_stages "
+            "ADD FOREIGN KEY (revision_id) "
+            "REFERENCES document_revisions(revision_id) ON DELETE RESTRICT"
+        )
+    if "document_revision_stages_stage_check" not in names:
+        stmts.append(
+            "ALTER TABLE document_revision_stages "
+            "ADD CONSTRAINT document_revision_stages_stage_check "
+            "CHECK (stage IN ('parse', 'embed', 'caption', 'kg'))"
+        )
+    if "document_revision_stages_state_check" not in names:
+        stmts.append(
+            "ALTER TABLE document_revision_stages "
+            "ADD CONSTRAINT document_revision_stages_state_check "
+            "CHECK (state IN "
+            "('pending', 'running', 'completed', 'skipped', 'failed'))"
+        )
+    if "document_revision_stages_attempt_count_check" not in names:
+        stmts.append(
+            "ALTER TABLE document_revision_stages "
+            "ADD CONSTRAINT document_revision_stages_attempt_count_check "
+            "CHECK (attempt_count >= 0)"
+        )
+    if stmts:
+        with db.begin() as conn:
+            for stmt in stmts:
+                conn.execute(text(stmt))
+
+
+def _stage_fk_name(db: Engine) -> str:
+    for name, contype, _ in _stage_constraints(db):
+        if contype == "f":
+            return name
+    raise AssertionError("stage table has no FOREIGN KEY constraint")
+
+
+def test_check_reports_no_stage_shape_errors_on_healthy_schema(
+    db: Engine,
+) -> None:
+    check = check_v2_schema(db)
+    assert check.is_clean is True, check
+    assert not [
+        error for error in check.shape_errors
+        if "document_revision_stages" in error
+    ], check.shape_errors
+
+
+def test_check_fails_closed_when_stage_pk_missing(db: Engine) -> None:
+    with db.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE document_revision_stages "
+                "DROP CONSTRAINT document_revision_stages_pkey"
+            )
+        )
+    try:
+        check = check_v2_schema(db)
+        assert check.is_clean is False, check
+        assert any(
+            "document_revision_stages" in error
+            and "PRIMARY KEY" in error
+            for error in check.shape_errors
+        ), check.shape_errors
+    finally:
+        _restore_stage_constraints(db)
+        assert check_v2_schema(db).is_clean is True
+
+
+def test_check_fails_closed_when_stage_fk_missing(db: Engine) -> None:
+    fk_name = _stage_fk_name(db)
+    with db.begin() as conn:
+        conn.execute(
+            text(
+                f"ALTER TABLE document_revision_stages DROP CONSTRAINT {fk_name}"
+            )
+        )
+    try:
+        check = check_v2_schema(db)
+        assert check.is_clean is False, check
+        assert any(
+            "document_revision_stages" in error
+            and "FOREIGN KEY" in error
+            for error in check.shape_errors
+        ), check.shape_errors
+    finally:
+        _restore_stage_constraints(db)
+        assert check_v2_schema(db).is_clean is True
+
+
+def test_check_fails_closed_when_stage_fk_not_restrict(db: Engine) -> None:
+    fk_name = _stage_fk_name(db)
+    with db.begin() as conn:
+        conn.execute(
+            text(
+                f"ALTER TABLE document_revision_stages DROP CONSTRAINT {fk_name}"
+            )
+        )
+        conn.execute(
+            text(
+                "ALTER TABLE document_revision_stages "
+                f"ADD CONSTRAINT {fk_name} FOREIGN KEY (revision_id) "
+                "REFERENCES document_revisions(revision_id) ON DELETE CASCADE"
+            )
+        )
+    try:
+        check = check_v2_schema(db)
+        assert check.is_clean is False, check
+        assert any(
+            "document_revision_stages" in error and "RESTRICT" in error
+            for error in check.shape_errors
+        ), check.shape_errors
+    finally:
+        with db.begin() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE document_revision_stages "
+                    f"DROP CONSTRAINT IF EXISTS {fk_name}"
+                )
+            )
+        _restore_stage_constraints(db)
+        assert check_v2_schema(db).is_clean is True
+
+
+def test_check_fails_closed_when_stage_state_check_missing(
+    db: Engine,
+) -> None:
+    with db.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE document_revision_stages "
+                "DROP CONSTRAINT document_revision_stages_state_check"
+            )
+        )
+    try:
+        check = check_v2_schema(db)
+        assert check.is_clean is False, check
+        assert any(
+            "document_revision_stages" in error and "CHECK" in error
+            for error in check.shape_errors
+        ), check.shape_errors
+    finally:
+        _restore_stage_constraints(db)
+        assert check_v2_schema(db).is_clean is True
 
 
 def test_check_fails_closed_without_stage_table(db: Engine) -> None:
@@ -271,4 +467,11 @@ def test_check_fails_closed_without_stage_table(db: Engine) -> None:
         assert check.is_clean is False, check
         assert "document_revision_stages" in check.missing_tables, check
     finally:
+        # ``apply_v2_schema`` is a no-op when the version row already reads
+        # 4, so force the stepwise 3 -> 4 upgrade to reliably recreate the
+        # dropped table (M1: a bare re-apply never restores it).
+        with db.begin() as conn:
+            conn.execute(text("UPDATE v2_schema_version SET version = 3"))
         apply_v2_schema(db)
+        restored = check_v2_schema(db)
+        assert restored.is_clean is True, restored
