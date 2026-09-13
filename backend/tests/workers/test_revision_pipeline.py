@@ -16,6 +16,7 @@ the endpoint/webhook code calls.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from pathlib import Path
@@ -1397,3 +1398,481 @@ async def test_stale_revision_failure_does_not_fail_a_live_document(
     assert stale_row.status == "failed"
     assert fresh.status == DocumentStatus.INDEXED
     assert fresh.status != DocumentStatus.FAILED
+
+
+# ---------------------------------------------------------------------------
+# P1 Task 2 — stage rows are initialized atomically on allocation
+# ---------------------------------------------------------------------------
+
+
+async def _stage_states(db, revision_id) -> dict:
+    """Stage -> state mapping for one revision (read-only)."""
+    repo = DocumentRevisionsRepository(db)
+    return {row.stage: row.state for row in await repo.get_stages(revision_id)}
+
+
+@pytest.mark.asyncio
+async def test_ingest_allocation_initializes_full_stage_rows(
+    async_db, document_factory
+):
+    """A FULL ingest allocation owns four ``pending`` stage rows."""
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+
+    revision, profile, created = await allocate_ingest_revision(
+        async_db,
+        doc_id,
+        object_key=key,
+        size_bytes=11,
+        content_sha256="7" * 64,
+        version_id="v-7",
+    )
+    assert created is True
+    assert profile is FULL
+    assert await _stage_states(async_db, revision.revision_id) == {
+        "parse": "pending",
+        "embed": "pending",
+        "caption": "pending",
+        "kg": "pending",
+    }
+    repo = DocumentRevisionsRepository(async_db)
+    assert await repo.required_stages_complete(revision.revision_id) is False
+
+
+@pytest.mark.asyncio
+async def test_ingest_allocation_initializes_chat_upload_stage_rows(
+    async_db, document_factory
+):
+    """A CHAT_UPLOAD ingest allocation pends parse/embed and skips caption/kg."""
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _chat_key(ws, doc_id)
+
+    revision, profile, _created = await allocate_ingest_revision(
+        async_db,
+        doc_id,
+        object_key=key,
+        size_bytes=7,
+        content_sha256="8" * 64,
+        version_id="v-8",
+    )
+    assert profile is CHAT
+    assert await _stage_states(async_db, revision.revision_id) == {
+        "parse": "pending",
+        "embed": "pending",
+        "caption": "skipped",
+        "kg": "skipped",
+    }
+    repo = DocumentRevisionsRepository(async_db)
+    assert await repo.required_stages_complete(revision.revision_id) is False
+    await repo.mark_stage_completed(revision.revision_id, "parse")
+    await repo.mark_stage_completed(revision.revision_id, "embed")
+    assert await repo.required_stages_complete(revision.revision_id) is True
+
+
+@pytest.mark.asyncio
+async def test_ingest_allocation_initializes_parse_only_stage_rows(
+    async_db, document_factory
+):
+    """A PARSE_ONLY ingest allocation pends only parse; the rest are skipped."""
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+
+    revision, profile, _created = await allocate_ingest_revision(
+        async_db,
+        doc_id,
+        object_key=key,
+        size_bytes=3,
+        content_sha256="9" * 64,
+        version_id="v-9",
+        parse_only=True,
+    )
+    assert profile is PARSE_ONLY
+    assert await _stage_states(async_db, revision.revision_id) == {
+        "parse": "pending",
+        "embed": "skipped",
+        "caption": "skipped",
+        "kg": "skipped",
+    }
+    repo = DocumentRevisionsRepository(async_db)
+    await repo.mark_stage_completed(revision.revision_id, "parse")
+    assert await repo.required_stages_complete(revision.revision_id) is True
+
+
+@pytest.mark.asyncio
+async def test_reindex_allocation_initializes_stage_rows(async_db, document_factory):
+    """A reindex generation starts with its own four ``pending`` stage rows."""
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+
+    first, _created = await _allocate_full(async_db, doc_id, key=key, sha="a" * 64)
+    await _build_and_publish(async_db, first, FULL)
+
+    second, profile = await allocate_reindex_revision(
+        async_db,
+        doc_id,
+        object_key=key,
+        size_bytes=11,
+        content_sha256="a" * 64,
+        version_id="v-1",
+        reindex_of_revision_id=first.revision_id,
+    )
+    assert profile is FULL
+    assert await _stage_states(async_db, second.revision_id) == {
+        "parse": "pending",
+        "embed": "pending",
+        "caption": "pending",
+        "kg": "pending",
+    }
+    # The new rows belong only to the new generation; the older generation's
+    # ownership is asserted precisely by
+    # ``test_reindex_stage_rows_are_owned_by_new_revision_only`` below.
+    repo = DocumentRevisionsRepository(async_db)
+    assert await repo.required_stages_complete(second.revision_id) is False
+
+
+@pytest.mark.asyncio
+async def test_clone_allocation_initializes_stage_rows(async_db, document_factory):
+    """A clone allocation initializes stage rows on the TARGET revision."""
+    source_doc = document_factory()
+    target_doc = document_factory()
+    ws_src = await _workspace_id(async_db, source_doc)
+    ws_tgt = await _workspace_id(async_db, target_doc)
+
+    source_rev, _created = await _allocate_full(
+        async_db, source_doc, key=_doc_key(ws_src, source_doc), sha="b" * 64
+    )
+    await _build_and_publish(async_db, source_rev, FULL)
+
+    target = await async_db.get(Document, target_doc)
+    target.upload_s3_key = _doc_key(ws_tgt, target_doc)
+    target.content_hash = "b" * 64
+    target.file_size = 11
+    await async_db.flush()
+
+    clone_rev, profile = await allocate_clone_revision(
+        async_db,
+        target_doc,
+        object_key=target.upload_s3_key,
+        size_bytes=11,
+        content_sha256="b" * 64,
+        etag="b" * 32,
+        cloned_from_revision_id=source_rev.revision_id,
+    )
+    assert profile is FULL
+    assert clone_rev.document_id == target_doc
+    assert await _stage_states(async_db, clone_rev.revision_id) == {
+        "parse": "pending",
+        "embed": "pending",
+        "caption": "pending",
+        "kg": "pending",
+    }
+
+
+@pytest.mark.asyncio
+async def test_duplicate_ingest_allocation_preserves_progressed_stages(
+    async_db, document_factory
+):
+    """A redelivered ingest event converges WITHOUT resetting stage progress.
+
+    Resetting stages at allocation would wipe a ``completed`` mark the first
+    delivery already recorded; ``initialize_stages`` is ``ON CONFLICT DO
+    NOTHING`` so the duplicate converges on the same rows untouched.
+    """
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+
+    first, _profile, created = await allocate_ingest_revision(
+        async_db,
+        doc_id,
+        object_key=key,
+        size_bytes=11,
+        content_sha256="c" * 64,
+        version_id="v-1",
+    )
+    assert created is True
+    repo = DocumentRevisionsRepository(async_db)
+    await repo.mark_stage_completed(first.revision_id, "parse")
+
+    redelivered, _profile2, created_again = await allocate_ingest_revision(
+        async_db,
+        doc_id,
+        object_key=key,
+        size_bytes=11,
+        content_sha256="c" * 64,
+        version_id="v-1",
+    )
+    assert created_again is False
+    assert redelivered.revision_id == first.revision_id
+    assert await _stage_states(async_db, first.revision_id) == {
+        "parse": "completed",
+        "embed": "pending",
+        "caption": "pending",
+        "kg": "pending",
+    }
+    assert len(await repo.get_stages(first.revision_id)) == 4
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ingest_allocation_converges_with_one_stage_set(
+    async_engine, document_factory
+):
+    """Two racing ingest allocations converge on one revision + one stage set."""
+    maker = _session_maker(async_engine)
+    doc_id = document_factory()
+    async with maker() as probe:
+        ws = await _workspace_id(probe, doc_id)
+    key = _doc_key(ws, doc_id)
+    results: dict = {}
+
+    async def _allocate(tag: str) -> None:
+        async with maker() as db:
+            revision, _profile, created = await allocate_ingest_revision(
+                db,
+                doc_id,
+                object_key=key,
+                size_bytes=11,
+                content_sha256="d" * 64,
+                version_id="v-1",
+            )
+            await db.commit()
+            results[tag] = (revision.revision_id, created)
+
+    await asyncio.gather(_allocate("a"), _allocate("b"))
+
+    assert results["a"][0] == results["b"][0]
+    assert sorted([results["a"][1], results["b"][1]]) == [False, True]
+    async with maker() as db:
+        assert await _stage_states(db, results["a"][0]) == {
+            "parse": "pending",
+            "embed": "pending",
+            "caption": "pending",
+            "kg": "pending",
+        }
+        repo = DocumentRevisionsRepository(db)
+        assert len(await repo.get_stages(results["a"][0])) == 4
+
+
+@pytest.mark.asyncio
+async def test_reindex_stage_rows_are_owned_by_new_revision_only(
+    async_db, document_factory
+):
+    """Completing R1's stages then reindexing leaves R1 done and R2 pending."""
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+
+    first, _created = await _allocate_full(async_db, doc_id, key=key, sha="e" * 64)
+    repo = DocumentRevisionsRepository(async_db)
+    for stage in ("parse", "embed", "caption", "kg"):
+        await repo.mark_stage_completed(first.revision_id, stage)
+    assert await repo.required_stages_complete(first.revision_id) is True
+
+    second, _profile = await allocate_reindex_revision(
+        async_db,
+        doc_id,
+        object_key=key,
+        size_bytes=11,
+        content_sha256="e" * 64,
+        version_id="v-1",
+        reindex_of_revision_id=first.revision_id,
+    )
+    assert await _stage_states(async_db, second.revision_id) == {
+        "parse": "pending",
+        "embed": "pending",
+        "caption": "pending",
+        "kg": "pending",
+    }
+    # The older generation is untouched by the new allocation.
+    assert await _stage_states(async_db, first.revision_id) == {
+        "parse": "completed",
+        "embed": "completed",
+        "caption": "completed",
+        "kg": "completed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_stale_mirror_flags_neither_satisfy_nor_block_stage_gate(
+    async_db, document_factory
+):
+    """``Document.*_done`` mirrors never satisfy ``required_stages_complete``.
+
+    Stale ``True`` mirrors from the previous generation must not complete the
+    new generation's gate, and ``False`` mirrors must not block a genuinely
+    complete revision — the gate reads only revision-owned stage rows.
+    """
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+
+    document = await async_db.get(Document, doc_id)
+    document.embed_done = True
+    document.captions_done = True
+    document.kg_done = True
+    await async_db.flush()
+
+    revision, _profile, _created = await allocate_ingest_revision(
+        async_db,
+        doc_id,
+        object_key=key,
+        size_bytes=11,
+        content_sha256="f" * 64,
+        version_id="v-1",
+    )
+    repo = DocumentRevisionsRepository(async_db)
+    assert await repo.required_stages_complete(revision.revision_id) is False
+
+    document.embed_done = False
+    document.captions_done = False
+    document.kg_done = False
+    await async_db.flush()
+    for stage in ("parse", "embed", "caption", "kg"):
+        await repo.mark_stage_completed(revision.revision_id, stage)
+    assert await repo.required_stages_complete(revision.revision_id) is True
+
+
+@pytest.mark.asyncio
+async def test_allocation_rollback_removes_revision_and_stage_rows(
+    async_engine, document_factory
+):
+    """Stage rows are allocated in the revision's own transaction: a rollback
+    removes both, so a failed allocation never leaves orphaned stage rows."""
+    maker = _session_maker(async_engine)
+    doc_id = document_factory()
+    async with maker() as probe:
+        ws = await _workspace_id(probe, doc_id)
+    key = _doc_key(ws, doc_id)
+
+    async with maker() as db:
+        revision, _profile = await allocate_reindex_revision(
+            db,
+            doc_id,
+            object_key=key,
+            size_bytes=11,
+            content_sha256="1" * 64,
+            version_id="v-1",
+        )
+        revision_id = revision.revision_id
+        repo = DocumentRevisionsRepository(db)
+        assert len(await repo.get_stages(revision_id)) == 4
+        await db.rollback()
+
+    async with maker() as db:
+        assert await db.get(DocumentRevision, revision_id) is None
+        repo = DocumentRevisionsRepository(db)
+        assert await repo.get_stages(revision_id) == []
+
+
+@pytest.mark.asyncio
+async def test_ingest_stages_committed_before_parse_publish(
+    async_engine, document_factory, monkeypatch
+):
+    """``allocate_commit_and_publish_parse`` commits stage rows before publish.
+
+    The worker loads the revision from its own connection; stage rows that
+    are merely flushed would vanish with the request unit-of-work and the
+    worker would fail closed on ``UnknownRevisionStage``.
+    """
+    maker = _session_maker(async_engine)
+    doc_id = document_factory()
+    async with maker() as probe:
+        ws = await _workspace_id(probe, doc_id)
+    key = _doc_key(ws, doc_id)
+    observed: dict = {}
+
+    async def spy_publish_parse_task(
+        *, document_id, workspace_id, minio_key, original_filename,
+        revision_id, build_profile,
+    ):
+        async with maker() as observer:
+            observed["revision"] = await observer.get(DocumentRevision, revision_id)
+            repo = DocumentRevisionsRepository(observer)
+            observed["stages"] = {
+                row.stage: row.state for row in await repo.get_stages(revision_id)
+            }
+
+    monkeypatch.setattr(
+        "app.queue.publisher.publish_parse_task", spy_publish_parse_task
+    )
+
+    async with maker() as db:
+        revision, _profile, _created = await allocate_commit_and_publish_parse(
+            db,
+            doc_id,
+            workspace_id=ws,
+            object_key=key,
+            original_filename="doc.pdf",
+            size_bytes=11,
+            content_sha256="2" * 64,
+            version_id="v-1",
+        )
+
+    assert observed.get("revision") is not None
+    assert observed["revision"].revision_id == revision.revision_id
+    assert observed["stages"] == {
+        "parse": "pending",
+        "embed": "pending",
+        "caption": "pending",
+        "kg": "pending",
+    }
+
+
+@pytest.mark.asyncio
+async def test_operator_retry_allocation_initializes_stage_rows(
+    async_engine, document_factory, monkeypatch
+):
+    """An operator retry generation owns fresh stage rows, committed pre-publish."""
+    maker = _session_maker(async_engine)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        key = _doc_key(ws, doc_id)
+        document = await db.get(Document, doc_id)
+        document.upload_s3_key = key
+        document.content_hash = "3" * 64
+        prior, _created = await _allocate_full(db, doc_id, key=key, sha="3" * 64)
+        await _build_and_publish(db, prior, FULL)
+        await db.commit()
+        prior_id = prior.revision_id
+        prior_generation = prior.generation
+
+    async def spy_publish_parse_task(
+        *, document_id, workspace_id, minio_key, original_filename,
+        revision_id, build_profile,
+    ):
+        pass
+
+    monkeypatch.setattr(
+        "app.queue.publisher.publish_parse_task", spy_publish_parse_task
+    )
+
+    async with maker() as db:
+        revision, profile = await allocate_commit_and_publish_retry(
+            db,
+            doc_id,
+            workspace_id=ws,
+            object_key=key,
+            original_filename="orig.pdf",
+            size_bytes=1024,
+            content_sha256="3" * 64,
+            etag="3" * 64,
+            previous_revision_id=prior_id,
+        )
+        assert profile is FULL
+        assert revision.generation > prior_generation
+        assert revision.reindex_of_revision_id == prior_id
+
+    async with maker() as db:
+        assert await _stage_states(db, revision.revision_id) == {
+            "parse": "pending",
+            "embed": "pending",
+            "caption": "pending",
+            "kg": "pending",
+        }
+        repo = DocumentRevisionsRepository(db)
+        assert await repo.required_stages_complete(revision.revision_id) is False

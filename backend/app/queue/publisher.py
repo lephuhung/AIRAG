@@ -120,6 +120,13 @@ async def allocate_ingest_revision(
     revision, created = await repo.get_or_create_ingestion_attempt(
         document_id, identity, profile
     )
+    # P1 Task 2: every allocated generation owns its stage rows for the exact
+    # resolved profile, in this same transaction (the caller commits before
+    # any worker message is published). Idempotent: a redelivered ingest event
+    # converges on the same revision and ``ON CONFLICT DO NOTHING`` leaves
+    # already-progressed stages untouched — this never resets another
+    # generation's (or this one's) progress.
+    await repo.initialize_stages(revision.revision_id, profile)
     return revision, profile, created
 
 
@@ -150,6 +157,13 @@ async def _allocate_explicit_revision(
         reindex_of_revision_id=reindex_of_revision_id,
         cloned_from_revision_id=cloned_from_revision_id,
     )
+    # P1 Task 2: the new generation owns its stage rows for the exact resolved
+    # profile, in this same transaction (callers commit before publishing the
+    # worker message). Idempotent ``ON CONFLICT DO NOTHING``: re-running for
+    # the same revision never resets progressed stages and never touches
+    # another generation's rows. This is NOT the mirror reset below — stage
+    # rows, not ``Document.*_done`` flags, authorize v2 finalization.
+    await repo.initialize_stages(revision.revision_id, profile)
     return revision, profile
 
 
