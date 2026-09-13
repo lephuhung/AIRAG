@@ -118,7 +118,7 @@ For each worker assert running→completed, retry increments attempt count, exha
 
 - [ ] **Step 2: Run RED and implement minimal calls**
 
-Each worker records running before work and completed only after its artifact transaction succeeds. Profile skips are initialized, not guessed by workers. Before a retryable message is requeued, the queue path calls `mark_stage_retry_pending` only for that message revision/stage; the next worker `mark_stage_running` increments `attempt_count`. Exhausted retries call `mark_stage_failed`, which remains terminal. Queue retry paths update only the failed message revision.
+Each worker records running before work and completed only after its artifact transaction succeeds. If the running edge reports an already-terminal stage, the delivery returns before performing work or mutating mirrors; it must not swallow the transition error and continue. Profile skips are initialized, not guessed by workers. A retryable worker exception must not terminalize the revision before the queue decides exhaustion. Before requeue, the queue path calls `mark_stage_retry_pending` only for that message revision/stage; the next worker remains executable and `mark_stage_running` increments `attempt_count`. On exhaustion, the queue atomically calls `mark_stage_failed` and terminalizes only that revision. Queue retry paths update only the failed message revision. Handler-level tests—not source-string checks alone—must exercise all four workers' terminal no-op behavior, running/work/commit/completed ordering, retry attempt bump, and queue stage mapping.
 
 - [ ] **Step 3: Run GREEN and commit**
 
