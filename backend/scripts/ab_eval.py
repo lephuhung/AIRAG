@@ -436,6 +436,38 @@ def extract_citations(terminal_data: dict) -> list[str]:
     return citations
 
 
+def extract_source_pairs(sources: list) -> list[dict]:
+    """Preserve per-source provenance: ``(document_number, article_label)``.
+
+    Sources are NOT flattened to bare document-number strings — the golden
+    article check needs the document each article label came from. Bare
+    string entries carry a document but no article provenance.
+    """
+    pairs: list[dict] = []
+    for source in sources or []:
+        if isinstance(source, dict):
+            doc = source.get("document_number") or source.get("document")
+            pairs.append(
+                {
+                    "document_number": str(doc) if doc else None,
+                    "article_label": source.get("article_label"),
+                }
+            )
+        elif source:
+            pairs.append({"document_number": str(source), "article_label": None})
+    return pairs
+
+
+def article_label_matches(label: Any, number: int) -> bool:
+    """True when an ``article_label`` names article ``number``."""
+    if label is None:
+        return False
+    text = str(label).strip()
+    if text == str(number):
+        return True
+    return number in {int(found) for found in _ARTICLE_RE.findall(text)}
+
+
 def evaluate_output(
     *, answer: str, sources: list, status: str, arm: str
 ) -> dict:
@@ -443,16 +475,14 @@ def evaluate_output(
 
     Both v1 and v2 outputs flow through this function (v2 via
     ``replay_v2.replay_transcript``), so the persisted ``evaluator_version``
-    is identical by construction.
+    is identical by construction. ``sources`` keeps full provenance pairs;
+    ``citations`` stays the de-duplicated document-number list.
     """
+    pairs = extract_source_pairs(sources)
     citations: list[str] = []
-    for source in sources or []:
-        if isinstance(source, dict):
-            doc = source.get("document_number") or source.get("document")
-        else:
-            doc = source
-        if doc and str(doc) not in citations:
-            citations.append(str(doc))
+    for pair in pairs:
+        if pair["document_number"] and pair["document_number"] not in citations:
+            citations.append(pair["document_number"])
     return {
         "evaluator_version": EVALUATOR_VERSION,
         "arm": arm,
@@ -460,6 +490,7 @@ def evaluate_output(
         "answer_chars": len(answer or ""),
         "citation_count": len(citations),
         "citations": citations,
+        "sources": pairs,
         "has_answer": bool((answer or "").strip()),
     }
 
@@ -476,14 +507,24 @@ def match_doc_pattern(citation: str, pattern: str) -> bool:
 
 
 def evaluate_functional(
-    case: dict, *, citations: list[str], answer: str, status: str
+    case: dict,
+    *,
+    citations: list[str],
+    answer: str,
+    status: str,
+    sources: list | None = None,
 ) -> dict:
-    """Judge a golden case's expectations against citations + answer text.
+    """Judge a golden case's expectations against citations + provenance.
 
     ``expect_document``/``accept_documents`` (ILIKE ``%`` patterns),
-    ``expect_article`` (``Điều N`` mentions in the answer), ``negative``
-    (refusal or non-complete terminal expected); ``tags`` persist for
-    filtering. A non-complete turn fails functionally by definition.
+    ``expect_article`` (valid ONLY within ``expect_document``: success needs
+    a returned source whose document matches ``expect_document`` AND whose
+    ``article_label`` names the expected article — an ``accept_documents``
+    alternate never satisfies it; answer prose alone never does either),
+    ``negative`` (refusal or non-complete terminal expected); ``tags``
+    persist for filtering. With no source provenance at all the article
+    result is ``indeterminate`` (``article_hit`` None, never a pass). A
+    non-complete turn fails functionally by definition.
     """
     complete = status == "complete"
     negative = bool(case.get("negative", False))
@@ -503,12 +544,32 @@ def evaluate_functional(
 
     article_hit: bool | None = None
     article_missing: list[int] = []
+    article_basis: str | None = None
     if expected_articles:
-        mentioned = {int(number) for number in _ARTICLE_RE.findall(answer or "")}
-        article_missing = [
-            number for number in expected_articles if number not in mentioned
+        provenance = [
+            pair
+            for pair in extract_source_pairs(sources or [])
+            if pair["document_number"]
         ]
-        article_hit = complete and not article_missing
+        if not complete:
+            article_hit, article_basis = False, "provenance"
+            article_missing = list(expected_articles)
+        elif not provenance:
+            # No provenance returned: cannot verify — indeterminate, not pass.
+            article_hit, article_basis = None, "indeterminate"
+            article_missing = list(expected_articles)
+        else:
+            article_basis = "provenance"
+            article_missing = [
+                number
+                for number in expected_articles
+                if not any(
+                    match_doc_pattern(pair["document_number"], expected_doc)
+                    and article_label_matches(pair["article_label"], number)
+                    for pair in provenance
+                )
+            ]
+            article_hit = not article_missing
 
     negative_pass: bool | None = None
     if negative:
@@ -533,6 +594,7 @@ def evaluate_functional(
         "expect_article": expected_articles,
         "article_hit": article_hit,
         "article_missing": article_missing,
+        "article_basis": article_basis,
         "negative_pass": negative_pass,
         "functional_pass": functional_pass,
     }
@@ -590,6 +652,7 @@ def run_eval_turn(
         "functional": evaluate_functional(
             case or {}, citations=evaluation["citations"],
             answer=answer, status=evaluation["status"],
+            sources=evaluation["sources"],
         ),
         "evaluator_version": EVALUATOR_VERSION,
     }
@@ -714,6 +777,10 @@ def compare_reports(report_a: dict, report_b: dict) -> dict:
         func_b = (other.get("functional") or {}).get("functional_pass")
         if func_a is True and func_b is not True:
             lost.append("functional")
+        # Answer-presence quality: losing the answer is a regression even
+        # for document-only cases (status alone does not catch it).
+        if case.get("has_answer") is True and other.get("has_answer") is not True:
+            lost.append("has_answer")
         for key in ("doc_hit", "article_hit", "negative_pass"):
             before = (case.get("functional") or {}).get(key)
             after = (other.get("functional") or {}).get(key)

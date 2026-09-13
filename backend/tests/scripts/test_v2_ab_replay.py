@@ -135,7 +135,9 @@ def _run_args(tmp_path, arm="v2", token="tok-123"):
 
 def _route_full_stack(http: FakeHttp, ab_eval, *, arm="v2", answer=None):
     answer = answer if answer is not None else "Trả lời theo Điều 17."
-    sources = [{"document_number": "85/2016/NĐ-CP"}]
+    sources = [
+        {"document_number": "85/2016/NĐ-CP", "article_label": "Điều 17"}
+    ]
     http.route(
         "POST", ab_eval.SESSIONS_PATH, FakeResponse(200, {"session_id": "sess-1"})
     )
@@ -513,6 +515,7 @@ def test_golden_functional_scores_doc_article_and_negative():
         citations=["85/2016/NĐ-CP"],
         answer="Theo Điều 17 của nghị định.",
         status="complete",
+        sources=[{"document_number": "85/2016/NĐ-CP", "article_label": "Điều 17"}],
     )
     assert positive["doc_hit"] is True
     assert positive["article_hit"] is True
@@ -523,6 +526,7 @@ def test_golden_functional_scores_doc_article_and_negative():
         citations=["85/2016/NĐ-CP"],
         answer="Theo Điều 17 của nghị định.",
         status="complete",
+        sources=[{"document_number": "85/2016/NĐ-CP", "article_label": "Điều 17"}],
     )
     assert missed_article["article_hit"] is False
     assert missed_article["article_missing"] == [20]
@@ -569,3 +573,81 @@ def test_compare_refuses_incomparable_reports():
     with pytest.raises(ValueError, match="incomparable"):
         empty = dict(good, cases=[])
         ab_eval.compare_reports(empty, _complete_report(ab_eval))
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2 (R11) — article provenance + answer-presence quality
+# ---------------------------------------------------------------------------
+
+
+def test_article_passes_via_expect_document_plus_article_label():
+    from scripts import ab_eval
+
+    result = ab_eval.evaluate_functional(
+        {
+            "expect_document": "85/2016%",
+            "accept_documents": ["361/2025%"],
+            "expect_article": [17],
+        },
+        citations=["85/2016/NĐ-CP"],
+        answer="Tóm tắt nội dung.",  # prose alone proves nothing
+        status="complete",
+        sources=[
+            {"document_number": "85/2016/NĐ-CP", "article_label": "Điều 17"}
+        ],
+    )
+    assert result["article_basis"] == "provenance"
+    assert result["article_hit"] is True
+    assert result["article_missing"] == []
+    assert result["functional_pass"] is True
+
+
+def test_article_fails_when_only_accept_alternate_carries_it():
+    from scripts import ab_eval
+
+    result = ab_eval.evaluate_functional(
+        {
+            "expect_document": "85/2016%",
+            "accept_documents": ["361/2025%"],
+            "expect_article": [17],
+        },
+        citations=["361/2025/NĐ-CP"],
+        answer="Theo Điều 17 của nghị định.",  # prose must not rescue it
+        status="complete",
+        sources=[
+            {"document_number": "361/2025/NĐ-CP", "article_label": "Điều 17"}
+        ],
+    )
+    assert result["doc_hit"] is True  # alternate still counts at doc level
+    assert result["article_hit"] is False
+    assert result["article_missing"] == [17]
+    assert result["functional_pass"] is False
+
+
+def test_article_indeterminate_with_no_provenance():
+    from scripts import ab_eval
+
+    result = ab_eval.evaluate_functional(
+        {"expect_document": "85/2016%", "expect_article": [17]},
+        citations=[],
+        answer="Theo Điều 17 của nghị định.",  # prose alone is not proof
+        status="complete",
+        sources=[],
+    )
+    assert result["article_basis"] == "indeterminate"
+    assert result["article_hit"] is None
+    assert result["functional_pass"] is not True
+
+
+def test_compare_regresses_when_answer_is_lost():
+    from scripts import ab_eval
+
+    good = _complete_report(ab_eval)
+    good["cases"][0]["has_answer"] = True
+    bad = _complete_report(ab_eval, arm="v2")
+    bad["cases"][0]["has_answer"] = False
+    bad["cases"][0]["status"] = "complete"  # status alone hides the loss
+    result = ab_eval.compare_reports(good, bad)
+    assert result["regressions"] == [
+        {"query_id": "sec-85-d17", "lost": ["has_answer"]}
+    ]
