@@ -1157,6 +1157,62 @@ _RE_ABBREVIATION = re.compile(
     re.UNICODE,
 )
 
+#: Specificity precedence for overlapping document-reference candidates.
+#: The six extraction patterns are independent generators and may emit
+#: overlapping spans for one real reference (e.g. a full document number and
+#: its short-number sub-span). A candidate that overlaps an already-kept
+#: higher-ranked candidate is dropped, so emitted ``document_refs`` are
+#: pairwise non-overlapping by construction and the frozen
+#: ``PreprocessingResult`` validator can never reject a real query.
+_REF_BASIS_RANK: dict[str, int] = {
+    "regex_doc_num": 60,
+    "regex_short_official": 50,
+    "regex_section": 40,
+    "regex_named_doc": 30,
+    "regex_bare_number": 20,
+    "regex_abbr_then_doc": 10,
+}
+
+
+def _arbitrate_ref_candidates(
+    candidates: list[RefExtraction],
+) -> list[RefExtraction]:
+    """Keep the most specific non-overlapping document references.
+
+    Rank by specificity, then span length, then start; greedily keep the first
+    candidate for each region and drop any candidate overlapping a kept one.
+    Surviving ``ref_id``s are renumbered ``r1..rN`` in span order.
+    """
+    ordered = sorted(
+        candidates,
+        key=lambda c: (
+            -_REF_BASIS_RANK.get(c.parse_basis, 0),
+            -(c.span_offset[1] - c.span_offset[0]),
+            c.span_offset[0],
+        ),
+    )
+    kept: list[RefExtraction] = []
+    for candidate in ordered:
+        start, end = candidate.span_offset
+        if any(
+            start < kept_ref.span_offset[1] and kept_ref.span_offset[0] < end
+            for kept_ref in kept
+        ):
+            continue
+        kept.append(candidate)
+    kept.sort(key=lambda c: c.span_offset[0])
+    return [
+        RefExtraction(
+            ref_id=f"r{i}",
+            original_span=c.original_span,
+            span_offset=c.span_offset,
+            reference=c.reference,
+            section_reference=c.section_reference,
+            parse_basis=c.parse_basis,
+        )
+        for i, c in enumerate(kept, start=1)
+    ]
+
 
 def _normalize_reference_for_doc_num(ref: str) -> dict:
     """Parse a document number reference into components."""
@@ -1247,7 +1303,7 @@ def extract_document_references(normalized: str, raw: str) -> list[RefExtraction
                 )
             )
 
-    return results
+    return _arbitrate_ref_candidates(results)
 
 
 # =============================================================================
