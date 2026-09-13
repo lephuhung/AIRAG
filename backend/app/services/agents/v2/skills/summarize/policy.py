@@ -38,6 +38,9 @@ Pilot scope (initial-plan-only):
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Literal
+
 from ...contracts.binding import ScopedDocument
 from ...contracts.capability import DocumentReadInput, SectionReadInput
 from ...contracts.locators import DocumentLocator, SectionLocator
@@ -55,7 +58,11 @@ from ...contracts.validation import ContractValidationError, validate_task_plan
 __all__ = [
     "SUMMARIZE_WORK_TYPE",
     "MAX_SUMMARY_TARGETS",
+    "ReduceMode",
+    "ReduceSpec",
+    "SummarizeWorkflow",
     "build_summarize_plan",
+    "build_summarize_workflow",
     "supports_work_type",
 ]
 
@@ -66,6 +73,39 @@ SUMMARIZE_WORK_TYPE = "summarize"
 MAX_SUMMARY_TARGETS = 1
 
 _SUMMARY_TARGET_ID = "t1"
+
+#: The only deterministic reduce mode (R43): ordered extractive reduction
+#: over the admitted map evidence, executed by the framework's existing
+#: ``build_extractive_draft`` — never by the agent, never a new capability.
+ReduceMode = Literal["extractive"]
+
+
+@dataclass(frozen=True)
+class ReduceSpec:
+    """Explicit deterministic REDUCE specification (implementation-only).
+
+    Not a frozen contract: it is the policy's deterministic workflow
+    descriptor consumed by the subgraph's reduce node. ``map_task_ids`` is
+    the exact ordered map-task lineage the reduction must cover; ``mode``
+    selects the existing framework reduction (extractive only).
+    """
+
+    map_task_ids: tuple[str, ...]
+    mode: ReduceMode = "extractive"
+
+
+@dataclass(frozen=True)
+class SummarizeWorkflow:
+    """Deterministic map/reduce workflow descriptor (implementation-only).
+
+    ``plan`` carries the ordered MAP read tasks (deterministic targets and
+    order); ``reduce`` carries the explicit reduce stage the framework's
+    reduce node drives through the existing evaluate → synthesis → grounding
+    boundaries. The agent never owns the reduce.
+    """
+
+    plan: TaskPlan
+    reduce: ReduceSpec
 
 
 def supports_work_type(work_type: str) -> bool:
@@ -162,13 +202,15 @@ def _require_read_capabilities(
             )
 
 
-def build_summarize_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
-    """Propose the initial one-target bounded summary plan.
+def build_summarize_workflow(planning_input: ResearchPlanningInput) -> SummarizeWorkflow:
+    """Propose the deterministic map/reduce workflow (R43).
 
-    Raises :class:`ContractValidationError` for any out-of-pilot input
-    (unsupported work type, wrong arity/role, missing read capability, or a
-    plan that fails frozen validation) — the caller turns that into the typed
-    unavailable boundary, never a partial plan.
+    Returns the ordered MAP plan plus the explicit REDUCE specification the
+    framework's reduce node drives. Raises :class:`ContractValidationError`
+    for any out-of-pilot input (unsupported work type, wrong arity/role,
+    missing read capability, or a plan that fails frozen validation) — the
+    caller turns that into the typed unavailable boundary, never a partial
+    plan.
     """
     if not supports_work_type(planning_input.query_analysis.work_type):
         raise ContractValidationError(
@@ -225,4 +267,19 @@ def build_summarize_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
         tasks=tuple(tasks),
     )
     validate_task_plan(plan, planning_input.bindings)
-    return plan
+    return SummarizeWorkflow(
+        plan=plan,
+        reduce=ReduceSpec(
+            map_task_ids=tuple(task.task_id for task in tasks),
+            mode="extractive",
+        ),
+    )
+
+
+def build_summarize_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
+    """Propose the initial one-target bounded summary plan (map stage only).
+
+    Thin wrapper over :func:`build_summarize_workflow` for callers that only
+    need the executable plan; the reduce stage stays with the workflow.
+    """
+    return build_summarize_workflow(planning_input).plan

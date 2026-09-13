@@ -60,13 +60,19 @@ from langgraph.runtime import Runtime
 
 from .contracts.base import ContractModel
 from .contracts.binding import DocumentBindingSet, ScopedDocument
-from .contracts.capability import DocumentReadInput, DocumentSearchInput, SectionReadInput
+from .contracts.capability import (
+    DocumentReadInput,
+    DocumentSearchInput,
+    PeopleLookupInput,
+    SectionReadInput,
+)
 from .contracts.evaluation import EvidenceEvaluation
 from .contracts.execution import AgentResult, TaskExecutionSummary
 from .contracts.evidence import EvidenceUseRef
 from .contracts.locators import SectionLocator
 from .contracts.planning import (
     DiscoveryPolicy,
+    InitialTaskOrigin,
     ReplanTaskOrigin,
     ResearchBudgetView,
     ResearchPlanningInput,
@@ -76,7 +82,12 @@ from .contracts.planning import (
 from .contracts.routing import QueryAnalysis
 from .contracts.semantic import SemanticContext
 from .contracts.state import GraphRuntimeContext, SupervisorV2State
-from .contracts.validation import ContractValidationError, validate_task_plan
+from .contracts.synthesis import SynthesisEvidence
+from .contracts.validation import (
+    ContractValidationError,
+    validate_answer_draft,
+    validate_task_plan,
+)
 from .dependencies.people_document import (
     MaterializationError,
     append_materialized_dependent,
@@ -88,9 +99,11 @@ from .discovery import DiscoveryDenied, DiscoveryDisabled, request_addition
 from .nodes.context import node_context
 from .nodes.evaluate import _EVIDENCE_SUPPLYING_CAPABILITIES, evaluate_evidence
 from .nodes.execute import execution_update
+from .nodes.synthesize import build_extractive_draft
 from .replanning import ReplanRejected, validate_runtime_replan
 from .skills.compare import policy as compare_policy
 from .skills.summarize import policy as summarize_policy
+from .skills.summarize.policy import ReduceSpec
 from .tools.discovery_candidates import (
     CandidateNotFound,
     DiscoveryCandidateRegistry,
@@ -108,7 +121,7 @@ __all__ = [
     "build_complex_research_state",
     "build_complex_research_subgraph",
     "build_discovery_policy",
-    "build_initial_plan",
+    "build_initial_proposal",
     "build_model_observations",
     "build_model_replan_input",
     "build_planning_input",
@@ -123,6 +136,7 @@ __all__ = [
     "make_complex_boundary_node",
     "discovery_settle_node",
     "merge_complex_result_into_supervisor",
+    "summarize_reduce_node",
     "normalize_complex_state",
     "people_document_materialize_node",
     "plan_node",
@@ -210,6 +224,17 @@ class ComplexResearchState(TypedDict, total=False):
     #: projector's explicit ``dependency_scalar_available`` parameter) rather
     #: than inferring availability from status.
     people_scalar_available: dict[str, bool]
+    #: Explicit deterministic REDUCE specification for summarize map/reduce
+    #: workflows (R43, implementation-only — not a frozen contract). Set only
+    #: by the summarize initial proposal; ``None`` everywhere else. The
+    #: reduce node consumes it; replans clear it so no stale spec survives
+    #: a changed task set.
+    reduce_spec: Any
+    #: Discovery candidates left unsettled because the policy cap was
+    #: reached (R44): candidate-ID strings in first-seen order. Recorded,
+    #: never added; a later pass with budget skips already-bound candidates
+    #: and settles the rest.
+    discovery_deferred: tuple[str, ...]
 
 
 def require_query_analysis(state: ComplexResearchState) -> QueryAnalysis:
@@ -435,6 +460,10 @@ def normalize_complex_state(state: ComplexResearchState) -> ComplexResearchState
         people_scalar_available=_coerce_availability_map(
             state.get("people_scalar_available", {})
         ),
+        reduce_spec=_coerce_reduce_spec(state.get("reduce_spec")),
+        discovery_deferred=_coerce_deferred_list(
+            state.get("discovery_deferred", ())
+        ),
     )
 
 
@@ -445,6 +474,49 @@ def _coerce_checkpoint_flag(value: Any) -> bool:
     raise ComplexResearchError(
         "complex checkpoint slot 'materialized_new_task' is not a bool "
         f"(got {type(value).__name__})"
+    )
+
+
+def _coerce_reduce_spec(value: Any) -> ReduceSpec | None:
+    """Coerce the checkpointed reduce spec (fail closed, R43)."""
+    if value is None:
+        return None
+    if isinstance(value, ReduceSpec):
+        if value.mode != "extractive" or not value.map_task_ids:
+            raise ComplexResearchError(
+                "complex checkpoint slot 'reduce_spec' is not a valid "
+                "extractive reduce specification"
+            )
+        return value
+    if isinstance(value, Mapping):
+        try:
+            spec = ReduceSpec(
+                map_task_ids=tuple(value.get("map_task_ids", ()) or ()),
+                mode=value.get("mode", "extractive"),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ComplexResearchError(
+                f"complex checkpoint slot 'reduce_spec' is not a valid "
+                f"reduce specification: {exc}"
+            ) from exc
+        return _coerce_reduce_spec(spec)
+    raise ComplexResearchError(
+        "complex checkpoint slot 'reduce_spec' is not a reduce "
+        f"specification (got {type(value).__name__})"
+    )
+
+
+def _coerce_deferred_list(value: Any) -> tuple[str, ...]:
+    """Coerce the checkpointed deferred-candidate record (fail closed, R44)."""
+    if value is None:
+        return ()
+    if isinstance(value, (list, tuple)) and all(
+        isinstance(item, str) and item for item in value
+    ):
+        return tuple(value)
+    raise ComplexResearchError(
+        "complex checkpoint slot 'discovery_deferred' is not a tuple of "
+        f"candidate-id strings (got {type(value).__name__})"
     )
 
 
@@ -655,21 +727,89 @@ def _evaluation_slot(value: Any, name: str, default: Any = None) -> Any:
     return getattr(value, name, default)
 
 
-def build_initial_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
+@dataclass(frozen=True)
+class InitialProposal:
+    """Deterministic initial proposal: executable plan + optional reduce spec.
+
+    ``reduce_spec`` is set only for summarize map/reduce workflows (R43);
+    every other pilot carries ``None``.
+    """
+
+    plan: TaskPlan
+    reduce_spec: ReduceSpec | None
+
+
+def _people_first_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
+    """Deterministic first step of the cross-domain People→Document pilot.
+
+    A single targetless ``people.lookup`` (T1) when the finalized semantics
+    names a person; the deterministic materializer appends the governed
+    dependent on success and the recovery replan owns ``not_found``/``TIMEOUT``.
+    Fails closed without person references or without the capability in the
+    current catalog — the planner never fabricates a person to look up.
+    """
+    references = sorted(
+        planning_input.semantic.person_refs, key=lambda reference: reference.ref_id
+    )
+    if not references:
+        raise ContractValidationError(
+            "cross_domain pilot needs a person reference for the governed "
+            "first lookup; refusing to fabricate one"
+        )
+    catalog = {entry.name for entry in planning_input.capability_catalog}
+    if "people.lookup" not in catalog:
+        raise ContractValidationError(
+            "cross_domain pilot needs 'people.lookup' in the request-scoped "
+            "capability catalog; refusing to plan an undispatchable lookup"
+        )
+    first = references[0]
+    task = TaskSpec(
+        task_id="T1",
+        capability="people.lookup",
+        task_objective=f"Resolve person {first.label} ({first.ref_id})",
+        input=PeopleLookupInput(
+            kind="people.lookup",
+            query=planning_input.semantic.contextualized_query,
+        ),
+        depends_on=(),
+        origin=InitialTaskOrigin(kind="initial"),
+    )
+    plan = TaskPlan(
+        contract_version="2.0",
+        plan_id=f"people-first-{first.ref_id}",
+        goal=planning_input.semantic.contextualized_query,
+        target_units=(),
+        tasks=(task,),
+    )
+    validate_task_plan(plan, planning_input.bindings)
+    return plan
+
+
+def build_initial_proposal(planning_input: ResearchPlanningInput) -> InitialProposal:
     """Select the skill/policy from the query work type (R38), then propose.
 
     ``compare`` (complex) routes to the compare skill; large/iterative
     ``summarize`` (complex) routes to the summarize skill with its
-    deterministic map/reduce proposal. Bounded summarize never reaches here
-    (the deterministic router keeps single-document summaries on the fast
-    path). Any other work type raises :class:`ContractValidationError` so
-    the caller returns the typed unavailable boundary, never a plan.
+    deterministic map/reduce workflow; ``cross_domain`` with a named person
+    routes to the deterministic people-first lookup (the People→Document
+    pilot's governed first step). Bounded summarize never reaches here (the
+    deterministic router keeps single-document summaries on the fast path).
+    Any other work type raises :class:`ContractValidationError` so the
+    caller returns the typed unavailable boundary, never a plan.
     """
     work_type = planning_input.query_analysis.work_type
     if work_type == compare_policy.COMPARE_WORK_TYPE:
-        return compare_policy.build_compare_plan(planning_input)
+        return InitialProposal(
+            plan=compare_policy.build_compare_plan(planning_input),
+            reduce_spec=None,
+        )
     if work_type == summarize_policy.SUMMARIZE_WORK_TYPE:
-        return summarize_policy.build_summarize_plan(planning_input)
+        workflow = summarize_policy.build_summarize_workflow(planning_input)
+        return InitialProposal(plan=workflow.plan, reduce_spec=workflow.reduce)
+    if work_type == "cross_domain":
+        return InitialProposal(
+            plan=_people_first_plan(planning_input), reduce_spec=None
+        )
     raise ContractValidationError(
         f"work type {work_type!r} has no complex skill policy; out of scope"
     )
@@ -984,25 +1124,35 @@ async def validate_checkpoint_node(
     state = normalize_complex_state(state)
     if state.get("plan") is None:
         try:
-            proposal = build_initial_plan(build_planning_input(state, context))
+            initial = build_initial_proposal(build_planning_input(state, context))
         except ContractValidationError:
             return {}
         bindings = state["bindings"]
-        validate_task_plan(proposal, bindings)
+        validate_task_plan(initial.plan, bindings)
         await _lease_pinned_state(
-            plan=proposal,
+            plan=initial.plan,
             bindings=bindings,
             results=tuple(state.get("task_results", ())),
             runtime=context,
         )
-        return {"plan": proposal, "materialized_new_task": False}
+        update: dict[str, Any] = {
+            "plan": initial.plan,
+            "materialized_new_task": False,
+        }
+        if initial.reduce_spec is not None:
+            update["reduce_spec"] = initial.reduce_spec
+        return update
     current = state["plan"]
     assert current is not None
     proposal = build_replan_proposal(state, context)
     if proposal is None:
         # Deterministically unplannable: spend the budget so decide finalizes
         # instead of routing back here forever.
-        return {"replans_remaining": 0, "materialized_new_task": False}
+        return {
+            "replans_remaining": 0,
+            "materialized_new_task": False,
+            "reduce_spec": None,
+        }
     await _lease_pinned_state(
         plan=proposal,
         bindings=state["bindings"],
@@ -1014,6 +1164,8 @@ async def validate_checkpoint_node(
         "plan": proposal,
         "replans_remaining": max(0, remaining - 1),
         "materialized_new_task": False,
+        # The task set changed: no stale reduce spec may survive.
+        "reduce_spec": None,
     }
 
 
@@ -1204,9 +1356,21 @@ async def discovery_settle_node(
         (binding.document_id, binding.document_revision)
         for binding in bindings.bindings
     }
+    # R44: the cap counts discovery-created bindings already pinned plus
+    # pending additions in this pass. Only role "discovered" is counted:
+    # "supporting" bindings may be user-bound, which must never consume
+    # the discovery budget.
+    remaining = policy.max_discovered_documents - sum(
+        1 for binding in bindings.bindings if binding.role == "discovered"
+    )
     settled: list[ScopedDocument] = []
+    deferred: list[str] = []
     for candidate in registry.candidates():
         if (candidate.document_id, candidate.document_revision) in existing:
+            continue
+        if remaining <= 0:
+            # Recorded, never added: a later pass still sees the candidate.
+            deferred.append(str(candidate.candidate_id))
             continue
         if policy.allow_reference_discovery:
             role = "discovered"
@@ -1252,11 +1416,15 @@ async def discovery_settle_node(
             )
         settled.append(created)
         existing.add((candidate.document_id, candidate.document_revision))
-    if not settled:
+        remaining -= 1
+    if not settled and not deferred:
         return {}
-    updated = bindings.model_copy(
-        update={"bindings": bindings.bindings + tuple(settled)}
-    )
+    update: dict[str, Any] = {"discovery_deferred": tuple(deferred)}
+    if settled:
+        updated = bindings.model_copy(
+            update={"bindings": bindings.bindings + tuple(settled)}
+        )
+        update["bindings"] = updated
     pairs: list[tuple[Any, Any]] = []
     for binding in settled:
         try:
@@ -1276,7 +1444,106 @@ async def discovery_settle_node(
             "wired; refusing to checkpoint unleased pins"
         ),
     )
-    return {"bindings": updated}
+    return update
+
+
+async def summarize_reduce_node(
+    state: ComplexResearchState,
+    runtime: "Runtime[GraphRuntimeContext]",
+) -> dict:
+    """Drive the deterministic REDUCE stage through framework boundaries (R43).
+
+    Runs between ``evaluate`` and ``decide``. Active only for a summarize
+    map plan whose checkpointed reduce spec survived with a ``sufficient``
+    evaluation. It hydrates the admitted map-task uses IN SPEC ORDER through
+    the governed hydrator, projects them with the existing synthesis
+    projection, reduces them with the existing deterministic
+    ``build_extractive_draft``, validates the draft against the admitted
+    use set, and stores it in the existing ``answer_draft_channel`` handoff
+    for the ground node. The agent never owns the reduce; no new
+    capability and no new contract are involved. Dormant (``{}``) for every
+    other plan, for non-sufficient evaluations, and when no channel is
+    wired (the supervisor synthesize node then covers the answer).
+    """
+    context = node_context(runtime)
+    state = normalize_complex_state(state)
+    plan = state.get("plan")
+    evaluation = state.get("evaluation")
+    spec = state.get("reduce_spec")
+    if plan is None or evaluation is None or spec is None:
+        return {}
+    if _evaluation_slot(evaluation, "status") != "sufficient":
+        return {}
+    if not str(getattr(plan, "plan_id", "")).startswith("summarize-"):
+        return {}
+    if not isinstance(spec, ReduceSpec):
+        return {}
+    if spec.mode != "extractive":
+        raise ComplexResearchError(
+            f"unknown reduce mode {spec.mode!r}; refusing to guess a reduction"
+        )
+    channel = getattr(context.services, "answer_draft_channel", None)
+    if channel is None:
+        return {}
+    results = tuple(state.get("task_results", ()))
+    result_by_task = {result.task_id: result for result in results}
+    ordered_refs = []
+    for map_task_id in spec.map_task_ids:
+        result = result_by_task.get(map_task_id)
+        if result is None:
+            raise ComplexResearchError(
+                f"reduce spec names map task {map_task_id!r} with no "
+                "checkpointed result; refusing a partial reduction"
+            )
+        ordered_refs.extend(result.evidence_uses)
+    if not ordered_refs:
+        return {}
+    hydrator = getattr(context.services, "evidence_hydrator", None)
+    if hydrator is None:
+        raise ComplexResearchError(
+            "reduce needs the governed evidence hydrator; refusing to "
+            "reduce unadmitted evidence"
+        )
+    hydrated = await hydrator.hydrate_for_evaluation(
+        tuple(ordered_refs),
+        runtime=context,
+        plan=plan,
+        bindings=state["bindings"],
+    )
+    position = {ref.use_id: index for index, ref in enumerate(ordered_refs)}
+    admitted = tuple(
+        item
+        for item in (hydrated or ())
+        if getattr(item, "purpose", None) != "discovery"
+        and getattr(item, "use_id", None) in position
+    )
+    admitted = tuple(sorted(admitted, key=lambda item: position[item.use_id]))
+    if not admitted:
+        return {}
+    evidence = tuple(
+        SynthesisEvidence(
+            use_id=item.use_id,
+            content=item.content,
+            role=item.role,
+            target_id=item.target_id,
+            source_label=item.source_label,
+        )
+        for item in admitted
+    )
+    draft = build_extractive_draft(evidence)
+    validate_answer_draft(
+        draft, frozenset(item.use_id for item in admitted)
+    )
+    store = getattr(channel, "store_draft", None)
+    if store is None:
+        raise ComplexResearchError(
+            "answer_draft_channel exposes no store_draft; refusing to "
+            "reduce without the framework handoff"
+        )
+    store(
+        context.capability_runtime.run_id, draft=draft, evidence=admitted
+    )
+    return {}
 
 
 async def complex_evaluate_node(
@@ -1390,7 +1657,8 @@ def _add_complex_edges(graph: StateGraph) -> None:
         "materialize", _materialize_branch, {"execute": "execute", "settle": "settle"}
     )
     graph.add_edge("settle", "evaluate")
-    graph.add_edge("evaluate", "decide")
+    graph.add_edge("evaluate", "reduce")
+    graph.add_edge("reduce", "decide")
     graph.add_conditional_edges(
         "decide", _decide_branch, {"replan": "replan", "finalize": "finalize"}
     )
@@ -1414,6 +1682,7 @@ def _build_complex_research_graph() -> StateGraph:
     graph.add_node("materialize", people_document_materialize_node)
     graph.add_node("settle", discovery_settle_node)
     graph.add_node("evaluate", complex_evaluate_node)
+    graph.add_node("reduce", summarize_reduce_node)
     graph.add_node("replan", replan_node)
     graph.add_node("decide", decide_node)
     graph.add_node("finalize", finalize_node)
@@ -1451,6 +1720,8 @@ def build_complex_research_state(state: SupervisorV2State) -> ComplexResearchSta
         # R36: production entry uses the SAME settings-driven limits the
         # budget view enforces — never a hardcoded constant.
         replans_remaining=V2ResearchLimits.from_settings().max_replans,
+        reduce_spec=None,
+        discovery_deferred=(),
     )
 
 
