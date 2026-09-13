@@ -63,6 +63,10 @@ then sends the turn to `finalizer`; `_finalize_factual` sees
 `evidence_evaluation is None` and raises `FinalizerError`, which the node wrapper
 converts to a generic `error` response.
 
+`_validate_execution_state` already accepts `plan=None, evaluation=None` as a
+valid aggregate, so the defect is entirely inside the finalizer's missing-verdict
+branch — no checkpoint/contract change is required to fix it.
+
 ### 2.4 `ChatSourceChunk` contract mismatch in the v1 harness (harness defect)
 
 `streaming.py` passes a `ChatSourceChunk` object into
@@ -131,24 +135,12 @@ resolution → `DocumentRefEntry[]` → `PreprocessingResult` (valid) → adapte
 
 ### 4.2 Typed terminal outcome (defect #3)
 
-**Contract addition.** Add one nullable slot to the checkpointed execution
-aggregate so the subgraph's typed reason survives the merge:
-
-```text
-Field: research_unavailable
-Authoritative owner: complex-research subgraph (decide_node)
-Produced by: decide_node when plan is None
-Consumed by: finalizer (_finalize_factual) via the merged ExecutionState
-Persisted? yes (inside ExecutionState checkpoint)
-Derivable? no — the policy decision is made inside the subgraph and is not a
-           function of the parent's checkpointed fields
-Reason it must exist: without it the typed unavailable reason is lost at the
-           merge boundary and the terminal outcome degrades to a generic error
-```
-
-`execution_update()` and `reset_execution()` handle the slot with the existing
-None-means-keep / clear semantics; `merge_complex_result_into_supervisor()`
-passes `child.get("unavailable")`.
+**Contract decision (simplified during planning).** No checkpoint field is
+added. The terminal outcome depends only on the semantic signal, so the
+subgraph's `ComplexResearchUnavailable` marker does not need to survive the merge
+(the marker is only needed to prove *why* no plan was produced, which the chosen
+criterion A never surfaces). This removes any `ExecutionState` serde/checkpoint
+change from the plan — strictly less risk, same user-facing behavior.
 
 **Finalizer rule.** In `_finalize_factual`, when `evaluation is None`, do not
 raise. Emit a typed non-success response using the semantic signal (chosen
@@ -158,9 +150,6 @@ criterion A):
   **or** `semantic.blocking_ambiguities` is non-empty → `FinalResponse(status="clarify")`
   with `_NEEDS_INPUT_CONTENT` plus the unresolved/ambiguous spans (user text, safe).
 - otherwise → `FinalResponse(status="insufficient")` with `_INSUFFICIENT_CONTENT`.
-
-`research_unavailable`, when present, is a secondary signal only: it still maps to
-`insufficient`; its `reason` (work type / policy) is never surfaced.
 
 **Invariants preserved:** never emit `success` without a verdict; `_require_route`
 and the persisted-clarification requirement for the `clarify` route remain
@@ -237,9 +226,9 @@ TDD: failing tests first, then implementation.
 2. **Title resolution:** fake session returning aliases/titles — longest-match,
    ACL filter, fallback when no DB match.
 3. **Finalizer/#3:** `evaluation is None` + (a) unresolved ref or blocking
-   ambiguity → `clarify`; (b) no refs → `insufficient`; (c) `research_unavailable`
-   → `insufficient`; never `success`. Merge test: subgraph `unavailable` survives
-   into `ExecutionState`; checkpoint round-trip with and without the new slot.
+   ambiguity → `clarify`; (b) no refs → `insufficient`; (c) any complex/factual
+   state with a missing verdict never emits `success`. No checkpoint round-trip
+   change is needed (no contract field is added).
 4. **Harness:** a `ChatSourceChunk` through the sources path raises no
    `AttributeError`; dedup identity is correct.
 5. **Regression:** existing `test_semantic_preprocessor_db_resolution.py` and the
@@ -262,7 +251,6 @@ TDD: failing tests first, then implementation.
 
 | Risk | Mitigation |
 |------|-----------|
-| New `ExecutionState` slot breaks checkpoint serde / old checkpoints | Nullable default `None`; checkpoint round-trip tests with and without the slot; `normalize_checkpoint_state` treats a missing slot as `None`. |
 | Arbitration changes existing resolved-ref behavior | Broad unit tests with real Vietnamese queries; assert current `test_semantic_preprocessor_db_resolution.py` behavior is preserved where intended. |
 | Multi-word stop-token set over/under-captures | DB longest-match + candidate fallback; bounded token window. |
 | Reindex mutates the test corpus | Small workspace (`Luật`) first, verify, then `Nghị định`; abort path; never set the pointer manually. |
