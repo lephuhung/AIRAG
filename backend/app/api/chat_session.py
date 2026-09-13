@@ -676,6 +676,74 @@ async def _session_v2_run(
             raise
 
 
+def _maybe_launch_shadow_turn(
+    *,
+    raw_message: str,
+    thread_id: str,
+    user_id,
+    workspace_ids,
+) -> "asyncio.Task | None":
+    """Launch a best-effort shadow v2 turn alongside the primary run.
+
+    Returns the shadow task when this turn is sampled (shadow enabled +
+    percent gate hit), else ``None``. The shadow replays the raw message
+    through its OWN isolated graph/saver with read-only adapters: it never
+    writes production state and never emits outbound events — only redacted
+    metrics are logged. Any failure (including sampling disabled) returns
+    ``None`` so the primary turn is never affected. Cancellation follows
+    the primary run via the caller's ``finally: task.cancel()``.
+    """
+    try:
+        from app.core.config import settings
+
+        if not bool(getattr(settings, "NEXUSRAG_AGENT_V2_SHADOW_ENABLED", False)):
+            return None
+        percent = float(
+            getattr(settings, "NEXUSRAG_AGENT_V2_SHADOW_PERCENT", 0) or 0
+        )
+        from app.services.agent.shadow_runtime import (
+            build_shadow_bundle,
+            should_run_shadow,
+        )
+        import random as _random
+
+        if not should_run_shadow(percent=percent, sample=_random.uniform(0, 100)):
+            return None
+    except Exception as e:  # noqa: BLE001 — shadow must never break primary
+        logger.warning("[shadow] sampling check failed (primary unaffected): %s", e)
+        return None
+
+    async def _run_shadow_best_effort() -> None:
+        try:
+            bundle = build_shadow_bundle(
+                raw_query=raw_message,
+                thread_id=thread_id,
+                user_id=user_id,
+                workspace_ids=tuple(workspace_ids or ()),
+            )
+            metrics = await bundle.run()
+            logger.info("[shadow] turn complete: %s", metrics.redacted())
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 — best-effort by contract
+            logger.warning("[shadow] turn failed (primary unaffected): %s", e)
+
+    def _consume(task: "asyncio.Task") -> None:
+        # Swallow late failures so an un-awaited shadow never warns.
+        try:
+            task.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    try:
+        task = asyncio.create_task(_run_shadow_best_effort())
+        task.add_done_callback(_consume)
+        return task
+    except Exception as e:  # noqa: BLE001 — shadow must never break primary
+        logger.warning("[shadow] launch failed (primary unaffected): %s", e)
+        return None
+
+
 @router.post("/{session_id}/stream")
 async def chat_stream_session(
     session_id: str,
@@ -1197,25 +1265,41 @@ async def chat_stream_session(
                 # Resolve the serving arm through the lazy selector (no
                 # direct graph construction on any entrypoint).
                 graph = await resolve_agent_graph(version)
-                if version == "v2":
-                    # I1: the ingress CM scopes the whole stream — evidence
-                    # commit/rollback and BOTH session closes run on EVERY
-                    # path (normal, raise, cancellation) via `async with`,
-                    # never via GC. Terminal lease release stays with the T8
-                    # outer runner (never here, never in the finalizer).
-                    async with _session_v2_run(
-                        graph=graph,
-                        raw_message=request.message,
-                        workspace_ids=runtime_workspace_ids,
-                        document_ids=filtered_doc_ids,
-                        user_id=user.id,
-                        can_read_people=bool(user.is_superadmin),
-                        thread_id=session_id,
-                        resume_message_id=raw_message_uuid,
-                    ) as (_v2_ingress, _v2_agen):
-                        await _drain(_v2_agen)
-                else:
-                    await _drain(stream_agent_to_sse(graph, initial_state))
+                # Side-effect-free shadow v2 (Phase 3, Task 6): sampled
+                # alongside the primary run; cancellation follows the
+                # primary via the finally below. Best-effort — a shadow
+                # failure never affects the primary turn.
+                shadow_task = _maybe_launch_shadow_turn(
+                    raw_message=request.message,
+                    thread_id=session_id,
+                    user_id=user.id,
+                    workspace_ids=runtime_workspace_ids,
+                )
+                try:
+                    if version == "v2":
+                        # I1: the ingress CM scopes the whole stream — evidence
+                        # commit/rollback and BOTH session closes run on EVERY
+                        # path (normal, raise, cancellation) via `async with`,
+                        # never via GC. Terminal lease release stays with the T8
+                        # outer runner (never here, never in the finalizer).
+                        async with _session_v2_run(
+                            graph=graph,
+                            raw_message=request.message,
+                            workspace_ids=runtime_workspace_ids,
+                            document_ids=filtered_doc_ids,
+                            user_id=user.id,
+                            can_read_people=bool(user.is_superadmin),
+                            thread_id=session_id,
+                            resume_message_id=raw_message_uuid,
+                        ) as (_v2_ingress, _v2_agen):
+                            await _drain(_v2_agen)
+                    else:
+                        await _drain(stream_agent_to_sse(graph, initial_state))
+                finally:
+                    # Cancellation follows the primary run: a stopped or
+                    # finished primary never leaves a shadow running.
+                    if shadow_task is not None and not shadow_task.done():
+                        shadow_task.cancel()
 
             # Generate the title now (first exchange) and push it immediately so
             # the client updates without a refresh; reuse the summary downstream.

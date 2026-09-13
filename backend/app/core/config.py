@@ -637,6 +637,16 @@ class Settings(BaseSettings):
     # readiness gate). Any other value fails fast at config validation.
     NEXUSRAG_AGENT_GRAPH_VERSION: str = Field(default="v1")
 
+    # ── LangGraph v2 shadow execution (Phase 3, Task 6) ──────────────────────
+    # Side-effect-free shadow v2 runs alongside the primary arm: a shadow run
+    # compiles its own graph against an isolated saver, uses read-only source
+    # adapters, never writes production state, and never emits outbound
+    # events. Safe defaults: shadowing is DISABLED and the percent is 0, so
+    # merely deploying this change alters no traffic. Percent is the share of
+    # primary turns sampled for shadowing (0..100).
+    NEXUSRAG_AGENT_V2_SHADOW_ENABLED: bool = Field(default=False)
+    NEXUSRAG_AGENT_V2_SHADOW_PERCENT: float = Field(default=0.0)
+
     # ── Phase 1A: Semantic preprocessor atomic enable (B.11 0.5) ─────────────
     # When True, semantic_preprocessor_node runs before supervisor_node;
     # legacy abbreviation expansion is suppressed via _preprocessor_marker.
@@ -660,6 +670,18 @@ class Settings(BaseSettings):
             raise ValueError(
                 "NEXUSRAG_AGENT_GRAPH_VERSION must be one of ('v1', 'v2'); "
                 f"got {self.NEXUSRAG_AGENT_GRAPH_VERSION!r}"
+            )
+        try:
+            shadow_percent = float(self.NEXUSRAG_AGENT_V2_SHADOW_PERCENT)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "NEXUSRAG_AGENT_V2_SHADOW_PERCENT must be a number; "
+                f"got {self.NEXUSRAG_AGENT_V2_SHADOW_PERCENT!r}"
+            ) from exc
+        if not 0.0 <= shadow_percent <= 100.0:
+            raise ValueError(
+                "NEXUSRAG_AGENT_V2_SHADOW_PERCENT must be within 0..100; "
+                f"got {self.NEXUSRAG_AGENT_V2_SHADOW_PERCENT!r}"
             )
         return self
 
