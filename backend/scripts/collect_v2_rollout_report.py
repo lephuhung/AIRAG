@@ -35,7 +35,18 @@ try:  # single source of truth lives in rollout_metrics; scripts stay runnable
 except Exception:  # operational runs from the repo root lack ``app`` on sys.path
     _SENTINEL_TERMINAL = "security_unobservable"
 
-ERROR_STATUSES = frozenset({"error", "failed", "timeout"})
+try:  # P0 Task 6: factual zero-dispatch sentinel (spec section 7.2)
+    from app.services.agent.rollout_metrics import (
+        FACTUAL_ZERO_DISPATCH_TERMINAL as _ZERO_DISPATCH_TERMINAL,
+    )
+except Exception:  # same runnable-from-repo-root fallback as above
+    _ZERO_DISPATCH_TERMINAL = "factual_zero_dispatch"
+
+# P0 Task 6: a factual complex terminal with zero capability calls is an
+# internal regression, not a normal insufficient answer — it is counted as
+# an error for rollout gates (spec section 7.2). Typed unsupported/denied
+# outcomes keep their typed terminal and are NOT errors.
+ERROR_STATUSES = frozenset({"error", "failed", "timeout", _ZERO_DISPATCH_TERMINAL})
 
 #: Terminal statuses that mean a requested cancellation actually stopped
 #: the run (a successful cancellation — NOT a cancellation failure).
@@ -144,6 +155,11 @@ def summarize_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             for row in completed
             if str(row.get("terminal_status", "")).lower() in ERROR_STATUSES
         )
+        # P0 Task 6: dedicated zero-dispatch regression signal (a subset of
+        # ``errors`` above). ``retrieved_unit_count`` is deliberately NEVER
+        # aggregated here as unique/distinct chunks — it counts admitted
+        # EvidenceUses (Task 2 M1), so no unique-chunk derivation exists in
+        # this report by construction.
         security_violations = 0
         for row in completed:
             security = row.get("security") or {}
@@ -189,6 +205,11 @@ def summarize_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "valid": invalid_security_rows == 0,
             "error_rate": (errors / len(completed)) if completed else 0.0,
             "errors": errors,
+            "factual_zero_dispatch_regressions": sum(
+                1
+                for row in completed
+                if str(row.get("terminal_status") or "") == _ZERO_DISPATCH_TERMINAL
+            ),
             "p50_ms": _percentile(durations, 50),
             "p95_ms": _percentile(durations, 95),
             "security_violations": security_violations,

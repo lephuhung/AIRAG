@@ -74,4 +74,14 @@ re-derive of heading paths for section-by-Điều retrieval).
 
 The v2 fast and complex paths share the same capability implementations
 (document search, section, KG) over this retrieval read path — no separate
-retrieval stack. Ownership model: [`CLAUDE.md`](../CLAUDE.md) (canonical).
+retrieval stack. Factual v2 queries additionally execute revision-aware
+retrieval through the `document.retrieve` capability: the request-scoped
+service loads the exact `DocumentRevisionBuild` manifest for the pinned (or
+workspace-resolved current) revision and queries **only that manifest's
+recorded `embedding_namespace`** with hard document/revision filters — it
+never falls back to a current-config namespace when the manifest is absent
+or incompatible (fail closed, typed `dependency_error`). `document_ids` are
+a hard scope after API ACL filtering. Probes: [`harness.md`](harness.md)
+(P0 factual-retrieval live gate). Ownership model: [`CLAUDE.md`](../CLAUDE.md)
+(canonical). Like every probe here, retrieval exercises the running stack
+as-is — **never restart vLLM engines** ([`vllm.md`](vllm.md)).

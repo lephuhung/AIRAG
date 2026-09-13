@@ -432,6 +432,9 @@ async def emit_terminal_rollout_metric(
     production_write_count: int | None,
     scope_bound: bool = False,
     unidentified_served_count: int | None = 0,
+    route: str | None = None,
+    response_status: str | None = None,
+    capability_call_count: int | None = None,
 ) -> Any:
     """Terminal-boundary append-only emission (R74; v1 + v2 arms).
 
@@ -444,8 +447,14 @@ async def emit_terminal_rollout_metric(
     ``terminal_status`` set to :data:`SECURITY_UNOBSERVABLE_TERMINAL`
     (R80: omission is not acceptable; the collector/gate counts the
     sentinel as an invalid security row). The row is never recorded as
-    "safe". Callers that must never break serving use
-    :func:`try_emit_terminal_rollout_metric`.
+    "safe". P0 Task 6: when the optional execution telemetry (``route`` /
+    ``response_status`` / ``capability_call_count``) classifies the turn as
+    a factual zero-dispatch regression, the stored ``terminal_status`` is
+    :data:`FACTUAL_ZERO_DISPATCH_TERMINAL` so the collector counts it as
+    an error for rollout gates (spec section 7.2). All three default to
+    ``None`` (unobservable → stored terminal unchanged), so existing
+    callers see byte-identical behavior. Callers that must never break
+    serving use :func:`try_emit_terminal_rollout_metric`.
     """
     row_cancelled = effective_cancelled(
         cancelled=cancelled, cancel_requested=cancel_requested
@@ -472,6 +481,16 @@ async def emit_terminal_rollout_metric(
         )
         security = dict(_SENTINEL_SECURITY)
         terminal_status = SECURITY_UNOBSERVABLE_TERMINAL
+    if terminal_status != SECURITY_UNOBSERVABLE_TERMINAL:
+        # P0 Task 6: execution-telemetry remap runs on the ORIGINAL
+        # terminal (detectors above already ran on it). Missing telemetry
+        # is unobservable → stored terminal unchanged, never fabricated.
+        terminal_status = resolve_execution_terminal(
+            terminal_status,
+            route=route,
+            response_status=response_status,
+            capability_call_count=capability_call_count,
+        )
     scope = sorted({str(item) for item in (workspace_ids or ()) if str(item)})
     finished = finished_at or datetime.now(timezone.utc)
     try:
@@ -683,3 +702,157 @@ def count_grounding_evidence(
         served = ()
     total += len(served)
     return total
+
+
+# ---------------------------------------------------------------------------
+# Factual-retrieval execution observability (P0 Task 6, spec section 7.2).
+#
+# A factual complex turn that reaches terminal state with zero capability
+# calls is an internal regression (the pre-P0 failure shape: ~100 ms
+# terminal, no plan, no capability call, typed ``insufficient``) unless it
+# is an explicitly unsupported/denied route. The regression is recorded
+# with the ``FACTUAL_ZERO_DISPATCH_TERMINAL`` sentinel terminal so the
+# collector counts it as an error for rollout gates instead of a normal
+# insufficient answer. The sentinel fits the existing frozen Text column —
+# no migration. Typed unsupported/denied outcomes keep their typed
+# outcome (``typed_non_execution`` — never remapped, never an error).
+# ---------------------------------------------------------------------------
+
+#: Sentinel ``terminal_status`` for a factual complex terminal answer that
+#: dispatched zero capabilities (spec section 7.2 regression). The
+#: collector counts every such row as an error; the gate fails sustained
+#: zero-dispatch volume via its error-rate regression threshold.
+FACTUAL_ZERO_DISPATCH_TERMINAL = "factual_zero_dispatch"
+
+#: Typed outcomes that classify as explicitly non-executed without being a
+#: regression: ``denied`` (permission/hard-scope violation — no dispatch by
+#: design), ``unsupported``/``unavailable`` (typed dependency-unavailable —
+#: dispatches nothing by design), ``clarify`` (user-input-pending suspend —
+#: no execution owed yet), ``error`` (already gate-visible as an error).
+_TYPED_NON_EXECUTION_OUTCOMES = frozenset(
+    {"clarify", "denied", "unsupported", "unavailable", "error"}
+)
+
+#: Answer-bearing response statuses eligible for the zero-dispatch
+#: regression: an answer was produced on a factual route with no execution
+#: behind it. ``success`` with zero grounding is additionally an
+#: ungrounded-factual-success security violation (detectors, unchanged);
+#: ``insufficient`` with zero dispatch is the pre-P0 bug shape.
+_ZERO_DISPATCH_ELIGIBLE_RESPONSES = frozenset({"success", "insufficient"})
+
+#: Columns stored on a metric row (content-hygiene contract: nothing else
+#: may persist — no answer text, chunk content, tokens, or secrets).
+METRIC_STORED_KEYS: tuple[str, ...] = (
+    "arm",
+    "request_id_hash",
+    "workspace_id_hash",
+    "started_at",
+    "finished_at",
+    "duration_ms",
+    "terminal_status",
+    "citation_count",
+    "cancelled",
+    "security_checkpoint_secret",
+    "security_ungrounded_factual_success",
+    "security_acl_leak",
+    "security_duplicate_production_write",
+)
+
+
+def classify_factual_execution(
+    *,
+    route: str | None,
+    response_status: str | None,
+    capability_call_count: int | None,
+) -> str:
+    """Classify one terminal turn's execution posture (pure).
+
+    Returns exactly one of ``"executed"`` / ``"zero_dispatch_regression"``
+    / ``"typed_non_execution"`` / ``"non_factual"`` / ``"unobservable"``.
+    ``capability_call_count`` is the observed number of capability calls
+    for the turn (counts only — never content). ``None`` anywhere
+    unclassifiable means ``"unobservable"`` (invalid, never safe, never
+    fabricated into a regression). Non-integer or negative counts raise
+    ``ValueError`` (fail closed; ``bool`` is rejected like the gate's
+    integer inputs).
+    """
+    if capability_call_count is None:
+        return "unobservable"
+    if isinstance(capability_call_count, bool) or not isinstance(
+        capability_call_count, int
+    ):
+        raise ValueError(
+            "capability_call_count must be an int, "
+            f"got {capability_call_count!r}; refusing to classify"
+        )
+    if capability_call_count < 0:
+        raise ValueError(
+            "capability_call_count must be >= 0, "
+            f"got {capability_call_count!r}; refusing to classify"
+        )
+    if response_status is None:
+        return "unobservable"
+    normalized_response = str(response_status).lower()
+    if normalized_response in _TYPED_NON_EXECUTION_OUTCOMES:
+        return "typed_non_execution"
+    normalized_route = str(route or "").lower() or None
+    if (
+        normalized_route in _FACTUAL_ROUTES
+        and normalized_response in _ZERO_DISPATCH_ELIGIBLE_RESPONSES
+    ):
+        if capability_call_count == 0:
+            return "zero_dispatch_regression"
+        return "executed"
+    if normalized_route in _NON_FACTUAL_ROUTES:
+        return "non_factual"
+    return "unobservable"
+
+
+def resolve_execution_terminal(
+    terminal_status: str,
+    *,
+    route: str | None = None,
+    response_status: str | None = None,
+    capability_call_count: int | None = None,
+) -> str:
+    """Map the stored terminal through the execution classifier (pure).
+
+    Returns :data:`FACTUAL_ZERO_DISPATCH_TERMINAL` only for an observed
+    ``"zero_dispatch_regression"``; every other classification — including
+    ``"unobservable"`` and invalid telemetry (``ValueError``) — returns
+    ``terminal_status`` unchanged, so missing telemetry never alters a
+    stored row and never fabricates a regression.
+    """
+    try:
+        verdict = classify_factual_execution(
+            route=route,
+            response_status=response_status,
+            capability_call_count=capability_call_count,
+        )
+    except ValueError:
+        return terminal_status
+    if verdict == "zero_dispatch_regression":
+        return FACTUAL_ZERO_DISPATCH_TERMINAL
+    return terminal_status
+
+
+def admitted_retrieval_unit_count(value: int) -> int:
+    """Return the admitted-use count carried by ``retrieved_unit_count``.
+
+    ``DocumentRetrieveOutput.retrieved_unit_count`` counts admitted
+    ``EvidenceUse`` records, NOT unique/distinct chunks: the same chunk
+    admitted twice counts twice, and this helper never dedupes. Callers
+    MUST NOT read the result as a unique-chunk count (Task 2 M1, still
+    open by design). Non-integer (``bool`` rejected) or negative inputs
+    raise ``ValueError``.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(
+            "retrieved_unit_count must be an int, "
+            f"got {value!r}; refusing to record"
+        )
+    if value < 0:
+        raise ValueError(
+            f"retrieved_unit_count must be >= 0, got {value!r}; refusing to record"
+        )
+    return value

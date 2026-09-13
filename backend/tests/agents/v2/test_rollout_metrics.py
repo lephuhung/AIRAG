@@ -1112,3 +1112,296 @@ def test_collector_counts_sentinel_rows_invalid_and_gate_fails():
     passed, failures = gate.check_gate(report)
     assert passed is False
     assert any("invalid security" in failure for failure in failures)
+
+
+# ---------------------------------------------------------------------------
+# P0 Task 6: factual-retrieval execution observability (zero-dispatch gate).
+# ---------------------------------------------------------------------------
+
+
+def test_task6_zero_dispatch_factual_complex_is_regression():
+    from app.services.agent import rollout_metrics as metrics
+
+    assert (
+        metrics.classify_factual_execution(
+            route="complex_research",
+            response_status="success",
+            capability_call_count=0,
+        )
+        == "zero_dispatch_regression"
+    )
+    assert (
+        metrics.classify_factual_execution(
+            route="complex_research",
+            response_status="insufficient",
+            capability_call_count=0,
+        )
+        == "zero_dispatch_regression"
+    )
+
+
+def test_task6_typed_unsupported_denied_stay_typed():
+    from app.services.agent import rollout_metrics as metrics
+
+    for typed in ("denied", "unsupported", "unavailable", "clarify", "error"):
+        assert (
+            metrics.classify_factual_execution(
+                route="complex_research",
+                response_status=typed,
+                capability_call_count=0,
+            )
+            == "typed_non_execution"
+        ), typed
+
+
+def test_task6_executed_non_factual_and_unobservable():
+    from app.services.agent import rollout_metrics as metrics
+
+    assert (
+        metrics.classify_factual_execution(
+            route="complex_research",
+            response_status="success",
+            capability_call_count=3,
+        )
+        == "executed"
+    )
+    assert (
+        metrics.classify_factual_execution(
+            route="direct", response_status="success", capability_call_count=0
+        )
+        == "non_factual"
+    )
+    assert (
+        metrics.classify_factual_execution(
+            route="complex_research",
+            response_status="success",
+            capability_call_count=None,
+        )
+        == "unobservable"
+    )
+    with pytest.raises(ValueError):
+        metrics.classify_factual_execution(
+            route="complex_research",
+            response_status="success",
+            capability_call_count=True,
+        )
+
+
+def test_task6_emit_remaps_zero_dispatch_to_sentinel_terminal():
+    import asyncio
+
+    from app.services.agent import rollout_metrics as metrics
+
+    added: list = []
+
+    class FakeDB:
+        def add(self, row):
+            added.append(row)
+
+        async def commit(self):
+            return None
+
+        async def rollback(self):
+            return None
+
+    async def _run():
+        return await metrics.emit_terminal_rollout_metric(
+            FakeDB(),
+            arm="v2",
+            request_id="req-zero-dispatch-1",
+            workspace_ids=["ws-1"],
+            started_at=datetime.now(UTC) - timedelta(seconds=2),
+            terminal_status="success",
+            citation_count=0,
+            cancelled=False,
+            answer_text="grounded answer",
+            factual_expected=True,
+            served_document_ids=[],
+            allowed_document_ids=None,
+            production_write_count=0,
+            scope_bound=True,
+            route="complex_research",
+            response_status="insufficient",
+            capability_call_count=0,
+        )
+
+    row = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(_run())
+    assert row is not None
+    assert len(added) == 1
+    assert row.terminal_status == metrics.FACTUAL_ZERO_DISPATCH_TERMINAL
+
+
+def test_task6_emit_keeps_typed_denied_terminal():
+    import asyncio
+
+    from app.services.agent import rollout_metrics as metrics
+
+    added: list = []
+
+    class FakeDB:
+        def add(self, row):
+            added.append(row)
+
+        async def commit(self):
+            return None
+
+        async def rollback(self):
+            return None
+
+    async def _run():
+        return await metrics.emit_terminal_rollout_metric(
+            FakeDB(),
+            arm="v2",
+            request_id="req-denied-1",
+            workspace_ids=["ws-1"],
+            started_at=datetime.now(UTC) - timedelta(seconds=2),
+            terminal_status="success",
+            citation_count=0,
+            cancelled=False,
+            answer_text="Access denied.",
+            factual_expected=False,
+            served_document_ids=[],
+            allowed_document_ids=["doc-a"],
+            production_write_count=0,
+            scope_bound=True,
+            route="complex_research",
+            response_status="denied",
+            capability_call_count=0,
+        )
+
+    row = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(_run())
+    assert row is not None
+    assert row.terminal_status == "success"
+
+
+def test_task6_collector_counts_zero_dispatch_as_error():
+    collector = _script_module("collect_v2_rollout_report")
+
+    from app.services.agent import rollout_metrics as metrics
+
+    rows = _synthetic_rows(n_v1=210, n_v2=210)
+    zero_dispatch = [row for row in rows if row["arm"] == "v2"][:5]
+    for index, row in enumerate(zero_dispatch):
+        row.update(
+            {
+                "terminal_status": metrics.FACTUAL_ZERO_DISPATCH_TERMINAL,
+                "request_id_hash": f"v2-zero-dispatch-{index}",
+            }
+        )
+    report = collector.summarize_metrics(rows)
+    arm = report["arms"]["v2"]
+    assert arm["factual_zero_dispatch_regressions"] == 5
+    assert arm["errors"] >= 5
+    dumped = repr(report).lower()
+    assert "unique" not in dumped
+    assert "distinct" not in dumped
+
+
+def test_task6_collector_keeps_typed_denied_out_of_errors():
+    collector = _script_module("collect_v2_rollout_report")
+
+    rows = _synthetic_rows(n_v1=210, n_v2=210)
+    denied = [row for row in rows if row["arm"] == "v2"][:3]
+    for index, row in enumerate(denied):
+        row.update(
+            {
+                "terminal_status": "denied",
+                "request_id_hash": f"v2-denied-{index}",
+            }
+        )
+    report = collector.summarize_metrics(rows)
+    arm = report["arms"]["v2"]
+    assert arm["factual_zero_dispatch_regressions"] == 0
+    assert arm["errors"] == 0
+    assert arm["completed"] == 210
+
+
+def test_task6_gate_fails_on_sustained_zero_dispatch():
+    collector = _script_module("collect_v2_rollout_report")
+    gate = _script_module("check_v2_rollout_gate")
+
+    from app.services.agent import rollout_metrics as metrics
+
+    rows = _synthetic_rows(n_v1=210, n_v2=210)
+    zero_dispatch = [row for row in rows if row["arm"] == "v2"][:10]
+    for index, row in enumerate(zero_dispatch):
+        row.update(
+            {
+                "terminal_status": metrics.FACTUAL_ZERO_DISPATCH_TERMINAL,
+                "request_id_hash": f"v2-zero-dispatch-{index}",
+            }
+        )
+    report = collector.summarize_metrics(rows)
+    passed, failures = gate.check_gate(report)
+    assert passed is False
+    assert any("error" in failure for failure in failures)
+
+
+def test_task6_no_raw_content_in_metric_rows():
+    import asyncio
+    import json
+
+    from app.services.agent import rollout_metrics as metrics
+
+    secret = "SECRET-CHUNK-9f3c2a-content-must-never-persist"
+    added: list = []
+
+    class FakeDB:
+        def add(self, row):
+            added.append(row)
+
+        async def commit(self):
+            return None
+
+        async def rollback(self):
+            return None
+
+    async def _run():
+        return await metrics.emit_terminal_rollout_metric(
+            FakeDB(),
+            arm="v2",
+            request_id="req-hygiene-1",
+            workspace_ids=["ws-1"],
+            started_at=datetime.now(UTC) - timedelta(seconds=2),
+            terminal_status="success",
+            citation_count=1,
+            cancelled=False,
+            answer_text=f"grounded answer citing {secret}",
+            factual_expected=True,
+            served_document_ids=["doc-a"],
+            allowed_document_ids=["doc-a"],
+            production_write_count=0,
+            scope_bound=True,
+        )
+
+    row = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(_run())
+    assert row is not None
+    dumped = json.dumps(row.__dict__, default=str)
+    assert secret not in dumped
+    assert set(metrics.METRIC_STORED_KEYS) == {
+        "arm",
+        "request_id_hash",
+        "workspace_id_hash",
+        "started_at",
+        "finished_at",
+        "duration_ms",
+        "terminal_status",
+        "citation_count",
+        "cancelled",
+        "security_checkpoint_secret",
+        "security_ungrounded_factual_success",
+        "security_acl_leak",
+        "security_duplicate_production_write",
+    }
+
+
+def test_task6_retrieved_unit_count_is_admitted_not_unique():
+    from app.services.agent import rollout_metrics as metrics
+
+    assert metrics.admitted_retrieval_unit_count(2) == 2
+    assert metrics.admitted_retrieval_unit_count(0) == 0
+    with pytest.raises(ValueError):
+        metrics.admitted_retrieval_unit_count(True)
+    with pytest.raises(ValueError):
+        metrics.admitted_retrieval_unit_count(-1)
+    assert "unique" in metrics.admitted_retrieval_unit_count.__doc__.lower()

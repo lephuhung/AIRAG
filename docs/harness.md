@@ -172,6 +172,44 @@ target workspace (or an authenticated superadmin `--token` drive through
 `POST /api/v1/admin/agent/evaluate`). Not runnable offline — record the
 reports as gate evidence when run.
 
+## P0 factual-retrieval live gate (v2 `document.retrieve`)
+
+Two authenticated factual probes prove reference-free and hard-scoped v2
+queries execute revision-aware retrieval instead of terminating with zero
+capability calls. Both need a JWT (`auth.md`: `POST /auth/login`, or the
+test-only in-container mint) and a workspace with indexed documents; the v2
+arm needs the canary for that workspace (or a superadmin evaluate drive).
+**Never restart vLLM or any engine for these probes** (`vllm.md`).
+
+```bash
+API=http://localhost:8080/api/v1
+TOKEN=$(curl -s -X POST $API/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"$AB_USER","password":"$AB_PASSWORD"}' | jq -r .access_token)
+WS=<workspace-uuid-with-documents>
+DOC=<document-uuid-in-$WS>   # from GET /workspaces + /rag/stats/$WS
+
+# 1) unscoped factual query (reference-free; retrieval over workspace scope)
+ curl -s -N $API/rag/chat/agent-lg/$WS/stream \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"message":"<factual question the corpus covers>","version":"v2"}'
+
+# 2) hard-scoped factual query (document_ids are a hard scope, not candidates)
+ curl -s -N $API/rag/chat/agent-lg/$WS/stream \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"message":"<factual question>","version":"v2","document_ids":["'$DOC'"]}'
+```
+
+Required evidence per probe: non-zero `document.retrieve` task /
+capability call and `EvidenceUse`; at least one citation on success; every
+scoped citation's document ID is a subset of the requested `document_ids`;
+no ~100 ms zero-dispatch terminal (a factual complex terminal with zero
+capability calls is recorded as `factual_zero_dispatch` and counted as an
+error for rollout gates — `app/services/agent/rollout_metrics.py`,
+`scripts/collect_v2_rollout_report.py`; typed `denied`/unsupported outcomes
+stay typed and are not errors). If credentials or the live stack are
+unavailable, record the exact blocker/commands — never fake success.
+
 ## Operational hand-off (live steps not runnable from a worktree session)
 
 These require the live Compose stack (`hrag-backend` bind-mounts the main
