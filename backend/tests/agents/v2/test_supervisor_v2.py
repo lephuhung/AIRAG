@@ -625,14 +625,16 @@ async def test_execute_requires_checkpointed_plan() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Complex route: typed unavailable, no dispatch (Phase 3 owns the seam)
+# Complex route: typed insufficient on a missing verdict (defect #3 owns this)
 # ---------------------------------------------------------------------------
 # Phase 3: the complex route enters the governed complex-research subgraph and
 # fails closed there (this fixture binds two `target` roles and wires no
 # document.read capability, so the compare pilot refuses to fabricate a plan).
-# The boundary wrapper converts that into the sticky typed error: the route
-# is cleared, the final response is a typed `error` (never success), nothing
-# is dispatched, and the binding pins stay leased.
+# With no checkpointed verdict the finalizer emits the typed missing-verdict
+# reply instead of raising: the semantic carries resolved refs and no blocking
+# ambiguities, so per criterion A the outcome is typed `insufficient` (never
+# success, never a generic `error`), nothing is dispatched, the route is
+# retained (no conversion cleared it), and the binding pins stay leased.
 
 
 @pytest.mark.asyncio
@@ -671,11 +673,11 @@ async def test_complex_route_returns_typed_unavailable() -> None:
     result = await graph.ainvoke(
         make_state(request=make_request("So sánh hai tài liệu")), config, context=runtime
     )
-    # The subgraph failed closed (no plannable two-sided read here), so the
-    # owned boundary converted: the topology is cleared and only the typed
-    # error marker remains.
-    assert N(result)["route_decision"] is None
-    assert N(result)["final_response"].status == "error"
+    # The subgraph failed closed (no plannable two-sided read here), so no
+    # verdict was checkpointed: the finalizer emits the typed missing-verdict
+    # reply (defect #3) instead of raising into a generic error conversion.
+    assert N(result)["route_decision"] is not None
+    assert N(result)["final_response"].status == "insufficient"
     assert N(result)["final_response"].status != "success"
     assert capability.calls == [], "complex routes must not dispatch Phase-2 capabilities"
     assert any(event.startswith("acquire:") for event in events)

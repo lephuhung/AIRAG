@@ -149,15 +149,64 @@ def _typed_synthesis_failure(state: SupervisorV2State) -> dict:
     )
 
 
+#: Statuses that mean the turn cannot proceed without the user naming a
+#: document (criterion A: the semantic signal, not the missing verdict, decides
+#: clarify vs insufficient).
+_NEEDS_INPUT_REF_STATUSES = frozenset({"unresolved", "ambiguous"})
+
+
+def _semantic_needs_input(state: SupervisorV2State) -> bool:
+    """True when an unresolved/ambiguous reference or a blocking ambiguity remains."""
+    semantic = state["semantic"]
+    if semantic.blocking_ambiguities:
+        return True
+    return any(
+        ref.resolution_status in _NEEDS_INPUT_REF_STATUSES
+        for ref in semantic.document_refs
+    )
+
+
+def _typed_missing_verdict(state: SupervisorV2State) -> dict:
+    """Turn a factual/complex turn with no checkpointed verdict into a typed reply.
+
+    Never raises, never succeeds: a user-fixable semantic gap clarifies; anything
+    else is typed ``insufficient``. Internal identifiers are never surfaced.
+    """
+    semantic = state["semantic"]
+    if _semantic_needs_input(state):
+        details = [ambiguity.description for ambiguity in semantic.blocking_ambiguities]
+        spans = [
+            ref.original_span
+            for ref in semantic.document_refs
+            if ref.resolution_status in _NEEDS_INPUT_REF_STATUSES
+        ]
+        if spans:
+            details.append("chưa xác định: " + ", ".join(spans))
+        content = _NEEDS_INPUT_CONTENT + (" " + " ".join(details) if details else "")
+        return _emit(
+            FinalResponse(
+                contract_version=CONTRACT_VERSION,
+                status="clarify",
+                content=content,
+                citations=(),
+            )
+        )
+    return _emit(
+        FinalResponse(
+            contract_version=CONTRACT_VERSION,
+            status="insufficient",
+            content=_INSUFFICIENT_CONTENT,
+            citations=(),
+        )
+    )
+
+
 async def _finalize_factual(
     state: SupervisorV2State, context: GraphRuntimeContext
 ) -> dict:
     evaluation = state["execution"].evidence_evaluation
     if evaluation is None:
-        raise FinalizerError(
-            "factual finalization requires a checkpointed EvidenceEvaluation; "
-            "refusing to emit a response without a verdict"
-        )
+        return _typed_missing_verdict(state)
     if evaluation.status == "needs_input":
         details = [
             ambiguity.description
@@ -309,8 +358,9 @@ async def finalizer_node(
     if route.route == "complex_research":
         # Phase 3 (R4): the complex subgraph evaluated; `sufficient` runs
         # were synthesized + grounded through the shared channel and every
-        # other verdict is typed here. An evaluation-less complex turn fails
-        # closed inside `_finalize_factual` (converted to a typed error).
+        # other verdict is typed here. An evaluation-less complex turn
+        # returns the typed missing-verdict reply from `_finalize_factual`
+        # (clarify when a semantic gap remains, else insufficient).
         return await _finalize_factual(state, context)
     return _emit(
         FinalResponse(
