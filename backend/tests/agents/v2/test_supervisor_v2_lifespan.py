@@ -668,18 +668,38 @@ async def test_task5_service_drops_foreign_and_malformed_hits(
     from uuid import UUID as _UUID
 
     other_rev = _UUID("44444444-4444-4444-4444-444444444444")
+    # Every rejected hit carries a DISTINCT dedupe key
+    # ``(revision_id, document_id, chunk_id)`` (see ``retrieve``) and distinct
+    # content, so a rejection is observable only through its own ``_coerce_hit``
+    # guard: dedupe can never hide a leaked hit, and the content assertion can
+    # never mistake a survivor for the admitted chunk.
     provider = _Task5Provider(
         hits=[
-            _task5_hit(),  # admitted
-            _task5_hit(revision_id=other_rev),  # stale revision → drop
-            _task5_hit(document_id=TASK5_FOREIGN_DOC),  # foreign doc → drop
-            _task5_hit(workspace_id=TASK5_OTHER_WS),  # foreign ws → drop
-            _task5_hit(content="   "),  # blank → drop
-            {
-                "id": "not-a-vector-id",
-                "content": "garbage",
-                "metadata": {"nope": True},
-            },  # malformed → drop
+            _task5_hit(),  # admitted (chunk-1 / "pinned chunk text")
+            _task5_hit(
+                revision_id=other_rev,
+                chunk_id="chunk-stale",
+                content="stale revision chunk",
+            ),  # stale revision → drop
+            _task5_hit(
+                document_id=TASK5_FOREIGN_DOC,
+                chunk_id="chunk-foreign-doc",
+                content="foreign document chunk",
+            ),  # foreign doc → drop
+            _task5_hit(
+                workspace_id=TASK5_OTHER_WS,
+                chunk_id="chunk-foreign-ws",
+                content="foreign workspace chunk",
+            ),  # foreign ws → drop (only the workspace check can drop it)
+            _task5_hit(
+                content="   ", chunk_id="chunk-blank"
+            ),  # blank → drop
+            _task5_hit(
+                vector_id=f"doc_{TASK5_DOC}_chunk_0",
+                chunk_id="chunk-legacy",
+                content="legacy vector id chunk",
+            ),  # legacy id shape → drop (metadata matches, so only the
+            # ``parse_revision_vector_id`` shape check can drop it)
         ]
     )
     service = _task5_service(provider)
@@ -692,7 +712,12 @@ async def test_task5_service_drops_foreign_and_malformed_hits(
         workspace_ids=(TASK5_WS,),
     )
 
+    # Exact admitted count AND content: removing any single ``_coerce_hit``
+    # guard admits an extra distinctly-identified chunk and fails here.
+    assert len(chunks) == 1
     assert [c.content for c in chunks] == ["pinned chunk text"]
+    assert chunks[0].locator.start == "chunk-1"
+    assert chunks[0].locator.end == "chunk-1"
 
 
 @pytest.mark.asyncio
@@ -725,6 +750,150 @@ async def test_task5_service_unscoped_skips_unresolvable_candidates(
     # Only the owned identity's namespace is ever queried.
     assert [c["namespace"] for c in provider.query_calls] == [TASK5_NS]
     assert calls["unscoped"] == []
+
+
+@pytest.mark.asyncio
+async def test_task5_default_namespace_query_uses_manifest_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production default query path passes the manifest namespace through."""
+    from app.services.embedding import vector_store as _vs
+
+    provider = _Task5Provider()
+    # No ``query_namespace`` port → the production
+    # ``_default_revision_namespace_query`` default is exercised.
+    service = supervisor_v2.V1RevisionAwareRetrievalService(
+        session_factory=_task5_session_factory(),
+        embed_query=provider.embed_query,
+        rerank=provider.rerank,
+    )
+    _patch_task5_manifests(monkeypatch, scoped=_task5_identity())
+
+    store_calls: list[dict] = []
+
+    class _FakeStore:
+        def query(
+            self,
+            *,
+            query_embedding: list[float],
+            n_results: int,
+            where: dict | None = None,
+        ) -> dict:
+            store_calls.append(
+                {"n_results": n_results, "where": where}
+            )
+            return {
+                "ids": [f"rev_{TASK5_REV}_chunk_0"],
+                "documents": ["pinned chunk text"],
+                "metadatas": [
+                    {
+                        "document_id": str(TASK5_DOC),
+                        "workspace_id": str(TASK5_WS),
+                        "revision_id": str(TASK5_REV),
+                        "chunk_id": "chunk-1",
+                        "ordinal": 0,
+                    }
+                ],
+                "distances": [0.1],
+            }
+
+    seen: list[tuple] = []
+
+    def _fake_get_store(workspace_id: Any, namespace: Any = None) -> Any:
+        seen.append((workspace_id, namespace))
+        return _FakeStore()
+
+    monkeypatch.setattr(_vs, "get_vector_store", _fake_get_store)
+
+    chunks = await service.retrieve(
+        "query",
+        top_k=8,
+        allowed_targets=(_task5_target(),),
+        workspace_ids=(TASK5_WS,),
+    )
+
+    # The default path reached the real vector-store seam (not the injected
+    # provider port) with the EXACT manifest namespace; the workspace is
+    # derived from that namespace, and the hard filters travel with it.
+    assert provider.query_calls == []
+    assert seen == [(TASK5_WS, TASK5_NS)]
+    assert len(store_calls) == 1
+    assert str(TASK5_REV) in str(store_calls[0]["where"])
+    assert str(TASK5_DOC) in str(store_calls[0]["where"])
+    assert len(chunks) == 1
+    assert chunks[0].content == "pinned chunk text"
+
+
+@pytest.mark.asyncio
+async def test_task5_default_namespace_query_rejects_unqualified_namespace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy/unqualified namespaces fail closed before any store IO."""
+    from app.services.embedding import vector_store as _vs
+
+    def _forbidden_store(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(
+            "an unqualified namespace must never reach the vector store"
+        )
+
+    monkeypatch.setattr(_vs, "get_vector_store", _forbidden_store)
+
+    # Direct seam: the legacy ``kb_<workspace>`` (current-config) collection
+    # name and a bare unqualified name both raise.
+    with pytest.raises(supervisor_v2.V1ServiceUnavailable):
+        await supervisor_v2._default_revision_namespace_query(
+            f"kb_{TASK5_WS}", [0.1, 0.2, 0.3], 8, {"$and": []}
+        )
+    with pytest.raises(supervisor_v2.V1ServiceUnavailable):
+        await supervisor_v2._default_revision_namespace_query(
+            "not-a-namespace", [0.1, 0.2, 0.3], 8, {"$and": []}
+        )
+
+    # Service level: a manifest carrying a legacy namespace fails closed
+    # through the same default path with zero provider/store calls.
+    provider = _Task5Provider(hits=[_task5_hit()])
+    service = supervisor_v2.V1RevisionAwareRetrievalService(
+        session_factory=_task5_session_factory(),
+        embed_query=provider.embed_query,
+        rerank=provider.rerank,
+    )
+    _patch_task5_manifests(
+        monkeypatch,
+        scoped=_task5_identity(embedding_namespace=f"kb_{TASK5_WS}"),
+    )
+    with pytest.raises(supervisor_v2.V1ServiceUnavailable):
+        await service.retrieve(
+            "query",
+            top_k=8,
+            allowed_targets=(_task5_target(),),
+            workspace_ids=(TASK5_WS,),
+        )
+    assert provider.query_calls == []
+
+
+def test_task5_probe_reports_revision_retrieval_gate_by_default() -> None:
+    """Default probe path: the vector-store backing imports → gate present."""
+    assert "v1-revision-retrieval" in supervisor_v2.probe_v1_services()
+
+
+def test_task5_probe_omits_revision_retrieval_gate_when_backing_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Probe default path fails closed when the vector-store seam is gone."""
+    real_v1_attr = supervisor_v2._v1_attr
+
+    def _missing_backing(module_name: str, attr: str) -> Any:
+        if (module_name, attr) == (
+            "app.services.embedding.vector_store",
+            "get_vector_store",
+        ):
+            raise supervisor_v2.V1ServiceUnavailable(
+                "app.services.embedding.vector_store is not importable"
+            )
+        return real_v1_attr(module_name, attr)
+
+    monkeypatch.setattr(supervisor_v2, "_v1_attr", _missing_backing)
+    assert "v1-revision-retrieval" not in supervisor_v2.probe_v1_services()
 
 
 def test_task5_registry_includes_document_retrieve_only_when_service_live() -> None:
