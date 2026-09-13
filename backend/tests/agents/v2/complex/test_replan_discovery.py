@@ -48,7 +48,6 @@ from app.services.agents.v2.contracts.evidence import DocumentSourceIdentity, Ev
 from app.services.agents.v2.contracts.execution import (
     AgentRequest,
     AgentResult,
-    TaskExecutionSummary,
 )
 from app.services.agents.v2.contracts.locators import DocumentLocator
 from app.services.agents.v2.contracts.planning import (
@@ -1060,7 +1059,9 @@ async def test_replan_origin_carries_evidence_use_trigger_lineage(replan_setting
 
     proposal = build_replan_proposal(child, context)
     assert proposal is not None
-    new_tasks = proposal.tasks[len(child["plan"].tasks):]
+    # R50: build_replan_proposal returns a PROPOSAL (new tasks), never an
+    # authoritative appended plan.
+    new_tasks = proposal.new_tasks
     assert len(new_tasks) >= 1
     prior_use_ids = {
         ref.use_id for result in child["task_results"] for ref in result.evidence_uses
@@ -1486,175 +1487,6 @@ async def test_real_t1_timeout_drives_distinct_recovery(
     assert [call[0].task_id for call in people.calls] == ["T1"]
     assert [call[0].task_id for call in search.calls] == ["T2"]
     assert terminal["evaluation"].status == "insufficient"
-
-
-@pytest.mark.asyncio
-async def test_timeout_recovery_is_distinct_and_fabricates_nothing(
-    discovery_settings: None,
-) -> None:
-    """R37/§26: TIMEOUT is typed distinctly from not_found, same guarantees."""
-    from app.services.agents.v2.complex_research_graph import (
-        build_complex_research_subgraph,
-        replan_advisable,
-    )
-
-    capabilities, _, _, context = _discovery_harness(run_id="run-timeout-1")
-    search_capability = capabilities[1]
-    child = _child_input(
-        plan=_people_plan(),
-        task_results=(_timeout_people_result(),),
-        evaluation=_insufficient_evaluation(),
-        replans_remaining=2,
-    )
-    assert replan_advisable(child) is True
-    output = await build_complex_research_subgraph().ainvoke(child, context=context)
-    tasks = output["plan"].tasks
-    assert [task.task_id for task in tasks] == ["T1", "T2"]
-    recovery = tasks[1]
-    assert recovery.capability == "document.search"
-    assert recovery.input.person_identifier is None  # type: ignore[union-attr]
-    assert isinstance(recovery.origin, ReplanTaskOrigin)
-    assert "TIMEOUT" in recovery.origin.reason
-    assert "not_found" not in recovery.origin.reason
-    assert [call[0].task_id for call in search_capability.calls] == ["T2"]
-    assert output["evaluation"].status == "insufficient"
-
-
-def test_denied_people_task_never_recovers() -> None:
-    """R37: denial is terminal — no fallback work is proposed for it."""
-    from app.services.agents.v2.complex_research_graph import replan_advisable
-
-    denied = AgentResult(
-        contract_version="2.0",
-        task_id="T1",
-        status="denied",
-        data=None,
-        evidence_uses=(),
-        coverage_observations=(),
-        error={"code": "PERMISSION_DENIED", "message": "no", "retryable": False},  # type: ignore[arg-type]
-    )
-    child = _child_input(
-        plan=_people_plan(),
-        task_results=(denied,),
-        evaluation=_insufficient_evaluation(),
-        replans_remaining=2,
-    )
-    assert replan_advisable(child) is False
-
-
-@pytest.mark.asyncio
-async def test_real_t1_not_found_drives_recovery(discovery_settings: None) -> None:
-    """R42: REAL graph entry — initial T1 executes not_found, recovery follows.
-
-    Builds the plan via the real initial-plan path (cross_domain →
-    people-first T1), runs the real execute (stub returns not_found), the
-    real evaluate (insufficient via the task-evidence gate), and the real
-    decide (recovery admissible). T1 is never rerun; no scalar is fabricated;
-    not_found stays distinct from TIMEOUT.
-    """
-    from app.services.agents.v2.complex_research_graph import (
-        _decide_branch,
-        complex_evaluate_node,
-        complex_execute_node,
-        decide_node,
-        people_document_materialize_node,
-        plan_node,
-        replan_advisable,
-        validate_checkpoint_node,
-    )
-
-    people, search, _, _, _, context = _people_harness(
-        "run-real-nf-1", FakePeopleCapability(status="not_found")
-    )
-    child = _child_input(
-        semantic=_person_semantic(),
-        query_analysis=_cross_domain_analysis(),
-        replans_remaining=2,
-    )
-    # Real entry: plan marker, then the initial-plan path builds T1.
-    assert await plan_node(child, context) == {}
-    child = {**child, **await validate_checkpoint_node(child, context)}
-    assert [task.task_id for task in child["plan"].tasks] == ["T1"]
-    assert child["plan"].tasks[0].capability == "people.lookup"
-
-    # Real execute: the stub capability returns not_found with no uses.
-    child = {**child, **await complex_execute_node(child, context)}
-    assert [(r.task_id, r.status) for r in child["task_results"]] == [
-        ("T1", "not_found")
-    ]
-    assert [call[0].task_id for call in people.calls] == ["T1"]
-
-    # Materialization stays dormant on not_found: no dependent, no scalar.
-    child = {**child, **await people_document_materialize_node(child, context)}
-    assert [task.task_id for task in child["plan"].tasks] == ["T1"]
-    assert child["people_scalar_available"] == {"T1": False}
-
-    # Real evaluate: insufficient via the task-evidence gate (no target gap).
-    child = {**child, **await complex_evaluate_node(child, context)}
-    assert child["evaluation"].status == "insufficient"
-    assert child["evaluation"].missing == ()
-
-    # Real decide: recovery admissible, not a silent finalize.
-    assert replan_advisable(child) is True
-    assert _decide_branch(child) == "replan"
-    assert (await decide_node(child, context)) == {}
-
-    # Recovery appends the fallback (T1 untouched) and T1 is never rerun.
-    child = {**child, **await validate_checkpoint_node(child, context)}
-    assert [task.task_id for task in child["plan"].tasks] == ["T1", "T2"]
-    recovery = child["plan"].tasks[1]
-    assert recovery.capability == "document.search"
-    assert recovery.input.person_identifier is None  # type: ignore[union-attr]
-    assert "not_found" in recovery.origin.reason  # type: ignore[union-attr]
-    assert "TIMEOUT" not in recovery.origin.reason  # type: ignore[union-attr]
-    child = {**child, **await complex_execute_node(child, context)}
-    assert [call[0].task_id for call in people.calls] == ["T1"]
-    assert [call[0].task_id for call in search.calls] == ["T2"]
-
-
-@pytest.mark.asyncio
-async def test_real_t1_timeout_drives_distinct_recovery(
-    discovery_settings: None,
-) -> None:
-    """R42: REAL graph entry — T1 TIMEOUT recovers distinctly from not_found."""
-    from app.services.agents.v2.complex_research_graph import (
-        _decide_branch,
-        build_task_execution_summaries,
-        complex_evaluate_node,
-        complex_execute_node,
-        replan_advisable,
-        validate_checkpoint_node,
-    )
-
-    people, search, _, _, _, context = _people_harness(
-        "run-real-to-1", FakePeopleCapability(status="error", error_code="TIMEOUT")
-    )
-    child = _child_input(
-        semantic=_person_semantic(),
-        query_analysis=_cross_domain_analysis(),
-        replans_remaining=2,
-    )
-    child = {**child, **await validate_checkpoint_node(child, context)}
-    assert child["plan"].tasks[0].capability == "people.lookup"
-    child = {**child, **await complex_execute_node(child, context)}
-    assert [(r.task_id, r.status) for r in child["task_results"]] == [
-        ("T1", "error")
-    ]
-    outcomes = build_task_execution_summaries(child["task_results"])
-    assert outcomes[0].error_code == "TIMEOUT"
-    child = {**child, **await complex_evaluate_node(child, context)}
-    assert child["evaluation"].status == "insufficient"
-    assert replan_advisable(child) is True
-    assert _decide_branch(child) == "replan"
-    child = {**child, **await validate_checkpoint_node(child, context)}
-    recovery = child["plan"].tasks[1]
-    assert recovery.capability == "document.search"
-    assert recovery.input.person_identifier is None  # type: ignore[union-attr]
-    assert "TIMEOUT" in recovery.origin.reason  # type: ignore[union-attr]
-    assert "not_found" not in recovery.origin.reason  # type: ignore[union-attr]
-    child = {**child, **await complex_execute_node(child, context)}
-    assert [call[0].task_id for call in people.calls] == ["T1"]
-    assert [call[0].task_id for call in search.calls] == ["T2"]
 
 
 def test_canonical_loop_edges_checkpoint_replan_before_execute() -> None:
@@ -2344,6 +2176,7 @@ def test_replan_input_carries_no_people_scalar() -> None:
     from app.services.agents.v2.dependencies.people_document import (
         append_materialized_dependent,
     )
+    from app.services.agents.v2.replanning import append_replan_tasks
 
     base = TaskPlan(
         contract_version="2.0",
@@ -2362,12 +2195,10 @@ def test_replan_input_carries_no_people_scalar() -> None:
         ),
     )
     use_id = uuid4()
-    materialized = append_materialized_dependent(
+    # R50: append_materialized_dependent returns the concrete T2 PROPOSAL;
+    # the governed append (append_replan_tasks) builds the authoritative plan.
+    dependent = append_materialized_dependent(
         current=base,
-        outcomes=(
-            # Success outcome for the people task (typed, no evidence content).
-            TaskExecutionSummary(task_id="T1", status="success"),
-        ),
         outcome=PeopleDocumentMaterialization(
             kind="materialized",
             scalar="012345678901",
@@ -2382,11 +2213,8 @@ def test_replan_input_carries_no_people_scalar() -> None:
         ),
         query="nghi dinh",
         next_task_id="T2",
-        policy=_policy(
-            allow_supporting_discovery=True, max_discovered_documents=1
-        ),
-        budget=_budget(max_tasks_remaining=7, max_replans_remaining=1),
     )
+    materialized = append_replan_tasks(base, (dependent,))
     assert materialized.tasks[1].input.person_identifier == "012345678901"  # type: ignore[union-attr]
 
     _, _, context = _harness(run_id="run-redact-1")
@@ -2844,90 +2672,154 @@ def test_bounded_summarize_stays_fast() -> None:
 
 @pytest.mark.asyncio
 async def test_subagent_cannot_append_authoritative_tasks() -> None:
-    """R48.1+R48.3: plan appends happen ONLY in governed entry points.
+    """R50: every authoritative plan-append is single-sourced and governed.
 
-    Structural (AST, function granularity — not a file whitelist): a
-    ``TaskPlan(`` constructor or a ``.tasks +`` tuple extension anywhere
-    outside the listed governed functions FAILS this guard, so a new
-    unvalidated append inside ``complex_research_graph.py`` (or anywhere
-    else) cannot slip through. A second AST check proves checkpointed-plan
-    updates are returned only by the two owning nodes. Behavioral: even a
-    hand-built rogue plan fed straight to the shared scheduler fails closed
-    with a typed error and dispatches nothing — a non-governed append is
-    unreachable AND unexecutable.
+    Structural (AST, function granularity, with temporary-variable taint
+    tracking -- not a file whitelist and not only ``.tasks +``):
+
+    * ``TaskPlan(`` constructors exist only in the deterministic builders
+      (initial plans, never appends).
+    * the ONLY authoritative append construction site is
+      ``replanning.append_replan_tasks`` (``model_copy(update={"tasks":
+      current.tasks + tuple(new_tasks)})``).
+    * no function mutates ``.tasks`` in place (``.tasks =`` / ``+=``).
+    * ``model_copy(update={"tasks": ...})`` appears only in
+      ``append_replan_tasks`` (append) and ``redact_scalar_for_model``
+      (same-length model-facing redaction, never an authoritative append).
+    * ``append_replan_tasks`` is called only from the governed owners:
+      ``validate_checkpoint_node``, ``people_document_materialize_node`` and
+      ``AgentToolGateway.propose`` (call-graph basis).
+    * checkpointed-plan updates are returned only by the two owning nodes.
+
+    A rogue append in any other function -- via temporary variable, unpacking,
+    list construction, or a helper that returns an appended plan -- fails one
+    of these assertions, so an ungoverned append cannot slip through.
     """
     import ast
 
     v2_root = Path(__file__).resolve().parents[5] / "backend/app/services/agents/v2"
     assert v2_root.is_dir()
 
-    def enclosing_functions(tree: ast.AST) -> dict[int, tuple[str, ...]]:
-        scopes: dict[int, tuple[str, ...]] = {}
-
-        class Visitor(ast.NodeVisitor):
-            def __init__(self) -> None:
-                self.stack: list[str] = []
-
-            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-                self.stack.append(node.name)
-                scopes[id(node)] = tuple(self.stack)
-                self.generic_visit(node)
-                self.stack.pop()
-
-            visit_AsyncFunctionDef = visit_FunctionDef
-
-            def visit_Call(self, node: ast.Call) -> None:
-                scopes[id(node)] = tuple(self.stack)
-                self.generic_visit(node)
-
-            def visit_BinOp(self, node: ast.BinOp) -> None:
-                scopes[id(node)] = tuple(self.stack)
-                self.generic_visit(node)
-
-            def visit_Return(self, node: ast.Return) -> None:
-                scopes[id(node)] = tuple(self.stack)
-                self.generic_visit(node)
-
-        Visitor().visit(tree)
-        return scopes
-
-    def is_tasks_add(node: ast.BinOp) -> bool:
-        if not isinstance(node.op, ast.Add):
-            return False
-        return any(
-            isinstance(side, ast.Attribute) and side.attr == "tasks"
-            for side in (node.left, node.right)
-        )
-
     constructors: set[tuple[str, str]] = set()
-    appends: set[tuple[str, str]] = set()
+    add_sites: set[tuple[str, str]] = set()
+    in_place_sites: set[tuple[str, str]] = set()
+    model_copy_tasks_sites: set[tuple[str, str]] = set()
     plan_returns: set[tuple[str, str]] = set()
+    append_replan_tasks_callers: set[tuple[str, str]] = set()
+
     for module_path in sorted(v2_root.rglob("*.py")):
         if "__pycache__" in module_path.parts:
             continue
         rel = str(module_path.relative_to(v2_root))
         tree = ast.parse(module_path.read_text())
-        scopes = enclosing_functions(tree)
-        for node in ast.walk(tree):
-            scope = scopes.get(id(node), ())
-            func = scope[-1] if scope else "<module>"
-            if isinstance(node, ast.Call):
-                func_ref = node.func
-                name = (
-                    func_ref.id
-                    if isinstance(func_ref, ast.Name)
-                    else (func_ref.attr if isinstance(func_ref, ast.Attribute) else "")
-                )
+
+        class Visitor(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.scope: list[str] = []
+                self.tainted: list[set[str]] = []
+
+            def _func(self) -> str:
+                return self.scope[-1] if self.scope else "<module>"
+
+            def _tainted(self) -> set[str]:
+                return self.tainted[-1] if self.tainted else set()
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                self.scope.append(node.name)
+                self.tainted.append(set())
+                self.generic_visit(node)
+                self.tainted.pop()
+                self.scope.pop()
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def reads_tasks(self, node: ast.AST) -> bool:
+                if isinstance(node, ast.Attribute) and node.attr == "tasks":
+                    return True
+                if isinstance(node, ast.Name) and node.id in self._tainted():
+                    return True
+                if isinstance(node, (ast.Tuple, ast.List)):
+                    return any(self.reads_tasks(element) for element in node.elts)
+                if isinstance(node, ast.Starred):
+                    return self.reads_tasks(node.value)
+                if isinstance(node, ast.BinOp):
+                    return self.reads_tasks(node.left) or self.reads_tasks(node.right)
+                # Deliberately do NOT descend into Call args: ``len(plan.tasks)
+                # + 1`` computes a task id and must not count as an append.
+                return False
+
+            @staticmethod
+            def _call_name(func_ref: ast.expr) -> str:
+                if isinstance(func_ref, ast.Name):
+                    return func_ref.id
+                if isinstance(func_ref, ast.Attribute):
+                    return func_ref.attr
+                return ""
+
+            @staticmethod
+            def _is_model_copy_with_tasks(node: ast.Call) -> bool:
+                if Visitor._call_name(node.func) != "model_copy":
+                    return False
+                for keyword in node.keywords:
+                    if keyword.arg == "update" and isinstance(keyword.value, ast.Dict):
+                        return any(
+                            isinstance(key, ast.Constant) and key.value == "tasks"
+                            for key in keyword.value.keys
+                        )
+                return False
+
+            def visit_Assign(self, node: ast.Assign) -> None:
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and self.reads_tasks(node.value):
+                        self._tainted().add(target.id)
+                    if isinstance(target, ast.Attribute) and target.attr == "tasks":
+                        in_place_sites.add((rel, self._func()))
+                self.generic_visit(node)
+
+            def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+                if (
+                    isinstance(node.target, ast.Name)
+                    and node.value is not None
+                    and self.reads_tasks(node.value)
+                ):
+                    self._tainted().add(node.target.id)
+                if isinstance(node.target, ast.Attribute) and node.target.attr == "tasks":
+                    in_place_sites.add((rel, self._func()))
+                self.generic_visit(node)
+
+            def visit_AugAssign(self, node: ast.AugAssign) -> None:
+                if isinstance(node.target, ast.Attribute) and node.target.attr == "tasks":
+                    in_place_sites.add((rel, self._func()))
+                if isinstance(node.op, ast.Add) and self.reads_tasks(node.value):
+                    add_sites.add((rel, self._func()))
+                self.generic_visit(node)
+
+            def visit_BinOp(self, node: ast.BinOp) -> None:
+                if isinstance(node.op, ast.Add) and (
+                    self.reads_tasks(node.left) or self.reads_tasks(node.right)
+                ):
+                    add_sites.add((rel, self._func()))
+                self.generic_visit(node)
+
+            def visit_Call(self, node: ast.Call) -> None:
+                name = self._call_name(node.func)
                 if name == "TaskPlan":
-                    constructors.add((rel, func))
-            elif isinstance(node, ast.BinOp) and is_tasks_add(node):
-                appends.add((rel, func))
-            elif isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
-                if any(
+                    constructors.add((rel, self._func()))
+                elif name == "append_replan_tasks":
+                    append_replan_tasks_callers.add((rel, self._func()))
+                elif self._is_model_copy_with_tasks(node):
+                    model_copy_tasks_sites.add((rel, self._func()))
+                self.generic_visit(node)
+
+            def visit_Return(self, node: ast.Return) -> None:
+                if isinstance(node.value, ast.Dict) and any(
                     isinstance(key, ast.Constant) and key.value == "plan"
                     for key in node.value.keys
                 ):
-                    plan_returns.add((rel, func))
+                    plan_returns.add((rel, self._func()))
+                self.generic_visit(node)
+
+        Visitor().visit(tree)
 
     # Initial-plan constructors: deterministic builders and skill policies.
     assert constructors == {
@@ -2936,22 +2828,31 @@ async def test_subagent_cannot_append_authoritative_tasks() -> None:
         ("skills/summarize/policy.py", "build_summarize_workflow"),
         ("complex_research_graph.py", "_people_first_plan"),
     }
-    # Task-tuple EXTENSIONS: exactly the governed append owners. A new
-    # unvalidated ``.tasks +`` append in any other function fails here.
-    assert appends == {
+    # The single authoritative append construction site (R50).
+    assert add_sites == {("replanning.py", "append_replan_tasks")}
+    assert in_place_sites == set()
+    # model_copy(update={"tasks": ...}) only: append + same-length redaction.
+    assert model_copy_tasks_sites == {
+        ("replanning.py", "append_replan_tasks"),
+        ("dependencies/people_document.py", "redact_scalar_for_model"),
+    }
+    # Call-graph basis: the single append helper is reached only from the
+    # governed owners.
+    assert append_replan_tasks_callers == {
+        ("complex_research_graph.py", "validate_checkpoint_node"),
+        ("complex_research_graph.py", "people_document_materialize_node"),
         ("tools/gateway.py", "propose"),
-        ("complex_research_graph.py", "build_replan_proposal"),
-        ("dependencies/people_document.py", "append_materialized_dependent"),
     }
     # Checkpointed-plan updates are returned only by the two owning nodes
-    # (the parent→child mapping passes the already-checkpointed plan through).
+    # (the parent->child mapping passes the already-checkpointed plan through).
     assert plan_returns == {
         ("complex_research_graph.py", "validate_checkpoint_node"),
         ("complex_research_graph.py", "people_document_materialize_node"),
     }
 
-    # Behavioral unreachability: a hand-built rogue plan fed straight to the
-    # shared scheduler fails closed — typed error, zero dispatches.
+    # Behavioral unreachability: a hand-built rogue plan with an UNKNOWN
+    # capability fed straight to the shared scheduler fails closed -- typed
+    # error, zero dispatches.
     from app.services.agents.v2.contracts.capability import KnowledgeGraphInput
     from app.services.agents.v2.execution import execute_ready_tasks
 
@@ -2996,14 +2897,67 @@ async def test_subagent_cannot_append_authoritative_tasks() -> None:
         require_planned_dispatch(_two_target_plan(), "T-subagent-1", context)
 
 
-def test_subagent_cannot_receive_raw_people_record_or_runtime_secrets() -> None:
-    """R48.2 (restored): KNOWN scalar + runtime secrets never reach advisory payloads.
+def test_catalog_valid_append_bypassing_governance_is_rejected() -> None:
+    """R50: governance, not capability validity, rejects an ungoverned append.
 
-    Places a known People scalar into authoritative checkpointed state and
-    proves it (plus runtime authority field names) is ABSENT from every
-    advisory/subagent-facing projection. Non-vacuous: the sentinel IS
-    present in the checkpointed plan JSON.
+    ``document.search`` IS in the current catalog, so capability validity
+    alone would not reject it. But an append that fabricates a
+    ``person_identifier`` without going through the governed
+    People->Document materializer (the only governed place that may produce
+    a materialized scalar) is rejected by the governed validation entry
+    point with a frozen contract error -- not a capability mismatch.
     """
+    from app.services.agents.v2.replanning import validate_runtime_replan
+
+    _, _, _, context = _discovery_harness(run_id="run-governance-1")
+    current = _people_plan()
+    rogue = current.model_copy(
+        update={
+            "tasks": current.tasks
+            + (
+                TaskSpec(
+                    task_id="T2",
+                    capability="document.search",
+                    task_objective="rogue discovery search with a fabricated scalar",
+                    input=DocumentSearchInput(
+                        kind="document.search",
+                        query="nghi dinh",
+                        person_identifier="smuggled-scalar",
+                    ),
+                    depends_on=(),
+                    origin=ReplanTaskOrigin(
+                        kind="replan",
+                        reason="smuggled",
+                        task_ids=(),
+                        evidence_use_ids=(),
+                    ),
+                ),
+            )
+        }
+    )
+    with pytest.raises(ContractValidationError):
+        validate_runtime_replan(
+            current,
+            rogue,
+            (),
+            _policy(allow_supporting_discovery=True, max_discovered_documents=1),
+            _budget(),
+            context,
+        )
+
+
+def test_subagent_cannot_receive_raw_people_record_or_runtime_secrets() -> None:
+    """R51: KNOWN scalar + KNOWN runtime secret never reach advisory payloads.
+
+    Both sentinels are REAL (non-vacuous): the People scalar is present in
+    the authoritative checkpointed plan (T2 ``person_identifier``) and the
+    runtime secret is present in the request-scoped service seam
+    (``RuntimeServices.authorization``). Both must be ABSENT from every
+    advisory/subagent-facing projection (model replan input, observations,
+    tool adapter inputs). The test fails if either leaks into a projection.
+    """
+    import json
+
     from app.services.agents.v2.complex_research_graph import (
         build_model_observations,
         build_model_replan_input,
@@ -3013,7 +2967,31 @@ def test_subagent_cannot_receive_raw_people_record_or_runtime_secrets() -> None:
 
     sentinel_scalar = "987654321098"
     sentinel_secret = "sentinel-workspace-" + WORKSPACE_ID.hex[:8]
-    _, _, context = _harness(run_id="run-subagent-2")
+    capabilities, leases, context = _harness(run_id="run-subagent-2")
+    # R51: inject the KNOWN runtime secret into the request-scoped service
+    # seam that a buggy model projection could otherwise serialize.
+    context = GraphRuntimeContext(
+        capability_runtime=context.capability_runtime,
+        services=RuntimeServices(
+            capability_registry=context.services.capability_registry,
+            retention_leases=context.services.retention_leases,
+            evidence_hydrator=context.services.evidence_hydrator,
+            authorization={
+                "runtime_secret": sentinel_secret,
+                "workspace_ids": [
+                    str(context.capability_runtime.workspace_ids[0])
+                ],
+                "can_read_people": context.capability_runtime.can_read_people,
+                "allowed_capabilities": sorted(
+                    context.capability_runtime.allowed_capabilities
+                ),
+                "deadline_at": str(context.capability_runtime.deadline_at),
+            },
+        ),
+    )
+    # Non-vacuous: the secret is genuinely present in the runtime seam.
+    assert sentinel_secret in json.dumps(context.services.authorization)
+
     base = _two_target_plan()
     sentinel_plan = base.model_copy(
         update={
@@ -3032,6 +3010,7 @@ def test_subagent_cannot_receive_raw_people_record_or_runtime_secrets() -> None:
             )
         }
     )
+    # Non-vacuous: the People scalar is genuinely present in the plan.
     assert sentinel_scalar in sentinel_plan.model_dump_json()
     child = _child_input(
         plan=sentinel_plan,
@@ -3067,6 +3046,7 @@ def test_subagent_cannot_receive_raw_people_record_or_runtime_secrets() -> None:
             "allowed_capabilities",
             "deadline_at",
             "storage_key",
+            "runtime_secret",
         ):
             assert secret not in payload
     assert sentinel_scalar in child["plan"].model_dump_json()
@@ -3080,6 +3060,32 @@ def test_subagent_cannot_receive_raw_people_record_or_runtime_secrets() -> None:
         "can_read_people",
         "allowed_capabilities",
         "deadline_at",
+        "runtime_secret",
     }
     for name in adapter.visible_tool_names():
         assert not (set(adapter.input_fields(name)) & runtime_only), name
+
+
+def test_no_duplicate_test_function_names() -> None:
+    """R49 recurrence guard: no duplicate test definitions may shadow a proof.
+
+    Parses THIS module and asserts every ``test_`` function name is defined
+    exactly once. A re-introduced duplicate (which Python silently lets
+    shadow the earlier definition) fails this guard instead of producing a
+    false-green run.
+    """
+    import ast
+
+    source = Path(__file__).read_text()
+    tree = ast.parse(source)
+    seen: dict[str, int] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith("test_"):
+                seen.setdefault(node.name, []).append(node.lineno)
+    duplicates = {
+        name: linenos for name, linenos in seen.items() if len(linenos) > 1
+    }
+    assert not duplicates, (
+        f"duplicate test function definitions shadow earlier proofs: {duplicates}"
+    )

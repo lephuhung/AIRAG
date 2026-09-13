@@ -96,7 +96,11 @@ from .nodes.context import node_context
 from .nodes.evaluate import _EVIDENCE_SUPPLYING_CAPABILITIES, evaluate_evidence
 from .nodes.execute import execution_update
 from .nodes.synthesize import DEFAULT_SYNTHESIS_BUDGET, synthesize_answer
-from .replanning import ReplanRejected, validate_runtime_replan
+from .replanning import (
+    ReplanRejected,
+    append_replan_tasks,
+    validate_runtime_replan,
+)
 from .skills.compare import policy as compare_policy
 from .skills.summarize import policy as summarize_policy
 from .skills.summarize.policy import ReduceSpec
@@ -735,6 +739,23 @@ class InitialProposal:
     reduce_spec: ReduceSpec | None
 
 
+@dataclass(frozen=True)
+class ReplanProposal:
+    """Deterministic append-only replan proposal (R50): new tasks only.
+
+    ``build_replan_proposal`` returns this proposal -- never an authoritative
+    plan and never an already-appended plan. The governed
+    ``validate_checkpoint_node`` performs the single authoritative append
+    (``append_replan_tasks``) and validates it through
+    ``validate_runtime_replan`` before leasing/checkpointing.
+    """
+
+    new_tasks: tuple[TaskSpec, ...]
+    outcomes: tuple[TaskExecutionSummary, ...]
+    policy: DiscoveryPolicy
+    budget: ResearchBudgetView
+
+
 def _people_first_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
     """Deterministic first step of the cross-domain People→Document pilot.
 
@@ -951,7 +972,7 @@ def _recovery_search_task(
 
 def build_replan_proposal(
     state: ComplexResearchState, runtime: GraphRuntimeContext
-) -> TaskPlan | None:
+) -> ReplanProposal | None:
     """Propose the bounded append-only replan from validated gaps (R32/R37).
 
     Consumes the redacted model-facing projection (R34) and the validated
@@ -961,9 +982,11 @@ def build_replan_proposal(
     no-evidence targetless failure (R37: ``not_found``/``TIMEOUT`` stay
     distinct, the completed task is never rerun, no scalar is fabricated).
     Every new task carries ``ReplanTaskOrigin`` trigger lineage (attempted
-    task IDs + prior evidence-use IDs). Returns ``None`` when no bounded
-    replan is advisable or validatable; the caller then spends the budget so
-    ``decide`` finalizes instead of looping.
+    task IDs + prior evidence-use IDs). Returns a :class:`ReplanProposal`
+    (new tasks + validation inputs), never an authoritative appended plan;
+    the governed ``validate_checkpoint_node`` owns the append + validation.
+    Returns ``None`` when no bounded replan is advisable; the caller then
+    spends the budget so ``decide`` finalizes instead of looping.
     """
     if not replan_advisable(state):
         return None
@@ -1056,18 +1079,15 @@ def build_replan_proposal(
         )
     if not new_tasks:
         return None
-    proposed = plan.model_copy(update={"tasks": plan.tasks + tuple(new_tasks)})
-    try:
-        return validate_runtime_replan(
-            plan,
-            proposed,
-            outcomes,
-            model_input.discovery_policy,
-            model_input.budget,
-            runtime,
-        )
-    except (ContractValidationError, ReplanRejected):
-        return None
+    # R50: return a PROPOSAL, not an authoritative plan. The governed
+    # validate_checkpoint_node performs the single authoritative append and
+    # validates it through validate_runtime_replan before lease/checkpoint.
+    return ReplanProposal(
+        new_tasks=tuple(new_tasks),
+        outcomes=outcomes,
+        policy=model_input.discovery_policy,
+        budget=model_input.budget,
+    )
 
 
 async def replan_node(
@@ -1149,15 +1169,35 @@ async def validate_checkpoint_node(
             "materialized_new_task": False,
             "reduce_spec": None,
         }
+    # R50: the single authoritative append + validation happen HERE, inside
+    # the governed entry point, on the proposal returned by
+    # build_replan_proposal (which never appends or validates itself).
+    proposed = append_replan_tasks(current, proposal.new_tasks)
+    try:
+        accepted = validate_runtime_replan(
+            current,
+            proposed,
+            proposal.outcomes,
+            proposal.policy,
+            proposal.budget,
+            context,
+        )
+    except (ContractValidationError, ReplanRejected):
+        # Deterministically invalid: spend the budget so decide finalizes.
+        return {
+            "replans_remaining": 0,
+            "materialized_new_task": False,
+            "reduce_spec": None,
+        }
     await _lease_pinned_state(
-        plan=proposal,
+        plan=accepted,
         bindings=state["bindings"],
         results=tuple(state.get("task_results", ())),
         runtime=context,
     )
     remaining = int(state.get("replans_remaining", 0))
     return {
-        "plan": proposal,
+        "plan": accepted,
         "replans_remaining": max(0, remaining - 1),
         "materialized_new_task": False,
         # The task set changed: no stale reduce spec may survive.
@@ -1268,34 +1308,42 @@ async def people_document_materialize_node(
         while f"T{index}" in taken:
             index += 1
         limits = V2ResearchLimits.from_settings()
+        # R50: append_materialized_dependent returns the concrete T2 PROPOSAL
+        # (never an authoritative plan); the single authoritative append
+        # (append_replan_tasks) and validation happen HERE, inside this
+        # governed node, before lease/checkpoint.
+        outcomes = build_task_execution_summaries(results)
+        policy = DiscoveryPolicy(
+            allow_reference_discovery=False,
+            allow_supporting_discovery=True,
+            max_discovered_documents=1,
+        )
+        budget = ResearchBudgetView(
+            max_tasks_remaining=max(0, limits.max_tasks - len(plan.tasks)),
+            max_replans_remaining=1,
+            max_parallel_branches=limits.max_parallel_branches,
+        )
         try:
-            proposed = append_materialized_dependent(
+            dependent = append_materialized_dependent(
                 current=plan,
-                outcomes=build_task_execution_summaries(results),
                 outcome=outcome,
                 query=plan.goal,
                 next_task_id=f"T{index}",
-                policy=DiscoveryPolicy(
-                    allow_reference_discovery=False,
-                    allow_supporting_discovery=True,
-                    max_discovered_documents=1,
-                ),
-                budget=ResearchBudgetView(
-                    max_tasks_remaining=max(0, limits.max_tasks - len(plan.tasks)),
-                    max_replans_remaining=1,
-                    max_parallel_branches=limits.max_parallel_branches,
-                ),
             )
-        except (MaterializationError, ContractValidationError):
+            proposed = append_replan_tasks(plan, (dependent,))
+            accepted = validate_runtime_replan(
+                plan, proposed, outcomes, policy, budget, context
+            )
+        except (MaterializationError, ContractValidationError, ReplanRejected):
             continue
         await _lease_pinned_state(
-            plan=proposed,
+            plan=accepted,
             bindings=bindings,
             results=results,
             runtime=context,
         )
         return {
-            "plan": proposed,
+            "plan": accepted,
             "materialized_new_task": True,
             "people_scalar_available": availability,
         }

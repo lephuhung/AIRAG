@@ -39,7 +39,11 @@ from ..contracts.planning import (
 )
 from ..contracts.state import GraphRuntimeContext
 from ..contracts.validation import ContractValidationError
-from ..replanning import ReplanRejected, validate_runtime_replan
+from ..replanning import (
+    ReplanRejected,
+    append_replan_tasks,
+    validate_runtime_replan,
+)
 
 RejectionCode = Literal[
     "unknown_capability",
@@ -136,9 +140,9 @@ class AgentToolGateway:
                     evidence_use_ids=(),
                 ),
             )
-            proposed = current_plan.model_copy(
-                update={"tasks": current_plan.tasks + (candidate,)}
-            )
+            # R50: the single authoritative append lives in
+            # append_replan_tasks, inside this governed entry point.
+            proposed = append_replan_tasks(current_plan, (candidate,))
             accepted_plan = validate_runtime_replan(
                 current_plan, proposed, (), self._policy, self._budget, runtime
             )

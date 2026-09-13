@@ -45,15 +45,12 @@ from uuid import UUID
 
 from ..contracts.capability import DocumentSearchInput, PeopleLookupOutput
 from ..contracts.evidence import PeopleSourceIdentity
-from ..contracts.execution import AgentResult, TaskExecutionSummary
+from ..contracts.execution import AgentResult
 from ..contracts.planning import (
-    DiscoveryPolicy,
     ReplanTaskOrigin,
-    ResearchBudgetView,
     TaskPlan,
     TaskSpec,
 )
-from ..contracts.validation import validate_replan
 
 __all__ = [
     "PERSON_IDENTIFIER_FIELD",
@@ -367,39 +364,36 @@ def build_dependent_search_task(
 def append_materialized_dependent(
     *,
     current: TaskPlan,
-    outcomes: tuple[TaskExecutionSummary, ...],
     outcome: PeopleDocumentMaterialization,
     query: str,
     next_task_id: str,
-    policy: DiscoveryPolicy,
-    budget: ResearchBudgetView,
-) -> TaskPlan:
-    """Append T2 and validate the append-only replan (no checkpoint here).
+) -> TaskSpec:
+    """Build the concrete T2 PROPOSAL (never the authoritative append, R50).
 
-    Builds the concrete T2 spec and returns ``validate_replan``'s accepted
-    plan. The caller node commits retention leases and checkpoints the
-    returned plan before the scheduler ever sees T2. Raises
-    ``MaterializationError`` for a non-materialized outcome and
-    ``ContractValidationError`` for an invalid append.
+    Returns the concrete dependent ``TaskSpec``; the governed
+    ``people_document_materialize_node`` performs the single authoritative
+    append (``append_replan_tasks``) and validates it through
+    ``validate_runtime_replan`` before it may be leased or checkpointed. The
+    scheduler therefore never sees an ungoverned append. Raises
+    ``MaterializationError`` for a non-materialized outcome or a taken task
+    id instead of fabricating a task.
     """
     if outcome.kind != "materialized":
         raise MaterializationError(
             f"dependency outcome {outcome.kind!r} ({outcome.reason}) cannot "
-            "append a dependent task; no T2"
+            "build a dependent task; no T2"
         )
     taken = {task.task_id for task in current.tasks}
     if next_task_id in taken:
         raise MaterializationError(
             f"dependent task id {next_task_id!r} is already in the plan"
         )
-    task = build_dependent_search_task(
+    return build_dependent_search_task(
         outcome,
         people_task_id=_people_task_id_for(current, outcome),
         query=query,
         next_task_id=next_task_id,
     )
-    proposed = current.model_copy(update={"tasks": current.tasks + (task,)})
-    return validate_replan(current, proposed, outcomes, policy, budget)
 
 
 def redact_scalar_for_model(plan: TaskPlan) -> TaskPlan:

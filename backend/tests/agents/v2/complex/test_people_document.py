@@ -47,12 +47,9 @@ from app.services.agents.v2.contracts.execution import (
     AgentError,
     AgentRequest,
     AgentResult,
-    TaskExecutionSummary,
 )
 from app.services.agents.v2.contracts.planning import (
-    DiscoveryPolicy,
     InitialTaskOrigin,
-    ResearchBudgetView,
     TaskPlan,
     TaskSpec,
 )
@@ -307,20 +304,6 @@ def _analysis() -> QueryAnalysis:
     # A non-compare work type: the compare skill fails closed in
     # validate_checkpoint, so the input T1 plan passes through untouched.
     return QueryAnalysis(work_type="lookup", domains=("people",))
-
-
-def _policy() -> DiscoveryPolicy:
-    return DiscoveryPolicy(
-        allow_reference_discovery=False,
-        allow_supporting_discovery=True,
-        max_discovered_documents=1,
-    )
-
-
-def _budget() -> ResearchBudgetView:
-    return ResearchBudgetView(
-        max_tasks_remaining=7, max_replans_remaining=1, max_parallel_branches=2
-    )
 
 
 def _materialized_outcome() -> PeopleDocumentMaterialization:
@@ -945,12 +928,9 @@ async def test_people_not_found_does_not_append_t2() -> None:
     with pytest.raises(Exception):
         append_materialized_dependent(
             current=plan,
-            outcomes=(),
             outcome=outcome,
             query="nghi dinh",
             next_task_id="T2",
-            policy=_policy(),
-            budget=_budget(),
         )
     assert [task.task_id for task in plan.tasks] == ["T1"]
 
@@ -1119,15 +1099,17 @@ async def test_raw_people_row_never_enters_checkpoint_plan() -> None:
         bindings=_bindings(),
         query="nghi dinh",
     )
-    proposed = append_materialized_dependent(
+    # R50: append_materialized_dependent returns the concrete T2 PROPOSAL;
+    # the single governed append builds the authoritative plan.
+    from app.services.agents.v2.replanning import append_replan_tasks
+
+    dependent = append_materialized_dependent(
         current=plan,
-        outcomes=(TaskExecutionSummary(task_id="T1", status="success"),),
         outcome=outcome,
         query="nghi dinh",
         next_task_id="T2",
-        policy=_policy(),
-        budget=_budget(),
     )
+    proposed = append_replan_tasks(plan, (dependent,))
     dumped = proposed.model_dump_json().lower()
     for token in FORBIDDEN_OBSERVATION_TOKENS:
         if token == PERSON_IDENTIFIER_FIELD:

@@ -32,6 +32,7 @@ from .contracts.validation import ContractValidationError, validate_replan
 
 __all__ = [
     "ReplanRejected",
+    "append_replan_tasks",
     "check_replan_dispatchable",
     "entry_fanout_width",
     "validate_runtime_replan",
@@ -120,6 +121,22 @@ def _require_capabilities_within_current_runtime_catalog(
                 "in the current request-scoped catalog; refusing an "
                 "undispatchable replan"
             )
+
+
+def append_replan_tasks(
+    current: TaskPlan, new_tasks: tuple[TaskSpec, ...]
+) -> TaskPlan:
+    """The single authoritative append-only construction site (R50).
+
+    Every governed owner that appends tasks to a checkpointed plan constructs
+    the append-only successor HERE, then validates it through
+    :func:`validate_runtime_replan` before it may be leased or checkpointed.
+    No other function in the v2 tree builds an appended plan, so rogue append
+    forms -- temporary variables, unpacking, list construction, or a helper
+    that returns an already-appended plan -- cannot exist elsewhere (the AST
+    guard in ``test_replan_discovery.py`` enforces this structurally).
+    """
+    return current.model_copy(update={"tasks": current.tasks + tuple(new_tasks)})
 
 
 def entry_fanout_width(new_tasks: tuple[TaskSpec, ...]) -> int:
