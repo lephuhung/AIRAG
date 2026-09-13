@@ -2,26 +2,35 @@
 
 Framework-neutral source of truth: given an ephemeral ``ResearchPlanningInput``
 the policy proposes the initial ``TaskPlan`` for a ``compare`` request — one
-whole-document ``document.read`` per side, no dependencies (parallel safe
-reads), initial origin. It never executes a capability, never checkpoints, and
-never reaches past validation: the returned plan still passes through
-``validate_task_plan`` in the subgraph ``validate_checkpoint`` node, the
-supervisor saver, and the shared scheduler.
+bounded read per side, no dependencies (parallel safe reads), initial origin.
+It never executes a capability, never checkpoints, and never reaches past
+validation: the returned plan still passes through ``validate_task_plan`` in
+the subgraph ``validate_checkpoint`` node, the supervisor saver, and the
+shared scheduler.
 
 Pilot scope (initial-plan-only):
 
 - exactly two bound documents, one with role ``target`` and one with role
   ``reference`` — any other arity or role pair fails closed;
-- ``document.read`` must be present in the request-scoped capability catalog;
+- each side's ``requested_locator`` derives from the query semantics: a
+  ``SemanticContext.section_refs`` entry naming a chapter/section for that
+  side (joined via the canonical ``binding_id_for_ref`` convention, whose
+  single owner is ``adapters/document.py``) becomes the exact
+  ``SectionLocator`` coordinate (and selects ``section.read``); only a side
+  with no finer coordinate falls back to a whole-document ``DocumentLocator``
+  (``document.read``);
+- every used read capability must be present in the request-scoped capability
+  catalog;
 - discovery/replan are rejected here (T5 adds them): only ``compare`` is
   supported, every other work type fails closed so the caller can return the
   typed ``COMPLEX_RESEARCH_UNAVAILABLE`` boundary instead of a fabricated plan.
 """
 from __future__ import annotations
 
+from ...adapters.document import binding_id_for_ref
 from ...contracts.binding import ScopedDocument
-from ...contracts.capability import DocumentReadInput
-from ...contracts.locators import DocumentLocator
+from ...contracts.capability import DocumentReadInput, SectionReadInput
+from ...contracts.locators import ContentLocator, DocumentLocator, SectionLocator
 from ...contracts.planning import (
     CoverageCriterion,
     InitialTaskOrigin,
@@ -30,10 +39,12 @@ from ...contracts.planning import (
     TaskPlan,
     TaskSpec,
 )
+from ...contracts.semantic import SemanticContext
 from ...contracts.validation import ContractValidationError, validate_task_plan
 
 __all__ = [
     "COMPARE_WORK_TYPE",
+    "MAX_COMPARISON_SIDES",
     "supports_work_type",
     "build_compare_plan",
 ]
@@ -77,14 +88,73 @@ def _compare_sides(bindings: object) -> tuple[ScopedDocument, ScopedDocument]:
     return target, reference
 
 
-def _require_read_capability(planning_input: ResearchPlanningInput) -> None:
-    """Fail closed when the current runtime catalog cannot serve the reads."""
-    names = {entry.name for entry in planning_input.capability_catalog}
-    if "document.read" not in names:
-        raise ContractValidationError(
-            "compare requires 'document.read' in the request-scoped capability "
-            "catalog; refusing to plan an undispatchable read"
+def _locator_for(binding: ScopedDocument, semantic: SemanticContext) -> ContentLocator:
+    """Exact requested coordinate for one side: section when named, else whole.
+
+    A section reference names its side through the canonical binding-ID
+    convention (``binding_id_for_ref``); the first match in ``ref_id`` order
+    wins deterministically. A side with no named section keeps the
+    whole-document coordinate — the only permitted fallback.
+    """
+    matches = sorted(
+        (
+            reference
+            for reference in semantic.section_refs
+            if reference.structure_node_id is not None
+            and binding_id_for_ref(reference.ref_id) == binding.binding_id
+        ),
+        key=lambda reference: reference.ref_id,
+    )
+    if matches:
+        structure_node_id = matches[0].structure_node_id
+        assert structure_node_id is not None
+        return SectionLocator(kind="section", structure_node_id=structure_node_id)
+    return DocumentLocator(kind="document")
+
+
+def _read_task(
+    task_id: str,
+    target_id: str,
+    binding: ScopedDocument,
+    locator: ContentLocator,
+) -> TaskSpec:
+    """One bounded side read: section reads for section coordinates."""
+    if isinstance(locator, SectionLocator):
+        return TaskSpec(
+            task_id=task_id,
+            capability="section.read",
+            task_objective=(
+                f"Read section {locator.structure_node_id} for comparison "
+                f"(document {binding.document_id})"
+            ),
+            input=SectionReadInput(kind="section.read", target_ids=(target_id,)),
+            depends_on=(),
+            origin=InitialTaskOrigin(kind="initial"),
         )
+    return TaskSpec(
+        task_id=task_id,
+        capability="document.read",
+        task_objective=(
+            "Read the comparison side "
+            f"(document {binding.document_id})"
+        ),
+        input=DocumentReadInput(kind="document.read", target_ids=(target_id,)),
+        depends_on=(),
+        origin=InitialTaskOrigin(kind="initial"),
+    )
+
+
+def _require_read_capabilities(
+    planning_input: ResearchPlanningInput, tasks: tuple[TaskSpec, ...]
+) -> None:
+    """Fail closed when the runtime catalog cannot serve the planned reads."""
+    names = {entry.name for entry in planning_input.capability_catalog}
+    for task in tasks:
+        if task.capability not in names:
+            raise ContractValidationError(
+                f"compare requires {task.capability!r} in the request-scoped "
+                "capability catalog; refusing to plan an undispatchable read"
+            )
 
 
 def build_compare_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
@@ -97,49 +167,32 @@ def build_compare_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
     """
     if not supports_work_type(planning_input.query_analysis.work_type):
         raise ContractValidationError(
-            f"compare skill cannot plan work type "
+            "compare skill cannot plan work type "
             f"{planning_input.query_analysis.work_type!r}; out of pilot scope"
         )
-    _require_read_capability(planning_input)
     target, reference = _compare_sides(planning_input.bindings)
+    semantic = planning_input.semantic
+    target_locator = _locator_for(target, semantic)
+    reference_locator = _locator_for(reference, semantic)
     units = (
         TargetUnit(
             target_id=_TARGET_SIDE_ID,
             binding_id=target.binding_id,
-            requested_locator=DocumentLocator(kind="document"),
+            requested_locator=target_locator,
             completion_criteria=(CoverageCriterion(kind="coverage"),),
         ),
         TargetUnit(
             target_id=_REFERENCE_SIDE_ID,
             binding_id=reference.binding_id,
-            requested_locator=DocumentLocator(kind="document"),
+            requested_locator=reference_locator,
             completion_criteria=(CoverageCriterion(kind="coverage"),),
         ),
     )
     tasks = (
-        TaskSpec(
-            task_id="T1",
-            capability="document.read",
-            task_objective=(
-                "Read the target side for comparison "
-                f"(document {target.document_id})"
-            ),
-            input=DocumentReadInput(kind="document.read", target_ids=("t1",)),
-            depends_on=(),
-            origin=InitialTaskOrigin(kind="initial"),
-        ),
-        TaskSpec(
-            task_id="T2",
-            capability="document.read",
-            task_objective=(
-                "Read the reference side for comparison "
-                f"(document {reference.document_id})"
-            ),
-            input=DocumentReadInput(kind="document.read", target_ids=("t2",)),
-            depends_on=(),
-            origin=InitialTaskOrigin(kind="initial"),
-        ),
+        _read_task("T1", _TARGET_SIDE_ID, target, target_locator),
+        _read_task("T2", _REFERENCE_SIDE_ID, reference, reference_locator),
     )
+    _require_read_capabilities(planning_input, tasks)
     plan = TaskPlan(
         contract_version="2.0",
         plan_id=f"compare-{target.binding_id}-{reference.binding_id}",

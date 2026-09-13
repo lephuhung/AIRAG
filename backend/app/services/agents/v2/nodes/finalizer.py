@@ -14,11 +14,12 @@ Only direct non-factual paths and grounded factual paths may emit success:
   responses (denied/insufficient/error from the checkpointed task outcomes),
   never escaping exceptions. User-facing content carries no internal
   target/criterion identifiers.
-- ``complex_research`` → never success here: Write (``simple_write_operation``)
-  is typed unavailable (``denied`` — T1 already routes it here), and every
-  other complex reason is owned by the Phase-3 ``complex_boundary`` (typed
-  ``error`` if it ever reaches this node, so a wiring bug cannot look like an
-  answer).
+- ``complex_research`` → the subgraph's verdict decides: ``sufficient``
+  flowed through ``synthesize``/``ground`` into the shared channel and
+  finalizes factually here (success when grounded); every other verdict
+  (or a missing evaluation) becomes a typed non-success response, never a
+  fabricated answer. Write (``simple_write_operation``) stays typed
+  unavailable (``denied``).
 
 On a channel miss (restart between ground and finalizer) the grounded result
 is re-derived deterministically ONCE through the shared
@@ -305,6 +306,12 @@ async def finalizer_node(
                 citations=(),
             )
         )
+    if route.route == "complex_research":
+        # Phase 3 (R4): the complex subgraph evaluated; `sufficient` runs
+        # were synthesized + grounded through the shared channel and every
+        # other verdict is typed here. An evaluation-less complex turn fails
+        # closed inside `_finalize_factual` (converted to a typed error).
+        return await _finalize_factual(state, context)
     return _emit(
         FinalResponse(
             contract_version=CONTRACT_VERSION,

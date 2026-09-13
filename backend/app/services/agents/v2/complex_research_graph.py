@@ -20,7 +20,14 @@ no subgraph-owned checkpointer, no ``plan_checkpoint`` service, no
 
 ``ResearchPlanningInput`` is ephemeral: rebuilt from checkpointed state plus
 the request-scoped registry on every planner call, never stored in
-``ComplexResearchState`` or ``SupervisorV2State``.
+``ComplexResearchState`` or ``SupervisorV2State``. The unvalidated plan
+proposal is equally ephemeral (R17): ``plan_node`` computes it into a
+runtime-scoped scratch keyed by stable run id — never into checkpointed
+state — and ``validate_checkpoint_node`` validates, leases, and only then
+returns it into state, so no checkpoint ever carries an unvalidated or
+unleased plan. The binding ownership sequence holds end to end::
+
+    proposal -> validate -> lease -> checkpoint -> scheduler
 
 Pilot scope is initial-plan-only plus the compare skill: discovery and replan
 are rejected here (T5 adds them). An unsupported work type (``evaluate``,
@@ -34,6 +41,7 @@ import inspect
 import json
 import warnings
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Literal, TypedDict
 from uuid import UUID
 
@@ -69,6 +77,7 @@ __all__ = [
     "ComplexResearchError",
     "ComplexResearchState",
     "ComplexResearchUnavailable",
+    "V2ResearchLimits",
     "build_complex_research_state",
     "build_complex_research_subgraph",
     "build_discovery_policy",
@@ -94,9 +103,54 @@ COMPLEX_RESEARCH_UNAVAILABLE = "COMPLEX_RESEARCH_UNAVAILABLE"
 #: Initial-plan-only pilot: no replan budget is carried or consumed (T5 adds it).
 MAX_REPLANS = 0
 
-#: Ephemeral planner sizing (implementation config, not a runtime field).
+#: Fallback planner sizing when implementation settings carry no v2 limits.
+#: ``V2ResearchLimits.from_settings()`` is the live source; these match the
+#: gateway defaults so behavior is identical with or without settings.
 MAX_TASKS = 8
 MAX_PARALLEL_BRANCHES = 2
+
+
+@dataclass(frozen=True)
+class V2ResearchLimits:
+    """Implementation planner sizing (config, NOT a frozen contract).
+
+    Read from implementation settings via :meth:`from_settings`, combined with
+    the CURRENT execution state by ``build_research_budget_view``. It is never
+    persisted and never a ``GraphRuntimeContext`` field: the planner consumes
+    it, the scheduler still enforces.
+    """
+
+    max_tasks: int = MAX_TASKS
+    max_parallel_branches: int = MAX_PARALLEL_BRANCHES
+    max_replans: int = MAX_REPLANS
+
+    @classmethod
+    def from_settings(cls, settings: Any = None) -> "V2ResearchLimits":
+        """Derive limits from implementation settings (lazy import, no coupling)."""
+        if settings is None:
+            from app.core.config import get_settings
+
+            settings = get_settings()
+        return cls(
+            max_tasks=int(getattr(settings, "V2_MAX_TASKS", cls.max_tasks)),
+            max_parallel_branches=int(
+                getattr(settings, "V2_MAX_PARALLEL_BRANCHES", cls.max_parallel_branches)
+            ),
+            max_replans=int(getattr(settings, "V2_MAX_REPLANS", cls.max_replans)),
+        )
+
+
+#: Ephemeral plan-proposal scratch, keyed by stable run id (R17).
+#
+# ``plan_node`` computes the proposal here WITHOUT writing it into
+# checkpointed state; ``validate_checkpoint_node`` consumes it — or
+# recomputes it via ``build_planning_input`` when absent (e.g. a fresh
+# process resuming mid-graph) — validates, leases, and ONLY THEN returns it
+# into state. The scratch is never a ``ComplexResearchState`` field and is
+# never serialized; ``finalize_node`` pops it at the terminal step (an entry
+# orphaned by a lost resume is overwritten by the next run or recomputed
+# around, never checkpointed).
+_PLAN_PROPOSALS: dict[str, TaskPlan] = {}
 
 
 class ComplexResearchError(ValueError):
@@ -195,19 +249,19 @@ def build_discovery_policy(runtime: GraphRuntimeContext) -> DiscoveryPolicy:
 def build_research_budget_view(
     state: ComplexResearchState, runtime: GraphRuntimeContext
 ) -> ResearchBudgetView:
-    """Ephemeral budget derived from the CURRENT execution state.
+    """Ephemeral budget from implementation settings + CURRENT execution state.
 
-    Never persisted; rebuilt on each planner/replanner call. ``runtime`` is
-    accepted for the T5 signature (deadline/parallelism source) and unused
-    while the pilot sizes from implementation constants.
+    Never persisted; rebuilt on each planner/replanner call. Settings supply
+    the deployment limits; the live plan and ``replans_remaining`` supply
+    what is already consumed.
     """
-    _ = runtime
+    limits = V2ResearchLimits.from_settings()
     plan = state.get("plan")
     used_tasks = len(plan.tasks) if plan is not None else 0
     return ResearchBudgetView(
-        max_tasks_remaining=max(0, MAX_TASKS - used_tasks),
-        max_replans_remaining=max(0, min(state.get("replans_remaining", 0), MAX_REPLANS)),
-        max_parallel_branches=MAX_PARALLEL_BRANCHES,
+        max_tasks_remaining=max(0, limits.max_tasks - used_tasks),
+        max_replans_remaining=max(0, min(state.get("replans_remaining", 0), limits.max_replans)),
+        max_parallel_branches=limits.max_parallel_branches,
     )
 
 
@@ -329,24 +383,29 @@ async def plan_node(
     state: ComplexResearchState,
     runtime: "Runtime[GraphRuntimeContext]",
 ) -> dict:
-    """Propose the initial plan through the compare skill (no execution).
+    """Compute the initial proposal into ephemeral scratch (R17, no checkpoint).
 
-    Unsupported work types propose nothing: ``plan`` stays ``None`` so the
-    ``decide`` node can return the typed unavailable boundary.
+    The proposal is carried through ``_PLAN_PROPOSALS`` keyed by stable run
+    id — never returned into ``ComplexResearchState`` — so the checkpoint
+    written after this node carries NO plan. ``validate_checkpoint_node``
+    validates, leases, and only then persists it. Unsupported work types
+    propose nothing: ``plan`` stays ``None`` so ``decide`` can return the
+    typed unavailable boundary.
     """
     context = node_context(runtime)
     state = normalize_complex_state(state)
     analysis = require_query_analysis(state)
     if not compare_policy.supports_work_type(analysis.work_type):
-        return {"plan": None}
+        return {}
     planning_input = build_planning_input(state, context)
     try:
-        plan = compare_policy.build_compare_plan(planning_input)
+        proposal = compare_policy.build_compare_plan(planning_input)
     except ContractValidationError as exc:
         raise ComplexResearchError(
             f"compare planning failed closed: {exc}"
         ) from exc
-    return {"plan": plan}
+    _PLAN_PROPOSALS[context.capability_runtime.run_id] = proposal
+    return {}
 
 
 async def _commit_lease_session(runtime: GraphRuntimeContext) -> None:
@@ -421,32 +480,74 @@ async def _lease_pinned_state(
     await _commit_lease_session(runtime)
 
 
+async def _refresh_existing_pairs(
+    *,
+    plan: TaskPlan,
+    bindings: DocumentBindingSet | None,
+    results: tuple[AgentResult, ...],
+    runtime: GraphRuntimeContext,
+) -> None:
+    """Refresh leases for already-checkpointed uses (resume path).
+
+    No-op when no prior results exist (first pass). On a resume that
+    re-enters ``execute`` with completed results, this re-acquires the SAME
+    ``(run, revision, use)`` rows so retained pins stay active without
+    waiting for new dispatches. New uses are still leased by the scheduler
+    itself before its results return.
+    """
+    pairs = refresh_pairs_for_checkpoint(plan, bindings, results)
+    if not pairs:
+        return
+    repo = runtime.services.retention_leases
+    if repo is None:
+        raise ComplexResearchError(
+            "checkpointed uses exist but no retention-lease service is "
+            "wired; refusing to run with unrefreshable pins"
+        )
+    run_id = runtime.capability_runtime.run_id
+    for revision_id, use_id in pairs:
+        result = repo.acquire_or_refresh(run_id, revision_id, use_id)
+        if inspect.isawaitable(result):
+            await result
+    await _commit_lease_session(runtime)
+
+
 async def validate_checkpoint_node(
     state: ComplexResearchState,
     runtime: "Runtime[GraphRuntimeContext]",
 ) -> dict:
-    """Validate the proposed plan and lease its pins; the saver checkpoints.
+    """Validate the proposal and lease its pins; the saver checkpoints (R17).
 
-    Initial-plan-only: ``validate_task_plan`` is authoritative (T5 adds the
-    append-only ``validate_replan`` path). There is no ``plan_checkpoint``
-    service — the returned plan enters ``ComplexResearchState`` and the
-    supervisor saver performs the checkpoint. A ``None`` plan is the
-    unsupported-work path: nothing to validate or pin.
+    Consumes the ephemeral proposal from ``_PLAN_PROPOSALS`` — or recomputes
+    it via ``build_planning_input`` when absent (fresh-process resume,
+    unsupported path). Initial-plan-only: ``validate_task_plan`` is
+    authoritative (T5 adds the append-only ``validate_replan`` path). There
+    is no ``plan_checkpoint`` service — the returned plan enters
+    ``ComplexResearchState`` and the supervisor saver performs the
+    checkpoint, so the checkpoint that first persists ``plan`` is written by
+    the SAME node that already acquired its leases. A recompute that still
+    cannot plan is the unsupported-work path: nothing to validate or pin.
     """
     context = node_context(runtime)
     state = normalize_complex_state(state)
-    plan = state.get("plan")
-    if plan is None:
-        return {}
+    run_id = context.capability_runtime.run_id
+    proposal = _PLAN_PROPOSALS.get(run_id)
+    if proposal is None:
+        try:
+            proposal = compare_policy.build_compare_plan(
+                build_planning_input(state, context)
+            )
+        except ContractValidationError:
+            return {}
     bindings = state["bindings"]
-    validate_task_plan(plan, bindings)
+    validate_task_plan(proposal, bindings)
     await _lease_pinned_state(
-        plan=plan,
+        plan=proposal,
         bindings=bindings,
         results=tuple(state.get("task_results", ())),
         runtime=context,
     )
-    return {"plan": plan}
+    return {"plan": proposal}
 
 
 async def complex_execute_node(
@@ -464,11 +565,18 @@ async def complex_execute_node(
     plan = state.get("plan")
     if plan is None:
         return {}
+    prior_results = tuple(state.get("task_results", ()))
+    await _refresh_existing_pairs(
+        plan=plan,
+        bindings=state.get("bindings"),
+        results=prior_results,
+        runtime=context,
+    )
     scheduler = shared_scheduler_for(context)
     report = await scheduler.execute(
         plan=plan,
         runtime=context,
-        prior_results=tuple(state.get("task_results", ())),
+        prior_results=prior_results,
         bindings=state.get("bindings"),
     )
     return {"task_results": report.results}
@@ -534,8 +642,9 @@ async def finalize_node(
     state: ComplexResearchState,
     runtime: "Runtime[GraphRuntimeContext]",
 ) -> dict:
-    """Terminal subgraph step: state already carries plan/results/evaluation."""
-    node_context(runtime)
+    """Terminal subgraph step: drop the ephemeral proposal, keep the result."""
+    context = node_context(runtime)
+    _PLAN_PROPOSALS.pop(context.capability_runtime.run_id, None)
     _ = state
     return {}
 
@@ -621,6 +730,11 @@ def make_complex_boundary_node(complex_subgraph: Any) -> Any:
         child_output = await complex_subgraph.ainvoke(
             child_input, config=config, context=context
         )
+        # A resume re-enters the subgraph mid-graph, so slots no node
+        # rewrote (e.g. the validated plan) arrive serde-degraded; coerce
+        # the raw child output exactly like a checkpoint load before the
+        # supervisor wrapper re-validates the merged aggregate.
+        child_output = normalize_complex_state(child_output)
         return merge_complex_result_into_supervisor(state, child_output)
 
     return complex_boundary_node
