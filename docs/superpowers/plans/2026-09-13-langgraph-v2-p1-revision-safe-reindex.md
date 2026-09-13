@@ -107,6 +107,8 @@ git commit -m "feat(worker): initialize revision stage state"
 - Modify: `backend/app/workers/caption_worker.py`
 - Modify: `backend/app/workers/kg_worker.py`
 - Modify: `backend/app/queue/connection.py`
+- Modify: `backend/app/services/agents/v2/persistence/document_revisions.py`
+- Modify: `backend/tests/agents/v2/persistence/test_revision_stages.py`
 - Modify: `backend/tests/workers/test_revision_pipeline.py`
 
 **Interfaces:**
@@ -118,7 +120,7 @@ For each worker assert running→completed, retry increments attempt count, exha
 
 - [ ] **Step 2: Run RED and implement minimal calls**
 
-Each worker records running before work and completed only after its artifact transaction succeeds. If the running edge reports an already-terminal stage, the delivery returns before performing work or mutating mirrors; it must not swallow the transition error and continue. Profile skips are initialized, not guessed by workers. A retryable worker exception must not terminalize the revision before the queue decides exhaustion. Before requeue, the queue path calls `mark_stage_retry_pending` only for that message revision/stage; the next worker remains executable and `mark_stage_running` increments `attempt_count`. On exhaustion, the queue atomically calls `mark_stage_failed` and terminalizes only that revision. Queue retry paths update only the failed message revision. Handler-level tests—not source-string checks alone—must exercise all four workers' terminal no-op behavior, running/work/commit/completed ordering, retry attempt bump, and queue stage mapping.
+Each worker records running before work and completed only after its artifact transaction succeeds. Workers acquire the running edge through an atomic repository claim that distinguishes a newly claimed `pending → running` attempt from an already-`running` duplicate. A duplicate/in-flight or terminal-stage delivery returns before performing work or mutating mirrors; it must not swallow a transition result/error and continue. Profile skips are initialized, not guessed by workers. A retryable worker exception must not terminalize the revision before the queue decides exhaustion. Before requeue, the queue path calls `mark_stage_retry_pending` only for that message revision/stage; the next worker remains executable and `mark_stage_running` increments `attempt_count`. On exhaustion, the queue atomically calls `mark_stage_failed` and terminalizes only that revision. Queue retry paths update only the failed message revision. Handler-level tests—not source-string checks alone—must exercise all four workers' terminal no-op behavior, running/work/commit/completed ordering, retry attempt bump, and queue stage mapping.
 
 - [ ] **Step 3: Run GREEN and commit**
 
