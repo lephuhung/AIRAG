@@ -1484,3 +1484,93 @@ async def test_persistently_resistant_shadow_fails_closed_bounded(
     except (asyncio.CancelledError, TimeoutError):
         pass
     assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_resistant_shadow_late_success_emits_nothing_after_cleanup(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R67: a resistant shadow that later SUCCEEDS must emit nothing post-cleanup.
+
+    Against the REAL hook and the REAL cleanup join
+    (``_join_shadow_at_cleanup``): the shadow swallows every cancel and —
+    only AFTER the bounded join has returned ``stopped=False`` — completes
+    successfully. The revoked output channel must make that late completion
+    a no-op: zero ``on_metrics`` calls and zero ``turn complete`` report
+    output. Fails on the pre-fix behavior (log-only fail-closed).
+    """
+    import logging as _logging
+
+    import app.services.agent.shadow_runtime as shadow_runtime
+    from app.api.chat_session import (
+        _join_shadow_at_cleanup,
+        _maybe_launch_shadow_turn,
+    )
+    from app.core.config import settings
+    from app.services.agent.shadow_runtime import ShadowMetrics
+
+    monkeypatch.setattr(settings, "NEXUSRAG_AGENT_V2_SHADOW_ENABLED", True)
+    monkeypatch.setattr(settings, "NEXUSRAG_AGENT_V2_SHADOW_PERCENT", 100.0)
+
+    async def _resistant_view(*args: Any, **kwargs: Any) -> dict:
+        await asyncio.sleep(0)
+        return {}
+
+    release = asyncio.Event()
+
+    class _ResistantSuccessBundle:
+        async def run(self) -> Any:
+            # Ignore EVERY cancel until released, then succeed for real.
+            while not release.is_set():
+                try:
+                    await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    continue
+            return ShadowMetrics(
+                status="success",
+                route="direct",
+                evaluation="sufficient",
+                task_count=1,
+                isolated_writes=0,
+                duration_ms=1,
+            )
+
+    monkeypatch.setattr(
+        "app.api.chat_session.resolve_shadow_document_view", _resistant_view
+    )
+    monkeypatch.setattr(
+        shadow_runtime, "build_shadow_bundle", lambda **kwargs: _ResistantSuccessBundle()
+    )
+
+    calls: list[Any] = []
+    task = _maybe_launch_shadow_turn(
+        raw_message="Xin chào",
+        thread_id="shadow-hook-r67-late-success",
+        user_id=USER_ID,
+        workspace_ids=[WORKSPACE_ID],
+        on_metrics=calls.append,
+    )
+    assert task is not None
+    await asyncio.sleep(0.05)  # let the resistant run start
+    task.cancel()  # the primary run was cancelled
+    with caplog.at_level(_logging.INFO, logger="app.api.chat_session"):
+        stopped = await _join_shadow_at_cleanup(
+            task, session_id="shadow-hook-r67-late-success", timeout=0.2
+        )
+    # Bounded join gave up on the still-resisting shadow.
+    assert stopped is False
+    assert not task.done()
+    # Forget everything emitted up to cleanup; only late output counts.
+    caplog.clear()
+    pre_calls = len(calls)
+    # The shadow now shakes off cancellation and SUCCEEDS after cleanup.
+    release.set()
+    await asyncio.wait_for(task, timeout=10)
+    assert task.done()
+    assert not task.cancelled()
+    # Late successful completion must be a no-op: no metrics observer
+    # call and no turn-complete report output escaped after cleanup.
+    assert len(calls) == pre_calls == 0, f"late shadow output escaped: {calls!r}"
+    assert not any(
+        "turn complete" in (record.message or "") for record in caplog.records
+    ), "late shadow report escaped after cleanup"

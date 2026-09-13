@@ -710,9 +710,19 @@ async def _join_shadow_at_cleanup(
     The single caller-owned sequencing point (R66.4): the bounded
     ``_stop_shadow_task`` join runs FIRST, and a ``False`` return fails
     the shadow closed with an error log BEFORE primary cleanup proceeds.
-    Returns the ``stopped`` flag.
+    Returns the ``stopped`` flag. Revoking the shadow's output channel
+    happens FIRST (R67): even a cancellation-resistant shadow that later
+    completes successfully then reports into a dead channel, so late
+    completion is a no-op — genuinely fail-closed, not a log line.
     """
     from app.services.agent.shadow_runtime import _stop_shadow_task
+
+    # R67: revoke BEFORE the bounded join — any late completion (even a
+    # success) after this point cannot emit metrics, call ``on_metrics``,
+    # or otherwise produce output.
+    holder = getattr(shadow_task, "_shadow_output_revoked", None)
+    if isinstance(holder, dict):
+        holder["revoked"] = True
 
     stopped = await _stop_shadow_task(shadow_task, timeout=timeout)
     if not stopped:
@@ -814,8 +824,9 @@ def _maybe_launch_shadow_turn(
     redacted metrics are logged (and handed to ``on_metrics`` when given).
     Any sampling failure returns ``None`` so the primary turn is never
     affected. Cancellation follows the primary run: the caller joins the
-    task via ``_stop_shadow_task`` in its ``finally`` and MUST act on a
-    False return before proceeding with primary cleanup.
+    task via ``_join_shadow_at_cleanup`` in its ``finally``, which revokes
+    the turn's output channel FIRST (R67) so late completion is a no-op,
+    and MUST act on a False return before proceeding with primary cleanup.
     """
     try:
         from app.core.config import settings
@@ -834,6 +845,13 @@ def _maybe_launch_shadow_turn(
         logger.warning("[shadow] sampling check failed (primary unaffected): %s", e)
         return None
 
+    # R67: revocable output channel for this turn. The cleanup join
+    # (``_join_shadow_at_cleanup``) revokes it BEFORE awaiting the shadow
+    # task, so a cancellation-resistant shadow that completes successfully
+    # after cleanup reports into a dead channel instead of emitting
+    # metrics — late completion is a no-op. Fail-closed, not a log line.
+    output_revoked: dict[str, bool] = {"revoked": False}
+
     async def _run_shadow_best_effort() -> None:
         from app.services.agent.shadow_runtime import (
             ShadowMetrics,
@@ -841,6 +859,8 @@ def _maybe_launch_shadow_turn(
         )
 
         def _report(metrics: ShadowMetrics) -> None:
+            if output_revoked["revoked"]:
+                return  # R67: revoked at cleanup — late output is a no-op.
             logger.info("[shadow] turn complete: %s", metrics.redacted())
             if callable(on_metrics):
                 try:
@@ -895,6 +915,9 @@ def _maybe_launch_shadow_turn(
     try:
         task = asyncio.create_task(_run_shadow_best_effort())
         task.add_done_callback(_consume)
+        # R67: publish the revocable channel on the task so the cleanup
+        # join can revoke output even when the shadow resists cancellation.
+        task._shadow_output_revoked = output_revoked  # type: ignore[attr-defined]
         return task
     except Exception as e:  # noqa: BLE001 — shadow must never break primary
         logger.warning("[shadow] launch failed (primary unaffected): %s", e)
