@@ -327,6 +327,10 @@ async def langgraph_chat_stream(
 
     # Run graph — collect events for persistence
     final_answer = ""
+    from datetime import datetime as _dt, timezone as _tz
+
+    turn_started_at = _dt.now(_tz.utc)
+    served_arm = version
     final_sources: list[dict] = []
     final_images: list[dict] = []
     final_people_data: list[dict] = []
@@ -385,6 +389,7 @@ async def langgraph_chat_stream(
             # capability execution — serve v1 with zero v2 output.
             logger.info("[lg_endpoint] v2 candidate fell back to v1")
             graph = await resolve_agent_graph("v1")
+            served_arm = "v1"
             async for sse_str in stream_agent_to_sse(graph, initial_state):
                 yield sse_str
                 _collect_terminal(sse_str)
@@ -392,6 +397,37 @@ async def langgraph_chat_stream(
         async for sse_str in stream_agent_to_sse(graph, initial_state):
             yield sse_str
             _collect_terminal(sse_str)
+
+    # Task 7B fix (R74): terminal-boundary metric emission for the serving
+    # arm (best-effort; never breaks serving or persistence). Detector
+    # verdicts come from real terminal observations; unobservable rows are
+    # skipped, never recorded safe.
+    try:
+        from app.services.agent import rollout_metrics as _metrics
+
+        _allowed_doc_ids = [
+            str(d) for d in (getattr(request, "document_ids", None) or [])
+        ]
+        await _metrics.try_emit_terminal_rollout_metric(
+            db,
+            arm=served_arm,
+            request_id=persisted_request_id,
+            workspace_ids=workspace_ids,
+            started_at=turn_started_at,
+            terminal_status=("success" if final_answer.strip() else "error"),
+            citation_count=_metrics.count_citation_markers(final_answer),
+            cancelled=False,
+            answer_text=final_answer,
+            factual_expected=bool(final_sources),
+            served_document_ids=_metrics.extract_served_document_ids(
+                final_sources
+            ),
+            allowed_document_ids=_allowed_doc_ids or None,
+            scope_bound=True,
+            production_write_count=0,
+        )
+    except Exception as e:
+        logger.warning(f"[lg_endpoint] rollout metric emission failed: {e}")
 
     # Persist assistant message + thinking steps
     try:

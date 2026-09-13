@@ -30,6 +30,17 @@ REPORT_SCHEMA = "v2_rollout_live_v1"
 
 ERROR_STATUSES = frozenset({"error", "failed", "timeout"})
 
+#: Terminal statuses that mean a requested cancellation actually stopped
+#: the run (a successful cancellation — NOT a cancellation failure).
+CANCELLED_TERMINALS = frozenset({"cancelled", "cancelling", "canceled"})
+
+SECURITY_KEYS = (
+    "checkpoint_secret",
+    "ungrounded_factual_success",
+    "acl_leak",
+    "duplicate_production_write",
+)
+
 
 def _parse_dt(value: Any) -> datetime | None:
     if value is None:
@@ -57,12 +68,48 @@ def _percentile(values: list[float], pct: float) -> float | None:
     return ordered[low] * (1.0 - fraction) + ordered[high] * fraction
 
 
+def _valid_security(row: dict[str, Any]) -> bool:
+    """True iff the row carries four EXPLICIT boolean security counters.
+
+    R72/R74: missing, null, or non-boolean security fields are INVALID —
+    never counted as zero violations. Invalid rows are excluded from every
+    aggregate and counted in ``invalid_security_rows`` (the arm is marked
+    ``valid: false`` and the gate rejects it).
+    """
+    security = row.get("security")
+    if not isinstance(security, dict):
+        return False
+    return all(
+        isinstance(security.get(key), bool) for key in SECURITY_KEYS
+    )
+
+
+def _is_cancel_failure(row: dict[str, Any]) -> bool:
+    """Authoritative cancellation-failure invariant (documented).
+
+    Cancellation failure is NOT the cancel rate: a run that was cancelled
+    AND ended in a cancelled terminal was successfully stopped (not a
+    failure). A run flagged ``cancelled`` that nevertheless completed with
+    any other terminal (e.g. ``success`` — output was produced despite the
+    cancel) FAILED to stop and counts as a cancellation failure.
+    """
+    if row.get("cancelled") is not True:
+        return False
+    return str(row.get("terminal_status", "")).lower() not in CANCELLED_TERMINALS
+
+
 def summarize_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Aggregate metric rows into a ``v2_rollout_live_v1`` report (pure)."""
     arms: dict[str, dict[str, Any]] = {}
     for arm in ("v1", "v2", "shadow"):
         arm_rows = [row for row in rows if row.get("arm") == arm]
-        completed = [row for row in arm_rows if row.get("finished_at") is not None]
+        finished = [
+            row for row in arm_rows if row.get("finished_at") is not None
+        ]
+        invalid_security_rows = sum(
+            1 for row in finished if not _valid_security(row)
+        )
+        completed = [row for row in finished if _valid_security(row)]
         durations = [
             float(row["duration_ms"])
             for row in completed
@@ -77,16 +124,10 @@ def summarize_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         for row in completed:
             security = row.get("security") or {}
             security_violations += sum(
-                1
-                for key in (
-                    "checkpoint_secret",
-                    "ungrounded_factual_success",
-                    "acl_leak",
-                    "duplicate_production_write",
-                )
-                if security.get(key) is True
+                1 for key in SECURITY_KEYS if security.get(key) is True
             )
         cancelled = sum(1 for row in completed if row.get("cancelled") is True)
+        cancel_failures = sum(1 for row in completed if _is_cancel_failure(row))
         starts = [
             parsed
             for parsed in (_parse_dt(row.get("started_at")) for row in arm_rows)
@@ -102,9 +143,26 @@ def summarize_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if starts and ends
             else 0.0
         )
+        # Continuity (not elapsed span): distinct UTC hour buckets holding
+        # >= 1 valid completed sample, plus the largest gap between
+        # consecutive valid completions. A pair of samples 24h apart has
+        # elapsed hours >= 24 but continuous_hours == 2.
+        buckets = {
+            int(moment.timestamp() // 3600)
+            for moment in ends
+        }
+        continuous_hours = float(len(buckets))
+        ordered = sorted(ends)
+        max_gap_hours = 0.0
+        for earlier, later in zip(ordered, ordered[1:]):
+            gap = (later - earlier).total_seconds() / 3600.0
+            if gap > max_gap_hours:
+                max_gap_hours = gap
         arms[arm] = {
             "samples": len(arm_rows),
             "completed": len(completed),
+            "invalid_security_rows": invalid_security_rows,
+            "valid": invalid_security_rows == 0,
             "error_rate": (errors / len(completed)) if completed else 0.0,
             "errors": errors,
             "p50_ms": _percentile(durations, 50),
@@ -112,7 +170,13 @@ def summarize_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "security_violations": security_violations,
             "cancelled": cancelled,
             "cancel_rate": (cancelled / len(completed)) if completed else 0.0,
+            "cancel_failures": cancel_failures,
+            "cancel_failure_rate": (
+                (cancel_failures / len(completed)) if completed else 0.0
+            ),
             "hours": hours,
+            "continuous_hours": continuous_hours,
+            "max_gap_hours": max_gap_hours,
         }
     generated_at = datetime.now(timezone.utc).isoformat()
     return {

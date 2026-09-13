@@ -1015,18 +1015,28 @@ async def _refresh_v2_resume_leases(*, runtime_context, checkpoint_state: dict) 
 async def _release_v2_run_leases(*, runtime_context, reason: str) -> int:
     """Release the run's leases (terminal boundary only; never raises)."""
     try:
-        from app.services.agents.v2.execution.scheduler import (
-            unregister_active_run as _unregister_active_run,
-        )
-
+        run_id = str(runtime_context.capability_runtime.run_id)
+    except Exception:
+        run_id = ""
+    if run_id:
+        # Awaited terminal cleanup (R75 lifecycle): the distributed
+        # registration is removed before this boundary returns, so a
+        # resumed run re-registers cleanly. Falls back to the sync
+        # wrapper when awaiting fails.
         try:
-            _unregister_active_run(
-                str(runtime_context.capability_runtime.run_id)
+            from app.services.agents.v2.execution.scheduler import (
+                unregister_active_run as _unregister_sync,
             )
+            from app.services.agents.v2.execution.scheduler import (
+                unregister_active_run_async as _unregister_active_run,
+            )
+
+            try:
+                await _unregister_active_run(run_id)
+            except Exception:
+                _unregister_sync(run_id)
         except Exception:
             logger.warning("[v2stream] active-run unregister failed", exc_info=True)
-    except Exception:
-        logger.warning("[v2stream] active-run unregister setup failed", exc_info=True)
     try:
         services = getattr(runtime_context, "services", None)
         repo = getattr(services, "retention_leases", None)
@@ -1202,6 +1212,22 @@ async def stream_v2_turn_events(
     acc = _V2StreamAccumulators()
     invoke_task = None
     released = False
+    try:
+        _run_id = str(runtime_context.capability_runtime.run_id or "")
+    except Exception:
+        _run_id = ""
+    if _run_id:
+        # Register at run start (awaited, R75 lifecycle): the distributed
+        # registry owns the run for its whole lifetime; per-dispatch
+        # guards refresh it and terminal release removes it.
+        try:
+            from app.services.agents.v2.execution.scheduler import (
+                register_active_run_async as _register_at_start,
+            )
+
+            await _register_at_start(_run_id)
+        except Exception:
+            logger.warning("[v2stream] active-run register failed", exc_info=True)
 
     async def _release_once(reason: str) -> int:
         nonlocal released

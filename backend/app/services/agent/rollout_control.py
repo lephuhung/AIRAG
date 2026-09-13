@@ -37,52 +37,60 @@ logger = logging.getLogger(__name__)
 
 CanaryArm = Literal["v1", "v2"]
 
-#: Frozen v2 routes (imported for reference only — never redefined here).
-_V2_KNOWN_ROUTES = frozenset({"direct", "clarify", "fast_domain", "complex_research"})
+#: Frozen v2 routes — imported from the frozen contract (never redefined
+#: here). The string sets below are only a defensive fallback when the
+#: frozen module is unavailable (e.g. script-time imports).
+try:  # pragma: no cover - import path varies by consumer
+    from app.services.agents.v2.contracts.routing import (
+        Domain as _FrozenDomain,
+        Route as _FrozenRoute,
+        RouteReason as _FrozenRouteReason,
+        WorkType as _FrozenWorkType,
+    )
+    from typing import get_args as _get_args
 
-#: Frozen work types (``v2/contracts/routing.py::WorkType`` — referenced,
-#: never redefined).
-_V2_KNOWN_WORK_TYPES = frozenset(
-    {
-        "direct",
-        "lookup",
-        "retrieve",
-        "explain",
-        "summarize",
-        "compare",
-        "evaluate",
-        "cross_domain",
-        "multi_goal",
-    }
-)
-
-#: Frozen domains (``v2/contracts/routing.py::Domain`` — referenced, never
-#: redefined).
-_V2_KNOWN_DOMAINS = frozenset(
-    {"people", "document", "section", "write", "knowledge_graph", "memory"}
-)
-
-#: Frozen route reasons (``v2/contracts/routing.py::RouteReason``).
-_V2_KNOWN_REASONS = frozenset(
-    {
-        "direct_greeting",
-        "direct_conversation",
-        "essential_ambiguity",
-        "unresolved_required_binding",
-        "simple_people_lookup",
-        "exact_document_metadata",
-        "exact_section_retrieval",
-        "simple_write_operation",
-        "simple_kg_lookup",
-        "multi_document_research",
-        "cross_domain_dependency",
-        "comparison",
-        "compliance_evaluation",
-        "multi_goal",
-        "runtime_dependency",
-        "evidence_replanning_required",
-    }
-)
+    _V2_KNOWN_ROUTES = frozenset(_get_args(_FrozenRoute))
+    _V2_KNOWN_WORK_TYPES = frozenset(_get_args(_FrozenWorkType))
+    _V2_KNOWN_DOMAINS = frozenset(_get_args(_FrozenDomain))
+    _V2_KNOWN_REASONS = frozenset(_get_args(_FrozenRouteReason))
+except Exception:  # pragma: no cover - frozen module always present in app
+    _V2_KNOWN_ROUTES = frozenset({"direct", "clarify", "fast_domain", "complex_research"})
+    _V2_KNOWN_WORK_TYPES = frozenset(
+        {
+            "direct",
+            "lookup",
+            "retrieve",
+            "explain",
+            "summarize",
+            "compare",
+            "evaluate",
+            "cross_domain",
+            "multi_goal",
+        }
+    )
+    _V2_KNOWN_DOMAINS = frozenset(
+        {"people", "document", "section", "write", "knowledge_graph", "memory"}
+    )
+    _V2_KNOWN_REASONS = frozenset(
+        {
+            "direct_greeting",
+            "direct_conversation",
+            "essential_ambiguity",
+            "unresolved_required_binding",
+            "simple_people_lookup",
+            "exact_document_metadata",
+            "exact_section_retrieval",
+            "simple_write_operation",
+            "simple_kg_lookup",
+            "multi_document_research",
+            "cross_domain_dependency",
+            "comparison",
+            "compliance_evaluation",
+            "multi_goal",
+            "runtime_dependency",
+            "evidence_replanning_required",
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -240,8 +248,21 @@ def select_canary_arm(
     effective = effective_canary_percent(env.canary_percent, snapshot.canary_percent)
     if effective <= 0.0:
         return "v1"
-    allowlist = snapshot.canary_workspaces or env.canary_workspaces
-    if allowlist and str(workspace_id) not in {str(item) for item in allowlist}:
+    if not env.bucket_salt:
+        # R77: canary enabled with no runtime bucket secret fails closed
+        # to v1 — unsalted buckets would be predictable. The empty default
+        # stays fine while disabled (returned above).
+        logger.warning("[canary] canary enabled without bucket salt; keeping v1")
+        return "v1"
+    # Both the environment ceiling and the DB row act as ceilings: when
+    # both allowlists are non-empty the workspace must be in BOTH
+    # (intersection); when only one is set it applies alone.
+    env_allow = {str(item) for item in (env.canary_workspaces or ())}
+    db_allow = {str(item) for item in (snapshot.canary_workspaces or ())}
+    if env_allow and db_allow:
+        if str(workspace_id) not in (env_allow & db_allow):
+            return "v1"
+    elif (env_allow or db_allow) and str(workspace_id) not in (env_allow | db_allow):
         return "v1"
     if bool(is_write_endpoint):
         # Deterministically-known Write endpoint: v1 BEFORE bucketing.

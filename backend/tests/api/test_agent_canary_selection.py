@@ -592,3 +592,313 @@ async def test_single_scheduler_ownership_chain_preserved():
     )
     assert names == ["SchedulerError", "TaskScheduler", "V1FallbackRequired"]
     assert issubclass(V1FallbackRequired, scheduler_module.SchedulerError)
+
+
+# ---------------------------------------------------------------------------
+# Task 7B fix round 1 (R73-R79): production-wired fallback, salt, ordering,
+# lifecycle, telegram, real-path eligibility
+# ---------------------------------------------------------------------------
+
+
+def test_empty_bucket_salt_fails_closed_when_canary_enabled():
+    """R77: canary enabled with an empty salt must fail closed to v1."""
+    from app.services.agent.rollout_control import select_canary_arm
+
+    session = FakeSession()
+    make_control(session, canary_percent=100)
+    arm = select_canary_arm(
+        workspace_id=str(WORKSPACE_ID),
+        request_id=REQUEST_ID,
+        control=session.row,
+        env=make_env(canary_percent=100.0, bucket_salt=""),
+    )
+    assert arm == "v1"
+
+
+def test_empty_bucket_salt_ok_while_disabled():
+    """R77: the empty default stays fine while canary is disabled (v1)."""
+    from app.services.agent.rollout_control import select_canary_arm
+
+    session = FakeSession()
+    make_control(session, canary_percent=0, enabled=False)
+    arm = select_canary_arm(
+        workspace_id=str(WORKSPACE_ID),
+        request_id=REQUEST_ID,
+        control=session.row,
+        env=make_env(enabled=False, canary_percent=0.0, bucket_salt=""),
+    )
+    assert arm == "v1"
+
+
+def test_workspace_allowlist_env_and_db_both_ceilings():
+    """Minor: a non-empty DB list must not replace the env ceiling (intersect)."""
+    from app.services.agent.rollout_control import select_canary_arm
+
+    session = FakeSession()
+    make_control(session, canary_percent=100, canary_workspaces=[str(OTHER_WORKSPACE_ID)])
+    arm = select_canary_arm(
+        workspace_id=str(WORKSPACE_ID),
+        request_id=REQUEST_ID,
+        control=session.row,
+        env=make_env(canary_workspaces=(str(WORKSPACE_ID),)),
+    )
+    assert arm == "v1"
+
+
+def _complex_execute_state(work_type, domains, route, reason):
+    from app.services.agents.v2.complex_research_graph import ComplexResearchState
+    from app.services.agents.v2.contracts.binding import DocumentBindingSet
+    from app.services.agents.v2.contracts.routing import QueryAnalysis, RouteDecision
+    from app.services.agents.v2.contracts.semantic import SemanticContext
+
+    return ComplexResearchState(
+        contract_version="2.0",
+        semantic=SemanticContext(
+            contextualized_query="q",
+            normalized_query="q",
+            abbreviations=(),
+            coreferences=(),
+            document_refs=(),
+            person_refs=(),
+            section_refs=(),
+            blocking_ambiguities=(),
+        ),
+        bindings=DocumentBindingSet(bindings=(), revision_requirement_refs=()),
+        query_analysis=QueryAnalysis(work_type=work_type, domains=tuple(domains)),
+        route_decision=RouteDecision(route=route, reason_code=reason),
+        plan=_scheduler_plan(),
+        task_results=(),
+        evaluation=None,
+        replans_remaining=1,
+        unavailable=None,
+        materialized_new_task=False,
+        people_scalar_available={},
+        reduce_spec=None,
+        discovery_deferred=(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_production_complex_execute_falls_back_on_write_route():
+    """R73/R79: the real complex execute node falls back on a write route.
+
+    Goes through the production ``complex_execute_node`` with real router
+    state (frozen QueryAnalysis/RouteDecision) and the sole scheduler call:
+    zero capability calls and zero v2 output (typed V1FallbackRequired).
+    """
+    from app.services.agents.v2.complex_research_graph import complex_execute_node
+    from app.services.agents.v2.execution.scheduler import V1FallbackRequired
+
+    registry, stub = _people_registry()
+    runtime = _graph_runtime(registry)
+    state = _complex_execute_state(
+        "retrieve", ("document", "write"), "complex_research", "simple_write_operation"
+    )
+    with pytest.raises(V1FallbackRequired):
+        await complex_execute_node(state, runtime)
+    assert stub.calls == []
+
+
+@pytest.mark.asyncio
+async def test_production_complex_execute_falls_back_on_evaluate_route():
+    """R73/R79: evaluate/legal/compliance falls back via the real execute node."""
+    from app.services.agents.v2.complex_research_graph import complex_execute_node
+    from app.services.agents.v2.execution.scheduler import V1FallbackRequired
+
+    registry, stub = _people_registry()
+    runtime = _graph_runtime(registry)
+    state = _complex_execute_state(
+        "evaluate", ("document",), "complex_research", "compliance_evaluation"
+    )
+    with pytest.raises(V1FallbackRequired):
+        await complex_execute_node(state, runtime)
+    assert stub.calls == []
+
+
+@pytest.mark.asyncio
+async def test_production_complex_execute_runs_supported_compare():
+    """R79: a supported compare route dispatches through the sole scheduler."""
+    from app.services.agents.v2.complex_research_graph import complex_execute_node
+
+    registry, stub = _people_registry()
+    runtime = _graph_runtime(registry)
+    state = _complex_execute_state(
+        "compare", ("document",), "complex_research", "comparison"
+    )
+    result = await complex_execute_node(state, runtime)
+    assert stub.calls != []
+    assert len(tuple(result.get("task_results", ()))) == 1
+
+
+@pytest.mark.asyncio
+async def test_async_redis_registration_is_awaited_before_cancel_check():
+    """R75: the Redis SET is awaited (ordered before dispatch), not fire-and-forget."""
+    import app.core.redis_client as redis_client
+    from app.services.agents.v2.execution import scheduler as scheduler_module
+
+    events: list[str] = []
+    state = {"active_set_done": False}
+
+    class AsyncRedisDouble:
+        async def set(self, *args, **kwargs):
+            events.append("set")
+            state["active_set_done"] = True
+            return True
+
+        async def exists(self, *args, **kwargs):
+            events.append("exists")
+            # The SET must have COMPLETED before the check runs; a
+            # fire-and-forget task would observe False here.
+            assert state["active_set_done"] is True
+            return 0
+
+        async def delete(self, *args, **kwargs):
+            events.append("delete")
+            return 1
+
+    double = AsyncRedisDouble()
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(redis_client, "is_redis_enabled", lambda: True)
+    monkeypatch.setattr(redis_client, "get_redis", lambda: double)
+    try:
+        run_id = f"run-order-{uuid4().hex[:8]}"
+        await scheduler_module.register_active_run_async(run_id)
+        assert await scheduler_module.is_run_cancel_requested_async(run_id) is False
+        assert events.index("set") < events.index("exists")
+        await scheduler_module.request_run_cancellation_async(run_id)
+        assert await scheduler_module.is_run_cancel_requested_async(run_id) is True
+    finally:
+        monkeypatch.undo()
+        scheduler_module.unregister_active_run(run_id)
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_guards_await_registration_before_dispatch():
+    """R75: the dispatch boundary awaits Redis registration before executing."""
+    import app.core.redis_client as redis_client
+    from app.services.agents.v2.execution import scheduler as scheduler_module
+    from app.services.agents.v2.execution.scheduler import TaskScheduler
+
+    completions: list[str] = []
+
+    class AsyncRedisDouble:
+        async def set(self, *args, **kwargs):
+            completions.append("set-done")
+            return True
+
+        async def exists(self, *args, **kwargs):
+            # Registration must be complete before the cancel check.
+            assert "set-done" in completions
+            completions.append("exists-done")
+            return 0
+
+        async def delete(self, *args, **kwargs):
+            return 1
+
+    double = AsyncRedisDouble()
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(redis_client, "is_redis_enabled", lambda: True)
+    monkeypatch.setattr(redis_client, "get_redis", lambda: double)
+    try:
+        registry, stub = _people_registry()
+        runtime = _graph_runtime(registry)
+        report = await TaskScheduler(registry).execute(
+            _scheduler_plan(), runtime, prior_results=(), bindings=None
+        )
+        assert len(report.results) == 1
+        assert completions.index("set-done") < completions.index("exists-done")
+    finally:
+        monkeypatch.undo()
+        scheduler_module.unregister_active_run(
+            runtime.capability_runtime.run_id
+        )
+
+
+@pytest.mark.asyncio
+async def test_active_run_refresh_extends_registration():
+    """Active-run TTL is refreshable for long/resumed runs (R75 lifecycle)."""
+    import app.core.redis_client as redis_client
+    from app.services.agents.v2.execution import scheduler as scheduler_module
+
+    calls: list[tuple] = []
+
+    class AsyncRedisDouble:
+        async def set(self, *args, **kwargs):
+            calls.append(("set", args, kwargs))
+            return True
+
+        async def exists(self, *args, **kwargs):
+            return 0
+
+        async def delete(self, *args, **kwargs):
+            return 1
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(redis_client, "is_redis_enabled", lambda: True)
+    monkeypatch.setattr(redis_client, "get_redis", lambda: AsyncRedisDouble())
+    try:
+        run_id = f"run-refresh-{uuid4().hex[:8]}"
+        await scheduler_module.register_active_run_async(run_id)
+        await scheduler_module.refresh_active_run_async(run_id)
+        assert scheduler_module.is_run_active(run_id) is True
+        set_calls = [call for call in calls if call[0] == "set"]
+        assert len(set_calls) == 2
+        await scheduler_module.unregister_active_run_async(run_id)
+        assert scheduler_module.is_run_active(run_id) is False
+    finally:
+        monkeypatch.undo()
+
+
+def test_operator_cancel_path_flags_run():
+    """R75: the operator cancel entrypoint flags the run for cancellation."""
+    import asyncio
+
+    from app.api.agent_admin import cancel_agent_run
+    from app.services.agents.v2.execution import scheduler as scheduler_module
+
+    async def _run():
+        run_id = f"run-op-{uuid4().hex[:8]}"
+        scheduler_module.register_active_run(run_id)
+
+        class FakeUser:
+            pass
+
+        await cancel_agent_run(run_id, user=FakeUser(), db=None)
+        assert scheduler_module.is_run_cancel_requested(run_id) is True
+        scheduler_module.unregister_active_run(run_id)
+
+    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(_run())
+
+
+def test_telegram_fallback_resolves_v1_graph():
+    """R76: Telegram V1FallbackRequired serves the v1 graph (not v2)."""
+    import asyncio
+
+    from app.services.agents.v2.execution.scheduler import V1FallbackRequired
+    from app.services.integrations import telegram_service as telegram_module
+
+    resolved: list[str] = []
+
+    async def fake_resolve(version):
+        resolved.append(version)
+        return f"graph-{version}"
+
+    async def collect_raises(**kwargs):
+        raise V1FallbackRequired("v1-only route")
+
+    async def _run():
+        graph, events = await telegram_module._collect_v2_or_fallback_to_v1(
+            graph="graph-v2",
+            version="v2",
+            collect_fn=collect_raises,
+            resolve_fn=fake_resolve,
+            collect_kwargs={},
+        )
+        return graph, events
+
+    graph, events = (
+        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(_run())
+    )
+    assert graph == "graph-v1"
+    assert events is None
+    assert resolved == ["v1"]

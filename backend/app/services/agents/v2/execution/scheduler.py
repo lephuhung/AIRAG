@@ -71,11 +71,17 @@ __all__ = [
     "execute_ready_tasks",
     "is_run_active",
     "is_run_cancel_requested",
+    "is_run_cancel_requested_async",
+    "refresh_active_run",
+    "refresh_active_run_async",
     "refresh_pairs_for_checkpoint",
     "register_active_run",
+    "register_active_run_async",
     "request_run_cancellation",
+    "request_run_cancellation_async",
     "shared_scheduler_for",
     "unregister_active_run",
+    "unregister_active_run_async",
 ]
 
 
@@ -118,6 +124,76 @@ def _active_key(run_id: str) -> str:
 
 def _cancel_key(run_id: str) -> str:
     return f"v2run:cancel:{run_id}"
+
+
+def _redis_client_if_enabled() -> Any | None:
+    """Return the shared async Redis client when enabled, else ``None``."""
+    try:
+        from app.core.redis_client import get_redis, is_redis_enabled
+
+        if is_redis_enabled():
+            return get_redis()
+    except Exception:
+        logger.warning("canary redis unavailable", exc_info=True)
+    return None
+
+
+async def register_active_run_async(run_id: str) -> None:
+    """Register ``run_id`` as active, awaiting the Redis write (R75).
+
+    The write is awaited so a cross-process dispatch checking Redis
+    immediately after CANNOT observe a missing key — this is the ordering
+    guarantee the fire-and-forget sync wrapper cannot give. Never raises.
+    """
+    if not run_id:
+        return
+    _local_active_runs.add(str(run_id))
+    client = _redis_client_if_enabled()
+    if client is None:
+        return
+    try:
+        await client.set(_active_key(run_id), "1", ex=_ACTIVE_RUN_TTL_SECONDS)
+    except Exception:
+        logger.warning("canary active-run register failed", exc_info=True)
+
+
+async def unregister_active_run_async(run_id: str) -> None:
+    """Drop ``run_id`` from the registry, awaiting Redis (terminal cleanup)."""
+    if not run_id:
+        return
+    _local_active_runs.discard(str(run_id))
+    _local_cancel_requests.discard(str(run_id))
+    client = _redis_client_if_enabled()
+    if client is None:
+        return
+    try:
+        await client.delete(_active_key(run_id), _cancel_key(run_id))
+    except Exception:
+        logger.warning("canary active-run unregister failed", exc_info=True)
+
+
+async def request_run_cancellation_async(run_id: str) -> None:
+    """Flag ``run_id`` for distributed cancellation, awaiting Redis (R75)."""
+    if not run_id:
+        return
+    _local_cancel_requests.add(str(run_id))
+    client = _redis_client_if_enabled()
+    if client is None:
+        return
+    try:
+        await client.set(_cancel_key(run_id), "1", ex=_ACTIVE_RUN_TTL_SECONDS)
+    except Exception:
+        logger.warning("canary cancel request failed", exc_info=True)
+
+
+def refresh_active_run(run_id: str) -> None:
+    """Refresh ``run_id``'s active TTL (sync; best-effort, never raises)."""
+    register_active_run(run_id)
+
+
+async def refresh_active_run_async(run_id: str) -> None:
+    """Refresh ``run_id``'s active TTL for long/resumed runs (awaited)."""
+    await register_active_run_async(run_id)
 
 
 def register_active_run(run_id: str) -> None:
@@ -581,9 +657,12 @@ async def _run_pre_dispatch_guards(
     """Run the Task 7B guards BEFORE each scheduler dispatch (in order).
 
     1. Local asyncio cancellation propagates (never converted).
-    2. The run registers as active, then distributed cancellation is
-       honored — a requested cancel raises ``CancelledError`` before any
-       capability executes.
+    2. The run registers as active via the AWAITED Redis write, then
+       distributed cancellation is honored — a requested cancel raises
+       ``CancelledError`` before any capability executes. Awaiting the
+       registration is the R75 ordering guarantee: a cross-process
+       dispatch checking Redis immediately after cannot observe a
+       missing key.
     3. The optional ``v1_fallback_guard`` (sync or async zero-arg callable
        supplied by the caller that owns the resolved QueryAnalysis/Router
        outcome) fires ``V1FallbackRequired`` — also before any capability
@@ -596,7 +675,7 @@ async def _run_pre_dispatch_guards(
     except Exception:
         run_id = ""
     if run_id:
-        register_active_run(run_id)
+        await register_active_run_async(run_id)
         if await is_run_cancel_requested_async(run_id):
             raise asyncio.CancelledError()
     if v1_fallback_guard is not None:

@@ -1486,6 +1486,12 @@ async def chat_stream_session(
                     can_read_people=bool(user.is_superadmin),
                     allowed_capabilities=DEFAULT_V2_ALLOWED_CAPABILITIES,
                 )
+                # R74 terminal metric observation window: the emission
+                # below attributes the turn to the arm that served it.
+                from datetime import datetime as _dt, timezone as _tz
+
+                turn_started_at = _dt.now(_tz.utc)
+                served_arm = version
                 try:
                     if version == "v2":
                         # I1: the ingress CM scopes the whole stream — evidence
@@ -1514,6 +1520,7 @@ async def chat_stream_session(
                                     session_id,
                                 )
                                 graph = await resolve_agent_graph("v1")
+                                served_arm = "v1"
                                 await _drain(
                                     stream_agent_to_sse(graph, initial_state)
                                 )
@@ -1531,6 +1538,44 @@ async def chat_stream_session(
                             session_id=session_id,
                             timeout=5.0,
                         )
+                # Task 7B fix (R74): terminal-boundary metric emission for
+                # the serving arm. Detector verdicts come from real terminal
+                # observations (answer text scan, citation markers vs served
+                # sources, served-vs-allowed document ids, architectural
+                # zero-write surface); unobservable rows are skipped, never
+                # recorded safe. Best-effort: never breaks serving.
+                try:
+                    from app.services.agent import rollout_metrics as _metrics
+
+                    _allowed_doc_ids = [str(d) for d in (filtered_doc_ids or [])]
+                    await _metrics.try_emit_terminal_rollout_metric(
+                        run_db,
+                        arm=served_arm,
+                        request_id=persisted_request_id,
+                        workspace_ids=runtime_workspace_ids,
+                        started_at=turn_started_at,
+                        terminal_status=(
+                            "success" if accumulated_text.strip() else "error"
+                        ),
+                        citation_count=_metrics.count_citation_markers(
+                            accumulated_text
+                        ),
+                        cancelled=False,
+                        answer_text=accumulated_text,
+                        factual_expected=bool(final_sources),
+                        served_document_ids=_metrics.extract_served_document_ids(
+                            final_sources
+                        ),
+                        allowed_document_ids=_allowed_doc_ids or None,
+                        scope_bound=True,
+                        production_write_count=0,
+                    )
+                except Exception:
+                    logger.warning(
+                        "[session/%s] rollout metric emission failed",
+                        session_id,
+                        exc_info=True,
+                    )
 
             # Generate the title now (first exchange) and push it immediately so
             # the client updates without a refresh; reuse the summary downstream.

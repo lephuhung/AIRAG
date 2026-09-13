@@ -34,12 +34,43 @@ import sys
 from typing import Any
 
 from collect_v2_rollout_report import REPORT_SCHEMA
+import math
 
 MIN_COMPLETED_PER_ARM = 200
 MIN_HOURS = 24.0
 MAX_ERROR_RATE_REGRESSION_PP = 0.01
 MAX_P95_REGRESSION_RATIO = 0.15
 MAX_CANCEL_FAILURE_RATE = 0.001
+
+
+def _req_int(arm_data: dict[str, Any], key: str) -> int | None:
+    """Require an explicit integer gate input (bools rejected)."""
+    value = arm_data.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _req_rate(arm_data: dict[str, Any], key: str) -> float | None:
+    """Require an explicit finite 0..1 gate input (null/NaN/inf rejected)."""
+    value = arm_data.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number) or number < 0.0 or number > 1.0:
+        return None
+    return number
+
+
+def _req_number(arm_data: dict[str, Any], key: str) -> float | None:
+    """Require an explicit finite numeric gate input."""
+    value = arm_data.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return number
 
 
 def _is_live_report(report: dict[str, Any]) -> tuple[bool, str]:
@@ -62,58 +93,109 @@ def _is_live_report(report: dict[str, Any]) -> tuple[bool, str]:
 
 
 def check_gate(report: dict[str, Any]) -> tuple[bool, list[str]]:
-    """Verdict a report against the rollback-gate thresholds (pure)."""
+    """Verdict a report against the rollback-gate thresholds (pure).
+
+    Strict validation: every gate input must be present with the correct
+    type and (for numerics) finite. Missing, null, non-finite, or
+    mistyped inputs FAIL the gate — they never default to a safe zero or
+    skip a check, so a forged report with only ``completed``/``hours``
+    cannot pass.
+    """
     live, reason = _is_live_report(report)
     if not live:
         return False, [reason]
     failures: list[str] = []
     arms = report["arms"]
+    valid_inputs: dict[str, dict[str, Any]] = {}
     for arm in ("v1", "v2"):
-        completed = int(arms[arm].get("completed", 0) or 0)
+        data = arms[arm]
+        if not isinstance(data, dict):
+            failures.append(f"{arm}: arm entry is not an object")
+            continue
+        completed = _req_int(data, "completed")
+        continuous = _req_number(data, "continuous_hours")
+        violations = _req_int(data, "security_violations")
+        invalid_rows = _req_int(data, "invalid_security_rows")
+        error_rate = _req_rate(data, "error_rate")
+        p95 = _req_number(data, "p95_ms")
+        cancel_failures = _req_int(data, "cancel_failures")
+        cancel_failure_rate = _req_rate(data, "cancel_failure_rate")
+        missing = [
+            key
+            for key, value in (
+                ("completed", completed),
+                ("continuous_hours", continuous),
+                ("security_violations", violations),
+                ("invalid_security_rows", invalid_rows),
+                ("error_rate", error_rate),
+                ("p95_ms", p95),
+                ("cancel_failures", cancel_failures),
+                ("cancel_failure_rate", cancel_failure_rate),
+            )
+            if value is None
+        ]
+        if missing:
+            failures.append(
+                f"{arm}: incomplete live gate inputs {missing} "
+                "(missing/null/non-finite/mistyped never defaults safe)"
+            )
+            continue
+        if data.get("valid") is not True or invalid_rows != 0:
+            failures.append(
+                f"{arm}: {invalid_rows} rows with invalid security "
+                "observations (missing fields are invalid, never safe)"
+            )
         if completed < MIN_COMPLETED_PER_ARM:
             failures.append(
                 f"{arm}: only {completed} completed samples "
                 f"(need >= {MIN_COMPLETED_PER_ARM})"
             )
-        hours = float(arms[arm].get("hours", 0.0) or 0.0)
-        if hours < MIN_HOURS:
+        if continuous < MIN_HOURS:
             failures.append(
-                f"{arm}: only {hours:.1f} continuous hours "
+                f"{arm}: only {continuous:.1f} continuous hours "
                 f"(need >= {MIN_HOURS:.0f})"
             )
-    total_violations = sum(
-        int(arms[arm].get("security_violations", 0) or 0) for arm in arms
-    )
-    if total_violations > 0:
-        failures.append(
-            f"security: {total_violations} violations (need zero)"
+        valid_inputs[arm] = {
+            "error_rate": error_rate,
+            "p95_ms": p95,
+            "security_violations": violations,
+            "cancel_failure_rate": cancel_failure_rate,
+        }
+    if "v1" in valid_inputs and "v2" in valid_inputs:
+        total_violations = (
+            valid_inputs["v1"]["security_violations"]
+            + valid_inputs["v2"]["security_violations"]
         )
-    v1 = arms["v1"]
-    v2 = arms["v2"]
-    error_regression = float(v2.get("error_rate", 0.0)) - float(
-        v1.get("error_rate", 0.0)
-    )
-    if error_regression > MAX_ERROR_RATE_REGRESSION_PP:
-        failures.append(
-            f"error-rate: v2 regressed {error_regression * 100:.2f}pp "
-            f"(limit {MAX_ERROR_RATE_REGRESSION_PP * 100:.0f}pp)"
+        if total_violations > 0:
+            failures.append(
+                f"security: {total_violations} violations (need zero)"
+            )
+        error_regression = (
+            valid_inputs["v2"]["error_rate"] - valid_inputs["v1"]["error_rate"]
         )
-    p95_v1 = v1.get("p95_ms")
-    p95_v2 = v2.get("p95_ms")
-    if p95_v1 is not None and p95_v2 is not None and float(p95_v1) > 0:
-        p95_regression = (float(p95_v2) - float(p95_v1)) / float(p95_v1)
-        if p95_regression > MAX_P95_REGRESSION_RATIO:
+        if error_regression > MAX_ERROR_RATE_REGRESSION_PP:
             failures.append(
-                f"p95: v2 regressed {p95_regression * 100:.1f}% "
-                f"(limit {MAX_P95_REGRESSION_RATIO * 100:.0f}%)"
+                f"error-rate: v2 regressed {error_regression * 100:.2f}pp "
+                f"(limit {MAX_ERROR_RATE_REGRESSION_PP * 100:.0f}pp)"
             )
-    for arm in ("v1", "v2"):
-        cancel_rate = float(arms[arm].get("cancel_rate", 0.0) or 0.0)
-        if cancel_rate > MAX_CANCEL_FAILURE_RATE:
-            failures.append(
-                f"{arm}: cancellation failure {cancel_rate * 100:.2f}% "
-                f"(limit {MAX_CANCEL_FAILURE_RATE * 100:.1f}%)"
-            )
+        p95_v1 = valid_inputs["v1"]["p95_ms"]
+        p95_v2 = valid_inputs["v2"]["p95_ms"]
+        if p95_v1 > 0:
+            p95_regression = (p95_v2 - p95_v1) / p95_v1
+            if p95_regression > MAX_P95_REGRESSION_RATIO:
+                failures.append(
+                    f"p95: v2 regressed {p95_regression * 100:.1f}% "
+                    f"(limit {MAX_P95_REGRESSION_RATIO * 100:.0f}%)"
+                )
+        for arm in ("v1", "v2"):
+            failure_rate = valid_inputs[arm]["cancel_failure_rate"]
+            if failure_rate > MAX_CANCEL_FAILURE_RATE:
+                failures.append(
+                    f"{arm}: cancellation failure {failure_rate * 100:.2f}% "
+                    f"(limit {MAX_CANCEL_FAILURE_RATE * 100:.1f}%)"
+                )
+    elif not failures:
+        failures.append("rejected: no verifiable v1/v2 gate inputs")
     return (len(failures) == 0), failures
 
 

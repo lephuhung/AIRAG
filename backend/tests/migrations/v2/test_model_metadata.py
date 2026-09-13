@@ -1410,3 +1410,82 @@ def test_main_lifespan_readiness_gate_unconditional_under_auto_create_false():
         "block so the readiness gate runs even when "
         "AUTO_CREATE_TABLES=false"
     )
+
+def test_rollout_metric_columns_match_t7a_contract_exactly(imported_app_models):
+    """R78: every frozen ``agent_rollout_metrics`` column's type,
+    nullability, default, and constraint is mapped exactly (T7A owns DDL).
+    """
+    from sqlalchemy import BigInteger, Boolean, DateTime, Integer, Text
+
+    from app.models.agent_rollout_metric import AgentRolloutMetric
+
+    table = AgentRolloutMetric.__table__
+    expected_types = {
+        "id": BigInteger,
+        "arm": Text,
+        "request_id_hash": Text,
+        "workspace_id_hash": Text,
+        "started_at": DateTime,
+        "finished_at": DateTime,
+        "duration_ms": Integer,
+        "terminal_status": Text,
+        "citation_count": Integer,
+        "cancelled": Boolean,
+        "security_checkpoint_secret": Boolean,
+        "security_ungrounded_factual_success": Boolean,
+        "security_acl_leak": Boolean,
+        "security_duplicate_production_write": Boolean,
+        "created_at": DateTime,
+    }
+    assert set(table.columns.keys()) == set(expected_types), (
+        f"metric columns {sorted(table.columns.keys())} != frozen contract"
+    )
+    for name, type_class in expected_types.items():
+        assert isinstance(table.c[name].type, type_class), (
+            f"{name}: {type(table.c[name].type).__name__} != {type_class.__name__}"
+        )
+    expected_nullable = {
+        "id": False,
+        "arm": False,
+        "request_id_hash": False,
+        "workspace_id_hash": True,
+        "started_at": False,
+        "finished_at": True,
+        "duration_ms": True,
+        "terminal_status": False,
+        "citation_count": False,
+        "cancelled": False,
+        "security_checkpoint_secret": False,
+        "security_ungrounded_factual_success": False,
+        "security_acl_leak": False,
+        "security_duplicate_production_write": False,
+        "created_at": False,
+    }
+    for name, nullable in expected_nullable.items():
+        assert table.c[name].nullable is nullable, f"{name} nullable"
+    # The migration's BIGSERIAL nextval default is mirrored in metadata.
+    assert table.c["id"].server_default is not None
+    assert "agent_rollout_metrics_id_seq" in str(table.c["id"].server_default.arg)
+    assert table.c["id"].primary_key is True
+    # NOT NULL ... DEFAULT false columns carry the migration's defaults.
+    for name in (
+        "citation_count",
+        "cancelled",
+        "security_checkpoint_secret",
+        "security_ungrounded_factual_success",
+        "security_acl_leak",
+        "security_duplicate_production_write",
+    ):
+        assert table.c[name].server_default is not None, f"{name} default"
+    assert "now()" in str(table.c["created_at"].server_default.arg)
+    # arm CHECK constraint (v1/v2/shadow) is mapped.
+    from sqlalchemy import CheckConstraint
+
+    checks = [
+        c for c in table.constraints if isinstance(c, CheckConstraint)
+    ]
+    assert any(
+        "agent_rollout_metrics_arm_check" in (c.name or "")
+        or "'v1'" in str(c.sqltext)
+        for c in checks
+    ), "arm CHECK constraint missing from ORM metadata"

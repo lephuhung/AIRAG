@@ -394,6 +394,12 @@ def _child_input() -> dict:
         semantic=_semantic(),
         bindings=_bindings(),
         query_analysis=_analysis(),
+        # Task 7B fix (R73): the execute node derives the post-router
+        # v1-fallback guard from the resolved routing — child inputs carry
+        # the same supported verdict production threads from the router.
+        route_decision=RouteDecision(
+            route="complex_research", reason_code="comparison"
+        ),
         plan=None,
         task_results=(),
         evaluation=None,

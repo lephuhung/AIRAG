@@ -172,6 +172,39 @@ async def update_rollout_control(
     return await get_rollout_control(user=user, db=db)
 
 
+class RunCancelResponse(BaseModel):
+    """Operator cancellation acknowledgement for one v2 run."""
+
+    run_id: str
+    cancel_requested: bool
+
+
+@router.post("/runs/{run_id}/cancel", response_model=RunCancelResponse)
+async def cancel_agent_run(
+    run_id: str,
+    user: User = Depends(require_superadmin),
+    db: Any = Depends(get_db),
+) -> RunCancelResponse:
+    """Operator kill path: flag one active v2 run for cancellation (R75).
+
+    Superadmin only. Flags the run in-process AND in Redis (when enabled)
+    so the next pre-dispatch guard — in this process or any other — stops
+    the run before further capability execution. Never raises on Redis
+    trouble; reports whether the flag is now observable.
+    """
+    _ = db
+    _ = user
+    from app.services.agents.v2.execution.scheduler import (
+        is_run_cancel_requested,
+        request_run_cancellation,
+    )
+
+    request_run_cancellation(run_id)
+    return RunCancelResponse(
+        run_id=str(run_id), cancel_requested=bool(is_run_cancel_requested(run_id))
+    )
+
+
 @router.post("/evaluate", response_model=EvaluateResponse)
 async def evaluate_arm(
     body: EvaluateRequest,

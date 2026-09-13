@@ -327,3 +327,324 @@ def test_gate_rejects_golden_and_preflight_schemas():
     passed, failures = check_gate(preflight)
     assert passed is False
     assert any("preflight" in failure.lower() for failure in failures)
+
+
+# ---------------------------------------------------------------------------
+# Task 7B fix round 1 (R74 + scripts): real detectors, terminal emission,
+# strict collector/gate, continuity, cancel-failure signal
+# ---------------------------------------------------------------------------
+
+
+def test_real_detectors_compute_verdicts_from_terminal():
+    from app.services.agent import rollout_metrics as metrics
+
+    # checkpoint_secret: scans terminal text for secret markers.
+    assert (
+        metrics.detect_checkpoint_secret("here is the answer, no secrets")
+        is False
+    )
+    assert (
+        metrics.detect_checkpoint_secret("leaked BEGIN PRIVATE KEY block")
+        is True
+    )
+    assert metrics.detect_checkpoint_secret(None) is None
+    # acl_leak: served ids outside the allowed set.
+    assert (
+        metrics.detect_acl_leak(
+            served_document_ids=["doc-a"], allowed_document_ids=["doc-a"]
+        )
+        is False
+    )
+    assert (
+        metrics.detect_acl_leak(
+            served_document_ids=["doc-evil"], allowed_document_ids=["doc-a"]
+        )
+        is True
+    )
+    assert (
+        metrics.detect_acl_leak(
+            served_document_ids=None, allowed_document_ids=["doc-a"]
+        )
+        is None
+    )
+    # ungrounded_factual_success: factual success with zero citations.
+    assert (
+        metrics.detect_ungrounded_factual_success(
+            terminal_status="success", citation_count=0, factual_expected=True
+        )
+        is True
+    )
+    assert (
+        metrics.detect_ungrounded_factual_success(
+            terminal_status="success", citation_count=2, factual_expected=True
+        )
+        is False
+    )
+    assert (
+        metrics.detect_ungrounded_factual_success(
+            terminal_status="success", citation_count=0, factual_expected=False
+        )
+        is False
+    )
+    assert (
+        metrics.detect_ungrounded_factual_success(
+            terminal_status="success", citation_count=0, factual_expected=None
+        )
+        is None
+    )
+    # duplicate_production_write: more than one production write.
+    assert metrics.detect_duplicate_production_write(0) is False
+    assert metrics.detect_duplicate_production_write(1) is False
+    assert metrics.detect_duplicate_production_write(2) is True
+    assert metrics.detect_duplicate_production_write(None) is None
+
+
+def test_unobservable_verdict_makes_row_invalid_never_safe():
+    from app.services.agent import rollout_metrics as metrics
+
+    with pytest.raises(ValueError):
+        metrics.build_security_verdicts(
+            answer_text=None,
+            terminal_status="success",
+            citation_count=0,
+            factual_expected=True,
+            served_document_ids=[],
+            allowed_document_ids=["doc-a"],
+            production_write_count=0,
+        )
+
+
+def test_security_verdicts_use_authoritative_producers():
+    from app.services.agent import rollout_metrics as metrics
+
+    verdicts = metrics.build_security_verdicts(
+        answer_text="plain answer",
+        terminal_status="success",
+        citation_count=2,
+        factual_expected=True,
+        served_document_ids=["doc-a"],
+        allowed_document_ids=["doc-a"],
+        production_write_count=1,
+    )
+    assert verdicts == {
+        "checkpoint_secret": False,
+        "ungrounded_factual_success": False,
+        "acl_leak": False,
+        "duplicate_production_write": False,
+    }
+
+
+def test_terminal_emission_records_one_append_only_row():
+    import asyncio
+
+    from app.services.agent import rollout_metrics as metrics
+
+    added: list = []
+
+    class FakeDB:
+        def add(self, row):
+            added.append(row)
+
+        async def commit(self):
+            return None
+
+        async def rollback(self):
+            return None
+
+    async def _run():
+        return await metrics.emit_terminal_rollout_metric(
+            FakeDB(),
+            arm="v2",
+            request_id="req-1",
+            workspace_ids=["ws-1"],
+            started_at=datetime.now(UTC) - timedelta(seconds=2),
+            terminal_status="success",
+            citation_count=1,
+            cancelled=False,
+            answer_text="grounded answer",
+            factual_expected=True,
+            served_document_ids=["doc-a"],
+            allowed_document_ids=["doc-a"],
+            production_write_count=0,
+        )
+
+    row = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(_run())
+    assert len(added) == 1
+    assert row.arm == "v2"
+    assert row.security_acl_leak is False
+    assert row.terminal_status == "success"
+
+
+def test_terminal_emission_refuses_unobservable_row():
+    import asyncio
+
+    from app.services.agent import rollout_metrics as metrics
+
+    class FakeDB:
+        def add(self, row):  # pragma: no cover
+            raise AssertionError("must not record an unobservable row")
+
+        async def commit(self):  # pragma: no cover
+            raise AssertionError("must not record an unobservable row")
+
+        async def rollback(self):
+            return None
+
+    async def _run():
+        with pytest.raises(ValueError):
+            await metrics.emit_terminal_rollout_metric(
+                FakeDB(),
+                arm="v2",
+                request_id="req-1",
+                workspace_ids=["ws-1"],
+                started_at=datetime.now(UTC),
+                terminal_status="success",
+                citation_count=0,
+                cancelled=False,
+                answer_text=None,
+                factual_expected=True,
+                served_document_ids=[],
+                allowed_document_ids=["doc-a"],
+                production_write_count=0,
+            )
+
+    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(_run())
+
+
+def _script_module(name):
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
+    try:
+        return __import__(name)
+    finally:
+        sys.path.pop(0)
+
+
+def test_collector_rejects_missing_security_as_invalid():
+    collector = _script_module("collect_v2_rollout_report")
+    gate = _script_module("check_v2_rollout_gate")
+
+    start = datetime.now(UTC) - timedelta(hours=25)
+    rows = []
+    for index in range(210):
+        moment = start + timedelta(minutes=index * 7)
+        rows.append(
+            _row(
+                arm="v2",
+                request_id_hash=f"v2-req-{index}",
+                started_at=moment,
+                finished_at=moment + timedelta(seconds=1),
+            )
+        )
+    # 210 v1 rows with NO security observations at all.
+    for index in range(210):
+        moment = start + timedelta(minutes=index * 7)
+        bad = _row(
+            arm="v1",
+            request_id_hash=f"v1-req-{index}",
+            started_at=moment,
+            finished_at=moment + timedelta(seconds=1),
+        )
+        del bad["security"]
+        rows.append(bad)
+    report = collector.summarize_metrics(rows)
+    assert report["arms"]["v1"]["invalid_security_rows"] == 210
+    assert report["arms"]["v1"]["valid"] is False
+    passed, _ = gate.check_gate(report)
+    assert passed is False
+
+
+def test_collector_continuity_rejects_gapped_series():
+    collector = _script_module("collect_v2_rollout_report")
+    gate = _script_module("check_v2_rollout_gate")
+
+    start = datetime.now(UTC) - timedelta(hours=25)
+    rows = []
+    # Two samples 25h apart: elapsed span >= 24h but no continuity.
+    for index, moment in (
+        (0, start),
+        (1, start + timedelta(hours=25)),
+    ):
+        for arm in ("v1", "v2"):
+            rows.append(
+                _row(
+                    arm=arm,
+                    request_id_hash=f"{arm}-gap-{index}",
+                    started_at=moment,
+                    finished_at=moment + timedelta(seconds=1),
+                )
+            )
+    report = collector.summarize_metrics(rows)
+    assert report["arms"]["v1"]["hours"] >= 24
+    assert report["arms"]["v1"]["continuous_hours"] < 24
+    passed, failures = gate.check_gate(report)
+    assert passed is False
+    assert any("continuous" in failure for failure in failures)
+
+
+def test_collector_cancel_failure_is_not_cancel_rate():
+    collector = _script_module("collect_v2_rollout_report")
+
+    start = datetime.now(UTC)
+    rows = []
+    # A successfully-cancelled run (terminal "cancelled") is NOT a failure;
+    # a run flagged cancelled that still completed with success IS one.
+    rows.append(
+        _row(
+            arm="v2",
+            request_id_hash="v2-cancel-ok",
+            started_at=start,
+            finished_at=start + timedelta(seconds=1),
+            cancelled=True,
+            terminal_status="cancelled",
+        )
+    )
+    rows.append(
+        _row(
+            arm="v2",
+            request_id_hash="v2-cancel-failed",
+            started_at=start,
+            finished_at=start + timedelta(seconds=1),
+            cancelled=True,
+            terminal_status="success",
+        )
+    )
+    report = collector.summarize_metrics(rows)
+    assert report["arms"]["v2"]["cancelled"] == 2
+    assert report["arms"]["v2"]["cancel_failures"] == 1
+
+
+def test_gate_rejects_incomplete_or_nonnumeric_inputs():
+    gate = _script_module("check_v2_rollout_gate")
+    collector = _script_module("collect_v2_rollout_report")
+
+    report = collector.summarize_metrics(_synthetic_rows())
+    # Missing security_violations must FAIL, never default to zero.
+    del report["arms"]["v2"]["security_violations"]
+    passed, _ = gate.check_gate(report)
+    assert passed is False
+
+    report = collector.summarize_metrics(_synthetic_rows())
+    report["arms"]["v2"]["error_rate"] = float("inf")
+    passed, _ = gate.check_gate(report)
+    assert passed is False
+
+    report = collector.summarize_metrics(_synthetic_rows())
+    report["arms"]["v1"]["p95_ms"] = None
+    passed, _ = gate.check_gate(report)
+    assert passed is False
+
+    # A forged minimal report with sufficient completed/hours still fails:
+    # the complete live schema is required.
+    forged = {
+        "schema": "v2_rollout_live_v1",
+        "generated_at": datetime.now(UTC).isoformat(),
+        "arms": {
+            "v1": {"completed": 500, "hours": 30},
+            "v2": {"completed": 500, "hours": 30},
+        },
+    }
+    passed, _ = gate.check_gate(forged)
+    assert passed is False

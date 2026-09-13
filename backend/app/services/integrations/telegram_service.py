@@ -350,6 +350,36 @@ async def _cmd_workspace(db, chat_id: str, link, arg: str) -> None:
     await send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
 
 
+async def _collect_v2_or_fallback_to_v1(
+    *,
+    graph,
+    version: str,
+    collect_fn,
+    resolve_fn,
+    collect_kwargs: dict,
+) -> tuple:
+    """Run the v2 collection, falling back to the v1 graph (R76).
+
+    On ``V1FallbackRequired`` (a v2 candidate that resolved to a v1-only
+    route before any capability execution) resolves AND assigns the v1
+    graph so the caller streams v1 with zero v2 output. ``collect_fn`` /
+    ``resolve_fn`` are injectable for unit tests; production passes the
+    real collector and ``resolve_agent_graph``.
+    """
+    from app.services.agents.v2.execution.scheduler import V1FallbackRequired
+
+    if version != "v2":
+        return graph, None
+    try:
+        events = await collect_fn(**collect_kwargs)
+        return graph, events
+    except V1FallbackRequired:
+        # Task 7B: serve the v1 graph — not just a None event list while
+        # ``graph`` still references v2.
+        v1_graph = await resolve_fn("v1")
+        return v1_graph, None
+
+
 async def _collect_v2_telegram_events(
     *,
     graph,
@@ -530,25 +560,25 @@ async def _handle_question(db, chat_id: str, question: str, tg_user_id: str | No
         # v2 turns emit no token stream (single terminal response), so the
         # events are collected up front; v1 streams token-by-token below.
         # Both arms then share the same delivery body.
-        from app.services.agents.v2.execution.scheduler import (
-            V1FallbackRequired,
-        )
-
         v2_events: list[dict] | None = None
         if version == "v2":
-            try:
-                v2_events = await _collect_v2_telegram_events(
-                    graph=graph,
-                    raw_question=question,
-                    workspace_ids=workspace_ids,
-                    user=user,
-                    session_id=str(session.id),
-                    resume_message_id=raw_message_uuid,
-                )
-            except V1FallbackRequired:
-                # Task 7B: v2 candidate resolved to a v1-only route before
-                # any capability execution — serve v1 with zero v2 output.
-                v2_events = None
+            # The helper resolves + assigns the v1 graph on
+            # V1FallbackRequired; other failures propagate to the outer
+            # handler exactly as before.
+            graph, v2_events = await _collect_v2_or_fallback_to_v1(
+                graph=graph,
+                version=version,
+                collect_fn=_collect_v2_telegram_events,
+                resolve_fn=resolve_agent_graph,
+                collect_kwargs={
+                    "graph": graph,
+                    "raw_question": question,
+                    "workspace_ids": workspace_ids,
+                    "user": user,
+                    "session_id": str(session.id),
+                    "resume_message_id": raw_message_uuid,
+                },
+            )
 
         async def _event_source():
             if v2_events is not None:

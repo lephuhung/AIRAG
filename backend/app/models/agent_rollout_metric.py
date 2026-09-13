@@ -38,7 +38,14 @@ class AgentRolloutMetric(Base):
         ),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        # T7A migration owns the table (BIGSERIAL): mirror its
+        # ``nextval('agent_rollout_metrics_id_seq')`` default exactly so
+        # ORM metadata matches the frozen column contract.
+        server_default=text("nextval('agent_rollout_metrics_id_seq'::regclass)"),
+    )
     arm: Mapped[str] = mapped_column(Text, nullable=False)
     request_id_hash: Mapped[str] = mapped_column(Text, nullable=False)
     workspace_id_hash: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

@@ -19,10 +19,15 @@ from .scheduler import (
     is_run_active,
     is_run_cancel_requested,
     is_run_cancel_requested_async,
+    refresh_active_run,
+    refresh_active_run_async,
     register_active_run,
+    register_active_run_async,
     request_run_cancellation,
+    request_run_cancellation_async,
     shared_scheduler_for,
     unregister_active_run,
+    unregister_active_run_async,
 )
 
 __all__ = [
@@ -35,8 +40,13 @@ __all__ = [
     "is_run_active",
     "is_run_cancel_requested",
     "is_run_cancel_requested_async",
+    "refresh_active_run",
+    "refresh_active_run_async",
     "register_active_run",
+    "register_active_run_async",
     "request_run_cancellation",
+    "request_run_cancellation_async",
     "shared_scheduler_for",
     "unregister_active_run",
+    "unregister_active_run_async",
 ]

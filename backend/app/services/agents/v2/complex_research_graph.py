@@ -79,7 +79,7 @@ from .contracts.planning import (
     TaskPlan,
     TaskSpec,
 )
-from .contracts.routing import QueryAnalysis
+from .contracts.routing import QueryAnalysis, RouteDecision
 from .contracts.semantic import SemanticContext
 from .contracts.state import GraphRuntimeContext, SupervisorV2State
 from .contracts.synthesis import SynthesisInput
@@ -90,7 +90,11 @@ from .dependencies.people_document import (
     materialize_person_dependency,
     redact_scalar_for_model,
 )
-from .execution.scheduler import refresh_pairs_for_checkpoint, shared_scheduler_for
+from .execution.scheduler import (
+    refresh_active_run_async as _refresh_active_run_async,
+    refresh_pairs_for_checkpoint,
+    shared_scheduler_for,
+)
 from .discovery import DiscoveryDenied, DiscoveryDisabled, request_addition
 from .nodes.context import node_context
 from .nodes.evaluate import _EVIDENCE_SUPPLYING_CAPABILITIES, evaluate_evidence
@@ -206,6 +210,11 @@ class ComplexResearchState(TypedDict, total=False):
     semantic: SemanticContext
     bindings: DocumentBindingSet
     query_analysis: QueryAnalysis | None
+    #: The already-resolved frozen router outcome, threaded from the
+    #: supervisor alongside ``query_analysis`` (R73). The execute node
+    #: derives the post-router v1-fallback guard from these two slots —
+    #: never from a fresh classification.
+    route_decision: RouteDecision | None
     plan: TaskPlan | None
     task_results: tuple[AgentResult, ...]
     evaluation: EvidenceEvaluation | None
@@ -445,6 +454,9 @@ def normalize_complex_state(state: ComplexResearchState) -> ComplexResearchState
         bindings=_coerce_slot(state.get("bindings"), DocumentBindingSet, slot="bindings"),
         query_analysis=_coerce_slot(
             state.get("query_analysis"), QueryAnalysis, slot="query_analysis"
+        ),
+        route_decision=_coerce_slot(
+            state.get("route_decision"), RouteDecision, slot="route_decision"
         ),
         plan=_coerce_slot(state.get("plan"), TaskPlan, slot="plan"),
         task_results=results,
@@ -1202,6 +1214,28 @@ async def validate_checkpoint_node(
     }
 
 
+def _production_v1_fallback_guard(state: ComplexResearchState) -> Any:
+    """Build the production post-router fallback guard (R73).
+
+    Derived from the ALREADY-resolved frozen ``QueryAnalysis`` and
+    ``RouteDecision`` in graph state — the sole guard the production
+    ComplexResearch scheduler call passes. Fires (returns True) when the
+    resolved route is write, evaluate/legal/compliance, or otherwise
+    unsupported, so the request falls back to v1 BEFORE any capability
+    execution or user-visible output. ``None`` outcomes fail closed
+    (guard fires) via ``requires_v1_fallback``.
+    """
+    analysis = state.get("query_analysis")
+    decision = state.get("route_decision")
+
+    def _guard() -> bool:
+        from app.services.agent.rollout_control import requires_v1_fallback
+
+        return bool(requires_v1_fallback(analysis, decision))
+
+    return _guard
+
+
 async def complex_execute_node(
     state: ComplexResearchState,
     runtime: "Runtime[GraphRuntimeContext]",
@@ -1224,12 +1258,21 @@ async def complex_execute_node(
         results=prior_results,
         runtime=context,
     )
+    try:
+        run_id = str(context.capability_runtime.run_id or "")
+    except Exception:
+        run_id = ""
+    if run_id:
+        # I2: refresh the distributed active registration for the run
+        # lifetime (long/resumed runs outlive the fixed TTL otherwise).
+        await _refresh_active_run_async(run_id)
     scheduler = shared_scheduler_for(context)
     report = await scheduler.execute(
         plan=plan,
         runtime=context,
         prior_results=prior_results,
         bindings=state.get("bindings"),
+        v1_fallback_guard=_production_v1_fallback_guard(state),
     )
     return {"task_results": report.results}
 
@@ -1740,6 +1783,7 @@ def build_complex_research_state(state: SupervisorV2State) -> ComplexResearchSta
         semantic=state["semantic"],
         bindings=state["bindings"],
         query_analysis=state["query_analysis"],
+        route_decision=state["route_decision"],
         plan=execution.plan,
         task_results=execution.task_results,
         evaluation=execution.evidence_evaluation,
