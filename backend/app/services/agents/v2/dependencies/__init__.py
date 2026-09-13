@@ -15,6 +15,7 @@ from .people_document import (
     build_dependent_search_task,
     extract_person_identifier,
     materialize_person_dependency,
+    redact_scalar_for_model,
 )
 
 __all__ = [
@@ -25,4 +26,5 @@ __all__ = [
     "build_dependent_search_task",
     "extract_person_identifier",
     "materialize_person_dependency",
+    "redact_scalar_for_model",
 ]

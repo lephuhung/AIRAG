@@ -466,7 +466,9 @@ def test_people_observation_does_not_expose_raw_record() -> None:
     assert isinstance(observation, AgentToolObservation)
     assert isinstance(observation.projection, PeopleLookupObservation)
     assert observation.projection.matched is True
-    assert observation.projection.dependency_scalar_available is True
+    # R28 (Task 4 fix1): without a checkpointed materialization decision the
+    # flag fails closed -- success + matched alone cannot prove extractability.
+    assert observation.projection.dependency_scalar_available is False
     assert observation.evidence_use_ids == (USE_ID,)
     payload = observation.model_dump_json()
     assert "record_id" not in payload

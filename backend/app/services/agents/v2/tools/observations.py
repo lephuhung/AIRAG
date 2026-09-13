@@ -101,50 +101,35 @@ class ObservationProjectionUnavailable(ValueError):
     """No typed projector exists for a result kind; failing closed, never generic."""
 
 
-#: Raw People fields that must never appear in any planner observation.
-#: The governed scalar is materialized server-side; the planner sees only
-#: the ``dependency_scalar_available`` availability flag. Any leak of these
-#: tokens (scalar value included) fails the projection closed.
-RAW_PEOPLE_FIELD_TOKENS: tuple[str, ...] = (
-    "cccd",
-    "national_id",
-    "citizen_id",
-    "dob",
-    "birth",
-    "address",
-    "phone",
-    "email",
-    "personnel",
-    "health",
-    "religion",
-    "ethnicity",
-    "biometric",
-)
-
-
-def assert_no_raw_people_fields(observation: AgentToolObservation) -> None:
-    """Executable minimization invariant: no raw People field is observable.
-
-    Inspects the serialized observation for the governed scalar value and
-    every raw People field token. A match raises
-    ``ObservationProjectionUnavailable`` instead of exposing the field to the
-    planner.
-    """
-    dumped = observation.model_dump_json().lower()
-    for token in RAW_PEOPLE_FIELD_TOKENS:
-        if token in dumped:
-            raise ObservationProjectionUnavailable(
-                f"planner observation exposes raw People field {token!r}; "
-                "refusing to leak governed People data"
-            )
-
-
 class ObservationProjector:
-    """Projects persisted capability results into minimized typed observations."""
+    """Projects persisted capability results into minimized typed observations.
+
+    Minimization is structural, not textual: ``PeopleLookupObservation``
+    declares exactly ``{kind, matched, dependency_scalar_available}`` (frozen
+    ``extra="forbid"``), so no raw People field or scalar value has any
+    typed carrier into the planner observation -- the schema itself is the
+    guarantee, and the tests pin its exact field set. There is deliberately
+    no substring scanner: scanning serialized JSON for field names cannot see
+    actual values and would false-positive on opaque hex (e.g. a UUID
+    containing ``cccd``).
+    """
 
     @staticmethod
-    def project(result: AgentResult) -> AgentToolObservation:
-        """Project one persisted ``AgentResult``; fail closed on unknown kinds."""
+    def project(
+        result: AgentResult,
+        *,
+        dependency_scalar_available: bool | None = None,
+    ) -> AgentToolObservation:
+        """Project one persisted ``AgentResult``; fail closed on unknown kinds.
+
+        ``dependency_scalar_available`` is the checkpointed materialization
+        decision for this People task (R28): pass the value the deterministic
+        materializer recorded (extractable under current governance right
+        now). When ``None`` (no materialization decision known) the flag is
+        ``False`` -- fail closed -- because ``success`` + ``matched`` alone
+        cannot prove the scalar is extractable (R24: missing scalar,
+        expired/unauthorized hydration). An explicit value always wins.
+        """
         evidence_use_ids = tuple(ref.use_id for ref in result.evidence_uses)
         data = result.data
         if data is None:
@@ -157,12 +142,14 @@ class ObservationProjector:
                 projection=NoObservation(kind="none"),
             )
         if isinstance(data, PeopleLookupOutput):
+            if dependency_scalar_available is None:
+                available = False
+            else:
+                available = dependency_scalar_available
             projection = PeopleLookupObservation(
                 kind="people.lookup",
                 matched=data.matched,
-                dependency_scalar_available=(
-                    result.status == "success" and data.matched
-                ),
+                dependency_scalar_available=available,
             )
         elif isinstance(data, DocumentSearchOutput):
             projection = DocumentSearchObservation(
@@ -197,12 +184,6 @@ class ObservationProjector:
             result_kind=data.kind,
             projection=projection,
         )
-        # People→Document invariant: the scalar and every raw People field
-        # stay server-side; the planner sees the availability flag only.
-        # (Scoped to the People projection: other projections carry opaque
-        # UUIDs whose hex may coincidentally contain a short token.)
-        if isinstance(projection, PeopleLookupObservation):
-            assert_no_raw_people_fields(observation)
         return observation
 
 

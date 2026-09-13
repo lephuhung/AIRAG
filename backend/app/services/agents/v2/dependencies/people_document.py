@@ -63,6 +63,7 @@ __all__ = [
     "build_dependent_search_task",
     "extract_person_identifier",
     "materialize_person_dependency",
+    "redact_scalar_for_model",
 ]
 
 #: The single approved People identifier field the materializer may extract.
@@ -162,6 +163,19 @@ async def materialize_person_dependency(
             f"people result for task {people_result.task_id!r} cannot supply "
             f"the dependency of task {people_task_id!r}"
         )
+    owner = next(
+        (task for task in plan.tasks if task.task_id == people_task_id), None
+    )
+    if owner is None:
+        raise MaterializationError(
+            f"task {people_task_id!r} is not in the checkpointed plan; "
+            "refusing to materialize for an unplanned task"
+        )
+    if owner.capability != "people.lookup":
+        raise MaterializationError(
+            f"task {people_task_id!r} is a {owner.capability!r} task, not "
+            "people.lookup; refusing to materialize from the wrong source"
+        )
     status = people_result.status
     if status == "not_found":
         return _outcome("not_found", reason="people.lookup found no record; no T2")
@@ -227,7 +241,26 @@ async def materialize_person_dependency(
     )
     scalars: list[str] = []
     admitted_use_ids: list[UUID] = []
+    owned_items = 0
     for item in admitted or ():
+        # R28: each hydrated item must be People evidence owned by the
+        # supplying people.lookup task. A use attached to another task, a
+        # target-bound read use, or a non-People record (the governed
+        # hydrator labels People content with source_label "people") is
+        # ignored -- fail closed -- never a scalar source.
+        if getattr(item, "task_id", None) != people_task_id:
+            continue
+        if getattr(item, "purpose", None) != "supporting":
+            continue
+        if getattr(item, "target_id", None) is not None:
+            continue
+        if getattr(item, "locator", None) is not None:
+            continue
+        if getattr(item, "document_revision", None) is not None:
+            continue
+        if getattr(item, "source_label", None) != "people":
+            continue
+        owned_items += 1
         content = getattr(item, "content", None)
         scalar = extract_person_identifier(content) if content is not None else None
         if scalar is None:
@@ -243,6 +276,14 @@ async def materialize_person_dependency(
             reason=(
                 "no governed People evidence admitted under current "
                 "ACL/expiry; no T2"
+            ),
+        )
+    if not owned_items:
+        return _outcome(
+            "unavailable",
+            reason=(
+                "admitted evidence is not People evidence owned by task "
+                f"{people_task_id!r}; no T2"
             ),
         )
     if not scalars:
@@ -283,9 +324,11 @@ def build_dependent_search_task(
     """Build the concrete T2 ``TaskSpec`` from a materialized outcome.
 
     Only ``kind == "materialized"`` may build: any other outcome raises
-    instead of fabricating a guessed/blank ``person_identifier``. When the
-    caller passes an explicit ``query`` it must match the materialized input
-    query; otherwise the materialized concrete input travels unchanged.
+    instead of fabricating a guessed/blank ``person_identifier``. The caller
+    supplies ONLY the search query; the ``person_identifier`` always comes
+    from the materialized scalar -- the append path can never overwrite it.
+    The concrete input is built fresh here (single construction site), never
+    carried over from a caller-supplied object.
     """
     if outcome.kind != "materialized" or outcome.scalar is None or outcome.input is None:
         raise MaterializationError(
@@ -294,13 +337,16 @@ def build_dependent_search_task(
         )
     if not next_task_id or not next_task_id.strip():
         raise MaterializationError("the dependent task needs a non-blank task id")
-    concrete = outcome.input
-    if query and query.strip() and query.strip() != concrete.query:
-        concrete = DocumentSearchInput(
-            kind="document.search",
-            query=query.strip(),
-            person_identifier=outcome.scalar,
+    if not query or not query.strip():
+        raise MaterializationError(
+            "the dependent document.search needs a non-blank query; refusing "
+            "to fabricate one"
         )
+    concrete = DocumentSearchInput(
+        kind="document.search",
+        query=query.strip(),
+        person_identifier=outcome.scalar,
+    )
     return TaskSpec(
         task_id=next_task_id,
         capability="document.search",
@@ -352,6 +398,39 @@ def append_materialized_dependent(
     )
     proposed = current.model_copy(update={"tasks": current.tasks + (task,)})
     return validate_replan(current, proposed, outcomes, policy, budget)
+
+
+def redact_scalar_for_model(plan: TaskPlan) -> TaskPlan:
+    """Return a model-facing projection of ``plan`` with scalars redacted (R25).
+
+    The frozen contract keeps ``person_identifier`` on the checkpointed
+    ``DocumentSearchInput`` (planner-visible through
+    ``ResearchPlanningInput.current_plan`` by contract). This helper is the
+    defence-in-depth boundary for model-facing planning/replanning
+    projections: every ``document.search`` input in the returned plan carries
+    ``person_identifier=None`` while task identity, ordering, objectives, and
+    ``depends_on`` are preserved, so the planner still sees that T2 depends
+    on T1 without ever seeing the scalar. T5 (model planner owner) MUST
+    consume this helper for any model-facing plan projection; the
+    checkpointed plan itself is never redacted.
+    """
+    redacted: list[TaskSpec] = []
+    for task in plan.tasks:
+        if isinstance(task.input, DocumentSearchInput) and task.input.person_identifier is not None:
+            redacted.append(
+                task.model_copy(
+                    update={
+                        "input": DocumentSearchInput(
+                            kind="document.search",
+                            query=task.input.query,
+                            person_identifier=None,
+                        )
+                    }
+                )
+            )
+        else:
+            redacted.append(task)
+    return plan.model_copy(update={"tasks": tuple(redacted)})
 
 
 def _people_task_id_for(

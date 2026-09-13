@@ -4,8 +4,12 @@ The governed People scalar is materialized server-side into a concrete
 ``DocumentSearchInput`` BEFORE the dependent task is appended/checkpointed:
 never an agent handoff, never inside the scheduler. ``depends_on`` expresses
 ordering only; the scheduler executes ``TaskSpec.input`` exactly as
-checkpointed and never mutates or lazily materializes it. The planner sees
-only T1 status, ``evidence_use_ids``, and ``dependency_scalar_available``.
+checkpointed and never mutates or lazily materializes it.
+
+Proof style (R27): the required ordering/checkpoint/no-T2 properties are proven
+on the REAL compiled subgraph with a real saver
+(``build_complex_research_subgraph(checkpointer=InMemorySaver)``); helper-level
+unit tests remain as additional coverage only.
 """
 from __future__ import annotations
 
@@ -14,17 +18,27 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
+from langgraph.checkpoint.memory import InMemorySaver
 
 from app.services.agents.v2.capabilities import (
     CapabilityRegistration,
     build_capability_registry,
 )
+from app.services.agents.v2.complex_research_graph import (
+    _build_complex_research_graph,
+    people_document_materialize_node,
+)
+
+
+def _compile_subgraph(saver: InMemorySaver):  # real saver, test-owned (R27)
+    return _build_complex_research_graph().compile(checkpointer=saver)
 from app.services.agents.v2.contracts.base import CONTRACT_VERSION
 from app.services.agents.v2.contracts.binding import DocumentBindingSet
 from app.services.agents.v2.contracts.capability import (
     CapabilityDescriptor,
     CapabilityRuntimeContext,
     DocumentSearchInput,
+    DocumentSearchOutput,
     PeopleLookupInput,
     PeopleLookupOutput,
 )
@@ -33,6 +47,7 @@ from app.services.agents.v2.contracts.execution import (
     AgentError,
     AgentRequest,
     AgentResult,
+    TaskExecutionSummary,
 )
 from app.services.agents.v2.contracts.planning import (
     DiscoveryPolicy,
@@ -41,36 +56,35 @@ from app.services.agents.v2.contracts.planning import (
     TaskPlan,
     TaskSpec,
 )
+from app.services.agents.v2.contracts.routing import QueryAnalysis
+from app.services.agents.v2.contracts.semantic import SemanticContext
 from app.services.agents.v2.contracts.state import (
     GraphRuntimeContext,
     RuntimeServices,
 )
 from app.services.agents.v2.dependencies.people_document import (
     PERSON_IDENTIFIER_FIELD,
+    MaterializationError,
     PeopleDocumentMaterialization,
     append_materialized_dependent,
     build_dependent_search_task,
     extract_person_identifier,
     materialize_person_dependency,
+    redact_scalar_for_model,
 )
-from app.services.agents.v2.tools.observations import ObservationProjector
+from app.services.agents.v2.nodes.evaluate import HydratedEvidence
+from app.services.agents.v2.tools.observations import (
+    ObservationProjector,
+    PeopleLookupObservation,
+)
 
 USER_ID = UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
 WORKSPACE_ID = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
 USE_ID = UUID("44444444-4444-4444-4444-444444444444")
+EVIDENCE_ID = UUID("55555555-5555-5555-5555-555555555555")
 SCALAR = "079000000001"
 OTHER_SCALAR = "079000000002"
-
-RAW_PEOPLE_ROW = {
-    "record_id": "rec-1",
-    "name": "Nguyen Van A",
-    PERSON_IDENTIFIER_FIELD: SCALAR,
-    "cccd": SCALAR,
-    "dob": "1990-01-01",
-    "address": "Hanoi",
-    "phone": "0900000000",
-    "email": "a@example.com",
-}
+GOAL = "A xuat hien trong nghi dinh nao"
 
 FORBIDDEN_OBSERVATION_TOKENS = (
     "cccd",
@@ -92,18 +106,35 @@ def _minimized_content(identifier: str | None = None) -> str:
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
-class FakeHydratedEvidence:
-    def __init__(self, content: str, use_id: UUID = USE_ID) -> None:
-        self.use_id = use_id
-        self.content = content
+def _hydrated(
+    content: str,
+    *,
+    use_id: UUID = USE_ID,
+    task_id: str = "T1",
+    purpose: str = "supporting",
+    target_id: str | None = None,
+    source_label: str | None = "people",
+) -> HydratedEvidence:
+    return HydratedEvidence(
+        use_id=use_id,
+        evidence_id=EVIDENCE_ID,
+        task_id=task_id,
+        purpose=purpose,  # type: ignore[arg-type]
+        target_id=target_id,
+        content=content,
+        role=None,
+        source_label=source_label,
+        classification="personal",
+        locator=None,
+        document_revision=None,
+    )
 
 
 class FakeHydrator:
-    """Governed-hydration stand-in: returns exactly the admitted set."""
+    """Governed-hydration stand-in: admits exactly the mapped uses."""
 
-    def __init__(self, admitted: tuple[FakeHydratedEvidence, ...] = ()) -> None:
-        self._admitted = admitted
-        self.calls: list[tuple[tuple[EvidenceUseRef, ...], object, object]] = []
+    def __init__(self, admitted: tuple[HydratedEvidence, ...] = ()) -> None:
+        self._by_use = {item.use_id: item for item in admitted}
 
     async def hydrate_for_evaluation(
         self,
@@ -112,9 +143,10 @@ class FakeHydrator:
         runtime: object,
         plan: object,
         bindings: object,
-    ) -> tuple[FakeHydratedEvidence, ...]:
-        self.calls.append((use_refs, plan, bindings))
-        return self._admitted
+    ) -> tuple[HydratedEvidence, ...]:
+        return tuple(
+            self._by_use[ref.use_id] for ref in use_refs if ref.use_id in self._by_use
+        )
 
 
 class FakeLeaseSession:
@@ -138,32 +170,65 @@ class FakeLeaseRepo:
         self.calls.append((run_id, revision_id, use_id))
 
 
-class StubSearchCapability:
-    """Atomic document.search stub: records the exact checkpointed input."""
+class StubPeopleCapability:
+    """Atomic people.lookup stub returning a governed success."""
 
-    def __init__(self, result: AgentResult) -> None:
+    def __init__(self, use_id: UUID = USE_ID) -> None:
         self.descriptor = CapabilityDescriptor(
-            name="document.search",  # type: ignore[arg-type]
-            domain="document",  # type: ignore[arg-type]
-            operation_type="search",
+            name="people.lookup",  # type: ignore[arg-type]
+            domain="people",  # type: ignore[arg-type]
+            operation_type="lookup",
             supports_parallel=True,
         )
-        self._result = result
+        self._use_id = use_id
         self.calls: list[tuple[AgentRequest, CapabilityRuntimeContext]] = []
 
     async def execute(
         self, request: AgentRequest, runtime: CapabilityRuntimeContext
     ) -> AgentResult:
         self.calls.append((request, runtime))
-        return self._result
+        return AgentResult(
+            contract_version=CONTRACT_VERSION,
+            task_id=request.task_id,
+            status="success",
+            data=PeopleLookupOutput(kind="people.lookup", matched=True),
+            evidence_uses=(EvidenceUseRef(use_id=self._use_id),),
+            coverage_observations=(),
+            error=None,
+        )
+
+
+class StubSearchCapability:
+    """Atomic document.search stub: records the exact checkpointed input."""
+
+    def __init__(self) -> None:
+        self.descriptor = CapabilityDescriptor(
+            name="document.search",  # type: ignore[arg-type]
+            domain="document",  # type: ignore[arg-type]
+            operation_type="search",
+            supports_parallel=True,
+        )
+        self.calls: list[tuple[AgentRequest, CapabilityRuntimeContext]] = []
+
+    async def execute(
+        self, request: AgentRequest, runtime: CapabilityRuntimeContext
+    ) -> AgentResult:
+        self.calls.append((request, runtime))
+        return AgentResult(
+            contract_version=CONTRACT_VERSION,
+            task_id=request.task_id,
+            status="success",
+            data=DocumentSearchOutput(kind="document.search", candidates=()),
+            evidence_uses=(),
+            coverage_observations=(),
+            error=None,
+        )
 
 
 def _runtime(
     *,
     hydrator: FakeHydrator | None = None,
     leases: FakeLeaseRepo | None = None,
-    allowed: frozenset[str] | None = None,
-    can_read_people: bool = True,
     registry: object = None,
 ) -> GraphRuntimeContext:
     return GraphRuntimeContext(
@@ -172,12 +237,8 @@ def _runtime(
             run_id="run-1",
             user_id=USER_ID,
             workspace_ids=(WORKSPACE_ID,),
-            can_read_people=can_read_people,
-            allowed_capabilities=(
-                allowed
-                if allowed is not None
-                else frozenset({"people.lookup", "document.search"})
-            ),
+            can_read_people=True,
+            allowed_capabilities=frozenset({"people.lookup", "document.search"}),
             deadline_at=datetime(2030, 1, 1, tzinfo=UTC),
         ),
         services=RuntimeServices(
@@ -192,7 +253,7 @@ def _people_plan() -> TaskPlan:
     return TaskPlan(
         contract_version=CONTRACT_VERSION,
         plan_id="p1",
-        goal="A xuat hien trong nghi dinh nao",
+        goal=GOAL,
         target_units=(),
         tasks=(
             TaskSpec(
@@ -223,6 +284,25 @@ def _bindings() -> DocumentBindingSet:
     return DocumentBindingSet(bindings=(), revision_requirement_refs=())
 
 
+def _semantic() -> SemanticContext:
+    return SemanticContext(
+        contextualized_query=GOAL,
+        normalized_query=GOAL,
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(),
+        person_refs=(),
+        section_refs=(),
+        blocking_ambiguities=(),
+    )
+
+
+def _analysis() -> QueryAnalysis:
+    # A non-compare work type: the compare skill fails closed in
+    # validate_checkpoint, so the input T1 plan passes through untouched.
+    return QueryAnalysis(work_type="lookup", domains=("people",))
+
+
 def _policy() -> DiscoveryPolicy:
     return DiscoveryPolicy(
         allow_reference_discovery=False,
@@ -234,6 +314,19 @@ def _policy() -> DiscoveryPolicy:
 def _budget() -> ResearchBudgetView:
     return ResearchBudgetView(
         max_tasks_remaining=7, max_replans_remaining=1, max_parallel_branches=2
+    )
+
+
+def _materialized_outcome() -> PeopleDocumentMaterialization:
+    return PeopleDocumentMaterialization(
+        kind="materialized",
+        scalar=SCALAR,
+        input=DocumentSearchInput(
+            kind="document.search", query="nghi dinh", person_identifier=SCALAR
+        ),
+        error_code=None,
+        reason="governed scalar materialized server-side",
+        evidence_use_ids=(USE_ID,),
     )
 
 
@@ -258,87 +351,409 @@ def test_extract_person_identifier_reads_only_the_approved_field() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Required Task 4 tests
+# R25: redacted model-facing projection vs checkpointed plan
+# ---------------------------------------------------------------------------
+
+
+def test_redact_scalar_for_model_keeps_checkpoint_but_hides_scalar() -> None:
+    plan = _people_plan()
+    task = build_dependent_search_task(
+        _materialized_outcome(), people_task_id="T1", query="nghi dinh", next_task_id="T2"
+    )
+    checkpointed = plan.model_copy(update={"tasks": plan.tasks + (task,)})
+    projected = redact_scalar_for_model(checkpointed)
+    # The checkpointed plan keeps the governed scalar (frozen contract).
+    assert checkpointed.tasks[1].input.person_identifier == SCALAR  # type: ignore[union-attr]
+    # The model-facing projection carries none of it.
+    redacted_input = projected.tasks[1].input
+    assert isinstance(redacted_input, DocumentSearchInput)
+    assert redacted_input.person_identifier is None
+    assert redacted_input.query == "nghi dinh"
+    assert projected.tasks[1].task_id == "T2"
+    assert projected.tasks[1].depends_on == ("T1",)
+    assert SCALAR not in projected.model_dump_json()
+    # The checkpointed plan is untouched by the projection.
+    assert checkpointed.tasks[1].input.person_identifier == SCALAR  # type: ignore[union-attr]
+
+
+# ---------------------------------------------------------------------------
+# R28.2: the typed schema is the only carrier (no raw-field escape hatch)
+# ---------------------------------------------------------------------------
+
+
+def test_people_projection_schema_carries_no_raw_field() -> None:
+    assert set(PeopleLookupObservation.model_fields) == {
+        "kind",
+        "matched",
+        "dependency_scalar_available",
+    }
+
+
+# ---------------------------------------------------------------------------
+# R28.3: availability reflects the materialization decision, fail-closed default
+# ---------------------------------------------------------------------------
+
+
+def test_availability_defaults_to_unavailable_without_materialization_decision() -> None:
+    observation = ObservationProjector.project(_people_success())
+    assert observation.projection.kind == "people.lookup"
+    assert observation.projection.matched is True
+    # success + matched alone cannot prove extractability (R24).
+    assert observation.projection.dependency_scalar_available is False
+
+
+@pytest.mark.asyncio
+async def test_availability_reflects_materialization_decision() -> None:
+    plan = _people_plan()
+    runtime = _runtime(hydrator=FakeHydrator((_hydrated(_minimized_content(SCALAR)),)))
+    outcome = await materialize_person_dependency(
+        people_task_id="T1",
+        people_result=_people_success(),
+        runtime=runtime,
+        plan=plan,
+        bindings=_bindings(),
+        query="nghi dinh",
+    )
+    assert outcome.kind == "materialized"
+    available = ObservationProjector.project(
+        _people_success(), dependency_scalar_available=(outcome.kind == "materialized")
+    )
+    assert available.projection.dependency_scalar_available is True
+
+    # Matched but not extractable: the planner is told unavailable.
+    denied_runtime = _runtime(hydrator=FakeHydrator(()))
+    denied_outcome = await materialize_person_dependency(
+        people_task_id="T1",
+        people_result=_people_success(),
+        runtime=denied_runtime,
+        plan=plan,
+        bindings=_bindings(),
+        query="nghi dinh",
+    )
+    assert denied_outcome.kind == "unavailable"
+    unavailable = ObservationProjector.project(
+        _people_success(),
+        dependency_scalar_available=(denied_outcome.kind == "materialized"),
+    )
+    assert unavailable.projection.dependency_scalar_available is False
+
+
+# ---------------------------------------------------------------------------
+# R28.1: hydrated evidence must be People evidence owned by T1
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_people_document_materializes_before_task_append() -> None:
+async def test_materializer_rejects_evidence_owned_by_another_task() -> None:
     plan = _people_plan()
-    result = _people_success()
-    runtime = _runtime(hydrator=FakeHydrator((FakeHydratedEvidence(_minimized_content(SCALAR)),)))
+    runtime = _runtime(
+        hydrator=FakeHydrator((_hydrated(_minimized_content(SCALAR), task_id="OTHER"),))
+    )
     outcome = await materialize_person_dependency(
         people_task_id="T1",
-        people_result=result,
+        people_result=_people_success(),
         runtime=runtime,
         plan=plan,
         bindings=_bindings(),
         query="nghi dinh",
     )
-    assert isinstance(outcome, PeopleDocumentMaterialization)
-    assert outcome.kind == "materialized"
-    assert outcome.scalar == SCALAR
-    assert outcome.input is not None
-    assert outcome.input.person_identifier == SCALAR
-    # T2 does not exist yet: materialization precedes the append.
-    assert [task.task_id for task in plan.tasks] == ["T1"]
+    assert outcome.kind == "unavailable"
+    assert outcome.input is None
+    assert "T1" in outcome.reason
+
+
+@pytest.mark.asyncio
+async def test_materializer_rejects_non_people_evidence() -> None:
+    plan = _people_plan()
+    for bad in (
+        _hydrated(
+            _minimized_content(SCALAR),
+            source_label="document",
+        ),
+        _hydrated(_minimized_content(SCALAR), purpose="coverage", target_id="t1"),
+        _hydrated(content=None),
+    ):
+        runtime = _runtime(hydrator=FakeHydrator((bad,)))
+        outcome = await materialize_person_dependency(
+            people_task_id="T1",
+            people_result=_people_success(),
+            runtime=runtime,
+            plan=plan,
+            bindings=_bindings(),
+            query="nghi dinh",
+        )
+        assert outcome.kind == "unavailable", bad
+        assert outcome.input is None
+
+
+# ---------------------------------------------------------------------------
+# R28.4: the append path can never overwrite the materialized scalar
+# ---------------------------------------------------------------------------
+
+
+def test_build_never_overwrites_materialized_scalar() -> None:
     task = build_dependent_search_task(
-        outcome, people_task_id="T1", query="nghi dinh", next_task_id="T2"
+        _materialized_outcome(),
+        people_task_id="T1",
+        query="a completely different query",
+        next_task_id="T2",
     )
-    assert task.task_id == "T2"
-    assert task.capability == "document.search"
-    assert task.depends_on == ("T1",)
     assert isinstance(task.input, DocumentSearchInput)
+    assert task.input.query == "a completely different query"
     assert task.input.person_identifier == SCALAR
+    with pytest.raises(MaterializationError):
+        build_dependent_search_task(
+            PeopleDocumentMaterialization(
+                kind="unavailable",
+                scalar=None,
+                input=None,
+                error_code=None,
+                reason="no T2",
+            ),
+            people_task_id="T1",
+            query="nghi dinh",
+            next_task_id="T2",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Graph-level proofs on the REAL subgraph with a real saver (R26/R27)
+# ---------------------------------------------------------------------------
+
+
+def _graph_harness() -> tuple[
+    StubPeopleCapability, StubSearchCapability, FakeHydrator, FakeLeaseRepo, list[str]
+]:
+    people = StubPeopleCapability()
+    search = StubSearchCapability()
+    hydrator = FakeHydrator((_hydrated(_minimized_content(SCALAR)),))
+    events: list[str] = []
+    leases = FakeLeaseRepo(events)
+    return people, search, hydrator, leases, events
+
+
+def _graph_runtime(
+    people: StubPeopleCapability,
+    search: StubSearchCapability,
+    hydrator: FakeHydrator,
+    leases: FakeLeaseRepo,
+) -> GraphRuntimeContext:
+    base = _runtime()
+    registry = build_capability_registry(
+        [CapabilityRegistration(capability=people), CapabilityRegistration(capability=search)],
+        base.capability_runtime,
+    )
+    return _runtime(hydrator=hydrator, leases=leases, registry=registry)
+
+
+def _graph_input() -> dict:
+    return {
+        "contract_version": "2.0",
+        "semantic": _semantic(),
+        "bindings": _bindings(),
+        "query_analysis": _analysis(),
+        "plan": _people_plan(),
+        "task_results": (),
+        "replans_remaining": 0,
+    }
+
+
+def _slot(values: object, name: str) -> object:
+    if isinstance(values, dict):
+        return values.get(name)
+    return getattr(values, name)
+
+
+def _tasks_of(plan: object) -> tuple:
+    return tuple(_slot(plan, "tasks") or ())
+
+
+def _results_of(values: object) -> tuple:
+    results = _slot(values, "task_results") or ()
+    return tuple(results)
+
+
+@pytest.mark.asyncio
+async def test_people_document_materializes_before_task_append() -> None:
+    """R26/R27: T1 executes -> materialize appends T2 -> scheduler runs T2.
+
+    Proves on the real compiled subgraph with a real saver that the T2
+    checkpoint (concrete input) precedes the T2 result, and that the final
+    checkpointed plan carries both tasks with both results present.
+    """
+    people, search, hydrator, leases, events = _graph_harness()
+    runtime = _graph_runtime(people, search, hydrator, leases)
+    saver = InMemorySaver()
+    graph = _compile_subgraph(saver)
+    config = {"configurable": {"thread_id": "thread-people-doc-1"}}
+
+    await graph.ainvoke(_graph_input(), config=config, context=runtime)
+
+    snapshot = await graph.aget_state(config)
+    plan = snapshot.values["plan"]
+    tasks = _tasks_of(plan)
+    assert [t["task_id"] if isinstance(t, dict) else t.task_id for t in tasks] == [
+        "T1",
+        "T2",
+    ]
+    results = _results_of(snapshot.values)
+    assert [r["task_id"] if isinstance(r, dict) else r.task_id for r in results] == [
+        "T1",
+        "T2",
+    ]
+    # The materialize node appended T2 and the scheduler dispatched it: the
+    # checkpointed T2 input is exactly what the search capability received.
+    t2 = tasks[1]
+    t2_input = _slot(t2, "input")
+    assert len(search.calls) == 1
+    dispatched = search.calls[0][0].input
+    assert dispatched == (
+        t2_input
+        if not isinstance(t2_input, dict)
+        else DocumentSearchInput.model_validate(t2_input)
+    )
+    assert dispatched.person_identifier == SCALAR
+    # Ordering proof from the real checkpoint history: the first checkpoint
+    # whose plan contains T2 carries no T2 result yet -- the append preceded
+    # the dispatch, never the reverse.
+    history: list[dict] = []
+    async for tup in saver.alist(config):
+        history.append(dict(tup.checkpoint["channel_values"]))
+    history.reverse()
+    first_t2_at = next(
+        (
+            index
+            for index, values in enumerate(history)
+            if values.get("plan") is not None
+            and "T2"
+            in [
+                t.get("task_id", "") if isinstance(t, dict) else t.task_id
+                for t in _tasks_of(values["plan"])
+            ]
+        ),
+        None,
+    )
+    assert first_t2_at is not None, "T2 was never checkpointed"
+    first_results = _results_of(history[first_t2_at])
+    assert [
+        r.get("task_id", "") if isinstance(r, dict) else r.task_id for r in first_results
+    ] == ["T1"]
+    assert "commit" in events, "leases were committed before the T2 checkpoint"
 
 
 @pytest.mark.asyncio
 async def test_t2_checkpoint_contains_final_document_search_input() -> None:
-    plan = _people_plan()
-    result = _people_success()
-    runtime = _runtime(hydrator=FakeHydrator((FakeHydratedEvidence(_minimized_content(SCALAR)),)))
+    """R27: the ACTUAL LangGraph checkpoint carries the concrete T2 input."""
+    people, search, hydrator, leases, _ = _graph_harness()
+    runtime = _graph_runtime(people, search, hydrator, leases)
+    saver = InMemorySaver()
+    graph = _compile_subgraph(saver)
+    config = {"configurable": {"thread_id": "thread-people-doc-2"}}
+
+    await graph.ainvoke(_graph_input(), config=config, context=runtime)
+
+    snapshot = await graph.aget_state(config)
+    t2 = _tasks_of(snapshot.values["plan"])[1]
+    t2_input = _slot(t2, "input")
+    if isinstance(t2_input, dict):
+        t2_input = DocumentSearchInput.model_validate(t2_input)
+    assert isinstance(t2_input, DocumentSearchInput)
+    assert t2_input.person_identifier == SCALAR
+    assert t2_input.query == GOAL
+    depends = _slot(t2, "depends_on")
+    assert list(depends) == ["T1"]
+
+
+@pytest.mark.asyncio
+async def test_graph_never_appends_t2_without_governed_scalar() -> None:
+    """R27: not_found/denied/timeout/unavailable on the real node -> no T2."""
+    from app.services.agents.v2.contracts.capability import PeopleLookupOutput as _Out
+
+    cases = {
+        "not_found": AgentResult(
+            contract_version=CONTRACT_VERSION,
+            task_id="T1",
+            status="not_found",
+            data=_Out(kind="people.lookup", matched=False),
+            evidence_uses=(),
+            coverage_observations=(),
+            error=None,
+        ),
+        "denied": AgentResult(
+            contract_version=CONTRACT_VERSION,
+            task_id="T1",
+            status="denied",
+            data=None,
+            evidence_uses=(),
+            coverage_observations=(),
+            error=AgentError(
+                code="PERMISSION_DENIED", message="denied", retryable=False
+            ),
+        ),
+        "timeout": AgentResult(
+            contract_version=CONTRACT_VERSION,
+            task_id="T1",
+            status="error",
+            data=None,
+            evidence_uses=(),
+            coverage_observations=(),
+            error=AgentError(code="TIMEOUT", message="timed out", retryable=True),
+        ),
+        "unavailable": _people_success(),  # matched, but hydrator admits nothing
+    }
+    kinds = {"not_found": "not_found", "denied": "denied", "timeout": "failed"}
+    for name, result in cases.items():
+        hydrator = FakeHydrator(())
+        runtime = _runtime(hydrator=hydrator)
+        state = {
+            "contract_version": "2.0",
+            "semantic": _semantic(),
+            "bindings": _bindings(),
+            "query_analysis": _analysis(),
+            "plan": _people_plan(),
+            "task_results": (result,),
+            "replans_remaining": 0,
+        }
+        update = await people_document_materialize_node(state, runtime)  # type: ignore[arg-type]
+        assert update.get("plan", None) is None, name
+        assert update.get("materialized_new_task", False) is False, name
+        if name in kinds:
+            outcome = await materialize_person_dependency(
+                people_task_id="T1",
+                people_result=result,
+                runtime=runtime,
+                plan=_people_plan(),
+                bindings=_bindings(),
+                query="nghi dinh",
+            )
+            assert outcome.kind == kinds[name], name
+            assert outcome.input is None, name
+    # The unavailable case is the distinct typed outcome, not not_found.
     outcome = await materialize_person_dependency(
         people_task_id="T1",
-        people_result=result,
-        runtime=runtime,
-        plan=plan,
+        people_result=_people_success(),
+        runtime=_runtime(hydrator=FakeHydrator(())),
+        plan=_people_plan(),
         bindings=_bindings(),
         query="nghi dinh",
     )
-    assert outcome.kind == "materialized"
-    from app.services.agents.v2.contracts.execution import TaskExecutionSummary
+    assert outcome.kind == "unavailable"
+    assert outcome.input is None
 
-    proposed = append_materialized_dependent(
-        current=plan,
-        outcomes=(TaskExecutionSummary(task_id="T1", status="success"),),
-        outcome=outcome,
-        query="nghi dinh",
-        next_task_id="T2",
-        policy=_policy(),
-        budget=_budget(),
-    )
-    assert [task.task_id for task in proposed.tasks] == ["T1", "T2"]
-    checkpointed = proposed.tasks[1].input
-    assert isinstance(checkpointed, DocumentSearchInput)
-    assert checkpointed.person_identifier == SCALAR
-    assert checkpointed.query == "nghi dinh"
-    # The checkpoint payload already carries the final concrete input.
-    payload = json.loads(proposed.model_dump_json())
-    t2 = next(task for task in payload["tasks"] if task["task_id"] == "T2")
-    assert t2["input"]["person_identifier"] == SCALAR
-    assert t2["input"]["query"] == "nghi dinh"
-    assert t2["depends_on"] == ["T1"]
+
+# ---------------------------------------------------------------------------
+# Scheduler + observation properties (helper-level additional coverage)
+# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_scheduler_never_rewrites_task_input() -> None:
-    from app.services.agents.v2.contracts.capability import DocumentSearchOutput
     from app.services.agents.v2.execution.scheduler import execute_ready_tasks
 
     plan = TaskPlan(
         contract_version=CONTRACT_VERSION,
         plan_id="p1",
-        goal="A xuat hien trong nghi dinh nao",
+        goal=GOAL,
         target_units=(),
         tasks=(
             TaskSpec(
@@ -370,10 +785,20 @@ async def test_scheduler_never_rewrites_task_input() -> None:
         coverage_observations=(),
         error=None,
     )
-    search = StubSearchCapability(search_result)
+    recorded: list[AgentRequest] = []
+
+    class RecordingSearch(StubSearchCapability):
+        async def execute(  # type: ignore[override]
+            self, request: AgentRequest, runtime: CapabilityRuntimeContext
+        ) -> AgentResult:
+            recorded.append(request)
+            return search_result
+
+    recording = RecordingSearch()
     runtime = _runtime(
         registry=build_capability_registry(
-            [CapabilityRegistration(capability=search)], runtime=_runtime().capability_runtime
+            [CapabilityRegistration(capability=recording)],
+            _runtime().capability_runtime,
         )
     )
     report = await execute_ready_tasks(
@@ -383,8 +808,8 @@ async def test_scheduler_never_rewrites_task_input() -> None:
         runtime=runtime,
         bindings=_bindings(),
     )
-    assert len(search.calls) == 1
-    request, _ = search.calls[0]
+    assert len(recorded) == 1
+    request = recorded[0]
     # The scheduler dispatched the checkpointed input verbatim: no rewrite,
     # no lazy materialization, no second scalar source.
     assert request.input == plan.tasks[1].input
@@ -398,15 +823,12 @@ async def test_people_scalar_never_enters_planner_observation() -> None:
     observation = ObservationProjector.project(_people_success())
     assert observation.projection.kind == "people.lookup"
     assert observation.projection.matched is True
-    assert observation.projection.dependency_scalar_available is True
+    # No materialization decision known -> fail closed.
+    assert observation.projection.dependency_scalar_available is False
     dumped = observation.model_dump_json().lower()
     assert SCALAR not in dumped
     for token in FORBIDDEN_OBSERVATION_TOKENS:
         assert token not in dumped
-    # The raw People row never enters the planner observation either.
-    for value in RAW_PEOPLE_ROW.values():
-        if isinstance(value, str) and len(value) >= 4 and value != SCALAR:
-            assert value.lower() not in dumped
 
 
 @pytest.mark.asyncio
@@ -471,11 +893,6 @@ async def test_people_timeout_does_not_fabricate_t2() -> None:
     assert outcome.error_code == "TIMEOUT"
     assert outcome.input is None
     assert [task.task_id for task in plan.tasks] == ["T1"]
-
-
-# ---------------------------------------------------------------------------
-# Distinct typed outcomes: denial / error / expired / missing scalar
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -554,7 +971,7 @@ async def test_expired_or_unauthorized_evidence_use_does_not_materialize() -> No
 async def test_matched_without_extractable_scalar_never_fabricates_input() -> None:
     plan = _people_plan()
     runtime = _runtime(
-        hydrator=FakeHydrator((FakeHydratedEvidence(_minimized_content(None)),))
+        hydrator=FakeHydrator((_hydrated(_minimized_content(None)),))
     )
     outcome = await materialize_person_dependency(
         people_task_id="T1",
@@ -586,8 +1003,8 @@ async def test_conflicting_scalars_across_uses_fail_closed() -> None:
     runtime = _runtime(
         hydrator=FakeHydrator(
             (
-                FakeHydratedEvidence(_minimized_content(SCALAR)),
-                FakeHydratedEvidence(_minimized_content(OTHER_SCALAR), use_id=use2),
+                _hydrated(_minimized_content(SCALAR)),
+                _hydrated(_minimized_content(OTHER_SCALAR), use_id=use2),
             )
         )
     )
@@ -606,7 +1023,7 @@ async def test_conflicting_scalars_across_uses_fail_closed() -> None:
 @pytest.mark.asyncio
 async def test_raw_people_row_never_enters_checkpoint_plan() -> None:
     plan = _people_plan()
-    runtime = _runtime(hydrator=FakeHydrator((FakeHydratedEvidence(_minimized_content(SCALAR)),)))
+    runtime = _runtime(hydrator=FakeHydrator((_hydrated(_minimized_content(SCALAR)),)))
     outcome = await materialize_person_dependency(
         people_task_id="T1",
         people_result=_people_success(),
@@ -615,8 +1032,6 @@ async def test_raw_people_row_never_enters_checkpoint_plan() -> None:
         bindings=_bindings(),
         query="nghi dinh",
     )
-    from app.services.agents.v2.contracts.execution import TaskExecutionSummary
-
     proposed = append_materialized_dependent(
         current=plan,
         outcomes=(TaskExecutionSummary(task_id="T1", status="success"),),
@@ -633,3 +1048,31 @@ async def test_raw_people_row_never_enters_checkpoint_plan() -> None:
         assert token not in dumped
     assert "1990-01-01" not in dumped
     assert "0900000000" not in dumped
+
+
+@pytest.mark.asyncio
+async def test_full_materialization_appends_validated_t2() -> None:
+    plan = _people_plan()
+    runtime = _runtime(hydrator=FakeHydrator((_hydrated(_minimized_content(SCALAR)),)))
+    outcome = await materialize_person_dependency(
+        people_task_id="T1",
+        people_result=_people_success(),
+        runtime=runtime,
+        plan=plan,
+        bindings=_bindings(),
+        query="nghi dinh",
+    )
+    assert outcome.kind == "materialized"
+    assert isinstance(outcome, PeopleDocumentMaterialization)
+    assert outcome.scalar == SCALAR
+    assert outcome.input is not None
+    assert outcome.input.person_identifier == SCALAR
+    assert [task.task_id for task in plan.tasks] == ["T1"]
+    task = build_dependent_search_task(
+        outcome, people_task_id="T1", query="nghi dinh", next_task_id="T2"
+    )
+    assert task.task_id == "T2"
+    assert task.capability == "document.search"
+    assert task.depends_on == ("T1",)
+    assert isinstance(task.input, DocumentSearchInput)
+    assert task.input.person_identifier == SCALAR

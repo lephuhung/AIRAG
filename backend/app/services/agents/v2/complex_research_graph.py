@@ -80,6 +80,7 @@ from .skills.compare import policy as compare_policy
 __all__ = [
     "COMPLEX_RESEARCH_UNAVAILABLE",
     "MAX_REPLANS",
+    "_build_complex_research_graph",
     "ComplexResearchError",
     "ComplexResearchState",
     "ComplexResearchUnavailable",
@@ -170,6 +171,18 @@ class ComplexResearchState(TypedDict, total=False):
     evaluation: EvidenceEvaluation | None
     replans_remaining: int
     unavailable: ComplexResearchUnavailable | None
+    #: True only on the pass that appended a materialized T2 (R26 routing).
+    #: The ``materialize -> execute`` edge is taken exactly then, so the
+    #: scheduler dispatches the checkpointed T2; every other pass routes to
+    #: ``evaluate``. Appends are bounded by the validate_replan task budget,
+    #: so the loop always terminates.
+    materialized_new_task: bool
+    #: Checkpointed materialization decisions per people task (R28): True
+    #: iff the scalar was extractable under current governance right now.
+    #: Future model-facing observation builders MUST read this map (via the
+    #: projector's explicit ``dependency_scalar_available`` parameter) rather
+    #: than inferring availability from status.
+    people_scalar_available: dict[str, bool]
 
 
 def require_query_analysis(state: ComplexResearchState) -> QueryAnalysis:
@@ -370,6 +383,36 @@ def normalize_complex_state(state: ComplexResearchState) -> ComplexResearchState
         unavailable=_coerce_slot(
             state.get("unavailable"), ComplexResearchUnavailable, slot="unavailable"
         ),
+        materialized_new_task=_coerce_checkpoint_flag(
+            state.get("materialized_new_task", False)
+        ),
+        people_scalar_available=_coerce_availability_map(
+            state.get("people_scalar_available", {})
+        ),
+    )
+
+
+def _coerce_checkpoint_flag(value: Any) -> bool:
+    """Coerce the checkpointed materialize-routing flag (fail closed)."""
+    if isinstance(value, bool):
+        return value
+    raise ComplexResearchError(
+        "complex checkpoint slot 'materialized_new_task' is not a bool "
+        f"(got {type(value).__name__})"
+    )
+
+
+def _coerce_availability_map(value: Any) -> dict[str, bool]:
+    """Coerce the checkpointed scalar-availability map (fail closed)."""
+    if value is None:
+        return {}
+    if isinstance(value, Mapping):
+        coerced = {str(key): item for key, item in value.items()}
+        if all(isinstance(item, bool) for item in coerced.values()):
+            return coerced
+    raise ComplexResearchError(
+        "complex checkpoint slot 'people_scalar_available' is not a "
+        f"str->bool mapping (got {type(value).__name__})"
     )
 
 
@@ -604,18 +647,28 @@ async def people_document_materialize_node(
     planner replan budget and proposes no open discovery. The narrow
     dependency-scoped policy authorizes exactly this governed dependent. Any
     non-materializable outcome (``not_found``/denied/timeout/error, expired
-    or unauthorized use, missing/conflicting scalar) returns ``{}``: no T2
-    is appended and nothing is fabricated. Dormant (``{}``) when the plan
-    has no unanswered successful ``people.lookup``.
+    or unauthorized use, missing/conflicting scalar, foreign-owned evidence)
+    appends nothing and records ``False`` in ``people_scalar_available``:
+    nothing is fabricated. Dormant when the plan has no unanswered successful
+    ``people.lookup``.
+
+    Routing (R26): the returned ``materialized_new_task`` is True only on the
+    pass that appended T2, so the graph routes back to ``execute`` exactly
+    once per append and the scheduler dispatches the checkpointed T2
+    unchanged; all other passes route to ``evaluate``.
     """
     context = node_context(runtime)
     state = normalize_complex_state(state)
     plan = state.get("plan")
     bindings = state.get("bindings")
+    availability: dict[str, bool] = dict(state.get("people_scalar_available", {}))
     if plan is None or bindings is None:
-        return {}
+        # Explicit reset: a bare {} would leave a stale True routing flag
+        # in state and loop materialize -> execute forever.
+        return {"materialized_new_task": False}
     results = tuple(state.get("task_results", ()))
     result_by_task = {result.task_id: result for result in results}
+    examined = False
     for task in plan.tasks:
         if task.capability != "people.lookup":
             continue
@@ -628,19 +681,18 @@ async def people_document_materialize_node(
             for dependent in plan.tasks
         ):
             continue
-        try:
-            outcome = await materialize_person_dependency(
-                people_task_id=task.task_id,
-                people_result=people_result,
-                runtime=context,
-                plan=plan,
-                bindings=bindings,
-                query=plan.goal,
-            )
-        except MaterializationError:
-            return {}
+        examined = True
+        outcome = await materialize_person_dependency(
+            people_task_id=task.task_id,
+            people_result=people_result,
+            runtime=context,
+            plan=plan,
+            bindings=bindings,
+            query=plan.goal,
+        )
+        availability[task.task_id] = outcome.kind == "materialized"
         if outcome.kind != "materialized":
-            return {}
+            continue
         taken = {existing.task_id for existing in plan.tasks}
         index = len(plan.tasks) + 1
         while f"T{index}" in taken:
@@ -665,15 +717,24 @@ async def people_document_materialize_node(
                 ),
             )
         except (MaterializationError, ContractValidationError):
-            return {}
+            continue
         await _lease_pinned_state(
             plan=proposed,
             bindings=bindings,
             results=results,
             runtime=context,
         )
-        return {"plan": proposed}
-    return {}
+        return {
+            "plan": proposed,
+            "materialized_new_task": True,
+            "people_scalar_available": availability,
+        }
+    if not examined:
+        return {
+            "materialized_new_task": False,
+            "people_scalar_available": availability,
+        }
+    return {"materialized_new_task": False, "people_scalar_available": availability}
 
 
 async def complex_evaluate_node(
@@ -754,6 +815,20 @@ async def finalize_node(
     return {}
 
 
+def _materialize_branch(state: ComplexResearchState) -> str:
+    """R26 routing seam: re-execute exactly when T2 was just appended.
+
+    ``materialized_new_task`` is True only on the pass that appended the
+    dependent, so the scheduler dispatches the checkpointed T2 unchanged and
+    the loop always terminates (appends are budget-bounded; a pass with no
+    append routes to ``evaluate`` even when tasks remain undispatched, e.g.
+    after a deadline truncation).
+    """
+    if bool(state.get("materialized_new_task", False)):
+        return "execute"
+    return "evaluate"
+
+
 def _decide_branch(state: ComplexResearchState) -> str:
     """Decide routing seam: initial-plan-only always finalizes (T5 adds replan)."""
     _ = state
@@ -765,19 +840,22 @@ def _add_complex_edges(graph: StateGraph) -> None:
     graph.add_edge("plan", "validate_checkpoint")
     graph.add_edge("validate_checkpoint", "execute")
     graph.add_edge("execute", "materialize")
-    graph.add_edge("materialize", "evaluate")
+    graph.add_conditional_edges(
+        "materialize", _materialize_branch, {"execute": "execute", "evaluate": "evaluate"}
+    )
     graph.add_edge("evaluate", "decide")
     graph.add_conditional_edges("decide", _decide_branch, {"finalize": "finalize"})
     graph.add_edge("finalize", END)
 
 
-def build_complex_research_subgraph() -> Any:
-    """Build the adaptive planning boundary as a checkpointed subgraph.
+def _build_complex_research_graph() -> StateGraph:
+    """Assemble the subgraph nodes and edges without compiling.
 
-    Compiled WITHOUT a checkpointer so it inherits the supervisor's saver
-    when attached as the ``complex_boundary`` node (a shadow run's isolated
-    saver is inherited the same way). It never opens its own production or
-    shadow saver, which keeps shadow execution isolated.
+    The compiled subgraph is produced by
+    :func:`build_complex_research_subgraph` (no saver: it inherits the
+    supervisor's). Tests compile this builder with an explicit saver to
+    audit the subgraph's own checkpoints. This module never names a saver
+    implementation and never passes one at compile time.
     """
     graph = StateGraph(ComplexResearchState, context_schema=GraphRuntimeContext)
     graph.add_node("plan", plan_node)
@@ -788,7 +866,18 @@ def build_complex_research_subgraph() -> Any:
     graph.add_node("decide", decide_node)
     graph.add_node("finalize", finalize_node)
     _add_complex_edges(graph)
-    return graph.compile()
+    return graph
+
+
+def build_complex_research_subgraph() -> Any:
+    """Build the adaptive planning boundary as a checkpointed subgraph.
+
+    Compiled WITHOUT a checkpointer so it inherits the supervisor's saver
+    when attached as the ``complex_boundary`` node (a shadow run's isolated
+    saver is inherited the same way). It never opens its own production or
+    shadow saver, which keeps shadow execution isolated.
+    """
+    return _build_complex_research_graph().compile()
 
 
 def build_complex_research_state(state: SupervisorV2State) -> ComplexResearchState:
