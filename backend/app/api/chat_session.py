@@ -962,10 +962,7 @@ async def chat_stream_session(
         [str(d) for d in accessible_doc_ids] if accessible_doc_ids else None
     )
     # Persist the RAW user text BEFORE any normalization/semantic work.
-    from app.services.agent.runtime_selector import (
-        configured_agent_version,
-        persist_raw_user_message,
-    )
+    from app.services.agent.runtime_selector import persist_raw_user_message
 
     raw_user_row = await persist_raw_user_message(
         db,
@@ -975,13 +972,17 @@ async def chat_stream_session(
         message_id=user_msg_id,
         document_ids=doc_ids_json,
     )
-    # v2 resume needs the persisted row's UUID (loaded only on the v2 arm
-    # so the v1 path is untouched).
-    raw_message_uuid = None
-    if configured_agent_version() == "v2" and raw_user_row is not None:
-        from app.services.agent.streaming import persisted_message_uuid
+    # The persisted row's UUID is the canary bucket's request ID (server-owned)
+    # and the v2 resume key. Loaded on every arm — selection needs it before
+    # the arm is known.
+    from app.services.agent.streaming import persisted_message_uuid
 
+    raw_message_uuid = None
+    persisted_request_id = user_msg_id
+    if raw_user_row is not None:
         raw_message_uuid = await persisted_message_uuid(db, raw_user_row)
+        if raw_message_uuid is not None:
+            persisted_request_id = str(raw_message_uuid)
 
     # Get system prompt
     from app.prompts.chat import DEFAULT_SYSTEM_PROMPT, HARD_SYSTEM_PROMPT
@@ -1288,19 +1289,24 @@ async def chat_stream_session(
     async def _run_and_persist():
         from app.core.database import async_session_maker
         from app.services.agent.runtime_selector import (
-            configured_agent_version,
             resolve_agent_graph,
             resolve_runtime_scope,
+            resolve_serving_arm,
         )
         from app.services.agent.streaming import (
             stream_agent_to_sse,
             build_initial_state,
         )
+        from app.services.agents.v2.execution.scheduler import (
+            V1FallbackRequired,
+        )
         import json as _json
 
         # Public chat takes no per-request arm override (the admin
         # evaluation surface is the only override, and it is admin-only).
-        version = configured_agent_version()
+        # The serving arm is resolved canary-aware on run_db below (Task 7B:
+        # authenticated scope + persisted request ID, server-owned).
+        version = "v1"
 
         accumulated_text = ""
         accumulated_thinking = ""
@@ -1442,6 +1448,17 @@ async def chat_stream_session(
                     f"force_search={getattr(request, 'force_search', False)}"
                 )
 
+                # Task 7B canary: server-owned arm selection over the
+                # authenticated scope + persisted request ID. This surface
+                # is not a deterministically-known Write endpoint, so the
+                # Write pre-exclusion flag stays False; a v2 candidate that
+                # resolves to a v1-only route falls back below (V1FB).
+                version = await resolve_serving_arm(
+                    db=run_db,
+                    workspace_ids=runtime_workspace_ids,
+                    request_id=persisted_request_id,
+                    is_write_endpoint=False,
+                )
                 # Resolve the serving arm through the lazy selector (no
                 # direct graph construction on any entrypoint).
                 graph = await resolve_agent_graph(version)
@@ -1486,7 +1503,20 @@ async def chat_stream_session(
                             thread_id=session_id,
                             resume_message_id=raw_message_uuid,
                         ) as (_v2_ingress, _v2_agen):
-                            await _drain(_v2_agen)
+                            try:
+                                await _drain(_v2_agen)
+                            except V1FallbackRequired:
+                                # Task 7B: the v2 candidate resolved to a
+                                # v1-only route before any capability
+                                # execution — serve v1 with zero v2 output.
+                                logger.info(
+                                    "[session/%s] v2 candidate fell back to v1",
+                                    session_id,
+                                )
+                                graph = await resolve_agent_graph("v1")
+                                await _drain(
+                                    stream_agent_to_sse(graph, initial_state)
+                                )
                     else:
                         await _drain(stream_agent_to_sse(graph, initial_state))
                 finally:

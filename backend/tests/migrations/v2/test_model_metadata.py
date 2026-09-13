@@ -139,7 +139,15 @@ def test_v2_orm_tables_are_exactly_v2_schema_v1_tables(imported_app_models):
         "users",
     }
     all_mapped = set(Base.metadata.tables.keys())
-    extras = all_mapped - expected_v2_orm_tables - v1_legacy_names
+    # Task 7B owns the two migration-owned rollout tables (Release 1A,
+    # version 3; mapped by app.models.agent_rollout_control /
+    # agent_rollout_metric, never created by create_all): they are the only
+    # permitted extras beyond V1 + legacy.
+    from app.services.agents.v2.persistence.migrate import V2_ROLLOUT_TABLES
+
+    extras = (
+        all_mapped - expected_v2_orm_tables - v1_legacy_names - V2_ROLLOUT_TABLES
+    )
     omissions = expected_v2_orm_tables - all_mapped
     assert not extras, (
         f"ORM-mapped tables NOT in V2_SCHEMA_V1_TABLES and not v1 legacy: "

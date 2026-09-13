@@ -136,6 +136,35 @@ def resolve_request_version(
         ) from exc
 
 
+async def resolve_serving_arm(
+    *,
+    db: Any,
+    workspace_ids: Any,
+    request_id: str,
+    is_write_endpoint: bool = False,
+) -> str:
+    """Resolve the serving arm for chat ingress (Task 7B canary, R8).
+
+    Thin entrypoint-facing wrapper over
+    ``app.services.agent.rollout_control.resolve_serving_arm`` (the single
+    owner of the canary rule). Server-owned inputs only: the authenticated
+    workspace scope, the persisted request ID, and the ingress call site's
+    deterministically-known Write flag. Ordinary headers are ignored (no
+    such parameter exists); public traffic takes no per-request override.
+    Import is function-local so this module stays graph-free at import time.
+    """
+    from app.services.agent.rollout_control import (
+        resolve_serving_arm as _canary_serving_arm,
+    )
+
+    return await _canary_serving_arm(
+        db=db,
+        workspace_ids=workspace_ids,
+        request_id=request_id,
+        is_write_endpoint=is_write_endpoint,
+    )
+
+
 def resolve_runtime_scope(
     *,
     authenticated_ids: Any,

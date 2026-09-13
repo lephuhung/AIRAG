@@ -99,6 +99,14 @@ from app.services.agents.v2.persistence.migrate import (
 # ---------------------------------------------------------------------------
 
 
+# Task 7B note: the rollout tables (``agent_rollout_control`` /
+# ``agent_rollout_metrics``) are intentionally NOT registered here and NOT in
+# ``LEGACY_STARTUP_TABLES``. They are migration-owned (Release 1A, version 3)
+# and mapped only by ``app.models.agent_rollout_control`` /
+# ``app.models.agent_rollout_metric`` (imported via ``app.models``), so
+# startup ``create_all`` can never create, alter, or seed them.
+
+
 # The legacy v1 tables that ``app.main.lifespan`` is allowed to create
 # or alter via ``Base.metadata.create_all(tables=...)``. This list is
 # the *only* code path that may issue v1 DDL on startup; v2 tables are

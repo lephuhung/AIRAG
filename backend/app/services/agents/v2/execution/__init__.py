@@ -14,8 +14,15 @@ from .scheduler import (
     DispatchReport,
     SchedulerError,
     TaskScheduler,
+    V1FallbackRequired,
     execute_ready_tasks,
+    is_run_active,
+    is_run_cancel_requested,
+    is_run_cancel_requested_async,
+    register_active_run,
+    request_run_cancellation,
     shared_scheduler_for,
+    unregister_active_run,
 )
 
 __all__ = [
@@ -23,6 +30,13 @@ __all__ = [
     "RuntimeServices",
     "SchedulerError",
     "TaskScheduler",
+    "V1FallbackRequired",
     "execute_ready_tasks",
+    "is_run_active",
+    "is_run_cancel_requested",
+    "is_run_cancel_requested_async",
+    "register_active_run",
+    "request_run_cancellation",
     "shared_scheduler_for",
+    "unregister_active_run",
 ]

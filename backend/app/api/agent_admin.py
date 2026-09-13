@@ -49,6 +49,31 @@ class EvaluateResponse(BaseModel):
     events: list[dict]
 
 
+class RolloutControlResponse(BaseModel):
+    """The DB rollout control row plus the environment ceilings."""
+
+    enabled: bool
+    shadow_percent: int
+    canary_percent: int
+    canary_workspaces: list[str]
+    kill_switch: bool
+    updated_by: Optional[str] = None
+    version: int
+    env_enabled: bool
+    env_canary_percent: float
+    env_canary_workspaces: list[str]
+    effective_canary_percent: float
+
+
+class RolloutControlUpdate(BaseModel):
+    """Operator tuning for the control row (all fields optional)."""
+
+    enabled: Optional[bool] = None
+    canary_percent: Optional[int] = Field(default=None, ge=0, le=100)
+    canary_workspaces: Optional[list[str]] = None
+    kill_switch: Optional[bool] = None
+
+
 @router.get("/status")
 async def agent_status(
     user: User = Depends(require_superadmin),
@@ -73,6 +98,78 @@ async def agent_status(
         "v2_ready": v2_ready,
         "problems": problems,
     }
+
+
+@router.get("/rollout", response_model=RolloutControlResponse)
+async def get_rollout_control(
+    user: User = Depends(require_superadmin),
+    db: Any = Depends(get_db),
+) -> RolloutControlResponse:
+    """Read the DB rollout control row + environment ceilings (no mutation)."""
+    from app.services.agent.rollout_control import (
+        effective_canary_percent,
+        parse_canary_workspaces,
+        read_canary_env,
+        read_control_row,
+    )
+
+    env = read_canary_env()
+    row = await read_control_row(db)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="rollout control row (id=1) is absent; run the v2 schema migration",
+        )
+    workspaces = list(parse_canary_workspaces(row.canary_workspaces))
+    return RolloutControlResponse(
+        enabled=bool(row.enabled),
+        shadow_percent=int(row.shadow_percent or 0),
+        canary_percent=int(row.canary_percent or 0),
+        canary_workspaces=workspaces,
+        kill_switch=bool(row.kill_switch),
+        updated_by=row.updated_by,
+        version=int(row.version or 1),
+        env_enabled=env.enabled,
+        env_canary_percent=env.canary_percent,
+        env_canary_workspaces=list(env.canary_workspaces),
+        effective_canary_percent=effective_canary_percent(
+            env.canary_percent, int(row.canary_percent or 0)
+        ),
+    )
+
+
+@router.put("/rollout", response_model=RolloutControlResponse)
+async def update_rollout_control(
+    body: RolloutControlUpdate,
+    user: User = Depends(require_superadmin),
+    db: Any = Depends(get_db),
+) -> RolloutControlResponse:
+    """Retune the control row (superadmin only; bumps ``version``)."""
+    from sqlalchemy import select
+
+    from app.models.agent_rollout_control import AgentRolloutControl
+
+    result = await db.execute(
+        select(AgentRolloutControl).where(AgentRolloutControl.id == 1)
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="rollout control row (id=1) is absent; run the v2 schema migration",
+        )
+    if body.enabled is not None:
+        row.enabled = bool(body.enabled)
+    if body.canary_percent is not None:
+        row.canary_percent = int(body.canary_percent)
+    if body.canary_workspaces is not None:
+        row.canary_workspaces = [str(item) for item in body.canary_workspaces]
+    if body.kill_switch is not None:
+        row.kill_switch = bool(body.kill_switch)
+    row.updated_by = str(user.email or user.id)
+    row.version = int(row.version or 1) + 1
+    await db.commit()
+    return await get_rollout_control(user=user, db=db)
 
 
 @router.post("/evaluate", response_model=EvaluateResponse)
@@ -117,6 +214,16 @@ async def run_admin_evaluation(
     )
 
     selected = resolve_request_version(user=user, admin_override=version)
+    if selected == "v2":
+        # The kill switch is authoritative even over an explicit admin
+        # evaluation turn: an engaged brake refuses v2 instead of serving it.
+        from app.services.agent.rollout_control import is_v2_killed
+
+        if await is_v2_killed(db):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="v2 kill switch is engaged; refusing explicit v2 turn",
+            )
     try:
         graph = await resolve_agent_graph(selected)
     except V2NotReadyError as exc:

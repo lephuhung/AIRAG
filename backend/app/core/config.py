@@ -647,6 +647,19 @@ class Settings(BaseSettings):
     NEXUSRAG_AGENT_V2_SHADOW_ENABLED: bool = Field(default=False)
     NEXUSRAG_AGENT_V2_SHADOW_PERCENT: float = Field(default=0.0)
 
+    # ── LangGraph v2 canary rollout (Phase 3, Task 7B) ───────────────────────
+    # Deterministic server-owned canary: DB control row (agent_rollout_control
+    # id=1) is authoritative WITHIN these environment ceilings. Safe defaults:
+    # canary disabled with percent 0, so deploying this changes no traffic.
+    # NEXUSRAG_AGENT_V2_ENABLED is the master arm switch; CANARY_PERCENT=100
+    # means 100% of v2-ELIGIBLE traffic (never a global replacement of v1).
+    # CANARY_WORKSPACES is a comma-separated allowlist (empty = all eligible
+    # workspaces); BUCKET_SALT feeds the deterministic workspace+request hash.
+    NEXUSRAG_AGENT_V2_ENABLED: bool = Field(default=False)
+    NEXUSRAG_AGENT_V2_CANARY_PERCENT: float = Field(default=0.0)
+    NEXUSRAG_AGENT_V2_CANARY_WORKSPACES: str = Field(default="")
+    NEXUSRAG_AGENT_V2_BUCKET_SALT: str = Field(default="")
+
     # ── Phase 1A: Semantic preprocessor atomic enable (B.11 0.5) ─────────────
     # When True, semantic_preprocessor_node runs before supervisor_node;
     # legacy abbreviation expansion is suppressed via _preprocessor_marker.
@@ -682,6 +695,18 @@ class Settings(BaseSettings):
             raise ValueError(
                 "NEXUSRAG_AGENT_V2_SHADOW_PERCENT must be within 0..100; "
                 f"got {self.NEXUSRAG_AGENT_V2_SHADOW_PERCENT!r}"
+            )
+        try:
+            canary_percent = float(self.NEXUSRAG_AGENT_V2_CANARY_PERCENT)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "NEXUSRAG_AGENT_V2_CANARY_PERCENT must be a number; "
+                f"got {self.NEXUSRAG_AGENT_V2_CANARY_PERCENT!r}"
+            ) from exc
+        if not 0.0 <= canary_percent <= 100.0:
+            raise ValueError(
+                "NEXUSRAG_AGENT_V2_CANARY_PERCENT must be within 0..100; "
+                f"got {self.NEXUSRAG_AGENT_V2_CANARY_PERCENT!r}"
             )
         return self
 

@@ -1015,6 +1015,19 @@ async def _refresh_v2_resume_leases(*, runtime_context, checkpoint_state: dict) 
 async def _release_v2_run_leases(*, runtime_context, reason: str) -> int:
     """Release the run's leases (terminal boundary only; never raises)."""
     try:
+        from app.services.agents.v2.execution.scheduler import (
+            unregister_active_run as _unregister_active_run,
+        )
+
+        try:
+            _unregister_active_run(
+                str(runtime_context.capability_runtime.run_id)
+            )
+        except Exception:
+            logger.warning("[v2stream] active-run unregister failed", exc_info=True)
+    except Exception:
+        logger.warning("[v2stream] active-run unregister setup failed", exc_info=True)
+    try:
         services = getattr(runtime_context, "services", None)
         repo = getattr(services, "retention_leases", None)
         if repo is None:
@@ -1179,6 +1192,10 @@ async def stream_v2_turn_events(
     """
     from langgraph.errors import GraphInterrupt
 
+    from app.services.agents.v2.execution.scheduler import (
+        V1FallbackRequired as _V1FallbackRequired,
+    )
+
     if (initial_state is None) == (resume_command is None):
         raise ValueError("exactly one of initial_state/resume_command is required")
     config = _v2_config(thread_id)
@@ -1293,6 +1310,15 @@ async def stream_v2_turn_events(
         if invoke_task is not None and not invoke_task.done():
             invoke_task.cancel()
         await _release_once("cancelled")
+        raise
+    except _V1FallbackRequired:
+        # Task 7B canary fallback: the v2 candidate resolved to a v1-only
+        # route BEFORE any capability execution. Release the (empty) run
+        # and re-raise typed — the entrypoint serves v1 with zero v2
+        # user-visible output (no terminal event is emitted here).
+        if invoke_task is not None and not invoke_task.done():
+            invoke_task.cancel()
+        await _release_once("terminal")
         raise
     except asyncio.CancelledError:
         # Cancellation prevents all later dispatch and any factual success:

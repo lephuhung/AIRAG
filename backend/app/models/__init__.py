@@ -39,6 +39,8 @@ from app.models.v2_registry import (  # noqa: E402,F401
     assert_v2_readiness,
     register_v2_models,
 )
+from app.models.agent_rollout_control import AgentRolloutControl  # noqa: E402,F401
+from app.models.agent_rollout_metric import AgentRolloutMetric  # noqa: E402,F401
 from app.models.document_revision import DocumentRevision  # noqa: E402,F401
 from app.models.document_revision_build import (  # noqa: E402,F401
     DocumentRevisionBuild,
@@ -84,6 +86,9 @@ __all__ = [
     "AuditLog",
     "AgentTrace",
     "SystemSetting",
+    # Phase 3 Task 7B rollout tables (migration-owned; mapped, never created)
+    "AgentRolloutControl",
+    "AgentRolloutMetric",
     # Phase 1B v2 models
     "DocumentRevision",
     "DocumentRevisionBuild",

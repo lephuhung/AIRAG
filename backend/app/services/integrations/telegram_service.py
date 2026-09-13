@@ -442,13 +442,13 @@ async def _handle_question(db, chat_id: str, question: str, tg_user_id: str | No
     # scope = authenticated scope ∩ requested scope (never widened). A
     # revoked active workspace now fails closed instead of being trusted.
     from app.services.agent.runtime_selector import (
-        configured_agent_version,
         persist_raw_user_message,
         resolve_agent_graph,
         resolve_runtime_scope,
+        resolve_serving_arm,
     )
 
-    version = configured_agent_version()
+    version = "v1"
     authenticated_ids = await _get_accessible_workspaces(db, user)
     if link.active_workspace_id:
         workspace_ids = list(
@@ -480,13 +480,25 @@ async def _handle_question(db, chat_id: str, question: str, tg_user_id: str | No
         user_id=user.id,
         raw_text=question,
     )
-    # v2 resume needs the persisted row's UUID (loaded only on the v2 arm
-    # so the v1 path is untouched).
-    raw_message_uuid = None
-    if version == "v2" and raw_user_row is not None:
-        from app.services.agent.streaming import persisted_message_uuid
+    # The persisted row's UUID is the canary bucket's request ID
+    # (server-owned) and the v2 resume key — loaded on every arm.
+    from app.services.agent.streaming import persisted_message_uuid
 
+    raw_message_uuid = None
+    persisted_request_id = f"telegram-{chat_id}"
+    if raw_user_row is not None:
         raw_message_uuid = await persisted_message_uuid(db, raw_user_row)
+        if raw_message_uuid is not None:
+            persisted_request_id = str(raw_message_uuid)
+
+    # Task 7B canary: server-owned selection over the authenticated scope
+    # + persisted request ID (this surface is not a Write endpoint).
+    version = await resolve_serving_arm(
+        db=db,
+        workspace_ids=workspace_ids,
+        request_id=persisted_request_id,
+        is_write_endpoint=False,
+    )
 
     # Placeholder message we'll keep editing as tokens stream in.
     await send_chat_action(chat_id, "typing")
@@ -518,16 +530,25 @@ async def _handle_question(db, chat_id: str, question: str, tg_user_id: str | No
         # v2 turns emit no token stream (single terminal response), so the
         # events are collected up front; v1 streams token-by-token below.
         # Both arms then share the same delivery body.
+        from app.services.agents.v2.execution.scheduler import (
+            V1FallbackRequired,
+        )
+
         v2_events: list[dict] | None = None
         if version == "v2":
-            v2_events = await _collect_v2_telegram_events(
-                graph=graph,
-                raw_question=question,
-                workspace_ids=workspace_ids,
-                user=user,
-                session_id=str(session.id),
-                resume_message_id=raw_message_uuid,
-            )
+            try:
+                v2_events = await _collect_v2_telegram_events(
+                    graph=graph,
+                    raw_question=question,
+                    workspace_ids=workspace_ids,
+                    user=user,
+                    session_id=str(session.id),
+                    resume_message_id=raw_message_uuid,
+                )
+            except V1FallbackRequired:
+                # Task 7B: v2 candidate resolved to a v1-only route before
+                # any capability execution — serve v1 with zero v2 output.
+                v2_events = None
 
         async def _event_source():
             if v2_events is not None:

@@ -40,10 +40,13 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
+
+logger = logging.getLogger(__name__)
 
 from ..capabilities import (
     CapabilityDenied,
@@ -63,15 +66,157 @@ __all__ = [
     "DispatchReport",
     "SchedulerError",
     "TaskScheduler",
+    "V1FallbackRequired",
     "assert_scheduler_input_passthrough",
     "execute_ready_tasks",
+    "is_run_active",
+    "is_run_cancel_requested",
     "refresh_pairs_for_checkpoint",
+    "register_active_run",
+    "request_run_cancellation",
     "shared_scheduler_for",
+    "unregister_active_run",
 ]
 
 
 class SchedulerError(ValueError):
     """Dispatch-boundary failure: the task must not be checkpointed."""
+
+
+class V1FallbackRequired(SchedulerError):
+    """A v2 candidate must fall back to v1 BEFORE any capability execution.
+
+    Raised by the Task 7B pre-dispatch guard when the resolved
+    QueryAnalysis/Router outcome is write, evaluate/legal/compliance, or
+    otherwise unsupported (see
+    ``app.services.agent.rollout_control.requires_v1_fallback``). The v2
+    outer runner lets this propagate (never converts it to an error event)
+    so the entrypoint serves v1 with zero v2 user-visible output.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Active-run registry + distributed cancellation (Task 7B).
+#
+# Every scheduler dispatch registers its run and honors cancellation BEFORE
+# dispatching: the local asyncio cancel path (``_raise_if_cancelled``) plus
+# a distributed cancel flag. With REDIS_ENABLED the flag is a cross-process
+# Redis key (``v2run:cancel:<run_id>``); otherwise an in-process set backs
+# it so single-process deploys and unit tests behave identically. All Redis
+# access is best-effort and never breaks dispatch when Redis is unreachable.
+# ---------------------------------------------------------------------------
+
+_ACTIVE_RUN_TTL_SECONDS = 300
+
+_local_active_runs: set[str] = set()
+_local_cancel_requests: set[str] = set()
+
+
+def _active_key(run_id: str) -> str:
+    return f"v2run:active:{run_id}"
+
+
+def _cancel_key(run_id: str) -> str:
+    return f"v2run:cancel:{run_id}"
+
+
+def register_active_run(run_id: str) -> None:
+    """Register ``run_id`` as an active v2 run (idempotent, never raises)."""
+    if not run_id:
+        return
+    _local_active_runs.add(str(run_id))
+    try:
+        from app.core.redis_client import get_redis, is_redis_enabled
+
+        if is_redis_enabled():
+            client = get_redis()
+            result = client.set(
+                _active_key(run_id), "1", ex=_ACTIVE_RUN_TTL_SECONDS
+            )
+            if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                task = asyncio.get_running_loop().create_task(result)  # type: ignore[arg-type]
+                task.add_done_callback(lambda _t: _t.exception() if not _t.cancelled() else None)
+    except Exception:
+        logger.warning("canary active-run register failed", exc_info=True)
+
+
+def unregister_active_run(run_id: str) -> None:
+    """Drop ``run_id`` from the active set (terminal boundary; never raises)."""
+    if not run_id:
+        return
+    _local_active_runs.discard(str(run_id))
+    _local_cancel_requests.discard(str(run_id))
+    try:
+        from app.core.redis_client import get_redis, is_redis_enabled
+
+        if is_redis_enabled():
+            client = get_redis()
+            result = client.delete(_active_key(run_id), _cancel_key(run_id))
+            if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                task = asyncio.get_running_loop().create_task(result)  # type: ignore[arg-type]
+                task.add_done_callback(lambda _t: _t.exception() if not _t.cancelled() else None)
+    except Exception:
+        logger.warning("canary active-run unregister failed", exc_info=True)
+
+
+def request_run_cancellation(run_id: str) -> None:
+    """Flag ``run_id`` for distributed cancellation (never raises)."""
+    if not run_id:
+        return
+    _local_cancel_requests.add(str(run_id))
+    try:
+        from app.core.redis_client import get_redis, is_redis_enabled
+
+        if is_redis_enabled():
+            client = get_redis()
+            result = client.set(
+                _cancel_key(run_id), "1", ex=_ACTIVE_RUN_TTL_SECONDS
+            )
+            if asyncio.iscoroutine(result) or asyncio.isfuture(result):
+                task = asyncio.get_running_loop().create_task(result)  # type: ignore[arg-type]
+                task.add_done_callback(lambda _t: _t.exception() if not _t.cancelled() else None)
+    except Exception:
+        logger.warning("canary cancel request failed", exc_info=True)
+
+
+def is_run_cancel_requested(run_id: str) -> bool:
+    """True when cancellation was requested for ``run_id`` (sync part)."""
+    if not run_id:
+        return False
+    if str(run_id) in _local_cancel_requests:
+        return True
+    try:
+        from app.core.redis_client import get_redis, is_redis_enabled
+
+        if is_redis_enabled():
+            client = get_redis()
+            exists = client.exists(_cancel_key(run_id))
+            if not (asyncio.iscoroutine(exists) or asyncio.isfuture(exists)):
+                return bool(exists)
+    except Exception:
+        logger.warning("canary cancel check failed", exc_info=True)
+    return False
+
+
+async def is_run_cancel_requested_async(run_id: str) -> bool:
+    """Async cancel check: local set first, then Redis when enabled."""
+    if not run_id:
+        return False
+    if str(run_id) in _local_cancel_requests:
+        return True
+    try:
+        from app.core.redis_client import get_redis, is_redis_enabled
+
+        if is_redis_enabled():
+            return bool(await get_redis().exists(_cancel_key(run_id)))
+    except Exception:
+        logger.warning("canary async cancel check failed", exc_info=True)
+    return False
+
+
+def is_run_active(run_id: str) -> bool:
+    """True when ``run_id`` is currently registered (sync local view)."""
+    return bool(run_id) and str(run_id) in _local_active_runs
 
 
 @dataclass(frozen=True)
@@ -429,6 +574,43 @@ async def _dispatch_one(
     )
 
 
+async def _run_pre_dispatch_guards(
+    runtime: GraphRuntimeContext,
+    v1_fallback_guard: Any | None = None,
+) -> None:
+    """Run the Task 7B guards BEFORE each scheduler dispatch (in order).
+
+    1. Local asyncio cancellation propagates (never converted).
+    2. The run registers as active, then distributed cancellation is
+       honored — a requested cancel raises ``CancelledError`` before any
+       capability executes.
+    3. The optional ``v1_fallback_guard`` (sync or async zero-arg callable
+       supplied by the caller that owns the resolved QueryAnalysis/Router
+       outcome) fires ``V1FallbackRequired`` — also before any capability
+       executes. ``None`` (the default) preserves the exact prior behavior.
+    """
+    _raise_if_cancelled()
+    run_id = ""
+    try:
+        run_id = str(runtime.capability_runtime.run_id or "")
+    except Exception:
+        run_id = ""
+    if run_id:
+        register_active_run(run_id)
+        if await is_run_cancel_requested_async(run_id):
+            raise asyncio.CancelledError()
+    if v1_fallback_guard is not None:
+        fired = v1_fallback_guard()
+        if inspect.isawaitable(fired):
+            fired = await fired
+        if fired:
+            raise V1FallbackRequired(
+                "v2 candidate resolved to a v1-only route (write, "
+                "evaluate/legal/compliance, or unsupported); falling back "
+                "to v1 before any capability execution"
+            )
+
+
 async def execute_ready_tasks(
     *,
     plan: TaskPlan,
@@ -436,6 +618,7 @@ async def execute_ready_tasks(
     registry: CapabilityRegistry | None,
     runtime: GraphRuntimeContext,
     bindings: DocumentBindingSet | None = None,
+    v1_fallback_guard: Any | None = None,
 ) -> DispatchReport:
     """Execute every ready plan task in plan order; report all results.
 
@@ -486,7 +669,7 @@ async def execute_ready_tasks(
                     "dependency or cycle); refusing to return a silent partial"
                 )
             break
-        _raise_if_cancelled()
+        await _run_pre_dispatch_guards(runtime, v1_fallback_guard)
         if not _dispatch_allowed(runtime):
             truncated = True
             break
@@ -530,6 +713,7 @@ class TaskScheduler:
         runtime: GraphRuntimeContext,
         prior_results: tuple[AgentResult, ...] = (),
         bindings: DocumentBindingSet | None = None,
+        v1_fallback_guard: Any | None = None,
     ) -> DispatchReport:
         """Execute the plan's ready tasks; report prior plus new results.
 
@@ -538,6 +722,8 @@ class TaskScheduler:
         checkpointed bindings for lease resolution. Cancellation and deadline
         stop dispatch without fabricating success; a deadline stop is
         recorded on the returned ``DispatchReport.truncated`` flag.
+        ``v1_fallback_guard`` is the Task 7B pre-dispatch hook (see
+        ``execute_ready_tasks``); ``None`` preserves prior behavior.
         """
         return await execute_ready_tasks(
             plan=plan,
@@ -545,6 +731,7 @@ class TaskScheduler:
             registry=self._registry,
             runtime=runtime,
             bindings=bindings,
+            v1_fallback_guard=v1_fallback_guard,
         )
 
 

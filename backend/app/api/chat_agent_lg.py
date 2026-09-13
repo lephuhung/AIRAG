@@ -229,12 +229,13 @@ async def langgraph_chat_stream(
     """
     from app.core.config import settings
     from app.services.agent.runtime_selector import (
-        configured_agent_version,
         persist_raw_user_message,
         resolve_agent_graph,
         resolve_runtime_scope,
+        resolve_serving_arm,
     )
     from app.services.agent.streaming import stream_agent_to_sse, build_initial_state
+    from app.services.agents.v2.execution.scheduler import V1FallbackRequired
 
     # F2: the runtime scope is the authenticated scope, full stop.
     # ``ChatRequest`` carries no ``workspace_ids`` field, so there is no
@@ -268,13 +269,11 @@ async def langgraph_chat_stream(
         content = m.content if hasattr(m, "content") else m.get("content", "")
         history.append({"role": role, "content": content})
 
-    # Public chat takes no per-request arm override (the admin evaluation
-    # surface is the only override, and it is admin-only): serve the
-    # configured default.
-    version = configured_agent_version()
-
     # Persist the RAW user text BEFORE any normalization/semantic work, so
-    # chat history owns exactly what the user sent.
+    # chat history owns exactly what the user sent. The persisted row id is
+    # the canary bucket's request ID (server-owned).
+    from app.services.agent.streaming import persisted_message_uuid
+
     raw_user_row = None
     try:
         raw_user_row = await persist_raw_user_message(
@@ -287,13 +286,26 @@ async def langgraph_chat_stream(
         logger.warning(f"[lg_endpoint] Failed to persist user message: {e}")
         await db.rollback()
 
-    # v2 resume needs the persisted row's UUID (loaded only on the v2 arm
-    # so the v1 path stays byte-identical).
     raw_message_uuid = None
-    if version == "v2" and raw_user_row is not None:
-        from app.services.agent.streaming import persisted_message_uuid
+    persisted_request_id = f"standalone-{uuid.uuid4().hex[:12]}"
+    if raw_user_row is not None:
+        try:
+            raw_message_uuid = await persisted_message_uuid(db, raw_user_row)
+            if raw_message_uuid is not None:
+                persisted_request_id = str(raw_message_uuid)
+        except Exception as e:
+            logger.warning(f"[lg_endpoint] Failed to read message id: {e}")
 
-        raw_message_uuid = await persisted_message_uuid(db, raw_user_row)
+    # Public chat takes no per-request arm override (the admin evaluation
+    # surface is the only override, and it is admin-only). Task 7B canary:
+    # server-owned selection over the authenticated scope + persisted
+    # request ID; DB failures fail closed to v1 inside the helper.
+    version = await resolve_serving_arm(
+        db=db,
+        workspace_ids=workspace_ids,
+        request_id=persisted_request_id,
+        is_write_endpoint=False,
+    )
 
     # Expand abbreviations in the incoming message (graph input only — the
     # persisted row above keeps the raw text).
@@ -355,18 +367,27 @@ async def langgraph_chat_stream(
     graph = await resolve_agent_graph(version)
 
     if version == "v2":
-        async for sse_str in _stream_v2_standalone(
-            graph=graph,
-            raw_message=request.message,
-            workspace_ids=workspace_ids,
-            document_ids=getattr(request, "document_ids", None),
-            user_id=user_id,
-            user_is_superadmin=user_is_superadmin,
-            session_id=session_id,
-            resume_message_id=raw_message_uuid,
-        ):
-            yield sse_str
-            _collect_terminal(sse_str)
+        try:
+            async for sse_str in _stream_v2_standalone(
+                graph=graph,
+                raw_message=request.message,
+                workspace_ids=workspace_ids,
+                document_ids=getattr(request, "document_ids", None),
+                user_id=user_id,
+                user_is_superadmin=user_is_superadmin,
+                session_id=session_id,
+                resume_message_id=raw_message_uuid,
+            ):
+                yield sse_str
+                _collect_terminal(sse_str)
+        except V1FallbackRequired:
+            # Task 7B: v2 candidate resolved to a v1-only route before any
+            # capability execution — serve v1 with zero v2 output.
+            logger.info("[lg_endpoint] v2 candidate fell back to v1")
+            graph = await resolve_agent_graph("v1")
+            async for sse_str in stream_agent_to_sse(graph, initial_state):
+                yield sse_str
+                _collect_terminal(sse_str)
     else:
         async for sse_str in stream_agent_to_sse(graph, initial_state):
             yield sse_str
