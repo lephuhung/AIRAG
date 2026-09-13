@@ -1519,14 +1519,17 @@ async def chat_stream_session(
                 async def _emit_turn_metric(
                     *, terminal_status: str, cancelled: bool
                 ) -> None:
-                    """Emit the turn's terminal metric row (Task 7B, fix round 2).
+                    """Emit the turn's terminal metric row (Task 7B, fix round 3).
 
                     Runs on EVERY terminal outcome — success, error,
                     cancellation, and fallback (attributed to the serving
                     arm) — with the TRUE cancelled outcome. Every verdict
                     comes from an observed terminal signal; an unobservable
-                    verdict makes the row INVALID (logged, never recorded
-                    safe). Best-effort: never breaks serving.
+                    verdict is written as an explicitly-INVALID sentinel
+                    row (R80, never omitted, never recorded safe); a
+                    requested-but-ineffective cancellation is recorded
+                    with cancelled=True on the actual terminal (R81).
+                    Best-effort: never breaks serving.
                     """
                     nonlocal metric_emitted
                     if metric_emitted:
@@ -1556,12 +1559,16 @@ async def chat_stream_session(
                             route=(v2_terminal_info or {}).get("route"),
                             greeting_observed=_greeting,
                         )
-                        if _factual is None:
-                            raise ValueError(
-                                "rollout metric INVALID: factual expectation "
-                                "unobservable for this terminal; refusing to "
-                                "record the row as safe"
+                        # R81: cancelled means REQUESTED — a request the
+                        # turn outran still marks the row (failed
+                        # cancellation = requested + non-cancelled
+                        # terminal). R80: ``None`` factual expectation
+                        # flows through — emission writes the sentinel row.
+                        _cancel_requested = (
+                            await _metrics.was_cancel_requested(
+                                (v2_terminal_info or {}).get("run_id")
                             )
+                        )
                         await _metrics.try_emit_terminal_rollout_metric(
                             run_db,
                             arm=served_arm,
@@ -1573,6 +1580,7 @@ async def chat_stream_session(
                                 accumulated_text, v2_citations, _served_doc_ids
                             ),
                             cancelled=cancelled,
+                            cancel_requested=_cancel_requested,
                             answer_text=accumulated_text,
                             factual_expected=_factual,
                             served_document_ids=_served_doc_ids,

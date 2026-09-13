@@ -32,6 +32,60 @@ SECURITY_FIELDS: tuple[str, ...] = (
 
 VALID_ARMS: frozenset[str] = frozenset({"v1", "v2", "shadow"})
 
+#: Sentinel ``terminal_status`` marking an explicitly-INVALID metric row
+#: (Task 7B fix round 3, R80). An unobservable security verdict MUST NOT
+#: be omitted (omission evades the gate): the emission writes the row with
+#: this terminal and explicit ``False`` counters, and the collector/gate
+#: counts every such row as an invalid security row (arm invalid). The
+#: value fits the existing frozen v3 schema — no new migration.
+SECURITY_UNOBSERVABLE_TERMINAL = "security_unobservable"
+
+#: Counters written on a sentinel row: explicit booleans (so the row
+#: itself validates) whose ``False`` values MUST be ignored by consumers
+#: — the ``terminal_status`` sentinel alone carries the invalid meaning.
+_SENTINEL_SECURITY: dict[str, bool] = {
+    "checkpoint_secret": False,
+    "ungrounded_factual_success": False,
+    "acl_leak": False,
+    "duplicate_production_write": False,
+}
+
+
+def effective_cancelled(*, cancelled: bool, cancel_requested: bool = False) -> bool:
+    """Resolve the row's ``cancelled`` flag (Task 7B fix round 3, R81).
+
+    ``cancelled`` means cancellation was REQUESTED for the run,
+    regardless of how the turn terminated; ``terminal_status`` records the
+    actual terminal. Failed cancellation = requested + non-cancelled
+    terminal (the collector's invariant); a cancelled request that exits
+    by cancellation is a success. Pure (testable) — ingresses supply
+    ``cancel_requested`` from :func:`was_cancel_requested`.
+    """
+    return bool(cancelled) or bool(cancel_requested)
+
+
+async def was_cancel_requested(run_id: Any) -> bool:
+    """True when cancellation was requested for ``run_id`` (R81).
+
+    Checks the distributed active-run registry (local set first, then
+    Redis when enabled) via the single ``TaskScheduler`` ownership chain.
+    Best-effort: any error (or an empty run id) maps to ``False`` — never
+    breaks serving, never fabricates a cancellation.
+    """
+    if not run_id:
+        return False
+    try:
+        from app.services.agents.v2.execution.scheduler import (
+            is_run_cancel_requested_async as _cancel_requested,
+        )
+
+        return bool(await _cancel_requested(str(run_id)))
+    except Exception:
+        logger.warning(
+            "[rollout] cancel-requested check failed", exc_info=True
+        )
+        return False
+
 
 def hash_rollout_id(value: Any) -> str | None:
     """sha256-hash one request/workspace id for metrics (``None`` stays)."""
@@ -370,32 +424,54 @@ async def emit_terminal_rollout_metric(
     terminal_status: str,
     citation_count: int = 0,
     cancelled: bool = False,
+    cancel_requested: bool = False,
     answer_text: str | None,
     factual_expected: bool | None,
     served_document_ids: list[Any] | tuple[Any, ...] | None,
     allowed_document_ids: list[Any] | tuple[Any, ...] | None,
     production_write_count: int | None,
     scope_bound: bool = False,
+    unidentified_served_count: int | None = 0,
 ) -> Any:
     """Terminal-boundary append-only emission (R74; v1 + v2 arms).
 
     Runs the four real detectors over the terminal observation, feeds the
     verdicts through the authoritative producers, hashes the request and
-    workspace ids, and appends exactly one row. Raises ``ValueError`` when
-    any verdict is unobservable — the row is invalid and is never recorded
-    as "safe". Callers that must never break serving use
+    workspace ids, and appends exactly one row. ``cancelled`` is resolved
+    through :func:`effective_cancelled` with ``cancel_requested`` (R81:
+    requested-but-ineffective cancellations are recorded). When any
+    verdict is unobservable the row is STILL written — with
+    ``terminal_status`` set to :data:`SECURITY_UNOBSERVABLE_TERMINAL`
+    (R80: omission is not acceptable; the collector/gate counts the
+    sentinel as an invalid security row). The row is never recorded as
+    "safe". Callers that must never break serving use
     :func:`try_emit_terminal_rollout_metric`.
     """
-    security = build_security_verdicts(
-        answer_text=answer_text,
-        terminal_status=terminal_status,
-        citation_count=citation_count,
-        factual_expected=factual_expected,
-        served_document_ids=served_document_ids,
-        allowed_document_ids=allowed_document_ids,
-        production_write_count=production_write_count,
-        scope_bound=scope_bound,
+    row_cancelled = effective_cancelled(
+        cancelled=cancelled, cancel_requested=cancel_requested
     )
+    try:
+        security = build_security_verdicts(
+            answer_text=answer_text,
+            terminal_status=terminal_status,
+            citation_count=citation_count,
+            factual_expected=factual_expected,
+            served_document_ids=served_document_ids,
+            allowed_document_ids=allowed_document_ids,
+            production_write_count=production_write_count,
+            scope_bound=scope_bound,
+            unidentified_served_count=unidentified_served_count,
+        )
+    except ValueError:
+        # R80: unobservable verdict — write the explicitly-invalid row
+        # (sentinel terminal, explicit counters) instead of omitting it.
+        logger.warning(
+            "[rollout] security verdict unobservable; "
+            "recording explicitly-invalid sentinel row",
+            exc_info=True,
+        )
+        security = dict(_SENTINEL_SECURITY)
+        terminal_status = SECURITY_UNOBSERVABLE_TERMINAL
     scope = sorted({str(item) for item in (workspace_ids or ()) if str(item)})
     finished = finished_at or datetime.now(timezone.utc)
     try:
@@ -412,7 +488,7 @@ async def emit_terminal_rollout_metric(
         duration_ms=duration_ms,
         terminal_status=terminal_status,
         citation_count=citation_count,
-        cancelled=cancelled,
+        cancelled=row_cancelled,
         security=security,
     )
 

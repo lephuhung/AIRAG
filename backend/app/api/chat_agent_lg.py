@@ -389,14 +389,16 @@ async def langgraph_chat_stream(
     graph = await resolve_agent_graph(version)
 
     async def _emit_turn_metric() -> None:
-        """Emit the turn's terminal metric row (Task 7B, fix round 2).
+        """Emit the turn's terminal metric row (Task 7B, fix round 3).
 
         Runs in the generator's ``finally`` so EVERY terminal outcome —
         success, error, cancellation (GeneratorExit/CancelledError), and
         fallback (attributed to the serving arm) — gets its row with the
         TRUE cancelled outcome. Every verdict comes from an observed
-        terminal signal; an unobservable verdict makes the row INVALID
-        (logged, never recorded safe). Best-effort: never breaks serving.
+        terminal signal; an unobservable verdict is written as an
+        explicitly-INVALID sentinel row (R80); a requested-but-
+        ineffective cancellation is recorded with cancelled=True on the
+        actual terminal (R81). Best-effort: never breaks serving.
         """
         nonlocal metric_emitted
         if metric_emitted:
@@ -425,12 +427,12 @@ async def langgraph_chat_stream(
                 route=(v2_terminal_info or {}).get("route"),
                 greeting_observed=_greeting,
             )
-            if _factual is None:
-                raise ValueError(
-                    "rollout metric INVALID: factual expectation "
-                    "unobservable for this terminal; refusing to record "
-                    "the row as safe"
-                )
+            # R81: cancelled means REQUESTED (registry check best-effort);
+            # R80: ``None`` factual expectation flows through — emission
+            # writes the explicitly-invalid sentinel row, never omits it.
+            _cancel_requested = await _metrics.was_cancel_requested(
+                (v2_terminal_info or {}).get("run_id")
+            )
             await _metrics.try_emit_terminal_rollout_metric(
                 db,
                 arm=served_arm,
@@ -442,6 +444,7 @@ async def langgraph_chat_stream(
                     final_answer, v2_citations, _served_doc_ids
                 ),
                 cancelled=turn_cancelled,
+                cancel_requested=_cancel_requested,
                 answer_text=final_answer,
                 factual_expected=_factual,
                 served_document_ids=_served_doc_ids,

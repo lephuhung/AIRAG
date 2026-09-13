@@ -1211,7 +1211,10 @@ async def stream_v2_turn_events(
     terminal route (``route``) when the turn reaches a terminal state —
     the Task 7B canary factual-expectation verdict reads it instead of
     inferring factual-ness from served sources. Populated before the
-    terminal event is yielded. The wire format is unchanged.
+    terminal event is yielded. It also receives the run id (``run_id``)
+    at registration so the canary metric emission can resolve whether a
+    cancellation was REQUESTED for the run (R81). The wire format is
+    unchanged.
 
     Exactly one of ``initial_state`` (first turn) or ``resume_command`` (a
     verbatim :func:`prepare_v2_resume_command` ``Command``) is required.
@@ -1256,6 +1259,14 @@ async def stream_v2_turn_events(
 
             await _register_at_start(_run_id)
             heartbeat = _start_heartbeat(_run_id)
+            if terminal_info is not None:
+                try:
+                    terminal_info["run_id"] = _run_id
+                except Exception:
+                    logger.warning(
+                        "[v2stream] terminal info run-id note failed",
+                        exc_info=True,
+                    )
         except Exception:
             logger.warning("[v2stream] active-run register failed", exc_info=True)
 
@@ -1282,6 +1293,22 @@ async def stream_v2_turn_events(
                 terminal_info["route"] = route
         except Exception:
             logger.warning("[v2stream] terminal info note failed", exc_info=True)
+
+    async def _stop_heartbeat_only() -> None:
+        # R82: clarification suspend keeps the persisted request AND the
+        # active leases (the resume continues the SAME run), but the
+        # heartbeat handle must not leak: stop this turn's background
+        # refresh here; the resume turn starts and owns a fresh one at
+        # registration above. Never raises; never releases leases.
+        nonlocal heartbeat
+        if heartbeat is not None:
+            try:
+                await heartbeat.stop()
+            except Exception:
+                logger.warning(
+                    "[v2stream] suspend heartbeat stop failed", exc_info=True
+                )
+            heartbeat = None
 
     async def _emit_suspend_turn(pending) -> AsyncGenerator[dict, None]:
         # Shared by the returned-state and nested-raise suspend paths:
@@ -1331,10 +1358,12 @@ async def stream_v2_turn_events(
             # the question as the turn's single terminal ``complete``.
             if pending is None:
                 yield {"event": "error", "data": {"message": _V2_MISSING_CLARIFICATION_MESSAGE}}
+                await _stop_heartbeat_only()
                 return
             _note_terminal(_terminal_route_of(state) or "clarify")
             async for ev in _emit_suspend_turn(pending):
                 yield ev
+            await _stop_heartbeat_only()
             return
         remaining = _v2_undispatched(state)
         if remaining:

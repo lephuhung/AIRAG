@@ -28,6 +28,13 @@ from typing import Any
 
 REPORT_SCHEMA = "v2_rollout_live_v1"
 
+try:  # single source of truth lives in rollout_metrics; scripts stay runnable
+    from app.services.agent.rollout_metrics import (
+        SECURITY_UNOBSERVABLE_TERMINAL as _SENTINEL_TERMINAL,
+    )
+except Exception:  # operational runs from the repo root lack ``app`` on sys.path
+    _SENTINEL_TERMINAL = "security_unobservable"
+
 ERROR_STATUSES = frozenset({"error", "failed", "timeout"})
 
 #: Terminal statuses that mean a requested cancellation actually stopped
@@ -68,14 +75,31 @@ def _percentile(values: list[float], pct: float) -> float | None:
     return ordered[low] * (1.0 - fraction) + ordered[high] * fraction
 
 
+def _is_unobservable_sentinel(row: dict[str, Any]) -> bool:
+    """True iff the row is an explicitly-invalid R80 sentinel row.
+
+    An unobservable security verdict is written with
+    ``terminal_status == "security_unobservable"`` (explicit ``False``
+    counters that MUST be ignored) — such a row is invalid by type, never
+    a clean observation, and must fail the gate like any other invalid
+    security row. A row that vanished from the counts would evade the
+    gate, so the sentinel is counted, not omitted.
+    """
+    return str(row.get("terminal_status") or "") == _SENTINEL_TERMINAL
+
+
 def _valid_security(row: dict[str, Any]) -> bool:
     """True iff the row carries four EXPLICIT boolean security counters.
 
     R72/R74: missing, null, or non-boolean security fields are INVALID —
-    never counted as zero violations. Invalid rows are excluded from every
-    aggregate and counted in ``invalid_security_rows`` (the arm is marked
-    ``valid: false`` and the gate rejects it).
+    never counted as zero violations. R80: ``security_unobservable``
+    sentinel rows are INVALID by type even though their counters are
+    explicit booleans. Invalid rows are excluded from every aggregate and
+    counted in ``invalid_security_rows`` (the arm is marked ``valid:
+    false`` and the gate rejects it).
     """
+    if _is_unobservable_sentinel(row):
+        return False
     security = row.get("security")
     if not isinstance(security, dict):
         return False

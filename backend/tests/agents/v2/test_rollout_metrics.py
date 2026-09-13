@@ -475,40 +475,23 @@ def test_terminal_emission_records_one_append_only_row():
     assert row.terminal_status == "success"
 
 
-def test_terminal_emission_refuses_unobservable_row():
-    import asyncio
-
+def test_detector_layer_still_refuses_unobservable_verdict():
+    """Fix round 3 (R80): the detector layer STILL refuses to bless an
+    unobservable verdict as safe (raises) — the refusal now routes into
+    an explicitly-invalid sentinel ROW at the emission layer instead of
+    an omission (see test_unobservable_security_writes_invalid_sentinel_row)."""
     from app.services.agent import rollout_metrics as metrics
 
-    class FakeDB:
-        def add(self, row):  # pragma: no cover
-            raise AssertionError("must not record an unobservable row")
-
-        async def commit(self):  # pragma: no cover
-            raise AssertionError("must not record an unobservable row")
-
-        async def rollback(self):
-            return None
-
-    async def _run():
-        with pytest.raises(ValueError):
-            await metrics.emit_terminal_rollout_metric(
-                FakeDB(),
-                arm="v2",
-                request_id="req-1",
-                workspace_ids=["ws-1"],
-                started_at=datetime.now(UTC),
-                terminal_status="success",
-                citation_count=0,
-                cancelled=False,
-                answer_text=None,
-                factual_expected=True,
-                served_document_ids=[],
-                allowed_document_ids=["doc-a"],
-                production_write_count=0,
-            )
-
-    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(_run())
+    with pytest.raises(ValueError):
+        metrics.build_security_verdicts(
+            answer_text=None,  # unobservable checkpoint-secret verdict
+            terminal_status="success",
+            citation_count=0,
+            factual_expected=True,
+            served_document_ids=[],
+            allowed_document_ids=["doc-a"],
+            production_write_count=0,
+        )
 
 
 def _script_module(name):
@@ -930,3 +913,202 @@ def test_gate_rejects_missing_max_gap():
     del report["arms"]["v2"]["max_gap_hours"]
     passed, _ = gate.check_gate(report)
     assert passed is False
+
+
+# ---------------------------------------------------------------------------
+# Task 7B fix round 3 (R80/R81): explicitly-invalid sentinel rows for
+# unobservable security verdicts; cancelled == "requested" (not "exited by")
+# ---------------------------------------------------------------------------
+
+
+def test_unobservable_security_writes_invalid_sentinel_row():
+    """R80: an unobservable verdict MUST produce a written metric row typed
+    explicitly invalid (terminal_status sentinel) — never be omitted."""
+    import asyncio
+
+    from app.services.agent import rollout_metrics as metrics
+
+    added: list = []
+
+    class FakeDB:
+        def add(self, row):
+            added.append(row)
+
+        async def commit(self):
+            return None
+
+        async def rollback(self):
+            return None
+
+    async def _run():
+        return await metrics.emit_terminal_rollout_metric(
+            FakeDB(),
+            arm="v2",
+            request_id="req-unobservable-1",
+            workspace_ids=["ws-1"],
+            started_at=datetime.now(UTC) - timedelta(seconds=2),
+            terminal_status="success",
+            citation_count=0,
+            cancelled=False,
+            answer_text=None,  # unobservable checkpoint-secret verdict
+            factual_expected=True,
+            served_document_ids=[],
+            allowed_document_ids=["doc-a"],
+            production_write_count=0,
+        )
+
+    row = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(_run())
+    assert row is not None
+    assert len(added) == 1
+    assert row.terminal_status == metrics.SECURITY_UNOBSERVABLE_TERMINAL
+    assert row.terminal_status == "security_unobservable"
+
+
+def test_emit_accepts_unidentified_served_count_kwarg():
+    """Serving-path regression: both ingresses pass
+    ``unidentified_served_count`` — emission must accept it and record."""
+    import asyncio
+
+    from app.services.agent import rollout_metrics as metrics
+
+    added: list = []
+
+    class FakeDB:
+        def add(self, row):
+            added.append(row)
+
+        async def commit(self):
+            return None
+
+        async def rollback(self):
+            return None
+
+    async def _run():
+        return await metrics.try_emit_terminal_rollout_metric(
+            FakeDB(),
+            arm="v1",
+            request_id="req-unidentified-1",
+            workspace_ids=["ws-1"],
+            started_at=datetime.now(UTC) - timedelta(seconds=2),
+            terminal_status="success",
+            citation_count=1,
+            cancelled=False,
+            answer_text="grounded answer",
+            factual_expected=True,
+            served_document_ids=["doc-a"],
+            allowed_document_ids=["doc-a"],
+            production_write_count=0,
+            scope_bound=True,
+            unidentified_served_count=0,
+        )
+
+    row = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(_run())
+    assert row is not None
+    assert len(added) == 1
+    assert row.terminal_status == "success"
+
+
+def test_effective_cancelled_marks_requested_cancellation():
+    """R81: ``cancelled`` means cancellation was REQUESTED, regardless of
+    the actual terminal; failed cancellation = requested + non-cancelled
+    terminal (the collector's invariant, now emittable)."""
+    from app.services.agent import rollout_metrics as metrics
+
+    assert metrics.effective_cancelled(cancelled=False, cancel_requested=False) is False
+    assert metrics.effective_cancelled(cancelled=True, cancel_requested=False) is True
+    assert metrics.effective_cancelled(cancelled=False, cancel_requested=True) is True
+    assert metrics.effective_cancelled(cancelled=True, cancel_requested=True) is True
+
+
+def test_was_cancel_requested_reflects_registry():
+    import asyncio
+
+    from app.services.agent import rollout_metrics as metrics
+    from app.services.agents.v2.execution import scheduler as scheduler_module
+
+    async def _run():
+        run_id = "run-was-cancel-requested-1"
+        assert await metrics.was_cancel_requested(run_id) is False
+        assert await metrics.was_cancel_requested("") is False
+        assert await metrics.was_cancel_requested(None) is False
+        scheduler_module.request_run_cancellation(run_id)
+        try:
+            assert await metrics.was_cancel_requested(run_id) is True
+        finally:
+            scheduler_module.unregister_active_run(run_id)
+        assert await metrics.was_cancel_requested(run_id) is False
+
+    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(_run())
+
+
+def test_emit_marks_requested_cancellation_on_success_terminal():
+    """R81: a requested-but-ineffective cancellation (success terminal
+    despite the request) MUST be recorded as cancelled=True so the
+    collector's cancel-failure invariant can fire."""
+    import asyncio
+
+    from app.services.agent import rollout_metrics as metrics
+
+    added: list = []
+
+    class FakeDB:
+        def add(self, row):
+            added.append(row)
+
+        async def commit(self):
+            return None
+
+        async def rollback(self):
+            return None
+
+    async def _run():
+        return await metrics.emit_terminal_rollout_metric(
+            FakeDB(),
+            arm="v2",
+            request_id="req-cancel-requested-1",
+            workspace_ids=["ws-1"],
+            started_at=datetime.now(UTC) - timedelta(seconds=2),
+            terminal_status="success",
+            citation_count=1,
+            cancelled=False,
+            cancel_requested=True,
+            answer_text="grounded answer",
+            factual_expected=True,
+            served_document_ids=["doc-a"],
+            allowed_document_ids=["doc-a"],
+            production_write_count=0,
+        )
+
+    row = asyncio.get_event_loop_policy().new_event_loop().run_until_complete(_run())
+    assert row is not None
+    assert row.terminal_status == "success"
+    assert row.cancelled is True
+
+
+def test_collector_counts_sentinel_rows_invalid_and_gate_fails():
+    """R80: the collector MUST count ``security_unobservable`` rows as
+    invalid security rows (arm invalid); the gate MUST fail on them."""
+    collector = _script_module("collect_v2_rollout_report")
+    gate = _script_module("check_v2_rollout_gate")
+
+    from app.services.agent import rollout_metrics as metrics
+
+    rows = _synthetic_rows(n_v1=210, n_v2=210)
+    sentinel_row = next(row for row in rows if row["arm"] == "v2")
+    sentinel_row.update(
+        {
+            "terminal_status": metrics.SECURITY_UNOBSERVABLE_TERMINAL,
+            "security": {
+                "checkpoint_secret": False,
+                "ungrounded_factual_success": False,
+                "acl_leak": False,
+                "duplicate_production_write": False,
+            },
+        }
+    )
+    report = collector.summarize_metrics(rows)
+    assert report["arms"]["v2"]["invalid_security_rows"] >= 1
+    assert report["arms"]["v2"]["valid"] is False
+    passed, failures = gate.check_gate(report)
+    assert passed is False
+    assert any("invalid security" in failure for failure in failures)
