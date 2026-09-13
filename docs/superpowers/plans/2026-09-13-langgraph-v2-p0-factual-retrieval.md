@@ -261,8 +261,12 @@ git commit -m "feat(v2): wire live revision retrieval"
 
 **Files:**
 - Modify: `backend/app/services/agent/rollout_metrics.py`
+- Modify: `backend/app/services/agent/streaming.py`
+- Modify: `backend/app/api/chat_agent_lg.py`
+- Modify: `backend/app/api/chat_session.py`
 - Modify: `backend/scripts/collect_v2_rollout_report.py`
 - Modify: `backend/tests/agents/v2/test_rollout_metrics.py`
+- Modify: `backend/tests/api/test_agent_v2_streaming.py`
 - Modify: `docs/harness.md`
 - Modify: `docs/embedding.md`
 - Modify: `CLAUDE.md`
@@ -275,9 +279,11 @@ git commit -m "feat(v2): wire live revision retrieval"
 
 Assert a factual complex terminal with zero capability calls is gate-invalid; explicitly unsupported/denied routes remain classified by their typed outcome; no raw content enters metrics.
 
-- [ ] **Step 2: Run RED, implement minimal counters, run GREEN**
+- [ ] **Step 2: Run RED, implement minimal counters, wire observed serving telemetry, run GREEN**
 
-Run: `cd backend && PYTHONPATH=. pytest tests/agents/v2/test_rollout_metrics.py tests/scripts/test_v2_ab_replay.py -q`
+The v2 streaming adapter records the observed terminal route and the number of actual task results in the caller-owned `terminal_info`. Both production metric emission call sites pass that route, the observed v2 response status, and the capability-call count into the additive classifier fields. Missing telemetry remains unobservable and must not be guessed. Tests must prove a real v2 factual terminal with zero task results persists `factual_zero_dispatch`, while typed denied/unsupported terminals remain unchanged.
+
+Run: `cd backend && PYTHONPATH=. pytest tests/agents/v2/test_rollout_metrics.py tests/api/test_agent_v2_streaming.py tests/scripts/test_v2_ab_replay.py -q`
 
 - [ ] **Step 3: Run static and regression gates**
 
