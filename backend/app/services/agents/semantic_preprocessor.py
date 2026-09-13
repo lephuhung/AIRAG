@@ -424,9 +424,12 @@ async def safe_lookup_metadata_only(
     ctx: "RuntimeContext",
     session: "AsyncSession",
 ) -> DocumentRefEntry:
-    """Strict metadata-only lookup. Exact-match SQL only. NO vector/rerank/fuzzy.
+    """Strict metadata-only lookup. No vector/rerank/alias-LLM paths.
 
-    Per B.4: 4 strategies by parse_basis. ACL pre-filter in SQL.
+    Exact-match SQL for the number (`regex_doc_num`, `regex_short_official`,
+    `regex_bare_number`), alias (`regex_abbr_then_doc`), and section-doc paths;
+    workspace-scoped longest-match title-prefix (`fuzzy_title`) for named
+    documents (`regex_named_doc`). ACL pre-filter in SQL.
     Status mapping per spec B.4 deterministic table.
     """
     # Early cancellation check

@@ -34,9 +34,9 @@ superadmin JWT, or resolve the workspace by name from the pre-check output.
 
 ```bash
 # Obtain $TOKEN first: mint a short-lived superadmin JWT in-container per
-docs/auth.md ("Mint a JWT without a password"); never print or commit it.
+# docs/auth.md ("Mint a JWT without a password"); never print or commit it.
 # Run curl INSIDE the container: host :8080 is the nginx proxy (it 301s) and
-hrag-backend publishes no host port, so localhost:8080 only serves the API
+# hrag-backend publishes no host port, so localhost:8080 only serves the API
 # in-container.
 docker exec hrag-backend curl -s -X POST "http://localhost:8080/api/v1/rag/reindex-workspace/$WS" -H "Authorization: Bearer $TOKEN" | jq
 ```
@@ -50,10 +50,11 @@ Run the smallest workspace first. The endpoint queues each document
 ```bash
 # pointer + published revision + build artifacts. LEFT JOINs (not an inner
 # join) so an empty result means "no live documents in the workspace" while
-# rows with published=false mean "documents exist but nothing published yet".
+# rows with published=false mean "documents exist but nothing published yet"
+# (coalesce renders false instead of a NULL/blank when the pointer is NULL).
 docker exec hrag-postgres psql -U postgres -d hrag -c \
   "select d.id, d.current_revision_id,
-          (r.status = 'published') as published, r.status, b.build_profile,
+          coalesce(r.status = 'published', false) as published, r.status, b.build_profile,
           b.markdown_artifact_key, b.structure_artifact_key,
           b.embedding_namespace, b.embedding_model_hash
      from documents d
@@ -103,6 +104,10 @@ async def main():
 asyncio.run(main())
 "
 ```
+
+Note: `abandon_revision` only accepts draft/building/verified revisions, so
+already-`failed` revisions need no action (failed revisions are
+reclaimed/re-attempted by a fresh reindex generation).
 
 Confirm `current_revision_id` is unchanged and the document still serves its old
 revision. Investigate before retrying.

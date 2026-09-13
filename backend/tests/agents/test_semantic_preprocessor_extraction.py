@@ -125,6 +125,62 @@ async def test_title_lookup_selects_the_longest_matching_title() -> None:
 
 
 @pytest.mark.asyncio
+async def test_safe_lookup_routes_named_doc_to_title_and_abbr_to_alias(monkeypatch) -> None:
+    """Stage-5 routing: named docs reach `_lookup_by_title`, abbr docs `_lookup_by_alias`."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    import app.services.agents.semantic_preprocessor as sp
+
+    async def _fake_title(ref, ctx, session):
+        return DocumentRefEntry(
+            ref_id=ref.ref_id,
+            original_span=ref.original_span,
+            span_offset=ref.span_offset,
+            reference=ref.reference,
+            section_reference=ref.section_reference,
+            resolution_status="not_found",
+        )
+
+    async def _fake_alias(ref, ctx, session):
+        return DocumentRefEntry(
+            ref_id=ref.ref_id,
+            original_span=ref.original_span,
+            span_offset=ref.span_offset,
+            reference=ref.reference,
+            section_reference=ref.section_reference,
+            resolution_status="not_found",
+        )
+
+    title_spy = AsyncMock(side_effect=_fake_title)
+    alias_spy = AsyncMock(side_effect=_fake_alias)
+    monkeypatch.setattr(sp, "_lookup_by_title", title_spy)
+    monkeypatch.setattr(sp, "_lookup_by_alias", alias_spy)
+
+    ctx = SimpleNamespace(allowed_workspace_ids=[])
+    session = SimpleNamespace()
+
+    named_ref = RefExtraction(
+        ref_id="r1", original_span="Luật An ninh mạng", span_offset=(0, 17),
+        reference="luật an ninh mạng", section_reference=None,
+        parse_basis="regex_named_doc",
+    )
+    abbr_ref = RefExtraction(
+        ref_id="r2", original_span="NĐ", span_offset=(0, 2),
+        reference="nđ", section_reference=None,
+        parse_basis="regex_abbr_then_doc",
+    )
+
+    await sp.safe_lookup_metadata_only(named_ref, ctx, session)
+    await sp.safe_lookup_metadata_only(abbr_ref, ctx, session)
+
+    assert title_spy.await_count == 1
+    assert alias_spy.await_count == 1
+    assert title_spy.await_args[0][0].parse_basis == "regex_named_doc"
+    assert alias_spy.await_args[0][0].parse_basis == "regex_abbr_then_doc"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("bare", ["luật", "nghị định"])
 async def test_title_lookup_rejects_a_bare_document_type_keyword(bare: str) -> None:
     from types import SimpleNamespace
