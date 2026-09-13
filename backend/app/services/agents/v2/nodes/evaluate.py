@@ -310,15 +310,34 @@ class SemanticJudge(Protocol):
 #: Capabilities whose tasks are expected to supply synthesis-eligible
 #: evidence. Discovery-only capabilities (``document.search``) and
 #: non-evidence capabilities never satisfy the task-evidence gate.
+#: ``document.retrieve`` supplies evidence through governed hydrated uses
+#: (coverage-purpose target-bound uses for scoped targets, supporting uses
+#: for unscoped retrieval); see ``build_coverage`` for its coverage rule.
 _EVIDENCE_SUPPLYING_CAPABILITIES = frozenset(
     {
         "document.read",
+        "document.retrieve",
         "section.read",
         "people.lookup",
         "knowledge_graph.query",
         "memory.lookup",
     }
 )
+
+#: The capability whose admitted coverage uses establish retrieval coverage
+#: without a read observation (spec §4.3, P0 Task 4).
+_RETRIEVAL_COVERAGE_CAPABILITY = "document.retrieve"
+
+#: Coverage-status rank for combining read and retrieval evidence: the
+#: stronger signal wins; anything below ``read_partial`` stays a gap unless
+#: the unit's criterion explicitly allows it.
+_COVERAGE_STATUS_RANK: dict[str, int] = {
+    "missing": 0,
+    "unreadable": 1,
+    "truncated": 2,
+    "read_partial": 3,
+    "read_complete": 4,
+}
 
 
 def _require_hydrator(runtime: GraphRuntimeContext) -> EvidenceHydrator:
@@ -390,6 +409,50 @@ def _binding_for_target(
     )
 
 
+def _retrieval_coverage_status(
+    unit: TargetUnit,
+    binding: ScopedDocument | None,
+    capability_by_task: Mapping[str, str],
+    hydrated: tuple[HydratedEvidence, ...],
+) -> CoverageStatus | None:
+    """Retrieval coverage for one target from governed hydrated uses.
+
+    Counts only admitted ``coverage``-purpose uses that are bound to this
+    target, were produced by a ``document.retrieve`` task, and whose record
+    revision still matches the pinned binding revision. A chunk from the
+    pinned revision establishes ``read_partial`` for a document-level target
+    without any read observation; locator-specific targets must additionally
+    satisfy ``locator_covers`` (full coordinates read ``read_complete``,
+    compatible parts read ``read_partial``). Wrong-target, wrong-revision,
+    non-retrieval-task, or locator-incompatible uses yield ``None``.
+    """
+    if binding is None:
+        return None
+    best: CoverageStatus | None = None
+    for item in hydrated:
+        if item.purpose != "coverage" or item.target_id != unit.target_id:
+            continue
+        if capability_by_task.get(item.task_id) != _RETRIEVAL_COVERAGE_CAPABILITY:
+            continue
+        if item.document_revision != binding.document_revision:
+            continue
+        if isinstance(unit.requested_locator, DocumentLocator):
+            candidate: CoverageStatus = "read_partial"
+        else:
+            if item.locator is None:
+                continue
+            verdict = locator_covers(unit.requested_locator, item.locator)
+            if verdict == "full":
+                candidate = "read_complete"
+            elif verdict == "partial":
+                candidate = "read_partial"
+            else:
+                continue
+        if best is None or _COVERAGE_STATUS_RANK[candidate] > _COVERAGE_STATUS_RANK[best]:
+            best = candidate
+    return best
+
+
 def build_coverage(
     plan: TaskPlan,
     bindings: DocumentBindingSet,
@@ -404,6 +467,14 @@ def build_coverage(
     tombstone, failed derived validation) — or whose revision drifted past
     hydration admission — completes nothing. Discovery and supporting purposes
     never complete coverage.
+
+    Retrieval coverage (spec §4.3): a governed, hydrated ``coverage`` use
+    produced by a ``document.retrieve`` task additionally establishes
+    coverage without any read observation — ``read_partial`` for a
+    document-level target on the pinned revision, ``locator_covers``-gated
+    for locator-specific targets. The stronger of the read and retrieval
+    signals wins; observed locators still come only from real observations,
+    so nothing fabricates a read.
     """
     observations_by_target: dict[str, list[Any]] = {}
     for result in results:
@@ -425,6 +496,12 @@ def build_coverage(
         if item.document_revision != binding.document_revision:
             continue
         admitted_locators.setdefault(item.target_id, set()).add(item.locator)
+    capability_by_task: dict[str, str] = {}
+    for task in plan.tasks:
+        capability = getattr(task, "capability", None)
+        task_id = getattr(task, "task_id", None)
+        if isinstance(capability, str) and isinstance(task_id, str):
+            capability_by_task[task_id] = capability
     items: list[CoverageItem] = []
     for unit in plan.target_units:
         observations = observations_by_target.get(unit.target_id, ())
@@ -441,17 +518,30 @@ def build_coverage(
             if locator in admitted_locators.get(unit.target_id, set())
         }
         if any(locator_covers(unit.requested_locator, locator) == "full" for locator in agreed):
-            status: CoverageStatus = "read_complete"
+            read_status: CoverageStatus = "read_complete"
         elif any(
             locator_covers(unit.requested_locator, locator) == "partial" for locator in agreed
         ):
-            status = "read_partial"
+            read_status = "read_partial"
         elif any(observation.outcome == "unreadable" for observation in observations):
-            status = "unreadable"
+            read_status = "unreadable"
         elif any(observation.outcome == "truncated" for observation in observations):
-            status = "truncated"
+            read_status = "truncated"
         else:
-            status = "missing"
+            read_status = "missing"
+        retrieval_status = _retrieval_coverage_status(
+            unit,
+            _binding_for_target(plan, bindings, unit.target_id),
+            capability_by_task,
+            hydrated,
+        )
+        if (
+            retrieval_status is not None
+            and _COVERAGE_STATUS_RANK[retrieval_status] > _COVERAGE_STATUS_RANK[read_status]
+        ):
+            status = retrieval_status
+        else:
+            status = read_status
         items.append(
             CoverageItem(
                 target_id=unit.target_id,

@@ -2947,6 +2947,7 @@ def test_subagent_cannot_append_authoritative_tasks() -> None:
     assert constructors == {
         ("nodes/fast_plan.py", "build_fast_plan"),
         ("skills/compare/policy.py", "build_compare_plan"),
+        ("skills/retrieve/policy.py", "build_retrieve_plan"),
         ("skills/summarize/policy.py", "build_summarize_workflow"),
         ("complex_research_graph.py", "_people_first_plan"),
         ("dependencies/people_document.py", "redact_scalar_for_model"),

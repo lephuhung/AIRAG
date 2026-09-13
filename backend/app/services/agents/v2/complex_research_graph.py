@@ -105,6 +105,7 @@ from .replanning import (
     append_replan_tasks,
 )
 from .skills.compare import policy as compare_policy
+from .skills.retrieve import policy as retrieve_policy
 from .skills.summarize import policy as summarize_policy
 from .skills.summarize.policy import ReduceSpec
 from .tools.discovery_candidates import (
@@ -817,7 +818,9 @@ def build_initial_proposal(planning_input: ResearchPlanningInput) -> InitialProp
 
     ``compare`` (complex) routes to the compare skill; large/iterative
     ``summarize`` (complex) routes to the summarize skill with its
-    deterministic map/reduce workflow; ``cross_domain`` with a named person
+    deterministic map/reduce workflow; ``retrieve`` routes to the retrieve
+    skill with its single deterministic ``document.retrieve`` task;
+    ``cross_domain`` with a named person
     routes to the deterministic people-first lookup (the People→Document
     pilot's governed first step). Bounded summarize never reaches here (the
     deterministic router keeps single-document summaries on the fast path).
@@ -833,6 +836,11 @@ def build_initial_proposal(planning_input: ResearchPlanningInput) -> InitialProp
     if work_type == summarize_policy.SUMMARIZE_WORK_TYPE:
         workflow = summarize_policy.build_summarize_workflow(planning_input)
         return InitialProposal(plan=workflow.plan, reduce_spec=workflow.reduce)
+    if work_type == retrieve_policy.RETRIEVE_WORK_TYPE:
+        return InitialProposal(
+            plan=retrieve_policy.build_retrieve_plan(planning_input),
+            reduce_spec=None,
+        )
     if work_type == "cross_domain":
         return InitialProposal(
             plan=_people_first_plan(planning_input), reduce_spec=None

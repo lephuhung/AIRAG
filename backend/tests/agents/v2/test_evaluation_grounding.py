@@ -217,7 +217,12 @@ class FakeHydrator:
             self.denied.append((use.use_id, "revision_mismatch"))
             return None
         if item.source_kind == "document":
-            if (
+            if use.target_id is None:
+                # Targetless supporting retrieval (unscoped workspace scope,
+                # spec §4.3): no binding to match; expiry/tombstone were
+                # already checked above, so the use hydrates admitted.
+                pass
+            elif (
                 binding is None
                 or item.document_id != binding.document_id
                 or item.document_revision != binding.document_revision
@@ -2168,3 +2173,319 @@ async def test_finalizer_turns_synthesis_failure_into_typed_response() -> None:
     )
     assert final["final_response"].status == "insufficient"
     assert "t1" not in final["final_response"].content
+
+
+# ---------------------------------------------------------------------------
+# P0 Task 4 — retrieval coverage owned by the evaluator (no read observation)
+# ---------------------------------------------------------------------------
+
+
+def _retrieve_plan(
+    *,
+    target_id: str = "t1",
+    binding_id: str = "b_r1",
+    locator: Any = None,
+    minimum_status: str = "read_partial",
+    task_id: str = "T1",
+    target_ids: tuple[str, ...] | None = None,
+) -> TaskPlan:
+    from app.services.agents.v2.contracts.capability import DocumentRetrieveInput
+
+    units = (
+        ()
+        if target_ids is not None and target_ids == ()
+        else (
+            TargetUnit(
+                target_id=target_id,
+                binding_id=binding_id,
+                requested_locator=locator or DocumentLocator(kind="document"),
+                completion_criteria=(
+                    CoverageCriterion(kind="coverage", minimum_status=minimum_status, allow_partial_reason=(  # type: ignore[arg-type]
+                        "retrieval chunks establish partial document coverage"
+                    ) if minimum_status == "read_partial" else None),
+                ),
+            ),
+        )
+    )
+    return TaskPlan(
+        contract_version="2.0",
+        plan_id="p-retrieve",
+        goal="Điều 5 của A nói gì?",
+        target_units=units,
+        tasks=(
+            TaskSpec(
+                task_id=task_id,
+                capability="document.retrieve",
+                task_objective="Truy hồi Điều 5 của A",
+                input=DocumentRetrieveInput(
+                    kind="document.retrieve",
+                    query="Điều 5 của A nói gì?",
+                    target_ids=() if target_ids is not None and target_ids == () else (target_id,),
+                ),
+                depends_on=(),
+                origin=InitialTaskOrigin(kind="initial"),
+            ),
+        ),
+    )
+
+
+def _retrieve_result(
+    task_id: str = "T1",
+    *,
+    use_id: UUID | None = None,
+    status: str = "success",
+) -> AgentResult:
+    from app.services.agents.v2.contracts.capability import DocumentRetrieveOutput
+
+    return AgentResult(
+        contract_version=CONTRACT_VERSION,
+        task_id=task_id,
+        status=status,  # type: ignore[arg-type]
+        data=DocumentRetrieveOutput(kind="document.retrieve", retrieved_unit_count=1)
+        if status in ("success", "partial")
+        else None,
+        evidence_uses=(EvidenceUseRef(use_id=use_id),) if use_id else (),
+        coverage_observations=(),
+        error=None,
+    )
+
+
+def _store_retrieve_use(
+    *,
+    use_id: UUID,
+    evidence_id: UUID,
+    task_id: str = "T1",
+    purpose: str = "coverage",
+    target_id: str | None = "t1",
+    revision: str = REVISION,
+    locator: Any = None,
+) -> StoredUse:
+    return StoredUse(
+        use=EvidenceUse(
+            use_id=use_id,
+            evidence_id=evidence_id,
+            task_id=task_id,
+            purpose=purpose,  # type: ignore[arg-type]
+            target_id=target_id,
+        ),
+        source_kind="document",
+        document_id=DOCUMENT_ID,
+        document_revision=revision,
+        locator=locator or DocumentLocator(kind="document"),
+        content="Điều 5 quy định mức phạt.",
+    )
+
+
+def test_retrieve_is_evidence_supplying() -> None:
+    from app.services.agents.v2.nodes.evaluate import _EVIDENCE_SUPPLYING_CAPABILITIES
+
+    assert "document.retrieve" in _EVIDENCE_SUPPLYING_CAPABILITIES
+
+
+@pytest.mark.asyncio
+async def test_unscoped_retrieve_supporting_use_passes_evidence_gate() -> None:
+    plan = _retrieve_plan(target_ids=())
+    assert every_expecting_task_has_evidence(plan, ()) is False
+    use_id, evidence_id = uuid4(), uuid4()
+    hydrator = FakeHydrator(
+        {use_id: _store_retrieve_use(use_id=use_id, evidence_id=evidence_id, purpose="supporting", target_id=None)}
+    )
+    runtime = graph_runtime(hydrator, FakeLeaseRepo([]))
+    evaluation = await evaluate_evidence(
+        plan=plan,
+        bindings=binding_set(),
+        results=(_retrieve_result(use_id=use_id),),
+        semantic=semantic(),
+        runtime=runtime,
+    )
+    assert evaluation.status == "sufficient"
+    assert evaluation.missing == ()
+
+
+@pytest.mark.asyncio
+async def test_scoped_retrieve_document_level_yields_read_partial() -> None:
+    plan = _retrieve_plan()
+    use_id, evidence_id = uuid4(), uuid4()
+    hydrator = FakeHydrator(
+        {use_id: _store_retrieve_use(use_id=use_id, evidence_id=evidence_id)}
+    )
+    runtime = graph_runtime(hydrator, FakeLeaseRepo([]))
+    results = (_retrieve_result(use_id=use_id),)
+    hydrated = await hydrator.hydrate_for_evaluation(
+        tuple(ref for result in results for ref in result.evidence_uses),
+        runtime=runtime,
+        plan=plan,
+        bindings=binding_set(),
+    )
+    coverage = build_coverage(plan, binding_set(), results, hydrated)
+    assert coverage.items[0].status == "read_partial"
+    assert find_missing_requirements(plan, coverage, hydrated, {}) == ()
+
+
+@pytest.mark.asyncio
+async def test_scoped_retrieve_wrong_target_fails() -> None:
+    plan = _retrieve_plan()
+    use_id, evidence_id = uuid4(), uuid4()
+    hydrator = FakeHydrator(
+        {
+            use_id: _store_retrieve_use(
+                use_id=use_id, evidence_id=evidence_id, target_id="tX"
+            )
+        }
+    )
+    runtime = graph_runtime(hydrator, FakeLeaseRepo([]))
+    results = (_retrieve_result(use_id=use_id),)
+    hydrated = await hydrator.hydrate_for_evaluation(
+        tuple(ref for result in results for ref in result.evidence_uses),
+        runtime=runtime,
+        plan=plan,
+        bindings=binding_set(),
+    )
+    coverage = build_coverage(plan, binding_set(), results, hydrated)
+    assert coverage.items[0].status == "missing"
+    assert [req.target_id for req in find_missing_requirements(plan, coverage, hydrated, {})] == ["t1"]
+
+
+@pytest.mark.asyncio
+async def test_scoped_retrieve_wrong_revision_fails() -> None:
+    plan = _retrieve_plan()
+    use_id, evidence_id = uuid4(), uuid4()
+    hydrator = FakeHydrator(
+        {
+            use_id: _store_retrieve_use(
+                use_id=use_id, evidence_id=evidence_id, revision=OTHER_REVISION
+            )
+        }
+    )
+    runtime = graph_runtime(hydrator, FakeLeaseRepo([]))
+    results = (_retrieve_result(use_id=use_id),)
+    hydrated = await hydrator.hydrate_for_evaluation(
+        tuple(ref for result in results for ref in result.evidence_uses),
+        runtime=runtime,
+        plan=plan,
+        bindings=binding_set(),
+    )
+    # The governed hydrator denies the stale revision, so nothing hydrates.
+    assert hydrated == ()
+    coverage = build_coverage(plan, binding_set(), results, hydrated)
+    assert coverage.items[0].status == "missing"
+
+
+@pytest.mark.asyncio
+async def test_scoped_retrieve_locator_incompatible_fails() -> None:
+    section_a = SectionLocator(kind="section", structure_node_id="chap-II")
+    section_b = SectionLocator(kind="section", structure_node_id="chap-III")
+    plan = _retrieve_plan(locator=section_a)
+    use_id, evidence_id = uuid4(), uuid4()
+    hydrator = FakeHydrator(
+        {
+            use_id: _store_retrieve_use(
+                use_id=use_id, evidence_id=evidence_id, locator=section_b
+            )
+        }
+    )
+    runtime = graph_runtime(hydrator, FakeLeaseRepo([]))
+    results = (_retrieve_result(use_id=use_id),)
+    hydrated = await hydrator.hydrate_for_evaluation(
+        tuple(ref for result in results for ref in result.evidence_uses),
+        runtime=runtime,
+        plan=plan,
+        bindings=binding_set(),
+    )
+    coverage = build_coverage(plan, binding_set(), results, hydrated)
+    assert coverage.items[0].status == "missing"
+
+
+@pytest.mark.asyncio
+async def test_scoped_retrieve_locator_compatible_section_succeeds() -> None:
+    section_a = SectionLocator(kind="section", structure_node_id="chap-II")
+    plan = _retrieve_plan(locator=section_a)
+    use_id, evidence_id = uuid4(), uuid4()
+    hydrator = FakeHydrator(
+        {
+            use_id: _store_retrieve_use(
+                use_id=use_id, evidence_id=evidence_id, locator=section_a
+            )
+        }
+    )
+    runtime = graph_runtime(hydrator, FakeLeaseRepo([]))
+    results = (_retrieve_result(use_id=use_id),)
+    hydrated = await hydrator.hydrate_for_evaluation(
+        tuple(ref for result in results for ref in result.evidence_uses),
+        runtime=runtime,
+        plan=plan,
+        bindings=binding_set(),
+    )
+    coverage = build_coverage(plan, binding_set(), results, hydrated)
+    assert coverage.items[0].status == "read_complete"
+    assert find_missing_requirements(plan, coverage, hydrated, {}) == ()
+
+
+def _admitted_retrieve_hydrated(
+    *,
+    target_id: str | None = "t1",
+    revision: str = REVISION,
+    locator: Any = None,
+    task_id: str = "T1",
+) -> HydratedEvidence:
+    return HydratedEvidence(
+        use_id=uuid4(),
+        evidence_id=uuid4(),
+        task_id=task_id,
+        purpose="coverage",
+        target_id=target_id,
+        content="Điều 5 quy định mức phạt.",
+        role="target",
+        source_label="t1",
+        source_identity=DocumentSourceIdentity(
+            kind="document",
+            document_id=DOCUMENT_ID,
+            document_revision=revision,
+            locator=locator or DocumentLocator(kind="document"),
+        ),
+        classification="normal",
+        locator=locator or DocumentLocator(kind="document"),
+        document_revision=revision,
+    )
+
+
+def test_build_coverage_rechecks_revision_even_if_hydrator_admitted() -> None:
+    plan = _retrieve_plan()
+    hydrated = (
+        _admitted_retrieve_hydrated(revision=OTHER_REVISION),
+    )
+    coverage = build_coverage(plan, binding_set(), (_retrieve_result(),), hydrated)
+    assert coverage.items[0].status == "missing"
+
+
+def test_build_coverage_ignores_use_for_unknown_target() -> None:
+    plan = _retrieve_plan()
+    hydrated = (_admitted_retrieve_hydrated(target_id="tX"),)
+    coverage = build_coverage(plan, binding_set(), (_retrieve_result(),), hydrated)
+    assert coverage.items[0].status == "missing"
+
+
+def test_build_coverage_ignores_non_retrieve_task_use() -> None:
+    """A search-task coverage use must never establish retrieval coverage."""
+    from app.services.agents.v2.contracts.capability import DocumentSearchInput
+
+    plan = _retrieve_plan()
+    hydrated = (_admitted_retrieve_hydrated(task_id="T-search"),)
+    search_plan = TaskPlan(
+        contract_version="2.0",
+        plan_id="p-retrieve",
+        goal="Điều 5 của A nói gì?",
+        target_units=plan.target_units,
+        tasks=(
+            TaskSpec(
+                task_id="T-search",
+                capability="document.search",
+                task_objective="Tìm Điều 5 của A",
+                input=DocumentSearchInput(kind="document.search", query="Điều 5"),
+                depends_on=(),
+                origin=InitialTaskOrigin(kind="initial"),
+            ),
+        ),
+    )
+    coverage = build_coverage(search_plan, binding_set(), (_retrieve_result("T-search"),), hydrated)
+    assert coverage.items[0].status == "missing"
