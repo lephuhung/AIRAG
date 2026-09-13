@@ -4,7 +4,7 @@
 
     proposal
     -> convert to a TaskSpec proposal
-    -> validate_task_plan / validate_replan (append-only, current runtime catalog)
+    -> validate_replan against the current runtime catalog (append-only)
     -> return accepted append-only plan or typed rejection
 
 It is a proposal adapter only: it never persists a plan, never dispatches work,
@@ -25,9 +25,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+from pydantic import ValidationError
+
 from ..capabilities import CapabilityDenied
-from ..contracts.binding import DocumentBindingSet
-from ..contracts.capability import DocumentSearchInput
+from ..contracts.capability import CapabilityInput, DocumentSearchInput
 from ..contracts.planning import (
     DiscoveryPolicy,
     ReplanTaskOrigin,
@@ -36,11 +37,7 @@ from ..contracts.planning import (
     TaskSpec,
 )
 from ..contracts.state import GraphRuntimeContext
-from ..contracts.validation import (
-    ContractValidationError,
-    validate_replan,
-    validate_task_plan,
-)
+from ..contracts.validation import ContractValidationError, validate_replan
 
 RejectionCode = Literal[
     "unknown_capability",
@@ -58,7 +55,7 @@ class CapabilityInvocationProposal:
 
     capability: str
     objective: str
-    input: object
+    input: CapabilityInput
     depends_on: tuple[str, ...] = ()
 
 
@@ -101,11 +98,9 @@ class AgentToolGateway:
     def __init__(
         self,
         *,
-        bindings: DocumentBindingSet | None = None,
         discovery_policy: DiscoveryPolicy | None = None,
         budget: ResearchBudgetView | None = None,
     ) -> None:
-        self._bindings = bindings
         self._policy = discovery_policy if discovery_policy is not None else _DEFAULT_POLICY
         self._budget = budget if budget is not None else _DEFAULT_BUDGET
 
@@ -115,6 +110,7 @@ class AgentToolGateway:
         current_plan: TaskPlan,
         runtime: GraphRuntimeContext,
     ) -> ToolProposalOutcome:
+
         """Convert one proposal to an appended TaskSpec and validate it closed."""
         rejection = self._check_proposal_shape(proposal)
         if rejection is None:
@@ -124,27 +120,35 @@ class AgentToolGateway:
                 accepted=False, plan=current_plan, rejection=rejection
             )
         task_id = self._next_task_id(current_plan)
-        candidate = TaskSpec(
-            task_id=task_id,
-            capability=proposal.capability,
-            task_objective=proposal.objective,
-            input=proposal.input,  # type: ignore[arg-type]
-            depends_on=tuple(proposal.depends_on),
-            origin=ReplanTaskOrigin(
-                kind="replan",
-                reason=proposal.objective,
-                task_ids=tuple(proposal.depends_on),
-                evidence_use_ids=(),
-            ),
-        )
-        proposed = current_plan.model_copy(
-            update={"tasks": current_plan.tasks + (candidate,)}
-        )
         try:
-            if self._bindings is not None:
-                validate_task_plan(proposed, self._bindings)
+            candidate = TaskSpec(
+                task_id=task_id,
+                capability=proposal.capability,
+                task_objective=proposal.objective,
+                input=proposal.input,
+                depends_on=tuple(proposal.depends_on),
+                origin=ReplanTaskOrigin(
+                    kind="replan",
+                    reason=proposal.objective,
+                    task_ids=tuple(proposal.depends_on),
+                    evidence_use_ids=(),
+                ),
+            )
+            proposed = current_plan.model_copy(
+                update={"tasks": current_plan.tasks + (candidate,)}
+            )
             accepted_plan = validate_replan(
                 current_plan, proposed, (), self._policy, self._budget
+            )
+        except ValidationError as error:
+            # Malformed proposal payloads never escape: the frozen
+            # CapabilityInput boundary is enforced as a typed rejection.
+            return ToolProposalOutcome(
+                accepted=False,
+                plan=current_plan,
+                rejection=ProposalRejection(
+                    code="invalid_proposal", message=str(error)
+                ),
             )
         except ContractValidationError as error:
             message = str(error)
@@ -194,20 +198,10 @@ class AgentToolGateway:
     def _check_runtime_catalog(
         proposal: CapabilityInvocationProposal, runtime: GraphRuntimeContext
     ) -> ProposalRejection | None:
-        services = runtime.services
-        registry = getattr(services, "capability_registry", None) if services else None
-        if registry is not None:
-            # Membership only: capability resolution for dispatch belongs to
-            # the shared scheduler, which owns the precise typed denial.
-            if proposal.capability not in registry.capability_names():
-                return ProposalRejection(
-                    code="unauthorized_capability",
-                    message=(
-                        f"capability {proposal.capability!r} is not permitted "
-                        "or available for this request"
-                    ),
-                )
-            return None
+        # Current trusted runtime authority ALWAYS narrows: registry membership
+        # is an additional check, never an early return that skips these.
+        # Capability resolution for dispatch belongs to the shared scheduler,
+        # which owns the precise typed denial.
         trusted = runtime.capability_runtime
         if proposal.capability not in trusted.allowed_capabilities:
             return ProposalRejection(
@@ -219,6 +213,17 @@ class AgentToolGateway:
                 code="unauthorized_capability",
                 message="capability 'people.lookup' is not permitted",
             )
+        services = runtime.services
+        registry = getattr(services, "capability_registry", None) if services else None
+        if registry is not None:
+            if proposal.capability not in registry.capability_names():
+                return ProposalRejection(
+                    code="unauthorized_capability",
+                    message=(
+                        f"capability {proposal.capability!r} is not permitted "
+                        "or available for this request"
+                    ),
+                )
         return None
 
     @staticmethod
@@ -247,19 +252,18 @@ dispatch and resolves no capability itself.
         raise UnplannedCapabilityDispatch(
             f"task {task_id!r} has no validated persisted TaskSpec"
         )
+    trusted = runtime.capability_runtime
+    if task.capability not in trusted.allowed_capabilities:
+        raise CapabilityDenied(
+            f"capability {task.capability!r} is not permitted for this request"
+        )
+    if task.capability == "people.lookup" and not trusted.can_read_people:
+        raise CapabilityDenied("capability 'people.lookup' is not permitted")
     services = runtime.services
     registry = getattr(services, "capability_registry", None) if services else None
-    if registry is not None:
-        visible = registry.capability_names()
-    else:
-        visible = runtime.capability_runtime.allowed_capabilities
-    if task.capability not in visible:
+    if registry is not None and task.capability not in registry.capability_names():
         raise CapabilityDenied(
             f"capability {task.capability!r} is not permitted or available "
             "for this request"
         )
-    if task.capability == "people.lookup":
-        trusted = runtime.capability_runtime
-        if not trusted.can_read_people:
-            raise CapabilityDenied("capability 'people.lookup' is not permitted")
     return task

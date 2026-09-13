@@ -11,9 +11,10 @@ additive-friendly and define no replan/discovery policy beyond this boundary.
 """
 from .adapters import AgentToolAdapter, AgentToolCall, build_agent_tool_catalog
 from .discovery_candidates import (
-    CandidateBindingDenied,
     CandidateNotFound,
     DiscoveryCandidateRegistry,
+    InvalidCandidateRole,
+    candidate_addition_request,
 )
 from .gateway import (
     AgentToolGateway,
@@ -41,8 +42,8 @@ __all__ = [
     "AgentToolCall",
     "AgentToolGateway",
     "AgentToolObservation",
-    "CandidateBindingDenied",
     "CandidateNotFound",
+    "InvalidCandidateRole",
     "CapabilityInvocationProposal",
     "DiscoveryCandidateRegistry",
     "DocumentReadObservation",
@@ -58,5 +59,6 @@ __all__ = [
     "ToolProposalOutcome",
     "UnplannedCapabilityDispatch",
     "build_agent_tool_catalog",
+    "candidate_addition_request",
     "require_planned_dispatch",
 ]

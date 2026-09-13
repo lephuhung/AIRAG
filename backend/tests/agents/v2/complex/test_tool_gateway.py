@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 from datetime import UTC, datetime
+from typing import TypedDict
 from uuid import UUID
 
 import pytest
@@ -55,8 +56,10 @@ from app.services.agents.v2.tools.adapters import (
     build_agent_tool_catalog,
 )
 from app.services.agents.v2.tools.discovery_candidates import (
-    CandidateBindingDenied,
+    CandidateNotFound,
     DiscoveryCandidateRegistry,
+    InvalidCandidateRole,
+    candidate_addition_request,
 )
 from app.services.agents.v2.tools.gateway import (
     AgentToolGateway,
@@ -186,9 +189,7 @@ def _read_plan() -> TaskPlan:
 
 
 def _gateway(**kwargs: object) -> AgentToolGateway:
-    defaults: dict[str, object] = {"bindings": _bindings()}
-    defaults.update(kwargs)
-    return AgentToolGateway(**defaults)  # type: ignore[arg-type]
+    return AgentToolGateway(**kwargs)  # type: ignore[arg-type]
 
 
 def _people_result(task_id: str = "T1") -> AgentResult:
@@ -591,12 +592,50 @@ def test_candidate_registry_reconstructs_from_checkpointed_agent_result() -> Non
 
 
 def test_candidate_ids_survive_interrupt_and_process_restart() -> None:
-    checkpointed = [_search_result().model_dump_json(), _people_result().model_dump_json()]
-    # Simulate a process restart: only the checkpointed JSON survives.
-    restored = [AgentResult.model_validate_json(payload) for payload in checkpointed]
-    registry = DiscoveryCandidateRegistry.from_results(restored)
-    assert registry.candidate_ids() == (CANDIDATE_ID_1, CANDIDATE_ID_2)
-    assert registry.get(CANDIDATE_ID_1) == _candidate(CANDIDATE_ID_1, DOCUMENT_ID, REVISION_1)
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import StateGraph
+
+    class CheckpointedResearch(TypedDict):
+        results: tuple
+
+    def run_search(state: CheckpointedResearch) -> dict:
+        return {"results": (_search_result(), _people_result())}
+
+    graph = StateGraph(CheckpointedResearch)
+    graph.add_node("search", run_search)
+    graph.set_entry_point("search")
+    graph.set_finish_point("search")
+    compiled = graph.compile(checkpointer=InMemorySaver())
+    config = {"configurable": {"thread_id": "thread-restart-1"}}
+    compiled.invoke({"results": ()}, config=config)
+
+    # Interrupt boundary: read the REAL checkpointed AgentResult.data path.
+    snapshot = compiled.get_state(config)
+    checkpointed = snapshot.values["results"]
+    assert len(checkpointed) == 2
+    # Checkpoint storage degrades nested data to a plain mapping; the fresh
+    # rebuild must prove itself against that degraded shape, not live models.
+    from collections.abc import Mapping
+
+    assert isinstance(checkpointed[0].data, Mapping)
+    fresh = DiscoveryCandidateRegistry.from_results(checkpointed)
+    assert [c.candidate_id for c in fresh.candidates()] == [
+        CANDIDATE_ID_1,
+        CANDIDATE_ID_2,
+    ]
+    assert fresh.get(CANDIDATE_ID_1) == _candidate(
+        CANDIDATE_ID_1, DOCUMENT_ID, REVISION_1
+    )
+    assert fresh.get(CANDIDATE_ID_2).document_revision == REVISION_2
+
+    # Resume shape: re-read the same thread after the interruption and rebuild
+    # again from scratch; the index is stable with no persistent store.
+    resumed = compiled.get_state(config)
+    rebuilt = DiscoveryCandidateRegistry.from_results(resumed.values["results"])
+    assert [c.candidate_id for c in rebuilt.candidates()] == [
+        c.candidate_id for c in fresh.candidates()
+    ]
+    assert rebuilt.get(CANDIDATE_ID_1).document_revision == REVISION_1
 
 
 def test_candidate_registry_does_not_require_persistence_table() -> None:
@@ -638,26 +677,122 @@ def test_model_observation_never_exposes_candidate_revision() -> None:
 
 
 def test_binding_resolver_revalidates_candidate_acl_before_binding() -> None:
+    from pathlib import Path
+
+    from app.services.agents.v2.contracts.binding import BindingAdditionRequest
+
     registry = DiscoveryCandidateRegistry.from_results([_search_result()])
-    seen: list[DocumentDiscoveryCandidate] = []
 
-    def deny(candidate: DocumentDiscoveryCandidate) -> bool:
-        seen.append(candidate)
-        return False
+    # (i) The registry is an index ONLY: nothing on it returns a binding and
+    # no authorization parameter exists anywhere on its surface.
+    assert not hasattr(registry, "bind")
+    for name in ("from_results", "get", "candidates"):
+        for parameter in inspect.signature(getattr(registry, name)).parameters:
+            assert "authoriz" not in parameter, (name, parameter)
 
-    with pytest.raises(CandidateBindingDenied):
-        registry.bind(CANDIDATE_ID_1, binding_id="b2", authorize=deny)
-    assert [c.candidate_id for c in seen] == [CANDIDATE_ID_1]
-
-    bound = registry.bind(
-        CANDIDATE_ID_1, binding_id="b2", authorize=lambda candidate: True
+    # (ii) No tools/ module references binding-construction contracts.
+    # Resolve from this test file so the check is independent of cwd.
+    tools_dir = (
+        Path(__file__).resolve().parents[5] / "backend/app/services/agents/v2/tools"
     )
-    assert isinstance(bound, ScopedDocument)
-    assert bound.binding_id == "b2"
-    assert bound.document_id == DOCUMENT_ID
-    # The binding pins the candidate's immutable discovered revision.
-    assert bound.document_revision == REVISION_1
-    assert bound.role == "discovered"
+    assert tools_dir.is_dir()
+    assert len(sorted(tools_dir.glob("*.py"))) >= 5
+    for module_path in sorted(tools_dir.glob("*.py")):
+        source = module_path.read_text()
+        assert "ScopedDocument" not in source, module_path.name
+        assert "DocumentBindingSet" not in source, module_path.name
+
+    # (iii) The pure handoff rejects unknown candidates and invalid roles with
+    # typed errors, and returns only a request carrying candidate UUID + role.
+    with pytest.raises(CandidateNotFound):
+        candidate_addition_request(registry, UUID(int=0), "discovered")
+    with pytest.raises(InvalidCandidateRole):
+        candidate_addition_request(registry, CANDIDATE_ID_1, "target")
+    request = candidate_addition_request(registry, CANDIDATE_ID_1, "discovered")
+    assert isinstance(request, BindingAdditionRequest)
+    assert request.candidate_id == CANDIDATE_ID_1
+    assert request.requested_role == "discovered"
+    assert not isinstance(request, ScopedDocument)
+    assert "document_revision" not in type(request).model_fields
+
+    # (iv) The candidate revision stays server-side only: reachable via get(),
+    # never through any model observation.
+    assert registry.get(CANDIDATE_ID_1).document_revision == REVISION_1
+    payload = ObservationProjector.project(_search_result()).model_dump_json()
+    assert REVISION_1 not in payload
+    assert "revision" not in payload.lower()
+
+
+@pytest.mark.asyncio
+async def test_malformed_proposal_input_returns_typed_rejection() -> None:
+    from types import SimpleNamespace
+
+    gateway = _gateway()
+    current = _read_plan()
+    # A duck-typed object with a matching kind is NOT the frozen CapabilityInput:
+    # it must fail closed as a typed rejection, never escape as an exception.
+    outcome = await gateway.propose(
+        CapabilityInvocationProposal(  # type: ignore[arg-type]
+            capability="document.read",
+            objective="Doc Dieu 5",
+            input=SimpleNamespace(kind="document.read", target_ids=("t1",)),
+        ),
+        current,
+        _runtime(),
+    )
+    assert outcome.accepted is False
+    assert outcome.rejection is not None
+    assert outcome.rejection.code == "invalid_proposal"
+    assert outcome.plan == current
+
+
+@pytest.mark.asyncio
+async def test_stale_registry_cannot_widen_current_runtime_authority() -> None:
+    from app.services.agents.v2.capabilities import CapabilityDenied
+
+    stale_full_registry = build_capability_registry(
+        _registrations(), _runtime().capability_runtime
+    )
+    gateway = _gateway()
+
+    # Stale full registry attached, but current runtime revoked People access.
+    outcome = await gateway.propose(
+        CapabilityInvocationProposal(
+            capability="people.lookup",
+            objective="Tra CCCD cua A",
+            input=PeopleLookupInput(kind="people.lookup", query="A"),
+        ),
+        _read_plan(),
+        _runtime(can_read_people=False, registry=stale_full_registry),
+    )
+    assert outcome.accepted is False
+    assert outcome.rejection is not None
+    assert outcome.rejection.code == "unauthorized_capability"
+    assert outcome.plan == _read_plan()
+
+    # Stale full registry attached, but capability absent from allowed set.
+    narrowed = await gateway.propose(
+        CapabilityInvocationProposal(
+            capability="document.read",
+            objective="Doc Dieu 5",
+            input=DocumentReadInput(kind="document.read", target_ids=("t1",)),
+        ),
+        _read_plan(),
+        _runtime(
+            allowed=frozenset({"people.lookup"}), registry=stale_full_registry
+        ),
+    )
+    assert narrowed.accepted is False
+    assert narrowed.rejection is not None
+    assert narrowed.rejection.code == "unauthorized_capability"
+
+    # The pre-dispatch guard narrows the same way.
+    with pytest.raises(CapabilityDenied):
+        require_planned_dispatch(
+            _read_plan(),
+            "T1",
+            _runtime(allowed=frozenset({"people.lookup"}), registry=stale_full_registry),
+        )
 
 
 def test_agent_tool_catalog_is_permission_intersected() -> None:
