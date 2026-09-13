@@ -11,7 +11,7 @@ push_event calls and deduplicate at terminal complete emission.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass
@@ -22,6 +22,36 @@ class Source:
     content_hash: str
     source_id: Optional[str] = None
     document_id: Optional[str] = None
+
+    @classmethod
+    def from_chat_source_chunk(cls, chunk: Any) -> "Source":
+        """Build a dedup identity from a ``ChatSourceChunk``-shaped object.
+
+        ``ChatSourceChunk`` exposes ``document_id``/``chunk_id``/``content``/
+        ``source_file``/``document_number``/``index`` but NOT ``chunk``/
+        ``content_hash``/``source_id``; reading it directly was the v1 A/B
+        ``AttributeError``. ``content`` owns the dedup text, ``chunk_id`` is the
+        stable identity, and ``index`` discriminates provenance.
+        """
+        import hashlib
+
+        content = getattr(chunk, "content", "") or ""
+        content_hash = getattr(chunk, "chunk_id", "") or hashlib.sha256(
+            content.encode("utf-8")
+        ).hexdigest()[:16]
+        document_id = str(getattr(chunk, "document_id", "") or "")
+        doc = (
+            getattr(chunk, "source_file", None)
+            or getattr(chunk, "document_number", None)
+            or document_id
+        )
+        return cls(
+            doc=doc,
+            chunk=content,
+            content_hash=content_hash,
+            source_id=getattr(chunk, "index", None),
+            document_id=document_id,
+        )
 
 
 class SourcesSnapshotAccumulator:

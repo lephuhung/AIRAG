@@ -347,7 +347,7 @@ async def stream_agent_events(
                         # Also track the original dict for rollback and output
                         original_sources.append(s)
                     elif hasattr(s, "document_id"):
-                        sources_acc.add([s])
+                        sources_acc.add([AccSource.from_chat_source_chunk(s)])
                         original_sources.append(s)
                     else:
                         original_sources.append(s)

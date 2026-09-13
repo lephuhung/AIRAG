@@ -69,3 +69,24 @@ def test_empty_accumulator():
     """Empty accumulator should return empty list."""
     acc = SourcesSnapshotAccumulator()
     assert acc.deduplicated() == []
+
+
+def test_accumulator_accepts_a_chat_source_chunk_object():
+    """The v1 SSE path emits ChatSourceChunk objects; the accumulator must not read .chunk."""
+    from app.schemas.rag import ChatSourceChunk
+
+    chunk = ChatSourceChunk(
+        index="id12",
+        chunk_id="chunk_1",
+        content="nội dung điều 17",
+        document_id="11111111-1111-1111-1111-111111111111",
+        source_file="luat.pdf",
+        document_number="12/2020/NĐ-CP",
+    )
+    acc = SourcesSnapshotAccumulator()
+    acc.add([Source.from_chat_source_chunk(chunk)])
+    sources = acc.deduplicated()
+    assert len(sources) == 1
+    assert sources[0].chunk == "nội dung điều 17"
+    assert sources[0].document_id == "11111111-1111-1111-1111-111111111111"
+    assert sources[0].source_id == "id12"
