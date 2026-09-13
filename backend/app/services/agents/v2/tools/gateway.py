@@ -4,7 +4,8 @@
 
     proposal
     -> convert to a TaskSpec proposal
-    -> validate_replan against the current runtime catalog (append-only)
+    -> validate_runtime_replan (frozen validate_replan + current catalog,
+       cancellation/deadline, fan-out width) against the current runtime
     -> return accepted append-only plan or typed rejection
 
 It is a proposal adapter only: it never persists a plan, never dispatches work,
@@ -37,7 +38,8 @@ from ..contracts.planning import (
     TaskSpec,
 )
 from ..contracts.state import GraphRuntimeContext
-from ..contracts.validation import ContractValidationError, validate_replan
+from ..contracts.validation import ContractValidationError
+from ..replanning import ReplanRejected, validate_runtime_replan
 
 RejectionCode = Literal[
     "unknown_capability",
@@ -137,8 +139,8 @@ class AgentToolGateway:
             proposed = current_plan.model_copy(
                 update={"tasks": current_plan.tasks + (candidate,)}
             )
-            accepted_plan = validate_replan(
-                current_plan, proposed, (), self._policy, self._budget
+            accepted_plan = validate_runtime_replan(
+                current_plan, proposed, (), self._policy, self._budget, runtime
             )
         except ValidationError as error:
             # Malformed proposal payloads never escape: the frozen
@@ -155,6 +157,22 @@ class AgentToolGateway:
             code: RejectionCode = (
                 "budget_exhausted" if "budget" in message.lower() else "invalid_plan"
             )
+            return ToolProposalOutcome(
+                accepted=False,
+                plan=current_plan,
+                rejection=ProposalRejection(code=code, message=message),
+            )
+        except ReplanRejected as error:
+            message = str(error)
+            lowered = message.lower()
+            if "not permitted" in lowered or "allowed capabilities" in lowered:
+                code = "unauthorized_capability"
+            elif "catalog" in lowered:
+                code = "unavailable_capability"
+            elif "fan-out" in lowered or "deadline" in lowered:
+                code = "budget_exhausted"
+            else:
+                code = "invalid_plan"
             return ToolProposalOutcome(
                 accepted=False,
                 plan=current_plan,

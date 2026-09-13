@@ -30,8 +30,12 @@ requests. The binding ownership sequence holds end to end::
 
     proposal -> validate -> lease -> checkpoint -> scheduler
 
-Pilot scope is initial-plan-only plus the compare skill: discovery and replan
-are rejected here (T5 adds them). An unsupported work type (``evaluate``,
+Pilot scope is the compare skill plus the bounded append-only replan loop
+(Task 5): ``decide`` routes an advisable coverage gap to the ``replan`` node,
+which proposes from validated observations/evaluation gaps (never raw
+evidence), and ``validate_checkpoint`` validates the append-only replan,
+leases, and checkpoints it before the next ``execute``. Discovery stays
+policy-gated (disabled by default). An unsupported work type (``evaluate``,
 ``cross_domain``, ``multi_goal``, ...) returns the typed
 ``COMPLEX_RESEARCH_UNAVAILABLE`` marker from the ``decide`` node — never a
 fabricated plan.
@@ -53,14 +57,18 @@ from langgraph.runtime import Runtime
 
 from .contracts.base import ContractModel
 from .contracts.binding import DocumentBindingSet
+from .contracts.capability import DocumentReadInput, SectionReadInput
 from .contracts.evaluation import EvidenceEvaluation
 from .contracts.execution import AgentResult, TaskExecutionSummary
 from .contracts.evidence import EvidenceUseRef
+from .contracts.locators import SectionLocator
 from .contracts.planning import (
     DiscoveryPolicy,
+    ReplanTaskOrigin,
     ResearchBudgetView,
     ResearchPlanningInput,
     TaskPlan,
+    TaskSpec,
 )
 from .contracts.routing import QueryAnalysis
 from .contracts.semantic import SemanticContext
@@ -70,12 +78,15 @@ from .dependencies.people_document import (
     MaterializationError,
     append_materialized_dependent,
     materialize_person_dependency,
+    redact_scalar_for_model,
 )
 from .execution.scheduler import refresh_pairs_for_checkpoint, shared_scheduler_for
 from .nodes.context import node_context
 from .nodes.evaluate import evaluate_evidence
 from .nodes.execute import execution_update
+from .replanning import ReplanRejected, validate_runtime_replan
 from .skills.compare import policy as compare_policy
+from .tools.observations import AgentToolObservation, ObservationProjector
 
 __all__ = [
     "COMPLEX_RESEARCH_UNAVAILABLE",
@@ -88,7 +99,10 @@ __all__ = [
     "build_complex_research_state",
     "build_complex_research_subgraph",
     "build_discovery_policy",
+    "build_model_observations",
+    "build_model_replan_input",
     "build_planning_input",
+    "build_replan_proposal",
     "build_research_budget_view",
     "build_task_execution_summaries",
     "collect_evidence_use_refs",
@@ -101,6 +115,8 @@ __all__ = [
     "normalize_complex_state",
     "people_document_materialize_node",
     "plan_node",
+    "replan_advisable",
+    "replan_node",
     "require_query_analysis",
     "validate_checkpoint_node",
 ]
@@ -108,7 +124,12 @@ __all__ = [
 #: Typed-unavailable code for out-of-pilot work (evaluate/compliance, ...).
 COMPLEX_RESEARCH_UNAVAILABLE = "COMPLEX_RESEARCH_UNAVAILABLE"
 
-#: Initial-plan-only pilot: no replan budget is carried or consumed (T5 adds it).
+#: Bounded replan budget carried by default (Task 5, R32): the canonical
+#: plan -> validate -> execute -> evaluate -> decide -> (replan -> validate)
+#: loop may append at most this many replans per run; every replan is
+#: checkpointed before the next execute and completed tasks are never rerun.
+#: Zero keeps the initial-plan-only default: deployment settings
+#: (``V2_MAX_REPLANS``) or an explicit run budget opens the bounded loop.
 MAX_REPLANS = 0
 
 #: Fallback planner sizing when implementation settings carry no v2 limits.
@@ -244,12 +265,31 @@ def collect_evidence_use_refs(
 
 
 def build_discovery_policy(runtime: GraphRuntimeContext) -> DiscoveryPolicy:
-    """Runtime-only policy: discovery is rejected for this pilot (T5 adds it)."""
+    """Runtime-only policy: discovery stays rejected unless settings allow it.
+
+    Deployment settings may authorize reference/supporting expansion
+    (``V2_ALLOW_REFERENCE_DISCOVERY`` / ``V2_ALLOW_SUPPORTING_DISCOVERY`` /
+    ``V2_MAX_DISCOVERED_DOCUMENTS``); the default keeps the pilot closed.
+    Policy restricts but never grants permission: the request-scoped registry
+    and current ACL still narrow every dispatch.
+    """
     _ = runtime
+    try:
+        from app.core.config import get_settings
+
+        settings = get_settings()
+    except Exception:
+        settings = None
     return DiscoveryPolicy(
-        allow_reference_discovery=False,
-        allow_supporting_discovery=False,
-        max_discovered_documents=0,
+        allow_reference_discovery=bool(
+            getattr(settings, "V2_ALLOW_REFERENCE_DISCOVERY", False)
+        ),
+        allow_supporting_discovery=bool(
+            getattr(settings, "V2_ALLOW_SUPPORTING_DISCOVERY", False)
+        ),
+        max_discovered_documents=int(
+            getattr(settings, "V2_MAX_DISCOVERED_DOCUMENTS", 0)
+        ),
     )
 
 
@@ -559,6 +599,209 @@ async def _refresh_existing_pairs(
     )
 
 
+def build_model_replan_input(
+    state: ComplexResearchState, runtime: GraphRuntimeContext
+) -> ResearchPlanningInput:
+    """Model-facing replanning projection: redacted plan, never raw evidence (R34).
+
+    Ephemeral like :func:`build_planning_input` and never checkpointed. The
+    checkpointed ``current_plan`` keeps its governed scalar (frozen contract
+    fidelity); the projection the planner model sees carries
+    ``person_identifier=None`` via ``redact_scalar_for_model`` (R25
+    carry-over). Every model-facing planning/replanning projection MUST flow
+    through here.
+    """
+    base = build_planning_input(state, runtime)
+    if base.current_plan is None:
+        return base
+    return base.model_copy(
+        update={"current_plan": redact_scalar_for_model(base.current_plan)}
+    )
+
+
+def build_model_observations(
+    state: ComplexResearchState,
+) -> tuple[AgentToolObservation, ...]:
+    """Validated per-task observations the replanner may see (R34).
+
+    Projects each checkpointed ``AgentResult`` through the typed
+    ``ObservationProjector`` with the checkpointed per-task availability
+    decision — never raw evidence, never the governed scalar. An unknown
+    result kind fails closed instead of leaking a generic carrier.
+    """
+    availability = state.get("people_scalar_available", {}) or {}
+    observations: list[AgentToolObservation] = []
+    for result in tuple(state.get("task_results", ())):
+        flag = availability.get(result.task_id) if isinstance(availability, Mapping) else None
+        observations.append(
+            ObservationProjector.project(
+                result,
+                dependency_scalar_available=bool(flag) if flag is not None else None,
+            )
+        )
+    return tuple(observations)
+
+
+def _evaluation_slot(value: Any, name: str, default: Any = None) -> Any:
+    """Read one evaluation slot from a live model or its serde mapping."""
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def replan_advisable(state: ComplexResearchState) -> bool:
+    """True only for a bounded coverage-gap replan (R32 decide seam).
+
+    Advisable means: a checkpointed plan exists, the latest evaluation is
+    ``insufficient`` with coverage-kind gaps only (semantic gaps and
+    contradictions belong to skill strategy and the evaluator — never to an
+    automatic re-read), and replan budget remains. Everything else —
+    sufficient, contradictory, needs_input, missing evaluation, exhausted
+    budget — finalizes. Total function: never raises on shape drift.
+    """
+    try:
+        if state.get("plan") is None:
+            return False
+        if state.get("unavailable") is not None:
+            return False
+        evaluation = state.get("evaluation")
+        if evaluation is None:
+            return False
+        if _evaluation_slot(evaluation, "status") != "insufficient":
+            return False
+        missing = _evaluation_slot(evaluation, "missing", ()) or ()
+        if not missing:
+            return False
+        for requirement in missing:
+            if _evaluation_slot(requirement, "criterion_kind") != "coverage":
+                return False
+        return int(state.get("replans_remaining", 0)) >= 1
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def build_replan_proposal(
+    state: ComplexResearchState, runtime: GraphRuntimeContext
+) -> TaskPlan | None:
+    """Propose the bounded append-only replan from validated gaps (R32).
+
+    Consumes the redacted model-facing projection (R34) and the validated
+    observations — never raw evidence. One dependency-free re-read per
+    missing coverage target (section reads for section coordinates, document
+    reads otherwise), with ``ReplanTaskOrigin`` trigger lineage (attempted
+    task IDs + prior evidence-use IDs). Returns ``None`` when no bounded
+    replan is advisable or validatable; the caller then spends the budget so
+    ``decide`` finalizes instead of looping.
+    """
+    if not replan_advisable(state):
+        return None
+    plan = state["plan"]
+    assert plan is not None
+    evaluation = state["evaluation"]
+    assert evaluation is not None
+    results = tuple(state.get("task_results", ()))
+    outcomes = build_task_execution_summaries(results)
+    prior_use_ids = tuple(ref.use_id for ref in collect_evidence_use_refs(results))
+    _ = build_model_observations(state)
+    model_input = build_model_replan_input(state, runtime)
+    catalog = {entry.name for entry in model_input.capability_catalog}
+    unit_by_target = {unit.target_id: unit for unit in plan.target_units}
+    attempted_by_target: dict[str, list[str]] = {}
+    for task in plan.tasks:
+        for target_id in getattr(task.input, "target_ids", None) or ():
+            attempted_by_target.setdefault(target_id, []).append(task.task_id)
+    outcome_ids = {outcome.task_id for outcome in outcomes}
+    taken = {task.task_id for task in plan.tasks}
+    index = len(plan.tasks) + 1
+    new_tasks: list[TaskSpec] = []
+    for gap in _evaluation_slot(evaluation, "missing", ()) or ():
+        target_id = _evaluation_slot(gap, "target_id")
+        unit = unit_by_target.get(target_id)
+        if unit is None:
+            return None
+        if isinstance(unit.requested_locator, SectionLocator):
+            capability = "section.read"
+            task_input: Any = SectionReadInput(
+                kind="section.read", target_ids=(target_id,)
+            )
+        else:
+            capability = "document.read"
+            task_input = DocumentReadInput(
+                kind="document.read", target_ids=(target_id,)
+            )
+        if capability not in catalog:
+            return None
+        while f"T{index}" in taken:
+            index += 1
+        task_id = f"T{index}"
+        index += 1
+        taken.add(task_id)
+        trigger_tasks = tuple(
+            task_id_
+            for task_id_ in attempted_by_target.get(target_id, ())
+            if task_id_ in outcome_ids
+        )
+        new_tasks.append(
+            TaskSpec(
+                task_id=task_id,
+                capability=capability,
+                task_objective=(
+                    f"Re-read {target_id} for missing coverage requirement"
+                ),
+                input=task_input,
+                depends_on=(),
+                origin=ReplanTaskOrigin(
+                    kind="replan",
+                    reason=(
+                        f"coverage gap for target {target_id}: "
+                        f"{_evaluation_slot(gap, 'description')}"
+                    ),
+                    task_ids=trigger_tasks,
+                    evidence_use_ids=prior_use_ids,
+                ),
+            )
+        )
+    if not new_tasks:
+        return None
+    proposed = plan.model_copy(update={"tasks": plan.tasks + tuple(new_tasks)})
+    try:
+        return validate_runtime_replan(
+            plan,
+            proposed,
+            outcomes,
+            model_input.discovery_policy,
+            model_input.budget,
+            runtime,
+        )
+    except (ContractValidationError, ReplanRejected):
+        return None
+
+
+async def replan_node(
+    state: ComplexResearchState,
+    runtime: "Runtime[GraphRuntimeContext]",
+) -> dict:
+    """Deterministic replan entry marker (R21 single-owner: writes NO state).
+
+    The replan proposal lives entirely inside ``validate_checkpoint_node``;
+    this node only fails closed when entered without a checkpointed plan or
+    without an advisable gap, and returns ``{}`` so no checkpoint written
+    after it carries an unvalidated plan.
+    """
+    node_context(runtime)
+    state = normalize_complex_state(state)
+    if state.get("plan") is None:
+        raise ComplexResearchError(
+            "replan requires a checkpointed plan; refusing to replan without one"
+        )
+    if not replan_advisable(state):
+        raise ComplexResearchError(
+            "replan entered without an advisable coverage gap; refusing to "
+            "fabricate a replan"
+        )
+    return {}
+
+
 async def validate_checkpoint_node(
     state: ComplexResearchState,
     runtime: "Runtime[GraphRuntimeContext]",
@@ -568,31 +811,55 @@ async def validate_checkpoint_node(
     Single-owner node (R17/R21): the planner invocation lives HERE, so there
     is no cross-node proposal store that could go stale or leak between
     requests — concurrent invocations sharing a run id compute from their own
-    checkpointed state. Initial-plan-only: ``validate_task_plan`` is
-    authoritative (T5 adds the append-only ``validate_replan`` path). There
-    is no ``plan_checkpoint`` service — the returned plan enters
+    checkpointed state. Initial entry (no checkpointed plan) validates the
+    compare-skill proposal with ``validate_task_plan``; replan entry (a
+    checkpointed plan exists) validates the gap-driven append with the
+    runtime replan wrapper (frozen ``validate_replan`` + current catalog).
+    There is no ``plan_checkpoint`` service — the returned plan enters
     ``ComplexResearchState`` and the supervisor saver performs the
-    checkpoint, so the checkpoint that first persists ``plan`` is written by
-    the SAME node that already acquired its leases. An unplannable input is
-    the unsupported-work path: nothing is validated, leased, or persisted.
+    checkpoint, so the checkpoint that first persists the plan/replan is
+    written by the SAME node that already acquired its leases. An
+    unplannable input is the unsupported-work path (initial) or a spent
+    budget (replan, so ``decide`` finalizes): nothing unvalidated is leased
+    or persisted.
     """
     context = node_context(runtime)
     state = normalize_complex_state(state)
-    try:
-        proposal = compare_policy.build_compare_plan(
-            build_planning_input(state, context)
+    if state.get("plan") is None:
+        try:
+            proposal = compare_policy.build_compare_plan(
+                build_planning_input(state, context)
+            )
+        except ContractValidationError:
+            return {}
+        bindings = state["bindings"]
+        validate_task_plan(proposal, bindings)
+        await _lease_pinned_state(
+            plan=proposal,
+            bindings=bindings,
+            results=tuple(state.get("task_results", ())),
+            runtime=context,
         )
-    except ContractValidationError:
-        return {}
-    bindings = state["bindings"]
-    validate_task_plan(proposal, bindings)
+        return {"plan": proposal, "materialized_new_task": False}
+    current = state["plan"]
+    assert current is not None
+    proposal = build_replan_proposal(state, context)
+    if proposal is None:
+        # Deterministically unplannable: spend the budget so decide finalizes
+        # instead of routing back here forever.
+        return {"replans_remaining": 0, "materialized_new_task": False}
     await _lease_pinned_state(
         plan=proposal,
-        bindings=bindings,
+        bindings=state["bindings"],
         results=tuple(state.get("task_results", ())),
         runtime=context,
     )
-    return {"plan": proposal}
+    remaining = int(state.get("replans_remaining", 0))
+    return {
+        "plan": proposal,
+        "replans_remaining": max(0, remaining - 1),
+        "materialized_new_task": False,
+    }
 
 
 async def complex_execute_node(
@@ -783,12 +1050,14 @@ async def decide_node(
     state: ComplexResearchState,
     runtime: "Runtime[GraphRuntimeContext]",
 ) -> dict:
-    """Recommend the terminal step: initial-plan-only, no replan/discovery.
+    """Recommend the terminal step: replan only for advisable coverage gaps.
 
     A missing plan means the work type is out of pilot scope: return the typed
     ``COMPLEX_RESEARCH_UNAVAILABLE`` marker. Otherwise the evaluation stands
     as-is; the supervisor routes ``sufficient`` to synthesis and everything
-    else to the finalizer (R4). Evaluator owns sufficiency/contradictions.
+    else to the finalizer (R4). Evaluator owns sufficiency/contradictions;
+    the ``replan`` edge (owned by ``_decide_branch``) fires only when
+    ``replan_advisable`` holds. Discovery stays policy-gated.
     """
     node_context(runtime)
     if state.get("plan") is None:
@@ -830,8 +1099,9 @@ def _materialize_branch(state: ComplexResearchState) -> str:
 
 
 def _decide_branch(state: ComplexResearchState) -> str:
-    """Decide routing seam: initial-plan-only always finalizes (T5 adds replan)."""
-    _ = state
+    """Decide routing seam (R32): replan only for advisable coverage gaps."""
+    if replan_advisable(state):
+        return "replan"
     return "finalize"
 
 
@@ -844,7 +1114,10 @@ def _add_complex_edges(graph: StateGraph) -> None:
         "materialize", _materialize_branch, {"execute": "execute", "evaluate": "evaluate"}
     )
     graph.add_edge("evaluate", "decide")
-    graph.add_conditional_edges("decide", _decide_branch, {"finalize": "finalize"})
+    graph.add_conditional_edges(
+        "decide", _decide_branch, {"replan": "replan", "finalize": "finalize"}
+    )
+    graph.add_edge("replan", "validate_checkpoint")
     graph.add_edge("finalize", END)
 
 
@@ -863,6 +1136,7 @@ def _build_complex_research_graph() -> StateGraph:
     graph.add_node("execute", complex_execute_node)
     graph.add_node("materialize", people_document_materialize_node)
     graph.add_node("evaluate", complex_evaluate_node)
+    graph.add_node("replan", replan_node)
     graph.add_node("decide", decide_node)
     graph.add_node("finalize", finalize_node)
     _add_complex_edges(graph)
