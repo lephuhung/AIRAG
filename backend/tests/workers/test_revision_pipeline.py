@@ -1266,9 +1266,11 @@ async def test_check_and_finalize_never_indexes_a_failed_revision(
 ):
     """The multi-stage choke point commits INDEXED only for a published revision.
 
-    The mirror flags reach completion (chat upload: ``embed_done``) while the
-    revision has no vector manifest, so ``verify_draft`` fails. The Document
-    must end up FAILED, never INDEXED.
+    The revision's required stages complete (chat upload: parse + embed)
+    while the revision has no vector manifest, so ``verify_draft`` fails.
+    The Document must end up FAILED, never INDEXED. (P1 Task 4: stage rows
+    authorize finalization — the mirror ``embed_done`` flag alone no longer
+    reaches ``finalize_revision_if_complete``.)
     """
     maker = _session_maker(async_engine)
     monkeypatch.setattr("app.core.database.async_session_maker", maker)
@@ -1284,6 +1286,9 @@ async def test_check_and_finalize_never_indexes_a_failed_revision(
             size_bytes=11,
             content_sha256="e" * 64,
             version_id="v-1",
+        )
+        await _task4_complete_stages(
+            db, revision.revision_id, ("parse", "embed")
         )
         await db.commit()
         revision_id = revision.revision_id
@@ -1305,7 +1310,7 @@ async def test_check_and_finalize_never_indexes_a_failed_revision(
 async def test_check_and_finalize_indexes_a_published_revision(
     async_engine, document_factory, monkeypatch
 ):
-    """The success path is unchanged: mirror complete + publishable → INDEXED."""
+    """The success path is unchanged: stages complete + publishable → INDEXED."""
     maker = _session_maker(async_engine)
     monkeypatch.setattr("app.core.database.async_session_maker", maker)
     doc_id = document_factory(is_chat_upload=True)
@@ -1320,6 +1325,9 @@ async def test_check_and_finalize_indexes_a_published_revision(
             size_bytes=11,
             content_sha256="f" * 64,
             version_id="v-1",
+        )
+        await _task4_complete_stages(
+            db, revision.revision_id, ("parse", "embed")
         )
         await _record_complete_artifacts(db, revision, profile)
         await db.commit()
@@ -3269,3 +3277,446 @@ async def test_task3_exhausted_note_commits_stage_and_revision_atomically(
     rows = await _handler_stage_rows(maker, rev_id)
     assert rows["embed"][0] == "failed"
     assert await _handler_revision_status(maker, rev_id) == "failed"
+
+
+# ---------------------------------------------------------------------------
+# P1 Task 4 — finalization is gated on revision stage rows, not mirrors
+# ---------------------------------------------------------------------------
+
+
+async def _task4_complete_stages(db, revision_id, stages) -> None:
+    """Mark every named stage completed (pending -> completed converges)."""
+    repo = DocumentRevisionsRepository(db)
+    for stage in stages:
+        await repo.mark_stage_completed(revision_id, stage)
+
+
+def _task4_patch_finalize_spy(monkeypatch):
+    """Spy on finalize_revision_if_complete through the real implementation."""
+    import app.workers.utils as utils
+
+    calls: list = []
+    real = utils.finalize_revision_if_complete
+
+    async def _spy(revision_id, *, expect_complete=False):
+        calls.append(
+            {"revision_id": revision_id, "expect_complete": expect_complete}
+        )
+        return await real(revision_id, expect_complete=expect_complete)
+
+    monkeypatch.setattr(utils, "finalize_revision_if_complete", _spy)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_task4_pending_stages_never_call_finalize(
+    async_engine, document_factory, monkeypatch
+):
+    """Pending stages + stale-True mirrors return NOT_READY without finalize.
+
+    The pre-Task-4 bug: a new generation observed the previous generation's
+    ``embed_done/captions_done/kg_done`` mirrors, called
+    ``finalize_revision_if_complete(expect_complete=True)`` and terminalized
+    itself ``failed`` while its own stages were still pending.
+    """
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    finalize_calls = _task4_patch_finalize_spy(monkeypatch)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        revision, profile, _created = await allocate_ingest_revision(
+            db,
+            doc_id,
+            object_key=_doc_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256="t4a" + "0" * 61,
+            version_id="v-1",
+        )
+        # Stale mirrors from a previous generation: all done.
+        document = await db.get(Document, doc_id)
+        document.embed_done = True
+        document.captions_done = True
+        document.kg_done = True
+        await db.commit()
+        revision_id = revision.revision_id
+    assert profile is FULL
+
+    async with maker() as db:
+        document = await db.get(Document, doc_id)
+        await check_and_finalize(document, db, revision_id=revision_id)
+
+    assert finalize_calls == [], "pending stages MUST NOT call finalize"
+    async with maker() as db:
+        row = await db.get(DocumentRevision, revision_id)
+        fresh = await db.get(Document, doc_id)
+    assert row.status in ("draft", "building")
+    assert fresh.status != DocumentStatus.INDEXED
+
+
+@pytest.mark.asyncio
+async def test_task4_running_stage_never_calls_finalize(
+    async_engine, document_factory, monkeypatch
+):
+    """A running stage + stale-True mirrors return NOT_READY without finalize."""
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    finalize_calls = _task4_patch_finalize_spy(monkeypatch)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        revision, _profile, _created = await allocate_ingest_revision(
+            db,
+            doc_id,
+            object_key=_doc_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256="t4b" + "0" * 61,
+            version_id="v-1",
+        )
+        repo = DocumentRevisionsRepository(db)
+        await repo.mark_stage_completed(revision.revision_id, "parse")
+        await repo.mark_stage_completed(revision.revision_id, "embed")
+        await repo.mark_stage_running(revision.revision_id, "caption")
+        document = await db.get(Document, doc_id)
+        document.embed_done = True
+        document.captions_done = True
+        document.kg_done = True
+        await db.commit()
+        revision_id = revision.revision_id
+
+    async with maker() as db:
+        document = await db.get(Document, doc_id)
+        await check_and_finalize(document, db, revision_id=revision_id)
+
+    assert finalize_calls == [], "a running stage MUST NOT call finalize"
+    async with maker() as db:
+        row = await db.get(DocumentRevision, revision_id)
+    assert row.status in ("draft", "building")
+
+
+@pytest.mark.asyncio
+async def test_task4_partial_stages_never_call_finalize(
+    async_engine, document_factory, monkeypatch
+):
+    """Three of four FULL stages complete + stale mirrors: still NOT_READY."""
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    finalize_calls = _task4_patch_finalize_spy(monkeypatch)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        revision, _profile, _created = await allocate_ingest_revision(
+            db,
+            doc_id,
+            object_key=_doc_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256="t4c" + "0" * 61,
+            version_id="v-1",
+        )
+        await _task4_complete_stages(
+            db, revision.revision_id, ("parse", "embed", "caption")
+        )
+        document = await db.get(Document, doc_id)
+        document.embed_done = True
+        document.captions_done = True
+        document.kg_done = True
+        await db.commit()
+        revision_id = revision.revision_id
+
+    async with maker() as db:
+        document = await db.get(Document, doc_id)
+        await check_and_finalize(document, db, revision_id=revision_id)
+
+    assert finalize_calls == [], "an incomplete stage MUST NOT call finalize"
+    async with maker() as db:
+        row = await db.get(DocumentRevision, revision_id)
+    assert row.status in ("draft", "building")
+
+
+@pytest.mark.asyncio
+async def test_task4_complete_stages_publish_despite_stale_false_mirrors(
+    async_engine, document_factory, monkeypatch
+):
+    """All stages complete + manifest complete publishes with mirrors False.
+
+    Stale-False mirrors must neither block finalization nor stop the mirror
+    from reaching INDEXED: the revision outcome authorizes the mirror.
+    """
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    finalize_calls = _task4_patch_finalize_spy(monkeypatch)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        revision, profile, _created = await allocate_ingest_revision(
+            db,
+            doc_id,
+            object_key=_doc_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256="t4d" + "0" * 61,
+            version_id="v-1",
+        )
+        await _task4_complete_stages(
+            db, revision.revision_id, ("parse", "embed", "caption", "kg")
+        )
+        await _record_complete_artifacts(db, revision, profile)
+        document = await db.get(Document, doc_id)
+        assert document.embed_done is False
+        assert document.captions_done is False
+        assert document.kg_done is False
+        await db.commit()
+        revision_id = revision.revision_id
+
+    async with maker() as db:
+        document = await db.get(Document, doc_id)
+        await check_and_finalize(document, db, revision_id=revision_id)
+
+    assert len(finalize_calls) == 1
+    assert finalize_calls[0]["revision_id"] == revision_id
+    assert finalize_calls[0]["expect_complete"] is True
+    async with maker() as db:
+        row = await db.get(DocumentRevision, revision_id)
+        fresh = await db.get(Document, doc_id)
+    assert row.status == "published"
+    assert fresh.status == DocumentStatus.INDEXED
+    assert fresh.current_revision_id == revision_id
+
+
+@pytest.mark.asyncio
+async def test_task4_complete_stages_incomplete_manifest_fails_only_that_revision(
+    async_engine, document_factory, monkeypatch
+):
+    """Authoritative stage completion + missing artifacts fails that revision.
+
+    Stage rows alone never certify absent artifacts (a caption/KG warning
+    completion cannot stand in for the manifest): ``verify_draft`` still
+    owns the manifest check, and the failure terminalizes only the revision
+    — the document pointer stays untouched.
+    """
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    finalize_calls = _task4_patch_finalize_spy(monkeypatch)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        revision, _profile, _created = await allocate_ingest_revision(
+            db,
+            doc_id,
+            object_key=_doc_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256="t4e" + "0" * 61,
+            version_id="v-1",
+        )
+        await _task4_complete_stages(
+            db, revision.revision_id, ("parse", "embed", "caption", "kg")
+        )
+        document = await db.get(Document, doc_id)
+        document.embed_done = True
+        document.captions_done = True
+        document.kg_done = True
+        await db.commit()
+        revision_id = revision.revision_id
+
+    async with maker() as db:
+        document = await db.get(Document, doc_id)
+        await check_and_finalize(document, db, revision_id=revision_id)
+
+    assert len(finalize_calls) == 1
+    assert finalize_calls[0]["expect_complete"] is True
+    async with maker() as db:
+        row = await db.get(DocumentRevision, revision_id)
+        fresh = await db.get(Document, doc_id)
+    assert row.status == "failed"
+    assert row.failure_stage == "verify"
+    assert row.failure_class == "RevisionArtifactsIncomplete"
+    assert fresh.status == DocumentStatus.FAILED
+    assert fresh.status != DocumentStatus.INDEXED
+    assert fresh.current_revision_id is None
+
+
+@pytest.mark.asyncio
+async def test_task4_parse_only_profile_skips_satisfy_gate(
+    async_engine, document_factory, monkeypatch
+):
+    """PARSE_ONLY: parse completed + profile-skipped rows satisfy the gate."""
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    finalize_calls = _task4_patch_finalize_spy(monkeypatch)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        revision, profile, _created = await allocate_ingest_revision(
+            db,
+            doc_id,
+            object_key=_doc_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256="t4f" + "0" * 61,
+            version_id="v-1",
+            parse_only=True,
+        )
+        assert profile is PARSE_ONLY
+        await _task4_complete_stages(db, revision.revision_id, ("parse",))
+        await _record_complete_artifacts(db, revision, profile)
+        await db.commit()
+        revision_id = revision.revision_id
+
+    async with maker() as db:
+        document = await db.get(Document, doc_id)
+        await check_and_finalize(document, db, revision_id=revision_id)
+
+    assert len(finalize_calls) == 1
+    assert finalize_calls[0]["expect_complete"] is True
+    async with maker() as db:
+        row = await db.get(DocumentRevision, revision_id)
+        fresh = await db.get(Document, doc_id)
+    assert row.status == "published"
+    assert fresh.status == DocumentStatus.INDEXED
+    assert fresh.current_revision_id == revision_id
+
+
+@pytest.mark.asyncio
+async def test_task4_concurrent_finalizers_publish_once(
+    async_engine, document_factory, monkeypatch
+):
+    """Concurrent finalizers preserve the CAS pointer and publish once."""
+    import asyncio as _asyncio
+
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        revision, profile, _created = await allocate_ingest_revision(
+            db,
+            doc_id,
+            object_key=_doc_key(ws, doc_id),
+            size_bytes=11,
+            content_sha256="t4g" + "0" * 61,
+            version_id="v-1",
+        )
+        await _task4_complete_stages(
+            db, revision.revision_id, ("parse", "embed", "caption", "kg")
+        )
+        await _record_complete_artifacts(db, revision, profile)
+        await db.commit()
+        revision_id = revision.revision_id
+
+    async with maker() as db:
+        document = await db.get(Document, doc_id)
+
+        async def _one(_i):
+            await check_and_finalize(document, db, revision_id=revision_id)
+
+        await _asyncio.gather(*(_one(i) for i in range(5)))
+
+    async with maker() as db:
+        row = await db.get(DocumentRevision, revision_id)
+        fresh = await db.get(Document, doc_id)
+        published_count = await db.scalar(
+            select(func.count())
+            .select_from(DocumentRevision)
+            .where(
+                DocumentRevision.document_id == doc_id,
+                DocumentRevision.status == "published",
+            )
+        )
+    assert row.status == "published"
+    assert published_count == 1
+    assert fresh.current_revision_id == revision_id
+    assert fresh.status == DocumentStatus.INDEXED
+
+
+@pytest.mark.asyncio
+async def test_task4_older_generation_cannot_rewrite_newer_pointer(
+    async_engine, document_factory, monkeypatch
+):
+    """A stale generation's late finalize never moves the current pointer.
+
+    R2 publishes first; R1 then completes its stages but has no manifest.
+    R1 terminalizes ``failed`` while the document keeps pointing at R2.
+    """
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    doc_id = document_factory()
+    async with maker() as db:
+        ws = await _workspace_id(db, doc_id)
+        key = _doc_key(ws, doc_id)
+        stale, _stale_profile = await allocate_reindex_revision(
+            db,
+            doc_id,
+            object_key=key,
+            size_bytes=11,
+            content_sha256="t4h" + "0" * 61,
+            version_id="v-1",
+        )
+        current, current_profile = await allocate_reindex_revision(
+            db,
+            doc_id,
+            object_key=key,
+            size_bytes=11,
+            content_sha256="t4h" + "0" * 61,
+            version_id="v-2",
+        )
+        await _task4_complete_stages(
+            db, current.revision_id, ("parse", "embed", "caption", "kg")
+        )
+        await _record_complete_artifacts(db, current, current_profile)
+        await db.commit()
+        stale_id = stale.revision_id
+        current_id = current.revision_id
+
+    async with maker() as db:
+        document = await db.get(Document, doc_id)
+        await check_and_finalize(document, db, revision_id=current_id)
+    async with maker() as db:
+        fresh = await db.get(Document, doc_id)
+    assert fresh.status == DocumentStatus.INDEXED
+    assert fresh.current_revision_id == current_id
+
+    # The older generation finishes late with an incomplete manifest.
+    async with maker() as db:
+        await _task4_complete_stages(
+            db, stale_id, ("parse", "embed", "caption", "kg")
+        )
+        await db.commit()
+    async with maker() as db:
+        document = await db.get(Document, doc_id)
+        await check_and_finalize(document, db, revision_id=stale_id)
+
+    async with maker() as db:
+        fresh = await db.get(Document, doc_id)
+        stale_row = await db.get(DocumentRevision, stale_id)
+    assert stale_row.status == "failed"
+    assert fresh.status == DocumentStatus.INDEXED
+    assert fresh.current_revision_id == current_id
+
+
+@pytest.mark.asyncio
+async def test_task4_legacy_call_without_revision_retains_mirror_behavior(
+    async_engine, document_factory, monkeypatch
+):
+    """No revision: the v1/UI mirror path is unchanged (authorize + block)."""
+    maker = _session_maker(async_engine)
+    monkeypatch.setattr("app.core.database.async_session_maker", maker)
+    finalize_calls = _task4_patch_finalize_spy(monkeypatch)
+    chat_id = document_factory(is_chat_upload=True)
+    plain_id = document_factory()
+    async with maker() as db:
+        chat = await db.get(Document, chat_id)
+        chat.embed_done = True
+        plain = await db.get(Document, plain_id)
+        assert plain.embed_done is False
+        await db.commit()
+
+    async with maker() as db:
+        chat = await db.get(Document, chat_id)
+        await check_and_finalize(chat, db)
+        plain = await db.get(Document, plain_id)
+        await check_and_finalize(plain, db)
+
+    assert finalize_calls == [], "legacy path never calls finalize"
+    async with maker() as db:
+        fresh_chat = await db.get(Document, chat_id)
+        fresh_plain = await db.get(Document, plain_id)
+    assert fresh_chat.status == DocumentStatus.INDEXED
+    assert fresh_plain.status != DocumentStatus.INDEXED

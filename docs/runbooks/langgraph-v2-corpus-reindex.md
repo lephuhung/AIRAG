@@ -66,6 +66,16 @@ docker exec hrag-postgres psql -U postgres -d hrag -c \
 - Every doc has a row with non-null `current_revision_id` and
   `published = true` (`status = 'published'`).
 - `document_revision_builds` has the profile's required artifacts + embedding manifest.
+- Every published revision's stage rows are terminally complete for its
+  profile (`completed` for required stages, `skipped` for profile-skipped
+  ones) — finalization is stage-gated, so a published pointer implies the
+  gate passed:
+
+```bash
+docker exec hrag-postgres psql -U postgres -d hrag -c \
+  "select revision_id, stage, state, attempt_count from document_revision_stages
+    where revision_id = '$REV' order by stage;"
+```
 
 Boundary check (in-container, read-only):
 

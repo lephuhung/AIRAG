@@ -13,7 +13,15 @@ Upload → parse_worker ─┬─→ embed_worker    (ChromaDB vectors)
 memory_worker (Graphiti personal memory) runs independently of the upload path.
 ```
 
-Finalization is checked once all three (embed/caption/kg) complete.
+Finalization is gated on revision-owned stage rows, not `Document` mirror
+flags: `check_and_finalize(..., revision_id=...)` calls
+`finalize_revision_if_complete(expect_complete=True)` only after
+`required_stages_complete()` holds for the revision's immutable build
+profile (pending/running/incomplete stages return NOT_READY without
+finalizing). The artifact manifest (`verify_draft`), tombstone handling
+(`publish`), and the generation CAS/guard stay authoritative alongside the
+stage rows. `Document.embed_done/captions_done/kg_done` are v1/UI mirrors
+only. Legacy calls without a revision keep the mirror behavior.
 
 | `WORKER_TYPE` | Container | Exchange / queue (`app/queue/connection.py`) | Prefetch env |
 |---------------|-----------|----------------------------------------------|--------------|

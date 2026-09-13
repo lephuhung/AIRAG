@@ -528,21 +528,29 @@ async def check_and_finalize(
     worker promotes the document.
 
     The status transition above is the **v1/UI mirror** of pipeline progress.
-    When ``revision_id`` is supplied, reaching the completion condition also
-    finalises the owning revision (``verify_draft`` then ``publish`` in
-    separate transactions, see :func:`finalize_revision_if_complete`) and the
-    mirror status follows the REVISION outcome
-    (:func:`apply_finalize_outcome`): ``INDEXED`` is written only when the
-    revision actually published, and ``FAILED`` when the revision was
-    terminalized by verification. The inline ``INDEXED`` writes below are the
-    legacy path for a message that carries no revision. This function is
-    therefore the single publication choke point for a multi-stage build;
-    individual stage execution decisions are made from revision-owned state by
-    each worker, never from these flags.
+    When ``revision_id`` is supplied, the revision's OWN stage rows — not the
+    ``Document`` mirror flags — decide whether the owning revision may
+    finalise. ``required_stages_complete`` loads the revision's immutable
+    allocated profile plus every stage row; a pending/running/incomplete
+    stage returns NOT_READY without calling
+    :func:`finalize_revision_if_complete`. Only when every required stage is
+    ``completed`` (or profile-authorized ``skipped``) does the revision
+    finalise (``verify_draft`` then ``publish`` in separate transactions,
+    see :func:`finalize_revision_if_complete`), and the mirror status follows
+    the REVISION outcome (:func:`apply_finalize_outcome`): ``INDEXED`` is
+    written only when the revision actually published, and ``FAILED`` when
+    the revision was terminalized by verification. The manifest check inside
+    ``verify_draft``, the tombstone handling inside ``publish``, and the
+    generation CAS/guard stay authoritative alongside the stage rows — a
+    completed stage row never certifies an absent artifact, and an older
+    generation never rewrites a newer pointer/mirror. The inline ``INDEXED``
+    writes below are the legacy path for a message that carries no revision.
+    This function is therefore the single publication choke point for a
+    multi-stage build; individual stage execution decisions are made from
+    revision-owned state by each worker, never from these flags.
     """
     from app.core.database import async_session_maker
 
-    completed = False
     async with async_session_maker() as fresh_db:
         result = await fresh_db.execute(
             select(Document)
@@ -567,7 +575,6 @@ async def check_and_finalize(
         # Chat-upload documents: skip KG and caption workers, so only embed_done is needed
         if fresh.is_chat_upload:
             if fresh.embed_done:
-                completed = True
                 if fresh.raw_chunks_json is not None:
                     fresh.raw_chunks_json = None
                     changed = True
@@ -588,8 +595,8 @@ async def check_and_finalize(
                 fresh.raw_chunks_json = None
                 changed = True
             if fresh.kg_done:
-                # All three done → revision finalize decides the mirror status
-                completed = True
+                # All three done → the stage gate below decides; the mirror
+                # status follows the revision outcome via apply_finalize_outcome.
                 if mirror_completes and fresh.status != DocumentStatus.INDEXED:
                     fresh.status = DocumentStatus.INDEXED
                     changed = True
@@ -611,10 +618,22 @@ async def check_and_finalize(
 
     # Finalise the revision OUTSIDE the mirror session: verify_draft and
     # publish take their own document/revision locks and must not nest inside
-    # the FOR UPDATE transaction above. Reaching ``completed`` means every
-    # required stage reported done, so an incomplete artifact set is a real
-    # failure (not "not ready yet").
-    if completed and revision_id is not None:
+    # the FOR UPDATE transaction above. The revision-owned stage gate (not
+    # the mirror flags read above) authorizes finalization: stale
+    # ``Document.*_done`` flags neither authorize it (a fast stage must not
+    # terminalize its generation via ``expect_complete`` while siblings are
+    # still working) nor block it (a slow mirror write must not hold back a
+    # fully-built revision). Reaching stage completion means every required
+    # stage reported done, so an incomplete artifact set is a real failure
+    # (not "not ready yet") — the manifest check stays authoritative.
+    if revision_id is not None:
+        async with async_session_maker() as gate_db:
+            gate_repo = DocumentRevisionsRepository(gate_db)
+            stages_complete = await gate_repo.required_stages_complete(
+                revision_id
+            )
+        if not stages_complete:
+            return
         outcome = await finalize_revision_if_complete(
             revision_id, expect_complete=True
         )
