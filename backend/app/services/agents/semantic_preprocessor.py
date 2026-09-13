@@ -783,7 +783,7 @@ async def _lookup_by_title(
 
     allowed = list(ctx.allowed_workspace_ids)
     needle = ref.reference.lower().strip()
-    if not needle or len(needle.split()) < 2:
+    if not needle or not _DOC_TYPE_KEYWORD_PREFIX.sub("", needle, count=1).strip():
         return alias_entry
     stmt = (
         select(Document)
@@ -1232,6 +1232,12 @@ _RE_NAMED_DOC = re.compile(
     r"thông\s*tư(?:\s*liên\s*tịch)?|pháp\s*lệnh|chỉ\s*thị)"
     r"(?:\s+(?!" + _NAMED_DOC_STOP + r"\b)[^\s,.;:?!\"()\[\]]+){0,8}"
     r")\s*(?P<num>\d+/\d{4}[/-][A-Za-z]+)?",
+    re.IGNORECASE | re.UNICODE,
+)
+
+_DOC_TYPE_KEYWORD_PREFIX = re.compile(
+    r"^(?:luật|nghị\s*định|nghị\s*quyết|quyết\s*định|"
+    r"thông\s*tư(?:\s*liên\s*tịch)?|pháp\s*lệnh|chỉ\s*thị)\s*",
     re.IGNORECASE | re.UNICODE,
 )
 

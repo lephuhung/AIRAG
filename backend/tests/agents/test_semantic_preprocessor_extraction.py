@@ -125,7 +125,8 @@ async def test_title_lookup_selects_the_longest_matching_title() -> None:
 
 
 @pytest.mark.asyncio
-async def test_title_lookup_rejects_a_bare_document_type_keyword() -> None:
+@pytest.mark.parametrize("bare", ["luật", "nghị định"])
+async def test_title_lookup_rejects_a_bare_document_type_keyword(bare: str) -> None:
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, MagicMock
     from uuid import UUID
@@ -140,8 +141,8 @@ async def test_title_lookup_rejects_a_bare_document_type_keyword() -> None:
     session = MagicMock(execute=AsyncMock(side_effect=[alias_result]))
 
     reference = RefExtraction(
-        ref_id="r1", original_span="Luật", span_offset=(0, 4),
-        reference="luật", section_reference=None,
+        ref_id="r1", original_span=bare, span_offset=(0, len(bare)),
+        reference=bare, section_reference=None,
         parse_basis="regex_named_doc",
     )
     resolved = await _lookup_by_title(reference, context, session)
