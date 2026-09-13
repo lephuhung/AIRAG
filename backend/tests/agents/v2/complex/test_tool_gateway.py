@@ -807,3 +807,38 @@ def test_agent_tool_catalog_is_permission_intersected() -> None:
     adapter = AgentToolAdapter(registry)
     assert adapter.visible_tool_names() == frozenset({"document.read"})
     assert adapter.is_visible("people.lookup") is False
+
+
+# ---------------------------------------------------------------------------
+# P0 Task 2: document.retrieve projects a count-only typed observation
+# ---------------------------------------------------------------------------
+
+
+def _retrieve_result(task_id: str = "T1", count: int = 2) -> AgentResult:
+    from app.services.agents.v2.contracts.capability import DocumentRetrieveOutput
+
+    return AgentResult(
+        contract_version="2.0",
+        task_id=task_id,
+        status="success",
+        data=DocumentRetrieveOutput(
+            kind="document.retrieve", retrieved_unit_count=count
+        ),
+        evidence_uses=(EvidenceUseRef(use_id=USE_ID),),
+        coverage_observations=(),
+        error=None,
+    )
+
+
+def test_document_retrieve_observation_is_count_only() -> None:
+    from app.services.agents.v2.tools.observations import DocumentRetrieveObservation
+
+    observation = ObservationProjector.project(_retrieve_result())
+    assert isinstance(observation.projection, DocumentRetrieveObservation)
+    assert observation.projection.retrieved_unit_count == 2
+    assert observation.evidence_use_ids == (USE_ID,)
+    assert observation.result_kind == "document.retrieve"
+    # Count-only: no chunk content, locator, or revision carrier exists.
+    payload = observation.model_dump_json()
+    assert "secret chunk" not in payload
+    assert "revision" not in payload.lower()

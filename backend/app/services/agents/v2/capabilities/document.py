@@ -24,8 +24,10 @@ Neither capability receives ``GraphRuntimeContext`` or reads supervisor state.
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 from typing import Protocol, runtime_checkable
 from uuid import UUID, uuid4
 
@@ -45,6 +47,8 @@ from ..contracts.capability import (
     CapabilityRuntimeContext,
     DocumentReadInput,
     DocumentReadOutput,
+    DocumentRetrieveInput,
+    DocumentRetrieveOutput,
     DocumentSearchInput,
     DocumentSearchOutput,
 )
@@ -313,4 +317,239 @@ class DocumentReadCapability:
             evidence_uses=tuple(uses),
             coverage_observations=tuple(observations),
             error=None,
+        )
+
+
+@dataclass(frozen=True)
+class RevisionRetrievedChunk:
+    """One revision-owned retrieved chunk from the retrieval port.
+
+    The chunk carries its authoritative ``(document_id, document_revision)``
+    identity, the stable content locator it was read at, minimized text, and
+    the provider score. ``target_id`` is an untrusted service hint naming the
+    planned target the chunk was retrieved for; the capability verifies it
+    against the pinned resolver before attributing any evidence.
+    """
+
+    document_id: UUID
+    document_revision: str
+    locator: ContentLocator
+    content: str
+    score: float
+    target_id: str | None = None
+
+
+@runtime_checkable
+class DocumentRetrievalService(Protocol):
+    """Revision-manifest retrieval port (server-side dependency).
+
+    ``allowed_targets`` carries the resolved planned targets for a scoped
+    request and is empty for an unscoped request; ``workspace_ids`` is the
+    trusted runtime scope. The service queries the revision-owned embedding
+    namespace and returns only chunks admitted by its own authorization and
+    revision-manifest checks; the capability re-verifies every chunk against
+    the pinned resolver before persisting evidence.
+    """
+
+    async def retrieve(
+        self,
+        query: str,
+        *,
+        top_k: int,
+        allowed_targets: tuple[ResolvedTarget, ...],
+        workspace_ids: tuple[UUID, ...],
+    ) -> Sequence[RevisionRetrievedChunk]:
+        """Retrieve revision-owned chunks for ``query`` under the given scope."""
+        ...
+
+
+class DocumentRetrieveCapability:
+    """Atomic ``document.retrieve`` capability: revision-pinned factual retrieval.
+
+    Every non-empty ``target_id`` resolves to its ``ResolvedTarget`` (planned
+    ``TargetUnit`` + pinned, currently-authorized ``ScopedDocument``) through
+    the constructor-injected ``PinnedTargetResolver``; an unknown, unpinned, or
+    no-longer-authorized target fails closed before the service is called. An
+    empty ``target_ids`` runs unscoped over the trusted runtime workspace scope.
+
+    Returned chunks are re-verified: a scoped chunk is admitted only when its
+    ``(document_id, document_revision)`` matches a pinned explicit target (a
+    service ``target_id`` hint must name that same pinned target or the chunk
+    is dropped). Accepted chunks are persisted as governed document evidence —
+    ``coverage``-purposed and target-bound for matched explicit targets,
+    ``supporting`` and targetless for unscoped retrieval — and the output
+    carries only ``retrieved_unit_count``. Target coverage is therefore reported
+    only for explicit target IDs actually represented by admitted chunks, and
+    an unscoped retrieval never fabricates target coverage (its observation
+    list stays empty). Raw chunk content never enters the checkpointed output.
+    """
+
+    descriptor = CapabilityDescriptor(
+        name="document.retrieve",
+        domain="document",
+        operation_type="search",
+        supports_parallel=True,
+    )
+
+    def __init__(
+        self,
+        *,
+        service: DocumentRetrievalService,
+        evidence: EvidenceBuilder,
+        resolver: PinnedTargetResolver,
+    ) -> None:
+        self._service = service
+        self._evidence = evidence
+        self._resolver = resolver
+
+    async def execute(
+        self, request: AgentRequest, runtime: CapabilityRuntimeContext
+    ) -> AgentResult:
+        if "document.retrieve" not in runtime.allowed_capabilities:
+            return denied_result(
+                request.task_id,
+                code="PERMISSION_DENIED",
+                message="document.retrieve is not permitted for this request",
+            )
+        if not isinstance(request.input, DocumentRetrieveInput):
+            return error_result(
+                request.task_id,
+                code="INVALID_INPUT",
+                message="document.retrieve requires a document.retrieve input",
+            )
+        # Dedupe while preserving order: a duplicate target must not mint a
+        # second EvidenceUse (the frozen validator rejects duplicate use_ids).
+        seen: set[str] = set()
+        distinct_ids: list[str] = []
+        for target_id in request.input.target_ids:
+            if target_id not in seen:
+                seen.add(target_id)
+                distinct_ids.append(target_id)
+        resolved: list[tuple[str, ResolvedTarget]] = []
+        for target_id in distinct_ids:
+            target = self._resolver.resolve(target_id)
+            if target is None:
+                return denied_result(
+                    request.task_id,
+                    code="SCOPE_VIOLATION",
+                    message=(
+                        f"target {target_id!r} has no pinned authorized revision"
+                    ),
+                )
+            resolved.append((target_id, target))
+        try:
+            chunks = await self._service.retrieve(
+                request.input.query,
+                top_k=request.input.top_k,
+                allowed_targets=tuple(target for _, target in resolved),
+                workspace_ids=runtime.workspace_ids,
+            )
+        except Exception as exc:
+            return dependency_error(
+                request.task_id, capability="document.retrieve", exc=exc
+            )
+        by_identity: Mapping[tuple[UUID, str], list[str]] = {}
+        for target_id, target in resolved:
+            key = (target.document.document_id, target.document.document_revision)
+            by_identity.setdefault(key, []).append(target_id)
+        by_target_id = dict(resolved)
+        # One acquisition id for every record produced by this execute call.
+        acquisition_id = uuid4()
+        fetched_at = datetime.now(timezone.utc)
+        uses: list[EvidenceUseRef] = []
+        admitted_keys: set[tuple[str | None, str, str, str, str]] = set()
+        covered: set[str] = set()
+        scoped = bool(resolved)
+        for chunk in chunks:
+            if not isinstance(chunk.content, str) or not chunk.content.strip():
+                continue
+            if scoped:
+                matched = self._match_targets(chunk, by_identity, by_target_id)
+                if not matched:
+                    continue
+            else:
+                matched = [None]
+            for target_id in matched:
+                dedupe_key = (
+                    target_id,
+                    str(chunk.document_id),
+                    chunk.document_revision,
+                    chunk.locator.model_dump_json(),
+                    hashlib.sha256(chunk.content.encode("utf-8")).hexdigest(),
+                )
+                if dedupe_key in admitted_keys:
+                    continue
+                admitted_keys.add(dedupe_key)
+                try:
+                    use = await self._evidence.persist_use(
+                        source=DocumentSourceIdentity(
+                            kind="document",
+                            document_id=chunk.document_id,
+                            document_revision=chunk.document_revision,
+                            locator=chunk.locator,
+                        ),
+                        content=chunk.content,
+                        provenance=Provenance(
+                            acquisition_id=acquisition_id,
+                            fetcher="document.retrieve",
+                            fetched_at=fetched_at,
+                        ),
+                        task_id=request.task_id,
+                        purpose="coverage" if target_id is not None else "supporting",
+                        target_id=target_id,
+                    )
+                except Exception as exc:
+                    return dependency_error(
+                        request.task_id, capability="document.retrieve", exc=exc
+                    )
+                uses.append(use)
+                if target_id is not None:
+                    covered.add(target_id)
+        if scoped:
+            status: AgentStatus = (
+                "success"
+                if len(covered) == len(resolved)
+                else "partial"
+                if covered
+                else "not_found"
+            )
+        else:
+            status = "success" if uses else "not_found"
+        return AgentResult(
+            contract_version=CONTRACT_VERSION,
+            task_id=request.task_id,
+            status=status,
+            data=DocumentRetrieveOutput(
+                kind="document.retrieve", retrieved_unit_count=len(uses)
+            ),
+            evidence_uses=tuple(uses),
+            coverage_observations=(),
+            error=None,
+        )
+
+    @staticmethod
+    def _match_targets(
+        chunk: RevisionRetrievedChunk,
+        by_identity: Mapping[tuple[UUID, str], list[str]],
+        by_target_id: Mapping[str, ResolvedTarget],
+    ) -> list[str]:
+        """Resolve a scoped chunk to its pinned explicit target IDs.
+
+        A service ``target_id`` hint is verified against the pinned identity
+        and must agree with the chunk coordinates; otherwise the chunk is
+        dropped. Hintless chunks match by authoritative ``(document_id,
+        document_revision)`` identity only.
+        """
+        if chunk.target_id is not None:
+            target = by_target_id.get(chunk.target_id)
+            if target is None:
+                return []
+            if (
+                chunk.document_id != target.document.document_id
+                or chunk.document_revision != target.document.document_revision
+            ):
+                return []
+            return [chunk.target_id]
+        return list(
+            by_identity.get((chunk.document_id, chunk.document_revision), ())
         )

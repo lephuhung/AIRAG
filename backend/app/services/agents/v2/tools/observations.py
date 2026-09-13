@@ -29,6 +29,7 @@ from pydantic import Field
 from ..contracts.base import ContractModel
 from ..contracts.capability import (
     DocumentReadOutput,
+    DocumentRetrieveOutput,
     DocumentSearchOutput,
     KnowledgeGraphOutput,
     PeopleLookupOutput,
@@ -59,6 +60,18 @@ class DocumentReadObservation(ContractModel):
     read_unit_count: int
 
 
+class DocumentRetrieveObservation(ContractModel):
+    """Planner-visible retrieval fact: admitted-unit count only.
+
+    Retrieved chunk content, locators, and revision identities stay governed
+    in the Evidence Store; the planner sees only how many units were
+    admitted plus the evidence-use identities on the enclosing observation.
+    """
+
+    kind: Literal["document.retrieve"] = "document.retrieve"
+    retrieved_unit_count: int
+
+
 class SectionReadObservation(ContractModel):
     kind: Literal["section.read"] = "section.read"
     read_unit_count: int
@@ -77,6 +90,7 @@ ToolObservationProjection = Annotated[
     Union[
         PeopleLookupObservation,
         DocumentSearchObservation,
+        DocumentRetrieveObservation,
         DocumentReadObservation,
         SectionReadObservation,
         KnowledgeGraphObservation,
@@ -158,6 +172,11 @@ class ObservationProjector:
                 candidate_ids=tuple(
                     candidate.candidate_id for candidate in data.candidates
                 ),
+            )
+        elif isinstance(data, DocumentRetrieveOutput):
+            projection = DocumentRetrieveObservation(
+                kind="document.retrieve",
+                retrieved_unit_count=data.retrieved_unit_count,
             )
         elif isinstance(data, DocumentReadOutput):
             projection = DocumentReadObservation(

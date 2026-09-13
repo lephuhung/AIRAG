@@ -70,6 +70,9 @@ __all__ = [
     "DocumentSearchService",
     "DocumentReadCapability",
     "DocumentContentReader",
+    "DocumentRetrieveCapability",
+    "DocumentRetrievalService",
+    "RevisionRetrievedChunk",
     "SectionReadCapability",
     "SectionContentReader",
     "KnowledgeGraphCapability",
@@ -399,8 +402,11 @@ from .abbreviation import AbbreviationCapability, AbbreviationResolverService
 from .document import (
     DocumentContentReader,
     DocumentReadCapability,
+    DocumentRetrievalService,
+    DocumentRetrieveCapability,
     DocumentSearchCapability,
     DocumentSearchService,
+    RevisionRetrievedChunk,
 )
 from .knowledge_graph import KnowledgeGraphCapability, KnowledgeGraphClient
 from .memory import MemoryCapability, MemoryStore

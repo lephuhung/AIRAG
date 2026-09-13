@@ -1185,3 +1185,244 @@ async def test_evidence_builder_is_idempotent() -> None:
         target_id=None,
     )
     assert first.use_id == second.use_id
+
+
+# ---------------------------------------------------------------------------
+# P0 Task 2: revision-aware retrieval capability (document.retrieve)
+# ---------------------------------------------------------------------------
+
+
+def _retrieve_runtime() -> CapabilityRuntimeContext:
+    return runtime_context(
+        allowed=frozenset(
+            {
+                "people.lookup",
+                "document.search",
+                "document.retrieve",
+                "document.read",
+                "section.read",
+                "knowledge_graph.query",
+                "memory.lookup",
+                "abbreviation.resolve",
+            }
+        )
+    )
+
+
+class FakeRetrievalService:
+    """Task-2 fake revision-manifest retrieval port.
+
+    Returns preset revision-owned chunks and records the exact filters the
+    capability passed (query/top_k/allowed targets/workspace scope).
+    """
+
+    def __init__(self, chunks=()) -> None:
+        self._chunks = tuple(chunks)
+        self.calls: list[dict] = []
+
+    async def retrieve(
+        self, query: str, *, top_k: int, allowed_targets, workspace_ids
+    ):
+        self.calls.append(
+            {
+                "query": query,
+                "top_k": top_k,
+                "allowed_targets": allowed_targets,
+                "workspace_ids": workspace_ids,
+            }
+        )
+        return self._chunks
+
+
+def _retrieved_chunk(
+    *,
+    document_id: UUID = DOCUMENT_ID,
+    revision: str = "rev-1",
+    content: str = "secret chunk",
+    locator=None,
+    score: float = 0.9,
+    target_id=None,
+):
+    from app.services.agents.v2.capabilities.document import RevisionRetrievedChunk
+    from app.services.agents.v2.contracts.locators import ChunkRangeLocator
+
+    return RevisionRetrievedChunk(
+        document_id=document_id,
+        document_revision=revision,
+        locator=(
+            locator
+            if locator is not None
+            else ChunkRangeLocator(kind="chunk_range", start="c1", end="c1")
+        ),
+        content=content,
+        score=score,
+        target_id=target_id,
+    )
+
+
+def _retrieve_request(task_id: str = "T1", **kwargs) -> AgentRequest:
+    from app.services.agents.v2.contracts.capability import DocumentRetrieveInput
+
+    return agent_request(
+        task_id,
+        "factual query",
+        DocumentRetrieveInput(kind="document.retrieve", query="lan bmnn", **kwargs),
+    )
+
+
+def _retrieve_plan(request: AgentRequest) -> TaskPlan:
+    return TaskPlan(
+        contract_version="2.0",
+        plan_id="p1",
+        goal="g",
+        target_units=(
+            TargetUnit(
+                target_id="t1",
+                binding_id="b_t1",
+                requested_locator=SectionLocator(kind="section", structure_node_id="node-5"),
+                completion_criteria=(),
+            ),
+        ),
+        tasks=(
+            TaskSpec(
+                task_id=request.task_id,
+                capability="document.retrieve",
+                task_objective="factual query",
+                input=request.input,
+                origin=InitialTaskOrigin(kind="initial"),
+            ),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_document_retrieve_scoped_success_persists_evidence_and_count_only() -> None:
+    from app.services.agents.v2.capabilities.document import DocumentRetrieveCapability
+    from app.services.agents.v2.contracts.validation import validate_agent_result
+
+    evidence = FakeEvidenceBuilder()
+    capability = DocumentRetrieveCapability(
+        service=FakeRetrievalService((_retrieved_chunk(),)),
+        evidence=evidence,
+        resolver=FakeTargetResolver(),
+    )
+    request = _retrieve_request(target_ids=("t1",))
+    result = await capability.execute(request, _retrieve_runtime())
+    assert result.status == "success"
+    assert result.data is not None and result.data.kind == "document.retrieve"
+    assert result.data.retrieved_unit_count == 1
+    assert len(result.evidence_uses) == 1
+    # Raw chunk content lives only in the Evidence Store, never in output.
+    assert "secret chunk" not in result.model_dump_json()
+    call = evidence.calls[0]
+    assert call["source"].document_id == DOCUMENT_ID
+    assert call["source"].document_revision == "rev-1"
+    assert call["purpose"] == "coverage"
+    assert call["target_id"] == "t1"
+    # A scoped retrieve result with coverage-purposed uses is checkpoint-valid.
+    validate_agent_result(result, _retrieve_plan(request))
+
+
+@pytest.mark.asyncio
+async def test_document_retrieve_drops_out_of_scope_and_revision_mismatch() -> None:
+    from app.services.agents.v2.capabilities.document import DocumentRetrieveCapability
+
+    other_id = UUID("22222222-2222-2222-2222-222222222222")
+    chunks = (
+        _retrieved_chunk(),
+        _retrieved_chunk(document_id=other_id),
+        _retrieved_chunk(revision="rev-stale"),
+        _retrieved_chunk(content="   "),
+    )
+    evidence = FakeEvidenceBuilder()
+    capability = DocumentRetrieveCapability(
+        service=FakeRetrievalService(chunks),
+        evidence=evidence,
+        resolver=FakeTargetResolver(),
+    )
+    result = await capability.execute(
+        _retrieve_request(target_ids=("t1",)), _retrieve_runtime()
+    )
+    assert result.status == "success"
+    assert result.data is not None and result.data.retrieved_unit_count == 1
+    assert len(result.evidence_uses) == 1
+    assert len(evidence.calls) == 1
+    assert evidence.calls[0]["source"].document_id == DOCUMENT_ID
+
+
+@pytest.mark.asyncio
+async def test_document_retrieve_unknown_target_is_denied() -> None:
+    from app.services.agents.v2.capabilities.document import DocumentRetrieveCapability
+
+    service = FakeRetrievalService((_retrieved_chunk(),))
+    capability = DocumentRetrieveCapability(
+        service=service,
+        evidence=FakeEvidenceBuilder(),
+        resolver=FakeTargetResolver({}),
+    )
+    result = await capability.execute(
+        _retrieve_request(target_ids=("t9",)), _retrieve_runtime()
+    )
+    assert result.status == "denied"
+    assert result.error is not None and result.error.code == "SCOPE_VIOLATION"
+    assert result.data is None
+    assert service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_document_retrieve_unscoped_uses_workspace_scope() -> None:
+    from app.services.agents.v2.capabilities.document import DocumentRetrieveCapability
+
+    service = FakeRetrievalService((_retrieved_chunk(),))
+    evidence = FakeEvidenceBuilder()
+    capability = DocumentRetrieveCapability(
+        service=service,
+        evidence=evidence,
+        resolver=FakeTargetResolver({}),
+    )
+    result = await capability.execute(_retrieve_request(), _retrieve_runtime())
+    assert result.status == "success"
+    assert result.data is not None and result.data.retrieved_unit_count == 1
+    assert len(result.evidence_uses) == 1
+    # Unscoped retrieval is targetless: no pinned targets cross the service
+    # boundary and the use is supporting, never fabricated target coverage.
+    assert service.calls[0]["allowed_targets"] == ()
+    assert service.calls[0]["workspace_ids"] == (WORKSPACE_ID,)
+    assert evidence.calls[0]["target_id"] is None
+    assert evidence.calls[0]["purpose"] == "supporting"
+    assert result.coverage_observations == ()
+
+
+@pytest.mark.asyncio
+async def test_document_retrieve_empty_results_is_not_found() -> None:
+    from app.services.agents.v2.capabilities.document import DocumentRetrieveCapability
+
+    capability = DocumentRetrieveCapability(
+        service=FakeRetrievalService(()),
+        evidence=FakeEvidenceBuilder(),
+        resolver=FakeTargetResolver(),
+    )
+    result = await capability.execute(
+        _retrieve_request(target_ids=("t1",)), _retrieve_runtime()
+    )
+    assert result.status == "not_found"
+    assert result.data is not None and result.data.retrieved_unit_count == 0
+    assert result.evidence_uses == ()
+
+
+@pytest.mark.asyncio
+async def test_document_retrieve_requires_permission() -> None:
+    from app.services.agents.v2.capabilities.document import DocumentRetrieveCapability
+
+    service = FakeRetrievalService((_retrieved_chunk(),))
+    capability = DocumentRetrieveCapability(
+        service=service,
+        evidence=FakeEvidenceBuilder(),
+        resolver=FakeTargetResolver(),
+    )
+    result = await capability.execute(
+        _retrieve_request(target_ids=("t1",)), runtime_context()
+    )
+    assert result.status == "denied"
+    assert result.error is not None and result.error.code == "PERMISSION_DENIED"
+    assert service.calls == []
