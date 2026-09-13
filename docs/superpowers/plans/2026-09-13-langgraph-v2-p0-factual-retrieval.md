@@ -151,8 +151,11 @@ git commit -m "feat(v2): add revision-aware retrieval capability"
 **Files:**
 - Modify: `backend/app/services/agents/supervisor_v2.py`
 - Modify: `backend/app/services/agents/v2/nodes/routing.py`
+- Modify: `backend/app/services/agents/v2/adapters/document.py`
+- Modify: `backend/app/services/agents/v2/persistence/document_views.py`
 - Modify: `backend/tests/agents/v2/test_context_binding_routes.py`
 - Modify: `backend/tests/agents/v2/test_supervisor_v2.py`
+- Modify: `backend/tests/agents/v2/test_adapters_and_registry.py`
 
 **Interfaces:**
 - Produces: deterministic `api_explicit:<resource_id>` references and scoped complex routing.
@@ -167,7 +170,7 @@ Run: `cd backend && PYTHONPATH=. pytest tests/agents/v2/test_context_binding_rou
 
 - [ ] **Step 3: Implement deterministic projection**
 
-Add `DeterministicSemanticAdapter.project_api_explicit_targets(draft, request)` and call it after UI reconciliation. Build resolved references only from `request.known_documents` whose source is `api_explicit`. Extend `decide_route(..., request=None)` so current explicit IDs force factual `retrieve` to `complex_research/multi_document_research`; `route_node` passes `state["request"]`.
+Add `DeterministicSemanticAdapter.project_api_explicit_targets(draft, request)` and call it after UI reconciliation. Build resolved references only from `request.known_documents` whose source is `api_explicit`. Extend `decide_route(..., request=None)` so current explicit IDs force factual `retrieve` to `complex_research/multi_document_research`; `route_node` passes `state["request"]`. Preserve direct routing for pure conversational turns even when the transport carries `api_explicit` resources; only intrinsic query references may defeat the conversational guard. Add a workspace-scoped current-revision identity lookup and require ordinary/current binding resolution to use it, including tombstone rejection, so every ingress fails closed even if an upstream API omitted document ACL filtering.
 
 - [ ] **Step 4: Run GREEN and commit**
 
