@@ -25,7 +25,8 @@ Global constraints honored here:
   ``can_read_people`` and ``allowed_capabilities`` are required caller
   inputs mirroring the primary turn (R64). Cancellation follows the
   primary run (``asyncio`` cancellation propagates; :func:`_stop_shadow_task`
-  cancels twice and enforces a terminal state, R65).
+  cancels twice over shield-bounded waits and reports ``False`` instead of
+  hanging on a persistently resistant shadow, R65/R66.4).
 - Output is discarded except redacted metrics (:class:`ShadowMetrics` —
   status/route/evaluation/counts/timing only, never response content).
 - Exactly one ownership chain: the shadow graph is the same
@@ -88,8 +89,25 @@ from app.services.agents.v2.persistence.shadow_checkpoint import (
     is_shadow_saver,
 )
 
+
+class ShadowDependencyGap(Exception):
+    """A shadow read-only dependency failed (typed gap, R66.1).
+
+    Raised when a shadow source the run depends on (currently the
+    read-only People source) fails instead of answering. Carries the
+    ``reason`` fragment; :meth:`ShadowBundle.run` maps it to a typed
+    ``unavailable`` / ``dependency-gap:`` outcome — never a generic
+    zero-task error.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 __all__ = [
     "ShadowIsolationError",
+    "ShadowDependencyGap",
     "ShadowMetrics",
     "ReadOnlySourceAdapter",
     "IsolatedShadowStores",
@@ -371,24 +389,40 @@ class ShadowSemanticAdapter:
         known_documents: tuple[UUID, ...] = (),
         document_view: Mapping[Any, Mapping[str, Any]] | None = None,
         people_source: Any | None = None,
+        can_read_people: bool = False,
     ) -> None:
         self._query = raw_query
         self._person_names = tuple(person_names)
         self._known_documents = tuple(known_documents)
         self._view = dict(document_view or {})
         self._people_source = people_source
+        # Mirrored primary authorization (R66.1): the read-only People
+        # source is consulted ONLY when the primary turn could read
+        # people. Safe default False — never consult unless granted.
+        self._can_read_people = bool(can_read_people)
+        # Cause of the last people-source failure, read by ShadowBundle.run
+        # to report a typed dependency gap (reset on every draft attempt).
+        self.last_gap_reason: str | None = None
 
     async def _confirmed_person_names(self) -> tuple[str, ...]:
         """Person names confirmed read-only against the people source.
 
         Explicit ``person_names`` (bundle-level/test input) win. Otherwise
-        the read-only source is consulted without any write: a directory
+        the read-only source is consulted without any write — but ONLY
+        when ``can_read_people`` mirrors a granted primary turn (R66.1): a
+        denied turn consults nothing and yields no names. A directory
         source contributes substring matches over its isolated snapshot; a
-        production source confirms capitalized spans via ``lookup`` (capped).
-        Unconfirmed spans never become references.
+        production source confirms capitalized spans via ``lookup``
+        (capped). Unconfirmed spans never become references; a source that
+        FAILS (rather than misses) records a dependency-gap reason and
+        raises :class:`ShadowDependencyGap` so the run reports a typed
+        gap instead of a generic zero-task outcome.
         """
+        self.last_gap_reason = None
         if self._person_names:
             return self._person_names
+        if not self._can_read_people:
+            return ()
         source = self._people_source
         if source is None:
             return ()
@@ -397,8 +431,9 @@ class ShadowSemanticAdapter:
         if callable(candidates):
             try:
                 names = tuple(candidates()) or ()
-            except Exception:  # noqa: BLE001 — read-only best effort
-                names = ()
+            except Exception as exc:  # noqa: BLE001
+                self.last_gap_reason = f"people source listing failed: {exc}"
+                raise ShadowDependencyGap(self.last_gap_reason) from exc
             if names:
                 return tuple(
                     name for name in names if name and name.lower() in lowered
@@ -419,8 +454,13 @@ class ShadowSemanticAdapter:
                 record = lookup(span)
                 if asyncio.iscoroutine(record):
                     record = await record
-            except Exception:  # noqa: BLE001 — read miss, skip span
-                continue
+            except ShadowDependencyGap:
+                raise
+            except Exception as exc:  # noqa: BLE001 — source failure: gap
+                self.last_gap_reason = (
+                    f"people source lookup failed for span {span!r}: {exc}"
+                )
+                raise ShadowDependencyGap(self.last_gap_reason) from exc
             if isinstance(record, Mapping) and record.get("name"):
                 confirmed.append(str(record["name"]))
         return tuple(confirmed)
@@ -747,6 +787,30 @@ class ShadowBundle:
             dict(self.initial_state), config, context=self.runtime_context
         )
         duration_ms = int((time.monotonic() - started) * 1000)
+        # Typed dependency gap (R66.1): the graph converts a node raise
+        # into a generic error marker, so the adapter records the people-
+        # source cause on itself; a recorded gap means THIS failure — the
+        # turn necessarily short-circuited at the semantic node — and the
+        # run reports unavailable/dependency-gap, never generic zero-task.
+        gap_reason = getattr(
+            self.runtime_context.services.semantic_adapter,
+            "last_gap_reason",
+            None,
+        )
+        if gap_reason is not None:
+            self.metrics = ShadowMetrics(
+                status="unavailable",
+                route=None,
+                evaluation=None,
+                task_count=0,
+                isolated_writes=self.isolated_write_count(),
+                duration_ms=duration_ms,
+                reason=f"dependency-gap: {gap_reason}",
+            )
+            logger.warning(
+                "shadow v2 turn dependency-gap: %s", gap_reason,
+            )
+            return self.metrics
         decision = result.get("route_decision")
         if isinstance(decision, dict):
             route = decision.get("route")
@@ -859,6 +923,9 @@ def build_shadow_bundle(
         people_source=(
             directory if people_directory is not None else people_source
         ),
+        # Mirrored primary authorization (R66.1): a denied turn never
+        # consults the People source, even read-only.
+        can_read_people=bool(can_read_people),
     )
     binding_resolver = ShadowBindingResolver(view)
     evidence_builder = ShadowEvidenceBuilder(stores)
@@ -970,35 +1037,42 @@ def build_shadow_bundle(
 
 
 async def _stop_shadow_task(task: asyncio.Task, *, timeout: float = 5.0) -> bool:
-    """Cancel and join a shadow task, enforcing a terminal state (R65).
+    """Cancel and join a shadow task, bounded end-to-end (R65/R66.4).
 
-    First cancel is delivered, then the task is awaited WITHOUT a shield
-    (a shielded wait only times out the waiter while the shadow keeps
-    running). On timeout the task is cancelled AGAIN and awaited until it
-    reaches a terminal state — a shadow that survives a double cancel via
-    shielding is pathological and documented, not silently abandoned.
-    Returns True only when the task is done. Every outcome is swallowed so
-    callers can use this in ``finally`` paths; callers MUST still act on a
-    False return (fail the shadow closed and log) before proceeding.
+    Both cancel-awaits go through ``asyncio.shield`` + ``wait_for``: the
+    shield keeps the join bounded on EVERY Python (on 3.11 a bare
+    ``wait_for(task)`` re-awaits a cancel-swallowing task in
+    ``_cancel_and_wait`` without bound — the M1 hang). First cancel is
+    delivered and awaited up to ``timeout``; on expiry the task is
+    cancelled AGAIN and awaited up to ``timeout`` once more. A shadow
+    that survives the double cancel yields ``stopped=False`` — reachable
+    by design — instead of blocking primary cleanup indefinitely.
+    Returns True only when the task is done. Every outcome is swallowed
+    so callers can use this in ``finally`` paths; callers MUST still act
+    on a False return (fail the shadow closed and log) before
+    proceeding. Total wall-time is bounded by ~2*timeout.
     """
     if task.done():
         return True
     task.cancel()
     try:
-        await asyncio.wait_for(task, timeout=timeout)
-        return True
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
     except TimeoutError:
         pass
     except (asyncio.CancelledError, Exception):
+        return task.done()
+    if task.done():
         return True
-    # The shadow resisted the first cancel: cancel again and enforce the
-    # terminal state instead of returning a live task.
-    if not task.done():
-        task.cancel()
+    # The shadow resisted the first cancel: cancel again and re-await
+    # BOUNDED — a persistently resistant shadow reports False instead of
+    # hanging the caller.
+    task.cancel()
     try:
-        await task
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+    except TimeoutError:
+        return False
     except (asyncio.CancelledError, Exception):
-        pass
+        return task.done()
     return task.done()
 
 

@@ -676,14 +676,15 @@ async def _session_v2_run(
             raise
 
 
-async def _latest_active_revision_id(db, document_id):
-    """Latest active revision row for a pointer-less document (read-only).
+async def _latest_published_revision_id(db, document_id):
+    """Latest published revision row for a pointer-less document (read-only).
 
     Production binding raises ``RevisionNotReady`` when the
     ``current_revision_id`` pointer is unset; the shadow instead pins the
-    latest ACTIVE revision record so the topology is still exercised. The
-    pinned id is always a real revision record — never fabricated — and
-    the divergence is recorded in the fix report.
+    latest PUBLISHED revision record — the authoritative terminal state
+    (``models/document_revision.py``; R66.2) — so the topology is still
+    exercised. The pinned id is always a real revision record — never
+    fabricated — and the divergence is recorded in the fix report.
     """
     from sqlalchemy import select
 
@@ -693,12 +694,35 @@ async def _latest_active_revision_id(db, document_id):
         select(DocumentRevision.revision_id)
         .where(
             DocumentRevision.document_id == document_id,
-            DocumentRevision.status == "active",
+            DocumentRevision.status == "published",
             DocumentRevision.failed_at.is_(None),
         )
         .order_by(DocumentRevision.created_at.desc())
         .limit(1)
     )
+
+
+async def _join_shadow_at_cleanup(
+    shadow_task, *, session_id: str, timeout: float = 5.0
+) -> bool:
+    """Join the shadow at primary-cleanup time; fail closed when unstopped.
+
+    The single caller-owned sequencing point (R66.4): the bounded
+    ``_stop_shadow_task`` join runs FIRST, and a ``False`` return fails
+    the shadow closed with an error log BEFORE primary cleanup proceeds.
+    Returns the ``stopped`` flag.
+    """
+    from app.services.agent.shadow_runtime import _stop_shadow_task
+
+    stopped = await _stop_shadow_task(shadow_task, timeout=timeout)
+    if not stopped:
+        logger.error(
+            "[shadow] session=%s failed to reach a "
+            "terminal state; failing closed — primary "
+            "cleanup proceeds without shadow output",
+            session_id,
+        )
+    return stopped
 
 
 async def resolve_shadow_document_view(
@@ -711,7 +735,7 @@ async def resolve_shadow_document_view(
 
     Reuses the production revision-identity boundary
     (``document_views.load_current_revision_identity``) per accessible
-    document id, falling back to the latest ACTIVE revision record when
+    document id, falling back to the latest PUBLISHED revision record when
     the legacy pointer is unset. Workspace scope is enforced up front by
     the ``documents`` filter. No object is mutated, nothing is committed,
     and the session closes on every path — production READs, which the
@@ -753,7 +777,7 @@ async def resolve_shadow_document_view(
             revision_id = (
                 identity.revision_id
                 if identity is not None
-                else await _latest_active_revision_id(db, document_id)
+                else await _latest_published_revision_id(db, document_id)
             )
             if revision_id is None:
                 continue
@@ -1444,25 +1468,16 @@ async def chat_stream_session(
                         await _drain(stream_agent_to_sse(graph, initial_state))
                 finally:
                     # Cancellation follows the primary run: the shadow is
-                    # cancelled (if pending) AND joined to a terminal state
-                    # (R65). A False return means the shadow survived a
-                    # double cancel — fail it closed with an error log
-                    # BEFORE primary cleanup proceeds.
+                    # cancelled (if pending) AND joined via the single
+                    # cleanup sequencing point (R65/R66.4), which fails the
+                    # shadow closed on stopped=False BEFORE primary cleanup
+                    # proceeds.
                     if shadow_task is not None:
-                        from app.services.agent.shadow_runtime import (
-                            _stop_shadow_task,
+                        await _join_shadow_at_cleanup(
+                            shadow_task,
+                            session_id=session_id,
+                            timeout=5.0,
                         )
-
-                        stopped = await _stop_shadow_task(
-                            shadow_task, timeout=5.0
-                        )
-                        if not stopped:
-                            logger.error(
-                                "[shadow] session=%s failed to reach a "
-                                "terminal state; failing closed — primary "
-                                "cleanup proceeds without shadow output",
-                                session_id,
-                            )
 
             # Generate the title now (first exchange) and push it immediately so
             # the client updates without a refresh; reuse the summary downstream.

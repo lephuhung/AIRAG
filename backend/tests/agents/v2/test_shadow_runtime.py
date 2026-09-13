@@ -334,6 +334,169 @@ async def _exercise_outbound_effectively(counters: dict[str, int]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# R66.3: required spies — ChatSession.title, chat relay, webhook emitter.
+# A required spy that cannot be installed FAILS the test (never env: skip).
+# ---------------------------------------------------------------------------
+
+
+def install_required_spies(monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, int], list[Any]]:
+    """Spy the REAL title/relay/webhook boundaries; fail hard when missing.
+
+    - ``ChatSession.__setattr__`` records + raises on any ``title``
+      assignment (the real first-exchange/inline title mutation path).
+    - ``asyncio.Queue.put_nowait`` records every queued item and DELEGATES
+      (the real chat relay is an ``asyncio.Queue``; record-and-raise would
+      break langgraph's own runner, which puts internal tuples through
+      queues during ``ainvoke`` — proven by probe — so transparency plus a
+      "no chat-relay-shaped (``str`` SSE) item" assertion is the honest
+      proof, paired with the AST no-``put_nowait`` guard).
+    - ``telegram_service.register_webhook`` / ``fetch_webhook_info``
+      record + raise (the real outbound webhook emitters).
+
+    Returns ``(counters, relay_items)``. Any install failure calls
+    ``pytest.fail`` — required targets never degrade to ``env:`` skips.
+    """
+    import asyncio as _asyncio
+
+    from app.services.agent.shadow_runtime import ShadowIsolationError
+
+    counters: dict[str, int] = {}
+    relay_items: list[Any] = []
+
+    try:
+        from app.models.chat_session import ChatSession
+    except Exception as exc:  # noqa: BLE001
+        pytest.fail(f"required ChatSession.title spy uninstallable: {exc!r}")
+    real_setattr = ChatSession.__setattr__
+
+    def _title_setattr(self: Any, name: str, value: Any) -> None:
+        if name == "title":
+            counters["chat.title"] = counters.get("chat.title", 0) + 1
+            raise ShadowIsolationError(
+                "production ChatSession.title mutation reached from shadow"
+            )
+        return real_setattr(self, name, value)
+
+    try:
+        monkeypatch.setattr(ChatSession, "__setattr__", _title_setattr)
+    except Exception as exc:  # noqa: BLE001
+        pytest.fail(
+            f"required ChatSession.title spy could not be installed: {exc!r}"
+        )
+
+    real_put_nowait = _asyncio.Queue.put_nowait
+
+    def _relay_put_nowait(self: Any, item: Any) -> None:
+        counters["relay.put_nowait"] = counters.get("relay.put_nowait", 0) + 1
+        relay_items.append(item)
+        return real_put_nowait(self, item)
+
+    try:
+        monkeypatch.setattr(_asyncio.Queue, "put_nowait", _relay_put_nowait)
+    except Exception as exc:  # noqa: BLE001
+        pytest.fail(f"required relay spy could not be installed: {exc!r}")
+
+    try:
+        import app.services.integrations.telegram_service as telegram_service
+    except Exception as exc:  # noqa: BLE001
+        pytest.fail(f"required webhook spy uninstallable: {exc!r}")
+
+    for emitter in ("register_webhook", "fetch_webhook_info"):
+        try:
+            target = getattr(telegram_service, emitter)
+            assert callable(target), f"{emitter} is not callable"
+        except Exception as exc:  # noqa: BLE001
+            pytest.fail(
+                f"required webhook spy {emitter!r} uninstallable: {exc!r}"
+            )
+
+        def _recorder(
+            *args: Any, _name: str = emitter, **kwargs: Any
+        ) -> Any:
+            async def _raise() -> Any:
+                counters[_name] = counters.get(_name, 0) + 1
+                raise ShadowIsolationError(
+                    f"outbound webhook emitter {_name!r} reached from shadow"
+                )
+
+            return _raise()
+
+        try:
+            monkeypatch.setattr(telegram_service, emitter, _recorder)
+        except Exception as exc:  # noqa: BLE001
+            pytest.fail(
+                f"required webhook spy {emitter!r} could not be installed:"
+                f" {exc!r}"
+            )
+    return counters, relay_items
+
+
+def _assert_no_chat_relay_emission(
+    counters: dict[str, int], relay_items: list[Any]
+) -> None:
+    """No shadow emission through the real chat-relay path (R66.3).
+
+    The chat relay carries only SSE strings (``format_sse_event`` output)
+    plus the ``None`` end-of-stream sentinel; langgraph's internal runner
+    traffic is tuples. A shadow relay emission would arrive as ``str`` —
+    its absence (alongside zero title/webhook trips) is the proof.
+    """
+    assert counters.get("chat.title", 0) == 0, (
+        f"shadow mutated ChatSession.title: {counters}"
+    )
+    assert counters.get("register_webhook", 0) == 0, (
+        f"shadow reached the webhook emitter: {counters}"
+    )
+    assert counters.get("fetch_webhook_info", 0) == 0, (
+        f"shadow reached the webhook emitter: {counters}"
+    )
+    relay_strings = [item for item in relay_items if isinstance(item, str)]
+    assert relay_strings == [], (
+        f"shadow emitted chat-relay-shaped items: {relay_strings[:3]!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_required_spies_are_effective(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R66.3: every required spy trips when its real boundary is used."""
+    import asyncio as _asyncio
+
+    import app.services.integrations.telegram_service as telegram_service
+    from app.models.chat_session import ChatSession
+    from app.services.agent.shadow_runtime import ShadowIsolationError
+
+    counters, relay_items = install_required_spies(monkeypatch)
+    assert getattr(ChatSession.__setattr__, "__name__", "") == "_title_setattr"
+    assert getattr(_asyncio.Queue.put_nowait, "__name__", "") == (
+        "_relay_put_nowait"
+    )
+    # Title path: a transient instance assignment trips record + raise.
+    sess = ChatSession.__new__(ChatSession)
+    with pytest.raises(ShadowIsolationError):
+        sess.title = "shadow must not set this"
+    assert counters.get("chat.title", 0) == 1
+    # Non-title assignments still delegate (spy is transparent otherwise).
+    sess2 = ChatSession.__new__(ChatSession)
+    sess2.shadow_probe_marker = "ok"
+    assert sess2.shadow_probe_marker == "ok"
+    # Relay path: a real queue delivery is recorded AND delivered.
+    queue: _asyncio.Queue[Any] = _asyncio.Queue()
+    queue.put_nowait("data: hello")
+    assert counters.get("relay.put_nowait", 0) == 1
+    assert relay_items == ["data: hello"]
+    assert queue.get_nowait() == "data: hello"
+    # Webhook emitters: record + raise, never reach the network.
+    with pytest.raises(ShadowIsolationError):
+        await telegram_service.register_webhook("tok", "https://x", "s")
+    with pytest.raises(ShadowIsolationError):
+        await telegram_service.fetch_webhook_info("tok")
+    assert counters.get("register_webhook", 0) == 1
+    assert counters.get("fetch_webhook_info", 0) == 1
+
+
+# ---------------------------------------------------------------------------
 # R54/R62 guards: production getter/saver never used + static proof
 # ---------------------------------------------------------------------------
 
@@ -396,6 +559,10 @@ def test_shadow_static_no_production_reference() -> None:
         "publish_control",
         "publish_parse_task",
         "publish_memory_save_task",
+        "put_nowait",
+        "register_webhook",
+        "raw_api",
+        "ChatSession",
     ):
         assert forbidden not in referenced, (
             f"shadow path references production symbol {forbidden!r}"
@@ -425,12 +592,14 @@ async def test_shadow_production_stores_receive_zero_writes(
     counters, skipped = install_production_spies(monkeypatch)
     hard = [s for s in skipped if not _is_env_skip(s)]
     assert not hard, f"production spies unavailable: {hard}"
+    required_counters, relay_items = install_required_spies(monkeypatch)
     factual = make_factual_bundle(thread_id="shadow-r58-factual")
     factual_metrics = await factual.run()
     assert factual_metrics.task_count >= 1
     direct = make_direct_bundle(thread_id="shadow-r58-direct")
     await direct.run()
     assert counters == {}, f"shadow reached production writes: {counters}"
+    _assert_no_chat_relay_emission(required_counters, relay_items)
 
 
 @pytest.mark.asyncio
@@ -458,6 +627,12 @@ V2_TABLES = (
     "revision_retention_leases",
     "documents",
     "document_revisions",
+    # R66.3: chat/title tables are in the row-count equality set. They are
+    # absent from the v2 harness test DB (chat lives in the dev DB), so the
+    # strict counter records that absence with reason; the title/relay
+    # proof itself is carried by the required mutation-path spies.
+    "chat_sessions",
+    "chat_messages",
 )
 REQUIRED_V2_TABLES = ("evidence_records", "evidence_uses", "binding_audit")
 CHECKPOINT_TABLES = ("checkpoints", "checkpoint_blobs", "checkpoint_writes")
@@ -605,10 +780,12 @@ async def test_shadow_emits_no_outbound_events(
     counters, skipped = install_outbound_spies(monkeypatch)
     hard = [s for s in skipped if not _is_env_skip(s)]
     assert not hard, f"outbound spies unavailable: {hard}"
+    required_counters, relay_items = install_required_spies(monkeypatch)
     bundle = make_factual_bundle(thread_id="shadow-r59")
     metrics = await bundle.run()
     assert metrics.task_count >= 1  # non-vacuous: factual path executed
     assert counters == {}, f"shadow emitted outbound events: {counters}"
+    _assert_no_chat_relay_emission(required_counters, relay_items)
 
 
 @pytest.mark.asyncio
@@ -678,6 +855,99 @@ async def test_shadow_mirrors_denied_authorization() -> None:
     assert metrics.status == "denied", metrics.redacted()
 
 
+class _RecordingPeopleSource:
+    """Read-only people source that records every consultation (R66.1)."""
+
+    def __init__(
+        self, record: dict[str, object] | None = None, *, fail: bool = False
+    ) -> None:
+        self.calls: list[str] = []
+        self._record = record
+        self._fail = fail
+
+    def candidate_names(self) -> tuple[str, ...]:
+        return ()
+
+    async def lookup(self, query: str) -> dict[str, object] | None:
+        self.calls.append(str(query))
+        if self._fail:
+            raise RuntimeError("people store unreachable")
+        if self._record is not None:
+            return dict(self._record)
+        return None
+
+
+@pytest.mark.asyncio
+async def test_shadow_people_source_gated_by_authorization() -> None:
+    """R66.1: the People source is never consulted when denied.
+
+    With ``can_read_people=False`` the semantic adapter must return no
+    person names WITHOUT calling the read-only source; the open-gate
+    control proves the source would otherwise be consulted.
+    """
+    denied_source = _RecordingPeopleSource(
+        record={"record_id": "rec-1", "name": PERSON_NAME}
+    )
+    denied = make_factual_bundle(
+        thread_id="shadow-r66-gated",
+        person_names=(),
+        people_directory=None,
+        people_source=denied_source,
+        can_read_people=False,
+    )
+    denied_metrics = await denied.run()
+    assert denied_source.calls == [], (
+        f"denied shadow consulted the People source: {denied_source.calls}"
+    )
+    assert denied_metrics.status in TYPED_STATUSES
+
+    open_source = _RecordingPeopleSource(
+        record={"record_id": "rec-1", "name": PERSON_NAME}
+    )
+    opened = make_factual_bundle(
+        thread_id="shadow-r66-open",
+        person_names=(),
+        people_directory=None,
+        people_source=open_source,
+        can_read_people=True,
+    )
+    await opened.run()
+    assert open_source.calls != [], (
+        "granted shadow never consulted the People source (control failed)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_shadow_people_failure_is_typed_gap(caplog: pytest.LogCaptureFixture) -> None:
+    """R66.1: a People-source failure is a TYPED dependency gap.
+
+    Never a generic zero-task outcome: the run reports
+    ``status=unavailable`` with a ``dependency-gap:`` reason in both the
+    metrics payload and the run log.
+    """
+    import logging as _logging
+
+    failing = _RecordingPeopleSource(fail=True)
+    bundle = make_factual_bundle(
+        thread_id="shadow-r66-gap",
+        person_names=(),
+        people_directory=None,
+        people_source=failing,
+        can_read_people=True,
+    )
+    with caplog.at_level(_logging.WARNING, logger="app.services.agent.shadow_runtime"):
+        metrics = await bundle.run()
+    assert failing.calls != [], "the People source was never consulted"
+    assert metrics.status == "unavailable", metrics.redacted()
+    assert metrics.task_count == 0
+    reason = metrics.redacted()["reason"] or ""
+    assert reason.startswith("dependency-gap:"), metrics.redacted()
+    assert "people" in reason.lower(), metrics.redacted()
+    assert any("dependency-gap:" in (record.message or "") for record in caplog.records), (
+        "dependency gap was not reported in the run log"
+    )
+
+
 @pytest.mark.asyncio
 async def test_shadow_preserves_refs_read_only() -> None:
     """Document refs + history survive read-only into the shadow run."""
@@ -745,12 +1015,20 @@ def _v2_test_session_factory():
     return async_sessionmaker(engine, expire_on_commit=False), engine
 
 
-async def _pick_revisioned_document(session_factory: Any) -> tuple[UUID, UUID]:
-    """Read one (document, workspace) pair with an ACTIVE revision.
+async def _pick_published_document(
+    session_factory: Any,
+) -> tuple[UUID, UUID, UUID | None]:
+    """Pick one (document, workspace) pair with a PUBLISHED revision (R66.2).
 
-    Read-only setup against the harness test DB; skips with reason when
-    no such document exists.
+    ``published`` is the authoritative revision state
+    (``models/document_revision.py``); the legacy ``active`` predicate is
+    gone. Prefers real test-DB data (read-only); when no published
+    revision exists, inserts a minimal published fixture row for a
+    revision-less document and returns its id for caller cleanup. Skips
+    with reason only when no document exists at all.
     """
+    import uuid as _uuid
+
     from sqlalchemy import text
 
     async with session_factory() as db:
@@ -758,13 +1036,66 @@ async def _pick_revisioned_document(session_factory: Any) -> tuple[UUID, UUID]:
             text(
                 "SELECT d.id, d.workspace_id FROM documents d "
                 "JOIN document_revisions r ON r.document_id = d.id "
-                "WHERE r.status = 'active' AND r.failed_at IS NULL LIMIT 1"
+                "WHERE r.status = 'published' AND r.failed_at IS NULL LIMIT 1"
             )
         )
         row = result.first()
-    if row is None:
-        pytest.skip("no revisioned document in the test DB to shadow")
-    return UUID(str(row[0])), UUID(str(row[1]))
+    if row is not None:
+        return UUID(str(row[0])), UUID(str(row[1])), None
+    async with session_factory() as db:
+        result = await db.execute(
+            text(
+                "SELECT d.id, d.workspace_id FROM documents d "
+                "LEFT JOIN document_revisions r ON r.document_id = d.id "
+                "WHERE r.document_id IS NULL LIMIT 1"
+            )
+        )
+        target = result.first()
+        if target is None:
+            fallback = await db.execute(
+                text("SELECT id, workspace_id FROM documents LIMIT 1")
+            )
+            target = fallback.first()
+        if target is None:
+            pytest.skip("no document in the test DB to shadow")
+        document_id, workspace_id = UUID(str(target[0])), UUID(str(target[1]))
+        gen_row = (
+            await db.execute(
+                text(
+                    "SELECT COALESCE(MAX(generation), 0) + 1 "
+                    "FROM document_revisions WHERE document_id = :doc"
+                ),
+                {"doc": str(document_id)},
+            )
+        ).scalar_one()
+        fixture_id = _uuid.uuid4()
+        await db.execute(
+            text(
+                "INSERT INTO document_revisions "
+                "(revision_id, document_id, generation, status, created_at) "
+                "VALUES (:rid, :doc, :gen, 'published', NOW())"
+            ),
+            {"rid": str(fixture_id), "doc": str(document_id), "gen": gen_row},
+        )
+        await db.commit()
+    return document_id, workspace_id, fixture_id
+
+
+async def _delete_revision_fixture(engine: Any, revision_id: UUID) -> None:
+    """Remove a fixture row inserted by :func:`_pick_published_document`.
+
+    Uses a raw engine connection (never ``AsyncSession.commit``) so the
+    cleanup cannot trip the production commit spy installed around the
+    shadow run.
+    """
+    from sqlalchemy import text
+
+    async with engine.connect() as conn:
+        await conn.execute(
+            text("DELETE FROM document_revisions WHERE revision_id = :rid"),
+            {"rid": str(revision_id)},
+        )
+        await conn.commit()
 
 
 @pytest.mark.asyncio
@@ -784,10 +1115,11 @@ async def test_real_hook_factual_reaches_scheduler_isolated(
     )
 
     session_factory, engine = _v2_test_session_factory()
+    fixture_revision: UUID | None = None
     try:
         try:
-            document_id, workspace_id = await _pick_revisioned_document(
-                session_factory
+            document_id, workspace_id, fixture_revision = (
+                await _pick_published_document(session_factory)
             )
         except Exception as exc:
             pytest.skip(f"hook test setup read failed: {exc!r}")
@@ -798,6 +1130,7 @@ async def test_real_hook_factual_reaches_scheduler_isolated(
         out_counters, out_skipped = install_outbound_spies(monkeypatch)
         hard = [s for s in (*prod_skipped, *out_skipped) if not _is_env_skip(s)]
         assert not hard, f"spies unavailable: {hard}"
+        required_counters, relay_items = install_required_spies(monkeypatch)
 
         seen: list[dict[str, Any]] = []
         task = _maybe_launch_shadow_turn(
@@ -822,7 +1155,10 @@ async def test_real_hook_factual_reaches_scheduler_isolated(
         assert metrics["evaluation"] == "insufficient", metrics
         assert prod_counters == {}, f"production writes fired: {prod_counters}"
         assert out_counters == {}, f"outbound events fired: {out_counters}"
+        _assert_no_chat_relay_emission(required_counters, relay_items)
     finally:
+        if fixture_revision is not None:
+            await _delete_revision_fixture(engine, fixture_revision)
         await engine.dispose()
 
 
@@ -1058,3 +1394,93 @@ async def test_shadow_cancellation_reaches_terminal_state(
     # Primary cleanup proceeds ONLY after the terminal state.
     cleaned.append("primary-cleanup")
     assert cleaned == ["primary-cleanup"]
+
+
+@pytest.mark.asyncio
+async def test_persistently_resistant_shadow_fails_closed_bounded(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """R66.4: a NEVER-yielding shadow cannot block primary cleanup.
+
+    Against the REAL hook and the REAL cleanup join
+    (``_join_shadow_at_cleanup``): the bounded join returns ``stopped=False``
+    within a bounded wall-time even though the shadow is still alive, the
+    caller fails the shadow closed with an error log, and primary cleanup
+    is sequenced strictly after the join returns.
+    """
+    import logging as _logging
+    import time as _time
+
+    import app.services.agent.shadow_runtime as shadow_runtime
+    from app.api.chat_session import (
+        _join_shadow_at_cleanup,
+        _maybe_launch_shadow_turn,
+    )
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "NEXUSRAG_AGENT_V2_SHADOW_ENABLED", True)
+    monkeypatch.setattr(settings, "NEXUSRAG_AGENT_V2_SHADOW_PERCENT", 100.0)
+
+    async def _resistant_view(*args: Any, **kwargs: Any) -> dict:
+        await asyncio.sleep(0)
+        return {}
+
+    state = {"resist": True}
+
+    class _PersistentBundle:
+        async def run(self) -> Any:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                # Persistently resist: swallow EVERY cancel while flagged.
+                while state["resist"]:
+                    try:
+                        await asyncio.sleep(3600)
+                    except asyncio.CancelledError:
+                        continue
+                raise
+            raise AssertionError("persistent shadow should never return")
+
+    monkeypatch.setattr(
+        "app.api.chat_session.resolve_shadow_document_view", _resistant_view
+    )
+    monkeypatch.setattr(
+        shadow_runtime, "build_shadow_bundle", lambda **kwargs: _PersistentBundle()
+    )
+
+    task = _maybe_launch_shadow_turn(
+        raw_message="Xin chào",
+        thread_id="shadow-hook-persistent",
+        user_id=USER_ID,
+        workspace_ids=[WORKSPACE_ID],
+    )
+    assert task is not None
+    await asyncio.sleep(0.05)  # let the persistent run start
+    task.cancel()  # the primary run was cancelled
+    cleaned: list[str] = []
+    started = _time.monotonic()
+    with caplog.at_level(_logging.ERROR, logger="app.api.chat_session"):
+        stopped = await _join_shadow_at_cleanup(
+            task, session_id="shadow-hook-persistent", timeout=0.2
+        )
+    elapsed = _time.monotonic() - started
+    # Bounded end-to-end: the join returned instead of awaiting forever.
+    assert stopped is False
+    assert elapsed < 5.0, f"cleanup join was not bounded: {elapsed:.2f}s"
+    # The shadow is STILL alive (False is reachable, not a lie)...
+    assert not task.done()
+    # ...the caller failed it closed with an error log BEFORE cleanup...
+    assert any(
+        "failed to reach" in (record.message or "") for record in caplog.records
+    ), "missing fail-closed error log"
+    # ...and primary cleanup is sequenced strictly after the join.
+    cleaned.append("primary-cleanup")
+    assert cleaned == ["primary-cleanup"]
+    # Test hygiene: release the shadow and join it for real.
+    state["resist"] = False
+    task.cancel()
+    try:
+        await asyncio.wait_for(task, timeout=10)
+    except (asyncio.CancelledError, TimeoutError):
+        pass
+    assert task.done()
