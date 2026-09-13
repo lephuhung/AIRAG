@@ -184,8 +184,8 @@ git commit -m "feat(v2): enforce explicit document hard scope"
 - Create: `backend/app/services/agents/v2/skills/retrieve/policy.py`
 - Modify: `backend/app/services/agents/v2/complex_research_graph.py`
 - Modify: `backend/app/services/agents/v2/nodes/evaluate.py`
-- Modify: `backend/tests/agents/v2/complex/test_retrieval.py`
-- Modify: `backend/tests/agents/v2/test_evaluate.py`
+- Create: `backend/tests/agents/v2/complex/test_retrieval.py`
+- Modify: `backend/tests/agents/v2/test_evaluation_grounding.py`
 
 **Interfaces:**
 - Produces: `build_retrieve_plan(ResearchPlanningInput) -> TaskPlan`, initial proposal selection for `retrieve`, and evaluator-owned sufficiency/coverage semantics for admitted retrieval evidence.
@@ -213,8 +213,8 @@ Select it in `build_initial_proposal()` for `work_type == "retrieve"`; preserve 
 - [ ] **Step 4: Run GREEN and commit**
 
 ```bash
-cd backend && PYTHONPATH=. pytest tests/agents/v2/complex tests/agents/v2/test_evaluate.py tests/agents/v2/fast_paths/test_scheduler.py -q
-git add backend/app/services/agents/v2/skills/retrieve backend/app/services/agents/v2/complex_research_graph.py backend/app/services/agents/v2/nodes/evaluate.py backend/tests/agents/v2/complex/test_retrieval.py backend/tests/agents/v2/test_evaluate.py
+cd backend && PYTHONPATH=. pytest tests/agents/v2/complex tests/agents/v2/test_evaluation_grounding.py tests/agents/v2/fast_paths/test_scheduler.py -q
+git add backend/app/services/agents/v2/skills/retrieve backend/app/services/agents/v2/complex_research_graph.py backend/app/services/agents/v2/nodes/evaluate.py backend/tests/agents/v2/complex/test_retrieval.py backend/tests/agents/v2/test_evaluation_grounding.py
 git commit -m "feat(v2): plan and evaluate factual retrieval"
 ```
 
@@ -224,7 +224,9 @@ git commit -m "feat(v2): plan and evaluate factual retrieval"
 - Modify: `backend/app/services/agent/runtime_selector.py`
 - Modify: `backend/app/services/agents/supervisor_v2.py`
 - Modify: `backend/app/services/agents/v2/persistence/document_views.py`
+- Modify: `backend/app/services/agents/v2/tools/adapters.py`
 - Modify: `backend/tests/agents/v2/test_supervisor_v2_lifespan.py`
+- Modify: `backend/tests/agents/v2/complex/test_tool_gateway.py`
 - Modify: `backend/tests/api/test_agent_v2_streaming.py`
 
 **Interfaces:**
@@ -240,7 +242,7 @@ Run: `cd backend && PYTHONPATH=. pytest tests/agents/v2/test_supervisor_v2_lifes
 
 - [ ] **Step 3: Implement request-scoped service**
 
-The service loads exact manifest identity via `document_views`, invokes the existing HTTP embed/rerank client with workspace/document/revision namespace filters, and converts only matching results to `RevisionRetrievedChunk`. Register the capability in `build_v2_capability_registry`; do not add scope fields to `CapabilityRuntimeContext`.
+The service loads exact manifest identity via `document_views`, invokes the existing HTTP embed/rerank client with workspace/document/revision namespace filters, and converts only matching results to `RevisionRetrievedChunk`. Register the capability in `build_v2_capability_registry`; do not add scope fields to `CapabilityRuntimeContext`. Add `document.retrieve` to the existing model-facing `_TOOL_INPUT_TYPES` schema map so a registered visible tool cannot raise `UnknownAgentTool`; test the real registry/schema projection path.
 
 - [ ] **Step 4: Run GREEN and commit**
 
