@@ -122,9 +122,11 @@ async def _note_stage(
     ``kind="exhausted"`` atomically moves pending/running → failed AND
     terminalizes that revision (``mark_failed``) in the same DB
     transaction, so an exhausted stage can never strand a live revision
-    with a pending row and no redelivery. Returns True when the edge
-    moved, False when the row was left untouched (terminal state,
-    unknown revision/stage, or infrastructure error). When ``db`` is
+    with a pending row and no redelivery. Returns True when the note
+    applied without infrastructure error (including idempotent
+    convergence on an already-failed stage), False when the row was left
+    untouched (terminal non-failed state, unknown revision/stage) or the
+    infrastructure failed. When ``db`` is
     None a private session is opened and committed; otherwise the
     caller's transaction owns the write (flushed, never committed).
     """
@@ -236,6 +238,98 @@ async def _note_failure_stage(
             revision_id, stage, failure_class=failure_class, db=db
         )
     return stage
+
+
+class AbandonedStageRecoveryError(RuntimeError):
+    """Pre-handler stage recovery hit an infrastructure failure.
+
+    Raised BEFORE the pipeline handler runs so the broker does NOT ack
+    the delivery as a success: aio-pika's ``ProcessContext`` rejects on
+    raise, which routes to the DLQ instead of silently stranding the
+    stage in ``running`` with an acked (lost) message.
+    """
+
+
+def _is_claim_recovery_redelivery(message, retry_count: int) -> bool:
+    """True when this delivery may carry an abandoned ``running`` claim.
+
+    Ownership-loss signals only: the broker redelivered flag (the owner
+    died before ack) or the bounded retry header/count (a previous
+    attempt's ``running → pending`` note never landed, or the attempt
+    died without reaching a queue failure branch). Plain duplicates —
+    neither signal — return False so the worker claim still no-ops them
+    cheaply without touching the row.
+    """
+    try:
+        redelivered = bool(getattr(message, "redelivered", False))
+    except Exception:  # noqa: BLE001 - a quirky message must not break consume
+        redelivered = False
+    if redelivered:
+        return True
+    if retry_count >= 1:
+        return True
+    try:
+        headers = message.headers or {}
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        x_death = headers.get("x-death")
+    except Exception:  # noqa: BLE001
+        return False
+    return isinstance(x_death, (list, tuple)) and len(x_death) > 0
+
+
+async def _recover_abandoned_claim(
+    *, message, queue_name: str, exchange_name: str, revision_id, retry_count: int
+) -> str | None:
+    """Recover this delivery's exact stage ``running → pending`` if signaled.
+
+    Idempotent: only the message revision's own queue-mapped stage is
+    touched; terminal (completed/skipped/failed) and unknown rows are a
+    logged no-op (``"noop"``) — the worker's atomic claim still decides
+    the delivery. Returns ``"recovered"`` when the edge applied,
+    ``None`` when no recovery was warranted (no revision, no pipeline
+    stage, no ownership-loss signal). Raises
+    :class:`AbandonedStageRecoveryError` on infrastructure failure so the
+    caller never runs the handler into a no-op ack.
+    """
+    from app.services.agents.v2.persistence.document_revisions import (
+        DocumentRevisionsRepository,
+        InvalidStageTransition,
+        UnknownRevisionStage,
+    )
+
+    if revision_id is None:
+        return None
+    stage = stage_for_queue(queue_name, exchange_name)
+    if stage is None:
+        return None
+    if not _is_claim_recovery_redelivery(message, retry_count):
+        return None
+    from app.core.database import async_session_maker
+
+    try:
+        async with async_session_maker() as session:
+            repo = DocumentRevisionsRepository(session)
+            try:
+                await repo.mark_stage_retry_pending(revision_id, stage)
+            except (InvalidStageTransition, UnknownRevisionStage) as e:
+                logger.info(
+                    f"[stage] pre-handler recovery left rev={revision_id} "
+                    f"stage={stage} untouched: {e}"
+                )
+                return "noop"
+            await session.commit()
+    except Exception as e:  # infra failure must raise, never strand
+        raise AbandonedStageRecoveryError(
+            f"pre-handler recovery failed for rev={revision_id} "
+            f"stage={stage}: {e}"
+        ) from e
+    logger.info(
+        f"[stage] pre-handler recovery rev={revision_id} "
+        f"stage={stage} running→pending"
+    )
+    return "recovered"
 
 
 # ── Singleton connection ────────────────────────────────────────────────────
@@ -767,11 +861,35 @@ async def _consume_on_channel(
                                 except (TypeError, ValueError):
                                     revision_id = None
 
+                            # Abandoned-claim recovery (P1 Task 3 I-R1): a
+                            # durable running row outlives its owner when the
+                            # broker redelivers after a crash (redelivered)
+                            # or when the retry note failed before the retry
+                            # publish (retry header). Recover ONLY this
+                            # message revision's exact stage running→pending
+                            # so the worker's atomic claim below can execute
+                            # it. Terminal stages converge to a no-op; plain
+                            # duplicates (no signal) skip recovery entirely.
+                            # Infrastructure failure raises (see below) so the
+                            # handler never no-ops into a stranding ack.
+                            await _recover_abandoned_claim(
+                                message=message,
+                                queue_name=queue_name,
+                                exchange_name=exchange_name,
+                                revision_id=revision_id,
+                                retry_count=retry_count,
+                            )
+
                             async with asyncio.timeout(handler_timeout):
                                 await handler(payload)
 
                             elapsed = time.monotonic() - start_time
                             worker_metrics.record_success(queue_name, elapsed)
+                        except AbandonedStageRecoveryError:
+                            # Never handle as a worker failure (no ack, no
+                            # retry-note, no DLQ-via-exhaustion): propagate so
+                            # the broker rejects instead of acking.
+                            raise
                         except asyncio.TimeoutError:
                             elapsed = time.monotonic() - start_time
                             worker_metrics.record_failure(queue_name, elapsed)
@@ -878,7 +996,7 @@ async def _consume_on_channel(
                             # it). Exhaustion terminalizes that stage.
                             # Terminal stages and unknown revisions are left
                             # untouched by the note helpers.
-                            _timeout_stage = await _note_failure_stage(
+                            await _note_failure_stage(
                                 queue_name=queue_name,
                                 exchange_name=exchange_name,
                                 revision_id=revision_id,
@@ -952,8 +1070,7 @@ async def _consume_on_channel(
                             # revision/stage BEFORE the retry requeue below.
                             # Exhaustion takes the failed edge instead (no
                             # requeue follows, so no retry edge is reported).
-                            _will_retry = retry_count < MAX_RETRIES
-                            _error_stage = await _note_failure_stage(
+                            await _note_failure_stage(
                                 queue_name=queue_name,
                                 exchange_name=exchange_name,
                                 revision_id=revision_id,
