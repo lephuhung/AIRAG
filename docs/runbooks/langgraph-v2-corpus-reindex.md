@@ -33,8 +33,12 @@ superadmin JWT, or resolve the workspace by name from the pre-check output.
 ## 2. Execute
 
 ```bash
-API=http://localhost:8080/api/v1
-curl -s -X POST "$API/rag/reindex-workspace/$WS" -H "Authorization: Bearer $TOKEN" | jq
+# Obtain $TOKEN first: mint a short-lived superadmin JWT in-container per
+docs/auth.md ("Mint a JWT without a password"); never print or commit it.
+# Run curl INSIDE the container: host :8080 is the nginx proxy (it 301s) and
+hrag-backend publishes no host port, so localhost:8080 only serves the API
+# in-container.
+docker exec hrag-backend curl -s -X POST "http://localhost:8080/api/v1/rag/reindex-workspace/$WS" -H "Authorization: Bearer $TOKEN" | jq
 ```
 
 Run the smallest workspace first. The endpoint queues each document
@@ -44,18 +48,22 @@ Run the smallest workspace first. The endpoint queues each document
 ## 3. Verify
 
 ```bash
-# pointer + published revision + build artifacts
+# pointer + published revision + build artifacts. LEFT JOINs (not an inner
+# join) so an empty result means "no live documents in the workspace" while
+# rows with published=false mean "documents exist but nothing published yet".
 docker exec hrag-postgres psql -U postgres -d hrag -c \
-  "select d.id, d.current_revision_id, r.status, b.build_profile,
+  "select d.id, d.current_revision_id,
+          (r.status = 'published') as published, r.status, b.build_profile,
           b.markdown_artifact_key, b.structure_artifact_key,
           b.embedding_namespace, b.embedding_model_hash
      from documents d
-     join document_revisions r on r.revision_id = d.current_revision_id
+     left join document_revisions r on r.revision_id = d.current_revision_id
      left join document_revision_builds b on b.revision_id = r.revision_id
-    where d.workspace_id = '$WS';"
+    where d.workspace_id = '$WS' and d.source_deleted_at is null;"
 ```
 
-- `current_revision_id` is non-null and `status = 'published'` for every doc.
+- Every doc has a row with non-null `current_revision_id` and
+  `published = true` (`status = 'published'`).
 - `document_revision_builds` has the profile's required artifacts + embedding manifest.
 
 Boundary check (in-container, read-only):
