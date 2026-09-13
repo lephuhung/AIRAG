@@ -65,13 +65,16 @@ eval-rag:        ## DeepEval RAG quality suite against /api/v1/rag (WORKSPACE=$(
 eval-ragas:      ## RAGAS synthetic-testset eval
 	$(BK) python scripts/eval_ragas_synthetic.py
 
-# ── Agent A/B harness (compare two configs on one query set) ─────────────────
+# ── Agent A/B harness (compare two arms on one query set) ─────────────────────
+# Phase-3 preflight: ARM is v1|v2 (server-side selection via the admin-only
+# evaluation endpoint); OUTPUT optionally pins the report/diff path.
+# Unit suite (no live stack): run via the Phase-3 harness, see docs/harness.md.
 .PHONY: ab ab-compare
-ab:              ## Run one A/B arm: make ab ARM=react QUERIES=tests/retrieval/datasets/golden_retrieval.yaml WORKSPACE=<uuid>
+ab:              ## Run one preflight arm: make ab ARM=v1|v2 QUERIES=<golden.yaml> WORKSPACE=<uuid> [OUTPUT=<report.json>]
 	$(BK_AB) python -m scripts.ab_eval run --arm $(ARM) --queries $(QUERIES) \
-		--workspace $(WORKSPACE) --out tests/prompts/reports/ab_$(ARM)_$(TS).json
-ab-compare:      ## Diff two arm reports: make ab-compare A=ab_base.json B=ab_react.json
-	$(BK) python -m scripts.ab_eval compare $(A) $(B)
+		--workspace $(WORKSPACE) --out $(if $(OUTPUT),$(OUTPUT),tests/prompts/reports/ab_$(ARM)_$(TS).json)
+ab-compare:      ## Diff two arm reports: make ab-compare A=ab_v1.json B=ab_v2.json [OUTPUT=<diff.json>]
+	$(BK) python -m scripts.ab_eval compare $(A) $(B) $(if $(OUTPUT),--out $(OUTPUT),)
 
 # ── Prompt report diff ───────────────────────────────────────────────────────
 .PHONY: compare-prompts

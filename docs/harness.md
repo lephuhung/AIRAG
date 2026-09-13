@@ -95,33 +95,59 @@ bare `pytest` never talks to the models.
 
 ## Agent A/B harness
 
-Compares two backend **arms** on the same query set. An arm = an env configuration;
-flip the flag, `docker restart hrag-backend`, run the arm. The report snapshots the
-live `NEXUSRAG_*` env so it is self-describing. Reuses the golden-retrieval YAML
+Compares two backend **arms** (`v1` | `v2`) on the same query set. An arm is
+selected **server-side only**: the driver (`backend/scripts/ab_eval.py`)
+creates a chat session, then posts the arm in the body of the authenticated
+superadmin evaluation endpoint (`POST /api/v1/admin/agent/evaluate` →
+`{"version": arm}`). Client graph-version headers are never sent — the
+driver raises instead of transmitting one. Reuses the golden-retrieval YAML
 schema (`query` + optional `expect_document` / `expect_article` / `negative`).
 
-**Auth + workspace.** `debug-chat` is JWT-gated and `workspace_id` is a **UUID**
-(not the numeric id `eval_rag.py` still uses — that script predates auth and is
-stale). Export credentials once, and pass the target workspace UUID:
+**Auth + workspace.** Export credentials once, and pass the target workspace UUID:
 
 ```bash
 export AB_USER=admin@hrag.local AB_PASSWORD=...   # or: export AB_TOKEN=<jwt>
 WS=3e10d875-...                                   # a workspace UUID with documents
 
-# arm A — current default
-make ab ARM=base  QUERIES=tests/retrieval/datasets/golden_retrieval.yaml WORKSPACE=$WS
+# arm A — v1 default
+make ab ARM=v1 QUERIES=tests/retrieval/datasets/golden_retrieval.yaml WORKSPACE=$WS
 
-# flip the flag, then reload backend
-#   e.g. set NEXUSRAG_LG_RAG_REACT=true in .env
-make restart-backend
+# arm B — v2 (server-side selection; no client header, no backend restart)
+make ab ARM=v2 QUERIES=tests/retrieval/datasets/golden_retrieval.yaml WORKSPACE=$WS
 
-# arm B — ReAct executor
-make ab ARM=react QUERIES=tests/retrieval/datasets/golden_retrieval.yaml WORKSPACE=$WS
+# optional pinned paths: OUTPUT=<report.json> on `ab`, OUTPUT=<diff.json> on `ab-compare`
+make ab ARM=v1 QUERIES=... WORKSPACE=$WS OUTPUT=reports/ab_v1.json
 
-# diff — prints metric deltas + per-case regressions (A hit → B miss) + env delta
-make ab-compare A=backend/tests/prompts/reports/ab_base_<ts>.json \
-                B=backend/tests/prompts/reports/ab_react_<ts>.json
+# diff — prints metric deltas + per-case regressions; refuses on evaluator mismatch
+make ab-compare A=backend/tests/prompts/reports/ab_v1_<ts>.json \
+                B=backend/tests/prompts/reports/ab_v2_<ts>.json
 ```
+
+### Session-SSE preflight (Phase-3 Task 1)
+
+The golden preflight used by the rollout gates. The driver reads the named SSE
+events (`status` / `thinking` / `sources` / `images` / `token` / `complete` /
+`error`) to exactly one terminal event per turn and records
+`latency_ms` / citations / `status` per case, redacting auth tokens and raw
+message text before persisting. `backend/scripts/replay_v2.py` re-judges
+recorded transcripts through the same evaluator.
+
+**Shared evaluator version.** Both arms are judged by the SAME preflight
+evaluator (`EVALUATOR_VERSION` in `backend/scripts/ab_eval.py`, imported — never
+redefined — by `replay_v2.py`). Every report persists `evaluator_version`, and
+`ab-compare` REFUSES (exit 2) when the two reports' versions differ instead of
+diffing across evaluators.
+
+**Offline unit suite** (no live stack, no LLM) — the harness-executable
+deliverable:
+
+```bash
+.superpowers/sdd/2026-09-11-langgraph-v2-phase3-rollout/harness.sh \
+  'python -m pytest tests/scripts/test_v2_ab_replay.py -q'
+```
+
+from `/app/backend`. The `make ab ...` form above is documented for the Compose
+stack (needs the live backend + providers + `AB_TOKEN`); it is not run offline.
 
 Metrics per arm (all comparable, no judge needed): `latency_ms` (mean/p50/p95),
 `source_count_mean`, `article_hit_rate`, `doc_hit_rate`, `refuse_rate_positive`
