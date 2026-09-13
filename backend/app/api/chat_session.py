@@ -682,16 +682,20 @@ def _maybe_launch_shadow_turn(
     thread_id: str,
     user_id,
     workspace_ids,
+    document_ids=(),
+    history=(),
 ) -> "asyncio.Task | None":
     """Launch a best-effort shadow v2 turn alongside the primary run.
 
     Returns the shadow task when this turn is sampled (shadow enabled +
     percent gate hit), else ``None``. The shadow replays the raw message
-    through its OWN isolated graph/saver with read-only adapters: it never
-    writes production state and never emits outbound events — only redacted
-    metrics are logged. Any failure (including sampling disabled) returns
-    ``None`` so the primary turn is never affected. Cancellation follows
-    the primary run via the caller's ``finally: task.cancel()``.
+    — with the SAME filtered document ids and conversation history the
+    primary used, preserved read-only — through its OWN isolated
+    graph/saver: it never writes production state and never emits outbound
+    events — only redacted metrics are logged. Any failure (including
+    sampling disabled) returns ``None`` so the primary turn is never
+    affected. Cancellation follows the primary run: the caller joins the
+    task via ``_stop_shadow_task`` in its ``finally``.
     """
     try:
         from app.core.config import settings
@@ -720,6 +724,8 @@ def _maybe_launch_shadow_turn(
                 thread_id=thread_id,
                 user_id=user_id,
                 workspace_ids=tuple(workspace_ids or ()),
+                known_documents=tuple(document_ids or ()),
+                history=tuple(history or ()),
             )
             metrics = await bundle.run()
             logger.info("[shadow] turn complete: %s", metrics.redacted())
@@ -1266,14 +1272,19 @@ async def chat_stream_session(
                 # direct graph construction on any entrypoint).
                 graph = await resolve_agent_graph(version)
                 # Side-effect-free shadow v2 (Phase 3, Task 6): sampled
-                # alongside the primary run; cancellation follows the
-                # primary via the finally below. Best-effort — a shadow
-                # failure never affects the primary turn.
+                # alongside the primary run with the same filtered document
+                # ids and conversation history (preserved read-only).
+                # Cancellation follows the primary via the join below.
+                # Best-effort — a shadow failure never affects the primary.
                 shadow_task = _maybe_launch_shadow_turn(
                     raw_message=request.message,
                     thread_id=session_id,
                     user_id=user.id,
                     workspace_ids=runtime_workspace_ids,
+                    document_ids=tuple(filtered_doc_ids or ()),
+                    history=tuple(
+                        (item["role"], item["content"]) for item in history
+                    ),
                 )
                 try:
                     if version == "v2":
@@ -1296,10 +1307,16 @@ async def chat_stream_session(
                     else:
                         await _drain(stream_agent_to_sse(graph, initial_state))
                 finally:
-                    # Cancellation follows the primary run: a stopped or
-                    # finished primary never leaves a shadow running.
-                    if shadow_task is not None and not shadow_task.done():
-                        shadow_task.cancel()
+                    # Cancellation follows the primary run: the shadow is
+                    # cancelled (if pending) AND joined to a bounded
+                    # completion, so a stopped or finished primary never
+                    # leaves a shadow running past its own cleanup.
+                    if shadow_task is not None:
+                        from app.services.agent.shadow_runtime import (
+                            _stop_shadow_task,
+                        )
+
+                        await _stop_shadow_task(shadow_task, timeout=5.0)
 
             # Generate the title now (first exchange) and push it immediately so
             # the client updates without a refresh; reuse the summary downstream.

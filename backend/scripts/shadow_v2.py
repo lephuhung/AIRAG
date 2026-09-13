@@ -20,6 +20,12 @@ import argparse
 import asyncio
 import json
 import sys
+from pathlib import Path
+
+# Make `cd backend && python scripts/shadow_v2.py ...` work without an
+# external PYTHONPATH: direct script execution puts `backend/scripts` at
+# sys.path[0], so bootstrap the `backend/` parent for the `app` package.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def _build_parser() -> argparse.ArgumentParser:

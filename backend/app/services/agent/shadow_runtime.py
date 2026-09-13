@@ -8,25 +8,28 @@ Global constraints honored here:
 
 - Shadow compiles its OWN graph with an isolated saver bundle
   (``v2.persistence.shadow_checkpoint.create_shadow_checkpointer``); it
-  NEVER calls the production ``get_supervisor_v2_graph()`` and NEVER
+  NEVER calls the production ``get_supervisor_v2_graph()``, NEVER
   constructs the production saver (``v2.persistence.checkpoint`` is not
-  imported on any path in this module).
-- Read-only source adapters only: every shadow source is wrapped in
-  :class:`ReadOnlySourceAdapter`, whose write surface raises
-  :class:`ShadowIsolationError` (an ``AttributeError``, so ``hasattr``
-  reports no write path at all).
-- Cancellation follows the primary run (``asyncio`` cancellation
-  propagates through :meth:`ShadowBundle.run`; the run holds no commit
-  path, so a cancelled shadow persists nothing anywhere).
+  imported on any path), and never touches the production graph selector,
+  evidence governor, chat persistence, lease tables, or outbound sinks
+  (proven by AST + live-spy + DB-count tests).
+- Read-only source adapters only: every shadow source exposes reads and
+  raises :class:`ShadowIsolationError` on any write surface. The shadow
+  people directory, document view, semantic adapter, binding resolver,
+  evidence builder/hydrator, lease repo, chat-messages stub, and
+  authorization stub are all constructed over per-run ISOLATED stores.
+- Factual shadow queries reach the SHARED ``TaskScheduler`` and the REAL
+  ``people.lookup`` capability (built by the real
+  ``build_v2_capability_registry``); document/section reads stay gated out
+  and fail closed to typed outcomes. Cancellation follows the primary run
+  (``asyncio`` cancellation propagates; :func:`_stop_shadow_task` joins
+  the shadow to a bounded completion).
 - Output is discarded except redacted metrics (:class:`ShadowMetrics` —
-  status/route/counts/timing only, never response content).
+  status/route/evaluation/counts/timing only, never response content).
 - Exactly one ownership chain: the shadow graph is the same
   ``create_supervisor_v2_graph`` topology — no alternate graph/agent.
 - Frozen contract types are imported, never redefined.
-- Only the shared ``TaskScheduler`` may dispatch a capability; the shadow
-  bundle wires no capability registry (``None``), so any factual route
-  fails closed instead of dispatching. Shadow traffic is therefore
-  direct-route-shaped by construction.
+- Only the shared ``TaskScheduler`` dispatches a capability.
 """
 from __future__ import annotations
 
@@ -35,23 +38,46 @@ import logging
 import random
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+from typing import Any, Mapping
 from uuid import UUID, uuid4
 
-from app.services.agents.supervisor_v2 import create_supervisor_v2_graph
+from app.services.agents.supervisor_v2 import (
+    V1ServiceBundle,
+    build_v2_capability_registry,
+    create_supervisor_v2_graph,
+)
+from app.services.agents.v2.adapters.document import binding_id_for_ref
 from app.services.agents.v2.capabilities import CapabilityRuntimeContext
 from app.services.agents.v2.contracts.base import CONTRACT_VERSION
-from app.services.agents.v2.contracts.binding import DocumentBindingSet
-from app.services.agents.v2.contracts.conversation import ConversationContext
-from app.services.agents.v2.contracts.request import RequestContext
-from app.services.agents.v2.contracts.semantic import SemanticContext, SemanticDraft
+from app.services.agents.v2.contracts.binding import DocumentBindingSet, ScopedDocument
+from app.services.agents.v2.contracts.conversation import (
+    ConversationContext,
+    ConversationTurn,
+    EntityReference,
+)
+from app.services.agents.v2.contracts.evidence import (
+    EvidencePurpose,
+    EvidenceUse,
+    EvidenceUseRef,
+    PeopleSourceIdentity,
+    Provenance,
+)
+from app.services.agents.v2.contracts.request import KnownDocumentResource, RequestContext
+from app.services.agents.v2.contracts.semantic import (
+    DocumentReference,
+    SemanticContext,
+    SemanticDraft,
+)
 from app.services.agents.v2.contracts.state import (
     ExecutionState,
     GraphRuntimeContext,
     RuntimeServices,
     SupervisorV2State,
 )
+from app.services.agents.v2.contracts.validation import validate_evidence_use
+from app.services.agents.v2.nodes.evaluate import AnswerDraftChannel, HydratedEvidence
 from app.services.agents.v2.persistence.shadow_checkpoint import (
     ShadowCheckpointBundle,
     create_shadow_checkpointer,
@@ -63,11 +89,18 @@ __all__ = [
     "ShadowMetrics",
     "ReadOnlySourceAdapter",
     "IsolatedShadowStores",
+    "ShadowPeopleDirectory",
+    "ShadowSemanticAdapter",
+    "ShadowBindingResolver",
+    "ShadowEvidenceBuilder",
+    "ShadowEvidenceHydrator",
+    "ShadowLeaseRepo",
+    "ShadowChatMessages",
+    "ShadowAuthorization",
     "ShadowBundle",
     "build_shadow_bundle",
     "should_run_shadow",
     "shadow_sampling_enabled",
-    "emit_outbound_event",
 ]
 
 
@@ -84,38 +117,30 @@ class ShadowIsolationError(AttributeError):
     """
 
 
-def emit_outbound_event(*args: Any, **kwargs: Any) -> None:
-    """The single outbound-event funnel (SSE/webhook/Telegram/chat).
-
-    Production wiring routes every outbound emission through here. The
-    shadow path NEVER calls it — any call raises, so a stray emission
-    fails the run loudly instead of leaking an event. Tests spy on this
-    funnel (plus the real SSE formatter) to prove R55 silence.
-    """
-    raise ShadowIsolationError(
-        "shadow runs must never emit outbound events "
-        f"(got args={args!r} kwargs={kwargs!r})"
-    )
-
-
-#: Attribute names that count as a write path on a source adapter. Any
-#: access to one of these on a :class:`ReadOnlySourceAdapter` raises
-#: :class:`ShadowIsolationError`.
+#: Attribute names that count as a write/outbound path on a shadow object.
+#: Any access to one of these raises :class:`ShadowIsolationError`.
 _WRITE_SURFACE = frozenset(
     {
         "write",
         "save",
         "commit",
         "persist",
-        "delete",
-        "update",
-        "append",
+        "persist_record",
+        "persist_people_evidence",
+        "persist_use",
         "insert",
+        "insert_record",
+        "append",
+        "append_use",
         "upsert",
+        "update",
+        "delete",
         "remove",
         "put",
         "post",
         "send",
+        "send_message",
+        "send_chat_action",
         "emit",
         "publish",
         "notify",
@@ -173,7 +198,8 @@ class ReadOnlySourceAdapter:
     def __setattr__(self, name: str, value: Any) -> None:
         if name in _WRITE_SURFACE:
             raise ShadowIsolationError(
-                f"shadow source adapter is read-only; cannot set {name!r}"
+                "shadow source adapter is read-only; cannot set "
+                f"{name!r}"
             )
         object.__setattr__(self, name, value)
 
@@ -183,9 +209,11 @@ class IsolatedShadowStores:
     """Per-run isolated stores: fresh dicts, never production handles.
 
     Keys mirror the production tables the isolation proof watches
-    (checkpoint/evidence/use/audit/chat/memory/title) so the test can
-    assert the production mappings are untouched while the shadow run
-    writes only here.
+    (checkpoint/evidence/use/audit/chat/memory/title) so tests can assert
+    every shadow write landed here while production mappings/rows are
+    untouched. ``leases`` records isolated retention-lease acquisitions
+    (proving the scheduler's lease path ran without touching the lease
+    table).
     """
 
     checkpoint: dict[str, Any] = field(default_factory=dict)
@@ -195,68 +223,382 @@ class IsolatedShadowStores:
     chat: dict[str, Any] = field(default_factory=dict)
     memory: dict[str, Any] = field(default_factory=dict)
     title: dict[str, Any] = field(default_factory=dict)
+    leases: list[dict[str, Any]] = field(default_factory=list)
+
+    def write_count(self) -> int:
+        """Total isolated entries written (records + uses + leases)."""
+        return (
+            len(self.evidence)
+            + len(self.evidence_use)
+            + len(self.leases)
+            + len(self.checkpoint)
+        )
 
 
 @dataclass(frozen=True)
 class ShadowMetrics:
     """Redacted shadow-run metrics — the ONLY shadow output.
 
-    Carries status/route/counts/timing. Response content, citations,
-    evidence payloads, and user text are deliberately absent: there is no
-    field that could carry them.
+    Carries status/route/evaluation/counts/timing. Response content,
+    citations, evidence payloads, and user text are deliberately absent:
+    there is no field that could carry them.
     """
 
     status: str
     route: str | None
+    evaluation: str | None
     task_count: int
+    isolated_writes: int
     duration_ms: int
 
     def redacted(self) -> dict[str, Any]:
         return {
             "status": self.status,
             "route": self.route,
+            "evaluation": self.evaluation,
             "task_count": self.task_count,
+            "isolated_writes": self.isolated_writes,
             "duration_ms": self.duration_ms,
         }
 
 
-class _ShadowSemanticAdapter:
-    """Deterministic read-only semantic adapter over the raw query."""
+class ShadowPeopleDirectory:
+    """Read-only isolated people directory (the ``people.lookup`` backing).
 
-    def __init__(self, query: str) -> None:
-        self._query = query
+    Constructed over an isolated ``{name: record}`` snapshot — never over
+    Mongo or any production store. The ONLY method is ``lookup``; there is
+    no write surface at all.
+    """
+
+    def __init__(self, records: Mapping[str, Mapping[str, object]]) -> None:
+        self._records = {
+            str(name).strip().lower(): dict(record)
+            for name, record in dict(records).items()
+        }
+
+    async def lookup(self, query: str) -> Mapping[str, object] | None:
+        """Return the isolated record whose name appears in ``query``."""
+        needle = str(query).strip().lower()
+        for name, record in self._records.items():
+            if name and name in needle:
+                return dict(record)
+        return None
+
+
+class ShadowSemanticAdapter:
+    """Deterministic read-only semantic adapter that PRESERVES references.
+
+    Unlike a stripping adapter, the draft keeps person references (from
+    ``person_names``), document references (from ``known_documents``), and
+    the verbatim normalized query — so factual shadow queries route to the
+    real fast-domain topology instead of collapsing to ``direct``. It reads
+    only its isolated inputs and writes nothing.
+    """
+
+    def __init__(
+        self,
+        raw_query: str,
+        *,
+        person_names: tuple[str, ...] = (),
+        known_documents: tuple[UUID, ...] = (),
+        document_view: Mapping[Any, Mapping[str, Any]] | None = None,
+    ) -> None:
+        self._query = raw_query
+        self._person_names = tuple(person_names)
+        self._known_documents = tuple(known_documents)
+        self._view = dict(document_view or {})
+
+    def _document_ref(
+        self, index: int, document_id: UUID
+    ) -> DocumentReference:
+        """Resolve one known document against the isolated view (read-only).
+
+        Mirrors the production adapter's read path: a known document with
+        exactly one isolated candidate resolves (status + canonical id);
+        an unknown document stays unresolved so the router clarifies — a
+        typed outcome, never a guess.
+        """
+        if document_id in self._view:
+            return DocumentReference(
+                ref_id=f"doc-{index}",
+                original_span=str(document_id),
+                normalized_reference=str(document_id).lower(),
+                requested_role="target",
+                revision_requirement=None,
+                resolution_status="resolved",
+                resolved_document_id=document_id,
+                candidate_document_ids=(),
+            )
+        return DocumentReference(
+            ref_id=f"doc-{index}",
+            original_span=str(document_id),
+            normalized_reference=str(document_id).lower(),
+            requested_role="target",
+            revision_requirement=None,
+            resolution_status="unresolved",
+            resolved_document_id=None,
+            candidate_document_ids=(document_id,),
+        )
 
     async def build_draft(
         self, request: RequestContext, conversation: ConversationContext
     ) -> SemanticDraft:
+        normalized = self._query.strip()
         return SemanticDraft(
-            provisional_contextualized_query=self._query.strip().lower(),
+            provisional_contextualized_query=normalized.lower(),
             abbreviations=(),
             coreferences=(),
-            document_refs=(),
-            person_refs=(),
+            document_refs=tuple(
+                self._document_ref(index, document_id)
+                for index, document_id in enumerate(self._known_documents)
+            ),
+            person_refs=tuple(
+                EntityReference(ref_id=f"p{index}", kind="person", label=name)
+                for index, name in enumerate(self._person_names)
+            ),
             section_refs=(),
             preliminary_ambiguities=(),
         )
 
 
-class _ShadowBindingResolver:
-    """Read-only binding resolver: pins nothing, returns the empty set."""
+class ShadowBindingResolver:
+    """Read-only binding resolver over an isolated document view.
+
+    ``document_view`` maps ``document_id -> {"revision": str, "role": str}``
+    from an isolated snapshot. Refs whose candidate is in the view pin to a
+    ``ScopedDocument``; unknown refs stay unresolved (the router then
+    clarifies — a typed outcome, never a guess). No lease, session, or
+    production store is touched.
+    """
+
+    def __init__(self, document_view: Mapping[Any, Mapping[str, str]]) -> None:
+        self._view = {
+            (key if isinstance(key, UUID) else UUID(str(key))): dict(value)
+            for key, value in dict(document_view).items()
+        }
 
     async def resolve(
         self, document_refs: Any, capability_runtime: CapabilityRuntimeContext
     ) -> DocumentBindingSet:
-        return DocumentBindingSet(bindings=(), revision_requirement_refs=())
+        pinned: list[ScopedDocument] = []
+        for reference in document_refs or ():
+            document_id = getattr(reference, "resolved_document_id", None)
+            if document_id is None:
+                candidates = tuple(
+                    getattr(reference, "candidate_document_ids", ()) or ()
+                )
+                document_id = candidates[0] if len(candidates) == 1 else None
+            if document_id is None or document_id not in self._view:
+                continue
+            entry = self._view[document_id]
+            pinned.append(
+                ScopedDocument(
+                    binding_id=binding_id_for_ref(reference.ref_id),
+                    document_id=document_id,
+                    document_revision=str(entry.get("revision", "r1")),
+                    role=entry.get("role", "target"),  # type: ignore[arg-type]
+                )
+            )
+        return DocumentBindingSet(bindings=tuple(pinned), revision_requirement_refs=())
+
+
+class ShadowEvidenceBuilder:
+    """Isolated ``EvidenceBuilder``: mints records + uses into shadow stores.
+
+    Implements the ``EvidenceBuilder`` protocol (``persist_use``) so the
+    REAL capabilities persist through it during a factual shadow run. Every
+    write lands in :attr:`IsolatedShadowStores.evidence` /
+    ``evidence_use`` — never in the production evidence tables.
+    """
+
+    def __init__(self, stores: IsolatedShadowStores) -> None:
+        self._stores = stores
+
+    async def persist_use(
+        self,
+        *,
+        source: Any,
+        content: str,
+        provenance: Provenance,
+        task_id: str,
+        purpose: EvidencePurpose,
+        target_id: str | None,
+    ) -> EvidenceUseRef:
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("evidence content must be non-blank")
+        evidence_id = uuid4()
+        use = EvidenceUse(
+            use_id=uuid4(),
+            evidence_id=evidence_id,
+            task_id=task_id,
+            purpose=purpose,
+            target_id=target_id,
+        )
+        validate_evidence_use(use)
+        classification = (
+            "personal" if isinstance(source, PeopleSourceIdentity) else "normal"
+        )
+        self._stores.evidence[str(evidence_id)] = {
+            "source": source,
+            "content": content,
+            "provenance": provenance,
+            "classification": classification,
+        }
+        self._stores.evidence_use[str(use.use_id)] = {"use": use}
+        return EvidenceUseRef(use_id=use.use_id)
+
+
+class ShadowEvidenceHydrator:
+    """Isolated evidence hydrator resolving ONLY shadow-store uses.
+
+    Revalidates each use against the checkpointed plan (task membership;
+    coverage uses need a planned target) and resolves content from the
+    isolated evidence map. Unknown or plan-incompatible uses fail closed.
+    """
+
+    def __init__(self, stores: IsolatedShadowStores) -> None:
+        self._stores = stores
+
+    def _resolve(
+        self, use_refs: tuple[Any, ...], *, plan: Any, bindings: Any
+    ) -> tuple[HydratedEvidence, ...]:
+        task_ids = {task.task_id for task in plan.tasks}
+        target_ids = {unit.target_id for unit in plan.target_units}
+        hydrated: list[HydratedEvidence] = []
+        for reference in use_refs:
+            use_id = getattr(reference, "use_id", None)
+            entry = self._stores.evidence_use.get(str(use_id))
+            if entry is None:
+                raise ValueError(
+                    f"shadow hydrator cannot resolve unknown use {use_id!r}; "
+                    "refusing to hydrate outside the isolated stores"
+                )
+            use: EvidenceUse = entry["use"]
+            if use.task_id not in task_ids:
+                raise ValueError(
+                    f"shadow use {use_id!r} names no planned task; refusing"
+                )
+            if use.purpose == "coverage" and use.target_id not in target_ids:
+                raise ValueError(
+                    f"shadow coverage use {use_id!r} names no planned target"
+                )
+            record = self._stores.evidence.get(str(use.evidence_id))
+            if record is None:
+                raise ValueError(
+                    f"shadow use {use_id!r} resolves to no isolated record"
+                )
+            hydrated.append(
+                HydratedEvidence(
+                    use_id=use.use_id,
+                    evidence_id=use.evidence_id,
+                    task_id=use.task_id,
+                    purpose=use.purpose,
+                    target_id=use.target_id,
+                    content=record["content"],
+                    role=None,
+                    source_label="shadow-isolated",
+                    source_identity=record["source"],
+                    classification=record["classification"],
+                    locator=None,
+                )
+            )
+        return tuple(hydrated)
+
+    async def hydrate_for_evaluation(
+        self, use_refs: tuple[Any, ...], *, runtime: Any, plan: Any, bindings: Any
+    ) -> tuple[HydratedEvidence, ...]:
+        return self._resolve(tuple(use_refs), plan=plan, bindings=bindings)
+
+    async def hydrate_for_synthesis(
+        self,
+        use_refs: tuple[Any, ...],
+        *,
+        runtime: Any,
+        plan: Any,
+        bindings: Any,
+        budget: Any,
+    ) -> tuple[HydratedEvidence, ...]:
+        return tuple(
+            item
+            for item in self._resolve(tuple(use_refs), plan=plan, bindings=bindings)
+            if item.purpose != "discovery"
+        )
+
+
+class ShadowLeaseRepo:
+    """Isolated retention-lease repository (scheduler/binding lease path).
+
+    Records acquisitions into the isolated ``leases`` log so the shared
+    scheduler's lease-before-checkpoint path executes for real without
+    touching ``revision_retention_leases``.
+    """
+
+    def __init__(self, stores: IsolatedShadowStores) -> None:
+        self._stores = stores
+        self.session = self._Session(stores)
+
+    class _Session:
+        def __init__(self, stores: IsolatedShadowStores) -> None:
+            self._stores = stores
+
+        async def commit(self) -> None:
+            self._stores.leases.append({"event": "commit"})
+
+    async def acquire_or_refresh(
+        self, run_id: str, revision_id: Any, evidence_use_id: Any = None, **kwargs: Any
+    ) -> SimpleNamespace:
+        self._stores.leases.append(
+            {
+                "run_id": run_id,
+                "revision_id": revision_id,
+                "evidence_use_id": evidence_use_id,
+            }
+        )
+        return SimpleNamespace(
+            run_id=run_id, revision_id=revision_id, evidence_use_id=evidence_use_id
+        )
+
+
+class ShadowChatMessages:
+    """Read-only chat-messages stub: revision-tracked reads, no writes.
+
+    The shadow never resumes a clarification (it starts a fresh isolated
+    thread), so any read misses fail closed with ``LookupError`` — the
+    same contract as the production service's not-found path.
+    """
+
+    async def get_user_message(self, message_id: UUID) -> Any:
+        raise LookupError(f"shadow has no chat message {message_id!r}")
+
+
+class ShadowAuthorization:
+    """Read-only authorization stub over the isolated document view.
+
+    Allows only documents present in the isolated view whose workspace is
+    in the current runtime scope; everything else raises
+    ``PermissionError``. No production ACL store is consulted.
+    """
+
+    def __init__(self, document_view: Mapping[Any, Any]) -> None:
+        self._view = dict(document_view)
+
+    async def require_document(
+        self, document_id: UUID, capability_runtime: Any
+    ) -> None:
+        if isinstance(document_id, str):
+            document_id = UUID(document_id)
+        scope = {item for item in (capability_runtime.workspace_ids or ())}
+        entry = self._view.get(document_id)
+        workspace_id = (entry or {}).get("workspace_id")
+        if entry is None or (scope and workspace_id not in scope):
+            raise PermissionError(
+                f"document {document_id!r} is not in the shadow runtime scope"
+            )
 
 
 @dataclass
 class ShadowBundle:
-    """One shadow run: isolated saver + stores + read-only adapters + graph.
-
-    ``production_rows`` is an optional READ handle to the production-row
-    mapping under test; the bundle never writes through it (the isolation
-    test asserts identity of the mapping afterwards).
-    """
+    """One shadow run: isolated saver + stores + read-only adapters + graph."""
 
     raw_query: str
     thread_id: str
@@ -266,8 +608,11 @@ class ShadowBundle:
     graph: Any = field(repr=False)
     runtime_context: Any = field(repr=False)
     initial_state: SupervisorV2State = field(repr=False)
-    production_rows: Any = field(default=None, repr=False)
     metrics: ShadowMetrics | None = field(default=None)
+
+    def isolated_write_count(self) -> int:
+        """Entries written to isolated stores (never production)."""
+        return self.stores.write_count()
 
     async def run(self) -> ShadowMetrics:
         """Run one shadow turn; return redacted metrics, discard the rest.
@@ -275,7 +620,8 @@ class ShadowBundle:
         Cancellation (primary-run follow) propagates as
         ``asyncio.CancelledError``: the run holds no commit path, so a
         cancelled shadow persists nothing — not even to its isolated
-        stores. No outbound emitter is invoked on any path.
+        stores. No outbound emitter is invoked on any path. A suspended
+        (clarify) turn reports ``status="clarify"`` without resuming.
         """
         started = time.monotonic()
         config = {"configurable": {"thread_id": self.thread_id}}
@@ -283,13 +629,6 @@ class ShadowBundle:
             dict(self.initial_state), config, context=self.runtime_context
         )
         duration_ms = int((time.monotonic() - started) * 1000)
-        # Output is discarded except redacted metrics: read the terminal
-        # status/route/counts WITHOUT keeping content, citations, or uses.
-        final = result.get("final_response")
-        if isinstance(final, dict):
-            status = final.get("status", "error")
-        else:
-            status = getattr(final, "status", "error")
         decision = result.get("route_decision")
         if isinstance(decision, dict):
             route = decision.get("route")
@@ -298,43 +637,52 @@ class ShadowBundle:
         execution = result.get("execution")
         if isinstance(execution, dict):
             plan = execution.get("plan")
+            evaluation = execution.get("evidence_evaluation")
         else:
             plan = getattr(execution, "plan", None)
+            evaluation = getattr(execution, "evidence_evaluation", None)
+        if isinstance(evaluation, dict):
+            evaluation_status = evaluation.get("status")
+        else:
+            evaluation_status = getattr(evaluation, "status", None)
+        if "__interrupt__" in result:
+            status = "clarify"
+        else:
+            final = result.get("final_response")
+            if isinstance(final, dict):
+                status = final.get("status", "error")
+            else:
+                status = getattr(final, "status", "error")
         if plan is None:
             task_count = 0
         elif isinstance(plan, dict):
             task_count = len(plan.get("tasks", ()))
         else:
             task_count = len(getattr(plan, "tasks", ()))
+        # Record only counts in the isolated stores (never content).
+        self.stores.checkpoint[self.thread_id] = {
+            "status": str(status),
+            "task_count": task_count,
+        }
         self.metrics = ShadowMetrics(
             status=str(status),
             route=route,
+            evaluation=evaluation_status,
             task_count=task_count,
+            isolated_writes=self.isolated_write_count(),
             duration_ms=duration_ms,
         )
-        # Record only counts in the isolated stores (never content).
-        self.stores.checkpoint[self.thread_id] = {
-            "status": self.metrics.status,
-            "task_count": task_count,
-        }
         logger.info(
-            "shadow v2 turn complete: status=%s route=%s tasks=%d duration_ms=%d",
+            "shadow v2 turn complete: status=%s route=%s eval=%s tasks=%d "
+            "isolated_writes=%d duration_ms=%d",
             self.metrics.status,
             self.metrics.route,
+            self.metrics.evaluation,
             task_count,
+            self.metrics.isolated_writes,
             duration_ms,
         )
         return self.metrics
-
-    async def run_forever(self) -> ShadowMetrics:
-        """Park the shadow run until the primary run cancels it.
-
-        Models "cancellation follows the primary run": the parked shadow
-        holds no resources and persists nothing; primary cancellation
-        arrives as ``asyncio.CancelledError``.
-        """
-        while True:
-            await asyncio.sleep(3600)
 
 
 def build_shadow_bundle(
@@ -343,27 +691,52 @@ def build_shadow_bundle(
     thread_id: str,
     user_id: UUID | None = None,
     workspace_ids: tuple[UUID, ...] = (),
-    production_rows: Any = None,
+    person_names: tuple[str, ...] = (),
+    known_documents: tuple[UUID, ...] = (),
+    document_view: Mapping[Any, Mapping[str, Any]] | None = None,
+    people_directory: Mapping[str, Mapping[str, object]] | None = None,
+    history: tuple[tuple[str, str], ...] = (),
+    deadline_seconds: float = 120.0,
 ) -> ShadowBundle:
-    """Assemble one isolated shadow bundle (R54 ownership chain).
+    """Assemble one isolated shadow bundle (R54 ownership chain + R60).
 
-    Fresh isolated saver + isolated conversation/evidence/use/audit
-    stores + read-only source adapters
+    Fresh isolated saver + isolated conversation/evidence/use/audit stores
+    + read-only source adapters
     -> ``create_supervisor_v2_graph(checkpointer=isolated_saver)``.
 
     The SAME ``create_supervisor_v2_graph`` topology as production — no
-    alternate graph/agent. The production graph resolver, the production
-    saver factory, and the production graph resolver in
-    ``agent.runtime_selector`` are not referenced on this path.
+    alternate graph/agent. ``RuntimeServices`` is wired with the REAL
+    capability registry (built by ``build_v2_capability_registry`` around
+    the isolated read-only people directory + isolated evidence builder),
+    a non-empty ``allowed_capabilities`` consistent with
+    ``can_read_people``, a real future deadline, the isolated hydrator,
+    lease repo, read-only chat/authorization stubs, and a fresh
+    ``AnswerDraftChannel`` — so factual queries reach the SHARED
+    ``TaskScheduler`` while every write lands in isolated stores.
+    Document/section reads stay gated out and fail closed to typed
+    outcomes. ``person_names``/``known_documents``/``history`` preserve the
+    primary turn's references read-only instead of stripping them.
     """
     saver = create_shadow_checkpointer()
     assert is_shadow_saver(saver)
     namespace = f"shadow-{uuid4().hex[:12]}"
     stores = IsolatedShadowStores()
+    view = dict(document_view or {})
+    directory = ShadowPeopleDirectory(dict(people_directory or {}))
+    semantic_adapter = ShadowSemanticAdapter(
+        raw_query,
+        person_names=tuple(person_names),
+        known_documents=tuple(known_documents),
+        document_view=view,
+    )
+    binding_resolver = ShadowBindingResolver(view)
+    evidence_builder = ShadowEvidenceBuilder(stores)
+    hydrator = ShadowEvidenceHydrator(stores)
+    leases = ShadowLeaseRepo(stores)
     adapters = (
         ReadOnlySourceAdapter("conversation"),
         ReadOnlySourceAdapter("evidence"),
-        ReadOnlySourceAdapter("documents"),
+        ReadOnlySourceAdapter("documents", reader=directory),
         ReadOnlySourceAdapter("memory"),
     )
     graph = create_supervisor_v2_graph(checkpointer=saver)
@@ -372,23 +745,51 @@ def build_shadow_bundle(
         run_id=f"shadow-run-{uuid4().hex[:12]}",
         user_id=user_id or UUID("00000000-0000-0000-0000-000000000000"),
         workspace_ids=tuple(workspace_ids),
-        can_read_people=False,
-        allowed_capabilities=frozenset(),
-        deadline_at=datetime.now(UTC),
+        can_read_people=True,
+        # Route-admitting but dispatch-denying by design: document/section
+        # queries take the fast_domain topology (plan + shared scheduler +
+        # typed outcome) while only people.lookup is registry-backed, so
+        # document/section dispatch fails closed to DEPENDENCY_UNAVAILABLE.
+        allowed_capabilities=frozenset(
+            {"people.lookup", "document.read", "section.read"}
+        ),
+        deadline_at=datetime.now(UTC) + timedelta(seconds=deadline_seconds),
+    )
+    registry = build_v2_capability_registry(
+        capability_runtime,
+        bundle=V1ServiceBundle(
+            people_lookup=directory,
+            evidence=evidence_builder,
+        ),
+        evidence=evidence_builder,
+        resolver=None,
+        available_services=frozenset({"v1-people"}),
     )
     services = RuntimeServices(
-        retention_leases=None,
-        semantic_adapter=_ShadowSemanticAdapter(raw_query),
-        binding_resolver=_ShadowBindingResolver(),
-        capability_registry=None,
-        chat_messages=None,
-        authorization=None,
-        evidence_hydrator=None,
-        answer_draft_channel=None,
+        retention_leases=leases,
+        semantic_adapter=semantic_adapter,
+        binding_resolver=binding_resolver,
+        capability_registry=registry,
+        chat_messages=ShadowChatMessages(),
+        authorization=ShadowAuthorization(view),
+        evidence_hydrator=hydrator,
+        answer_draft_channel=AnswerDraftChannel(),
     )
     runtime_context = GraphRuntimeContext(
         capability_runtime=capability_runtime,
         services=services,
+    )
+    known_resources = tuple(
+        KnownDocumentResource(
+            resource_id=str(document_id),
+            document_id=document_id,
+            source="api_explicit",
+        )
+        for document_id in tuple(known_documents)
+    )
+    recent_turns = tuple(
+        ConversationTurn(role=role, content=content)  # type: ignore[arg-type]
+        for role, content in tuple(history)
     )
     initial_state = SupervisorV2State(
         contract_version=CONTRACT_VERSION,
@@ -397,10 +798,13 @@ def build_shadow_bundle(
             request_id=capability_runtime.request_id,
             thread_id=thread_id,
             original_query=raw_query,
-            known_documents=(),
+            known_documents=known_resources,
         ),
         conversation=ConversationContext(
-            summary="", active_entities=(), last_focus=None, recent_turns=()
+            summary="",
+            active_entities=(),
+            last_focus=None,
+            recent_turns=recent_turns,
         ),
         semantic=SemanticContext(
             contextualized_query="",
@@ -422,16 +826,30 @@ def build_shadow_bundle(
     return ShadowBundle(
         raw_query=raw_query,
         thread_id=f"{namespace}:{thread_id}",
-        checkpoint_bundle=ShadowCheckpointBundle(
-            saver=saver, namespace=namespace, _production_rows_ref=production_rows
-        ),
+        checkpoint_bundle=ShadowCheckpointBundle(saver=saver, namespace=namespace),
         stores=stores,
         source_adapters=adapters,
         graph=graph,
         runtime_context=runtime_context,
         initial_state=initial_state,
-        production_rows=production_rows,
     )
+
+
+async def _stop_shadow_task(task: asyncio.Task, *, timeout: float = 5.0) -> bool:
+    """Cancel (if pending) and join a shadow task to a bounded completion.
+
+    Returns True when the task reached a terminal state within ``timeout``.
+    Swallows every outcome — callers use this in ``finally`` paths where
+    the primary turn's cleanup must proceed regardless. Cancellation of the
+    primary run therefore always stops its shadow before cleanup proceeds.
+    """
+    if not task.done():
+        task.cancel()
+    try:
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+    except (asyncio.CancelledError, TimeoutError, Exception):
+        pass
+    return task.done()
 
 
 def should_run_shadow(*, percent: float, sample: float | None = None) -> bool:

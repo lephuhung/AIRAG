@@ -61,9 +61,3 @@ class ShadowCheckpointBundle:
 
     saver: InMemorySaver
     namespace: str
-    _production_rows_ref: Any = field(default=None, repr=False)
-
-    @property
-    def production_rows(self) -> Any:
-        """The production-row mapping under test (read handle only)."""
-        return self._production_rows_ref
