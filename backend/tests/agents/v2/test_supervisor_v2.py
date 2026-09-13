@@ -1694,3 +1694,48 @@ async def test_clarify_denied_selection_converts_to_typed_denied() -> None:
     assert resumed["clarification"] is None
     assert resumed["final_response"] is not None
     assert resumed["final_response"].status == "denied"
+
+
+@pytest.mark.asyncio
+async def test_build_draft_projects_api_explicit_hard_scope() -> None:
+    """P0 Task 3: build_draft projects api_explicit resources as hard targets."""
+    from app.services.agents.supervisor_v2 import DeterministicSemanticAdapter
+    from app.services.agents.v2.contracts.request import KnownDocumentResource
+
+    async def _fake_preprocess(raw_query: str):
+        from app.services.agents.semantic_preprocessor import PreprocessingResult
+
+        return PreprocessingResult(
+            original_query=raw_query,
+            normalized_query=raw_query.strip().lower(),
+            preprocessing_status="ok",
+            preprocessor_trace=[],
+        )
+
+    adapter = DeterministicSemanticAdapter(preprocess=_fake_preprocess)
+    request = RequestContext(
+        contract_version="2.0",
+        request_id="req-api",
+        thread_id="thread-api",
+        original_query="Văn bản được chỉ định nói gì về thuế",
+        known_documents=(
+            KnownDocumentResource(
+                resource_id="doc-1",
+                document_id=DOCUMENT_ID,
+                source="api_explicit",
+            ),
+            KnownDocumentResource(
+                resource_id="att-1",
+                document_id=OTHER_DOCUMENT_ID,
+                source="attachment",
+            ),
+        ),
+    )
+    first = await adapter.build_draft(request, make_conversation())
+    second = await adapter.build_draft(request, make_conversation())
+    assert first == second
+    assert [ref.ref_id for ref in first.document_refs] == ["api_explicit:doc-1"]
+    ref = first.document_refs[0]
+    assert ref.resolution_status == "resolved"
+    assert ref.resolved_document_id == DOCUMENT_ID
+    assert ref.requested_role == "target"

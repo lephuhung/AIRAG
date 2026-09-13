@@ -107,7 +107,7 @@ from .v2.contracts.planning import TaskPlan
 from .v2.contracts.request import KnownDocumentResource, RequestContext
 from .v2.contracts.response import FinalResponse
 from .v2.contracts.routing import QueryAnalysis, RouteDecision
-from .v2.contracts.semantic import SemanticContext, SemanticDraft
+from .v2.contracts.semantic import DocumentReference, SemanticContext, SemanticDraft
 from .v2.contracts.state import (
     ExecutionState,
     GraphRuntimeContext,
@@ -1187,9 +1187,20 @@ class DeterministicSemanticAdapter:
     every still-unresolved draft ref answered this way is projected to
     ``resolved`` with the selected canonical document id (candidates
     cleared). Only ``ui_selection`` sources reconcile — ``attachment`` /
-    ``conversation`` / ``api_explicit`` resources are never auto-bound
-    (T1 attachment exclusion), and an already-resolved ref is never
-    overridden. Deterministic and read-only like the rest of the build.
+    ``conversation`` resources are never auto-bound (T1 attachment
+    exclusion), and an already-resolved ref is never overridden.
+    Deterministic and read-only like the rest of the build.
+
+    ``api_explicit`` projection (P0 factual retrieval): after UI
+    reconciliation, every current-turn ``KnownDocumentResource`` with
+    ``source="api_explicit"`` is projected into a resolved ``target``
+    document reference whose ``ref_id`` is namespaced as
+    ``api_explicit:<resource_id>``. The namespace cannot collide with
+    preprocessor-generated ``r1``/``r2`` or clarification references, the
+    projection never reads document IDs from raw query text or model
+    output, and ordinary attachments stay unprojected candidates. The
+    Binding Resolver remains the sole owner that pins the projected refs
+    under the current ACL.
 
     T7/T8 LIFETIME REQUIREMENT (recorded): ``ui_selection`` attachments
     live on the thread-persisted ``RequestContext`` while v1 ref ids are
@@ -1231,6 +1242,60 @@ class DeterministicSemanticAdapter:
             return draft
         return draft.model_copy(update={"document_refs": refs})
 
+    #: Namespace prefix for API-explicit hard-scope reference IDs. The
+    #: prefix guarantees projected IDs cannot collide with
+    #: preprocessor-generated ``r1``/``r2`` or clarification references.
+    API_EXPLICIT_REF_PREFIX = "api_explicit:"
+
+    @staticmethod
+    def project_api_explicit_targets(
+        draft: SemanticDraft, request: RequestContext
+    ) -> SemanticDraft:
+        """Project current-turn ``api_explicit`` resources into target refs.
+
+        Builds one resolved ``target`` ``DocumentReference`` per
+        ``KnownDocumentResource`` with ``source == "api_explicit"``,
+        namespaced as ``api_explicit:<resource_id>``. Only resources
+        supplied for the current turn are projected; ordinary attachments,
+        conversation resources, and ``ui_selection`` answers are never
+        projected here, and an already-present namespaced ref is never
+        duplicated. Deterministic and read-only like the rest of the build.
+        """
+        explicit = [
+            known
+            for known in request.known_documents
+            if known.source == "api_explicit"
+        ]
+        if not explicit:
+            return draft
+        seen = {reference.ref_id for reference in draft.document_refs}
+        additions: list[DocumentReference] = []
+        for known in explicit:
+            ref_id = (
+                f"{DeterministicSemanticAdapter.API_EXPLICIT_REF_PREFIX}"
+                f"{known.resource_id}"
+            )
+            if ref_id in seen:
+                continue
+            seen.add(ref_id)
+            additions.append(
+                DocumentReference(
+                    ref_id=ref_id,
+                    original_span=f"tài liệu {known.resource_id}",
+                    normalized_reference=f"tài liệu {known.resource_id}",
+                    requested_role="target",
+                    revision_requirement=None,
+                    resolution_status="resolved",
+                    resolved_document_id=known.document_id,
+                    candidate_document_ids=(),
+                )
+            )
+        if not additions:
+            return draft
+        return draft.model_copy(
+            update={"document_refs": draft.document_refs + tuple(additions)}
+        )
+
     async def build_draft(
         self, request: RequestContext, conversation: ConversationContext
     ) -> SemanticDraft:
@@ -1246,7 +1311,8 @@ class DeterministicSemanticAdapter:
             raise SemanticAdapterError(
                 f"v1 preprocessing output cannot become a v2 draft: {exc}"
             ) from exc
-        return self.reconcile_ui_selections(draft, request)
+        reconciled = self.reconcile_ui_selections(draft, request)
+        return self.project_api_explicit_targets(reconciled, request)
 
 
 class V1BindingResolver:

@@ -37,6 +37,7 @@ from langgraph.runtime import Runtime
 
 from ..adapters.document import binding_id_for_ref
 from ..contracts.binding import DocumentBindingSet
+from ..contracts.request import RequestContext
 from ..contracts.routing import QueryAnalysis, RouteDecision, SemanticDependencyHint
 from ..contracts.semantic import SemanticContext
 from ..contracts.state import GraphRuntimeContext, SupervisorV2State
@@ -213,12 +214,38 @@ def _fast_or_runtime_dependency(
     return RouteDecision(route="complex_research", reason_code="runtime_dependency")
 
 
+def _has_api_explicit_target(
+    semantic: SemanticContext, request: RequestContext | None
+) -> bool:
+    """True when the current turn pins an API-explicit hard-scope target.
+
+    Matches only resolved semantic references whose namespaced
+    ``api_explicit:<resource_id>`` ID names a current-turn
+    ``api_explicit`` resource on the request: raw query text and model
+    output can never mint the namespace, so a match proves the target
+    came from the API ACL-filtered scope.
+    """
+    if request is None:
+        return False
+    explicit = {
+        f"api_explicit:{known.resource_id}"
+        for known in request.known_documents
+        if known.source == "api_explicit"
+    }
+    if not explicit:
+        return False
+    return any(
+        reference.ref_id in explicit for reference in semantic.document_refs
+    )
+
+
 def decide_route(
     analysis: QueryAnalysis,
     semantic: SemanticContext,
     bindings: DocumentBindingSet,
     *,
     allowed_capabilities: frozenset[str] = frozenset(),
+    request: RequestContext | None = None,
 ) -> RouteDecision:
     """Map deterministic analysis facts to one frozen route (never raises)."""
     if "write" in analysis.domains:
@@ -238,6 +265,15 @@ def decide_route(
         return RouteDecision(route="direct", reason_code=reason)  # type: ignore[arg-type]
 
     bound_count = _current_bound_count(semantic, bindings)
+    if analysis.work_type == "retrieve" and _has_api_explicit_target(
+        semantic, request
+    ):
+        # Hard-scoped factual retrieval (P0): an API-explicit document is a
+        # retrieval target, never the exact-document metadata/read fast path
+        # — including the one-document case.
+        return RouteDecision(
+            route="complex_research", reason_code="multi_document_research"
+        )
     if analysis.work_type == "lookup" and analysis.domains == ("people",):
         return _fast_or_runtime_dependency("people", allowed_capabilities, "simple_people_lookup")
     if (
@@ -290,5 +326,6 @@ async def route_node(
         state["semantic"],
         state["bindings"],
         allowed_capabilities=context.capability_runtime.allowed_capabilities,
+        request=state["request"],
     )
     return {"query_analysis": analysis, "route_decision": decision}

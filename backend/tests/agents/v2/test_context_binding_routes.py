@@ -1469,3 +1469,197 @@ async def test_route_node_returns_analysis_and_decision() -> None:
     update = await route_node(state, make_graph_runtime())
     assert update["route_decision"].route == "direct"
     assert update["query_analysis"] is not None
+
+
+# ---------------------------------------------------------------------------
+# P0 Task 3: api_explicit hard-scope projection + scoped factual routing
+# ---------------------------------------------------------------------------
+
+API_DOCUMENT_ID = UUID("33333333-3333-3333-3333-333333333333")
+API_OTHER_DOCUMENT_ID = UUID("44444444-4444-4444-4444-444444444444")
+
+
+def api_explicit_request(
+    *pairs: tuple[str, UUID], query: str = "Văn bản được chỉ định nói gì về thuế"
+) -> RequestContext:
+    return RequestContext(
+        contract_version="2.0",
+        request_id="req-api",
+        thread_id="thread-api",
+        original_query=query,
+        known_documents=tuple(
+            KnownDocumentResource(
+                resource_id=resource_id,
+                document_id=document_id,
+                source="api_explicit",
+            )
+            for resource_id, document_id in pairs
+        ),
+    )
+
+
+def api_explicit_ref(
+    resource_id: str = "doc-1", document_id: UUID = API_DOCUMENT_ID
+) -> DocumentReference:
+    return DocumentReference(
+        ref_id=f"api_explicit:{resource_id}",
+        original_span=f"tài liệu {resource_id}",
+        normalized_reference=f"tài liệu {resource_id}",
+        requested_role="target",
+        revision_requirement=None,
+        resolution_status="resolved",
+        resolved_document_id=document_id,
+        candidate_document_ids=(),
+    )
+
+
+def test_api_explicit_single_resource_projects_deterministic_target() -> None:
+    from app.services.agents.supervisor_v2 import DeterministicSemanticAdapter
+
+    request = api_explicit_request(("doc-1", API_DOCUMENT_ID))
+    first = DeterministicSemanticAdapter.project_api_explicit_targets(
+        greeting_draft(), request
+    )
+    second = DeterministicSemanticAdapter.project_api_explicit_targets(
+        greeting_draft(), request
+    )
+    assert first == second
+    assert len(first.document_refs) == 1
+    ref = first.document_refs[0]
+    assert ref.ref_id == "api_explicit:doc-1"
+    assert ref.resolution_status == "resolved"
+    assert ref.resolved_document_id == API_DOCUMENT_ID
+    assert ref.requested_role == "target"
+
+
+def test_api_explicit_multiple_resources_project_all_targets() -> None:
+    from app.services.agents.supervisor_v2 import DeterministicSemanticAdapter
+
+    request = api_explicit_request(
+        ("doc-1", API_DOCUMENT_ID), ("doc-2", API_OTHER_DOCUMENT_ID)
+    )
+    projected = DeterministicSemanticAdapter.project_api_explicit_targets(
+        greeting_draft(), request
+    )
+    assert [ref.ref_id for ref in projected.document_refs] == [
+        "api_explicit:doc-1",
+        "api_explicit:doc-2",
+    ]
+    assert [ref.resolved_document_id for ref in projected.document_refs] == [
+        API_DOCUMENT_ID,
+        API_OTHER_DOCUMENT_ID,
+    ]
+    assert all(ref.requested_role == "target" for ref in projected.document_refs)
+
+
+def test_ordinary_attachment_is_not_projected_as_target() -> None:
+    from app.services.agents.supervisor_v2 import DeterministicSemanticAdapter
+
+    request = RequestContext(
+        contract_version="2.0",
+        request_id="req-att",
+        thread_id="thread-att",
+        original_query="Xem Nghị định 12/2020",
+        known_documents=(
+            KnownDocumentResource(
+                resource_id="att-1",
+                document_id=ATTACHMENT_DOCUMENT_ID,
+                source="attachment",
+            ),
+        ),
+    )
+    projected = DeterministicSemanticAdapter.project_api_explicit_targets(
+        greeting_draft(), request
+    )
+    assert projected.document_refs == ()
+
+
+def test_api_explicit_ids_cannot_collide_with_preprocessor_refs() -> None:
+    from app.services.agents.supervisor_v2 import DeterministicSemanticAdapter
+
+    # Even a hostile resource_id of "r1" namespaces to "api_explicit:r1".
+    request = api_explicit_request(("r1", API_DOCUMENT_ID))
+    draft = draft_with_refs((resolved_ref(ref_id="r1"),))
+    projected = DeterministicSemanticAdapter.project_api_explicit_targets(
+        draft, request
+    )
+    assert [ref.ref_id for ref in projected.document_refs] == [
+        "r1",
+        "api_explicit:r1",
+    ]
+    assert binding_id_for_ref("api_explicit:r1") != binding_id_for_ref("r1")
+
+
+def test_scoped_factual_document_routes_complex_not_fast() -> None:
+    semantic = SemanticContext(
+        contextualized_query="Văn bản được chỉ định nói gì về thuế",
+        normalized_query="văn bản được chỉ định nói gì về thuế",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(api_explicit_ref(),),
+        person_refs=(),
+        section_refs=(),
+        blocking_ambiguities=(),
+    )
+    bindings = DocumentBindingSet(
+        bindings=(
+            ScopedDocument(
+                binding_id="b_api_explicit:doc-1",
+                document_id=API_DOCUMENT_ID,
+                document_revision=str(REVISION_ID),
+                role="target",
+            ),
+        ),
+        revision_requirement_refs=(),
+    )
+    analysis = analyze_query(semantic)
+    assert analysis.work_type == "retrieve"
+    # Without the request the legacy exact-document fast path still applies.
+    legacy = decide_route(
+        analysis, semantic, bindings, allowed_capabilities=FULL_CAPABILITIES
+    )
+    assert legacy.route == "fast_domain"
+    # With the current explicit scope the same factual query must go complex.
+    request = api_explicit_request(("doc-1", API_DOCUMENT_ID))
+    decision = decide_route(
+        analysis,
+        semantic,
+        bindings,
+        allowed_capabilities=FULL_CAPABILITIES,
+        request=request,
+    )
+    assert decision.route == "complex_research"
+    assert decision.reason_code == "multi_document_research"
+
+
+@pytest.mark.asyncio
+async def test_route_node_passes_request_for_scoped_routing() -> None:
+    semantic = SemanticContext(
+        contextualized_query="Văn bản được chỉ định nói gì",
+        normalized_query="văn bản được chỉ định nói gì",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(api_explicit_ref(),),
+        person_refs=(),
+        section_refs=(),
+        blocking_ambiguities=(),
+    )
+    bindings = DocumentBindingSet(
+        bindings=(
+            ScopedDocument(
+                binding_id="b_api_explicit:doc-1",
+                document_id=API_DOCUMENT_ID,
+                document_revision=str(REVISION_ID),
+                role="target",
+            ),
+        ),
+        revision_requirement_refs=(),
+    )
+    state = make_state(
+        request=api_explicit_request(("doc-1", API_DOCUMENT_ID)),
+        semantic=semantic,
+        bindings=bindings,
+    )
+    update = await route_node(state, make_graph_runtime())
+    assert update["route_decision"].route == "complex_research"
+    assert update["route_decision"].reason_code == "multi_document_research"
