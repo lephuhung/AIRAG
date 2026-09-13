@@ -18,6 +18,7 @@ BK_EVAL   := docker exec -e PROMPT_EVAL=1 hrag-backend
 # A/B forwards auth env (JWT-gated debug-chat): export AB_TOKEN, or AB_USER+AB_PASSWORD.
 BK_AB     := docker exec -e AB_TOKEN -e AB_USER -e AB_PASSWORD -e AB_TOTP hrag-backend
 WORKSPACE ?=             # workspace UUID (required for eval-rag / ab)
+AB_BASE_URL ?= http://localhost:8080  # server origin (NO /api/v1 suffix; routes carry it)
 TS        := $(shell date +%Y%m%dT%H%M%S)
 
 # ── Stack lifecycle ──────────────────────────────────────────────────────────
@@ -72,7 +73,7 @@ eval-ragas:      ## RAGAS synthetic-testset eval
 .PHONY: ab ab-compare
 ab:              ## Run one preflight arm: make ab ARM=v1|v2 QUERIES=<golden.yaml> WORKSPACE=<uuid> [OUTPUT=<report.json>]
 	$(BK_AB) python -m scripts.ab_eval run --arm $(ARM) --queries $(QUERIES) \
-		--workspace $(WORKSPACE) --out $(if $(OUTPUT),$(OUTPUT),tests/prompts/reports/ab_$(ARM)_$(TS).json)
+		--workspace $(WORKSPACE) --base-url $(AB_BASE_URL) --out $(if $(OUTPUT),$(OUTPUT),tests/prompts/reports/ab_$(ARM)_$(TS).json)
 ab-compare:      ## Diff two arm reports: make ab-compare A=ab_v1.json B=ab_v2.json [OUTPUT=<diff.json>]
 	$(BK) python -m scripts.ab_eval compare $(A) $(B) $(if $(OUTPUT),--out $(OUTPUT),)
 

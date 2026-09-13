@@ -7,11 +7,12 @@ rollout gates. Two subcommands:
   authenticated session-SSE surface with **server-side arm selection** and
   write an evaluator-versioned JSON report.
 - ``compare`` — diff two arm reports evaluated by the SAME preflight
-  evaluator version; rejects comparison when versions differ.
+  evaluator version; rejects comparison when versions differ or when the
+  reports are incomparable.
 
 Global-constraint compliance (binding):
 
-- Arm selection is server-side only: the arm travels in the body of the
+- Arm selection is server-side only: the measured arm results come from the
   authenticated superadmin evaluation endpoint
   (``POST /api/v1/admin/agent/evaluate`` → ``{"version": arm}``). This
   driver NEVER sends client graph-version headers — any such header raises
@@ -20,6 +21,9 @@ Global-constraint compliance (binding):
 - Every report persists ``evaluator_version`` (``EVALUATOR_VERSION`` — the
   single source of truth, shared with ``replay_v2``); ``compare`` rejects
   mismatched versions instead of diffing across evaluators.
+- ``--base-url`` is a server ORIGIN with no ``/api/v1`` suffix (default
+  ``http://localhost:8080``); every route constant carries the full
+  ``/api/v1/...`` prefix and URLs are composed with ``compose_url``.
 
 Live usage (Compose stack: live backend + providers + AB_TOKEN)::
 
@@ -35,6 +39,7 @@ Offline unit suite (no backend, no LLM)::
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import re
 import sys
@@ -87,13 +92,50 @@ CLIENT_GRAPH_VERSION_HEADERS = frozenset(
 
 SESSIONS_PATH = "/api/v1/rag/chat/sessions"
 ADMIN_EVALUATE_PATH = "/api/v1/admin/agent/evaluate"
+ADMIN_STATUS_PATH = "/api/v1/admin/agent/status"
+
+DEFAULT_BASE_URL = "http://localhost:8080"
 
 _BEARER_RE = re.compile(r"Bearer\s+\S+", re.IGNORECASE)
 REDACTED = "[REDACTED]"
 
+_REFUSAL_RE = re.compile(
+    r"không tìm thấy|không có thông tin|ngoài phạm vi|không thể trả lời"
+    r"|no information|cannot (find|answer)|not found|out of scope"
+    r"|insufficient (sources|information)",
+    re.IGNORECASE,
+)
+_ARTICLE_RE = re.compile(r"[Đđ]iều\s+(\d+)")
+
 
 class EvaluatorVersionMismatch(ValueError):
     """Reports were produced by different preflight evaluator versions."""
+
+
+class CompareRefused(ValueError):
+    """Reports are incomparable (no overlap or no usable baseline)."""
+
+
+# ---------------------------------------------------------------------------
+# URL composition: origin + full /api/v1/... route (R10.1)
+# ---------------------------------------------------------------------------
+
+
+def compose_url(base_url: str, path: str) -> str:
+    """Join a server origin with a full ``/api/v1/...`` route path."""
+    if not path.startswith("/"):
+        raise ValueError(f"route path must start with '/': {path!r}")
+    return base_url.rstrip("/") + path
+
+
+def session_stream_path(session_id: str) -> str:
+    """Session SSE endpoint carrying the created session's id."""
+    return f"{SESSIONS_PATH}/{session_id}/stream"
+
+
+def session_path(session_id: str) -> str:
+    """Single-session route (delete-after-smoke)."""
+    return f"{SESSIONS_PATH}/{session_id}"
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +161,13 @@ def build_auth_headers(token: str) -> dict[str, str]:
     return headers
 
 
+def build_sse_headers(token: str) -> dict[str, str]:
+    """Headers for the session SSE stream: bearer + event-stream Accept."""
+    headers = {**build_auth_headers(token), "Accept": "text/event-stream"}
+    assert_no_client_version_headers(headers)
+    return headers
+
+
 # ---------------------------------------------------------------------------
 # Minimal HTTP client (injectable for offline tests)
 # ---------------------------------------------------------------------------
@@ -137,7 +186,7 @@ class UrllibHttpClient:
         assert_no_client_version_headers(dict(headers or {}))
         data = json.dumps(payload).encode() if payload is not None else None
         request = urllib.request.Request(
-            self.base_url + path,
+            compose_url(self.base_url, path),
             data=data,
             headers={"Content-Type": "application/json", **dict(headers or {})},
             method=method,
@@ -145,8 +194,14 @@ class UrllibHttpClient:
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
             return SimpleResponse(response.status, response.read().decode())
 
+    def get(self, path: str, *, headers=None) -> Any:
+        return self._request("GET", path, headers=headers)
+
     def post(self, path: str, *, headers=None, json=None) -> Any:
         return self._request("POST", path, headers=headers, payload=json)
+
+    def delete(self, path: str, *, headers=None) -> Any:
+        return self._request("DELETE", path, headers=headers)
 
 
 class SimpleResponse:
@@ -156,6 +211,71 @@ class SimpleResponse:
 
     def json(self):
         return json.loads(self.text)
+
+
+# ---------------------------------------------------------------------------
+# Raw SSE frame parser (session stream is text/event-stream, not JSON)
+# ---------------------------------------------------------------------------
+
+
+def parse_sse_stream(raw: bytes | str) -> list[dict]:
+    """Parse raw ``text/event-stream`` bytes into named ``{event, data}``.
+
+    Frames are split on blank lines; ``event:`` names the frame (default
+    ``message``), consecutive ``data:`` lines join with ``\\n``, ``:`` comment
+    lines are skipped, and each data payload is JSON-decoded when possible
+    (kept as a raw string otherwise).
+    """
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+    events: list[dict] = []
+    name: str | None = None
+    data_lines: list[str] = []
+
+    def _flush() -> None:
+        nonlocal name, data_lines
+        if name is None and not data_lines:
+            return
+        payload = "\n".join(data_lines)
+        try:
+            data: Any = json.loads(payload) if payload else {}
+        except ValueError:
+            data = payload
+        events.append({"event": name or "message", "data": data})
+        name, data_lines = None, []
+
+    for line in text.splitlines():
+        if not line.strip():
+            _flush()
+            continue
+        if line.startswith(":"):
+            continue
+        field, _, value = line.partition(":")
+        value = value.lstrip(" ")
+        if field == "event":
+            # A new event line without an intervening blank line still
+            # terminates the previous frame (tolerant split).
+            if name is not None or data_lines:
+                _flush()
+            name = value or "message"
+        elif field == "data":
+            data_lines.append(value)
+    _flush()
+    return events
+
+
+def collect_first_terminal(events: list[dict]) -> dict:
+    """First terminal event of a parsed SSE frame list.
+
+    The live session stream is consumed to its first terminal (``complete``
+    or ``error``); later frames (e.g. heartbeats after close) are ignored.
+    """
+    for event in events:
+        if event.get("event") in TERMINAL_EVENTS:
+            return event
+    raise ValueError(
+        f"stream ended with no terminal event {TERMINAL_EVENTS}; "
+        f"got {[event.get('event') for event in events]}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +296,7 @@ def create_session(
     """
     del base_url  # paths are absolute; the client owns the host.
     headers = build_auth_headers(token)
-    payload: dict[str, Any] = {}
+    payload: dict[str, Any] = {"title": "AB preflight"}
     if workspace_id:
         payload["workspace_id"] = workspace_id
     response = client.post(SESSIONS_PATH, headers=headers, json=payload)
@@ -185,6 +305,14 @@ def create_session(
     if not session_id:
         raise ValueError(f"session creation returned no id: {body!r}")
     return str(session_id)
+
+
+def delete_session(client: Any, *, token: str, session_id: str) -> None:
+    """Best-effort delete of the smoke session (route exists: 204/200)."""
+    try:
+        client.delete(session_path(session_id), headers=build_auth_headers(token))
+    except Exception:  # noqa: BLE001 — cleanup must not fail the report
+        pass
 
 
 def evaluate_arm(
@@ -215,6 +343,70 @@ def evaluate_arm(
         raise PermissionError("admin evaluation endpoint returned 403")
     body = response.json()
     return str(body.get("version", normalized)), list(body.get("events", []))
+
+
+def get_configured_arm(client: Any, *, token: str) -> str:
+    """Probe the server-owned configured arm (no client selection exists)."""
+    response = client.get(ADMIN_STATUS_PATH, headers=build_auth_headers(token))
+    if response.status_code == 403:
+        raise PermissionError("admin status endpoint returned 403")
+    return str(response.json().get("configured_version", "")).strip().lower()
+
+
+def run_session_sse_smoke(
+    client: Any,
+    *,
+    token: str,
+    arm: str,
+    message: str,
+    workspace_id: str | None = None,
+) -> dict:
+    """One turn through the REAL session SSE endpoint (R10.4).
+
+    Creates a session, POSTs ``{session_id}/stream`` with
+    ``Accept: text/event-stream``, parses raw ``event:``/``data:`` frames to
+    the first terminal, deletes the session, and records the smoke. The
+    stream runs on the server-configured arm: the smoke fails when
+    ``configured_version != --arm``.
+    """
+    started = time.monotonic()
+    smoke: dict[str, Any] = {
+        "session_id": None,
+        "configured_version": None,
+        "terminal_event": None,
+        "latency_ms": 0,
+        "ok": False,
+    }
+    try:
+        configured = get_configured_arm(client, token=token)
+        smoke["configured_version"] = configured
+        if configured != arm:
+            smoke["error"] = (
+                f"server configured_version={configured!r} != --arm {arm!r}"
+            )
+            return smoke
+        session_id = create_session(
+            client, base_url="", token=token, workspace_id=workspace_id
+        )
+        smoke["session_id"] = session_id
+        response = client.post(
+            session_stream_path(session_id),
+            headers=build_sse_headers(token),
+            json={"message": message},
+        )
+        events = parse_sse_stream(response.text)
+        terminal = collect_first_terminal(events)
+        smoke["terminal_event"] = terminal.get("event")
+        smoke["ok"] = terminal.get("event") == "complete"
+        if not smoke["ok"]:
+            smoke["error"] = f"smoke terminal was {terminal.get('event')!r}"
+    except Exception as exc:  # noqa: BLE001 — smoke failure, not a crash
+        smoke["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        smoke["latency_ms"] = max(int((time.monotonic() - started) * 1000), 0)
+        if smoke["session_id"]:
+            delete_session(client, token=token, session_id=smoke["session_id"])
+    return smoke
 
 
 def collect_terminal(events: list[dict]) -> dict:
@@ -272,6 +464,80 @@ def evaluate_output(
     }
 
 
+# ---------------------------------------------------------------------------
+# Golden functional evaluation (R10.5: document/article/negative quality)
+# ---------------------------------------------------------------------------
+
+
+def match_doc_pattern(citation: str, pattern: str) -> bool:
+    """SQL-ILIKE match: ``%`` is a wildcard, case-insensitive."""
+    cleaned = str(pattern).strip().strip("'\"").lower().replace("%", "*")
+    return fnmatch.fnmatchcase(str(citation).lower(), cleaned)
+
+
+def evaluate_functional(
+    case: dict, *, citations: list[str], answer: str, status: str
+) -> dict:
+    """Judge a golden case's expectations against citations + answer text.
+
+    ``expect_document``/``accept_documents`` (ILIKE ``%`` patterns),
+    ``expect_article`` (``Điều N`` mentions in the answer), ``negative``
+    (refusal or non-complete terminal expected); ``tags`` persist for
+    filtering. A non-complete turn fails functionally by definition.
+    """
+    complete = status == "complete"
+    negative = bool(case.get("negative", False))
+    tags = list(case.get("tags", []) or [])
+    expected_doc = case.get("expect_document")
+    accepted = list(case.get("accept_documents", []) or [])
+    expected_articles = list(case.get("expect_article", []) or [])
+
+    doc_hit: bool | None = None
+    if expected_doc is not None:
+        patterns = [expected_doc, *accepted]
+        doc_hit = any(
+            match_doc_pattern(citation, pattern)
+            for citation in citations
+            for pattern in patterns
+        )
+
+    article_hit: bool | None = None
+    article_missing: list[int] = []
+    if expected_articles:
+        mentioned = {int(number) for number in _ARTICLE_RE.findall(answer or "")}
+        article_missing = [
+            number for number in expected_articles if number not in mentioned
+        ]
+        article_hit = complete and not article_missing
+
+    negative_pass: bool | None = None
+    if negative:
+        negative_pass = (not complete) or bool(_REFUSAL_RE.search(answer or ""))
+
+    if negative:
+        functional_pass: bool | None = bool(negative_pass)
+    elif expected_doc is not None:
+        functional_pass = bool(complete and doc_hit) and (
+            article_hit is not False
+        )
+    else:
+        functional_pass = bool(complete) if not expected_articles else None
+        if expected_articles and functional_pass:
+            functional_pass = bool(article_hit)
+
+    return {
+        "negative": negative,
+        "tags": tags,
+        "expect_document": expected_doc,
+        "doc_hit": doc_hit,
+        "expect_article": expected_articles,
+        "article_hit": article_hit,
+        "article_missing": article_missing,
+        "negative_pass": negative_pass,
+        "functional_pass": functional_pass,
+    }
+
+
 def run_eval_turn(
     client: Any,
     *,
@@ -281,12 +547,13 @@ def run_eval_turn(
     query_id: str,
     message: str,
     workspace_id: str | None = None,
+    case: dict | None = None,
 ) -> dict:
     """One preflight turn: session → server-side arm eval → terminal record.
 
-    Records latency/citations/status and redacts auth/message PII before
-    returning (the raw message text and bearer token never leave this
-    function in the clear).
+    Records latency/citations/status plus quality stats and golden
+    functional results; redacts auth/message PII before returning (raw
+    message/answer text and bearer tokens never persist in the clear).
     """
     started = time.monotonic()
     session_id = create_session(
@@ -303,8 +570,9 @@ def run_eval_turn(
     latency_ms = int((time.monotonic() - started) * 1000)
     terminal = collect_terminal(events)
     data = terminal.get("data") or {}
+    answer = str(data.get("answer", ""))
     evaluation = evaluate_output(
-        answer=str(data.get("answer", "")),
+        answer=answer,
         sources=list(data.get("sources", [])),
         status=terminal["event"],
         arm=version,
@@ -316,9 +584,35 @@ def run_eval_turn(
         "latency_ms": max(latency_ms, 0),
         "citations": evaluation["citations"],
         "status": evaluation["status"],
+        "answer_chars": evaluation["answer_chars"],
+        "citation_count": evaluation["citation_count"],
+        "has_answer": evaluation["has_answer"],
+        "functional": evaluate_functional(
+            case or {}, citations=evaluation["citations"],
+            answer=answer, status=evaluation["status"],
+        ),
         "evaluator_version": EVALUATOR_VERSION,
     }
-    return redact_record(record, secrets=(token, message))
+    return redact_record(record, secrets=(token, message, answer))
+
+
+def _failed_case(query_id: str, arm: str, detail: str, *, secrets=()) -> dict:
+    return redact_record(
+        {
+            "query_id": query_id,
+            "arm": arm,
+            "latency_ms": 0,
+            "citations": [],
+            "status": f"error: {detail}",
+            "answer_chars": 0,
+            "citation_count": 0,
+            "has_answer": False,
+            "functional": evaluate_functional({}, citations=[], answer="",
+                                             status="error"),
+            "evaluator_version": EVALUATOR_VERSION,
+        },
+        secrets=tuple(secrets),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +635,8 @@ def redact_record(record: dict, *, secrets: tuple[str, ...] = ()) -> dict:
 
 
 def build_arm_report(
-    *, arm: str, cases: list[dict], auth_token: str | None = None
+    *, arm: str, cases: list[dict], auth_token: str | None = None,
+    session_sse: dict | None = None,
 ) -> dict:
     """Assemble a redacted, evaluator-versioned arm report."""
     secrets = tuple(
@@ -352,15 +647,18 @@ def build_arm_report(
     )
     clean = [redact_record(dict(case), secrets=secrets) for case in cases]
     latencies = [case.get("latency_ms", 0) for case in clean]
+    complete = sum(1 for case in clean if case.get("status") == "complete")
+    smoke = dict(session_sse or {})
+    if auth_token and smoke.get("error"):
+        smoke = redact_record(smoke, secrets=(auth_token,))
     return {
         "arm": arm,
         "evaluator_version": EVALUATOR_VERSION,
         "cases": clean,
+        "session_sse": smoke,
         "summary": {
             "case_count": len(clean),
-            "complete_count": sum(
-                1 for case in clean if case.get("status") == "complete"
-            ),
+            "complete_count": complete,
             "mean_latency_ms": (
                 sum(latencies) / len(latencies) if latencies else 0
             ),
@@ -369,12 +667,19 @@ def build_arm_report(
 
 
 # ---------------------------------------------------------------------------
-# Comparison (Step 2: same evaluator version or refuse)
+# Comparison (Step 2: same evaluator version or refuse; never false-pass)
 # ---------------------------------------------------------------------------
 
 
 def compare_reports(report_a: dict, report_b: dict) -> dict:
-    """Diff two arm reports; reject when evaluator versions differ."""
+    """Diff two arm reports; reject version drift and incomparable pairs.
+
+    Refuses (``EvaluatorVersionMismatch`` / ``CompareRefused``) when the
+    evaluator versions differ, when there are no common query ids, or when
+    either report has zero ``complete`` cases. Otherwise regresses on
+    status, golden functional, document-hit, article-hit, and negative
+    refusal losses — not only complete→error.
+    """
     version_a = report_a.get("evaluator_version")
     version_b = report_b.get("evaluator_version")
     if version_a != version_b:
@@ -383,23 +688,72 @@ def compare_reports(report_a: dict, report_b: dict) -> dict:
             f"({version_a!r} vs {version_b!r}): both arms must be judged by "
             "the SAME preflight evaluator version"
         )
+    complete_a = sum(
+        1 for case in report_a.get("cases", []) if case.get("status") == "complete"
+    )
+    complete_b = sum(
+        1 for case in report_b.get("cases", []) if case.get("status") == "complete"
+    )
+    if complete_a == 0 or complete_b == 0:
+        raise CompareRefused(
+            f"incomparable reports: complete counts are {complete_a} vs "
+            f"{complete_b} (need at least one complete case per arm)"
+        )
     by_id_b = {case["query_id"]: case for case in report_b.get("cases", [])}
-    regressions: list[str] = []
+    regressions: list[dict] = []
     compared = 0
     for case in report_a.get("cases", []):
         other = by_id_b.get(case.get("query_id"))
         if other is None:
             continue
         compared += 1
+        lost: list[str] = []
         if case.get("status") == "complete" and other.get("status") != "complete":
-            regressions.append(case.get("query_id"))
+            lost.append("status")
+        func_a = (case.get("functional") or {}).get("functional_pass")
+        func_b = (other.get("functional") or {}).get("functional_pass")
+        if func_a is True and func_b is not True:
+            lost.append("functional")
+        for key in ("doc_hit", "article_hit", "negative_pass"):
+            before = (case.get("functional") or {}).get(key)
+            after = (other.get("functional") or {}).get(key)
+            if before is True and after is not True:
+                lost.append(key)
+        if lost:
+            regressions.append({"query_id": case.get("query_id"), "lost": lost})
+    if compared == 0:
+        raise CompareRefused(
+            "incomparable reports: no common query_id between arms"
+        )
     return {
         "evaluator_version": version_a,
         "arm_a": report_a.get("arm"),
         "arm_b": report_b.get("arm"),
         "compared": compared,
+        "complete_a": complete_a,
+        "complete_b": complete_b,
         "regressions": regressions,
     }
+
+
+# ---------------------------------------------------------------------------
+# Exit codes: failures are recorded AND surfaced (never silent success)
+# ---------------------------------------------------------------------------
+
+
+def run_exit_code(report: dict, *, want_arm: str) -> int:
+    """Non-zero when any case missed terminal-complete, the echoed arm
+    differs, zero cases ran, or the session-SSE smoke failed."""
+    cases = report.get("cases", [])
+    if not cases:
+        return 1
+    if any(case.get("status") != "complete" for case in cases):
+        return 1
+    if any(case.get("arm") != want_arm for case in cases):
+        return 1
+    if not (report.get("session_sse") or {}).get("ok"):
+        return 1
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +781,7 @@ def _resolve_token(args) -> str:
 def _login(base_url: str, user: str, password: str) -> str:
     payload = json.dumps({"email": user, "password": password}).encode()
     request = urllib.request.Request(
-        base_url.rstrip("/") + "/auth/login",
+        compose_url(base_url, "/api/v1/auth/login"),
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -441,7 +795,7 @@ def _login(base_url: str, user: str, password: str) -> str:
 
 
 def _load_queries(path: str) -> list[dict]:
-    import yaml  # test-only/live dep; unit tests never touch this path
+    import yaml  # live dep; unit tests never touch this path
 
     with open(path, encoding="utf-8") as handle:
         doc = yaml.safe_load(handle)
@@ -453,44 +807,54 @@ def _load_queries(path: str) -> list[dict]:
     return queries
 
 
-def _cmd_run(args) -> int:
-    client = UrllibHttpClient(args.base_url)
+def _cmd_run(args, client=None) -> int:
+    live = client if client is not None else UrllibHttpClient(args.base_url)
     token = _resolve_token(args)
     queries = _load_queries(args.queries)
     cases: list[dict] = []
     for case in queries:
         query_id = str(case.get("id", case.get("query_id", "query")))
+        message = str(case["query"])
         try:
             record = run_eval_turn(
-                client,
+                live,
                 base_url=args.base_url,
                 token=token,
                 arm=args.arm,
                 query_id=query_id,
-                message=str(case["query"]),
+                message=message,
                 workspace_id=args.workspace,
+                case=case,
             )
-        except Exception as exc:  # noqa: BLE001 — one bad case != dead arm
-            record = redact_record(
-                {
-                    "query_id": query_id,
-                    "arm": args.arm,
-                    "latency_ms": 0,
-                    "citations": [],
-                    "status": f"error: {exc}",
-                    "evaluator_version": EVALUATOR_VERSION,
-                },
-                secrets=(token, str(case.get("query", ""))),
-            )
+            if record.get("arm") != args.arm:
+                record = _failed_case(
+                    query_id, args.arm,
+                    f"arm-mismatch (echoed={record.get('arm')!r}, want={args.arm!r})",
+                    secrets=(token, message),
+                )
+        except Exception as exc:  # noqa: BLE001 — recorded, never success
+            record = _failed_case(query_id, args.arm, str(exc),
+                                  secrets=(token, message))
         cases.append(record)
-    report = build_arm_report(arm=args.arm, cases=cases, auth_token=token)
+    smoke: dict = {}
+    if queries:
+        smoke = run_session_sse_smoke(
+            live, token=token, arm=args.arm,
+            message=str(queries[0]["query"]), workspace_id=args.workspace,
+        )
+    else:
+        smoke = {"ok": False, "error": "zero cases ran"}
+    report = build_arm_report(arm=args.arm, cases=cases, auth_token=token,
+                              session_sse=smoke)
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(report, handle, ensure_ascii=False, indent=2)
+    code = run_exit_code(report, want_arm=args.arm)
     print(
         f"arm={report['arm']} evaluator={report['evaluator_version']} "
-        f"cases={len(cases)} out={args.out}"
+        f"cases={len(cases)} complete={report['summary']['complete_count']} "
+        f"smoke_ok={smoke.get('ok')} out={args.out}"
     )
-    return 0
+    return code
 
 
 def _cmd_compare(args) -> int:
@@ -503,6 +867,9 @@ def _cmd_compare(args) -> int:
     except EvaluatorVersionMismatch as exc:
         print(f"REFUSED: {exc}")
         return 2
+    except CompareRefused as exc:
+        print(f"INCOMPARABLE: {exc}")
+        return 1
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if args.out:
         with open(args.out, "w", encoding="utf-8") as handle:
@@ -524,7 +891,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--queries", required=True, help="Golden YAML query set.")
     run.add_argument("--workspace", required=True, help="Workspace UUID.")
     run.add_argument("--out", required=True, help="Report JSON path.")
-    run.add_argument("--base-url", default="http://localhost:8080/api/v1")
+    run.add_argument(
+        "--base-url", default=DEFAULT_BASE_URL,
+        help="Server origin WITHOUT /api/v1 suffix "
+        f"(default: {DEFAULT_BASE_URL}).",
+    )
     run.add_argument("--token", default=None)
     run.set_defaults(func=_cmd_run)
 
