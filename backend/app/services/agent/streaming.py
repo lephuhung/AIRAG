@@ -1213,8 +1213,11 @@ async def stream_v2_turn_events(
     inferring factual-ness from served sources. Populated before the
     terminal event is yielded. It also receives the run id (``run_id``)
     at registration so the canary metric emission can resolve whether a
-    cancellation was REQUESTED for the run (R81). The wire format is
-    unchanged.
+    cancellation was REQUESTED for the run (R81), plus the
+    pre-cleanup cancellation-request verdict (``cancel_requested``),
+    captured before terminal cleanup unregisters the run and deletes the
+    cancel markers (R85: a late check would observe ``False``). The wire
+    format is unchanged.
 
     Exactly one of ``initial_state`` (first turn) or ``resume_command`` (a
     verbatim :func:`prepare_v2_resume_command` ``Command``) is required.
@@ -1275,6 +1278,28 @@ async def stream_v2_turn_events(
         if released:
             return 0
         released = True
+        # R85: capture the cancellation-request verdict BEFORE terminal
+        # cleanup unregisters the run and deletes the cancel markers
+        # (local set + Redis key). A later ``was_cancel_requested`` check
+        # would observe ``False``, leaving requested-but-non-cancelled
+        # terminals invisible — so the verdict is threaded to the metric
+        # emission via ``terminal_info["cancel_requested"]``.
+        if terminal_info is not None and "cancel_requested" not in terminal_info:
+            try:
+                from app.services.agents.v2.execution.scheduler import (
+                    is_run_cancel_requested_async as _cancel_requested_check,
+                )
+
+                terminal_info["cancel_requested"] = (
+                    bool(await _cancel_requested_check(_run_id))
+                    if _run_id
+                    else False
+                )
+            except Exception:
+                logger.warning(
+                    "[v2stream] cancel-requested capture failed",
+                    exc_info=True,
+                )
         if heartbeat is not None:
             try:
                 await heartbeat.stop()

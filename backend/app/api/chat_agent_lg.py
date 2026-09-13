@@ -428,11 +428,20 @@ async def langgraph_chat_stream(
                 greeting_observed=_greeting,
             )
             # R81: cancelled means REQUESTED (registry check best-effort);
-            # R80: ``None`` factual expectation flows through — emission
-            # writes the explicitly-invalid sentinel row, never omits it.
-            _cancel_requested = await _metrics.was_cancel_requested(
-                (v2_terminal_info or {}).get("run_id")
+            # R85: prefer the verdict the adapter captured BEFORE terminal
+            # cleanup erased the cancel markers; fall back to a live check
+            # only when the adapter did not thread one. R80: ``None``
+            # factual expectation flows through — emission writes the
+            # explicitly-invalid sentinel row, never omits it.
+            _stashed_cancel_requested = (v2_terminal_info or {}).get(
+                "cancel_requested"
             )
+            if isinstance(_stashed_cancel_requested, bool):
+                _cancel_requested = _stashed_cancel_requested
+            else:
+                _cancel_requested = await _metrics.was_cancel_requested(
+                    (v2_terminal_info or {}).get("run_id")
+                )
             await _metrics.try_emit_terminal_rollout_metric(
                 db,
                 arm=served_arm,

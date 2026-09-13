@@ -1186,17 +1186,25 @@ def _canary_serving_graph(plan, registry, runtime_context):
 
 
 async def _drive_serving_adapter(query, *, request_id, thread_id):
-    """Select the arm (production path, canary 100) then drive the REAL
-    serving ingress adapter over the compiled serving-path graph.
+    """Select the arm (production path) then serve EXACTLY as the real
+    entrypoints do (R84): ``arm == "v1"`` serves v1 WITHOUT invoking the
+    v2 adapter; ``arm == "v2"`` invokes ``stream_v2_turn_events``.
 
     Returns ``(arm, stub, yielded)`` or raises ``V1FallbackRequired``
-    (with ``yielded`` attached as ``exc.yielded``) for v1-only routes.
+    (with ``arm``, ``yielded`` and ``capability_calls`` attached) for
+    v1-only routes reached from a v2 selection.
     """
     from app.services.agent.streaming import stream_v2_turn_events
     from app.services.agents.v2.execution.scheduler import V1FallbackRequired
 
     arm = await _resolve_arm_at_canary_100(request_id=request_id)
     registry, stub = _people_registry()
+    if arm != "v2":
+        # Production entrypoints serve the v1 graph here and never touch
+        # the v2 adapter: zero capability calls, zero v2 user-visible
+        # output by construction (nothing v2 runs at all).
+        assert arm == "v1", f"unexpected serving arm {arm!r}"
+        return arm, stub, [{"event": "v1_served", "data": {}}]
     runtime_context = _graph_runtime(registry)
     graph = _canary_serving_graph(_scheduler_plan(), registry, runtime_context)
     yielded: list = []
@@ -1209,6 +1217,7 @@ async def _drive_serving_adapter(query, *, request_id, thread_id):
         ):
             yielded.append(event)
     except V1FallbackRequired as exc:
+        exc.arm = arm  # type: ignore[attr-defined]
         exc.yielded = yielded  # type: ignore[attr-defined]
         exc.capability_calls = list(stub.calls)  # type: ignore[attr-defined]
         raise
@@ -1237,6 +1246,9 @@ async def test_ingress_write_falls_back_with_zero_output_at_canary_100():
             )
     finally:
         settings_patch.undo()
+    # R84: prove canary selection chose v2 FIRST — a driver that would
+    # still pass if select_canary_arm regressed to v1 is not a proof.
+    assert excinfo.value.arm == "v2"
     assert excinfo.value.capability_calls == []
     _assert_zero_v2_output(excinfo.value.yielded)
 
@@ -1256,6 +1268,8 @@ async def test_ingress_evaluate_falls_back_with_zero_output_at_canary_100():
             )
     finally:
         settings_patch.undo()
+    # R84: prove canary selection chose v2 FIRST (see write case above).
+    assert excinfo.value.arm == "v2"
     assert excinfo.value.capability_calls == []
     _assert_zero_v2_output(excinfo.value.yielded)
 
@@ -1277,6 +1291,8 @@ async def test_ingress_legal_falls_back_with_zero_output_at_canary_100():
             )
     finally:
         settings_patch.undo()
+    # R84: prove canary selection chose v2 FIRST (see write case above).
+    assert excinfo.value.arm == "v2"
     assert excinfo.value.capability_calls == []
     _assert_zero_v2_output(excinfo.value.yielded)
 
@@ -1408,3 +1424,112 @@ async def test_suspend_stops_heartbeat_and_resume_starts_fresh():
         assert handles[1].active is False
     finally:
         monkeypatch.undo()
+
+
+# ---------------------------------------------------------------------------
+# Task 7B fix round 4 (R84): the serving-path driver must branch on the
+# selected arm exactly as the real entrypoints do (v1 -> serve v1 WITHOUT
+# invoking the v2 adapter; v2 -> invoke stream_v2_turn_events).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_serving_driver_serves_v1_without_invoking_v2_when_arm_is_v1():
+    """R84: when canary selection returns v1, the driver serves v1 and never
+    invokes the v2 adapter (zero capability calls, zero v2 output)."""
+    import app.core.config as _config
+    import app.services.agent.streaming as streaming_module
+
+    from app.services.agent.rollout_control import resolve_serving_arm
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(_config.settings, "NEXUSRAG_AGENT_V2_ENABLED", True)
+    monkeypatch.setattr(_config.settings, "NEXUSRAG_AGENT_V2_CANARY_PERCENT", 0.0)
+    monkeypatch.setattr(_config.settings, "NEXUSRAG_AGENT_V2_CANARY_WORKSPACES", "")
+    monkeypatch.setattr(_config.settings, "NEXUSRAG_AGENT_V2_BUCKET_SALT", SALT)
+
+    async def _forbidden_adapter(**kwargs):
+        raise AssertionError("v2 adapter must not be invoked when arm == v1")
+        yield  # pragma: no cover — makes this an async generator
+
+    monkeypatch.setattr(
+        streaming_module, "stream_v2_turn_events", _forbidden_adapter
+    )
+    try:
+        arm, stub, yielded = await _drive_serving_adapter(
+            "So sánh hiệu quả hai phương án",
+            request_id="req-driver-v1-branch-1",
+            thread_id="thread-driver-v1-branch-1",
+        )
+    finally:
+        monkeypatch.undo()
+    assert arm == "v1"
+    assert stub.calls == []
+    _assert_zero_v2_output(yielded)
+
+
+# ---------------------------------------------------------------------------
+# Task 7B fix round 4 (R85): the cancellation-request verdict must be
+# captured BEFORE terminal cleanup unregisters the run and deletes the
+# cancel markers, and threaded into the terminal metric emission.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_terminal_info_carries_cancel_request_before_cleanup_erases_it():
+    """R85: a requested-but-non-cancelled terminal still reports the request.
+
+    The cancel flag is requested up front; the turn completes normally
+    (success terminal, no scheduler dispatch to cancel). The adapter must
+    capture ``cancel_requested=True`` into ``terminal_info`` BEFORE the
+    terminal cleanup erases the markers — after the turn,
+    ``was_cancel_requested`` observes ``False`` (markers gone), so a late
+    check alone would leave the failed cancellation invisible.
+    """
+    from uuid import uuid4 as _uuid4
+
+    from app.services.agent.rollout_metrics import was_cancel_requested
+    from app.services.agent.streaming import stream_v2_turn_events
+    from app.services.agents.v2.contracts.base import CONTRACT_VERSION
+    from app.services.agents.v2.contracts.response import FinalResponse
+    from app.services.agents.v2.execution import scheduler as scheduler_module
+
+    class _SuccessGraph:
+        def __init__(self):
+            self.calls = []
+
+        async def ainvoke(self, payload, config, context=None):
+            self.calls.append((payload, config, context))
+            return {
+                "final_response": FinalResponse(
+                    contract_version=CONTRACT_VERSION,
+                    status="success",
+                    content="Câu trả lời đã xác minh.",
+                    citations=(),
+                )
+            }
+
+    registry, _stub = _people_registry()
+    runtime = _graph_runtime(registry)
+    run_id = str(runtime.capability_runtime.run_id)
+    scheduler_module.request_run_cancellation(run_id)
+    assert await was_cancel_requested(run_id) is True
+    terminal_info: dict = {}
+    try:
+        yielded = [
+            event
+            async for event in stream_v2_turn_events(
+                graph=_SuccessGraph(),
+                runtime_context=runtime,
+                thread_id=f"thread-cancel-capture-{_uuid4().hex[:8]}",
+                initial_state={"query": "Ai là Nguyễn Văn A?"},
+                terminal_info=terminal_info,
+            )
+        ]
+    finally:
+        scheduler_module.unregister_active_run(run_id)
+    assert any(event.get("event") == "complete" for event in yielded)
+    # Captured BEFORE cleanup erased the markers ...
+    assert terminal_info.get("cancel_requested") is True
+    # ... which the markers' absence after the terminal proves.
+    assert await was_cancel_requested(run_id) is False
