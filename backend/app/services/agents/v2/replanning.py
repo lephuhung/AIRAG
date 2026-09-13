@@ -89,19 +89,20 @@ def _catalog_names(runtime: GraphRuntimeContext) -> frozenset[str] | None:
 
 
 def _require_capabilities_within_current_runtime_catalog(
-    proposed: TaskPlan, runtime: GraphRuntimeContext
+    new_tasks: tuple[TaskSpec, ...], runtime: GraphRuntimeContext
 ) -> None:
-    """Every task must stay servable by the CURRENT runtime catalog.
+    """Every NEW task must stay servable by the CURRENT runtime catalog.
 
     The frozen validator owns shape/append-only/budget/discovery; this is the
     runtime intersection (registry view ∩ current permissions) that only the
-    live request can answer. A task whose capability left the catalog — or was
-    never permitted — rejects the whole replan instead of checkpointing an
-    undispatchable plan.
+    live request can answer. Completed tasks are immutable history — the
+    scheduler never redispatches them, so only appended tasks are checked.
+    A new task whose capability left the catalog — or was never permitted —
+    rejects the whole replan instead of checkpointing undispatchable work.
     """
     trusted = runtime.capability_runtime
     names = _catalog_names(runtime)
-    for task in proposed.tasks:
+    for task in new_tasks:
         if task.capability not in trusted.allowed_capabilities:
             raise ReplanRejected(
                 f"task {task.task_id} capability {task.capability!r} is not "
@@ -149,8 +150,8 @@ def validate_runtime_replan(
     """
     check_replan_dispatchable(runtime)
     accepted = validate_replan(current, proposed, outcomes, policy, budget)
-    _require_capabilities_within_current_runtime_catalog(accepted, runtime)
     new_tasks = accepted.tasks[len(current.tasks):]
+    _require_capabilities_within_current_runtime_catalog(new_tasks, runtime)
     width = entry_fanout_width(new_tasks)
     if width > budget.max_parallel_branches:
         raise ReplanRejected(

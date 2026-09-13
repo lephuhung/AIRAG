@@ -30,15 +30,18 @@ requests. The binding ownership sequence holds end to end::
 
     proposal -> validate -> lease -> checkpoint -> scheduler
 
-Pilot scope is the compare skill plus the bounded append-only replan loop
-(Task 5): ``decide`` routes an advisable coverage gap to the ``replan`` node,
-which proposes from validated observations/evaluation gaps (never raw
-evidence), and ``validate_checkpoint`` validates the append-only replan,
-leases, and checkpoints it before the next ``execute``. Discovery stays
-policy-gated (disabled by default). An unsupported work type (``evaluate``,
-``cross_domain``, ``multi_goal``, ...) returns the typed
-``COMPLEX_RESEARCH_UNAVAILABLE`` marker from the ``decide`` node — never a
-fabricated plan.
+Pilot scope is skill-selected initial planning (compare, large/iterative
+summarize with a deterministic map/reduce proposal) plus the bounded
+append-only replan loop (Task 5, fix round 1): ``decide`` routes an advisable
+coverage gap — or a no-evidence targetless failure awaiting its fallback
+(R37) — to the ``replan`` node, which proposes from validated
+observations/evaluation gaps (never raw evidence), and
+``validate_checkpoint`` validates the append-only replan, leases, and
+checkpoints it before the next ``execute``. The ``settle`` node hands
+discovery candidates to the Binding Resolver (policy-gated, R39). An
+unsupported work type (``evaluate``, ``cross_domain``, ``multi_goal``, ...)
+returns the typed ``COMPLEX_RESEARCH_UNAVAILABLE`` marker from the ``decide``
+node — never a fabricated plan.
 """
 from __future__ import annotations
 
@@ -56,8 +59,8 @@ from langgraph.graph import END, StateGraph
 from langgraph.runtime import Runtime
 
 from .contracts.base import ContractModel
-from .contracts.binding import DocumentBindingSet
-from .contracts.capability import DocumentReadInput, SectionReadInput
+from .contracts.binding import DocumentBindingSet, ScopedDocument
+from .contracts.capability import DocumentReadInput, DocumentSearchInput, SectionReadInput
 from .contracts.evaluation import EvidenceEvaluation
 from .contracts.execution import AgentResult, TaskExecutionSummary
 from .contracts.evidence import EvidenceUseRef
@@ -81,16 +84,22 @@ from .dependencies.people_document import (
     redact_scalar_for_model,
 )
 from .execution.scheduler import refresh_pairs_for_checkpoint, shared_scheduler_for
+from .discovery import DiscoveryDenied, DiscoveryDisabled, request_addition
 from .nodes.context import node_context
-from .nodes.evaluate import evaluate_evidence
+from .nodes.evaluate import _EVIDENCE_SUPPLYING_CAPABILITIES, evaluate_evidence
 from .nodes.execute import execution_update
 from .replanning import ReplanRejected, validate_runtime_replan
 from .skills.compare import policy as compare_policy
+from .skills.summarize import policy as summarize_policy
+from .tools.discovery_candidates import (
+    CandidateNotFound,
+    DiscoveryCandidateRegistry,
+    InvalidCandidateRole,
+)
 from .tools.observations import AgentToolObservation, ObservationProjector
 
 __all__ = [
     "COMPLEX_RESEARCH_UNAVAILABLE",
-    "MAX_REPLANS",
     "_build_complex_research_graph",
     "ComplexResearchError",
     "ComplexResearchState",
@@ -99,6 +108,7 @@ __all__ = [
     "build_complex_research_state",
     "build_complex_research_subgraph",
     "build_discovery_policy",
+    "build_initial_plan",
     "build_model_observations",
     "build_model_replan_input",
     "build_planning_input",
@@ -111,6 +121,7 @@ __all__ = [
     "decide_node",
     "finalize_node",
     "make_complex_boundary_node",
+    "discovery_settle_node",
     "merge_complex_result_into_supervisor",
     "normalize_complex_state",
     "people_document_materialize_node",
@@ -123,14 +134,6 @@ __all__ = [
 
 #: Typed-unavailable code for out-of-pilot work (evaluate/compliance, ...).
 COMPLEX_RESEARCH_UNAVAILABLE = "COMPLEX_RESEARCH_UNAVAILABLE"
-
-#: Bounded replan budget carried by default (Task 5, R32): the canonical
-#: plan -> validate -> execute -> evaluate -> decide -> (replan -> validate)
-#: loop may append at most this many replans per run; every replan is
-#: checkpointed before the next execute and completed tasks are never rerun.
-#: Zero keeps the initial-plan-only default: deployment settings
-#: (``V2_MAX_REPLANS``) or an explicit run budget opens the bounded loop.
-MAX_REPLANS = 0
 
 #: Fallback planner sizing when implementation settings carry no v2 limits.
 #: ``V2ResearchLimits.from_settings()`` is the live source; these match the
@@ -151,7 +154,10 @@ class V2ResearchLimits:
 
     max_tasks: int = MAX_TASKS
     max_parallel_branches: int = MAX_PARALLEL_BRANCHES
-    max_replans: int = MAX_REPLANS
+    #: Closed by default (R36): the single source of truth for the replan
+    #: budget is ``V2_MAX_REPLANS`` in implementation settings, read by
+    #: :meth:`from_settings`. No hardcoded constant exists anywhere else.
+    max_replans: int = 0
 
     @classmethod
     def from_settings(cls, settings: Any = None) -> "V2ResearchLimits":
@@ -649,15 +655,85 @@ def _evaluation_slot(value: Any, name: str, default: Any = None) -> Any:
     return getattr(value, name, default)
 
 
+def build_initial_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
+    """Select the skill/policy from the query work type (R38), then propose.
+
+    ``compare`` (complex) routes to the compare skill; large/iterative
+    ``summarize`` (complex) routes to the summarize skill with its
+    deterministic map/reduce proposal. Bounded summarize never reaches here
+    (the deterministic router keeps single-document summaries on the fast
+    path). Any other work type raises :class:`ContractValidationError` so
+    the caller returns the typed unavailable boundary, never a plan.
+    """
+    work_type = planning_input.query_analysis.work_type
+    if work_type == compare_policy.COMPARE_WORK_TYPE:
+        return compare_policy.build_compare_plan(planning_input)
+    if work_type == summarize_policy.SUMMARIZE_WORK_TYPE:
+        return summarize_policy.build_summarize_plan(planning_input)
+    raise ContractValidationError(
+        f"work type {work_type!r} has no complex skill policy; out of scope"
+    )
+
+
+#: Outcome statuses that admit a no-evidence recovery replan (R37): the
+#: completed task stays completed (never rerun) and the fallback carries no
+#: fabricated scalar. Denial and needs_input are terminal and never recover.
+_RECOVERABLE_OUTCOME_STATUSES = frozenset({"not_found", "error"})
+
+
+def _recovery_candidates(plan: Any, results: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Targetless evidence-supplying tasks whose failure left no target gap.
+
+    A ``people.lookup`` (or other targetless evidence supplier) returning
+    ``not_found`` or ``error`` with no admitted uses cannot create a
+    target-based ``MissingRequirement``, yet the run must stay actionable
+    (spec §26): these tasks are recovery candidates unless a dependent task
+    was already appended for them. Tolerant of checkpoint-serde mappings so
+    the decide seam stays total on resumed state.
+    """
+    tasks = _evaluation_slot(plan, "tasks", ()) or ()
+    result_by_task = {
+        _evaluation_slot(result, "task_id"): result for result in results
+    }
+    candidates: list[Any] = []
+    for task in tasks:
+        capability = _evaluation_slot(task, "capability")
+        if capability not in _EVIDENCE_SUPPLYING_CAPABILITIES:
+            continue
+        if capability == "document.search":
+            continue
+        task_input = _evaluation_slot(task, "input")
+        if _evaluation_slot(task_input, "target_ids", ()):
+            continue
+        task_id = _evaluation_slot(task, "task_id")
+        result = result_by_task.get(task_id)
+        if result is None:
+            continue
+        if _evaluation_slot(result, "status") not in _RECOVERABLE_OUTCOME_STATUSES:
+            continue
+        if tuple(_evaluation_slot(result, "evidence_uses", ()) or ()):
+            continue
+        if any(
+            task_id in (_evaluation_slot(other, "depends_on", ()) or ())
+            for other in tasks
+            if _evaluation_slot(other, "task_id") != task_id
+        ):
+            continue
+        candidates.append(task)
+    return tuple(candidates)
+
+
 def replan_advisable(state: ComplexResearchState) -> bool:
-    """True only for a bounded coverage-gap replan (R32 decide seam).
+    """True only for a bounded coverage-gap or no-evidence recovery replan.
 
     Advisable means: a checkpointed plan exists, the latest evaluation is
-    ``insufficient`` with coverage-kind gaps only (semantic gaps and
-    contradictions belong to skill strategy and the evaluator — never to an
-    automatic re-read), and replan budget remains. Everything else —
-    sufficient, contradictory, needs_input, missing evaluation, exhausted
-    budget — finalizes. Total function: never raises on shape drift.
+    ``insufficient``, replan budget remains, and either coverage-kind gaps
+    exist (automatic re-read; semantic gaps and contradictions belong to
+    skill strategy and the evaluator) or a targetless evidence-supplying
+    task failed without admitted uses and awaits its fallback (R37, spec
+    §26). Everything else — sufficient, contradictory, needs_input,
+    missing evaluation, exhausted budget — finalizes. Total function: never
+    raises on shape drift.
     """
     try:
         if state.get("plan") is None:
@@ -669,26 +745,86 @@ def replan_advisable(state: ComplexResearchState) -> bool:
             return False
         if _evaluation_slot(evaluation, "status") != "insufficient":
             return False
-        missing = _evaluation_slot(evaluation, "missing", ()) or ()
-        if not missing:
+        if int(state.get("replans_remaining", 0)) < 1:
             return False
+        missing = _evaluation_slot(evaluation, "missing", ()) or ()
         for requirement in missing:
             if _evaluation_slot(requirement, "criterion_kind") != "coverage":
                 return False
-        return int(state.get("replans_remaining", 0)) >= 1
+        if missing:
+            return True
+        plan = state.get("plan")
+        results = tuple(state.get("task_results", ()))
+        return bool(_recovery_candidates(plan, results))
     except (TypeError, ValueError, AttributeError):
         return False
+
+
+def _recovery_search_task(
+    failed: TaskSpec,
+    result: AgentResult,
+    *,
+    next_task_id: str,
+    query: str,
+    evidence_use_ids: tuple[Any, ...],
+) -> TaskSpec:
+    """Fallback discovery search after a no-evidence targetless failure (R37).
+
+    The completed task is never rerun and no downstream input is fabricated:
+    the search carries the checkpointed plan goal as its query and
+    ``person_identifier=None`` — the governed scalar is never guessed. The
+    reason keeps ``not_found`` distinct from ``TIMEOUT``/other errors.
+    Depends on the failed task so ordering lineage survives; policy
+    validation (discovery must be authorized) happens in the wrapper.
+    """
+    status = result.status
+    if status == "not_found":
+        reason = (
+            f"task {failed.task_id} ({failed.capability}) returned not_found "
+            "with no admitted evidence; fallback discovery search without "
+            "a materialized scalar"
+        )
+    else:
+        code = result.error.code if result.error is not None else "INTERNAL_ERROR"
+        reason = (
+            f"task {failed.task_id} ({failed.capability}) failed with "
+            f"{code} and no admitted evidence; fallback discovery search "
+            "without a materialized scalar"
+        )
+    return TaskSpec(
+        task_id=next_task_id,
+        capability="document.search",
+        task_objective=(
+            f"Broad discovery search after {failed.task_id} "
+            f"returned {status} with no admitted evidence"
+        ),
+        input=DocumentSearchInput(
+            kind="document.search",
+            query=query,
+            person_identifier=None,
+        ),
+        depends_on=(failed.task_id,),
+        origin=ReplanTaskOrigin(
+            kind="replan",
+            reason=reason,
+            task_ids=(failed.task_id,),
+            evidence_use_ids=evidence_use_ids,
+        ),
+    )
 
 
 def build_replan_proposal(
     state: ComplexResearchState, runtime: GraphRuntimeContext
 ) -> TaskPlan | None:
-    """Propose the bounded append-only replan from validated gaps (R32).
+    """Propose the bounded append-only replan from validated gaps (R32/R37).
 
     Consumes the redacted model-facing projection (R34) and the validated
     observations — never raw evidence. One dependency-free re-read per
     missing coverage target (section reads for section coordinates, document
-    reads otherwise), with ``ReplanTaskOrigin`` trigger lineage (attempted
+    reads otherwise), plus one policy-gated fallback discovery search per
+    no-evidence targetless failure (R37: ``not_found``/``TIMEOUT`` stay
+    distinct, the completed task is never rerun, no scalar is fabricated).
+    Every new task carries ``ReplanTaskOrigin`` trigger lineage (attempted
     task IDs + prior evidence-use IDs). Returns ``None`` when no bounded
     replan is advisable or validatable; the caller then spends the budget so
     ``decide`` finalizes instead of looping.
@@ -761,6 +897,27 @@ def build_replan_proposal(
                 ),
             )
         )
+    result_by_task = {result.task_id: result for result in results}
+    for failed in _recovery_candidates(plan, results):
+        if "document.search" not in catalog:
+            return None
+        while f"T{index}" in taken:
+            index += 1
+        task_id = f"T{index}"
+        index += 1
+        taken.add(task_id)
+        recovery_result = result_by_task.get(failed.task_id)
+        if recovery_result is None:
+            return None
+        new_tasks.append(
+            _recovery_search_task(
+                failed,
+                recovery_result,
+                next_task_id=task_id,
+                query=plan.goal,
+                evidence_use_ids=prior_use_ids,
+            )
+        )
     if not new_tasks:
         return None
     proposed = plan.model_copy(update={"tasks": plan.tasks + tuple(new_tasks)})
@@ -827,9 +984,7 @@ async def validate_checkpoint_node(
     state = normalize_complex_state(state)
     if state.get("plan") is None:
         try:
-            proposal = compare_policy.build_compare_plan(
-                build_planning_input(state, context)
-            )
+            proposal = build_initial_plan(build_planning_input(state, context))
         except ContractValidationError:
             return {}
         bindings = state["bindings"]
@@ -1004,6 +1159,126 @@ async def people_document_materialize_node(
     return {"materialized_new_task": False, "people_scalar_available": availability}
 
 
+async def discovery_settle_node(
+    state: ComplexResearchState,
+    runtime: "Runtime[GraphRuntimeContext]",
+) -> dict:
+    """Settle discovery candidates through the Binding Resolver (R39).
+
+    Runs after ``materialize`` and before ``evaluate``. Rebuilds the
+    ephemeral candidate index from checkpointed ``document.search`` results,
+    validates each unsettled candidate through ``discovery.request_addition``
+    (policy first: disabled discovery settles nothing), then hands the
+    frozen ``BindingAdditionRequest`` plus the server-side candidate to the
+    injected ``runtime.services.binding_resolver`` via its
+    ``add_discovered_binding`` seam. The resolver — never the tools layer —
+    revalidates current ACL/scope and creates/pins the exact discovered
+    revision; an ACL denial (``DiscoveryDenied``) settles to nothing. New
+    pins are validated (exact candidate identity, discovered/supporting
+    role) and retention-leased before the checkpoint. Dormant (``{}``)
+    when there is no plan/bindings, no search candidates, or no resolver
+    wired: candidates simply stay unsettled and nothing is created.
+    """
+    context = node_context(runtime)
+    state = normalize_complex_state(state)
+    plan = state.get("plan")
+    bindings = state.get("bindings")
+    if plan is None or bindings is None:
+        return {}
+    search_ids = {
+        task.task_id for task in plan.tasks if task.capability == "document.search"
+    }
+    if not search_ids:
+        return {}
+    registry = DiscoveryCandidateRegistry.from_results(
+        result for result in tuple(state.get("task_results", ()))
+        if result.task_id in search_ids
+    )
+    if len(registry) == 0:
+        return {}
+    resolver = context.services.binding_resolver
+    if resolver is None:
+        return {}
+    policy = build_discovery_policy(context)
+    existing = {
+        (binding.document_id, binding.document_revision)
+        for binding in bindings.bindings
+    }
+    settled: list[ScopedDocument] = []
+    for candidate in registry.candidates():
+        if (candidate.document_id, candidate.document_revision) in existing:
+            continue
+        if policy.allow_reference_discovery:
+            role = "discovered"
+        elif policy.allow_supporting_discovery:
+            role = "supporting"
+        else:
+            continue
+        try:
+            request = request_addition(
+                registry, candidate.candidate_id, role, policy=policy
+            )
+        except (DiscoveryDisabled, CandidateNotFound, InvalidCandidateRole):
+            continue
+        add = getattr(resolver, "add_discovered_binding", None)
+        if add is None:
+            raise ComplexResearchError(
+                "binding resolver exposes no add_discovered_binding seam; "
+                "refusing to settle discovery without an owning resolver"
+            )
+        try:
+            created = add(request, candidate, context.capability_runtime)
+            if inspect.isawaitable(created):
+                created = await created
+        except DiscoveryDenied:
+            continue
+        if not isinstance(created, ScopedDocument):
+            raise ComplexResearchError(
+                "binding resolver did not return a ScopedDocument for a "
+                "discovery candidate; refusing an unowned pin"
+            )
+        if (
+            created.document_id != candidate.document_id
+            or created.document_revision != candidate.document_revision
+        ):
+            raise ComplexResearchError(
+                "binding resolver did not pin the exact discovered revision; "
+                "refusing a moved pin"
+            )
+        if created.role not in ("discovered", "supporting"):
+            raise ComplexResearchError(
+                "discovery settled a non-discovery role; the planner cannot "
+                "create user targets"
+            )
+        settled.append(created)
+        existing.add((candidate.document_id, candidate.document_revision))
+    if not settled:
+        return {}
+    updated = bindings.model_copy(
+        update={"bindings": bindings.bindings + tuple(settled)}
+    )
+    pairs: list[tuple[Any, Any]] = []
+    for binding in settled:
+        try:
+            revision = UUID(str(binding.document_revision))
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise ComplexResearchError(
+                f"settled binding {binding.binding_id} pins revision "
+                f"{binding.document_revision!r}, not a revision id; refusing "
+                "to checkpoint an unleasable pin"
+            ) from exc
+        pairs.append((revision, None))
+    await _acquire_pairs(
+        pairs,
+        runtime=context,
+        missing_message=(
+            "discovery settled bindings but no retention-lease service is "
+            "wired; refusing to checkpoint unleased pins"
+        ),
+    )
+    return {"bindings": updated}
+
+
 async def complex_evaluate_node(
     state: ComplexResearchState,
     runtime: "Runtime[GraphRuntimeContext]",
@@ -1050,14 +1325,15 @@ async def decide_node(
     state: ComplexResearchState,
     runtime: "Runtime[GraphRuntimeContext]",
 ) -> dict:
-    """Recommend the terminal step: replan only for advisable coverage gaps.
+    """Recommend the terminal step: replan only when advisable (R32/R37).
 
     A missing plan means the work type is out of pilot scope: return the typed
     ``COMPLEX_RESEARCH_UNAVAILABLE`` marker. Otherwise the evaluation stands
     as-is; the supervisor routes ``sufficient`` to synthesis and everything
     else to the finalizer (R4). Evaluator owns sufficiency/contradictions;
     the ``replan`` edge (owned by ``_decide_branch``) fires only when
-    ``replan_advisable`` holds. Discovery stays policy-gated.
+    ``replan_advisable`` holds (coverage gaps or no-evidence recovery).
+    Discovery stays policy-gated.
     """
     node_context(runtime)
     if state.get("plan") is None:
@@ -1066,8 +1342,8 @@ async def decide_node(
             "unavailable": ComplexResearchUnavailable(
                 code=COMPLEX_RESEARCH_UNAVAILABLE,
                 reason=(
-                    f"work type {work_type!r} is out of scope for the "
-                    "Phase-3 comparison pilot (initial-plan-only compare)"
+                    f"work type {work_type!r} has no complex skill policy "
+                    "(compare and large/iterative summarize are supported)"
                 ),
             )
         }
@@ -1090,12 +1366,12 @@ def _materialize_branch(state: ComplexResearchState) -> str:
     ``materialized_new_task`` is True only on the pass that appended the
     dependent, so the scheduler dispatches the checkpointed T2 unchanged and
     the loop always terminates (appends are budget-bounded; a pass with no
-    append routes to ``evaluate`` even when tasks remain undispatched, e.g.
+    append routes to ``settle`` even when tasks remain undispatched, e.g.
     after a deadline truncation).
     """
     if bool(state.get("materialized_new_task", False)):
         return "execute"
-    return "evaluate"
+    return "settle"
 
 
 def _decide_branch(state: ComplexResearchState) -> str:
@@ -1111,8 +1387,9 @@ def _add_complex_edges(graph: StateGraph) -> None:
     graph.add_edge("validate_checkpoint", "execute")
     graph.add_edge("execute", "materialize")
     graph.add_conditional_edges(
-        "materialize", _materialize_branch, {"execute": "execute", "evaluate": "evaluate"}
+        "materialize", _materialize_branch, {"execute": "execute", "settle": "settle"}
     )
+    graph.add_edge("settle", "evaluate")
     graph.add_edge("evaluate", "decide")
     graph.add_conditional_edges(
         "decide", _decide_branch, {"replan": "replan", "finalize": "finalize"}
@@ -1135,6 +1412,7 @@ def _build_complex_research_graph() -> StateGraph:
     graph.add_node("validate_checkpoint", validate_checkpoint_node)
     graph.add_node("execute", complex_execute_node)
     graph.add_node("materialize", people_document_materialize_node)
+    graph.add_node("settle", discovery_settle_node)
     graph.add_node("evaluate", complex_evaluate_node)
     graph.add_node("replan", replan_node)
     graph.add_node("decide", decide_node)
@@ -1170,7 +1448,9 @@ def build_complex_research_state(state: SupervisorV2State) -> ComplexResearchSta
         plan=execution.plan,
         task_results=execution.task_results,
         evaluation=execution.evidence_evaluation,
-        replans_remaining=MAX_REPLANS,
+        # R36: production entry uses the SAME settings-driven limits the
+        # budget view enforces — never a hardcoded constant.
+        replans_remaining=V2ResearchLimits.from_settings().max_replans,
     )
 
 

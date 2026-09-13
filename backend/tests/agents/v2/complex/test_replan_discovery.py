@@ -36,6 +36,7 @@ from app.services.agents.v2.contracts.capability import (
     PeopleLookupInput,
     PeopleLookupOutput,
     SectionReadInput,
+    SectionReadOutput,
 )
 from app.services.agents.v2.contracts.evaluation import (
     Contradiction,
@@ -99,6 +100,7 @@ class FakeReadCapability:
         missing_targets: frozenset[str] = frozenset(),
         fail_first_for: frozenset[str] = frozenset(),
         truncate_first_for: frozenset[str] = frozenset(),
+        locator_for: dict[str, object] | None = None,
     ) -> None:
         domain = "section" if name == "section.read" else "document"
         self.descriptor = CapabilityDescriptor(
@@ -111,9 +113,24 @@ class FakeReadCapability:
         self.missing_targets = missing_targets
         self.fail_first_for = fail_first_for
         self.truncate_first_for = truncate_first_for
+        self._locator_for = locator_for or {}
         self._failed_once: set[str] = set()
         self._truncated_once: set[str] = set()
         self.uses: dict[UUID, tuple[str, str]] = {}
+
+    def _locator(self, target_id: str):  # type: ignore[no-untyped-def]
+        return self._locator_for.get(
+            target_id, DocumentLocator(kind="document")
+        )
+
+    def _output(self, read_unit_count: int):  # type: ignore[no-untyped-def]
+        if self.descriptor.name == "section.read":
+            return SectionReadOutput(
+                kind="section.read", read_unit_count=read_unit_count
+            )
+        return DocumentReadOutput(
+            kind="document.read", read_unit_count=read_unit_count
+        )
 
     async def execute(self, request: AgentRequest, runtime: object) -> AgentResult:
         self.calls.append((request, runtime))
@@ -162,7 +179,7 @@ class FakeReadCapability:
                 contract_version="2.0",
                 task_id=request.task_id,
                 status="success",
-                data=DocumentReadOutput(kind="document.read", read_unit_count=0),
+                data=self._output(0),
                 evidence_uses=(),
                 coverage_observations=(
                     CoverageObservation(
@@ -179,12 +196,12 @@ class FakeReadCapability:
             contract_version="2.0",
             task_id=request.task_id,
             status="success",
-            data=DocumentReadOutput(kind="document.read", read_unit_count=1),
+            data=self._output(1),
             evidence_uses=(EvidenceUseRef(use_id=use_id),),
             coverage_observations=(
                 CoverageObservation(
                     target_id=target_id,
-                    observed_locators=(DocumentLocator(kind="document"),),
+                    observed_locators=(self._locator(target_id),),
                     outcome="read",
                 ),
             ),
@@ -357,6 +374,7 @@ def _harness(
     allowed: frozenset[str] | None = None,
     fail_first_for: frozenset[str] = frozenset(),
     truncate_first_for: frozenset[str] = frozenset(),
+    locator_for: dict[str, object] | None = None,
 ) -> tuple[tuple[FakeReadCapability, ...], FakeLeases, GraphRuntimeContext]:
     capabilities = (
         FakeReadCapability(
@@ -364,12 +382,14 @@ def _harness(
             missing_targets=missing,
             fail_first_for=fail_first_for,
             truncate_first_for=truncate_first_for,
+            locator_for=locator_for,
         ),
         FakeReadCapability(
             "section.read",
             missing_targets=missing,
             fail_first_for=fail_first_for,
             truncate_first_for=truncate_first_for,
+            locator_for=locator_for,
         ),
     )
     leases = FakeLeases()
@@ -404,6 +424,221 @@ def _harness(
     )
 
 
+DOC_C = UUID("33333333-3333-3333-3333-333333333333")
+DOC_D = UUID("44444444-4444-4444-4444-444444444444")
+REV_C = UUID("c3c3c3c3-c3c3-c3c3-c3c3-c3c3c3c3c3c3")
+REV_D = UUID("d4d4d4d4-d4d4-d4d4-d4d4-d4d4d4d4d4d4")
+CANDIDATE_C = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+CANDIDATE_D = UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
+
+
+class FakeSearchCapability:
+    """Atomic stub: discovery search returning fixed UUID candidates."""
+
+    def __init__(self) -> None:
+        self.descriptor = CapabilityDescriptor(
+            name="document.search",  # type: ignore[arg-type]
+            domain="document",  # type: ignore[arg-type]
+            operation_type="search",
+            supports_parallel=False,
+        )
+        self.calls: list[tuple[AgentRequest, object]] = []
+
+    async def execute(self, request: AgentRequest, runtime: object) -> AgentResult:
+        self.calls.append((request, runtime))
+        assert isinstance(request.input, DocumentSearchInput)
+        assert request.input.person_identifier is None
+        return AgentResult(
+            contract_version="2.0",
+            task_id=request.task_id,
+            status="success",
+            data=DocumentSearchOutput(
+                kind="document.search",
+                candidates=(
+                    DocumentDiscoveryCandidate(
+                        candidate_id=CANDIDATE_C,
+                        document_id=DOC_C,
+                        document_revision=str(REV_C),
+                    ),
+                    DocumentDiscoveryCandidate(
+                        candidate_id=CANDIDATE_D,
+                        document_id=DOC_D,
+                        document_revision=str(REV_D),
+                    ),
+                ),
+            ),
+            evidence_uses=(),
+            coverage_observations=(),
+            error=None,
+        )
+
+
+class FakeBindingResolver:
+    """Binding Resolver double: it alone creates/pins discovered bindings.
+
+    Revalidates current visibility (ACL) against its server-side set and pins
+    the candidate's exact discovered revision. Raises ``DiscoveryDenied``
+    for invisible documents instead of leaking metadata.
+    """
+
+    def __init__(self, visible: frozenset[UUID]) -> None:
+        from app.services.agents.v2.discovery import DiscoveryDenied
+
+        self._visible = visible
+        self._denied = DiscoveryDenied
+        self.created: list[tuple[object, object, ScopedDocument]] = []
+
+    async def add_discovered_binding(
+        self, request, candidate, capability_runtime
+    ):  # type: ignore[no-untyped-def]
+        if candidate.document_id not in self._visible:
+            raise self._denied(
+                "the discovered document is not visible under current authorization"
+            )
+        binding = ScopedDocument(
+            binding_id=f"d_{candidate.candidate_id.hex[:8]}",
+            document_id=candidate.document_id,
+            document_revision=candidate.document_revision,
+            role=request.requested_role,
+        )
+        self.created.append((request, candidate, binding))
+        return binding
+
+
+def _discovery_harness(
+    run_id: str = "run-discovery-1",
+    visible: frozenset[UUID] | None = None,
+    truncate_first_for: frozenset[str] = frozenset(),
+) -> tuple[tuple[object, ...], FakeLeases, FakeBindingResolver, GraphRuntimeContext]:
+    document_capability = FakeReadCapability(
+        "document.read", truncate_first_for=truncate_first_for
+    )
+    search_capability = FakeSearchCapability()
+    capabilities = (document_capability, search_capability)
+    leases = FakeLeases()
+    resolver = FakeBindingResolver(
+        visible if visible is not None else frozenset({DOC_C, DOC_D})
+    )
+    runtime = CapabilityRuntimeContext(
+        request_id="req-discovery-1",
+        run_id=run_id,
+        user_id=USER_ID,
+        workspace_ids=(WORKSPACE_ID,),
+        can_read_people=True,
+        allowed_capabilities=frozenset(
+            {"people.lookup", "document.search", "document.read"}
+        ),
+        deadline_at=datetime(2030, 1, 1, tzinfo=UTC),
+    )
+    registry = build_capability_registry(
+        [CapabilityRegistration(capability=capability) for capability in capabilities],
+        runtime,
+    )
+    return (
+        capabilities,
+        leases,
+        resolver,
+        GraphRuntimeContext(
+            capability_runtime=runtime,
+            services=RuntimeServices(
+                capability_registry=registry,
+                retention_leases=leases,
+                evidence_hydrator=FakeHydrator((document_capability,)),
+                binding_resolver=resolver,
+            ),
+        ),
+    )
+
+
+def _people_plan() -> TaskPlan:
+    """Targetless people plan: T1 people.lookup with no TargetUnits."""
+    return TaskPlan(
+        contract_version="2.0",
+        plan_id="p-people",
+        goal="CCCD cua A xuat hien trong nghi dinh nao",
+        target_units=(),
+        tasks=(
+            TaskSpec(
+                task_id="T1",
+                capability="people.lookup",
+                task_objective="find A",
+                input=PeopleLookupInput(kind="people.lookup", query="A"),
+                depends_on=(),
+                origin=InitialTaskOrigin(kind="initial"),
+            ),
+        ),
+    )
+
+
+def _insufficient_evaluation() -> EvidenceEvaluation:
+    return EvidenceEvaluation(
+        status="insufficient",
+        coverage=Coverage(items=()),
+        missing=(),
+        contradictions=(),
+    )
+
+
+def _not_found_people_result() -> AgentResult:
+    return AgentResult(
+        contract_version="2.0",
+        task_id="T1",
+        status="not_found",
+        data=PeopleLookupOutput(kind="people.lookup", matched=False),
+        evidence_uses=(),
+        coverage_observations=(),
+        error=None,
+    )
+
+
+def _timeout_people_result() -> AgentResult:
+    return AgentResult(
+        contract_version="2.0",
+        task_id="T1",
+        status="error",
+        data=None,
+        evidence_uses=(),
+        coverage_observations=(),
+        error={"code": "TIMEOUT", "message": "upstream slow", "retryable": True},  # type: ignore[arg-type]
+    )
+
+
+def _parent_state() -> dict:
+    from app.services.agents.v2.contracts.base import CONTRACT_VERSION
+    from app.services.agents.v2.contracts.conversation import ConversationContext
+    from app.services.agents.v2.contracts.request import RequestContext
+    from app.services.agents.v2.contracts.routing import RouteDecision
+    from app.services.agents.v2.contracts.state import ExecutionState
+
+    return {
+        "contract_version": CONTRACT_VERSION,
+        "request": RequestContext(
+            contract_version=CONTRACT_VERSION,
+            request_id="req-replan-1",
+            thread_id="thread-replan-1",
+            original_query=COMPARE_QUERY,
+            known_documents=(),
+        ),
+        "conversation": ConversationContext(
+            summary="",
+            active_entities=(),
+            last_focus=None,
+            recent_turns=(),
+        ),
+        "semantic": _semantic(),
+        "bindings": _bindings(),
+        "query_analysis": _analysis(),
+        "route_decision": RouteDecision(
+            route="complex_research", reason_code="comparison"
+        ),
+        "execution": ExecutionState(
+            plan=None, task_results=(), evidence_evaluation=None
+        ),
+        "clarification": None,
+        "final_response": None,
+    }
+
+
 def _policy(**overrides):  # type: ignore[no-untyped-def]
     values = {
         "allow_reference_discovery": False,
@@ -433,6 +668,24 @@ def replan_settings(monkeypatch: pytest.MonkeyPatch) -> None:
         "app.core.config.get_settings",
         lambda: SimpleNamespace(
             V2_MAX_TASKS=8, V2_MAX_PARALLEL_BRANCHES=2, V2_MAX_REPLANS=2
+        ),
+    )
+
+
+@pytest.fixture
+def discovery_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Policy-enabled discovery plus a bounded replan budget."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "app.core.config.get_settings",
+        lambda: SimpleNamespace(
+            V2_MAX_TASKS=8,
+            V2_MAX_PARALLEL_BRANCHES=2,
+            V2_MAX_REPLANS=2,
+            V2_ALLOW_REFERENCE_DISCOVERY=True,
+            V2_ALLOW_SUPPORTING_DISCOVERY=True,
+            V2_MAX_DISCOVERED_DOCUMENTS=4,
         ),
     )
 
@@ -849,6 +1102,144 @@ async def test_replan_loop_terminates_on_terminal_or_typed_failure() -> None:
     assert _decide_branch(unsupported) == "finalize"
 
 
+def test_production_entry_budget_comes_from_settings(replan_settings: None) -> None:
+    """R36: supervisor entry uses the settings-driven limits, not a constant.
+
+    Routes through ``build_complex_research_state`` (the production
+    supervisor-entry mapping) and proves a non-zero ``V2_MAX_REPLANS``
+    yields a non-zero remaining replan budget. There is no ``MAX_REPLANS``
+    constant left to pin: the single source of truth is the settings.
+    """
+    import app.services.agents.v2.complex_research_graph as graph_module
+
+    assert not hasattr(graph_module, "MAX_REPLANS")
+    from app.services.agents.v2.complex_research_graph import (
+        build_complex_research_state,
+        build_research_budget_view,
+    )
+
+    child = build_complex_research_state(_parent_state())  # type: ignore[arg-type]
+    assert child["replans_remaining"] == 2
+
+    _, _, context = _harness(run_id="run-prod-entry")
+    budget = build_research_budget_view(child, context)
+    assert budget.max_replans_remaining == 2
+
+
+@pytest.mark.asyncio
+async def test_production_entry_allows_a_replan(replan_settings: None) -> None:
+    """R36 end to end: production-mapped state actually replans once."""
+    from app.services.agents.v2.complex_research_graph import (
+        build_complex_research_state,
+        build_complex_research_subgraph,
+    )
+
+    (_, _), _, context = _harness(
+        run_id="run-prod-entry-2", truncate_first_for=frozenset({"t2"})
+    )
+    child = build_complex_research_state(_parent_state())  # type: ignore[arg-type]
+    assert child["replans_remaining"] == 2
+    output = await build_complex_research_subgraph().ainvoke(child, context=context)
+    assert [task.task_id for task in output["plan"].tasks] == ["T1", "T2", "T3"]
+    assert output["evaluation"].status == "sufficient"
+
+
+@pytest.mark.asyncio
+async def test_not_found_recovery_replan_on_real_graph(
+    discovery_settings: None,
+) -> None:
+    """R37/§26: no-evidence not_found stays actionable on the real graph.
+
+    T1 people.lookup returns not_found with no EvidenceUse: the run must
+    propose a recovery replan (fallback discovery search, no rerun of T1,
+    no fabricated scalar) instead of finalizing as a silent success.
+    """
+    from app.services.agents.v2.complex_research_graph import (
+        build_complex_research_subgraph,
+        replan_advisable,
+    )
+
+    capabilities, _, _, context = _discovery_harness(run_id="run-notfound-1")
+    search_capability = capabilities[1]
+    child = _child_input(
+        plan=_people_plan(),
+        task_results=(_not_found_people_result(),),
+        evaluation=_insufficient_evaluation(),
+        replans_remaining=2,
+    )
+    assert replan_advisable(child) is True
+    output = await build_complex_research_subgraph().ainvoke(child, context=context)
+    tasks = output["plan"].tasks
+    assert [task.task_id for task in tasks] == ["T1", "T2"]
+    recovery = tasks[1]
+    assert recovery.capability == "document.search"
+    assert recovery.depends_on == ("T1",)
+    assert recovery.input.person_identifier is None  # type: ignore[union-attr]
+    assert recovery.input.query == _people_plan().goal  # type: ignore[union-attr]
+    assert isinstance(recovery.origin, ReplanTaskOrigin)
+    assert "not_found" in recovery.origin.reason
+    assert "TIMEOUT" not in recovery.origin.reason
+    assert recovery.origin.task_ids == ("T1",)
+    # T1 was never redispatched: only the fallback search ran.
+    assert [call[0].task_id for call in search_capability.calls] == ["T2"]
+    # Not a silent success: the people task still owns no admitted use.
+    assert output["evaluation"].status == "insufficient"
+
+
+@pytest.mark.asyncio
+async def test_timeout_recovery_is_distinct_and_fabricates_nothing(
+    discovery_settings: None,
+) -> None:
+    """R37/§26: TIMEOUT is typed distinctly from not_found, same guarantees."""
+    from app.services.agents.v2.complex_research_graph import (
+        build_complex_research_subgraph,
+        replan_advisable,
+    )
+
+    capabilities, _, _, context = _discovery_harness(run_id="run-timeout-1")
+    search_capability = capabilities[1]
+    child = _child_input(
+        plan=_people_plan(),
+        task_results=(_timeout_people_result(),),
+        evaluation=_insufficient_evaluation(),
+        replans_remaining=2,
+    )
+    assert replan_advisable(child) is True
+    output = await build_complex_research_subgraph().ainvoke(child, context=context)
+    tasks = output["plan"].tasks
+    assert [task.task_id for task in tasks] == ["T1", "T2"]
+    recovery = tasks[1]
+    assert recovery.capability == "document.search"
+    assert recovery.input.person_identifier is None  # type: ignore[union-attr]
+    assert isinstance(recovery.origin, ReplanTaskOrigin)
+    assert "TIMEOUT" in recovery.origin.reason
+    assert "not_found" not in recovery.origin.reason
+    assert [call[0].task_id for call in search_capability.calls] == ["T2"]
+    assert output["evaluation"].status == "insufficient"
+
+
+def test_denied_people_task_never_recovers() -> None:
+    """R37: denial is terminal — no fallback work is proposed for it."""
+    from app.services.agents.v2.complex_research_graph import replan_advisable
+
+    denied = AgentResult(
+        contract_version="2.0",
+        task_id="T1",
+        status="denied",
+        data=None,
+        evidence_uses=(),
+        coverage_observations=(),
+        error={"code": "PERMISSION_DENIED", "message": "no", "retryable": False},  # type: ignore[arg-type]
+    )
+    child = _child_input(
+        plan=_people_plan(),
+        task_results=(denied,),
+        evaluation=_insufficient_evaluation(),
+        replans_remaining=2,
+    )
+    assert replan_advisable(child) is False
+
+
 def test_canonical_loop_edges_checkpoint_replan_before_execute() -> None:
     from app.services.agents.v2.complex_research_graph import (
         _build_complex_research_graph,
@@ -859,40 +1250,37 @@ def test_canonical_loop_edges_checkpoint_replan_before_execute() -> None:
     assert ("plan", "validate_checkpoint") in edges
     assert ("validate_checkpoint", "execute") in edges
     assert ("execute", "materialize") in edges
+    assert ("settle", "evaluate") in edges
     assert ("evaluate", "decide") in edges
     assert ("replan", "validate_checkpoint") in edges
     assert ("finalize", "__end__") in edges
 
 
 @pytest.mark.asyncio
-async def test_tool_gateway_checkpoints_replan_before_dispatch() -> None:
-    """Propose checkpoint dispatch: the new task runs only via the accepted plan."""
-    from app.services.agents.v2.execution import execute_ready_tasks
+async def test_tool_gateway_checkpoints_replan_before_dispatch(
+    replan_settings: None,
+) -> None:
+    """R40: gateway proposes only; a REAL saver proves replan-before-dispatch.
 
-    registry_names = ("document.read", "section.read")
-    capabilities = tuple(FakeReadCapability(name) for name in registry_names)
-    leases = FakeLeases()
-    base = CapabilityRuntimeContext(
-        request_id="req-gw-1",
-        run_id="run-gw-1",
-        user_id=USER_ID,
-        workspace_ids=(WORKSPACE_ID,),
-        can_read_people=False,
-        allowed_capabilities=frozenset(registry_names),
-        deadline_at=datetime(2030, 1, 1, tzinfo=UTC),
+    First the gateway contract holds (accepted plan, zero dispatches, no
+    checkpoint/execute surface). Then the subgraph runs under a real
+    ``InMemorySaver`` and the audit asserts the checkpoint that first
+    carries the 3-task replan strictly precedes the checkpoint that first
+    carries the new T3 result — the Task-3 reviewer saver-audit method.
+    """
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from app.services.agents.v2.complex_research_graph import (
+        _build_complex_research_graph,
+        complex_evaluate_node,
+        complex_execute_node,
+        validate_checkpoint_node,
     )
-    registry = build_capability_registry(
-        [CapabilityRegistration(capability=capability) for capability in capabilities],
-        base,
+
+    capabilities, leases, context = _harness(
+        run_id="run-gw-audit-1", truncate_first_for=frozenset({"t2"})
     )
-    runtime = GraphRuntimeContext(
-        capability_runtime=base,
-        services=RuntimeServices(
-            capability_registry=registry,
-            retention_leases=leases,
-            evidence_hydrator=FakeHydrator(capabilities),
-        ),
-    )
+    document_capability = capabilities[0]
     gateway = AgentToolGateway()
     current = _two_target_plan()
     outcome = await gateway.propose(
@@ -903,30 +1291,66 @@ async def test_tool_gateway_checkpoints_replan_before_dispatch() -> None:
             depends_on=("T2",),
         ),
         current,
-        runtime,
+        context,
     )
     assert outcome.accepted is True
-    # The gateway never dispatches: proposing alone executes nothing.
     assert all(capability.calls == [] for capability in capabilities)
     assert not hasattr(gateway, "checkpoint")
+    assert not hasattr(gateway, "execute")
+    assert require_planned_dispatch(outcome.plan, "T3", context).task_id == "T3"
 
-    # The CURRENT checkpoint runs only T1/T2...
-    first = await execute_ready_tasks(
-        plan=current, results=(), registry=registry, runtime=runtime,
-        bindings=_bindings(),
-    )
-    assert {result.task_id for result in first.results} == {"T1", "T2"}
+    # Drive the first pass through the real nodes, then resume the loop
+    # under a real saver from that checkpointed first pass.
+    child = _child_input(replans_remaining=2)
+    child = {**child, **await validate_checkpoint_node(child, context)}
+    child = {**child, **await complex_execute_node(child, context)}
+    child = {**child, **await complex_evaluate_node(child, context)}
+    assert child["evaluation"].status == "insufficient"
 
-    # ...and the checkpointed replan dispatches only the NEW task after it.
-    second = await execute_ready_tasks(
-        plan=outcome.plan,
-        results=first.results,
-        registry=registry,
-        runtime=runtime,
-        bindings=_bindings(),
+    saver = InMemorySaver()
+    compiled = _build_complex_research_graph().compile(checkpointer=saver)
+    config = {"configurable": {"thread_id": "thread-gw-audit-1"}}
+    terminal = await compiled.ainvoke(child, config=config, context=context)
+    assert terminal["evaluation"].status == "sufficient"
+    assert [task.task_id for task in terminal["plan"].tasks] == ["T1", "T2", "T3"]
+
+    history: list[dict] = []
+    async for tup in saver.alist(config):
+        history.append(dict(tup.checkpoint["channel_values"]))
+    history.reverse()  # oldest first
+    assert history, "the subgraph wrote checkpoints under the saver"
+
+    def plan_task_count(values: dict) -> int:
+        plan = values.get("plan")
+        if plan is None:
+            return 0
+        tasks = plan.get("tasks") if isinstance(plan, dict) else plan.tasks
+        return len(tasks or ())
+
+    def result_ids(values: dict) -> set[str]:
+        results = values.get("task_results") or ()
+        ids = set()
+        for result in results:
+            task_id = result.get("task_id") if isinstance(result, dict) else result.task_id
+            ids.add(task_id)
+        return ids
+
+    first_replan_at = next(
+        (index for index, values in enumerate(history) if plan_task_count(values) == 3),
+        None,
     )
-    assert {result.task_id for result in second.results} == {"T1", "T2", "T3"}
-    assert require_planned_dispatch(outcome.plan, "T3", runtime).task_id == "T3"
+    first_t3_result_at = next(
+        (index for index, values in enumerate(history) if "T3" in result_ids(values)),
+        None,
+    )
+    assert first_replan_at is not None, "a checkpoint carries the replan"
+    assert first_t3_result_at is not None, "a checkpoint carries the T3 result"
+    assert first_replan_at < first_t3_result_at, (
+        "the replan-bearing checkpoint must precede the new-task dispatch"
+    )
+    assert leases.session.commits >= 1
+    served = [call[0].task_id for call in document_capability.calls]
+    assert served.count("T1") == 1 and served.count("T3") == 1
 
 
 @pytest.mark.asyncio
@@ -1275,6 +1699,119 @@ def test_current_latest_rebinding() -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_discovery_end_to_end_through_binding_resolver(
+    discovery_settings: None,
+) -> None:
+    """R39: policy-enabled search → UUID candidate → resolver pins exact revision.
+
+    The recovery fallback search runs on the real graph, its checkpointed
+    candidates settle through the injected Binding Resolver (the tools layer
+    creates nothing), and each new binding pins the candidate's exact
+    discovered revision.
+    """
+    from pathlib import Path as _Path
+
+    from app.services.agents.v2.complex_research_graph import (
+        build_complex_research_subgraph,
+    )
+
+    capabilities, leases, resolver, context = _discovery_harness(
+        run_id="run-disc-e2e-1"
+    )
+    search_capability = capabilities[1]
+    child = _child_input(
+        plan=_people_plan(),
+        task_results=(_not_found_people_result(),),
+        evaluation=_insufficient_evaluation(),
+        replans_remaining=2,
+    )
+    output = await build_complex_research_subgraph().ainvoke(child, context=context)
+    assert [call[0].task_id for call in search_capability.calls] == ["T2"]
+
+    # The resolver — not the tools layer — performed creation and received
+    # the server-side candidates (UUID identity, exact revision).
+    assert len(resolver.created) == 2
+    for request, candidate, binding in resolver.created:
+        assert candidate.candidate_id in (CANDIDATE_C, CANDIDATE_D)
+        assert binding.document_id == candidate.document_id
+        assert binding.document_revision == candidate.document_revision
+        assert binding.role == request.requested_role == "discovered"
+    pinned = {
+        (binding.document_id, binding.document_revision)
+        for binding in output["bindings"].bindings
+    }
+    assert (DOC_C, str(REV_C)) in pinned
+    assert (DOC_D, str(REV_D)) in pinned
+    assert leases.session.commits >= 1
+
+    # The tools layer creates/pins no binding: no binding contracts there.
+    tools_dir = (
+        _Path(__file__).resolve().parents[5]
+        / "backend/app/services/agents/v2/tools"
+    )
+    for module_path in sorted(tools_dir.glob("*.py")):
+        source = module_path.read_text()
+        assert "ScopedDocument" not in source, module_path.name
+        assert "DocumentBindingSet" not in source, module_path.name
+
+
+@pytest.mark.asyncio
+async def test_discovery_policy_disabled_settles_nothing(replan_settings: None) -> None:
+    """R39: with discovery disabled, no search is proposed and nothing settles."""
+    from app.services.agents.v2.complex_research_graph import (
+        build_complex_research_subgraph,
+    )
+
+    capabilities, _, resolver, context = _discovery_harness(
+        run_id="run-disc-off-1"
+    )
+    search_capability = capabilities[1]
+    child = _child_input(
+        plan=_people_plan(),
+        task_results=(_not_found_people_result(),),
+        evaluation=_insufficient_evaluation(),
+        replans_remaining=2,
+    )
+    output = await build_complex_research_subgraph().ainvoke(child, context=context)
+    assert [task.task_id for task in output["plan"].tasks] == ["T1"]
+    assert search_capability.calls == []
+    assert resolver.created == []
+    assert output["evaluation"].status == "insufficient"
+
+
+@pytest.mark.asyncio
+async def test_discovery_acl_denied_candidate_settles_nothing(
+    discovery_settings: None,
+) -> None:
+    """R39: an ACL-denied candidate is skipped without metadata leakage."""
+    from app.services.agents.v2.complex_research_graph import (
+        build_complex_research_subgraph,
+    )
+
+    capabilities, _, resolver, context = _discovery_harness(
+        run_id="run-disc-deny-1", visible=frozenset({DOC_C})
+    )
+    child = _child_input(
+        plan=_people_plan(),
+        task_results=(_not_found_people_result(),),
+        evaluation=_insufficient_evaluation(),
+        replans_remaining=2,
+    )
+    output = await build_complex_research_subgraph().ainvoke(child, context=context)
+    assert len(resolver.created) == 1
+    _, denied_candidate, _ = resolver.created[0]
+    assert denied_candidate.document_id == DOC_C
+    pinned = {
+        (binding.document_id, binding.document_revision)
+        for binding in output["bindings"].bindings
+    }
+    assert (DOC_C, str(REV_C)) in pinned
+    assert (DOC_D, str(REV_D)) not in pinned
+    # The run terminates (finalize) rather than looping on the denial.
+    assert output["evaluation"].status == "insufficient"
+
+
 # ---------------------------------------------------------------------------
 # Model-facing projections carry no People scalar (R34)
 # ---------------------------------------------------------------------------
@@ -1370,32 +1907,12 @@ def test_replan_input_carries_no_people_scalar() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Summarize is a skill, not an agent route (R35)
+# Summarize is a skill, not an agent route (R35/R38)
 # ---------------------------------------------------------------------------
 
 
-def test_summary_is_skill_not_agent_route() -> None:
-    from app.services.agents.v2.skills.summarize import policy as summarize_policy
-
-    assert callable(summarize_policy.build_summarize_plan)
-    assert summarize_policy.supports_work_type("summarize") is True
-    assert summarize_policy.supports_work_type("compare") is False
-    assert summarize_policy.supports_work_type("evaluate") is False
-    v2_root = Path(__file__).resolve().parents[5] / "app" / "services" / "agents" / "v2"
-    assert list(v2_root.glob("*summary_agent*")) == []
-    import app.services.agents.v2.complex_research_graph as subgraph_module
-
-    source = inspect.getsource(subgraph_module)
-    assert "SummaryAgent" not in source
-    assert "summary_agent" not in source
-
-
-def test_bounded_summarize_is_read_evaluate_synthesize_ground() -> None:
-    from app.services.agents.v2.complex_research_graph import build_planning_input
-    from app.services.agents.v2.skills.summarize import policy as summarize_policy
-
-    _, _, context = _harness(run_id="run-summarize-1")
-    single_bindings = DocumentBindingSet(
+def _single_target_bindings() -> DocumentBindingSet:
+    return DocumentBindingSet(
         bindings=(
             ScopedDocument(
                 binding_id="b1",
@@ -1406,21 +1923,164 @@ def test_bounded_summarize_is_read_evaluate_synthesize_ground() -> None:
         ),
         revision_requirement_refs=(),
     )
-    child = _child_input(
-        query_analysis=_analysis("summarize"), bindings=single_bindings
+
+
+def _section_semantic() -> SemanticContext:
+    from app.services.agents.v2.contracts.semantic import SectionReference
+
+    return SemanticContext(
+        contextualized_query="Tom tat Chuong II va Chuong III",
+        normalized_query="tom tat chuong ii va chuong iii",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(),
+        person_refs=(),
+        section_refs=(
+            SectionReference(
+                ref_id="r1", label="Chuong II", structure_node_id="chap-II"
+            ),
+            SectionReference(
+                ref_id="r2", label="Chuong III", structure_node_id="chap-III"
+            ),
+        ),
+        blocking_ambiguities=(),
     )
-    plan = summarize_policy.build_summarize_plan(build_planning_input(child, context))
+
+
+@pytest.mark.asyncio
+async def test_summary_is_skill_not_agent_route() -> None:
+    """R38: the REAL selection path serves summarize; no summary agent."""
+    from app.services.agents.v2.complex_research_graph import (
+        validate_checkpoint_node,
+    )
+    from app.services.agents.v2.skills.summarize import policy as summarize_policy
+
+    assert summarize_policy.supports_work_type("summarize") is True
+    assert summarize_policy.supports_work_type("compare") is False
+    assert summarize_policy.supports_work_type("evaluate") is False
+
+    _, leases, context = _harness(run_id="run-summarize-1")
+    child = _child_input(
+        query_analysis=_analysis("summarize"), bindings=_single_target_bindings()
+    )
+    # The real initial-validation path selects the summarize skill by work
+    # type — the test never calls the policy directly.
+    decided = await validate_checkpoint_node(child, context)
+    plan = decided["plan"]
+    assert plan.plan_id.startswith("summarize-")
     assert len(plan.target_units) == 1
     assert len(plan.tasks) == 1
-    assert plan.tasks[0].capability in ("document.read", "section.read")
+    assert plan.tasks[0].capability == "document.read"
     assert isinstance(plan.tasks[0].origin, InitialTaskOrigin)
+    assert leases.session.commits >= 1
+
+    v2_root = (
+        Path(__file__).resolve().parents[5]
+        / "backend/app/services/agents/v2"
+    )
+    assert v2_root.is_dir()
+    assert list(v2_root.glob("*summary_agent*")) == []
+    import app.services.agents.v2.complex_research_graph as subgraph_module
+
+    source = inspect.getsource(subgraph_module)
+    assert "SummaryAgent" not in source
+    assert "summary_agent" not in source
     import app.services.agents.v2.skills.summarize.policy as policy_module
 
-    source = inspect.getsource(policy_module)
-    assert "capability.execute(" not in source
-    assert "TaskScheduler" not in source
-    assert "FinalResponse" not in source
-    assert "EvidenceUse" not in source
+    policy_source = inspect.getsource(policy_module)
+    assert "capability.execute(" not in policy_source
+    assert "TaskScheduler" not in policy_source
+    assert "FinalResponse" not in policy_source
+    assert "EvidenceUse" not in policy_source
+
+
+@pytest.mark.asyncio
+async def test_large_summarize_map_reduces_over_sections() -> None:
+    """R38: large summarize maps one read per named section, then covers."""
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from app.services.agents.v2.complex_research_graph import (
+        _build_complex_research_graph,
+        validate_checkpoint_node,
+    )
+    from app.services.agents.v2.contracts.locators import SectionLocator
+
+    locator_for = {
+        "s1": SectionLocator(kind="section", structure_node_id="chap-II"),
+        "s2": SectionLocator(kind="section", structure_node_id="chap-III"),
+    }
+    capabilities, _, context = _harness(
+        run_id="run-summarize-map-1", locator_for=locator_for
+    )
+    section_capability = capabilities[1]
+    child = _child_input(
+        query_analysis=_analysis("summarize"),
+        bindings=_single_target_bindings(),
+        semantic=_section_semantic(),
+    )
+    decided = await validate_checkpoint_node(child, context)
+    plan = decided["plan"]
+    assert plan.plan_id.startswith("summarize-")
+    assert [unit.target_id for unit in plan.target_units] == ["s1", "s2"]
+    assert [task.task_id for task in plan.tasks] == ["T1", "T2"]
+    assert {task.capability for task in plan.tasks} == {"section.read"}
+
+    compiled = _build_complex_research_graph().compile(
+        checkpointer=InMemorySaver()
+    )
+    output = await compiled.ainvoke(
+        child,
+        config={"configurable": {"thread_id": "thread-summarize-map-1"}},
+        context=context,
+    )
+    assert output["evaluation"].status == "sufficient"
+    assert len(section_capability.calls) == 2
+
+
+def test_bounded_summarize_stays_fast() -> None:
+    """R38: a single bound document summarizes on the fast path, not complex."""
+    from app.services.agents.v2.contracts.semantic import DocumentReference
+    from app.services.agents.v2.nodes.routing import decide_route
+
+    semantic = SemanticContext(
+        contextualized_query="Tom tat A",
+        normalized_query="tom tat a",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(
+            DocumentReference(
+                ref_id="r1",
+                original_span="tai lieu A",
+                normalized_reference="tai lieu a",
+                requested_role="target",
+                revision_requirement=None,
+                resolution_status="resolved",
+                resolved_document_id=DOC_A,
+                candidate_document_ids=(),
+            ),
+        ),
+        person_refs=(),
+        section_refs=(),
+        blocking_ambiguities=(),
+    )
+    bindings = DocumentBindingSet(
+        bindings=(
+            ScopedDocument(
+                binding_id="b_r1",
+                document_id=DOC_A,
+                document_revision=str(REV_A),
+                role="target",
+            ),
+        ),
+        revision_requirement_refs=(),
+    )
+    decision = decide_route(
+        _analysis("summarize"),
+        semantic,
+        bindings,
+        allowed_capabilities=frozenset({"document.read"}),
+    )
+    assert decision.route == "fast_domain"
 
 
 # ---------------------------------------------------------------------------
@@ -1428,54 +2088,129 @@ def test_bounded_summarize_is_read_evaluate_synthesize_ground() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_subagent_cannot_append_authoritative_tasks() -> None:
-    """A fabricated subagent task has no authority until validated+checkpointed."""
-    _, _, context = _harness()
+# R41 uses option (b): no advisory/subagent module exists (the amendment
+# authorizes advisory subagents but requires none), so the guards pin the
+# actual invariants structurally — a new module would add surface the
+# amendment does not require. Advisory input can only be the typed
+# observation/projection payloads, whose schemas are pinned below, and no
+# advisory output can become an authoritative task except through the
+# validated gateway/replan path.
+
+
+@pytest.mark.asyncio
+async def test_subagent_cannot_append_authoritative_tasks() -> None:
+    """R41(b): advisory output gains authority ONLY via the governed path."""
+    from app.services.agents.v2.tools.observations import (
+        AgentToolObservation,
+        PeopleLookupObservation,
+    )
+
+    # The advisory payload schema is pinned to the minimized set: a People
+    # observation carries exactly availability truth, so no raw scalar has
+    # any typed carrier into an advisory consumer.
+    assert set(PeopleLookupObservation.model_fields) == {
+        "kind",
+        "matched",
+        "dependency_scalar_available",
+    }
+    for field_name, field in AgentToolObservation.model_fields.items():
+        annotation = str(field.annotation)
+        assert "Mapping" not in annotation, field_name
+        assert "dict" not in annotation.lower(), field_name
+        assert "Any" not in annotation, field_name
+
+    # An advisory suggestion (free text + capability name) is not a TaskSpec:
+    # smuggling it past the gateway fails closed and changes no plan.
+    _, _, context = _harness(run_id="run-subagent-1")
     current = _two_target_plan()
-    # A subagent invents a task outside the governed boundary: the
-    # pre-dispatch guard rejects it because no validated checkpoint owns it.
+    gateway = AgentToolGateway()
+    smuggled = await gateway.propose(
+        CapabilityInvocationProposal(
+            capability="advisory.summarize",
+            objective="a subagent suggests summarizing",
+            input=DocumentReadInput(kind="document.read", target_ids=("t1",)),
+        ),
+        current,
+        context,
+    )
+    assert smuggled.accepted is False
+    assert smuggled.plan == current
     with pytest.raises(UnplannedCapabilityDispatch):
         require_planned_dispatch(current, "T-subagent-1", context)
-    # Advisory text is not a TaskSpec: it cannot enter the plan or scheduler.
-    assert not hasattr(current, "append_subagent_task")
-    import app.services.agents.v2.complex_research_graph as subgraph_module
-
-    source = inspect.getsource(subgraph_module)
-    assert "subagent" not in source.lower()
 
 
 def test_subagent_cannot_receive_raw_people_record_or_runtime_secrets() -> None:
-    """Advisory consumers see typed observations only: no raw record, no secrets."""
+    """R41(b): a KNOWN sentinel scalar/secrets set must not reach advisory payloads."""
+    from app.services.agents.v2.complex_research_graph import (
+        build_model_observations,
+        build_model_replan_input,
+    )
     from app.services.agents.v2.tools.adapters import AgentToolAdapter
     from app.services.agents.v2.tools.observations import ObservationProjector
 
-    _, _, context = _harness(run_id="run-subagent-1")
-    raw_scalar = "987654321098"
-    people_result = AgentResult(
-        contract_version="2.0",
-        task_id="T1",
-        status="success",
-        data=PeopleLookupOutput(kind="people.lookup", matched=True),
-        evidence_uses=(EvidenceUseRef(use_id=uuid4()),),
-        coverage_observations=(),
-        error=None,
+    sentinel_scalar = "987654321098"
+    sentinel_secret = "sentinel-workspace-" + WORKSPACE_ID.hex[:8]
+    _, _, context = _harness(run_id="run-subagent-2")
+    # The sentinel lives in the governed checkpointed plan input (as the
+    # materialized scalar would) and the runtime carries real authority.
+    base = _two_target_plan()
+    sentinel_plan = base.model_copy(
+        update={
+            "tasks": (
+                base.tasks[0],
+                base.tasks[1].model_copy(
+                    update={
+                        "capability": "document.search",
+                        "input": DocumentSearchInput(
+                            kind="document.search",
+                            query="nghi dinh",
+                            person_identifier=sentinel_scalar,
+                        ),
+                    }
+                ),
+            )
+        }
     )
-    observation = ObservationProjector.project(
-        people_result, dependency_scalar_available=True
+    assert sentinel_scalar in sentinel_plan.model_dump_json()
+    child = _child_input(
+        plan=sentinel_plan,
+        task_results=(
+            AgentResult(
+                contract_version="2.0",
+                task_id="T1",
+                status="success",
+                data=PeopleLookupOutput(kind="people.lookup", matched=True),
+                evidence_uses=(EvidenceUseRef(use_id=uuid4()),),
+                coverage_observations=(),
+                error=None,
+            ),
+        ),
+        people_scalar_available={"T1": True},
     )
-    payload = observation.model_dump_json()
-    assert raw_scalar not in payload
-    for secret in (
-        "workspace",
-        "user_id",
-        "deadline",
-        "secret",
-        "token",
-        "acl",
-        "service",
-        "storage_key",
-    ):
-        assert secret not in payload.lower()
+    advisory_payloads = [
+        build_model_replan_input(child, context).model_dump_json(),
+        ObservationProjector.project(
+            child["task_results"][0], dependency_scalar_available=True
+        ).model_dump_json(),
+        "".join(
+            observation.model_dump_json()
+            for observation in build_model_observations(child)
+        ),
+    ]
+    for payload in advisory_payloads:
+        assert sentinel_scalar not in payload
+        assert sentinel_secret not in payload
+        for secret in (
+            "workspace_ids",
+            "can_read_people",
+            "allowed_capabilities",
+            "deadline_at",
+            "storage_key",
+        ):
+            assert secret not in payload
+    # Without the redaction helper the sentinel WOULD be visible, so the
+    # assertions above are non-vacuous.
+    assert sentinel_scalar in child["plan"].model_dump_json()
 
     adapter = AgentToolAdapter(context.services.capability_registry)
     runtime_only = {

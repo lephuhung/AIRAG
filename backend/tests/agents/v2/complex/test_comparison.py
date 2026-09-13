@@ -1063,12 +1063,21 @@ async def test_complex_subgraph_resumes_under_supervisor_checkpointer() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_complex_boundary_maps_parent_to_child_state() -> None:
+def test_complex_boundary_maps_parent_to_child_state(monkeypatch) -> None:
+    from types import SimpleNamespace
+
     from app.services.agents.v2.complex_research_graph import (
-        MAX_REPLANS,
         build_complex_research_state,
     )
 
+    # R36: production entry uses the SAME settings-driven limits the budget
+    # view enforces — no hardcoded constant anywhere.
+    monkeypatch.setattr(
+        "app.core.config.get_settings",
+        lambda: SimpleNamespace(
+            V2_MAX_TASKS=8, V2_MAX_PARALLEL_BRANCHES=2, V2_MAX_REPLANS=3
+        ),
+    )
     child = build_complex_research_state(_parent_state())
     assert child["contract_version"] == "2.0"
     assert child["semantic"] == _semantic()
@@ -1077,7 +1086,7 @@ def test_complex_boundary_maps_parent_to_child_state() -> None:
     assert child["plan"] is None
     assert child["task_results"] == ()
     assert child["evaluation"] is None
-    assert child["replans_remaining"] == MAX_REPLANS
+    assert child["replans_remaining"] == 3
     assert "planning_input" not in child
     assert "ResearchPlanningInput" not in json.dumps(
         {key: str(value)[:64] for key, value in child.items()}

@@ -18,14 +18,19 @@ Pilot scope (initial-plan-only):
 
 - exactly one bound document with role ``target`` — any other arity or role
   fails closed;
-- the ``requested_locator`` derives from the query semantics: a
-  ``SemanticContext.section_refs`` entry for this side (joined via the
-  canonical ``binding_id_for_ref`` convention, whose single owner is
-  ``adapters/document.py``) becomes the exact ``SectionLocator`` coordinate
-  (and selects ``section.read``); with no finer coordinate the plan falls back
-  to a whole-document ``DocumentLocator`` (``document.read``);
-- the used read capability must be present in the request-scoped capability
-  catalog;
+- deterministic map/reduce proposal: every ``SemanticContext.section_refs``
+  entry carrying a ``structure_node_id`` names one map chunk of the single
+  target document (in ``ref_id`` order), each becoming a ``TargetUnit`` with
+  the exact ``SectionLocator`` coordinate plus one ``section.read`` map task;
+  the reduce step is governed synthesis downstream, never a task here. With
+  no named sections the plan falls back to a single whole-document
+  ``DocumentLocator`` (``document.read``) — the bounded shape the fast path
+  also serves;
+- map fan-out is bounded by ``ResearchBudgetView.max_tasks_remaining``: more
+  named sections than task budget fails closed instead of silently dropping
+  content;
+- every used read capability must be present in the request-scoped
+  capability catalog;
 - discovery/replan are rejected here (the replan loop owns appends): only
   ``summarize`` is supported, every other work type fails closed so the caller
   can return the typed ``COMPLEX_RESEARCH_UNAVAILABLE`` boundary instead of a
@@ -33,10 +38,9 @@ Pilot scope (initial-plan-only):
 """
 from __future__ import annotations
 
-from ...adapters.document import binding_id_for_ref
 from ...contracts.binding import ScopedDocument
 from ...contracts.capability import DocumentReadInput, SectionReadInput
-from ...contracts.locators import ContentLocator, DocumentLocator, SectionLocator
+from ...contracts.locators import DocumentLocator, SectionLocator
 from ...contracts.planning import (
     CoverageCriterion,
     InitialTaskOrigin,
@@ -91,43 +95,47 @@ def _summary_target(bindings: object) -> ScopedDocument:
     return target
 
 
-def _locator_for(binding: ScopedDocument, semantic: SemanticContext) -> ContentLocator:
-    """Exact requested coordinate: section when named, else whole document.
+def _map_chunks(semantic: SemanticContext) -> tuple[str, ...]:
+    """Structure-node IDs naming map chunks of the single target, in order.
 
-    A section reference names its side through the canonical binding-ID
-    convention (``binding_id_for_ref``); the first match in ``ref_id`` order
-    wins deterministically.
+    With exactly one bound document there is no side ambiguity: every
+    section reference carrying a coordinate names one map chunk.
+    Deterministic ``ref_id`` order wins.
     """
     matches = sorted(
         (
             reference
             for reference in semantic.section_refs
             if reference.structure_node_id is not None
-            and binding_id_for_ref(reference.ref_id) == binding.binding_id
         ),
         key=lambda reference: reference.ref_id,
     )
-    if matches:
-        structure_node_id = matches[0].structure_node_id
-        assert structure_node_id is not None
-        return SectionLocator(kind="section", structure_node_id=structure_node_id)
-    return DocumentLocator(kind="document")
+    return tuple(
+        reference.structure_node_id
+        for reference in matches
+        if reference.structure_node_id is not None
+    )
 
 
-def _read_task(target_id: str, binding: ScopedDocument, locator: ContentLocator) -> TaskSpec:
-    """One bounded summary read: section reads for section coordinates."""
-    if isinstance(locator, SectionLocator):
-        return TaskSpec(
-            task_id="T1",
-            capability="section.read",
-            task_objective=(
-                f"Read section {locator.structure_node_id} for summary "
-                f"(document {binding.document_id})"
-            ),
-            input=SectionReadInput(kind="section.read", target_ids=(target_id,)),
-            depends_on=(),
-            origin=InitialTaskOrigin(kind="initial"),
-        )
+def _map_task(
+    task_id: str, target_id: str, binding: ScopedDocument, structure_node_id: str
+) -> TaskSpec:
+    """One map read: the exact section coordinate, nothing else."""
+    return TaskSpec(
+        task_id=task_id,
+        capability="section.read",
+        task_objective=(
+            f"Read section {structure_node_id} for summary "
+            f"(document {binding.document_id})"
+        ),
+        input=SectionReadInput(kind="section.read", target_ids=(target_id,)),
+        depends_on=(),
+        origin=InitialTaskOrigin(kind="initial"),
+    )
+
+
+def _whole_document_task(binding: ScopedDocument) -> TaskSpec:
+    """The bounded fallback: one whole-document read."""
     return TaskSpec(
         task_id="T1",
         capability="document.read",
@@ -135,22 +143,23 @@ def _read_task(target_id: str, binding: ScopedDocument, locator: ContentLocator)
             "Read the summary target "
             f"(document {binding.document_id})"
         ),
-        input=DocumentReadInput(kind="document.read", target_ids=(target_id,)),
+        input=DocumentReadInput(kind="document.read", target_ids=(_SUMMARY_TARGET_ID,)),
         depends_on=(),
         origin=InitialTaskOrigin(kind="initial"),
     )
 
 
-def _require_read_capability(
-    planning_input: ResearchPlanningInput, task: TaskSpec
+def _require_read_capabilities(
+    planning_input: ResearchPlanningInput, tasks: tuple[TaskSpec, ...]
 ) -> None:
-    """Fail closed when the runtime catalog cannot serve the planned read."""
+    """Fail closed when the runtime catalog cannot serve the planned reads."""
     names = {entry.name for entry in planning_input.capability_catalog}
-    if task.capability not in names:
-        raise ContractValidationError(
-            f"summarize requires {task.capability!r} in the request-scoped "
-            "capability catalog; refusing to plan an undispatchable read"
-        )
+    for task in tasks:
+        if task.capability not in names:
+            raise ContractValidationError(
+                f"summarize requires {task.capability!r} in the request-scoped "
+                "capability catalog; refusing to plan an undispatchable read"
+            )
 
 
 def build_summarize_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
@@ -167,21 +176,53 @@ def build_summarize_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
             f"{planning_input.query_analysis.work_type!r}; out of pilot scope"
         )
     target = _summary_target(planning_input.bindings)
-    locator = _locator_for(target, planning_input.semantic)
-    unit = TargetUnit(
-        target_id=_SUMMARY_TARGET_ID,
-        binding_id=target.binding_id,
-        requested_locator=locator,
-        completion_criteria=(CoverageCriterion(kind="coverage"),),
-    )
-    task = _read_task(_SUMMARY_TARGET_ID, target, locator)
-    _require_read_capability(planning_input, task)
+    chunks = _map_chunks(planning_input.semantic)
+    if chunks:
+        # Deterministic map fan-out: one target + one section read per
+        # named chunk. Bounded by the task budget: silently dropping a
+        # named chunk would corrupt the summary, so excess fails closed.
+        if len(chunks) > planning_input.budget.max_tasks_remaining:
+            raise ContractValidationError(
+                f"summarize names {len(chunks)} section(s) but the task "
+                f"budget allows {planning_input.budget.max_tasks_remaining}; "
+                "refusing a partial map"
+            )
+        units: list[TargetUnit] = []
+        tasks: list[TaskSpec] = []
+        for position, structure_node_id in enumerate(chunks, start=1):
+            target_id = f"s{position}"
+            units.append(
+                TargetUnit(
+                    target_id=target_id,
+                    binding_id=target.binding_id,
+                    requested_locator=SectionLocator(
+                        kind="section", structure_node_id=structure_node_id
+                    ),
+                    completion_criteria=(CoverageCriterion(kind="coverage"),),
+                )
+            )
+            tasks.append(
+                _map_task(f"T{position}", target_id, target, structure_node_id)
+            )
+        plan_id = f"summarize-{target.binding_id}-map{len(chunks)}"
+    else:
+        units = [
+            TargetUnit(
+                target_id=_SUMMARY_TARGET_ID,
+                binding_id=target.binding_id,
+                requested_locator=DocumentLocator(kind="document"),
+                completion_criteria=(CoverageCriterion(kind="coverage"),),
+            )
+        ]
+        tasks = [_whole_document_task(target)]
+        plan_id = f"summarize-{target.binding_id}"
+    _require_read_capabilities(planning_input, tuple(tasks))
     plan = TaskPlan(
         contract_version="2.0",
-        plan_id=f"summarize-{target.binding_id}",
+        plan_id=plan_id,
         goal=planning_input.semantic.contextualized_query,
-        target_units=(unit,),
-        tasks=(task,),
+        target_units=tuple(units),
+        tasks=tuple(tasks),
     )
     validate_task_plan(plan, planning_input.bindings)
     return plan
