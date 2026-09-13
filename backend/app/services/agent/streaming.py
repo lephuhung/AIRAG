@@ -1197,6 +1197,55 @@ def _terminal_route_of(state: Any) -> str | None:
     return text or None
 
 
+def _terminal_capability_call_count(state: Any) -> int | None:
+    """Observed number of executed capability calls (counts only).
+
+    Derived from the terminal state's ``execution.task_results``: an
+    observed empty sequence is ``0`` (a real zero-dispatch terminal),
+    while a missing ``execution``/``task_results`` (or a non-sequence) is
+    ``None`` (unobservable — never inferred, never fabricated).
+    """
+    try:
+        execution = (
+            state.get("execution")
+            if isinstance(state, dict)
+            else getattr(state, "execution", None)
+        )
+    except Exception:
+        return None
+    if execution is None:
+        return None
+    if isinstance(execution, dict):
+        if "task_results" not in execution:
+            return None
+        raw = execution["task_results"]
+    else:
+        try:
+            if not hasattr(execution, "task_results"):
+                return None
+            raw = getattr(execution, "task_results")
+        except Exception:
+            return None
+    if raw is None:
+        return None
+    try:
+        return len(tuple(raw))
+    except TypeError:
+        return None
+
+
+def _terminal_response_status_of(final: Any) -> str | None:
+    """Observed terminal response status from a ``FinalResponse``."""
+    try:
+        status = (
+            final.get("status") if isinstance(final, dict) else getattr(final, "status", None)
+        )
+    except Exception:
+        return None
+    text = str(status or "").strip()
+    return text or None
+
+
 async def stream_v2_turn_events(
     *,
     graph,
@@ -1211,9 +1260,15 @@ async def stream_v2_turn_events(
     """Run one v2 turn and yield SSE-compatible dict events (see module note).
 
     ``terminal_info`` (optional caller-owned dict) receives the observed
-    terminal route (``route``) when the turn reaches a terminal state —
-    the Task 7B canary factual-expectation verdict reads it instead of
-    inferring factual-ness from served sources. Populated before the
+    terminal route (``route``), the observed terminal response status
+    (``response_status`` from the terminal ``FinalResponse``), and the
+    observed capability-call count (``capability_call_count`` from the
+    terminal state's ``execution.task_results``: ``0`` is an observed
+    zero-dispatch terminal, missing is absent/``None`` and never
+    inferred) when the turn reaches a terminal state — the Task 7B canary
+    factual-expectation verdict reads the route instead of inferring
+    factual-ness from served sources, and the P0 factual-retrieval rollout
+    metric reads all three instead of guessing. Populated before the
     terminal event is yielded. It also receives the run id (``run_id``)
     at registration so the canary metric emission can resolve whether a
     cancellation was REQUESTED for the run (R81), plus the
@@ -1313,12 +1368,32 @@ async def stream_v2_turn_events(
             runtime_context=runtime_context, reason=reason
         )
 
-    def _note_terminal(route: str | None) -> None:
+    def _note_terminal(
+        route: str | None,
+        *,
+        state: Any | None = None,
+        response_status: str | None = None,
+    ) -> None:
+        """Record observed terminal telemetry in the caller-owned dict.
+
+        ``route`` and ``response_status`` are stored when truthy;
+        ``capability_call_count`` is stored whenever it is observed —
+        including ``0`` (a real zero-dispatch terminal). A missing
+        ``execution``/``task_results`` leaves the key absent (``None`` via
+        ``.get`` — unobservable, never inferred). Never raises; never
+        touches the wire format.
+        """
         if terminal_info is None:
             return
         try:
             if route:
                 terminal_info["route"] = route
+            if response_status:
+                terminal_info["response_status"] = response_status
+            if state is not None:
+                observed_count = _terminal_capability_call_count(state)
+                if observed_count is not None:
+                    terminal_info["capability_call_count"] = observed_count
         except Exception:
             logger.warning("[v2stream] terminal info note failed", exc_info=True)
 
@@ -1388,7 +1463,11 @@ async def stream_v2_turn_events(
                 yield {"event": "error", "data": {"message": _V2_MISSING_CLARIFICATION_MESSAGE}}
                 await _stop_heartbeat_only()
                 return
-            _note_terminal(_terminal_route_of(state) or "clarify")
+            _note_terminal(
+                _terminal_route_of(state) or "clarify",
+                state=state,
+                response_status="clarify",
+            )
             async for ev in _emit_suspend_turn(pending):
                 yield ev
             await _stop_heartbeat_only()
@@ -1403,6 +1482,7 @@ async def stream_v2_turn_events(
             )
             yield acc.on_rollback()
             yield {"event": "error", "data": {"message": _V2_TRUNCATION_MESSAGE}}
+            _note_terminal(_terminal_route_of(state), state=state)
             await _release_once("terminal")
             return
         try:
@@ -1410,10 +1490,15 @@ async def stream_v2_turn_events(
         except (TypeError, ValueError):
             logger.error("[v2stream] turn ended without a terminal response")
             yield {"event": "error", "data": {"message": _V2_MISSING_TERMINAL_MESSAGE}}
+            _note_terminal(_terminal_route_of(state), state=state)
             await _release_once("terminal")
             return
         event, data = _v2_terminal_event(final)
-        _note_terminal(_terminal_route_of(state))
+        _note_terminal(
+            _terminal_route_of(state),
+            state=state,
+            response_status=_terminal_response_status_of(final),
+        )
         if event == "complete" and not _v2_terminal_is_error(state):
             # Success only (T7-owned rule): chunk the terminal content into
             # ``token`` events, then emit the single terminal. Clarify
@@ -1484,8 +1569,9 @@ async def stream_v2_turn_to_sse(
 ):
     """SSE wrapper around :func:`stream_v2_turn_events` (v1 wire format).
 
-    ``terminal_info`` passes through: the observed terminal route lands in
-    the caller-owned dict (wire format unchanged).
+    ``terminal_info`` passes through: the observed terminal route,
+    response status, and capability-call count land in the caller-owned
+    dict (wire format unchanged).
     """
     async for ev in stream_v2_turn_events(
         graph=graph,

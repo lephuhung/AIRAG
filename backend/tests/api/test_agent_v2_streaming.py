@@ -1588,3 +1588,307 @@ def test_task5_v2_ingress_callers_construct_equivalent_trusted_scope():
         source = files[name].read_text()
         assert 'source="api_explicit"' in source
     assert 'source="api_explicit"' not in files["telegram"].read_text()
+
+
+# ---------------------------------------------------------------------------
+# P0 Task 6 fix round 1 (F1): observed serving telemetry drives the
+# factual zero-dispatch sentinel through the real streaming/metric path.
+# ---------------------------------------------------------------------------
+
+
+def _task6_insufficient_response(content: str = "Not enough evidence.") -> FinalResponse:
+    return FinalResponse(
+        contract_version=CONTRACT_VERSION,
+        status="insufficient",
+        content=content,
+        citations=(),
+    )
+
+
+def _task6_denied_response(content: str = "Access denied.") -> FinalResponse:
+    return FinalResponse(
+        contract_version=CONTRACT_VERSION,
+        status="denied",
+        content=content,
+        citations=(),
+    )
+
+
+def _task6_factual_state(*, response, task_results_present: bool, task_results) -> dict:
+    state: dict = {
+        "route_decision": {"route": "complex_research"},
+        "final_response": response,
+    }
+    if task_results_present:
+        state["execution"] = {"plan": None, "task_results": task_results}
+    return state
+
+
+class _Task6FakeDB:
+    """Minimal append-only stand-in for the metric emission DB session."""
+
+    def __init__(self) -> None:
+        self.added: list = []
+
+    def add(self, row) -> None:
+        self.added.append(row)
+
+    async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        return None
+
+
+def test_task6_streaming_zero_task_results_persists_factual_zero_dispatch():
+    """Factual v2 terminal with zero task results -> factual_zero_dispatch.
+
+    Drives the REAL streaming adapter (observed route + count in the
+    caller-owned terminal_info) into the REAL metric emission: the stored
+    terminal must be the sentinel.
+    """
+    import app.services.agent.streaming as convert_streaming
+    from app.services.agent import rollout_metrics as metrics
+
+    state = _task6_factual_state(
+        response=_task6_insufficient_response(),
+        task_results_present=True,
+        task_results=(),
+    )
+    graph = FakeGraph([("return", state)])
+    terminal_info: dict = {}
+    events = asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=graph,
+                runtime_context=_runtime(),
+                thread_id="thread-task6-zero",
+                initial_state={"request": "q"},
+                terminal_info=terminal_info,
+            )
+        )
+    )
+    assert [ev["event"] for ev in events].count("error") == 1
+    assert terminal_info.get("route") == "complex_research"
+    assert terminal_info.get("capability_call_count") == 0
+    # The error-terminal status is observed via the seam (the SSE error
+    # payload carries no status, so the ingress cannot read it from the
+    # complete event).
+    assert terminal_info.get("response_status") == "insufficient"
+
+    db = _Task6FakeDB()
+
+    async def _run():
+        return await metrics.try_emit_terminal_rollout_metric(
+            db,
+            arm="v2",
+            request_id="req-task6-zero",
+            workspace_ids=["ws-1"],
+            started_at=datetime.now(timezone.utc) - timedelta(seconds=2),
+            terminal_status="success",
+            citation_count=0,
+            cancelled=False,
+            answer_text="grounded answer",
+            factual_expected=True,
+            served_document_ids=[],
+            allowed_document_ids=None,
+            production_write_count=0,
+            scope_bound=True,
+            route=terminal_info.get("route"),
+            response_status=terminal_info.get("response_status"),
+            capability_call_count=terminal_info.get("capability_call_count"),
+        )
+
+    row = asyncio.run(_run())
+    assert row is not None
+    assert row.terminal_status == metrics.FACTUAL_ZERO_DISPATCH_TERMINAL
+
+
+def test_task6_streaming_nonzero_task_results_does_not_remap():
+    """Factual v2 terminal with one task result stays a normal terminal."""
+    import app.services.agent.streaming as convert_streaming
+    from app.services.agent import rollout_metrics as metrics
+
+    state = _task6_factual_state(
+        response=_task6_insufficient_response(),
+        task_results_present=True,
+        task_results=({"task_id": "t1"},),
+    )
+    graph = FakeGraph([("return", state)])
+    terminal_info: dict = {}
+    events = asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=graph,
+                runtime_context=_runtime(),
+                thread_id="thread-task6-nonzero",
+                initial_state={"request": "q"},
+                terminal_info=terminal_info,
+            )
+        )
+    )
+    assert [ev["event"] for ev in events].count("error") == 1
+    assert terminal_info.get("route") == "complex_research"
+    assert terminal_info.get("capability_call_count") == 1
+    assert terminal_info.get("response_status") == "insufficient"
+
+    db = _Task6FakeDB()
+
+    async def _run():
+        return await metrics.try_emit_terminal_rollout_metric(
+            db,
+            arm="v2",
+            request_id="req-task6-nonzero",
+            workspace_ids=["ws-1"],
+            started_at=datetime.now(timezone.utc) - timedelta(seconds=2),
+            terminal_status="success",
+            citation_count=0,
+            cancelled=False,
+            answer_text="grounded answer",
+            factual_expected=True,
+            served_document_ids=[],
+            allowed_document_ids=None,
+            production_write_count=0,
+            scope_bound=True,
+            route=terminal_info.get("route"),
+            response_status=terminal_info.get("response_status"),
+            capability_call_count=terminal_info.get("capability_call_count"),
+        )
+
+    row = asyncio.run(_run())
+    assert row is not None
+    assert row.terminal_status == "success"
+
+
+def test_task6_streaming_missing_execution_stays_unobservable():
+    """Missing execution.task_results is None (never inferred as zero)."""
+    import app.services.agent.streaming as convert_streaming
+    from app.services.agent import rollout_metrics as metrics
+
+    state = _task6_factual_state(
+        response=_task6_insufficient_response(),
+        task_results_present=False,
+        task_results=None,
+    )
+    graph = FakeGraph([("return", state)])
+    terminal_info: dict = {}
+    asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=graph,
+                runtime_context=_runtime(),
+                thread_id="thread-task6-missing",
+                initial_state={"request": "q"},
+                terminal_info=terminal_info,
+            )
+        )
+    )
+    assert terminal_info.get("route") == "complex_research"
+    assert "capability_call_count" not in terminal_info
+    assert terminal_info.get("response_status") == "insufficient"
+
+    db = _Task6FakeDB()
+
+    async def _run():
+        return await metrics.try_emit_terminal_rollout_metric(
+            db,
+            arm="v2",
+            request_id="req-task6-missing",
+            workspace_ids=["ws-1"],
+            started_at=datetime.now(timezone.utc) - timedelta(seconds=2),
+            terminal_status="success",
+            citation_count=0,
+            cancelled=False,
+            answer_text="grounded answer",
+            factual_expected=True,
+            served_document_ids=[],
+            allowed_document_ids=None,
+            production_write_count=0,
+            scope_bound=True,
+            route=terminal_info.get("route"),
+            response_status=terminal_info.get("response_status"),
+            capability_call_count=terminal_info.get("capability_call_count"),
+        )
+
+    row = asyncio.run(_run())
+    assert row is not None
+    assert row.terminal_status == "success"
+
+
+def test_task6_streaming_denied_and_security_sentinel_not_remapped():
+    """Typed denied stays typed; security-unobservable keeps precedence."""
+    import app.services.agent.streaming as convert_streaming
+    from app.services.agent import rollout_metrics as metrics
+
+    denied_state = _task6_factual_state(
+        response=_task6_denied_response(),
+        task_results_present=True,
+        task_results=(),
+    )
+    denied_graph = FakeGraph([("return", denied_state)])
+    denied_info: dict = {}
+    asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=denied_graph,
+                runtime_context=_runtime(),
+                thread_id="thread-task6-denied",
+                initial_state={"request": "q"},
+                terminal_info=denied_info,
+            )
+        )
+    )
+    assert denied_info.get("capability_call_count") == 0
+    assert denied_info.get("response_status") == "denied"
+    denied_db = _Task6FakeDB()
+
+    async def _run_denied():
+        return await metrics.try_emit_terminal_rollout_metric(
+            denied_db,
+            arm="v2",
+            request_id="req-task6-denied",
+            workspace_ids=["ws-1"],
+            started_at=datetime.now(timezone.utc) - timedelta(seconds=2),
+            terminal_status="success",
+            citation_count=0,
+            cancelled=False,
+            answer_text="Access denied.",
+            factual_expected=False,
+            served_document_ids=[],
+            allowed_document_ids=["doc-a"],
+            production_write_count=0,
+            scope_bound=True,
+            route=denied_info.get("route"),
+            response_status=denied_info.get("response_status"),
+            capability_call_count=denied_info.get("capability_call_count"),
+        )
+
+    denied_row = asyncio.run(_run_denied())
+    assert denied_row is not None
+    assert denied_row.terminal_status == "success"
+
+    sentinel_db = _Task6FakeDB()
+
+    async def _run_sentinel():
+        return await metrics.try_emit_terminal_rollout_metric(
+            sentinel_db,
+            arm="v2",
+            request_id="req-task6-sentinel",
+            workspace_ids=["ws-1"],
+            started_at=datetime.now(timezone.utc) - timedelta(seconds=2),
+            terminal_status="success",
+            citation_count=0,
+            cancelled=False,
+            answer_text=None,
+            factual_expected=True,
+            served_document_ids=[],
+            allowed_document_ids=["doc-a"],
+            production_write_count=0,
+            route="complex_research",
+            response_status="insufficient",
+            capability_call_count=0,
+        )
+
+    sentinel_row = asyncio.run(_run_sentinel())
+    assert sentinel_row is not None
+    assert sentinel_row.terminal_status == metrics.SECURITY_UNOBSERVABLE_TERMINAL

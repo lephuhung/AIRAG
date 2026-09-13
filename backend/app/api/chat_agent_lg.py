@@ -465,6 +465,17 @@ async def langgraph_chat_stream(
                         final_sources
                     )
                 ),
+                # P0 Task 6 fix round 1 (F1): observed execution
+                # telemetry only — missing stays None (unobservable, never
+                # guessed); v1/fallback turns carry no v2 terminal info.
+                route=(v2_terminal_info or {}).get("route"),
+                response_status=(
+                    v2_response_status
+                    or (v2_terminal_info or {}).get("response_status")
+                ),
+                capability_call_count=(v2_terminal_info or {}).get(
+                    "capability_call_count"
+                ),
             )
         except Exception as e:
             logger.warning(f"[lg_endpoint] rollout metric emission failed: {e}")

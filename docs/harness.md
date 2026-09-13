@@ -185,19 +185,24 @@ arm needs the canary for that workspace (or a superadmin evaluate drive).
 API=http://localhost:8080/api/v1
 TOKEN=$(curl -s -X POST $API/auth/login \
   -H 'Content-Type: application/json' \
-  -d '{"email":"$AB_USER","password":"$AB_PASSWORD"}' | jq -r .access_token)
+  -d '{"email":"'"$AB_USER"'","password":"'"$AB_PASSWORD"'"}' | jq -r .access_token)
 WS=<workspace-uuid-with-documents>
 DOC=<document-uuid-in-$WS>   # from GET /workspaces + /rag/stats/$WS
+
+# The v2 arm is server-selected: enable the canary for $WS (or drive the
+# probes through the authenticated superadmin evaluate endpoint). No
+# request field forces v2 — do not send a version field (ChatRequest has
+# none; extras are dropped and the turn would silently serve v1).
 
 # 1) unscoped factual query (reference-free; retrieval over workspace scope)
  curl -s -N $API/rag/chat/agent-lg/$WS/stream \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"message":"<factual question the corpus covers>","version":"v2"}'
+  -d '{"message":"<factual question the corpus covers>"}'
 
 # 2) hard-scoped factual query (document_ids are a hard scope, not candidates)
  curl -s -N $API/rag/chat/agent-lg/$WS/stream \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"message":"<factual question>","version":"v2","document_ids":["'$DOC'"]}'
+  -d '{"message":"<factual question>","document_ids":["'"$DOC"'"]}'
 ```
 
 Required evidence per probe: non-zero `document.retrieve` task /
