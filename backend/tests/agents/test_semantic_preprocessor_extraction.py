@@ -6,6 +6,7 @@ import pytest
 from app.services.agents.semantic_preprocessor import (
     DocumentRefEntry,
     PreprocessingResult,
+    RefExtraction,
     build_normalized_match_view,
     extract_document_references,
 )
@@ -65,3 +66,59 @@ def test_number_query_constructs_a_valid_preprocessing_result() -> None:
         preprocessor_trace=[],
     )
     assert len(result.document_refs) == 1
+
+
+def test_multi_word_titles_are_captured_whole() -> None:
+    refs = _extract(
+        "So sánh Luật An ninh mạng và Luật Bảo vệ dữ liệu cá nhân"
+    )
+    assert [r.reference for r in refs] == [
+        "luật an ninh mạng",
+        "luật bảo vệ dữ liệu cá nhân",
+    ]
+
+
+def test_title_stops_before_a_question_phrase() -> None:
+    refs = _extract("Luật An ninh mạng quy định gì?")
+    assert [r.reference for r in refs] == ["luật an ninh mạng"]
+
+
+@pytest.mark.asyncio
+async def test_title_lookup_selects_the_longest_matching_title() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+    from uuid import UUID
+
+    from app.services.agents.semantic_preprocessor import _lookup_by_title
+
+    workspace_id = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+    document_id = UUID("11111111-1111-1111-1111-111111111111")
+    context = SimpleNamespace(allowed_workspace_ids=[workspace_id])
+
+    short_doc = SimpleNamespace(
+        id=document_id, workspace_id=workspace_id,
+        document_title="Luật An ninh", document_number=None,
+        updated_at=None, content_hash=None,
+    )
+    long_doc = SimpleNamespace(
+        id=document_id, workspace_id=workspace_id,
+        document_title="Luật An ninh mạng", document_number=None,
+        updated_at=None, content_hash=None,
+    )
+    alias_result = MagicMock()
+    alias_result.all.return_value = []  # no exact alias
+    title_result = MagicMock()
+    title_result.scalars.return_value.all.return_value = [short_doc, long_doc]
+    session = MagicMock(execute=AsyncMock(side_effect=[alias_result, title_result]))
+
+    reference = RefExtraction(
+        ref_id="r1", original_span="Luật An", span_offset=(0, 7),
+        reference="luật an", section_reference=None,
+        parse_basis="regex_named_doc",
+    )
+    resolved = await _lookup_by_title(reference, context, session)
+
+    assert resolved.resolution_status == "resolved"
+    assert resolved.document_handle == document_id
+    assert resolved.match_basis == "fuzzy_title"
+    assert resolved.reference == "Luật An ninh mạng"

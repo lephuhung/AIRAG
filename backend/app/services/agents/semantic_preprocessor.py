@@ -448,7 +448,7 @@ async def safe_lookup_metadata_only(
         elif ref.parse_basis == "regex_bare_number":
             return await _lookup_by_bare_number(ref, ctx, session)
         elif ref.parse_basis == "regex_named_doc":
-            return await _lookup_by_alias(ref, ctx, session)
+            return await _lookup_by_title(ref, ctx, session)
         elif ref.parse_basis == "regex_abbr_then_doc":
             return await _lookup_by_alias(ref, ctx, session)
         elif ref.parse_basis == "regex_section":
@@ -757,6 +757,86 @@ async def _lookup_by_alias(
         document_handle=doc.id,
         resolution_status="resolved",
         match_basis="alias_match",
+        version=version,
+        metadata=DocumentMetadata(workspace_id=doc.workspace_id),
+        authorized_at_lookup=True,
+    )
+
+
+async def _lookup_by_title(
+    ref: RefExtraction, ctx: "RuntimeContext", session: "AsyncSession"
+) -> DocumentRefEntry:
+    """Longest-match title lookup for a multi-word named document.
+
+    An exact alias match wins first (reusing ``_lookup_by_alias``). Otherwise
+    candidate documents whose title starts with the reference are compared and
+    the longest title wins; a shared longest title is ambiguous. A miss
+    degrades to the alias path's verdict (usually ``not_found``) and never
+    raises, so the arbitrated reference is preserved.
+    """
+    from sqlalchemy import func, select
+    from app.models.document import Document
+
+    alias_entry = await _lookup_by_alias(ref, ctx, session)
+    if alias_entry.resolution_status != "not_found":
+        return alias_entry
+
+    allowed = list(ctx.allowed_workspace_ids)
+    needle = ref.reference.lower().strip()
+    stmt = (
+        select(Document)
+        .where(
+            Document.workspace_id.in_(allowed),
+            func.lower(Document.document_title).like(f"{needle}%"),
+        )
+    )
+    result = await session.execute(stmt)
+    docs = list(result.scalars().all())
+    matching = [
+        d for d in docs
+        if (d.document_title or "").lower().strip().startswith(needle)
+    ]
+    if not matching:
+        return alias_entry
+
+    best_title = max((d.document_title or "").strip() for d in matching)
+    best_docs = [
+        d for d in matching if (d.document_title or "").strip() == best_title
+    ]
+    if len(best_docs) > 1:
+        return DocumentRefEntry(
+            ref_id=ref.ref_id,
+            original_span=ref.original_span,
+            span_offset=ref.span_offset,
+            reference=ref.reference,
+            section_reference=ref.section_reference,
+            resolution_status="ambiguous",
+            candidates=[
+                DocumentCandidate(
+                    document_id=d.id,
+                    match_basis="fuzzy_title",
+                    confidence=0.6,
+                    title=d.document_title,
+                    doc_number=d.document_number,
+                )
+                for d in best_docs
+            ],
+        )
+
+    doc = best_docs[0]
+    version = (
+        f"{doc.updated_at.isoformat() if doc.updated_at else ''}"
+        f"|{doc.content_hash[:8] if doc.content_hash else ''}"
+    )
+    return DocumentRefEntry(
+        ref_id=ref.ref_id,
+        original_span=ref.original_span,
+        span_offset=ref.span_offset,
+        reference=doc.document_title or ref.reference,
+        section_reference=ref.section_reference,
+        document_handle=doc.id,
+        resolution_status="resolved",
+        match_basis="fuzzy_title",
         version=version,
         metadata=DocumentMetadata(workspace_id=doc.workspace_id),
         authorized_at_lookup=True,
@@ -1133,12 +1213,23 @@ _RE_BARE_NUMBER = re.compile(
     re.IGNORECASE,
 )
 
+#: Stop words/phrases that end a document title in a free-form legal query.
+#: The normalized query is lowercased, so capitalization cannot mark the
+#: title boundary; punctuation and these function/verb/question phrases do.
+_NAMED_DOC_STOP = (
+    r"(?:và|với|của|cho|về|trong|tại|theo|gồm|hay|hoặc|mà|để|khi|nếu|do|bởi|"
+    r"từ|đến|tới|trên|dưới|giữa|ngoài|sau|trước|cùng|các|những|một|này|đó|kia|"
+    r"ấy|mỗi|mọi|tất|cả|quy\s*định|so\s*sánh|tóm\s*tắt|liệt\s*kê|trình\s*bày|"
+    r"áp\s*dụng|sửa\s*đổi|bổ\s*sung|ban\s*hành|gì|nào|như\s*thế|sao|có|không|"
+    r"được|là|bao\s*nhiêu|ai|đâu)"
+)
+
 _RE_NAMED_DOC = re.compile(
     r"\b(?P<doc>"
-    r"Luật\s+\S+|Nghị\s*định\s+\S+|Nghị\s*quyết\s+\S+|"
-    r"Quyết\s*định\s+\S+|Thông\s*tư(?:\s*liên\s*tịch)?\s+\S+|"
-    r"Pháp\s*lệnh\s+\S+|Chỉ\s*thị\s+\S+|"
-    r"Nghị\s*định)\s*(?P<num>\d+/\d{4}[/-][A-Z]+)?",
+    r"(?:luật|nghị\s*định|nghị\s*quyết|quyết\s*định|"
+    r"thông\s*tư(?:\s*liên\s*tịch)?|pháp\s*lệnh|chỉ\s*thị)"
+    r"(?:\s+(?!" + _NAMED_DOC_STOP + r"\b)[^\s,.;:?!\"()\[\]]+){0,8}"
+    r")\s*(?P<num>\d+/\d{4}[/-][A-Za-z]+)?",
     re.IGNORECASE | re.UNICODE,
 )
 
