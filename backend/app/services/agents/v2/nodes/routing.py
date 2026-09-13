@@ -214,28 +214,41 @@ def _fast_or_runtime_dependency(
     return RouteDecision(route="complex_research", reason_code="runtime_dependency")
 
 
+def _api_explicit_ref_ids(request: RequestContext | None) -> frozenset[str]:
+    """Namespaced ref IDs for the current turn's ``api_explicit`` resources.
+
+    Only ``KnownDocumentResource`` entries with ``source == "api_explicit"``
+    are projected; raw query text and model output can never mint the
+    namespace, so membership proves the target came from the API-supplied
+    scope. Empty when the request is absent or carries no explicit scope.
+    """
+    if request is None:
+        return frozenset()
+    return frozenset(
+        f"api_explicit:{known.resource_id}"
+        for known in request.known_documents
+        if known.source == "api_explicit"
+    )
+
+
 def _has_api_explicit_target(
     semantic: SemanticContext, request: RequestContext | None
 ) -> bool:
     """True when the current turn pins an API-explicit hard-scope target.
 
-    Matches only resolved semantic references whose namespaced
+    Matches only *resolved* semantic references whose namespaced
     ``api_explicit:<resource_id>`` ID names a current-turn
     ``api_explicit`` resource on the request: raw query text and model
     output can never mint the namespace, so a match proves the target
-    came from the API ACL-filtered scope.
+    came from the API-supplied scope.
     """
-    if request is None:
-        return False
-    explicit = {
-        f"api_explicit:{known.resource_id}"
-        for known in request.known_documents
-        if known.source == "api_explicit"
-    }
+    explicit = _api_explicit_ref_ids(request)
     if not explicit:
         return False
     return any(
-        reference.ref_id in explicit for reference in semantic.document_refs
+        reference.ref_id in explicit
+        and reference.resolution_status == "resolved"
+        for reference in semantic.document_refs
     )
 
 
@@ -259,8 +272,16 @@ def decide_route(
         return RouteDecision(route="clarify", reason_code="unresolved_required_binding")
 
     text = semantic.normalized_query.casefold()
-    has_refs = bool(semantic.document_refs or semantic.person_refs or semantic.section_refs)
-    if _is_conversational(text) and not has_refs:
+    explicit_ids = _api_explicit_ref_ids(request)
+    # Transport-only explicit targets must not defeat the conversational
+    # guard: a greeting that merely carries `document_ids` stays direct.
+    # Only intrinsic query references (person/section refs, or a document
+    # ref outside the current-turn explicit namespace) count here.
+    has_intrinsic_refs = bool(semantic.person_refs or semantic.section_refs) or any(
+        reference.ref_id not in explicit_ids
+        for reference in semantic.document_refs
+    )
+    if _is_conversational(text) and not has_intrinsic_refs:
         reason = "direct_greeting" if _is_greeting(text) else "direct_conversation"
         return RouteDecision(route="direct", reason_code=reason)  # type: ignore[arg-type]
 

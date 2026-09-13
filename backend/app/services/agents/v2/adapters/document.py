@@ -9,9 +9,11 @@ Immutable revision lookup always goes through
 :mod:`app.services.agents.v2.persistence.document_views`:
 
 - an ordinary or explicit-current reference resolves the document's current
-  revision identity (the mutable ``Document.current_revision_id`` pointer selects
-  the revision, but every artifact fact comes from the immutable revision build
-  manifest);
+  revision identity through the workspace-scoped guard (the mutable
+  ``Document.current_revision_id`` pointer selects the revision, but every
+  artifact fact comes from the immutable revision build manifest; a document
+  outside the caller's workspace, or a tombstoned one, fails closed instead
+  of pinning);
 - an explicit pinned reference resolves that exact revision through the
   workspace-scoped guard, so a caller can never pin a revision owned by another
   workspace.
@@ -133,7 +135,9 @@ async def resolve_document_binding(
             db, revision_id, workspace_id
         )
     else:
-        identity = await document_views.load_current_revision_identity(db, document_id)
+        identity = await document_views.load_current_revision_identity_for_workspace(
+            db, document_id, workspace_id
+        )
         if identity is None:
             raise document_views.RevisionNotReady(
                 document_id,

@@ -426,6 +426,49 @@ async def load_revision_vector_manifest(
     )
 
 
+async def load_current_revision_identity_for_workspace(
+    db: AsyncSession,
+    document_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    *,
+    require_vectors: bool = False,
+) -> Optional[RevisionArtifactIdentity]:
+    """Resolve the document's *current* revision only inside ``workspace_id``.
+
+    Defense-in-depth for caller-supplied document ids: the row is joined to
+    its owning document with a workspace match and a tombstone rejection
+    (``source_deleted_at`` set), so a foreign-workspace or tombstoned
+    document raises :class:`RevisionNotReady` instead of pinning. A document
+    with no current revision returns ``None`` (legacy), exactly like
+    :func:`load_current_revision_identity`.
+
+    :raises RevisionNotReady: the document does not exist, is not owned by
+        this workspace, is tombstoned, or its current revision fails the
+        published/artifact contract.
+    """
+    row = (
+        await db.execute(
+            select(Document.current_revision_id).where(
+                Document.id == document_id,
+                Document.workspace_id == workspace_id,
+                Document.source_deleted_at.is_(None),
+            )
+        )
+    ).first()
+    if row is None:
+        raise RevisionNotReady(
+            document_id,
+            "document does not exist, is not owned by this workspace, or "
+            "is tombstoned",
+        )
+    current_revision_id = row[0]
+    if current_revision_id is None:
+        return None
+    return await load_revision_identity(
+        db, current_revision_id, require_vectors=require_vectors
+    )
+
+
 async def load_current_revision_identity(
     db: AsyncSession,
     document_id: uuid.UUID,

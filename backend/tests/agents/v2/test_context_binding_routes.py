@@ -1663,3 +1663,119 @@ async def test_route_node_passes_request_for_scoped_routing() -> None:
     update = await route_node(state, make_graph_runtime())
     assert update["route_decision"].route == "complex_research"
     assert update["route_decision"].reason_code == "multi_document_research"
+
+
+# ---------------------------------------------------------------------------
+# P0 Task 3 fix round 1 (I1): conversational turns keep direct routing when
+# refs are only current-turn api_explicit transport targets
+# ---------------------------------------------------------------------------
+
+
+def greeting_semantic_with_only_explicit_targets() -> SemanticContext:
+    return SemanticContext(
+        contextualized_query="Xin chào",
+        normalized_query="xin chào",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(api_explicit_ref(),),
+        person_refs=(),
+        section_refs=(),
+        blocking_ambiguities=(),
+    )
+
+
+def explicit_pin() -> DocumentBindingSet:
+    return DocumentBindingSet(
+        bindings=(
+            ScopedDocument(
+                binding_id="b_api_explicit:doc-1",
+                document_id=API_DOCUMENT_ID,
+                document_revision=str(REVISION_ID),
+                role="target",
+            ),
+        ),
+        revision_requirement_refs=(),
+    )
+
+
+def test_greeting_with_only_api_explicit_transport_targets_routes_direct() -> None:
+    semantic = greeting_semantic_with_only_explicit_targets()
+    request = api_explicit_request(("doc-1", API_DOCUMENT_ID), query="Xin chào")
+    decision = decide_route(
+        analyze_query(semantic),
+        semantic,
+        explicit_pin(),
+        allowed_capabilities=FULL_CAPABILITIES,
+        request=request,
+    )
+    assert decision.route == "direct"
+    assert decision.reason_code == "direct_greeting"
+
+
+def test_thanks_with_only_api_explicit_transport_targets_routes_direct() -> None:
+    semantic = SemanticContext(
+        contextualized_query="Cảm ơn bạn",
+        normalized_query="cảm ơn bạn",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(api_explicit_ref(),),
+        person_refs=(),
+        section_refs=(),
+        blocking_ambiguities=(),
+    )
+    request = api_explicit_request(("doc-1", API_DOCUMENT_ID), query="Cảm ơn bạn")
+    decision = decide_route(
+        analyze_query(semantic),
+        semantic,
+        explicit_pin(),
+        allowed_capabilities=FULL_CAPABILITIES,
+        request=request,
+    )
+    assert decision.route == "direct"
+    assert decision.reason_code == "direct_conversation"
+
+
+def test_conversational_with_intrinsic_reference_still_leaves_direct() -> None:
+    semantic = SemanticContext(
+        contextualized_query="Xin chào, xem giúp nghị định này",
+        normalized_query="xin chào, xem giúp nghị định này",
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(resolved_ref(ref_id="r1"), api_explicit_ref()),
+        person_refs=(),
+        section_refs=(),
+        blocking_ambiguities=(),
+    )
+    bindings = DocumentBindingSet(
+        bindings=(
+            scoped_binding(binding_id="b_r1"),
+            ScopedDocument(
+                binding_id="b_api_explicit:doc-1",
+                document_id=API_DOCUMENT_ID,
+                document_revision=str(REVISION_ID),
+                role="target",
+            ),
+        ),
+        revision_requirement_refs=(),
+    )
+    request = api_explicit_request(("doc-1", API_DOCUMENT_ID), query="Xin chào")
+    decision = decide_route(
+        analyze_query(semantic),
+        semantic,
+        bindings,
+        allowed_capabilities=FULL_CAPABILITIES,
+        request=request,
+    )
+    assert decision.route != "direct"
+
+
+@pytest.mark.asyncio
+async def test_route_node_preserves_direct_for_conversational_scope_carrier() -> None:
+    state = make_state(
+        request=api_explicit_request(("doc-1", API_DOCUMENT_ID), query="Xin chào"),
+        semantic=greeting_semantic_with_only_explicit_targets(),
+        bindings=explicit_pin(),
+    )
+    update = await route_node(state, make_graph_runtime())
+    assert update["route_decision"].route == "direct"
+    assert update["route_decision"].reason_code == "direct_greeting"

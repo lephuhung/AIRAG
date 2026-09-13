@@ -383,21 +383,21 @@ def test_legacy_inconsistent_resolved_reference_without_handle_is_rejected() -> 
 
 @pytest.mark.asyncio
 async def test_current_revision_lookup_goes_through_document_views(monkeypatch) -> None:
-    calls: list[UUID] = []
+    calls: list[tuple[UUID, UUID]] = []
 
-    async def fake_current(db, document_id, *, require_vectors=False):
-        calls.append(document_id)
+    async def fake_current(db, document_id, workspace_id, *, require_vectors=False):
+        calls.append((document_id, workspace_id))
         return revision_identity()
 
     monkeypatch.setattr(
-        document_views, "load_current_revision_identity", fake_current
+        document_views, "load_current_revision_identity_for_workspace", fake_current
     )
 
     resolution = await resolve_document_binding(
         object(), resolved_reference(), workspace_id=WORKSPACE_ID
     )
 
-    assert calls == [DOCUMENT_ID]
+    assert calls == [(DOCUMENT_ID, WORKSPACE_ID)]
     assert resolution.binding == ScopedDocument(
         binding_id="b_r1",
         document_id=DOCUMENT_ID,
@@ -512,10 +512,12 @@ async def test_resolved_reference_without_a_role_is_rejected() -> None:
 
 @pytest.mark.asyncio
 async def test_legacy_document_without_a_current_revision_is_not_bound(monkeypatch) -> None:
-    async def no_current(db, document_id, *, require_vectors=False):
+    async def no_current(db, document_id, workspace_id, *, require_vectors=False):
         return None
 
-    monkeypatch.setattr(document_views, "load_current_revision_identity", no_current)
+    monkeypatch.setattr(
+        document_views, "load_current_revision_identity_for_workspace", no_current
+    )
 
     with pytest.raises(document_views.RevisionNotReady):
         await resolve_document_binding(
@@ -525,10 +527,12 @@ async def test_legacy_document_without_a_current_revision_is_not_bound(monkeypat
 
 @pytest.mark.asyncio
 async def test_current_requirement_binding_records_exactly_one_relation(monkeypatch) -> None:
-    async def fake_current(db, document_id, *, require_vectors=False):
+    async def fake_current(db, document_id, workspace_id, *, require_vectors=False):
         return revision_identity()
 
-    monkeypatch.setattr(document_views, "load_current_revision_identity", fake_current)
+    monkeypatch.setattr(
+        document_views, "load_current_revision_identity_for_workspace", fake_current
+    )
 
     reference = resolved_reference(
         revision_requirement=CurrentRevisionRequirement(kind="current")
@@ -543,10 +547,12 @@ async def test_current_requirement_binding_records_exactly_one_relation(monkeypa
 
 @pytest.mark.asyncio
 async def test_ordinary_reference_binding_has_no_revision_relation(monkeypatch) -> None:
-    async def fake_current(db, document_id, *, require_vectors=False):
+    async def fake_current(db, document_id, workspace_id, *, require_vectors=False):
         return revision_identity()
 
-    monkeypatch.setattr(document_views, "load_current_revision_identity", fake_current)
+    monkeypatch.setattr(
+        document_views, "load_current_revision_identity_for_workspace", fake_current
+    )
 
     resolved = await resolve_document_bindings(
         object(), (resolved_reference(),), workspace_id=WORKSPACE_ID
@@ -556,10 +562,12 @@ async def test_ordinary_reference_binding_has_no_revision_relation(monkeypatch) 
 
 @pytest.mark.asyncio
 async def test_draft_binding_finalizer_flow(monkeypatch) -> None:
-    async def fake_current(db, document_id, *, require_vectors=False):
+    async def fake_current(db, document_id, workspace_id, *, require_vectors=False):
         return revision_identity()
 
-    monkeypatch.setattr(document_views, "load_current_revision_identity", fake_current)
+    monkeypatch.setattr(
+        document_views, "load_current_revision_identity_for_workspace", fake_current
+    )
 
     draft = draft_from_preprocessing(legacy_preprocessing())
     resolved = await resolve_document_bindings(
@@ -1052,3 +1060,137 @@ def test_task2_registry_serves_the_real_capabilities() -> None:
     )
     assert registry.get("people.lookup") is by_name["people.lookup"]
     assert registry.get("abbreviation.resolve") is by_name["abbreviation.resolve"]
+
+
+# ---------------------------------------------------------------------------
+# P0 Task 3 fix round 1 (I2): workspace/tombstone-scoped current binding
+# ---------------------------------------------------------------------------
+
+
+class _StubResult:
+    def __init__(self, row) -> None:
+        self._row = row
+
+    def first(self):
+        return self._row
+
+
+class _StubDB:
+    """Database-free stand-in for the AsyncSession surface document_views uses."""
+
+    def __init__(self, *, current_row=None, revision=None, build=None) -> None:
+        self._current_row = current_row
+        self._revision = revision
+        self._build = build
+
+    async def execute(self, stmt):
+        return _StubResult(self._current_row)
+
+    async def get(self, model, pk):
+        return self._revision
+
+    async def scalar(self, stmt):
+        return self._build
+
+
+def _stub_revision(
+    *,
+    status: str = "published",
+    revision_id: UUID = CURRENT_REVISION_ID,
+    document_id: UUID = DOCUMENT_ID,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        status=status,
+        revision_id=revision_id,
+        document_id=document_id,
+        generation=1,
+    )
+
+
+def _stub_build() -> SimpleNamespace:
+    return SimpleNamespace(
+        build_profile="FULL",
+        markdown_artifact_key="markdown.md",
+        structure_artifact_key="structure.json",
+        embedding_namespace=None,
+        embedding_model_hash=None,
+        embedding_dimension=None,
+        vector_artifact_version=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_ordinary_reference_binding_is_workspace_scoped(monkeypatch) -> None:
+    calls: list[tuple[UUID, UUID]] = []
+
+    async def fake_workspace_current(db, document_id, workspace_id, *, require_vectors=False):
+        calls.append((document_id, workspace_id))
+        return revision_identity()
+
+    monkeypatch.setattr(
+        document_views, "load_current_revision_identity_for_workspace", fake_workspace_current
+    )
+
+    resolution = await resolve_document_binding(
+        object(), resolved_reference(), workspace_id=WORKSPACE_ID
+    )
+
+    assert calls == [(DOCUMENT_ID, WORKSPACE_ID)]
+    assert resolution.binding == ScopedDocument(
+        binding_id="b_r1",
+        document_id=DOCUMENT_ID,
+        document_revision=str(CURRENT_REVISION_ID),
+        role="target",
+    )
+
+
+@pytest.mark.asyncio
+async def test_ordinary_reference_in_foreign_workspace_fails_closed(monkeypatch) -> None:
+    async def fake_workspace_current(db, document_id, workspace_id, *, require_vectors=False):
+        raise document_views.RevisionNotReady(
+            document_id,
+            "document does not exist, is not owned by this workspace, or is tombstoned",
+        )
+
+    monkeypatch.setattr(
+        document_views, "load_current_revision_identity_for_workspace", fake_workspace_current
+    )
+
+    with pytest.raises(document_views.RevisionNotReady):
+        await resolve_document_binding(
+            object(), resolved_reference(), workspace_id=WORKSPACE_ID
+        )
+
+
+@pytest.mark.asyncio
+async def test_workspace_scoped_current_lookup_rejects_unknown_workspace_or_tombstone() -> None:
+    db = _StubDB(current_row=None)
+    with pytest.raises(document_views.RevisionNotReady):
+        await document_views.load_current_revision_identity_for_workspace(
+            db, DOCUMENT_ID, WORKSPACE_ID
+        )
+
+
+@pytest.mark.asyncio
+async def test_workspace_scoped_current_lookup_returns_none_for_legacy() -> None:
+    db = _StubDB(current_row=(None,))
+    assert (
+        await document_views.load_current_revision_identity_for_workspace(
+            db, DOCUMENT_ID, WORKSPACE_ID
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_workspace_scoped_current_lookup_resolves_published_identity() -> None:
+    db = _StubDB(
+        current_row=(CURRENT_REVISION_ID,),
+        revision=_stub_revision(),
+        build=_stub_build(),
+    )
+    identity = await document_views.load_current_revision_identity_for_workspace(
+        db, DOCUMENT_ID, WORKSPACE_ID
+    )
+    assert identity.revision_id == CURRENT_REVISION_ID
+    assert identity.document_id == DOCUMENT_ID
