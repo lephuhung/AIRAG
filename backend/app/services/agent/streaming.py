@@ -1178,6 +1178,22 @@ async def persisted_message_uuid(db, row):
         return None
 
 
+def _terminal_route_of(state: Any) -> str | None:
+    """Observed v2 route from terminal state (live model or serde mapping)."""
+    try:
+        decision = state.get("route_decision") if isinstance(state, dict) else getattr(state, "route_decision", None)
+    except Exception:
+        return None
+    if decision is None:
+        return None
+    try:
+        route = decision.get("route") if isinstance(decision, dict) else getattr(decision, "route", None)
+    except Exception:
+        return None
+    text = str(route or "").strip()
+    return text or None
+
+
 async def stream_v2_turn_events(
     *,
     graph,
@@ -1187,8 +1203,15 @@ async def stream_v2_turn_events(
     resume_command=None,
     plan_resolver=None,
     token_chunk_size: int = _V2_TOKEN_CHUNK_DEFAULT,
+    terminal_info: dict | None = None,
 ):
     """Run one v2 turn and yield SSE-compatible dict events (see module note).
+
+    ``terminal_info`` (optional caller-owned dict) receives the observed
+    terminal route (``route``) when the turn reaches a terminal state —
+    the Task 7B canary factual-expectation verdict reads it instead of
+    inferring factual-ness from served sources. Populated before the
+    terminal event is yielded. The wire format is unchanged.
 
     Exactly one of ``initial_state`` (first turn) or ``resume_command`` (a
     verbatim :func:`prepare_v2_resume_command` ``Command``) is required.
@@ -1212,6 +1235,7 @@ async def stream_v2_turn_events(
     acc = _V2StreamAccumulators()
     invoke_task = None
     released = False
+    heartbeat = None
     try:
         _run_id = str(runtime_context.capability_runtime.run_id or "")
     except Exception:
@@ -1219,24 +1243,45 @@ async def stream_v2_turn_events(
     if _run_id:
         # Register at run start (awaited, R75 lifecycle): the distributed
         # registry owns the run for its whole lifetime; per-dispatch
-        # guards refresh it and terminal release removes it.
+        # guards refresh it and terminal release removes it. The heartbeat
+        # (fix round 2, Important 4) keeps the key alive across TTL-length
+        # dispatches for the whole run; it stops at the terminal boundary.
         try:
             from app.services.agents.v2.execution.scheduler import (
                 register_active_run_async as _register_at_start,
             )
+            from app.services.agents.v2.execution.scheduler import (
+                start_active_run_heartbeat as _start_heartbeat,
+            )
 
             await _register_at_start(_run_id)
+            heartbeat = _start_heartbeat(_run_id)
         except Exception:
             logger.warning("[v2stream] active-run register failed", exc_info=True)
 
     async def _release_once(reason: str) -> int:
-        nonlocal released
+        nonlocal released, heartbeat
         if released:
             return 0
         released = True
+        if heartbeat is not None:
+            try:
+                await heartbeat.stop()
+            except Exception:
+                logger.warning("[v2stream] heartbeat stop failed", exc_info=True)
+            heartbeat = None
         return await _release_v2_run_leases(
             runtime_context=runtime_context, reason=reason
         )
+
+    def _note_terminal(route: str | None) -> None:
+        if terminal_info is None:
+            return
+        try:
+            if route:
+                terminal_info["route"] = route
+        except Exception:
+            logger.warning("[v2stream] terminal info note failed", exc_info=True)
 
     async def _emit_suspend_turn(pending) -> AsyncGenerator[dict, None]:
         # Shared by the returned-state and nested-raise suspend paths:
@@ -1287,6 +1332,7 @@ async def stream_v2_turn_events(
             if pending is None:
                 yield {"event": "error", "data": {"message": _V2_MISSING_CLARIFICATION_MESSAGE}}
                 return
+            _note_terminal(_terminal_route_of(state) or "clarify")
             async for ev in _emit_suspend_turn(pending):
                 yield ev
             return
@@ -1310,6 +1356,7 @@ async def stream_v2_turn_events(
             await _release_once("terminal")
             return
         event, data = _v2_terminal_event(final)
+        _note_terminal(_terminal_route_of(state))
         if event == "complete" and not _v2_terminal_is_error(state):
             # Success only (T7-owned rule): chunk the terminal content into
             # ``token`` events, then emit the single terminal. Clarify
@@ -1376,8 +1423,13 @@ async def stream_v2_turn_to_sse(
     resume_command=None,
     plan_resolver=None,
     token_chunk_size: int = _V2_TOKEN_CHUNK_DEFAULT,
+    terminal_info: dict | None = None,
 ):
-    """SSE wrapper around :func:`stream_v2_turn_events` (v1 wire format)."""
+    """SSE wrapper around :func:`stream_v2_turn_events` (v1 wire format).
+
+    ``terminal_info`` passes through: the observed terminal route lands in
+    the caller-owned dict (wire format unchanged).
+    """
     async for ev in stream_v2_turn_events(
         graph=graph,
         runtime_context=runtime_context,
@@ -1386,5 +1438,6 @@ async def stream_v2_turn_to_sse(
         resume_command=resume_command,
         plan_resolver=plan_resolver,
         token_chunk_size=token_chunk_size,
+        terminal_info=terminal_info,
     ):
         yield _sse(ev["event"], ev["data"])

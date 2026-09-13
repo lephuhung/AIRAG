@@ -320,6 +320,24 @@ _INTENT_CACHE: OrderedDict[str, tuple[dict, float]] = OrderedDict()
 _CACHE_MAXSIZE = 500
 _CACHE_TTL = 60.0  # seconds
 
+#: Human-readable intent labels pushed as ``status`` events (single source
+#: for the fresh-classification and cache-hit paths; Task 7B reads the
+#: greeting label as the observed v1 conversational signal).
+_INTENT_LABELS = {
+    "greeting": "Tin nhắn thông thường",
+    "search": "Tìm kiếm tài liệu",
+    "list_docs": "Liệt kê tài liệu",
+    "summarize": "Tóm tắt tài liệu",
+    "kg_query": "Truy vấn đồ thị tri thức",
+    "search_abbr": "Tra cứu viết tắt",
+    "search_doc_num": "Tra cứu số văn bản",
+    "resolve_doc": "Tìm văn bản theo tên",
+    "write_summarize": "Tóm tắt văn bản",
+    "write_suggest_edits": "Đề xuất chỉnh sửa",
+    "write_grammar_check": "Kiểm tra ngữ pháp",
+    "write_format_check": "Kiểm tra định dạng",
+}
+
 
 def _get_cache_key(message: str) -> str:
     """Fast cache key: SHA256 truncated to 32 chars."""
@@ -464,6 +482,19 @@ async def intent_classifier(state: "AgentState") -> dict:
     cached = _get_cached_intent(user_message)
     if cached is not None:
         logger.info(f"[intent_classifier] Cache hit for key={_get_cache_key(user_message)[:8]}…")
+        # Task 7B (fix round 2): a cache hit must emit the SAME intent
+        # status as a fresh classification. The canary terminal observation
+        # reads the greeting label from these status events; skipping the
+        # push on cache hits would hide conversational turns from the
+        # factual-expectation verdict (fail-open by omission).
+        await push_event(
+            state,
+            "status",
+            {
+                "step": "searching",
+                "detail": f"Phân loại: {_INTENT_LABELS.get(cached.get('intent'), 'Tìm kiếm')}",
+            },
+        )
         return {
             "intent": cached["intent"],
             "rewritten_query": cached.get("rewritten_query") or user_message,
@@ -499,21 +530,7 @@ async def intent_classifier(state: "AgentState") -> dict:
         )
 
         # Emit a meaningful status based on intent
-        intent_labels = {
-            "greeting": "Tin nhắn thông thường",
-            "search": "Tìm kiếm tài liệu",
-            "list_docs": "Liệt kê tài liệu",
-            "summarize": "Tóm tắt tài liệu",
-            "kg_query": "Truy vấn đồ thị tri thức",
-            "search_abbr": "Tra cứu viết tắt",
-            "search_doc_num": "Tra cứu số văn bản",
-            "resolve_doc": "Tìm văn bản theo tên",
-            "write_summarize": "Tóm tắt văn bản",
-            "write_suggest_edits": "Đề xuất chỉnh sửa",
-            "write_grammar_check": "Kiểm tra ngữ pháp",
-            "write_format_check": "Kiểm tra định dạng",
-        }
-        intent_label = intent_labels.get(result["intent"], "Tìm kiếm")
+        intent_label = _INTENT_LABELS.get(result["intent"], "Tìm kiếm")
         await push_event(
             state,
             "status",

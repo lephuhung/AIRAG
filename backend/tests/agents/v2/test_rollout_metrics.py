@@ -648,3 +648,285 @@ def test_gate_rejects_incomplete_or_nonnumeric_inputs():
     }
     passed, _ = gate.check_gate(forged)
     assert passed is False
+
+
+# ---------------------------------------------------------------------------
+# Task 7B fix round 2: like-ID ACL comparison (new Important), observed
+# factual expectation (Critical 2), bounded-gap continuity (Important 7)
+# ---------------------------------------------------------------------------
+
+
+def test_acl_extractor_uses_document_ids_only():
+    from app.services.agent import rollout_metrics as metrics
+
+    # A normal source carrying BOTH a workspace id and a document id must
+    # compare the document id (like vs like), never the workspace id.
+    sources = [
+        {
+            "workspace_id": "ws-1",
+            "knowledge_base_id": "kb-1",
+            "document_id": "doc-a",
+            "chunk": "c1",
+        }
+    ]
+    served = metrics.extract_served_document_ids(sources)
+    assert served == ["doc-a"]
+    assert (
+        metrics.detect_acl_leak(
+            served_document_ids=served, allowed_document_ids=["doc-a"]
+        )
+        is False
+    )
+    assert (
+        metrics.detect_acl_leak(
+            served_document_ids=served, allowed_document_ids=["doc-other"]
+        )
+        is True
+    )
+
+
+def test_acl_unidentified_served_entries_are_invalid_not_safe():
+    from app.services.agent import rollout_metrics as metrics
+
+    # A served entry with no document id cannot be compared like-vs-like:
+    # under a document filter the verdict is unobservable (invalid), never
+    # "safe" and never a fabricated workspace-vs-document violation.
+    sources = [{"workspace_id": "ws-1", "chunk": "c1"}]
+    served = metrics.extract_served_document_ids(sources)
+    assert served == []
+    assert metrics.count_served_sources_without_document_id(sources) == 1
+    assert (
+        metrics.detect_acl_leak(
+            served_document_ids=served,
+            allowed_document_ids=["doc-a"],
+            unidentified_served_count=1,
+        )
+        is None
+    )
+    with pytest.raises(ValueError):
+        metrics.build_security_verdicts(
+            answer_text="an answer",
+            terminal_status="success",
+            citation_count=1,
+            factual_expected=True,
+            served_document_ids=served,
+            allowed_document_ids=["doc-a"],
+            production_write_count=0,
+            unidentified_served_count=1,
+        )
+
+
+def test_resolve_factual_expected_covers_terminal_outcomes():
+    from app.services.agent import rollout_metrics as metrics
+
+    # No factual success occurred: error / cancellation / empty answer.
+    assert (
+        metrics.resolve_factual_expected(
+            arm="v2", terminal_status="error", cancelled=False, answer_text="x"
+        )
+        is False
+    )
+    assert (
+        metrics.resolve_factual_expected(
+            arm="v2",
+            terminal_status="cancelled",
+            cancelled=True,
+            answer_text="partial",
+        )
+        is False
+    )
+    assert (
+        metrics.resolve_factual_expected(
+            arm="v2", terminal_status="success", cancelled=False, answer_text="  "
+        )
+        is False
+    )
+    # Observed non-factual turns: v2 clarify status / direct+clarify routes.
+    assert (
+        metrics.resolve_factual_expected(
+            arm="v2",
+            terminal_status="success",
+            cancelled=False,
+            answer_text="Which document?",
+            response_status="clarify",
+        )
+        is False
+    )
+    assert (
+        metrics.resolve_factual_expected(
+            arm="v2",
+            terminal_status="success",
+            cancelled=False,
+            answer_text="Xin chào!",
+            response_status="success",
+            route="direct",
+        )
+        is False
+    )
+    # v2 research-route success answers must be grounded (R72 invariant).
+    assert (
+        metrics.resolve_factual_expected(
+            arm="v2",
+            terminal_status="success",
+            cancelled=False,
+            answer_text="The decree states ...",
+            response_status="success",
+            route="complex_research",
+        )
+        is True
+    )
+    # v2 success-shaped but route/status unknown: unobservable -> invalid.
+    assert (
+        metrics.resolve_factual_expected(
+            arm="v2",
+            terminal_status="success",
+            cancelled=False,
+            answer_text="The decree states ...",
+        )
+        is None
+    )
+    # v1: observed greeting intent is non-factual; other success answers
+    # are expected grounded (fail-closed, never defaulted safe).
+    assert (
+        metrics.resolve_factual_expected(
+            arm="v1",
+            terminal_status="success",
+            cancelled=False,
+            answer_text="Xin chào!",
+            greeting_observed=True,
+        )
+        is False
+    )
+    assert (
+        metrics.resolve_factual_expected(
+            arm="v1",
+            terminal_status="success",
+            cancelled=False,
+            answer_text="The decree states ...",
+        )
+        is True
+    )
+
+
+def test_v1_greeting_label_matches_classifier_source():
+    from app.services.agent import rollout_metrics as metrics
+
+    # The observed v1 conversational signal must track the classifier's
+    # greeting label (drift fails closed loudly instead of fabricating
+    # violations for greetings).
+    from pathlib import Path
+
+    nodes_source = (
+        Path(__file__).resolve().parents[3]
+        / "app"
+        / "services"
+        / "agent"
+        / "nodes.py"
+    ).read_text(encoding="utf-8")
+    assert '"greeting": "Tin nhắn thông thường"' in nodes_source
+    assert "Tin nhắn thông thường" in metrics.V1_GREETING_INTENT_DETAIL
+
+
+def test_count_grounding_evidence_folds_terminal_signals():
+    from app.services.agent import rollout_metrics as metrics
+
+    assert metrics.count_grounding_evidence("", [], []) == 0
+    # v1 inline markers ([xxxx]) count.
+    assert metrics.count_grounding_evidence("Xem [ab12] nhé", [], []) == 1
+    # v2 presented citations count.
+    assert (
+        metrics.count_grounding_evidence(
+            "The decree states this.",
+            [{"citation_id": "cite-1", "label": "L1"}],
+            [],
+        )
+        == 1
+    )
+    # Served document ids count.
+    assert (
+        metrics.count_grounding_evidence("The decree states this.", [], ["doc-a"])
+        == 1
+    )
+
+
+def test_intent_cache_hit_still_emits_greeting_signal():
+    import asyncio
+
+    from app.services.agent import nodes as nodes_module
+
+    async def _run():
+        queue: asyncio.Queue = asyncio.Queue()
+        try:
+            nodes_module._set_cached_intent(
+                "xin chào canary",
+                {
+                    "intent": "greeting",
+                    "rewritten_query": "",
+                    "needs_tool": False,
+                },
+            )
+            state = {
+                "messages": [{"role": "user", "content": "xin chào canary"}],
+                "_event_queue": queue,
+            }
+            result = await nodes_module.intent_classifier(state)
+            assert result["intent"] == "greeting"
+            details = []
+            while not queue.empty():
+                event = queue.get_nowait()
+                if isinstance(event, tuple) and event[0] == "status":
+                    details.append(event[1].get("detail", ""))
+            assert any("Tin nhắn thông thường" in detail for detail in details)
+        finally:
+            try:
+                nodes_module._INTENT_CACHE.pop(
+                    nodes_module._get_cache_key("xin chào canary"), None
+                )
+            except Exception:
+                pass
+
+    asyncio.get_event_loop_policy().new_event_loop().run_until_complete(_run())
+
+
+def _gapped_24_bucket_rows():
+    from datetime import UTC as _UTC
+
+    start = datetime.now(_UTC) - timedelta(hours=100)
+    rows = []
+    # 12 consecutive hourly buckets, a 72h telemetry gap, 12 more buckets:
+    # 24 distinct hours occupied but NOT consecutive coverage.
+    moments = [start + timedelta(hours=index) for index in range(12)]
+    moments += [start + timedelta(hours=12 + 72 + index) for index in range(12)]
+    for arm in ("v1", "v2"):
+        for index, moment in enumerate(moments):
+            rows.append(
+                _row(
+                    arm=arm,
+                    request_id_hash=f"{arm}-gap24-{index}",
+                    started_at=moment,
+                    finished_at=moment + timedelta(seconds=1),
+                )
+            )
+    return rows
+
+
+def test_gate_rejects_gapped_24_bucket_series():
+    collector = _script_module("collect_v2_rollout_report")
+    gate = _script_module("check_v2_rollout_gate")
+
+    report = collector.summarize_metrics(_gapped_24_bucket_rows())
+    assert report["arms"]["v1"]["continuous_hours"] == 24
+    assert report["arms"]["v1"]["max_gap_hours"] >= 72
+    passed, failures = gate.check_gate(report)
+    assert passed is False
+    assert any("gap" in failure for failure in failures)
+
+
+def test_gate_rejects_missing_max_gap():
+    collector = _script_module("collect_v2_rollout_report")
+    gate = _script_module("check_v2_rollout_gate")
+
+    report = collector.summarize_metrics(_synthetic_rows())
+    del report["arms"]["v2"]["max_gap_hours"]
+    passed, _ = gate.check_gate(report)
+    assert passed is False

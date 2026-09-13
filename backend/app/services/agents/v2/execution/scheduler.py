@@ -69,6 +69,7 @@ __all__ = [
     "V1FallbackRequired",
     "assert_scheduler_input_passthrough",
     "execute_ready_tasks",
+    "ActiveRunHeartbeat",
     "is_run_active",
     "is_run_cancel_requested",
     "is_run_cancel_requested_async",
@@ -76,6 +77,7 @@ __all__ = [
     "refresh_active_run_async",
     "refresh_pairs_for_checkpoint",
     "register_active_run",
+    "start_active_run_heartbeat",
     "register_active_run_async",
     "request_run_cancellation",
     "request_run_cancellation_async",
@@ -184,6 +186,84 @@ async def request_run_cancellation_async(run_id: str) -> None:
         await client.set(_cancel_key(run_id), "1", ex=_ACTIVE_RUN_TTL_SECONDS)
     except Exception:
         logger.warning("canary cancel request failed", exc_info=True)
+
+
+_HEARTBEAT_INTERVAL_SECONDS = 60.0
+
+
+class ActiveRunHeartbeat:
+    """Run-lifetime keeper for the distributed active-run key (fix round 2).
+
+    Registration at run start plus per-dispatch refresh still leaves a gap:
+    a single capability dispatch (or a quiet resumed stretch) longer than
+    the fixed TTL lets the key vanish before terminal cleanup. The
+    heartbeat re-``SET``s the key every ``interval_seconds`` for the whole
+    run; the owner stops it at the terminal boundary (idempotent).
+    """
+
+    def __init__(self, run_id: str, task: "asyncio.Task[None]") -> None:
+        self._run_id = str(run_id)
+        self._task = task
+
+    @property
+    def run_id(self) -> str:
+        return self._run_id
+
+    @property
+    def active(self) -> bool:
+        task = self._task
+        return task is not None and not task.done()
+
+    async def stop(self) -> None:
+        """Stop refreshing (idempotent, never raises)."""
+        task, self._task = self._task, None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001 — stop is best effort
+            pass
+
+
+async def _heartbeat_loop(run_id: str, interval_seconds: float) -> None:
+    try:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            await refresh_active_run_async(run_id)
+    except asyncio.CancelledError:
+        pass
+    except Exception:  # noqa: BLE001 — heartbeat never breaks the run
+        logger.warning("canary active-run heartbeat failed", exc_info=True)
+
+
+def start_active_run_heartbeat(
+    run_id: str, interval_seconds: float = _HEARTBEAT_INTERVAL_SECONDS
+) -> ActiveRunHeartbeat | None:
+    """Start refreshing ``run_id``'s active key for the run lifetime.
+
+    Returns the heartbeat handle (the caller stops it at the terminal
+    boundary) or ``None`` when there is no run or no running loop.
+    Never raises.
+    """
+    if not run_id:
+        return None
+    try:
+        interval = float(interval_seconds)
+    except (TypeError, ValueError):
+        return None
+    if interval <= 0:
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    try:
+        task = loop.create_task(_heartbeat_loop(str(run_id), interval))
+    except Exception:
+        logger.warning("canary active-run heartbeat start failed", exc_info=True)
+        return None
+    return ActiveRunHeartbeat(str(run_id), task)
 
 
 def refresh_active_run(run_id: str) -> None:

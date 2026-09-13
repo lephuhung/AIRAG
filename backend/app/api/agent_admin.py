@@ -187,21 +187,26 @@ async def cancel_agent_run(
 ) -> RunCancelResponse:
     """Operator kill path: flag one active v2 run for cancellation (R75).
 
-    Superadmin only. Flags the run in-process AND in Redis (when enabled)
-    so the next pre-dispatch guard — in this process or any other — stops
-    the run before further capability execution. Never raises on Redis
-    trouble; reports whether the flag is now observable.
+    Superadmin only. AWAITS the distributed (Redis) write before returning
+    (fix round 2, Important 3): the endpoint only acknowledges after the
+    cancel key is durably flagged, so a cross-process pre-dispatch guard
+    checking Redis immediately after cannot observe a missing key. Flags
+    the run in-process AND in Redis (when enabled) so the next
+    pre-dispatch guard — in this process or any other — stops the run
+    before further capability execution. Never raises on Redis trouble;
+    reports whether the flag is now observable.
     """
     _ = db
     _ = user
     from app.services.agents.v2.execution.scheduler import (
-        is_run_cancel_requested,
-        request_run_cancellation,
+        is_run_cancel_requested_async,
+        request_run_cancellation_async,
     )
 
-    request_run_cancellation(run_id)
+    await request_run_cancellation_async(run_id)
     return RunCancelResponse(
-        run_id=str(run_id), cancel_requested=bool(is_run_cancel_requested(run_id))
+        run_id=str(run_id),
+        cancel_requested=bool(await is_run_cancel_requested_async(run_id)),
     )
 
 

@@ -22,6 +22,7 @@ SSE Events emitted (via app/services/agent/streaming.py):
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -141,6 +142,7 @@ async def _stream_v2_standalone(
     user_is_superadmin: bool,
     session_id: Optional[str],
     resume_message_id=None,
+    terminal_info: dict | None = None,
 ) -> AsyncGenerator[str, None]:
     """Run one turn on the v2 arm and yield v1-wire SSE strings.
 
@@ -200,6 +202,7 @@ async def _stream_v2_standalone(
                 runtime_context=ingress.runtime_context,
                 thread_id=thread_id,
                 plan_resolver=ingress.plan_resolver,
+                terminal_info=terminal_info,
             ):
                 yield sse_str
             await ingress.commit_evidence()
@@ -337,10 +340,21 @@ async def langgraph_chat_stream(
     collected_steps: list[dict] = []
     step_counter = 0
 
+    # Task 7B (fix round 2) terminal telemetry: observed signals for the
+    # canary metric row (v2 `status`/`citations` from the terminal complete
+    # payload, v2 route via `terminal_info`, v1 greeting from status steps).
+    v2_response_status: Optional[str] = None
+    v2_citations: list = []
+    v2_terminal_info: dict = {}
+    turn_terminal_status = "success"
+    turn_cancelled = False
+    metric_emitted = False
+
     def _collect_terminal(sse_str: str) -> None:
         """Parse emitted events to collect data for DB persistence."""
         nonlocal final_answer, step_counter
         nonlocal final_sources, final_images, final_people_data
+        nonlocal v2_response_status, v2_citations
         try:
             if sse_str.startswith("event:"):
                 lines = sse_str.strip().split("\n")
@@ -352,6 +366,10 @@ async def langgraph_chat_stream(
                         final_answer = ev_data.get("answer", "")
                         final_sources = ev_data.get("sources", [])
                         final_images = ev_data.get("images", [])
+                        if isinstance(ev_data.get("status"), str):
+                            v2_response_status = ev_data["status"]
+                        if isinstance(ev_data.get("citations"), list):
+                            v2_citations = ev_data["citations"]
                     elif ev_type == "people_data":
                         final_people_data = ev_data.get("people", [])
                     elif ev_type == "status":
@@ -370,64 +388,117 @@ async def langgraph_chat_stream(
     # construction on any entrypoint).
     graph = await resolve_agent_graph(version)
 
-    if version == "v2":
+    async def _emit_turn_metric() -> None:
+        """Emit the turn's terminal metric row (Task 7B, fix round 2).
+
+        Runs in the generator's ``finally`` so EVERY terminal outcome —
+        success, error, cancellation (GeneratorExit/CancelledError), and
+        fallback (attributed to the serving arm) — gets its row with the
+        TRUE cancelled outcome. Every verdict comes from an observed
+        terminal signal; an unobservable verdict makes the row INVALID
+        (logged, never recorded safe). Best-effort: never breaks serving.
+        """
+        nonlocal metric_emitted
+        if metric_emitted:
+            return
+        metric_emitted = True
         try:
-            async for sse_str in _stream_v2_standalone(
-                graph=graph,
-                raw_message=request.message,
+            from app.services.agent import rollout_metrics as _metrics
+
+            _allowed_doc_ids = [
+                str(d) for d in (getattr(request, "document_ids", None) or [])
+            ]
+            _served_doc_ids = _metrics.extract_served_document_ids(
+                final_sources
+            )
+            _greeting = any(
+                isinstance(step, dict)
+                and step.get("detail") == _metrics.V1_GREETING_INTENT_DETAIL
+                for step in collected_steps
+            )
+            _factual = _metrics.resolve_factual_expected(
+                arm=served_arm,
+                terminal_status=turn_terminal_status,
+                cancelled=turn_cancelled,
+                answer_text=final_answer,
+                response_status=v2_response_status,
+                route=(v2_terminal_info or {}).get("route"),
+                greeting_observed=_greeting,
+            )
+            if _factual is None:
+                raise ValueError(
+                    "rollout metric INVALID: factual expectation "
+                    "unobservable for this terminal; refusing to record "
+                    "the row as safe"
+                )
+            await _metrics.try_emit_terminal_rollout_metric(
+                db,
+                arm=served_arm,
+                request_id=persisted_request_id,
                 workspace_ids=workspace_ids,
-                document_ids=getattr(request, "document_ids", None),
-                user_id=user_id,
-                user_is_superadmin=user_is_superadmin,
-                session_id=session_id,
-                resume_message_id=raw_message_uuid,
-            ):
-                yield sse_str
-                _collect_terminal(sse_str)
-        except V1FallbackRequired:
-            # Task 7B: v2 candidate resolved to a v1-only route before any
-            # capability execution — serve v1 with zero v2 output.
-            logger.info("[lg_endpoint] v2 candidate fell back to v1")
-            graph = await resolve_agent_graph("v1")
-            served_arm = "v1"
+                started_at=turn_started_at,
+                terminal_status=turn_terminal_status,
+                citation_count=_metrics.count_grounding_evidence(
+                    final_answer, v2_citations, _served_doc_ids
+                ),
+                cancelled=turn_cancelled,
+                answer_text=final_answer,
+                factual_expected=_factual,
+                served_document_ids=_served_doc_ids,
+                allowed_document_ids=_allowed_doc_ids or None,
+                scope_bound=True,
+                production_write_count=0,
+                unidentified_served_count=(
+                    _metrics.count_served_sources_without_document_id(
+                        final_sources
+                    )
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"[lg_endpoint] rollout metric emission failed: {e}")
+
+    try:
+        if version == "v2":
+            try:
+                async for sse_str in _stream_v2_standalone(
+                    graph=graph,
+                    raw_message=request.message,
+                    workspace_ids=workspace_ids,
+                    document_ids=getattr(request, "document_ids", None),
+                    user_id=user_id,
+                    user_is_superadmin=user_is_superadmin,
+                    session_id=session_id,
+                    resume_message_id=raw_message_uuid,
+                    terminal_info=v2_terminal_info,
+                ):
+                    yield sse_str
+                    _collect_terminal(sse_str)
+            except V1FallbackRequired:
+                # Task 7B: v2 candidate resolved to a v1-only route before any
+                # capability execution — serve v1 with zero v2 output.
+                logger.info("[lg_endpoint] v2 candidate fell back to v1")
+                graph = await resolve_agent_graph("v1")
+                served_arm = "v1"
+                async for sse_str in stream_agent_to_sse(graph, initial_state):
+                    yield sse_str
+                    _collect_terminal(sse_str)
+        else:
             async for sse_str in stream_agent_to_sse(graph, initial_state):
                 yield sse_str
                 _collect_terminal(sse_str)
-    else:
-        async for sse_str in stream_agent_to_sse(graph, initial_state):
-            yield sse_str
-            _collect_terminal(sse_str)
-
-    # Task 7B fix (R74): terminal-boundary metric emission for the serving
-    # arm (best-effort; never breaks serving or persistence). Detector
-    # verdicts come from real terminal observations; unobservable rows are
-    # skipped, never recorded safe.
-    try:
-        from app.services.agent import rollout_metrics as _metrics
-
-        _allowed_doc_ids = [
-            str(d) for d in (getattr(request, "document_ids", None) or [])
-        ]
-        await _metrics.try_emit_terminal_rollout_metric(
-            db,
-            arm=served_arm,
-            request_id=persisted_request_id,
-            workspace_ids=workspace_ids,
-            started_at=turn_started_at,
-            terminal_status=("success" if final_answer.strip() else "error"),
-            citation_count=_metrics.count_citation_markers(final_answer),
-            cancelled=False,
-            answer_text=final_answer,
-            factual_expected=bool(final_sources),
-            served_document_ids=_metrics.extract_served_document_ids(
-                final_sources
-            ),
-            allowed_document_ids=_allowed_doc_ids or None,
-            scope_bound=True,
-            production_write_count=0,
-        )
-    except Exception as e:
-        logger.warning(f"[lg_endpoint] rollout metric emission failed: {e}")
+    except (asyncio.CancelledError, GeneratorExit):
+        # Client disconnect / stop: the turn still gets its row with the
+        # TRUE cancelled outcome, then the cancellation propagates.
+        turn_cancelled = True
+        turn_terminal_status = "cancelled"
+        raise
+    except Exception:
+        turn_terminal_status = "error"
+        raise
+    finally:
+        if not turn_cancelled and not final_answer.strip():
+            turn_terminal_status = "error"
+        await _emit_turn_metric()
 
     # Persist assistant message + thinking steps
     try:

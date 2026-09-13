@@ -604,14 +604,18 @@ async def _session_v2_run(
     preprocess=None,
     available_services=None,
     resume_message_id=None,
+    terminal_info: dict | None = None,
 ):
     """Run one session turn's v2 ingress with unconditional cleanup (I1).
 
     Yields ``(ingress, agen)`` where ``agen`` streams v1-wire SSE strings
     through the T8 production adapter (one terminal event, truncation →
     rollback/error, terminal lease release after the terminal checkpoint).
-    When ``resume_message_id`` answers a suspended clarification on this
-    thread, the turn resumes from the checkpoint instead of starting fresh.
+    ``terminal_info`` is an optional caller-owned dict receiving the
+    observed terminal route (Task 7B canary factual expectation; wire
+    format unchanged). When ``resume_message_id`` answers a suspended
+    clarification on this thread, the turn resumes from the checkpoint
+    instead of starting fresh.
     The evidence unit of work commits after the consumer drains the stream;
     any raise rolls it back; cancellation skips the commit (the session
     close rolls the partial turn back). The ingress sessions close on EVERY
@@ -669,6 +673,7 @@ async def _session_v2_run(
                 runtime_context=ingress.runtime_context,
                 thread_id=thread_id,
                 plan_resolver=ingress.plan_resolver,
+                terminal_info=terminal_info,
             )
             await ingress.commit_evidence()
         except Exception:
@@ -1351,11 +1356,22 @@ async def chat_stream_session(
             finally:
                 await agen.aclose()
 
+        # Task 7B (fix round 2) terminal telemetry: observed signals for
+        # the canary metric row. v2 `status`/`citations` come from the
+        # terminal `complete` payload; the v2 route lands in
+        # `v2_terminal_info` via `_session_v2_run`; v1 conversational turns
+        # are observed from the classifier status events in `final_steps`.
+        v2_response_status: str | None = None
+        v2_citations: list = []
+        v2_terminal_info: dict = {}
+        metric_emitted = False
+
         async def _collect_and_relay(sse_str: str) -> None:
             # Collect data for DB persistence while relaying
             nonlocal accumulated_text, accumulated_thinking
             nonlocal final_sources, final_images
             nonlocal final_potential_abbreviations, final_people_data
+            nonlocal v2_response_status, v2_citations
             try:
                 if sse_str.startswith("event:"):
                     lines = sse_str.strip().split("\n")
@@ -1380,6 +1396,13 @@ async def chat_stream_session(
                         elif ev_type == "complete":
                             if "answer" in ev_data:
                                 accumulated_text = ev_data["answer"]
+                            # v2 terminal payload carries the observed
+                            # response status + presented citations (v1
+                            # complete events carry neither: stays None/[]).
+                            if isinstance(ev_data.get("status"), str):
+                                v2_response_status = ev_data["status"]
+                            if isinstance(ev_data.get("citations"), list):
+                                v2_citations = ev_data["citations"]
                         elif ev_type == "token_rollback":
                             # The streaming core reset final_answer
                             # + sources + images on rollback; mirror
@@ -1492,6 +1515,84 @@ async def chat_stream_session(
 
                 turn_started_at = _dt.now(_tz.utc)
                 served_arm = version
+
+                async def _emit_turn_metric(
+                    *, terminal_status: str, cancelled: bool
+                ) -> None:
+                    """Emit the turn's terminal metric row (Task 7B, fix round 2).
+
+                    Runs on EVERY terminal outcome — success, error,
+                    cancellation, and fallback (attributed to the serving
+                    arm) — with the TRUE cancelled outcome. Every verdict
+                    comes from an observed terminal signal; an unobservable
+                    verdict makes the row INVALID (logged, never recorded
+                    safe). Best-effort: never breaks serving.
+                    """
+                    nonlocal metric_emitted
+                    if metric_emitted:
+                        return
+                    metric_emitted = True
+                    try:
+                        from app.services.agent import rollout_metrics as _metrics
+
+                        _allowed_doc_ids = [
+                            str(d) for d in (filtered_doc_ids or [])
+                        ]
+                        _served_doc_ids = (
+                            _metrics.extract_served_document_ids(final_sources)
+                        )
+                        _greeting = any(
+                            isinstance(step, dict)
+                            and step.get("detail")
+                            == _metrics.V1_GREETING_INTENT_DETAIL
+                            for step in final_steps
+                        )
+                        _factual = _metrics.resolve_factual_expected(
+                            arm=served_arm,
+                            terminal_status=terminal_status,
+                            cancelled=cancelled,
+                            answer_text=accumulated_text,
+                            response_status=v2_response_status,
+                            route=(v2_terminal_info or {}).get("route"),
+                            greeting_observed=_greeting,
+                        )
+                        if _factual is None:
+                            raise ValueError(
+                                "rollout metric INVALID: factual expectation "
+                                "unobservable for this terminal; refusing to "
+                                "record the row as safe"
+                            )
+                        await _metrics.try_emit_terminal_rollout_metric(
+                            run_db,
+                            arm=served_arm,
+                            request_id=persisted_request_id,
+                            workspace_ids=runtime_workspace_ids,
+                            started_at=turn_started_at,
+                            terminal_status=terminal_status,
+                            citation_count=_metrics.count_grounding_evidence(
+                                accumulated_text, v2_citations, _served_doc_ids
+                            ),
+                            cancelled=cancelled,
+                            answer_text=accumulated_text,
+                            factual_expected=_factual,
+                            served_document_ids=_served_doc_ids,
+                            allowed_document_ids=_allowed_doc_ids or None,
+                            scope_bound=True,
+                            production_write_count=0,
+                            unidentified_served_count=(
+                                _metrics.count_served_sources_without_document_id(
+                                    final_sources
+                                )
+                            ),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[session/%s] rollout metric emission failed",
+                            session_id,
+                            exc_info=True,
+                        )
+
+                _stream_error: Exception | None = None
                 try:
                     if version == "v2":
                         # I1: the ingress CM scopes the whole stream — evidence
@@ -1508,6 +1609,7 @@ async def chat_stream_session(
                             can_read_people=bool(user.is_superadmin),
                             thread_id=session_id,
                             resume_message_id=raw_message_uuid,
+                            terminal_info=v2_terminal_info,
                         ) as (_v2_ingress, _v2_agen):
                             try:
                                 await _drain(_v2_agen)
@@ -1526,6 +1628,11 @@ async def chat_stream_session(
                                 )
                     else:
                         await _drain(stream_agent_to_sse(graph, initial_state))
+                except Exception as _stream_exc:
+                    # The drain raised before the terminal event: the turn
+                    # still gets its row (error outcome), then the error
+                    # propagates to the outer handler below.
+                    _stream_error = _stream_exc
                 finally:
                     # Cancellation follows the primary run: the shadow is
                     # cancelled (if pending) AND joined via the single
@@ -1538,44 +1645,19 @@ async def chat_stream_session(
                             session_id=session_id,
                             timeout=5.0,
                         )
-                # Task 7B fix (R74): terminal-boundary metric emission for
-                # the serving arm. Detector verdicts come from real terminal
-                # observations (answer text scan, citation markers vs served
-                # sources, served-vs-allowed document ids, architectural
-                # zero-write surface); unobservable rows are skipped, never
-                # recorded safe. Best-effort: never breaks serving.
-                try:
-                    from app.services.agent import rollout_metrics as _metrics
-
-                    _allowed_doc_ids = [str(d) for d in (filtered_doc_ids or [])]
-                    await _metrics.try_emit_terminal_rollout_metric(
-                        run_db,
-                        arm=served_arm,
-                        request_id=persisted_request_id,
-                        workspace_ids=runtime_workspace_ids,
-                        started_at=turn_started_at,
-                        terminal_status=(
-                            "success" if accumulated_text.strip() else "error"
-                        ),
-                        citation_count=_metrics.count_citation_markers(
-                            accumulated_text
-                        ),
-                        cancelled=False,
-                        answer_text=accumulated_text,
-                        factual_expected=bool(final_sources),
-                        served_document_ids=_metrics.extract_served_document_ids(
-                            final_sources
-                        ),
-                        allowed_document_ids=_allowed_doc_ids or None,
-                        scope_bound=True,
-                        production_write_count=0,
+                if _stream_error is not None:
+                    await _emit_turn_metric(
+                        terminal_status="error", cancelled=False
                     )
-                except Exception:
-                    logger.warning(
-                        "[session/%s] rollout metric emission failed",
-                        session_id,
-                        exc_info=True,
-                    )
+                    raise _stream_error
+                # Terminal-boundary emission for the serving arm (success,
+                # fallback-served-by-v1, or empty-answer error).
+                await _emit_turn_metric(
+                    terminal_status=(
+                        "success" if accumulated_text.strip() else "error"
+                    ),
+                    cancelled=False,
+                )
 
             # Generate the title now (first exchange) and push it immediately so
             # the client updates without a refresh; reuse the summary downstream.
@@ -1615,7 +1697,15 @@ async def chat_stream_session(
 
         except asyncio.CancelledError:
             # Stop button (cancel endpoint) or server shutdown — keep whatever
-            # was generated so the user still sees the partial answer.
+            # was generated so the user still sees the partial answer. The
+            # turn still gets its terminal row with the TRUE cancelled
+            # outcome (fix round 2, Important 8).
+            try:
+                await _emit_turn_metric(
+                    terminal_status="cancelled", cancelled=True
+                )
+            except Exception:
+                pass
             try:
                 await asyncio.shield(_persist(partial=True))
             except asyncio.CancelledError:
@@ -1623,6 +1713,12 @@ async def chat_stream_session(
             raise
         except Exception as e:
             logger.error(f"[lg/session] LangGraph stream error: {e}", exc_info=True)
+            try:
+                await _emit_turn_metric(
+                    terminal_status="error", cancelled=False
+                )
+            except Exception:
+                pass
             relay.put_nowait(format_sse_event("error", {"message": str(e)}))
             await _persist(partial=True)
         finally:

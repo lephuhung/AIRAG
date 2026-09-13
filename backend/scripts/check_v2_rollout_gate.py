@@ -6,7 +6,8 @@ Reads a ``v2_rollout_live_v1`` report (see
 rollback-gate thresholds::
 
     >= 200 completed samples per arm (v1 + v2)
-    >= 24 continuous hours
+    >= 24 continuous hours with no gap between consecutive completions
+    larger than 2h (consecutive coverage, not occupied buckets)
     zero security violations
     v2 error-rate regression <= 1 percentage point
     v2 p95 regression <= 15%
@@ -38,6 +39,10 @@ import math
 
 MIN_COMPLETED_PER_ARM = 200
 MIN_HOURS = 24.0
+# Continuity means CONSECUTIVE coverage (fix round 2, Important 7): 24
+# occupied hour buckets are not enough when a telemetry gap splits them.
+# No two consecutive valid completions may be further apart than this.
+MAX_GAP_HOURS = 2.0
 MAX_ERROR_RATE_REGRESSION_PP = 0.01
 MAX_P95_REGRESSION_RATIO = 0.15
 MAX_CANCEL_FAILURE_RATE = 0.001
@@ -114,6 +119,7 @@ def check_gate(report: dict[str, Any]) -> tuple[bool, list[str]]:
             continue
         completed = _req_int(data, "completed")
         continuous = _req_number(data, "continuous_hours")
+        max_gap = _req_number(data, "max_gap_hours")
         violations = _req_int(data, "security_violations")
         invalid_rows = _req_int(data, "invalid_security_rows")
         error_rate = _req_rate(data, "error_rate")
@@ -125,6 +131,7 @@ def check_gate(report: dict[str, Any]) -> tuple[bool, list[str]]:
             for key, value in (
                 ("completed", completed),
                 ("continuous_hours", continuous),
+                ("max_gap_hours", max_gap),
                 ("security_violations", violations),
                 ("invalid_security_rows", invalid_rows),
                 ("error_rate", error_rate),
@@ -154,6 +161,13 @@ def check_gate(report: dict[str, Any]) -> tuple[bool, list[str]]:
             failures.append(
                 f"{arm}: only {continuous:.1f} continuous hours "
                 f"(need >= {MIN_HOURS:.0f})"
+            )
+        if max_gap > MAX_GAP_HOURS:
+            failures.append(
+                f"{arm}: max gap between consecutive completions is "
+                f"{max_gap:.1f}h (limit {MAX_GAP_HOURS:.0f}h); 24 occupied "
+                "hour buckets with a telemetry gap are not continuous "
+                "coverage"
             )
         valid_inputs[arm] = {
             "error_rate": error_rate,

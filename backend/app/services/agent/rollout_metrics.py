@@ -172,6 +172,7 @@ def detect_acl_leak(
     served_document_ids: list[Any] | tuple[Any, ...] | None,
     allowed_document_ids: list[Any] | tuple[Any, ...] | None,
     scope_bound: bool = False,
+    unidentified_served_count: int | None = 0,
 ) -> bool | None:
     """Any served document outside the allowed set is a leak.
 
@@ -183,6 +184,14 @@ def detect_acl_leak(
     narrower document filter is an observed clean verdict (scope-bound
     retrieval), not a default. An empty served set is likewise observed
     clean. A missing served observation is always unobservable.
+
+    Like-vs-like (fix round 2): served ids are document ids and the
+    allowed set holds document ids. Served entries whose document id
+    could not be determined (see
+    :func:`count_served_sources_without_document_id`) cannot be proven
+    inside a document allowlist: when such entries exist AND a document
+    allowlist applies, the verdict is UNOBSERVABLE (``None`` — invalid,
+    never safe, never a fabricated workspace-vs-document violation).
     """
     if served_document_ids is None:
         return None
@@ -190,9 +199,15 @@ def detect_acl_leak(
         served = [str(item) for item in served_document_ids]
     except Exception:
         return None
+    try:
+        unidentified = int(unidentified_served_count or 0)
+    except (TypeError, ValueError):
+        return None
     if allowed_document_ids is None:
         if scope_bound:
             return False
+        return None
+    if unidentified > 0:
         return None
     try:
         allowed = {str(item) for item in allowed_document_ids}
@@ -224,6 +239,7 @@ def build_security_verdicts(
     allowed_document_ids: list[Any] | tuple[Any, ...] | None,
     production_write_count: int | None,
     scope_bound: bool = False,
+    unidentified_served_count: int | None = 0,
 ) -> dict[str, bool]:
     """Run the four real detectors and validate through the producers.
 
@@ -242,6 +258,7 @@ def build_security_verdicts(
             served_document_ids=served_document_ids,
             allowed_document_ids=allowed_document_ids,
             scope_bound=scope_bound,
+            unidentified_served_count=unidentified_served_count,
         ),
         "duplicate_production_write": detect_duplicate_production_write(
             production_write_count
@@ -413,8 +430,23 @@ _CITATION_MARKER_RE = re.compile(
     r"\[(?:[A-Za-z0-9]{4}|MEM-[A-Za-z0-9]+|IMG-[A-Za-z0-9-]+)\]"
 )
 
-_SCOPE_ID_KEYS = ("workspace_id", "knowledge_base_id", "kb_id")
-_DOC_ID_KEYS = ("document_id", "id")
+#: The v1 intent-classifier status detail for conversational turns, pushed
+#: by ``app.services.agent.nodes.intent_classifier``
+#: (``intent_labels["greeting"]``). The ingress observes this status event
+#: to mark greeting turns non-factual; a drift test pins the label against
+#: the classifier source so a rename fails closed loudly instead of
+#: fabricating ungrounded violations for greetings.
+V1_GREETING_INTENT_DETAIL = "Phân loại: Tin nhắn thông thường"
+
+#: Non-factual v2 routes: the direct route is the codebase's own
+#: "non-factual success boundary" and clarify routes ask questions.
+_NON_FACTUAL_ROUTES = frozenset({"direct", "clarify"})
+
+#: v2 research routes whose successful answers must be grounded (R72:
+#: v2 grounded-success completeness is an invariant).
+_FACTUAL_ROUTES = frozenset({"complex_research", "fast_domain"})
+
+_DOC_ID_KEYS = ("document_id",)
 
 
 def count_citation_markers(answer_text: str | None) -> int:
@@ -424,12 +456,35 @@ def count_citation_markers(answer_text: str | None) -> int:
     return len(_CITATION_MARKER_RE.findall(answer_text))
 
 
-def extract_served_document_ids(sources: Any) -> list[str]:
-    """Extract served document/scope ids from terminal sources (observed).
+def _served_document_id_of(item: Any) -> str | None:
+    """One entry's document id (like-vs-like: ``document_id`` only)."""
+    try:
+        if isinstance(item, dict):
+            value = item.get("document_id")
+        else:
+            value = getattr(item, "document_id", None)
+    except Exception:
+        return None
+    if value is None or value is False:
+        return None
+    try:
+        text = str(value).strip()
+    except Exception:
+        return None
+    return text or None
 
-    Prefers scope keys (workspace/KB) when present, else document ids.
-    Unparseable entries are skipped; a turn that served nothing yields []
-    (observed empty, never a default "safe").
+
+def extract_served_document_ids(sources: Any) -> list[str]:
+    """Extract served DOCUMENT ids from terminal sources (observed).
+
+    Like-vs-like (fix round 2): only ``document_id`` is extracted — never
+    workspace/KB/scope keys, never ``doc``/``id``/chunk labels — because
+    the ingress allowlist holds document ids and comparing a workspace id
+    against document ids fabricates ACL violations. Entries without a
+    document id contribute nothing here; count them with
+    :func:`count_served_sources_without_document_id` (under a document
+    filter they make the ACL verdict unobservable, never safe). A turn
+    that served nothing yields [] (observed empty, never a default).
     """
     served: list[str] = []
     try:
@@ -437,21 +492,118 @@ def extract_served_document_ids(sources: Any) -> list[str]:
     except TypeError:
         return []
     for item in items:
-        try:
-            slot = (
-                item.get if isinstance(item, dict) else getattr
-            )
-            found = None
-            for key in _SCOPE_ID_KEYS + _DOC_ID_KEYS:
-                try:
-                    value = slot(key) if isinstance(item, dict) else slot(item, key, None)
-                except Exception:
-                    value = None
-                if value:
-                    found = str(value)
-                    break
-            if found:
-                served.append(found)
-        except Exception:
-            continue
+        found = _served_document_id_of(item)
+        if found:
+            served.append(found)
     return served
+
+
+def count_served_sources_without_document_id(sources: Any) -> int:
+    """Count served entries with no determinable document id.
+
+    ``0`` for no served sources (observed empty). A positive count with an
+    applicable document allowlist makes the ACL verdict unobservable
+    (invalid, never safe); without a filter, scope-bound retrieval still
+    attests in-scope cleanliness.
+    """
+    try:
+        items = tuple(sources or ())
+    except TypeError:
+        return 0
+    unidentified = 0
+    for item in items:
+        if _served_document_id_of(item) is None:
+            try:
+                is_empty = not item
+            except Exception:
+                is_empty = False
+            if not is_empty:
+                unidentified += 1
+    return unidentified
+
+
+def resolve_factual_expected(
+    *,
+    arm: str,
+    terminal_status: str | None,
+    cancelled: bool = False,
+    answer_text: str | None = None,
+    response_status: str | None = None,
+    route: str | None = None,
+    greeting_observed: bool = False,
+) -> bool | None:
+    """Resolve whether a turn was a factual-answer turn (observed, never defaulted).
+
+    Three-valued: ``True``/``False`` are observed verdicts; ``None`` means
+    factual-ness is UNOBSERVABLE and the row is invalid (never safe).
+
+    Observed non-factual (``False``): cancellation or a non-success
+    terminal (no factual SUCCESS occurred — definitional, not a default),
+    an empty answer, a v2 clarify response, a non-factual v2 route
+    (``direct``/``clarify`` — the direct route is the codebase's own
+    non-factual success boundary), or the v1 greeting-intent status.
+
+    Observed factual (``True``): a successful answer turn on a factual
+    path — v2 research routes / observed v2 success (R72: v2
+    grounded-success completeness is an invariant, so a v2 success answer
+    with zero grounding evidence is a violation, never safe), and v1
+    success answers (fail-closed: v1 grounds through served sources and
+    inline markers, so a sourceless v1 success answer is a violation).
+
+    Unobservable (``None``): a v2 success-shaped answer whose route and
+    response status are both unknown — the invariant cannot be checked,
+    so the row is invalid rather than recorded safe.
+    """
+    if cancelled:
+        return False
+    status = str(terminal_status or "").lower()
+    if status and status in _CANCELLED_STATUSES:
+        return False
+    if status and status not in _SUCCESS_STATUSES:
+        return False
+    if not (answer_text or "").strip():
+        return False
+    if str(response_status or "").lower() == "clarify":
+        return False
+    normalized_route = str(route or "").lower() or None
+    if normalized_route in _NON_FACTUAL_ROUTES:
+        return False
+    if greeting_observed and str(arm or "").lower() == "v1":
+        return False
+    if str(arm or "").lower() == "v2":
+        if str(response_status or "").lower() in _SUCCESS_STATUSES:
+            return True
+        if normalized_route in _FACTUAL_ROUTES:
+            return True
+        return None
+    if str(arm or "").lower() == "v1":
+        return True
+    return None
+
+
+def count_grounding_evidence(
+    answer_text: str | None,
+    citations: Any,
+    served_document_ids: Any,
+) -> int:
+    """Count presented grounding evidence for one terminal answer.
+
+    Folds the three observed terminal signals: v1-style inline citation
+    markers (``[xxxx]``), v2 presented citations (``citation_id``/``label``
+    entries from the terminal payload), and served document ids. Pure
+    observation counting — factual-ness is resolved separately by
+    :func:`resolve_factual_expected` and must never be derived from these
+    signals (that fail-open shape is exactly what fix round 2 removes).
+    """
+    total = count_citation_markers(answer_text)
+    try:
+        presented = tuple(citations or ())
+    except TypeError:
+        presented = ()
+    total += len(presented)
+    try:
+        served = tuple(served_document_ids or ())
+    except TypeError:
+        served = ()
+    total += len(served)
+    return total

@@ -902,3 +902,305 @@ def test_telegram_fallback_resolves_v1_graph():
     assert graph == "graph-v1"
     assert events is None
     assert resolved == ["v1"]
+
+
+# ---------------------------------------------------------------------------
+# Task 7B fix round 2: real router/ingress fallback proof (Critical 1 + Important 12),
+# awaited operator cancellation (Important 3), run-lifetime heartbeat (Important 4)
+# ---------------------------------------------------------------------------
+
+
+def _router_semantic(normalized_query):
+    from app.services.agents.v2.contracts.semantic import SemanticContext
+
+    return SemanticContext(
+        contextualized_query=normalized_query,
+        normalized_query=normalized_query,
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(),
+        person_refs=(),
+        section_refs=(),
+        blocking_ambiguities=(),
+    )
+
+
+def _supervisor_state_with_plan(semantic, plan):
+    from app.services.agents.v2.contracts.binding import DocumentBindingSet
+    from app.services.agents.v2.contracts.conversation import ConversationContext
+    from app.services.agents.v2.contracts.request import RequestContext
+    from app.services.agents.v2.contracts.state import ExecutionState, SupervisorV2State
+
+    return SupervisorV2State(
+        contract_version="2.0",
+        request=RequestContext(
+            contract_version="2.0",
+            request_id="req-router-1",
+            thread_id="thread-router-1",
+            original_query=semantic.normalized_query,
+            known_documents=(),
+        ),
+        conversation=ConversationContext(
+            summary="",
+            active_entities=(),
+            last_focus=None,
+            recent_turns=(),
+        ),
+        semantic=semantic,
+        bindings=DocumentBindingSet(bindings=(), revision_requirement_refs=()),
+        query_analysis=None,
+        route_decision=None,
+        execution=ExecutionState(
+            plan=plan, task_results=(), evidence_evaluation=None
+        ),
+        clarification=None,
+        final_response=None,
+    )
+
+
+async def _route_then_execute(normalized_query):
+    """Drive the REAL router + ingress + execute path (no synthesized routing).
+
+    Returns ``(route_decision, stub)`` after running the production
+    ``route_node`` (real ``analyze_query``/``decide_route``), the production
+    ``build_complex_research_state`` ingress mapping, and the production
+    ``complex_execute_node`` (sole scheduler, stub capability). Raises
+    ``V1FallbackRequired`` for v1-only routes.
+    """
+    from langgraph.runtime import Runtime
+
+    from app.services.agents.v2.complex_research_graph import (
+        build_complex_research_state,
+        complex_execute_node,
+    )
+    from app.services.agents.v2.nodes.routing import route_node
+
+    registry, stub = _people_registry()
+    runtime_context = _graph_runtime(registry)
+    semantic = _router_semantic(normalized_query)
+    supervisor_state = _supervisor_state_with_plan(semantic, _scheduler_plan())
+    # REAL router: semantic text -> frozen QueryAnalysis/RouteDecision.
+    update = await route_node(
+        supervisor_state, Runtime(context=runtime_context)
+    )
+    assert update["query_analysis"] is not None
+    assert update["route_decision"] is not None
+    merged = dict(supervisor_state)
+    merged.update(update)
+    # REAL ingress mapping: supervisor state -> complex child state.
+    child_state = build_complex_research_state(merged)
+    # REAL execute node: sole scheduler call with the production guard.
+    await complex_execute_node(child_state, runtime_context)
+    return update["route_decision"], stub
+
+
+@pytest.mark.asyncio
+async def test_post_router_fallback_via_real_router_write():
+    """Critical 1 / Important 12: a real write query falls back with zero
+    capability calls and zero v2 output (no synthesized routing state)."""
+    from app.services.agents.v2.execution.scheduler import V1FallbackRequired
+
+    with pytest.raises(V1FallbackRequired):
+        await _route_then_execute("Viết báo cáo tổng kết năm")
+    # The helper raises before returning the stub; re-drive to inspect calls.
+    from langgraph.runtime import Runtime
+
+    from app.services.agents.v2.complex_research_graph import (
+        build_complex_research_state,
+        complex_execute_node,
+    )
+    from app.services.agents.v2.execution.scheduler import V1FallbackRequired as _V1FB
+    from app.services.agents.v2.nodes.routing import route_node
+
+    registry, stub = _people_registry()
+    runtime_context = _graph_runtime(registry)
+    supervisor_state = _supervisor_state_with_plan(
+        _router_semantic("Viết báo cáo tổng kết năm"), _scheduler_plan()
+    )
+    update = await route_node(
+        supervisor_state, Runtime(context=runtime_context)
+    )
+    assert update["route_decision"].reason_code == "simple_write_operation"
+    child_state = build_complex_research_state({**dict(supervisor_state), **update})
+    with pytest.raises(_V1FB):
+        await complex_execute_node(child_state, runtime_context)
+    assert stub.calls == []
+
+
+@pytest.mark.asyncio
+async def test_post_router_fallback_via_real_router_evaluate():
+    """Critical 1 / Important 12: a real evaluate query falls back with zero
+    capability calls (real router + ingress, CANARY_PERCENT=100 shape)."""
+    from app.services.agents.v2.execution.scheduler import V1FallbackRequired as _V1FB
+    from langgraph.runtime import Runtime
+
+    from app.services.agents.v2.complex_research_graph import (
+        build_complex_research_state,
+        complex_execute_node,
+    )
+    from app.services.agents.v2.nodes.routing import route_node
+
+    registry, stub = _people_registry()
+    runtime_context = _graph_runtime(registry)
+    supervisor_state = _supervisor_state_with_plan(
+        _router_semantic("Đánh giá tuân thủ quy định nội bộ"), _scheduler_plan()
+    )
+    update = await route_node(
+        supervisor_state, Runtime(context=runtime_context)
+    )
+    assert update["query_analysis"].work_type == "evaluate"
+    assert update["route_decision"].reason_code == "compliance_evaluation"
+    child_state = build_complex_research_state({**dict(supervisor_state), **update})
+    with pytest.raises(_V1FB):
+        await complex_execute_node(child_state, runtime_context)
+    assert stub.calls == []
+
+
+@pytest.mark.asyncio
+async def test_supported_compare_via_real_router_dispatches():
+    """Important 12: a real eligible compare query flows through the router +
+    ingress and dispatches through the sole scheduler (not fallback)."""
+    from langgraph.runtime import Runtime
+
+    from app.services.agents.v2.complex_research_graph import (
+        build_complex_research_state,
+        complex_execute_node,
+    )
+    from app.services.agents.v2.nodes.routing import route_node
+
+    registry, stub = _people_registry()
+    runtime_context = _graph_runtime(registry)
+    supervisor_state = _supervisor_state_with_plan(
+        _router_semantic("So sánh hiệu quả hai phương án"), _scheduler_plan()
+    )
+    update = await route_node(
+        supervisor_state, Runtime(context=runtime_context)
+    )
+    assert update["route_decision"].reason_code == "comparison"
+    child_state = build_complex_research_state({**dict(supervisor_state), **update})
+    result = await complex_execute_node(child_state, runtime_context)
+    assert stub.calls != []
+    assert len(tuple(result.get("task_results", ()))) == 1
+
+
+@pytest.mark.asyncio
+async def test_streaming_fallback_emits_zero_v2_output():
+    """Critical 1: the user-visible layer re-raises the typed fallback with
+    zero v2 output (no token/complete/sources/images events)."""
+    from app.services.agent.streaming import stream_v2_turn_events
+    from app.services.agents.v2.execution.scheduler import V1FallbackRequired
+
+    registry, _stub = _people_registry()
+    runtime = _graph_runtime(registry)
+
+    class _FallbackGraph:
+        async def ainvoke(self, *args, **kwargs):
+            raise V1FallbackRequired("v1-only route")
+
+    yielded: list = []
+    with pytest.raises(V1FallbackRequired):
+        async for event in stream_v2_turn_events(
+            graph=_FallbackGraph(),
+            runtime_context=runtime,
+            thread_id="thread-fallback-1",
+            initial_state={"query": "write this down"},
+        ):
+            yielded.append(event)
+    assert all(
+        event.get("event") not in ("token", "complete", "sources", "images")
+        for event in yielded
+    )
+
+
+@pytest.mark.asyncio
+async def test_operator_cancel_awaits_distributed_write():
+    """Important 3: the operator endpoint awaits the Redis write before
+    returning (ordering proven through the endpoint, not the local set)."""
+    import app.core.redis_client as redis_client
+    from app.api.agent_admin import cancel_agent_run
+    from app.services.agents.v2.execution import scheduler as scheduler_module
+
+    store: dict = {}
+    events: list[str] = []
+
+    class DictBackedRedis:
+        async def set(self, key, value, ex=None):
+            events.append("set")
+            store[key] = value
+            return True
+
+        async def exists(self, *keys):
+            events.append("exists")
+            # Ordering: the SET must have COMPLETED before any read observes.
+            assert "set" in events
+            return sum(1 for key in keys if key in store)
+
+        async def delete(self, *keys):
+            for key in keys:
+                store.pop(key, None)
+            return 1
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(redis_client, "is_redis_enabled", lambda: True)
+    monkeypatch.setattr(redis_client, "get_redis", lambda: DictBackedRedis())
+    try:
+        run_id = f"run-op-await-{uuid4().hex[:8]}"
+
+        class FakeUser:
+            pass
+
+        response = await cancel_agent_run(run_id, user=FakeUser(), db=None)
+        assert response.cancel_requested is True
+        assert "set" in events
+        # Cross-process view: drop the process-local flag; the distributed
+        # (Redis) flag alone must still read back as requested.
+        scheduler_module._local_cancel_requests.discard(run_id)
+        assert (
+            await scheduler_module.is_run_cancel_requested_async(run_id) is True
+        )
+    finally:
+        monkeypatch.undo()
+        scheduler_module.unregister_active_run(run_id)
+
+
+@pytest.mark.asyncio
+async def test_active_run_heartbeat_refreshes_for_run_lifetime():
+    """Important 4: the run-lifetime heartbeat keeps the active-run key alive
+    across TTL-length dispatches and stops at the terminal boundary."""
+    import asyncio
+
+    import app.core.redis_client as redis_client
+    from app.services.agents.v2.execution import scheduler as scheduler_module
+
+    sets: list = []
+
+    class CountingRedis:
+        async def set(self, *args, **kwargs):
+            sets.append(args)
+            return True
+
+        async def exists(self, *args, **kwargs):
+            return 0
+
+        async def delete(self, *args, **kwargs):
+            return 1
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(redis_client, "is_redis_enabled", lambda: True)
+    monkeypatch.setattr(redis_client, "get_redis", lambda: CountingRedis())
+    try:
+        run_id = f"run-heartbeat-{uuid4().hex[:8]}"
+        heartbeat = scheduler_module.start_active_run_heartbeat(
+            run_id, interval_seconds=0.02
+        )
+        assert heartbeat is not None
+        await asyncio.sleep(0.09)
+        assert len(sets) >= 2
+        await heartbeat.stop()
+        frozen = len(sets)
+        await asyncio.sleep(0.05)
+        assert len(sets) == frozen
+        await heartbeat.stop()  # idempotent
+    finally:
+        monkeypatch.undo()
+        scheduler_module.unregister_active_run(run_id)
