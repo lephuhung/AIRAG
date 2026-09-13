@@ -56,6 +56,14 @@ V2_TABLES_IN_ORDER = (
     "binding_audit",
     "evidence_records",
     "evidence_uses",
+    # P1 Task 1: the v4 tables. The fixture drops v2 state CASCADE before
+    # re-applying; omitting a table here leaves it behind with a stripped
+    # FK (e.g. dropping document_revisions CASCADE removes the stages
+    # table's FK), and the idempotent re-apply then no-ops on the version
+    # row without repairing it — breaking suite-order independence.
+    "agent_rollout_control",
+    "agent_rollout_metrics",
+    "document_revision_stages",
 )
 
 EXPECTED_V2_TABLES = frozenset(V2_TABLES_IN_ORDER)

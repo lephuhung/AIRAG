@@ -22,16 +22,16 @@ from app.models.system_setting import SystemSetting
 from app.models.document_alias import DocumentAlias
 
 # ── Phase 1B — post-migration v2 ORM registration ─────────────────────────
-# Importing ``v2_registry`` registers the 11 v2 ORM classes on
+# Importing ``v2_registry`` registers the 12 v2 ORM classes on
 # ``Base.metadata`` and exposes the post-migration entrypoints used by
 # ``app.main.lifespan`` (``LEGACY_STARTUP_TABLES``,
 # ``assert_v2_readiness``). The lifespan function refuses to start
 # the app unless the live database is at v2 schema version 1; this
 # module performs the metadata registration only (no DB writes, no DDL).
 #
-# The model classes imported below are the 11 v2 tables from
-# ``V2_SCHEMA_V1_TABLES`` (set in
-# ``app.services.agents.v2.persistence.migrate``). ``v2_schema_version``
+# The model classes imported below are the 12 v2 tables: the 11 from
+# ``V2_SCHEMA_V1_TABLES`` plus ``document_revision_stages`` (P1 Task 1,
+# ``V2_STAGE_TABLES``). ``v2_schema_version``
 # is intentionally NOT mapped because it has no per-row semantics for
 # application code — it is a migration-control surface.
 from app.models.v2_registry import (  # noqa: E402,F401
@@ -47,6 +47,9 @@ from app.models.document_revision_build import (  # noqa: E402,F401
 )
 from app.models.document_revision_chunk import (  # noqa: E402,F401
     DocumentRevisionChunk,
+)
+from app.models.document_revision_stage import (  # noqa: E402,F401
+    DocumentRevisionStage,
 )
 from app.models.document_ingestion_attempt import (  # noqa: E402,F401
     DocumentIngestionAttempt,
@@ -93,6 +96,7 @@ __all__ = [
     "DocumentRevision",
     "DocumentRevisionBuild",
     "DocumentRevisionChunk",
+    "DocumentRevisionStage",
     "DocumentIngestionAttempt",
     "SourceArrival",
     "RevisionRetentionLease",

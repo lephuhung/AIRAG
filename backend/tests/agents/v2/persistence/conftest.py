@@ -224,6 +224,7 @@ def _reset_legacy_schema(conn) -> None:
         "document_revisions",
         "document_revision_builds",
         "document_revision_chunks",
+        "document_revision_stages",
         "revision_ingestion_attempts",
         "source_arrivals",
         "revision_retention_leases",
@@ -471,6 +472,11 @@ def document_factory(raw_connection):
                 (did,),
             )
             # Build rows FK-RESTRICT their revision; delete them first.
+            cur.execute(
+                "DELETE FROM document_revision_stages WHERE revision_id IN "
+                "(SELECT revision_id FROM document_revisions WHERE document_id = %s)",
+                (did,),
+            )
             cur.execute(
                 "DELETE FROM document_revision_builds WHERE revision_id IN "
                 "(SELECT revision_id FROM document_revisions WHERE document_id = %s)",

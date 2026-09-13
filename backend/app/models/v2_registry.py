@@ -2,7 +2,7 @@
 
 Release 1B only maps the v2 tables that Release 1A (``app.services.
 agents.v2.persistence.migrate``) created. This module is the
-*post-migration entrypoint* for the v2 ORM mappings: it imports the 11
+*post-migration entrypoint* for the v2 ORM mappings: it imports the 12
 v2 model classes (which register themselves on
 ``app.core.database.Base.metadata``) and exposes the runtime gates
 that the application uses to refuse startup on a database that has not
@@ -161,6 +161,7 @@ LEGACY_STARTUP_TABLES: frozenset[str] = frozenset(
         #   "document_revisions",
         #   "document_revision_builds",
         #   "document_revision_chunks",
+        #   "document_revision_stages",
         #   "revision_ingestion_attempts",
         #   "source_arrivals",
         #   "revision_retention_leases",
@@ -177,7 +178,7 @@ LEGACY_STARTUP_TABLES: frozenset[str] = frozenset(
 # v2 model imports
 # ---------------------------------------------------------------------------
 #
-# Importing the 11 v2 model modules registers the corresponding ORM
+# Importing the 12 v2 model modules registers the corresponding ORM
 # classes on ``Base.metadata``. This is the single source of truth
 # for "v2 models are present" — if any model file is renamed, removed,
 # or fails to import, ``Base.metadata.tables`` will reflect the change
@@ -203,7 +204,7 @@ def register_v2_models() -> None:
     SQLAlchemy declarative ``Base`` subclasses register themselves
     on ``app.core.database.Base.metadata`` at *class-definition*
     time (i.e. at module import). Importing ``app.models.v2_registry``
-    therefore registers the 11 v2 model classes on ``Base.metadata``
+    therefore registers the 12 v2 model classes on ``Base.metadata``
     automatically; calling ``register_v2_models()`` is a no-op that
     lets callers prove the registration ran.
 
@@ -219,7 +220,7 @@ def register_v2_models() -> None:
     return None
 
 
-# Importing the 11 v2 model modules registers the corresponding
+# Importing the 12 v2 model modules registers the corresponding
 # classes on ``Base.metadata``. The import order is preserved for
 # readability; SQLAlchemy resolves inter-model FKs lazily so order
 # is not significant at runtime.
@@ -231,6 +232,9 @@ from app.models.document_revision_build import (  # noqa: E402,F401
 )
 from app.models.document_revision_chunk import (  # noqa: E402,F401
     DocumentRevisionChunk,
+)
+from app.models.document_revision_stage import (  # noqa: E402,F401
+    DocumentRevisionStage,
 )
 from app.models.document_ingestion_attempt import (  # noqa: E402,F401
     DocumentIngestionAttempt,
@@ -354,6 +358,7 @@ def v2_models_registered() -> bool:
         "document_revisions",
         "document_revision_builds",
         "document_revision_chunks",
+        "document_revision_stages",
         "revision_ingestion_attempts",
         "source_arrivals",
         "revision_retention_leases",

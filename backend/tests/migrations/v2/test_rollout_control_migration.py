@@ -89,9 +89,9 @@ def db() -> Engine:
 def version2_db(db: Engine) -> Engine:
     """Regress the database to the version-2 shape, then hand it over.
 
-    Ensures the full v3 schema first (so the V1 tables exist regardless
+    Ensures the full v4 schema first (so the V1 tables exist regardless
     of suite order), then drops the two rollout tables and sets the
-    version row back to 2. Restores the v3 schema on teardown so later
+    version row back to 2. Restores the v4 schema on teardown so later
     tests observe a migrated database.
     """
     apply_v2_schema(db)
@@ -130,7 +130,7 @@ def test_rollout_tables_constant_is_the_v3_delta() -> None:
     assert V2_SCHEMA_V3_TABLES == V2_SCHEMA_V1_TABLES | V2_ROLLOUT_TABLES
     assert len(V2_SCHEMA_V1_TABLES) == 12
     assert len(V2_SCHEMA_V3_TABLES) == 14
-    assert V2_SCHEMA_VERSION == 3
+    assert V2_SCHEMA_VERSION == 4
 
 
 def test_version2_fixture_shape(version2_db: Engine) -> None:
@@ -153,10 +153,10 @@ def test_version2_fixture_shape(version2_db: Engine) -> None:
     )
 
 
-def test_version2_upgrades_to_version3(version2_db: Engine) -> None:
+def test_version2_upgrades_to_version4(version2_db: Engine) -> None:
     apply_v2_schema(version2_db)
     with version2_db.connect() as conn:
-        assert _recorded_version(conn) == 3
+        assert _recorded_version(conn) == 4
         control = _columns(conn, "agent_rollout_control")
         metrics = _columns(conn, "agent_rollout_metrics")
     assert set(control) == set(EXPECTED_CONTROL_COLUMNS), (
@@ -167,7 +167,7 @@ def test_version2_upgrades_to_version3(version2_db: Engine) -> None:
     )
     check = check_v2_schema(version2_db)
     assert check.applied is True
-    assert check.version == 3
+    assert check.version == 4
     assert check.is_clean is True, check
 
 
@@ -202,7 +202,7 @@ def test_rollout_upgrade_is_idempotent(version2_db: Engine) -> None:
         ).scalar()
     apply_v2_schema(version2_db)
     with version2_db.connect() as conn:
-        assert _recorded_version(conn) == 3
+        assert _recorded_version(conn) == 4
         n_after = conn.execute(
             text("SELECT count(*) FROM agent_rollout_control")
         ).scalar()
@@ -364,14 +364,14 @@ def test_check_does_not_report_rollout_tables_as_extra(
 def test_check_reports_genuinely_missing_rollout_table(
     version2_db: Engine,
 ) -> None:
-    """A v3 database missing one rollout table must name it in missing."""
+    """A v4 database missing one rollout table must name it in missing."""
     apply_v2_schema(version2_db)
     with version2_db.begin() as conn:
         conn.execute(text("DROP TABLE agent_rollout_metrics"))
     try:
         check = check_v2_schema(version2_db)
         assert check.applied is True
-        assert check.version == 3
+        assert check.version == 4
         assert "agent_rollout_metrics" in check.missing_tables, check
         assert check.is_clean is False
     finally:
@@ -383,9 +383,10 @@ def test_check_reports_genuinely_missing_rollout_table(
     assert check_v2_schema(version2_db).is_clean is True
 
 
-def test_stepwise_version1_upgrades_to_version3(version2_db: Engine) -> None:
-    """The 1 -> 2 lease repair and the 2 -> 3 rollout DDL compose: a
-    version-1 database lands directly at 3 in a single apply."""
+def test_stepwise_version1_upgrades_to_version4(version2_db: Engine) -> None:
+    """The 1 -> 2 lease repair, the 2 -> 3 rollout DDL, and the 3 -> 4
+    stage DDL compose: a version-1 database lands directly at 4 in a
+    single apply."""
     with version2_db.begin() as conn:
         conn.execute(
             text(
@@ -396,7 +397,7 @@ def test_stepwise_version1_upgrades_to_version3(version2_db: Engine) -> None:
         conn.execute(text("UPDATE v2_schema_version SET version = 1"))
     apply_v2_schema(version2_db)
     with version2_db.connect() as conn:
-        assert _recorded_version(conn) == 3
+        assert _recorded_version(conn) == 4
         nullable = conn.execute(
             text(
                 "SELECT is_nullable FROM information_schema.columns "
@@ -425,7 +426,7 @@ def test_apply_rejects_newer_versions(db: Engine) -> None:
             assert _recorded_version(conn) == 99
     finally:
         with db.begin() as conn:
-            conn.execute(text("UPDATE v2_schema_version SET version = 3"))
+            conn.execute(text("UPDATE v2_schema_version SET version = 4"))
 
 
 def test_apply_rejects_unsupported_version_gap(db: Engine) -> None:
@@ -437,7 +438,7 @@ def test_apply_rejects_unsupported_version_gap(db: Engine) -> None:
             apply_v2_schema(db)
     finally:
         with db.begin() as conn:
-            conn.execute(text("UPDATE v2_schema_version SET version = 3"))
+            conn.execute(text("UPDATE v2_schema_version SET version = 4"))
     assert check_v2_schema(db).is_clean is True
 
 

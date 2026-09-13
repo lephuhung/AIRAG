@@ -41,6 +41,7 @@ from sqlalchemy.engine import Engine
 from app.services.agents.v2.persistence.migrate import (
     V2_SCHEMA_VERSION,
     V2_SCHEMA_V1_TABLES,
+    V2_STAGE_TABLES,
     check_v2_schema,
     make_engine,
 )
@@ -141,12 +142,17 @@ def test_v2_orm_tables_are_exactly_v2_schema_v1_tables(imported_app_models):
     all_mapped = set(Base.metadata.tables.keys())
     # Task 7B owns the two migration-owned rollout tables (Release 1A,
     # version 3; mapped by app.models.agent_rollout_control /
-    # agent_rollout_metric, never created by create_all): they are the only
-    # permitted extras beyond V1 + legacy.
+    # agent_rollout_metric, never created by create_all): they are permitted
+    # extras beyond V1 + legacy. P1 Task 1 owns document_revision_stages
+    # (version 4; mapped by app.models.document_revision_stage) the same way.
     from app.services.agents.v2.persistence.migrate import V2_ROLLOUT_TABLES
 
     extras = (
-        all_mapped - expected_v2_orm_tables - v1_legacy_names - V2_ROLLOUT_TABLES
+        all_mapped
+        - expected_v2_orm_tables
+        - v1_legacy_names
+        - V2_ROLLOUT_TABLES
+        - V2_STAGE_TABLES
     )
     omissions = expected_v2_orm_tables - all_mapped
     assert not extras, (
@@ -521,7 +527,7 @@ def test_v2_orm_mapped_tables_exist_in_database(
             )
         ).fetchall()
     live_tables = {row[0] for row in rows}
-    missing = V2_SCHEMA_V1_TABLES - live_tables
+    missing = (V2_SCHEMA_V1_TABLES | V2_STAGE_TABLES) - live_tables
     assert not missing, (
         f"v2 ORM tables missing from live DB: {sorted(missing)}. "
         f"Run the Release 1A migration before deploying Phase 1B."
@@ -536,7 +542,7 @@ def test_orm_fks_resolve(imported_app_models, db: Engine):
 
     inspector = inspect(db)
     failures: list[str] = []
-    for table_name in V2_SCHEMA_V1_TABLES:
+    for table_name in V2_SCHEMA_V1_TABLES | V2_STAGE_TABLES:
         if table_name not in inspector.get_table_names():
             failures.append(f"missing v2 table in DB: {table_name}")
             continue
@@ -1024,7 +1030,7 @@ def test_orm_matches_live_db_schema_parity(imported_app_models, db: Engine):
     """Brief I3: ORM metadata must match the live DB schema exactly.
 
     Compares ``Base.metadata.tables`` against
-    ``inspect(engine).get_columns(<table>)`` for each of the 12 v2
+    ``inspect(engine).get_columns(<table>)`` for each of the 13 v2
     tables AND the 4 legacy columns (``documents.current_revision_id``,
     ``documents.source_deleted_at``, ``document_images.revision_id``,
     ``document_tables.revision_id``). For each column the test asserts:
@@ -1044,9 +1050,10 @@ def test_orm_matches_live_db_schema_parity(imported_app_models, db: Engine):
 
     inspector = inspect(db)
 
-    # 12 v2 tables — all of them, including ``v2_schema_version``
-    # which is not ORM-mapped but must still appear in the live DB.
-    v2_tables = set(V2_SCHEMA_V1_TABLES)
+    # 13 v2 tables — the 12 V1 tables plus the P1 stage table (all of
+    # them, including ``v2_schema_version``
+    # which is not ORM-mapped but must still appear in the live DB).
+    v2_tables = set(V2_SCHEMA_V1_TABLES) | set(V2_STAGE_TABLES)
     # 4 legacy columns (table, column) pairs added by the migration.
     legacy_cols = {
         ("documents", "current_revision_id"),

@@ -23,7 +23,7 @@ import psycopg
 import pytest
 
 from app.services.agents.v2.persistence.migrate import (
-    V2_SCHEMA_V3_TABLES,
+    V2_SCHEMA_V4_TABLES,
     apply_v2_schema,
     make_engine,
 )
@@ -50,8 +50,9 @@ def _drop_v2_state() -> None:
     with psycopg.connect(V2_DSN, autocommit=False) as conn:
         with conn.cursor() as cur:
             # v2 tables first — CASCADE removes FKs pointing at them.
-            # Task 7A: the v3 set (V1 + rollout) so no residue survives.
-            for tbl in V2_SCHEMA_V3_TABLES:
+            # P1 Task 1: the v4 set (V3 + revision stages) so no residue
+            # survives.
+            for tbl in V2_SCHEMA_V4_TABLES:
                 cur.execute(f'DROP TABLE IF EXISTS "{tbl}" CASCADE')
             for trigger, table in (
                 ("trg_documents_revision_id_stable", "documents"),

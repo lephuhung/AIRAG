@@ -137,13 +137,15 @@ grow ``pg_relation_size``) but never raises.
 
 Module layout::
 
-    V2_SCHEMA_VERSION = 3
+    V2_SCHEMA_VERSION = 4
     V2_SCHEMA_V1_TABLES = frozenset({...})  # the 12 tables of Release 1A
     V2_ROLLOUT_TABLES = frozenset({...})  # the 2 Task 7A rollout tables
     V2_SCHEMA_V3_TABLES = V2_SCHEMA_V1_TABLES | V2_ROLLOUT_TABLES
+    V2_STAGE_TABLES = frozenset({...})  # P1 revision-owned stage state
+    V2_SCHEMA_V4_TABLES = V2_SCHEMA_V3_TABLES | V2_STAGE_TABLES
     SchemaCheck = dataclass(frozen=True)
     check_v2_schema(engine) -> SchemaCheck
-    apply_v2_schema(engine) -> None  # fresh create, or stepwise 1 -> 2 -> 3
+    apply_v2_schema(engine) -> None  # fresh create, or stepwise 1 -> 2 -> 3 -> 4
     main()  # CLI entrypoint
 """
 
@@ -161,7 +163,7 @@ from sqlalchemy.engine import Engine
 # Public constants
 # ---------------------------------------------------------------------------
 
-V2_SCHEMA_VERSION: int = 3
+V2_SCHEMA_VERSION: int = 4
 # Version history: 1 = Release 1A foundation (lease revision_id NOT NULL);
 # 2 = T3 evidence-only leases (revision_retention_leases.revision_id nullable
 # via the idempotent _LEASE_EVIDENCE_ONLY_ALTER upgrade step). Fresh creates
@@ -170,6 +172,10 @@ V2_SCHEMA_VERSION: int = 3
 # via the idempotent _ROLLOUT_DDL upgrade step, plus the seeded disabled
 # control row). Fresh creates land directly on 3. Upgrades are stepwise
 # (1 -> 2 -> 3) so a database at any older recorded version converges.
+# 4 = P1 revision-owned stage state (document_revision_stages via the
+# idempotent _STAGE_DDL upgrade step). Fresh creates land directly on 4.
+# Upgrades are stepwise (1 -> 2 -> 3 -> 4) so a database at any older
+# recorded version converges.
 
 # The exact 12 tables created by Release 1A. Frozen: Task 7A adds the
 # rollout tables as a separate V2_ROLLOUT_TABLES set, never by editing this.
@@ -204,6 +210,19 @@ V2_ROLLOUT_TABLES: frozenset[str] = frozenset(
 )
 
 V2_SCHEMA_V3_TABLES: frozenset[str] = V2_SCHEMA_V1_TABLES | V2_ROLLOUT_TABLES
+
+# P1 Task 1: revision-owned stage state. ``V2_SCHEMA_V4_TABLES`` is the
+# version-aware expected set for a version-4 database (V3 tables +
+# document_revision_stages); ``check_v2_schema`` uses it so the new
+# table is never reported as ``extra``. Like the rollout set, this is a
+# separate frozenset — ``V2_SCHEMA_V1_TABLES`` stays frozen.
+V2_STAGE_TABLES: frozenset[str] = frozenset(
+    {
+        "document_revision_stages",
+    }
+)
+
+V2_SCHEMA_V4_TABLES: frozenset[str] = V2_SCHEMA_V3_TABLES | V2_STAGE_TABLES
 
 # Advisory-lock key for the v2 migration. A unique stable bigint avoids
 # colliding with any other advisory-lock user in the database.
@@ -640,6 +659,35 @@ _ROLLOUT_SEED: str = (
 )
 
 
+# P1 Task 1: revision-owned stage state. One row per (revision, canonical
+# stage); the composite PRIMARY KEY is the (revision_id, stage) UNIQUE
+# boundary the plan mandates. The FK is ON DELETE RESTRICT (stage rows are
+# revision-owned evidence — Phase 1C tombstone + artifact-GC owns
+# reclamation, not DB cascade). CHECKs pin the exact stage/state literals
+# and the non-negative attempt counter; ``failure_class`` stays nullable
+# (populated only when state = 'failed').
+_STAGE_DDL: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS document_revision_stages (
+        revision_id   UUID        NOT NULL,
+        stage         TEXT        NOT NULL,
+        state         TEXT        NOT NULL DEFAULT 'pending',
+        attempt_count INTEGER     NOT NULL DEFAULT 0,
+        updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        failure_class TEXT        NULL,
+        PRIMARY KEY (revision_id, stage),
+        FOREIGN KEY (revision_id) REFERENCES document_revisions(revision_id)
+            ON DELETE RESTRICT,
+        CHECK (stage IN ('parse', 'embed', 'caption', 'kg')),
+        CHECK (state IN ('pending', 'running', 'completed', 'skipped', 'failed')),
+        CHECK (attempt_count >= 0)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_revision_stages_revision "
+    "ON document_revision_stages(revision_id)",
+)
+
+
 _NULLABILITY_INDEXES: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS ix_documents_source_deleted_at "
     "ON documents(source_deleted_at) WHERE source_deleted_at IS NOT NULL",
@@ -949,6 +997,19 @@ _EXPECTED_SHAPE_COLUMNS: dict[str, frozenset[str]] = {
             "created_at",
         }
     ),
+    # P1 Task 1: a database that recorded version 4 (or an interrupted
+    # 3 -> 4 upgrade that left the version row behind) without the stage
+    # table's columns fails closed instead of reporting clean.
+    "document_revision_stages": frozenset(
+        {
+            "revision_id",
+            "stage",
+            "state",
+            "attempt_count",
+            "updated_at",
+            "failure_class",
+        }
+    ),
 }
 
 #: The R1 arbiter must be the full canonical identity, not decomposed keys.
@@ -1088,7 +1149,9 @@ def _shape_errors(conn) -> frozenset[str]:
 
 
 def _expected_tables(version: int) -> frozenset[str]:
-    """Version-aware expected-table set (R7)."""
+    """Version-aware expected-table set (R7, extended by P1 Task 1)."""
+    if version >= 4:
+        return V2_SCHEMA_V4_TABLES
     if version >= 3:
         return V2_SCHEMA_V3_TABLES
     return V2_SCHEMA_V1_TABLES
@@ -1106,14 +1169,14 @@ def check_v2_schema(engine: Engine) -> SchemaCheck:
             return SchemaCheck(
                 applied=False,
                 version=None,
-                missing_tables=V2_SCHEMA_V3_TABLES,
+                missing_tables=V2_SCHEMA_V4_TABLES,
                 extra_tables=frozenset(),
             )
         version_row = recorded
         tables = _table_names(conn)
         missing = _expected_tables(version_row) - tables
         shape_errors = _shape_errors(conn)
-        extra = tables - V2_SCHEMA_V3_TABLES - {
+        extra = tables - V2_SCHEMA_V4_TABLES - {
             # known legacy tables that share the public schema
             "abbreviations",
             "agent_traces",
@@ -1151,14 +1214,17 @@ def check_v2_schema(engine: Engine) -> SchemaCheck:
 
 
 def apply_v2_schema(engine: Engine) -> None:
-    """Apply the v2 schema: fresh create, or stepwise 1 -> 2 -> 3 upgrades.
+    """Apply the v2 schema: fresh create, or stepwise 1 -> 2 -> 3 -> 4 upgrades.
 
     Fresh databases get the full shape (Release 1A tables with the nullable
     lease revision, plus the Task 7A rollout tables and the seeded disabled
-    control row) and a version-3 row. Databases that recorded version 1 get
-    the idempotent evidence-only lease upgrade (``_LEASE_EVIDENCE_ONLY_ALTER``)
-    advancing them to 2, then the rollout DDL (``_ROLLOUT_DDL`` + seed)
-    advancing them to 3. Databases at version 2 get the rollout step only.
+    control row, plus the P1 revision-stage table) and a version-4 row.
+    Databases that recorded version 1 get the idempotent evidence-only lease
+    upgrade (``_LEASE_EVIDENCE_ONLY_ALTER``) advancing them to 2, then the
+    rollout DDL (``_ROLLOUT_DDL`` + seed) advancing them to 3, then the
+    stage DDL (``_STAGE_DDL``) advancing them to 4. Databases at version 2
+    get the rollout + stage steps; databases at version 3 get the stage
+    step only.
     Already-current databases are a no-op. A recorded version
     below 1 or above ``V2_SCHEMA_VERSION`` is an unsupported history
     and raises ``RuntimeError`` instead of
@@ -1190,7 +1256,7 @@ def apply_v2_schema(engine: Engine) -> None:
             # Unknown schema history (e.g. a newer release migrated
             # further): refuse to report success against it.
             raise RuntimeError(
-                f"unsupported v2 schema version {current}: expected 1, 2, "
+                f"unsupported v2 schema version {current}: expected 1, 2, 3, "
                 f"or {V2_SCHEMA_VERSION} (run a supported migration path)"
             )
 
@@ -1198,7 +1264,7 @@ def apply_v2_schema(engine: Engine) -> None:
             # Unsupported gap (e.g. a hand-written version-0 row): refuse
             # to stack another version row on top of an unknown history.
             raise RuntimeError(
-                f"unsupported v2 schema version {current}: expected 1, 2, "
+                f"unsupported v2 schema version {current}: expected 1, 2, 3, "
                 f"or {V2_SCHEMA_VERSION} (run a supported migration path)"
             )
 
@@ -1222,7 +1288,8 @@ def apply_v2_schema(engine: Engine) -> None:
             # Version-2 -> 3 upgrade: rollout control (Task 7A, R7).
             # Creates both tables idempotently, seeds the disabled control
             # row without overwriting operator tuning, and advances the
-            # version row. Legacy tables are untouched on this path.
+            # version row. Legacy tables are untouched on this path. Falls
+            # through to the 3 -> 4 step below (stepwise, P1 Task 1).
             for stmt in _ROLLOUT_DDL:
                 conn.execute(text(stmt))
             conn.execute(text(_ROLLOUT_SEED))
@@ -1232,6 +1299,21 @@ def apply_v2_schema(engine: Engine) -> None:
                     "WHERE version = 2"
                 ),
                 {"d": "v2 rollout control: agent_rollout_control + metrics"},
+            )
+            current = 3
+
+        if current == 3:
+            # Version-3 -> 4 upgrade: revision-owned stage state (P1 Task 1).
+            # Creates document_revision_stages idempotently and advances the
+            # version row. Legacy tables are untouched on this path.
+            for stmt in _STAGE_DDL:
+                conn.execute(text(stmt))
+            conn.execute(
+                text(
+                    "UPDATE v2_schema_version SET version = 4, description = :d "
+                    "WHERE version = 3"
+                ),
+                {"d": "v2 revision stage state: document_revision_stages"},
             )
             return
 
@@ -1243,12 +1325,14 @@ def apply_v2_schema(engine: Engine) -> None:
         baseline = _capture_legacy_baseline(conn)
 
         # 2. Create the v2 tables in dependency order (Release 1A set),
-        # then the Task 7A rollout tables.
+        # then the Task 7A rollout tables, then the P1 stage table.
         for stmt in _CREATE_DDL:
             conn.execute(text(stmt))
         for stmt in _ROLLOUT_DDL:
             conn.execute(text(stmt))
         conn.execute(text(_ROLLOUT_SEED))
+        for stmt in _STAGE_DDL:
+            conn.execute(text(stmt))
 
         # 2b. Repair pre-C1 lease tables whose revision_id is still NOT NULL
         # (fresh CREATEs already declare it NULL; the ALTER is a no-op there).
@@ -1290,7 +1374,7 @@ def apply_v2_schema(engine: Engine) -> None:
             {
                 "v": V2_SCHEMA_VERSION,
                 "d": "Release 1A foundation + evidence-only leases + "
-                "rollout control (seeded disabled)",
+                "rollout control (seeded disabled) + revision stage state",
             },
         )
 

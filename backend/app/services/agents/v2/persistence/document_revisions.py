@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,6 +50,7 @@ from app.models.document import Document
 from app.models.document_ingestion_attempt import DocumentIngestionAttempt
 from app.models.document_revision import DocumentRevision
 from app.models.document_revision_build import DocumentRevisionBuild
+from app.models.document_revision_stage import DocumentRevisionStage
 
 from app.services.agents.v2.persistence.source_identity import (  # noqa: F401
     SOURCE_SCHEME,
@@ -69,6 +70,21 @@ from app.services.agents.v2.persistence.source_identity import (  # noqa: F401
 #: calls it ``self.MAX_REVISION_RETRIES`` and the value is a deployment
 #: setting rather than a per-document choice.
 MAX_REVISION_RETRIES: int = 3
+
+
+#: Canonical revision-owned pipeline stages. The set is closed: worker
+#: messages naming any other stage fail closed (``UnknownRevisionStage``)
+#: and the DB CHECK enforces the same literals. Frozen by P1 Task 1.
+REVISION_STAGES: tuple[str, ...] = ("parse", "embed", "caption", "kg")
+
+#: Required stages per immutable build profile. Stages not required by a
+#: profile are initialized as explicitly ``skipped``; a skip satisfies
+#: ``required_stages_complete`` only for its matching profile.
+_PROFILE_REQUIRED_STAGES: dict[RevisionBuildProfile, frozenset[str]] = {
+    RevisionBuildProfile.FULL: frozenset({"parse", "embed", "caption", "kg"}),
+    RevisionBuildProfile.CHAT_UPLOAD: frozenset({"parse", "embed"}),
+    RevisionBuildProfile.PARSE_ONLY: frozenset({"parse"}),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +142,18 @@ class RevisionNotFound(Exception):
 
 class RevisionArtifactsIncomplete(Exception):
     """``verify_draft`` found the profile's required artifacts missing."""
+
+
+class UnknownRevisionStage(ValueError):
+    """A stage transition named an unknown stage or a revision with no
+    stage rows. Fail-closed: the caller must call ``initialize_stages``
+    first and may only name the canonical ``REVISION_STAGES``."""
+
+
+class InvalidStageTransition(ValueError):
+    """A stage transition from a terminal state (``completed`` /
+    ``skipped`` / ``failed``) or any other disallowed edge was rejected.
+    Terminal stage states never transition."""
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +623,205 @@ class DocumentRevisionsRepository:
         build = (await self.session.scalars(stmt)).one()
         await self.session.flush()
         return build
+
+    # -------------------------------------------------------------------
+    # Revision-owned stage state (P1 Task 1)
+    # -------------------------------------------------------------------
+
+    async def initialize_stages(
+        self,
+        revision_id: uuid.UUID,
+        profile: RevisionBuildProfile,
+    ) -> list[DocumentRevisionStage]:
+        """Create the revision's stage rows for its immutable profile.
+
+        Required stages start ``pending``; stages the profile does not
+        require start explicitly ``skipped`` (a skip is recorded, never
+        inferred). Idempotent: re-running converges via
+        ``ON CONFLICT DO NOTHING`` and never resets completed work, so
+        allocation retry / queue redelivery cannot clobber another
+        generation's progress.
+
+        :raises ValueError: if the revision row does not exist.
+        """
+        revision = await self.get(revision_id)
+        if revision is None:
+            raise ValueError(f"revision {revision_id} not found")
+        required = _PROFILE_REQUIRED_STAGES[profile]
+        now = _now()
+        stmt = pg_insert(DocumentRevisionStage).values(
+            [
+                {
+                    "revision_id": revision_id,
+                    "stage": stage,
+                    "state": "pending" if stage in required else "skipped",
+                    "attempt_count": 0,
+                    "updated_at": now,
+                    "failure_class": None,
+                }
+                for stage in REVISION_STAGES
+            ]
+        )
+        await self.session.execute(
+            stmt.on_conflict_do_nothing(
+                index_elements=["revision_id", "stage"]
+            )
+        )
+        await self.session.flush()
+        return await self.get_stages(revision_id)
+
+    async def get_stages(
+        self, revision_id: uuid.UUID
+    ) -> list[DocumentRevisionStage]:
+        """Read-only fetch of every stage row for a revision."""
+        result = await self.session.execute(
+            select(DocumentRevisionStage)
+            .where(DocumentRevisionStage.revision_id == revision_id)
+            .order_by(DocumentRevisionStage.stage)
+        )
+        return list(result.scalars())
+
+    async def _transition_stage(
+        self,
+        revision_id: uuid.UUID,
+        stage: str,
+        *,
+        from_states: tuple[str, ...],
+        to_state: str,
+        failure_class: Optional[str] = None,
+    ) -> DocumentRevisionStage:
+        """Single conditional UPDATE; the arbiter, not read-then-write.
+
+        On zero updated rows the existing row (if any) is classified:
+        already in ``to_state`` converges (idempotent redelivery),
+        a missing row raises :class:`UnknownRevisionStage`, and any
+        other state raises :class:`InvalidStageTransition`.
+        """
+        if stage not in REVISION_STAGES:
+            raise UnknownRevisionStage(f"unknown revision stage {stage!r}")
+        set_values: dict = {"state": to_state, "updated_at": _now()}
+        if to_state == "running":
+            set_values["attempt_count"] = (
+                DocumentRevisionStage.attempt_count + 1
+            )
+        if failure_class is not None:
+            set_values["failure_class"] = failure_class
+        stmt = (
+            update(DocumentRevisionStage)
+            .where(
+                DocumentRevisionStage.revision_id == revision_id,
+                DocumentRevisionStage.stage == stage,
+                DocumentRevisionStage.state.in_(from_states),
+            )
+            .values(**set_values)
+            .returning(DocumentRevisionStage)
+        )
+        row = (await self.session.execute(stmt)).scalar_one_or_none()
+        await self.session.flush()
+        if row is not None:
+            return row
+        existing = await self.session.scalar(
+            select(DocumentRevisionStage).where(
+                DocumentRevisionStage.revision_id == revision_id,
+                DocumentRevisionStage.stage == stage,
+            )
+        )
+        if existing is None:
+            raise UnknownRevisionStage(
+                f"no stage row for revision {revision_id} stage {stage!r} "
+                "(call initialize_stages first)"
+            )
+        if existing.state == to_state:
+            return existing
+        raise InvalidStageTransition(
+            f"revision {revision_id} stage {stage!r} cannot transition "
+            f"from {existing.state!r} to {to_state!r}"
+        )
+
+    async def mark_stage_running(
+        self, revision_id: uuid.UUID, stage: str
+    ) -> DocumentRevisionStage:
+        """``pending`` -> ``running`` (bumps ``attempt_count``).
+
+        A redelivered running mark converges without bumping attempts.
+        """
+        return await self._transition_stage(
+            revision_id,
+            stage,
+            from_states=("pending",),
+            to_state="running",
+        )
+
+    async def mark_stage_completed(
+        self, revision_id: uuid.UUID, stage: str
+    ) -> DocumentRevisionStage:
+        """``pending`` / ``running`` -> ``completed``.
+
+        ``pending`` -> ``completed`` converges out-of-order delivery;
+        ``completed`` -> ``completed`` is idempotent. Terminal
+        ``skipped`` / ``failed`` never transition.
+        """
+        return await self._transition_stage(
+            revision_id,
+            stage,
+            from_states=("pending", "running"),
+            to_state="completed",
+        )
+
+    async def mark_stage_skipped(
+        self, revision_id: uuid.UUID, stage: str
+    ) -> DocumentRevisionStage:
+        """``pending`` / ``running`` -> ``skipped`` (explicit only).
+
+        Whether the skip satisfies completion is decided at read time by
+        :meth:`required_stages_complete` against the revision's profile.
+        """
+        return await self._transition_stage(
+            revision_id,
+            stage,
+            from_states=("pending", "running"),
+            to_state="skipped",
+        )
+
+    async def mark_stage_failed(
+        self,
+        revision_id: uuid.UUID,
+        stage: str,
+        failure_class: Optional[str] = None,
+    ) -> DocumentRevisionStage:
+        """``pending`` / ``running`` -> ``failed`` (records the class).
+
+        A redelivered failure converges. A failed stage terminalizes only
+        its own revision's gate; it never touches another revision.
+        """
+        return await self._transition_stage(
+            revision_id,
+            stage,
+            from_states=("pending", "running"),
+            to_state="failed",
+            failure_class=failure_class,
+        )
+
+    async def required_stages_complete(
+        self, revision_id: uuid.UUID
+    ) -> bool:
+        """True iff every required stage is ``completed`` and every
+        profile-skipped stage is exactly ``skipped``.
+
+        Fail-closed: a missing allocation profile, missing rows, or any
+        unexpected state yields False. ``Document.*_done`` mirror flags
+        are never consulted.
+        """
+        profile = await self._allocated_profile(revision_id)
+        if profile is None:
+            return False
+        required = _PROFILE_REQUIRED_STAGES[profile]
+        by_stage = {row.stage: row.state for row in await self.get_stages(revision_id)}
+        for stage in REVISION_STAGES:
+            expected = "completed" if stage in required else "skipped"
+            if by_stage.get(stage) != expected:
+                return False
+        return True
 
     # -------------------------------------------------------------------
     # verify / publish / fail / abandon / supersede
