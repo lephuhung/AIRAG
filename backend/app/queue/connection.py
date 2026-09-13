@@ -73,6 +73,119 @@ RETRY_EXCHANGE = "hrag.retry"
 _RETRY_QUEUE_NAMES = [f"hrag.retry.{d}s" for d in RETRY_DELAYS]
 
 
+# ── Revision-stage reporting (P1 Task 3) ─────────────────────────────────
+# Each pipeline queue owns exactly one revision stage. The retry path below
+# reports stage transitions for the FAILED message's revision only, so a
+# retry/redelivery can never touch another generation's rows:
+#
+# - before a retryable message is requeued: running → pending for that
+#   message revision/stage (``mark_stage_retry_pending`` preserves
+#   ``attempt_count``; the next worker ``mark_stage_running`` bumps it);
+# - when retries are exhausted: that stage → failed (terminal).
+#
+# Terminal stages (completed / skipped / failed) and unknown revisions are
+# left untouched — the note helpers are best-effort and never raise.
+_STAGE_BY_QUEUE_SUBSTRING: tuple[tuple[str, str], ...] = (
+    ("parse", "parse"),
+    ("embed", "embed"),
+    ("caption", "caption"),
+    ("kg", "kg"),
+)
+
+
+def stage_for_queue(queue_name: str, exchange_name: str = "") -> str | None:
+    """Map a pipeline queue/exchange to its revision-owned stage.
+
+    Returns ``None`` for non-pipeline queues (e.g. memory), which own no
+    revision stage and are left untouched by the retry path.
+    """
+    haystack = f"{exchange_name} {queue_name}".lower()
+    for substring, stage in _STAGE_BY_QUEUE_SUBSTRING:
+        if substring in haystack:
+            return stage
+    return None
+
+
+async def _note_stage(
+    revision_id,
+    stage: str,
+    *,
+    kind: str,
+    failure_class: str | None = None,
+    db=None,
+) -> bool:
+    """Apply one queue-owned stage edge; never raises.
+
+    ``kind="retry"`` moves running → pending before a retry requeue;
+    ``kind="exhausted"`` moves pending/running → failed. Returns True
+    when the edge moved, False when the row was left untouched (terminal
+    state, unknown revision/stage, or infrastructure error). When ``db``
+    is None a private session is opened and committed; otherwise the
+    caller's transaction owns the write (flushed, never committed).
+    """
+    from app.services.agents.v2.persistence.document_revisions import (
+        DocumentRevisionsRepository,
+        InvalidStageTransition,
+        UnknownRevisionStage,
+    )
+
+    try:
+        if db is None:
+            from app.core.database import async_session_maker
+
+            try:
+                async with async_session_maker() as session:
+                    repo = DocumentRevisionsRepository(session)
+                    if kind == "retry":
+                        await repo.mark_stage_retry_pending(revision_id, stage)
+                    else:
+                        await repo.mark_stage_failed(
+                            revision_id, stage, failure_class=failure_class
+                        )
+                    await session.commit()
+            except (InvalidStageTransition, UnknownRevisionStage) as e:
+                logger.info(
+                    f"[stage] {kind} note left rev={revision_id} "
+                    f"stage={stage} untouched: {e}"
+                )
+                return False
+        else:
+            repo = DocumentRevisionsRepository(db)
+            if kind == "retry":
+                await repo.mark_stage_retry_pending(revision_id, stage)
+            else:
+                await repo.mark_stage_failed(
+                    revision_id, stage, failure_class=failure_class
+                )
+        return True
+    except (InvalidStageTransition, UnknownRevisionStage) as e:
+        logger.info(
+            f"[stage] {kind} note left rev={revision_id} "
+            f"stage={stage} untouched: {e}"
+        )
+        return False
+    except Exception as e:  # noqa: BLE001 - retry path must never break
+        logger.warning(
+            f"[stage] could not note {kind} for rev={revision_id} "
+            f"stage={stage}: {e}"
+        )
+        return False
+
+
+async def note_stage_retry_pending(revision_id, stage: str, *, db=None) -> bool:
+    """Best-effort running → pending before a retry requeue (never raises)."""
+    return await _note_stage(revision_id, stage, kind="retry", db=db)
+
+
+async def note_stage_exhausted(
+    revision_id, stage: str, *, failure_class: str | None = None, db=None
+) -> bool:
+    """Best-effort pending/running → failed on exhausted retries (never raises)."""
+    return await _note_stage(
+        revision_id, stage, kind="exhausted", failure_class=failure_class, db=db
+    )
+
+
 # ── Singleton connection ────────────────────────────────────────────────────
 _connection: AbstractRobustConnection | None = None
 _lock = asyncio.Lock()
@@ -706,6 +819,28 @@ async def _consume_on_channel(
                                     logger.warning(
                                         f"[timeout_rollback] KG failed for doc={document_id}: {rollback_err}"
                                     )
+                            # Revision-owned stage retry (P1 Task 3): before
+                            # requeueing, move ONLY this message's
+                            # revision/stage running → pending (the attempt is
+                            # preserved; the next worker running mark bumps
+                            # it). Exhaustion terminalizes that stage.
+                            # Terminal stages and unknown revisions are left
+                            # untouched by the note helpers.
+                            if revision_id is not None:
+                                _timeout_stage = stage_for_queue(
+                                    queue_name, exchange_name
+                                )
+                                if _timeout_stage is not None:
+                                    if will_retry:
+                                        await note_stage_retry_pending(
+                                            revision_id, _timeout_stage
+                                        )
+                                    else:
+                                        await note_stage_exhausted(
+                                            revision_id,
+                                            _timeout_stage,
+                                            failure_class="TimeoutError",
+                                        )
                             # Requeue the message for retry (with existing retry count, no new retry)
                             if retry_count < MAX_RETRIES:
                                 try:
@@ -754,6 +889,20 @@ async def _consume_on_channel(
                                     "cuda_visible_devices": cuda_visible,
                                 },
                             )
+                            # Revision-owned stage retry (P1 Task 3): report
+                            # running → pending for ONLY this message's
+                            # revision/stage BEFORE the retry requeue below.
+                            # Exhaustion takes the failed edge instead (no
+                            # requeue follows, so no retry edge is reported).
+                            _will_retry = retry_count < MAX_RETRIES
+                            if _will_retry and revision_id is not None:
+                                _error_stage = stage_for_queue(
+                                    queue_name, exchange_name
+                                )
+                                if _error_stage is not None:
+                                    await note_stage_retry_pending(
+                                        revision_id, _error_stage
+                                    )
                             if retry_count < MAX_RETRIES:
                                 log_fn(
                                     f"[{queue_name}] Scheduling retry {retry_count + 1}/{MAX_RETRIES + 1} "
@@ -805,6 +954,18 @@ async def _consume_on_channel(
                                         "cuda_visible_devices": cuda_visible,
                                     },
                                 )
+                                # Retries exhausted (P1 Task 3): terminalize ONLY
+                                # this message's revision/stage as failed.
+                                if revision_id is not None:
+                                    _exhausted_stage = stage_for_queue(
+                                        queue_name, exchange_name
+                                    )
+                                    if _exhausted_stage is not None:
+                                        await note_stage_exhausted(
+                                            revision_id,
+                                            _exhausted_stage,
+                                            failure_class=type(e).__name__,
+                                        )
                                 try:
                                     await message.reject(requeue=False)  # trigger x-dead-letter-exchange → DLQ
                                     logger.info(f"[{queue_name}] Message sent to DLQ")

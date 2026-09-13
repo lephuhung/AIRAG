@@ -28,6 +28,10 @@ from app.models.document_type import DocumentType as _DocumentType  # noqa: F401
 from app.models.document import Document, DocumentStatus
 from app.models.document_revision_build import DocumentRevisionBuild
 from app.queue.messages import EmbedMessage
+from app.services.agents.v2.persistence.document_revisions import (
+    DocumentRevisionsRepository,
+    InvalidStageTransition,
+)
 from app.services.agents.v2.persistence.source_identity import (
     RevisionBuildProfile,
 )
@@ -91,6 +95,18 @@ async def handle_embed(payload: dict) -> None:
             )
             return
 
+        # Revision-owned stage report (P1 Task 3): pending → running BEFORE
+        # any work (unknown rows fail closed; a terminal stage converges at
+        # completion time below). Only this message's revision/stage.
+        _stage_repo = DocumentRevisionsRepository(db)
+        try:
+            await _stage_repo.mark_stage_running(msg.revision_id, "embed")
+        except InvalidStageTransition:
+            logger.debug(
+                f"[embed_worker] doc={msg.document_id} rev={msg.revision_id} "
+                f"embed stage already terminal — converging"
+            )
+
         # Idempotency is revision-scoped: a redelivered message re-runs only
         # its incomplete stage. The build manifest, not Document.embed_done,
         # proves whether THIS revision's vectors already exist.
@@ -107,6 +123,8 @@ async def handle_embed(payload: dict) -> None:
                 f"[embed_worker] doc={msg.document_id} rev={msg.revision_id} "
                 f"already has a vector manifest — skipping"
             )
+            await _stage_repo.mark_stage_completed(msg.revision_id, "embed")
+            await db.commit()
             await check_and_finalize(
                 document, db, revision_id=msg.revision_id
             )
@@ -129,6 +147,8 @@ async def handle_embed(payload: dict) -> None:
             if not chunks_data:
                 logger.warning(f"[embed_worker] doc={msg.document_id} has no raw_chunks_json — skipping embed")
                 document.embed_done = True
+                await db.commit()
+                await _stage_repo.mark_stage_completed(msg.revision_id, "embed")
                 await db.commit()
                 await check_and_finalize(
                     document, db, revision_id=msg.revision_id
@@ -284,6 +304,10 @@ async def handle_embed(payload: dict) -> None:
                 embedding_dimension=dimension,
                 vector_artifact_version=_VECTOR_ARTIFACT_VERSION,
             )
+            await db.commit()
+            # The embed stage completes ONLY after its vector manifest
+            # transaction succeeded (never guessed, never from mirrors).
+            await _stage_repo.mark_stage_completed(msg.revision_id, "embed")
             await db.commit()
             logger.info(
                 f"[embed_worker] doc={msg.document_id} rev={msg.revision_id} "

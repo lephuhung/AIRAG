@@ -1876,3 +1876,309 @@ async def test_operator_retry_allocation_initializes_stage_rows(
         }
         repo = DocumentRevisionsRepository(db)
         assert await repo.required_stages_complete(revision.revision_id) is False
+
+
+# ---------------------------------------------------------------------------
+# P1 Task 3 — workers report revision-owned stage completion
+# ---------------------------------------------------------------------------
+
+_TASK3_STAGES = ("parse", "embed", "caption", "kg")
+
+_WORKER_STAGE_FILES = {
+    "parse": "app/workers/parse_worker.py",
+    "embed": "app/workers/embed_worker.py",
+    "caption": "app/workers/caption_worker.py",
+    "kg": "app/workers/kg_worker.py",
+}
+
+
+def _task3_worker_source(stage: str) -> str:
+    backend_root = Path(__file__).resolve().parents[2]
+    return (backend_root / _WORKER_STAGE_FILES[stage]).read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", _TASK3_STAGES)
+async def test_task3_stage_running_before_work_completed_after_artifact(
+    async_db, document_factory, stage
+):
+    """Each message revision/stage goes pending -> running before work.
+
+    The running mark lands (attempt 1) while the gate is still unsatisfied;
+    completion is recorded only after that stage's artifact transaction
+    succeeds. Profile skips stay initialized rows — this test never skips.
+    """
+    from app.workers.utils import record_embed_artifacts, record_parse_artifacts
+
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+    revision, _created = await _allocate_full(async_db, doc_id, key=key, sha="a" * 64)
+    repo = DocumentRevisionsRepository(async_db)
+
+    assert (await _stage_states(async_db, revision.revision_id))[stage] == "pending"
+    running = await repo.mark_stage_running(revision.revision_id, stage)
+    assert running.state == "running"
+    assert running.attempt_count == 1
+    assert await repo.required_stages_complete(revision.revision_id) is False
+
+    if stage == "parse":
+        await record_parse_artifacts(
+            async_db,
+            revision.revision_id,
+            FULL,
+            markdown_artifact_key="kb_x/doc.md",
+            structure_artifact_key="kb_x/doc.structure",
+        )
+    elif stage == "embed":
+        await record_embed_artifacts(
+            async_db,
+            revision.revision_id,
+            FULL,
+            embedding_namespace="ws_test",
+            embedding_model_hash="hash",
+            embedding_dimension=1024,
+            vector_artifact_version="v1",
+        )
+    # caption/kg stages commit mirror rows (no manifest recorder); the
+    # completion below models the post-commit report, not a skip guess.
+    completed = await repo.mark_stage_completed(revision.revision_id, stage)
+    assert completed.state == "completed"
+    assert completed.attempt_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", _TASK3_STAGES)
+async def test_task3_duplicate_running_and_completion_converge(
+    async_db, document_factory, stage
+):
+    """Redelivered running/completion marks converge without side effects."""
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+    revision, _created = await _allocate_full(async_db, doc_id, key=key, sha="b" * 64)
+    repo = DocumentRevisionsRepository(async_db)
+
+    first = await repo.mark_stage_running(revision.revision_id, stage)
+    second = await repo.mark_stage_running(revision.revision_id, stage)
+    assert (first.state, second.state) == ("running", "running")
+    assert second.attempt_count == 1
+
+    done_once = await repo.mark_stage_completed(revision.revision_id, stage)
+    done_twice = await repo.mark_stage_completed(revision.revision_id, stage)
+    assert (done_once.state, done_twice.state) == ("completed", "completed")
+    assert done_twice.attempt_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", _TASK3_STAGES)
+async def test_task3_retry_edge_preserves_attempt_then_bumps(
+    async_db, document_factory, stage
+):
+    """running -> pending preserves the attempt; next running bumps it."""
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+    revision, _created = await _allocate_full(async_db, doc_id, key=key, sha="c" * 64)
+    repo = DocumentRevisionsRepository(async_db)
+
+    await repo.mark_stage_running(revision.revision_id, stage)
+    pending = await repo.mark_stage_retry_pending(revision.revision_id, stage)
+    assert pending.state == "pending"
+    assert pending.attempt_count == 1
+    rerun = await repo.mark_stage_running(revision.revision_id, stage)
+    assert rerun.state == "running"
+    assert rerun.attempt_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", _TASK3_STAGES)
+async def test_task3_exhausted_stage_failed_is_terminal(
+    async_db, document_factory, stage
+):
+    """Exhausted retries mark that stage failed; terminal stages never move."""
+    from app.services.agents.v2.persistence.document_revisions import (
+        InvalidStageTransition,
+    )
+
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+    revision, _created = await _allocate_full(async_db, doc_id, key=key, sha="d" * 64)
+    repo = DocumentRevisionsRepository(async_db)
+
+    await repo.mark_stage_running(revision.revision_id, stage)
+    failed = await repo.mark_stage_failed(
+        revision.revision_id, stage, failure_class="TimeoutError"
+    )
+    assert failed.state == "failed"
+    assert failed.failure_class == "TimeoutError"
+    for coro in (
+        repo.mark_stage_running(revision.revision_id, stage),
+        repo.mark_stage_retry_pending(revision.revision_id, stage),
+        repo.mark_stage_completed(revision.revision_id, stage),
+    ):
+        with pytest.raises(InvalidStageTransition):
+            await coro
+    assert (await _stage_states(async_db, revision.revision_id))[stage] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_task3_stale_revision_completion_isolated_to_own_generation(
+    async_db, document_factory
+):
+    """A late R1 completion cannot touch the newer R2 generation's rows."""
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+    r1, _ = await _allocate_full(async_db, doc_id, key=key, sha="e" * 64)
+    r2, _created = await _allocate_full(async_db, doc_id, key=key, sha="f" * 64)
+    assert r2.generation > r1.generation
+    repo = DocumentRevisionsRepository(async_db)
+
+    for stage in _TASK3_STAGES:
+        await repo.mark_stage_running(r1.revision_id, stage)
+        await repo.mark_stage_completed(r1.revision_id, stage)
+    assert await repo.required_stages_complete(r1.revision_id) is True
+    assert await _stage_states(async_db, r2.revision_id) == {
+        "parse": "pending",
+        "embed": "pending",
+        "caption": "pending",
+        "kg": "pending",
+    }
+    assert await repo.required_stages_complete(r2.revision_id) is False
+
+
+def test_task3_queue_stage_mapping_covers_all_pipeline_queues():
+    """The queue retry path maps every pipeline queue to exactly one stage."""
+    from app.queue.connection import stage_for_queue
+
+    assert stage_for_queue("hrag.parse", "hrag.parse") == "parse"
+    assert stage_for_queue("hrag.embed", "hrag.embed") == "embed"
+    assert stage_for_queue("hrag.caption", "hrag.caption") == "caption"
+    assert stage_for_queue("hrag.kg.00000000-0000-0000-0000-000000000000", "hrag.kg") == "kg"
+    assert stage_for_queue("hrag.memory", "hrag.memory") is None
+
+
+@pytest.mark.asyncio
+async def test_task3_queue_retry_note_touches_only_failed_message_stage(
+    async_db, document_factory
+):
+    """Retry requeue marks pending ONLY the failed message revision/stage."""
+    from app.queue.connection import note_stage_retry_pending
+
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+    revision, _created = await _allocate_full(async_db, doc_id, key=key, sha="g" * 64)
+    repo = DocumentRevisionsRepository(async_db)
+    await repo.mark_stage_running(revision.revision_id, "embed")
+
+    assert await note_stage_retry_pending(
+        revision.revision_id, "embed", db=async_db
+    ) is True
+    assert await _stage_states(async_db, revision.revision_id) == {
+        "parse": "pending",
+        "embed": "pending",
+        "caption": "pending",
+        "kg": "pending",
+    }
+    rows = await repo.get_stages(revision.revision_id)
+    assert {r.stage: r.attempt_count for r in rows}["embed"] == 1
+    # Unknown revisions and already-terminal stages are left untouched,
+    # never raised through the retry path.
+    assert await note_stage_retry_pending(uuid.uuid4(), "embed", db=async_db) is False
+    await repo.mark_stage_completed(revision.revision_id, "parse")
+    assert await note_stage_retry_pending(
+        revision.revision_id, "parse", db=async_db
+    ) is False
+    assert (await _stage_states(async_db, revision.revision_id))["parse"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_task3_queue_exhausted_note_marks_stage_failed_terminal(
+    async_db, document_factory
+):
+    """Exhausted queue retries mark that stage failed and stay terminal."""
+    from app.queue.connection import note_stage_exhausted
+    from app.services.agents.v2.persistence.document_revisions import (
+        InvalidStageTransition,
+    )
+
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+    revision, _created = await _allocate_full(async_db, doc_id, key=key, sha="h" * 64)
+    repo = DocumentRevisionsRepository(async_db)
+    await repo.mark_stage_running(revision.revision_id, "kg")
+
+    assert await note_stage_exhausted(
+        revision.revision_id, "kg", failure_class="TimeoutError", db=async_db
+    ) is True
+    assert (await _stage_states(async_db, revision.revision_id))["kg"] == "failed"
+    with pytest.raises(InvalidStageTransition):
+        await repo.mark_stage_completed(revision.revision_id, "kg")
+    # A completed stage is immutable even to the exhausted path.
+    await repo.mark_stage_completed(revision.revision_id, "parse")
+    assert await note_stage_exhausted(
+        revision.revision_id, "parse", failure_class="ValueError", db=async_db
+    ) is False
+    assert (await _stage_states(async_db, revision.revision_id))["parse"] == "completed"
+
+
+@pytest.mark.parametrize("stage", _TASK3_STAGES)
+def test_task3_workers_report_only_their_own_stage(stage):
+    """Each worker marks running/completed for exactly its message stage."""
+    source = _task3_worker_source(stage)
+    assert f'mark_stage_running(msg.revision_id, "{stage}")' in source
+    assert f'mark_stage_completed(msg.revision_id, "{stage}")' in source
+    for other in _TASK3_STAGES:
+        if other == stage:
+            continue
+        assert f'mark_stage_running(msg.revision_id, "{other}")' not in source
+        assert f'mark_stage_completed(msg.revision_id, "{other}")' not in source
+    # Skips are initialized rows (Task 2), never guessed by workers; workers
+    # never fail a stage directly — exhaustion is owned by the queue path.
+    assert "mark_stage_skipped" not in source
+    assert "mark_stage_failed" not in source
+
+
+@pytest.mark.parametrize(
+    "stage,artifact_anchor",
+    [
+        ("parse", "record_parse_artifacts"),
+        ("embed", "record_embed_artifacts"),
+        ("caption", "captions_done = True"),
+        ("kg", "kg_done = True"),
+    ],
+)
+def test_task3_worker_completed_only_after_artifact_transaction(
+    stage, artifact_anchor
+):
+    """Running lands before work; completed lands after the artifact commit."""
+    source = _task3_worker_source(stage)
+    running_call = f'mark_stage_running(msg.revision_id, "{stage}")'
+    completed_call = f'mark_stage_completed(msg.revision_id, "{stage}")'
+    running_at = source.index(running_call)
+    first_completed_at = source.index(completed_call)
+    last_completed_at = source.rindex(completed_call)
+    # ``await``-prefixed call anchors match the execution/call sites, never
+    # the module import block; mirror-assignment anchors match as written.
+    await_anchor = artifact_anchor if "=" in artifact_anchor else f"await {artifact_anchor}"
+    anchor_at = source.index(await_anchor)
+    gate_at = source.index("await load_revision_execution(")
+    # Running lands after the execution gate and before any work; the main
+    # artifact path completes after its transaction (early-return paths
+    # complete after their own mirror commits, hence the last-site bound).
+    assert gate_at < running_at < anchor_at
+    assert running_at < first_completed_at
+    assert anchor_at < last_completed_at
+
+
+def test_task3_queue_retry_branch_reports_stage_before_requeue():
+    """Retry requeues report the failed revision/stage; exhaustion fails it."""
+    backend_root = Path(__file__).resolve().parents[2]
+    source = (backend_root / "app/queue/connection.py").read_text(encoding="utf-8")
+    assert "note_stage_retry_pending" in source
+    assert "note_stage_exhausted" in source
+    assert "stage_for_queue" in source

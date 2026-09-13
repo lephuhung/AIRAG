@@ -28,6 +28,10 @@ from app.core.database import async_session_maker
 from app.models.document_type import DocumentType as _DocumentType  # noqa: F401
 from app.models.document import Document, DocumentImage, DocumentStatus, DocumentTable
 from app.queue.messages import CaptionMessage
+from app.services.agents.v2.persistence.document_revisions import (
+    DocumentRevisionsRepository,
+    InvalidStageTransition,
+)
 from app.services.parsing.deep_document_parser import DeepDocumentParser
 from app.services.embedding.embedder import get_embedding_service
 from app.services.models.parsed_document import ExtractedImage, ExtractedTable
@@ -92,6 +96,18 @@ async def handle_caption(payload: dict) -> None:
             )
             return
 
+        # Revision-owned stage report (P1 Task 3): pending → running BEFORE
+        # any work (unknown rows fail closed; a terminal stage converges at
+        # completion time below). Only this message's revision/stage.
+        _stage_repo = DocumentRevisionsRepository(db)
+        try:
+            await _stage_repo.mark_stage_running(msg.revision_id, "caption")
+        except InvalidStageTransition:
+            logger.debug(
+                f"[caption_worker] doc={msg.document_id} rev={msg.revision_id} "
+                f"caption stage already terminal — converging"
+            )
+
         has_images  = settings.HRAG_ENABLE_IMAGE_CAPTIONING
         has_tables  = settings.HRAG_ENABLE_TABLE_CAPTIONING
 
@@ -106,6 +122,8 @@ async def handle_caption(payload: dict) -> None:
             if not db_images and not db_tables:
                 logger.info(f"[caption_worker] doc={msg.document_id} no images/tables — done")
                 document.captions_done = True
+                await db.commit()
+                await _stage_repo.mark_stage_completed(msg.revision_id, "caption")
                 await db.commit()
                 await check_and_finalize(
                     document, db, revision_id=msg.revision_id
@@ -218,6 +236,10 @@ async def handle_caption(payload: dict) -> None:
             # ── Done ────────────────────────────────────────────────────────
             document.captions_done = True
             await db.commit()
+            # The caption stage completes ONLY after its mirror transaction
+            # committed (never guessed; skips are initialized, not inferred).
+            await _stage_repo.mark_stage_completed(msg.revision_id, "caption")
+            await db.commit()
             logger.info(f"[caption_worker] doc={msg.document_id} captions done")
             await check_and_finalize(
                     document, db, revision_id=msg.revision_id
@@ -233,6 +255,10 @@ async def handle_caption(payload: dict) -> None:
             await db.rollback()
             document.captions_done = True   # mark done to unblock INDEXED transition
             document.error_message = f"caption_warning: {str(e)[:400]}"
+            await db.commit()
+            # Caption failures stay warnings (the document can still reach
+            # INDEXED), so the stage completes with the warning mirrored.
+            await _stage_repo.mark_stage_completed(msg.revision_id, "caption")
             await db.commit()
             await check_and_finalize(
                     document, db, revision_id=msg.revision_id

@@ -23,6 +23,10 @@ from sqlalchemy import select
 from app.core.database import async_session_maker
 from app.models.document import Document
 from app.queue.messages import KGMessage
+from app.services.agents.v2.persistence.document_revisions import (
+    DocumentRevisionsRepository,
+    InvalidStageTransition,
+)
 from app.services.kg.knowledge_graph_service import get_kg_service
 from app.workers.utils import (
     check_and_finalize,
@@ -65,6 +69,18 @@ async def handle_kg(payload: dict) -> None:
             )
             return
 
+        # Revision-owned stage report (P1 Task 3): pending → running BEFORE
+        # any work (unknown rows fail closed; a terminal stage converges at
+        # completion time below). Only this message's revision/stage.
+        _stage_repo = DocumentRevisionsRepository(db)
+        try:
+            await _stage_repo.mark_stage_running(msg.revision_id, "kg")
+        except InvalidStageTransition:
+            logger.debug(
+                f"[kg_worker] doc={msg.document_id} rev={msg.revision_id} "
+                f"kg stage already terminal — converging"
+            )
+
         try:
             # ── Load markdown ────────────────────────────────────────────────
             # New messages carry only markdown_s3_key (small broker payload);
@@ -89,6 +105,8 @@ async def handle_kg(payload: dict) -> None:
                 logger.warning(f"[kg_worker] doc={msg.document_id} empty markdown — skipping KG")
                 document.kg_done = True
                 await db.commit()
+                await _stage_repo.mark_stage_completed(msg.revision_id, "kg")
+                await db.commit()
                 await check_and_finalize(
                     document, db, revision_id=msg.revision_id
                 )
@@ -112,6 +130,10 @@ async def handle_kg(payload: dict) -> None:
                 ("kg_", "timeout_retry")
             ):
                 document.error_message = None
+            await db.commit()
+            # The kg stage completes ONLY after its mirror transaction
+            # committed (never guessed; skips are initialized, not inferred).
+            await _stage_repo.mark_stage_completed(msg.revision_id, "kg")
             await db.commit()
             logger.info(f"[kg_worker] doc={msg.document_id} KG ingest done")
             await check_and_finalize(
@@ -139,6 +161,10 @@ async def handle_kg(payload: dict) -> None:
                 if is_timeout
                 else f"kg_warning: {str(e)[:400]}"
             )
+            await db.commit()
+            # KG ingest failures stay warnings (the document can still reach
+            # INDEXED), so the stage completes with the warning mirrored.
+            await _stage_repo.mark_stage_completed(msg.revision_id, "kg")
             await db.commit()
             await check_and_finalize(
                 document, db, revision_id=msg.revision_id

@@ -90,6 +90,12 @@ async def test_caption_worker_writes_back_to_revision_markdown_key(
             RevisionBuildProfile.FULL,
         )
         rev_id = revision.revision_id
+        # P1 Task 3: workers report revision-owned stages, so every revision
+        # under test owns initialized stage rows (as the publisher creates
+        # for all production allocation paths since Task 2).
+        await DocumentRevisionsRepository(db).initialize_stages(
+            rev_id, RevisionBuildProfile.FULL
+        )
         db.add(
             DocumentTable(
                 document_id=doc_id,

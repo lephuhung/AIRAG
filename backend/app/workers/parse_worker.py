@@ -28,6 +28,10 @@ from app.models.document_type import DocumentType as _DocumentType  # noqa: F401
 from app.models.document import Document, DocumentImage, DocumentStatus, DocumentTable
 from app.queue import connection as mq
 from app.queue.messages import CaptionMessage, EmbedMessage, KGMessage, ParseMessage
+from app.services.agents.v2.persistence.document_revisions import (
+    DocumentRevisionsRepository,
+    InvalidStageTransition,
+)
 from app.services.agents.v2.persistence.source_identity import (
     RevisionBuildProfile,
 )
@@ -83,6 +87,20 @@ async def handle_parse(payload: dict) -> None:
                 f"no-op ({execution.reason})"
             )
             return
+
+        # Revision-owned stage report (P1 Task 3): pending → running BEFORE
+        # any work. A redelivered mark converges without bumping attempts;
+        # an already-terminal stage converges at completion time below.
+        # Unknown rows (a pre-Task-2 revision) fail closed — no artifact or
+        # mirror is touched. Only this message's revision/stage is reported.
+        _stage_repo = DocumentRevisionsRepository(db)
+        try:
+            await _stage_repo.mark_stage_running(msg.revision_id, "parse")
+        except InvalidStageTransition:
+            logger.debug(
+                f"[parse_worker] doc={msg.document_id} rev={msg.revision_id} "
+                f"parse stage already terminal — converging"
+            )
 
         await mark_revision_building(db, msg.revision_id)
         document.is_chat_upload = msg.is_chat_upload
@@ -213,6 +231,10 @@ async def handle_parse(payload: dict) -> None:
                 markdown_artifact_key=s3_key,
                 structure_artifact_key=structure_key,
             )
+            await db.commit()
+            # The parse stage completes ONLY after its artifact transaction
+            # succeeded (never guessed, never from Document mirrors).
+            await _stage_repo.mark_stage_completed(msg.revision_id, "parse")
             await db.commit()
 
             # ── Classify document type & extract rich header ────────────────────────
