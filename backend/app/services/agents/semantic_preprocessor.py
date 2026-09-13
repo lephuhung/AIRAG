@@ -783,6 +783,8 @@ async def _lookup_by_title(
 
     allowed = list(ctx.allowed_workspace_ids)
     needle = ref.reference.lower().strip()
+    if not needle or len(needle.split()) < 2:
+        return alias_entry
     stmt = (
         select(Document)
         .where(

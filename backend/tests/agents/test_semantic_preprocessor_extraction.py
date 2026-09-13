@@ -122,3 +122,29 @@ async def test_title_lookup_selects_the_longest_matching_title() -> None:
     assert resolved.document_handle == document_id
     assert resolved.match_basis == "fuzzy_title"
     assert resolved.reference == "Luật An ninh mạng"
+
+
+@pytest.mark.asyncio
+async def test_title_lookup_rejects_a_bare_document_type_keyword() -> None:
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+    from uuid import UUID
+
+    from app.services.agents.semantic_preprocessor import _lookup_by_title
+
+    workspace_id = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+    context = SimpleNamespace(allowed_workspace_ids=[workspace_id])
+
+    alias_result = MagicMock()
+    alias_result.all.return_value = []  # no exact alias
+    session = MagicMock(execute=AsyncMock(side_effect=[alias_result]))
+
+    reference = RefExtraction(
+        ref_id="r1", original_span="Luật", span_offset=(0, 4),
+        reference="luật", section_reference=None,
+        parse_basis="regex_named_doc",
+    )
+    resolved = await _lookup_by_title(reference, context, session)
+
+    assert resolved.resolution_status == "not_found"
+    assert session.execute.await_count == 1  # alias query only, no title query
