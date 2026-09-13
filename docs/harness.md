@@ -179,9 +179,12 @@ repo, so a worktree session cannot execute them) and, for canary, real
 traffic. Run them from a checkout that owns the stack:
 
 ```bash
+# Run from the repository root; the migration + gate scripts take one initial
+# `cd backend` so later lines never resolve `backend/backend`.
+cd backend
 # 0) one-time: apply the v2 schema migration against the live DB, then verify
-cd backend && python -m app.services.agents.v2.persistence.migrate apply --dsn <prod-dsn>
-cd backend && python -m app.services.agents.v2.persistence.migrate check --dsn <prod-dsn>
+python -m app.services.agents.v2.persistence.migrate apply --dsn <prod-dsn>
+python -m app.services.agents.v2.persistence.migrate check --dsn <prod-dsn>
 # 1) golden preflight (see above), then ab-compare — must be green
 # 2) enable shadow first (no production effect), watch one window:
 #    NEXUSRAG_AGENT_V2_SHADOW_ENABLED=true NEXUSRAG_AGENT_V2_SHADOW_PERCENT=5
@@ -191,8 +194,8 @@ cd backend && python -m app.services.agents.v2.persistence.migrate check --dsn <
 #    shadow 5% -> internal-workspace canary -> 5% -> 25% -> 50% -> 100%
 #    (100% = v2-eligible traffic only; Write/evaluate stay on v1)
 # 4) offline gate over collected metrics:
-cd backend && python scripts/collect_v2_rollout_report.py --dsn <prod-dsn> --out /tmp/v2-rollout.json
-cd backend && python scripts/check_v2_rollout_gate.py --report /tmp/v2-rollout.json
+python scripts/collect_v2_rollout_report.py --dsn <prod-dsn> --out /tmp/v2-rollout.json
+python scripts/check_v2_rollout_gate.py --report /tmp/v2-rollout.json
 # 5) emergency brake (any stage): PUT /api/v1/admin/agent/rollout {kill_switch: true}
 #    -> new requests go to v1, control revision increments, active v2 runs
 #    are cancelled without success.
@@ -207,9 +210,13 @@ executed here at promotion time; record their output with the gate evidence.
 
 ```bash
 H=.superpowers/sdd/2026-09-11-langgraph-v2-phase3-rollout/harness.sh
-$H 'python -m pytest tests/agents/v2 tests/api tests/migrations/v2 tests/workers -q'
+$H 'python -m pytest tests/agents/v2 tests/api tests/migrations/v2 tests/workers -q --ignore=tests/agents/v2/orchestrator_compat'
 # tests/agents/v2/orchestrator_compat hardcodes a localhost:5433 DSN and is
-# excluded from the harness run (validated from the host bench venv instead).
+# excluded from the harness run; it is validated from the host bench venv
+# instead (cwd backend/):
+#   python -m pytest tests/agents/v2/orchestrator_compat -q
+# Known outcome (Task 8 evidence): the ONLY failure is the E2 probe
+# (hardcoded localhost:5433, unreachable from the bridge-network harness).
 ```
 
 Static guards (must all pass — empty output — while v1 stays the

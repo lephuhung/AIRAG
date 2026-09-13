@@ -138,8 +138,10 @@ executor** instead of the fixed intent→tool chain: the model is given the RAG 
 A second-generation agent stack lives under `backend/app/services/agents/v2/`:
 Agent proposes → validated + checkpointed `TaskPlan` → shared `TaskScheduler` →
 capability. It serves only traffic the DB-backed canary control explicitly
-selects; **v1 remains the default and the rollback path** (every failure mode
-fails closed to v1, and the kill switch routes new requests to v1 and cancels
+selects; **v1 remains the default and the rollback path** (for ordinary serving
+selection every failure mode fails closed to v1 — the authenticated superadmin
+admin override bypasses the remaining gates but never escapes the kill switch —
+and the kill switch routes new requests to v1 and cancels
 active v2 runs). Staged order: shadow → internal workspace canary →
 5% → 25% → 50% → 100% of *v2-eligible* traffic (Write/evaluate stay on v1;
 global replacement of v1 is out of scope). 📖 **Ownership model, invariants,

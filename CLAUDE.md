@@ -48,7 +48,7 @@ agent tool call → validated + checkpointed TaskPlan → TaskScheduler → capa
   `scheduler.execute(`, no `checkpointer`, no `safe_metadata`/`Mapping[str`
   in `tools/`. They emit proposals (`AgentToolGateway.propose`) and
   observations; the graph validates, checkpoints, then dispatches.
-- Capabilities receive **`AgentRequest` + `CapabilityRuntimeContext`** and
+- Capabilities receive **`AgentRequest` (the typed invocation payload) + `CapabilityRuntimeContext` (the only runtime context)** and
   never supervisor/graph state.
 
 ## Sensitive observation projection
@@ -89,20 +89,25 @@ shadow's output channel so a late-completing shadow is a no-op.
 ## Rollout: DB-backed canary, kill switch, v1 default
 
 - **v1 is the default and the rollback path.**
-  `NEXUSRAG_AGENT_GRAPH_VERSION` defaults to `"v1"`. Every failure mode fails
-  closed to v1: kill switch set, control row absent/disabled, percent 0, empty
-  bucket salt while enabled, workspace not allowlisted, Write endpoint,
-  selector exception.
+  `NEXUSRAG_AGENT_GRAPH_VERSION` defaults to `"v1"`. For ordinary serving
+  selection every failure mode fails closed to v1: kill switch set, control
+  row absent/disabled, env/DB disabled, percent 0, empty bucket salt while
+  enabled, workspace not allowlisted, Write endpoint, selector exception.
+  (This fail-closed claim scopes to ordinary serving selection — it does not
+  cover the authenticated superadmin admin override below, which bypasses
+  the remaining gates but never escapes the kill switch.)
 - **Master switch + DB control.** `NEXUSRAG_AGENT_V2_ENABLED` (default
   `false`) is the environment ceiling; the `agent_rollout_control` row
   (`id=1`, schema v3) is authoritative within it. Deploying the code changes
   no traffic (both default off/0).
 - **Deterministic server-owned selection** (`select_canary_arm`, pure):
-  kill switch → env/DB enable → effective percent (min of env + DB) →
-  workspace allowlist (env ∩ DB when both set) → deterministically-known
-  Write exclusion (supplied at the ingress call site, never derived from
-  query content) → admin override (authenticated superadmin only, never
-  escapes the kill switch) → deterministic `workspace+request+salt` bucket.
+  kill switch → admin override (authenticated superadmin only, bypasses the
+  remaining gates including the Write-endpoint exclusion, never escapes the
+  kill switch) → env enabled → DB row enabled → effective percent (min of
+  env + DB) → workspace allowlist (env ∩ DB when both set) →
+  deterministically-known Write exclusion (supplied at the ingress call
+  site, never derived from query content) → deterministic
+  `workspace+request+salt` bucket.
   `CANARY_PERCENT=100` promotes **100% of v2-eligible traffic only** — never
   a global replacement of v1.
 - **Ineligible traffic stays on v1.** Write endpoints route to v1 before
