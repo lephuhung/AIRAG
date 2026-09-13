@@ -572,8 +572,9 @@ def test_production_binding_resolver_pins_role_less_reference(monkeypatch):
     document_id = uuid4()
     revision_id = uuid4()
 
-    async def _fake_current(db, document_id_arg, *, require_vectors=False):
+    async def _fake_current(db, document_id_arg, workspace_id_arg, *, require_vectors=False):
         assert document_id_arg == document_id
+        assert workspace_id_arg == workspace_id
         return document_views.RevisionArtifactIdentity(
             revision_id=revision_id,
             document_id=document_id,
@@ -588,7 +589,7 @@ def test_production_binding_resolver_pins_role_less_reference(monkeypatch):
         )
 
     monkeypatch.setattr(
-        document_views, "load_current_revision_identity", _fake_current
+        document_views, "load_current_revision_identity_for_workspace", _fake_current
     )
 
     class _FakeSession:

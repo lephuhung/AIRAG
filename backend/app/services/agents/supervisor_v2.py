@@ -1320,12 +1320,15 @@ class V1BindingResolver:
 
     Wraps ``adapters/document.py::resolve_document_bindings`` behind the
     node-facing ``resolve(document_refs, capability_runtime) ->
-    DocumentBindingSet`` contract: iterates EVERY workspace in the trusted
-    runtime (never collapsed to one), opens a dedicated session per
-    workspace through ``session_factory`` (default: the app's
-    ``async_session_maker``), and unions the per-workspace sets with
-    first-workspace-wins pin identity. Empty references resolve to the empty
-    set without opening any session; an empty workspace scope fails closed.
+    DocumentBindingSet`` contract: resolves EACH reference across EVERY
+    workspace in the trusted runtime (never collapsed to one) with
+    first-authorized-match wins, opening a dedicated session per attempt
+    through ``session_factory`` (default: the app's
+    ``async_session_maker``). A reference fails only after no workspace can
+    resolve it, so references owned by different workspaces union instead of
+    failing closed on the first foreign workspace. Empty references resolve
+    to the empty set without opening any session; an empty workspace scope
+    fails closed.
     """
 
     def __init__(
@@ -1353,7 +1356,11 @@ class V1BindingResolver:
         document_refs: Any,
         capability_runtime: CapabilityRuntimeContext,
     ) -> DocumentBindingSet:
-        from .v2.adapters.document import resolve_document_bindings
+        from .v2.adapters.document import (
+            DocumentAdapterError,
+            resolve_document_bindings,
+        )
+        from .v2.persistence.document_views import RevisionNotReady
 
         refs = tuple(document_refs)
         if not refs:
@@ -1367,20 +1374,46 @@ class V1BindingResolver:
         open_session = self._sessions()
         bindings: dict[str, Any] = {}
         relations: dict[tuple[str, str], Any] = {}
-        for workspace_id in workspaces:
-            async with open_session() as db:
-                resolved = await resolve_document_bindings(
-                    db,
-                    refs,
-                    workspace_id=workspace_id,
-                    default_role=self._default_role,
-                )
-            for binding in resolved.binding_set.bindings:
-                bindings.setdefault(binding.binding_id, binding)
-            for relation in resolved.binding_set.revision_requirement_refs:
-                relations.setdefault(
-                    (relation.binding_id, relation.ref_id), relation
-                )
+        for reference in refs:
+            last_error: Exception | None = None
+            pinned = False
+            for workspace_id in workspaces:
+                async with open_session() as db:
+                    try:
+                        resolved = await resolve_document_bindings(
+                            db,
+                            (reference,),
+                            workspace_id=workspace_id,
+                            default_role=self._default_role,
+                        )
+                    except (DocumentAdapterError, RevisionNotReady) as exc:
+                        # Per-reference union: a workspace that cannot
+                        # authorize this reference (foreign workspace,
+                        # tombstone, unpublished revision, revision/document
+                        # mismatch) only disqualifies THAT workspace for THIS
+                        # reference. Keep the last error and try the next
+                        # trusted workspace; the reference fails only after no
+                        # workspace resolves it. Unexpected errors (DB/IO)
+                        # propagate immediately instead of being masked as a
+                        # workspace miss.
+                        last_error = exc
+                        continue
+                for binding in resolved.binding_set.bindings:
+                    bindings.setdefault(binding.binding_id, binding)
+                    pinned = True
+                for relation in resolved.binding_set.revision_requirement_refs:
+                    relations.setdefault(
+                        (relation.binding_id, relation.ref_id), relation
+                    )
+                if pinned or not resolved.binding_set.bindings:
+                    # Bound here (first authorized match wins), or the
+                    # reference binds nothing by semantics (unresolved /
+                    # ambiguous refs are owned by clarification) — either way
+                    # do not probe further workspaces for this reference.
+                    last_error = None
+                    break
+            if last_error is not None:
+                raise last_error
         return DocumentBindingSet(
             bindings=tuple(bindings.values()),
             revision_requirement_refs=tuple(relations.values()),

@@ -38,6 +38,7 @@ from app.services.agents.v2.persistence.document_views import (
     embedding_namespace,
     legacy_vector_id,
     load_current_revision_identity,
+    load_current_revision_identity_for_workspace,
     load_revision_chunks,
     load_revision_identity,
     load_revision_identity_for_workspace,
@@ -771,4 +772,93 @@ async def test_resolve_document_targets_marks_foreign_documents_ineligible(
     )
     assert foreign[0].eligible is False
     assert foreign[0].is_legacy is False
+
+
+# ---------------------------------------------------------------------------
+# P0 Task 3 fix round 2 (R2-I3): mutation-sensitive DB tests for the
+# workspace-scoped CURRENT-revision guard.
+#
+# Unlike the stub-level adapter tests, these mutate real rows: publish a
+# revision (sets ``documents.current_revision_id``), move the document to a
+# foreign workspace / tombstone it, and prove the guarded lookup rejects
+# while the owned legacy pointer still returns ``None``.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workspace_current_lookup_rejects_foreign_workspace(
+    async_db, document_factory
+):
+    """R2-I3: the current-revision pointer of another workspace is rejected."""
+    doc_id = document_factory()
+    ws = await async_db.scalar(
+        select(Document.workspace_id).where(Document.id == doc_id)
+    )
+    storage = FakeArtifactStore()
+    rid = await _publish_revision(
+        async_db,
+        document_id=doc_id,
+        workspace_id=ws,
+        object_key=f"kb_{ws}/doc_{doc_id}.pdf",
+        sha="1" * 64,
+        chunks=_chunks("W1"),
+        storage=storage,
+        namespace=embedding_namespace(ws, "hashA", 768),
+    )
+    owned = await load_current_revision_identity_for_workspace(
+        async_db, doc_id, ws
+    )
+    assert owned is not None and owned.revision_id == rid
+
+    with pytest.raises(RevisionNotReady):
+        await load_current_revision_identity_for_workspace(
+            async_db, doc_id, uuid.uuid4()
+        )
+
+
+@pytest.mark.asyncio
+async def test_workspace_current_lookup_rejects_tombstoned_document(
+    async_db, document_factory
+):
+    """R2-I3: tombstoning the owned document rejects its current revision."""
+    doc_id = document_factory()
+    ws = await async_db.scalar(
+        select(Document.workspace_id).where(Document.id == doc_id)
+    )
+    storage = FakeArtifactStore()
+    await _publish_revision(
+        async_db,
+        document_id=doc_id,
+        workspace_id=ws,
+        object_key=f"kb_{ws}/doc_{doc_id}.pdf",
+        sha="2" * 64,
+        chunks=_chunks("W2"),
+        storage=storage,
+        namespace=embedding_namespace(ws, "hashA", 768),
+    )
+    assert (
+        await load_current_revision_identity_for_workspace(async_db, doc_id, ws)
+    ) is not None
+
+    await DocumentRevisionsRepository(async_db).mark_source_deleted(
+        doc_id, reason="document_deleted"
+    )
+    await async_db.commit()
+
+    with pytest.raises(RevisionNotReady):
+        await load_current_revision_identity_for_workspace(async_db, doc_id, ws)
+
+
+@pytest.mark.asyncio
+async def test_workspace_current_lookup_returns_none_for_owned_legacy(
+    async_db, document_factory
+):
+    """R2-I3: an owned document with ``current_revision_id=None`` returns None."""
+    doc_id = document_factory()
+    ws = await async_db.scalar(
+        select(Document.workspace_id).where(Document.id == doc_id)
+    )
+    assert (
+        await load_current_revision_identity_for_workspace(async_db, doc_id, ws)
+    ) is None
 

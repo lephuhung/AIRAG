@@ -1739,3 +1739,121 @@ async def test_build_draft_projects_api_explicit_hard_scope() -> None:
     assert ref.resolution_status == "resolved"
     assert ref.resolved_document_id == DOCUMENT_ID
     assert ref.requested_role == "target"
+
+
+# ---------------------------------------------------------------------------
+# P0 Task 3 fix round 2: multi-workspace union lives per reference.
+# Each reference resolves across ALL trusted workspace IDs with
+# first-authorized-match wins; a reference fails only after no workspace
+# can resolve it. Refs owned by different workspaces must union.
+# ---------------------------------------------------------------------------
+
+
+class _UnionFakeSession:
+    async def __aenter__(self):
+        return object()
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _union_runtime(workspace_ids):
+    from datetime import datetime
+
+    from app.services.agents.v2.contracts.capability import (
+        CapabilityRuntimeContext,
+    )
+
+    return CapabilityRuntimeContext(
+        request_id="req-union",
+        run_id="run-union",
+        user_id=USER_ID,
+        workspace_ids=tuple(workspace_ids),
+        can_read_people=False,
+        allowed_capabilities=FULL_CAPABILITIES,
+        deadline_at=datetime(2030, 1, 1, tzinfo=UTC),
+    )
+
+
+@pytest.mark.asyncio
+async def test_binding_resolver_resolves_ref_owned_by_last_workspace(monkeypatch) -> None:
+    """R2: a single ref owned by the LAST trusted workspace must still pin."""
+    from app.services.agents.supervisor_v2 import V1BindingResolver
+    from app.services.agents.v2.persistence import document_views
+
+    ws_first = UUID("aaaaaaaa-0000-0000-0000-000000000001")
+    ws_last = UUID("aaaaaaaa-0000-0000-0000-000000000002")
+
+    async def _fake_current(db, document_id, workspace_id, *, require_vectors=False):
+        assert workspace_id in (ws_first, ws_last)
+        if workspace_id != ws_last:
+            raise document_views.RevisionNotReady(document_id, "not owned here")
+        return document_views.RevisionArtifactIdentity(
+            revision_id=REVISION_ID,
+            document_id=document_id,
+            generation=1,
+            build_profile="FULL",
+            markdown_artifact_key="markdown.md",
+            structure_artifact_key="structure.json",
+            embedding_namespace=None,
+            embedding_model_hash=None,
+            embedding_dimension=None,
+            vector_artifact_version=None,
+        )
+
+    monkeypatch.setattr(
+        document_views, "load_current_revision_identity_for_workspace", _fake_current
+    )
+    resolver = V1BindingResolver(
+        session_factory=lambda: _UnionFakeSession(), default_role="target"
+    )
+    binding_set = await resolver.resolve(
+        (resolved_ref("r1", DOCUMENT_ID),), _union_runtime([ws_first, ws_last])
+    )
+    assert len(binding_set.bindings) == 1
+    assert binding_set.bindings[0].binding_id == "b_r1"
+    assert binding_set.bindings[0].document_revision == str(REVISION_ID)
+
+
+@pytest.mark.asyncio
+async def test_binding_resolver_unions_refs_spanning_workspaces(monkeypatch) -> None:
+    """R2: refs owned by DIFFERENT workspaces must union, not fail closed."""
+    from app.services.agents.supervisor_v2 import V1BindingResolver
+    from app.services.agents.v2.persistence import document_views
+
+    ws_a = UUID("aaaaaaaa-0000-0000-0000-00000000000a")
+    ws_b = UUID("aaaaaaaa-0000-0000-0000-00000000000b")
+    owners = {DOCUMENT_ID: ws_a, OTHER_DOCUMENT_ID: ws_b}
+    revisions = {DOCUMENT_ID: REVISION_ID, OTHER_DOCUMENT_ID: OTHER_REVISION_ID}
+
+    async def _fake_current(db, document_id, workspace_id, *, require_vectors=False):
+        assert workspace_id in (ws_a, ws_b)
+        if owners.get(document_id) != workspace_id:
+            raise document_views.RevisionNotReady(document_id, "not owned here")
+        return document_views.RevisionArtifactIdentity(
+            revision_id=revisions[document_id],
+            document_id=document_id,
+            generation=1,
+            build_profile="FULL",
+            markdown_artifact_key="markdown.md",
+            structure_artifact_key="structure.json",
+            embedding_namespace=None,
+            embedding_model_hash=None,
+            embedding_dimension=None,
+            vector_artifact_version=None,
+        )
+
+    monkeypatch.setattr(
+        document_views, "load_current_revision_identity_for_workspace", _fake_current
+    )
+    resolver = V1BindingResolver(
+        session_factory=lambda: _UnionFakeSession(), default_role="target"
+    )
+    binding_set = await resolver.resolve(
+        (resolved_ref("r1", DOCUMENT_ID), resolved_ref("r2", OTHER_DOCUMENT_ID)),
+        _union_runtime([ws_a, ws_b]),
+    )
+    by_id = {binding.binding_id: binding for binding in binding_set.bindings}
+    assert set(by_id) == {"b_r1", "b_r2"}
+    assert by_id["b_r1"].document_revision == str(REVISION_ID)
+    assert by_id["b_r2"].document_revision == str(OTHER_REVISION_ID)
