@@ -698,7 +698,7 @@ async def _lookup_by_alias(
     ref: RefExtraction, ctx: "RuntimeContext", session: "AsyncSession"
 ) -> DocumentRefEntry:
     """DocumentAlias exact-match lookup with ACL filter."""
-    from sqlalchemy import select
+    from sqlalchemy import func, select
     from app.models.document import Document
     from app.models.document_alias import DocumentAlias
 
@@ -876,6 +876,7 @@ async def _resolve_abbreviations_db(
     """Look up abbreviation entries in DocumentAlias table."""
     import re
     from sqlalchemy import func, select
+    from app.models.document import Document
     from app.models.document_alias import DocumentAlias
 
     allowed = list(ctx.allowed_workspace_ids)
@@ -917,22 +918,36 @@ async def _resolve_abbreviations_db(
         alias_lower = row.alias_text.lower()
         alias_map.setdefault(alias_lower, []).append(full_form)
 
+    resolved_entries: list[AbbreviationEntry] = []
     for entry in entries:
         sf_key = entry.short_form.lower()
         forms = alias_map.get(sf_key, [])
         if len(forms) == 1:
-            entry.chosen = forms[0]
-            entry.status = "resolved"
-            entry.confidence = "high"
-            entry.source = "db_single"
-            entry.candidates = [AbbreviationCandidate(full_form=forms[0])]
+            resolved_entries.append(
+                entry.model_copy(
+                    update={
+                        "chosen": forms[0],
+                        "status": "resolved",
+                        "confidence": "high",
+                        "source": "db_single",
+                        "candidates": [AbbreviationCandidate(full_form=forms[0])],
+                    }
+                )
+            )
         elif len(forms) > 1:
-            entry.status = "ambiguous"
-            entry.confidence = "low"
-            entry.source = "db_multi"
-            entry.candidates = [AbbreviationCandidate(full_form=f) for f in forms]
-        # else: keep as unknown/not_in_db
-    return entries
+            resolved_entries.append(
+                entry.model_copy(
+                    update={
+                        "status": "ambiguous",
+                        "confidence": "low",
+                        "source": "db_multi",
+                        "candidates": [AbbreviationCandidate(full_form=f) for f in forms],
+                    }
+                )
+            )
+        else:
+            resolved_entries.append(entry)
+    return resolved_entries
 
 
 async def llm_disambiguate_ambiguous(
@@ -1009,7 +1024,7 @@ async def _call_llm_for_disambiguation(
 Dựa vào câu truy vấn: "{query}"
 
 Hãy xác định ý nghĩa đầy đủ (full_form) cho các từ viết tắt sau đây:
-{abrr_list}
+{abbr_list}
 
 Trả lời theo định dạng JSON, mỗi từ viết tắt một object với các trường:
 - short_form: từ viết tắt gốc
