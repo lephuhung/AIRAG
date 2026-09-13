@@ -129,9 +129,10 @@ class HydratedEvidence:
     People→Document materializer) verify the source kind without trusting the
     human-readable ``source_label``, which remains the ONLY source descriptor
     that reaches model-facing projections. The typed identity itself is never
-    serialized into a model prompt. It defaults to ``None`` for
-    backward-compatible doubles; production hydration always populates it,
-    and consumers MUST treat a missing identity as unverified (fail closed).
+    serialized into a model prompt. The field is REQUIRED: every construction
+    site (production hydration, derived hydration, and test doubles) MUST
+    supply an appropriate typed variant; consumers fail closed on any other
+    shape.
     """
 
     use_id: UUID
@@ -142,10 +143,10 @@ class HydratedEvidence:
     content: str
     role: Any
     source_label: str | None
+    source_identity: EvidenceSourceIdentity
     classification: EvidenceClassification
     locator: ContentLocator | None
     document_revision: str | None = None
-    source_identity: EvidenceSourceIdentity | None = None
 
 
 @dataclass

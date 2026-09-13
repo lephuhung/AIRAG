@@ -32,7 +32,11 @@ from app.services.agents.v2.contracts.capability import (
 )
 from app.services.agents.v2.contracts.conversation import ConversationContext
 from app.services.agents.v2.contracts.evaluation import CoverageObservation
-from app.services.agents.v2.contracts.evidence import EvidenceUseRef
+from app.services.agents.v2.contracts.evidence import (
+    DocumentSourceIdentity,
+    EvidenceUseRef,
+    PeopleSourceIdentity,
+)
 from app.services.agents.v2.contracts.execution import AgentError, AgentRequest, AgentResult
 from app.services.agents.v2.contracts.locators import DocumentLocator
 from app.services.agents.v2.contracts.request import RequestContext
@@ -328,6 +332,12 @@ def hydrated_doc(
         content=content,
         role="target",
         source_label="doc-A",
+        source_identity=DocumentSourceIdentity(
+            kind="document",
+            document_id=DOCUMENT_ID,
+            document_revision=REVISION,
+            locator=DocumentLocator(kind="document"),
+        ),
         classification="normal",
         locator=DocumentLocator(kind="document"),
         document_revision=REVISION,
@@ -479,6 +489,7 @@ async def test_fast_people_uses_shared_capability_registry() -> None:
                 content='{"name":"Nguyễn Văn A"}',
                 role=None,
                 source_label="people",
+                source_identity=PeopleSourceIdentity(kind="people", record_id="rec-1"),
                 classification="personal",
                 locator=None,
             )

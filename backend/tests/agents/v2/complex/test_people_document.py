@@ -499,6 +499,64 @@ async def test_materializer_rejects_non_people_evidence() -> None:
         )
         assert outcome.kind == "unavailable", bad
         assert outcome.input is None
+        assert outcome.scalar is None, bad
+
+
+def test_hydrated_evidence_without_identity_fails() -> None:
+    """R30.1: the typed identity is REQUIRED -- omitting it is a TypeError."""
+    with pytest.raises(TypeError):
+        HydratedEvidence(  # type: ignore[call-arg]
+            use_id=USE_ID,
+            evidence_id=EVIDENCE_ID,
+            task_id="T1",
+            purpose="supporting",
+            target_id=None,
+            content=_minimized_content(SCALAR),
+            role=None,
+            source_label="people",
+            classification="personal",
+            locator=None,
+            document_revision=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_typed_wrong_source_appends_no_t2_on_real_node() -> None:
+    """R30.2: typed non-People identity -> no scalar AND no T2 end-to-end."""
+    from app.services.agents.v2.contracts.locators import DocumentLocator
+
+    doc_identity = DocumentSourceIdentity(
+        kind="document",
+        document_id=UUID("11111111-1111-1111-1111-111111111111"),
+        document_revision="rev-1",
+        locator=DocumentLocator(kind="document"),
+    )
+    hydrator = FakeHydrator((_hydrated(_minimized_content(SCALAR), source_identity=doc_identity),))
+    runtime = _runtime(hydrator=hydrator)
+    state = {
+        "contract_version": "2.0",
+        "semantic": _semantic(),
+        "bindings": _bindings(),
+        "query_analysis": _analysis(),
+        "plan": _people_plan(),
+        "task_results": (_people_success(),),
+        "replans_remaining": 0,
+    }
+    update = await people_document_materialize_node(state, runtime)  # type: ignore[arg-type]
+    assert update.get("plan", None) is None
+    assert update.get("materialized_new_task", False) is False
+    assert update.get("people_scalar_available", {}) == {"T1": False}
+    outcome = await materialize_person_dependency(
+        people_task_id="T1",
+        people_result=_people_success(),
+        runtime=runtime,
+        plan=_people_plan(),
+        bindings=_bindings(),
+        query="nghi dinh",
+    )
+    assert outcome.kind == "unavailable"
+    assert outcome.scalar is None
+    assert outcome.input is None
 
 
 # ---------------------------------------------------------------------------

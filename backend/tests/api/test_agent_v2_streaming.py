@@ -1328,7 +1328,10 @@ async def test_c2_real_resume_advances_feeds_resolver_and_anchored_refresh():
     )
     from app.services.agents.v2.contracts.binding import DocumentBindingSet
     from app.services.agents.v2.contracts.capability import DocumentReadOutput
-    from app.services.agents.v2.contracts.evidence import EvidenceUseRef
+    from app.services.agents.v2.contracts.evidence import (
+        DerivedSourceIdentity,
+        EvidenceUseRef,
+    )
     from app.services.agents.v2.contracts.evaluation import CoverageObservation
     from app.services.agents.v2.contracts.execution import AgentRequest, AgentResult
     from app.services.agents.v2.contracts.locators import DocumentLocator
@@ -1423,6 +1426,9 @@ async def test_c2_real_resume_advances_feeds_resolver_and_anchored_refresh():
                     content="Nội dung tài liệu.",
                     role=None,
                     source_label="doc",
+                    source_identity=DerivedSourceIdentity(
+                        kind="derived", source_evidence_ids=(ref.use_id,)
+                    ),
                     classification="official",
                     locator=None,
                 )

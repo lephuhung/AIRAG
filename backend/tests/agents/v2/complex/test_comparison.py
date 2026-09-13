@@ -44,7 +44,7 @@ from app.services.agents.v2.contracts.evaluation import (
     Contradiction,
     CoverageObservation,
 )
-from app.services.agents.v2.contracts.evidence import EvidenceUseRef
+from app.services.agents.v2.contracts.evidence import DocumentSourceIdentity, EvidenceUseRef
 from app.services.agents.v2.contracts.execution import AgentRequest, AgentResult
 from app.services.agents.v2.contracts.locators import (
     ContentLocator,
@@ -240,6 +240,12 @@ class FakeHydrator:
                     content=f"content of {target_id}",
                     role=binding.role,
                     source_label=target_id,
+                    source_identity=DocumentSourceIdentity(
+                        kind="document",
+                        document_id=binding.document_id,
+                        document_revision=binding.document_revision,
+                        locator=locator_by_target[target_id],
+                    ),
                     classification="normal",
                     locator=locator_by_target[target_id],
                     document_revision=binding.document_revision,

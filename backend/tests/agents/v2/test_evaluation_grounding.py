@@ -135,6 +135,22 @@ def _role_for(binding: ScopedDocument | None) -> Any:
     return binding.role if binding is not None else None
 
 
+def _source_identity_for(item: StoredUse) -> Any:
+    """Typed identity mirror of the fake store's source_kind (R30)."""
+    if item.source_kind == "document":
+        return DocumentSourceIdentity(
+            kind="document",
+            document_id=item.document_id or DOCUMENT_ID,
+            document_revision=item.document_revision or REVISION,
+            locator=item.locator or DocumentLocator(kind="document"),
+        )
+    if item.source_kind == "people":
+        return PeopleSourceIdentity(kind="people", record_id="rec-1")
+    return DerivedSourceIdentity(
+        kind="derived", source_evidence_ids=item.lineage
+    )
+
+
 class FakeHydrator:
     """In-memory EvidenceHydrator: admission mirrors the governed gate.
 
@@ -238,6 +254,7 @@ class FakeHydrator:
             content=item.content,
             role=_role_for(binding),
             source_label=label,
+            source_identity=_source_identity_for(item),
             classification=item.classification,
             locator=item.locator,
             document_revision=item.document_revision,
@@ -416,6 +433,9 @@ class FakeHydrator:
             content=item.content,
             role=None,
             source_label="derived",
+            source_identity=DerivedSourceIdentity(
+                kind="derived", source_evidence_ids=item.lineage
+            ),
             classification=item.classification,
             locator=None,
             document_revision=None,
@@ -897,6 +917,12 @@ async def test_evaluator_rechecks_revision_even_when_hydration_admits() -> None:
             content="Điều 5.",
             role="target",
             source_label="doc",
+            source_identity=DocumentSourceIdentity(
+                kind="document",
+                document_id=DOCUMENT_ID,
+                document_revision=OTHER_REVISION,
+                locator=DocumentLocator(kind="document"),
+            ),
             classification="normal",
             locator=DocumentLocator(kind="document"),
             document_revision=OTHER_REVISION,
@@ -1738,12 +1764,20 @@ async def test_apply_budget_split_is_deterministic() -> None:
             use_id=uuid4(), evidence_id=uuid4(), task_id="T1",
             purpose="coverage", target_id="t1", content="a" * 10,
             role="target", source_label="s",
+            source_identity=DerivedSourceIdentity(
+                kind="derived",
+                source_evidence_ids=(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),),
+            ),
             classification="normal", locator=None,
         ),
         HydratedEvidence(
             use_id=uuid4(), evidence_id=uuid4(), task_id="T1",
             purpose="coverage", target_id="t1", content="b" * 10,
             role="target", source_label="s",
+            source_identity=DerivedSourceIdentity(
+                kind="derived",
+                source_evidence_ids=(UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),),
+            ),
             classification="normal", locator=None,
         ),
     )
@@ -1784,6 +1818,12 @@ def _grounded_fixture() -> tuple[AnswerDraft, list[HydratedEvidence]]:
             use_id=u1, evidence_id=e1, task_id="T1", purpose="coverage",
             target_id="t1", content="Điều 5 quy định mức phạt.",
             role="target", source_label="doc-A",
+            source_identity=DocumentSourceIdentity(
+                kind="document",
+                document_id=DOCUMENT_ID,
+                document_revision=REVISION,
+                locator=DocumentLocator(kind="document"),
+            ),
             classification="normal",
             locator=DocumentLocator(kind="document"),
             document_revision=REVISION,
@@ -1792,6 +1832,12 @@ def _grounded_fixture() -> tuple[AnswerDraft, list[HydratedEvidence]]:
             use_id=u2, evidence_id=e2, task_id="T1", purpose="coverage",
             target_id="t1", content="Điều 6 quy định thẩm quyền.",
             role="target", source_label="doc-A",
+            source_identity=DocumentSourceIdentity(
+                kind="document",
+                document_id=DOCUMENT_ID,
+                document_revision=REVISION,
+                locator=DocumentLocator(kind="document"),
+            ),
             classification="normal",
             locator=DocumentLocator(kind="document"),
             document_revision=REVISION,
@@ -1900,12 +1946,16 @@ async def test_ambiguous_assertion_needs_revision() -> None:
         HydratedEvidence(
             use_id=u1, evidence_id=uuid4(), task_id="T1", purpose="supporting",
             target_id=None, content="x", role=None,
-            source_label="s", classification="normal", locator=None,
+            source_label="s",
+            source_identity=PeopleSourceIdentity(kind="people", record_id="rec-test"),
+            classification="normal", locator=None,
         ),
         HydratedEvidence(
             use_id=u2, evidence_id=uuid4(), task_id="T1", purpose="supporting",
             target_id=None, content="y", role=None,
-            source_label="s", classification="normal", locator=None,
+            source_label="s",
+            source_identity=PeopleSourceIdentity(kind="people", record_id="rec-test"),
+            classification="normal", locator=None,
         ),
     ]
     with pytest.raises(GroundingInsufficient) as exc_info:

@@ -35,7 +35,7 @@ from app.services.agents.v2.contracts.conversation import (
     ConversationTurn,
     EntityReference,
 )
-from app.services.agents.v2.contracts.evidence import EvidenceUseRef
+from app.services.agents.v2.contracts.evidence import EvidenceUseRef, PeopleSourceIdentity
 from app.services.agents.v2.contracts.execution import AgentRequest, AgentResult
 from app.services.agents.v2.contracts.request import RequestContext
 from app.services.agents.v2.contracts.semantic import DocumentReference, SemanticContext, SemanticDraft
@@ -208,6 +208,7 @@ class FakeHydrator:
                 content=self._content,
                 role=None,
                 source_label="people-record",
+                source_identity=PeopleSourceIdentity(kind="people", record_id="rec-1"),
                 classification="personal",
                 locator=None,
             )
