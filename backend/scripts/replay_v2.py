@@ -20,7 +20,9 @@ from typing import Any
 from scripts.ab_eval import (
     EVALUATOR_VERSION,
     build_arm_report,
+    build_case_record,
     collect_terminal,
+    evaluate_functional,
     evaluate_output,
 )
 
@@ -51,35 +53,60 @@ def replay_transcript(events: list[dict], *, arm: str = "v2") -> dict:
 
 
 def replay_to_report(
-    transcripts: dict[str, list[dict]], *, arm: str = "v2"
+    transcripts: dict[str, list[dict]],
+    *,
+    arm: str = "v2",
+    cases: dict[str, dict] | None = None,
 ) -> dict:
-    """Judge many recorded transcripts into one evaluator-versioned report."""
-    cases: list[dict] = []
+    """Judge many recorded transcripts into one evaluator-versioned report.
+
+    Each case record goes through the SHARED ``build_case_record``
+    serializer, so replay reports carry the same keys as run reports
+    (``sources`` provenance, ``has_answer``, golden functional fields).
+    ``cases`` optionally maps query ids to golden case expectations for
+    document/article/negative scoring; without it only status-level
+    functional fields apply. Raw answer text is used transiently for
+    scoring and never persisted.
+    """
+    golden = cases or {}
+    records: list[dict] = []
     for query_id, events in transcripts.items():
         try:
-            judged = replay_transcript(events, arm=arm)
-            cases.append(
-                {
-                    "query_id": query_id,
-                    "arm": arm,
-                    "latency_ms": 0,
-                    "citations": judged["citations"],
-                    "status": judged["status"],
-                    "evaluator_version": EVALUATOR_VERSION,
-                }
+            terminal = collect_terminal(events)
+            data = terminal.get("data") or {}
+            answer = str(data.get("answer", ""))
+            judged = evaluate_output(
+                answer=answer,
+                sources=list(data.get("sources", [])),
+                status=terminal["event"],
+                arm=arm,
+            )
+            functional = evaluate_functional(
+                golden.get(query_id, {}),
+                citations=judged["citations"],
+                answer=answer,
+                status=judged["status"],
+                sources=judged["sources"],
+            )
+            records.append(
+                build_case_record(
+                    query_id=query_id, arm=arm, evaluation=judged,
+                    functional=functional,
+                )
             )
         except ValueError as exc:
-            cases.append(
-                {
-                    "query_id": query_id,
-                    "arm": arm,
-                    "latency_ms": 0,
-                    "citations": [],
-                    "status": f"error: {exc}",
-                    "evaluator_version": EVALUATOR_VERSION,
-                }
+            evaluation = evaluate_output(answer="", sources=[],
+                                         status=f"error: {exc}", arm=arm)
+            records.append(
+                build_case_record(
+                    query_id=query_id, arm=arm, evaluation=evaluation,
+                    functional=evaluate_functional(
+                        golden.get(query_id, {}), citations=[], answer="",
+                        status="error",
+                    ),
+                )
             )
-    return build_arm_report(arm=arm, cases=cases)
+    return build_arm_report(arm=arm, cases=records)
 
 
 def load_report(path: str) -> dict:

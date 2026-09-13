@@ -600,6 +600,55 @@ def evaluate_functional(
     }
 
 
+# ---------------------------------------------------------------------------
+# Shared case-record schema (R12.3): run AND replay build every persisted
+# case record through ``build_case_record`` so both reports carry identical
+# keys for every field ``compare`` reads — neither side can silently drop
+# a compared field (provenance ``sources``, ``has_answer``, functional).
+# ---------------------------------------------------------------------------
+
+CASE_RECORD_KEYS = (
+    "query_id",
+    "session_id",
+    "arm",
+    "latency_ms",
+    "citations",
+    "sources",
+    "status",
+    "answer_chars",
+    "citation_count",
+    "has_answer",
+    "functional",
+    "evaluator_version",
+)
+
+
+def build_case_record(
+    *,
+    query_id: str,
+    arm: str,
+    evaluation: dict,
+    functional: dict,
+    latency_ms: int = 0,
+    session_id: str | None = None,
+) -> dict:
+    """ONE serializer for every persisted case record (run + replay)."""
+    return {
+        "query_id": query_id,
+        "session_id": session_id,
+        "arm": arm,
+        "latency_ms": max(latency_ms, 0),
+        "citations": evaluation["citations"],
+        "sources": evaluation["sources"],
+        "status": evaluation["status"],
+        "answer_chars": evaluation["answer_chars"],
+        "citation_count": evaluation["citation_count"],
+        "has_answer": evaluation["has_answer"],
+        "functional": functional,
+        "evaluator_version": EVALUATOR_VERSION,
+    }
+
+
 def run_eval_turn(
     client: Any,
     *,
@@ -639,41 +688,31 @@ def run_eval_turn(
         status=terminal["event"],
         arm=version,
     )
-    record = {
-        "query_id": query_id,
-        "session_id": session_id,
-        "arm": version,
-        "latency_ms": max(latency_ms, 0),
-        "citations": evaluation["citations"],
-        "status": evaluation["status"],
-        "answer_chars": evaluation["answer_chars"],
-        "citation_count": evaluation["citation_count"],
-        "has_answer": evaluation["has_answer"],
-        "functional": evaluate_functional(
-            case or {}, citations=evaluation["citations"],
-            answer=answer, status=evaluation["status"],
-            sources=evaluation["sources"],
-        ),
-        "evaluator_version": EVALUATOR_VERSION,
-    }
+    functional = evaluate_functional(
+        case or {}, citations=evaluation["citations"],
+        answer=answer, status=evaluation["status"],
+        sources=evaluation["sources"],
+    )
+    record = build_case_record(
+        query_id=query_id,
+        arm=version,
+        evaluation=evaluation,
+        functional=functional,
+        latency_ms=latency_ms,
+        session_id=session_id,
+    )
     return redact_record(record, secrets=(token, message, answer))
 
 
 def _failed_case(query_id: str, arm: str, detail: str, *, secrets=()) -> dict:
+    evaluation = evaluate_output(answer="", sources=[], status=f"error: {detail}",
+                                 arm=arm)
+    functional = evaluate_functional({}, citations=[], answer="", status="error")
     return redact_record(
-        {
-            "query_id": query_id,
-            "arm": arm,
-            "latency_ms": 0,
-            "citations": [],
-            "status": f"error: {detail}",
-            "answer_chars": 0,
-            "citation_count": 0,
-            "has_answer": False,
-            "functional": evaluate_functional({}, citations=[], answer="",
-                                             status="error"),
-            "evaluator_version": EVALUATOR_VERSION,
-        },
+        build_case_record(
+            query_id=query_id, arm=arm, evaluation=evaluation,
+            functional=functional,
+        ),
         secrets=tuple(secrets),
     )
 

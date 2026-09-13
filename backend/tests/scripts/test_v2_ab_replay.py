@@ -651,3 +651,149 @@ def test_compare_regresses_when_answer_is_lost():
     assert result["regressions"] == [
         {"query_id": "sec-85-d17", "lost": ["has_answer"]}
     ]
+
+
+# ---------------------------------------------------------------------------
+# Fix round 3 (R12) — shared record schema, provenance + has_answer persisted
+# ---------------------------------------------------------------------------
+
+
+def test_run_record_contains_source_provenance_pairs():
+    from scripts import ab_eval
+
+    http = FakeHttp()
+    http.route(
+        "POST", ab_eval.SESSIONS_PATH, FakeResponse(200, {"session_id": "s"})
+    )
+    http.route(
+        "POST",
+        ab_eval.ADMIN_EVALUATE_PATH,
+        FakeResponse(
+            200,
+            {
+                "version": "v1",
+                "events": _terminal_complete(
+                    answer="Tóm tắt Điều 17.",
+                    sources=[
+                        {
+                            "document_number": "85/2016/NĐ-CP",
+                            "article_label": "Điều 17",
+                        }
+                    ],
+                ),
+            },
+        ),
+    )
+    result = ab_eval.run_eval_turn(
+        http,
+        base_url="http://test",
+        token="tok",
+        arm="v1",
+        query_id="sec-85-d17",
+        message="q",
+    )
+    assert result["sources"] == [
+        {"document_number": "85/2016/NĐ-CP", "article_label": "Điều 17"}
+    ]
+    assert result["citations"] == ["85/2016/NĐ-CP"]
+
+
+def test_replay_record_matches_run_record_keys():
+    from scripts import ab_eval
+    from scripts import replay_v2
+
+    events = _terminal_complete(
+        answer="Tóm tắt Điều 17.",
+        sources=[
+            {"document_number": "85/2016/NĐ-CP", "article_label": "Điều 17"}
+        ],
+    )
+    replayed = replay_v2.replay_to_report({"sec-85-d17": events}, arm="v2")
+    case = replayed["cases"][0]
+    assert case["has_answer"] is True
+    assert set(case.keys()) == set(ab_eval.CASE_RECORD_KEYS)
+    assert case["sources"] == [
+        {"document_number": "85/2016/NĐ-CP", "article_label": "Điều 17"}
+    ]
+
+
+def test_run_vs_replay_same_answers_has_no_answer_loss():
+    from scripts import ab_eval
+    from scripts import replay_v2
+
+    events = _terminal_complete(
+        answer="Tóm tắt Điều 17.",
+        sources=[
+            {"document_number": "85/2016/NĐ-CP", "article_label": "Điều 17"}
+        ],
+    )
+    baseline = {
+        "arm": "v1",
+        "evaluator_version": ab_eval.EVALUATOR_VERSION,
+        "cases": [
+            {
+                "query_id": "sec-85-d17",
+                "status": "complete",
+                "arm": "v1",
+                "has_answer": True,
+                "functional": {
+                    "doc_hit": True,
+                    "article_hit": True,
+                    "negative_pass": None,
+                    "functional_pass": True,
+                },
+            }
+        ],
+    }
+    replayed = replay_v2.replay_to_report(
+        {"sec-85-d17": events},
+        arm="v2",
+        cases={
+            "sec-85-d17": {
+                "expect_document": "85/2016%",
+                "expect_article": [17],
+            }
+        },
+    )
+    result = ab_eval.compare_reports(baseline, replayed)
+    assert result["compared"] == 1
+    assert result["regressions"] == []
+
+
+def test_replay_with_genuine_answer_loss_still_regresses():
+    from scripts import ab_eval
+    from scripts import replay_v2
+
+    baseline = _complete_report(ab_eval)
+    baseline["cases"][0]["has_answer"] = True
+    golden = {
+        "sec-85-d17": {
+            "expect_document": "85/2016%",
+            "expect_article": [17],
+        }
+    }
+    baseline = replay_v2.replay_to_report(
+        {"sec-85-d17": _terminal_complete(
+            answer="Tóm tắt Điều 17.",
+            sources=[
+                {"document_number": "85/2016/NĐ-CP",
+                 "article_label": "Điều 17"}
+            ],
+        )},
+        arm="v1",
+        cases=golden,
+    )
+    replayed = replay_v2.replay_to_report(
+        {"sec-85-d17": _terminal_complete(answer="   ", sources=[])},
+        arm="v2",
+        cases=golden,
+    )
+    assert replayed["cases"][0]["has_answer"] is False
+    result = ab_eval.compare_reports(baseline, replayed)
+    assert result["compared"] == 1
+    assert result["regressions"] == [
+        {
+            "query_id": "sec-85-d17",
+            "lost": ["functional", "has_answer", "doc_hit", "article_hit"],
+        }
+    ]
