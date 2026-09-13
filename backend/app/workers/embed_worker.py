@@ -40,6 +40,7 @@ from app.services.embedding.embedder import get_embedding_service
 from app.services.parsing.heading_path import extract_article_nos
 from app.services.embedding.vector_store import get_vector_store
 from app.workers.utils import (
+    check_and_finalize,
     load_revision_chunk_payloads,
     load_revision_execution,
     mark_revision_failed,
