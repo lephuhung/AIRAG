@@ -120,6 +120,10 @@ from .v2.contracts.validation import (
     validate_checkpoint_payload,
     validate_supervisor_state,
 )
+from .v2.complex_research_graph import (
+    build_complex_research_subgraph,
+    make_complex_boundary_node,
+)
 from .v2.nodes.binding import binding_node
 from .v2.nodes.clarification import clarify_node as _persist_clarification
 from .v2.nodes.clarification import (
@@ -985,6 +989,34 @@ def _route_branch(state: SupervisorV2State) -> str:
     return decision.route
 
 
+def _complex_branch(state: SupervisorV2State) -> str:
+    """Route after the complex subgraph on the MERGED evidence evaluation (R4).
+
+    ``sufficient`` continues into the existing ``synthesize`` node (which then
+    flows ``synthesize -> ground -> finalizer``); every other verdict —
+    ``insufficient``, ``contradictory``, ``needs_input``, or a missing
+    evaluation (typed unavailable/failure path) — goes straight to the
+    ``finalizer``. Synthesis and grounding are never duplicated inside the
+    subgraph. Edges receive raw checkpoint state, so ``Mapping`` execution
+    and evaluation values left by a real round-trip are read tolerantly; a
+    missing execution fails closed to the finalizer, never to synthesis.
+    """
+    execution = state.get("execution")
+    evaluation = None
+    if execution is not None:
+        if isinstance(execution, Mapping):
+            evaluation = execution.get("evidence_evaluation")
+        else:
+            evaluation = getattr(execution, "evidence_evaluation", None)
+    if evaluation is None:
+        return "finalizer"
+    if isinstance(evaluation, Mapping):
+        status = evaluation.get("status")
+    else:
+        status = getattr(evaluation, "status", None)
+    return "synthesize" if status == "sufficient" else "finalizer"
+
+
 def _add_supervisor_edges(graph: StateGraph) -> None:
     graph.set_entry_point("context")
     graph.add_edge("context", "binding")
@@ -1004,7 +1036,11 @@ def _add_supervisor_edges(graph: StateGraph) -> None:
     graph.add_edge("evaluate", "synthesize")
     graph.add_edge("synthesize", "ground")
     graph.add_edge("ground", "finalizer")
-    graph.add_edge("complex_boundary", "finalizer")
+    graph.add_conditional_edges(
+        "complex_boundary",
+        _complex_branch,
+        {"synthesize": "synthesize", "finalizer": "finalizer"},
+    )
     graph.add_edge("finalizer", END)
 
 
@@ -1015,8 +1051,17 @@ def create_supervisor_v2_graph(checkpointer: BaseCheckpointSaver) -> Any:
     lifespan-owned opened ``AsyncPostgresSaver``; tests: ``InMemorySaver``).
     """
     graph = StateGraph(SupervisorV2State, context_schema=GraphRuntimeContext)
+    # Phase 3 replaces only the Phase-2 `complex_boundary` implementation
+    # with the compiled complex-research subgraph. It is compiled WITHOUT
+    # its own checkpointer so it inherits `checkpointer` (and therefore the
+    # shadow run's isolated saver) rather than opening its own.
+    # SUPERVISOR_V2_NODES keeps the Phase-2 unavailable entry untouched.
+    complex_subgraph = build_complex_research_subgraph()
+    complex_boundary_fn = _wrap_node(
+        "complex_boundary", make_complex_boundary_node(complex_subgraph)
+    )
     for name, fn in SUPERVISOR_V2_NODES.items():
-        graph.add_node(name, fn)
+        graph.add_node(name, complex_boundary_fn if name == "complex_boundary" else fn)
     _add_supervisor_edges(graph)
     return graph.compile(checkpointer=checkpointer)
 

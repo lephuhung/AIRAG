@@ -65,6 +65,7 @@ __all__ = [
     "TaskScheduler",
     "execute_ready_tasks",
     "refresh_pairs_for_checkpoint",
+    "shared_scheduler_for",
 ]
 
 
@@ -514,3 +515,14 @@ class TaskScheduler:
             runtime=runtime,
             bindings=bindings,
         )
+
+
+def shared_scheduler_for(runtime: GraphRuntimeContext) -> TaskScheduler:
+    """Return the shared scheduler bound to the request-scoped registry.
+
+    R5 seam for Phase 3: the complex subgraph's ``execute`` node dispatches
+    ONLY through this constructor. No second scheduler is defined or
+    duplicated here — this is the same class Phase 2's ``execute_node``
+    builds inline — and no capability is resolved outside it.
+    """
+    return TaskScheduler(runtime.services.capability_registry)

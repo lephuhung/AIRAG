@@ -626,6 +626,12 @@ async def test_execute_requires_checkpointed_plan() -> None:
 # ---------------------------------------------------------------------------
 # Complex route: typed unavailable, no dispatch (Phase 3 owns the seam)
 # ---------------------------------------------------------------------------
+# Phase 3: the complex route enters the governed complex-research subgraph and
+# fails closed there (this fixture binds two `target` roles and wires no
+# document.read capability, so the compare pilot refuses to fabricate a plan).
+# The boundary wrapper converts that into the sticky typed error: the route
+# is cleared, the final response is a typed `error` (never success), nothing
+# is dispatched, and the binding pins stay leased.
 
 
 @pytest.mark.asyncio
@@ -664,8 +670,11 @@ async def test_complex_route_returns_typed_unavailable() -> None:
     result = await graph.ainvoke(
         make_state(request=make_request("So sánh hai tài liệu")), config, context=runtime
     )
-    assert N(result)["route_decision"].route == "complex_research"
-    assert N(result)["final_response"].status in ("denied", "error")
+    # The subgraph failed closed (no plannable two-sided read here), so the
+    # owned boundary converted: the topology is cleared and only the typed
+    # error marker remains.
+    assert N(result)["route_decision"] is None
+    assert N(result)["final_response"].status == "error"
     assert N(result)["final_response"].status != "success"
     assert capability.calls == [], "complex routes must not dispatch Phase-2 capabilities"
     assert any(event.startswith("acquire:") for event in events)

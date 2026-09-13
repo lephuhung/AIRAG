@@ -15,6 +15,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import inspect
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4, uuid5
@@ -546,11 +547,33 @@ def test_v2_has_no_domain_agent_or_domain_graph_wrappers() -> None:
     root = Path(v2.__file__).parent
     # No domain-agent modules and no LangGraph graph/subgraph construction
     # anywhere under v2: only nodes and atomic capabilities may exist.
+    # Phase-3 exception (normative amendment §6): `complex_research_graph.py`
+    # is the ONE authorized adaptive planning boundary, implemented as a
+    # checkpointed LangGraph subgraph inheriting the supervisor saver. It
+    # must still contain no domain agent (no *_agent.py module, no *Agent
+    # class, no second scheduler/checkpointer).
+    COMPLEX_SUBGRAPH = "complex_research_graph.py"
     for path in sorted(root.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
         assert not path.name.endswith("_agent.py"), path.name
         text = path.read_text()
+        if path.name == COMPLEX_SUBGRAPH:
+            assert not re.search(r"class\s+\w*Agent\b", text), path.name
+            for banned in (
+                "people_agent",
+                "comparison_agent",
+                "summary_agent",
+                "document_agent",
+                "section_agent",
+                "kg_agent",
+                "evaluation_agent",
+                "grounding_agent",
+            ):
+                assert banned not in text, (path.name, banned)
+            assert "class TaskScheduler" not in text, path.name
+            assert "checkpointer=" not in text, path.name
+            continue
         assert "StateGraph" not in text, path.name
         assert "Subgraph" not in text, path.name
     # Capability modules define atomic capabilities only: no *Agent classes
