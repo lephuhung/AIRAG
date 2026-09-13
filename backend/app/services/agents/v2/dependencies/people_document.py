@@ -44,6 +44,7 @@ from typing import Any, Literal
 from uuid import UUID
 
 from ..contracts.capability import DocumentSearchInput, PeopleLookupOutput
+from ..contracts.evidence import PeopleSourceIdentity
 from ..contracts.execution import AgentResult, TaskExecutionSummary
 from ..contracts.planning import (
     DiscoveryPolicy,
@@ -243,12 +244,15 @@ async def materialize_person_dependency(
     admitted_use_ids: list[UUID] = []
     owned_items = 0
     for item in admitted or ():
-        # R28: each hydrated item must be People evidence owned by the
-        # supplying people.lookup task. A use attached to another task, a
-        # target-bound read use, or a non-People record (the governed
-        # hydrator labels People content with source_label "people") is
-        # ignored -- fail closed -- never a scalar source.
+        # R29: each hydrated item must be People evidence owned by the
+        # supplying people.lookup task, verified on the TYPED source
+        # identity (non-spoofable) -- never on the human-readable label.
+        # A use attached to another task, a target-bound read use, or a
+        # non-People record is ignored -- fail closed -- never a scalar
+        # source.
         if getattr(item, "task_id", None) != people_task_id:
+            continue
+        if not isinstance(getattr(item, "source_identity", None), PeopleSourceIdentity):
             continue
         if getattr(item, "purpose", None) != "supporting":
             continue
@@ -257,8 +261,6 @@ async def materialize_person_dependency(
         if getattr(item, "locator", None) is not None:
             continue
         if getattr(item, "document_revision", None) is not None:
-            continue
-        if getattr(item, "source_label", None) != "people":
             continue
         owned_items += 1
         content = getattr(item, "content", None)

@@ -42,7 +42,7 @@ from app.services.agents.v2.contracts.capability import (
     PeopleLookupInput,
     PeopleLookupOutput,
 )
-from app.services.agents.v2.contracts.evidence import EvidenceUseRef
+from app.services.agents.v2.contracts.evidence import DocumentSourceIdentity, EvidenceUseRef, PeopleSourceIdentity
 from app.services.agents.v2.contracts.execution import (
     AgentError,
     AgentRequest,
@@ -107,13 +107,14 @@ def _minimized_content(identifier: str | None = None) -> str:
 
 
 def _hydrated(
-    content: str,
+    content: str | None,
     *,
     use_id: UUID = USE_ID,
     task_id: str = "T1",
     purpose: str = "supporting",
     target_id: str | None = None,
     source_label: str | None = "people",
+    source_identity: object | None = None,
 ) -> HydratedEvidence:
     return HydratedEvidence(
         use_id=use_id,
@@ -121,9 +122,14 @@ def _hydrated(
         task_id=task_id,
         purpose=purpose,  # type: ignore[arg-type]
         target_id=target_id,
-        content=content,
+        content=content,  # type: ignore[arg-type]
         role=None,
         source_label=source_label,
+        source_identity=(
+            source_identity
+            if source_identity is not None
+            else PeopleSourceIdentity(kind="people", record_id="rec-1")
+        ),
         classification="personal",
         locator=None,
         document_revision=None,
@@ -464,12 +470,21 @@ async def test_materializer_rejects_evidence_owned_by_another_task() -> None:
 
 @pytest.mark.asyncio
 async def test_materializer_rejects_non_people_evidence() -> None:
+    from app.services.agents.v2.contracts.locators import DocumentLocator
+
     plan = _people_plan()
+    doc_identity = DocumentSourceIdentity(
+        kind="document",
+        document_id=UUID("11111111-1111-1111-1111-111111111111"),
+        document_revision="rev-1",
+        locator=DocumentLocator(kind="document"),
+    )
     for bad in (
-        _hydrated(
-            _minimized_content(SCALAR),
-            source_label="document",
-        ),
+        # REAL wrong-source proof (R29): the TYPED identity is a document
+        # record carrying an extractable scalar -- and the label even claims
+        # "people". The typed identity check still refuses it: labels are
+        # not a security boundary.
+        _hydrated(_minimized_content(SCALAR), source_identity=doc_identity),
         _hydrated(_minimized_content(SCALAR), purpose="coverage", target_id="t1"),
         _hydrated(content=None),
     ):
@@ -829,6 +844,20 @@ async def test_people_scalar_never_enters_planner_observation() -> None:
     assert SCALAR not in dumped
     for token in FORBIDDEN_OBSERVATION_TOKENS:
         assert token not in dumped
+
+
+def test_synthesis_projection_exposes_label_only_never_typed_identity() -> None:
+    """R29.5: the typed source identity must NOT reach the synthesis model."""
+    from app.services.agents.v2.contracts.synthesis import SynthesisEvidence
+    from app.services.agents.v2.nodes.synthesize import _project
+
+    assert "source_identity" not in SynthesisEvidence.model_fields
+    item = _hydrated(_minimized_content(SCALAR))
+    assert isinstance(item.source_identity, PeopleSourceIdentity)
+    projected = _project(item)
+    assert projected.source_label == "people"
+    assert not hasattr(projected, "source_identity")
+    assert "source_identity" not in projected.model_dump_json()
 
 
 @pytest.mark.asyncio

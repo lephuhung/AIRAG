@@ -66,7 +66,7 @@ from ..contracts.evaluation import (
     EvidenceEvaluation,
     MissingRequirement,
 )
-from ..contracts.evidence import EvidenceClassification, EvidencePurpose, EvidenceUseRef
+from ..contracts.evidence import EvidenceClassification, EvidencePurpose, EvidenceSourceIdentity, EvidenceUseRef
 from ..contracts.execution import AgentResult
 from ..contracts.locators import (
     ArticleLocator,
@@ -123,7 +123,15 @@ class HydratedEvidence:
     content so deterministic coverage and the synthesis budget need no second
     store lookup, and ``document_revision`` lets the evaluator re-check the
     pinned revision independently of hydration admission. ``target_id`` is the
-    admitted use's own target; discovery uses never hydrate.
+    admitted use's own target; discovery uses never hydrate. ``source_identity``
+    is the typed ``EvidenceSourceIdentity`` resolved from the admitted
+    ``EvidenceRecord`` (R29): it lets server-side consumers (e.g. the
+    People→Document materializer) verify the source kind without trusting the
+    human-readable ``source_label``, which remains the ONLY source descriptor
+    that reaches model-facing projections. The typed identity itself is never
+    serialized into a model prompt. It defaults to ``None`` for
+    backward-compatible doubles; production hydration always populates it,
+    and consumers MUST treat a missing identity as unverified (fail closed).
     """
 
     use_id: UUID
@@ -137,6 +145,7 @@ class HydratedEvidence:
     classification: EvidenceClassification
     locator: ContentLocator | None
     document_revision: str | None = None
+    source_identity: EvidenceSourceIdentity | None = None
 
 
 @dataclass

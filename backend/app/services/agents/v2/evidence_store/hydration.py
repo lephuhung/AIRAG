@@ -206,6 +206,7 @@ class GovernorEvidenceHydrator(EvidenceHydrator):
             content=content,
             role=binding.role if binding is not None else None,
             source_label=_source_label(record),
+            source_identity=record.source,
             classification=row.classification,
             locator=(
                 record.source.locator
@@ -348,10 +349,11 @@ class GovernorEvidenceHydrator(EvidenceHydrator):
             raise HydrationError("derived overflow content must be non-blank")
         if not source_evidence_ids:
             raise HydrationError("derived overflow requires source lineage")
+        derived_source = DerivedSourceIdentity(
+            kind="derived", source_evidence_ids=source_evidence_ids
+        )
         evidence_id = await self._governor.persist_record(
-            source=DerivedSourceIdentity(
-                kind="derived", source_evidence_ids=source_evidence_ids
-            ),
+            source=derived_source,
             content=content,
             provenance=provenance,
             validation_state=DERIVED_VALIDATED,
@@ -399,6 +401,7 @@ class GovernorEvidenceHydrator(EvidenceHydrator):
             content=content,
             role=binding.role if binding is not None else None,
             source_label="derived",
+            source_identity=derived_source,
             classification=classification,
             locator=None,
             document_revision=None,
