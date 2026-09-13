@@ -82,12 +82,8 @@ from .contracts.planning import (
 from .contracts.routing import QueryAnalysis
 from .contracts.semantic import SemanticContext
 from .contracts.state import GraphRuntimeContext, SupervisorV2State
-from .contracts.synthesis import SynthesisEvidence
-from .contracts.validation import (
-    ContractValidationError,
-    validate_answer_draft,
-    validate_task_plan,
-)
+from .contracts.synthesis import SynthesisInput
+from .contracts.validation import ContractValidationError, validate_task_plan
 from .dependencies.people_document import (
     MaterializationError,
     append_materialized_dependent,
@@ -99,7 +95,7 @@ from .discovery import DiscoveryDenied, DiscoveryDisabled, request_addition
 from .nodes.context import node_context
 from .nodes.evaluate import _EVIDENCE_SUPPLYING_CAPABILITIES, evaluate_evidence
 from .nodes.execute import execution_update
-from .nodes.synthesize import build_extractive_draft
+from .nodes.synthesize import DEFAULT_SYNTHESIS_BUDGET, synthesize_answer
 from .replanning import ReplanRejected, validate_runtime_replan
 from .skills.compare import policy as compare_policy
 from .skills.summarize import policy as summarize_policy
@@ -1451,19 +1447,20 @@ async def summarize_reduce_node(
     state: ComplexResearchState,
     runtime: "Runtime[GraphRuntimeContext]",
 ) -> dict:
-    """Drive the deterministic REDUCE stage through framework boundaries (R43).
+    """Drive the deterministic REDUCE through the EXISTING synthesis path (R47).
 
     Runs between ``evaluate`` and ``decide``. Active only for a summarize
     map plan whose checkpointed reduce spec survived with a ``sufficient``
-    evaluation. It hydrates the admitted map-task uses IN SPEC ORDER through
-    the governed hydrator, projects them with the existing synthesis
-    projection, reduces them with the existing deterministic
-    ``build_extractive_draft``, validates the draft against the admitted
-    use set, and stores it in the existing ``answer_draft_channel`` handoff
-    for the ground node. The agent never owns the reduce; no new
-    capability and no new contract are involved. Dormant (``{}``) for every
-    other plan, for non-sufficient evaluations, and when no channel is
-    wired (the supervisor synthesize node then covers the answer).
+    evaluation. It calls the existing ``synthesize_answer`` boundary with
+    the map-task uses IN SPEC ORDER under the existing synthesis budget —
+    so hydration, budget/overflow governance, drafting (extractive
+    default), claim validation, and fresh-use leasing all run inside the
+    framework's own synthesis path — then stores the validated draft in
+    the existing ``answer_draft_channel`` handoff for the ground node. The
+    agent never owns the reduce; no new capability and no new contract are
+    involved. Dormant (``{}``) for every other plan and for non-sufficient
+    evaluations. Mandatory: a missing channel or synthesis seam fails
+    closed with a typed error instead of silently skipping the reduce.
     """
     context = node_context(runtime)
     state = normalize_complex_state(state)
@@ -1484,7 +1481,16 @@ async def summarize_reduce_node(
         )
     channel = getattr(context.services, "answer_draft_channel", None)
     if channel is None:
-        return {}
+        raise ComplexResearchError(
+            "summarize reduce needs the answer_draft_channel handoff; "
+            "refusing to silently skip the mandatory reduce"
+        )
+    store = getattr(channel, "store_draft", None)
+    if store is None:
+        raise ComplexResearchError(
+            "answer_draft_channel exposes no store_draft; refusing to "
+            "reduce without the framework handoff"
+        )
     results = tuple(state.get("task_results", ()))
     result_by_task = {result.task_id: result for result in results}
     ordered_refs = []
@@ -1497,51 +1503,27 @@ async def summarize_reduce_node(
             )
         ordered_refs.extend(result.evidence_uses)
     if not ordered_refs:
-        return {}
-    hydrator = getattr(context.services, "evidence_hydrator", None)
-    if hydrator is None:
         raise ComplexResearchError(
-            "reduce needs the governed evidence hydrator; refusing to "
-            "reduce unadmitted evidence"
+            "reduce spec names map tasks with no evidence uses; refusing "
+            "an empty reduction"
         )
-    hydrated = await hydrator.hydrate_for_evaluation(
-        tuple(ordered_refs),
+    # The existing synthesis boundary owns hydration (budget/overflow),
+    # drafting, validation, and leasing from here on.
+    synthesis = await synthesize_answer(
+        synthesis_input=SynthesisInput(
+            semantic=state["semantic"],
+            evaluation=evaluation,
+            evidence_uses=tuple(ordered_refs),
+        ),
         runtime=context,
         plan=plan,
         bindings=state["bindings"],
+        budget=DEFAULT_SYNTHESIS_BUDGET,
     )
-    position = {ref.use_id: index for index, ref in enumerate(ordered_refs)}
-    admitted = tuple(
-        item
-        for item in (hydrated or ())
-        if getattr(item, "purpose", None) != "discovery"
-        and getattr(item, "use_id", None) in position
-    )
-    admitted = tuple(sorted(admitted, key=lambda item: position[item.use_id]))
-    if not admitted:
-        return {}
-    evidence = tuple(
-        SynthesisEvidence(
-            use_id=item.use_id,
-            content=item.content,
-            role=item.role,
-            target_id=item.target_id,
-            source_label=item.source_label,
-        )
-        for item in admitted
-    )
-    draft = build_extractive_draft(evidence)
-    validate_answer_draft(
-        draft, frozenset(item.use_id for item in admitted)
-    )
-    store = getattr(channel, "store_draft", None)
-    if store is None:
-        raise ComplexResearchError(
-            "answer_draft_channel exposes no store_draft; refusing to "
-            "reduce without the framework handoff"
-        )
     store(
-        context.capability_runtime.run_id, draft=draft, evidence=admitted
+        context.capability_runtime.run_id,
+        draft=synthesis.draft,
+        evidence=synthesis.evidence,
     )
     return {}
 

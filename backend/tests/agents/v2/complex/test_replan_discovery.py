@@ -1366,6 +1366,184 @@ def test_denied_people_task_never_recovers() -> None:
 
 @pytest.mark.asyncio
 async def test_real_t1_not_found_drives_recovery(discovery_settings: None) -> None:
+    """R46: production graph routes T1 not_found to a distinct recovery replan.
+
+    Starts from the real initial entry with a stub registry, lets the
+    compiled graph route plan → validate → execute → evaluate → decide →
+    replan → validate naturally (asserted on the stream), and proves: T1
+    dispatched exactly once, the real evaluate went insufficient, decide
+    admitted the replan, T2 was appended and dispatched, no scalar was
+    fabricated, and not_found stays distinct from TIMEOUT.
+    """
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from app.services.agents.v2.complex_research_graph import (
+        _build_complex_research_graph,
+        normalize_complex_state,
+    )
+
+    people, search, _, _, _, context = _people_harness(
+        "run-real-nf-1", FakePeopleCapability(status="not_found")
+    )
+    child = _child_input(
+        semantic=_person_semantic(),
+        query_analysis=_cross_domain_analysis(),
+        replans_remaining=2,
+    )
+    compiled = _build_complex_research_graph().compile(
+        checkpointer=InMemorySaver()
+    )
+    config = {"configurable": {"thread_id": "thread-real-nf-1"}}
+    seen: list[str] = []
+    node_updates: dict[str, list[dict]] = {}
+    async for chunk in compiled.astream(child, config=config, context=context):
+        for node_name, update in chunk.items():
+            seen.append(node_name)
+            node_updates.setdefault(node_name, []).append(update)
+    assert seen[0] == "plan"
+    assert "replan" in seen
+    first_replan = seen.index("replan")
+    assert "validate_checkpoint" in seen[first_replan:]
+
+    first_execute = node_updates["execute"][0]
+    assert [(r.task_id, r.status) for r in first_execute["task_results"]] == [
+        ("T1", "not_found")
+    ]
+    first_evaluate = node_updates["evaluate"][0]
+    assert first_evaluate["evaluation"].status == "insufficient"
+    assert first_evaluate["evaluation"].missing == ()
+
+    snapshot = await compiled.aget_state(config)
+    # aget_state returns checkpoint-serde values: coerce exactly like a
+    # checkpoint load before walking the aggregate.
+    terminal = normalize_complex_state(dict(snapshot.values))
+    assert [task.task_id for task in terminal["plan"].tasks] == ["T1", "T2"]
+    recovery = terminal["plan"].tasks[1]
+    assert recovery.capability == "document.search"
+    assert recovery.input.person_identifier is None  # type: ignore[union-attr]
+    assert recovery.input.query == terminal["plan"].goal  # type: ignore[union-attr]
+    assert "not_found" in recovery.origin.reason  # type: ignore[union-attr]
+    assert "TIMEOUT" not in recovery.origin.reason  # type: ignore[union-attr]
+    assert recovery.origin.task_ids == ("T1",)  # type: ignore[union-attr]
+    assert [call[0].task_id for call in people.calls] == ["T1"]
+    assert [call[0].task_id for call in search.calls] == ["T2"]
+    assert terminal["evaluation"].status == "insufficient"
+
+
+@pytest.mark.asyncio
+async def test_real_t1_timeout_drives_distinct_recovery(
+    discovery_settings: None,
+) -> None:
+    """R46: production graph routes T1 TIMEOUT to a distinct recovery replan."""
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from app.services.agents.v2.complex_research_graph import (
+        _build_complex_research_graph,
+        build_task_execution_summaries,
+        normalize_complex_state,
+    )
+
+    people, search, _, _, _, context = _people_harness(
+        "run-real-to-1", FakePeopleCapability(status="error", error_code="TIMEOUT")
+    )
+    child = _child_input(
+        semantic=_person_semantic(),
+        query_analysis=_cross_domain_analysis(),
+        replans_remaining=2,
+    )
+    compiled = _build_complex_research_graph().compile(
+        checkpointer=InMemorySaver()
+    )
+    config = {"configurable": {"thread_id": "thread-real-to-1"}}
+    seen: list[str] = []
+    node_updates: dict[str, list[dict]] = {}
+    async for chunk in compiled.astream(child, config=config, context=context):
+        for node_name, update in chunk.items():
+            seen.append(node_name)
+            node_updates.setdefault(node_name, []).append(update)
+    assert seen[0] == "plan"
+    assert "replan" in seen
+
+    first_execute = node_updates["execute"][0]
+    assert [(r.task_id, r.status) for r in first_execute["task_results"]] == [
+        ("T1", "error")
+    ]
+    outcomes = build_task_execution_summaries(first_execute["task_results"])
+    assert outcomes[0].error_code == "TIMEOUT"
+    first_evaluate = node_updates["evaluate"][0]
+    assert first_evaluate["evaluation"].status == "insufficient"
+
+    snapshot = await compiled.aget_state(config)
+    # aget_state returns checkpoint-serde values: coerce exactly like a
+    # checkpoint load before walking the aggregate.
+    terminal = normalize_complex_state(dict(snapshot.values))
+    assert [task.task_id for task in terminal["plan"].tasks] == ["T1", "T2"]
+    recovery = terminal["plan"].tasks[1]
+    assert recovery.capability == "document.search"
+    assert recovery.input.person_identifier is None  # type: ignore[union-attr]
+    assert "TIMEOUT" in recovery.origin.reason  # type: ignore[union-attr]
+    assert "not_found" not in recovery.origin.reason  # type: ignore[union-attr]
+    assert [call[0].task_id for call in people.calls] == ["T1"]
+    assert [call[0].task_id for call in search.calls] == ["T2"]
+    assert terminal["evaluation"].status == "insufficient"
+
+
+@pytest.mark.asyncio
+async def test_timeout_recovery_is_distinct_and_fabricates_nothing(
+    discovery_settings: None,
+) -> None:
+    """R37/§26: TIMEOUT is typed distinctly from not_found, same guarantees."""
+    from app.services.agents.v2.complex_research_graph import (
+        build_complex_research_subgraph,
+        replan_advisable,
+    )
+
+    capabilities, _, _, context = _discovery_harness(run_id="run-timeout-1")
+    search_capability = capabilities[1]
+    child = _child_input(
+        plan=_people_plan(),
+        task_results=(_timeout_people_result(),),
+        evaluation=_insufficient_evaluation(),
+        replans_remaining=2,
+    )
+    assert replan_advisable(child) is True
+    output = await build_complex_research_subgraph().ainvoke(child, context=context)
+    tasks = output["plan"].tasks
+    assert [task.task_id for task in tasks] == ["T1", "T2"]
+    recovery = tasks[1]
+    assert recovery.capability == "document.search"
+    assert recovery.input.person_identifier is None  # type: ignore[union-attr]
+    assert isinstance(recovery.origin, ReplanTaskOrigin)
+    assert "TIMEOUT" in recovery.origin.reason
+    assert "not_found" not in recovery.origin.reason
+    assert [call[0].task_id for call in search_capability.calls] == ["T2"]
+    assert output["evaluation"].status == "insufficient"
+
+
+def test_denied_people_task_never_recovers() -> None:
+    """R37: denial is terminal — no fallback work is proposed for it."""
+    from app.services.agents.v2.complex_research_graph import replan_advisable
+
+    denied = AgentResult(
+        contract_version="2.0",
+        task_id="T1",
+        status="denied",
+        data=None,
+        evidence_uses=(),
+        coverage_observations=(),
+        error={"code": "PERMISSION_DENIED", "message": "no", "retryable": False},  # type: ignore[arg-type]
+    )
+    child = _child_input(
+        plan=_people_plan(),
+        task_results=(denied,),
+        evaluation=_insufficient_evaluation(),
+        replans_remaining=2,
+    )
+    assert replan_advisable(child) is False
+
+
+@pytest.mark.asyncio
+async def test_real_t1_not_found_drives_recovery(discovery_settings: None) -> None:
     """R42: REAL graph entry — initial T1 executes not_found, recovery follows.
 
     Builds the plan via the real initial-plan path (cross_domain →
@@ -2431,14 +2609,16 @@ async def test_large_summarize_map_reduces_over_sections() -> None:
 
 
 def test_reduce_uses_framework_boundaries_not_agent_or_capability() -> None:
-    """R43(c)(d): reduce runs framework code; no new capability/contract."""
+    """R43(c)(d)/R47: reduce runs the synthesis boundary; no new capability."""
     import app.services.agents.v2.complex_research_graph as graph_module
     import app.services.agents.v2.skills.summarize.policy as policy_module
     from app.services.agents.v2.contracts.capability import CapabilityInput
 
     reduce_source = inspect.getsource(graph_module.summarize_reduce_node)
-    assert "build_extractive_draft" in reduce_source
+    assert "synthesize_answer" in reduce_source
     assert "store_draft" in reduce_source
+    assert "hydrate_for_evaluation" not in reduce_source
+    assert "build_extractive_draft" not in reduce_source
     assert "capability.execute(" not in reduce_source
     assert "TaskScheduler" not in reduce_source
     policy_source = inspect.getsource(policy_module)
@@ -2466,6 +2646,140 @@ def test_reduce_uses_framework_boundaries_not_agent_or_capability() -> None:
 
     assert not hasattr(contracts_package, "SummarizeWorkflow")
     assert not hasattr(contracts_package, "ReduceSpec")
+
+
+class BudgetSpyHydrator(FakeHydrator):
+    """Synthesis-entry spy: records the budget and enforces its item head."""
+
+    def __init__(self, capabilities: tuple[FakeReadCapability, ...]) -> None:
+        super().__init__(capabilities)
+        self.synthesis_calls: list[dict] = []
+
+    async def hydrate_for_synthesis(  # type: ignore[no-untyped-def]
+        self, use_refs, *, runtime, plan, bindings, budget
+    ):
+        self.synthesis_calls.append(
+            {"budget": budget, "ref_ids": [ref.use_id for ref in use_refs]}
+        )
+        admitted = await super().hydrate_for_synthesis(
+            use_refs, runtime=runtime, plan=plan, bindings=bindings, budget=budget
+        )
+        return tuple(admitted)[: budget.max_evidence_items]
+
+
+@pytest.mark.asyncio
+async def test_reduce_applies_synthesis_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R47: the reduce exercises the synthesis entry and honors its budget."""
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    import app.services.agents.v2.complex_research_graph as graph_module
+    from app.services.agents.v2.complex_research_graph import (
+        _build_complex_research_graph,
+    )
+    from app.services.agents.v2.contracts.locators import SectionLocator
+    from app.services.agents.v2.contracts.synthesis import SynthesisRuntimeContext
+
+    tiny_budget = SynthesisRuntimeContext(
+        max_evidence_items=1, max_total_chars=100000, max_total_tokens=10000
+    )
+    monkeypatch.setattr(
+        graph_module, "DEFAULT_SYNTHESIS_BUDGET", tiny_budget
+    )
+    locator_for = {
+        "s1": SectionLocator(kind="section", structure_node_id="chap-II"),
+        "s2": SectionLocator(kind="section", structure_node_id="chap-III"),
+    }
+    (document_capability, section_capability), leases, context = _harness(
+        run_id="run-reduce-budget-1", locator_for=locator_for
+    )
+    spy = BudgetSpyHydrator((document_capability, section_capability))
+    context.services.evidence_hydrator = spy
+    channel = FakeDraftChannel()
+    context.services.answer_draft_channel = channel
+    child = _child_input(
+        query_analysis=_analysis("summarize"),
+        bindings=_single_target_bindings(),
+        semantic=_section_semantic(),
+    )
+    compiled = _build_complex_research_graph().compile(
+        checkpointer=InMemorySaver()
+    )
+    output = await compiled.ainvoke(
+        child,
+        config={"configurable": {"thread_id": "thread-reduce-budget-1"}},
+        context=context,
+    )
+    assert output["evaluation"].status == "sufficient"
+    # The synthesis entry ran exactly once (the reduce), with the budget,
+    # and the map uses arrived in spec order.
+    assert len(spy.synthesis_calls) == 1
+    call = spy.synthesis_calls[0]
+    assert call["budget"] is tiny_budget
+    s1_uses = {
+        use_id
+        for use_id, (_, target_id) in section_capability.uses.items()
+        if target_id == "s1"
+    }
+    s2_uses = {
+        use_id
+        for use_id, (_, target_id) in section_capability.uses.items()
+        if target_id == "s2"
+    }
+    assert len(s1_uses) == 1 and len(s2_uses) == 1
+    assert call["ref_ids"] == [next(iter(s1_uses)), next(iter(s2_uses))]
+    # The passed budget bound the draft: one head claim, not two.
+    assert len(channel.stored) == 1
+    _, draft, _ = channel.stored[0]
+    assert [claim.text for claim in draft.claims] == ["content of s1"]
+
+
+@pytest.mark.asyncio
+async def test_reduce_missing_seam_fails_closed() -> None:
+    """R47: a missing channel or hydrator fails the mandatory reduce closed."""
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    from app.services.agents.v2.complex_research_graph import (
+        ComplexResearchError,
+        _build_complex_research_graph,
+        summarize_reduce_node,
+    )
+    from app.services.agents.v2.contracts.locators import SectionLocator
+    from app.services.agents.v2.nodes.synthesize import SynthesisError
+
+    locator_for = {
+        "s1": SectionLocator(kind="section", structure_node_id="chap-II"),
+        "s2": SectionLocator(kind="section", structure_node_id="chap-III"),
+    }
+    _, _, context = _harness(
+        run_id="run-reduce-closed-1", locator_for=locator_for
+    )
+    channel = FakeDraftChannel()
+    context.services.answer_draft_channel = channel
+    child = _child_input(
+        query_analysis=_analysis("summarize"),
+        bindings=_single_target_bindings(),
+        semantic=_section_semantic(),
+    )
+    compiled = _build_complex_research_graph().compile(
+        checkpointer=InMemorySaver()
+    )
+    sufficient = await compiled.ainvoke(
+        child,
+        config={"configurable": {"thread_id": "thread-reduce-closed-1"}},
+        context=context,
+    )
+    assert sufficient["evaluation"].status == "sufficient"
+    assert len(channel.stored) == 1
+
+    context.services.answer_draft_channel = None
+    with pytest.raises(ComplexResearchError):
+        await summarize_reduce_node(sufficient, context)
+    context.services.answer_draft_channel = channel
+    context.services.evidence_hydrator = None
+    with pytest.raises(SynthesisError):
+        await summarize_reduce_node(sufficient, context)
 
 
 def test_bounded_summarize_stays_fast() -> None:
@@ -2530,113 +2844,242 @@ def test_bounded_summarize_stays_fast() -> None:
 
 @pytest.mark.asyncio
 async def test_subagent_cannot_append_authoritative_tasks() -> None:
-    """R45: authoritative TaskSpec appends happen ONLY through the governed path.
+    """R48.1+R48.3: plan appends happen ONLY in governed entry points.
 
-    Structural (AST): every ``TaskSpec(`` construction site in production v2
-    code lives in the governed set — frozen contract definition, deterministic
-    fast-plan builder, the subgraph's validate/materialize/replan ownership,
-    the gateway proposal adapter, the skill policies, and the governed
-    People→Document materializer. Behavioral: a hand-appended unauthorized
-    task is rejected by the runtime replan wrapper, and an unknown task id
-    fails the pre-dispatch guard.
+    Structural (AST, function granularity — not a file whitelist): a
+    ``TaskPlan(`` constructor or a ``.tasks +`` tuple extension anywhere
+    outside the listed governed functions FAILS this guard, so a new
+    unvalidated append inside ``complex_research_graph.py`` (or anywhere
+    else) cannot slip through. A second AST check proves checkpointed-plan
+    updates are returned only by the two owning nodes. Behavioral: even a
+    hand-built rogue plan fed straight to the shared scheduler fails closed
+    with a typed error and dispatches nothing — a non-governed append is
+    unreachable AND unexecutable.
     """
     import ast
 
-    from app.services.agents.v2.replanning import ReplanRejected
-    from app.services.agents.v2.tools.observations import (
-        AgentToolObservation,
-        PeopleLookupObservation,
-    )
-
     v2_root = Path(__file__).resolve().parents[5] / "backend/app/services/agents/v2"
     assert v2_root.is_dir()
-    allowed = {
-        "nodes/fast_plan.py",
-        "complex_research_graph.py",
-        "dependencies/people_document.py",
-        "tools/gateway.py",
-        "skills/compare/policy.py",
-        "skills/summarize/policy.py",
-    }
-    offenders = []
+
+    def enclosing_functions(tree: ast.AST) -> dict[int, tuple[str, ...]]:
+        scopes: dict[int, tuple[str, ...]] = {}
+
+        class Visitor(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.stack: list[str] = []
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+                self.stack.append(node.name)
+                scopes[id(node)] = tuple(self.stack)
+                self.generic_visit(node)
+                self.stack.pop()
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+            def visit_Call(self, node: ast.Call) -> None:
+                scopes[id(node)] = tuple(self.stack)
+                self.generic_visit(node)
+
+            def visit_BinOp(self, node: ast.BinOp) -> None:
+                scopes[id(node)] = tuple(self.stack)
+                self.generic_visit(node)
+
+            def visit_Return(self, node: ast.Return) -> None:
+                scopes[id(node)] = tuple(self.stack)
+                self.generic_visit(node)
+
+        Visitor().visit(tree)
+        return scopes
+
+    def is_tasks_add(node: ast.BinOp) -> bool:
+        if not isinstance(node.op, ast.Add):
+            return False
+        return any(
+            isinstance(side, ast.Attribute) and side.attr == "tasks"
+            for side in (node.left, node.right)
+        )
+
+    constructors: set[tuple[str, str]] = set()
+    appends: set[tuple[str, str]] = set()
+    plan_returns: set[tuple[str, str]] = set()
     for module_path in sorted(v2_root.rglob("*.py")):
         if "__pycache__" in module_path.parts:
             continue
+        rel = str(module_path.relative_to(v2_root))
         tree = ast.parse(module_path.read_text())
+        scopes = enclosing_functions(tree)
         for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "TaskSpec"
-            ):
-                offenders.append(
-                    str(module_path.relative_to(v2_root))
+            scope = scopes.get(id(node), ())
+            func = scope[-1] if scope else "<module>"
+            if isinstance(node, ast.Call):
+                func_ref = node.func
+                name = (
+                    func_ref.id
+                    if isinstance(func_ref, ast.Name)
+                    else (func_ref.attr if isinstance(func_ref, ast.Attribute) else "")
                 )
-                break
-    assert set(offenders) <= allowed, sorted(set(offenders) - allowed)
-    assert set(offenders) == allowed
+                if name == "TaskPlan":
+                    constructors.add((rel, func))
+            elif isinstance(node, ast.BinOp) and is_tasks_add(node):
+                appends.add((rel, func))
+            elif isinstance(node, ast.Return) and isinstance(node.value, ast.Dict):
+                if any(
+                    isinstance(key, ast.Constant) and key.value == "plan"
+                    for key in node.value.keys
+                ):
+                    plan_returns.add((rel, func))
 
-    # The advisory payload schema is pinned to the minimized set: a People
-    # observation carries exactly availability truth, so no raw scalar has
-    # any typed carrier into an advisory consumer.
-    assert set(PeopleLookupObservation.model_fields) == {
-        "kind",
-        "matched",
-        "dependency_scalar_available",
+    # Initial-plan constructors: deterministic builders and skill policies.
+    assert constructors == {
+        ("nodes/fast_plan.py", "build_fast_plan"),
+        ("skills/compare/policy.py", "build_compare_plan"),
+        ("skills/summarize/policy.py", "build_summarize_workflow"),
+        ("complex_research_graph.py", "_people_first_plan"),
     }
-    for field_name, field in AgentToolObservation.model_fields.items():
-        annotation = str(field.annotation)
-        assert "Mapping" not in annotation, field_name
-        assert "dict" not in annotation.lower(), field_name
-        assert "Any" not in annotation, field_name
+    # Task-tuple EXTENSIONS: exactly the governed append owners. A new
+    # unvalidated ``.tasks +`` append in any other function fails here.
+    assert appends == {
+        ("tools/gateway.py", "propose"),
+        ("complex_research_graph.py", "build_replan_proposal"),
+        ("dependencies/people_document.py", "append_materialized_dependent"),
+    }
+    # Checkpointed-plan updates are returned only by the two owning nodes
+    # (the parent→child mapping passes the already-checkpointed plan through).
+    assert plan_returns == {
+        ("complex_research_graph.py", "validate_checkpoint_node"),
+        ("complex_research_graph.py", "people_document_materialize_node"),
+    }
 
-    # An advisory suggestion (free text + capability name) is not a TaskSpec:
-    # smuggling it past the gateway fails closed and changes no plan.
-    _, _, context = _harness(run_id="run-subagent-1")
-    current = _two_target_plan()
-    gateway = AgentToolGateway()
-    smuggled = await gateway.propose(
-        CapabilityInvocationProposal(
-            capability="advisory.summarize",
-            objective="a subagent suggests summarizing",
-            input=DocumentReadInput(kind="document.read", target_ids=("t1",)),
-        ),
-        current,
-        context,
-    )
-    assert smuggled.accepted is False
-    assert smuggled.plan == current
-    with pytest.raises(UnplannedCapabilityDispatch):
-        require_planned_dispatch(current, "T-subagent-1", context)
-
-    # A hand-appended task that bypasses the gateway still fails the runtime
-    # replan wrapper when its capability left the current catalog.
+    # Behavioral unreachability: a hand-built rogue plan fed straight to the
+    # shared scheduler fails closed — typed error, zero dispatches.
     from app.services.agents.v2.contracts.capability import KnowledgeGraphInput
-    from app.services.agents.v2.replanning import validate_runtime_replan
+    from app.services.agents.v2.execution import execute_ready_tasks
 
-    rogue = current.model_copy(
+    capabilities, _, context = _harness(run_id="run-subagent-rogue-1")
+    rogue_plan = TaskPlan(
+        contract_version="2.0",
+        plan_id="rogue",
+        goal="smuggled work",
+        target_units=(),
+        tasks=(
+            TaskSpec(
+                task_id="T-rogue",
+                capability="rogue.tool",
+                task_objective="non-governed append",
+                input=KnowledgeGraphInput(
+                    kind="knowledge_graph.query", query="A"
+                ),
+                depends_on=(),
+                origin=ReplanTaskOrigin(
+                    kind="replan",
+                    reason="smuggled",
+                    task_ids=(),
+                    evidence_use_ids=(),
+                ),
+            ),
+        ),
+    )
+    report = await execute_ready_tasks(
+        plan=rogue_plan,
+        results=(),
+        registry=context.services.capability_registry,
+        runtime=context,
+        bindings=_bindings(),
+    )
+    assert len(report.results) == 1
+    assert report.results[0].status == "error"
+    assert report.results[0].error is not None
+    assert report.results[0].error.code == "CONTRACT_MISMATCH"
+    for capability in capabilities:
+        assert capability.calls == []
+    with pytest.raises(UnplannedCapabilityDispatch):
+        require_planned_dispatch(_two_target_plan(), "T-subagent-1", context)
+
+
+def test_subagent_cannot_receive_raw_people_record_or_runtime_secrets() -> None:
+    """R48.2 (restored): KNOWN scalar + runtime secrets never reach advisory payloads.
+
+    Places a known People scalar into authoritative checkpointed state and
+    proves it (plus runtime authority field names) is ABSENT from every
+    advisory/subagent-facing projection. Non-vacuous: the sentinel IS
+    present in the checkpointed plan JSON.
+    """
+    from app.services.agents.v2.complex_research_graph import (
+        build_model_observations,
+        build_model_replan_input,
+    )
+    from app.services.agents.v2.tools.adapters import AgentToolAdapter
+    from app.services.agents.v2.tools.observations import ObservationProjector
+
+    sentinel_scalar = "987654321098"
+    sentinel_secret = "sentinel-workspace-" + WORKSPACE_ID.hex[:8]
+    _, _, context = _harness(run_id="run-subagent-2")
+    base = _two_target_plan()
+    sentinel_plan = base.model_copy(
         update={
-            "tasks": current.tasks
-            + (
-                TaskSpec(
-                    task_id="T-rogue",
-                    capability="knowledge_graph.query",
-                    task_objective="subagent-invented lookup",
-                    input=KnowledgeGraphInput(
-                        kind="knowledge_graph.query", query="A"
-                    ),
-                    depends_on=(),
-                    origin=ReplanTaskOrigin(
-                        kind="replan",
-                        reason="subagent suggestion",
-                        task_ids=(),
-                        evidence_use_ids=(),
-                    ),
+            "tasks": (
+                base.tasks[0],
+                base.tasks[1].model_copy(
+                    update={
+                        "capability": "document.search",
+                        "input": DocumentSearchInput(
+                            kind="document.search",
+                            query="nghi dinh",
+                            person_identifier=sentinel_scalar,
+                        ),
+                    }
                 ),
             )
         }
     )
-    with pytest.raises(ReplanRejected):
-        validate_runtime_replan(
-            current, rogue, (), _policy(), _budget(), context
-        )
+    assert sentinel_scalar in sentinel_plan.model_dump_json()
+    child = _child_input(
+        plan=sentinel_plan,
+        task_results=(
+            AgentResult(
+                contract_version="2.0",
+                task_id="T1",
+                status="success",
+                data=PeopleLookupOutput(kind="people.lookup", matched=True),
+                evidence_uses=(EvidenceUseRef(use_id=uuid4()),),
+                coverage_observations=(),
+                error=None,
+            ),
+        ),
+        people_scalar_available={"T1": True},
+    )
+    advisory_payloads = [
+        build_model_replan_input(child, context).model_dump_json(),
+        ObservationProjector.project(
+            child["task_results"][0], dependency_scalar_available=True
+        ).model_dump_json(),
+        "".join(
+            observation.model_dump_json()
+            for observation in build_model_observations(child)
+        ),
+    ]
+    for payload in advisory_payloads:
+        assert sentinel_scalar not in payload
+        assert sentinel_secret not in payload
+        for secret in (
+            "workspace_ids",
+            "can_read_people",
+            "allowed_capabilities",
+            "deadline_at",
+            "storage_key",
+        ):
+            assert secret not in payload
+    assert sentinel_scalar in child["plan"].model_dump_json()
+
+    adapter = AgentToolAdapter(context.services.capability_registry)
+    runtime_only = {
+        "request_id",
+        "run_id",
+        "user_id",
+        "workspace_ids",
+        "can_read_people",
+        "allowed_capabilities",
+        "deadline_at",
+    }
+    for name in adapter.visible_tool_names():
+        assert not (set(adapter.input_fields(name)) & runtime_only), name
