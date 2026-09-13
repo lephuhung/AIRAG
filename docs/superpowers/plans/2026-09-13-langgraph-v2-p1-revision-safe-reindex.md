@@ -134,6 +134,8 @@ git commit -m "feat(worker): report revision-owned completion"
 
 **Files:**
 - Modify: `backend/app/workers/utils.py`
+- Modify: `backend/app/workers/parse_worker.py`
+- Modify: `backend/app/queue/connection.py`
 - Modify: `backend/tests/workers/test_revision_pipeline.py`
 - Modify: `docs/runbooks/langgraph-v2-corpus-reindex.md`
 - Modify: `docs/workers.md`
@@ -148,7 +150,7 @@ Assert pending/running returns NOT_READY; all required complete + manifest publi
 
 - [ ] **Step 2: Implement finalization gate**
 
-When `revision_id` is supplied, load profile/stage rows/manifest and call `finalize_revision_if_complete(expect_complete=True)` only after `required_stages_complete` is true. Legacy calls without revision retain mirror behavior.
+When `revision_id` is supplied, load profile/stage rows/manifest and call `finalize_revision_if_complete(expect_complete=True)` only after `required_stages_complete` is true. Legacy calls without revision retain mirror behavior. PARSE_ONLY must use the same stage gate and may not call finalization directly. On exhausted KG timeout, do not convert failure into a synthetic `kg_done=True` skip or call finalization: atomically fail the exact stage+revision first, then mirror `Document.status=FAILED` only when that revision still describes the active generation; a newer published pointer/mirror remains untouched.
 
 - [ ] **Step 3: Run full worker/migration gate and commit**
 
