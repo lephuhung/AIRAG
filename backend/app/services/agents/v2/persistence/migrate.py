@@ -605,6 +605,30 @@ _ROLLOUT_DDL: tuple[str, ...] = (
         created_at                          TIMESTAMPTZ NOT NULL DEFAULT now()
     )
     """,
+    # agent_rollout_metrics — DB-level append-only enforcement. The
+    # function is replaced idempotently; the trigger is dropped and
+    # recreated so re-running apply never errors and never loses the
+    # UPDATE/DELETE rejection. Not a table: check_v2_schema never sees it
+    # as extra/missing.
+    """
+    CREATE OR REPLACE FUNCTION agent_rollout_metrics_no_update_delete()
+    RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        RAISE EXCEPTION 'agent_rollout_metrics is append-only: % not allowed',
+            TG_OP;
+    END;
+    $$;
+    """,
+    """
+    DROP TRIGGER IF EXISTS trg_agent_rollout_metrics_no_update_delete
+        ON agent_rollout_metrics
+    """,
+    """
+    CREATE TRIGGER trg_agent_rollout_metrics_no_update_delete
+        BEFORE UPDATE OR DELETE ON agent_rollout_metrics
+        FOR EACH ROW EXECUTE FUNCTION
+            agent_rollout_metrics_no_update_delete()
+    """,
 )
 
 # The seeded disabled control row. Idempotent: ON CONFLICT DO NOTHING so a
@@ -1135,13 +1159,15 @@ def apply_v2_schema(engine: Engine) -> None:
     the idempotent evidence-only lease upgrade (``_LEASE_EVIDENCE_ONLY_ALTER``)
     advancing them to 2, then the rollout DDL (``_ROLLOUT_DDL`` + seed)
     advancing them to 3. Databases at version 2 get the rollout step only.
-    Already-current (or newer) databases are a no-op. A recorded version
-    below 1 is an unsupported gap and raises ``RuntimeError`` instead of
+    Already-current databases are a no-op. A recorded version
+    below 1 or above ``V2_SCHEMA_VERSION`` is an unsupported history
+    and raises ``RuntimeError`` instead of
     writing a second version row. Legacy-row verification (brief item 5)
     runs on the fresh path, which is the only path that mutates legacy
     tables.
 
     Idempotent: a second call with the schema already applied is a no-op.
+    Newer versions are never downgraded — they raise instead.
     The transaction commits (or rolls back) when ``engine.begin()`` exits.
     """
     with engine.begin() as conn:
@@ -1156,10 +1182,17 @@ def apply_v2_schema(engine: Engine) -> None:
         )
 
         current = _recorded_version(conn)
-        if current is not None and current >= V2_SCHEMA_VERSION:
-            # Already current (or newer) — nothing to do. Idempotent;
-            # a newer version is never downgraded.
+        if current is not None and current == V2_SCHEMA_VERSION:
+            # Already current — nothing to do. Idempotent.
             return
+
+        if current is not None and current > V2_SCHEMA_VERSION:
+            # Unknown schema history (e.g. a newer release migrated
+            # further): refuse to report success against it.
+            raise RuntimeError(
+                f"unsupported v2 schema version {current}: expected 1, 2, "
+                f"or {V2_SCHEMA_VERSION} (run a supported migration path)"
+            )
 
         if current is not None and current < 1:
             # Unsupported gap (e.g. a hand-written version-0 row): refuse

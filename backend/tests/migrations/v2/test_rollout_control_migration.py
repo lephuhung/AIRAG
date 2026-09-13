@@ -9,8 +9,7 @@ upgrade in place to version 3 via the rollout DDL:
 - ``agent_rollout_metrics`` created append-only with the exact contract
   columns (inserts only, no update path).
 - The upgrade is idempotent, holds the advisory lock, imports no ORM
-  metadata, leaves newer versions untouched, and rejects unsupported
-  version gaps.
+  metadata, rejects newer versions and unsupported version gaps.
 
 Setup regresses a migrated database back to the version-2 shape (drop
 the two rollout tables, set the version row to 2) so the test exercises
@@ -215,6 +214,86 @@ def test_rollout_upgrade_is_idempotent(version2_db: Engine) -> None:
     assert check_v2_schema(version2_db).is_clean is True
 
 
+def test_rollout_metrics_rejects_update_and_delete(
+    version2_db: Engine,
+) -> None:
+    """DB-level append-only: UPDATE and DELETE fail, INSERT succeeds."""
+    from sqlalchemy.exc import DBAPIError
+
+    apply_v2_schema(version2_db)
+    with version2_db.begin() as conn:
+        metric_id = conn.execute(
+            text(
+                "INSERT INTO agent_rollout_metrics "
+                "(arm, request_id_hash, started_at, terminal_status) "
+                "VALUES ('v2', 'req-immutable', now(), 'success') "
+                "RETURNING id"
+            ),
+        ).scalar()
+    assert metric_id is not None
+    with pytest.raises(DBAPIError):
+        with version2_db.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE agent_rollout_metrics "
+                    "SET terminal_status = 'failed' WHERE id = :i"
+                ),
+                {"i": metric_id},
+            )
+    with pytest.raises(DBAPIError):
+        with version2_db.begin() as conn:
+            conn.execute(
+                text("DELETE FROM agent_rollout_metrics WHERE id = :i"),
+                {"i": metric_id},
+            )
+    with version2_db.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO agent_rollout_metrics "
+                "(arm, request_id_hash, started_at, terminal_status) "
+                "VALUES ('v2', 'req-immutable-2', now(), 'success')"
+            ),
+        )
+        n = conn.execute(
+            text("SELECT count(*) FROM agent_rollout_metrics")
+        ).scalar()
+        status = conn.execute(
+            text(
+                "SELECT terminal_status FROM agent_rollout_metrics "
+                "WHERE id = :i"
+            ),
+            {"i": metric_id},
+        ).scalar()
+    assert status == "success"
+    assert n >= 2
+
+
+def test_rollout_metrics_append_only_survives_reapply(
+    version2_db: Engine,
+) -> None:
+    """Re-running apply must not drop the UPDATE/DELETE enforcement."""
+    from sqlalchemy.exc import DBAPIError
+
+    apply_v2_schema(version2_db)
+    apply_v2_schema(version2_db)
+    with version2_db.begin() as conn:
+        metric_id = conn.execute(
+            text(
+                "INSERT INTO agent_rollout_metrics "
+                "(arm, request_id_hash, started_at, terminal_status) "
+                "VALUES ('shadow', 'req-reapply', now(), 'success') "
+                "RETURNING id"
+            ),
+        ).scalar()
+    with pytest.raises(DBAPIError):
+        with version2_db.begin() as conn:
+            conn.execute(
+                text("DELETE FROM agent_rollout_metrics WHERE id = :i"),
+                {"i": metric_id},
+            )
+    assert check_v2_schema(version2_db).is_clean is True
+
+
 def test_rollout_metrics_is_append_only(version2_db: Engine) -> None:
     """Two inserts with identical business keys both persist: no dedup
     arbiter, no update path — the table is insert-only by construction."""
@@ -334,16 +413,16 @@ def test_stepwise_version1_upgrades_to_version3(version2_db: Engine) -> None:
     assert check_v2_schema(version2_db).is_clean is True
 
 
-def test_apply_leaves_newer_versions_untouched(db: Engine) -> None:
-    """A newer recorded version is a no-op: no downgrade, no DDL churn."""
+def test_apply_rejects_newer_versions(db: Engine) -> None:
+    """A recorded version above V2_SCHEMA_VERSION raises; no DDL churn."""
     apply_v2_schema(db)
     with db.begin() as conn:
         conn.execute(text("UPDATE v2_schema_version SET version = 99"))
     try:
-        apply_v2_schema(db)
+        with pytest.raises(RuntimeError, match="unsupported v2 schema version"):
+            apply_v2_schema(db)
         with db.connect() as conn:
             assert _recorded_version(conn) == 99
-            assert _columns(conn, "agent_rollout_control") != {}
     finally:
         with db.begin() as conn:
             conn.execute(text("UPDATE v2_schema_version SET version = 3"))
