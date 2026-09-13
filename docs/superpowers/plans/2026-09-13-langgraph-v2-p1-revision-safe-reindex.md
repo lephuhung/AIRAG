@@ -35,7 +35,7 @@
 - Test: `backend/tests/agents/v2/persistence/test_revision_stages.py`
 
 **Interfaces:**
-- Produces: `DocumentRevisionStage` and repository methods `initialize_stages`, `mark_stage_running`, `mark_stage_completed`, `mark_stage_skipped`, `mark_stage_failed`, `required_stages_complete`.
+- Produces: `DocumentRevisionStage` and repository methods `initialize_stages`, `mark_stage_running`, `mark_stage_retry_pending`, `mark_stage_completed`, `mark_stage_skipped`, `mark_stage_failed`, `required_stages_complete`.
 
 - [ ] **Step 1: Write RED migration/repository tests**
 
@@ -49,7 +49,7 @@ await repo.mark_stage_completed(revision_id, "kg")
 assert await repo.required_stages_complete(revision_id) is True
 ```
 
-Also assert duplicate/redelivered transitions converge, unknown stages fail, and CHAT_UPLOAD/PARSE_ONLY use explicit skipped rows.
+Also assert duplicate/redelivered transitions converge, unknown stages fail, and CHAT_UPLOAD/PARSE_ONLY use explicit skipped rows. The explicit retry edge is `running → pending` without resetting `attempt_count`; the next `pending → running` increments it. `completed`, `skipped`, and exhausted `failed` remain terminal.
 
 - [ ] **Step 2: Run RED**
 
@@ -118,7 +118,7 @@ For each worker assert running→completed, retry increments attempt count, exha
 
 - [ ] **Step 2: Run RED and implement minimal calls**
 
-Each worker records running before work and completed only after its artifact transaction succeeds. Profile skips are initialized, not guessed by workers. Queue retry paths update only the failed message revision.
+Each worker records running before work and completed only after its artifact transaction succeeds. Profile skips are initialized, not guessed by workers. Before a retryable message is requeued, the queue path calls `mark_stage_retry_pending` only for that message revision/stage; the next worker `mark_stage_running` increments `attempt_count`. Exhausted retries call `mark_stage_failed`, which remains terminal. Queue retry paths update only the failed message revision.
 
 - [ ] **Step 3: Run GREEN and commit**
 
