@@ -368,15 +368,14 @@ def append_materialized_dependent(
     query: str,
     next_task_id: str,
 ) -> TaskSpec:
-    """Build the concrete T2 PROPOSAL (never the authoritative append, R50).
+    """Build the concrete T2 PROPOSAL (never the authoritative append, R52).
 
     Returns the concrete dependent ``TaskSpec``; the governed
     ``people_document_materialize_node`` performs the single authoritative
-    append (``append_replan_tasks``) and validates it through
-    ``validate_runtime_replan`` before it may be leased or checkpointed. The
-    scheduler therefore never sees an ungoverned append. Raises
-    ``MaterializationError`` for a non-materialized outcome or a taken task
-    id instead of fabricating a task.
+    append + validation (``append_replan_tasks``) before it may be leased or
+    checkpointed. The scheduler therefore never sees an ungoverned append.
+    Raises ``MaterializationError`` for a non-materialized outcome or a taken
+    task id instead of fabricating a task.
     """
     if outcome.kind != "materialized":
         raise MaterializationError(
@@ -426,7 +425,20 @@ def redact_scalar_for_model(plan: TaskPlan) -> TaskPlan:
             )
         else:
             redacted.append(task)
-    return plan.model_copy(update={"tasks": tuple(redacted)})
+    # R52: this projection must not construct the plan through
+    # ``model_copy(update={"tasks": ...})`` -- that form is reserved for the
+    # single authoritative append in ``replanning.append_replan_tasks`` and the
+    # AST guard asserts it appears nowhere else. Rebuilding the same frozen
+    # TaskPlan here is equivalent (same fields, no private attrs) and keeps
+    # the redaction same-length: task identity, ordering, objectives, and
+    # ``depends_on`` are preserved, only the scalar is cleared.
+    return TaskPlan(
+        contract_version=plan.contract_version,
+        plan_id=plan.plan_id,
+        goal=plan.goal,
+        target_units=plan.target_units,
+        tasks=tuple(redacted),
+    )
 
 
 def _people_task_id_for(

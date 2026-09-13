@@ -124,19 +124,33 @@ def _require_capabilities_within_current_runtime_catalog(
 
 
 def append_replan_tasks(
-    current: TaskPlan, new_tasks: tuple[TaskSpec, ...]
+    current: TaskPlan,
+    proposed_tasks: tuple[TaskSpec, ...],
+    outcomes: tuple[TaskExecutionSummary, ...],
+    policy: DiscoveryPolicy,
+    budget: ResearchBudgetView,
+    runtime: GraphRuntimeContext,
 ) -> TaskPlan:
-    """The single authoritative append-only construction site (R50).
+    """The single authoritative append + validation construction site (R52).
 
     Every governed owner that appends tasks to a checkpointed plan constructs
-    the append-only successor HERE, then validates it through
-    :func:`validate_runtime_replan` before it may be leased or checkpointed.
-    No other function in the v2 tree builds an appended plan, so rogue append
-    forms -- temporary variables, unpacking, list construction, or a helper
-    that returns an already-appended plan -- cannot exist elsewhere (the AST
-    guard in ``test_replan_discovery.py`` enforces this structurally).
+    the append-only successor HERE and validates it HERE through the frozen
+    :func:`contracts.validation.validate_replan` (via
+    :func:`validate_runtime_replan`, which adds the current runtime catalog /
+    cancellation-deadline / fan-out checks) before it may be leased or
+    checkpointed. No other function in the v2 tree builds an appended plan, so
+    rogue append forms -- temporary variables, ``list(plan.tasks)`` unpacking,
+    ``plan.model_copy(update={"tasks": ...})`` outside this function, or a
+    helper that returns an already-appended plan -- cannot exist elsewhere
+    (the AST guard in ``test_replan_discovery.py`` enforces this structurally
+    by resolving the ENCLOSING FUNCTION of every append expression).
     """
-    return current.model_copy(update={"tasks": current.tasks + tuple(new_tasks)})
+    proposed = current.model_copy(
+        update={"tasks": current.tasks + tuple(proposed_tasks)}
+    )
+    return validate_runtime_replan(
+        current, proposed, outcomes, policy, budget, runtime
+    )
 
 
 def entry_fanout_width(new_tasks: tuple[TaskSpec, ...]) -> int:

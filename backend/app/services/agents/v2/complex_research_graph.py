@@ -99,7 +99,6 @@ from .nodes.synthesize import DEFAULT_SYNTHESIS_BUDGET, synthesize_answer
 from .replanning import (
     ReplanRejected,
     append_replan_tasks,
-    validate_runtime_replan,
 )
 from .skills.compare import policy as compare_policy
 from .skills.summarize import policy as summarize_policy
@@ -741,13 +740,12 @@ class InitialProposal:
 
 @dataclass(frozen=True)
 class ReplanProposal:
-    """Deterministic append-only replan proposal (R50): new tasks only.
+    """Deterministic append-only replan proposal (R52): new tasks only.
 
     ``build_replan_proposal`` returns this proposal -- never an authoritative
     plan and never an already-appended plan. The governed
-    ``validate_checkpoint_node`` performs the single authoritative append
-    (``append_replan_tasks``) and validates it through
-    ``validate_runtime_replan`` before leasing/checkpointing.
+    ``validate_checkpoint_node`` performs the single authoritative append +
+    validation (``append_replan_tasks``) before leasing/checkpointing.
     """
 
     new_tasks: tuple[TaskSpec, ...]
@@ -1079,9 +1077,9 @@ def build_replan_proposal(
         )
     if not new_tasks:
         return None
-    # R50: return a PROPOSAL, not an authoritative plan. The governed
-    # validate_checkpoint_node performs the single authoritative append and
-    # validates it through validate_runtime_replan before lease/checkpoint.
+    # R52: return a PROPOSAL, not an authoritative plan. The governed
+    # validate_checkpoint_node performs the single authoritative append +
+    # validation (append_replan_tasks) before lease/checkpoint.
     return ReplanProposal(
         new_tasks=tuple(new_tasks),
         outcomes=outcomes,
@@ -1169,14 +1167,13 @@ async def validate_checkpoint_node(
             "materialized_new_task": False,
             "reduce_spec": None,
         }
-    # R50: the single authoritative append + validation happen HERE, inside
+    # R52: the single authoritative append + validation happen HERE, inside
     # the governed entry point, on the proposal returned by
     # build_replan_proposal (which never appends or validates itself).
-    proposed = append_replan_tasks(current, proposal.new_tasks)
     try:
-        accepted = validate_runtime_replan(
+        accepted = append_replan_tasks(
             current,
-            proposed,
+            proposal.new_tasks,
             proposal.outcomes,
             proposal.policy,
             proposal.budget,
@@ -1308,10 +1305,10 @@ async def people_document_materialize_node(
         while f"T{index}" in taken:
             index += 1
         limits = V2ResearchLimits.from_settings()
-        # R50: append_materialized_dependent returns the concrete T2 PROPOSAL
-        # (never an authoritative plan); the single authoritative append
-        # (append_replan_tasks) and validation happen HERE, inside this
-        # governed node, before lease/checkpoint.
+        # R52: append_materialized_dependent returns the concrete T2 PROPOSAL
+        # (never an authoritative plan); the single authoritative append +
+        # validation (append_replan_tasks) happen HERE, inside this governed
+        # node, before lease/checkpoint.
         outcomes = build_task_execution_summaries(results)
         policy = DiscoveryPolicy(
             allow_reference_discovery=False,
@@ -1330,9 +1327,8 @@ async def people_document_materialize_node(
                 query=plan.goal,
                 next_task_id=f"T{index}",
             )
-            proposed = append_replan_tasks(plan, (dependent,))
-            accepted = validate_runtime_replan(
-                plan, proposed, outcomes, policy, budget, context
+            accepted = append_replan_tasks(
+                plan, (dependent,), outcomes, policy, budget, context
             )
         except (MaterializationError, ContractValidationError, ReplanRejected):
             continue

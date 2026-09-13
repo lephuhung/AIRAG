@@ -4,7 +4,7 @@
 
     proposal
     -> convert to a TaskSpec proposal
-    -> validate_runtime_replan (frozen validate_replan + current catalog,
+    -> append_replan_tasks (frozen validate_replan + current catalog,
        cancellation/deadline, fan-out width) against the current runtime
     -> return accepted append-only plan or typed rejection
 
@@ -42,7 +42,6 @@ from ..contracts.validation import ContractValidationError
 from ..replanning import (
     ReplanRejected,
     append_replan_tasks,
-    validate_runtime_replan,
 )
 
 RejectionCode = Literal[
@@ -140,11 +139,15 @@ class AgentToolGateway:
                     evidence_use_ids=(),
                 ),
             )
-            # R50: the single authoritative append lives in
+            # R52: the single authoritative append + validation live in
             # append_replan_tasks, inside this governed entry point.
-            proposed = append_replan_tasks(current_plan, (candidate,))
-            accepted_plan = validate_runtime_replan(
-                current_plan, proposed, (), self._policy, self._budget, runtime
+            accepted_plan = append_replan_tasks(
+                current_plan,
+                (candidate,),
+                (),
+                self._policy,
+                self._budget,
+                runtime,
             )
         except ValidationError as error:
             # Malformed proposal payloads never escape: the frozen

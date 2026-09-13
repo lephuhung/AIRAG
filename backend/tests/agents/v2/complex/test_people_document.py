@@ -47,9 +47,12 @@ from app.services.agents.v2.contracts.execution import (
     AgentError,
     AgentRequest,
     AgentResult,
+    TaskExecutionSummary,
 )
 from app.services.agents.v2.contracts.planning import (
+    DiscoveryPolicy,
     InitialTaskOrigin,
+    ResearchBudgetView,
     TaskPlan,
     TaskSpec,
 )
@@ -1109,7 +1112,24 @@ async def test_raw_people_row_never_enters_checkpoint_plan() -> None:
         query="nghi dinh",
         next_task_id="T2",
     )
-    proposed = append_replan_tasks(plan, (dependent,))
+    # R52: the single governed append + validation happen inside
+    # append_replan_tasks; the concrete T2 is only a proposal here.
+    proposed = append_replan_tasks(
+        plan,
+        (dependent,),
+        (TaskExecutionSummary(task_id="T1", status="success"),),
+        DiscoveryPolicy(
+            allow_reference_discovery=False,
+            allow_supporting_discovery=True,
+            max_discovered_documents=1,
+        ),
+        ResearchBudgetView(
+            max_tasks_remaining=8,
+            max_replans_remaining=1,
+            max_parallel_branches=2,
+        ),
+        runtime,
+    )
     dumped = proposed.model_dump_json().lower()
     for token in FORBIDDEN_OBSERVATION_TOKENS:
         if token == PERSON_IDENTIFIER_FIELD:

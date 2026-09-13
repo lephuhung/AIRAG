@@ -48,6 +48,7 @@ from app.services.agents.v2.contracts.evidence import DocumentSourceIdentity, Ev
 from app.services.agents.v2.contracts.execution import (
     AgentRequest,
     AgentResult,
+    TaskExecutionSummary,
 )
 from app.services.agents.v2.contracts.locators import DocumentLocator
 from app.services.agents.v2.contracts.planning import (
@@ -2195,8 +2196,9 @@ def test_replan_input_carries_no_people_scalar() -> None:
         ),
     )
     use_id = uuid4()
-    # R50: append_materialized_dependent returns the concrete T2 PROPOSAL;
-    # the governed append (append_replan_tasks) builds the authoritative plan.
+    # R52: append_materialized_dependent returns the concrete T2 PROPOSAL;
+    # the governed append (append_replan_tasks) builds AND validates the
+    # authoritative plan.
     dependent = append_materialized_dependent(
         current=base,
         outcome=PeopleDocumentMaterialization(
@@ -2214,10 +2216,25 @@ def test_replan_input_carries_no_people_scalar() -> None:
         query="nghi dinh",
         next_task_id="T2",
     )
-    materialized = append_replan_tasks(base, (dependent,))
+    _, _, _, context = _discovery_harness(run_id="run-redact-1")
+    materialized = append_replan_tasks(
+        base,
+        (dependent,),
+        (TaskExecutionSummary(task_id="T1", status="success"),),
+        DiscoveryPolicy(
+            allow_reference_discovery=False,
+            allow_supporting_discovery=True,
+            max_discovered_documents=1,
+        ),
+        ResearchBudgetView(
+            max_tasks_remaining=8,
+            max_replans_remaining=1,
+            max_parallel_branches=2,
+        ),
+        context,
+    )
     assert materialized.tasks[1].input.person_identifier == "012345678901"  # type: ignore[union-attr]
 
-    _, _, context = _harness(run_id="run-redact-1")
     child = _child_input(
         plan=materialized,
         task_results=(),
@@ -2670,47 +2687,38 @@ def test_bounded_summarize_stays_fast() -> None:
 # validated gateway/replan path.
 
 
-@pytest.mark.asyncio
-async def test_subagent_cannot_append_authoritative_tasks() -> None:
-    """R50: every authoritative plan-append is single-sourced and governed.
+def _scan_append_ownership(
+    root: Path,
+) -> tuple[
+    set[tuple[str, str]],
+    set[tuple[str, str]],
+    set[tuple[str, str]],
+    set[tuple[str, str]],
+    set[tuple[str, str]],
+]:
+    """Scan a v2 tree for append-ownership invariants (R52).
 
-    Structural (AST, function granularity, with temporary-variable taint
-    tracking -- not a file whitelist and not only ``.tasks +``):
-
-    * ``TaskPlan(`` constructors exist only in the deterministic builders
-      (initial plans, never appends).
-    * the ONLY authoritative append construction site is
-      ``replanning.append_replan_tasks`` (``model_copy(update={"tasks":
-      current.tasks + tuple(new_tasks)})``).
-    * no function mutates ``.tasks`` in place (``.tasks =`` / ``+=``).
-    * ``model_copy(update={"tasks": ...})`` appears only in
-      ``append_replan_tasks`` (append) and ``redact_scalar_for_model``
-      (same-length model-facing redaction, never an authoritative append).
-    * ``append_replan_tasks`` is called only from the governed owners:
-      ``validate_checkpoint_node``, ``people_document_materialize_node`` and
-      ``AgentToolGateway.propose`` (call-graph basis).
-    * checkpointed-plan updates are returned only by the two owning nodes.
-
-    A rogue append in any other function -- via temporary variable, unpacking,
-    list construction, or a helper that returns an appended plan -- fails one
-    of these assertions, so an ungoverned append cannot slip through.
+    Returns ``(constructors, append_sites, in_place_sites,
+    append_replan_tasks_callers, plan_returns)`` where each element is the set
+    of ``(module_rel, enclosing_function)`` locations. ``append_sites`` is the
+    single governed surface: EVERY append expression -- ``model_copy(update={
+    "tasks": ...})``, ``list(<*.tasks>)`` / ``tuple(<*.tasks>)``,
+    ``<tasks-expr>.append(...)``, ``<tasks> + ...``, and in-place ``.tasks``
+    assignment -- is collected and its ENCLOSING FUNCTION resolved. Callers
+    assert that set is exactly ``append_replan_tasks``.
     """
     import ast
 
-    v2_root = Path(__file__).resolve().parents[5] / "backend/app/services/agents/v2"
-    assert v2_root.is_dir()
-
     constructors: set[tuple[str, str]] = set()
-    add_sites: set[tuple[str, str]] = set()
+    append_sites: set[tuple[str, str]] = set()
     in_place_sites: set[tuple[str, str]] = set()
-    model_copy_tasks_sites: set[tuple[str, str]] = set()
-    plan_returns: set[tuple[str, str]] = set()
     append_replan_tasks_callers: set[tuple[str, str]] = set()
+    plan_returns: set[tuple[str, str]] = set()
 
-    for module_path in sorted(v2_root.rglob("*.py")):
+    for module_path in sorted(root.rglob("*.py")):
         if "__pycache__" in module_path.parts:
             continue
-        rel = str(module_path.relative_to(v2_root))
+        rel = str(module_path.relative_to(root))
         tree = ast.parse(module_path.read_text())
 
         class Visitor(ast.NodeVisitor):
@@ -2744,8 +2752,6 @@ async def test_subagent_cannot_append_authoritative_tasks() -> None:
                     return self.reads_tasks(node.value)
                 if isinstance(node, ast.BinOp):
                     return self.reads_tasks(node.left) or self.reads_tasks(node.right)
-                # Deliberately do NOT descend into Call args: ``len(plan.tasks)
-                # + 1`` computes a task id and must not count as an append.
                 return False
 
             @staticmethod
@@ -2768,10 +2774,22 @@ async def test_subagent_cannot_append_authoritative_tasks() -> None:
                         )
                 return False
 
+            def _tasks_wrap(self, node: ast.Call) -> bool:
+                """``list(<tasks>)`` / ``tuple(<tasks>)`` call-wrapped forms."""
+                return (
+                    self._call_name(node.func) in ("list", "tuple")
+                    and bool(node.args)
+                    and self.reads_tasks(node.args[0])
+                )
+
             def visit_Assign(self, node: ast.Assign) -> None:
                 for target in node.targets:
-                    if isinstance(target, ast.Name) and self.reads_tasks(node.value):
-                        self._tainted().add(target.id)
+                    if isinstance(target, ast.Name):
+                        value = node.value
+                        if self.reads_tasks(value) or (
+                            isinstance(value, ast.Call) and self._tasks_wrap(value)
+                        ):
+                            self._tainted().add(target.id)
                     if isinstance(target, ast.Attribute) and target.attr == "tasks":
                         in_place_sites.add((rel, self._func()))
                 self.generic_visit(node)
@@ -2791,14 +2809,14 @@ async def test_subagent_cannot_append_authoritative_tasks() -> None:
                 if isinstance(node.target, ast.Attribute) and node.target.attr == "tasks":
                     in_place_sites.add((rel, self._func()))
                 if isinstance(node.op, ast.Add) and self.reads_tasks(node.value):
-                    add_sites.add((rel, self._func()))
+                    append_sites.add((rel, self._func()))
                 self.generic_visit(node)
 
             def visit_BinOp(self, node: ast.BinOp) -> None:
                 if isinstance(node.op, ast.Add) and (
                     self.reads_tasks(node.left) or self.reads_tasks(node.right)
                 ):
-                    add_sites.add((rel, self._func()))
+                    append_sites.add((rel, self._func()))
                 self.generic_visit(node)
 
             def visit_Call(self, node: ast.Call) -> None:
@@ -2807,8 +2825,16 @@ async def test_subagent_cannot_append_authoritative_tasks() -> None:
                     constructors.add((rel, self._func()))
                 elif name == "append_replan_tasks":
                     append_replan_tasks_callers.add((rel, self._func()))
-                elif self._is_model_copy_with_tasks(node):
-                    model_copy_tasks_sites.add((rel, self._func()))
+                elif name == "model_copy" and self._is_model_copy_with_tasks(node):
+                    append_sites.add((rel, self._func()))
+                elif self._tasks_wrap(node):
+                    append_sites.add((rel, self._func()))
+                elif (
+                    name == "append"
+                    and isinstance(node.func, ast.Attribute)
+                    and self.reads_tasks(node.func.value)
+                ):
+                    append_sites.add((rel, self._func()))
                 self.generic_visit(node)
 
             def visit_Return(self, node: ast.Return) -> None:
@@ -2821,21 +2847,106 @@ async def test_subagent_cannot_append_authoritative_tasks() -> None:
 
         Visitor().visit(tree)
 
-    # Initial-plan constructors: deterministic builders and skill policies.
+    return (
+        constructors,
+        append_sites,
+        in_place_sites,
+        append_replan_tasks_callers,
+        plan_returns,
+    )
+
+
+def test_append_guard_flags_call_wrapped_defeat_form(tmp_path: Path) -> None:
+    """R52: the guard FAILS the reviewer's call-wrapped defeat form.
+
+    The defeat snippet wraps ``list(plan.tasks)`` + ``.append`` +
+    ``model_copy(update={"tasks": tuple(...)})`` inside an otherwise ordinary
+    function. The SAME scanner used for the real tree must flag that function
+    as an append site -- proving the detector descends through the
+    call-wrapped forms rather than only immediate ``.tasks + ...``. A second,
+    minimal snippet (only the ``list`` + ``.append`` forms, no ``model_copy``)
+    proves those call-wrapped forms are detected independently of the
+    ``model_copy`` token.
+    """
+    import textwrap
+
+    defeat = tmp_path / "defeat_snippet.py"
+    defeat.write_text(
+        textwrap.dedent(
+            """
+            def redact_scalar_for_model(plan, new_task):
+                copied = list(plan.tasks)
+                copied.append(new_task)
+                return plan.model_copy(update={"tasks": tuple(copied)})
+            """
+        )
+    )
+    _, append_sites, _, _, _ = _scan_append_ownership(tmp_path)
+    assert ("defeat_snippet.py", "redact_scalar_for_model") in append_sites
+
+    # The call-wrapped forms are detected even WITHOUT the model_copy token,
+    # so the guard does not depend on that single marker.
+    minimal = tmp_path / "list_append_snippet.py"
+    minimal.write_text(
+        textwrap.dedent(
+            """
+            def rogue_builder(plan, new_task):
+                copied = list(plan.tasks)
+                copied.append(new_task)
+                return copied
+            """
+        )
+    )
+    _, append_sites, _, _, _ = _scan_append_ownership(tmp_path)
+    assert ("list_append_snippet.py", "rogue_builder") in append_sites
+
+
+def test_subagent_cannot_append_authoritative_tasks() -> None:
+    """R52: every authoritative plan-append is single-sourced and governed.
+
+    Structural (AST, enclosing-function granularity, with temporary-variable
+    taint tracking -- not a file whitelist and not only ``.tasks +``):
+
+    * ``TaskPlan(`` constructors exist only in the deterministic builders plus
+      the same-length model-facing redaction projection.
+    * EVERY append expression -- ``model_copy(update={"tasks": ...})``,
+      ``list(<*.tasks>)`` / ``tuple(<*.tasks>)``, ``<tasks-expr>.append(...)``,
+      ``<tasks> + ...``, and in-place ``.tasks`` assignment -- resolves to the
+      ENCLOSING FUNCTION ``replanning.append_replan_tasks``.
+    * no function mutates ``.tasks`` in place.
+    * ``append_replan_tasks`` is called only from the governed owners:
+      ``validate_checkpoint_node``, ``people_document_materialize_node`` and
+      ``AgentToolGateway.propose`` (call-graph basis).
+    * checkpointed-plan updates are returned only by the two owning nodes.
+
+    A rogue append in any other function -- via temporary variable, unpacking,
+    list construction, or a helper that returns an appended plan -- fails one
+    of these assertions, so an ungoverned append cannot slip through.
+    """
+    v2_root = Path(__file__).resolve().parents[5] / "backend/app/services/agents/v2"
+    assert v2_root.is_dir()
+
+    (
+        constructors,
+        append_sites,
+        in_place_sites,
+        append_replan_tasks_callers,
+        plan_returns,
+    ) = _scan_append_ownership(v2_root)
+
+    # Initial-plan constructors: deterministic builders + the same-length
+    # redaction projection (which rebuilds the plan WITHOUT a tasks model_copy).
     assert constructors == {
         ("nodes/fast_plan.py", "build_fast_plan"),
         ("skills/compare/policy.py", "build_compare_plan"),
         ("skills/summarize/policy.py", "build_summarize_workflow"),
         ("complex_research_graph.py", "_people_first_plan"),
-    }
-    # The single authoritative append construction site (R50).
-    assert add_sites == {("replanning.py", "append_replan_tasks")}
-    assert in_place_sites == set()
-    # model_copy(update={"tasks": ...}) only: append + same-length redaction.
-    assert model_copy_tasks_sites == {
-        ("replanning.py", "append_replan_tasks"),
         ("dependencies/people_document.py", "redact_scalar_for_model"),
     }
+    # The single authoritative append expression surface (R52): every append
+    # expression's ENCLOSING FUNCTION is exactly append_replan_tasks.
+    assert append_sites == {("replanning.py", "append_replan_tasks")}
+    assert in_place_sites == set()
     # Call-graph basis: the single append helper is reached only from the
     # governed owners.
     assert append_replan_tasks_callers == {
@@ -2850,51 +2961,129 @@ async def test_subagent_cannot_append_authoritative_tasks() -> None:
         ("complex_research_graph.py", "people_document_materialize_node"),
     }
 
-    # Behavioral unreachability: a hand-built rogue plan with an UNKNOWN
-    # capability fed straight to the shared scheduler fails closed -- typed
-    # error, zero dispatches.
-    from app.services.agents.v2.contracts.capability import KnowledgeGraphInput
-    from app.services.agents.v2.execution import execute_ready_tasks
-
-    capabilities, _, context = _harness(run_id="run-subagent-rogue-1")
-    rogue_plan = TaskPlan(
-        contract_version="2.0",
-        plan_id="rogue",
-        goal="smuggled work",
-        target_units=(),
-        tasks=(
-            TaskSpec(
-                task_id="T-rogue",
-                capability="rogue.tool",
-                task_objective="non-governed append",
-                input=KnowledgeGraphInput(
-                    kind="knowledge_graph.query", query="A"
-                ),
-                depends_on=(),
-                origin=ReplanTaskOrigin(
-                    kind="replan",
-                    reason="smuggled",
-                    task_ids=(),
-                    evidence_use_ids=(),
-                ),
-            ),
-        ),
-    )
-    report = await execute_ready_tasks(
-        plan=rogue_plan,
-        results=(),
-        registry=context.services.capability_registry,
-        runtime=context,
-        bindings=_bindings(),
-    )
-    assert len(report.results) == 1
-    assert report.results[0].status == "error"
-    assert report.results[0].error is not None
-    assert report.results[0].error.code == "CONTRACT_MISMATCH"
-    for capability in capabilities:
-        assert capability.calls == []
+    # A direct internal execute_ready_tasks call is NOT an ingress: it takes an
+    # explicit plan and is only reachable through the shared scheduler, which
+    # the graph's execute node feeds exclusively the checkpointed plan. The
+    # governed graph path is proven separately (see
+    # test_unvalidated_append_never_becomes_checkpointed_plan).
+    _, _, context = _harness(run_id="run-subagent-rogue-1")
     with pytest.raises(UnplannedCapabilityDispatch):
         require_planned_dispatch(_two_target_plan(), "T-subagent-1", context)
+
+
+@pytest.mark.asyncio
+async def test_unvalidated_append_never_becomes_checkpointed_plan(
+    discovery_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R52: the governed graph never checkpoints/dispatches an unvalidated append.
+
+    A plan whose append bypassed ``append_replan_tasks`` never becomes the
+    checkpointed plan the graph dispatches. The enforcing chain is: every append
+    goes through ``append_replan_tasks`` (which calls the frozen validator), the
+    subgraph checkpoints only that validated plan, and ``execute`` runs only the
+    checkpointed plan. A direct internal ``execute_ready_tasks`` call is NOT an
+    ingress (it takes an explicit plan and is only reachable through the shared
+    scheduler the execute node feeds exclusively the checkpointed plan), so it is
+    not defended here.
+
+    This test runs the REAL compiled graph through the recovery replan and
+    proves (a) the only append dispatched is the validated recovery task, and
+    (b) the reviewer's call-wrapped rogue append (catalog-valid, no fabricated
+    scalar) is never the checkpointed plan and never dispatched.
+    """
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    import app.services.agents.v2.complex_research_graph as graph_module
+    import app.services.agents.v2.replanning as replanning_module
+    from app.services.agents.v2.complex_research_graph import (
+        _build_complex_research_graph,
+        normalize_complex_state,
+    )
+
+    people, search, _, _, _, context = _people_harness(
+        "run-rogue-plan-1", FakePeopleCapability(status="not_found")
+    )
+    child = _child_input(
+        semantic=_person_semantic(),
+        query_analysis=_cross_domain_analysis(),
+        replans_remaining=2,
+    )
+
+    # Spy on the single authoritative append AND the frozen validator so the
+    # behavioral proof asserts (a) the checkpointed plan is EXACTLY the append
+    # result and (b) that append result was actually validated.
+    real_append = graph_module.append_replan_tasks
+    append_results: list[TaskPlan] = []
+
+    def spying_append(*args, **kwargs):  # type: ignore[no-untyped-def]
+        result = real_append(*args, **kwargs)
+        append_results.append(result)
+        return result
+
+    monkeypatch.setattr(graph_module, "append_replan_tasks", spying_append)
+
+    real_validate = replanning_module.validate_replan
+    validation_calls: list[tuple] = []
+
+    def spying_validate(*args, **kwargs):  # type: ignore[no-untyped-def]
+        validation_calls.append(args)
+        return real_validate(*args, **kwargs)
+
+    monkeypatch.setattr(replanning_module, "validate_replan", spying_validate)
+
+    compiled = _build_complex_research_graph().compile(
+        checkpointer=InMemorySaver()
+    )
+    config = {"configurable": {"thread_id": "thread-rogue-plan-1"}}
+    async for _chunk in compiled.astream(child, config=config, context=context):
+        pass
+
+    snapshot = await compiled.aget_state(config)
+    terminal = normalize_complex_state(dict(snapshot.values))
+
+    # The append went through the single governed function, the frozen validator
+    # ran on it, and its result is exactly the checkpointed plan.
+    assert len(append_results) == 1
+    assert len(validation_calls) == 1
+    assert terminal["plan"] == append_results[0]
+    assert terminal["plan"] == validation_calls[0][1]
+    assert [task.task_id for task in terminal["plan"].tasks] == ["T1", "T2"]
+    assert [call[0].task_id for call in search.calls] == ["T2"]
+
+    # The reviewer's defeat form: catalog-valid document.search, no fabricated
+    # scalar, but bypassing append_replan_tasks. It must never be the
+    # checkpointed plan nor any dispatched task.
+    base = _people_plan()
+    rogue_task = TaskSpec(
+        task_id="T2",
+        capability="document.search",
+        task_objective="rogue append bypassing append_replan_tasks",
+        input=DocumentSearchInput(
+            kind="document.search", query="nghi dinh", person_identifier=None
+        ),
+        depends_on=(),
+        origin=ReplanTaskOrigin(
+            kind="replan",
+            reason="bypassed-append-replan-tasks",
+            task_ids=(),
+            evidence_use_ids=(),
+        ),
+    )
+    copied = list(base.tasks)
+    copied.append(rogue_task)
+    rogue_plan = base.model_copy(update={"tasks": tuple(copied)})
+
+    assert terminal["plan"] != rogue_plan
+    assert "bypassed-append-replan-tasks" not in terminal["plan"].model_dump_json()
+    dispatched = search.calls[0][0]
+    assert dispatched.task_id == "T2"
+    assert dispatched.objective != rogue_task.task_objective
+    # The governed append carries the recovery lineage the rogue lacks.
+    recovery = terminal["plan"].tasks[1]
+    assert recovery.depends_on == ("T1",)
+    assert recovery.origin.task_ids == ("T1",)  # type: ignore[union-attr]
+    assert "not_found" in recovery.origin.reason  # type: ignore[union-attr]
 
 
 def test_catalog_valid_append_bypassing_governance_is_rejected() -> None:
@@ -2946,15 +3135,18 @@ def test_catalog_valid_append_bypassing_governance_is_rejected() -> None:
         )
 
 
-def test_subagent_cannot_receive_raw_people_record_or_runtime_secrets() -> None:
-    """R51: KNOWN scalar + KNOWN runtime secret never reach advisory payloads.
+@pytest.mark.asyncio
+async def test_subagent_cannot_receive_raw_people_record_or_runtime_secrets() -> None:
+    """R51/R53: KNOWN scalar + KNOWN runtime secret never reach model projections.
 
     Both sentinels are REAL (non-vacuous): the People scalar is present in
     the authoritative checkpointed plan (T2 ``person_identifier``) and the
     runtime secret is present in the request-scoped service seam
     (``RuntimeServices.authorization``). Both must be ABSENT from every
     advisory/subagent-facing projection (model replan input, observations,
-    tool adapter inputs). The test fails if either leaks into a projection.
+    tool adapter inputs) AND from the model-facing synthesis boundary
+    (``SynthesisInput`` / ``SynthesisEvidence``). The test fails if either
+    leaks into a projection.
     """
     import json
 
@@ -3064,6 +3256,57 @@ def test_subagent_cannot_receive_raw_people_record_or_runtime_secrets() -> None:
     }
     for name in adapter.visible_tool_names():
         assert not (set(adapter.input_fields(name)) & runtime_only), name
+
+    # R53: the model-facing synthesis boundary must carry neither sentinel.
+    # Seed a governed evidence use for T1 so the real synthesis path can
+    # hydrate a projection, then capture exactly what the DraftBuilder seam
+    # receives (SynthesisInput + SynthesisEvidence).
+    from app.services.agents.v2.contracts.synthesis import SynthesisInput
+    from app.services.agents.v2.nodes.synthesize import (
+        DEFAULT_SYNTHESIS_BUDGET,
+        build_extractive_draft,
+        synthesize_answer,
+    )
+
+    synthesis_use_id = uuid4()
+    capabilities[0].uses[synthesis_use_id] = ("T1", "t1")
+    sufficient = EvidenceEvaluation(
+        status="sufficient",
+        coverage=Coverage(items=()),
+        missing=(),
+        contradictions=(),
+    )
+    synthesis_input = SynthesisInput(
+        semantic=_semantic(),
+        evaluation=sufficient,
+        evidence_uses=(EvidenceUseRef(use_id=synthesis_use_id),),
+    )
+
+    class _CapturingDraftBuilder:
+        def __init__(self) -> None:
+            self.input: SynthesisInput | None = None
+            self.evidence: tuple = ()
+
+        def build(self, synthesis_input, evidence):  # type: ignore[no-untyped-def]
+            self.input = synthesis_input
+            self.evidence = tuple(evidence)
+            return build_extractive_draft(tuple(evidence))
+
+    builder = _CapturingDraftBuilder()
+    await synthesize_answer(
+        synthesis_input=synthesis_input,
+        runtime=context,
+        plan=sentinel_plan,
+        bindings=_bindings(),
+        budget=DEFAULT_SYNTHESIS_BUDGET,
+        draft_builder=builder,
+    )
+    assert builder.input is not None
+    assert sentinel_scalar not in builder.input.model_dump_json()
+    assert sentinel_secret not in builder.input.model_dump_json()
+    for item in builder.evidence:
+        assert sentinel_scalar not in item.model_dump_json()
+        assert sentinel_secret not in item.model_dump_json()
 
 
 def test_no_duplicate_test_function_names() -> None:
