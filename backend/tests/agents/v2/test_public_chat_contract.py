@@ -330,3 +330,57 @@ def test_prepare_resume_rejects_wrong_clarification_id():
                 clarification_id="clr-other",
             )
         )
+
+
+def test_relay_preserves_citation_handle_and_source_type():
+    """Fix round 2 (N-C1): the answer cites sources by the 4-char ``index``
+    code and the UI resolves markers by exact ``index`` match — the public
+    boundary must preserve ``index``/``source_type``/``score`` instead of
+    coercing every source to an unlocatable vector citation.
+    """
+    import json
+
+    raw = (
+        'event: sources\ndata: {"sources": ['
+        '{"index": "a3x9", "chunk_id": "c1", "content": "excerpt", '
+        '"document_id": "d1", "page_no": 2, "score": 0.91, '
+        '"source_type": "vector"}, '
+        '{"index": "k7q2", "chunk_id": "k1", "content": "kg excerpt", '
+        '"document_id": "d2", "page_no": 0, "score": 0.77, '
+        '"source_type": "kg"}'
+        ']}\n\n'
+    )
+    frames = transport_normalize(raw)
+    assert len(frames) == 1
+    payload = json.loads(frames[0].split("\ndata: ", 1)[1])
+    by_index = {c.get("index"): c for c in payload["citations"]}
+    assert set(by_index) == {"a3x9", "k7q2"}
+    assert by_index["a3x9"]["source_type"] == "vector"
+    assert by_index["a3x9"]["score"] == 0.91
+    assert by_index["k7q2"]["source_type"] == "kg"
+    assert by_index["k7q2"]["score"] == 0.77
+
+
+def transport_normalize(raw: str) -> list[str]:
+    from app.services.agents.v2 import transport
+
+    return transport.normalize_sse_frame(raw)
+
+
+def test_relay_stamps_outside_funnel_frames():
+    """Fix round 2 (bullet-2 residual): session-plumbing frames emitted
+    outside the drain funnel must still reach the client stamped.
+    """
+    import json
+
+    for raw in (
+        'event: status\ndata: {"step": "starting", "detail": "hi"}\n\n',
+        'event: user_id\ndata: {"id": "msg_1"}\n\n',
+        'event: ai_message_id\ndata: {"message_id": "msg_2"}\n\n',
+        'event: session_title_updated\ndata: {"Title": "T"}\n\n',
+        'event: error\ndata: {"message": "boom"}\n\n',
+    ):
+        frames = transport_normalize(raw)
+        assert len(frames) == 1, raw
+        payload = json.loads(frames[0].split("\ndata: ", 1)[1])
+        assert payload.get("contract_version") == "v2.chat/1", raw

@@ -579,6 +579,12 @@ export type PublicUIPhase =
 export interface PublicCitation {
   citation_id: string;
   label: string;
+  /** 4-char answer citation handle (preserved end-to-end, fix round 2). */
+  index?: string | null;
+  /** Provenance: vector | kg (preserved, never coerced). */
+  source_type?: "vector" | "kg" | null;
+  /** Advisory rank signal. */
+  score?: number | null;
   document_id?: string | null;
   chunk_id?: string | null;
   content?: string;

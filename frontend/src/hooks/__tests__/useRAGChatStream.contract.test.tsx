@@ -251,6 +251,9 @@ describe('normalized relay vocabulary (fix round 1, C1/I4)', () => {
     expect(result.current.pendingCitations).toHaveLength(0);
     expect(result.current.pendingSources).toHaveLength(0);
     expect(final?.sources ?? []).toHaveLength(0);
+    // Fix round 2 (N-I2): the discarded draft's citations must not survive
+    // into the completed message either.
+    expect(final?.citations ?? []).toHaveLength(0);
   });
 
   it('sends the structured selection envelope with clarification replies', async () => {
@@ -282,5 +285,76 @@ describe('normalized relay vocabulary (fix round 1, C1/I4)', () => {
       clarification_id: 'clr-1',
       selected_option_id: 'opt-1',
     });
+  });
+});
+
+describe('citation handle preservation (fix round 2, N-C1)', () => {
+  it('keeps the answer index and KG provenance, and markers resolve', async () => {
+    const { injectCitations } = await import(
+      '@/components/rag/chat/markdown/citations'
+    );
+    const { Children, isValidElement } = await import('react');
+    mockFetchFrames([
+      'event: citation\ndata: {"contract_version":"v2.chat/1","citations":[{"citation_id":"cit-1","label":"L1","index":"a3x9","document_id":"d1","chunk_id":"c1","content":"excerpt","source_type":"vector","score":0.91},{"citation_id":"cit-2","label":"L2","index":"k7q2","document_id":"d2","chunk_id":"k1","content":"kg","source_type":"kg","score":0.77}],"image_refs":[],"people":[]}\n\n',
+      'event: complete\ndata: {"answer":"done"}\n\n',
+    ]);
+    const { result } = renderStreamHook();
+
+    await act(async () => {
+      await result.current.sendMessage('rag query', [], false);
+    });
+
+    // Compat projection preserves the handle the answer cites by.
+    expect(result.current.pendingSources[0].index).toBe('a3x9');
+    expect(result.current.pendingSources[1].index).toBe('k7q2');
+    expect(result.current.pendingSources[1].source_type).toBe('kg');
+
+    // In-text markers resolve against the projected sources (incl. KG).
+    const nodes = Children.toArray(
+      injectCitations(
+        'Theo quy định [a3x9] và đồ thị tri thức [k7q2].',
+        result.current.pendingSources,
+        [],
+      ),
+    );
+    const indexes = nodes
+      .filter((n) => isValidElement(n))
+      .map((n) => (n as any).props.index);
+    expect(indexes).toContain('a3x9');
+    expect(indexes).toContain('k7q2');
+    expect(
+      nodes.some((n) => typeof n === 'string' && String(n).includes('[a3x9]')),
+    ).toBe(false);
+  });
+});
+
+describe('required scenarios (fix round 2, I1)', () => {
+  it('preserves exact-section locators through normalized citations', async () => {
+    mockFetchFrames([
+      'event: citation\ndata: {"citations":[{"citation_id":"cit-s","label":"\\u0110i\\u1ec1u 5 \\u2014 24/2018/QH14","index":"d5f1","document_id":"d9","chunk_id":"sec-5","document_number":"24/2018/QH14","article_label":"\\u0110i\\u1ec1u 5"}]}\n\n',
+      'event: complete\ndata: {"answer":"ok"}\n\n',
+    ]);
+    const { result } = renderStreamHook();
+
+    await act(async () => {
+      await result.current.sendMessage('section query', [], false);
+    });
+
+    expect(result.current.pendingSources[0].article_label).toBe('Điều 5');
+    expect(result.current.pendingSources[0].document_number).toBe('24/2018/QH14');
+  });
+
+  it('surfaces not-found/error terminals without crashing', async () => {
+    mockFetchFrames([
+      'event: error\ndata: {"contract_version":"v2.chat/1","message":"Không tìm thấy văn bản phù hợp"}\n\n',
+    ]);
+    const { result } = renderStreamHook();
+
+    await act(async () => {
+      await result.current.sendMessage('unknown doc query', [], false);
+    });
+
+    expect(result.current.error).toContain('Không tìm thấy');
+    expect(result.current.isStreaming).toBe(false);
   });
 });

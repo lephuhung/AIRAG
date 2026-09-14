@@ -106,11 +106,17 @@ _PASSTHROUGH_EVENTS: Final[frozenset[str]] = frozenset(
 )
 
 # Allowlisted public citation fields. Everything else — internal evidence
-# UUIDs, task/run/binding/workspace identity, scores internals — is dropped.
+# UUIDs, task/run/binding/workspace identity — is dropped. ``index`` (the
+# 4-char answer citation handle), ``source_type`` (vector/kg provenance)
+# and ``score`` (advisory rank) are presentation facts the answer text and
+# the UI resolve by, so they cross the boundary (fix round 2, N-C1).
 _PUBLIC_CITATION_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "citation_id",
         "label",
+        "index",
+        "source_type",
+        "score",
         "document_id",
         "chunk_id",
         "content",

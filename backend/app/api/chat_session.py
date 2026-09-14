@@ -435,6 +435,23 @@ from app.schemas.rag import ChatRequest
 from app.api.chat_agent import _get_accessible_workspaces
 
 
+def _public_frames(event: str, data: dict) -> list[str]:
+    """Format one session-plumbing frame through the public funnel.
+
+    Fix round 2 (bullet-2 residual): frames emitted outside the drain
+    funnel (``status:starting``, ``user_id``, ``ai_message_id``,
+    ``session_title_updated``, ``error``) reach the client stamped with
+    ``contract_version`` like every relayed frame. Unmapped frames pass
+    through byte-identical.
+    """
+    from app.api.chat_agent import format_sse_event
+    from app.services.agents.v2.transport import (
+        normalize_sse_frame as _normalize_frame,
+    )
+
+    return _normalize_frame(format_sse_event(event, data))
+
+
 # ---------------------------------------------------------------------------
 # Attachment ACL + delete authorization helpers (Task 1 / B1).
 #
@@ -1769,9 +1786,10 @@ async def chat_stream_session(
                 accumulated_text
             )
             if new_title:
-                relay.put_nowait(
-                    format_sse_event("session_title_updated", {"Title": new_title})
-                )
+                for out_frame in _public_frames(
+                    "session_title_updated", {"Title": new_title}
+                ):
+                    relay.put_nowait(out_frame)
 
             # Persist the answer synchronously so it is durable the instant the
             # stream closes (survives an immediate hard reload).
@@ -1836,7 +1854,8 @@ async def chat_stream_session(
                 )
             except Exception:
                 pass
-            relay.put_nowait(format_sse_event("error", {"message": str(e)}))
+            for out_frame in _public_frames("error", {"message": str(e)}):
+                relay.put_nowait(out_frame)
             await _persist(partial=True)
         finally:
             relay.put_nowait(None)
@@ -1847,12 +1866,17 @@ async def chat_stream_session(
     _ACTIVE_STREAMS[session_id] = run_task
 
     async def _event_generator_lg():
-        yield format_sse_event(
+        for out_frame in _public_frames(
             "status",
             {"step": "starting", "detail": "Initializing LangGraph agent..."},
-        )
-        yield format_sse_event("user_id", {"id": user_msg_id})
-        yield format_sse_event("ai_message_id", {"message_id": ai_msg_id})
+        ):
+            yield out_frame
+        for out_frame in _public_frames("user_id", {"id": user_msg_id}):
+            yield out_frame
+        for out_frame in _public_frames(
+            "ai_message_id", {"message_id": ai_msg_id}
+        ):
+            yield out_frame
 
         while True:
             item = await relay.get()

@@ -483,12 +483,19 @@ export function useRAGChatStream(
                       ]);
                     } else if (step === "rollback") {
                       // Public-contract form of token_rollback: clear
-                      // speculative content the same way.
+                      // speculative content the same way (fix round 2, N-I2:
+                      // citations too, else the draft's citations survive
+                      // into `complete` via the localCitations preference).
                       bufferRef.current = "";
+                      if (rafRef.current) {
+                        cancelAnimationFrame(rafRef.current);
+                        rafRef.current = undefined;
+                      }
                       setStreamingContent("");
                       localSources = [];
                       localImages = [];
                       localPeople = [];
+                      localCitations = [];
                       setPendingSources([]);
                       setPendingImages([]);
                       setPendingPeople([]);
@@ -585,20 +592,21 @@ export function useRAGChatStream(
                     const citations = (data.citations || []) as PublicCitation[];
                     localCitations = citations;
                     setPendingCitations([...citations]);
-                    // I4 compat: project locatable citations into the
-                    // sources presentation model so existing citation panels
-                    // keep rendering on normalized frames (dedup by chunk).
+                    // Fix round 2 (N-C1): project locatable citations into the
+                    // sources presentation model preserving the answer's
+                    // citation handle (`index`), provenance (`source_type`)
+                    // and rank (`score`) — never synthesize them.
                     const compat: ChatSourceChunk[] = citations
                       .filter((c) => c.document_id && c.chunk_id)
                       .map((c) => ({
-                        index: c.citation_id,
+                        index: c.index || c.citation_id,
                         chunk_id: String(c.chunk_id),
                         content: c.content || "",
                         document_id: String(c.document_id),
                         page_no: c.page_no ?? 0,
                         heading_path: c.heading_path || [],
-                        score: 0,
-                        source_type: "vector" as const,
+                        score: c.score ?? 0,
+                        source_type: (c.source_type === "kg" ? "kg" : "vector") as ChatSourceChunk["source_type"],
                         document_number: c.document_number ?? null,
                         article_label: c.article_label ?? null,
                       }));
