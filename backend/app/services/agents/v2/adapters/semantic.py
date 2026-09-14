@@ -27,6 +27,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from uuid import UUID
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ..semantic.document_identity import DocumentIdentityResolver
+
 from app.services.agents.semantic_preprocessor import (
     AbbreviationEntry,
     BlockingAmbiguity as LegacyBlockingAmbiguity,
@@ -416,6 +420,49 @@ def finalize_semantics(
 # ``AbbreviationEntry`` is referenced for the typed signature above; re-exported
 # so Phase 2 can type its preprocessor boundary without importing legacy modules
 # directly.
+async def resolve_draft_identities(
+    draft: SemanticDraft,
+    *,
+    question: str,
+    identity_resolver: DocumentIdentityResolver | None,
+    workspace_ids: Sequence[UUID],
+    db: AsyncSession,
+    use_llm_fallback: bool = True,
+) -> SemanticDraft:
+    """Enrich unresolved draft refs with v1 identity facts (Phase 4B, Task 6).
+
+    Already-resolved refs (preprocessor/ui_selection/api_explicit) pass
+    through untouched; each remaining ref is resolved through the shared
+    request-scoped ``DocumentIdentityResolver`` with the full
+    contextualized question as ``topic``. Only identity fields
+    (``resolution_status``/``resolved_document_id``/
+    ``candidate_document_ids``) change: revision pinning stays with the
+    existing v2 binding resolver, and the resolver's per-request cache
+    makes repeated builds free. Errors fail closed (propagate) rather
+    than fabricating an identity.
+    """
+    if identity_resolver is None:
+        raise SemanticAdapterError(
+            "identity resolution requires a DocumentIdentityResolver; "
+            "refusing to fabricate document identity"
+        )
+    resolved_refs: list[DocumentReference] = []
+    for reference in draft.document_refs:
+        if reference.resolution_status == "resolved":
+            resolved_refs.append(reference)
+            continue
+        resolved_refs.append(
+            await identity_resolver.resolve_reference(
+                reference,
+                question=question,
+                workspace_ids=workspace_ids,
+                db=db,
+                use_llm_fallback=use_llm_fallback,
+            )
+        )
+    return draft.model_copy(update={"document_refs": tuple(resolved_refs)})
+
+
 __all__ = [
     "FinalizedSemantics",
     "PERSISTED_SEMANTIC_VERSION",
@@ -425,4 +472,5 @@ __all__ = [
     "draft_from_preprocessing",
     "finalize_semantic_context",
     "finalize_semantics",
+    "resolve_draft_identities",
 ]

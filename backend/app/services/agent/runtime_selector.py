@@ -846,6 +846,9 @@ async def build_v2_ingress(
         GovernorEvidenceHydrator,
     )
     from app.services.agents.v2.nodes.evaluate import AnswerDraftChannel
+    from app.services.agents.v2.semantic.document_identity import (
+        DocumentIdentityResolver,
+    )
     from app.services.agents.v2.semantic.intent import IntentClassifier
     from app.services.agents.supervisor_v2 import build_initial_v2_state
 
@@ -914,7 +917,12 @@ async def build_v2_ingress(
                 session_id=thread_id,
                 can_read_people=bool(can_read_people),
                 session_factory=session_factory,
-            )
+            ),
+            # Exactly one typed v1 identity wrapper per ingress turn
+            # (Phase 4B, Task 6): the request-scoped cache behind it means
+            # repeated semantic builds resolve once per turn. The existing
+            # v2 binding resolver stays the only revision-pin authority.
+            identity_resolver=DocumentIdentityResolver(),
         )
         # F1 role policy: the production semantic adapter emits
         # ``requested_role=None`` for every user reference, so the wired

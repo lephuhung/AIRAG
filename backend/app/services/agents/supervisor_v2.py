@@ -1218,8 +1218,22 @@ class DeterministicSemanticAdapter:
     for a different query.
     """
 
-    def __init__(self, *, preprocess: Callable[[str], Any]) -> None:
+    def __init__(
+        self,
+        *,
+        preprocess: Callable[[str], Any],
+        identity_resolver: Any = None,
+    ) -> None:
         self._preprocess = preprocess
+        # Phase 4B (Task 6): the request-scoped v2
+        # ``DocumentIdentityResolver`` (typed v1 ``resolve_candidates()``
+        # wrapper). Optional and defaulting to ``None`` so existing
+        # construction sites are unaffected; ``build_draft`` never uses it
+        # implicitly — consumers call
+        # ``adapters/semantic.py::resolve_draft_identities`` explicitly
+        # with the contextualized question, db, and trusted workspace
+        # scope. Never checkpointed; read via this attribute only.
+        self.identity_resolver = identity_resolver
 
     @staticmethod
     def reconcile_ui_selections(
