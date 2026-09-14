@@ -846,6 +846,7 @@ async def build_v2_ingress(
         GovernorEvidenceHydrator,
     )
     from app.services.agents.v2.nodes.evaluate import AnswerDraftChannel
+    from app.services.agents.v2.semantic.intent import IntentClassifier
     from app.services.agents.supervisor_v2 import build_initial_v2_state
 
     if session_factory is None:
@@ -952,6 +953,10 @@ async def build_v2_ingress(
             authorization=V2AuthorizationService(session_factory),
             evidence_hydrator=hydrator,
             answer_draft_channel=AnswerDraftChannel(),
+            # Exactly one typed v1 intent adapter per ingress turn (Phase
+            # 4A, Task 2): the request-scoped cache behind it means repeated
+            # semantic draft builds classify once per turn.
+            intent_classifier=IntentClassifier(),
             # The exact same request-scoped resolver the document
             # capabilities resolve through: the shared TaskScheduler feeds
             # it from the checkpointed plan + bindings before dispatch.

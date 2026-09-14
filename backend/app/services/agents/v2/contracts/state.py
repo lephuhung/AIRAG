@@ -77,9 +77,11 @@ class RuntimeServices(RuntimeModel):
     adapter/cache. ``IntentDecision`` values it produces are advisory-only
     semantic facts consumed by the deterministic route policy; they are
     never checkpointed and never carry legacy supervisor control fields
-    (``next_agent`` / ``pending_intent`` / task plans). Defaults to
-    ``None``; consumers construct an ephemeral classifier or fail closed
-    when the service is absent.
+    (``next_agent`` / ``pending_intent`` / task plans). The ingress owner
+    constructs exactly one classifier per turn; consumers reuse
+    ``services.intent_classifier`` and never construct a classifier per
+    call. Defaults to ``None``; consumers fail closed when the service
+    is absent.
 
     The bag deliberately excludes ``plan_checkpoint`` (plan persistence is
     LangGraph state plus the supervisor checkpointer — no service) and any

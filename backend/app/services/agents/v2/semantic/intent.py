@@ -22,11 +22,16 @@ Ownership rules enforced here:
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import re
 from collections.abc import Callable
 from typing import Any, Literal
 
 from ..contracts.base import RuntimeModel
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "IntentDecision",
@@ -64,6 +69,17 @@ _VALID_INTENTS = frozenset(
 )
 
 
+#: Inline reasoning tags emitted by thinking-capable models; stripped before
+#: JSON extraction exactly like the v1 supervisor parser.
+_THINK_TAG_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+#: Anti-prose user wrapper (v1 parity): chatty proxy models otherwise answer
+#: the legal question in prose instead of returning routing JSON.
+_CLASSIFY_USER_TEMPLATE = (
+    "You are a ROUTING classifier. Do NOT answer the user's question. "
+    "Output ONE JSON object only (no markdown, no prose) with keys: "
+    "intent, needs_memory, is_legal_query.\n\nUSER MESSAGE:\n{query}"
+)
 class IntentDecision(RuntimeModel):
     """Typed v1 intent projection (runtime-only, advisory, never checkpointed)."""
 
@@ -114,23 +130,77 @@ def classify_deterministic(
     )
 
 
+def _as_bool(value: object) -> bool:
+    """Strict boolean projection: only a real ``True`` is true.
+
+    The model prompt asks for JSON booleans, but a chatty model may emit
+    ``"false"`` / ``"yes"`` strings; ``bool(...)`` would coerce every
+    non-empty string to ``True``. Anything that is not exactly ``True``
+    is ``False``.
+    """
+    return value is True
+
+
+def _extract_json_object(raw: str) -> tuple[dict | None, bool]:
+    """Extract the routing JSON object using v1's tolerant semantics.
+
+    Order mirrors ``_parse_supervisor_response``: strip ``<think>`` tags,
+    unwrap a fenced block, try a direct parse, then salvage the
+    ``raw[find("{") : rfind("}")+1]`` slice from prose. Returns the
+    payload and whether it was salvaged (informational only).
+    """
+    text = (raw or "").strip()
+    text = _THINK_TAG_RE.sub("", text).strip()
+    candidate = text
+    if "```json" in candidate:
+        candidate = candidate.split("```json", 1)[-1].split("```", 1)[0].strip()
+    elif "```" in candidate:
+        parts = candidate.split("```")
+        if len(parts) >= 3:
+            candidate = parts[1].strip()
+    try:
+        data = json.loads(candidate) if candidate else None
+        if isinstance(data, dict):
+            return data, False
+    except json.JSONDecodeError:
+        pass
+    start, end = candidate.find("{"), candidate.rfind("}")
+    if start != -1 and end > start:
+        try:
+            data = json.loads(candidate[start : end + 1])
+            if isinstance(data, dict):
+                logger.info(
+                    "[intent] Salvaged JSON object embedded in model output "
+                    f"({len(candidate)} chars \u2192 {end - start + 1} chars)"
+                )
+                return data, True
+        except json.JSONDecodeError:
+            pass
+    return None, False
+
+
 def _parse_model_output(raw: str) -> IntentDecision:
     """Project the full-taxonomy model JSON onto ``IntentDecision``.
 
     Only ``intent`` / ``needs_memory`` / ``is_legal_query`` are read; any
     legacy control fields the prompt emits are ignored, never stored.
     Unknown intents fall back to ``search`` (the v1 classifier default).
+    A total parse failure falls back to ``search`` with ``is_legal_query``
+    ``True`` and a warning (v1 parity: retrieval-backed, never silent).
     """
-    text = (raw or "").strip()
-    if "```" in text:
-        parts = text.split("```")
-        text = parts[-2].strip() if len(parts) >= 3 else parts[-1].strip()
-    try:
-        data = json.loads(text) if text else {}
-    except json.JSONDecodeError:
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
+    data, _salvaged = _extract_json_object(raw)
+    if data is None:
+        logger.warning(
+            "[intent] Failed to parse model JSON (falling back to search): %r",
+            (raw or "")[:200],
+        )
+        return IntentDecision(
+            intent="search",
+            source="model",
+            confidence=None,
+            needs_memory=False,
+            is_legal_query=True,
+        )
     intent = data.get("intent", "search")
     if intent not in _VALID_INTENTS:
         intent = "search"
@@ -143,34 +213,42 @@ def _parse_model_output(raw: str) -> IntentDecision:
         intent=intent,
         source="model",
         confidence=confidence,
-        needs_memory=bool(data.get("needs_memory", False)),
-        is_legal_query=bool(data.get("is_legal_query", False)),
+        needs_memory=_as_bool(data.get("needs_memory", False)),
+        is_legal_query=_as_bool(data.get("is_legal_query", False)),
     )
 
 
 class IntentClassifier:
     """Request-scoped v1 intent adapter with per-turn cache.
 
-    One instance lives for one request/turn (wired onto
-    ``RuntimeServices.intent_classifier``). ``classify()`` checks the
-    deterministic narrow scopes first and only then calls the
-    ``semantic_router`` model; every result is cached by normalized query
-    so repeated semantic draft builds classify once.
+    One instance lives for one request/turn (constructed once by the
+    ingress owner and wired onto ``RuntimeServices.intent_classifier``).
+    ``classify()`` checks the deterministic narrow scopes first and only
+    then calls the ``semantic_router`` model; every result is cached by
+    ``(normalized query, has_doc_ids)`` so repeated semantic draft builds
+    classify once. Concurrent callers share one in-flight model call per
+    key (single-flight). Consumers must reuse
+    ``services.intent_classifier`` and never construct a classifier per
+    call — a per-call instance would defeat cross-build caching.
     """
 
     def __init__(
         self, *, provider_factory: Callable[[], Any] | None = None
     ) -> None:
-        self._cache: dict[str, IntentDecision] = {}
+        self._cache: dict[tuple[str, bool], IntentDecision] = {}
+        self._locks: dict[tuple[str, bool], asyncio.Lock] = {}
         self._provider_factory = provider_factory
 
     @staticmethod
-    def _cache_key(query: str) -> str:
-        return (query or "").strip()
+    def _cache_key(query: str, has_doc_ids: bool = False) -> tuple[str, bool]:
+        # ``has_doc_ids`` changes ``classify_supervisor_scope``, so it is
+        # part of the key: the same text with attached documents may route
+        # through a different scope.
+        return ((query or "").strip(), bool(has_doc_ids))
 
-    def cached(self, query: str) -> IntentDecision | None:
+    def cached(self, query: str, *, has_doc_ids: bool = False) -> IntentDecision | None:
         """Return the cached decision for ``query``, if present."""
-        return self._cache.get(self._cache_key(query))
+        return self._cache.get(self._cache_key(query, has_doc_ids))
 
     @property
     def cache_size(self) -> int:
@@ -184,20 +262,25 @@ class IntentClassifier:
     async def classify(
         self, query: str, *, has_doc_ids: bool = False
     ) -> IntentDecision:
-        """Classify ``query`` into a typed ``IntentDecision`` (cached)."""
-        key = self._cache_key(query)
-        if not key:
+        """Classify ``query`` into a typed ``IntentDecision`` (cached, single-flight)."""
+        key = self._cache_key(query, has_doc_ids)
+        if not key[0]:
             raise IntentClassifierError("cannot classify an empty query")
-        hit = self._cache.get(key)
-        if hit is not None:
-            return hit
-        deterministic = classify_deterministic(query, has_doc_ids=has_doc_ids)
-        if deterministic is not None:
-            self._cache[key] = deterministic
-            return deterministic
-        decision = await self._classify_via_model(key)
-        self._cache[key] = decision
-        return decision
+        # ``setdefault`` with no await in between is atomic on the event
+        # loop: one lock per key, so concurrent callers serialize and the
+        # second reuses the first caller's cached result (double-checked).
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            hit = self._cache.get(key)
+            if hit is not None:
+                return hit
+            deterministic = classify_deterministic(query, has_doc_ids=has_doc_ids)
+            if deterministic is not None:
+                self._cache[key] = deterministic
+                return deterministic
+            decision = await self._classify_via_model(key[0])
+            self._cache[key] = decision
+            return decision
 
     async def _classify_via_model(self, query: str) -> IntentDecision:
         """Full-taxonomy v1 prompt behavior via the ``semantic_router`` role."""
@@ -212,14 +295,35 @@ class IntentClassifier:
         from app.services.llm.types import LLMMessage as _LLMMsg
 
         system_prompt = build_supervisor_system_prompt("full", max_iterations=3)
+        user_content = _CLASSIFY_USER_TEMPLATE.format(query=query)
         response_text = ""
         async for chunk in provider.astream(
-            [_LLMMsg(role="user", content=query)],
+            [_LLMMsg(role="user", content=user_content)],
             system_prompt=system_prompt,
             temperature=0.0,
-            max_tokens=256,
+            max_tokens=160,  # routing JSON only; keep short so chatty models can't rant
+            think=False,  # disable thinking to reduce latency for classification
         ):
+            # Thinking-capable providers yield reasoning separately; the
+            # routing JSON lives in text chunks only (v1 parity).
+            if getattr(chunk, "type", "text") == "thinking":
+                continue
             text = getattr(chunk, "text", None)
-            if text:
-                response_text += str(text)
+            if not text:
+                continue
+            response_text += str(text)
+            # Early-stop once a complete JSON object is buffered — prevents
+            # waiting for a long prose answer after a valid routing blob.
+            if "{" in response_text and "}" in response_text:
+                _s, _e = response_text.find("{"), response_text.rfind("}")
+                if _e > _s:
+                    try:
+                        json.loads(response_text[_s : _e + 1])
+                        logger.info(
+                            "[intent] Early-stop classifier stream "
+                            f"({len(response_text)} chars, valid JSON)"
+                        )
+                        break
+                    except json.JSONDecodeError:
+                        pass
         return _parse_model_output(response_text)
