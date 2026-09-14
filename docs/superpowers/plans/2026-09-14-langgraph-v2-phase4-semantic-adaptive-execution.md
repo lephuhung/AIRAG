@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Preserve the proven semantic/intent/document-resolution intelligence of `LLM-Optimize`, translate it into frozen v2 contracts, achieve fast-path parity, then add governed adaptive planning only for genuinely complex execution topologies.
+**Goal:** Preserve the proven semantic/intent/document-resolution intelligence of `LLM-Optimize`, translate it into frozen v2 contracts, achieve fast-path parity, synchronize the public frontend transport contract, then add governed adaptive planning only for genuinely complex execution topologies.
 
-**Architecture:** V1 remains the semantic intelligence source for simple-query understanding, document identity, intent, contextualization, and fast-path semantics. A request-scoped adapter/cache translates those outputs into `SemanticDraft`/`SemanticContext`/`QueryAnalysis`; v2 remains authoritative for ACL, immutable revision binding, deterministic route policy, planning validation, scheduling, evidence, checkpointing, and grounding.
+**Architecture:** V1 remains the semantic intelligence source for simple-query understanding, document identity, intent, contextualization, and fast-path semantics. A request-scoped adapter/cache translates those outputs into `SemanticDraft`/`SemanticContext`/`QueryAnalysis`; v2 remains authoritative for ACL, immutable revision binding, deterministic route policy, planning validation, scheduling, evidence, checkpointing, and grounding. A separate public transport adapter maps internal v2 results to versioned UI-safe DTO/SSE events so the frontend never depends directly on checkpoint/runtime contracts.
 
-**Tech Stack:** Python 3, LangGraph, Pydantic v2, SQLAlchemy async, existing AIRAG LLM providers/runtime config, Qdrant/vector search, pytest, React/TypeScript Admin LLM Config.
+**Tech Stack:** Python 3, LangGraph, Pydantic v2, SQLAlchemy async, existing AIRAG LLM providers/runtime config, Qdrant/vector search, pytest, React/TypeScript, SSE chat transport, frontend component/hook tests.
 
 **Spec:** `docs/superpowers/specs/2026-09-14-langgraph-v2-semantic-adaptive-execution-design.md`
 
@@ -19,7 +19,9 @@
 - `RouteDecision` is deterministic v2 policy. Semantic models never directly choose route/capability/tool.
 - Document resolver candidates are server-side identity candidates; v2 binding remains the sole immutable revision-pin authority.
 - Whether an LLM was needed to understand a query is not a complexity signal.
-- Planner work starts only after v1-v2 fast-path parity passes.
+- Frontend never consumes raw `SupervisorV2State`, runtime services, checkpoint payloads, hidden model reasoning, planner prompts, or internal evidence-store identifiers.
+- Public chat/SSE DTOs are an explicit compatibility boundary and must support v1/v2 canary operation.
+- Planner work starts only after v1-v2 fast-path parity **and core frontend transport compatibility** pass.
 - Reuse existing LLM runtime role configuration; do not add separate router/planner provider stacks.
 - One scheduler, one supervisor checkpointer, one capability registry.
 
@@ -247,13 +249,78 @@ class IntelligenceService:
 - [ ] Record semantic-router call counts and assert zero where deterministic v1 narrow scopes suffice.
 - [ ] Commit: `feat(v2): restore fast path parity with simple eligibility gate`.
 
-**Hard acceptance gate:** v2 simple-query behavior must meet or exceed `LLM-Optimize` on the versioned corpus before Task 7 begins.
+**Hard acceptance gate:** v2 simple-query behavior must meet or exceed `LLM-Optimize` on the versioned corpus before Planner begins.
+
+---
+
+## Task 6A — Synchronize V2 public transport contract with the frontend
+
+**Priority:** P0 — frontend compatibility gate before Planner/canary
+
+**Why:** the current frontend is centered on legacy chat types (`ChatMessage`, `ChatSourceChunk`, `AgentStep`) and `useRAGChatStream` parses legacy-style SSE `status/token/source/...` events. It does not yet model v2 clarification/resume, richer terminal states, or complex execution progress. The solution is **not** to expose `SupervisorV2State`; create an explicit public chat transport boundary.
+
+**Files — Backend:**
+- Create or modify the reviewed v2 chat/SSE transport adapter that owns `stream_v2_turn_events` / `stream_v2_turn_to_sse`.
+- Create: `backend/app/services/agents/v2/transport/contracts.py` or equivalent public DTO owner.
+- Modify persistence/serialization owner for assistant chat metadata only where public metadata must survive reload.
+- Add backend transport-contract tests.
+
+**Files — Frontend:**
+- Modify: `frontend/src/types/index.ts`
+- Modify: `frontend/src/hooks/useRAGChatStream.ts`
+- Modify chat panel/message/timeline components that render clarification/progress/citations.
+- Modify: `frontend/src/hooks/useChatHistory.ts` and history hydration adapters if persisted metadata changes.
+- Add frontend hook/component tests for SSE parsing and reload behavior.
+
+**Interfaces:**
+- Consumes internal v2: `ClarificationRequest`, `RouteDecision`, safe progress summaries from `TaskPlan`/`AgentResult`, governed citations, `FinalResponse`.
+- Produces a UI-safe versioned/discriminated public event union. Conceptual minimum:
+
+```ts
+type ChatTransportEvent =
+  | { version: "2"; type: "status"; phase: ChatPhase; detail?: string }
+  | { version: "2"; type: "clarification_required"; request: PublicClarification }
+  | { version: "2"; type: "clarification_resolved"; requestId: string }
+  | { version: "2"; type: "source"; source: PublicCitationSource }
+  | { version: "2"; type: "token"; text: string }
+  | { version: "2"; type: "complete"; response: PublicFinalResponse }
+  | { version: "2"; type: "error"; message: string; retryable: boolean }
+  | { version: "2"; type: "cancelled" };
+```
+
+Exact naming may follow existing endpoint conventions, but it must be discriminated and validated rather than an untyped open payload.
+
+- [ ] Inventory every SSE event currently emitted by v1 and v2 and every frontend branch that consumes it.
+- [ ] Define the public transport DTO/event contract separately from checkpoint/business contracts.
+- [ ] Preserve v1-compatible events or add a normalization adapter so canary users receive one frontend shape regardless of serving arm.
+- [ ] Add `clarifying`, `planning`, `executing`, `evaluating`, `generating`, `error/cancelled` UI phases as needed; do not expose hidden reasoning.
+- [ ] Represent clarification as structured data: `clarification_id/request_id`, prompt, allowed choices, safe labels/metadata, expiry if applicable.
+- [ ] Add frontend action for selecting a clarification option and resuming the same suspended v2 thread/run through the reviewed backend resume endpoint.
+- [ ] Do not let the frontend manufacture document UUIDs, workspace scope, binding IDs, or arbitrary clarification values; submit only server-issued option identifiers/allowed values.
+- [ ] Normalize v1/v2 citations/sources to one TypeScript presentation type.
+- [ ] Persist only public message metadata needed for reload; prove a page refresh reconstructs clarification/completed message state without reading checkpoints.
+- [ ] Update `useRAGChatStream` to tolerate/ignore unknown forward-compatible events instead of crashing the stream.
+- [ ] Add hook tests for fragmented SSE frames, duplicate/idempotent events, unknown events, cancel/error, clarification interrupt/resume, and normal completion.
+- [ ] Add browser/component tests for:
+  - simple RAG + citations;
+  - exact-section fast path;
+  - People lookup;
+  - ambiguous document → choices → resume → answer;
+  - low-confidence/not-found document state;
+  - refresh after completion;
+  - refresh while clarification is outstanding where product behavior supports resume.
+- [ ] Add backend/frontend contract fixture tests so event-field drift fails CI.
+- [ ] Commit: `feat(v2): synchronize chat transport contract with frontend`.
+
+**Security boundary:** public transport may expose user-safe labels, candidate option identifiers, citation metadata, and progress summaries. It must not expose ACL internals, raw checkpoint state, planner prompts, hidden CoT, internal evidence-use UUIDs unless they are explicitly approved public citation handles, or runtime service/config secrets.
+
+**Hard acceptance gate:** fast-path v2 is not canary-ready until actual web UI behavior passes the same simple/clarification golden scenarios as backend Task 6.
 
 ---
 
 ## Task 7 — Integrate the governed Adaptive Planner for true complex queries
 
-**Priority:** P1 after Task 6 gate
+**Priority:** P1 after Tasks 6 and 6A gates
 
 **Supersedes/absorbs:** `docs/superpowers/plans/2026-09-13-langgraph-v2-p2-adaptive-planner.md`
 
@@ -276,6 +343,7 @@ class IntelligenceService:
 - [ ] Acquire leases/checkpoint only after validation and before scheduler dispatch.
 - [ ] Fall back to existing deterministic policy when planner is disabled/times out/returns malformed or rejected output and a safe deterministic policy exists.
 - [ ] Never let Planner mint trusted document identity or widen hard scope.
+- [ ] Emit only public summarized planning/execution progress through Task 6A transport; never stream the raw internal DAG/checkpoint to the browser.
 - [ ] Commit: `feat(v2): add governed adaptive planner`.
 
 ---
@@ -298,6 +366,7 @@ class IntelligenceService:
 - [ ] Support bounded gaps such as missing target coverage, insufficient evidence, failed dependency, supporting/reference discovery, and contradictions requiring one bounded additional read.
 - [ ] Keep replans append-only; completed tasks cannot be replaced.
 - [ ] Enforce max tasks, max replans, budgets, capability availability, and hard scope.
+- [ ] Expose only coarse public `evaluating/replanning` progress through the frontend transport; no raw evaluator gaps are required in UI unless separately designed.
 - [ ] Keep default rollout conservative until termination/quality tests pass.
 - [ ] Commit: `feat(v2): add evaluator driven bounded replanning`.
 
@@ -314,26 +383,30 @@ class IntelligenceService:
 3. `evaluate` / compliance with trusted typed criteria and grounded evidence.
 
 - [ ] Add real graph tests with causal dependencies for each work type.
+- [ ] Add transport/UI E2E coverage for any new user-visible progress/clarification state introduced by each work type.
 - [ ] Keep complex execution as validated DAGs; do not introduce an unconstrained ReAct loop.
 - [ ] Commit each independently reviewable work type separately.
 
 ---
 
-## Task 10 — Observability, shadow parity, and rollout
+## Task 10 — Observability, shadow parity, frontend compatibility, and rollout
 
 **Priority:** continuous + final gate
 
 **Files:**
 - Modify existing rollout metrics/shadow runtime files identified during implementation
 - Extend golden replay tooling if useful
+- Extend frontend contract/E2E test fixtures from Task 6A
 
 - [ ] Add semantic-intelligence metrics: deterministic bypass, model call count, document resolver stages used, ambiguity/low-confidence rate, latency.
 - [ ] Add v1-v2 parity counters on shadow replay.
 - [ ] Add Planner metrics: calls, latency, proposal rejection reason, fallback, task count, DAG depth, replan count, final evidence sufficiency.
+- [ ] Add public transport schema/version/error metrics without logging sensitive payloads.
 - [ ] Keep planner-proposal shadow distinct from full read-only execution shadow.
 - [ ] Extend shadow support for document read/retrieve parity before claiming full planner execution quality.
+- [ ] Run backend contract + frontend SSE/UI compatibility suites before every canary promotion.
 - [ ] Canary through existing v1/v2 selector with v1 preserved as rollback.
-- [ ] Promote only after fast-path parity, contract safety, planner quality, and grounded-answer gates pass.
+- [ ] Promote only after fast-path parity, frontend compatibility, contract safety, planner quality, and grounded-answer gates pass.
 
 ---
 
@@ -347,6 +420,11 @@ Phase 4 is complete only when all of the following are true:
 - approximate references such as `Điều 5 luật an ninh`, `luật số 24`, or `Thông tư 15 của Bộ Công an` can resolve through the proven multi-stage resolver without making the user query complex;
 - People/general RAG/section/summarize/KG fast paths meet or exceed `LLM-Optimize` golden behavior;
 - v1 legacy state/routing fields do not leak into v2 contracts;
+- frontend does not consume raw `SupervisorV2State`/checkpoint/runtime contracts;
+- v1 and v2 chat arms normalize into a stable public frontend transport shape during canary;
+- clarification is structured, selectable, resumable, and survives supported history/reload flows;
+- citations/sources and terminal status render consistently for both fast and complex v2 turns;
+- actual web E2E passes simple RAG, exact section, People, ambiguity/clarification, not-found/low-confidence, cancel/error, and reload scenarios;
 - current v2 ACL, revision binding, scheduler, checkpoint, evidence, and grounding invariants remain intact;
 - true multi-step queries alone enter adaptive planning;
 - semantic-router/planner model assignment is independently configurable through existing Admin LLM Runtime Config;
