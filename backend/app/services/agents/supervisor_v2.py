@@ -1331,7 +1331,11 @@ class DeterministicSemanticAdapter:
         self, request: RequestContext, conversation: ConversationContext
     ) -> SemanticDraft:
         from .v2.adapters.semantic import SemanticAdapterError, draft_from_preprocessing
-        from .v2.semantic.discourse import resolve_coreferences
+        from .v2.semantic.discourse import (
+            merge_ambiguities,
+            merge_coreferences,
+            resolve_coreferences,
+        )
 
         result = await _maybe_await(self._preprocess(request.original_query))
         try:
@@ -1368,13 +1372,16 @@ class DeterministicSemanticAdapter:
         )
         if not corefs and not coref_ambiguities:
             return projected
+        # Merge (never blind-concat): a re-run over the same turn must
+        # stay idempotent under the frozen uniqueness rules.
         return projected.model_copy(
             update={
-                "coreferences": tuple(projected.coreferences) + corefs,
-                "preliminary_ambiguities": tuple(
-                    projected.preliminary_ambiguities
-                )
-                + coref_ambiguities,
+                "coreferences": merge_coreferences(
+                    projected.coreferences, corefs
+                ),
+                "preliminary_ambiguities": merge_ambiguities(
+                    projected.preliminary_ambiguities, coref_ambiguities
+                ),
             }
         )
 

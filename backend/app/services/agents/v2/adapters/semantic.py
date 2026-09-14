@@ -548,7 +548,11 @@ async def resolve_draft_identities(
                 use_llm_fallback=use_llm_fallback,
             )
         )
-    from ..semantic.discourse import resolve_coreferences
+    from ..semantic.discourse import (
+        merge_ambiguities,
+        merge_coreferences,
+        resolve_coreferences,
+    )
 
     # Task 8 fix round 1 (Critical-2): the allowed scope is resolved
     # DOCUMENT identity, never the workspace/tenant scope. ``workspace_ids``
@@ -599,9 +603,13 @@ async def resolve_draft_identities(
         update={
             "document_refs": tuple(resolved_refs),
             "section_refs": section_refs,
-            "coreferences": tuple(draft.coreferences) + corefs,
-            "preliminary_ambiguities": tuple(draft.preliminary_ambiguities)
-            + coref_ambiguities,
+            # Merge (never blind-concat): chained with the draft-build
+            # seam on the same turn, output stays idempotent under the
+            # frozen uniqueness rules.
+            "coreferences": merge_coreferences(draft.coreferences, corefs),
+            "preliminary_ambiguities": merge_ambiguities(
+                draft.preliminary_ambiguities, coref_ambiguities
+            ),
         }
     )
 

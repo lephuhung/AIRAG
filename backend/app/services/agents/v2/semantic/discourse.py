@@ -29,6 +29,8 @@ __all__ = [
     "classify_entity_kind",
     "derive_last_focus",
     "extract_person_refs",
+    "merge_ambiguities",
+    "merge_coreferences",
     "resolve_coreferences",
     "typed_active_entities",
 ]
@@ -290,6 +292,13 @@ def resolve_coreferences(
     invisible here, so history can never reauthorize a resource. Person
     targets additionally require ``can_read_people``. Ambiguity text is
     generic (counts only) — no out-of-scope IDs, titles, or scores leak.
+
+    Zero-visible-candidate mentions are "no local referent", not a
+    choice: they resolve nothing and block nothing (only >=2 visible
+    candidates become a ``BlockingAmbiguity``). Ambiguity IDs derive
+    from the mention span, so repeated producers (draft build +
+    identity-resolution seams) merge idempotently via
+    ``merge_coreferences``/``merge_ambiguities``.
     """
     _ = active_entities  # kind confirmation only; never a resolution target.
     text = (query or "").strip()
@@ -314,9 +323,13 @@ def resolve_coreferences(
     ambiguities: list[BlockingAmbiguity] = []
 
     def _clarify(mention: str, kind: str, count: int) -> None:
+        # Stable mention-derived ID (not a per-call counter): chained
+        # producers merge idempotently instead of hard-failing on
+        # duplicate IDs at frozen validation.
+        slug = re.sub(r"\s+", "-", mention.strip().lower())
         ambiguities.append(
             BlockingAmbiguity(
-                ambiguity_id=f"coref-{kind}-{len(ambiguities) + 1}",
+                ambiguity_id=f"coref-{kind}-{slug}",
                 description=(
                     f"Không rõ {mention!r} chỉ tới đâu "
                     f"({count} ứng viên {kind}); "
@@ -332,8 +345,11 @@ def resolve_coreferences(
                     mention=mention, resolved_ref_id=candidates[0]
                 )
             )
-        else:
+        elif len(candidates) >= 2:
             _clarify(mention, kind, len(candidates))
+        # Zero visible candidates: no local referent — silent by design
+        # (a candidate-free clarification could never resume by
+        # selection and would drop the user's follow-up).
 
     ordinal = _ORDINAL_DOC_RE.search(text)
     if ordinal is not None:
@@ -346,8 +362,7 @@ def resolve_coreferences(
                     resolved_ref_id=scoped_docs[index - 1].ref_id,
                 )
             )
-        else:
-            _clarify(mention, "tài liệu", len(scoped_docs))
+        # Out-of-range ordinal: no local referent — silent (see above).
     doc_mention = _DOC_MENTION_RE.search(text)
     if doc_mention is not None and ordinal is None:
         mention = doc_mention.group(0)
@@ -362,11 +377,45 @@ def resolve_coreferences(
         )
     person_mention = _PERSON_MENTION_RE.search(text)
     if person_mention is not None:
+        # Without permission ``people`` is empty, so this falls into the
+        # silent zero-candidate path (never a blocking question the user
+        # cannot answer by selection).
         mention = person_mention.group(0)
-        if not can_read_people:
-            _clarify(mention, "người", 0)
-        else:
-            _resolve_one(
-                mention, "người", [reference.ref_id for reference in people]
-            )
+        _resolve_one(
+            mention, "người", [reference.ref_id for reference in people]
+        )
     return tuple(corefs), tuple(ambiguities)
+
+
+def merge_coreferences(
+    existing: Sequence[CoreferenceResolution],
+    new: Sequence[CoreferenceResolution],
+) -> tuple[CoreferenceResolution, ...]:
+    """Union two producer outputs, deduped by ``(mention, resolved_ref_id)``."""
+    merged = list(existing or ())
+    seen = {(item.mention, item.resolved_ref_id) for item in merged}
+    for item in new or ():
+        key = (item.mention, item.resolved_ref_id)
+        if key not in seen:
+            seen.add(key)
+            merged.append(item)
+    return tuple(merged)
+
+
+def merge_ambiguities(
+    existing: Sequence[BlockingAmbiguity],
+    new: Sequence[BlockingAmbiguity],
+) -> tuple[BlockingAmbiguity, ...]:
+    """Union two producer outputs, deduped by ``ambiguity_id``.
+
+    Chained seams (draft build + identity resolution) re-emit the same
+    mention-derived IDs; without dedupe the frozen validator fails the
+    turn on duplicates.
+    """
+    merged = list(existing or ())
+    seen = {item.ambiguity_id for item in merged}
+    for item in new or ():
+        if item.ambiguity_id not in seen:
+            seen.add(item.ambiguity_id)
+            merged.append(item)
+    return tuple(merged)

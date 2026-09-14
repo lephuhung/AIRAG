@@ -106,13 +106,11 @@ def test_history_never_reauthorizes_out_of_scope():
         allowed_document_ids=SCOPE,
         can_read_people=False,
     )
-    # The out-of-scope pin is invisible: no resolution, and the mention
-    # itself becomes the ambiguity (never a binding).
-    assert corefs == () or all(
-        ref.resolved_ref_id != "r1" for ref in corefs
-    )
-    assert len(ambiguities) == 1
-    assert all("r1" not in str(a) for a in ambiguities)
+    # The out-of-scope pin is invisible: no resolution. Zero visible
+    # candidates is "no local referent" — silent, never a binding and
+    # never a candidate-free blocking question (fix round 2).
+    assert corefs == ()
+    assert ambiguities == ()
 
 
 def test_true_ambiguity_becomes_clarification():
@@ -157,8 +155,10 @@ def test_ong_ay_resolves_person_only_with_permission():
         allowed_document_ids=SCOPE,
         can_read_people=False,
     )
+    # Denied permission leaves zero visible candidates: silent, never a
+    # blocking question the user could not answer by selection (round 2).
     assert corefs_denied == ()
-    assert len(ambiguities) == 1
+    assert ambiguities == ()
 
 
 def test_file_thu_hai_resolves_ordinal():
