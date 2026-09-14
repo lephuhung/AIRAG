@@ -2870,6 +2870,7 @@ def build_runtime_services(
     evidence_hydrator: Any = None,
     answer_draft_channel: AnswerDraftChannel | None = None,
     pinned_target_resolver: Any = None,
+    intent_classifier: Any = None,
 ) -> RuntimeServices:
     """Construct the request-scoped ``RuntimeServices`` (single bag, T7 seam).
 
@@ -2888,6 +2889,7 @@ def build_runtime_services(
         evidence_hydrator=evidence_hydrator,
         answer_draft_channel=answer_draft_channel,
         pinned_target_resolver=pinned_target_resolver,
+        intent_classifier=intent_classifier,
     )
 
 

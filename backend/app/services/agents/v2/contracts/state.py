@@ -72,6 +72,15 @@ class RuntimeServices(RuntimeModel):
     it resolves nothing and the capabilities fail closed. Never
     checkpointed, never fed from ``AgentRequest``/``CapabilityRuntimeContext``.
 
+    ``intent_classifier`` is the runtime-only request-scoped v2 semantic
+    ``IntentClassifier`` (Phase 4A, Task 2): the typed v1 intent
+    adapter/cache. ``IntentDecision`` values it produces are advisory-only
+    semantic facts consumed by the deterministic route policy; they are
+    never checkpointed and never carry legacy supervisor control fields
+    (``next_agent`` / ``pending_intent`` / task plans). Defaults to
+    ``None``; consumers construct an ephemeral classifier or fail closed
+    when the service is absent.
+
     The bag deliberately excludes ``plan_checkpoint`` (plan persistence is
     LangGraph state plus the supervisor checkpointer — no service) and any
     ``EvidenceEvaluator`` service (evidence evaluation is the shared
@@ -87,6 +96,7 @@ class RuntimeServices(RuntimeModel):
     evidence_hydrator: Any = None
     answer_draft_channel: Any = None
     pinned_target_resolver: Any = None
+    intent_classifier: Any = None
 
 
 class GraphRuntimeContext(ContractModel):
