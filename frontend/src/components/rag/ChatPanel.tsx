@@ -488,6 +488,9 @@ export const ChatPanel = memo(function ChatPanel({
           timestamp: m.created_at,
           potential_abbreviations: m.potential_abbreviations ?? undefined,
           peopleData: m.people_data ?? undefined,
+          // Phase 4D (Task 9): rebuild completed/clarified turns after reload.
+          citations: m.citations ?? undefined,
+          clarification: m.clarification ?? undefined,
           agentSteps: stepsMap.get(m.message_id) ?? (m.agent_steps?.length
             ? (m.agent_steps as any[]).map((s, i) => ({
               id: s.id || `hist-${m.message_id}-${i}`,
@@ -739,6 +742,9 @@ export const ChatPanel = memo(function ChatPanel({
       const newPeople = stream.pendingPeople.length > 0
         ? stream.pendingPeople
         : (stream.isStreaming ? m.peopleData : (m.peopleData ?? stream.pendingPeople));
+      // Phase 4D (Task 9): public-contract reload metadata.
+      const newCitations = stream.pendingCitations.length > 0 ? stream.pendingCitations : m.citations;
+      const newClarification = stream.pendingClarification ?? m.clarification;
 
       if (
         m.content === newContent &&
@@ -748,6 +754,8 @@ export const ChatPanel = memo(function ChatPanel({
         m.agentSteps === newSteps &&
         m.potential_abbreviations === newPotentials &&
         m.peopleData === newPeople &&
+        m.citations === newCitations &&
+        m.clarification === newClarification &&
         m.isStreaming === stream.isStreaming
       ) {
         return prev;
@@ -763,11 +771,13 @@ export const ChatPanel = memo(function ChatPanel({
         agentSteps: newSteps,
         potential_abbreviations: newPotentials,
         peopleData: newPeople,
+        citations: newCitations,
+        clarification: newClarification,
         isStreaming: stream.isStreaming,
       };
       return updated;
     });
-  }, [stream.streamingContent, stream.pendingSources, stream.pendingImages, stream.thinkingText, stream.isStreaming, stream.agentSteps, stream.pendingPeople, stream.streamCompleteTick]);
+  }, [stream.streamingContent, stream.pendingSources, stream.pendingImages, stream.thinkingText, stream.isStreaming, stream.agentSteps, stream.pendingPeople, stream.pendingCitations, stream.pendingClarification, stream.streamCompleteTick]);
 
   const handleSend = useCallback(
     async (text?: string) => {
@@ -931,6 +941,8 @@ export const ChatPanel = memo(function ChatPanel({
               agent_steps: m.agentSteps ?? null,
               potential_abbreviations: m.potential_abbreviations ?? null,
               people_data: m.peopleData ?? null,
+              citations: m.citations ?? null,
+              clarification: m.clarification ?? null,
               created_at: m.timestamp ?? new Date().toISOString(),
             }));
             const cacheSessionId = effectiveSessionId;
@@ -1228,6 +1240,43 @@ export const ChatPanel = memo(function ChatPanel({
                     </button>
                   )}
                   <div className="w-full max-w-[720px] mx-auto px-2">
+                    {/* Phase 4D (Task 9): structured clarification options.
+                        Live request from the stream, else the persisted resume
+                        block on the last assistant message (reload-safe).
+                        Selection submits ONLY server-issued option values. */}
+                    {(() => {
+                      const live = stream.pendingClarification;
+                      const persisted = [...messages].reverse().find(
+                        (m) => m.role === "assistant" && m.clarification?.options?.length,
+                      )?.clarification;
+                      const req = live ?? persisted ?? null;
+                      if (!req || req.options.length === 0) return null;
+                      const active = live != null;
+                      return (
+                        <div
+                          data-testid="clarification-options"
+                          className="mb-3 rounded-xl border border-primary/25 bg-primary/5 p-3"
+                        >
+                          <p className="text-sm font-medium mb-2">{req.question}</p>
+                          <div className="flex flex-wrap gap-2">
+                            {req.options.map((opt) => (
+                              <button
+                                key={opt.option_id}
+                                type="button"
+                                disabled={!active || stream.isStreaming}
+                                onClick={() => {
+                                  const label = stream.submitClarification(opt.option_id);
+                                  if (label) void handleSend(label);
+                                }}
+                                className="px-3 py-1.5 rounded-lg border border-primary/30 bg-background text-sm hover:bg-primary/10 disabled:opacity-50"
+                              >
+                                {opt.label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    })()}
                     <ChatInputArea
                       input={input}
                       setInput={setInput}

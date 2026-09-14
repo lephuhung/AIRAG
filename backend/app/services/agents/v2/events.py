@@ -29,6 +29,13 @@ from typing import Any
 
 from .contracts.response import FinalResponse
 
+# Phase 4D (Task 9): the versioned public chat/SSE contract owner. This
+# adapter only *projects* onto it — the v1 wire format stays frozen as the
+# rollback arm. Import is module-local-safe: ``transport`` depends on no
+# app modules (no cycle risk with the v2 package).
+from .transport import PUBLIC_CHAT_CONTRACT_VERSION as PUBLIC_CHAT_CONTRACT_VERSION
+from .transport import normalize_wire_event as _normalize_wire_event
+
 __all__ = [
     "SSE_STATUS",
     "SSE_THINKING",
@@ -40,6 +47,9 @@ __all__ = [
     "SSE_PEOPLE_DATA",
     "SSE_ERROR",
     "SSE_COMPLETE",
+    "PUBLIC_CHAT_CONTRACT_VERSION",
+    "clarification_public_metadata",
+    "to_public_event",
     "format_sse_event",
     "final_response_payload",
     "terminal_event_for_response",
@@ -81,13 +91,17 @@ def final_response_payload(
     images: list[dict] | None = None,
     potential_abbreviations: list[dict] | None = None,
     people_data: list[dict] | None = None,
+    clarification: dict | None = None,
 ) -> dict:
     """Render a ``FinalResponse`` into the v1 ``complete`` payload shape.
 
     Citations are presentation output (``citation_id`` + ``label``); evidence
-    identity internals stay out of the payload.
+    identity internals stay out of the payload. ``clarification`` (Task 9)
+    carries the public clarify-turn resume block built by
+    :func:`clarification_public_metadata` — persisted so a reload can
+    rebuild the resume instead of minting identity client-side.
     """
-    return {
+    payload = {
         "status": response.status,
         "answer": response.content,
         "sources": sources if sources is not None else [],
@@ -101,6 +115,61 @@ def final_response_payload(
             for citation in response.citations
         ],
     }
+    if clarification is not None:
+        payload["clarification"] = clarification
+    return payload
+
+
+def clarification_public_metadata(request, *, thread_id: str) -> dict:
+    """Project a checkpointed ``ClarificationRequest`` onto public metadata.
+
+    Options expose server-issued ``option_id`` (the stable candidate id)
+    plus display ``label`` only — never the internal document UUID, so the
+    frontend can submit the selection without fabricating trusted identity.
+    ``resume`` carries the stable thread plus the request expiry; the
+    entrypoint re-resolves the persisted request from the checkpoint.
+    """
+    try:
+        candidates = request.candidates if not isinstance(request, dict) else request.get("candidates", ())
+    except Exception:
+        candidates = ()
+    options = []
+    for candidate in candidates or ():
+        if isinstance(candidate, dict):
+            option_id = str(candidate.get("candidate_id") or "")
+            label = str(candidate.get("label") or option_id)
+        else:
+            option_id = str(getattr(candidate, "candidate_id", "") or "")
+            label = str(getattr(candidate, "label", None) or option_id)
+        if not option_id:
+            continue
+        options.append({"option_id": option_id, "label": label})
+    try:
+        clarification_id = request.get("clarification_id") if isinstance(request, dict) else getattr(request, "clarification_id", "")
+    except Exception:
+        clarification_id = ""
+    try:
+        expires_at = request.get("expires_at") if isinstance(request, dict) else getattr(request, "expires_at", None)
+        expires = expires_at.isoformat() if hasattr(expires_at, "isoformat") else (str(expires_at) if expires_at else None)
+    except Exception:
+        expires = None
+    metadata: dict = {
+        "clarification_id": str(clarification_id or ""),
+        "options": options,
+        "resume": {"thread_id": str(thread_id or "")},
+    }
+    if expires is not None:
+        metadata["resume"]["expires_at"] = expires
+    return metadata
+
+
+def to_public_event(event: str, data: dict) -> list[dict]:
+    """Normalize one v1/v2 wire event onto the versioned public contract.
+
+    Thin adapter over :mod:`app.services.agents.v2.transport` — the single
+    funnel keeping the hook's presentation model identical across arms.
+    """
+    return _normalize_wire_event(event, data)
 
 
 def terminal_event_for_response(response: FinalResponse) -> tuple[str, dict]:

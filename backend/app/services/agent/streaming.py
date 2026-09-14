@@ -1429,6 +1429,18 @@ async def stream_v2_turn_events(
                 }
             )
         )
+        # Task 9: clarify turns carry structured public resume metadata
+        # (server-issued option IDs + resume thread) so the frontend can
+        # resume after reload without fabricating trusted identity.
+        # Additive key only — existing complete keys are untouched.
+        try:
+            from app.services.agents.v2.events import (
+                clarification_public_metadata as _clarify_public,
+            )
+
+            data["clarification"] = _clarify_public(pending, thread_id=thread_id)
+        except Exception:
+            logger.warning("[v2stream] clarification metadata failed", exc_info=True)
         yield {"event": event, "data": data}
 
     try:

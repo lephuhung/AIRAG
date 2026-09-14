@@ -43,6 +43,16 @@ class ChatMessage(Base):
     potential_abbreviations: Mapped[list | None] = mapped_column(JSON, nullable=True)
     people_data: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
+    # Phase 4D (Task 9): versioned public chat contract reload metadata.
+    # Nullable JSON — ``citations`` is the public citation projection
+    # ([{citation_id, label, document_id, ...}]), ``clarification`` is the
+    # structured clarify-turn resume block ({clarification_id, options:
+    # [{option_id, label}], resume: {thread_id, ...}}). Server-issued only;
+    # the frontend never fabricates identity from these. NULL for user
+    # messages and pre-contract turns.
+    citations: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    clarification: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     # User who sent/received this message
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=True

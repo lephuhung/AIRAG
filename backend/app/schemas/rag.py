@@ -407,6 +407,10 @@ class PersistedChatMessage(BaseModel):
     agent_steps: list | None = None
     potential_abbreviations: list[str] | None = None
     people_data: list[dict] | None = None
+    # Phase 4D (Task 9): public-contract reload metadata (nullable for
+    # user messages and pre-contract turns).
+    citations: list | None = None
+    clarification: dict | None = None
     created_at: str  # ISO format
 
     model_config = {"from_attributes": True}

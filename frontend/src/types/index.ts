@@ -453,6 +453,10 @@ export interface ChatMessage {
   potential_abbreviations?: string[];
   formatProgress?: FormatUploadProgress;
   peopleData?: PeopleRecord[];
+  /** Phase 4D (Task 9): public citation projection (reload-safe). */
+  citations?: PublicCitation[];
+  /** Phase 4D (Task 9): structured clarification resume block. */
+  clarification?: PublicClarificationRequest | null;
 }
 
 /**
@@ -515,6 +519,10 @@ export interface PersistedChatMessage {
   agent_steps?: AgentStep[] | null;
   potential_abbreviations?: string[] | null;
   people_data?: PeopleRecord[] | null;
+  /** Phase 4D (Task 9): public citation projection for reload rebuilds. */
+  citations?: PublicCitation[] | null;
+  /** Phase 4D (Task 9): structured clarification resume block. */
+  clarification?: PublicClarificationRequest | null;
   created_at: string;
 }
 
@@ -538,7 +546,77 @@ export interface LLMCapabilities {
 
 // SSE Streaming Types
 // * useRAGChatStream — SSE streaming hook for HRAG chat.
-export type ChatStreamStatus = "idle" | "analyzing" | "retrieving" | "generating" | "error";
+export type ChatStreamStatus = "idle" | "analyzing" | "retrieving" | "generating" | "clarifying" | "error";
+
+// ── Phase 4D (Task 9): versioned public chat/SSE contract ──────────────────
+// Single frontend presentation contract normalizing the v1 wire and the v2
+// arm during canary. Version pinned to the backend transport owner
+// (backend/app/services/agents/v2/transport.py). The UI never consumes raw
+// SupervisorV2State, checkpoint state, TaskPlan, runtime services, hidden
+// model reasoning, or internal evidence UUIDs.
+
+export const PUBLIC_CHAT_CONTRACT_VERSION = "v2.chat/1";
+
+export type PublicChatEventType =
+  | "status"
+  | "clarification_required"
+  | "clarification_resolved"
+  | "citation"
+  | "token"
+  | "complete"
+  | "error"
+  | "cancelled";
+
+/** Public UI phases (no chain-of-thought ever leaves the backend). */
+export type PublicUIPhase =
+  | "clarifying"
+  | "planning"
+  | "executing"
+  | "evaluating"
+  | "generating";
+
+/** Stable public citation — allowlist-projected, no internal evidence IDs. */
+export interface PublicCitation {
+  citation_id: string;
+  label: string;
+  document_id?: string | null;
+  chunk_id?: string | null;
+  content?: string;
+  page_no?: number | null;
+  heading_path?: string[];
+  source_file?: string | null;
+  document_number?: string | null;
+  article_label?: string | null;
+  validity_status?: "effective" | "superseded" | "partially_amended" | "unknown" | null;
+  superseded_by?: string | null;
+}
+
+/** One server-issued clarification option. The client submits ONLY option_id. */
+export interface ClarificationOption {
+  option_id: string;
+  label: string;
+  document_id?: string | null;
+}
+
+/** Structured public clarification request + resume metadata. */
+export interface PublicClarificationRequest {
+  clarification_id: string;
+  reason?: string;
+  question: string;
+  options: ClarificationOption[];
+  resume: {
+    thread_id: string;
+    message_id?: string;
+    expires_at?: string;
+  };
+  contract_version?: string;
+}
+
+/** What the UI submits for a clarification reply: server-issued IDs only. */
+export interface ClarificationSelection {
+  clarification_id: string;
+  selected_option_id: string;
+}
 
 // Format Upload Progress Types
 export type FormatUploadStep = "idle" | "uploading" | "extracting" | "analyzing" | "complete" | "error";

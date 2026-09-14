@@ -344,6 +344,10 @@ async def get_session_history(
                 agent_steps=m.agent_steps,
                 potential_abbreviations=m.potential_abbreviations,
                 people_data=m.people_data,
+                # Phase 4D (Task 9): public-contract reload metadata —
+                # citations + structured clarification resume block.
+                citations=m.citations,
+                clarification=m.clarification,
                 # Stored as naive UTC (datetime.utcnow). Emit an explicit UTC
                 # offset so the frontend doesn't misread it as local time
                 # (which made VN display 7h behind).
@@ -1032,6 +1036,8 @@ async def chat_stream_session(
         user_msg_id: str,
         ai_msg_id: str,
         precomputed_summary: dict | None = None,
+        citations: list | None = None,
+        clarification: dict | None = None,
     ):
         """Run entirely in background: save message + exchange summary, update title.
 
@@ -1088,6 +1094,8 @@ async def chat_stream_session(
                         agent_steps=processed_steps,
                         potential_abbreviations=potentials or None,
                         people_data=people_data or None,
+                        citations=citations,
+                        clarification=clarification,
                     )
                     db.add(ai_msg)
 
@@ -1224,6 +1232,8 @@ async def chat_stream_session(
         potentials: list,
         people_data: list,
         ai_msg_id: str,
+        citations: list | None = None,
+        clarification: dict | None = None,
     ) -> None:
         """Persist the assistant message SYNCHRONOUSLY (own DB session) before the
         stream closes, so the answer is durable immediately — even a hard reload
@@ -1271,6 +1281,8 @@ async def chat_stream_session(
                     agent_steps=processed_steps,
                     potential_abbreviations=potentials or None,
                     people_data=people_data or None,
+                    citations=citations,
+                    clarification=clarification,
                 ))
                 await db.commit()
         except Exception as e:
@@ -1320,6 +1332,12 @@ async def chat_stream_session(
         final_steps: list = []
         final_potential_abbreviations: list = []
         final_people_data: list = []
+        # Phase 4D (Task 9): public-contract reload metadata captured
+        # from the terminal ``complete`` (v2 citations + structured
+        # clarification resume block). Persisted so a reload rebuilds
+        # completed/clarified turns without fabricating identity.
+        final_citations: list = []
+        final_clarification: dict | None = None
         saved = False
 
         async def _persist(partial: bool) -> None:
@@ -1337,6 +1355,8 @@ async def chat_stream_session(
                 potentials=final_potential_abbreviations,
                 people_data=final_people_data,
                 ai_msg_id=ai_msg_id,
+                citations=final_citations or None,
+                clarification=final_clarification,
             )
             saved = True
 
@@ -1350,6 +1370,7 @@ async def chat_stream_session(
             nonlocal accumulated_text, accumulated_thinking
             nonlocal final_sources, final_images
             nonlocal final_potential_abbreviations, final_people_data
+            nonlocal final_citations, final_clarification
             try:
                 async for sse_str in agen:
                     await _collect_and_relay(sse_str)
@@ -1371,6 +1392,7 @@ async def chat_stream_session(
             nonlocal accumulated_text, accumulated_thinking
             nonlocal final_sources, final_images
             nonlocal final_potential_abbreviations, final_people_data
+            nonlocal final_citations, final_clarification
             nonlocal v2_response_status, v2_citations
             try:
                 if sse_str.startswith("event:"):
@@ -1403,6 +1425,9 @@ async def chat_stream_session(
                                 v2_response_status = ev_data["status"]
                             if isinstance(ev_data.get("citations"), list):
                                 v2_citations = ev_data["citations"]
+                                final_citations = ev_data["citations"]
+                            if isinstance(ev_data.get("clarification"), dict):
+                                final_clarification = ev_data["clarification"]
                         elif ev_type == "token_rollback":
                             # The streaming core reset final_answer
                             # + sources + images on rollback; mirror
@@ -1415,6 +1440,8 @@ async def chat_stream_session(
                             final_images = []
                             final_potential_abbreviations = []
                             final_people_data = []
+                            final_citations = []
+                            final_clarification = None
                         elif ev_type == "potential_abbreviations":
                             final_potential_abbreviations = ev_data.get(
                                 "abbreviations", []
@@ -1726,6 +1753,8 @@ async def chat_stream_session(
                 user_msg_id=user_msg_id,
                 ai_msg_id=ai_msg_id,
                 precomputed_summary=precomputed_summary,
+                citations=final_citations or None,
+                clarification=final_clarification,
             )
 
         except asyncio.CancelledError:

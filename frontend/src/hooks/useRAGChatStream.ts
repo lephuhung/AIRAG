@@ -16,6 +16,9 @@ import type {
   AgentStep,
   AgentStepType,
   PeopleRecord,
+  PublicCitation,
+  PublicClarificationRequest,
+  ClarificationOption,
 } from "@/types";
 
 const BASE_URL = import.meta.env.VITE_API_URL || "/api/v1";
@@ -33,6 +36,10 @@ export interface RAGStreamResult {
   pendingImages: ChatImageRef[];
   /** People records from MongoDB people search */
   pendingPeople: PeopleRecord[];
+  /** Public citations normalized from sources/citation events */
+  pendingCitations: PublicCitation[];
+  /** Structured clarification request awaiting user selection (or null) */
+  pendingClarification: PublicClarificationRequest | null;
   /** Tick to force ChatPanel useEffect re-run after streaming complete */
   streamCompleteTick: number;
   /** Error message if any */
@@ -60,6 +67,12 @@ export interface RAGStreamResult {
   ) => Promise<ChatMessage | null>;
   /** Cancel ongoing stream */
   cancel: () => void;
+  /**
+   * Resolve a clarification selection to the server-issued label to send.
+   * Returns null unless `optionId` was issued in the pending request —
+   * the UI can never submit fabricated document/workspace/binding identity.
+   */
+  submitClarification: (optionId: string) => string | null;
   /** Reset all state */
   reset: () => void;
 }
@@ -117,6 +130,14 @@ export function useRAGChatStream(
   const [aiMessageId, setAiMessageId] = useState<string | null>(null);
   const [userMessageId, setUserMessageId] = useState<string | null>(null);
   const [pendingPeople, setPendingPeople] = useState<PeopleRecord[]>([]);
+  const [pendingCitations, setPendingCitations] = useState<PublicCitation[]>([]);
+  const [pendingClarification, setPendingClarification] = useState<PublicClarificationRequest | null>(null);
+  // Ref mirror so submitClarification can resolve synchronously (state
+  // updaters must stay pure — no side effects inside setState).
+  const pendingClarificationRef = useRef<PublicClarificationRequest | null>(null);
+  useEffect(() => {
+    pendingClarificationRef.current = pendingClarification;
+  }, [pendingClarification]);
   // Tick to force ChatPanel useEffect to re-run after complete
   const [streamCompleteTick, setStreamCompleteTick] = useState(0);
 
@@ -158,6 +179,8 @@ export function useRAGChatStream(
     setIsStreaming(false);
     setAgentSteps([]);
     setPotentialAbbreviations([]);
+    setPendingCitations([]);
+    setPendingClarification(null);
     setAiMessageId(null);
     setUserMessageId(null);
     // Keep pendingPeople - it persists across streaming sessions for card display
@@ -294,6 +317,8 @@ export function useRAGChatStream(
       setIsStreaming(true);
       setAgentSteps([]);
       setPotentialAbbreviations([]);
+      setPendingCitations([]);
+      setPendingClarification(null);
       setAiMessageId(null);
       setUserMessageId(null);
       setPendingPeople([]);
@@ -307,6 +332,8 @@ export function useRAGChatStream(
       let localSources: ChatSourceChunk[] = [];
       let localImages: ChatImageRef[] = [];
       let localPeople: PeopleRecord[] = [];
+      let localCitations: PublicCitation[] = [];
+      let localClarification: PublicClarificationRequest | null = null;
       let localAiMessageId: string | null = null;
       let localUserMessageId: string | null = null;
       // Accumulate all thinking text in this scope so it can be flushed into
@@ -375,20 +402,32 @@ export function useRAGChatStream(
           for (const line of lines) {
             // Skip heartbeat comments
             if (line.startsWith(":")) continue;
-
-            if (line.startsWith("event: ")) {
-              currentEventType = line.slice(7).trim();
+            if (line === "") {
+              // Blank line ends one SSE dispatch — a following data-only
+              // frame must not inherit the previous event type.
+              currentEventType = "unknown";
               continue;
             }
 
-            if (line.startsWith("data: ")) {
-              const jsonStr = line.slice(6).trim();
+            // Tolerate both "event: x" and "event:x" framing.
+            if (line.startsWith("event:")) {
+              currentEventType = line.slice(6).trim() || "unknown";
+              continue;
+            }
+
+            if (line.startsWith("data:")) {
+              const jsonStr = line.slice(5).trim();
               if (!jsonStr) continue;
+
+              // Capture the dispatch type, then reset so a later data-only
+              // frame is ignored instead of misattributed.
+              const dispatchType = currentEventType;
+              currentEventType = "unknown";
 
               try {
                 const data = JSON.parse(jsonStr);
 
-                switch (currentEventType) {
+                switch (dispatchType) {
                   case "status": {
                     const step = data.step as string;
                     const detail = (data.detail as string) || "";
@@ -421,6 +460,28 @@ export function useRAGChatStream(
                         ...completeActiveStep(prev),
                         createStep("generating", detail || "Generating answer..."),
                       ]);
+                    } else if (step === "rollback") {
+                      // Public-contract form of token_rollback: clear
+                      // speculative content the same way.
+                      bufferRef.current = "";
+                      setStreamingContent("");
+                      localSources = [];
+                      localImages = [];
+                      localPeople = [];
+                      setPendingSources([]);
+                      setPendingImages([]);
+                      setPendingPeople([]);
+                      peopleDataRef.current = [];
+                      setPendingCitations([]);
+                      setPotentialAbbreviations([]);
+                    }
+                    // Public UI phases (Task 9): clarifying/planning surfaced
+                    // without exposing chain-of-thought.
+                    const phase = data.phase as string | undefined;
+                    if (phase === "clarifying") {
+                      setStatus("clarifying");
+                    } else if (phase === "planning" && step !== "analyzing") {
+                      setStatus("analyzing");
                     }
                     break;
                   }
@@ -504,6 +565,95 @@ export function useRAGChatStream(
                     onToken(data.text || "");
                     break;
 
+                  // ── Phase 4D (Task 9): versioned public contract events ──
+                  case "citation": {
+                    const citations = (data.citations || []) as PublicCitation[];
+                    localCitations = citations;
+                    setPendingCitations([...citations]);
+                    if (Array.isArray(data.image_refs) && data.image_refs.length > 0) {
+                      localImages = data.image_refs as ChatImageRef[];
+                      setPendingImages([...localImages]);
+                    }
+                    if (Array.isArray(data.people) && data.people.length > 0) {
+                      localPeople = data.people as PeopleRecord[];
+                      peopleDataRef.current = localPeople;
+                      setPendingPeople([...localPeople]);
+                    }
+                    break;
+                  }
+
+                  case "clarification_required":
+                  case "clarification": {
+                    // Structured request (public) or legacy v1 shape
+                    // {message, options: string[], context}. Legacy labels are
+                    // server-issued values: presented as options whose id is
+                    // the label itself, so selection still submits only
+                    // server-issued values.
+                    const rawOptions: unknown[] = Array.isArray(data.options)
+                      ? data.options
+                      : [];
+                    const options: ClarificationOption[] = rawOptions.map(
+                      (o: unknown, i: number) =>
+                        typeof o === "string"
+                          ? { option_id: o, label: o }
+                          : {
+                              option_id: String(
+                                (o as Record<string, unknown>).option_id ||
+                                (o as Record<string, unknown>).candidate_id ||
+                                `opt-${i + 1}`,
+                              ),
+                              label: String(
+                                (o as Record<string, unknown>).label ||
+                                (o as Record<string, unknown>).option_id ||
+                                `opt-${i + 1}`,
+                              ),
+                            },
+                    );
+                    const req: PublicClarificationRequest = {
+                      clarification_id: String(
+                        data.clarification_id || data.clarificationId || "clr-1",
+                      ),
+                      reason: String(data.reason || "semantic_ambiguity"),
+                      question: String(
+                        data.question || data.message || "",
+                      ),
+                      options,
+                      resume: {
+                        thread_id: String(
+                          data.resume?.thread_id ||
+                            data.context?.thread_id ||
+                            "",
+                        ),
+                        message_id: data.resume?.message_id
+                          ? String(data.resume.message_id)
+                          : undefined,
+                      },
+                    };
+                    localClarification = req;
+                    setPendingClarification(req);
+                    setStatus("clarifying");
+                    break;
+                  }
+
+                  case "clarification_resolved": {
+                    setPendingClarification(null);
+                    localClarification = null;
+                    break;
+                  }
+
+                  case "cancelled": {
+                    // Server-initiated cancel terminal: finalize quietly
+                    // without an error banner.
+                    setStatus("idle");
+                    setIsStreaming(false);
+                    break;
+                  }
+
+                  default:
+                    // Forward-compatible: unknown future event types never
+                    // crash the stream.
+                    break;
+
                   case "potential_abbreviations":
                     setPotentialAbbreviations(data.abbreviations || []);
                     break;
@@ -522,9 +672,11 @@ export function useRAGChatStream(
                     localSources = [];
                     localImages = [];
                     localPeople = [];
+                    localCitations = [];
                     setPendingSources([]);
                     setPendingImages([]);
                     setPendingPeople([]);
+                    setPendingCitations([]);
                     peopleDataRef.current = [];
                     setPotentialAbbreviations([]);
                     break;
@@ -579,6 +731,13 @@ export function useRAGChatStream(
                       thinking: data.thinking || null,
                       agentSteps: localSteps, // include synced steps directly in finalMessage
                       potential_abbreviations: data.potential_abbreviations || potentialAbbreviations,
+                      // Phase 4D (Task 9): public-contract reload metadata.
+                      citations: localCitations.length > 0
+                        ? localCitations
+                        : (Array.isArray(data.citations) ? data.citations : undefined),
+                      clarification: localClarification
+                        || (data.clarification as PublicClarificationRequest | undefined)
+                        || undefined,
                       timestamp: new Date().toISOString(),
                     };
 
@@ -654,6 +813,17 @@ export function useRAGChatStream(
     [sessionId, onToken, onThinkingToken],
   );
 
+  const submitClarification = useCallback((optionId: string): string | null => {
+    // Only a server-issued option_id from the pending request resolves.
+    // Returns the server-issued label for the caller to send as the resume
+    // reply (the suspended turn auto-resumes on this thread); null refuses
+    // fabricated identity.
+    const pending = pendingClarificationRef.current;
+    if (!pending) return null;
+    const match = pending.options.find((o) => o.option_id === optionId);
+    return match ? match.label : null;
+  }, []);
+
   return {
     status,
     streamingContent,
@@ -661,6 +831,8 @@ export function useRAGChatStream(
     pendingSources,
     pendingImages,
     pendingPeople,
+    pendingCitations,
+    pendingClarification,
     streamCompleteTick,
     error,
     isStreaming,
@@ -671,5 +843,6 @@ export function useRAGChatStream(
     sendMessage,
     cancel,
     reset,
+    submitClarification,
   };
 }
