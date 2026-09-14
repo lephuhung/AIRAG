@@ -1,0 +1,27 @@
+# Phase-3 live-test override: run the worktree (feat/langgraph-v2) code with the
+# pinned v2 image and v2 canary enabled. Does NOT touch vLLM.
+services:
+  backend:
+    image: airag-backend:v2phase2
+    environment:
+      CHECKPOINT_DATABASE_URL: postgresql://postgres:postgres@postgres:5432/hrag_checkpoints
+      NEXUSRAG_AGENT_V2_ENABLED: "true"
+      NEXUSRAG_AGENT_V2_CANARY_PERCENT: "100"
+      NEXUSRAG_AGENT_V2_BUCKET_SALT: "cbac0f7c094d5df49bd3980506355cfe"
+  worker-parse:
+    image: airag-backend:v2phase2
+  worker-embed:
+    image: airag-backend:v2phase2
+  worker-caption:
+    image: airag-backend:v2phase2
+  worker-kg:
+    image: airag-backend:v2phase2
+  worker-memory:
+    image: airag-backend:v2phase2
+  embed-rerank:
+    image: airag-backend:v2phase2
+  stt:
+    image: airag-backend:v2phase2
+  frontend:
+    ports:
+      - "5174:5174"
