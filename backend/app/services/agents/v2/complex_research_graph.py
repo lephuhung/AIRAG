@@ -126,6 +126,7 @@ __all__ = [
     "build_complex_research_state",
     "build_complex_research_subgraph",
     "build_governed_initial_proposal",
+    "build_governed_replan_proposal",
     "build_discovery_policy",
     "build_initial_proposal",
     "build_model_observations",
@@ -815,6 +816,33 @@ def _people_first_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
     return plan
 
 
+async def build_governed_replan_proposal(
+    state: ComplexResearchState, runtime: GraphRuntimeContext
+) -> ReplanProposal | None:
+    """Deterministic gap policy first, governed Adaptive Replanner otherwise (Task 11).
+
+    Without a wired ``adaptive_replanner`` service this is exactly
+    :func:`build_replan_proposal` (legacy behavior: advisable coverage and
+    no-evidence recovery gaps propose deterministically, everything else
+    yields ``None`` so the caller spends the budget and finalizes). With
+    one, the replanner owns the deterministic-first ordering — a
+    constructible deterministic proposal is returned untouched with zero
+    model calls — and the model path serves only advisable gaps the
+    deterministic policy cannot build, still as a proposal the caller
+    appends, validates, leases, and checkpoints before dispatch.
+    """
+    replanner = getattr(runtime.services, "adaptive_replanner", None)
+    if replanner is None:
+        return build_replan_proposal(state, runtime)
+    propose = getattr(replanner, "propose_replan", None)
+    if propose is None:
+        raise ComplexResearchError(
+            "adaptive_replanner exposes no propose_replan; refusing to replan "
+            "through a miswired replanner service"
+        )
+    return await propose(state, runtime)
+
+
 async def build_governed_initial_proposal(
     planning_input: ResearchPlanningInput, runtime: GraphRuntimeContext
 ) -> InitialProposal:
@@ -1210,7 +1238,7 @@ async def validate_checkpoint_node(
         return update
     current = state["plan"]
     assert current is not None
-    proposal = build_replan_proposal(state, context)
+    proposal = await build_governed_replan_proposal(state, context)
     if proposal is None:
         # Deterministically unplannable: spend the budget so decide finalizes
         # instead of routing back here forever.

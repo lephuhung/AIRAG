@@ -937,7 +937,7 @@ async def build_v2_ingress(
         GovernorEvidenceHydrator,
     )
     from app.services.agents.v2.nodes.evaluate import AnswerDraftChannel
-    from app.services.agents.v2.planning import AdaptivePlanner
+    from app.services.agents.v2.planning import AdaptivePlanner, AdaptiveReplanner
     from app.services.agents.v2.semantic.intent import IntentClassifier
     from app.services.agents.supervisor_v2 import build_initial_v2_state
 
@@ -1069,6 +1069,15 @@ async def build_v2_ingress(
             # refusal is final); the model path runs only for uncovered
             # work types and never dispatches tools.
             adaptive_planner=AdaptivePlanner(),
+            # Exactly one governed replanner per ingress turn (Phase 5,
+            # Task 11): proposal-only bounded append-only replanning from
+            # minimized evaluator gaps behind the existing
+            # validate/lease/checkpoint/scheduler boundary. The
+            # deterministic gap policy still wins when it can construct
+            # (zero model calls); the model path serves only advisable
+            # gaps the deterministic policy cannot build and never
+            # dispatches tools.
+            adaptive_replanner=AdaptiveReplanner(),
             # The exact same request-scoped resolver the document
             # capabilities resolve through: the shared TaskScheduler feeds
             # it from the checkpointed plan + bindings before dispatch.

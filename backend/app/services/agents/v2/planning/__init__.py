@@ -18,10 +18,16 @@ from __future__ import annotations
 
 from .planner import AdaptivePlanner, PlannerError
 from .projection import PlannerModelInput, build_planner_model_input
+from .replan_projection import ReplannerModelInput, build_replanner_model_input
+from .replanner import AdaptiveReplanner, ReplannerError
 
 __all__ = [
     "AdaptivePlanner",
+    "AdaptiveReplanner",
     "PlannerError",
     "PlannerModelInput",
+    "ReplannerError",
+    "ReplannerModelInput",
     "build_planner_model_input",
+    "build_replanner_model_input",
 ]

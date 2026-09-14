@@ -92,6 +92,15 @@ class RuntimeServices(RuntimeModel):
     it is typed ``Any`` for the same framework-free reason and is never
     checkpointed.
 
+    ``adaptive_replanner`` is the runtime-only request-scoped governed
+    ``AdaptiveReplanner`` (Phase 5, Task 11): proposal-only bounded
+    append-only replanning from minimized evaluator gaps behind the same
+    validate/lease/checkpoint/scheduler boundary. It defaults to ``None``;
+    the complex boundary keeps its deterministic gap policy when the
+    service is absent, and the deterministic proposal still wins when it
+    can construct. Typed ``Any`` for the same framework-free reason and
+    never checkpointed.
+
     The bag deliberately excludes ``plan_checkpoint`` (plan persistence is
     LangGraph state plus the supervisor checkpointer — no service) and any
     ``EvidenceEvaluator`` service (evidence evaluation is the shared
@@ -109,6 +118,7 @@ class RuntimeServices(RuntimeModel):
     pinned_target_resolver: Any = None
     intent_classifier: Any = None
     adaptive_planner: Any = None
+    adaptive_replanner: Any = None
 
 
 class GraphRuntimeContext(ContractModel):

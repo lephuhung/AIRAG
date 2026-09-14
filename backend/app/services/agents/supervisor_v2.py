@@ -2936,6 +2936,7 @@ def build_runtime_services(
     pinned_target_resolver: Any = None,
     intent_classifier: Any = None,
     adaptive_planner: Any = None,
+    adaptive_replanner: Any = None,
 ) -> RuntimeServices:
     """Construct the request-scoped ``RuntimeServices`` (single bag, T7 seam).
 
@@ -2956,6 +2957,7 @@ def build_runtime_services(
         pinned_target_resolver=pinned_target_resolver,
         intent_classifier=intent_classifier,
         adaptive_planner=adaptive_planner,
+        adaptive_replanner=adaptive_replanner,
     )
 
 
