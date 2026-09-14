@@ -1061,16 +1061,22 @@ def test_fresh_resolver_graph_turn_reaches_provider():
     ``TaskScheduler`` in this test. The turn flows through the real nodes
     (context -> binding -> semantic -> route -> complex plan -> shared
     execute) into the REAL ``DocumentRetrieveCapability`` with test-double
-    IO backings (retrieval provider / evidence / leases / hydrator /
-    binding resolver) injected around — never instead of — the wired
-    resolver. The API-explicit hard scope routes to ``complex_research``
-    (never the read fast path), the provider is reached exactly once, the
-    task succeeds with target-bound coverage evidence, the terminal
-    response succeeds with a citation, and no raw chunk leaks.
+    IO backings (retrieval provider / leases / hydrator / binding
+    resolver) injected around — never instead of — the wired resolver.
+    Evidence goes through the REAL ``GovernorEvidenceBuilder`` over a
+    recording governor that enforces the production revision invariant
+    (document evidence REQUIRES the authoritative ``revision_id``), so
+    deleting the ``revision_id`` kwarg from the builder turns this
+    terminal success into a failed turn. The API-explicit hard scope
+    routes to ``complex_research`` (never the read fast path), the
+    provider is reached exactly once, the task succeeds with target-bound
+    coverage evidence, the terminal response succeeds with a citation,
+    and no raw chunk leaks.
 
-    Kills all three seams: deleting the ingress wiring, the supervisor
-    pass-through, or the scheduler feed turns this terminal success into a
-    raise or a denied/failed turn.
+    Kills all four seams: deleting the ingress wiring, the supervisor
+    pass-through, the scheduler feed, or the builder ``revision_id``
+    kwarg turns this terminal success into a raise or a denied/failed
+    turn.
     """
     import asyncio
     from types import SimpleNamespace
@@ -1130,23 +1136,57 @@ def test_fresh_resolver_graph_turn_reaches_provider():
             )
             return self._chunks
 
-    class _FakeEvidence:
+    class _RecordingRepository:
         def __init__(self):
-            self.calls: list[dict] = []
+            self.envelopes: list = []
 
-        async def persist_use(
-            self, *, source, content, provenance, task_id, purpose, target_id
-        ):
-            ref = EvidenceUseRef(use_id=uuid4())
-            self.calls.append(
-                {
-                    "task_id": task_id,
-                    "purpose": purpose,
-                    "target_id": target_id,
-                    "use_id": ref.use_id,
-                }
+        async def append_use(self, envelope):
+            self.envelopes.append(envelope)
+            return envelope.use.use_id
+
+    class _RecordingGovernor:
+        """Recording governor enforcing the production revision invariant.
+
+        Mirrors ``EvidenceGovernor._require_valid_governance_fields`` for
+        the revision rule so deleting the builder ``revision_id`` kwarg
+        fails this test exactly like the live ``EvidenceValidationError``.
+        """
+
+        def __init__(self):
+            from app.services.agents.v2.evidence_store.governance import (
+                EvidenceValidationError,
             )
-            return ref
+
+            self._validation_error = EvidenceValidationError
+            self.record_calls: list[dict] = []
+            self.repository = _RecordingRepository()
+
+        async def persist_record(
+            self, *, source, content, provenance, revision_id=None, **kwargs
+        ):
+            from app.services.agents.v2.contracts.evidence import (
+                DocumentSourceIdentity,
+            )
+
+            if isinstance(source, DocumentSourceIdentity):
+                if revision_id is None:
+                    raise self._validation_error(
+                        "document evidence must reference the authoritative "
+                        "revision_id it was read from (workspace resolves "
+                        "through the revision, never a copied allowlist)"
+                    )
+            elif revision_id is not None:
+                raise self._validation_error(
+                    f"{source.kind!r} evidence must not carry a document "
+                    "revision_id"
+                )
+            self.record_calls.append(
+                {"source": source, "revision_id": revision_id}
+            )
+            return uuid4()
+
+        async def persist_people_evidence(self, **kwargs):
+            raise AssertionError("retrieve pilot persists document evidence")
 
     class _FakeLeaseSession:
         def __init__(self, events):
@@ -1189,19 +1229,20 @@ def test_fresh_resolver_graph_turn_reaches_provider():
             )
 
     class _FakeHydrator:
-        def __init__(self, evidence):
-            self._evidence = evidence
+        def __init__(self, governor):
+            self._governor = governor
 
         async def hydrate_for_evaluation(
             self, use_refs, *, runtime, plan, bindings
         ):
             admitted = []
             for ref in use_refs:
-                call = next(
+                envelope = next(
                     item
-                    for item in self._evidence.calls
-                    if item["use_id"] == ref.use_id
+                    for item in self._governor.repository.envelopes
+                    if item.use.use_id == ref.use_id
                 )
+                use = envelope.use
                 unit = plan.target_units[0]
                 binding = next(
                     item
@@ -1212,9 +1253,9 @@ def test_fresh_resolver_graph_turn_reaches_provider():
                     HydratedEvidence(
                         use_id=ref.use_id,
                         evidence_id=uuid4(),
-                        task_id=call["task_id"],
-                        purpose=call["purpose"],
-                        target_id=call["target_id"],
+                        task_id=use.task_id,
+                        purpose=use.purpose,
+                        target_id=use.target_id,
                         content="content of t1",
                         role=binding.role,
                         source_label="t1",
@@ -1284,13 +1325,17 @@ def test_fresh_resolver_graph_turn_reaches_provider():
                 ),
             )
             retrieval = _FakeRetrieval(chunks)
-            evidence = _FakeEvidence()
+            governor = _RecordingGovernor()
+            evidence = selector.GovernorEvidenceBuilder(
+                governor,
+                run_id=ingress.runtime_context.capability_runtime.run_id,
+            )
             capability._service = retrieval
             capability._evidence = evidence
             ingress.runtime_context.services.retention_leases = _FakeLeases()
             ingress.runtime_context.services.binding_resolver = _FakeBindings()
             ingress.runtime_context.services.evidence_hydrator = _FakeHydrator(
-                evidence
+                governor
             )
             ingress.runtime_context.services.answer_draft_channel = (
                 AnswerDraftChannel()
@@ -1301,9 +1346,9 @@ def test_fresh_resolver_graph_turn_reaches_provider():
                 {"configurable": {"thread_id": thread_id}},
                 context=ingress.runtime_context,
             )
-            return out, retrieval, evidence
+            return out, retrieval, governor
 
-    out, retrieval, evidence = asyncio.run(_main())
+    out, retrieval, governor = asyncio.run(_main())
     # The API-explicit hard scope routes to complex research, never fast read.
     assert out["route_decision"].route == "complex_research"
     assert out["query_analysis"].work_type == "retrieve"
@@ -1315,9 +1360,11 @@ def test_fresh_resolver_graph_turn_reaches_provider():
     assert results[0].status == "success"
     assert results[0].data.kind == "document.retrieve"
     assert len(results[0].evidence_uses) == 1
-    assert len(evidence.calls) == 1
-    assert evidence.calls[0]["purpose"] == "coverage"
-    assert evidence.calls[0]["target_id"] == "t1"
+    assert len(governor.record_calls) == 1
+    assert governor.record_calls[0]["revision_id"] == UUID(revision)
+    assert len(governor.repository.envelopes) == 1
+    assert governor.repository.envelopes[0].use.purpose == "coverage"
+    assert governor.repository.envelopes[0].use.target_id == "t1"
     # Terminal citation success with no raw chunk anywhere.
     final = out["final_response"]
     status = final.status if hasattr(final, "status") else final["status"]

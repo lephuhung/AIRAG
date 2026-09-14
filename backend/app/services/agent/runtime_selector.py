@@ -459,6 +459,7 @@ class GovernorEvidenceBuilder:
         target_id: str | None,
     ) -> Any:
         from app.services.agents.v2.contracts.evidence import (
+            DocumentSourceIdentity,
             EvidenceUse,
             EvidenceUseEnvelope,
             EvidenceUseRef,
@@ -486,10 +487,33 @@ class GovernorEvidenceBuilder:
                 provenance=provenance,
             )
         else:
+            # Document evidence must reference the authoritative revision it
+            # was read from: ``document_revision`` is the string form of the
+            # revision UUID (see ``adapters/document.py``), parsed here and
+            # passed as ``revision_id`` so workspace ACL resolves through the
+            # immutable revision row. Anything else fails closed before
+            # persistence — never a fallback to a current pointer/request.
+            persist_kwargs: dict[str, Any] = {}
+            if isinstance(source, DocumentSourceIdentity):
+                try:
+                    persist_kwargs["revision_id"] = UUID(
+                        source.document_revision
+                    )
+                except (ValueError, AttributeError, TypeError) as exc:
+                    from app.services.agents.v2.evidence_store.governance import (
+                        EvidenceValidationError,
+                    )
+
+                    raise EvidenceValidationError(
+                        "document evidence revision "
+                        f"{source.document_revision!r} is not the authoritative "
+                        "revision_id it was read from"
+                    ) from exc
             evidence_id = await self._governor.persist_record(
                 source=source,
                 content=content,
                 provenance=provenance,
+                **persist_kwargs,
             )
         use = EvidenceUse(
             use_id=uuid.uuid4(),
