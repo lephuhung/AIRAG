@@ -29,7 +29,10 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..semantic.document_identity import DocumentIdentityResolver
+from ..semantic.document_identity import (
+    DocumentIdentityResolver,
+    normalize_section_label,
+)
 
 from app.services.agents.semantic_preprocessor import (
     AbbreviationEntry,
@@ -44,6 +47,7 @@ from ..contracts.semantic import (
     AbbreviationResolution,
     BlockingAmbiguity,
     DocumentReference,
+    SectionReference,
     SemanticContext,
     SemanticDraft,
     SemanticSnapshot,
@@ -137,6 +141,28 @@ def _blocking_ambiguities(
     return tuple(translated)
 
 
+def _section_refs_from_labels(labels: Sequence[str | None]) -> tuple[SectionReference, ...]:
+    """Project authoritative one-turn section labels onto v2 section refs.
+
+    Label-only by design (Phase 4B, Task 7): ``structure_node_id`` stays
+    ``None`` because no revision is pinned here. Non-authoritative spans
+    (multi-locator, discourse anaphora) are dropped for Phase 4C.
+    """
+    refs: list[SectionReference] = []
+    for label in labels:
+        normalized = normalize_section_label(label)
+        if normalized is None:
+            continue
+        refs.append(
+            SectionReference(
+                ref_id=f"s{len(refs) + 1}",
+                label=normalized,
+                structure_node_id=None,
+            )
+        )
+    return tuple(refs)
+
+
 def _legacy_reference(reference: DocumentRefEntry) -> DocumentReference:
     status = _map_resolution_status(reference.resolution_status)
     resolved_document_id = reference.document_handle
@@ -197,7 +223,9 @@ def draft_from_preprocessing(
         coreferences=(),
         document_refs=tuple(_legacy_reference(ref) for ref in result.document_refs),
         person_refs=(),
-        section_refs=(),
+        section_refs=_section_refs_from_labels(
+            [ref.section_reference for ref in result.document_refs]
+        ),
         preliminary_ambiguities=_blocking_ambiguities(result.blocking_ambiguities),
     )
 
@@ -257,6 +285,35 @@ def _optional_uuid(value: object, field: str) -> UUID | None:
         ) from exc
 
 
+def _persisted_candidates(value: object) -> tuple[UUID, ...]:
+    """Project persisted candidate IDs onto valid document UUIDs.
+
+    Absent/invalid entries are dropped (never fabricated into identity);
+    order is preserved and duplicates collapsed. A non-list payload is
+    rejected rather than migrated.
+    """
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise SemanticAdapterError("persisted semantic document_refs.candidates must be a list or null")
+    seen: set[UUID] = set()
+    ordered: list[UUID] = []
+    for entry in value:
+        # Writer shape is a {document_id, match_basis, confidence} record;
+        # a bare uuid string is accepted for forward compatibility.
+        raw = entry.get("document_id") if isinstance(entry, Mapping) else entry
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            parsed = UUID(raw)
+        except ValueError:
+            continue
+        if parsed not in seen:
+            seen.add(parsed)
+            ordered.append(parsed)
+    return tuple(ordered)
+
+
 def _persisted_reference(entry: Mapping[str, object]) -> DocumentReference:
     reference = _require_str(entry.get("reference"), "document_refs.reference")
     status = _map_resolution_status(
@@ -273,6 +330,13 @@ def _persisted_reference(entry: Mapping[str, object]) -> DocumentReference:
         )
     if status != "resolved":
         document_id = None
+    # Candidates survive only on ambiguity (the frozen validator forbids
+    # them on unresolved/not-found/error and they are noise on resolved).
+    candidates = (
+        _persisted_candidates(entry.get("candidates"))
+        if status == "ambiguous"
+        else ()
+    )
     return DocumentReference(
         ref_id=_require_str(entry.get("ref_id"), "document_refs.ref_id"),
         original_span=reference,
@@ -281,7 +345,7 @@ def _persisted_reference(entry: Mapping[str, object]) -> DocumentReference:
         revision_requirement=None,
         resolution_status=status,
         resolved_document_id=document_id,
-        candidate_document_ids=(),
+        candidate_document_ids=candidates,
     )
 
 
@@ -349,16 +413,23 @@ def draft_from_persisted_semantic(payload: Mapping[str, object]) -> SemanticDraf
             )
         )
 
+    persisted_refs = _record_list(payload.get("document_refs"), "document_refs")
     return SemanticDraft(
         provisional_contextualized_query=normalized_query,
         abbreviations=tuple(abbreviations),
         coreferences=(),
         document_refs=tuple(
-            _persisted_reference(entry)
-            for entry in _record_list(payload.get("document_refs"), "document_refs")
+            _persisted_reference(entry) for entry in persisted_refs
         ),
         person_refs=(),
-        section_refs=(),
+        section_refs=_section_refs_from_labels(
+            [
+                entry.get("section_reference")
+                if isinstance(entry.get("section_reference"), str)
+                else None
+                for entry in persisted_refs
+            ]
+        ),
         preliminary_ambiguities=tuple(ambiguities),
     )
 
@@ -438,8 +509,11 @@ async def resolve_draft_identities(
     (``resolution_status``/``resolved_document_id``/
     ``candidate_document_ids``) change: revision pinning stays with the
     existing v2 binding resolver, and the resolver's per-request cache
-    makes repeated builds free. Errors fail closed (propagate) rather
-    than fabricating an identity.
+    makes repeated builds free. When the draft carries no section refs,
+    the resolver's preserved authoritative one-turn locator (if any) is
+    projected as a label-only ``SectionReference`` (no revision
+    coordinate). Errors fail closed (propagate) rather than fabricating
+    an identity.
     """
     if identity_resolver is None:
         raise SemanticAdapterError(
@@ -447,10 +521,14 @@ async def resolve_draft_identities(
             "refusing to fabricate document identity"
         )
     resolved_refs: list[DocumentReference] = []
+    # Refs resolved below may carry a v1 one-turn section locator; capture
+    # the pre-resolution refs so their preserved labels can be projected.
+    pending: list[DocumentReference] = []
     for reference in draft.document_refs:
         if reference.resolution_status == "resolved":
             resolved_refs.append(reference)
             continue
+        pending.append(reference)
         resolved_refs.append(
             await identity_resolver.resolve_reference(
                 reference,
@@ -460,7 +538,35 @@ async def resolve_draft_identities(
                 use_llm_fallback=use_llm_fallback,
             )
         )
-    return draft.model_copy(update={"document_refs": tuple(resolved_refs)})
+    section_refs = draft.section_refs
+    if not section_refs and pending:
+        # Task 7 bridge: preserve the resolver's authoritative one-turn
+        # locator as a label-only section ref (no revision coordinate, so
+        # routing must use the bounded document fallback, never
+        # section.read). Drafts that already carry section refs win.
+        bridged: list[SectionReference] = []
+        for reference in pending:
+            label = normalize_section_label(
+                identity_resolver.cached_section_label(
+                    reference,
+                    question=question,
+                    workspace_ids=workspace_ids,
+                    use_llm_fallback=use_llm_fallback,
+                )
+            )
+            if label is None:
+                continue
+            bridged.append(
+                SectionReference(
+                    ref_id=f"s{len(bridged) + 1}",
+                    label=label,
+                    structure_node_id=None,
+                )
+            )
+        section_refs = tuple(bridged)
+    return draft.model_copy(
+        update={"document_refs": tuple(resolved_refs), "section_refs": section_refs}
+    )
 
 
 __all__ = [

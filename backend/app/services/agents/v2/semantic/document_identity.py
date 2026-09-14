@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any, Sequence
 from uuid import UUID
 
@@ -49,11 +50,41 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DocumentIdentityError",
     "DocumentIdentityResolver",
+    "normalize_section_label",
     "reference_from_candidates",
 ]
 
 #: How many top candidates an ambiguous reference carries for clarification.
 _MAX_AMBIGUOUS_CANDIDATES = 5
+
+#: Authoritative one-turn section locator (Phase 4B, Task 7 only).
+#:
+#: A single ``Điều/Chương/Khoản/Mục/Phụ lục`` coordinate with no
+#: multi-turn coreference. Fullmatch by design: a compound or free-text
+#: span (multi-locator, discourse anaphora) is NOT authoritative here and
+#: stays ``None`` for Phase 4C. Mirrors the v1 ``_SECTION_PATTERNS``
+#: vocabulary, never v1 logic.
+_SECTION_LOCATOR_RE = re.compile(
+    r"(?:điều|chương|khoản|mục|phụ\s*lục)\s+[\dIVXivx]+(?:\.\d+)*",
+    re.IGNORECASE,
+)
+
+
+def normalize_section_label(raw: object) -> str | None:
+    """Project a raw section span onto an authoritative one-turn label.
+
+    Returns the whitespace-collapsed label (``Điều 5``) when ``raw`` is a
+    single authoritative locator, else ``None``. Advisory-only: the label
+    carries no revision coordinate (``structure_node_id`` stays ``None``),
+    so routing must use the bounded document fallback, never
+    ``section.read``, for a label-only locator.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    label = " ".join(raw.split())
+    if _SECTION_LOCATOR_RE.fullmatch(label) is None:
+        return None
+    return label
 
 
 class DocumentIdentityError(ValueError):
@@ -166,6 +197,10 @@ class DocumentIdentityResolver:
             tuple[str, str, tuple[str, ...], bool],
             tuple[str, UUID | None, tuple[UUID, ...]],
         ] = {}
+        # Advisory one-turn section labels per cache key (Task 7 bridge:
+        # the v1 top-level ``section_reference`` is preserved alongside
+        # identity facts, never projected into identity itself).
+        self._sections: dict[tuple[str, str, tuple[str, ...], bool], str | None] = {}
         self._locks: dict[tuple[str, str, tuple[str, ...], bool], asyncio.Lock] = {}
 
     @staticmethod
@@ -190,6 +225,29 @@ class DocumentIdentityResolver:
     def clear(self) -> None:
         """Drop all cached resolutions (turn boundary)."""
         self._cache.clear()
+        self._sections.clear()
+
+    def cached_section_label(
+        self,
+        reference: DocumentReference,
+        *,
+        question: str,
+        workspace_ids: Sequence[Any],
+        use_llm_fallback: bool = True,
+    ) -> str | None:
+        """Return the preserved one-turn section label for a prior resolution.
+
+        ``None`` when the reference was never resolved through this
+        instance or the v1 result carried no authoritative locator.
+        Never resolves: call only after ``resolve_reference``.
+        """
+        topic = (question or "").strip()
+        scope = tuple(workspace_ids or ())
+        reference_text = (
+            reference.normalized_reference or reference.original_span or ""
+        ).strip()
+        key = self._cache_key(reference_text, topic, scope, use_llm_fallback)
+        return self._sections.get(key)
 
     async def resolve_reference(
         self,
@@ -231,6 +289,9 @@ class DocumentIdentityResolver:
                 db,
                 topic=topic,
                 use_llm_fallback=use_llm_fallback,
+            )
+            self._sections[key] = normalize_section_label(
+                result.get("section_reference")
             )
             resolved = reference_from_candidates(
                 reference, result.get("candidates", [])

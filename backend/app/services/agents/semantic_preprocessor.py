@@ -320,6 +320,16 @@ def to_persisted_dict(result: PreprocessingResult) -> dict:
                 "section_reference": r.section_reference,
                 "document_handle": str(r.document_handle) if r.document_handle else None,
                 "resolution_status": r.resolution_status,
+                # Task 7 bridge: candidate IDs must survive persistence so
+                # translation never has to re-derive (or fabricate) them.
+                "candidates": [
+                    {
+                        "document_id": str(c.document_id) if c.document_id else None,
+                        "match_basis": c.match_basis,
+                        "confidence": c.confidence,
+                    }
+                    for c in r.candidates
+                ],
             }
             for r in result.document_refs
         ],
@@ -335,12 +345,47 @@ def to_persisted_dict(result: PreprocessingResult) -> dict:
     }
 
 
+def _restore_persisted_candidates(value: object) -> list["DocumentCandidate"]:
+    """Best-effort restore of candidate IDs persisted by to_persisted_dict.
+
+    Malformed entries are dropped, never fabricated; unknown/absent
+    match basis degrades to ``"unknown"`` with zero confidence.
+    """
+    if not isinstance(value, list):
+        return []
+    restored: list["DocumentCandidate"] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            continue
+        raw_id = entry.get("document_id")
+        try:
+            document_id = uuid.UUID(str(raw_id)) if raw_id else None
+        except (ValueError, AttributeError):
+            continue
+        if document_id is None:
+            continue
+        basis = entry.get("match_basis")
+        try:
+            confidence = float(entry.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        restored.append(
+            DocumentCandidate(
+                document_id=document_id,
+                match_basis=basis if isinstance(basis, str) else "unknown",
+                confidence=min(max(confidence, 0.0), 1.0),
+            )
+        )
+    return restored
+
+
 def from_persisted_dict(d: dict) -> PreprocessingResult:
     """Round-trip from persistence dict.
 
     Per A.8: restores minimum reconstruction with safe defaults.
-    Non-persisted fields (preprocessor_trace, candidates, reasoning) default
-    to empty/safe values.
+    Non-persisted fields (preprocessor_trace, abbreviation candidates,
+    reasoning) default to empty/safe values. Document-ref candidate IDs
+    persisted by to_persisted_dict are restored best-effort.
     """
     abbreviations = [
         AbbreviationEntry(
@@ -366,6 +411,9 @@ def from_persisted_dict(d: dict) -> PreprocessingResult:
             reference=r["reference"],
             section_reference=r.get("section_reference"),
             document_handle=uuid.UUID(r["document_handle"]) if r.get("document_handle") else None,
+            # Task 7 bridge: restore candidate IDs persisted by
+            # to_persisted_dict (best-effort; malformed entries dropped).
+            candidates=_restore_persisted_candidates(r.get("candidates")),
             resolution_status=r["resolution_status"],
         )
         for r in d.get("document_refs", [])

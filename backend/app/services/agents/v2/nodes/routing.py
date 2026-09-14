@@ -530,11 +530,31 @@ def decide_route(
         and set(analysis.domains) <= {"document", "section"}
         and semantic.section_refs
         and bound_count == 1
+        # Task 7 bridge: section.read needs a revision-specific
+        # structure_node_id. A label-only locator ("Điều 5" with no
+        # coordinate) must never claim the capability — it would fail
+        # closed at dispatch. The bounded document fallback below owns it.
+        and any(reference.structure_node_id for reference in semantic.section_refs)
     ):
         return _fast_or_runtime_dependency(
             _FAST_CAPABILITY["section"],
             allowed_capabilities,
             "exact_section_retrieval",
+        )
+    if (
+        analysis.work_type == "retrieve"
+        and "section" in analysis.domains
+        and set(analysis.domains) <= {"document", "section"}
+        and semantic.section_refs
+        and bound_count == 1
+    ):
+        # Bounded document fallback for a label-only section locator:
+        # one pinned document, no revision coordinate — a single-pin
+        # document.read fast path, never the Planner.
+        return _fast_or_runtime_dependency(
+            _FAST_CAPABILITY["document"],
+            allowed_capabilities,
+            "exact_document_metadata",
         )
     if analysis.work_type == "summarize" and analysis.domains == ("document",) and bound_count == 1:
         return _fast_or_runtime_dependency(
