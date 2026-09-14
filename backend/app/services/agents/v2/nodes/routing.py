@@ -556,7 +556,10 @@ def decide_route(
             allowed_capabilities,
             "exact_document_metadata",
         )
-    if analysis.work_type == "summarize" and analysis.domains == ("document",) and bound_count == 1:
+    # A label-only section locator adds the ``section`` domain without pinning
+    # a coordinate (Task 7 bridge): a bounded one-document summarize naming a
+    # section is still a single-pin document.read fast path, never the Planner.
+    if analysis.work_type == "summarize" and set(analysis.domains) <= {"document", "section"} and bound_count == 1:
         return _fast_or_runtime_dependency(
             _FAST_CAPABILITY["document"],
             allowed_capabilities,

@@ -237,6 +237,30 @@ class _StubIdentityResolver:
         return self._section_label
 
 
+def test_summarize_with_label_only_section_stays_fast() -> None:
+    """I1 pin: a bounded one-document summarize naming a section locator
+
+    must keep the document.read fast path (never the Planner). The plan
+    itself must build: a route label pointing at an unmappable capability
+    would raise FastPlanError at checkpoint time.
+    """
+    from app.services.agents.v2.nodes.fast_plan import build_fast_plan
+
+    semantic = _semantic_with_label_only_section()
+    analysis = analyze_query(semantic, intent="summarize")
+    assert analysis.work_type == "summarize"
+    assert set(analysis.domains) == {"document", "section"}
+    bindings = _binding_set()
+    decision = decide_route(
+        analysis, semantic, bindings, allowed_capabilities=_FULL_CAPABILITIES
+    )
+    assert decision.route == "fast_domain"
+    assert decision.reason_code == "exact_document_metadata"
+    plan = build_fast_plan(semantic, bindings, analysis, decision)
+    assert len(plan.tasks) == 1
+    assert plan.tasks[0].capability == "document.read"
+
+
 def test_resolve_draft_identities_preserves_resolver_section() -> None:
     import asyncio
 
