@@ -24,7 +24,13 @@ routes to ``complex_research`` with an explicit reason code so T6's
 is never silently routed to ``fast_domain``.
 
 Routing may inspect request-scoped capability availability (via the injected
-``allowed_capabilities``); availability never reaches business state. Fast-path
+``allowed_capabilities`` permission grant plus the actual request-scoped
+capability catalog when the caller supplies it); availability never reaches
+business state. A capability that is allowed but absent from the actual
+catalog gets a deterministic ``runtime_dependency`` fallback — routing never
+enters an execution path that cannot exist. Reference-free factual retrieval
+(``retrieve``/``document`` with no pinned target) is a bounded targetless
+``document.retrieve`` fast path where the catalog serves it. Fast-path
 gates count only pins referenced by the current semantic projection, never
 stale merged pins from prior turns.
 """
@@ -114,6 +120,14 @@ _FAST_CAPABILITY = {
     "section": "section.read",
     "knowledge_graph": "knowledge_graph.query",
 }
+
+#: Capability serving reference-free factual retrieval. Unlike the pinned
+#: ``document.read`` fast path, ``document.retrieve`` supports empty
+#: ``target_ids`` (workspace-scope retrieval); its presence in the
+#: request-scoped catalog is the workspace-search policy signal. The literal
+#: must match ``skills/retrieve/policy.py::RETRIEVE_CAPABILITY`` (kept as a
+#: literal so nodes stay decoupled from skill policy modules).
+_TARGETLESS_RETRIEVE_CAPABILITY = "document.retrieve"
 
 
 def _contains(text: str, needles: tuple[str, ...]) -> bool:
@@ -347,11 +361,32 @@ def _current_bound_count(
 
 
 def _fast_or_runtime_dependency(
-    domain: str, allowed_capabilities: frozenset[str], reason_code: Any
+    capability: str,
+    allowed_capabilities: frozenset[str],
+    reason_code: Any,
+    available_capabilities: frozenset[str] | None = None,
 ) -> RouteDecision:
-    if _FAST_CAPABILITY[domain] in allowed_capabilities:
-        return RouteDecision(route="fast_domain", reason_code=reason_code)
-    return RouteDecision(route="complex_research", reason_code="runtime_dependency")
+    """Fast when the capability is permitted AND deployable, else fallback.
+
+    ``allowed_capabilities`` is the request permission grant;
+    ``available_capabilities`` is the actual request-scoped catalog (the
+    registry view) when the caller can supply it. A capability that is
+    allowed but absent from the catalog gets the deterministic
+    ``runtime_dependency`` outcome — never a route into a path that cannot
+    exist. ``None`` keeps the allowed-only gate: the pre-existing pinned
+    fast branches use it deliberately so the shared scheduler + registry
+    stays the unavailable authority (typed denied / DEPENDENCY_UNAVAILABLE
+    outcomes); only the new targetless retrieval branch passes the
+    catalog through.
+    """
+    if capability not in allowed_capabilities:
+        return RouteDecision(route="complex_research", reason_code="runtime_dependency")
+    if (
+        available_capabilities is not None
+        and capability not in available_capabilities
+    ):
+        return RouteDecision(route="complex_research", reason_code="runtime_dependency")
+    return RouteDecision(route="fast_domain", reason_code=reason_code)
 
 
 def _api_explicit_ref_ids(request: RequestContext | None) -> frozenset[str]:
@@ -398,9 +433,19 @@ def decide_route(
     bindings: DocumentBindingSet,
     *,
     allowed_capabilities: frozenset[str] = frozenset(),
+    available_capabilities: frozenset[str] | None = None,
     request: RequestContext | None = None,
 ) -> RouteDecision:
-    """Map deterministic analysis facts to one frozen route (never raises)."""
+    """Map deterministic analysis facts to one frozen route (never raises).
+
+    ``available_capabilities`` is the actual request-scoped capability
+    catalog when the caller can supply it (``route_node`` passes the
+    registry view); the targetless retrieval fast gate requires the
+    capability in both the permission grant and the catalog. ``None``
+    keeps the allowed-only gate for pure-function callers. Pre-existing
+    pinned fast branches intentionally keep the allowed-only gate so the
+    shared scheduler + registry remains their unavailable authority.
+    """
     if "write" in analysis.domains:
         # Typed-unavailable outcome: T6's complex_boundary owns the response.
         return RouteDecision(
@@ -421,11 +466,35 @@ def decide_route(
         reference.ref_id not in explicit_ids
         for reference in semantic.document_refs
     )
+
+    bound_count = _current_bound_count(semantic, bindings)
+    # Phase 4A Task 4: reference-free factual retrieval is a bounded
+    # targetless fast path. This branch sits before the conversational
+    # guard so a greeting-prefixed factual query (``chào anh, hỏi về chế
+    # độ thai sản?``) stays factual — and it is safe there because it
+    # requires zero pinned targets, so a greeting that merely carries
+    # transport-only explicit targets (bound_count >= 1) still falls
+    # through to the guard and stays direct. All other factual fast paths
+    # keep their original position below the guard.
+    if (
+        analysis.work_type == "retrieve"
+        and analysis.domains == ("document",)
+        and bound_count == 0
+    ):
+        # Bounded targetless document retrieval: no explicit binding is
+        # required for general factual RAG. The ``document.retrieve``
+        # presence in the request-scoped catalog is the workspace-search
+        # policy signal; absence fails closed to ``runtime_dependency``.
+        return _fast_or_runtime_dependency(
+            _TARGETLESS_RETRIEVE_CAPABILITY,
+            allowed_capabilities,
+            "targetless_document_retrieval",
+            available_capabilities,
+        )
     if _is_conversational(text) and not has_intrinsic_refs:
         reason = "direct_greeting" if _is_greeting(text) else "direct_conversation"
         return RouteDecision(route="direct", reason_code=reason)  # type: ignore[arg-type]
 
-    bound_count = _current_bound_count(semantic, bindings)
     if analysis.work_type == "retrieve" and _has_api_explicit_target(
         semantic, request
     ):
@@ -436,14 +505,24 @@ def decide_route(
             route="complex_research", reason_code="multi_document_research"
         )
     if analysis.work_type == "lookup" and analysis.domains == ("people",):
-        return _fast_or_runtime_dependency("people", allowed_capabilities, "simple_people_lookup")
+        # Allowed-only gate by design: the shared scheduler + registry is
+        # the unavailable authority here, so a denied/gated capability
+        # still yields its typed execution outcome (denied /
+        # DEPENDENCY_UNAVAILABLE) instead of a vague router fallback.
+        return _fast_or_runtime_dependency(
+            _FAST_CAPABILITY["people"],
+            allowed_capabilities,
+            "simple_people_lookup",
+        )
     if (
         analysis.work_type == "retrieve"
         and analysis.domains == ("document",)
         and bound_count == 1
     ):
         return _fast_or_runtime_dependency(
-            "document", allowed_capabilities, "exact_document_metadata"
+            _FAST_CAPABILITY["document"],
+            allowed_capabilities,
+            "exact_document_metadata",
         )
     if (
         analysis.work_type == "retrieve"
@@ -453,17 +532,22 @@ def decide_route(
         and bound_count == 1
     ):
         return _fast_or_runtime_dependency(
-            "section", allowed_capabilities, "exact_section_retrieval"
+            _FAST_CAPABILITY["section"],
+            allowed_capabilities,
+            "exact_section_retrieval",
         )
     if analysis.work_type == "summarize" and analysis.domains == ("document",) and bound_count == 1:
         return _fast_or_runtime_dependency(
-            "document", allowed_capabilities, "exact_document_metadata"
+            _FAST_CAPABILITY["document"],
+            allowed_capabilities,
+            "exact_document_metadata",
         )
     if analysis.work_type == "lookup" and analysis.domains == ("knowledge_graph",):
         return _fast_or_runtime_dependency(
-            "knowledge_graph", allowed_capabilities, "simple_kg_lookup"
+            _FAST_CAPABILITY["knowledge_graph"],
+            allowed_capabilities,
+            "simple_kg_lookup",
         )
-
     if analysis.work_type == "cross_domain":
         return RouteDecision(route="complex_research", reason_code="cross_domain_dependency")
     if analysis.work_type == "compare":
@@ -508,6 +592,29 @@ async def _intent_for_route(
         return None
 
 
+async def _available_catalog(
+    services: Any,
+) -> frozenset[str] | None:
+    """Actual request-scoped capability catalog, or ``None`` when unknown.
+
+    Reads the registry view (``capability_names()``) without dispatching
+    anything: capabilities receive ``AgentRequest`` +
+    ``CapabilityRuntimeContext`` only from the shared scheduler, never from
+    nodes. A missing/unreadable registry returns ``None`` so routing keeps
+    the legacy allowed-only gate; the catalog gate is availability-only and
+    must never break routing.
+    """
+    registry = getattr(services, "capability_registry", None)
+    names_fn = getattr(registry, "capability_names", None)
+    if not callable(names_fn):
+        return None
+    try:
+        return frozenset(names_fn())
+    except Exception as exc:  # noqa: BLE001 - availability gate must not break routing
+        logger.warning("[route] capability catalog unreadable, using allowed-only gate: %s", exc)
+        return None
+
+
 async def route_node(
     state: SupervisorV2State,
     runtime: "Runtime[GraphRuntimeContext]",
@@ -516,7 +623,10 @@ async def route_node(
 
     Typed v1 intent (when the turn-scoped classifier is wired) is the
     semantic input to ``analyze_query``; the deterministic
-    ``decide_route()`` policy keeps route authority.
+    ``decide_route()`` policy keeps route authority. Fast gates check the
+    actual registry catalog in addition to the permission grant, so a
+    missing runtime capability falls back deterministically instead of
+    routing into a path that cannot exist.
     """
     context = _context_of(runtime)
     intent = await _intent_for_route(
@@ -528,6 +638,7 @@ async def route_node(
         state["semantic"],
         state["bindings"],
         allowed_capabilities=context.capability_runtime.allowed_capabilities,
+        available_capabilities=await _available_catalog(context.services),
         request=state["request"],
     )
     return {"query_analysis": analysis, "route_decision": decision}

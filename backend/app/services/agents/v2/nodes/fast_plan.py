@@ -5,7 +5,8 @@
 and knowledge-graph lookups carry zero target units; document/section reads
 carry one target unit per required pin (document) or per named section on the
 single pin (section), and the single task input references exactly those
-targets. ``fast_plan_node`` checkpoints that plan via ``reset_execution``
+targets. Reference-free factual retrieval carries zero target units with a
+targetless ``document.retrieve`` task over the workspace scope. ``fast_plan_node`` checkpoints that plan via ``reset_execution``
 (clearing stale results and evaluation: a fast plan is initial planning,
 which receives no outcomes) before any capability is dispatched. Follows the
 Task-1 node-injection convention via ``_context_of``.
@@ -22,6 +23,7 @@ from ..contracts.binding import DocumentBindingSet
 from ..contracts.capability import (
     CapabilityInput,
     DocumentReadInput,
+    DocumentRetrieveInput,
     KnowledgeGraphInput,
     PeopleLookupInput,
     SectionReadInput,
@@ -55,11 +57,14 @@ class FastPlanError(ValueError):
 #: Router reason code -> the one shared capability serving the fast route.
 #: Bounded summaries arrive here as document/section reads (the router maps a
 #: one-pin summary to exact_document_metadata); there is no summary agent.
+#: Reference-free factual retrieval arrives as ``document.retrieve`` (the
+#: router maps unpinned retrieve/document to targetless_document_retrieval).
 _FAST_CAPABILITY_FOR_REASON = {
     "simple_people_lookup": "people.lookup",
     "exact_document_metadata": "document.read",
     "exact_section_retrieval": "section.read",
     "simple_kg_lookup": "knowledge_graph.query",
+    "targetless_document_retrieval": "document.retrieve",
 }
 
 #: Fast capabilities whose plans carry zero target units.
@@ -107,6 +112,21 @@ def _build_required_targets(
     if capability in _TARGETLESS_CAPABILITIES:
         return ()
     pins = _current_target_pins(semantic, bindings)
+    if capability == "document.retrieve":
+        # Reference-free factual RAG: no pins means a targetless task over
+        # the workspace scope (empty ``target_ids`` by contract). Pinned
+        # targets, if ever present under this reason, get one unit per pin
+        # exactly like the pinned read path; the router only emits this
+        # reason when nothing is pinned.
+        return tuple(
+            TargetUnit(
+                target_id=f"t_{binding.binding_id}",
+                binding_id=binding.binding_id,
+                requested_locator=DocumentLocator(kind="document"),
+                completion_criteria=_coverage_criteria(),
+            )
+            for binding in pins
+        )
     if capability == "document.read":
         if not pins:
             raise FastPlanError(
@@ -165,6 +185,15 @@ def _capability_input(
             kind="knowledge_graph.query", query=semantic.normalized_query
         )
     target_ids = tuple(unit.target_id for unit in targets)
+    if capability == "document.retrieve":
+        return DocumentRetrieveInput(
+            kind="document.retrieve",
+            query=semantic.normalized_query,
+            target_ids=target_ids,
+            # Must match skills/retrieve/policy.py::RETRIEVE_TOP_K (kept as
+            # a literal so nodes stay decoupled from skill policy modules).
+            top_k=8,
+        )
     if capability == "document.read":
         return DocumentReadInput(kind="document.read", target_ids=target_ids)
     if capability == "section.read":

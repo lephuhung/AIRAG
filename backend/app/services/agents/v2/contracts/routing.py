@@ -34,6 +34,11 @@ RouteReason = Literal[
     "simple_people_lookup",
     "exact_document_metadata",
     "exact_section_retrieval",
+    # Phase 4A Task 4 ruling: reference-free factual retrieval without an
+    # explicit document binding is a bounded targetless workspace retrieval
+    # fast path (``document.retrieve`` with empty ``target_ids``), closing
+    # the ``v2_reason_proposal`` deferred by the Task-1 parity corpus.
+    "targetless_document_retrieval",
     "simple_write_operation",
     "simple_kg_lookup",
     "multi_document_research",
