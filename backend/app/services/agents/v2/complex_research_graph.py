@@ -98,6 +98,7 @@ from .execution.scheduler import (
 from .discovery import DiscoveryDenied, DiscoveryDisabled, request_addition
 from .nodes.context import node_context
 from .nodes.evaluate import _EVIDENCE_SUPPLYING_CAPABILITIES, evaluate_evidence
+from .planning import PlannerError
 from .nodes.execute import execution_update
 from .nodes.synthesize import DEFAULT_SYNTHESIS_BUDGET, synthesize_answer
 from .replanning import (
@@ -124,6 +125,7 @@ __all__ = [
     "V2ResearchLimits",
     "build_complex_research_state",
     "build_complex_research_subgraph",
+    "build_governed_initial_proposal",
     "build_discovery_policy",
     "build_initial_proposal",
     "build_model_observations",
@@ -813,6 +815,30 @@ def _people_first_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
     return plan
 
 
+async def build_governed_initial_proposal(
+    planning_input: ResearchPlanningInput, runtime: GraphRuntimeContext
+) -> InitialProposal:
+    """Deterministic skill first, governed Adaptive Planner otherwise (Task 10).
+
+    Without a wired ``adaptive_planner`` service this is exactly
+    :func:`build_initial_proposal` (legacy behavior: work no skill covers
+    raises :class:`ContractValidationError`). With one, the planner owns
+    the deterministic-first ordering and the model path stays
+    proposal-only — the caller still validates, leases, and checkpoints
+    before the shared scheduler dispatches anything.
+    """
+    planner = getattr(runtime.services, "adaptive_planner", None)
+    if planner is None:
+        return build_initial_proposal(planning_input)
+    propose = getattr(planner, "propose_initial", None)
+    if propose is None:
+        raise ComplexResearchError(
+            "adaptive_planner exposes no propose_initial; refusing to plan "
+            "through a miswired planner service"
+        )
+    return await propose(planning_input, runtime)
+
+
 def build_initial_proposal(planning_input: ResearchPlanningInput) -> InitialProposal:
     """Select the skill/policy from the query work type (R38), then propose.
 
@@ -1143,7 +1169,9 @@ async def validate_checkpoint_node(
     is no cross-node proposal store that could go stale or leak between
     requests — concurrent invocations sharing a run id compute from their own
     checkpointed state. Initial entry (no checkpointed plan) validates the
-    compare-skill proposal with ``validate_task_plan``; replan entry (a
+    compare-skill proposal with ``validate_task_plan`` (via the governed
+    entry, which consults the wired ``adaptive_planner`` only when no
+    deterministic skill covers the work type); replan entry (a
     checkpointed plan exists) validates the gap-driven append with the
     runtime replan wrapper (frozen ``validate_replan`` + current catalog).
     There is no ``plan_checkpoint`` service — the returned plan enters
@@ -1158,8 +1186,10 @@ async def validate_checkpoint_node(
     state = normalize_complex_state(state)
     if state.get("plan") is None:
         try:
-            initial = build_initial_proposal(build_planning_input(state, context))
-        except ContractValidationError:
+            initial = await build_governed_initial_proposal(
+                build_planning_input(state, context), context
+            )
+        except (ContractValidationError, PlannerError):
             return {}
         bindings = state["bindings"]
         validate_task_plan(initial.plan, bindings)

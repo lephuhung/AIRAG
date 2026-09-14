@@ -83,6 +83,15 @@ class RuntimeServices(RuntimeModel):
     call. Defaults to ``None``; consumers fail closed when the service
     is absent.
 
+    ``adaptive_planner`` is the runtime-only request-scoped governed
+    ``AdaptivePlanner`` (Phase 5, Task 10): proposal-only initial planning
+    behind the existing validate/lease/checkpoint/scheduler boundary. It
+    defaults to ``None``; the complex boundary keeps its deterministic
+    skill behavior when the service is absent and returns the typed
+    unavailable boundary for work no skill covers. Like every other slot
+    it is typed ``Any`` for the same framework-free reason and is never
+    checkpointed.
+
     The bag deliberately excludes ``plan_checkpoint`` (plan persistence is
     LangGraph state plus the supervisor checkpointer — no service) and any
     ``EvidenceEvaluator`` service (evidence evaluation is the shared
@@ -99,6 +108,7 @@ class RuntimeServices(RuntimeModel):
     answer_draft_channel: Any = None
     pinned_target_resolver: Any = None
     intent_classifier: Any = None
+    adaptive_planner: Any = None
 
 
 class GraphRuntimeContext(ContractModel):

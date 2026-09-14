@@ -508,11 +508,14 @@ def test_runtime_services_excludes_plan_checkpoint_and_evaluator_service() -> No
         "evidence_hydrator",
         "answer_draft_channel",
         "pinned_target_resolver",
+        "intent_classifier",
+        "adaptive_planner",
     }
     assert "plan_checkpoint" not in RuntimeServices.model_fields
     assert not any("evaluator" in name for name in RuntimeServices.model_fields)
     assert RuntimeServices().capability_registry is None
     assert RuntimeServices().pinned_target_resolver is None
+    assert RuntimeServices().adaptive_planner is None
 
 
 # ---------------------------------------------------------------------------

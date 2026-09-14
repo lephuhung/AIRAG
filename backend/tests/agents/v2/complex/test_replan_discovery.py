@@ -2926,8 +2926,10 @@ def test_subagent_cannot_append_authoritative_tasks() -> None:
     Structural (AST, enclosing-function granularity, with temporary-variable
     taint tracking -- not a file whitelist and not only ``.tasks +``):
 
-    * ``TaskPlan(`` constructors exist only in the deterministic builders plus
-      the same-length model-facing redaction projection.
+    * ``TaskPlan(`` constructors exist only in the deterministic builders,
+      the same-length model-facing redaction projection, and the governed
+      initial planner (which builds fresh from validated model steps and
+      still passes frozen ``validate_task_plan`` before lease/checkpoint).
     * EVERY append expression -- ``model_copy(update={"tasks": ...})``,
       ``list(<*.tasks>)`` / ``tuple(<*.tasks>)``, ``<tasks-expr>.append(...)``,
       ``<tasks> + ...``, and in-place ``.tasks`` assignment -- resolves to the
@@ -2954,7 +2956,10 @@ def test_subagent_cannot_append_authoritative_tasks() -> None:
     ) = _scan_append_ownership(v2_root)
 
     # Initial-plan constructors: deterministic builders + the same-length
-    # redaction projection (which rebuilds the plan WITHOUT a tasks model_copy).
+    # redaction projection (which rebuilds the plan WITHOUT a tasks model_copy)
+    # + the governed initial planner (fresh construction from model steps;
+    # every TaskSpec input is server-built and the plan passes frozen
+    # validation before lease/checkpoint — never an append).
     assert constructors == {
         ("nodes/fast_plan.py", "build_fast_plan"),
         ("skills/compare/policy.py", "build_compare_plan"),
@@ -2962,6 +2967,7 @@ def test_subagent_cannot_append_authoritative_tasks() -> None:
         ("skills/summarize/policy.py", "build_summarize_workflow"),
         ("complex_research_graph.py", "_people_first_plan"),
         ("dependencies/people_document.py", "redact_scalar_for_model"),
+        ("planning/planner.py", "_build_plan"),
     }
     # The single authoritative append expression surface (R52): every append
     # expression's ENCLOSING FUNCTION is exactly append_replan_tasks.
