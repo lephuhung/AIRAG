@@ -514,10 +514,12 @@ async def reindex_document(
         )
 
     # Copy-on-write reindex: NOTHING belonging to the currently published
-    # revision is deleted, and no Document completion flag is reset. The old
-    # revision stays current and fully readable until the replacement revision
-    # publishes and atomically advances Document.current_revision_id. Physical
-    # reclamation is Task 9's GC, never reindex.
+    # revision is deleted. The old revision stays current and fully readable
+    # until the replacement revision publishes and atomically advances
+    # Document.current_revision_id. Physical reclamation is Task 9's GC,
+    # never reindex. Per-build progress markers are re-armed for the new
+    # generation inside the allocator (publisher), so the new generation's
+    # workers start from a clean slate; published data is never touched.
 
     # Explicit reindex: allocate a NEW monotonic generation even though
     # ``upload_s3_key`` is unchanged, recording ``reindex_of_revision_id``

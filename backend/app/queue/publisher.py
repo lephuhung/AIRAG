@@ -22,6 +22,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.models.document import Document
 from app.models.document_revision import DocumentRevision
 from app.models.source_arrival import SourceArrival
 from app.queue.messages import MemorySaveMessage, ParseMessage
@@ -164,6 +165,21 @@ async def _allocate_explicit_revision(
     # another generation's rows. This is NOT the mirror reset below — stage
     # rows, not ``Document.*_done`` flags, authorize v2 finalization.
     await repo.initialize_stages(revision.revision_id, profile)
+    # New generation, clean progress slate. The v1/UI mirror completion
+    # markers describe the PREVIOUS generation's workers; leaving them set
+    # lets the new generation's first fast stage (e.g. caption with no
+    # images) observe a bogus "all stages done" in check_and_finalize and
+    # terminalize the new revision via verify (expect_complete) while the
+    # slower stages (embed/KG) are still working — observed in production
+    # as verify:RevisionArtifactsIncomplete on a revision whose artifacts
+    # landed seconds later. The published revision stays untouched: only
+    # per-build progress is re-armed here; pointer, builds and vectors
+    # remain copy-on-write (GC reclaims the superseded).
+    doc = await db.get(Document, document_id)
+    if doc is not None:
+        doc.embed_done = False
+        doc.captions_done = False
+        doc.kg_done = False
     return revision, profile
 
 

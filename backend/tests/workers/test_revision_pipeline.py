@@ -582,6 +582,46 @@ async def test_document_completion_flags_do_not_gate_revision_stage(
 
 
 @pytest.mark.asyncio
+async def test_reindex_allocation_resets_completion_flags(
+    async_db, document_factory
+):
+    """A new reindex generation starts with a clean progress slate.
+
+    Regression: stale ``embed_done/captions_done/kg_done`` markers from the
+    previous generation let the new generation's first fast stage (e.g.
+    caption with no images) observe a bogus "all stages done" in
+    ``check_and_finalize`` and terminalize the new revision via verify
+    (``expect_complete``) while embed/KG were still working — surfaced as
+    ``verify:RevisionArtifactsIncomplete`` on artifacts that landed seconds
+    later. Published revision data itself is untouched (pointer, builds,
+    vectors stay copy-on-write).
+    """
+    doc_id = document_factory()
+    ws = await _workspace_id(async_db, doc_id)
+    key = _doc_key(ws, doc_id)
+
+    document = await async_db.get(Document, doc_id)
+    document.embed_done = True
+    document.captions_done = True
+    document.kg_done = True
+    await async_db.flush()
+
+    r2, _profile = await allocate_reindex_revision(
+        async_db,
+        doc_id,
+        object_key=key,
+        size_bytes=11,
+        content_sha256="2" * 64,
+        version_id="v-1",
+    )
+    fresh = await async_db.get(Document, doc_id)
+    assert fresh.embed_done is False
+    assert fresh.captions_done is False
+    assert fresh.kg_done is False
+    assert r2.generation >= 1
+
+
+@pytest.mark.asyncio
 async def test_stale_message_cannot_publish_newer_revision(async_db, document_factory):
     """R1 finishing late cannot regress a document whose current revision is R2.
 
