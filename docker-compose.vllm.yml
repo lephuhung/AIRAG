@@ -23,17 +23,23 @@ networks:
 services:
   # ═══════════════════════════════════════════════════════════════════════════
   # VLLM SERVICES — GPU 0 (same as workers, 48GB VRAM total)
-  # Budget (2026-07-04): vllm-ocr 0.28 (~13.8GB) | vllm-memory 0.50 (~24.6GB)
-  # → ~38.4GB engines + ~7GB fixed (omnivoice TTS 2.3GB, embed bge-m3 4.8GB)
-  # ≈ 45.5GB, để ~3.5GB slack cho CUDA-graph capture + fragmentation.
+  # Budget (2026-09-13): vllm-ocr 0.24 (~11.8GB) | vllm-memory 0.50 (~24.6GB)
+  # → ~36.4GB engines + ~7GB fixed (omnivoice TTS 2.3GB, embed bge-m3 4.8GB)
+  # ≈ 43.5GB, để ~5.5GB slack (trước đây ocr 0.28 gây OOM tổng thể;
+  # 0.20 thử cùng ngày KHÔNG boot được: KV 0.31 GiB < 0.7 GiB cần cho
+  # max-model-len 12288 → engine crash-loop ValueError).
   # CUDA graphs BẬT (không enforce-eager) cho cả hai — eager từng làm decode
   # chậm ~2× (đo 24 tok/s gemma). --max-num-seqs chặn kích thước graph capture
   # nên spike khởi động chỉ vài trăm MB, không cần eager nữa.
   # ═══════════════════════════════════════════════════════════════════════════
 
   # ── Unlimited-OCR (Baidu, OCR Model) ──────────────────────────────────────
-  # Port: 8001, GPU 0, ~10GB VRAM (0.2 × 48GB). ~3B model → needs more VRAM
-  # than the old 1B HunyuanOCR, hence gpu-memory-utilization bumped 0.13 → 0.20.
+  # Port: 8001, GPU 0, ~11.8GB VRAM (0.24 × 48GB).
+  # Giảm từ 0.28 (2026-09-13: tổng resident vượt 48GB → CUDA OOM) — đánh đổi:
+  # --max-num-seqs hạ 16 → 8, worker vẫn bắn HRAG_OCR_CONCURRENCY=16 trang
+  # song song → 8 trang xếp hàng trong engine, tài liệu scan dày OCR chậm hơn
+  # nhưng vẫn chạy được. GIỮ max-model-len 12288 (0.20 + 12288 đã chứng minh
+  # không boot nổi). Tăng lại 0.28/16 khi nào GPU còn dư.
   # OpenAI-compatible API → workers call via Docker network.
   #
   # Uses Baidu's OFFICIAL prebuilt vLLM image (NOT Dockerfile.vllm) — it ships
@@ -61,15 +67,15 @@ services:
       - "8001"
       - --max-model-len
       - "12288"
-      # 0.22 cho KV chỉ 23.7k tokens (concurrency 1.93x @12k) trong khi worker
-      # bắn HRAG_OCR_CONCURRENCY=16 trang song song → trang xếp hàng. 0.28 ≈
-      # gấp đôi KV để batch thật sự ~16 trang.
+      # 0.24 ≈ ~11.8GB reserve. Đủ batch ~8 trang scan song song; worker bắn
+      # 16 → nửa còn lại xếp hàng trong engine.
+      # (Trước đây 0.28 ≈ gấp đôi KV để batch thật sự ~16 trang, nhưng gây OOM.)
       - --gpu-memory-utilization
-      - "0.28"
-      # Giới hạn batch = mức worker thực dùng → CUDA graph capture nhỏ, đủ chỗ
-      # bật graphs (bỏ enforce-eager) lấy lại tốc độ decode.
+      - "0.24"
+      # Giới hạn batch = 8 (một nửa mức worker) → vừa KV nhỏ, vừa giữ CUDA
+      # graph capture nhỏ để bật graphs (bỏ enforce-eager) giữ tốc độ decode.
       - --max-num-seqs
-      - "16"
+      - "8"
       - --trust-remote-code
       - --logits_processors
       - vllm.model_executor.models.unlimited_ocr:NGramPerReqLogitsProcessor
