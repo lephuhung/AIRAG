@@ -837,6 +837,14 @@
           "title": "Thinking",
           "desc": "Định tuyến supervisor & ReAct judge của LangGraph agent"
         },
+        "semantic_router": {
+          "title": "Semantic Router",
+          "desc": "Phân loại route/intent cho V2 — kế thừa Thinking nếu chưa gán riêng"
+        },
+        "planner": {
+          "title": "Planner",
+          "desc": "Lập kế hoạch thích ứng cho tác vụ phức tạp V2 — kế thừa Thinking nếu chưa gán riêng"
+        },
         "memory_agent": {
           "title": "Memory Agent",
           "desc": "Phân loại intent, condense follow-up, contextual embeddings"

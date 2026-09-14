@@ -38,7 +38,14 @@ logger = logging.getLogger(__name__)
 ROLES = [
     "main", "vision", "thinking", "memory_agent", "kg_extract", "graphiti",
     "stt", "tts", "embedding", "rerank",
+    "semantic_router", "planner",
 ]
+
+# Control-plane reasoning roles with no independent `.env` defaults. Unless a
+# role has its own DB assignment, it inherits the EFFECTIVE "thinking"
+# connection/model (DB overrides included) — see _build_from_settings() and
+# _load_effective(). Explicit assignment always wins over inheritance.
+THINKING_INHERITED_ROLES = ("semantic_router", "planner")
 
 _VERSION_KEY = "_config_version"
 # V2 two-level architecture (plan §12.2):
@@ -128,6 +135,11 @@ def _build_from_settings(role: str) -> EffectiveLLMConfig:
             model=settings.OPENAI_COMPATIBLE_MODEL,
             api_key=settings.OPENAI_COMPATIBLE_API_KEY,
         )
+
+    if role in THINKING_INHERITED_ROLES:
+        # No independent `.env` defaults: unassigned reasoning roles inherit
+        # the effective "thinking" configuration exactly.
+        return _build_from_settings("thinking")
 
     if role == "thinking":
         # Mirrors _resolve_thinking_endpoint() in app/services/llm/__init__.py:
@@ -361,6 +373,10 @@ async def _load_effective(role: str) -> EffectiveLLMConfig:
         row = None
 
     if row is None:
+        # Unassigned reasoning roles inherit the EFFECTIVE thinking assignment
+        # (DB overrides included), not just the `.env` defaults.
+        if role in THINKING_INHERITED_ROLES:
+            return await _load_effective("thinking")
         return _build_from_settings(role)
 
     try:

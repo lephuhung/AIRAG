@@ -846,6 +846,14 @@
           "title": "Thinking",
           "desc": "LangGraph supervisor routing & ReAct judge"
         },
+        "semantic_router": {
+          "title": "Semantic Router",
+          "desc": "V2 route/intent classification — inherits Thinking unless assigned"
+        },
+        "planner": {
+          "title": "Planner",
+          "desc": "V2 adaptive complex planning — inherits Thinking unless assigned"
+        },
         "memory_agent": {
           "title": "Memory Agent",
           "desc": "Intent classification, follow-up condensing, contextual embeddings"

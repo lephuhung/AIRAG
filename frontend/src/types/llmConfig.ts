@@ -12,6 +12,8 @@ export type LlmRole =
   | "main"
   | "vision"
   | "thinking"
+  | "semantic_router"
+  | "planner"
   | "memory_agent"
   | "kg_extract"
   | "graphiti"
@@ -24,6 +26,8 @@ export const LLM_ROLES: LlmRole[] = [
   "main",
   "vision",
   "thinking",
+  "semantic_router",
+  "planner",
   "memory_agent",
   "kg_extract",
   "graphiti",

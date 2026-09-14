@@ -8,6 +8,7 @@ plaintext — only a masked form.
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 
 import httpx
@@ -26,6 +27,8 @@ from app.services import runtime_config
 from app.services.audit_service import AuditService
 
 router = APIRouter(prefix="/admin/llm-config", tags=["admin"])
+
+logger = logging.getLogger(__name__)
 
 _TEST_TIMEOUT = 15.0  # seconds per probe request
 
@@ -268,12 +271,22 @@ async def get_llm_config(user: User = Depends(require_superadmin)):
     """V2 state: role assignments + connections (API keys masked — plaintext
     never leaves the server)."""
     overrides = await runtime_config.list_overrides()
+    thinking_ov = overrides.get("thinking", {})
     roles: dict[str, dict] = {}
     for role in runtime_config.ROLES:
         cfg = runtime_config.get_effective_sync(role)
         ov = overrides.get(role, {})
+        conn_id = ov.get("conn_id", "@env")
+        if (
+            conn_id == "@env"
+            and role in runtime_config.THINKING_INHERITED_ROLES
+            and role not in overrides
+        ):
+            # Unassigned reasoning role: report the EFFECTIVE thinking
+            # assignment it inherits (DB overrides included), not "@env".
+            conn_id = thinking_ov.get("conn_id", "@env")
         roles[role] = {
-            "conn_id": ov.get("conn_id", "@env"),
+            "conn_id": conn_id,
             "model": cfg.model,
             "source": cfg.source,
             "resolved": {
@@ -378,8 +391,16 @@ async def assign_role(
         raise HTTPException(status_code=404, detail=f"Unknown LLM role: {role}")
 
     conn_id = body.conn_id.strip()
+    # No hard reject for a not-yet-known connection id: the runtime resolver
+    # (_load_effective) already treats a dangling conn_id as fail-open to
+    # `.env` with a warning, and the delete flow can leave dangling refs via
+    # force=true. Log so typos are visible in server logs without blocking
+    # role assignment (e.g. connection created right after the assignment).
     if conn_id != "@env" and conn_id not in await runtime_config.list_connections():
-        raise HTTPException(status_code=400, detail=f"Unknown connection {conn_id!r}")
+        logger.warning(
+            f"[llm_config] role {role!r} assigned to unknown connection "
+            f"{conn_id!r} — resolves to .env defaults until it exists"
+        )
 
     try:
         await runtime_config.set_override(

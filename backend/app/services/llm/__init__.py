@@ -264,6 +264,50 @@ def get_thinking_provider() -> LLMProvider:
     return _cached_provider("role:thinking", "thinking", _build)
 
 
+def _reasoning_provider(role: str, label: str) -> LLMProvider:
+    """Shared factory for control-plane reasoning roles (thinking inheritors).
+
+    Uses the single provider factory (``build_provider``) — never a separate
+    hardcoded stack — so an explicit role assignment to any provider
+    (gemini | ollama | openai_compatible) just works. Unassigned roles resolve
+    to the effective "thinking" config via runtime_config inheritance.
+    """
+    def _build():
+        from app.services.agent.langfuse_tracing import trace_llm
+        from app.services.runtime_config import _build_from_settings, get_effective_sync
+
+        try:
+            cfg = get_effective_sync(role)
+        except Exception as exc:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                f"[llm] resolving {role} failed ({exc}) — using thinking defaults"
+            )
+            cfg = _build_from_settings(role)
+        return trace_llm(build_provider(cfg), label=label)
+
+    return _cached_provider(f"role:{role}", role, _build)
+
+
+def get_semantic_router_provider() -> LLMProvider:
+    """LLM for v2 semantic route/intent classification (Phase 4A).
+
+    Unassigned → effective "thinking" connection/model; explicit assignment
+    wins. Advisory-only classification — never route authority.
+    """
+    return _reasoning_provider("semantic_router", "semantic_router_llm")
+
+
+def get_planner_provider() -> LLMProvider:
+    """LLM for v2 governed adaptive planning (Phase 5).
+
+    Unassigned → effective "thinking" connection/model; explicit assignment
+    wins. Proposal-only — validated/scheduled by v2, never direct execution.
+    """
+    return _reasoning_provider("planner", "planner_llm")
+
+
 def clear_thinking_provider_cache() -> None:
     """Drop cached providers. Backward-compat shim: normal A/B swaps happen via
     runtime-config version bumps; this now clears everything (tests only)."""
@@ -340,6 +384,8 @@ __all__ = [
     "get_llm_provider",
     "get_memory_agent",
     "get_thinking_provider",
+    "get_semantic_router_provider",
+    "get_planner_provider",
     "_resolve_thinking_endpoint",
     "clear_thinking_provider_cache",
     "get_kg_llm_provider",
