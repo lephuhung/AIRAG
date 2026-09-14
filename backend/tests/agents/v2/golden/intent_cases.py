@@ -12,14 +12,22 @@ any v2 routing change. Each case records:
   are decided by ``classify_supervisor_scope`` +
   ``deterministic_decision_for_scope`` without any model call (asserted
   exactly); ``model-full-taxonomy`` cases fall through to the full v1
-  prompt (``scope == "full"``, asserted) and the recorded intent documents
-  the full-taxonomy model expectation (NOT asserted against a live model —
-  characterization only, no network in tests).
+  prompt (asserted scope ``"full"``) and the recorded intent documents
+  the full-taxonomy model expectation; the
+  ``derived-from-v1-prerequisite-rewrite`` case (summarize via the
+  ``rag_named_doc`` scope) records the terminal semantic intent of a v1
+  resolve_doc prerequisite chain (scoped prompt + ``supervisor.py``
+  prerequisite injection rewrites the emitted first-step intent to
+  ``resolve_doc``). Model/derived expectations are NOT asserted against a
+  live model — characterization only, no network in tests.
 - ``v2_*`` — the SEPARATELY recorded Phase 4A target: expected v2
   ``QueryAnalysis`` (``work_type`` + ``domains``) and execution topology
-  (``route`` + frozen ``reason_code``). ``v2_reason_code = None`` means the
-  fast route is expected but the exact frozen reason code is assigned by
-  Task 4 (targetless ``document.retrieve`` fast path does not exist yet).
+  (``route`` + frozen ``reason_code``). ``v2_route`` is always a frozen
+  ``Route`` member (asserted). Where the frozen ``RouteReason`` vocabulary
+  has no code for the target yet (targetless ``document.retrieve`` fast
+  path), the case carries ``v2_reason_pending_contract_extension: True``
+  plus a named ``v2_reason_proposal`` instead of a code — an explicit
+  decision item for the Task 4 ruling, never a silent gap.
   Shape-validity of these targets is asserted; equality with CURRENT v2
   output is NOT (Tasks 3/4 close the gap and must pass every case here).
 
@@ -78,6 +86,8 @@ INTENT_CASES: tuple[dict, ...] = (
         "v2_domains": ("document",),
         "v2_route": "fast_domain",
         "v2_reason_code": None,
+        "v2_reason_pending_contract_extension": True,
+        "v2_reason_proposal": "targetless_document_retrieval",
         "note": "Greeting prefix + factual remainder is NOT a greeting; "
         "factual retrieve fast path (targetless).",
     },
@@ -150,6 +160,8 @@ INTENT_CASES: tuple[dict, ...] = (
         "v2_domains": ("document",),
         "v2_route": "fast_domain",
         "v2_reason_code": None,
+        "v2_reason_pending_contract_extension": True,
+        "v2_reason_proposal": "targetless_document_retrieval",
         "note": "General document retrieve FAST: bounded targetless "
         "document retrieval, no explicit binding required.",
     },
@@ -165,6 +177,8 @@ INTENT_CASES: tuple[dict, ...] = (
         "v2_domains": ("document",),
         "v2_route": "fast_domain",
         "v2_reason_code": None,
+        "v2_reason_pending_contract_extension": True,
+        "v2_reason_proposal": "targetless_document_retrieval",
         "note": "General factual retrieve; comparison topology ONLY with "
         "explicit multi-target research (two resolved docs).",
     },
@@ -174,7 +188,7 @@ INTENT_CASES: tuple[dict, ...] = (
         "v1_intent": "summarize",
         "v1_prerequisite": "resolve_doc",
         "v1_scope": "rag_named_doc",
-        "v1_intent_source": "model-full-taxonomy",
+        "v1_intent_source": "derived-from-v1-prerequisite-rewrite",
         "v1_needs_memory": False,
         "v1_is_legal_query": True,
         "v2_work_type": "summarize",
