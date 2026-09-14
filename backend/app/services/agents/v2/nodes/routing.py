@@ -30,6 +30,8 @@ stale merged pins from prior turns.
 """
 from __future__ import annotations
 
+import inspect
+import logging
 import re
 from typing import Any
 
@@ -40,11 +42,20 @@ from app.prompts.agents.supervisor_scope import classify_supervisor_scope
 from ..adapters.document import binding_id_for_ref
 from ..contracts.binding import DocumentBindingSet
 from ..contracts.request import RequestContext
-from ..contracts.routing import QueryAnalysis, RouteDecision, SemanticDependencyHint
+from ..contracts.routing import (
+    Domain,
+    QueryAnalysis,
+    RouteDecision,
+    SemanticDependencyHint,
+    WorkType,
+)
 from ..contracts.semantic import SemanticContext
 from ..contracts.state import GraphRuntimeContext, SupervisorV2State
 from ..contracts.validation import validate_query_analysis
+from ..semantic.intent import IntentDecision
 from .context import _context_of
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "analyze_query",
@@ -115,8 +126,91 @@ def _write_intent(text: str) -> bool:
     return any(pattern.search(text) for pattern in _WRITE_RES)
 
 
-def analyze_query(semantic: SemanticContext) -> QueryAnalysis:
-    """Deterministic-first analysis of the finalized query meaning."""
+#: Phase 4A Task 3: v1 intent taxonomy -> v2 (work_type, domains).
+#: Typed intent is advisory semantic input only; the deterministic
+#: ``decide_route()`` policy keeps route authority. ``resolve_doc`` is a
+#: semantic prerequisite (retrieve the document), never complexity.
+#: Intents outside the v1 taxonomy return ``None`` so the caller falls
+#: back to the legacy deterministic path.
+_INTENT_ANALYSIS: dict[str, tuple[str, ...]] = {
+    "greeting": ("direct", "memory"),
+    "personal": ("direct", "memory"),
+    "mongo_search_cccd": ("lookup", "people"),
+    "mongo_search_phone": ("lookup", "people"),
+    "mongo_search_bhxh": ("lookup", "people"),
+    "mongo_search_name": ("lookup", "people"),
+    "mongo_search_advanced": ("lookup", "people"),
+    "search": ("retrieve", "document"),
+    "search_doc_num": ("retrieve", "document"),
+    "search_section": ("retrieve", "document", "section"),
+    "summarize": ("summarize", "document"),
+    "kg_query": ("lookup", "knowledge_graph"),
+    "resolve_doc": ("retrieve", "document"),
+    "list_docs": ("retrieve", "document"),
+    "search_abbr": ("retrieve", "document"),
+    "write_summarize": ("retrieve", "write"),
+    "write_suggest_edits": ("retrieve", "write"),
+    "write_grammar_check": ("retrieve", "write"),
+    "write_format_check": ("retrieve", "write"),
+}
+
+
+def _analysis_for_intent(
+    intent: IntentDecision | str,
+) -> tuple[WorkType, tuple[Domain, ...]] | None:
+    """Map a typed v1 intent onto v2 analysis facts (``None`` when unknown)."""
+    name = getattr(intent, "intent", intent)
+    if not isinstance(name, str):
+        return None
+    mapped = _INTENT_ANALYSIS.get(name)
+    if mapped is None:
+        return None
+    return mapped[0], tuple(sorted(mapped[1:]))  # type: ignore[return-value]
+
+
+def _dependency_hints_for(
+    domains: set[str],
+) -> tuple[SemanticDependencyHint, ...]:
+    """Domain-family dependency hints shared by both analysis paths."""
+    families = {_FAMILY.get(domain, domain) for domain in domains}
+    dependency_families = sorted(set(_DEPENDENCY_FAMILIES) & families)
+    return tuple(
+        SemanticDependencyHint(
+            hint_id=f"dep-{index + 1}",
+            description=f"{first}->{second} dependency",
+        )
+        for index, (first, second) in enumerate(
+            zip(dependency_families, dependency_families[1:])
+        )
+    )
+
+
+def analyze_query(
+    semantic: SemanticContext, *, intent: IntentDecision | str | None = None
+) -> QueryAnalysis:
+    """Deterministic-first analysis of the finalized query meaning.
+
+    When a typed v1 ``IntentDecision`` is supplied, its taxonomy mapping
+    above is authoritative and the generic regex/keyword classifiers
+    (“là ai”, “khác biệt”, “tổng hợp”, “đánh giá”) do not govern.
+    ``IntentDecision``
+    confidence is never projected: frozen ``QueryAnalysis`` carries no
+    confidence field. Without typed intent the legacy deterministic
+    behavior is preserved exactly.
+    """
+    if intent is not None:
+        mapped = _analysis_for_intent(intent)
+        if mapped is not None:
+            work_type, domains = mapped
+            analysis = QueryAnalysis(
+                work_type=work_type,
+                domains=domains,
+                dependency_hints=_dependency_hints_for(set(domains)),
+            )
+            validate_query_analysis(analysis)
+            return analysis
+        # Unknown intent name: fall through to the legacy path rather
+        # than acting on an unmapped taxonomy value.
     text = semantic.normalized_query.casefold()
     domains: set[str] = set()
     if semantic.person_refs:
@@ -156,16 +250,10 @@ def analyze_query(semantic: SemanticContext) -> QueryAnalysis:
     summary = _contains(text, _SUMMARY_RES)
     evaluate = _contains(text, _EVALUATE_RES)
 
-    families = {_FAMILY.get(domain, domain) for domain in domains}
-    dependency_families = sorted(set(_DEPENDENCY_FAMILIES) & families)
-    hints = tuple(
-        SemanticDependencyHint(
-            hint_id=f"dep-{index + 1}",
-            description=f"{first}->{second} dependency",
-        )
-        for index, (first, second) in enumerate(
-            zip(dependency_families, dependency_families[1:])
-        )
+    hints = _dependency_hints_for(domains)
+    dependency_families = sorted(
+        set(_DEPENDENCY_FAMILIES)
+        & {_FAMILY.get(domain, domain) for domain in domains}
     )
     multi_goal = (compare and summary) or len(semantic.document_refs) >= 3
 
@@ -345,13 +433,54 @@ def decide_route(
     return RouteDecision(route="complex_research", reason_code="multi_document_research")
 
 
+async def _intent_for_route(
+    classifier: Any, request: RequestContext
+) -> IntentDecision | None:
+    """Fetch the turn-scoped typed v1 intent, if the service is wired.
+
+    Uses the cached decision when the semantic seam already classified
+    this turn, otherwise classifies once (the classifier single-flights
+    per turn). A missing service or a classifier failure returns ``None``
+    so routing falls back to the legacy deterministic path; typed intent
+    is advisory-only and must never break routing.
+    """
+    if classifier is None:
+        return None
+    query = request.original_query
+    has_doc_ids = bool(request.known_documents)
+    try:
+        cached_fn = getattr(classifier, "cached", None)
+        if cached_fn is not None:
+            cached = cached_fn(query, has_doc_ids=has_doc_ids)
+            if cached is not None:
+                return cached
+        classify = getattr(classifier, "classify", None)
+        if classify is None:
+            return None
+        result = classify(query, has_doc_ids=has_doc_ids)
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+    except Exception as exc:  # noqa: BLE001 - advisory input must not break routing
+        logger.warning("[route] intent classification failed, using legacy path: %s", exc)
+        return None
+
+
 async def route_node(
     state: SupervisorV2State,
     runtime: "Runtime[GraphRuntimeContext]",
 ) -> dict:
-    """Analyze the finalized query and decide the execution topology."""
+    """Analyze the finalized query and decide the execution topology.
+
+    Typed v1 intent (when the turn-scoped classifier is wired) is the
+    semantic input to ``analyze_query``; the deterministic
+    ``decide_route()`` policy keeps route authority.
+    """
     context = _context_of(runtime)
-    analysis = analyze_query(state["semantic"])
+    intent = await _intent_for_route(
+        context.services.intent_classifier, state["request"]
+    )
+    analysis = analyze_query(state["semantic"], intent=intent)
     decision = decide_route(
         analysis,
         state["semantic"],
