@@ -357,6 +357,7 @@ RouteReason = Literal[
     "direct_greeting", "direct_conversation", "essential_ambiguity",
     "unresolved_required_binding", "simple_people_lookup",
     "exact_document_metadata", "exact_section_retrieval",
+    "targetless_document_retrieval",
     "simple_write_operation", "simple_kg_lookup",
     "multi_document_research", "cross_domain_dependency", "comparison",
     "compliance_evaluation", "multi_goal", "runtime_dependency",

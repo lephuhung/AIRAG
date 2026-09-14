@@ -1229,6 +1229,8 @@ class DeterministicSemanticAdapter:
         preprocess: Callable[[str], Any],
         identity_resolver: Any = None,
         can_read_people: bool = False,
+        session_factory: Callable[[], Any] | None = None,
+        workspace_ids: tuple[Any, ...] = (),
     ) -> None:
         self._preprocess = preprocess
         # Phase 4C (Task 8 fix round 1): gates person-mention (``ông ấy``)
@@ -1238,12 +1240,16 @@ class DeterministicSemanticAdapter:
         # Phase 4B (Task 6): the request-scoped v2
         # ``DocumentIdentityResolver`` (typed v1 ``resolve_candidates()``
         # wrapper). Optional and defaulting to ``None`` so existing
-        # construction sites are unaffected; ``build_draft`` never uses it
-        # implicitly — consumers call
-        # ``adapters/semantic.py::resolve_draft_identities`` explicitly
-        # with the contextualized question, db, and trusted workspace
-        # scope. Never checkpointed; read via this attribute only.
+        # construction sites are unaffected. When set (with a session
+        # factory + trusted workspace scope), ``build_draft`` resolves
+        # still-unresolved draft refs through
+        # ``adapters/semantic.py::resolve_draft_identities`` (final review
+        # I2: the previously-latent resolver bridge is now live). The
+        # existing v2 binding resolver stays the only revision-pin
+        # authority. Never checkpointed; read via this attribute only.
         self.identity_resolver = identity_resolver
+        self._session_factory = session_factory
+        self._workspace_ids = tuple(workspace_ids or ())
 
     @staticmethod
     def reconcile_ui_selections(
@@ -1350,6 +1356,32 @@ class DeterministicSemanticAdapter:
             ) from exc
         reconciled = self.reconcile_ui_selections(draft, request)
         projected = self.project_api_explicit_targets(reconciled, request)
+        # Final review I2: when the request-scoped identity resolver is
+        # wired (production ingress), resolve still-unresolved draft refs
+        # through the v1 ``resolve_candidates()`` pipeline before the
+        # coreference pass below. Already-resolved refs (preprocessor/
+        # ui_selection/api_explicit) pass through untouched; the existing
+        # v2 binding resolver stays the only revision-pin authority.
+        if (
+            self.identity_resolver is not None
+            and self._session_factory is not None
+            and self._workspace_ids
+            and any(
+                reference.resolution_status != "resolved"
+                for reference in projected.document_refs
+            )
+        ):
+            from .v2.adapters.semantic import resolve_draft_identities
+
+            async with self._session_factory() as db:
+                projected = await resolve_draft_identities(
+                    projected,
+                    question=request.original_query,
+                    identity_resolver=self.identity_resolver,
+                    workspace_ids=self._workspace_ids,
+                    db=db,
+                    can_read_people=self._can_read_people,
+                )
         # Task 8 fix round 1 (Important-1): the production coreference
         # call site. Mentions (``văn bản này``/``điều này``/``ông ấy``/
         # ``file thứ hai``) resolve only to current-turn refs that are

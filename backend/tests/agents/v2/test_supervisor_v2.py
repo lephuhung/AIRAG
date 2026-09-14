@@ -1747,6 +1747,134 @@ async def test_build_draft_projects_api_explicit_hard_scope() -> None:
     assert ref.requested_role == "target"
 
 
+@pytest.mark.asyncio
+async def test_build_draft_wires_identity_resolution_when_configured(monkeypatch) -> None:
+    """Final review I2: with identity_resolver + session_factory + trusted
+    workspace scope wired (production ingress shape), ``build_draft`` resolves
+    still-unresolved refs through ``resolve_draft_identities`` instead of
+    leaving the Phase-4B adapter latent."""
+    import app.services.agents.v2.adapters.semantic as semantic_adapter_module
+    from app.services.agents.semantic_preprocessor import (
+        DocumentRefEntry,
+        PreprocessingResult,
+    )
+    from app.services.agents.supervisor_v2 import DeterministicSemanticAdapter
+
+    async def _fake_preprocess(raw_query: str):
+        return PreprocessingResult(
+            original_query=raw_query,
+            normalized_query=raw_query.strip().lower(),
+            preprocessing_status="ok",
+            preprocessor_trace=[],
+            document_refs=[
+                DocumentRefEntry(
+                    ref_id="r1",
+                    original_span="Luật X",
+                    span_offset=(0, 6),
+                    reference="Luật X",
+                    resolution_status="deferred",
+                )
+            ],
+        )
+
+    calls: list[tuple[Any, ...]] = []
+
+    class _FakeResolver:
+        pass
+
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+    async def _fake_resolve(
+        draft,
+        *,
+        question,
+        identity_resolver,
+        workspace_ids,
+        db,
+        use_llm_fallback=True,
+        can_read_people=False,
+    ):
+        calls.append((question, identity_resolver, workspace_ids, db))
+        return draft
+
+    monkeypatch.setattr(
+        semantic_adapter_module, "resolve_draft_identities", _fake_resolve
+    )
+    resolver = _FakeResolver()
+    adapter = DeterministicSemanticAdapter(
+        preprocess=_fake_preprocess,
+        identity_resolver=resolver,
+        session_factory=lambda: _FakeSession(),
+        workspace_ids=(WORKSPACE_ID,),
+    )
+    request = RequestContext(
+        contract_version="2.0",
+        request_id="req-i2",
+        thread_id="thread-i2",
+        original_query="Luật X quy định gì?",
+        known_documents=(),
+    )
+    draft = await adapter.build_draft(request, make_conversation())
+    assert calls, "identity resolution must be invoked when wired"
+    question, identity_resolver, workspace_ids, db = calls[0]
+    assert question == "Luật X quy định gì?"
+    assert identity_resolver is resolver
+    assert workspace_ids == (WORKSPACE_ID,)
+    assert isinstance(db, _FakeSession)
+    assert draft.document_refs[0].ref_id == "r1"
+
+
+@pytest.mark.asyncio
+async def test_build_draft_skips_identity_resolution_without_wiring(monkeypatch) -> None:
+    """Final review I2: no resolver/session/scope means no identity-resolution
+    call (existing construction sites stay inert and read-only)."""
+    import app.services.agents.v2.adapters.semantic as semantic_adapter_module
+    from app.services.agents.semantic_preprocessor import (
+        DocumentRefEntry,
+        PreprocessingResult,
+    )
+    from app.services.agents.supervisor_v2 import DeterministicSemanticAdapter
+
+    async def _fake_preprocess(raw_query: str):
+        return PreprocessingResult(
+            original_query=raw_query,
+            normalized_query=raw_query.strip().lower(),
+            preprocessing_status="ok",
+            preprocessor_trace=[],
+            document_refs=[
+                DocumentRefEntry(
+                    ref_id="r1",
+                    original_span="Luật X",
+                    span_offset=(0, 6),
+                    reference="Luật X",
+                    resolution_status="deferred",
+                )
+            ],
+        )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("identity resolution must not run when unwired")
+
+    monkeypatch.setattr(
+        semantic_adapter_module, "resolve_draft_identities", _boom
+    )
+    adapter = DeterministicSemanticAdapter(preprocess=_fake_preprocess)
+    request = RequestContext(
+        contract_version="2.0",
+        request_id="req-i2b",
+        thread_id="thread-i2b",
+        original_query="Luật X quy định gì?",
+        known_documents=(),
+    )
+    draft = await adapter.build_draft(request, make_conversation())
+    assert draft.document_refs[0].resolution_status == "unresolved"
+
+
 # ---------------------------------------------------------------------------
 # P0 Task 3 fix round 2: multi-workspace union lives per reference.
 # Each reference resolves across ALL trusted workspace IDs with

@@ -38,6 +38,7 @@ __all__ = [
     "IntentClassifier",
     "IntentClassifierError",
     "classify_deterministic",
+    "classify_evaluate",
 ]
 
 #: V1 taxonomy intents this adapter may project. Legacy control values
@@ -65,7 +66,32 @@ _VALID_INTENTS = frozenset(
         "mongo_search_bhxh",
         "mongo_search_phone",
         "mongo_search_advanced",
+        # Phase 4A follow-up (final review I1): the v1 taxonomy
+        # (RAG/WRITE/PEOPLE/DIRECT) has no evaluate/compliance intent, so
+        # ``evaluate`` is produced only by the v2-only deterministic narrow
+        # scope below — never by the shared v1 model prompt.
+        "evaluate",
     }
+)
+
+#: Compliance/legal-evaluation cues for the deterministic ``evaluate``
+#: narrow scope (final review I1). The v1 taxonomy has no evaluate intent,
+#: so a compliance question would otherwise be model-classified to
+#: ``search`` and silently degrade to targetless retrieval in the
+#: production-wired arm. This mirrors the v1 conservative narrow-scope
+#: pattern (greeting/personal/people): strong compliance/legal-validity
+#: signals short-circuit the model, while the bare generic ``đánh giá``
+#: keyword stays demoted (the Task-3 ruling keeps it out of typed-search
+#: authority).
+_EVALUATE_SCOPE_RE = re.compile(
+    r"(?:"
+    r"\btuân\s*thủ\b"
+    r"|\bcompliance\b"
+    r"|\btính\s+pháp\s*lý\b"
+    r"|\bevaluate\b|\bevaluation\b"
+    r"|\bđánh\s*giá\s+(?:tuân\s*thủ|tính\s+pháp\s*lý|mức\s*độ\s+(?:tuân\s*thủ|rủi\s*ro))"
+    r")",
+    re.IGNORECASE | re.UNICODE,
 )
 
 
@@ -127,6 +153,34 @@ def classify_deterministic(
         confidence=1.0,
         needs_memory=bool(decision.get("needs_memory", False)),
         is_legal_query=bool(decision.get("is_legal_query", False)),
+    )
+
+
+def classify_evaluate(
+    query: str, *, has_doc_ids: bool = False
+) -> IntentDecision | None:
+    """Deterministic compliance/evaluate narrow scope (v2-only), or ``None``.
+
+    ``evaluate`` has no v1 taxonomy intent, so it cannot come from the shared
+    model prompt. This conservative scope short-circuits strong
+    compliance/legal-evaluation cues to a typed ``evaluate`` decision before
+    any model call — exactly like the greeting/personal/people narrow scopes
+    above. The bare ``đánh giá`` keyword is deliberately absent (it stays a
+    generic lexical pattern under the Task-3 ruling), so a plain
+    "đánh giá chung về …" question still reaches the model path.
+    """
+    _ = has_doc_ids
+    text = (query or "").strip()
+    if not text:
+        raise IntentClassifierError("cannot classify an empty query")
+    if _EVALUATE_SCOPE_RE.search(text) is None:
+        return None
+    return IntentDecision(
+        intent="evaluate",
+        source="deterministic",
+        confidence=1.0,
+        needs_memory=False,
+        is_legal_query=True,
     )
 
 
@@ -278,6 +332,10 @@ class IntentClassifier:
             if deterministic is not None:
                 self._cache[key] = deterministic
                 return deterministic
+            evaluate = classify_evaluate(query, has_doc_ids=has_doc_ids)
+            if evaluate is not None:
+                self._cache[key] = evaluate
+                return evaluate
             decision = await self._classify_via_model(key[0])
             self._cache[key] = decision
             return decision

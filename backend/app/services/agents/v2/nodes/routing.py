@@ -153,11 +153,21 @@ def _write_intent(text: str) -> bool:
 #: deliberately ABSENT: it is a semantic-prerequisite marker without
 #: terminal semantics (the v1 task plan is dropped at the Task-2
 #: boundary), so it falls back to the reference/text path instead of a
-#: fixed mapping. Intents outside the v1 taxonomy likewise return
-#: ``None`` so the caller falls back to the legacy deterministic path.
+#: fixed mapping. ``personal`` is likewise deliberately ABSENT (final
+#: review I4): its typed ``direct``/``memory`` mapping had no
+#: ``work_type == "direct"`` branch in ``decide_route``, so typed
+#: ``personal`` fell through to ``complex_research`` while the legacy
+#: path served it fast (``simple_kg_lookup`` / targetless retrieval).
+#: Until a frozen-reason ruling records how typed ``direct`` should be
+#: served, ``personal`` falls back to the legacy deterministic path so
+#: simple fast-path behavior is preserved. ``evaluate`` is a v2-only
+#: addition (final review I1): the v1 taxonomy has no evaluate intent, so
+#: this mapping is reachable only via the deterministic
+#: ``classify_evaluate`` narrow scope, never the shared v1 model prompt.
+#: Intents outside the v1 taxonomy likewise return ``None`` so the caller
+#: falls back to the legacy deterministic path.
 _INTENT_ANALYSIS: dict[str, tuple[str, ...]] = {
     "greeting": ("direct", "memory"),
-    "personal": ("direct", "memory"),
     "mongo_search_cccd": ("lookup", "people"),
     "mongo_search_phone": ("lookup", "people"),
     "mongo_search_bhxh": ("lookup", "people"),
@@ -174,6 +184,7 @@ _INTENT_ANALYSIS: dict[str, tuple[str, ...]] = {
     "write_suggest_edits": ("retrieve", "write"),
     "write_grammar_check": ("retrieve", "write"),
     "write_format_check": ("retrieve", "write"),
+    "evaluate": ("evaluate", "document"),
 }
 
 
@@ -269,6 +280,14 @@ def analyze_query(
         if mapped is not None:
             base_work_type, base_domains = mapped
             domains = set(base_domains) | _ref_domains(semantic)
+            # Final review Mod5: the v1-owned write boundary stays
+            # defence-in-depth even when a write request is misclassified
+            # to a read taxonomy intent (e.g. ``search``). Typed intent must
+            # not silently drop the write domain that the legacy path would
+            # have surfaced to ``simple_write_operation``.
+            text = semantic.normalized_query.casefold()
+            if _write_intent(text):
+                domains.add("write")
             analysis = QueryAnalysis(
                 work_type=_typed_work_type(
                     base_work_type, domains, len(semantic.document_refs)

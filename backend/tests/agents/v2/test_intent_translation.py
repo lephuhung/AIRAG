@@ -436,3 +436,139 @@ async def test_route_node_typed_retrieve_still_needs_decide_route() -> None:
         request=state["request"],
     )
     assert update["route_decision"] == expected
+
+
+# ---------------------------------------------------------------------------
+# Final fix wave — I1 (evaluate reachable with classifier wired), I4
+# (typed ``personal`` falls back to the legacy fast path), Mod5 (typed
+# path keeps the write boundary).
+# ---------------------------------------------------------------------------
+
+
+def _raising_provider_factory():
+    raise AssertionError("deterministic scope must not invoke the model")
+
+
+class _FakeSearchChunk:
+    def __init__(self, text: str) -> None:
+        self.type = "text"
+        self.text = text
+
+
+class _FakeSearchProvider:
+    """A model that WOULD misclassify the compliance query to ``search``."""
+
+    def __init__(self) -> None:
+        self.called = False
+
+    async def astream(self, messages, **kwargs):
+        self.called = True
+        yield _FakeSearchChunk(
+            '{"intent":"search","needs_memory":false,"is_legal_query":true}'
+        )
+
+
+def test_classify_evaluate_deterministic_scope() -> None:
+    from app.services.agents.v2.semantic.intent import classify_evaluate
+
+    for query in (
+        "Đánh giá tuân thủ quy định nội bộ",
+        "Đánh giá tính pháp lý của hợp đồng mới",
+        "Tôi có tuân thủ quy định nội bộ không?",
+        "Kiểm tra mức độ tuân thủ an toàn thông tin",
+    ):
+        decision = classify_evaluate(query)
+        assert decision is not None, query
+        assert decision.intent == "evaluate"
+        assert decision.source == "deterministic"
+        assert decision.is_legal_query is True
+
+    # Bare ``đánh giá`` is a generic keyword under the Task-3 ruling, not a
+    # compliance signal: it must stay reachable by the model path.
+    assert classify_evaluate("đánh giá chung về chế độ thai sản?") is None
+    assert classify_evaluate("chế độ thai sản được quy định thế nào?") is None
+
+
+def test_classify_evaluate_short_circuits_model() -> None:
+    from app.services.agents.v2.semantic.intent import IntentClassifier
+
+    classifier = IntentClassifier(provider_factory=_raising_provider_factory)
+
+    async def _run() -> IntentDecision:
+        return await classifier.classify("Đánh giá tuân thủ quy định nội bộ")
+
+    import asyncio
+
+    decision = asyncio.run(_run())
+    assert decision.intent == "evaluate"
+    assert decision.source == "deterministic"
+
+
+@pytest.mark.asyncio
+async def test_route_node_compliance_with_classifier_wired() -> None:
+    # Final review I1: with the production classifier wired and a model that
+    # would emit the generic ``search`` intent, a compliance query must still
+    # reach the governed evaluate/compliance topology — never the targetless
+    # document retrieval the typed ``search`` misclassification produced
+    # before this fix.
+    from app.services.agents.v2.semantic.intent import IntentClassifier
+
+    query = "Đánh giá tuân thủ quy định nội bộ"
+    state = make_state(query)
+    provider = _FakeSearchProvider()
+    runtime = make_runtime(
+        intent_classifier=IntentClassifier(
+            provider_factory=lambda: provider
+        )
+    )
+    update = await route_node(state, runtime)
+    assert update["query_analysis"].work_type == "evaluate"
+    assert update["query_analysis"].domains == ("document",)
+    assert update["route_decision"].route == "complex_research"
+    assert update["route_decision"].reason_code == "compliance_evaluation"
+    # The deterministic evaluate scope short-circuits before the model.
+    assert provider.called is False
+
+
+def test_typed_personal_falls_back_to_legacy_fast_path() -> None:
+    # Final review I4: typed ``personal`` had no ``direct`` branch, so it
+    # fell through to complex_research while the legacy path served it fast.
+    # Until a frozen-reason ruling records typed ``direct``, ``personal``
+    # must fall back to the legacy deterministic path.
+    for query in ("Tôi là ai?", "Tôi đang công tác tại đâu?"):
+        typed = analyze_query(make_semantic(query), intent=make_intent("personal"))
+        legacy = analyze_query(make_semantic(query))
+        assert (typed.work_type, typed.domains) == (
+            legacy.work_type,
+            legacy.domains,
+        )
+
+
+@pytest.mark.asyncio
+async def test_route_node_typed_personal_served_fast() -> None:
+    query = "Tôi là ai?"
+    state = make_state(query)
+    runtime = make_runtime(
+        intent_classifier=FakeIntentClassifier(make_intent("personal"))
+    )
+    update = await route_node(state, runtime)
+    assert update["route_decision"].route == "fast_domain"
+    assert update["route_decision"].reason_code == "simple_kg_lookup"
+
+
+def test_typed_search_preserves_write_boundary() -> None:
+    # Final review Mod5: a write request misclassified to typed ``search``
+    # must still surface the write domain (defence-in-depth), never a
+    # document-read fast path.
+    analysis = analyze_query(
+        make_semantic("Viết báo cáo tổng kết năm"), intent=make_intent("search")
+    )
+    assert "write" in analysis.domains
+    decision = decide_route(
+        analysis,
+        make_semantic("Viết báo cáo tổng kết năm"),
+        DocumentBindingSet(bindings=(), revision_requirement_refs=()),
+        allowed_capabilities=FULL_CAPABILITIES,
+    )
+    assert decision.route == "complex_research"
+    assert decision.reason_code == "simple_write_operation"

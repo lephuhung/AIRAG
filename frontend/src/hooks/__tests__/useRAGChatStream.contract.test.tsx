@@ -19,7 +19,6 @@ import { renderHook, waitFor, act } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { useRAGChatStream } from '../useRAGChatStream';
 import { useAuthStore } from '@/stores/authStore';
-import type { ChatMessage } from '@/types';
 
 function mockFetchFrames(frames: string[]) {
   const encoder = new TextEncoder();
@@ -74,10 +73,9 @@ describe('public chat contract (Task 9)', () => {
     ]);
     const { result } = renderStreamHook();
 
-    let final: ChatMessage | null = null;
-    await act(async () => {
-      final = await result.current.sendMessage('ambiguous query', [], false);
-    });
+    const final = await act(async () =>
+      result.current.sendMessage('ambiguous query', [], false),
+    );
 
     await waitFor(() => {
       expect(result.current.pendingClarification?.clarification_id).toBe('clr-1');
@@ -136,10 +134,9 @@ describe('public chat contract (Task 9)', () => {
     ]);
     const { result } = renderStreamHook();
 
-    let final: ChatMessage | null = null;
-    await act(async () => {
-      final = await result.current.sendMessage('hi', [], false);
-    });
+    const final = await act(async () =>
+      result.current.sendMessage('hi', [], false),
+    );
 
     expect(final?.content).toBe('hello');
   });
@@ -152,10 +149,9 @@ describe('public chat contract (Task 9)', () => {
     ]);
     const { result } = renderStreamHook();
 
-    let final: ChatMessage | null = null;
-    await act(async () => {
-      final = await result.current.sendMessage('hi', [], false);
-    });
+    const final = await act(async () =>
+      result.current.sendMessage('hi', [], false),
+    );
 
     expect(final?.content).toBe('ok');
     expect(result.current.error).toBeNull();
@@ -168,10 +164,9 @@ describe('public chat contract (Task 9)', () => {
     ]);
     const { result } = renderStreamHook();
 
-    let final: ChatMessage | null = null;
-    await act(async () => {
-      final = await result.current.sendMessage('section query', [], false);
-    });
+    const final = await act(async () =>
+      result.current.sendMessage('section query', [], false),
+    );
 
     await waitFor(() => {
       expect(result.current.pendingCitations).toHaveLength(1);
@@ -203,10 +198,9 @@ describe('normalized relay vocabulary (fix round 1, C1/I4)', () => {
     ]);
     const { result } = renderStreamHook();
 
-    let final: ChatMessage | null = null;
-    await act(async () => {
-      final = await result.current.sendMessage('rag query', [], false);
-    });
+    const final = await act(async () =>
+      result.current.sendMessage('rag query', [], false),
+    );
 
     // Existing citation panels keep rendering via the compat projection.
     expect(result.current.pendingSources.length).toBeGreaterThan(0);
@@ -243,10 +237,9 @@ describe('normalized relay vocabulary (fix round 1, C1/I4)', () => {
     ]);
     const { result } = renderStreamHook();
 
-    let final: ChatMessage | null = null;
-    await act(async () => {
-      final = await result.current.sendMessage('q', [], false);
-    });
+    const final = await act(async () =>
+      result.current.sendMessage('q', [], false),
+    );
 
     expect(result.current.pendingCitations).toHaveLength(0);
     expect(result.current.pendingSources).toHaveLength(0);

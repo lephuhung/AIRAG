@@ -127,6 +127,58 @@ def test_greeting_prefix_factual_is_targetless_fast_path() -> None:
     )
 
 
+def test_general_compare_is_targetless_fast_path() -> None:
+    """Final review Mod1: rag-general-compare is a factual retrieve, not a
+    comparison topology — the bare ``khác biệt`` keyword stays demoted under
+    typed ``search``, so the frozen corpus targetless reason must hold here
+    too (the only Phase 4A gate case that previously lacked a route pin)."""
+    semantic = bare_factual_semantic(
+        "sự khác biệt giữa nghỉ phép và nghỉ ốm?"
+    )
+    analysis = analyze_query(semantic, intent=search_intent())
+    assert (analysis.work_type, analysis.domains) == ("retrieve", ("document",))
+    decision = decide_route(
+        analysis,
+        semantic,
+        empty_bindings(),
+        allowed_capabilities=RETRIEVE_ALLOWED_ONLY,
+        available_capabilities=RETRIEVE_AVAILABLE,
+    )
+    assert (decision.route, decision.reason_code) == (
+        "fast_domain",
+        "targetless_document_retrieval",
+    )
+
+
+def test_corpus_targetless_cases_route_via_decide_route() -> None:
+    """Final review Mod1: every frozen-corpus targetless case now carries the
+    approved frozen reason and reaches it through the real ``decide_route``."""
+    from tests.agents.v2.golden.intent_cases import INTENT_CASES
+
+    targetless_ids = {
+        "greeting-prefix-factual",
+        "rag-general-thai-san",
+        "rag-general-compare",
+    }
+    for case in INTENT_CASES:
+        if case["id"] not in targetless_ids:
+            continue
+        assert case["v2_reason_code"] == "targetless_document_retrieval"
+        semantic = bare_factual_semantic(case["query"])
+        analysis = analyze_query(semantic, intent=search_intent())
+        decision = decide_route(
+            analysis,
+            semantic,
+            empty_bindings(),
+            allowed_capabilities=RETRIEVE_ALLOWED_ONLY,
+            available_capabilities=RETRIEVE_AVAILABLE,
+        )
+        assert (decision.route, decision.reason_code) == (
+            "fast_domain",
+            "targetless_document_retrieval",
+        )
+
+
 def test_people_gate_case_stays_people_fast_path() -> None:
     """Gate case: Nguyễn Văn A là ai? -> people fast path (unchanged)."""
     from app.services.agents.v2.contracts.conversation import EntityReference

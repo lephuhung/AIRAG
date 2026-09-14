@@ -23,13 +23,12 @@ any v2 routing change. Each case records:
 - ``v2_*`` — the SEPARATELY recorded Phase 4A target: expected v2
   ``QueryAnalysis`` (``work_type`` + ``domains``) and execution topology
   (``route`` + frozen ``reason_code``). ``v2_route`` is always a frozen
-  ``Route`` member (asserted). Where the frozen ``RouteReason`` vocabulary
-  has no code for the target yet (targetless ``document.retrieve`` fast
-  path), the case carries ``v2_reason_pending_contract_extension: True``
-  plus a named ``v2_reason_proposal`` instead of a code — an explicit
-  decision item for the Task 4 ruling, never a silent gap.
-  Shape-validity of these targets is asserted; equality with CURRENT v2
-  output is NOT (Tasks 3/4 close the gap and must pass every case here).
+  ``Route`` member (asserted) and ``v2_reason_code`` is always a frozen
+  ``RouteReason`` member (the targetless ``document.retrieve`` fast path
+  was approved as the ``targetless_document_retrieval`` frozen-literal
+  extension — final review Mod1 erratum). Shape-validity of these targets
+  is asserted; equality with CURRENT v2 output is NOT (Tasks 3/4 close the
+  gap and must pass every case here).
 
 Verified against current code on 2026-09-14 (see task-1 report for the
 probe outputs):
@@ -85,9 +84,7 @@ INTENT_CASES: tuple[dict, ...] = (
         "v2_work_type": "retrieve",
         "v2_domains": ("document",),
         "v2_route": "fast_domain",
-        "v2_reason_code": None,
-        "v2_reason_pending_contract_extension": True,
-        "v2_reason_proposal": "targetless_document_retrieval",
+        "v2_reason_code": "targetless_document_retrieval",
         "note": "Greeting prefix + factual remainder is NOT a greeting; "
         "factual retrieve fast path (targetless).",
     },
@@ -159,9 +156,7 @@ INTENT_CASES: tuple[dict, ...] = (
         "v2_work_type": "retrieve",
         "v2_domains": ("document",),
         "v2_route": "fast_domain",
-        "v2_reason_code": None,
-        "v2_reason_pending_contract_extension": True,
-        "v2_reason_proposal": "targetless_document_retrieval",
+        "v2_reason_code": "targetless_document_retrieval",
         "note": "General document retrieve FAST: bounded targetless "
         "document retrieval, no explicit binding required.",
     },
@@ -176,9 +171,7 @@ INTENT_CASES: tuple[dict, ...] = (
         "v2_work_type": "retrieve",
         "v2_domains": ("document",),
         "v2_route": "fast_domain",
-        "v2_reason_code": None,
-        "v2_reason_pending_contract_extension": True,
-        "v2_reason_proposal": "targetless_document_retrieval",
+        "v2_reason_code": "targetless_document_retrieval",
         "note": "General factual retrieve; comparison topology ONLY with "
         "explicit multi-target research (two resolved docs).",
     },

@@ -938,6 +938,9 @@ async def build_v2_ingress(
     )
     from app.services.agents.v2.nodes.evaluate import AnswerDraftChannel
     from app.services.agents.v2.planning import AdaptivePlanner, AdaptiveReplanner
+    from app.services.agents.v2.semantic.document_identity import (
+        DocumentIdentityResolver,
+    )
     from app.services.agents.v2.semantic.intent import IntentClassifier
     from app.services.agents.supervisor_v2 import build_initial_v2_state
 
@@ -1007,18 +1010,16 @@ async def build_v2_ingress(
                 can_read_people=bool(can_read_people),
                 session_factory=session_factory,
             ),
-            # No identity_resolver here: nothing consumes
-            # ``DeterministicSemanticAdapter.identity_resolver`` yet, so
-            # per-turn construction would be inert (fix Task 6 round 1).
-            # No identity_resolver here: nothing consumes
-            # ``DeterministicSemanticAdapter.identity_resolver`` yet, so
-            # per-turn construction would be inert (fix Task 6 round 1).
-            # Task 7 owns the ``resolve_draft_identities`` call site, which
-            # needs db + trusted scope that ``build_draft`` deliberately
-            # lacks. The existing v2 binding resolver stays the only
-            # revision-pin authority.
-            # Task 8 fix round 1: the live people permission gates
-            # person-mention resolution in ``build_draft`` (default-deny).
+            # Final review I2: exactly one request-scoped v1 identity
+            # wrapper per ingress turn; the request-scoped cache behind it
+            # means repeated semantic draft builds resolve once. The
+            # existing v2 binding resolver stays the only revision-pin
+            # authority. Task 8 fix round 1: the live people permission
+            # gates person-mention resolution in ``build_draft``
+            # (default-deny).
+            identity_resolver=DocumentIdentityResolver(),
+            session_factory=session_factory,
+            workspace_ids=scope,
             can_read_people=bool(can_read_people),
         )
         # F1 role policy: the production semantic adapter emits
