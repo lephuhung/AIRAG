@@ -211,6 +211,8 @@ def draft_from_preprocessing(
     defaulted to ``result.original_query``: if no normalized/contextualized form
     exists the adapter refuses rather than copying the raw query.
     """
+    from ..semantic.discourse import extract_person_refs
+
     base = contextualized_query if contextualized_query is not None else result.normalized_query
     if base is None or not base.strip():
         raise SemanticAdapterError(
@@ -222,7 +224,10 @@ def draft_from_preprocessing(
         abbreviations=_abbreviations(result.abbreviations),
         coreferences=(),
         document_refs=tuple(_legacy_reference(ref) for ref in result.document_refs),
-        person_refs=(),
+        # Phase 4C (Task 8): stable typed person identities from the
+        # current query (advisory only; people lookup stays gated on
+        # can_read_people + capability authorization downstream).
+        person_refs=extract_person_refs(base),
         section_refs=_section_refs_from_labels(
             [ref.section_reference for ref in result.document_refs]
         ),
@@ -413,6 +418,8 @@ def draft_from_persisted_semantic(payload: Mapping[str, object]) -> SemanticDraf
             )
         )
 
+    from ..semantic.discourse import extract_person_refs
+
     persisted_refs = _record_list(payload.get("document_refs"), "document_refs")
     return SemanticDraft(
         provisional_contextualized_query=normalized_query,
@@ -421,7 +428,7 @@ def draft_from_persisted_semantic(payload: Mapping[str, object]) -> SemanticDraf
         document_refs=tuple(
             _persisted_reference(entry) for entry in persisted_refs
         ),
-        person_refs=(),
+        person_refs=extract_person_refs(normalized_query),
         section_refs=_section_refs_from_labels(
             [
                 entry.get("section_reference")
@@ -499,6 +506,7 @@ async def resolve_draft_identities(
     workspace_ids: Sequence[UUID],
     db: AsyncSession,
     use_llm_fallback: bool = True,
+    can_read_people: bool = False,
 ) -> SemanticDraft:
     """Enrich unresolved draft refs with v1 identity facts (Phase 4B, Task 6).
 
@@ -538,6 +546,16 @@ async def resolve_draft_identities(
                 use_llm_fallback=use_llm_fallback,
             )
         )
+    from ..semantic.discourse import resolve_coreferences
+
+    corefs, coref_ambiguities = resolve_coreferences(
+        question,
+        document_refs=tuple(resolved_refs),
+        person_refs=draft.person_refs,
+        section_refs=draft.section_refs,
+        allowed_document_ids=tuple(workspace_ids),
+        can_read_people=can_read_people,
+    )
     section_refs = draft.section_refs
     if not section_refs and pending:
         # Task 7 bridge: preserve the resolver's authoritative one-turn
@@ -565,7 +583,13 @@ async def resolve_draft_identities(
             )
         section_refs = tuple(bridged)
     return draft.model_copy(
-        update={"document_refs": tuple(resolved_refs), "section_refs": section_refs}
+        update={
+            "document_refs": tuple(resolved_refs),
+            "section_refs": section_refs,
+            "coreferences": tuple(draft.coreferences) + corefs,
+            "preliminary_ambiguities": tuple(draft.preliminary_ambiguities)
+            + coref_ambiguities,
+        }
     )
 
 

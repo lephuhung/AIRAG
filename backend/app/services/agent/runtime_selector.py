@@ -799,6 +799,77 @@ class V2Ingress:
                 logger.warning("v2 ingress session close failed", exc_info=True)
 
 
+async def load_conversation_for_thread(
+    session_factory: Callable[[], Any],
+    thread_id: str,
+    max_recent_turns: int = 20,
+) -> Any:
+    """Load the persisted discourse window for one v2 ingress turn (Phase 4C).
+
+    Reads the last ``max_recent_turns`` ``ChatMessage`` rows plus all
+    ``ExchangeSummary`` rows for the thread and projects them through
+    ``adapters/conversation.py::context_from_legacy`` (typed entities +
+    derived ``last_focus``). Returns an empty ``ConversationContext`` when
+    the thread is not a persisted session (``standalone-...``), when no
+    history exists, or when any load fails (fail-open: a turn without
+    history is always safer than a failed turn).
+
+    Confinement: only labels/text cross this boundary. ``document_ids`` /
+    ``sources`` / ``people_data`` columns are never projected into v2
+    contracts, so history can never reauthorize an out-of-scope resource
+    — resolution always re-checks the current runtime scope.
+    """
+    from app.services.agents.v2.adapters.conversation import (
+        DEFAULT_RECENT_TURN_LIMIT,
+        context_from_legacy,
+    )
+    from app.services.agents.v2.contracts.conversation import ConversationContext
+
+    limit = max(0, int(max_recent_turns or DEFAULT_RECENT_TURN_LIMIT))
+    empty = ConversationContext(
+        summary="", active_entities=(), last_focus=None, recent_turns=()
+    )
+    try:
+        thread_uuid = UUID(str(thread_id))
+    except (ValueError, AttributeError, TypeError):
+        return empty
+    try:
+        from sqlalchemy import select
+
+        from app.models.chat_message import ChatMessage
+        from app.models.exchange_summary import ExchangeSummary
+
+        async with session_factory() as db:
+            msg_result = await db.execute(
+                select(ChatMessage)
+                .where(ChatMessage.session_id == thread_uuid)
+                .order_by(ChatMessage.created_at.asc())
+            )
+            messages = list(msg_result.scalars().all())
+            sum_result = await db.execute(
+                select(ExchangeSummary)
+                .where(ExchangeSummary.session_id == thread_uuid)
+                .order_by(ExchangeSummary.exchange_index.asc())
+            )
+            summaries = list(sum_result.scalars().all())
+        if not messages and not summaries:
+            return empty
+        # Labels/text only: document_ids/sources/people_data columns stay
+        # in the database and never enter v2 contracts.
+        recent = messages[-limit:] if limit else []
+        return context_from_legacy(
+            messages=recent,
+            exchange_summaries=summaries,
+            max_recent_turns=limit,
+        )
+    except Exception:  # noqa: BLE001 — fail-open to an empty window
+        logger.warning(
+            "v2 ingress history load failed; continuing without history",
+            exc_info=True,
+        )
+        return empty
+
+
 @asynccontextmanager
 async def build_v2_ingress(
     *,
@@ -819,6 +890,8 @@ async def build_v2_ingress(
     preprocess: Callable[[str], Any] | None = None,
     abbreviation_lookup: Callable[[str], str | None] | None = None,
     available_services: frozenset[str] | None = None,
+    load_history: bool = True,
+    max_recent_turns: int = 20,
 ) -> AsyncIterator[V2Ingress]:
     """Build the real request-scoped v2 runtime for one ingress turn.
 
@@ -972,6 +1045,15 @@ async def build_v2_ingress(
         runtime_context = build_graph_runtime_context(
             capability_runtime, services=services
         )
+        # Phase 4C (Task 8): production ingress supplies the persisted
+        # discourse window (labels/text only — never document identity,
+        # so history cannot reauthorize out-of-scope resources).
+        # Fail-open: history load failures yield an empty window.
+        conversation = None
+        if load_history:
+            conversation = await load_conversation_for_thread(
+                session_factory, thread_id, max_recent_turns=max_recent_turns
+            )
         initial_state = build_initial_v2_state(
             request=RequestContext(
                 contract_version=CONTRACT_VERSION,
@@ -979,7 +1061,8 @@ async def build_v2_ingress(
                 thread_id=thread_id,
                 original_query=raw_query,
                 known_documents=tuple(known_documents or ()),
-            )
+            ),
+            conversation=conversation,
         )
         ingress = V2Ingress(
             runtime_context=runtime_context,

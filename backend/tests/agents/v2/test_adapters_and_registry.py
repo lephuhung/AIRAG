@@ -644,8 +644,15 @@ def test_conversation_context_translates_legacy_messages_and_summaries() -> None
         "Nghị định 12/2020",
         "Điều 5",
     ]
-    assert all(entity.kind == "concept" for entity in context.active_entities)
-    assert context.last_focus is None
+    # Phase 4C (Task 8): entities carry typed kinds and focus derives
+    # from the validated outcomes (most recent entity).
+    assert [entity.kind for entity in context.active_entities] == [
+        "document",
+        "section",
+    ]
+    assert context.last_focus is not None
+    assert context.last_focus.label == "Điều 5"
+    assert context.last_focus.kind == "section"
 
 
 def test_conversation_context_truncates_to_the_recent_window() -> None:

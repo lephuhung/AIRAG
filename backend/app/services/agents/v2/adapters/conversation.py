@@ -9,10 +9,17 @@ translates already-loaded legacy rows into the minimal v2 shapes:
   ``summary_version`` (``exchange_index``) and ``built_through_message_id`` of
   ``ConversationSnapshot``, plus ``ActiveEntity`` labels from ``key_entities``.
 
-``last_focus`` is left ``None``: the legacy rows carry no last-focus owner, and
-the v2 conversation builder derives it from the turns, so this adapter does not
-invent one. Persistence/optimistic locking stays with
+``last_focus`` is derived from the validated typed entities (Phase 4C,
+Task 8): the most recent active entity is the current discourse focus.
+It is never invented — empty entity windows yield ``None``.
+Persistence/optimistic locking stays with
 ``persistence.snapshots.ConversationSnapshotRepository``.
+
+Confinement: history rows carry labels only, never identity. This port
+consumes ``key_entities`` labels and recent-turn text; document IDs from
+``document_ids``/``sources``/``people_data`` columns are never projected
+into v2 contracts, so history can never reauthorize an out-of-scope
+resource (resolution always re-checks the current runtime scope).
 """
 from __future__ import annotations
 
@@ -84,19 +91,19 @@ def _recent_turns(
 def _active_entities(
     summaries: Sequence[LegacyExchangeSummary],
 ) -> tuple[ActiveEntity, ...]:
-    entities: list[ActiveEntity] = []
-    seen: set[str] = set()
+    from ..semantic.discourse import typed_active_entities
+
+    labels: list[str] = []
     for summary in summaries:
         for label in summary.key_entities or ():
             if not isinstance(label, str) or not label.strip():
                 raise ConversationAdapterError(
                     "legacy exchange key_entities must contain non-blank strings"
                 )
-            if label in seen:
-                continue
-            seen.add(label)
-            entities.append(ActiveEntity(ref_id=label, kind="concept", label=label))
-    return tuple(entities)
+            labels.append(label)
+    # Typed kinds (document/person/section/concept) from the shared
+    # deterministic discourse layer — never flattened to ``concept``.
+    return typed_active_entities(labels)
 
 
 def _summary_text(summaries: Sequence[LegacyExchangeSummary]) -> str:
@@ -116,11 +123,15 @@ def context_from_legacy(
     max_recent_turns: int = DEFAULT_RECENT_TURN_LIMIT,
 ) -> ConversationContext:
     """Translate legacy chat rows into the minimal v2 discourse context."""
+    from ..semantic.discourse import derive_last_focus
+
     summaries = _ordered_summaries(exchange_summaries)
+    entities = _active_entities(summaries)
+    focus = derive_last_focus(entities)
     context = ConversationContext(
         summary=_summary_text(summaries),
-        active_entities=_active_entities(summaries),
-        last_focus=None,
+        active_entities=entities,
+        last_focus=focus,
         recent_turns=_recent_turns(messages, max_recent_turns),
     )
     validate_conversation_context(context)
