@@ -1601,6 +1601,12 @@ async def test_clarify_selection_resume_advances_to_binding() -> None:
         [CapabilityRegistration(capability=capability)],
         runtime.capability_runtime,
     )
+    # Mirror production ingress: the resumed turn dispatches a targeted
+    # document.read through the shared scheduler, which feeds the
+    # request-scoped resolver before dispatch (round 2 N1).
+    from app.services.agent.runtime_selector import PlanBindingResolver
+
+    runtime.services.pinned_target_resolver = PlanBindingResolver()
 
     command = await resume_clarification(message_id, suspended["clarification"], runtime)
     # Verbatim T5 artifact (no outer goto — the graph owns navigation).

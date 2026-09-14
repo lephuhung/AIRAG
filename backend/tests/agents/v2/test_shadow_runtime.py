@@ -53,7 +53,15 @@ def make_factual_bundle(**overrides: Any):
         "people_directory": dict(PEOPLE_DIRECTORY),
     }
     params.update(overrides)
-    return build_shadow_bundle(**params)
+    bundle = build_shadow_bundle(**params)
+    # Mirror production ingress: the shared scheduler feeds the
+    # request-scoped resolver before dispatch (round 2 N1 raises on
+    # targeted plans without one). Registry-gating still fails closed for
+    # unregistered document capabilities.
+    from app.services.agent.runtime_selector import PlanBindingResolver
+
+    bundle.runtime_context.services.pinned_target_resolver = PlanBindingResolver()
+    return bundle
 
 
 def make_direct_bundle(**overrides: Any):

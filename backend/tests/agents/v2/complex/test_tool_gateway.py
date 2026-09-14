@@ -142,7 +142,20 @@ def _runtime(
             allowed_capabilities=allowed,
             deadline_at=datetime(2030, 1, 1, tzinfo=UTC),
         ),
-        services=RuntimeServices(capability_registry=registry),
+        services=_services_with_resolver(registry),
+    )
+
+
+def _services_with_resolver(registry):
+    from app.services.agent.runtime_selector import PlanBindingResolver
+    from app.services.agents.v2.contracts.state import RuntimeServices
+
+    # Production ingress wires the request-scoped resolver the shared
+    # scheduler feeds before dispatch (round 2 N1: targeted read plans
+    # raise without one).
+    return RuntimeServices(
+        capability_registry=registry,
+        pinned_target_resolver=PlanBindingResolver(),
     )
 
 

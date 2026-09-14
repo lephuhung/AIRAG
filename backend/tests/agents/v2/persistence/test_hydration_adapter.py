@@ -110,6 +110,8 @@ def _graph_runtime(
     channel: AnswerDraftChannel | None = None,
     registry: Any = None,
 ) -> GraphRuntimeContext:
+    from app.services.agent.runtime_selector import PlanBindingResolver
+
     return GraphRuntimeContext(
         capability_runtime=capability_runtime,
         services=RuntimeServices(
@@ -117,6 +119,10 @@ def _graph_runtime(
             retention_leases=leases,
             evidence_hydrator=adapter,
             answer_draft_channel=channel,
+            # Production ingress wires the request-scoped resolver the
+            # shared scheduler feeds before dispatch (round 2 N1:
+            # targeted read plans raise without one).
+            pinned_target_resolver=PlanBindingResolver(),
         ),
     )
 

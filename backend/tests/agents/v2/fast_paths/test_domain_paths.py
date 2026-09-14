@@ -350,6 +350,8 @@ def full_context(
     hydrator: FakeHydrator,
     allowed: frozenset[str] = FULL_FAST_CAPABILITIES,
 ) -> tuple[GraphRuntimeContext, FakeLeaseRepo, AnswerDraftChannel]:
+    from app.services.agent.runtime_selector import PlanBindingResolver
+
     leases = FakeLeaseRepo()
     channel = AnswerDraftChannel()
     return (
@@ -360,6 +362,10 @@ def full_context(
                 retention_leases=leases,
                 evidence_hydrator=hydrator,
                 answer_draft_channel=channel,
+                # Production ingress wires the request-scoped resolver the
+                # shared scheduler feeds before dispatch (round 2 N1:
+                # targeted read plans raise without one).
+                pinned_target_resolver=PlanBindingResolver(),
             ),
         ),
         leases,

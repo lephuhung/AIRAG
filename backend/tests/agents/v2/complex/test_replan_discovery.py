@@ -419,9 +419,18 @@ def _harness(
                 capability_registry=registry,
                 retention_leases=leases,
                 evidence_hydrator=FakeHydrator(capabilities),
+                pinned_target_resolver=_fresh_pinned_resolver(),
             ),
         ),
     )
+
+
+def _fresh_pinned_resolver():
+    """Request-scoped resolver mirror: production ingress wires one for the
+    shared scheduler feed (round 2 N1: targeted plans raise without one)."""
+    from app.services.agent.runtime_selector import PlanBindingResolver
+
+    return PlanBindingResolver()
 
 
 DOC_C = UUID("33333333-3333-3333-3333-333333333333")
@@ -568,6 +577,7 @@ def _people_harness(
                 evidence_hydrator=FakeHydrator((document_capability,)),
                 binding_resolver=resolver,
                 answer_draft_channel=channel,
+                pinned_target_resolver=_fresh_pinned_resolver(),
             ),
         ),
     )
@@ -669,6 +679,7 @@ def _discovery_harness(
                 retention_leases=leases,
                 evidence_hydrator=FakeHydrator((document_capability,)),
                 binding_resolver=resolver,
+                pinned_target_resolver=_fresh_pinned_resolver(),
             ),
         ),
     )

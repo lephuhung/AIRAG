@@ -770,19 +770,31 @@ async def _run_pre_dispatch_guards(
             )
 
 
-def _plan_has_targeted_document_tasks(plan: Any) -> bool:
-    """True when the plan dispatches a scoped ``document.retrieve`` task.
+#: Capabilities that resolve scoped targets through the constructor-injected
+#: ``PinnedTargetResolver``. ``document.read`` / ``section.read`` inputs require
+#: non-empty ``target_ids`` by contract; ``document.retrieve`` supports both
+#: scoped (non-empty) and unscoped (empty) requests. Only a task in this set
+#: whose input carries non-empty ``target_ids`` counts as targeted — every
+#: other capability (people/KG/memory lookups, search, write) never requires
+#: a resolver, so the shadow rig and targetless plans stay supported.
+_PINNED_TARGET_CAPABILITIES = frozenset(
+    {"document.retrieve", "document.read", "section.read"}
+)
 
-    Narrow by construction: only a ``document.retrieve`` task whose input
-    carries non-empty ``target_ids`` counts. Targetless plans (empty
-    ``target_ids``, other capabilities, or no tasks) return False, so the
-    shadow rig and unscoped retrieval never require a resolver. Duck-typed
-    via ``_slot`` so checkpoint-serde mappings read identically to live
-    models.
+
+def _plan_has_targeted_document_tasks(plan: Any) -> bool:
+    """True when the plan dispatches a scoped resolver-consumer task.
+
+    Narrow by construction: only a ``document.retrieve`` / ``document.read``
+    / ``section.read`` task whose input carries non-empty ``target_ids``
+    counts. Targetless plans (empty ``target_ids``, other capabilities, or
+    no tasks) return False, so the shadow rig and unscoped retrieval never
+    require a resolver. Duck-typed via ``_slot`` so checkpoint-serde
+    mappings read identically to live models.
     """
     tasks = _slot(plan, "tasks") or ()
     for task in tasks:
-        if _slot(task, "capability") != "document.retrieve":
+        if _slot(task, "capability") not in _PINNED_TARGET_CAPABILITIES:
             continue
         task_input = _slot(task, "input") or {}
         if tuple(_slot(task_input, "target_ids") or ()):
@@ -790,7 +802,7 @@ def _plan_has_targeted_document_tasks(plan: Any) -> bool:
     return False
 
 
-def _feed_pinned_targets(
+async def _feed_pinned_targets(
     plan: TaskPlan,
     bindings: DocumentBindingSet | None,
     runtime: GraphRuntimeContext,
@@ -810,13 +822,16 @@ def _feed_pinned_targets(
     owner (not scheduler input materialization: ``TaskSpec.input`` is
     never mutated).
 
-    A wiring fault on a TARGETED plan (no resolver, no callable ``feed``,
-    missing plan/bindings, or a ``feed`` exception) raises typed
-    ``SchedulerError`` with a warning — it must never masquerade as a
-    capability ``denied``/``SCOPE_VIOLATION`` authorization decision. A
-    genuine target mismatch AFTER a successful feed still fails closed in
-    the capability (``denied``/``SCOPE_VIOLATION``). Targetless plans with
-    no resolver remain supported (no-op).
+    The feed is async-aware: an ``async def feed`` result is awaited, so an
+    installing or exploding async feed can neither silently no-op nor
+    masquerade as a denial. A wiring fault on a TARGETED plan (no
+    resolver, no callable ``feed``, missing plan/bindings, or a ``feed``
+    exception — sync or async) raises typed ``SchedulerError`` with a
+    warning — it must never masquerade as a capability
+    ``denied``/``SCOPE_VIOLATION`` authorization decision. A genuine target
+    mismatch AFTER a successful feed still fails closed in the capability
+    (``denied``/``SCOPE_VIOLATION``). Targetless plans with no resolver
+    remain supported (no-op).
     """
     targeted = _plan_has_targeted_document_tasks(plan)
     try:
@@ -832,7 +847,8 @@ def _feed_pinned_targets(
                 "raising instead of reporting a wiring fault as a denial"
             )
             raise SchedulerError(
-                "targeted document.retrieve tasks require a wired "
+                "targeted document tasks (document.retrieve/document.read/"
+                "section.read with target_ids) require a wired "
                 "pinned-target resolver; refusing to report a wiring fault "
                 "as an authorization denial"
             )
@@ -856,13 +872,15 @@ def _feed_pinned_targets(
                 "for a targeted plan; raising instead of denying"
             )
             raise SchedulerError(
-                "targeted document.retrieve tasks require checkpointed plan "
+                "targeted document tasks require checkpointed plan "
                 "+ bindings for the pinned-target feed; refusing to report "
                 "a wiring fault as an authorization denial"
             )
         return
     try:
-        feed(plan, bindings)
+        fed = feed(plan, bindings)
+        if inspect.isawaitable(fed):
+            await fed
     except SchedulerError:
         raise
     except Exception as exc:
@@ -916,7 +934,7 @@ async def execute_ready_tasks(
     # resolver resolves the checkpointed plan's targets for every dispatch
     # below (fresh turns included); the resume-path pre-feed stays as an
     # idempotent compatibility refresh.
-    _feed_pinned_targets(plan, bindings, runtime)
+    await _feed_pinned_targets(plan, bindings, runtime)
     leased_any = False
     truncated = False
     while True:

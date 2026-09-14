@@ -375,12 +375,18 @@ def _harness(
         [CapabilityRegistration(capability=capability) for capability in capabilities],
         runtime,
     )
+    from app.services.agent.runtime_selector import PlanBindingResolver
+
     context = GraphRuntimeContext(
         capability_runtime=runtime,
         services=RuntimeServices(
             capability_registry=registry,
             retention_leases=leases,
             evidence_hydrator=FakeHydrator(capabilities),
+            # Production ingress wires the request-scoped resolver the
+            # shared scheduler feeds before dispatch (round 2 N1:
+            # targeted read plans raise without one).
+            pinned_target_resolver=PlanBindingResolver(),
         ),
     )
     return capabilities, leases, context

@@ -152,8 +152,21 @@ def services(
     *,
     registry: Any = None,
     leases: Any = None,
+    pinned_target_resolver: Any = "__fresh__",
 ) -> RuntimeServices:
-    return RuntimeServices(capability_registry=registry, retention_leases=leases)
+    # Production ingress always wires a request-scoped PlanBindingResolver
+    # the shared scheduler feeds before dispatch (round 2 N1: targeted
+    # document.retrieve/document.read/section.read plans raise without one,
+    # so every legitimate targeted harness must wire one too).
+    if pinned_target_resolver == "__fresh__":
+        from app.services.agent.runtime_selector import PlanBindingResolver
+
+        pinned_target_resolver = PlanBindingResolver()
+    return RuntimeServices(
+        capability_registry=registry,
+        retention_leases=leases,
+        pinned_target_resolver=pinned_target_resolver,
+    )
 
 
 def graph_runtime(
@@ -162,12 +175,17 @@ def graph_runtime(
     leases: Any = None,
     allowed: frozenset[str] = frozenset({"people.lookup", "document.read"}),
     deadline_at: datetime | None = None,
+    pinned_target_resolver: Any = "__fresh__",
 ) -> GraphRuntimeContext:
     return GraphRuntimeContext(
         capability_runtime=capability_runtime(
             allowed=allowed, deadline_at=deadline_at
         ),
-        services=services(registry=registry, leases=leases),
+        services=services(
+            registry=registry,
+            leases=leases,
+            pinned_target_resolver=pinned_target_resolver,
+        ),
     )
 
 
@@ -892,13 +910,15 @@ class _FeedFakeRetrieval:
         return self._chunks
 
 
-def _retrieve_stack(task_id: str = "T1", *, target_ids=("t1",), chunks=None):
+def _retrieve_stack(task_id: str = "T1", *, target_ids=("t1",), chunks=None, resolver=None):
     """Fresh-turn retrieve wiring: a real, initially EMPTY PlanBindingResolver.
 
     The SAME resolver instance is injected into the real retrieve
     capability AND (when the services bag supports it) exposed as the
     runtime-only ``pinned_target_resolver`` service — exactly the ingress
     wiring under repair. The scheduler must feed it before dispatch.
+    A caller-supplied ``resolver`` (e.g. an async-fed inner resolver under
+    test) is used as-is instead of minting a fresh one.
     """
     from app.services.agent.runtime_selector import PlanBindingResolver
     from app.services.agents.v2.capabilities.document import (
@@ -964,7 +984,7 @@ def _retrieve_stack(task_id: str = "T1", *, target_ids=("t1",), chunks=None):
                 target_id="t1",
             ),
         )
-    resolver = PlanBindingResolver()  # fresh turn: empty until fed
+    resolver = resolver if resolver is not None else PlanBindingResolver()  # fresh turn: empty until fed
     assert resolver.resolve("t1") is None
     service = _FeedFakeRetrieval(chunks)
     evidence = _FeedFakeEvidence()
@@ -1115,7 +1135,6 @@ async def test_scheduler_missing_resolver_raises_not_denies() -> None:
     raises instead of letting the capability deny with SCOPE_VIOLATION.
     Uses a fresh unfed resolver fixture (no private-state poking).
     """
-    from app.services.agent.runtime_selector import PlanBindingResolver
     from app.services.agents.v2.execution.scheduler import (
         SchedulerError,
         TaskScheduler,
@@ -1123,11 +1142,9 @@ async def test_scheduler_missing_resolver_raises_not_denies() -> None:
 
     stack = _retrieve_stack()
     stack["runtime"].services.pinned_target_resolver = None
-    # The capability resolves through a fresh, unfed resolver: without the
-    # scheduler feed every scoped target is unknown.
-    fresh = PlanBindingResolver()
-    assert fresh.resolve("t1") is None
-    stack["registry"].get("document.retrieve")._resolver = fresh
+    # The capability resolves through the stack's own fresh, unfed resolver:
+    # without the scheduler feed every scoped target is unknown.
+    assert stack["resolver"].resolve("t1") is None
     with pytest.raises(SchedulerError):
         await TaskScheduler(stack["registry"]).execute(
             stack["plan"],
@@ -1208,7 +1225,8 @@ async def test_scheduler_unscoped_retrieve_needs_no_pinned_targets() -> None:
 # P0 live-gate fix round 1 (F3/F4): wiring faults never masquerade as denial;
 # feed is atomic with no stale authority.
 #
-# Targeted plans (a document.retrieve task with non-empty target_ids) with
+# Targeted plans (a document.retrieve/document.read/section.read task with
+# non-empty target_ids) with
 # an absent / unfeedable / failing resolver must raise typed SchedulerError
 # with a warning — never a denied/SCOPE_VIOLATION that looks like an ACL
 # decision. Targetless plans with no resolver stay supported, and a genuine
@@ -1227,8 +1245,6 @@ async def test_scheduler_targeted_plan_without_resolver_raises() -> None:
 
     stack = _retrieve_stack()
     assert stack["resolver"].resolve("t1") is None  # fresh fixture is unfed
-    fresh = PlanBindingResolverFresh()
-    assert fresh.resolve("t1") is None
     ctx = GraphRuntimeContext(
         capability_runtime=stack["runtime"].capability_runtime,
         services=RuntimeServices(
@@ -1374,7 +1390,7 @@ async def test_scheduler_targetless_plan_without_resolver_succeeds() -> None:
     assert len(service.calls) == 1
 
 
-def PlanBindingResolverFresh():
+def fresh_plan_binding_resolver():
     """Fresh unfed resolver fixture (no private-state poking)."""
     from app.services.agent.runtime_selector import PlanBindingResolver
 
@@ -1388,7 +1404,7 @@ def test_plan_binding_feed_is_atomic_and_clears_stale_on_failure() -> None:
     from app.services.agent.runtime_selector import PlanBindingResolver
 
     stack = _retrieve_stack()
-    resolver = PlanBindingResolverFresh()
+    resolver = fresh_plan_binding_resolver()
     resolver.feed(stack["plan"], stack["bindings"])
     assert resolver.resolve("t1") is not None
 
@@ -1409,7 +1425,7 @@ def test_plan_binding_feed_replaces_mapping_without_stale_leftovers() -> None:
     from app.services.agents.v2.contracts.locators import SectionLocator
 
     stack = _retrieve_stack()
-    resolver = PlanBindingResolverFresh()
+    resolver = fresh_plan_binding_resolver()
     resolver.feed(stack["plan"], stack["bindings"])
     assert resolver.resolve("t1") is not None
 
@@ -1445,3 +1461,434 @@ def test_plan_binding_feed_replaces_mapping_without_stale_leftovers() -> None:
     resolver.feed(plan_b, bindings_b)
     assert resolver.resolve("t1") is None
     assert resolver.resolve("t2") is not None
+
+
+# ---------------------------------------------------------------------------
+# P0 live-gate fix round 2 (N1): the wiring-fault discriminator covers every
+# PinnedTargetResolver consumer, not just document.retrieve.
+#
+# document.read and section.read resolve every target_id through the same
+# constructor-injected resolver (their inputs require non-empty target_ids
+# by contract), so a targeted read/section plan with a missing or
+# unfeedable resolver must raise typed SchedulerError — never a silent
+# denied/SCOPE_VIOLATION that looks like an ACL decision. A genuine target
+# mismatch AFTER a successful feed still fails closed in the capability.
+# ---------------------------------------------------------------------------
+
+
+def _read_stack(
+    capability_name: str, *, task_id: str = "T1", target_ids=("t1",)
+):
+    """Fresh-turn read wiring: a real, initially EMPTY PlanBindingResolver.
+
+    Same shape as ``_retrieve_stack`` but for the fast-path read
+    capabilities: the SAME resolver instance is injected into the real
+    ``DocumentReadCapability`` / ``SectionReadCapability`` AND exposed as
+    the runtime-only ``pinned_target_resolver`` service. The scheduler must
+    feed it before dispatch.
+    """
+    from app.services.agent.runtime_selector import PlanBindingResolver
+    from app.services.agents.v2.capabilities import LocatedContent
+    from app.services.agents.v2.capabilities.document import (
+        DocumentReadCapability,
+    )
+    from app.services.agents.v2.capabilities.section import SectionReadCapability
+    from app.services.agents.v2.contracts.capability import (
+        DocumentReadInput,
+        SectionReadInput,
+    )
+    from app.services.agents.v2.contracts.locators import (
+        DocumentLocator,
+        SectionLocator,
+    )
+
+    assert capability_name in ("document.read", "section.read")
+    if capability_name == "document.read":
+        locator = DocumentLocator(kind="document")
+        task_input = DocumentReadInput(
+            kind="document.read", target_ids=tuple(target_ids)
+        )
+    else:
+        locator = SectionLocator(kind="section", structure_node_id="node-5")
+        task_input = SectionReadInput(
+            kind="section.read", target_ids=tuple(target_ids)
+        )
+    plan = TaskPlan(
+        contract_version="2.0",
+        plan_id=f"plan-{capability_name}",
+        goal="factual query",
+        target_units=(
+            TargetUnit(
+                target_id="t1",
+                binding_id="b_t1",
+                requested_locator=locator,
+                completion_criteria=(),
+            ),
+        ),
+        tasks=(
+            TaskSpec(
+                task_id=task_id,
+                capability=capability_name,
+                task_objective="factual query",
+                input=task_input,
+                depends_on=(),
+                origin=InitialTaskOrigin(kind="initial"),
+            ),
+        ),
+    )
+    bindings = DocumentBindingSet(
+        bindings=(
+            ScopedDocument(
+                binding_id="b_t1",
+                document_id=DOCUMENT_ID,
+                document_revision=RETRIEVE_REVISION,
+                role="target",
+            ),
+        ),
+        revision_requirement_refs=(),
+    )
+    resolver = PlanBindingResolver()  # fresh turn: empty until fed
+    assert resolver.resolve("t1") is None
+
+    class _FakeReader:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def read(self, binding, read_locator):
+            self.calls.append({"binding": binding, "locator": read_locator})
+            return LocatedContent(
+                outcome="read",
+                observed_locator=read_locator,
+                content="pinned body",
+            )
+
+        async def read_section(self, binding, read_locator):
+            self.calls.append({"binding": binding, "locator": read_locator})
+            return LocatedContent(
+                outcome="read",
+                observed_locator=read_locator,
+                content="pinned body",
+            )
+
+    reader = _FakeReader()
+    evidence = _FeedFakeEvidence()
+    if capability_name == "document.read":
+        capability = DocumentReadCapability(
+            reader=reader, evidence=evidence, resolver=resolver
+        )
+    else:
+        capability = SectionReadCapability(
+            reader=reader, evidence=evidence, resolver=resolver
+        )
+    runtime = capability_runtime(allowed=frozenset({capability_name}))
+    registry = build_capability_registry(
+        [CapabilityRegistration(capability=capability)], runtime
+    )
+    events: list[str] = []
+    ctx = GraphRuntimeContext(
+        capability_runtime=runtime,
+        services=services(registry=registry, leases=FakeLeaseRepo(events)),
+    )
+    ctx.services.pinned_target_resolver = resolver
+    return {
+        "plan": plan,
+        "bindings": bindings,
+        "resolver": resolver,
+        "reader": reader,
+        "evidence": evidence,
+        "registry": registry,
+        "runtime": ctx,
+        "events": events,
+        "capability": capability_name,
+    }
+
+
+@pytest.mark.asyncio
+async def test_scheduler_targeted_document_read_without_resolver_raises() -> None:
+    """N1: a targeted document.read plan with no resolver raises, never denies."""
+    from app.services.agents.v2.contracts.state import RuntimeServices
+    from app.services.agents.v2.execution.scheduler import (
+        SchedulerError,
+        TaskScheduler,
+    )
+
+    stack = _read_stack("document.read")
+    ctx = GraphRuntimeContext(
+        capability_runtime=stack["runtime"].capability_runtime,
+        services=RuntimeServices(
+            capability_registry=stack["registry"],
+            retention_leases=FakeLeaseRepo(stack["events"]),
+            pinned_target_resolver=None,
+        ),
+    )
+    with pytest.raises(SchedulerError):
+        await TaskScheduler(stack["registry"]).execute(
+            stack["plan"], ctx, bindings=stack["bindings"]
+        )
+    assert stack["reader"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_targeted_document_read_with_unfeedable_resolver_raises() -> None:
+    """N1: a targeted document.read plan + non-callable feed raises."""
+    from types import SimpleNamespace
+
+    from app.services.agents.v2.contracts.state import RuntimeServices
+    from app.services.agents.v2.execution.scheduler import (
+        SchedulerError,
+        TaskScheduler,
+    )
+
+    stack = _read_stack("document.read")
+    ctx = GraphRuntimeContext(
+        capability_runtime=stack["runtime"].capability_runtime,
+        services=RuntimeServices(
+            capability_registry=stack["registry"],
+            retention_leases=FakeLeaseRepo(stack["events"]),
+            pinned_target_resolver=SimpleNamespace(feed=None),
+        ),
+    )
+    with pytest.raises(SchedulerError):
+        await TaskScheduler(stack["registry"]).execute(
+            stack["plan"], ctx, bindings=stack["bindings"]
+        )
+    assert stack["reader"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_targeted_section_read_without_resolver_raises() -> None:
+    """N1: a targeted section.read plan with no resolver raises, never denies."""
+    from app.services.agents.v2.contracts.state import RuntimeServices
+    from app.services.agents.v2.execution.scheduler import (
+        SchedulerError,
+        TaskScheduler,
+    )
+
+    stack = _read_stack("section.read")
+    ctx = GraphRuntimeContext(
+        capability_runtime=stack["runtime"].capability_runtime,
+        services=RuntimeServices(
+            capability_registry=stack["registry"],
+            retention_leases=FakeLeaseRepo(stack["events"]),
+            pinned_target_resolver=None,
+        ),
+    )
+    with pytest.raises(SchedulerError):
+        await TaskScheduler(stack["registry"]).execute(
+            stack["plan"], ctx, bindings=stack["bindings"]
+        )
+    assert stack["reader"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_targeted_section_read_with_unfeedable_resolver_raises() -> None:
+    """N1: a targeted section.read plan + non-callable feed raises."""
+    from types import SimpleNamespace
+
+    from app.services.agents.v2.contracts.state import RuntimeServices
+    from app.services.agents.v2.execution.scheduler import (
+        SchedulerError,
+        TaskScheduler,
+    )
+
+    stack = _read_stack("section.read")
+    ctx = GraphRuntimeContext(
+        capability_runtime=stack["runtime"].capability_runtime,
+        services=RuntimeServices(
+            capability_registry=stack["registry"],
+            retention_leases=FakeLeaseRepo(stack["events"]),
+            pinned_target_resolver=SimpleNamespace(feed=None),
+        ),
+    )
+    with pytest.raises(SchedulerError):
+        await TaskScheduler(stack["registry"]).execute(
+            stack["plan"], ctx, bindings=stack["bindings"]
+        )
+    assert stack["reader"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_fed_document_read_mismatch_stays_denied() -> None:
+    """N1: after a successful feed, an unknown read target stays denied."""
+    from app.services.agents.v2.execution.scheduler import TaskScheduler
+
+    stack = _read_stack("document.read", target_ids=("t9",))
+    report = await TaskScheduler(stack["registry"]).execute(
+        stack["plan"],
+        stack["runtime"],
+        bindings=stack["bindings"],
+    )
+    assert len(report.results) == 1
+    result = report.results[0]
+    assert result.status == "denied"
+    assert result.error is not None
+    assert result.error.code == "SCOPE_VIOLATION"
+    assert stack["reader"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_fed_section_read_mismatch_stays_denied() -> None:
+    """N1: after a successful feed, an unknown section target stays denied."""
+    from app.services.agents.v2.execution.scheduler import TaskScheduler
+
+    stack = _read_stack("section.read", target_ids=("t9",))
+    report = await TaskScheduler(stack["registry"]).execute(
+        stack["plan"],
+        stack["runtime"],
+        bindings=stack["bindings"],
+    )
+    assert len(report.results) == 1
+    result = report.results[0]
+    assert result.status == "denied"
+    assert result.error is not None
+    assert result.error.code == "SCOPE_VIOLATION"
+    assert stack["reader"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_fed_document_read_match_succeeds() -> None:
+    """N1: a matching read target resolves after the feed and reads."""
+    from app.services.agents.v2.execution.scheduler import TaskScheduler
+
+    stack = _read_stack("document.read")
+    report = await TaskScheduler(stack["registry"]).execute(
+        stack["plan"],
+        stack["runtime"],
+        bindings=stack["bindings"],
+    )
+    assert len(report.results) == 1
+    result = report.results[0]
+    assert result.status == "success"
+    assert len(stack["reader"].calls) == 1
+    assert len(result.evidence_uses) == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduler_nontargeted_lookup_without_resolver_succeeds() -> None:
+    """N1 narrowness: a targetless lookup never requires a resolver."""
+    from app.services.agents.v2.contracts.state import RuntimeServices
+    from app.services.agents.v2.execution.scheduler import TaskScheduler
+
+    stub = StubCapability(
+        "people.lookup", "people", result=people_result("P1")
+    )
+    runtime = capability_runtime(allowed=frozenset({"people.lookup"}))
+    registry = build_capability_registry(
+        [CapabilityRegistration(capability=stub)], runtime
+    )
+    events: list[str] = []
+    ctx = GraphRuntimeContext(
+        capability_runtime=runtime,
+        services=RuntimeServices(
+            capability_registry=registry,
+            retention_leases=FakeLeaseRepo(events),
+            pinned_target_resolver=None,
+        ),
+    )
+    report = await TaskScheduler(registry).execute(
+        people_plan(task_id="P1"), ctx, bindings=None
+    )
+    assert len(report.results) == 1
+    assert report.results[0].status == "success"
+    assert len(stub.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# P0 live-gate fix round 2 (N3): the pinned-target feed is async-aware.
+#
+# An ``async def feed`` is callable, so the old guard accepted it and left
+# the returned coroutine unawaited: the targeted plan proceeded to a
+# capability denial with a "coroutine was never awaited" warning — the same
+# masquerade class as F3. The scheduler now awaits an awaitable feed
+# result, and an async feed failure surfaces as SchedulerError.
+# ---------------------------------------------------------------------------
+
+
+class _AsyncFeedResolver:
+    """Test double exposing an async feed over a real PlanBindingResolver."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.feed_calls = 0
+
+    async def feed(self, plan, bindings):
+        self.feed_calls += 1
+        return self._inner.feed(plan, bindings)
+
+    def resolve(self, target_id: str):
+        return self._inner.resolve(target_id)
+
+
+class _AsyncExplodingFeedResolver:
+    """Test double whose async feed always fails."""
+
+    def __init__(self) -> None:
+        self.feed_calls = 0
+
+    async def feed(self, plan, bindings):
+        self.feed_calls += 1
+        raise RuntimeError("async boom")
+
+    def resolve(self, target_id: str):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_scheduler_async_feed_is_awaited_and_installed() -> None:
+    """N3: an async feed is awaited, so the scoped turn reaches the provider."""
+    from app.services.agent.runtime_selector import PlanBindingResolver
+    from app.services.agents.v2.contracts.state import RuntimeServices
+    from app.services.agents.v2.execution.scheduler import TaskScheduler
+
+    inner = PlanBindingResolver()
+    resolver = _AsyncFeedResolver(inner)
+    stack = _retrieve_stack(resolver=inner)
+    ctx = GraphRuntimeContext(
+        capability_runtime=stack["runtime"].capability_runtime,
+        services=RuntimeServices(
+            capability_registry=stack["registry"],
+            retention_leases=FakeLeaseRepo(stack["events"]),
+            pinned_target_resolver=resolver,
+        ),
+    )
+    report = await TaskScheduler(stack["registry"]).execute(
+        stack["plan"], ctx, bindings=stack["bindings"]
+    )
+    assert resolver.feed_calls == 1
+    assert inner.resolve("t1") is not None
+    assert len(report.results) == 1
+    assert report.results[0].status == "success"
+    assert len(stack["service"].calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduler_async_failing_feed_raises_not_denies(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """N3: an async feed failure raises SchedulerError with a warning."""
+    from app.services.agents.v2.contracts.state import RuntimeServices
+    from app.services.agents.v2.execution.scheduler import (
+        SchedulerError,
+        TaskScheduler,
+    )
+
+    stack = _retrieve_stack()
+    resolver = _AsyncExplodingFeedResolver()
+    ctx = GraphRuntimeContext(
+        capability_runtime=stack["runtime"].capability_runtime,
+        services=RuntimeServices(
+            capability_registry=stack["registry"],
+            retention_leases=FakeLeaseRepo(stack["events"]),
+            pinned_target_resolver=resolver,
+        ),
+    )
+    with caplog.at_level("WARNING"):
+        with pytest.raises(SchedulerError):
+            await TaskScheduler(stack["registry"]).execute(
+                stack["plan"], ctx, bindings=stack["bindings"]
+            )
+    assert resolver.feed_calls == 1
+    assert stack["service"].calls == []
+    assert any(
+        "pinned-target" in record.getMessage() for record in caplog.records
+    )

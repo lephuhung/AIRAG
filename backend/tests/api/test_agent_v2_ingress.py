@@ -1051,3 +1051,280 @@ def test_ingress_pinned_resolver_wired_to_dispatch():
     assert evidence.calls[0]["purpose"] == "coverage"
     assert evidence.calls[0]["target_id"] == "t1"
     assert "secret chunk" not in result.model_dump_json()
+
+
+def test_fresh_resolver_graph_turn_reaches_provider():
+    """N2: a TRUE fresh (non-resume) scoped turn through the compiled graph.
+
+    Actual ``build_v2_ingress`` runtime + ``create_supervisor_v2_graph``
+    (``InMemorySaver``), driven with ``graph.ainvoke`` — no manual
+    ``TaskScheduler`` in this test. The turn flows through the real nodes
+    (context -> binding -> semantic -> route -> complex plan -> shared
+    execute) into the REAL ``DocumentRetrieveCapability`` with test-double
+    IO backings (retrieval provider / evidence / leases / hydrator /
+    binding resolver) injected around — never instead of — the wired
+    resolver. The API-explicit hard scope routes to ``complex_research``
+    (never the read fast path), the provider is reached exactly once, the
+    task succeeds with target-bound coverage evidence, the terminal
+    response succeeds with a citation, and no raw chunk leaks.
+
+    Kills all three seams: deleting the ingress wiring, the supervisor
+    pass-through, or the scheduler feed turns this terminal success into a
+    raise or a denied/failed turn.
+    """
+    import asyncio
+    from types import SimpleNamespace
+    from uuid import UUID, uuid4
+
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    import app.services.agent.runtime_selector as selector
+    from app.services.agents.supervisor_v2 import create_supervisor_v2_graph
+    from app.services.agents.v2.capabilities.document import RevisionRetrievedChunk
+    from app.services.agents.v2.contracts.binding import (
+        DocumentBindingSet,
+        ScopedDocument,
+    )
+    from app.services.agents.v2.contracts.evidence import (
+        DocumentSourceIdentity,
+        EvidenceUseRef,
+    )
+    from app.services.agents.v2.contracts.locators import ChunkRangeLocator
+    from app.services.agents.v2.contracts.request import KnownDocumentResource
+    from app.services.agents.v2.nodes.evaluate import (
+        AnswerDraftChannel,
+        HydratedEvidence,
+    )
+
+    workspace_id = uuid4()
+    document_id = UUID("11111111-1111-1111-1111-111111111111")
+    revision = "22222222-2222-2222-2222-222222222222"
+    thread_id = f"thread-{uuid4().hex[:8]}"
+
+    class _FakeSession:
+        async def commit(self):
+            return None
+
+        async def rollback(self):
+            return None
+
+        async def close(self):
+            return None
+
+    async def _fake_preprocess(raw_query: str):
+        return SimpleNamespace(
+            normalized_query="Điều 5 của A nói gì?",
+            abbreviations=(),
+            document_refs=(),
+            blocking_ambiguities=(),
+        )
+
+    class _FakeRetrieval:
+        def __init__(self, chunks):
+            self._chunks = tuple(chunks)
+            self.calls: list[dict] = []
+
+        async def retrieve(self, query, *, top_k, allowed_targets, workspace_ids):
+            self.calls.append(
+                {"query": query, "allowed_targets": allowed_targets}
+            )
+            return self._chunks
+
+    class _FakeEvidence:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        async def persist_use(
+            self, *, source, content, provenance, task_id, purpose, target_id
+        ):
+            ref = EvidenceUseRef(use_id=uuid4())
+            self.calls.append(
+                {
+                    "task_id": task_id,
+                    "purpose": purpose,
+                    "target_id": target_id,
+                    "use_id": ref.use_id,
+                }
+            )
+            return ref
+
+    class _FakeLeaseSession:
+        def __init__(self, events):
+            self._events = events
+            self.commits = 0
+
+        async def commit(self):
+            self.commits += 1
+            self._events.append("commit")
+
+    class _FakeLeases:
+        def __init__(self):
+            self.events: list[str] = []
+            self.calls: list[tuple] = []
+            self.session = _FakeLeaseSession(self.events)
+
+        async def acquire_or_refresh(
+            self, run_id, revision_id=None, evidence_use_id=None, **kwargs
+        ):
+            self.calls.append((run_id, revision_id, evidence_use_id))
+            return {"run_id": run_id}
+
+        async def release_run(self, run_id, reason="terminal"):
+            return 0
+
+    class _FakeBindings:
+        async def resolve(self, document_refs, capability_runtime):
+            assert len(document_refs) == 1
+            assert document_refs[0].ref_id == "api_explicit:doc1"
+            return DocumentBindingSet(
+                bindings=(
+                    ScopedDocument(
+                        binding_id="b_api_explicit:doc1",
+                        document_id=document_id,
+                        document_revision=revision,
+                        role="target",
+                    ),
+                ),
+                revision_requirement_refs=(),
+            )
+
+    class _FakeHydrator:
+        def __init__(self, evidence):
+            self._evidence = evidence
+
+        async def hydrate_for_evaluation(
+            self, use_refs, *, runtime, plan, bindings
+        ):
+            admitted = []
+            for ref in use_refs:
+                call = next(
+                    item
+                    for item in self._evidence.calls
+                    if item["use_id"] == ref.use_id
+                )
+                unit = plan.target_units[0]
+                binding = next(
+                    item
+                    for item in bindings.bindings
+                    if item.binding_id == unit.binding_id
+                )
+                admitted.append(
+                    HydratedEvidence(
+                        use_id=ref.use_id,
+                        evidence_id=uuid4(),
+                        task_id=call["task_id"],
+                        purpose=call["purpose"],
+                        target_id=call["target_id"],
+                        content="content of t1",
+                        role=binding.role,
+                        source_label="t1",
+                        source_identity=DocumentSourceIdentity(
+                            kind="document",
+                            document_id=binding.document_id,
+                            document_revision=binding.document_revision,
+                            locator=unit.requested_locator,
+                        ),
+                        classification="normal",
+                        locator=unit.requested_locator,
+                        document_revision=binding.document_revision,
+                    )
+                )
+            return tuple(admitted)
+
+        async def hydrate_for_synthesis(
+            self, use_refs, *, runtime, plan, bindings, budget
+        ):
+            return await self.hydrate_for_evaluation(
+                use_refs, runtime=runtime, plan=plan, bindings=bindings
+            )
+
+        async def persist_derived_summary(self, **kwargs):
+            raise AssertionError("retrieve pilot never persists derived summaries")
+
+    async def _main():
+        async with selector.build_v2_ingress(
+            user_id=uuid4(),
+            authenticated_workspace_ids=[workspace_id],
+            requested_workspace_ids=None,
+            raw_query="Điều 5 của A nói gì?",
+            thread_id=thread_id,
+            session_factory=lambda: _FakeSession(),
+            lease_session_factory=lambda: _FakeSession(),
+            preprocess=_fake_preprocess,
+            known_documents=(
+                KnownDocumentResource(
+                    resource_id="doc1",
+                    document_id=document_id,
+                    source="api_explicit",
+                ),
+            ),
+            available_services=frozenset(
+                {"v1-people", "v1-document-search", "v1-revision-retrieval"}
+            ),
+        ) as ingress:
+            # The wiring under repair: exact instance identity.
+            assert (
+                ingress.runtime_context.services.pinned_target_resolver
+                is ingress.plan_resolver
+            )
+            # Inject IO doubles around (never instead of) the wired resolver.
+            registry = ingress.runtime_context.services.capability_registry
+            capability = registry.get("document.retrieve")
+            assert capability._resolver is ingress.plan_resolver
+            chunks = (
+                RevisionRetrievedChunk(
+                    document_id=document_id,
+                    document_revision=revision,
+                    locator=ChunkRangeLocator(
+                        kind="chunk_range", start="c1", end="c1"
+                    ),
+                    content="secret chunk",
+                    score=0.9,
+                    target_id="t1",
+                ),
+            )
+            retrieval = _FakeRetrieval(chunks)
+            evidence = _FakeEvidence()
+            capability._service = retrieval
+            capability._evidence = evidence
+            ingress.runtime_context.services.retention_leases = _FakeLeases()
+            ingress.runtime_context.services.binding_resolver = _FakeBindings()
+            ingress.runtime_context.services.evidence_hydrator = _FakeHydrator(
+                evidence
+            )
+            ingress.runtime_context.services.answer_draft_channel = (
+                AnswerDraftChannel()
+            )
+            graph = create_supervisor_v2_graph(InMemorySaver())
+            out = await graph.ainvoke(
+                ingress.initial_state,
+                {"configurable": {"thread_id": thread_id}},
+                context=ingress.runtime_context,
+            )
+            return out, retrieval, evidence
+
+    out, retrieval, evidence = asyncio.run(_main())
+    # The API-explicit hard scope routes to complex research, never fast read.
+    assert out["route_decision"].route == "complex_research"
+    assert out["query_analysis"].work_type == "retrieve"
+    # The shared scheduler fed the wired resolver: provider reached once.
+    assert len(retrieval.calls) == 1
+    # Task success with target-bound coverage evidence.
+    results = out["execution"].task_results
+    assert len(results) == 1
+    assert results[0].status == "success"
+    assert results[0].data.kind == "document.retrieve"
+    assert len(results[0].evidence_uses) == 1
+    assert len(evidence.calls) == 1
+    assert evidence.calls[0]["purpose"] == "coverage"
+    assert evidence.calls[0]["target_id"] == "t1"
+    # Terminal citation success with no raw chunk anywhere.
+    final = out["final_response"]
+    status = final.status if hasattr(final, "status") else final["status"]
+    assert status == "success"
+    citations = (
+        final.citations if hasattr(final, "citations") else final["citations"]
+    )
+    assert len(citations) >= 1
+    assert "secret chunk" not in final.model_dump_json()
+    assert "secret chunk" not in results[0].model_dump_json()

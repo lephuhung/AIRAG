@@ -1466,6 +1466,10 @@ async def test_c2_real_resume_advances_feeds_resolver_and_anchored_refresh():
     assert not getattr(command, "goto", None)
 
     resolver = PlanBindingResolver()
+    # Mirror production ingress: the resume pre-feed and the scheduler feed
+    # resolve through the SAME request-scoped instance (round 2 N1 raises on
+    # targeted plans without a wired resolver).
+    runtime.services.pinned_target_resolver = resolver
     second = [
         ev
         async for ev in convert_streaming.stream_v2_turn_events(

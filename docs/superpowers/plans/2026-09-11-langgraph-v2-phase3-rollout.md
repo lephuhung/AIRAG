@@ -25,7 +25,7 @@
 - Subagents, if selected by the orchestrator, are advisory/context-isolation helpers only and have no capability execution, TaskPlan, EvidenceUse, sufficiency, or FinalResponse authority.
 - Shadow v2 cannot write production checkpoints/evidence/audit/chat/memory/title or outbound events.
 - Rollout bucket selection is deterministic and server-owned.
-- Exactly one ownership chain exists: Supervisor → `complex_boundary_node` adapter → ComplexResearch subgraph → validate/lease/checkpoint → shared `TaskScheduler` → `CapabilityRegistry` → `Capability.execute`. A second scheduler, a plain-Python execute loop, an `AgentToolGateway` that dispatches, a `plan_checkpoint` service, an `EvidenceEvaluator` service, a subgraph-owned checkpointer, or scheduler input materialization is forbidden.
+- Exactly one ownership chain exists: Supervisor → `complex_boundary_node` adapter → ComplexResearch subgraph → validate/lease/checkpoint → shared `TaskScheduler` → `CapabilityRegistry` → `Capability.execute`. A second scheduler, a plain-Python execute loop, an `AgentToolGateway` that dispatches, a `plan_checkpoint` service, an `EvidenceEvaluator` service, a subgraph-owned checkpointer, or scheduler input materialization is forbidden. (The scheduler's dispatch-time pinned-target feed is authoritative ownership, not input materialization: it installs the checkpointed plan + bindings on the runtime-only resolver without mutating `TaskSpec.input`; see the agent-tool-node amendment §6.)
 - Before editing existing symbols run exact impact; before every commit run compare-scope detect-changes and stage narrow paths.
 
 Canonical Phase-3 additions:
