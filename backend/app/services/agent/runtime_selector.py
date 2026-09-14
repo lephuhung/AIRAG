@@ -910,6 +910,10 @@ async def build_v2_ingress(
             authorization=V2AuthorizationService(session_factory),
             evidence_hydrator=hydrator,
             answer_draft_channel=AnswerDraftChannel(),
+            # The exact same request-scoped resolver the document
+            # capabilities resolve through: the shared TaskScheduler feeds
+            # it from the checkpointed plan + bindings before dispatch.
+            pinned_target_resolver=plan_resolver,
         )
         runtime_context = build_graph_runtime_context(
             capability_runtime, services=services

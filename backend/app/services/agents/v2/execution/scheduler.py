@@ -770,6 +770,47 @@ async def _run_pre_dispatch_guards(
             )
 
 
+def _feed_pinned_targets(
+    plan: TaskPlan,
+    bindings: DocumentBindingSet | None,
+    runtime: GraphRuntimeContext,
+) -> None:
+    """Feed the request-scoped pinned-target resolver before dispatch.
+
+    P0 factual-retrieval live-gate fix: fresh (non-resume) turns reach the
+    shared scheduler with a fresh, empty resolver, so every scoped target
+    reads as "unknown" and retrieval fails closed before the provider is
+    called. The scheduler — the one and only dispatch path — installs the
+    authoritative checkpointed plan + bindings on the runtime-only
+    ``pinned_target_resolver`` service (the exact instance the document
+    capabilities resolve through) immediately before the first dispatch.
+    The feed replaces the whole mapping, so replans/resumes never inherit
+    stale targets. A missing/unfeedable resolver preserves fail-closed
+    dispatch (capabilities deny unknown targets); a feed failure logs and
+    keeps the resolver unfed rather than crashing the turn into an error.
+    """
+    try:
+        resolver = getattr(
+            getattr(runtime, "services", None), "pinned_target_resolver", None
+        )
+    except Exception:
+        return
+    if resolver is None:
+        return
+    feed = getattr(resolver, "feed", None)
+    if not callable(feed):
+        return
+    if plan is None or bindings is None:
+        return
+    try:
+        feed(plan, bindings)
+    except Exception:
+        logger.warning(
+            "pinned-target feed failed; dispatch continues fail-closed",
+            exc_info=True,
+        )
+
+
 async def execute_ready_tasks(
     *,
     plan: TaskPlan,
@@ -804,6 +845,11 @@ async def execute_ready_tasks(
     known_use_ids = {
         ref.use_id for result in completed for ref in result.evidence_uses
     }
+    # Authoritative dispatch-time feed: the request-scoped pinned-target
+    # resolver resolves the checkpointed plan's targets for every dispatch
+    # below (fresh turns included); the resume-path pre-feed stays as an
+    # idempotent compatibility refresh.
+    _feed_pinned_targets(plan, bindings, runtime)
     leased_any = False
     truncated = False
     while True:

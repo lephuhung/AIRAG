@@ -63,6 +63,15 @@ class RuntimeServices(RuntimeModel):
     deterministically once from checkpointed state on a miss, e.g. after a
     restart between nodes).
 
+    ``pinned_target_resolver`` is the runtime-only request-scoped
+    ``PinnedTargetResolver`` (P0 factual-retrieval live-gate fix): the exact
+    same instance the document capabilities resolve scoped targets through.
+    The shared ``TaskScheduler`` feeds it deterministically from the
+    authoritative checkpointed plan + bindings immediately before any
+    dispatch, so fresh (non-resume) turns resolve pinned targets; until fed
+    it resolves nothing and the capabilities fail closed. Never
+    checkpointed, never fed from ``AgentRequest``/``CapabilityRuntimeContext``.
+
     The bag deliberately excludes ``plan_checkpoint`` (plan persistence is
     LangGraph state plus the supervisor checkpointer — no service) and any
     ``EvidenceEvaluator`` service (evidence evaluation is the shared
@@ -77,6 +86,7 @@ class RuntimeServices(RuntimeModel):
     authorization: Any = None
     evidence_hydrator: Any = None
     answer_draft_channel: Any = None
+    pinned_target_resolver: Any = None
 
 
 class GraphRuntimeContext(ContractModel):

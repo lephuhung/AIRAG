@@ -489,10 +489,12 @@ def test_runtime_services_excludes_plan_checkpoint_and_evaluator_service() -> No
         "authorization",
         "evidence_hydrator",
         "answer_draft_channel",
+        "pinned_target_resolver",
     }
     assert "plan_checkpoint" not in RuntimeServices.model_fields
     assert not any("evaluator" in name for name in RuntimeServices.model_fields)
     assert RuntimeServices().capability_registry is None
+    assert RuntimeServices().pinned_target_resolver is None
 
 
 # ---------------------------------------------------------------------------
@@ -831,3 +833,366 @@ async def test_execute_node_preserves_prior_results_without_redispatch() -> None
     )
     assert update["execution"].task_results == prior
     assert stub.calls == []
+
+
+# ---------------------------------------------------------------------------
+# P0 live-gate fix: the scheduler feeds pinned targets before dispatch.
+#
+# Fresh (non-resume) turns dispatch through the shared scheduler with a
+# fresh, empty request-scoped resolver. Until the scheduler feeds that
+# resolver from the authoritative checkpointed plan + bindings, every
+# scoped target is "unknown" and the retrieve capability fails closed
+# (denied/SCOPE_VIOLATION) before the retrieval provider is ever called.
+# ---------------------------------------------------------------------------
+
+RETRIEVE_REVISION = "22222222-2222-2222-2222-222222222222"
+
+
+class _FeedFakeEvidence:
+    """Minimal evidence builder: mints one ref per persist, records calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def persist_use(
+        self, *, source, content, provenance, task_id, purpose, target_id
+    ) -> EvidenceUseRef:
+        ref = EvidenceUseRef(use_id=uuid4())
+        self.calls.append(
+            {
+                "source": source,
+                "content": content,
+                "task_id": task_id,
+                "purpose": purpose,
+                "target_id": target_id,
+                "use_id": ref.use_id,
+            }
+        )
+        return ref
+
+
+class _FeedFakeRetrieval:
+    """Preset revision-owned chunks; records the exact dispatch filters."""
+
+    def __init__(self, chunks=()) -> None:
+        self._chunks = tuple(chunks)
+        self.calls: list[dict] = []
+
+    async def retrieve(
+        self, query: str, *, top_k: int, allowed_targets, workspace_ids
+    ):
+        self.calls.append(
+            {
+                "query": query,
+                "top_k": top_k,
+                "allowed_targets": allowed_targets,
+                "workspace_ids": workspace_ids,
+            }
+        )
+        return self._chunks
+
+
+def _retrieve_stack(task_id: str = "T1", *, target_ids=("t1",), chunks=None):
+    """Fresh-turn retrieve wiring: a real, initially EMPTY PlanBindingResolver.
+
+    The SAME resolver instance is injected into the real retrieve
+    capability AND (when the services bag supports it) exposed as the
+    runtime-only ``pinned_target_resolver`` service — exactly the ingress
+    wiring under repair. The scheduler must feed it before dispatch.
+    """
+    from app.services.agent.runtime_selector import PlanBindingResolver
+    from app.services.agents.v2.capabilities.document import (
+        DocumentRetrieveCapability,
+        RevisionRetrievedChunk,
+    )
+    from app.services.agents.v2.contracts.capability import DocumentRetrieveInput
+    from app.services.agents.v2.contracts.locators import (
+        ChunkRangeLocator,
+        SectionLocator,
+    )
+
+    plan = TaskPlan(
+        contract_version="2.0",
+        plan_id="plan-retrieve",
+        goal="factual query",
+        target_units=(
+            TargetUnit(
+                target_id="t1",
+                binding_id="b_t1",
+                requested_locator=SectionLocator(
+                    kind="section", structure_node_id="node-5"
+                ),
+                completion_criteria=(),
+            ),
+        ),
+        tasks=(
+            TaskSpec(
+                task_id=task_id,
+                capability="document.retrieve",
+                task_objective="factual query",
+                input=DocumentRetrieveInput(
+                    kind="document.retrieve",
+                    query="lan bmnn",
+                    target_ids=tuple(target_ids),
+                ),
+                depends_on=(),
+                origin=InitialTaskOrigin(kind="initial"),
+            ),
+        ),
+    )
+    bindings = DocumentBindingSet(
+        bindings=(
+            ScopedDocument(
+                binding_id="b_t1",
+                document_id=DOCUMENT_ID,
+                document_revision=RETRIEVE_REVISION,
+                role="target",
+            ),
+        ),
+        revision_requirement_refs=(),
+    )
+    if chunks is None:
+        chunks = (
+            RevisionRetrievedChunk(
+                document_id=DOCUMENT_ID,
+                document_revision=RETRIEVE_REVISION,
+                locator=ChunkRangeLocator(
+                    kind="chunk_range", start="c1", end="c1"
+                ),
+                content="secret chunk",
+                score=0.9,
+                target_id="t1",
+            ),
+        )
+    resolver = PlanBindingResolver()  # fresh turn: empty until fed
+    assert resolver.resolve("t1") is None
+    service = _FeedFakeRetrieval(chunks)
+    evidence = _FeedFakeEvidence()
+    capability = DocumentRetrieveCapability(
+        service=service, evidence=evidence, resolver=resolver
+    )
+    runtime = capability_runtime(allowed=frozenset({"document.retrieve"}))
+    registry = build_capability_registry(
+        [CapabilityRegistration(capability=capability)], runtime
+    )
+    events: list[str] = []
+    ctx = GraphRuntimeContext(
+        capability_runtime=runtime,
+        services=services(registry=registry, leases=FakeLeaseRepo(events)),
+    )
+    if hasattr(ctx.services, "pinned_target_resolver"):
+        ctx.services.pinned_target_resolver = resolver
+    state = make_state(plan=plan, task_results=())
+    state = SupervisorV2State(
+        contract_version=state["contract_version"],
+        request=state["request"],
+        conversation=state["conversation"],
+        semantic=state["semantic"],
+        bindings=bindings,
+        query_analysis=state["query_analysis"],
+        route_decision=state["route_decision"],
+        execution=ExecutionState(
+            plan=plan, task_results=(), evidence_evaluation=None
+        ),
+        clarification=None,
+        final_response=None,
+    )
+    return {
+        "plan": plan,
+        "bindings": bindings,
+        "resolver": resolver,
+        "service": service,
+        "evidence": evidence,
+        "registry": registry,
+        "runtime": ctx,
+        "events": events,
+        "state": state,
+    }
+
+
+@pytest.mark.asyncio
+async def test_fresh_turn_pinned_targets_fed_before_dispatch() -> None:
+    """RED: a fresh hard-scoped retrieve turn must reach the provider.
+
+    Before the fix the shared scheduler never feeds the request-scoped
+    resolver, so T1 is denied/SCOPE_VIOLATION and the provider is never
+    called. After the fix the same fresh turn succeeds with one governed
+    EvidenceUse and citation-scoped output (no raw chunks on the result).
+    """
+    from app.services.agents.v2.nodes.execute import execute_node
+
+    stack = _retrieve_stack()
+    update = await execute_node(stack["state"], stack["runtime"])
+    results = update["execution"].task_results
+    assert len(results) == 1
+    result = results[0]
+    assert result.status == "success"
+    assert result.data is not None
+    assert result.data.kind == "document.retrieve"
+    assert result.data.retrieved_unit_count == 1
+    assert len(result.evidence_uses) == 1
+    assert len(stack["service"].calls) == 1
+    assert stack["evidence"].calls[0]["purpose"] == "coverage"
+    assert stack["evidence"].calls[0]["target_id"] == "t1"
+    # Raw chunk content lives only in the Evidence Store, never in output.
+    assert "secret chunk" not in result.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_feeds_matching_targets_but_denies_mismatch() -> None:
+    """A pinned target resolves; an unknown target still fails closed."""
+    from app.services.agents.v2.execution.scheduler import TaskScheduler
+
+    stack = _retrieve_stack(target_ids=("t9",))
+    report = await TaskScheduler(stack["registry"]).execute(
+        stack["plan"],
+        stack["runtime"],
+        bindings=stack["bindings"],
+    )
+    assert len(report.results) == 1
+    result = report.results[0]
+    assert result.status == "denied"
+    assert result.error is not None
+    assert result.error.code == "SCOPE_VIOLATION"
+    assert stack["service"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_feed_replaces_stale_mappings_across_replans() -> None:
+    """A replan must not inherit the previous plan's pinned targets."""
+    from app.services.agents.v2.contracts.locators import SectionLocator
+    from app.services.agents.v2.execution.scheduler import TaskScheduler
+
+    stack = _retrieve_stack()
+    scheduler = TaskScheduler(stack["registry"])
+    first = await scheduler.execute(
+        stack["plan"], stack["runtime"], bindings=stack["bindings"]
+    )
+    assert first.results[0].status == "success"
+    assert stack["resolver"].resolve("t1") is not None
+
+    other_doc = UUID("33333333-3333-3333-3333-333333333333")
+    other_rev = "44444444-4444-4444-4444-444444444444"
+    plan_b = TaskPlan(
+        contract_version="2.0",
+        plan_id="plan-retrieve-b",
+        goal="factual query b",
+        target_units=(
+            TargetUnit(
+                target_id="t2",
+                binding_id="b_t2",
+                requested_locator=SectionLocator(
+                    kind="section", structure_node_id="node-9"
+                ),
+                completion_criteria=(),
+            ),
+        ),
+        tasks=(),
+    )
+    bindings_b = DocumentBindingSet(
+        bindings=(
+            ScopedDocument(
+                binding_id="b_t2",
+                document_id=other_doc,
+                document_revision=other_rev,
+                role="target",
+            ),
+        ),
+        revision_requirement_refs=(),
+    )
+    second = await scheduler.execute(
+        plan_b, stack["runtime"], bindings=bindings_b
+    )
+    assert second.results == ()
+    assert stack["resolver"].resolve("t1") is None
+    assert stack["resolver"].resolve("t2") is not None
+
+
+@pytest.mark.asyncio
+async def test_scheduler_missing_resolver_stays_fail_closed() -> None:
+    """No pinned-target service: scoped dispatch denies, provider uncalled."""
+    from app.services.agents.v2.execution.scheduler import TaskScheduler
+
+    stack = _retrieve_stack()
+    if hasattr(stack["runtime"].services, "pinned_target_resolver"):
+        stack["runtime"].services.pinned_target_resolver = None
+    # The capability keeps its own unfed resolver: unknown targets deny.
+    stack["resolver"]._documents.clear()
+    stack["resolver"]._plan = None
+    report = await TaskScheduler(stack["registry"]).execute(
+        stack["plan"],
+        stack["runtime"],
+        bindings=stack["bindings"],
+    )
+    assert len(report.results) == 1
+    assert report.results[0].status == "denied"
+    assert report.results[0].error is not None
+    assert report.results[0].error.code == "SCOPE_VIOLATION"
+    assert stack["service"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_unscoped_retrieve_needs_no_pinned_targets() -> None:
+    """Empty target_ids run over workspace scope with no resolver feed."""
+    from app.services.agent.runtime_selector import PlanBindingResolver
+    from app.services.agents.v2.capabilities.document import (
+        DocumentRetrieveCapability,
+        RevisionRetrievedChunk,
+    )
+    from app.services.agents.v2.contracts.capability import DocumentRetrieveInput
+    from app.services.agents.v2.contracts.locators import ChunkRangeLocator
+    from app.services.agents.v2.execution.scheduler import TaskScheduler
+
+    plan = TaskPlan(
+        contract_version="2.0",
+        plan_id="plan-unscoped",
+        goal="broad query",
+        target_units=(),
+        tasks=(
+            TaskSpec(
+                task_id="U1",
+                capability="document.retrieve",
+                task_objective="broad query",
+                input=DocumentRetrieveInput(
+                    kind="document.retrieve", query="broad", target_ids=()
+                ),
+                depends_on=(),
+                origin=InitialTaskOrigin(kind="initial"),
+            ),
+        ),
+    )
+    chunk = RevisionRetrievedChunk(
+        document_id=DOCUMENT_ID,
+        document_revision=RETRIEVE_REVISION,
+        locator=ChunkRangeLocator(
+            kind="chunk_range", start="c1", end="c1"
+        ),
+        content="workspace chunk",
+        score=0.5,
+        target_id=None,
+    )
+    resolver = PlanBindingResolver()
+    service = _FeedFakeRetrieval((chunk,))
+    evidence = _FeedFakeEvidence()
+    capability = DocumentRetrieveCapability(
+        service=service, evidence=evidence, resolver=resolver
+    )
+    runtime = capability_runtime(allowed=frozenset({"document.retrieve"}))
+    registry = build_capability_registry(
+        [CapabilityRegistration(capability=capability)], runtime
+    )
+    events: list[str] = []
+    ctx = GraphRuntimeContext(
+        capability_runtime=runtime,
+        services=services(registry=registry, leases=FakeLeaseRepo(events)),
+    )
+    report = await TaskScheduler(registry).execute(plan, ctx, bindings=None)
+    assert len(report.results) == 1
+    result = report.results[0]
+    assert result.status == "success"
+    assert result.data is not None
+    assert result.data.retrieved_unit_count == 1
+    assert len(service.calls) == 1
+    assert service.calls[0]["allowed_targets"] == ()
+    assert evidence.calls[0]["purpose"] == "supporting"
+    assert evidence.calls[0]["target_id"] is None
