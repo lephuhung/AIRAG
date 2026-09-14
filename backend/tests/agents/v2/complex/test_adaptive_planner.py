@@ -236,16 +236,49 @@ def _analysis(work_type: str = "multi_goal") -> QueryAnalysis:
     )
 
 
+def _person_semantic(query: str = PLANNER_QUERY) -> SemanticContext:
+    from app.services.agents.v2.contracts.conversation import EntityReference
+
+    return SemanticContext(
+        contextualized_query=query,
+        normalized_query=query.lower(),
+        abbreviations=(),
+        coreferences=(),
+        document_refs=(),
+        person_refs=(
+            EntityReference(ref_id="p1", kind="person", label="A"),
+        ),
+        section_refs=(),
+        blocking_ambiguities=(),
+    )
+
+
+def _single_binding() -> DocumentBindingSet:
+    return DocumentBindingSet(
+        bindings=(
+            ScopedDocument(
+                binding_id="b1",
+                document_id=DOC_A,
+                document_revision=str(REV_A),
+                role="target",
+            ),
+        ),
+        revision_requirement_refs=(),
+    )
+
+
 def _planning_input(
     work_type: str = "multi_goal",
     capability_names: frozenset[str] = frozenset({"document.read", "section.read"}),
     *,
     discovery: bool = False,
     max_tasks: int = 8,
+    semantic: SemanticContext | None = None,
+    bindings: DocumentBindingSet | None = None,
 ) -> ResearchPlanningInput:
     return ResearchPlanningInput(
-        semantic=_semantic(),
-        bindings=_bindings(),
+        semantic=semantic or _semantic(),
+        bindings=bindings or _bindings(),
         query_analysis=_analysis(work_type),
         capability_catalog=tuple(
             CapabilityDescriptor(
@@ -564,6 +597,117 @@ async def test_end_to_end_model_planned_reads_dispatch_once() -> None:
     assert [task.task_id for task in output["plan"].tasks] == ["T1", "T2"]
     assert [call[0].task_id for call in capability.calls] == ["T1", "T2"]
     assert output["evaluation"].status == "sufficient"
+
+
+# ---------------------------------------------------------------------------
+# I1 (fix round 1): a covering skill's refusal is final — the model path
+# serves genuinely uncovered work types only; v1-owned evaluate is excluded
+# until Task 12. Every refusal test also asserts the provider was never
+# consulted, so the assertions cannot pass for the wrong reason.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_summarize_arity_refusal_never_reaches_model() -> None:
+    from app.services.agents.v2.contracts.validation import ContractValidationError
+
+    provider = FakePlannerProvider(_two_read_proposal())
+    planner = AdaptivePlanner(provider_factory=lambda: provider)
+    _, _, context = _harness("run-planner-sumref", planner=planner)
+    with pytest.raises(ContractValidationError, match="summarize requires"):
+        await planner.propose_initial(_planning_input(work_type="summarize"), context)
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_retrieve_catalog_refusal_never_reaches_model() -> None:
+    from app.services.agents.v2.contracts.validation import ContractValidationError
+
+    provider = FakePlannerProvider(_two_read_proposal())
+    planner = AdaptivePlanner(provider_factory=lambda: provider)
+    _, _, context = _harness("run-planner-retref", planner=planner)
+    with pytest.raises(ContractValidationError, match="undispatchable"):
+        await planner.propose_initial(
+            _planning_input(
+                work_type="retrieve",
+                capability_names=frozenset({"document.read"}),
+            ),
+            context,
+        )
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_compare_arity_refusal_never_reaches_model() -> None:
+    from app.services.agents.v2.contracts.validation import ContractValidationError
+
+    provider = FakePlannerProvider(_two_read_proposal())
+    planner = AdaptivePlanner(provider_factory=lambda: provider)
+    _, _, context = _harness("run-planner-cmpside", planner=planner)
+    with pytest.raises(ContractValidationError):
+        await planner.propose_initial(
+            _planning_input(work_type="compare", bindings=_single_binding()),
+            context,
+        )
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_people_first_catalog_refusal_never_reaches_model() -> None:
+    from app.services.agents.v2.contracts.validation import ContractValidationError
+
+    provider = FakePlannerProvider(_two_read_proposal())
+    planner = AdaptivePlanner(provider_factory=lambda: provider)
+    _, _, context = _harness("run-planner-p1ref", planner=planner)
+    with pytest.raises(ContractValidationError, match="people.lookup"):
+        await planner.propose_initial(
+            _planning_input(work_type="cross_domain", semantic=_person_semantic()),
+            context,
+        )
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_evaluate_excluded_until_task_12() -> None:
+    provider = FakePlannerProvider(_two_read_proposal())
+    planner = AdaptivePlanner(provider_factory=lambda: provider)
+    _, _, context = _harness("run-planner-eval", planner=planner)
+    with pytest.raises(PlannerError, match="Task 12"):
+        await planner.propose_initial(_planning_input(work_type="evaluate"), context)
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_uncovered_cross_domain_without_person_still_model_plans() -> None:
+    provider = FakePlannerProvider(_two_read_proposal())
+    planner = AdaptivePlanner(provider_factory=lambda: provider)
+    _, _, context = _harness("run-planner-xdopen", planner=planner)
+    proposal = await planner.propose_initial(
+        _planning_input(work_type="cross_domain"), context
+    )
+    assert proposal.plan.plan_id == "adaptive-cross_domain"
+    assert [task.task_id for task in proposal.plan.tasks] == ["T1", "T2"]
+    assert len(provider.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_governed_entry_preserves_skill_refusal_end_to_end() -> None:
+    from app.services.agents.v2.complex_research_graph import (
+        COMPLEX_RESEARCH_UNAVAILABLE,
+        decide_node,
+        validate_checkpoint_node,
+    )
+
+    provider = FakePlannerProvider(_two_read_proposal())
+    planner = AdaptivePlanner(provider_factory=lambda: provider)
+    capability, _, context = _harness("run-planner-sumref-e2e", planner=planner)
+    child = _child_input(work_type="summarize")
+    output = await validate_checkpoint_node(child, _runtime_for(context))
+    assert output.get("plan") is None
+    decided = await decide_node(child, _runtime_for(context))
+    assert decided["unavailable"].code == COMPLEX_RESEARCH_UNAVAILABLE
+    assert provider.calls == []
+    assert capability.calls == []
 
 
 def test_planner_service_is_runtime_only() -> None:

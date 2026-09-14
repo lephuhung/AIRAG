@@ -823,8 +823,10 @@ async def build_governed_initial_proposal(
     Without a wired ``adaptive_planner`` service this is exactly
     :func:`build_initial_proposal` (legacy behavior: work no skill covers
     raises :class:`ContractValidationError`). With one, the planner owns
-    the deterministic-first ordering and the model path stays
-    proposal-only — the caller still validates, leases, and checkpoints
+    the deterministic-first ordering — a covering skill's refusal is final
+    and the model path runs only for uncovered work types (v1-owned
+    ``evaluate`` excluded until Task 12) — and the model path stays
+    proposal-only: the caller still validates, leases, and checkpoints
     before the shared scheduler dispatches anything.
     """
     planner = getattr(runtime.services, "adaptive_planner", None)

@@ -1065,8 +1065,9 @@ async def build_v2_ingress(
             # Exactly one governed planner per ingress turn (Phase 5,
             # Task 10): proposal-only initial planning behind the existing
             # validate/lease/checkpoint/scheduler boundary. Deterministic
-            # skills still win when they cover the work type; the model
-            # path runs only otherwise and never dispatches tools.
+            # skills still win when they cover the work type (a covering
+            # refusal is final); the model path runs only for uncovered
+            # work types and never dispatches tools.
             adaptive_planner=AdaptivePlanner(),
             # The exact same request-scoped resolver the document
             # capabilities resolve through: the shared TaskScheduler feeds
