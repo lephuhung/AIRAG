@@ -358,3 +358,35 @@ describe('required scenarios (fix round 2, I1)', () => {
     expect(result.current.isStreaming).toBe(false);
   });
 });
+
+describe('validity badges + clarification symmetry (fix round 3)', () => {
+  it('preserves validity_status/superseded_by for destructive badges', async () => {
+    mockFetchFrames([
+      'event: citation\ndata: {"citations":[{"citation_id":"cit-v","label":"L","index":"e8f2","document_id":"d1","chunk_id":"c1","validity_status":"superseded","superseded_by":"VB 99/2024"}]}\n\n',
+      'event: complete\ndata: {"answer":"ok"}\n\n',
+    ]);
+    const { result } = renderStreamHook();
+
+    await act(async () => {
+      await result.current.sendMessage('validity query', [], false);
+    });
+
+    expect(result.current.pendingSources[0].validity_status).toBe('superseded');
+    expect(result.current.pendingSources[0].superseded_by).toBe('VB 99/2024');
+  });
+
+  it('clears pending clarification on public status-rollback', async () => {
+    mockFetchFrames([
+      'event: clarification_required\ndata: {"clarification_id":"clr-1","question":"Which?","options":[{"option_id":"opt-1","label":"Doc A"}],"resume":{"thread_id":"t"}}\n\n',
+      'event: status\ndata: {"step":"rollback","phase":"executing","detail":""}\n\n',
+      'event: complete\ndata: {"answer":"fresh"}\n\n',
+    ]);
+    const { result } = renderStreamHook();
+
+    await act(async () => {
+      await result.current.sendMessage('q', [], false);
+    });
+
+    expect(result.current.pendingClarification).toBeNull();
+  });
+});

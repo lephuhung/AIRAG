@@ -1835,14 +1835,12 @@ async def chat_stream_session(
             # producer. A still-connected client (e.g. the stop button)
             # finalizes quietly; a disconnected one never reads it.
             # Queued ahead of the end-of-stream sentinel below.
+            # Task 9 fix round 3 (N-M5): versioned producer — the raw
+            # format_public_sse frame carries no contract_version.
             try:
-                from app.services.agents.v2.transport import (
-                    format_public_sse as _public_frame,
-                )
-
-                relay.put_nowait(
-                    _public_frame("cancelled", {"reason": "user_stop"})
-                )
+                frames = _public_frames("cancelled", {"reason": "user_stop"})
+                for out_frame in frames:
+                    relay.put_nowait(out_frame)
             except Exception:
                 pass
             raise

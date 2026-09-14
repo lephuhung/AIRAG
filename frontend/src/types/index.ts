@@ -477,7 +477,7 @@ export interface ChatSourceChunk {
   page_no: number;
   heading_path: string[];
   score: number;
-  source_type?: "vector" | "kg";
+  source_type?: "vector" | "kg" | "extraction";
   // Citation cấp điều khoản: "Điều 17" + số hiệu văn bản
   document_number?: string | null;
   article_label?: string | null;
@@ -581,8 +581,8 @@ export interface PublicCitation {
   label: string;
   /** 4-char answer citation handle (preserved end-to-end, fix round 2). */
   index?: string | null;
-  /** Provenance: vector | kg (preserved, never coerced). */
-  source_type?: "vector" | "kg" | null;
+  /** Provenance: vector | kg | extraction (preserved, never coerced). */
+  source_type?: "vector" | "kg" | "extraction" | null;
   /** Advisory rank signal. */
   score?: number | null;
   document_id?: string | null;

@@ -496,11 +496,13 @@ export function useRAGChatStream(
                       localImages = [];
                       localPeople = [];
                       localCitations = [];
+                      localClarification = null;
                       setPendingSources([]);
                       setPendingImages([]);
                       setPendingPeople([]);
                       peopleDataRef.current = [];
                       setPendingCitations([]);
+                      setPendingClarification(null);
                       setPotentialAbbreviations([]);
                     }
                     // Public UI phases (Task 9): clarifying/planning surfaced
@@ -599,16 +601,18 @@ export function useRAGChatStream(
                     const compat: ChatSourceChunk[] = citations
                       .filter((c) => c.document_id && c.chunk_id)
                       .map((c) => ({
-                        index: c.index || c.citation_id,
+                        index: c.index ?? c.citation_id,
                         chunk_id: String(c.chunk_id),
                         content: c.content || "",
                         document_id: String(c.document_id),
                         page_no: c.page_no ?? 0,
                         heading_path: c.heading_path || [],
                         score: c.score ?? 0,
-                        source_type: (c.source_type === "kg" ? "kg" : "vector") as ChatSourceChunk["source_type"],
+                        source_type: (c.source_type ?? "vector") as ChatSourceChunk["source_type"],
                         document_number: c.document_number ?? null,
                         article_label: c.article_label ?? null,
+                        validity_status: c.validity_status ?? null,
+                        superseded_by: c.superseded_by ?? null,
                       }));
                     if (compat.length > 0) {
                       const seen = new Set(localSources.map((s) => String(s.chunk_id)));
@@ -722,10 +726,12 @@ export function useRAGChatStream(
                     localImages = [];
                     localPeople = [];
                     localCitations = [];
+                    localClarification = null;
                     setPendingSources([]);
                     setPendingImages([]);
                     setPendingPeople([]);
                     setPendingCitations([]);
+                    setPendingClarification(null);
                     peopleDataRef.current = [];
                     setPotentialAbbreviations([]);
                     break;

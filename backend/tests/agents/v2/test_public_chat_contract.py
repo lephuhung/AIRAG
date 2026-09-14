@@ -384,3 +384,34 @@ def test_relay_stamps_outside_funnel_frames():
         assert len(frames) == 1, raw
         payload = json.loads(frames[0].split("\ndata: ", 1)[1])
         assert payload.get("contract_version") == "v2.chat/1", raw
+
+
+def test_session_plumbing_producer_stamps_every_frame():
+    """Fix round 3 (N-M5/N-M6): the guard asserts the real session
+    producer (``_public_frames``), not just the transport helper — every
+    outside-funnel event incl. ``cancelled`` must carry contract_version.
+    """
+    import json
+
+    from app.api.chat_session import _public_frames
+
+    for event, data in (
+        ("status", {"step": "starting", "detail": "hi"}),
+        ("user_id", {"id": "msg_1"}),
+        ("ai_message_id", {"message_id": "msg_2"}),
+        ("session_title_updated", {"Title": "T"}),
+        ("error", {"message": "boom"}),
+        ("cancelled", {"reason": "user_stop"}),
+    ):
+        frames = _public_frames(event, data)
+        assert len(frames) == 1, event
+        payload = json.loads(frames[0].split("\ndata: ", 1)[1])
+        assert payload.get("contract_version") == "v2.chat/1", event
+    # The stop-path cancel site must use the funnel (raw format_public_sse
+    # leaves `cancelled` unstamped — the live N-M5 counterexample).
+    import pathlib
+
+    source = pathlib.Path(__file__).resolve().parents[3] / "app" / "api" / "chat_session.py"
+    text = source.read_text(encoding="utf-8")
+    assert '_public_frames("cancelled"' in text
+    assert 'format_public_sse("cancelled"' not in text
