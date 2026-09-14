@@ -353,14 +353,21 @@ def test_live_phone_query_routes_people_lookup_not_document() -> None:
 
 @pytest.mark.asyncio
 async def test_live_phone_end_to_end_returns_all_three_people() -> None:
-    from app.services.agents.supervisor_v2 import V1PeopleLookupService
+    from app.services.agents.supervisor_v2 import (
+        V1PeopleLookupService,
+        V1PeopleMultiMatchAdapter,
+    )
     from app.services.agents.v2.capabilities import PeopleCapability
 
     phone_calls: list = []
     doc_retrieve = SpyDocumentRetrieveCapability()
-    service = V1PeopleLookupService(phone_lookup=phone_search_stub(phone_calls))
+    stub = phone_search_stub(phone_calls)
+    service = V1PeopleLookupService(phone_lookup=stub)
+    adapter = V1PeopleMultiMatchAdapter(phone_lookup=stub)
     evidence = FakeEvidenceBuilder()
-    people = PeopleCapability(service=service, evidence=evidence)
+    people = PeopleCapability(
+        service=service, evidence=evidence, multi_match=adapter
+    )
     runtime = capability_runtime()
     registry = build_capability_registry(
         [
@@ -438,17 +445,28 @@ async def test_live_phone_end_to_end_returns_all_three_people() -> None:
 
 @pytest.mark.asyncio
 async def test_phone_capability_uses_search_by_phone_not_search_by_name() -> None:
-    from app.services.agents.supervisor_v2 import V1PeopleLookupService
+    from app.services.agents.supervisor_v2 import (
+        V1PeopleLookupService,
+        V1PeopleMultiMatchAdapter,
+    )
     from app.services.agents.v2.capabilities import PeopleCapability
 
     phone_calls: list = []
     name_calls: list = []
+    phone_stub = phone_search_stub(phone_calls)
+    name_stub = name_search_spy(name_calls)
     service = V1PeopleLookupService(
-        phone_lookup=phone_search_stub(phone_calls),
-        name_lookup=name_search_spy(name_calls),
+        phone_lookup=phone_stub,
+        name_lookup=name_stub,
+    )
+    adapter = V1PeopleMultiMatchAdapter(
+        phone_lookup=phone_stub,
+        name_lookup=name_stub,
     )
     evidence = FakeEvidenceBuilder()
-    capability = PeopleCapability(service=service, evidence=evidence)
+    capability = PeopleCapability(
+        service=service, evidence=evidence, multi_match=adapter
+    )
     result = await capability.execute(
         AgentRequest(
             contract_version="2.0", task_id="T1", objective=LIVE_QUERY,
@@ -468,14 +486,21 @@ async def test_phone_capability_uses_search_by_phone_not_search_by_name() -> Non
 
 @pytest.mark.asyncio
 async def test_phone_not_found_has_no_document_fallback() -> None:
-    from app.services.agents.supervisor_v2 import V1PeopleLookupService
+    from app.services.agents.supervisor_v2 import (
+        V1PeopleLookupService,
+        V1PeopleMultiMatchAdapter,
+    )
     from app.services.agents.v2.capabilities import PeopleCapability
 
     phone_calls: list = []
     doc_retrieve = SpyDocumentRetrieveCapability()
-    service = V1PeopleLookupService(phone_lookup=phone_search_stub(phone_calls, persons=[]))
+    stub = phone_search_stub(phone_calls, persons=[])
+    service = V1PeopleLookupService(phone_lookup=stub)
+    adapter = V1PeopleMultiMatchAdapter(phone_lookup=stub)
     evidence = FakeEvidenceBuilder()
-    people = PeopleCapability(service=service, evidence=evidence)
+    people = PeopleCapability(
+        service=service, evidence=evidence, multi_match=adapter
+    )
     runtime = capability_runtime()
     registry = build_capability_registry(
         [
@@ -681,3 +706,302 @@ def test_people_evidence_classification_floor_is_personal() -> None:
         )
         == "personal"
     )
+
+
+# ---------------------------------------------------------------------------
+# Hardening (C1/I2): CCCD/BHXH fakes mirror the EXACT production signatures
+# (no ``limit``) so a limit-passing dispatch fails loudly instead of being
+# certified as working.
+# ---------------------------------------------------------------------------
+
+
+def test_production_search_signatures_limit_parity() -> None:
+    """Real ``_v1_attr`` search functions: only phone/name accept ``limit``."""
+    import inspect
+
+    from app.services.agents.supervisor_v2 import V1ServiceUnavailable, _v1_attr
+
+    try:
+        cccd = _v1_attr("app.services.people.mongo_people_service", "search_by_cccd")
+    except V1ServiceUnavailable as exc:
+        pytest.skip(f"v1 mongo module unavailable in this env: {exc}")
+    bhxh = _v1_attr("app.services.people.mongo_people_service", "search_by_bhxh")
+    phone = _v1_attr("app.services.people.mongo_people_service", "search_by_phone")
+    name = _v1_attr("app.services.people.mongo_people_service", "search_by_name")
+    assert "limit" not in inspect.signature(cccd).parameters
+    assert "limit" not in inspect.signature(bhxh).parameters
+    assert "limit" in inspect.signature(phone).parameters
+    assert "limit" in inspect.signature(name).parameters
+
+
+@pytest.mark.asyncio
+async def test_cccd_bhxh_exact_production_signatures_dispatch() -> None:
+    """CCCD/BHXH searches are invoked WITHOUT ``limit`` (C1)."""
+    from app.services.agents.supervisor_v2 import V1PeopleLookupService
+
+    cccd_calls: list = []
+    bhxh_calls: list = []
+
+    async def _cccd_search(cccd: str):
+        cccd_calls.append((cccd,))
+        yield {
+            "found": True,
+            "persons": [
+                {"hoTen": "Nguyễn Văn An", "soCmnd": "079203012345",
+                 "_source_schema": "bhxh", "_person_group": 1}
+            ],
+            "lookup_type": "cccd",
+        }
+        yield {"found": False, "persons": []}
+
+    async def _bhxh_search(so_bhxh: str):
+        bhxh_calls.append((so_bhxh,))
+        yield {
+            "found": True,
+            "persons": [
+                {"hoTen": "Nguyễn Văn An", "maSoBhxh": "1234567890",
+                 "_source_schema": "bhxh", "_person_group": 1}
+            ],
+            "lookup_type": "bhxh",
+        }
+        yield {"found": False, "persons": []}
+
+    service = V1PeopleLookupService(
+        cccd_lookup=_cccd_search,
+        bhxh_lookup=_bhxh_search,
+        phone_lookup=phone_search_stub([]),
+    )
+    cccd_matches = await service._lookup_many("Tra cứu CCCD 079203012345")
+    assert len(cccd_matches) == 1
+    assert cccd_matches[0].fields["name"] == "Nguyễn Văn An"
+    assert len(cccd_calls) == 1
+    assert "079203012345" in cccd_calls[0][0]
+    bhxh_matches = await service._lookup_many("Tra cứu BHXH 1234567890")
+    assert len(bhxh_matches) == 1
+    assert bhxh_matches[0].fields["name"] == "Nguyễn Văn An"
+    assert len(bhxh_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Hardening (I3): a Mongo match without a name (``uids`` phone schema) is
+# never silently dropped: placeholder identity, exact phone+source evidence.
+# ---------------------------------------------------------------------------
+
+UIDS_PHONE = "0989111222"
+
+UIDS_PERSONS = [
+    {
+        "_id": "u1",
+        "_source_schema": "uids",
+        "_person_group": 7,
+        "uid": "1000123",
+        "phone": UIDS_PHONE,
+    },
+    {
+        "_id": "u2",
+        "_source_schema": "uids",
+        "_person_group": 8,
+        "uid": "1000456",
+        "phone": UIDS_PHONE,
+    },
+]
+
+
+def uids_search_stub(calls: list, persons: list[dict] | None = None):
+    """Injectable ``search_by_phone`` stand-in yielding name-less records."""
+
+    async def _search(phone: str, limit: int = 10):
+        calls.append((phone, limit))
+        found = persons if persons is not None else UIDS_PERSONS
+        if found:
+            yield {
+                "found": True,
+                "persons": [dict(p) for p in found],
+                "schemas": sorted({p["_source_schema"] for p in found}),
+                "lookup_type": "phone",
+            }
+        yield {"found": False, "persons": [], "display": "Không tìm thấy"}
+
+    return _search
+
+
+@pytest.mark.asyncio
+async def test_uids_nameless_phone_match_is_preserved_with_placeholder() -> None:
+    """Name-less ``uids`` matches succeed with a placeholder identity (I3)."""
+    from app.services.agents.supervisor_v2 import V1PeopleLookupService
+    from app.services.agents.v2.capabilities import PeopleCapability
+
+    phone_calls: list = []
+    stub = uids_search_stub(phone_calls)
+    service = V1PeopleLookupService(phone_lookup=stub)
+    matches = await service._lookup_many(
+        f"Tra cứu số điện thoại {UIDS_PHONE}"
+    )
+    # Both Mongo groups survive (exact ``_person_group`` preserved in dedupe).
+    assert len(matches) == 2
+    assert matches[0].record_id != matches[1].record_id
+    for match in matches:
+        assert match.fields["name"] == "Không rõ tên"
+        assert match.fields["phone"] == UIDS_PHONE
+        assert match.fields["source"] == "uids"
+        assert "Không rõ" not in match.record_id
+        assert UIDS_PHONE not in match.record_id
+
+    # End to end: found => success evidence, never ``not_found``.
+    from app.services.agents.supervisor_v2 import V1PeopleMultiMatchAdapter
+    from app.services.agents.v2.capabilities import PeopleCapability
+
+    evidence = FakeEvidenceBuilder()
+    capability = PeopleCapability(
+        service=service,
+        evidence=evidence,
+        multi_match=V1PeopleMultiMatchAdapter(phone_lookup=stub),
+    )
+    result = await capability.execute(
+        AgentRequest(
+            contract_version="2.0", task_id="T1",
+            objective=f"Tra cứu số điện thoại {UIDS_PHONE}",
+            input=PeopleLookupInput(
+                kind="people.lookup",
+                query=f"Tra cứu số điện thoại {UIDS_PHONE}",
+            ),
+        ),
+        capability_runtime(),
+    )
+    assert result.status == "success"
+    assert len(result.evidence_uses) == 2
+    for call in evidence.calls:
+        assert UIDS_PHONE in call["content"]
+        assert "uids" in call["content"]
+    checkpoint_json = result.model_dump_json()
+    assert "1000123" not in checkpoint_json
+    assert "1000456" not in checkpoint_json
+
+
+# ---------------------------------------------------------------------------
+# Hardening: limit is still passed where declared; private seam is dead;
+# malformed matches never leave partial rows; DOB widens the dedupe key.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_phone_search_still_receives_limit() -> None:
+    """Phone/name searches keep the explicit ``limit=`` kwarg."""
+    from app.services.agents.supervisor_v2 import V1PeopleMultiMatchAdapter
+
+    phone_calls: list = []
+
+    async def _strict_phone_search(phone: str, limit: int):
+        # No default: ``limit`` MUST be passed explicitly (kills the
+        # never-pass-limit over-correction of the C1 fix).
+        phone_calls.append((phone, limit))
+        async for result in phone_search_stub([], persons=LIVE_PERSONS)(
+            phone, limit=limit
+        ):
+            yield result
+
+    adapter = V1PeopleMultiMatchAdapter(
+        phone_lookup=_strict_phone_search, limit=25
+    )
+    matches = await adapter.lookup_many(LIVE_QUERY)
+    assert len(matches) == 3
+    assert len(phone_calls) == 1
+    assert phone_calls[0][1] == 25
+
+
+@pytest.mark.asyncio
+async def test_capability_never_probes_private_lookup_many() -> None:
+    """A service exposing only ``_lookup_many`` falls back to legacy (M6)."""
+    from app.services.agents.v2.capabilities import PeopleCapability
+
+    private_calls: list = []
+
+    class PrivateOnlyService:
+        async def _lookup_many(self, query: str):
+            private_calls.append(query)
+            raise AssertionError("private seam must never dispatch")
+
+        async def lookup(self, query: str):
+            return None
+
+    capability = PeopleCapability(
+        service=PrivateOnlyService(), evidence=FakeEvidenceBuilder()
+    )
+    result = await capability.execute(
+        AgentRequest(
+            contract_version="2.0", task_id="T1", objective=LIVE_QUERY,
+            input=PeopleLookupInput(kind="people.lookup", query=LIVE_QUERY),
+        ),
+        capability_runtime(),
+    )
+    assert result.status == "not_found"
+    assert private_calls == []
+
+
+@pytest.mark.asyncio
+async def test_malformed_match_fails_closed_with_zero_persists() -> None:
+    """A malformed kth match persists nothing (M4 prevalidation)."""
+    from types import SimpleNamespace
+
+    from app.services.agents.v2.capabilities import PeopleCapability
+
+    good = SimpleNamespace(
+        record_id="p_good",
+        fields={"name": "Nguyễn Văn An", "phone": LIVE_PHONE,
+                "source": "bhxh"},
+        required_fields=("name", "phone", "source"),
+    )
+    bad = SimpleNamespace(
+        record_id="",  # malformed: no resolvable handle
+        fields={"name": "Trần Thị Bình", "phone": LIVE_PHONE,
+                "source": "vnvc"},
+        required_fields=("name", "phone", "source"),
+    )
+
+    class CannedAdapter:
+        async def lookup_many(self, query: str):
+            return [good, bad]
+
+    class LegacyService:
+        async def lookup(self, query: str):
+            raise AssertionError("multi-match path must be used")
+
+    evidence = FakeEvidenceBuilder()
+    capability = PeopleCapability(
+        service=LegacyService(), evidence=evidence,
+        multi_match=CannedAdapter(),
+    )
+    result = await capability.execute(
+        AgentRequest(
+            contract_version="2.0", task_id="T1", objective=LIVE_QUERY,
+            input=PeopleLookupInput(kind="people.lookup", query=LIVE_QUERY),
+        ),
+        capability_runtime(),
+    )
+    assert result.status == "error"
+    assert evidence.calls == []
+
+
+@pytest.mark.asyncio
+async def test_dedupe_key_splits_on_dob_without_persisting_it() -> None:
+    """Same name+phone but different DOB are distinct people (M5)."""
+    from app.services.agents.supervisor_v2 import V1PeopleMultiMatchAdapter
+
+    persons = [
+        {"_id": "d1", "_source_schema": "bhxh", "hoTen": "Nguyễn Văn An",
+         "soDienThoai": LIVE_PHONE, "ngaySinhHienThi": "01/01/1980"},
+        {"_id": "d2", "_source_schema": "bhxh", "hoTen": "Nguyễn Văn An",
+         "soDienThoai": LIVE_PHONE, "ngaySinhHienThi": "02/02/1990"},
+        {"_id": "d3", "_source_schema": "bhxh", "hoTen": "Nguyễn Văn An",
+         "soDienThoai": LIVE_PHONE, "ngaySinhHienThi": "02/02/1990"},
+    ]
+    adapter = V1PeopleMultiMatchAdapter(
+        phone_lookup=phone_search_stub([], persons=persons)
+    )
+    matches = await adapter.lookup_many(LIVE_QUERY)
+    assert len(matches) == 2
+    assert matches[0].record_id != matches[1].record_id
+    for match in matches:
+        assert set(match.fields) <= {"name", "phone", "source"}
+        assert "1980" not in str(match.fields)
+        assert "1990" not in str(match.fields)

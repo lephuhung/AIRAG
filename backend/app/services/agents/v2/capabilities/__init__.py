@@ -64,6 +64,7 @@ __all__ = [
     "denied_result",
     "error_result",
     "dependency_error",
+    "MultiMatchPeopleLookupService",
     "PeopleCapability",
     "PeopleLookupService",
     "DocumentSearchCapability",
@@ -410,5 +411,9 @@ from .document import (
 )
 from .knowledge_graph import KnowledgeGraphCapability, KnowledgeGraphClient
 from .memory import MemoryCapability, MemoryStore
-from .people import PeopleCapability, PeopleLookupService
+from .people import (
+    MultiMatchPeopleLookupService,
+    PeopleCapability,
+    PeopleLookupService,
+)
 from .section import SectionContentReader, SectionReadCapability

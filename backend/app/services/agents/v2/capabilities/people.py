@@ -12,7 +12,7 @@ The capability enforces the *current* trusted authorization on every call:
 """
 from __future__ import annotations
 
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Protocol, runtime_checkable
 from uuid import uuid4
@@ -29,6 +29,7 @@ from ..contracts.evidence import PeopleSourceIdentity, Provenance
 from ..contracts.execution import AgentRequest, AgentResult
 from ..evidence_store.governance import (
     EvidenceMinimizationError,
+    MinimizedEvidence,
     minimize_people_record,
 )
 
@@ -39,6 +40,23 @@ class PeopleLookupService(Protocol):
 
     async def lookup(self, query: str) -> Mapping[str, object] | None:
         """Return the raw People record for ``query`` or ``None`` when unknown."""
+        ...
+
+
+@runtime_checkable
+class MultiMatchPeopleLookupService(Protocol):
+    """Explicit multi-match seam for ``people.lookup`` (M6).
+
+    A capability-injected adapter returning one minimized match per distinct
+    person behind a query. Each entry carries ``record_id`` (a stable
+    non-PII handle), ``fields`` (the minimized task-required mapping) and
+    ``required_fields``. The capability never probes private readers: the
+    adapter arrives by name at construction, and a service without one
+    keeps the legacy first-only ``lookup`` path below.
+    """
+
+    async def lookup_many(self, query: str) -> Sequence[object]:
+        """Return the distinct-person matches for ``query`` (maybe empty)."""
         ...
 
 
@@ -58,10 +76,12 @@ class PeopleCapability:
         service: PeopleLookupService,
         evidence: EvidenceBuilder,
         required_fields: Collection[str] = ("name",),
+        multi_match: MultiMatchPeopleLookupService | None = None,
     ) -> None:
         self._service = service
         self._evidence = evidence
         self._required_fields = tuple(required_fields)
+        self._multi_match = multi_match
 
     async def execute(
         self, request: AgentRequest, runtime: CapabilityRuntimeContext
@@ -81,16 +101,17 @@ class PeopleCapability:
                 code="INVALID_INPUT",
                 message="people.lookup requires a people.lookup input",
             )
-        # Multi-match seam: the v1-backed service owns grouped-record
-        # dedupe under a private reader (the shadow R64 surface pins the
-        # public reader to ``lookup`` only); legacy single-``lookup``
-        # services keep the first-only path below untouched.
-        lookup_many = getattr(self._service, "lookup_many", None)
-        if lookup_many is None:
-            lookup_many = getattr(self._service, "_lookup_many", None)
-        if callable(lookup_many):
+        # Multi-match seam (M6): an explicitly injected named adapter. The
+        # shadow R64 surface pins the v1 service's public reader to
+        # ``lookup`` only, so the capability never probes private readers
+        # (``_lookup_many`` and friends are unreachable from here); legacy
+        # single-``lookup`` services keep the first-only path below
+        # untouched.
+        if self._multi_match is not None:
             try:
-                matches = await lookup_many(request.input.query)
+                matches = await self._multi_match.lookup_many(
+                    request.input.query
+                )
             except Exception as exc:
                 return dependency_error(
                     request.task_id, capability="people.lookup", exc=exc
@@ -188,9 +209,12 @@ class PeopleCapability:
                 coverage_observations=(),
                 error=None,
             )
-        # Defensive dedupe: the service owns grouped-record dedupe, but a
+        # M4: validate + minimize EVERY match BEFORE the first persistence,
+        # so a malformed kth match fails closed with zero rows instead of
+        # leaving earlier uses orphaned behind an error result. Defensive
+        # dedupe rides along: the adapter owns grouped-record dedupe, but a
         # duplicated handle must never mint two uses for one person.
-        deduped: list = []
+        prepared: list[tuple[str, MinimizedEvidence]] = []
         seen_ids: set[str] = set()
         for match in matches:
             record_id = getattr(match, "record_id", None)
@@ -204,11 +228,6 @@ class PeopleCapability:
             if key in seen_ids:
                 continue
             seen_ids.add(key)
-            deduped.append(match)
-        acquisition_id = uuid4()
-        fetched_at = datetime.now(timezone.utc)
-        uses: list = []
-        for match in deduped:
             fields = getattr(match, "fields", None)
             if not isinstance(fields, Mapping):
                 return error_result(
@@ -227,10 +246,15 @@ class PeopleCapability:
                 return error_result(
                     request.task_id, code="CONTRACT_MISMATCH", message=str(exc)
                 )
+            prepared.append((key, minimized))
+        acquisition_id = uuid4()
+        fetched_at = datetime.now(timezone.utc)
+        uses: list = []
+        for record_id, minimized in prepared:
             try:
                 use = await self._evidence.persist_use(
                     source=PeopleSourceIdentity(
-                        kind="people", record_id=str(match.record_id)
+                        kind="people", record_id=record_id
                     ),
                     content=minimized.content,
                     provenance=Provenance(
@@ -243,6 +267,13 @@ class PeopleCapability:
                     target_id=None,
                 )
             except Exception as exc:
+                # Runtime persistence failure AFTER prevalidation: uses
+                # already committed under this acquisition_id stay in the
+                # encrypted run-scoped Evidence Store (no delete API exists,
+                # so no ad-hoc deletes/transactions are invented). The
+                # residue is encrypted, run-owned, non-PII handles with
+                # ACL-enforced reads, and the typed error names the failed
+                # capability for the evaluator to mark insufficient.
                 return dependency_error(
                     request.task_id, capability="people.lookup", exc=exc
                 )
