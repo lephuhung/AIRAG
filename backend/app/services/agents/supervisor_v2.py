@@ -1183,9 +1183,14 @@ class DeterministicSemanticAdapter:
     finalizer turn), and building MUST be read-only (no writes, no side
     effects). ``RequestContext.original_query`` stays the sole raw-query
     owner: it is passed to ``preprocess`` but never copied into the draft.
-    The discourse-contextualized form comes from ``conversation.summary``
-    (when set), else the preprocessor's normalized query; when neither
-    exists the adapter refuses rather than copying the raw query.
+    The draft's contextualized form is the preprocessor's normalized
+    CURRENT query (Task 8 fix round 1: ``conversation.summary`` must
+    never substitute for the query — history reaches the turn only via
+    ``recent_turns``/``active_entities``/``last_focus``; when no
+    normalized form exists the adapter refuses rather than copying the
+    raw query). Coreference mentions in the current query resolve only
+    against current-turn already-authorized refs (no new identity is
+    minted; true ambiguity becomes a ``BlockingAmbiguity``).
 
     ``ui_selection`` reconciliation: the clarify resume path records an
     answered selection as a ``KnownDocumentResource`` with
@@ -1223,8 +1228,13 @@ class DeterministicSemanticAdapter:
         *,
         preprocess: Callable[[str], Any],
         identity_resolver: Any = None,
+        can_read_people: bool = False,
     ) -> None:
         self._preprocess = preprocess
+        # Phase 4C (Task 8 fix round 1): gates person-mention (``ông ấy``)
+        # resolution for this turn. Default-deny; the ingress wires the
+        # request's live value. Additive so existing sites are unaffected.
+        self._can_read_people = bool(can_read_people)
         # Phase 4B (Task 6): the request-scoped v2
         # ``DocumentIdentityResolver`` (typed v1 ``resolve_candidates()``
         # wrapper). Optional and defaulting to ``None`` so existing
@@ -1321,19 +1331,52 @@ class DeterministicSemanticAdapter:
         self, request: RequestContext, conversation: ConversationContext
     ) -> SemanticDraft:
         from .v2.adapters.semantic import SemanticAdapterError, draft_from_preprocessing
+        from .v2.semantic.discourse import resolve_coreferences
 
         result = await _maybe_await(self._preprocess(request.original_query))
-        summary = conversation.summary.strip() if conversation.summary else ""
         try:
-            draft = draft_from_preprocessing(
-                result, contextualized_query=summary or None
-            )
+            # Task 8 fix round 1 (Critical-1): never substitute the
+            # session summary for the current query. ``conversation``
+            # still flows into the turn via the checkpointed
+            # ``ConversationContext`` (recent turns/entities/focus).
+            draft = draft_from_preprocessing(result)
         except Exception as exc:
             raise SemanticAdapterError(
                 f"v1 preprocessing output cannot become a v2 draft: {exc}"
             ) from exc
         reconciled = self.reconcile_ui_selections(draft, request)
-        return self.project_api_explicit_targets(reconciled, request)
+        projected = self.project_api_explicit_targets(reconciled, request)
+        # Task 8 fix round 1 (Important-1): the production coreference
+        # call site. Mentions (``văn bản này``/``điều này``/``ông ấy``/
+        # ``file thứ hai``) resolve only to current-turn refs that are
+        # already authorized (resolved preprocessor/ui/api refs); the
+        # allowed scope is those resolved document IDs — never workspace
+        # IDs, never history identity. No binding is minted here.
+        allowed_ids = tuple(
+            reference.resolved_document_id
+            for reference in projected.document_refs
+            if reference.resolution_status == "resolved"
+            and reference.resolved_document_id is not None
+        )
+        corefs, coref_ambiguities = resolve_coreferences(
+            request.original_query,
+            document_refs=projected.document_refs,
+            person_refs=projected.person_refs,
+            section_refs=projected.section_refs,
+            allowed_document_ids=allowed_ids,
+            can_read_people=self._can_read_people,
+        )
+        if not corefs and not coref_ambiguities:
+            return projected
+        return projected.model_copy(
+            update={
+                "coreferences": tuple(projected.coreferences) + corefs,
+                "preliminary_ambiguities": tuple(
+                    projected.preliminary_ambiguities
+                )
+                + coref_ambiguities,
+            }
+        )
 
 
 class V1BindingResolver:

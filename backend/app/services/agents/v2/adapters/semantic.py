@@ -521,7 +521,9 @@ async def resolve_draft_identities(
     the resolver's preserved authoritative one-turn locator (if any) is
     projected as a label-only ``SectionReference`` (no revision
     coordinate). Errors fail closed (propagate) rather than fabricating
-    an identity.
+    an identity. Discourse mentions in ``question`` then resolve only
+    against the just-resolved document IDs (never workspace IDs, never
+    history identity); true ambiguity appends a ``BlockingAmbiguity``.
     """
     if identity_resolver is None:
         raise SemanticAdapterError(
@@ -548,12 +550,23 @@ async def resolve_draft_identities(
         )
     from ..semantic.discourse import resolve_coreferences
 
+    # Task 8 fix round 1 (Critical-2): the allowed scope is resolved
+    # DOCUMENT identity, never the workspace/tenant scope. ``workspace_ids``
+    # authorize the resolver search; the resolved IDs below are the only
+    # targets a mention may link to (a workspace UUID never equals a
+    # document UUID, so passing it here yielded false clarifications).
+    allowed_ids = tuple(
+        reference.resolved_document_id
+        for reference in resolved_refs
+        if reference.resolution_status == "resolved"
+        and reference.resolved_document_id is not None
+    )
     corefs, coref_ambiguities = resolve_coreferences(
         question,
         document_refs=tuple(resolved_refs),
         person_refs=draft.person_refs,
         section_refs=draft.section_refs,
-        allowed_document_ids=tuple(workspace_ids),
+        allowed_document_ids=allowed_ids,
         can_read_people=can_read_people,
     )
     section_refs = draft.section_refs

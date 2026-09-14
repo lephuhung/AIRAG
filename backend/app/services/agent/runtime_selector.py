@@ -799,6 +799,14 @@ class V2Ingress:
                 logger.warning("v2 ingress session close failed", exc_info=True)
 
 
+#: Bound on the rolling-summary window loaded per ingress turn (Task 8 fix
+#: round 1, Important-2): the summary is the concatenation of every
+#: ExchangeSummary row, so an unbounded read is O(thread) DB + checkpoint
+#: growth per turn. ``summary_version``/``built_through_message_id`` still
+#: come from the highest ``exchange_index`` (DESC-first read).
+MAX_HISTORY_SUMMARIES = 20
+
+
 async def load_conversation_for_thread(
     session_factory: Callable[[], Any],
     thread_id: str,
@@ -806,8 +814,10 @@ async def load_conversation_for_thread(
 ) -> Any:
     """Load the persisted discourse window for one v2 ingress turn (Phase 4C).
 
-    Reads the last ``max_recent_turns`` ``ChatMessage`` rows plus all
-    ``ExchangeSummary`` rows for the thread and projects them through
+    Reads the last ``max_recent_turns`` ``ChatMessage`` rows (DB-side
+    DESC + LIMIT, role/content columns only) plus the newest
+    ``MAX_HISTORY_SUMMARIES`` ``ExchangeSummary`` rows for the thread
+    and projects them through
     ``adapters/conversation.py::context_from_legacy`` (typed entities +
     derived ``last_focus``). Returns an empty ``ConversationContext`` when
     the thread is not a persisted session (``standalone-...``), when no
@@ -835,21 +845,29 @@ async def load_conversation_for_thread(
         return empty
     try:
         from sqlalchemy import select
+        from sqlalchemy.orm import load_only
 
         from app.models.chat_message import ChatMessage
         from app.models.exchange_summary import ExchangeSummary
 
         async with session_factory() as db:
+            # Task 8 fix round 1 (Important-2): DB-side DESC + LIMIT,
+            # then reverse to chronological. Only the contract-consumed
+            # columns (role/content) are loaded — heavy JSON columns
+            # (thinking/agent_steps/sources/...) never leave the row.
             msg_result = await db.execute(
                 select(ChatMessage)
                 .where(ChatMessage.session_id == thread_uuid)
-                .order_by(ChatMessage.created_at.asc())
+                .order_by(ChatMessage.created_at.desc())
+                .limit(limit if limit else DEFAULT_RECENT_TURN_LIMIT)
+                .options(load_only(ChatMessage.role, ChatMessage.content))
             )
-            messages = list(msg_result.scalars().all())
+            messages = list(reversed(msg_result.scalars().all()))
             sum_result = await db.execute(
                 select(ExchangeSummary)
                 .where(ExchangeSummary.session_id == thread_uuid)
-                .order_by(ExchangeSummary.exchange_index.asc())
+                .order_by(ExchangeSummary.exchange_index.desc())
+                .limit(MAX_HISTORY_SUMMARIES)
             )
             summaries = list(sum_result.scalars().all())
         if not messages and not summaries:
@@ -991,10 +1009,16 @@ async def build_v2_ingress(
             # No identity_resolver here: nothing consumes
             # ``DeterministicSemanticAdapter.identity_resolver`` yet, so
             # per-turn construction would be inert (fix Task 6 round 1).
+            # No identity_resolver here: nothing consumes
+            # ``DeterministicSemanticAdapter.identity_resolver`` yet, so
+            # per-turn construction would be inert (fix Task 6 round 1).
             # Task 7 owns the ``resolve_draft_identities`` call site, which
             # needs db + trusted scope that ``build_draft`` deliberately
             # lacks. The existing v2 binding resolver stays the only
             # revision-pin authority.
+            # Task 8 fix round 1: the live people permission gates
+            # person-mention resolution in ``build_draft`` (default-deny).
+            can_read_people=bool(can_read_people),
         )
         # F1 role policy: the production semantic adapter emits
         # ``requested_role=None`` for every user reference, so the wired
