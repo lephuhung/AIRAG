@@ -1,431 +1,545 @@
-# LangGraph v2 Phase 4 — V1 Intelligence, V2 Contracts & Adaptive Execution Implementation Plan
+# LangGraph v2 — V1 Intelligence to V2 Contracts Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Preserve the proven semantic/intent/document-resolution intelligence of `LLM-Optimize`, translate it into frozen v2 contracts, achieve fast-path parity, synchronize the public frontend transport contract, then add governed adaptive planning only for genuinely complex execution topologies.
+**Goal:** Move the two proven v1 intelligence capabilities explicitly requested for v2 — **route/intent classification** and **document identity/number resolution** — behind v2 typed contracts, restore simple fast-path behavior, then complete discourse/frontend compatibility and only afterwards expand adaptive complex execution.
 
-**Architecture:** V1 remains the semantic intelligence source for simple-query understanding, document identity, intent, contextualization, and fast-path semantics. A request-scoped adapter/cache translates those outputs into `SemanticDraft`/`SemanticContext`/`QueryAnalysis`; v2 remains authoritative for ACL, immutable revision binding, deterministic route policy, planning validation, scheduling, evidence, checkpointing, and grounding. A separate public transport adapter maps internal v2 results to versioned UI-safe DTO/SSE events so the frontend never depends directly on checkpoint/runtime contracts.
+**Architecture:** Do not interpret “reuse the v1 brain” as “port the v1 supervisor.” The immediate migration surface is narrow: v1 decides semantic intent/work type and resolves remembered document identity; an adapter translates those results into v2 `SemanticContext`/`DocumentReference`/`QueryAnalysis`. V2 alone owns `RouteDecision`, ACL, revision binding, capability availability, planning, scheduling, evidence, checkpoints, and grounding.
 
-**Tech Stack:** Python 3, LangGraph, Pydantic v2, SQLAlchemy async, existing AIRAG LLM providers/runtime config, Qdrant/vector search, pytest, React/TypeScript, SSE chat transport, frontend component/hook tests.
+**Tech Stack:** Python 3, LangGraph, Pydantic v2, SQLAlchemy async, existing AIRAG LLM providers/runtime config, Qdrant/vector search, pytest, React/TypeScript, SSE chat transport.
 
 **Spec:** `docs/superpowers/specs/2026-09-14-langgraph-v2-semantic-adaptive-execution-design.md`
 
-## Global Constraints
+---
 
-- Reuse the existing v1 `app.services.agent.doc_resolver.resolve_candidates()` behavior; do not clone a second resolver implementation.
-- Preserve v1 fast-path semantic quality where already proven.
-- V1 legacy `SupervisorState`, `next_agent`, `pending_intent`, mutable `document_ids`, and agent-to-agent routing do not become v2 contracts.
-- Preserve frozen v2 `SemanticContext`, `QueryAnalysis`, `RouteDecision`, `TaskPlan`, `TaskSpec`, `AgentResult`, ACL, binding, scheduler, evidence, and checkpoint boundaries.
-- `RouteDecision` is deterministic v2 policy. Semantic models never directly choose route/capability/tool.
-- Document resolver candidates are server-side identity candidates; v2 binding remains the sole immutable revision-pin authority.
-- Whether an LLM was needed to understand a query is not a complexity signal.
-- Frontend never consumes raw `SupervisorV2State`, runtime services, checkpoint payloads, hidden model reasoning, planner prompts, or internal evidence-store identifiers.
-- Public chat/SSE DTOs are an explicit compatibility boundary and must support v1/v2 canary operation.
-- Planner work starts only after v1-v2 fast-path parity **and core frontend transport compatibility** pass.
-- Reuse existing LLM runtime role configuration; do not add separate router/planner provider stacks.
-- One scheduler, one supervisor checkpointer, one capability registry.
+## 0. Scope boundary — read this before implementing any task
+
+### What “move the v1 brain to v2” means in this plan
+
+**Immediate migration — required:**
+
+1. **V1 route/intent intelligence**
+   - greeting/direct vs factual;
+   - People lookup;
+   - general RAG search;
+   - search by document number;
+   - search section;
+   - one-document summarize;
+   - KG lookup;
+   - resolve-document as a semantic prerequisite.
+
+2. **V1 document identity/number intelligence**
+   - official/full number;
+   - short/bare number;
+   - number + issuing agency;
+   - approximate/partial title;
+   - topic/year-based recollection;
+   - existing DB → LLM → vector → rerank/fuzzy behavior from `resolve_candidates()`.
+
+**Not part of the V1-intent migration itself:**
+
+- legacy `next_agent` / `pending_intent` / `SupervisorState`;
+- v1 task plans;
+- v1 agent-to-agent routing;
+- ACL/binding/checkpoint behavior;
+- full conversation/coreference migration;
+- Planner/replan;
+- frontend transport.
+
+Those items have their own later phases below. They may be rollout dependencies, but they are **not acceptance criteria for proving that V1 intent was transferred correctly**.
+
+### Canonical ownership
+
+```text
+V1 intelligence
+  intent/work type
+  document identity candidates
+          │
+          ▼
+V1 -> V2 adapters
+          │
+          ▼
+V2 contracts
+  DocumentReference
+  SemanticContext
+  QueryAnalysis
+          │
+          ▼
+V2 deterministic policy
+  RouteDecision
+          │
+    ┌─────┴─────┐
+    ▼           ▼
+ Fast Path   Complex boundary
+```
+
+**Invariant:** V1/model output says **what the query means**. V2 says **what the system may execute**.
 
 ---
 
+# Phase 4A — Route/Intent Intelligence Migration
+
+This phase proves that v2 understands simple queries at least as well as `LLM-Optimize`. It does **not** require document fuzzy resolution, coreference, frontend clarification, or Planner to be considered complete.
+
 ## Task 0 — Add explicit semantic-router and planner LLM roles
 
-**Priority:** P0 prerequisite
+**Priority:** P0 shared prerequisite
 
 **Files:**
 - Modify: `backend/app/services/runtime_config.py`
 - Modify: `backend/app/services/llm/__init__.py`
-- Modify: `backend/app/api/llm_config.py` only if inherited-role metadata requires it
+- Modify: `backend/app/api/llm_config.py` only if effective inheritance metadata requires it
 - Modify: `frontend/src/types/llmConfig.ts`
 - Modify: `frontend/src/pages/AdminLLMConfigPage.tsx`
-- Modify: `frontend/src/lib/translations/vi.json`
-- Modify: `frontend/src/lib/translations/en.json`
-- Test: runtime-config/provider/API/UI tests
+- Modify i18n files
+- Test runtime-role/provider/API/UI behavior
 
-**Interfaces:**
-- Produces: `get_semantic_router_provider()` and `get_planner_provider()`.
-- Preserves: `get_thinking_provider()` behavior.
+**Required behavior:**
 
-- [ ] Add `semantic_router` and `planner` to runtime roles.
-- [ ] Implement fallback to the **effective** `thinking` role, including DB override inheritance.
-- [ ] Keep explicit per-role assignment higher priority than inherited thinking.
-- [ ] Refactor current reasoning-provider construction into one shared role-aware factory with distinct cache/tracing labels.
-- [ ] Add the two roles to Admin UI types/metadata/translations.
-- [ ] Ensure GET config reports truthful inherited effective connection/model semantics.
-- [ ] Audit control-plane LLM callsites and record intentional role ownership; abbreviation/contextualization/document semantic calls must not accidentally use the main answer model.
-- [ ] Run runtime-config/provider/API tests.
+- [ ] Add `semantic_router` and `planner` roles.
+- [ ] Unassigned roles inherit the **effective** `thinking` connection/model including DB overrides.
+- [ ] Explicit assignment overrides inheritance.
+- [ ] Use one provider factory; do not hardcode a separate OpenAI-only stack.
+- [ ] Keep `get_thinking_provider()` backward compatible.
+- [ ] Audit semantic/control-plane LLM callsites so role ownership is deliberate.
 - [ ] Commit: `feat(v2): add semantic router and planner llm roles`.
 
-**Acceptance:** changing the `thinking` DB assignment updates unassigned semantic-router/planner effective configs after refresh; explicit assignments remain independent.
-
 ---
 
-## Task 1 — Build the v1 fast-path golden parity corpus before changing behavior
+## Task 1 — Freeze a route-intent parity corpus from V1
 
-**Priority:** P0 gate foundation
+**Priority:** P0
 
 **Files:**
-- Create: `backend/tests/agents/v2/golden/test_v1_intelligence_parity.py`
-- Create: `backend/tests/agents/v2/golden/fast_path_cases.py` or equivalent fixture data
-- Read: `backend/app/prompts/agents/supervisor_scope.py`
-- Read: `backend/app/services/agents/supervisor.py`
-- Read: `backend/app/services/agent/doc_resolver.py`
-- Read: `backend/app/services/agents/resolve_doc_agent.py`
+- Create: `backend/tests/agents/v2/golden/intent_cases.py`
+- Create: `backend/tests/agents/v2/golden/test_v1_intent_parity.py`
+- Read/reuse: `backend/app/prompts/agents/supervisor_scope.py`
+- Read/reuse: v1 supervisor classification prompt/taxonomy
 
-**Interfaces:**
-- Produces: versioned expected semantic/intent/document-resolution cases used by Tasks 2–6.
+**Cases required:**
 
-- [ ] Add pure greeting and greeting-prefix factual cases.
-- [ ] Add People cases: phone, CCCD, BHXH, name, `Nguyễn Văn A là ai?`.
-- [ ] Add general factual RAG cases with no explicit document.
-- [ ] Add exact title and approximate title cases.
-- [ ] Add full official number cases.
-- [ ] Add bare/short number cases such as `luật số 24`, `thông tư 15`.
-- [ ] Add number + issuing-agency cases such as `Thông tư 15 của Bộ Công an`.
-- [ ] Add year + topic and topic-only remembered-document cases.
-- [ ] Add exact section and nested `Điểm/Khoản/Điều` cases.
-- [ ] Add one-document summarize and simple KG cases.
-- [ ] Add ambiguous candidates and low-confidence target cases.
-- [ ] Add follow-up/coreference sequences.
-- [ ] Capture expected v1 intent/resolution behavior and expected v2 final topology separately.
-- [ ] Run the corpus against v1 helpers to prove the fixture reflects current `LLM-Optimize` behavior.
-- [ ] Commit: `test(v2): capture v1 fast path intelligence parity`.
+```text
+xin chào                                  -> greeting/direct
+chào anh, hỏi về chế độ thai sản?         -> factual search, NOT greeting
+0901234567 là ai?                          -> people lookup
+079012345678 CCCD này của ai?             -> people lookup
+Nguyễn Văn A là ai?                        -> people lookup
+Tìm ông Nguyễn Văn A                      -> people lookup
+chế độ thai sản được quy định thế nào?    -> general document retrieve FAST
+sự khác biệt giữa nghỉ phép và nghỉ ốm?   -> general factual retrieve unless explicit multi-target research
+Tóm tắt Nghị định A                       -> one-doc bounded summarize when one target is resolved
+<simple KG query>                          -> knowledge_graph lookup
+```
 
-**Gate:** later tasks may improve behavior, but must not silently regress cases already passing in v1.
+- [ ] Record expected **v1 semantic intent**, not `next_agent`.
+- [ ] Record separately the expected **v2 QueryAnalysis + topology**.
+- [ ] Prove fixtures represent current v1 behavior before changing v2.
+- [ ] Commit: `test(v2): capture v1 route intent parity`.
 
 ---
 
-## Task 2 — Add request-scoped IntelligenceService/cache boundary
+## Task 2 — Add runtime-only typed `IntentDecision` adapter/cache
 
-**Priority:** P0 prerequisite for resolver/model wiring
+**Priority:** P0
 
 **Files:**
 - Modify: `backend/app/services/agents/v2/contracts/state.py` (`RuntimeServices` only)
-- Create: `backend/app/services/agents/v2/semantic/intelligence.py`
-- Modify: `backend/app/services/agents/supervisor_v2.py`
-- Modify: runtime construction owner as needed
-- Test: new runtime-only intelligence tests
+- Create: `backend/app/services/agents/v2/semantic/intent.py`
+- Modify runtime construction/wiring owner
+- Add unit tests
 
-**Interfaces:**
-- Produces conceptually:
+**Internal interface:**
 
 ```python
-class IntentDecision: ...
-class DocumentIdentityResolution: ...
-class IntelligenceService:
-    async def classify_intent(...): ...
-    async def resolve_document(...): ...
+class IntentDecision:
+    intent: str
+    source: Literal["deterministic", "model"]
+    confidence: float | None
+    needs_memory: bool = False
+    is_legal_query: bool = False
 ```
 
-- Runtime-only; no new `SupervisorV2State` slot.
-
-- [ ] Add one request-scoped runtime service that caches intent/document/semantic inference for the current turn.
-- [ ] Key cache by current request/query plus relevant conversation semantic context.
-- [ ] Prove cache cannot cross user/workspace/turn/shadow-live boundaries.
-- [ ] Prove the service is not serialized into checkpoints.
-- [ ] Ensure repeated `build_semantic_draft()` calls in binding and semantic-finalizer paths reuse cached expensive work.
-- [ ] Add cancellation/deadline handling.
-- [ ] Commit: `feat(v2): add request scoped semantic intelligence service`.
-
-**Acceptance:** one turn may rebuild drafts multiple times, but the same document-resolution/semantic model inference executes at most once per cache key.
+- [ ] Runtime-only; never add `IntentDecision` to checkpoint state.
+- [ ] Keep v1 deterministic narrow scopes for obvious greeting/People cases.
+- [ ] For uncertain/full cases, reuse v1 taxonomy/prompt behavior through `semantic_router` role.
+- [ ] Cache the result per request/turn so repeated semantic draft builds do not repeat classification.
+- [ ] Do not return/import `next_agent`, `pending_intent`, or v1 task plans.
+- [ ] Commit: `feat(v2): add typed v1 intent adapter`.
 
 ---
 
-## Task 3 — Adapt the proven v1 document resolver into v2 document identity
+## Task 3 — Translate V1 intent taxonomy into V2 `QueryAnalysis`
+
+**Priority:** P0
+
+**Files:**
+- Modify: `backend/app/services/agents/v2/nodes/routing.py`
+- Modify semantic adapter only where it consumes `IntentDecision`
+- Add mapping/routing tests
+
+**Required mapping:**
+
+```text
+mongo_search_* -> work_type=lookup,    domains=(people,)
+search         -> work_type=retrieve,  domains=(document,)
+search_doc_num -> work_type=retrieve,  domains=(document,)
+search_section -> work_type=retrieve,  domains=(document, section)
+summarize      -> work_type=summarize, domains=(document,)
+kg_query       -> work_type=lookup,    domains=(knowledge_graph,)
+greeting       -> work_type=direct
+resolve_doc    -> semantic prerequisite, NOT complexity
+```
+
+- [ ] V1 intent is a semantic input only; V2 still calls deterministic `decide_route()`.
+- [ ] Remove generic regex/keywords such as `là ai`, `khác biệt`, `tổng hợp`, `đánh giá` from being authoritative when typed intent is available.
+- [ ] Do not add confidence to frozen `QueryAnalysis`.
+- [ ] Pass all Task-1 cases.
+- [ ] Commit: `feat(v2): translate v1 intent into query analysis`.
+
+---
+
+## Task 4 — Restore simple execution topology for general factual RAG
+
+**Priority:** P0 — Phase 4A gate
+
+**Files:**
+- Modify: `backend/app/services/agents/v2/nodes/routing.py`
+- Modify: `backend/app/services/agents/v2/nodes/fast_plan.py`
+- Modify capability-catalog availability checks
+- Extend fast-path tests
+
+**Required behavior:**
+
+- [ ] `search -> retrieve/document` without an explicit document binding is a bounded **targetless document retrieval** fast path where policy allows workspace search.
+- [ ] Add/repair `document.retrieve` fast-plan mapping for reference-free factual RAG.
+- [ ] Do not require exactly one binding for general document retrieval.
+- [ ] Route decisions must check **actual available capability catalog**, not only `allowed_capabilities` requested/granted flags.
+- [ ] Missing runtime capability gets a deterministic fallback/unavailable decision; do not route into an execution path that cannot exist.
+- [ ] A model classification call itself never makes a query complex.
+- [ ] Commit: `feat(v2): restore general rag fast path`.
+
+### Phase 4A acceptance gate
+
+Phase 4A is complete when all Task-1 route-intent cases produce the correct `QueryAnalysis` and bounded topology. In particular:
+
+```text
+Nguyễn Văn A là ai?                       -> people fast path
+chào anh, hỏi về chế độ thai sản?         -> factual retrieve fast path
+chế độ thai sản được quy định thế nào?    -> targetless document.retrieve fast path
+```
+
+**Do not block this gate on:** fuzzy document resolution, conversation focus, frontend clarification UI, or Planner.
+
+---
+
+# Phase 4B — Document Identity / Number Migration
+
+This phase implements the second v1 capability explicitly requested: robust resolution when users remember a document number/title only approximately.
+
+## Task 5 — Freeze V1 document-resolution parity cases
+
+**Priority:** P0
+
+**Files:**
+- Create: `backend/tests/agents/v2/golden/document_identity_cases.py`
+- Create: `backend/tests/agents/v2/golden/test_v1_document_identity_parity.py`
+- Reuse: `backend/app/services/agent/doc_resolver.py`
+
+**Cases:**
+
+- [ ] full official number;
+- [ ] short/bare number (`luật số 24`, `thông tư 15`);
+- [ ] number + issuing agency (`Thông tư 15 của Bộ Công an`);
+- [ ] exact title;
+- [ ] approximate/partial title;
+- [ ] year + topic;
+- [ ] topic-only remembered document;
+- [ ] explicit number identity must dominate topic rerank;
+- [ ] ambiguous candidates;
+- [ ] low-confidence/no candidate.
+
+- [ ] Record candidate IDs/scores/status expected from v1 behavior where stable enough for a fixture.
+- [ ] Commit: `test(v2): capture v1 document identity parity`.
+
+---
+
+## Task 6 — Adapt `resolve_candidates()` into V2 `DocumentReference`
 
 **Priority:** P0
 
 **Files:**
 - Create: `backend/app/services/agents/v2/semantic/document_identity.py`
-- Reuse: `backend/app/services/agent/doc_resolver.py`
+- Reuse directly: `backend/app/services/agent/doc_resolver.py`
 - Modify: `backend/app/services/agents/v2/adapters/semantic.py`
-- Modify: `backend/app/services/agents/supervisor_v2.py` runtime wiring
-- Test: focused document identity + binding tests
+- Modify runtime service/cache wiring
+- Add binding integration tests
 
-**Interfaces:**
-- Consumes: `resolve_candidates(reference, workspace_ids, db, topic=full_query, ...)`.
-- Produces: v2 `DocumentReference` states: `resolved`, `ambiguous`, `not_found`; never a legacy state update.
+**Required behavior:**
 
-- [ ] Write failing tests for exact number, short number, number+agency, approximate title, topic-only fallback, ambiguous candidates, low confidence, and explicit-number identity dominance over topic rerank.
-- [ ] Wrap `resolve_candidates()` rather than copying `_extract_by_regex`, `_query_db`, vector, fuzzy, or rerank implementations.
-- [ ] Pass the full contextualized question as `topic` so the existing vector/rerank behavior is preserved.
-- [ ] Translate clear winners to `DocumentReference(resolved_document_id=...)`.
-- [ ] Translate close candidates to `candidate_document_ids` + `resolution_status="ambiguous"`.
+- [ ] Wrap `resolve_candidates()`; do not clone its regex/SQL/LLM/vector/fuzzy/rerank code.
+- [ ] Pass the full contextualized user question as `topic`.
+- [ ] Translate a clear winner to `DocumentReference(resolution_status="resolved", resolved_document_id=...)`.
+- [ ] Translate close candidates to `resolution_status="ambiguous"` + candidate IDs.
+- [ ] Keep not-found as not-found; do not fabricate an identity.
 - [ ] Do not force-bind low-confidence candidates.
-- [ ] Keep current runtime workspace/authorization scope authoritative; model text can never mint trusted workspace IDs.
-- [ ] Preserve the section hint returned by the resolver for later `SectionReference` construction.
-- [ ] Feed the resulting v2 reference into the existing binding resolver; do not pin revisions in the identity adapter.
-- [ ] Run golden document cases plus binding regression tests.
-- [ ] Commit: `feat(v2): adapt v1 document resolver to v2 identities`.
-
-**Acceptance:** resolving a document may internally use DB → LLM → vector → rerank, yet a one-document/one-section user request remains eligible for fast path.
+- [ ] Resolver output remains inside current authorized workspace scope.
+- [ ] Existing v2 binding resolver remains the only revision-pin authority.
+- [ ] Cache expensive resolver/model/vector work per request.
+- [ ] Commit: `feat(v2): adapt v1 document resolver to v2 contract`.
 
 ---
 
-## Task 4 — Translate v1 intent intelligence into V2 semantic facts and QueryAnalysis
+## Task 7 — Bridge the minimum section signal needed for simple section fast path
 
-**Priority:** P0
+**Priority:** P0 for the canonical section query; this is **not** the full discourse/coreference task.
 
 **Files:**
-- Create: `backend/app/services/agents/v2/semantic/intent.py`
-- Reuse/read: `backend/app/prompts/agents/supervisor_scope.py`
-- Reuse/read: v1 supervisor classification prompt/taxonomy in `backend/app/services/agents/supervisor.py`
-- Modify: `backend/app/services/agents/v2/adapters/semantic.py`
-- Modify: `backend/app/services/agents/v2/nodes/routing.py`
-- Test: intent translation + routing tests
+- Modify semantic adapter/context finalization as needed
+- Add section fast-path tests
 
-**Interfaces:**
-- Consumes: v1 narrow deterministic scope behavior and semantic-router model for uncertain/full cases.
-- Produces: runtime-only `IntentDecision`, translated to existing `QueryAnalysis`.
+**Required behavior:**
 
-- [ ] Keep deterministic v1 short-circuit behavior for unambiguous greeting/personal/People cases.
-- [ ] Reuse the v1 intent taxonomy for uncertain/full cases; do not import `next_agent` as a v2 decision.
-- [ ] Map simple v1 intents into v2 semantics:
-  - `mongo_search_*` → `lookup/people`
-  - `search` → `retrieve/document`
-  - `search_doc_num` → `retrieve/document`
-  - `search_section` → `retrieve/document+section`
-  - one-doc `summarize` → `summarize/document`
-  - `kg_query` → `lookup/knowledge_graph`
-  - greeting/personal → direct/memory semantics
-- [ ] Treat `resolve_doc` as a semantic prerequisite to identity resolution, not an execution-complexity signal.
-- [ ] Remove generic keyword/regex patterns such as `là ai`, `khác biệt`, `tổng hợp`, `đánh giá` from being authoritative work-type decisions where v1 semantic intent is available.
-- [ ] Keep regex/patterns only as conservative safety nets or narrow deterministic scopes.
-- [ ] Do not add confidence to frozen `QueryAnalysis`.
-- [ ] Run People/KG/general-RAG/greeting-prefix golden cases.
-- [ ] Commit: `feat(v2): translate v1 intent intelligence into v2 analysis`.
+- [ ] Preserve resolver/preprocessor `section_reference` instead of dropping it.
+- [ ] Translate a simple authoritative `Điều/Chương/Khoản` locator into the existing v2 section contract shape required by fast routing.
+- [ ] Preserve candidate document IDs across preprocessing persistence/translation.
+- [ ] Do not implement full multi-turn coreference/focus in this task.
+- [ ] If `section.read` requires a revision-specific `structure_node_id`, either resolve that locator deterministically here/at capability boundary or use a bounded document-retrieve fallback; do not pretend the capability is available when it will fail closed.
+- [ ] Commit: `feat(v2): bridge section locator for fast retrieval`.
 
-**Acceptance:** `Nguyễn Văn A là ai?` is not classified as KG solely due to `là ai`; `sự khác biệt giữa nghỉ phép và nghỉ ốm` does not become a complex document comparison unless semantic intent/targets require it.
+### Phase 4B acceptance gate
+
+The canonical case must be:
+
+```text
+"Điều 5 Luật An ninh mạng quy định gì?"
+    -> V1-compatible document identity resolution
+    -> V2 DocumentReference + section locator
+    -> V2 immutable binding
+    -> QueryAnalysis(retrieve, document+section)
+    -> fast bounded section/document retrieval
+    -> NO Planner
+```
+
+Resolver complexity (`DB -> LLM -> vector -> rerank`) is not execution complexity.
 
 ---
 
-## Task 5 — Complete SemanticDraft translation: section, person, coreference, conversation focus
+# Phase 4C — Semantic Discourse Completeness
 
-**Priority:** P0
+This is a separate follow-up capability phase. It is **not** part of proving that V1 route intent or document-number resolution was transferred correctly.
+
+## Task 8 — Complete person/coreference/conversation focus
+
+**Priority:** P1 before multi-turn production parity
 
 **Files:**
 - Modify: `backend/app/services/agents/v2/adapters/semantic.py`
 - Modify: `backend/app/services/agents/v2/adapters/conversation.py`
-- Modify: `backend/app/services/agents/v2/nodes/context.py` where focus persistence belongs
-- Create focused semantic/coreference tests
+- Modify context/history ingress owner
+- Add multi-turn tests
 
-**Interfaces:**
-- Consumes: cached intelligence results from Tasks 2–4.
-- Produces: complete v2 `SemanticDraft` / finalized `SemanticContext`.
+**Required behavior:**
 
-- [ ] Remove unconditional `coreferences=()`, `person_refs=()`, `section_refs=()` information loss.
-- [ ] Build `SectionReference` from trusted resolver/semantic output, including nested `Điểm/Khoản/Điều` locators where supported.
-- [ ] Populate People/person refs from validated People intent/identifiers.
-- [ ] Preserve typed active document/person/section entities in conversation context.
-- [ ] Populate `last_focus` from validated completed turns.
-- [ ] Resolve unambiguous `văn bản này`, `nghị định trên`, `điều này`, `ông ấy`, `file thứ hai` against current authorized conversation entities.
-- [ ] Emit clarification for true ambiguity rather than guessing.
-- [ ] Ensure history cannot reauthorize a document outside current runtime scope.
-- [ ] Run multi-turn golden sequences.
-- [ ] Commit: `feat(v2): complete semantic and discourse translation`.
+- [ ] Populate `person_refs` where a stable typed identity exists.
+- [ ] Populate typed `active_entities` instead of flattening everything to `concept`.
+- [ ] Populate `last_focus` from validated outcomes.
+- [ ] Ensure production v2 ingress actually supplies relevant conversation history/context.
+- [ ] Resolve unambiguous `văn bản này`, `nghị định trên`, `điều này`, `ông ấy`, `file thứ hai`.
+- [ ] True ambiguity becomes clarification.
+- [ ] History never reauthorizes out-of-scope resources.
+- [ ] Commit: `feat(v2): complete discourse and coreference context`.
 
 ---
 
-## Task 6 — Add deterministic Simple Eligibility Gate and achieve v1 fast-path parity
+# Phase 4D — Public Transport / Frontend Synchronization
 
-**Priority:** P0 — hard gate before Planner
+This is a **production-canary gate**, not a prerequisite for proving Phase 4A route-intent parity and not a prerequisite for writing backend Planner code.
 
-**Files:**
-- Modify: `backend/app/services/agents/v2/nodes/routing.py`
-- Optionally create: `backend/app/services/agents/v2/semantic/execution_shape.py`
-- Modify: `backend/tests/agents/v2/fast_paths/test_domain_paths.py`
-- Extend: golden parity tests
+## Task 9 — Define a versioned public chat/SSE contract
 
-**Interfaces:**
-- Consumes: finalized `SemanticContext`, translated `QueryAnalysis`, bindings, capability availability.
-- Produces: deterministic v2 `RouteDecision`.
-
-- [ ] Define runtime execution shape/simple-eligibility from logical evidence operations, not internal helper-call count.
-- [ ] Fast eligibility includes known bounded workflows: People lookup, general factual retrieve, one document, one section, search-by-number after resolution, one-doc bounded summarize, simple KG.
-- [ ] Document identity resolution complexity must not force `complex_research`.
-- [ ] A semantic-router LLM call must not itself force `complex_research`.
-- [ ] Route to Planner/complex only for query-specific DAG/dependency needs: multi-target compare, evaluate/compliance, cross-domain dependency, multi-goal, iterative evidence completion.
-- [ ] Keep `decide_route()` free of LLM calls.
-- [ ] Run complete Task-1 parity corpus comparing v1 semantic result and expected v2 topology.
-- [ ] Record semantic-router call counts and assert zero where deterministic v1 narrow scopes suffice.
-- [ ] Commit: `feat(v2): restore fast path parity with simple eligibility gate`.
-
-**Hard acceptance gate:** v2 simple-query behavior must meet or exceed `LLM-Optimize` on the versioned corpus before Planner begins.
-
----
-
-## Task 6A — Synchronize V2 public transport contract with the frontend
-
-**Priority:** P0 — frontend compatibility gate before Planner/canary
-
-**Why:** the current frontend is centered on legacy chat types (`ChatMessage`, `ChatSourceChunk`, `AgentStep`) and `useRAGChatStream` parses legacy-style SSE `status/token/source/...` events. It does not yet model v2 clarification/resume, richer terminal states, or complex execution progress. The solution is **not** to expose `SupervisorV2State`; create an explicit public chat transport boundary.
+**Priority:** P0 before canary
 
 **Files — Backend:**
-- Create or modify the reviewed v2 chat/SSE transport adapter that owns `stream_v2_turn_events` / `stream_v2_turn_to_sse`.
-- Create: `backend/app/services/agents/v2/transport/contracts.py` or equivalent public DTO owner.
-- Modify persistence/serialization owner for assistant chat metadata only where public metadata must survive reload.
-- Add backend transport-contract tests.
+- Create/modify v2 public transport DTO owner
+- Modify v1/v2 SSE normalization adapter
+- Modify public chat persistence only for metadata that must survive reload
+- Add transport-contract tests
 
 **Files — Frontend:**
 - Modify: `frontend/src/types/index.ts`
 - Modify: `frontend/src/hooks/useRAGChatStream.ts`
-- Modify chat panel/message/timeline components that render clarification/progress/citations.
-- Modify: `frontend/src/hooks/useChatHistory.ts` and history hydration adapters if persisted metadata changes.
-- Add frontend hook/component tests for SSE parsing and reload behavior.
+- Modify chat UI/history hydration components
+- Add hook/component/E2E tests
 
-**Interfaces:**
-- Consumes internal v2: `ClarificationRequest`, `RouteDecision`, safe progress summaries from `TaskPlan`/`AgentResult`, governed citations, `FinalResponse`.
-- Produces a UI-safe versioned/discriminated public event union. Conceptual minimum:
+**Boundary:** frontend never consumes raw `SupervisorV2State`, checkpoint state, `TaskPlan`, runtime services, hidden model reasoning, or internal evidence UUIDs.
 
-```ts
-type ChatTransportEvent =
-  | { version: "2"; type: "status"; phase: ChatPhase; detail?: string }
-  | { version: "2"; type: "clarification_required"; request: PublicClarification }
-  | { version: "2"; type: "clarification_resolved"; requestId: string }
-  | { version: "2"; type: "source"; source: PublicCitationSource }
-  | { version: "2"; type: "token"; text: string }
-  | { version: "2"; type: "complete"; response: PublicFinalResponse }
-  | { version: "2"; type: "error"; message: string; retryable: boolean }
-  | { version: "2"; type: "cancelled" };
+**Minimum public event union:**
+
+```text
+status
+clarification_required
+clarification_resolved
+source/citation
+token
+complete
+error
+cancelled
 ```
 
-Exact naming may follow existing endpoint conventions, but it must be discriminated and validated rather than an untyped open payload.
+**Required behavior:**
 
-- [ ] Inventory every SSE event currently emitted by v1 and v2 and every frontend branch that consumes it.
-- [ ] Define the public transport DTO/event contract separately from checkpoint/business contracts.
-- [ ] Preserve v1-compatible events or add a normalization adapter so canary users receive one frontend shape regardless of serving arm.
-- [ ] Add `clarifying`, `planning`, `executing`, `evaluating`, `generating`, `error/cancelled` UI phases as needed; do not expose hidden reasoning.
-- [ ] Represent clarification as structured data: `clarification_id/request_id`, prompt, allowed choices, safe labels/metadata, expiry if applicable.
-- [ ] Add frontend action for selecting a clarification option and resuming the same suspended v2 thread/run through the reviewed backend resume endpoint.
-- [ ] Do not let the frontend manufacture document UUIDs, workspace scope, binding IDs, or arbitrary clarification values; submit only server-issued option identifiers/allowed values.
-- [ ] Normalize v1/v2 citations/sources to one TypeScript presentation type.
-- [ ] Persist only public message metadata needed for reload; prove a page refresh reconstructs clarification/completed message state without reading checkpoints.
-- [ ] Update `useRAGChatStream` to tolerate/ignore unknown forward-compatible events instead of crashing the stream.
-- [ ] Add hook tests for fragmented SSE frames, duplicate/idempotent events, unknown events, cancel/error, clarification interrupt/resume, and normal completion.
-- [ ] Add browser/component tests for:
-  - simple RAG + citations;
-  - exact-section fast path;
-  - People lookup;
-  - ambiguous document → choices → resume → answer;
-  - low-confidence/not-found document state;
-  - refresh after completion;
-  - refresh while clarification is outstanding where product behavior supports resume.
-- [ ] Add backend/frontend contract fixture tests so event-field drift fails CI.
-- [ ] Commit: `feat(v2): synchronize chat transport contract with frontend`.
-
-**Security boundary:** public transport may expose user-safe labels, candidate option identifiers, citation metadata, and progress summaries. It must not expose ACL internals, raw checkpoint state, planner prompts, hidden CoT, internal evidence-use UUIDs unless they are explicitly approved public citation handles, or runtime service/config secrets.
-
-**Hard acceptance gate:** fast-path v2 is not canary-ready until actual web UI behavior passes the same simple/clarification golden scenarios as backend Task 6.
+- [ ] Inventory every v1/v2 emitted event and every frontend consumer branch.
+- [ ] Normalize v1 and v2 into one frontend presentation contract during canary.
+- [ ] Add structured clarification options + server-issued option IDs + resume metadata.
+- [ ] Frontend may submit only server-issued clarification values/options; never fabricate document UUID/workspace/binding identity.
+- [ ] Normalize citations into one stable public type and persist enough metadata to rebuild completed messages after refresh.
+- [ ] Add UI phases such as `clarifying`, `planning`, `executing`, `evaluating`, `generating` where useful, without exposing CoT.
+- [ ] Unknown forward-compatible event types must not crash the stream.
+- [ ] Test fragmented SSE frames and actual `event:` + `data:` framing, not only data-only frames.
+- [ ] Browser/component E2E: simple RAG+citation, exact section, People, clarification/resume, not-found, cancel/error, reload.
+- [ ] Commit: `feat(v2): synchronize public chat contract with frontend`.
 
 ---
 
-## Task 7 — Integrate the governed Adaptive Planner for true complex queries
+# Phase 5 — Adaptive Complex Execution
 
-**Priority:** P1 after Tasks 6 and 6A gates
+Planner is a distinct complex-execution phase. It consumes the already-correct semantic contracts from Phase 4A/4B/4C. Frontend Task 9 must pass before canarying Planner, but Planner backend implementation may proceed in parallel after Phase 4A/4B gates.
 
-**Supersedes/absorbs:** `docs/superpowers/plans/2026-09-13-langgraph-v2-p2-adaptive-planner.md`
+## Task 10 — Integrate governed Adaptive Planner
+
+**Priority:** P1 after Phase 4A + 4B backend gates
 
 **Files:**
-- Create: `backend/app/services/agents/v2/planning/__init__.py`
-- Create: `backend/app/services/agents/v2/planning/adapter.py`
-- Modify: `backend/app/services/agents/v2/contracts/state.py` (`RuntimeServices.planner` only)
-- Modify: `backend/app/services/agents/v2/complex_research_graph.py`
-- Consume: `get_planner_provider()`
-- Test: `backend/tests/agents/v2/complex/test_adaptive_planner.py`
+- Create planning adapter/package
+- Modify `RuntimeServices` with runtime-only planner service
+- Modify `complex_research_graph.py`
+- Consume `get_planner_provider()`
+- Add complex planner tests
 
-**Interfaces:**
-- Consumes: existing `ResearchPlanningInput`, finalized v2 semantics/bindings/capability catalogue.
-- Produces: proposal-only typed planner output, converted to validated `TaskPlan`.
+**Required behavior:**
 
-- [ ] Build a minimized/redacted model projection from existing planning inputs.
-- [ ] Exclude ACL internals, raw evidence, secrets, runtime clients, and unnecessary internal evidence UUIDs from model input.
-- [ ] Implement strict structured initial-plan proposal.
-- [ ] Validate proposal through existing task-plan/scope/capability/budget checks.
-- [ ] Acquire leases/checkpoint only after validation and before scheduler dispatch.
-- [ ] Fall back to existing deterministic policy when planner is disabled/times out/returns malformed or rejected output and a safe deterministic policy exists.
-- [ ] Never let Planner mint trusted document identity or widen hard scope.
-- [ ] Emit only public summarized planning/execution progress through Task 6A transport; never stream the raw internal DAG/checkpoint to the browser.
+- [ ] Use existing `ResearchPlanningInput` as authoritative runtime planning envelope.
+- [ ] Project only minimized/redacted model input.
+- [ ] Planner returns a proposal, never dispatches tools.
+- [ ] Validate scope/capability/budget/DAG before lease/checkpoint/scheduler.
+- [ ] Do not expose raw internal evidence UUIDs unnecessarily to the model.
+- [ ] Fallback to safe deterministic policies when available.
+- [ ] Planner cannot mint document identity or widen hard scope.
 - [ ] Commit: `feat(v2): add governed adaptive planner`.
 
 ---
 
-## Task 8 — Project evaluator gaps into bounded append-only replan
+## Task 11 — Evaluator-driven bounded append-only replan
 
 **Priority:** P1
 
-**Files:**
-- Modify: `backend/app/services/agents/v2/complex_research_graph.py`
-- Modify: `backend/app/services/agents/v2/replanning.py`
-- Modify: `backend/app/services/agents/v2/nodes/evaluate.py` only if projection helper belongs there
-- Test: replan/evaluation suites
-
-**Interfaces:**
-- Reuse: existing `EvidenceEvaluation`, `MissingRequirement`, `Contradiction`, `TaskExecutionSummary`.
-- Do not create a parallel persisted planner-gap contract.
-
-- [ ] Project only minimized typed evaluator facts to the planner.
-- [ ] Support bounded gaps such as missing target coverage, insufficient evidence, failed dependency, supporting/reference discovery, and contradictions requiring one bounded additional read.
-- [ ] Keep replans append-only; completed tasks cannot be replaced.
-- [ ] Enforce max tasks, max replans, budgets, capability availability, and hard scope.
-- [ ] Expose only coarse public `evaluating/replanning` progress through the frontend transport; no raw evaluator gaps are required in UI unless separately designed.
-- [ ] Keep default rollout conservative until termination/quality tests pass.
-- [ ] Commit: `feat(v2): add evaluator driven bounded replanning`.
+- [ ] Reuse existing `EvidenceEvaluation`, `MissingRequirement`, `Contradiction`, `TaskExecutionSummary`.
+- [ ] Project minimized evaluator gaps only.
+- [ ] Replan is append-only; completed tasks are immutable.
+- [ ] Enforce max tasks/replans/budgets/capability catalog/hard scope.
+- [ ] Commit: `feat(v2): add bounded adaptive replanning`.
 
 ---
 
-## Task 9 — Expand unsupported complex work types only after planner/replan quality passes
+## Task 12 — Expand complex work types
 
 **Priority:** P1/P2
 
-**Order:**
+Order:
 
-1. `multi_goal` composed from supported atomic capabilities.
-2. generic `cross_domain` beyond current People → Document vertical slice.
-3. `evaluate` / compliance with trusted typed criteria and grounded evidence.
+1. `multi_goal`;
+2. generic `cross_domain`;
+3. `evaluate` / compliance.
 
-- [ ] Add real graph tests with causal dependencies for each work type.
-- [ ] Add transport/UI E2E coverage for any new user-visible progress/clarification state introduced by each work type.
-- [ ] Keep complex execution as validated DAGs; do not introduce an unconstrained ReAct loop.
-- [ ] Commit each independently reviewable work type separately.
+Keep execution as validated DAGs; do not introduce an unconstrained ReAct loop.
 
 ---
 
-## Task 10 — Observability, shadow parity, frontend compatibility, and rollout
+# Cross-cutting rollout blockers — independent of V1 intent migration
 
-**Priority:** continuous + final gate
+The following findings are valid production-safety blockers, but they must not be confused with route-intent migration acceptance:
 
-**Files:**
-- Modify existing rollout metrics/shadow runtime files identified during implementation
-- Extend golden replay tooling if useful
-- Extend frontend contract/E2E test fixtures from Task 6A
+- ACL filtering for standalone/fallback and defense-in-depth document reads;
+- current-ACL filtering when hydrating chat history/sources/people data;
+- tracing redaction/approved sink policy;
+- correct `langgraph.checkpoint.postgres` dependency/readiness;
+- capability service availability probes/catalog correctness;
+- public frontend transport compatibility before canary.
 
-- [ ] Add semantic-intelligence metrics: deterministic bypass, model call count, document resolver stages used, ambiguity/low-confidence rate, latency.
-- [ ] Add v1-v2 parity counters on shadow replay.
-- [ ] Add Planner metrics: calls, latency, proposal rejection reason, fallback, task count, DAG depth, replan count, final evidence sufficiency.
-- [ ] Add public transport schema/version/error metrics without logging sensitive payloads.
-- [ ] Keep planner-proposal shadow distinct from full read-only execution shadow.
-- [ ] Extend shadow support for document read/retrieve parity before claiming full planner execution quality.
-- [ ] Run backend contract + frontend SSE/UI compatibility suites before every canary promotion.
-- [ ] Canary through existing v1/v2 selector with v1 preserved as rollback.
-- [ ] Promote only after fast-path parity, frontend compatibility, contract safety, planner quality, and grounded-answer gates pass.
+These items block **production rollout/canary**, not the semantic proof that Phase 4A successfully translated V1 intent into v2 contracts.
 
 ---
 
-## Final Acceptance Criteria
+# Dependency graph
 
-Phase 4 is complete only when all of the following are true:
+```text
+Task 0 LLM roles
+   |
+   +--------------------+
+   |                    |
+   v                    v
+Phase 4A             Phase 4B
+Intent migration     Document identity migration
+T1 -> T2 -> T3 -> T4 T5 -> T6 -> T7
+   |                    |
+   +---------+----------+
+             |
+             v
+      backend fast-path parity
+             |
+       +-----+-------------------+
+       |                         |
+       v                         v
+Phase 4C                    Phase 5 backend
+Discourse/coreference       Planner/replan
+T8                          T10 -> T11 -> T12
+       |
+       +-------------+
+                     |
+                     v
+              Phase 4D frontend
+              Public transport T9
+                     |
+                     v
+          production canary / rollout
+```
 
-- v1 document-number/approximate-title/topic-based resolution behavior is available behind v2 adapters;
-- v1 simple-intent strengths are preserved or improved;
-- `Điều 5 Luật An ninh mạng quy định gì?` resolves document + section and routes to fast bounded execution without Planner;
-- approximate references such as `Điều 5 luật an ninh`, `luật số 24`, or `Thông tư 15 của Bộ Công an` can resolve through the proven multi-stage resolver without making the user query complex;
-- People/general RAG/section/summarize/KG fast paths meet or exceed `LLM-Optimize` golden behavior;
-- v1 legacy state/routing fields do not leak into v2 contracts;
-- frontend does not consume raw `SupervisorV2State`/checkpoint/runtime contracts;
-- v1 and v2 chat arms normalize into a stable public frontend transport shape during canary;
-- clarification is structured, selectable, resumable, and survives supported history/reload flows;
-- citations/sources and terminal status render consistently for both fast and complex v2 turns;
-- actual web E2E passes simple RAG, exact section, People, ambiguity/clarification, not-found/low-confidence, cancel/error, and reload scenarios;
-- current v2 ACL, revision binding, scheduler, checkpoint, evidence, and grounding invariants remain intact;
-- true multi-step queries alone enter adaptive planning;
-- semantic-router/planner model assignment is independently configurable through existing Admin LLM Runtime Config;
-- shadow/canary gates pass with v1 still available as rollback.
+Frontend work is a canary dependency, not an artificial blocker on Planner implementation.
+
+---
+
+# Final acceptance criteria
+
+## Phase 4A — Intent migration
+
+- V2 no longer uses regex keywords as the primary classifier when v1 intent intelligence is available.
+- `Nguyễn Văn A là ai?` -> People fast path.
+- greeting prefix + factual remainder -> factual fast path.
+- general legal factual query without named document -> targetless `document.retrieve` fast path.
+- V1 `next_agent`/`pending_intent` do not leak into v2 contracts.
+
+## Phase 4B — Document identity migration
+
+- V1 full/short document number and approximate-title behavior is available behind v2 `DocumentReference`.
+- `Điều 5 Luật An ninh mạng quy định gì?` is a fast bounded query, not complex.
+- low-confidence/ambiguous identity never becomes a fabricated binding.
+
+## Phase 4C — Discourse
+
+- typed focus/coreference works for supported multi-turn flows under current ACL.
+
+## Phase 4D — Frontend
+
+- v1/v2 normalize to one public chat contract.
+- citations, clarification/resume, terminal status, and reload are UI-safe and test-covered.
+
+## Phase 5 — Complex
+
+- only genuinely multi-step/dependent work enters Planner.
+- Planner proposals remain governed by V2 validation/scheduler/evidence/checkpoint boundaries.
+
+## Production canary
+
+- ACL/history/tracing/dependency/capability-readiness blockers are cleared.
+- Backend parity and frontend transport E2E pass.
+- V1 remains rollback until the agreed observation window is clean.
