@@ -35,6 +35,8 @@ from typing import Any
 
 from langgraph.runtime import Runtime
 
+from app.prompts.agents.supervisor_scope import classify_supervisor_scope
+
 from ..adapters.document import binding_id_for_ref
 from ..contracts.binding import DocumentBindingSet
 from ..contracts.request import RequestContext
@@ -139,8 +141,16 @@ def analyze_query(semantic: SemanticContext) -> QueryAnalysis:
             )
             validate_query_analysis(analysis)
             return analysis
-        # A ref-less factual query can only proceed via discovery.
-        domains = {"document"}
+        # An exact unscoped people-identifier query (phone/CCCD/BHXH/name
+        # cue recognized by the deterministic supervisor-scope classifier)
+        # is a people lookup, never document discovery. This branch is
+        # reachable only with no refs at all, so document/section refs keep
+        # document semantics authoritative by construction.
+        if classify_supervisor_scope(semantic.normalized_query) == "people":
+            domains = {"people"}
+        else:
+            # A ref-less factual query can only proceed via discovery.
+            domains = {"document"}
 
     compare = _contains(text, _COMPARE_RES) or len(semantic.document_refs) >= 2
     summary = _contains(text, _SUMMARY_RES)

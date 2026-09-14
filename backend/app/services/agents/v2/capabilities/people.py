@@ -81,6 +81,21 @@ class PeopleCapability:
                 code="INVALID_INPUT",
                 message="people.lookup requires a people.lookup input",
             )
+        # Multi-match seam: the v1-backed service owns grouped-record
+        # dedupe under a private reader (the shadow R64 surface pins the
+        # public reader to ``lookup`` only); legacy single-``lookup``
+        # services keep the first-only path below untouched.
+        lookup_many = getattr(self._service, "lookup_many", None)
+        if lookup_many is None:
+            lookup_many = getattr(self._service, "_lookup_many", None)
+        if callable(lookup_many):
+            try:
+                matches = await lookup_many(request.input.query)
+            except Exception as exc:
+                return dependency_error(
+                    request.task_id, capability="people.lookup", exc=exc
+                )
+            return await self._execute_matches(request, matches)
         try:
             raw = await self._service.lookup(request.input.query)
         except Exception as exc:
@@ -139,6 +154,105 @@ class PeopleCapability:
             status="success",
             data=PeopleLookupOutput(kind="people.lookup", matched=True),
             evidence_uses=(use,),
+            coverage_observations=(),
+            error=None,
+        )
+
+    async def _execute_matches(
+        self, request: AgentRequest, matches: object
+    ) -> AgentResult:
+        """One governed ``EvidenceUse`` per distinct supplied match.
+
+        ``matches`` is the service-owned distinct-person list (see
+        ``V1PeopleLookupService.lookup_many``): every entry carries its
+        stable ``record_id`` plus its minimized task-required mapping, so
+        the capability persists one minimized record per person instead of
+        the legacy first-only use. An empty list is the typed ``not_found``
+        (never a document fallback); malformed entries fail closed.
+        """
+        if matches is None:
+            matches = []
+        if not isinstance(matches, (list, tuple)):
+            return error_result(
+                request.task_id,
+                code="CONTRACT_MISMATCH",
+                message="people.lookup returned a non-sequence match list",
+            )
+        if len(matches) == 0:
+            return AgentResult(
+                contract_version=CONTRACT_VERSION,
+                task_id=request.task_id,
+                status="not_found",
+                data=PeopleLookupOutput(kind="people.lookup", matched=False),
+                evidence_uses=(),
+                coverage_observations=(),
+                error=None,
+            )
+        # Defensive dedupe: the service owns grouped-record dedupe, but a
+        # duplicated handle must never mint two uses for one person.
+        deduped: list = []
+        seen_ids: set[str] = set()
+        for match in matches:
+            record_id = getattr(match, "record_id", None)
+            if record_id is None or str(record_id).strip() == "":
+                return error_result(
+                    request.task_id,
+                    code="CONTRACT_MISMATCH",
+                    message="people.lookup match carries no resolvable record_id",
+                )
+            key = str(record_id)
+            if key in seen_ids:
+                continue
+            seen_ids.add(key)
+            deduped.append(match)
+        acquisition_id = uuid4()
+        fetched_at = datetime.now(timezone.utc)
+        uses: list = []
+        for match in deduped:
+            fields = getattr(match, "fields", None)
+            if not isinstance(fields, Mapping):
+                return error_result(
+                    request.task_id,
+                    code="CONTRACT_MISMATCH",
+                    message="people.lookup match carries no minimized mapping",
+                )
+            required = getattr(match, "required_fields", None)
+            if required is None:
+                required = self._required_fields
+            try:
+                minimized = minimize_people_record(
+                    dict(fields), required_fields=tuple(required)
+                )
+            except EvidenceMinimizationError as exc:
+                return error_result(
+                    request.task_id, code="CONTRACT_MISMATCH", message=str(exc)
+                )
+            try:
+                use = await self._evidence.persist_use(
+                    source=PeopleSourceIdentity(
+                        kind="people", record_id=str(match.record_id)
+                    ),
+                    content=minimized.content,
+                    provenance=Provenance(
+                        acquisition_id=acquisition_id,
+                        fetcher="people.lookup",
+                        fetched_at=fetched_at,
+                    ),
+                    task_id=request.task_id,
+                    purpose="supporting",
+                    target_id=None,
+                )
+            except Exception as exc:
+                return dependency_error(
+                    request.task_id, capability="people.lookup", exc=exc
+                )
+            uses.append(use)
+        return AgentResult(
+            contract_version=CONTRACT_VERSION,
+            task_id=request.task_id,
+            status="success",
+            data=PeopleLookupOutput(kind="people.lookup", matched=True),
+            evidence_uses=tuple(uses),
             coverage_observations=(),
             error=None,
         )

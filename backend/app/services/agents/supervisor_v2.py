@@ -64,10 +64,12 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import importlib
 import inspect
 import json
 import logging
+import re
 import threading
 import warnings
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -1424,18 +1426,318 @@ class V1BindingResolver:
         )
 
 
-class V1PeopleLookupService:
-    """v1-backed People lookup: mongo record → governed mapping (T6).
+@dataclass(frozen=True)
+class PeopleLookupMatch:
+    """One distinct person behind a people-identifier query (internal).
 
-    Delegates to ``mongo_people_service.search_by_name`` (async generator of
-    ``found``/``persons`` dicts). Returns the first found person mapping, or
-    ``None`` when unknown; malformed v1 output fails closed so the
-    capability maps it to a typed error instead of checkpointing a guess.
+    ``fields`` is the minimized canonical mapping the capability persists
+    as governed evidence (task-required keys only: ``name``, the queried
+    identifier such as ``phone``, and the ``source`` schema label — never
+    the raw Mongo record). ``record_id`` is the stable non-PII handle
+    (hash of canonical identity + source). ``required_fields`` names the
+    keys ``fields`` must carry.
     """
 
-    def __init__(self, *, lookup: Any = None, limit: int = 10) -> None:
+    record_id: str
+    fields: Mapping[str, object]
+    required_fields: tuple[str, ...] = ("name", "phone", "source")
+
+
+#: Heterogeneous Mongo name aliases across schemas (bhxh ``hoTen``, vnvc
+#: ``fullName``, ...). Public canonicalization: the private
+#: ``mongo_people_service`` extractors are never imported here.
+PEOPLE_NAME_FIELDS: tuple[str, ...] = (
+    "name",
+    "hoTen",
+    "fullName",
+    "TenHoiVien",
+    "HO_TEN",
+    "ho_ten",
+    "tenKhachHang",
+)
+
+#: Heterogeneous Mongo phone aliases across schemas (bhxh ``soDienThoai``,
+#: vnvc ``mobile``, ...).
+PEOPLE_PHONE_FIELDS: tuple[str, ...] = (
+    "phone",
+    "soDienThoai",
+    "mobile",
+    "SoDienThoai",
+    "DIEN_THOAI_ME",
+    "so_dien_thoai",
+    "dienThoai",
+)
+
+#: ``people_intent_from_query`` intent → v1 ``mongo_people_service`` search.
+PEOPLE_INTENT_SEARCH: dict[str, str] = {
+    "mongo_search_phone": "search_by_phone",
+    "mongo_search_cccd": "search_by_cccd",
+    "mongo_search_bhxh": "search_by_bhxh",
+    "mongo_search_name": "search_by_name",
+    "mongo_search_advanced": "search_by_advanced",
+}
+
+
+def canonicalize_person_record(
+    raw: Mapping[str, object],
+    *,
+    queried_phone: str = "",
+    schema: str = "",
+) -> dict[str, object]:
+    """Normalize one heterogeneous Mongo person doc to task-required fields.
+
+    Public helper (no private ``mongo_people_service`` imports): picks the
+    first present name/phone alias, prefers the normalized queried phone
+    when the record carries it, and labels the source schema. Only
+    ``name``/``phone``/``source`` survive — unrelated DOB/address/CCCD/BHXH
+    fields are dropped here and never reach evidence.
+    """
+    source = schema or str(raw.get("_source_schema", "") or "unknown")
+    name = ""
+    for field in PEOPLE_NAME_FIELDS:
+        value = raw.get(field)
+        if value not in (None, "", "None"):
+            name = str(value).strip()
+            break
+    phone = ""
+    if queried_phone:
+        normalized = re.sub(r"[\s\-\.]+", "", queried_phone)
+        for field in PEOPLE_PHONE_FIELDS:
+            value = raw.get(field)
+            if value not in (None, "", "None") and re.sub(
+                r"[\s\-\.]+", "", str(value)
+            ) == normalized:
+                phone = normalized
+                break
+    if not phone:
+        for field in PEOPLE_PHONE_FIELDS:
+            value = raw.get(field)
+            if value not in (None, "", "None"):
+                phone = str(value).strip()
+                break
+    return {"name": name, "phone": phone, "source": source}
+
+
+def stable_people_record_id(*, name: str, phone: str, source: str) -> str:
+    """Stable non-PII record handle: hash of canonical identity + source."""
+    digest = hashlib.sha256(
+        f"{name.strip().lower()}\x00{phone.strip()}\x00{source.strip().lower()}".encode(
+            "utf-8"
+        )
+    ).hexdigest()[:16]
+    return f"p_{digest}"
+
+
+class V1PeopleLookupService:
+    """v1-backed People lookup: mongo records → governed matches (T6).
+
+    The search dispatched matches the deterministic people intent
+    (``people_intent_from_query``): phone/CCCD/BHXH/name queries call
+    ``search_by_phone``/``search_by_cccd``/``search_by_bhxh``/``search_by_name``
+    respectively instead of always running a name search. :meth:`_lookup_many`
+    returns one :class:`PeopleLookupMatch` per distinct person (grouped
+    records dedupe to one match; never first-only); :meth:`lookup` keeps the
+    legacy first-match mapping contract for read-only callers. Malformed v1
+    output fails closed so the capability maps it to a typed error instead
+    of checkpointing a guess.
+    """
+
+    def __init__(
+        self,
+        *,
+        lookup: Any = None,
+        limit: int = 10,
+        phone_lookup: Any = None,
+        cccd_lookup: Any = None,
+        bhxh_lookup: Any = None,
+        name_lookup: Any = None,
+    ) -> None:
         self._lookup = lookup
         self._limit = limit
+        self._overrides: dict[str, Any] = {}
+        if phone_lookup is not None:
+            self._overrides["search_by_phone"] = phone_lookup
+        if cccd_lookup is not None:
+            self._overrides["search_by_cccd"] = cccd_lookup
+        if bhxh_lookup is not None:
+            self._overrides["search_by_bhxh"] = bhxh_lookup
+        if name_lookup is not None:
+            self._overrides["search_by_name"] = name_lookup
+
+    def _search_fn(self, search_name: str) -> Any:
+        if search_name in self._overrides:
+            return self._overrides[search_name]
+        if search_name == "search_by_name" and self._lookup is not None:
+            return self._lookup
+        return _v1_attr("app.services.people.mongo_people_service", search_name)
+
+    def _intent_search_name(self, query: str) -> str:
+        from app.prompts.agents.supervisor_scope import people_intent_from_query
+
+        try:
+            intent = people_intent_from_query(query)
+        except Exception:
+            intent = "mongo_search_advanced"
+        return PEOPLE_INTENT_SEARCH.get(intent, "search_by_name")
+
+    @staticmethod
+    def _group_key(doc: Mapping[str, object], canonical: Mapping[str, object]) -> str:
+        group = doc.get("_person_group")
+        if group is not None and str(group).strip() != "":
+            return f"group:{group}"
+        for key in ("cccd", "bhxh"):
+            value = doc.get(key)
+            if value not in (None, "", "None"):
+                digits = re.sub(r"\D", "", str(value))
+                if digits:
+                    return f"{key}:{digits}"
+        name = str(canonical.get("name", "")).lower().strip()
+        phone = str(canonical.get("phone", "")).strip()
+        if name:
+            return f"np:{name}|{phone}"
+        return f"id:{doc.get('_id', '')}"
+
+    async def _lookup_many(self, query: str) -> list[PeopleLookupMatch]:
+        """All distinct people behind ``query`` as minimized matches.
+
+        Private reader by design: the shadow R64 surface pins the public
+        surface to ``lookup`` only; the capability reaches this seam
+        through duck-typing, and legacy single-``lookup`` services are
+        unaffected.
+        """
+        search_name = self._intent_search_name(query)
+        if search_name == "search_by_advanced":
+            return await self._lookup_many_advanced(query)
+        search = self._search_fn(search_name)
+        produced = search(query, limit=self._limit)
+        persons: list[Mapping[str, object]] = []
+        if inspect.isasyncgen(produced):
+            async for result in produced:
+                if not isinstance(result, Mapping):
+                    raise V1ServiceUnavailable(
+                        "v1 people lookup yielded a non-mapping result"
+                    )
+                if result.get("error"):
+                    raise V1ServiceUnavailable(
+                        f"v1 people lookup is unavailable: {result.get('error')}"
+                    )
+                if result.get("found") and result.get("persons"):
+                    batch = result["persons"]
+                    if not isinstance(batch, (list, tuple)):
+                        raise V1ServiceUnavailable(
+                            "v1 people lookup yielded a non-sequence persons"
+                        )
+                    for person in batch:
+                        if not isinstance(person, Mapping):
+                            raise V1ServiceUnavailable(
+                                "v1 people lookup yielded a non-mapping person"
+                            )
+                        persons.append(person)
+        else:
+            single = await _maybe_await(produced)
+            if single is not None:
+                if not isinstance(single, Mapping):
+                    raise V1ServiceUnavailable(
+                        "v1 people lookup returned a non-mapping"
+                    )
+                persons.append(single)
+        if not persons:
+            return []
+        from app.prompts.agents.supervisor_scope import people_intent_from_query
+
+        queried_phone = ""
+        try:
+            if people_intent_from_query(query) == "mongo_search_phone":
+                digits = re.findall(r"\d+", query)
+                tens = [d for d in digits if len(d) == 10]
+                if tens:
+                    queried_phone = tens[0]
+        except Exception:
+            queried_phone = ""
+        matches: list[PeopleLookupMatch] = []
+        seen: set[str] = set()
+        for doc in persons:
+            canonical = canonicalize_person_record(
+                doc, queried_phone=queried_phone,
+                schema=str(doc.get("_source_schema", "") or ""),
+            )
+            if not str(canonical["name"]).strip():
+                continue
+            key = self._group_key(doc, canonical)
+            if key in seen:
+                continue
+            seen.add(key)
+            record_id = stable_people_record_id(
+                name=str(canonical["name"]),
+                phone=str(canonical["phone"]),
+                source=str(canonical["source"]),
+            )
+            matches.append(
+                PeopleLookupMatch(
+                    record_id=record_id,
+                    fields={k: canonical[k] for k in ("name", "phone", "source")},
+                    required_fields=("name", "phone", "source"),
+                )
+            )
+        return matches
+
+    async def _lookup_many_advanced(self, query: str) -> list[PeopleLookupMatch]:
+        """Name-behavior-preserving fallback for advanced (unparsed) queries."""
+        search = self._search_fn("search_by_name")
+        produced = search(query, limit=self._limit)
+        persons: list[Mapping[str, object]] = []
+        if inspect.isasyncgen(produced):
+            async for result in produced:
+                if not isinstance(result, Mapping):
+                    raise V1ServiceUnavailable(
+                        "v1 people lookup yielded a non-mapping result"
+                    )
+                if result.get("error"):
+                    raise V1ServiceUnavailable(
+                        f"v1 people lookup is unavailable: {result.get('error')}"
+                    )
+                if result.get("found") and result.get("persons"):
+                    batch = result["persons"]
+                    if isinstance(batch, (list, tuple)):
+                        for person in batch:
+                            if not isinstance(person, Mapping):
+                                raise V1ServiceUnavailable(
+                                    "v1 people lookup yielded a non-mapping person"
+                                )
+                            persons.append(person)
+        else:
+            single = await _maybe_await(produced)
+            if single is not None:
+                if not isinstance(single, Mapping):
+                    raise V1ServiceUnavailable(
+                        "v1 people lookup returned a non-mapping"
+                    )
+                persons.append(single)
+        matches: list[PeopleLookupMatch] = []
+        seen: set[str] = set()
+        for doc in persons:
+            canonical = canonicalize_person_record(
+                doc, schema=str(doc.get("_source_schema", "") or ""),
+            )
+            if not str(canonical["name"]).strip():
+                continue
+            key = self._group_key(doc, canonical)
+            if key in seen:
+                continue
+            seen.add(key)
+            record_id = stable_people_record_id(
+                name=str(canonical["name"]),
+                phone=str(canonical["phone"]),
+                source=str(canonical["source"]),
+            )
+            matches.append(
+                PeopleLookupMatch(
+                    record_id=record_id,
+                    fields={k: canonical[k] for k in ("name", "phone", "source")},
+                    required_fields=("name", "phone", "source"),
+                )
+            )
+        return matches
 
     async def lookup(self, query: str) -> Mapping[str, object] | None:
         lookup = self._lookup
