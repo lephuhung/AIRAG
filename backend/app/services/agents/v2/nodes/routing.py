@@ -128,10 +128,12 @@ def _write_intent(text: str) -> bool:
 
 #: Phase 4A Task 3: v1 intent taxonomy -> v2 (work_type, domains).
 #: Typed intent is advisory semantic input only; the deterministic
-#: ``decide_route()`` policy keeps route authority. ``resolve_doc`` is a
-#: semantic prerequisite (retrieve the document), never complexity.
-#: Intents outside the v1 taxonomy return ``None`` so the caller falls
-#: back to the legacy deterministic path.
+#: ``decide_route()`` policy keeps route authority. ``resolve_doc`` is
+#: deliberately ABSENT: it is a semantic-prerequisite marker without
+#: terminal semantics (the v1 task plan is dropped at the Task-2
+#: boundary), so it falls back to the reference/text path instead of a
+#: fixed mapping. Intents outside the v1 taxonomy likewise return
+#: ``None`` so the caller falls back to the legacy deterministic path.
 _INTENT_ANALYSIS: dict[str, tuple[str, ...]] = {
     "greeting": ("direct", "memory"),
     "personal": ("direct", "memory"),
@@ -145,7 +147,6 @@ _INTENT_ANALYSIS: dict[str, tuple[str, ...]] = {
     "search_section": ("retrieve", "document", "section"),
     "summarize": ("summarize", "document"),
     "kg_query": ("lookup", "knowledge_graph"),
-    "resolve_doc": ("retrieve", "document"),
     "list_docs": ("retrieve", "document"),
     "search_abbr": ("retrieve", "document"),
     "write_summarize": ("retrieve", "write"),
@@ -155,12 +156,31 @@ _INTENT_ANALYSIS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _ref_domains(semantic: SemanticContext) -> set[str]:
+    """Typed reference-derived domains (no lexical signals)."""
+    domains: set[str] = set()
+    if semantic.person_refs:
+        domains.add("people")
+    if semantic.document_refs:
+        domains.add("document")
+    if semantic.section_refs:
+        domains.add("section")
+    return domains
+
+
 def _analysis_for_intent(
     intent: IntentDecision | str,
 ) -> tuple[WorkType, tuple[Domain, ...]] | None:
-    """Map a typed v1 intent onto v2 analysis facts (``None`` when unknown)."""
+    """Map a typed v1 intent onto v2 analysis facts (``None`` when unknown).
+
+    ``resolve_doc`` returns ``None`` by design (see the table comment):
+    without the dropped v1 task plan only the reference/text path knows
+    the terminal semantics (summarize vs section vs search).
+    """
     name = getattr(intent, "intent", intent)
     if not isinstance(name, str):
+        return None
+    if name == "resolve_doc":
         return None
     mapped = _INTENT_ANALYSIS.get(name)
     if mapped is None:
@@ -185,6 +205,26 @@ def _dependency_hints_for(
     )
 
 
+def _typed_work_type(
+    base_work_type: WorkType, domains: set[str], document_ref_count: int
+) -> WorkType:
+    """Work type for the typed path: intent base plus ref-count arity.
+
+    Mirrors the legacy precedence (cross-domain > multi-goal > compare)
+    without any text signal: generic lexical patterns stay demoted under
+    typed intent, while typed reference counts keep their topology.
+    """
+    families = {_FAMILY.get(domain, domain) for domain in domains}
+    dependency_families = set(_DEPENDENCY_FAMILIES) & families
+    if len(dependency_families) >= 2:
+        return "cross_domain"
+    if document_ref_count >= 3:
+        return "multi_goal"
+    if document_ref_count >= 2:
+        return "compare"
+    return base_work_type
+
+
 def analyze_query(
     semantic: SemanticContext, *, intent: IntentDecision | str | None = None
 ) -> QueryAnalysis:
@@ -193,32 +233,34 @@ def analyze_query(
     When a typed v1 ``IntentDecision`` is supplied, its taxonomy mapping
     above is authoritative and the generic regex/keyword classifiers
     (“là ai”, “khác biệt”, “tổng hợp”, “đánh giá”) do not govern.
-    ``IntentDecision``
+    Typed reference-derived semantics survive: the intent-mapped domains
+    are unioned with the reference-derived domains and the
+    reference-count arity rules (two targets → compare, three or more →
+    multi_goal) still apply, mirroring the legacy precedence without any
+    text signal. ``IntentDecision``
     confidence is never projected: frozen ``QueryAnalysis`` carries no
-    confidence field. Without typed intent the legacy deterministic
-    behavior is preserved exactly.
+    confidence field. Without typed intent (or for ``resolve_doc`` /
+    unknown intents) the legacy deterministic behavior is preserved
+    exactly.
     """
     if intent is not None:
         mapped = _analysis_for_intent(intent)
         if mapped is not None:
-            work_type, domains = mapped
+            base_work_type, base_domains = mapped
+            domains = set(base_domains) | _ref_domains(semantic)
             analysis = QueryAnalysis(
-                work_type=work_type,
-                domains=domains,
-                dependency_hints=_dependency_hints_for(set(domains)),
+                work_type=_typed_work_type(
+                    base_work_type, domains, len(semantic.document_refs)
+                ),
+                domains=tuple(sorted(domains)),  # type: ignore[arg-type]
+                dependency_hints=_dependency_hints_for(domains),
             )
             validate_query_analysis(analysis)
             return analysis
-        # Unknown intent name: fall through to the legacy path rather
-        # than acting on an unmapped taxonomy value.
+        # resolve_doc / unknown intent name: fall through to the legacy
+        # path rather than acting on an unmapped taxonomy value.
     text = semantic.normalized_query.casefold()
-    domains: set[str] = set()
-    if semantic.person_refs:
-        domains.add("people")
-    if semantic.document_refs:
-        domains.add("document")
-    if semantic.section_refs:
-        domains.add("section")
+    domains = _ref_domains(semantic)
     if _write_intent(text):
         domains.add("write")
     if _contains(text, _KG_RES):

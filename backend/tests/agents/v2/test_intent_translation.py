@@ -21,7 +21,12 @@ from app.services.agents.v2.contracts.capability import CapabilityRuntimeContext
 from app.services.agents.v2.contracts.conversation import ConversationContext
 from app.services.agents.v2.contracts.request import RequestContext
 from app.services.agents.v2.contracts.routing import QueryAnalysis
-from app.services.agents.v2.contracts.semantic import SemanticContext
+from app.services.agents.v2.contracts.conversation import EntityReference
+from app.services.agents.v2.contracts.semantic import (
+    DocumentReference,
+    SectionReference,
+    SemanticContext,
+)
 from app.services.agents.v2.contracts.state import (
     ExecutionState,
     GraphRuntimeContext,
@@ -142,10 +147,13 @@ def test_typed_intent_maps_to_query_analysis(
 
 
 def test_resolve_doc_is_prerequisite_not_complexity() -> None:
+    # resolve_doc is a prerequisite marker without terminal semantics: it
+    # falls back to the legacy reference/text path, which never treats
+    # resolution cost as execution complexity.
     analysis = analyze_query(
         make_semantic("Tóm tắt Nghị định A"), intent=make_intent("resolve_doc")
     )
-    assert analysis.work_type == "retrieve"
+    assert analysis.work_type == "summarize"
     assert analysis.domains == ("document",)
 
 
@@ -226,6 +234,145 @@ def test_intent_accepts_plain_taxonomy_string() -> None:
         make_semantic("Tóm tắt Nghị định A"), intent="summarize"  # type: ignore[arg-type]
     )
     assert (analysis.work_type, analysis.domains) == ("summarize", ("document",))
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1/5 (I1) — typed path must preserve typed ref-derived semantics.
+# Only generic lexical patterns are demoted; person/document/section refs
+# and reference-count arity (compare/multi_goal) survive typed intent.
+# ---------------------------------------------------------------------------
+
+DOC_ID_A = UUID("11111111-1111-1111-1111-111111111111")
+DOC_ID_B = UUID("22222222-2222-2222-2222-222222222222")
+
+
+def make_resolved_doc_ref(ref_id: str, document_id: UUID) -> DocumentReference:
+    return DocumentReference(
+        ref_id=ref_id,
+        original_span="tài liệu kiểm thử",
+        normalized_reference="tài liệu kiểm thử",
+        requested_role="target",
+        revision_requirement=None,
+        resolution_status="resolved",
+        resolved_document_id=document_id,
+    )
+
+
+def make_section_ref(ref_id: str = "s1") -> SectionReference:
+    return SectionReference(ref_id=ref_id, label="Điều 5", structure_node_id=None)
+
+
+def make_person_ref(ref_id: str = "p1") -> EntityReference:
+    return EntityReference(ref_id=ref_id, kind="person", label="Nguyễn Văn A")
+
+
+def make_semantic_with_refs(
+    query: str,
+    *,
+    document_refs: tuple[DocumentReference, ...] = (),
+    person_refs: tuple[EntityReference, ...] = (),
+    section_refs: tuple[SectionReference, ...] = (),
+) -> SemanticContext:
+    return SemanticContext(
+        contextualized_query=query,
+        normalized_query=query,
+        abbreviations=(),
+        coreferences=(),
+        document_refs=document_refs,
+        person_refs=person_refs,
+        section_refs=section_refs,
+        blocking_ambiguities=(),
+    )
+
+
+def test_typed_search_two_resolved_docs_is_compare() -> None:
+    # I1.1: two resolved targets + typed search must reach the compare
+    # skill (comparison topology), not a targetless retrieve.
+    semantic = make_semantic_with_refs(
+        "so sánh hai văn bản",
+        document_refs=(
+            make_resolved_doc_ref("r1", DOC_ID_A),
+            make_resolved_doc_ref("r2", DOC_ID_B),
+        ),
+    )
+    analysis = analyze_query(semantic, intent=make_intent("search"))
+    assert (analysis.work_type, analysis.domains) == ("compare", ("document",))
+
+
+def test_typed_search_three_resolved_docs_is_multi_goal() -> None:
+    semantic = make_semantic_with_refs(
+        "tra cứu ba văn bản",
+        document_refs=(
+            make_resolved_doc_ref("r1", DOC_ID_A),
+            make_resolved_doc_ref("r2", DOC_ID_B),
+            make_resolved_doc_ref(
+                "r3", UUID("33333333-3333-3333-3333-333333333333")
+            ),
+        ),
+    )
+    analysis = analyze_query(semantic, intent=make_intent("search"))
+    assert (analysis.work_type, analysis.domains) == ("multi_goal", ("document",))
+
+
+def test_typed_search_keeps_section_refs() -> None:
+    # I1.2: spec §9 / Task 7 gate needs QueryAnalysis(retrieve,
+    # document+section) to stay achievable with the classifier wired.
+    semantic = make_semantic_with_refs(
+        "Điều 5 nói gì?",
+        document_refs=(make_resolved_doc_ref("r1", DOC_ID_A),),
+        section_refs=(make_section_ref(),),
+    )
+    analysis = analyze_query(semantic, intent=make_intent("search"))
+    assert (analysis.work_type, analysis.domains) == (
+        "retrieve",
+        ("document", "section"),
+    )
+
+
+def test_typed_search_keeps_person_refs_as_cross_domain() -> None:
+    # Typed ref-derived people + document families stay cross-domain,
+    # exactly as the legacy path derives from the same refs.
+    semantic = make_semantic_with_refs(
+        "tra cứu văn bản",
+        document_refs=(make_resolved_doc_ref("r1", DOC_ID_A),),
+        person_refs=(make_person_ref(),),
+    )
+    typed = analyze_query(semantic, intent=make_intent("search"))
+    legacy = analyze_query(semantic)
+    assert (typed.work_type, typed.domains) == ("cross_domain", ("document", "people"))
+    assert (legacy.work_type, legacy.domains) == (typed.work_type, typed.domains)
+
+
+def test_resolve_doc_falls_back_to_legacy() -> None:
+    # I1.3: resolve_doc carries no terminal semantics (the v1 task plan is
+    # dropped at the Task-2 boundary), so analysis falls back to the
+    # reference/text path instead of a fixed retrieve/document.
+    for query in (
+        "Tóm tắt Nghị định A",
+        "Điều 5 Luật An ninh mạng quy định gì?",
+        "chế độ thai sản được quy định thế nào?",
+    ):
+        semantic = make_semantic(query)
+        typed = analyze_query(semantic, intent=make_intent("resolve_doc"))
+        legacy = analyze_query(semantic)
+        assert (typed.work_type, typed.domains) == (legacy.work_type, legacy.domains)
+
+
+def test_corpus_summarize_named_doc_live_resolve_doc() -> None:
+    # I1.3 driven from the frozen Task-1 corpus: v1 emits resolve_doc as the
+    # first step for "Tóm tắt Nghị định A" (corpus v1_prerequisite), and the
+    # terminal v2 target stays summarize/document.
+    from tests.agents.v2.golden.intent_cases import INTENT_CASES
+
+    case = next(c for c in INTENT_CASES if c["id"] == "summarize-named-doc")
+    assert case["v1_prerequisite"] == "resolve_doc"
+    analysis = analyze_query(
+        make_semantic(case["query"]), intent=make_intent("resolve_doc")
+    )
+    assert (analysis.work_type, analysis.domains) == (
+        case["v2_work_type"],
+        tuple(case["v2_domains"]),
+    )
 
 
 # ---------------------------------------------------------------------------
