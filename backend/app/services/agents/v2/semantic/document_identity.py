@@ -9,8 +9,12 @@ Ownership rules enforced here:
 
 - The full contextualized user question is always passed as ``topic``; the
   bare reference span alone never drives disambiguation.
-- A clear winner becomes ``resolved``; close candidates become
-  ``ambiguous`` with candidate IDs; not-found stays not-found and
+- v1 decision precedence is honoured (``EARLY_EXIT`` binds before the
+  close-second rule is considered). A clear winner becomes ``resolved``;
+  close candidates become ``ambiguous`` only when at least two distinct
+  usable ids survive (the frozen validator rejects 1-candidate
+  ambiguity); a lone medium-confidence hit reads ``unresolved`` — still
+  actionable, never force-bound. Not-found stays not-found and
   low-confidence candidates are never force-bound.
 - Only candidate document UUIDs are projected into the v2 contract.
   Candidate titles/scores/strategies and resolver internals stay out of
@@ -33,11 +37,12 @@ from uuid import UUID
 from app.services.agent.doc_resolver import resolve_candidates
 from app.services.agents.resolve_doc_agent import (
     AMBIGUITY_RATIO,
+    EARLY_EXIT_THRESHOLD,
     HIGH_CONFIDENCE_THRESHOLD,
     MEDIUM_CONFIDENCE_THRESHOLD,
 )
 
-from ..contracts.semantic import DocumentReference
+from ..contracts.semantic import DocumentReference, DocumentResolutionStatus
 
 logger = logging.getLogger(__name__)
 
@@ -77,75 +82,67 @@ def _candidate_uuids(candidates: Sequence[dict]) -> list[UUID]:
     return ordered
 
 
+def _with_identity(
+    reference: DocumentReference,
+    status: DocumentResolutionStatus,
+    resolved_id: UUID | None,
+    candidate_ids: tuple[UUID, ...],
+) -> DocumentReference:
+    """Project identity facts onto the caller's own reference shell."""
+    return reference.model_copy(
+        update={
+            "resolution_status": status,
+            "resolved_document_id": resolved_id,
+            "candidate_document_ids": candidate_ids,
+        }
+    )
+
+
 def reference_from_candidates(
     reference: DocumentReference,
     candidates: Sequence[dict],
 ) -> DocumentReference:
     """Translate ranked v1 candidates into a v2 identity fact.
 
-    Thresholds are the live ``resolve_doc_agent`` constants (imported, not
-    copied): ``HIGH`` clears to ``resolved``; the ``AMBIGUITY_RATIO``
-    close-second rule and the ``MEDIUM`` confirmation band become
-    ``ambiguous`` with candidate IDs; anything below ``MEDIUM`` (including
-    an empty list or zero usable UUIDs) stays ``not_found`` so a
-    low-confidence guess can never become a binding.
+    Thresholds and precedence are the live ``resolve_doc_agent`` constants
+    (imported, not copied): the ``EARLY_EXIT`` check runs first exactly as
+    v1 evaluates it, then the ``AMBIGUITY_RATIO`` close-second rule, then
+    ``HIGH``/``MEDIUM``. ``ambiguous`` is emitted only when at least two
+    distinct usable candidate UUIDs survive (the frozen validator rejects
+    1-candidate ambiguity): a lone ``MEDIUM`` hit, or a close second with
+    only one usable id, reads ``unresolved`` — still actionable, never a
+    force-bind and never contract-invalid. Anything below ``MEDIUM``
+    (including an empty list or zero usable UUIDs) stays ``not_found`` so
+    a low-confidence guess can never become a binding.
     """
     ranked = list(candidates or [])
     if not ranked:
-        return reference.model_copy(
-            update={
-                "resolution_status": "not_found",
-                "resolved_document_id": None,
-                "candidate_document_ids": (),
-            }
-        )
+        return _with_identity(reference, "not_found", None, ())
     top_score = float(ranked[0].get("score", 0.0) or 0.0)
     second_score = float(ranked[1].get("score", 0.0) or 0.0) if len(ranked) > 1 else 0.0
+    # v1 precedence: the early exit binds before ambiguity is considered.
+    if top_score >= EARLY_EXIT_THRESHOLD:
+        top_uuids = _candidate_uuids(ranked[:1])
+        if top_uuids:
+            return _with_identity(reference, "resolved", top_uuids[0], ())
+        # Top id unusable: fall through to the ambiguity/unresolved rules.
+    uuids = tuple(_candidate_uuids(ranked[:_MAX_AMBIGUOUS_CANDIDATES]))
     is_ambiguous = (
         len(ranked) > 1
         and (second_score / max(top_score, 0.01)) >= AMBIGUITY_RATIO
     )
     if is_ambiguous or (MEDIUM_CONFIDENCE_THRESHOLD <= top_score < HIGH_CONFIDENCE_THRESHOLD):
-        uuids = tuple(_candidate_uuids(ranked[:_MAX_AMBIGUOUS_CANDIDATES]))
-        if not uuids:
-            return reference.model_copy(
-                update={
-                    "resolution_status": "not_found",
-                    "resolved_document_id": None,
-                    "candidate_document_ids": (),
-                }
-            )
-        return reference.model_copy(
-            update={
-                "resolution_status": "ambiguous",
-                "resolved_document_id": None,
-                "candidate_document_ids": uuids,
-            }
-        )
+        if len(set(uuids)) >= 2:
+            return _with_identity(reference, "ambiguous", None, uuids)
+        if uuids and top_score >= MEDIUM_CONFIDENCE_THRESHOLD:
+            return _with_identity(reference, "unresolved", None, ())
+        return _with_identity(reference, "not_found", None, ())
     if top_score >= HIGH_CONFIDENCE_THRESHOLD:
-        uuids = _candidate_uuids(ranked[:1])
-        if not uuids:
-            return reference.model_copy(
-                update={
-                    "resolution_status": "not_found",
-                    "resolved_document_id": None,
-                    "candidate_document_ids": (),
-                }
-            )
-        return reference.model_copy(
-            update={
-                "resolution_status": "resolved",
-                "resolved_document_id": uuids[0],
-                "candidate_document_ids": (),
-            }
-        )
-    return reference.model_copy(
-        update={
-            "resolution_status": "not_found",
-            "resolved_document_id": None,
-            "candidate_document_ids": (),
-        }
-    )
+        top_uuids = _candidate_uuids(ranked[:1])
+        if top_uuids:
+            return _with_identity(reference, "resolved", top_uuids[0], ())
+        return _with_identity(reference, "not_found", None, ())
+    return _with_identity(reference, "not_found", None, ())
 
 
 class DocumentIdentityResolver:
@@ -154,15 +151,21 @@ class DocumentIdentityResolver:
     One instance lives for one request/turn (constructed once by the
     ingress owner alongside ``IntentClassifier``). ``resolve_reference()``
     wraps ``resolve_candidates()`` with the full question as ``topic`` and
-    translates the outcome via ``reference_from_candidates()``; every
-    result is cached by ``(reference span, topic, workspace scope)`` so
-    repeated semantic builds resolve once. Concurrent callers share one
-    in-flight resolution per key (single-flight). The resolver performs
-    no capability dispatch and never imports supervisor/graph state.
+    translates the outcome via ``reference_from_candidates()``; the cache
+    stores only the translated identity facts (status, resolved id,
+    candidate ids) by ``(reference span, topic, workspace scope)`` and
+    re-applies them to each caller's own reference, so same-span refs keep
+    their ``ref_id``/role/revision requirement. Repeated semantic builds
+    resolve once. Concurrent callers share one in-flight resolution per
+    key (single-flight). The resolver performs no capability dispatch and
+    never imports supervisor/graph state.
     """
 
     def __init__(self) -> None:
-        self._cache: dict[tuple[str, str, tuple[str, ...], bool], DocumentReference] = {}
+        self._cache: dict[
+            tuple[str, str, tuple[str, ...], bool],
+            tuple[str, UUID | None, tuple[UUID, ...]],
+        ] = {}
         self._locks: dict[tuple[str, str, tuple[str, ...], bool], asyncio.Lock] = {}
 
     @staticmethod
@@ -220,7 +223,8 @@ class DocumentIdentityResolver:
         async with lock:
             hit = self._cache.get(key)
             if hit is not None:
-                return hit
+                status, resolved_id, candidate_ids = hit
+                return _with_identity(reference, status, resolved_id, candidate_ids)  # type: ignore[arg-type]
             result = await resolve_candidates(
                 reference_text or topic,
                 list(scope),
@@ -231,7 +235,11 @@ class DocumentIdentityResolver:
             resolved = reference_from_candidates(
                 reference, result.get("candidates", [])
             )
-            self._cache[key] = resolved
+            self._cache[key] = (
+                resolved.resolution_status,
+                resolved.resolved_document_id,
+                resolved.candidate_document_ids,
+            )
             return resolved
 
     async def resolve_references(
