@@ -38,6 +38,7 @@ from app.services.agent.doc_resolver import (
     _generate_number_candidates,
     _merge_candidates,
     _number_token_present,
+    _query_db,
     _rerank_candidates,
     _topic_tokens,
 )
@@ -61,9 +62,18 @@ PARSE_SOURCES = frozenset({"regex-deterministic", "pipeline-characterization"})
 #: Strategy names the v1 pipeline can emit (doc_resolver stages + topic boost).
 KNOWN_STRATEGIES = frozenset({"db_query", "llm_db", "vector", "topic", "similar"})
 
-#: v1 outcome vocabulary (resolve_doc_agent routing).
+#: v1 outcome vocabulary (resolve_doc_agent routing). ``low_confidence_no_bind``
+#: is the fixture label for the ``_build_resolved_state`` LOW path (agent span
+#: outcome "resolved" but ``document_ids=[]`` — no scoping, no binding).
 KNOWN_STATUSES = frozenset(
-    {"resolved", "ambiguous", "medium_confirm", "not_found", "similar_suggest"}
+    {
+        "resolved",
+        "ambiguous",
+        "medium_confirm",
+        "low_confidence_no_bind",
+        "not_found",
+        "similar_suggest",
+    }
 )
 
 #: Brief-pinned query strings: catches query drift an id-only gate would miss.
@@ -240,6 +250,59 @@ async def test_rerank_empty_when_no_candidate_matches_number() -> None:
     assert out == []
 
 
+class _StubDoc:
+    def __init__(self, doc_id: str, title: str) -> None:
+        self.id = doc_id
+        self.document_title = title
+        self.original_filename = ""
+        self.document_number = ""
+        self.published_date = ""
+        self.issuing_agency = ""
+        self.parent_agency = ""
+        self.document_type = None
+
+
+class _StubScalars:
+    def __init__(self, docs: list[_StubDoc]) -> None:
+        self._docs = docs
+
+    def all(self) -> list[_StubDoc]:
+        return list(self._docs)
+
+
+class _StubResult:
+    def __init__(self, docs: list[_StubDoc]) -> None:
+        self._docs = docs
+
+    def scalars(self) -> _StubScalars:
+        return _StubScalars(self._docs)
+
+
+class _StubQueryDB:
+    """Mimics a populated workspace: arbitrary indexed docs, no filters."""
+
+    def __init__(self, docs: list[_StubDoc]) -> None:
+        self._docs = docs
+
+    async def execute(self, _query: object) -> _StubResult:
+        return _StubResult(self._docs)
+
+
+@pytest.mark.asyncio
+async def test_empty_parse_db_stage_returns_zero_scored_docs() -> None:
+    """I1 code pin: with an all-empty parse ``_query_db`` applies no
+    content filter, so a populated workspace yields arbitrary candidates
+    scored exactly 0.0 (strategy ``db_query``) — and that non-empty list
+    gates off the llm_db/vector/similar stages in ``resolve_candidates``."""
+    parsed = _extract_by_regex("cho tôi xem")
+    assert parsed["confidence"] == "low"
+    db = _StubQueryDB([_StubDoc("doc-x", "X"), _StubDoc("doc-y", "Y")])
+    out = await _query_db(parsed, ["ws-1"], db)  # type: ignore[arg-type]
+    assert len(out) == 2
+    assert all(c["score"] == 0.0 for c in out)
+    assert all(c["strategy"] == "db_query" for c in out)
+
+
 def test_merge_agreement_boost_matches_v1_semantics() -> None:
     """Two strategies agreeing on one doc boost it by +30% of the second
     score and record both strategies."""
@@ -266,6 +329,38 @@ def test_status_thresholds_match_live_v1_constants() -> None:
     # Ratio predicate on synthetic pairs (mirrors resolve_doc_agent logic):
     assert (0.80 / 1.00) >= AMBIGUITY_RATIO, "close 2nd must read ambiguous"
     assert not (0.50 / 1.00) >= AMBIGUITY_RATIO, "distant 2nd must read clear"
+
+
+def _case(case_id: str) -> dict:
+    return next(c for c in DOCUMENT_IDENTITY_CASES if c["id"] == case_id)
+
+
+def test_low_confidence_case_runs_db_stage_only() -> None:
+    """I1: an all-empty parse must not claim the llm/vector/similar stages.
+    ``_query_db`` builds only workspace+status filters for it, so a populated
+    workspace short-circuits every later stage."""
+    pipe = _case("low-confidence-no-candidate")["v1_pipeline"]
+    assert pipe["stages"] == ["db_query"], (
+        "empty parse never reaches llm_db/vector/similar in a populated workspace"
+    )
+    assert pipe["expected_status"] == "low_confidence_no_bind"
+
+
+def test_section_query_status_never_exceeds_exact_title() -> None:
+    """I2: for the same matched document the section query scores no higher
+    than the exact-title query (same +0.25 type bonus, strictly lower keyword
+    ratio from the noise token), so "section resolved" must imply
+    "exact-title resolved"."""
+    exact = _case("exact-title")
+    section = _case("canonical-section-query")
+    assert not (
+        section["v1_pipeline"]["expected_status"] == "resolved"
+        and exact["v1_pipeline"]["expected_status"] != "resolved"
+    ), "mutually exclusive statuses: section resolved implies exact resolved"
+    exact_kw = exact["v1_parse"]["title_keywords"]
+    section_kw = section["v1_parse"]["title_keywords"]
+    assert set(exact_kw) <= set(section_kw), "same matchable title signal"
+    assert len(section_kw) > len(exact_kw), "noise token dilutes the ratio"
 
 
 def test_pipeline_expectations_use_known_vocabulary() -> None:

@@ -323,11 +323,17 @@ DOCUMENT_IDENTITY_CASES: tuple[dict, ...] = (
             "confidence": "low",
         },
         "v1_pipeline": {
-            "stages": ["db_query", "llm_db", "vector", "similar"],
-            "expected_status": "not_found",
+            "stages": ["db_query"],
+            "expected_status": "low_confidence_no_bind",
             "condition": "no identity signal at all: action words strip to "
-            "nothing, so every stage runs dry and only the fuzzy "
-            "similar-title fallback (or plain not-found guidance) remains",
+            "nothing, so `_query_db` applies no content filter — in a "
+            "populated workspace it returns up to 10 arbitrary documents "
+            "scored 0.0, and that non-empty list gates off llm_db/vector/"
+            "similar. Downstream the single-winner branch takes the "
+            "`_build_resolved_state` LOW path (score < 0.30): agent span "
+            "outcome 'resolved' but `document_ids=[]`, i.e. no scoping and "
+            "no binding. Only an empty/cold workspace runs every stage dry "
+            "and reads `not_found` (or `similar_suggest`).",
         },
     },
     {
@@ -349,11 +355,18 @@ DOCUMENT_IDENTITY_CASES: tuple[dict, ...] = (
         },
         "v1_pipeline": {
             "stages": ["db_query", "llm_db", "vector", "topic"],
-            "expected_status": "resolved",
+            "expected_status": "medium_confirm",
             "condition": "binding-spec section 9 canonical case: the "
             "section_reference (Điều 5) must survive into the resolver "
             "output alongside document identity — Task 7 bridges it to the "
-            "v2 section contract",
+            "v2 section contract. Status is representative like its "
+            "exact-title sibling: same +0.25 `luat` bonus but a strictly "
+            "lower keyword ratio (noise token 'gì?'), so for any matched "
+            "document this query scores no higher than `exact-title`; a "
+            "catalog hit on every keyword can still clear HIGH (0.60). "
+            "Task 7 acceptance concerns the pipeline shape (identity + "
+            "section_reference preserved, fast bounded retrieval), not a "
+            "guaranteed `resolved` outcome.",
         },
     },
 )
