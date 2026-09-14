@@ -303,6 +303,8 @@ def _harness(
     bindings: DocumentBindingSet | None = None,
     allowed: frozenset[str] | None = None,
 ) -> tuple[FakeRetrieveCapability, FakeLeases, GraphRuntimeContext]:
+    from app.services.agent.runtime_selector import PlanBindingResolver
+
     capability = FakeRetrieveCapability()
     leases = FakeLeases()
     runtime = _capability_runtime(run_id, allowed)
@@ -315,6 +317,11 @@ def _harness(
             capability_registry=registry,
             retention_leases=leases,
             evidence_hydrator=FakeHydrator(capability),
+            # Production ingress wires the request-scoped resolver the
+            # shared scheduler feeds before dispatch; targeted retrieve
+            # harnesses must wire one too (F3 raises on unwired targeted
+            # plans instead of masquerading as a denial).
+            pinned_target_resolver=PlanBindingResolver(),
         ),
     )
     return capability, leases, context

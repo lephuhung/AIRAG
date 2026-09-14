@@ -513,12 +513,18 @@ class PlanBindingResolver:
     """The 15-line pure ``PinnedTargetResolver`` (T6 handoff, T7 ships it).
 
     Fed the authoritative checkpointed plan/bindings — ``feed`` is owned by
-    the outer runner (T8), which refreshes it from the latest checkpoint
-    before each resume-invoke. Until fed (e.g. a first-turn read before any
-    plan checkpoint exists), ``resolve`` returns ``None`` and the read
-    capabilities fail closed per their contract — never a guessed target.
-    The resolver never reads supervisor/graph state and is never fed from
-    ``AgentRequest`` or ``CapabilityRuntimeContext``.
+    the shared ``TaskScheduler`` at dispatch time (authoritative; installs
+    the checkpointed plan + bindings immediately before every dispatch, so
+    fresh non-resume turns resolve) with the outer runner (T8) resume
+    pre-feed kept as an idempotent compatibility refresh. This is not
+    scheduler input materialization: ``TaskSpec.input`` is never mutated,
+    rewritten, or lazily built — the feed only installs request-scoped
+    authority the scheduler was already handed. Until fed (e.g. a
+    first-turn read before any plan checkpoint exists), ``resolve`` returns
+    ``None`` and the read capabilities fail closed per their contract —
+    never a guessed target. The resolver never reads supervisor/graph
+    state and is never fed from ``AgentRequest`` or
+    ``CapabilityRuntimeContext``.
     """
 
     def __init__(self) -> None:
@@ -526,25 +532,37 @@ class PlanBindingResolver:
         self._documents: dict[str, Any] = {}
 
     def feed(self, plan: Any, bindings: Any) -> None:
-        """Install the authoritative checkpointed plan + binding set."""
+        """Install the authoritative checkpointed plan + binding set.
+
+        Atomic: the replacement mapping is built locally first, then
+        ``_plan`` and ``_documents`` are assigned together. On any build
+        failure no stale authority is kept (both slots are cleared) and
+        the error propagates so the scheduler surfaces it instead of
+        dispatching against a half-installed map.
+        """
         from app.services.agents.v2.capabilities import ResolvedTarget
 
+        try:
+            documents: dict[str, Any] = {}
+            for binding in bindings.bindings or ():
+                unit = next(
+                    (
+                        item
+                        for item in plan.target_units
+                        if item.binding_id == binding.binding_id
+                    ),
+                    None,
+                )
+                if unit is None:
+                    continue
+                documents[unit.target_id] = ResolvedTarget(
+                    target_unit=unit, document=binding
+                )
+        except Exception:
+            self._plan = None
+            self._documents = {}
+            raise
         self._plan = plan
-        documents: dict[str, Any] = {}
-        for binding in bindings.bindings or ():
-            unit = next(
-                (
-                    item
-                    for item in plan.target_units
-                    if item.binding_id == binding.binding_id
-                ),
-                None,
-            )
-            if unit is None:
-                continue
-            documents[unit.target_id] = ResolvedTarget(
-                target_unit=unit, document=binding
-            )
         self._documents = documents
 
     def resolve(self, target_id: str) -> Any | None:

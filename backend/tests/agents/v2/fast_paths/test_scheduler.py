@@ -980,8 +980,7 @@ def _retrieve_stack(task_id: str = "T1", *, target_ids=("t1",), chunks=None):
         capability_runtime=runtime,
         services=services(registry=registry, leases=FakeLeaseRepo(events)),
     )
-    if hasattr(ctx.services, "pinned_target_resolver"):
-        ctx.services.pinned_target_resolver = resolver
+    ctx.services.pinned_target_resolver = resolver
     state = make_state(plan=plan, task_results=())
     state = SupervisorV2State(
         contract_version=state["contract_version"],
@@ -1109,25 +1108,32 @@ async def test_scheduler_feed_replaces_stale_mappings_across_replans() -> None:
 
 
 @pytest.mark.asyncio
-async def test_scheduler_missing_resolver_stays_fail_closed() -> None:
-    """No pinned-target service: scoped dispatch denies, provider uncalled."""
-    from app.services.agents.v2.execution.scheduler import TaskScheduler
+async def test_scheduler_missing_resolver_raises_not_denies() -> None:
+    """F3 round 1: a targeted plan with no resolver raises SchedulerError.
+
+    A wiring fault must never masquerade as an ACL denial: the scheduler
+    raises instead of letting the capability deny with SCOPE_VIOLATION.
+    Uses a fresh unfed resolver fixture (no private-state poking).
+    """
+    from app.services.agent.runtime_selector import PlanBindingResolver
+    from app.services.agents.v2.execution.scheduler import (
+        SchedulerError,
+        TaskScheduler,
+    )
 
     stack = _retrieve_stack()
-    if hasattr(stack["runtime"].services, "pinned_target_resolver"):
-        stack["runtime"].services.pinned_target_resolver = None
-    # The capability keeps its own unfed resolver: unknown targets deny.
-    stack["resolver"]._documents.clear()
-    stack["resolver"]._plan = None
-    report = await TaskScheduler(stack["registry"]).execute(
-        stack["plan"],
-        stack["runtime"],
-        bindings=stack["bindings"],
-    )
-    assert len(report.results) == 1
-    assert report.results[0].status == "denied"
-    assert report.results[0].error is not None
-    assert report.results[0].error.code == "SCOPE_VIOLATION"
+    stack["runtime"].services.pinned_target_resolver = None
+    # The capability resolves through a fresh, unfed resolver: without the
+    # scheduler feed every scoped target is unknown.
+    fresh = PlanBindingResolver()
+    assert fresh.resolve("t1") is None
+    stack["registry"].get("document.retrieve")._resolver = fresh
+    with pytest.raises(SchedulerError):
+        await TaskScheduler(stack["registry"]).execute(
+            stack["plan"],
+            stack["runtime"],
+            bindings=stack["bindings"],
+        )
     assert stack["service"].calls == []
 
 
@@ -1196,3 +1202,246 @@ async def test_scheduler_unscoped_retrieve_needs_no_pinned_targets() -> None:
     assert service.calls[0]["allowed_targets"] == ()
     assert evidence.calls[0]["purpose"] == "supporting"
     assert evidence.calls[0]["target_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# P0 live-gate fix round 1 (F3/F4): wiring faults never masquerade as denial;
+# feed is atomic with no stale authority.
+#
+# Targeted plans (a document.retrieve task with non-empty target_ids) with
+# an absent / unfeedable / failing resolver must raise typed SchedulerError
+# with a warning — never a denied/SCOPE_VIOLATION that looks like an ACL
+# decision. Targetless plans with no resolver stay supported, and a genuine
+# target mismatch after a successful feed stays denied/SCOPE_VIOLATION.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_scheduler_targeted_plan_without_resolver_raises() -> None:
+    """F3: targeted plan + absent resolver raises, provider never called."""
+    from app.services.agents.v2.contracts.state import RuntimeServices
+    from app.services.agents.v2.execution.scheduler import (
+        SchedulerError,
+        TaskScheduler,
+    )
+
+    stack = _retrieve_stack()
+    assert stack["resolver"].resolve("t1") is None  # fresh fixture is unfed
+    fresh = PlanBindingResolverFresh()
+    assert fresh.resolve("t1") is None
+    ctx = GraphRuntimeContext(
+        capability_runtime=stack["runtime"].capability_runtime,
+        services=RuntimeServices(
+            capability_registry=stack["registry"],
+            retention_leases=FakeLeaseRepo(stack["events"]),
+            pinned_target_resolver=None,
+        ),
+    )
+    with pytest.raises(SchedulerError):
+        await TaskScheduler(stack["registry"]).execute(
+            stack["plan"], ctx, bindings=stack["bindings"]
+        )
+    assert stack["service"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_targeted_plan_with_unfeedable_resolver_raises() -> None:
+    """F3: targeted plan + non-callable feed raises instead of denying."""
+    from types import SimpleNamespace
+
+    from app.services.agents.v2.contracts.state import RuntimeServices
+    from app.services.agents.v2.execution.scheduler import (
+        SchedulerError,
+        TaskScheduler,
+    )
+
+    stack = _retrieve_stack()
+    ctx = GraphRuntimeContext(
+        capability_runtime=stack["runtime"].capability_runtime,
+        services=RuntimeServices(
+            capability_registry=stack["registry"],
+            retention_leases=FakeLeaseRepo(stack["events"]),
+            pinned_target_resolver=SimpleNamespace(feed=None),
+        ),
+    )
+    with pytest.raises(SchedulerError):
+        await TaskScheduler(stack["registry"]).execute(
+            stack["plan"], ctx, bindings=stack["bindings"]
+        )
+    assert stack["service"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_scheduler_targeted_plan_with_failing_feed_raises_and_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """F3: targeted plan + exploding feed raises with warning observability."""
+    from app.services.agents.v2.contracts.state import RuntimeServices
+    from app.services.agents.v2.execution.scheduler import (
+        SchedulerError,
+        TaskScheduler,
+    )
+
+    stack = _retrieve_stack()
+
+    class _ExplodingFeed:
+        def feed(self, plan, bindings):
+            raise RuntimeError("boom")
+
+    ctx = GraphRuntimeContext(
+        capability_runtime=stack["runtime"].capability_runtime,
+        services=RuntimeServices(
+            capability_registry=stack["registry"],
+            retention_leases=FakeLeaseRepo(stack["events"]),
+            pinned_target_resolver=_ExplodingFeed(),
+        ),
+    )
+    with caplog.at_level("WARNING"):
+        with pytest.raises(SchedulerError):
+            await TaskScheduler(stack["registry"]).execute(
+                stack["plan"], ctx, bindings=stack["bindings"]
+            )
+    assert stack["service"].calls == []
+    assert any(
+        "pinned-target" in record.getMessage() for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_scheduler_targetless_plan_without_resolver_succeeds() -> None:
+    """F3: targetless plans stay supported with no resolver (shadow-safe)."""
+    from app.services.agents.v2.contracts.state import RuntimeServices
+    from app.services.agents.v2.execution.scheduler import TaskScheduler
+
+    stack = _retrieve_stack()
+    # Reuse the unscoped shape: no target_ids, no target_units, no resolver.
+    from app.services.agent.runtime_selector import PlanBindingResolver
+    from app.services.agents.v2.capabilities.document import (
+        DocumentRetrieveCapability,
+        RevisionRetrievedChunk,
+    )
+    from app.services.agents.v2.contracts.capability import DocumentRetrieveInput
+    from app.services.agents.v2.contracts.locators import ChunkRangeLocator
+
+    plan = TaskPlan(
+        contract_version="2.0",
+        plan_id="plan-unscoped-noresolver",
+        goal="broad query",
+        target_units=(),
+        tasks=(
+            TaskSpec(
+                task_id="U9",
+                capability="document.retrieve",
+                task_objective="broad query",
+                input=DocumentRetrieveInput(
+                    kind="document.retrieve", query="broad", target_ids=()
+                ),
+                depends_on=(),
+                origin=InitialTaskOrigin(kind="initial"),
+            ),
+        ),
+    )
+    chunk = RevisionRetrievedChunk(
+        document_id=DOCUMENT_ID,
+        document_revision=RETRIEVE_REVISION,
+        locator=ChunkRangeLocator(kind="chunk_range", start="c1", end="c1"),
+        content="workspace chunk",
+        score=0.5,
+        target_id=None,
+    )
+    resolver = PlanBindingResolver()
+    service = _FeedFakeRetrieval((chunk,))
+    evidence = _FeedFakeEvidence()
+    capability = DocumentRetrieveCapability(
+        service=service, evidence=evidence, resolver=resolver
+    )
+    runtime = capability_runtime(allowed=frozenset({"document.retrieve"}))
+    registry = build_capability_registry(
+        [CapabilityRegistration(capability=capability)], runtime
+    )
+    events: list[str] = []
+    ctx = GraphRuntimeContext(
+        capability_runtime=runtime,
+        services=RuntimeServices(
+            capability_registry=registry,
+            retention_leases=FakeLeaseRepo(events),
+            pinned_target_resolver=None,
+        ),
+    )
+    report = await TaskScheduler(registry).execute(plan, ctx, bindings=None)
+    assert len(report.results) == 1
+    assert report.results[0].status == "success"
+    assert len(service.calls) == 1
+
+
+def PlanBindingResolverFresh():
+    """Fresh unfed resolver fixture (no private-state poking)."""
+    from app.services.agent.runtime_selector import PlanBindingResolver
+
+    return PlanBindingResolver()
+
+
+def test_plan_binding_feed_is_atomic_and_clears_stale_on_failure() -> None:
+    """F4: a mid-feed exception leaves no stale authority behind."""
+    from types import SimpleNamespace
+
+    from app.services.agent.runtime_selector import PlanBindingResolver
+
+    stack = _retrieve_stack()
+    resolver = PlanBindingResolverFresh()
+    resolver.feed(stack["plan"], stack["bindings"])
+    assert resolver.resolve("t1") is not None
+
+    class _BadBindings:
+        @property
+        def bindings(self):
+            return (SimpleNamespace(),)  # no binding_id -> AttributeError
+
+    with pytest.raises(Exception):
+        resolver.feed(stack["plan"], _BadBindings())
+    assert resolver.resolve("t1") is None
+    assert resolver.resolve("t2") is None
+
+
+def test_plan_binding_feed_replaces_mapping_without_stale_leftovers() -> None:
+    """F4: a successful re-feed installs the new map whole (no leftovers)."""
+    from app.services.agent.runtime_selector import PlanBindingResolver
+    from app.services.agents.v2.contracts.locators import SectionLocator
+
+    stack = _retrieve_stack()
+    resolver = PlanBindingResolverFresh()
+    resolver.feed(stack["plan"], stack["bindings"])
+    assert resolver.resolve("t1") is not None
+
+    other_doc = UUID("33333333-3333-3333-3333-333333333333")
+    other_rev = "44444444-4444-4444-4444-444444444444"
+    plan_b = TaskPlan(
+        contract_version="2.0",
+        plan_id="plan-retrieve-b",
+        goal="factual query b",
+        target_units=(
+            TargetUnit(
+                target_id="t2",
+                binding_id="b_t2",
+                requested_locator=SectionLocator(
+                    kind="section", structure_node_id="node-9"
+                ),
+                completion_criteria=(),
+            ),
+        ),
+        tasks=(),
+    )
+    bindings_b = DocumentBindingSet(
+        bindings=(
+            ScopedDocument(
+                binding_id="b_t2",
+                document_id=other_doc,
+                document_revision=other_rev,
+                role="target",
+            ),
+        ),
+        revision_requirement_refs=(),
+    )
+    resolver.feed(plan_b, bindings_b)
+    assert resolver.resolve("t1") is None
+    assert resolver.resolve("t2") is not None

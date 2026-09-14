@@ -770,6 +770,26 @@ async def _run_pre_dispatch_guards(
             )
 
 
+def _plan_has_targeted_document_tasks(plan: Any) -> bool:
+    """True when the plan dispatches a scoped ``document.retrieve`` task.
+
+    Narrow by construction: only a ``document.retrieve`` task whose input
+    carries non-empty ``target_ids`` counts. Targetless plans (empty
+    ``target_ids``, other capabilities, or no tasks) return False, so the
+    shadow rig and unscoped retrieval never require a resolver. Duck-typed
+    via ``_slot`` so checkpoint-serde mappings read identically to live
+    models.
+    """
+    tasks = _slot(plan, "tasks") or ()
+    for task in tasks:
+        if _slot(task, "capability") != "document.retrieve":
+            continue
+        task_input = _slot(task, "input") or {}
+        if tuple(_slot(task_input, "target_ids") or ()):
+            return True
+    return False
+
+
 def _feed_pinned_targets(
     plan: TaskPlan,
     bindings: DocumentBindingSet | None,
@@ -785,30 +805,77 @@ def _feed_pinned_targets(
     ``pinned_target_resolver`` service (the exact instance the document
     capabilities resolve through) immediately before the first dispatch.
     The feed replaces the whole mapping, so replans/resumes never inherit
-    stale targets. A missing/unfeedable resolver preserves fail-closed
-    dispatch (capabilities deny unknown targets); a feed failure logs and
-    keeps the resolver unfed rather than crashing the turn into an error.
+    stale targets. The resume-path pre-feed stays as an idempotent
+    compatibility refresh; this dispatch-time feed is the authoritative
+    owner (not scheduler input materialization: ``TaskSpec.input`` is
+    never mutated).
+
+    A wiring fault on a TARGETED plan (no resolver, no callable ``feed``,
+    missing plan/bindings, or a ``feed`` exception) raises typed
+    ``SchedulerError`` with a warning — it must never masquerade as a
+    capability ``denied``/``SCOPE_VIOLATION`` authorization decision. A
+    genuine target mismatch AFTER a successful feed still fails closed in
+    the capability (``denied``/``SCOPE_VIOLATION``). Targetless plans with
+    no resolver remain supported (no-op).
     """
+    targeted = _plan_has_targeted_document_tasks(plan)
     try:
         resolver = getattr(
             getattr(runtime, "services", None), "pinned_target_resolver", None
         )
     except Exception:
-        return
+        resolver = None
     if resolver is None:
+        if targeted:
+            logger.warning(
+                "pinned-target feed has no resolver for a targeted plan; "
+                "raising instead of reporting a wiring fault as a denial"
+            )
+            raise SchedulerError(
+                "targeted document.retrieve tasks require a wired "
+                "pinned-target resolver; refusing to report a wiring fault "
+                "as an authorization denial"
+            )
         return
     feed = getattr(resolver, "feed", None)
     if not callable(feed):
+        if targeted:
+            logger.warning(
+                "pinned-target resolver has no callable feed for a targeted "
+                "plan; raising instead of reporting a wiring fault as a denial"
+            )
+            raise SchedulerError(
+                "pinned-target resolver exposes no callable feed; refusing "
+                "to report a wiring fault as an authorization denial"
+            )
         return
     if plan is None or bindings is None:
+        if targeted:
+            logger.warning(
+                "pinned-target feed is missing checkpointed plan/bindings "
+                "for a targeted plan; raising instead of denying"
+            )
+            raise SchedulerError(
+                "targeted document.retrieve tasks require checkpointed plan "
+                "+ bindings for the pinned-target feed; refusing to report "
+                "a wiring fault as an authorization denial"
+            )
         return
     try:
         feed(plan, bindings)
-    except Exception:
+    except SchedulerError:
+        raise
+    except Exception as exc:
         logger.warning(
-            "pinned-target feed failed; dispatch continues fail-closed",
+            "pinned-target feed failed; raising instead of reporting a "
+            "wiring fault as a denial",
             exc_info=True,
         )
+        if targeted:
+            raise SchedulerError(
+                "pinned-target feed failed; refusing to report a wiring "
+                "fault as an authorization denial"
+            ) from exc
 
 
 async def execute_ready_tasks(

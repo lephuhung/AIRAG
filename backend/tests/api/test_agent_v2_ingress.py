@@ -813,3 +813,241 @@ def test_dead_v2_turn_runner_removed():
     import app.services.agent.runtime_selector as selector
 
     assert not hasattr(selector, "run_v2_turn_sse")
+
+
+# ---------------------------------------------------------------------------
+# P0 live-gate fix round 1 (F1/F2): pinned-target wiring coverage.
+#
+# F1 kills deleting ``pinned_target_resolver=plan_resolver`` in
+# ``build_v2_ingress``: the identity assertion fails and the fresh scoped
+# dispatch below denies without ever reaching the provider. F2 kills
+# deleting the ``build_runtime_services`` pass-through seam the same way.
+# ---------------------------------------------------------------------------
+
+
+def test_build_runtime_services_passes_through_pinned_resolver():
+    """F2: the single construction seam forwards the resolver by identity."""
+    from app.services.agents.supervisor_v2 import build_runtime_services
+
+    sentinel = object()
+    services = build_runtime_services(pinned_target_resolver=sentinel)
+    assert services.pinned_target_resolver is sentinel
+
+
+def test_build_runtime_services_defaults_pinned_resolver_to_none():
+    """F2: absent resolver defaults to None (targetless plans stay supported)."""
+    from app.services.agents.supervisor_v2 import build_runtime_services
+
+    assert build_runtime_services().pinned_target_resolver is None
+
+
+def test_ingress_pinned_resolver_wired_to_dispatch():
+    """F1: ingress wires the exact resolver; a fresh scoped turn reaches the provider.
+
+    Builds the REAL ``build_v2_ingress`` (no ingress bypass), asserts the
+    runtime-only ``pinned_target_resolver`` service ``is`` the ingress
+    ``plan_resolver`` the document capabilities resolve through, compiles the
+    real supervisor graph against ``InMemorySaver`` (sole-scheduler shape),
+    then dispatches a fresh non-resume hard-scoped ``document.retrieve``
+    request through the WIRED registry via the shared ``TaskScheduler`` with
+    test-double IO backings (retrieval/evidence/leases/semantic/binding)
+    injected around — never instead of — the wired resolver.
+    """
+    import asyncio
+    from uuid import UUID, uuid4
+
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    import app.services.agent.runtime_selector as selector
+    from app.services.agents.supervisor_v2 import create_supervisor_v2_graph
+    from app.services.agents.v2.capabilities.document import RevisionRetrievedChunk
+    from app.services.agents.v2.contracts.binding import (
+        DocumentBindingSet,
+        ScopedDocument,
+    )
+    from app.services.agents.v2.contracts.capability import DocumentRetrieveInput
+    from app.services.agents.v2.contracts.evidence import EvidenceUseRef
+    from app.services.agents.v2.contracts.locators import (
+        ChunkRangeLocator,
+        SectionLocator,
+    )
+    from app.services.agents.v2.contracts.planning import (
+        InitialTaskOrigin,
+        TargetUnit,
+        TaskPlan,
+        TaskSpec,
+    )
+    from app.services.agents.v2.execution.scheduler import TaskScheduler
+
+    workspace_id = uuid4()
+    document_id = UUID("11111111-1111-1111-1111-111111111111")
+    revision = "22222222-2222-2222-2222-222222222222"
+
+    class _FakeSession:
+        async def commit(self):
+            return None
+
+        async def rollback(self):
+            return None
+
+        async def close(self):
+            return None
+
+    async def _fake_preprocess(raw_query: str):
+        from types import SimpleNamespace as _NS
+
+        return _NS(normalized_query=raw_query)
+
+    class _FakeRetrieval:
+        def __init__(self, chunks):
+            self._chunks = tuple(chunks)
+            self.calls: list[dict] = []
+
+        async def retrieve(self, query, *, top_k, allowed_targets, workspace_ids):
+            self.calls.append(
+                {
+                    "query": query,
+                    "top_k": top_k,
+                    "allowed_targets": allowed_targets,
+                    "workspace_ids": workspace_ids,
+                }
+            )
+            return self._chunks
+
+    class _FakeEvidence:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        async def persist_use(
+            self, *, source, content, provenance, task_id, purpose, target_id
+        ):
+            ref = EvidenceUseRef(use_id=uuid4())
+            self.calls.append(
+                {
+                    "task_id": task_id,
+                    "purpose": purpose,
+                    "target_id": target_id,
+                    "use_id": ref.use_id,
+                }
+            )
+            return ref
+
+    class _FakeLeaseSession:
+        def __init__(self, events):
+            self._events = events
+
+        async def commit(self):
+            self._events.append("commit")
+
+    class _FakeLeases:
+        def __init__(self):
+            self.events: list[str] = []
+            self.calls: list[tuple] = []
+            self.session = _FakeLeaseSession(self.events)
+
+        async def acquire_or_refresh(self, run_id, revision_id=None, evidence_use_id=None, **kwargs):
+            self.calls.append((run_id, revision_id, evidence_use_id))
+            self.events.append(f"acquire:{evidence_use_id}")
+            return None
+
+    async def _main():
+        async with selector.build_v2_ingress(
+            user_id=uuid4(),
+            authenticated_workspace_ids=[workspace_id],
+            requested_workspace_ids=None,
+            raw_query="\u0110i\u1ec1u 5 n\u00f3i g\u00ec?",
+            thread_id=f"thread-{uuid4().hex[:8]}",
+            session_factory=lambda: _FakeSession(),
+            lease_session_factory=lambda: _FakeSession(),
+            preprocess=_fake_preprocess,
+            available_services=frozenset(
+                {"v1-people", "v1-document-search", "v1-revision-retrieval"}
+            ),
+        ) as ingress:
+            # The wiring under repair: exact instance identity.
+            assert (
+                ingress.runtime_context.services.pinned_target_resolver
+                is ingress.plan_resolver
+            )
+            # Compiled-graph shape: the sole-scheduler dispatch path exists.
+            compiled = create_supervisor_v2_graph(InMemorySaver())
+            assert "execute" in compiled.get_graph().nodes
+            # Inject IO doubles around (never instead of) the wired resolver.
+            registry = ingress.runtime_context.services.capability_registry
+            capability = registry.get("document.retrieve")
+            assert capability._resolver is ingress.plan_resolver
+            chunks = (
+                RevisionRetrievedChunk(
+                    document_id=document_id,
+                    document_revision=revision,
+                    locator=ChunkRangeLocator(
+                        kind="chunk_range", start="c1", end="c1"
+                    ),
+                    content="secret chunk",
+                    score=0.9,
+                    target_id="t1",
+                ),
+            )
+            retrieval = _FakeRetrieval(chunks)
+            evidence = _FakeEvidence()
+            capability._service = retrieval
+            capability._evidence = evidence
+            leases = _FakeLeases()
+            ingress.runtime_context.services.retention_leases = leases
+            plan = TaskPlan(
+                contract_version="2.0",
+                plan_id="plan-ingress-pinned",
+                goal="factual query",
+                target_units=(
+                    TargetUnit(
+                        target_id="t1",
+                        binding_id="b_t1",
+                        requested_locator=SectionLocator(
+                            kind="section", structure_node_id="node-5"
+                        ),
+                        completion_criteria=(),
+                    ),
+                ),
+                tasks=(
+                    TaskSpec(
+                        task_id="T1",
+                        capability="document.retrieve",
+                        task_objective="factual query",
+                        input=DocumentRetrieveInput(
+                            kind="document.retrieve",
+                            query="lan bmnn",
+                            target_ids=("t1",),
+                        ),
+                        depends_on=(),
+                        origin=InitialTaskOrigin(kind="initial"),
+                    ),
+                ),
+            )
+            bindings = DocumentBindingSet(
+                bindings=(
+                    ScopedDocument(
+                        binding_id="b_t1",
+                        document_id=document_id,
+                        document_revision=revision,
+                        role="target",
+                    ),
+                ),
+                revision_requirement_refs=(),
+            )
+            report = await TaskScheduler(registry).execute(
+                plan, ingress.runtime_context, bindings=bindings
+            )
+            return report, retrieval, evidence
+
+    report, retrieval, evidence = asyncio.run(_main())
+    assert len(report.results) == 1
+    result = report.results[0]
+    assert result.status == "success"
+    assert result.data is not None
+    assert result.data.kind == "document.retrieve"
+    assert result.data.retrieved_unit_count == 1
+    assert len(retrieval.calls) == 1
+    assert len(result.evidence_uses) == 1
+    assert evidence.calls[0]["purpose"] == "coverage"
+    assert evidence.calls[0]["target_id"] == "t1"
+    assert "secret chunk" not in result.model_dump_json()
