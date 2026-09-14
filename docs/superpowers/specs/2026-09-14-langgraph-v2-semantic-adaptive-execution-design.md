@@ -72,6 +72,14 @@ Models never own ACL, trusted workspace scope, immutable revision binding, capab
 │ Planner / TaskScheduler / CapabilityRegistry             │
 │ ACL / immutable revision pinning                         │
 │ Checkpoint/resume / Evidence / Evaluator / Grounding     │
+└───────────────────────────┬──────────────────────────────┘
+                            │ public transport adapter
+                            ▼
+┌──────────────────────────────────────────────────────────┐
+│ PRESENTATION/TRANSPORT LAYER                              │
+│                                                          │
+│ versioned chat DTO + SSE events                          │
+│ frontend state / clarification / sources / progress      │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -317,9 +325,79 @@ expected capability/workflow
 
 Planner implementation does not begin until this gate passes.
 
-## 11. Governed adaptive planner
+## 11. Frontend/public transport contract synchronization
 
-After fast-path parity passes, complex work uses the Phase-4 planner role.
+The frontend must not depend directly on `SupervisorV2State`, checkpoint schemas, runtime-only semantic inference, or raw internal `TaskPlan` objects. Internal v2 contracts and the public chat transport contract have different stability/security responsibilities.
+
+Introduce a versioned public DTO/SSE boundary that maps internal v2 outcomes into UI-safe events and persisted chat metadata.
+
+Conceptually:
+
+```text
+Internal v2 contracts
+    SemanticContext
+    ClarificationRequest
+    RouteDecision
+    TaskPlan / AgentResult
+    Evidence / FinalResponse
+          │
+          ▼
+Public Chat Transport Adapter
+          │
+          ├─ status/progress events
+          ├─ clarification_required
+          ├─ clarification_resolved
+          ├─ sources/citations
+          ├─ final_response
+          └─ typed error/cancel terminal
+          │
+          ▼
+TypeScript transport contracts
+          │
+          ▼
+useRAGChatStream / ChatPanel / history hydration
+```
+
+### 11.1 Public transport requirements
+
+- Version the public event/envelope contract independently from checkpoint schema where practical.
+- Preserve currently supported v1 events during canary/dual-runtime operation.
+- Do not expose raw ACL state, hidden model reasoning, internal evidence-store identifiers, service objects, planner prompts, or unrestricted checkpoint contents.
+- Clarification must be first-class structured data, not only a tokenized prose message.
+- Candidate document choices must use safe public option IDs/titles/metadata needed by the UI; frontend must not fabricate document identities.
+- Final response/citations must have one stable frontend representation regardless of whether v1 or v2 served the turn.
+- Unknown event types must fail safely/ignore compatibly rather than crash the active stream.
+
+### 11.2 Frontend state requirements
+
+The frontend TypeScript model must support at least:
+
+- `clarifying` status and structured clarification choices;
+- semantic/document-resolution progress without exposing internal reasoning;
+- planning/executing/evaluating phases for complex turns;
+- stable source/citation payloads;
+- terminal `success | clarify | error | cancelled` states;
+- persisted/reloaded messages carrying the same public metadata needed to reconstruct the UI after refresh.
+
+Existing `ChatStreamStatus`/`AgentStepType` may be extended or replaced by a discriminated public event union; avoid growing an untyped `Record<string, unknown>` event switch.
+
+### 11.3 Compatibility gate
+
+Fast-path v2 canary is not considered frontend-ready until the same golden flows work through the actual web stream and history reload:
+
+- simple RAG answer with citations;
+- exact section answer;
+- People lookup;
+- ambiguous document -> clarification choices -> resume -> answer;
+- not-found/low-confidence document behavior;
+- cancel/error terminal;
+- refresh/reload after a completed or clarified turn.
+
+Planner rollout additionally requires frontend handling for planning/task progress and resumed/replanned runs, but the UI consumes only public progress summaries, not the internal DAG contract.
+
+## 12. Governed adaptive planner
+
+After fast-path parity and core frontend transport compatibility pass, complex work uses the Phase-4 planner role.
 
 Planner input is typed, minimized, request-scoped, and redacted. Planner output is proposal-only:
 
@@ -336,13 +414,13 @@ The planner cannot widen explicit hard scope, mint trusted document IDs, replace
 
 Existing deterministic compare/summarize/retrieve policies remain safe fallback/reference implementations.
 
-## 12. Evaluator-driven bounded replan
+## 13. Evaluator-driven bounded replan
 
 Reuse existing `EvidenceEvaluation`, `MissingRequirement`, `Contradiction`, and task summaries. Do not create a parallel persisted gap contract merely for the planner.
 
 Project only minimized facts into model-facing replan input. Replans are append-only, bounded by configured budgets, and validated before scheduling.
 
-## 13. Complex-work expansion order
+## 14. Complex-work expansion order
 
 Only after fast-path parity and planner integration:
 
@@ -352,27 +430,31 @@ Only after fast-path parity and planner integration:
 
 Do not replace this with an unconstrained ReAct loop.
 
-## 14. Shadow and rollout
+## 15. Shadow and rollout
 
 Rollout stages:
 
 1. unit/contract tests;
 2. v1-v2 fast-path golden parity;
-3. semantic/document-intelligence shadow comparison;
-4. planner-proposal shadow;
-5. full read-only document execution shadow where available;
-6. internal workspace enablement;
-7. canary through existing v1/v2 rollout controls;
-8. promotion only after quality/safety gates pass.
+3. backend -> frontend public transport contract tests;
+4. web E2E fast-path + clarification/history compatibility;
+5. semantic/document-intelligence shadow comparison;
+6. planner-proposal shadow;
+7. full read-only document execution shadow where available;
+8. internal workspace enablement;
+9. canary through existing v1/v2 rollout controls;
+10. promotion only after quality/safety/UI compatibility gates pass.
 
 V1 remains the rollback arm until the observation window is clean.
 
-## 15. Non-goals
+## 16. Non-goals
 
 - Rewriting proven v1 document-resolution behavior as a new regex-only implementation.
 - Importing v1 mutable SupervisorState/agent routing into v2.
 - Letting v1/model output decide ACL or trusted workspace scope.
 - Letting a semantic model directly choose v2 capabilities/routes.
+- Exposing raw v2 checkpoint/state contracts directly to the frontend.
+- Exposing hidden model reasoning, raw planner prompts, or internal evidence IDs to the UI.
 - Replacing `TaskScheduler`, capability registry, evidence, or checkpointer.
 - Adding a second planner/router provider configuration stack.
 - Persisting model reasoning/chain-of-thought.
