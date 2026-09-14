@@ -288,8 +288,11 @@ def requires_v1_fallback(analysis: Any, route_decision: Any) -> bool:
     Pure function over the ALREADY-resolved v2 ``QueryAnalysis``/Router
     outcome (consulted by the dispatch path — never by the selector, which
     must not inspect semantic domains). Falls back when the resolved route
-    is ``write``, ``evaluate``/legal/compliance, or otherwise unsupported;
-    missing/unparseable outcomes fail closed to v1 (never served by v2).
+    is ``write`` or otherwise unsupported; missing/unparseable outcomes fail
+    closed to v1 (never served by v2). Task 12 serves ``evaluate`` /
+    compliance through the governed v2 complex DAG (bounded evidence reads
+    + evidence evaluation + grounded synthesis, never a new capability), so
+    the former evaluate/compliance exclusions are lifted here.
     """
     if analysis is None or route_decision is None:
         return True
@@ -304,9 +307,6 @@ def requires_v1_fallback(analysis: Any, route_decision: Any) -> bool:
     if any("write" in item.lower() for item in domains):
         return True
     if isinstance(work_type, str):
-        lowered = work_type.lower()
-        if lowered == "evaluate" or "legal" in lowered or "compliance" in lowered:
-            return True
         if work_type not in _V2_KNOWN_WORK_TYPES:
             return True
     else:
@@ -314,9 +314,6 @@ def requires_v1_fallback(analysis: Any, route_decision: Any) -> bool:
     if any(item not in _V2_KNOWN_DOMAINS for item in domains):
         return True
     if isinstance(reason, str):
-        lowered_reason = reason.lower()
-        if "compliance" in lowered_reason or "legal" in lowered_reason:
-            return True
         if reason not in _V2_KNOWN_REASONS:
             return True
     else:

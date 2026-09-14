@@ -63,7 +63,6 @@ from .contracts.binding import DocumentBindingSet, ScopedDocument
 from .contracts.capability import (
     DocumentReadInput,
     DocumentSearchInput,
-    PeopleLookupInput,
     SectionReadInput,
 )
 from .contracts.evaluation import EvidenceEvaluation
@@ -72,7 +71,6 @@ from .contracts.evidence import EvidenceUseRef
 from .contracts.locators import SectionLocator
 from .contracts.planning import (
     DiscoveryPolicy,
-    InitialTaskOrigin,
     ReplanTaskOrigin,
     ResearchBudgetView,
     ResearchPlanningInput,
@@ -106,6 +104,9 @@ from .replanning import (
     append_replan_tasks,
 )
 from .skills.compare import policy as compare_policy
+from .skills.cross_domain import policy as cross_domain_policy
+from .skills.evaluate import policy as evaluate_policy
+from .skills.multi_goal import policy as multi_goal_policy
 from .skills.retrieve import policy as retrieve_policy
 from .skills.summarize import policy as summarize_policy
 from .skills.summarize.policy import ReduceSpec
@@ -153,7 +154,7 @@ __all__ = [
     "validate_checkpoint_node",
 ]
 
-#: Typed-unavailable code for out-of-pilot work (evaluate/compliance, ...).
+#: Typed-unavailable code for out-of-pilot work (unsupported work types).
 COMPLEX_RESEARCH_UNAVAILABLE = "COMPLEX_RESEARCH_UNAVAILABLE"
 
 #: Fallback planner sizing when implementation settings carry no v2 limits.
@@ -773,47 +774,12 @@ class ReplanProposal:
 def _people_first_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
     """Deterministic first step of the cross-domain People→Document pilot.
 
-    A single targetless ``people.lookup`` (T1) when the finalized semantics
-    names a person; the deterministic materializer appends the governed
-    dependent on success and the recovery replan owns ``not_found``/``TIMEOUT``.
-    Fails closed without person references or without the capability in the
-    current catalog — the planner never fabricates a person to look up.
+    Thin delegate to the cross-domain skill (Task 12): the skill owns the
+    governed first lookup construction, so the plan stays byte-identical
+    while ownership lives in exactly one place. See the skill policy for
+    the fail-closed contract.
     """
-    references = sorted(
-        planning_input.semantic.person_refs, key=lambda reference: reference.ref_id
-    )
-    if not references:
-        raise ContractValidationError(
-            "cross_domain pilot needs a person reference for the governed "
-            "first lookup; refusing to fabricate one"
-        )
-    catalog = {entry.name for entry in planning_input.capability_catalog}
-    if "people.lookup" not in catalog:
-        raise ContractValidationError(
-            "cross_domain pilot needs 'people.lookup' in the request-scoped "
-            "capability catalog; refusing to plan an undispatchable lookup"
-        )
-    first = references[0]
-    task = TaskSpec(
-        task_id="T1",
-        capability="people.lookup",
-        task_objective=f"Resolve person {first.label} ({first.ref_id})",
-        input=PeopleLookupInput(
-            kind="people.lookup",
-            query=planning_input.semantic.contextualized_query,
-        ),
-        depends_on=(),
-        origin=InitialTaskOrigin(kind="initial"),
-    )
-    plan = TaskPlan(
-        contract_version="2.0",
-        plan_id=f"people-first-{first.ref_id}",
-        goal=planning_input.semantic.contextualized_query,
-        target_units=(),
-        tasks=(task,),
-    )
-    validate_task_plan(plan, planning_input.bindings)
-    return plan
+    return cross_domain_policy.build_cross_domain_plan(planning_input)
 
 
 async def build_governed_replan_proposal(
@@ -852,10 +818,9 @@ async def build_governed_initial_proposal(
     :func:`build_initial_proposal` (legacy behavior: work no skill covers
     raises :class:`ContractValidationError`). With one, the planner owns
     the deterministic-first ordering — a covering skill's refusal is final
-    and the model path runs only for uncovered work types (v1-owned
-    ``evaluate`` excluded until Task 12) — and the model path stays
-    proposal-only: the caller still validates, leases, and checkpoints
-    before the shared scheduler dispatches anything.
+    and the model path serves only below-intake work no skill covers — and
+    the model path stays proposal-only: the caller still validates, leases,
+    and checkpoints before the shared scheduler dispatches anything.
     """
     planner = getattr(runtime.services, "adaptive_planner", None)
     if planner is None:
@@ -877,8 +842,15 @@ def build_initial_proposal(planning_input: ResearchPlanningInput) -> InitialProp
     deterministic map/reduce workflow; ``retrieve`` routes to the retrieve
     skill with its single deterministic ``document.retrieve`` task;
     ``cross_domain`` with a named person
-    routes to the deterministic people-first lookup (the People→Document
-    pilot's governed first step). Bounded summarize never reaches here (the
+    ``cross_domain`` (Task 12) routes to the cross-domain skill — the
+    governed people-first lookup when a person is named, bounded parallel
+    reads over bound documents otherwise; ``multi_goal`` (Task 12) routes
+    to the multi-goal skill with one bounded read per distinct bound
+    document; ``evaluate`` (Task 12) routes to the evaluate skill with
+    bounded evidence-gathering reads (the compliance judgment itself comes
+    from the governed evaluate/replan/synthesis pipeline, never a
+    capability).
+    Bounded summarize never reaches here (the
     deterministic router keeps single-document summaries on the fast path).
     Any other work type raises :class:`ContractValidationError` so the
     caller returns the typed unavailable boundary, never a plan.
@@ -895,6 +867,16 @@ def build_initial_proposal(planning_input: ResearchPlanningInput) -> InitialProp
     if work_type == retrieve_policy.RETRIEVE_WORK_TYPE:
         return InitialProposal(
             plan=retrieve_policy.build_retrieve_plan(planning_input),
+            reduce_spec=None,
+        )
+    if work_type == multi_goal_policy.MULTI_GOAL_WORK_TYPE:
+        return InitialProposal(
+            plan=multi_goal_policy.build_multi_goal_plan(planning_input),
+            reduce_spec=None,
+        )
+    if work_type == evaluate_policy.EVALUATE_WORK_TYPE:
+        return InitialProposal(
+            plan=evaluate_policy.build_evaluate_plan(planning_input),
             reduce_spec=None,
         )
     if work_type == "cross_domain":
@@ -1288,10 +1270,10 @@ def _production_v1_fallback_guard(state: ComplexResearchState) -> Any:
     Derived from the ALREADY-resolved frozen ``QueryAnalysis`` and
     ``RouteDecision`` in graph state — the sole guard the production
     ComplexResearch scheduler call passes. Fires (returns True) when the
-    resolved route is write, evaluate/legal/compliance, or otherwise
-    unsupported, so the request falls back to v1 BEFORE any capability
-    execution or user-visible output. ``None`` outcomes fail closed
-    (guard fires) via ``requires_v1_fallback``.
+    resolved route is write or otherwise unsupported, so the request falls
+    back to v1 BEFORE any capability execution or user-visible output.
+    ``None`` outcomes fail closed (guard fires) via
+    ``requires_v1_fallback``.
     """
     analysis = state.get("query_analysis")
     decision = state.get("route_decision")
@@ -1747,7 +1729,8 @@ async def decide_node(
                 code=COMPLEX_RESEARCH_UNAVAILABLE,
                 reason=(
                     f"work type {work_type!r} has no complex skill policy "
-                    "(compare and large/iterative summarize are supported)"
+                    "(compare, summarize, retrieve, multi-goal, cross-domain, "
+                    "and compliance evaluation are supported)"
                 ),
             )
         }

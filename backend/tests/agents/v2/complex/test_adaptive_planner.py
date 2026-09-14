@@ -668,25 +668,72 @@ async def test_people_first_catalog_refusal_never_reaches_model() -> None:
 
 
 @pytest.mark.asyncio
-async def test_evaluate_excluded_until_task_12() -> None:
+async def test_evaluate_prefers_deterministic_skill_over_model() -> None:
+    """Task 12: bound ``evaluate`` work is owned by the deterministic evaluate
+    skill — the model is never consulted and the plan carries the skill's
+    deterministic ID."""
     provider = FakePlannerProvider(_two_read_proposal())
     planner = AdaptivePlanner(provider_factory=lambda: provider)
     _, _, context = _harness("run-planner-eval", planner=planner)
-    with pytest.raises(PlannerError, match="Task 12"):
-        await planner.propose_initial(_planning_input(work_type="evaluate"), context)
+    proposal = await planner.propose_initial(
+        _planning_input(work_type="evaluate"), context
+    )
+    assert proposal.plan.plan_id == "evaluate-b1-b2"
+    assert [task.capability for task in proposal.plan.tasks] == [
+        "document.read",
+        "document.read",
+    ]
     assert provider.calls == []
 
 
 @pytest.mark.asyncio
-async def test_uncovered_cross_domain_without_person_still_model_plans() -> None:
+async def test_covered_cross_domain_without_person_prefers_deterministic_skill() -> None:
+    """Task 12: generic ``cross_domain`` with bound documents is now owned by
+    the deterministic cross-domain skill — the model is never consulted and
+    the plan carries the skill's deterministic ID, not an adaptive one."""
     provider = FakePlannerProvider(_two_read_proposal())
     planner = AdaptivePlanner(provider_factory=lambda: provider)
     _, _, context = _harness("run-planner-xdopen", planner=planner)
     proposal = await planner.propose_initial(
         _planning_input(work_type="cross_domain"), context
     )
-    assert proposal.plan.plan_id == "adaptive-cross_domain"
+    assert proposal.plan.plan_id == "cross-domain-b1-b2"
     assert [task.task_id for task in proposal.plan.tasks] == ["T1", "T2"]
+    assert [task.capability for task in proposal.plan.tasks] == [
+        "document.read",
+        "document.read",
+    ]
+    assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_open_cross_domain_without_bindings_still_model_plans() -> None:
+    """Task 12: a fully open ``cross_domain`` (no person, no bound documents)
+    stays below the deterministic intake, so the governed model path still
+    owns it — exactly one provider call, proposal-only, zero dispatch."""
+    from app.services.agents.v2.contracts.binding import DocumentBindingSet
+
+    provider = FakePlannerProvider(
+        {"tasks": [{"capability": "document.search", "task_objective": "Discover",
+                     "targets": [], "depends_on": []}]}
+    )
+    planner = AdaptivePlanner(provider_factory=lambda: provider)
+    _, _, context = _harness(
+        "run-planner-xdsearch",
+        planner=planner,
+        allowed=frozenset({"document.read", "document.search"}),
+    )
+    proposal = await planner.propose_initial(
+        _planning_input(
+            work_type="cross_domain",
+            capability_names=frozenset({"document.read", "document.search"}),
+            discovery=True,
+            bindings=DocumentBindingSet(bindings=(), revision_requirement_refs=()),
+        ),
+        context,
+    )
+    assert proposal.plan.plan_id == "adaptive-cross_domain"
+    assert [task.capability for task in proposal.plan.tasks] == ["document.search"]
     assert len(provider.calls) == 1
 
 

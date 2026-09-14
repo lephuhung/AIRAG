@@ -653,7 +653,9 @@ async def test_unsupported_request_never_consumes_prior_proposal() -> None:
     _, leases, context = _harness(run_id="run-r21-same")
     await plan_node(_child_input(), context)
     unsupported = _child_input()
-    unsupported["query_analysis"] = _analysis("evaluate")
+    # Task 12 covers evaluate deterministically; the unsupported
+    # fixture uses lookup (fast-path work, no complex skill policy).
+    unsupported["query_analysis"] = _analysis("lookup")
     await plan_node(unsupported, context)
     update = await validate_checkpoint_node(unsupported, context)
     assert "plan" not in update
@@ -676,7 +678,9 @@ async def test_concurrent_sequences_share_no_proposal_state() -> None:
     _, leases, context = _harness(run_id="run-r21-shared")
     supported = _child_input()
     unsupported = _child_input()
-    unsupported["query_analysis"] = _analysis("evaluate")
+    # Task 12 covers evaluate deterministically; the unsupported
+    # fixture uses lookup (fast-path work, no complex skill policy).
+    unsupported["query_analysis"] = _analysis("lookup")
     first = await validate_checkpoint_node(supported, context)
     second = await validate_checkpoint_node(unsupported, context)
     third = await validate_checkpoint_node(supported, context)
@@ -1242,7 +1246,9 @@ async def test_unsupported_work_type_returns_typed_unavailable() -> None:
 
     _, _, context = _harness()
     child = _child_input()
-    child["query_analysis"] = _analysis("evaluate")
+    # Task 12 covers evaluate deterministically; the unsupported
+    # fixture uses lookup (fast-path work, no complex skill policy).
+    child["query_analysis"] = _analysis("lookup")
     output = await build_complex_research_subgraph().ainvoke(child, context=context)
     assert output["plan"] is None, "unsupported work never fabricates a plan"
     assert output["task_results"] == ()

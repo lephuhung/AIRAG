@@ -95,9 +95,9 @@ class V1FallbackRequired(SchedulerError):
     """A v2 candidate must fall back to v1 BEFORE any capability execution.
 
     Raised by the Task 7B pre-dispatch guard when the resolved
-    QueryAnalysis/Router outcome is write, evaluate/legal/compliance, or
-    otherwise unsupported (see
-    ``app.services.agent.rollout_control.requires_v1_fallback``). The v2
+    QueryAnalysis/Router outcome is write or otherwise unsupported (see
+    ``app.services.agent.rollout_control.requires_v1_fallback``; Task 12
+    serves evaluate/compliance through the governed v2 DAG). The v2
     outer runner lets this propagate (never converts it to an error event)
     so the entrypoint serves v1 with zero v2 user-visible output.
     """
@@ -764,8 +764,8 @@ async def _run_pre_dispatch_guards(
             fired = await fired
         if fired:
             raise V1FallbackRequired(
-                "v2 candidate resolved to a v1-only route (write, "
-                "evaluate/legal/compliance, or unsupported); falling back "
+                "v2 candidate resolved to a v1-only route (write or "
+                "unsupported); falling back "
                 "to v1 before any capability execution"
             )
 

@@ -338,8 +338,10 @@ def test_rollout_100_percent_still_routes_write_to_v1():
     assert arm == "v1"
 
 
-def test_rollout_100_percent_still_routes_evaluate_to_v1():
-    """A v2 candidate resolving to evaluate/compliance falls back to v1."""
+def test_rollout_100_percent_serves_governed_evaluate_on_v2():
+    """Task 12: a v2 candidate resolving to evaluate/compliance stays on v2 —
+    the governed complex DAG (bounded reads + evidence evaluation + grounded
+    synthesis) serves it, so the post-router fallback guard must not fire."""
     from app.services.agent.rollout_control import requires_v1_fallback
     from app.services.agents.v2.contracts.routing import (
         QueryAnalysis,
@@ -350,7 +352,7 @@ def test_rollout_100_percent_still_routes_evaluate_to_v1():
     decision = RouteDecision(
         route="complex_research", reason_code="compliance_evaluation"
     )
-    assert requires_v1_fallback(analysis, decision) is True
+    assert requires_v1_fallback(analysis, decision) is False
 
 
 def test_supported_compare_uses_v2_at_100_percent_eligible_rollout():
@@ -700,19 +702,21 @@ async def test_production_complex_execute_falls_back_on_write_route():
 
 
 @pytest.mark.asyncio
-async def test_production_complex_execute_falls_back_on_evaluate_route():
-    """R73/R79: evaluate/legal/compliance falls back via the real execute node."""
+async def test_production_complex_execute_serves_evaluate_route():
+    """Task 12: the real complex execute node serves a governed evaluate
+    route — the post-router fallback guard no longer fires for
+    evaluate/compliance, so the canned plan dispatches through the sole
+    scheduler (write routes still fall back, see the write test above)."""
     from app.services.agents.v2.complex_research_graph import complex_execute_node
-    from app.services.agents.v2.execution.scheduler import V1FallbackRequired
 
     registry, stub = _people_registry()
     runtime = _graph_runtime(registry)
     state = _complex_execute_state(
         "evaluate", ("document",), "complex_research", "compliance_evaluation"
     )
-    with pytest.raises(V1FallbackRequired):
-        await complex_execute_node(state, runtime)
-    assert stub.calls == []
+    result = await complex_execute_node(state, runtime)
+    assert stub.calls != []
+    assert len(tuple(result.get("task_results", ()))) == 1
 
 
 @pytest.mark.asyncio
@@ -1254,47 +1258,42 @@ async def test_ingress_write_falls_back_with_zero_output_at_canary_100():
 
 
 @pytest.mark.asyncio
-async def test_ingress_evaluate_falls_back_with_zero_output_at_canary_100():
-    """R83: evaluate -> fallback through the serving ingress at CANARY 100."""
-    from app.services.agents.v2.execution.scheduler import V1FallbackRequired
-
+async def test_ingress_evaluate_served_at_canary_100():
+    """Task 12: an evaluate query is selected to v2 at CANARY 100 and really
+    dispatches through the sole scheduler to a user-visible terminal (the
+    pre-Task-12 V1FallbackRequired boundary is lifted for governed
+    evaluate/compliance work)."""
     settings_patch = _patch_canary_100_settings()
     try:
-        with pytest.raises(V1FallbackRequired) as excinfo:
-            await _drive_serving_adapter(
-                "Đánh giá tuân thủ quy định nội bộ",
-                request_id="req-ingress-evaluate-1",
-                thread_id="thread-ingress-evaluate-1",
-            )
+        arm, stub, yielded = await _drive_serving_adapter(
+            "Đánh giá tuân thủ quy định nội bộ",
+            request_id="req-ingress-evaluate-1",
+            thread_id="thread-ingress-evaluate-1",
+        )
     finally:
         settings_patch.undo()
-    # R84: prove canary selection chose v2 FIRST (see write case above).
-    assert excinfo.value.arm == "v2"
-    assert excinfo.value.capability_calls == []
-    _assert_zero_v2_output(excinfo.value.yielded)
+    assert arm == "v2"
+    assert stub.calls != []
+    assert any(event.get("event") == "complete" for event in yielded)
 
 
 @pytest.mark.asyncio
-async def test_ingress_legal_falls_back_with_zero_output_at_canary_100():
-    """R83: legal/compliance -> fallback through the serving ingress at
-    CANARY 100 (a legal query the real router resolves to
-    compliance_evaluation)."""
-    from app.services.agents.v2.execution.scheduler import V1FallbackRequired
-
+async def test_ingress_legal_served_at_canary_100():
+    """Task 12: a legal query the real router resolves to
+    compliance_evaluation is served on v2 at CANARY 100 (same lifted
+    boundary as the evaluate case above)."""
     settings_patch = _patch_canary_100_settings()
     try:
-        with pytest.raises(V1FallbackRequired) as excinfo:
-            await _drive_serving_adapter(
-                "Đánh giá tính pháp lý của hợp đồng mới",
-                request_id="req-ingress-legal-1",
-                thread_id="thread-ingress-legal-1",
-            )
+        arm, stub, yielded = await _drive_serving_adapter(
+            "Đánh giá tính pháp lý của hợp đồng mới",
+            request_id="req-ingress-legal-1",
+            thread_id="thread-ingress-legal-1",
+        )
     finally:
         settings_patch.undo()
-    # R84: prove canary selection chose v2 FIRST (see write case above).
-    assert excinfo.value.arm == "v2"
-    assert excinfo.value.capability_calls == []
-    _assert_zero_v2_output(excinfo.value.yielded)
+    assert arm == "v2"
+    assert stub.calls != []
+    assert any(event.get("event") == "complete" for event in yielded)
 
 
 @pytest.mark.asyncio

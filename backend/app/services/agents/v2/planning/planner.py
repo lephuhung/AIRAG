@@ -8,10 +8,10 @@ still validates, leases, and checkpoints before the shared ``TaskScheduler``
 sees it.
 
 Ordering: deterministic skill policies win whenever they cover the work type
-(compare / retrieve / summarize / governed people-first cross_domain) — a
+(compare / retrieve / summarize / multi-goal / cross-domain / evaluate) — a
 covering skill's refusal is final and never falls through to the model; the
-model path runs only for work no skill covers (v1-owned ``evaluate`` /
-compliance excluded until Task 12). The model returns an ordered step
+model path runs only for below-intake work no skill covers. The model
+returns an ordered step
 list over server-issued binding IDs; every ``TaskSpec`` input is constructed
 server-side from typed constructors, so a model cannot smuggle scalars,
 identity, or authorization. Any failure raises :class:`PlannerError` and the
@@ -88,22 +88,23 @@ _PLANNER_CAPABILITIES = (
     _PLANNER_TARGETLESS | _PLANNER_TARGET_BEARING | _PLANNER_OPTIONAL_TARGETS | _PLANNER_TOKEN_BEARING
 )
 
-#: v1-owned work the planner must not serve until Task 12 expands it.
-#: Planning it now would lease/checkpoint a plan for a route the scheduler
-#: hands back to v1 — pure overhead on a v1 answer.
-_PLANNER_EXCLUDED_WORK_TYPES = frozenset({"evaluate"})
-
 
 def _skill_covers_work_type(planning_input: ResearchPlanningInput) -> bool:
-    """True when a deterministic skill owns this work type (fix round 1, I1).
+    """True when a deterministic skill owns this work type (Task 12 expansion).
 
     Coverage is work-type ownership, not success: ``compare``/``retrieve``/
-    ``summarize`` are always skill-owned, and the governed People→Document
-    pilot owns ``cross_domain`` only when a person is named (its governed
-    first step). A covering skill's ``ContractValidationError`` refusal is
-    deliberate and final — the model path must not second-guess it.
+    ``summarize`` are always skill-owned; ``multi_goal``, ``cross_domain``,
+    and ``evaluate`` are skill-owned exactly when their intake predicate
+    holds (``covers_input``: routing arity met, a named person or bound
+    documents present). A covering skill's ``ContractValidationError``
+    refusal is deliberate and final — the model path must not second-guess
+    it. Below-intake inputs stay uncovered so the governed model path still
+    owns genuinely open work.
     """
     from ..skills.compare import policy as compare_policy
+    from ..skills.cross_domain import policy as cross_domain_policy
+    from ..skills.evaluate import policy as evaluate_policy
+    from ..skills.multi_goal import policy as multi_goal_policy
     from ..skills.retrieve import policy as retrieve_policy
     from ..skills.summarize import policy as summarize_policy
 
@@ -114,9 +115,13 @@ def _skill_covers_work_type(planning_input: ResearchPlanningInput) -> bool:
         or summarize_policy.supports_work_type(work_type)
     ):
         return True
-    return work_type == "cross_domain" and bool(
-        planning_input.semantic.person_refs
-    )
+    if multi_goal_policy.supports_work_type(work_type):
+        return multi_goal_policy.covers_input(planning_input)
+    if cross_domain_policy.supports_work_type(work_type):
+        return cross_domain_policy.covers_input(planning_input)
+    if evaluate_policy.supports_work_type(work_type):
+        return evaluate_policy.covers_input(planning_input)
+    return False
 
 
 #: Roles a planner step may target. The planner references server-issued
@@ -188,10 +193,9 @@ class AdaptivePlanner(RuntimeModel):
         Returns the shared ``InitialProposal`` (plan + optional reduce spec)
         so the governed entry leases/checkpoints exactly like the skill path.
         The model path runs only when no deterministic skill covers the work
-        type (a covering skill's refusal is re-raised untouched); v1-owned
-        ``evaluate`` is refused until Task 12. Raises :class:`PlannerError`
-        when no governable proposal exists; the caller then keeps the typed
-        unavailable boundary (zero dispatch).
+        type (a covering skill's refusal is re-raised untouched). Raises
+        :class:`PlannerError` when no governable proposal exists; the caller
+        then keeps the typed unavailable boundary (zero dispatch).
         """
         from ..complex_research_graph import InitialProposal, build_initial_proposal
 
@@ -203,13 +207,7 @@ class AdaptivePlanner(RuntimeModel):
             raise _fail("the adaptive planner proposes initial plans only")
         try:
             return build_initial_proposal(planning_input)
-        except ContractValidationError as exc:
-            work_type = str(planning_input.query_analysis.work_type)
-            if work_type in _PLANNER_EXCLUDED_WORK_TYPES:
-                raise _fail(
-                    f"work type {work_type!r} stays v1-owned until Task 12; "
-                    "refusing to plan it here"
-                ) from exc
+        except ContractValidationError:
             if _skill_covers_work_type(planning_input):
                 # The covering skill refused deliberately (arity, roles, or
                 # catalog): re-raise untouched so the caller keeps the typed

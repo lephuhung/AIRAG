@@ -2959,13 +2959,19 @@ def test_subagent_cannot_append_authoritative_tasks() -> None:
     # redaction projection (which rebuilds the plan WITHOUT a tasks model_copy)
     # + the governed initial planner (fresh construction from model steps;
     # every TaskSpec input is server-built and the plan passes frozen
-    # validation before lease/checkpoint — never an append).
+    # validation before lease/checkpoint — never an append). Task 12 moved
+    # the people-first construction into the cross-domain skill:
+    # ``_people_first_plan`` is now a thin delegate with no ``TaskPlan(``
+    # constructor, so the scanner correctly drops it and the skill builder
+    # takes its place — the single-construction-site property is preserved.
     assert constructors == {
         ("nodes/fast_plan.py", "build_fast_plan"),
         ("skills/compare/policy.py", "build_compare_plan"),
+        ("skills/cross_domain/policy.py", "build_cross_domain_plan"),
+        ("skills/evaluate/policy.py", "build_evaluate_plan"),
+        ("skills/multi_goal/policy.py", "build_multi_goal_plan"),
         ("skills/retrieve/policy.py", "build_retrieve_plan"),
         ("skills/summarize/policy.py", "build_summarize_workflow"),
-        ("complex_research_graph.py", "_people_first_plan"),
         ("dependencies/people_document.py", "redact_scalar_for_model"),
         ("planning/planner.py", "_build_plan"),
     }
