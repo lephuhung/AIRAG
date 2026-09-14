@@ -84,8 +84,12 @@ describe('public chat contract (Task 9)', () => {
     });
     expect(result.current.pendingClarification?.options).toHaveLength(2);
     expect(result.current.status).toBe('idle');
-    // Server-issued option resolves to its label for the resume reply.
-    expect(result.current.submitClarification('opt-2')).toBe('Doc B');
+    // Server-issued option resolves to the selection triple for the resume reply.
+    expect(result.current.submitClarification('opt-2')).toEqual({
+      clarification_id: 'clr-1',
+      selected_option_id: 'opt-2',
+      label: 'Doc B',
+    });
     // Fabricated document UUID / unknown id is refused.
     expect(
       result.current.submitClarification('33333333-3333-3333-3333-333333333333'),
@@ -113,7 +117,11 @@ describe('public chat contract (Task 9)', () => {
       { option_id: 'Beta', label: 'Beta' },
     ]);
     // Legacy labels are server-issued values: selectable, nothing else is.
-    expect(result.current.submitClarification('Alpha')).toBe('Alpha');
+    expect(result.current.submitClarification('Alpha')).toEqual({
+      clarification_id: 'clr-1',
+      selected_option_id: 'Alpha',
+      label: 'Alpha',
+    });
     expect(result.current.submitClarification('Gamma')).toBeNull();
   });
 
@@ -182,5 +190,97 @@ describe('public chat contract (Task 9)', () => {
 
     expect(result.current.status).toBe('idle');
     expect(result.current.error).toBeNull();
+  });
+});
+
+describe('normalized relay vocabulary (fix round 1, C1/I4)', () => {
+  it('projects normalized citations into the sources presentation model', async () => {
+    mockFetchFrames([
+      'event: status\ndata: {"contract_version":"v2.chat/1","step":"retrieving","phase":"executing","detail":"Searching"}\n\n',
+      'event: citation\ndata: {"contract_version":"v2.chat/1","citations":[{"citation_id":"cit-1","label":"L1","document_id":"d1","chunk_id":"c1","content":"excerpt"}],"image_refs":[],"people":[]}\n\n',
+      'event: token\ndata: {"contract_version":"v2.chat/1","text":"answer"}\n\n',
+      'event: complete\ndata: {"contract_version":"v2.chat/1","answer":"answer","citations":[],"image_refs":[],"people":[],"potential_abbreviations":[]}\n\n',
+    ]);
+    const { result } = renderStreamHook();
+
+    let final: ChatMessage | null = null;
+    await act(async () => {
+      final = await result.current.sendMessage('rag query', [], false);
+    });
+
+    // Existing citation panels keep rendering via the compat projection.
+    expect(result.current.pendingSources.length).toBeGreaterThan(0);
+    expect(result.current.pendingSources[0].chunk_id).toBe('c1');
+    expect(final?.sources?.[0].chunk_id).toBe('c1');
+    expect(
+      result.current.agentSteps.some((s) => s.step === 'sources_found'),
+    ).toBe(true);
+  });
+
+  it('merges people from citation frames and abbreviations from status', async () => {
+    mockFetchFrames([
+      'event: citation\ndata: {"citations":[],"image_refs":[],"people":[{"ho_ten":"Nguyen Van A","_source_schema":"lg"}]}\n\n',
+      'event: status\ndata: {"step":"abbreviations","phase":"evaluating","abbreviations":["ABC"]}\n\n',
+      'event: complete\ndata: {"answer":"done"}\n\n',
+    ]);
+    const { result } = renderStreamHook();
+
+    await act(async () => {
+      await result.current.sendMessage('who is X', [], false);
+    });
+
+    await waitFor(() => {
+      expect(result.current.pendingPeople).toHaveLength(1);
+    });
+    expect(result.current.potentialAbbreviations).toEqual(['ABC']);
+  });
+
+  it('clears speculative citations on public status-rollback', async () => {
+    mockFetchFrames([
+      'event: citation\ndata: {"citations":[{"citation_id":"cit-1","label":"L1","document_id":"d1","chunk_id":"c1"}]}\n\n',
+      'event: status\ndata: {"step":"rollback","phase":"executing","detail":""}\n\n',
+      'event: complete\ndata: {"answer":"fresh"}\n\n',
+    ]);
+    const { result } = renderStreamHook();
+
+    let final: ChatMessage | null = null;
+    await act(async () => {
+      final = await result.current.sendMessage('q', [], false);
+    });
+
+    expect(result.current.pendingCitations).toHaveLength(0);
+    expect(result.current.pendingSources).toHaveLength(0);
+    expect(final?.sources ?? []).toHaveLength(0);
+  });
+
+  it('sends the structured selection envelope with clarification replies', async () => {
+    mockFetchFrames([
+      'event: clarification_required\ndata: {"clarification_id":"clr-1","question":"Which?","options":[{"option_id":"opt-1","label":"Doc A"}],"resume":{"thread_id":"t"}}\n\n',
+      'event: complete\ndata: {"answer":"Which?"}\n\n',
+    ]);
+    const { result } = renderStreamHook();
+
+    await act(async () => {
+      await result.current.sendMessage('ambiguous', [], false);
+    });
+
+    const triple = result.current.submitClarification('opt-1');
+    expect(triple?.selected_option_id).toBe('opt-1');
+
+    mockFetchFrames(['event: complete\ndata: {"answer":"ok"}\n\n']);
+    await act(async () => {
+      await result.current.sendMessage('Doc A', [], false, false, undefined, undefined, {
+        clarification_id: triple!.clarification_id,
+        selected_option_id: triple!.selected_option_id,
+      });
+    });
+
+    const currentFetch = global.fetch as any;
+    const lastCall = currentFetch.mock.calls[currentFetch.mock.calls.length - 1];
+    const body = JSON.parse(lastCall[1].body);
+    expect(body.clarification_selection).toEqual({
+      clarification_id: 'clr-1',
+      selected_option_id: 'opt-1',
+    });
   });
 });

@@ -230,6 +230,20 @@ class ChatMessageSchema(BaseModel):
     content: str
 
 
+class ClarificationSelection(BaseModel):
+    """Structured clarification reply: server-issued IDs only (Task 9).
+
+    Optional and additive: when present, the resume path validates the
+    selection against the persisted request's issued options before
+    resuming. The reply ``message`` text still carries the human answer;
+    this envelope pins WHICH option was chosen so a fabricated identity
+    can never resume a suspended turn.
+    """
+
+    clarification_id: str = Field(..., description="Server-issued request id")
+    selected_option_id: str = Field(..., description="Server-issued option id")
+
+
 class ChatRequest(BaseModel):
     """Request for the chat endpoint."""
 
@@ -243,6 +257,10 @@ class ChatRequest(BaseModel):
     enable_thinking: bool = False
     force_search: bool = (
         False  # Pre-search before LLM call; injects sources as context directly
+    )
+    clarification_selection: ClarificationSelection | None = Field(
+        default=None,
+        description="Structured clarification choice (server-issued IDs only)",
     )
 
 

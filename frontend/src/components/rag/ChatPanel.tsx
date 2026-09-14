@@ -36,6 +36,10 @@ import type {
   PersistedChatMessage,
 } from "@/types";
 import { MessageBubble } from "@/components/rag/chat/message/MessageBubble";
+import {
+  ClarificationBanner,
+  selectActiveClarification,
+} from "@/components/rag/ClarificationBanner";
 import { ChatInputArea } from "@/components/rag/chat/input/ChatInputArea";
 import type { AttachedFile } from "@/components/rag/chat/input/ChatInputArea";
 import { SuggestionChips } from "@/components/rag/chat/input/SuggestionChips";
@@ -780,7 +784,13 @@ export const ChatPanel = memo(function ChatPanel({
   }, [stream.streamingContent, stream.pendingSources, stream.pendingImages, stream.thinkingText, stream.isStreaming, stream.agentSteps, stream.pendingPeople, stream.pendingCitations, stream.pendingClarification, stream.streamCompleteTick]);
 
   const handleSend = useCallback(
-    async (text?: string) => {
+    async (
+      text?: string,
+      clarificationSelection?: {
+        clarification_id: string;
+        selected_option_id: string;
+      } | null,
+    ) => {
       const msg = (text || input).trim();
       // Block send while any file is still uploading OR parsing — its markdown is not
       // yet in MinIO, so the backend would silently drop it. "ready"/"indexed" are safe.
@@ -896,7 +906,8 @@ export const ChatPanel = memo(function ChatPanel({
         false, // thinking is decided server-side by query complexity
         false, // search is no longer forced from the UI — the agent decides when to search
         effectiveSessionId || undefined,
-        documentIds
+        documentIds,
+        clarificationSelection ?? null,
       );
 
       // Finalize the streaming message (prefer finalMsg.agentSteps — directly from SSE loop,
@@ -1240,41 +1251,46 @@ export const ChatPanel = memo(function ChatPanel({
                     </button>
                   )}
                   <div className="w-full max-w-[720px] mx-auto px-2">
-                    {/* Phase 4D (Task 9): structured clarification options.
-                        Live request from the stream, else the persisted resume
-                        block on the last assistant message (reload-safe).
-                        Selection submits ONLY server-issued option values. */}
+                    {/* Phase 4D (Task 9 fix round 1, I2): structured
+                        clarification options — live request while
+                        streaming, else the persisted resume block only when
+                        no user reply follows it. Selection submits ONLY
+                        server-issued IDs. */}
                     {(() => {
-                      const live = stream.pendingClarification;
-                      const persisted = [...messages].reverse().find(
-                        (m) => m.role === "assistant" && m.clarification?.options?.length,
-                      )?.clarification;
-                      const req = live ?? persisted ?? null;
-                      if (!req || req.options.length === 0) return null;
-                      const active = live != null;
+                      const selected = selectActiveClarification(
+                        messages,
+                        stream.pendingClarification,
+                      );
+                      if (!selected) return null;
                       return (
-                        <div
-                          data-testid="clarification-options"
-                          className="mb-3 rounded-xl border border-primary/25 bg-primary/5 p-3"
-                        >
-                          <p className="text-sm font-medium mb-2">{req.question}</p>
-                          <div className="flex flex-wrap gap-2">
-                            {req.options.map((opt) => (
-                              <button
-                                key={opt.option_id}
-                                type="button"
-                                disabled={!active || stream.isStreaming}
-                                onClick={() => {
-                                  const label = stream.submitClarification(opt.option_id);
-                                  if (label) void handleSend(label);
-                                }}
-                                className="px-3 py-1.5 rounded-lg border border-primary/30 bg-background text-sm hover:bg-primary/10 disabled:opacity-50"
-                              >
-                                {opt.label}
-                              </button>
-                            ))}
-                          </div>
-                        </div>
+                        <ClarificationBanner
+                          request={selected.request}
+                          active={selected.active && !stream.isStreaming}
+                          onSelect={(optionId) => {
+                            // Live path resolves via the hook; after a reload
+                            // the pending request is null, so resolve against
+                            // the server-issued persisted block instead.
+                            // Either way only issued option_ids resolve.
+                            const triple = stream.submitClarification(optionId) ?? (() => {
+                              const opt = selected.request.options.find(
+                                (o) => o.option_id === optionId,
+                              );
+                              return opt
+                                ? {
+                                    clarification_id: selected.request.clarification_id,
+                                    selected_option_id: opt.option_id,
+                                    label: opt.label,
+                                  }
+                                : null;
+                            })();
+                            if (triple) {
+                              void handleSend(triple.label, {
+                                clarification_id: triple.clarification_id,
+                                selected_option_id: triple.selected_option_id,
+                              });
+                            }
+                          }}
+                        />
                       );
                     })()}
                     <ChatInputArea

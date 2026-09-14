@@ -481,6 +481,8 @@ def normalize_wire_event(event: str, data: dict) -> list[dict]:
         }
         if isinstance(payload.get("status"), str):
             out_complete["status"] = payload["status"]
+        if isinstance(payload.get("related_entities"), list):
+            out_complete["related_entities"] = list(payload["related_entities"])
         if payload.get("clarification") is not None:
             out_complete["clarification"] = payload["clarification"]
         return [_versioned("complete", out_complete)]
@@ -501,6 +503,40 @@ def format_public_sse(event: str, data: dict) -> str:
     """Format one public event with canonical ``event:`` + ``data:`` framing."""
     json_data = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return f"event: {event}\ndata: {json_data}\n\n"
+
+
+def normalize_sse_frame(frame: str) -> list[str]:
+    """Normalize one raw wire SSE frame for the session relay (C1 funnel).
+
+    Parses the frame's ``event:``/``data:`` lines, projects the payload via
+    :func:`normalize_wire_event`, and returns canonical public frame(s).
+    Frames the normalizer maps to ``[]`` (advisory ``thinking``, unknown
+    future types) and unparseable/non-event frames (heartbeats, comments,
+    data-only) are returned **untouched** — the relay never drops a byte
+    it does not understand, and advisory model output is preserved.
+    """
+    event_name: str | None = None
+    data_lines: list[str] = []
+    for line in (frame or "").split("\n"):
+        if line.startswith("event:"):
+            if event_name is None:
+                event_name = line[len("event:"):].strip() or None
+        elif line.startswith("data:"):
+            data_lines.append(line[len("data:"):].lstrip(" "))
+    if event_name is None or not data_lines:
+        return [frame]
+    try:
+        payload = json.loads("\n".join(data_lines))
+    except (json.JSONDecodeError, ValueError):
+        return [frame]
+    if not isinstance(payload, dict):
+        return [frame]
+    normalized = normalize_wire_event(event_name, payload)
+    if not normalized:
+        return [frame]
+    return [
+        format_public_sse(item["event"], item["data"]) for item in normalized
+    ]
 
 
 def feed_sse_chunks(chunks: list[str]) -> list[dict]:

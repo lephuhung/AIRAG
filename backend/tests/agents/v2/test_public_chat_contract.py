@@ -193,3 +193,140 @@ def test_final_response_payload_carries_clarification_block():
     assert payload["clarification"]["clarification_id"] == "clr-9"
     # Existing callers without the kwarg are unaffected.
     assert "clarification" not in events.final_response_payload(response)
+
+
+def _relay_frames(raw_frame: str) -> list[str]:
+    """Drive one raw v1-wire SSE frame through the session relay funnel."""
+    from app.services.agents.v2 import transport
+
+    return transport.normalize_sse_frame(raw_frame)
+
+
+def test_relay_normalizes_v1_sources_into_stamped_citation():
+    import json
+
+    raw = (
+        'event: sources\ndata: {"sources": [{"document_id": "d1", '
+        '"chunk_id": "c1", "content": "excerpt", '
+        '"evidence_id": "99999999-9999-9999-9999-999999999999"}]}\n\n'
+    )
+    frames = _relay_frames(raw)
+    assert len(frames) == 1
+    assert frames[0].startswith("event: citation\ndata: ")
+    payload = json.loads(frames[0].split("\ndata: ", 1)[1])
+    assert payload["contract_version"] == "v2.chat/1"
+    assert payload["citations"][0]["document_id"] == "d1"
+    assert "99999999-9999-9999-9999-999999999999" not in frames[0]
+
+
+def test_relay_stamps_status_with_phase_and_keeps_token_wire():
+    import json
+
+    status_frames = _relay_frames(
+        'event: status\ndata: {"step": "analyzing", "detail": "x"}\n\n'
+    )
+    assert len(status_frames) == 1
+    payload = json.loads(status_frames[0].split("\ndata: ", 1)[1])
+    assert payload["phase"] == "planning"
+    assert payload["contract_version"] == "v2.chat/1"
+
+    token_frames = _relay_frames('event: token\ndata: {"text": "hi"}\n\n')
+    assert token_frames == [
+        'event: token\ndata: {"contract_version":"v2.chat/1","text":"hi"}\n\n'
+    ]
+
+
+def test_relay_passes_thinking_and_unknown_through_untouched():
+    raw_thinking = 'event: thinking\ndata: {"text": "advisory"}\n\n'
+    assert _relay_frames(raw_thinking) == [raw_thinking]
+    raw_future = 'event: future_shiny\ndata: {"a": 1}\n\n'
+    assert _relay_frames(raw_future) == [raw_future]
+
+
+def test_relay_maps_rollback_and_complete_with_resume_block():
+    import json
+
+    rollback = _relay_frames('event: token_rollback\ndata: {}\n\n')
+    assert rollback[0].startswith("event: status\n")
+    assert json.loads(rollback[0].split("\ndata: ", 1)[1])["step"] == "rollback"
+
+    complete = _relay_frames(
+        'event: complete\ndata: {"answer": "Which?", "status": "clarify", '
+        '"citations": [], "clarification": {"clarification_id": "clr-1", '
+        '"options": [], "resume": {"thread_id": "t"}}}\n\n'
+    )
+    payload = json.loads(complete[0].split("\ndata: ", 1)[1])
+    assert payload["clarification"]["clarification_id"] == "clr-1"
+    assert payload["contract_version"] == "v2.chat/1"
+
+
+def _selection_request():
+    from datetime import datetime, timezone
+    from uuid import UUID
+
+    from app.services.agents.v2.contracts.clarification import (
+        ClarificationRequest,
+        DocumentCandidate,
+    )
+
+    return ClarificationRequest(
+        contract_version="2.0",
+        clarification_id="clr-9",
+        reason="required_document_ambiguous",
+        question="Which one?",
+        unresolved_ref_ids=("ref-a",),
+        candidates=(
+            DocumentCandidate(
+                candidate_id="cand-1",
+                ordinal=1,
+                ref_id="ref-a",
+                document_id=UUID("11111111-1111-1111-1111-111111111111"),
+                label="Doc A",
+            ),
+        ),
+        expires_at=datetime(2030, 1, 1, tzinfo=timezone.utc),
+    )
+
+
+def test_prepare_resume_rejects_fabricated_selection():
+    """Task 9 fix round 1 (I3): a selection the server never issued raises
+    ``ClarificationError`` before any resume dispatch (caller falls back to
+    a fresh turn — never a resume). No DB/runtime touched on this path.
+    """
+    import asyncio
+
+    import pytest
+
+    from app.services.agent.streaming import prepare_v2_resume_command
+    from app.services.agents.v2.nodes.clarification import ClarificationError
+
+    with pytest.raises(ClarificationError):
+        asyncio.run(
+            prepare_v2_resume_command(
+                message_id="msg-1",
+                request=_selection_request(),
+                runtime_context=object(),
+                selected_option_id="33333333-3333-3333-3333-333333333333",
+                clarification_id="clr-9",
+            )
+        )
+
+
+def test_prepare_resume_rejects_wrong_clarification_id():
+    import asyncio
+
+    import pytest
+
+    from app.services.agent.streaming import prepare_v2_resume_command
+    from app.services.agents.v2.nodes.clarification import ClarificationError
+
+    with pytest.raises(ClarificationError):
+        asyncio.run(
+            prepare_v2_resume_command(
+                message_id="msg-1",
+                request=_selection_request(),
+                runtime_context=object(),
+                selected_option_id="cand-1",
+                clarification_id="clr-other",
+            )
+        )

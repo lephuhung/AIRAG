@@ -609,6 +609,7 @@ async def _session_v2_run(
     available_services=None,
     resume_message_id=None,
     terminal_info: dict | None = None,
+    clarification_selection=None,
 ):
     """Run one session turn's v2 ingress with unconditional cleanup (I1).
 
@@ -666,6 +667,16 @@ async def _session_v2_run(
                 thread_id=thread_id,
                 message_id=resume_message_id,
                 runtime_context=ingress.runtime_context,
+                selected_option_id=(
+                    clarification_selection.selected_option_id
+                    if clarification_selection is not None
+                    else None
+                ),
+                clarification_id=(
+                    clarification_selection.clarification_id
+                    if clarification_selection is not None
+                    else None
+                ),
             )
             yield ingress, stream_v2_turn_to_sse(
                 graph=graph,
@@ -1394,6 +1405,15 @@ async def chat_stream_session(
             nonlocal final_potential_abbreviations, final_people_data
             nonlocal final_citations, final_clarification
             nonlocal v2_response_status, v2_citations
+            # Task 9 fix round 1 (C1): the session relay is the runtime
+            # producer of the versioned public contract — every raw wire
+            # frame is projected through the single funnel before it
+            # reaches the client. Frames the funnel does not map
+            # (advisory ``thinking``, unknown future types, heartbeats)
+            # are relayed byte-identical.
+            from app.services.agents.v2.transport import (
+                normalize_sse_frame as _normalize_frame,
+            )
             try:
                 if sse_str.startswith("event:"):
                     lines = sse_str.strip().split("\n")
@@ -1428,6 +1448,25 @@ async def chat_stream_session(
                                 final_citations = ev_data["citations"]
                             if isinstance(ev_data.get("clarification"), dict):
                                 final_clarification = ev_data["clarification"]
+                        elif ev_type == "clarification_required":
+                            # v2 suspend structured request (already public
+                            # shaped): persist for reload rebuilds.
+                            if isinstance(ev_data, dict):
+                                final_clarification = ev_data
+                        elif ev_type == "clarification":
+                            # v1 legacy request: normalize to the public
+                            # shape and pin this session as resume thread.
+                            from app.services.agents.v2.events import (
+                                to_public_event as _to_public,
+                            )
+
+                            normalized = _to_public("clarification", ev_data)
+                            if normalized:
+                                block = dict(normalized[0]["data"])
+                                resume = dict(block.get("resume") or {})
+                                resume.setdefault("thread_id", str(session_id))
+                                block["resume"] = resume
+                                final_clarification = block
                         elif ev_type == "token_rollback":
                             # The streaming core reset final_answer
                             # + sources + images on rollback; mirror
@@ -1451,7 +1490,8 @@ async def chat_stream_session(
             except Exception:
                 pass
 
-            relay.put_nowait(sse_str)
+            for out_frame in _normalize_frame(sse_str):
+                relay.put_nowait(out_frame)
 
         try:
             history = []
@@ -1670,6 +1710,7 @@ async def chat_stream_session(
                             thread_id=session_id,
                             resume_message_id=raw_message_uuid,
                             terminal_info=v2_terminal_info,
+                            clarification_selection=request.clarification_selection,
                         ) as (_v2_ingress, _v2_agen):
                             try:
                                 await _drain(_v2_agen)
@@ -1771,6 +1812,20 @@ async def chat_stream_session(
             try:
                 await asyncio.shield(_persist(partial=True))
             except asyncio.CancelledError:
+                pass
+            # Task 9 fix round 1 (C1): the public union's ``cancelled``
+            # producer. A still-connected client (e.g. the stop button)
+            # finalizes quietly; a disconnected one never reads it.
+            # Queued ahead of the end-of-stream sentinel below.
+            try:
+                from app.services.agents.v2.transport import (
+                    format_public_sse as _public_frame,
+                )
+
+                relay.put_nowait(
+                    _public_frame("cancelled", {"reason": "user_stop"})
+                )
+            except Exception:
                 pass
             raise
         except Exception as e:

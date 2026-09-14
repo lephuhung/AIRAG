@@ -242,6 +242,21 @@ async def lifespan(app: FastAPI):
                     "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS people_data JSON"
                 )
             )
+            # Phase 4D (Task 9 fix round 1, C2): versioned public chat
+            # contract reload metadata — public citation projection +
+            # structured clarification resume block. Same idempotent
+            # mechanism as people_data above; the standalone SQL migration
+            # covers AUTO_CREATE_TABLES=false deployments.
+            await conn.execute(
+                text(
+                    "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS citations JSON"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS clarification JSON"
+                )
+            )
             # Exchange summaries for per-Q&A conversation context
             await conn.execute(
                 text("""

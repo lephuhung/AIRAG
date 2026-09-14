@@ -19,6 +19,7 @@ import type {
   PublicCitation,
   PublicClarificationRequest,
   ClarificationOption,
+  ClarificationSelection,
 } from "@/types";
 
 const BASE_URL = import.meta.env.VITE_API_URL || "/api/v1";
@@ -64,15 +65,17 @@ export interface RAGStreamResult {
     forceSearch?: boolean,
     overrideSessionId?: string,
     documentIds?: string[],
+    clarificationSelection?: ClarificationSelection | null,
   ) => Promise<ChatMessage | null>;
   /** Cancel ongoing stream */
   cancel: () => void;
   /**
-   * Resolve a clarification selection to the server-issued label to send.
-   * Returns null unless `optionId` was issued in the pending request —
-   * the UI can never submit fabricated document/workspace/binding identity.
+   * Resolve a clarification selection against the pending server-issued
+   * request. Returns the {clarification_id, option_id, label} triple, or
+   * null unless `optionId` was issued — the UI can never submit
+   * fabricated document/workspace/binding identity.
    */
-  submitClarification: (optionId: string) => string | null;
+  submitClarification: (optionId: string) => ClarificationSelection & { label: string } | null;
   /** Reset all state */
   reset: () => void;
 }
@@ -306,6 +309,7 @@ export function useRAGChatStream(
       forceSearch: boolean = false,
       overrideSessionId?: string,
       documentIds?: string[],
+      clarificationSelection?: ClarificationSelection | null,
     ): Promise<ChatMessage | null> => {
       // Reset state for new message
       setStreamingContent("");
@@ -345,6 +349,20 @@ export function useRAGChatStream(
         localSteps = next;
         setAgentSteps(next);
       }
+      // Shared sources_found step (v1 `sources` and public `citation` frames
+      // feed one presentation model during canary).
+      function noteSourcesFound(sources: ChatSourceChunk[]): void {
+        if (sources.length === 0) return;
+        const badges = sources.map((s) => String(s.index));
+        syncUpdateSteps((prev) => [
+          ...completeActiveStep(prev),
+          createStep("sources_found", `Found ${sources.length} source${sources.length > 1 ? "s" : ""}`, "completed"),
+        ].map((s) =>
+          s.step === "sources_found" && s.status === "completed" && !s.sourceBadges
+            ? { ...s, sourceBadges: badges, sourceCount: sources.length }
+            : s,
+        ));
+      }
 
       abortRef.current = new AbortController();
 
@@ -371,6 +389,9 @@ export function useRAGChatStream(
               enable_thinking: enableThinking,
               force_search: forceSearch,
               document_ids: documentIds,
+              // Structured clarification choice (server-issued IDs only);
+              // omitted for ordinary turns.
+              ...(clarificationSelection ? { clarification_selection: clarificationSelection } : {}),
             }),
             signal: abortRef.current.signal,
           },
@@ -483,6 +504,10 @@ export function useRAGChatStream(
                     } else if (phase === "planning" && step !== "analyzing") {
                       setStatus("analyzing");
                     }
+                    // Normalized abbreviation advisories ride on status.
+                    if (Array.isArray(data.abbreviations)) {
+                      setPotentialAbbreviations(data.abbreviations as string[]);
+                    }
                     break;
                   }
 
@@ -504,17 +529,7 @@ export function useRAGChatStream(
                     const sources = (data.sources || []) as ChatSourceChunk[];
                     localSources = sources;
                     setPendingSources([...sources]);
-
-                    // Add sources_found step with badges
-                    const badges = sources.map((s) => String(s.index));
-                    syncUpdateSteps((prev) => [
-                      ...completeActiveStep(prev),
-                      createStep("sources_found", `Found ${sources.length} source${sources.length > 1 ? "s" : ""}`, "completed"),
-                    ].map((s) =>
-                      s.step === "sources_found" && s.status === "completed" && !s.sourceBadges
-                        ? { ...s, sourceBadges: badges, sourceCount: sources.length }
-                        : s,
-                    ));
+                    noteSourcesFound(sources);
                     break;
                   }
 
@@ -570,6 +585,32 @@ export function useRAGChatStream(
                     const citations = (data.citations || []) as PublicCitation[];
                     localCitations = citations;
                     setPendingCitations([...citations]);
+                    // I4 compat: project locatable citations into the
+                    // sources presentation model so existing citation panels
+                    // keep rendering on normalized frames (dedup by chunk).
+                    const compat: ChatSourceChunk[] = citations
+                      .filter((c) => c.document_id && c.chunk_id)
+                      .map((c) => ({
+                        index: c.citation_id,
+                        chunk_id: String(c.chunk_id),
+                        content: c.content || "",
+                        document_id: String(c.document_id),
+                        page_no: c.page_no ?? 0,
+                        heading_path: c.heading_path || [],
+                        score: 0,
+                        source_type: "vector" as const,
+                        document_number: c.document_number ?? null,
+                        article_label: c.article_label ?? null,
+                      }));
+                    if (compat.length > 0) {
+                      const seen = new Set(localSources.map((s) => String(s.chunk_id)));
+                      const fresh = compat.filter((s) => !seen.has(String(s.chunk_id)));
+                      if (fresh.length > 0) {
+                        localSources = [...localSources, ...fresh];
+                        setPendingSources([...localSources]);
+                        noteSourcesFound(localSources);
+                      }
+                    }
                     if (Array.isArray(data.image_refs) && data.image_refs.length > 0) {
                       localImages = data.image_refs as ChatImageRef[];
                       setPendingImages([...localImages]);
@@ -813,15 +854,20 @@ export function useRAGChatStream(
     [sessionId, onToken, onThinkingToken],
   );
 
-  const submitClarification = useCallback((optionId: string): string | null => {
+  const submitClarification = useCallback((optionId: string): (ClarificationSelection & { label: string }) | null => {
     // Only a server-issued option_id from the pending request resolves.
-    // Returns the server-issued label for the caller to send as the resume
-    // reply (the suspended turn auto-resumes on this thread); null refuses
+    // Returns the triple for the caller to send as the resume reply (the
+    // suspended turn auto-resumes on this thread); null refuses
     // fabricated identity.
     const pending = pendingClarificationRef.current;
     if (!pending) return null;
     const match = pending.options.find((o) => o.option_id === optionId);
-    return match ? match.label : null;
+    if (!match) return null;
+    return {
+      clarification_id: pending.clarification_id,
+      selected_option_id: match.option_id,
+      label: match.label,
+    };
   }, []);
 
   return {

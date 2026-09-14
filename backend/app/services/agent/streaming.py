@@ -417,6 +417,12 @@ async def stream_agent_events(
                 yield {"event": "people_data", "data": {"people": all_people_data}}
                 logger.info(f"[stream] Emitted {len(all_people_data)} people records")
 
+            elif ev_type == "clarification":
+                # Task 9 fix round 1 (I5): the v1 clarification request was
+                # queued but never forwarded — the session relay normalizes
+                # it into the public ``clarification_required`` union member.
+                yield {"event": "clarification", "data": item[1] if isinstance(item[1], dict) else {}}
+
     finally:
         # Reset contextvars
         _event_queue_ctx.reset(queue_token)
@@ -1065,6 +1071,8 @@ async def prepare_v2_resume_command(
     message_id,
     request,
     runtime_context,
+    selected_option_id: str | None = None,
+    clarification_id: str | None = None,
 ):
     """Build the verbatim resume ``Command`` for a clarification reply.
 
@@ -1073,6 +1081,14 @@ async def prepare_v2_resume_command(
     by T7's ``clarification_reply_is_fresh_turn`` (single owner): a
     candidate-free request raises ``V2FreshTurnRequired`` and the caller
     must treat the reply as a new turn, never retry the resume.
+
+    Task 9 fix round 1 (I3): when the frontend submits a structured
+    selection (``selected_option_id`` + ``clarification_id``), it is
+    validated against the server-issued options of THIS persisted request
+    via ``validate_clarification_selection`` — a value the server never
+    issued raises ``ClarificationError`` (caller falls back to a fresh
+    turn; never a resume). ``None`` selection keeps the legacy free-text
+    reply path unchanged.
     """
     from app.services.agent.runtime_selector import (
         clarification_reply_is_fresh_turn as _is_fresh_turn,
@@ -1087,6 +1103,28 @@ async def prepare_v2_resume_command(
             "persisted clarification request does not re-validate; "
             "refusing to resume from it"
         )
+    if selected_option_id is not None or clarification_id is not None:
+        from app.services.agents.v2.events import (
+            clarification_public_metadata as _clarify_public,
+        )
+        from app.services.agents.v2.transport import (
+            ClarificationSelectionError,
+            validate_clarification_selection as _validate_selection,
+        )
+        from app.services.agents.v2.nodes.clarification import ClarificationError
+
+        try:
+            public = _clarify_public(request, thread_id="")
+            if clarification_id is not None and str(clarification_id) != str(
+                public.get("clarification_id")
+            ):
+                raise ClarificationSelectionError(
+                    f"clarification {clarification_id!r} does not match the "
+                    f"pending request {public.get('clarification_id')!r}"
+                )
+            _validate_selection(public, str(selected_option_id or ""))
+        except ClarificationSelectionError as exc:
+            raise ClarificationError(str(exc)) from exc
     try:
         return await resume_clarification(message_id, request, runtime_context)
     except Exception as exc:
@@ -1126,6 +1164,8 @@ async def resolve_v2_resume_command(
     thread_id: str,
     message_id,
     runtime_context,
+    selected_option_id: str | None = None,
+    clarification_id: str | None = None,
 ):
     """Resolve this turn's resume ``Command`` (or ``None`` for a fresh turn).
 
@@ -1148,6 +1188,8 @@ async def resolve_v2_resume_command(
             message_id=message_id,
             request=pending,
             runtime_context=runtime_context,
+            selected_option_id=selected_option_id,
+            clarification_id=clarification_id,
         )
     except V2FreshTurnRequired:
         logger.info(
@@ -1415,9 +1457,35 @@ async def stream_v2_turn_events(
 
     async def _emit_suspend_turn(pending) -> AsyncGenerator[dict, None]:
         # Shared by the returned-state and nested-raise suspend paths:
-        # the question arrives whole in the single terminal ``complete``
-        # (tokens stream for success terminals only — see below); leases
-        # stay active.
+        # a structured ``clarification_required`` frame first (server-issued
+        # option IDs + resume metadata — the public union's producer), then
+        # the question whole in the single terminal ``complete`` (tokens
+        # stream for success terminals only — see below); leases stay active.
+        try:
+            from app.services.agents.v2.transport import (
+                build_clarification_required as _build_required,
+            )
+
+            candidates = pending.candidates if not isinstance(pending, dict) else pending.get("candidates", ())
+            options = []
+            for candidate in candidates or ():
+                if isinstance(candidate, dict):
+                    option_id = str(candidate.get("candidate_id") or "")
+                    label = str(candidate.get("label") or option_id)
+                else:
+                    option_id = str(getattr(candidate, "candidate_id", "") or "")
+                    label = str(getattr(candidate, "label", None) or option_id)
+                if option_id:
+                    options.append({"option_id": option_id, "label": label})
+            clarification_id = pending.get("clarification_id") if isinstance(pending, dict) else getattr(pending, "clarification_id", "clr-1")
+            yield _build_required(
+                clarification_id=str(clarification_id or "clr-1"),
+                question=str(pending.get("question") if isinstance(pending, dict) else getattr(pending, "question", "")),
+                options=options,
+                resume={"thread_id": thread_id},
+            )
+        except Exception:
+            logger.warning("[v2stream] clarification_required frame failed", exc_info=True)
         yield {"event": "status", "data": {"step": "generating", "detail": "clarification pending"}}
         event, data = _v2_terminal_event(
             _coerce_final_response(
@@ -1446,6 +1514,7 @@ async def stream_v2_turn_events(
     try:
         if resume_command is not None:
             yield {"event": "status", "data": {"step": "analyzing", "detail": "Resuming v2 graph..."}}
+            checkpoint_state: dict = {}
             checkpoint_state = await _v2_checkpoint_values(graph, config)
             await _refresh_v2_resume_leases(
                 runtime_context=runtime_context,
@@ -1455,6 +1524,7 @@ async def stream_v2_turn_events(
             payload = resume_command
         else:
             yield {"event": "status", "data": {"step": "analyzing", "detail": "Running v2 graph..."}}
+            checkpoint_state = {}
             payload = initial_state
         invoke_task = asyncio.create_task(
             graph.ainvoke(payload, config, context=runtime_context)
@@ -1516,6 +1586,28 @@ async def stream_v2_turn_events(
             # ``token`` events, then emit the single terminal. Clarify
             # terminals (non-success ``complete``) carry the question in the
             # payload itself — no speculative prose precedes them.
+            if resume_command is not None:
+                # Task 9 fix round 1 (C1): a resumed turn that reaches
+                # success acknowledges the answered request — the public
+                # union's ``clarification_resolved`` producer. Advisory
+                # only; the terminal ``complete`` below is unchanged.
+                try:
+                    resolved_id = ""
+                    pending_req = _coerce_clarification_request(
+                        checkpoint_state.get("clarification")
+                    )
+                    if pending_req is not None:
+                        resolved_id = str(
+                            pending_req.get("clarification_id")
+                            if isinstance(pending_req, dict)
+                            else getattr(pending_req, "clarification_id", "")
+                        )
+                    yield {
+                        "event": "clarification_resolved",
+                        "data": {"clarification_id": resolved_id},
+                    }
+                except Exception:
+                    logger.warning("[v2stream] clarification_resolved frame failed", exc_info=True)
             yield {"event": "status", "data": {"step": "generating", "detail": "Streaming v2 answer..."}}
             for chunk in _chunk_prose(data.get("answer", ""), token_chunk_size):
                 acc.on_token(chunk)

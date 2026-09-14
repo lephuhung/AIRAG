@@ -506,6 +506,64 @@ def test_interrupt_suspends_with_clarify_complete_and_no_release():
     assert graph.calls[0][1] == {"configurable": {"thread_id": "thread-stable-1"}}
 
 
+def test_interrupt_emits_structured_clarification_required_before_terminal():
+    """Task 9 fix round 1 (C1): the suspend turn produces a real
+    ``clarification_required`` frame (server-issued option IDs + resume
+    metadata) ahead of its single terminal ``complete``.
+    """
+    import asyncio
+
+    from langgraph.errors import GraphInterrupt
+
+    import app.services.agent.streaming as convert_streaming
+    from app.services.agents.v2.contracts.clarification import (
+        ClarificationRequest,
+        DocumentCandidate,
+    )
+
+    request = ClarificationRequest(
+        contract_version=CONTRACT_VERSION,
+        clarification_id="clr-9",
+        reason="required_document_ambiguous",
+        question="Which document?",
+        unresolved_ref_ids=("r1",),
+        candidates=(
+            DocumentCandidate(
+                candidate_id="cand-1",
+                ordinal=1,
+                ref_id="r1",
+                document_id=uuid4(),
+                label="Doc A",
+            ),
+        ),
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    graph = FakeGraph(
+        [("interrupt", GraphInterrupt([]))],
+        checkpoint={"clarification": request},
+    )
+    leases = FakeLeaseRepo()
+    events = asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=graph,
+                runtime_context=_runtime(leases=leases),
+                thread_id="thread-stable-9",
+                initial_state={"request": "q"},
+            )
+        )
+    )
+    required = [ev for ev in events if ev["event"] == "clarification_required"]
+    assert len(required) == 1
+    data = required[0]["data"]
+    assert data["clarification_id"] == "clr-9"
+    assert data["options"] == [{"option_id": "cand-1", "label": "Doc A"}]
+    assert data["resume"]["thread_id"] == "thread-stable-9"
+    # Still exactly one terminal, and leases stay active on suspension.
+    assert _terminal_events(events)[0]["event"] == "complete"
+    assert leases.released == []
+
+
 def test_resume_uses_command_verbatim_on_stable_thread():
     import asyncio
 
