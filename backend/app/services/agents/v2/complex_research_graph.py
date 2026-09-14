@@ -841,7 +841,6 @@ def build_initial_proposal(planning_input: ResearchPlanningInput) -> InitialProp
     ``summarize`` (complex) routes to the summarize skill with its
     deterministic map/reduce workflow; ``retrieve`` routes to the retrieve
     skill with its single deterministic ``document.retrieve`` task;
-    ``cross_domain`` with a named person
     ``cross_domain`` (Task 12) routes to the cross-domain skill — the
     governed people-first lookup when a person is named, bounded parallel
     reads over bound documents otherwise; ``multi_goal`` (Task 12) routes

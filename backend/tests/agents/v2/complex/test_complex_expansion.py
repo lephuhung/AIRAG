@@ -14,6 +14,7 @@ from uuid import UUID
 
 import pytest
 from app.services.agents.v2.contracts.binding import DocumentBindingSet, ScopedDocument
+from app.services.agents.v2.contracts.capability import CapabilityDescriptor
 from app.services.agents.v2.contracts.planning import (
     DiscoveryPolicy,
     ResearchBudgetView,
@@ -21,7 +22,6 @@ from app.services.agents.v2.contracts.planning import (
 )
 from app.services.agents.v2.contracts.routing import QueryAnalysis
 from app.services.agents.v2.contracts.semantic import SemanticContext
-from app.services.agents.v2.contracts.capability import CapabilityDescriptor
 
 USER_ID = UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
 WORKSPACE_ID = UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
@@ -82,10 +82,10 @@ def _two_bindings() -> DocumentBindingSet:
     )
 
 
-def _analysis(work_type: str = "multi_goal") -> QueryAnalysis:
+def _analysis(work_type: str = "multi_goal", domains: tuple = ("document",)) -> QueryAnalysis:
     return QueryAnalysis(
         work_type=work_type,  # type: ignore[arg-type]
-        domains=("document",),  # type: ignore[arg-type]
+        domains=domains,  # type: ignore[arg-type]
     )
 
 
@@ -230,11 +230,12 @@ def _cross_domain_input(
     *,
     semantic: SemanticContext | None = None,
     bindings: DocumentBindingSet | None = None,
+    domains: tuple = ("document",),
 ) -> ResearchPlanningInput:
     return ResearchPlanningInput(
         semantic=semantic or _semantic(),
         bindings=bindings or _two_bindings(),
-        query_analysis=_analysis("cross_domain"),
+        query_analysis=_analysis("cross_domain", domains),
         capability_catalog=tuple(
             CapabilityDescriptor(
                 name=name,  # type: ignore[arg-type]
@@ -343,6 +344,88 @@ def test_build_initial_proposal_selects_cross_domain_skill() -> None:
         "document.read",
     ]
     assert proposal.reduce_spec is None
+
+
+def test_cross_domain_two_family_input_not_covered() -> None:
+    """I1: a person-less ``cross_domain`` whose families extend beyond
+    document/section (here: a ``kg_query``-typed input over document +
+    knowledge_graph) must NOT be claimed deterministically — the governed
+    model path can plan the missing family (``knowledge_graph.query``).
+    Claiming it would silently drop the second family and still report
+    ``sufficient``."""
+    from app.services.agents.v2.skills.cross_domain import policy as xd_policy
+
+    assert xd_policy.covers_input(
+        _cross_domain_input(domains=("document", "knowledge_graph"))
+    ) is False
+
+
+def test_cross_domain_two_family_build_refuses() -> None:
+    """I1: defense in depth — even when called directly, the generic branch
+    fails closed on a two-family input instead of planning a one-sided
+    document-only DAG."""
+    from app.services.agents.v2.contracts.validation import ContractValidationError
+    from app.services.agents.v2.skills.cross_domain import policy as xd_policy
+
+    with pytest.raises(ContractValidationError, match="document and section"):
+        xd_policy.build_cross_domain_plan(
+            _cross_domain_input(domains=("document", "knowledge_graph"))
+        )
+
+
+def test_cross_domain_doc_section_still_covered() -> None:
+    """I1 control: document+section stays inside the deterministic intake
+    (section coordinates are served by ``section.read`` on the same reads)."""
+    from app.services.agents.v2.skills.cross_domain import policy as xd_policy
+
+    planning_input = _cross_domain_input(domains=("document", "section"))
+    assert xd_policy.covers_input(planning_input) is True
+    plan = xd_policy.build_cross_domain_plan(planning_input)
+    assert [task.capability for task in plan.tasks] == [
+        "document.read",
+        "document.read",
+    ]
+
+
+def test_cross_domain_person_branch_unaffected_by_second_family() -> None:
+    """I1 control: the named-person pilot branch keeps ownership regardless
+    of other domains — the governed first lookup is the pilot's answer."""
+    from app.services.agents.v2.skills.cross_domain import policy as xd_policy
+
+    planning_input = _cross_domain_input(
+        capability_names=frozenset({"people.lookup", "document.read"}),
+        semantic=_person_semantic(),
+        bindings=_empty_bindings(),
+        domains=("document", "knowledge_graph"),
+    )
+    assert xd_policy.covers_input(planning_input) is True
+    plan = xd_policy.build_cross_domain_plan(planning_input)
+    assert plan.plan_id == "people-first-p1"
+
+
+@pytest.mark.asyncio
+async def test_entry_two_family_cross_domain_stays_unavailable_unwired() -> None:
+    """I1 entry proof: unwired (no planner), a two-family ``cross_domain``
+    yields no plan and the typed unavailable boundary — never a one-sided
+    document-only DAG."""
+    from app.services.agents.v2.complex_research_graph import (
+        COMPLEX_RESEARCH_UNAVAILABLE,
+        decide_node,
+        validate_checkpoint_node,
+    )
+    from langgraph.runtime import Runtime
+
+    _, context = _e2e_harness("run-expand-xd-twofam")
+    child = _e2e_child(
+        "cross_domain", "cross_domain_dependency", _two_bindings()
+    )
+    child["query_analysis"] = _analysis(
+        "cross_domain", ("document", "knowledge_graph")
+    )
+    runtime = Runtime(context=context)
+    assert (await validate_checkpoint_node(child, runtime)).get("plan") is None
+    decided = await decide_node(child, runtime)
+    assert decided["unavailable"].code == COMPLEX_RESEARCH_UNAVAILABLE
 
 
 # ---------------------------------------------------------------------------
@@ -726,3 +809,27 @@ async def test_end_to_end_evaluate_reads_dispatch_without_v1_fallback() -> None:
     assert output["plan"].plan_id == "evaluate-b1-b2"
     assert [call[0].task_id for call in capability.calls] == ["T1", "T2"]
     assert output["evaluation"].status == "sufficient"
+
+
+@pytest.mark.asyncio
+async def test_unbound_evaluate_stays_typed_unavailable_never_v1() -> None:
+    """M6: an ``evaluate`` query with no bound documents (and no wired
+    planner) ends at the typed ``COMPLEX_RESEARCH_UNAVAILABLE`` boundary —
+    the plan-less execute node returns empty without consulting the
+    fallback guard, so no ``V1FallbackRequired`` is raised and no v1 answer
+    is fabricated by v2."""
+    from app.services.agents.v2.complex_research_graph import (
+        COMPLEX_RESEARCH_UNAVAILABLE,
+        complex_execute_node,
+        decide_node,
+        validate_checkpoint_node,
+    )
+    from langgraph.runtime import Runtime
+
+    _, context = _e2e_harness("run-expand-ev-unbound")
+    child = _e2e_child("evaluate", "compliance_evaluation", _empty_bindings())
+    runtime = Runtime(context=context)
+    assert (await validate_checkpoint_node(child, runtime)).get("plan") is None
+    decided = await decide_node(child, runtime)
+    assert decided["unavailable"].code == COMPLEX_RESEARCH_UNAVAILABLE
+    assert await complex_execute_node(child, runtime) == {}

@@ -454,12 +454,12 @@ def test_build_initial_proposal_preserves_other_work_types() -> None:
     from app.services.agents.v2.complex_research_graph import build_initial_proposal
     from app.services.agents.v2.contracts.validation import ContractValidationError
 
-    # Task 12 covers evaluate deterministically; fast-path work (lookup)
+    # Task 12 covers evaluate deterministically; uncovered work (explain)
     # still has no complex skill policy and stays the typed unavailable
     # boundary.
     with pytest.raises(ContractValidationError):
         build_initial_proposal(_planning_input(_unscoped_bindings()).model_copy(
-            update={"query_analysis": _analysis("lookup")}
+            update={"query_analysis": _analysis("explain")}
         ))
 
 

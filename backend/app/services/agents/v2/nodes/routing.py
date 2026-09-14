@@ -23,6 +23,13 @@ routes to ``complex_research`` with an explicit reason code so T6's
 ``complex_boundary`` returns the typed unavailable response. Unsupported work
 is never silently routed to ``fast_domain``.
 
+Supersession note (Task 12, binding spec §15): ``evaluate``/compliance is no
+longer an example of unsupported work — it is served by the governed v2
+complex DAG (``skills/evaluate`` bounded evidence reads + evidence
+evaluation + grounded synthesis, ``requires_v1_fallback`` lifted for the
+``evaluate``/``compliance_evaluation`` outcome). The paragraph above now
+applies to genuinely uncovered work (e.g. write, or work no skill covers).
+
 Routing may inspect request-scoped capability availability (via the injected
 ``allowed_capabilities`` permission grant plus the actual request-scoped
 capability catalog when the caller supplies it); availability never reaches

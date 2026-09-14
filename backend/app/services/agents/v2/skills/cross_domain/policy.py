@@ -54,6 +54,29 @@ CROSS_DOMAIN_WORK_TYPE = "cross_domain"
 #: stays a bounded fan-out of reads, never an open-ended crawl.
 MAX_CROSS_DOMAIN_TARGETS = 8
 
+#: Families the generic bound-read branch can serve deterministically.
+#: Anything else (people without a named person ref, knowledge_graph,
+#: memory, write) needs family-specific work the read fan-out cannot plan,
+#: so those inputs stay uncovered for the governed model path.
+_DOCUMENT_FAMILIES = frozenset({"document", "section"})
+
+
+def _generic_branch_eligible(planning_input: ResearchPlanningInput) -> bool:
+    """True when the bound-read branch can serve every declared family (I1).
+
+    The frozen router assigns ``cross_domain`` only when ≥2 dependency
+    families exist, and the read fan-out serves document/section families
+    alone. Claiming a wider input (e.g. document + knowledge_graph) would
+    silently drop the second family while the run still reports
+    ``sufficient`` — so those inputs stay uncovered for the governed model
+    path, which can plan the missing family. The named-person branch is
+    unaffected: the pilot's first lookup is the governed answer there."""
+    domains = set(planning_input.query_analysis.domains)
+    if not domains <= _DOCUMENT_FAMILIES:
+        return False
+    count = len(plannable_bindings(planning_input.bindings))
+    return 1 <= count <= MAX_CROSS_DOMAIN_TARGETS
+
 
 def supports_work_type(work_type: str) -> bool:
     """True only for the ``cross_domain`` pilot; ``compare`` and the rest are out."""
@@ -64,18 +87,19 @@ def covers_input(planning_input: ResearchPlanningInput) -> bool:
     """True when the deterministic skill owns this input (Task 12 planner seam).
 
     Ownership is work-type plus intake: a named person (the governed first
-    lookup) or at least one settled-role binding within the hard ceiling. A
-    covered input whose build still refuses (missing catalog capability, over
-    task budget) is a deliberate final refusal — the model path must not
-    second-guess it. Fully open inputs (no person, no bound documents) stay
+    lookup) or, for the generic bound-read branch, settled-role bindings
+    whose declared families are all servable (document/section only — I1).
+    A covered input whose build still refuses (missing catalog capability,
+    over task budget) is a deliberate final refusal — the model path must
+    not second-guess it. Fully open or multi-family inputs (no person, no
+    bound documents, or a second family the reads cannot serve) stay
     uncovered so the governed model path still owns them.
     """
     if not supports_work_type(planning_input.query_analysis.work_type):
         return False
     if bool(planning_input.semantic.person_refs):
         return True
-    count = len(plannable_bindings(planning_input.bindings))
-    return 1 <= count <= MAX_CROSS_DOMAIN_TARGETS
+    return _generic_branch_eligible(planning_input)
 
 
 def _first_person(planning_input: ResearchPlanningInput):  # type: ignore[no-untyped-def]
@@ -139,6 +163,12 @@ def build_cross_domain_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
         raise ContractValidationError(
             "cross_domain needs a named person or at least one bound document, "
             "got neither; refusing to fabricate cross-domain targets"
+        )
+    if not _generic_branch_eligible(planning_input):
+        raise ContractValidationError(
+            "cross_domain generic branch serves document and section families "
+            f"only, got domains {sorted(planning_input.query_analysis.domains)}; "
+            "refusing a one-sided plan that would drop a dependency family"
         )
     if len(sides) > MAX_CROSS_DOMAIN_TARGETS:
         raise ContractValidationError(
