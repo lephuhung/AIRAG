@@ -84,7 +84,7 @@ def _resolve_role_config(role: str):
     return cfg
 
 
-def _cached_provider(cache_key: str, cfg_role: str, build) -> LLMProvider:
+def _cached_provider(cache_key: str, build) -> LLMProvider:
     """Version-keyed provider cache. Sync, non-blocking, lazy rebuild."""
     from app.services.runtime_config import snapshot_version
 
@@ -127,7 +127,7 @@ def get_llm_provider(role: str = "main") -> LLMProvider:
             return trace_llm(inner, label="vision_llm")
         return trace_llm(inner, label="main_llm")
 
-    return _cached_provider(f"role:{role}", role, _build)
+    return _cached_provider(f"role:{role}", _build)
 
 
 def get_memory_agent() -> LLMProvider:
@@ -176,7 +176,7 @@ def get_memory_agent() -> LLMProvider:
             inner = OpenAICompatFallback().memory_agent_fallback()
         return trace_llm(inner, label="memory_agent")
 
-    return _cached_provider("role:memory_agent", "memory_agent", _build)
+    return _cached_provider("role:memory_agent", _build)
 
 
 class OpenAICompatFallback:
@@ -261,7 +261,7 @@ def get_thinking_provider() -> LLMProvider:
         )
         return trace_llm(inner, label="thinking_llm")
 
-    return _cached_provider("role:thinking", "thinking", _build)
+    return _cached_provider("role:thinking", _build)
 
 
 def _reasoning_provider(role: str, label: str) -> LLMProvider:
@@ -287,7 +287,7 @@ def _reasoning_provider(role: str, label: str) -> LLMProvider:
             cfg = _build_from_settings(role)
         return trace_llm(build_provider(cfg), label=label)
 
-    return _cached_provider(f"role:{role}", role, _build)
+    return _cached_provider(f"role:{role}", _build)
 
 
 def get_semantic_router_provider() -> LLMProvider:
@@ -300,7 +300,7 @@ def get_semantic_router_provider() -> LLMProvider:
 
 
 def get_planner_provider() -> LLMProvider:
-    """LLM for v2 governed adaptive planning (Phase 5).
+    """LLM for v2 governed adaptive planning (plan Task 10 / Phase 5 backend).
 
     Unassigned → effective "thinking" connection/model; explicit assignment
     wins. Proposal-only — validated/scheduled by v2, never direct execution.
@@ -337,7 +337,7 @@ def get_kg_llm_provider() -> LLMProvider:
             cfg = _build_from_settings("kg_extract")
         return build_provider(cfg)
 
-    return _cached_provider("role:kg_extract", "kg_extract", _build)
+    return _cached_provider("role:kg_extract", _build)
 
 
 def get_embedding_provider() -> EmbeddingProvider:

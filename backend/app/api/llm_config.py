@@ -8,7 +8,6 @@ plaintext — only a masked form.
 from __future__ import annotations
 
 import hashlib
-import logging
 import time
 
 import httpx
@@ -27,8 +26,6 @@ from app.services import runtime_config
 from app.services.audit_service import AuditService
 
 router = APIRouter(prefix="/admin/llm-config", tags=["admin"])
-
-logger = logging.getLogger(__name__)
 
 _TEST_TIMEOUT = 15.0  # seconds per probe request
 
@@ -391,17 +388,11 @@ async def assign_role(
         raise HTTPException(status_code=404, detail=f"Unknown LLM role: {role}")
 
     conn_id = body.conn_id.strip()
-    # No hard reject for a not-yet-known connection id: the runtime resolver
-    # (_load_effective) already treats a dangling conn_id as fail-open to
-    # `.env` with a warning, and the delete flow can leave dangling refs via
-    # force=true. Log so typos are visible in server logs without blocking
-    # role assignment (e.g. connection created right after the assignment).
-    if conn_id != "@env" and conn_id not in await runtime_config.list_connections():
-        logger.warning(
-            f"[llm_config] role {role!r} assigned to unknown connection "
-            f"{conn_id!r} — resolves to .env defaults until it exists"
-        )
-
+    # No connection-existence pre-check here on purpose: set_override() below
+    # is the single authoritative guard and rejects unknown connections with
+    # a 400 (ValueError → HTTPException). A dangling reference can therefore
+    # never be persisted from this endpoint; reader-side `.env` fallback only
+    # covers rows left dangling by forced connection deletes.
     try:
         await runtime_config.set_override(
             role, {"conn_id": conn_id, "model": body.model.strip(), "extra": body.extra},

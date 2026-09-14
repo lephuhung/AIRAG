@@ -1096,7 +1096,10 @@ async def _call_llm_for_disambiguation(
     The call is wrapped in asyncio.wait_for to enforce timeout_sec.
     Returns list of updated AbbreviationEntry objects.
     """
-    from app.services.llm import get_llm_provider
+    # Phase-4 Task 0 ownership: abbreviation disambiguation is a
+    # control-plane call owned by the semantic_router role — never the main
+    # answer model (spec §17: model output is advisory only).
+    from app.services.llm import get_semantic_router_provider
     from app.services.llm.types import LLMMessage
 
     if not ambigs:
@@ -1122,7 +1125,7 @@ Trả lời JSON (chỉ JSON, không có gì khác):
     )
 
     messages = [LLMMessage(role="user", content=prompt)]
-    llm = get_llm_provider()
+    llm = get_semantic_router_provider()
 
     try:
         response = await asyncio.wait_for(
