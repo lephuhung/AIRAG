@@ -1,341 +1,379 @@
-# LangGraph v2 Phase 4 — Semantic Intelligence & Adaptive Execution Design
+# LangGraph v2 Phase 4 — V1 Intelligence, V2 Contracts & Adaptive Execution Design
 
 **Date:** 2026-09-14
 
 ## 1. Goal
 
-Move LangGraph v2 from contract-first/runtime-pilot maturity to reliable end-to-end execution for real user queries by adding semantic completeness, deterministic-first LLM fallback routing, governed adaptive planning/replanning, and query-quality gates without weakening the frozen authorization, binding, scheduler, evidence, checkpoint, or grounding boundaries.
+Phase 4 must preserve the parts of `LLM-Optimize` that already understand real user queries well, while moving their outputs behind the stricter v2 contracts and execution boundaries.
 
-This phase does **not** rebuild the v2 runtime. The existing contract/runtime machinery remains authoritative:
+The guiding rule is:
+
+> **V1 answers “what does the user mean, and what are they referring to?”**  
+> **V2 answers “what may the system execute, how is it validated, and what evidence is sufficient?”**
+
+Phase 4 therefore does **not** rewrite v1 semantic intelligence with a new regex-first classifier. It reuses/refactors proven v1 behavior for:
+
+- intent understanding;
+- named/partial/approximate document references;
+- document-number handling;
+- document identity resolution;
+- abbreviation/contextualization behavior;
+- People/simple RAG/section/summarize/KG fast-path semantics;
+
+and translates that intelligence into the existing v2 contract/runtime model.
+
+The existing v2 execution chain remains authoritative:
 
 ```text
-proposal -> validate -> lease -> checkpoint -> TaskScheduler
-          -> CapabilityRegistry -> Capability.execute
-          -> Evidence -> Evaluator -> Grounding/Synthesis
+semantic meaning / resolved identities
+        -> V2 contracts
+        -> deterministic RouteDecision
+        -> validated plan
+        -> lease/checkpoint
+        -> TaskScheduler
+        -> CapabilityRegistry
+        -> Evidence
+        -> Evaluator
+        -> Grounding/Synthesis
 ```
 
-The new intelligence is advisory and typed. Models never own ACL, bindings, tool execution, checkpoint writes, or scope widening.
+Models never own ACL, trusted workspace scope, immutable revision binding, capability authorization, checkpoint writes, or arbitrary tool execution.
 
-## 2. Existing baseline to preserve
+## 2. Architecture boundary
 
-Keep the following architecture stable unless a concrete Phase-4 regression proves a change is required:
+```text
+┌──────────────────────────────────────────────────────────┐
+│ INTELLIGENCE LAYER — preserve/refactor proven V1 logic  │
+│                                                          │
+│ - follow-up contextualization                            │
+│ - abbreviation understanding                             │
+│ - People/simple RAG/section/summarize/KG intent          │
+│ - document mention understanding                         │
+│ - document number / agency / year hints                  │
+│ - DB -> LLM -> vector -> fuzzy/rerank document resolver │
+└───────────────────────────┬──────────────────────────────┘
+                            │ typed adapter boundary
+                            ▼
+┌──────────────────────────────────────────────────────────┐
+│ CONTRACT LAYER — V2                                      │
+│                                                          │
+│ SemanticDraft / SemanticContext                          │
+│ DocumentReference / SectionReference                     │
+│ QueryAnalysis / RouteDecision                            │
+│ DocumentBindingSet                                       │
+│ TaskPlan / TaskSpec / AgentResult                        │
+└───────────────────────────┬──────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────┐
+│ EXECUTION/GOVERNANCE LAYER — V2                          │
+│                                                          │
+│ Fast Path / ComplexResearchGraph                         │
+│ Planner / TaskScheduler / CapabilityRegistry             │
+│ ACL / immutable revision pinning                         │
+│ Checkpoint/resume / Evidence / Evaluator / Grounding     │
+└──────────────────────────────────────────────────────────┘
+```
 
-- `SemanticContext`, `QueryAnalysis`, `RouteDecision`, `TaskPlan`, `TaskSpec`, `AgentResult` frozen contract shapes.
-- request-scoped authorization and capability registry.
-- immutable document revision bindings and binding provenance.
-- shared `TaskScheduler` as the only capability dispatcher.
-- evidence governance, hydration, evaluation, grounding, and retention leases.
-- supervisor-owned checkpointer; no subgraph-owned second saver.
-- current fast paths for deterministic bounded operations.
-- current complex-research subgraph and deterministic compare/summarize/retrieve policies as fallback/reference behavior.
-- v1 as rollback arm during rollout.
+V1 legacy state/control fields such as `next_agent`, `pending_intent`, mutable `document_ids`, and agent-to-agent routing are not imported into v2 contracts.
 
-## 3. Key current gaps
+## 3. Existing v1 intelligence to preserve
 
-### 3.1 Semantic information is dropped before routing
+### 3.1 Document resolution
 
-`draft_from_preprocessing(...)` currently preserves document refs and abbreviations but initializes:
+`app.services.agent.doc_resolver.resolve_candidates()` is the proven identity-resolution core and already exists on `feat/langgraph-v2`. Phase 4 reuses it through a v2 adapter rather than copying/reimplementing it.
+
+Its behavior to preserve includes:
+
+```text
+reference + full question topic
+    -> regex/metadata hints
+    -> DB exact/partial candidate search
+    -> LLM metadata extraction when DB is dry
+    -> DB search again
+    -> vector fallback using the full question
+    -> number-identity filter
+    -> topic rerank
+    -> fuzzy similar-title fallback
+```
+
+This supports users who remember only:
+
+- a full document number;
+- a short number such as `15`;
+- a number plus agency such as `Thông tư 15 của Bộ Công an`;
+- a partial/approximate title;
+- a year plus topic;
+- only the subject matter of the document.
+
+A difficult identity resolution does **not** make the user request complex. For example, resolving `Điều 5 luật an ninh mạng` may internally require DB/LLM/vector work, but once it resolves to one document + one section, the execution topology is still a bounded fast-path read.
+
+### 3.2 Intent classification
+
+The v1 behavior in `supervisor_scope.py` and the v1 supervisor prompt/taxonomy is retained as the semantic basis for simple intents:
+
+- greeting/direct;
+- personal/contextual;
+- People lookup;
+- general RAG search;
+- named-document resolution;
+- search by document number;
+- section read/search;
+- one-document summarize;
+- KG lookup;
+- list/search-abbreviation where supported.
+
+Deterministic narrow scopes continue to bypass an LLM where v1 already treats them as unambiguous. Uncertain/full cases may use the configured semantic-routing model, but its result is translated into v2 semantic facts rather than accepted as a v2 route.
+
+### 3.3 Follow-up and abbreviation intelligence
+
+Existing v1 follow-up contextualization and abbreviation behavior are implementation evidence to reuse selectively. Phase 4 must preserve the user-visible behavior while moving ownership of model selection to explicit LLM task roles and keeping outputs within v2 semantic contracts.
+
+## 4. V2 boundaries that remain authoritative
+
+The following remain v2-owned and must not be delegated back to v1:
+
+- trusted `RequestContext` scope;
+- authorization/workspace ACL;
+- `DocumentReference.resolved_document_id` acceptance rules;
+- immutable document revision pinning;
+- retention leases;
+- deterministic `RouteDecision`;
+- capability availability;
+- plan validation;
+- scheduler dispatch;
+- evidence governance/evaluation;
+- checkpoint/resume;
+- final grounding and citation policy.
+
+The document resolver may propose/return server-side candidate document IDs, but the existing v2 binding resolver remains the only authority that pins an authorized current/historical revision.
+
+## 5. Runtime-only intelligence adapters
+
+Phase 4 introduces request-scoped runtime adapters, not new checkpoint contracts.
+
+Conceptually:
 
 ```python
-coreferences=()
-person_refs=()
-section_refs=()
+class IntentDecision:
+    intent: str
+    task_hints: tuple[str, ...]
+    needs_memory: bool
+    is_legal_query: bool
+    source: Literal["deterministic", "model"]
+    confidence: float | None
+
+class DocumentIdentityResolution:
+    reference: str
+    resolved_document_id: UUID | None
+    candidate_document_ids: tuple[UUID, ...]
+    section_reference: str | None
+    status: Literal["resolved", "ambiguous", "not_found"]
+    score: float | None
 ```
 
-This makes exact-section routing, person-aware routing, and multi-turn references such as `văn bản này`, `nghị định trên`, or `ông ấy` unreliable.
+These shapes are internal/runtime-only. They are translated into frozen v2 contracts and never checkpointed as raw model/resolver output.
 
-### 3.2 Query analysis is deterministic-only
+## 6. Request-scoped inference/cache seam
 
-`analyze_query()` currently relies on refs, supervisor-scope classification, and keyword/regex sets. This is correct for high-confidence cases but unsafe as a universal classifier. The frozen design already allows uncertain cases to use a small model.
+The current v2 graph rebuilds `SemanticDraft` in both binding and semantic-finalization paths. Therefore any model-backed intent/document inference must be cached request-locally so a single turn does not run the same LLM/vector resolution multiple times.
 
-### 3.3 The complex runtime exists, but planning is still mainly policy-selected
+Use `RuntimeServices` or an equivalent request-scoped runtime owner for:
 
-`ComplexResearchGraph` already executes validated plans through the shared scheduler and supports deterministic compare/summarize/retrieve plus bounded dependency/replan machinery. The missing capability is an adaptive planner that can propose typed multi-step plans for supported complex work while remaining subordinate to validation/governance.
+- intent classification result;
+- document identity resolution result;
+- semantic completion result.
 
-### 3.4 Conversation state is structurally capable but under-populated
+Cache keys must include the current request/query and relevant conversation semantic context. Cache data cannot cross turns, users, workspaces, or live/shadow runs.
 
-`ConversationContext` already has `active_entities`, `last_focus`, and recent turns, but the legacy adapter currently maps summary `key_entities` to generic `concept` entities and leaves `last_focus=None`. Phase 4 must populate useful typed discourse references before coreference resolution can be dependable.
+No inference object is serialized into `SupervisorV2State`.
 
-## 4. LLM role architecture
+## 7. Translation into V2 semantic contracts
 
-Phase 4 MUST reuse the existing runtime LLM configuration system. It MUST NOT create a second model-connection stack for LangGraph v2.
+The intelligence adapter enriches `SemanticDraft` with:
 
-Existing architecture:
+- resolved/ambiguous/not-found `DocumentReference` values;
+- `SectionReference` values;
+- typed People/person references where available;
+- abbreviation resolutions;
+- coreference resolutions;
+- blocking ambiguities only when user choice is genuinely required.
+
+Example:
 
 ```text
-llm_conn.<conn_id>  -> provider + base_url + encrypted api key + extras
-llm_role.<role>     -> conn_id + model
+User: "Điều 5 Luật An ninh mạng quy định gì?"
+
+V1 intelligence:
+  intent = search_section
+  document mention = "Luật An ninh mạng"
+  document_id = X
+  section = "Điều 5"
+
+Adapter -> V2:
+  DocumentReference(resolved_document_id=X, status="resolved")
+  SectionReference(label="Điều 5")
+
+Binding -> immutable revision pin
+
+QueryAnalysis:
+  work_type="retrieve"
+  domains=("document", "section")
+
+RouteDecision:
+  route="fast_domain"
 ```
 
-Add two logical task roles:
+No Planner call is required.
+
+## 8. Simple eligibility and routing policy
+
+Whether an LLM was needed to understand the query is **not** a complexity signal.
+
+Complexity is determined from the logical evidence/execution topology after semantic resolution.
+
+A query is eligible for a fast/bounded workflow when the system can select a known atomic capability or fixed bounded workflow without synthesizing a query-specific DAG.
+
+Examples that should stay fast where capabilities are available:
+
+- People lookup;
+- general factual RAG retrieval;
+- one resolved document retrieval;
+- one resolved section read;
+- search by document number after identity resolution;
+- one-document bounded summarize;
+- simple KG lookup.
+
+Planner is required only for true query-specific multi-step topology such as:
+
+- multi-target comparison;
+- evaluate/compliance across evidence sets;
+- People -> Document dependency;
+- multi-goal requests;
+- generic cross-domain dependency;
+- iterative evidence completion where a fixed bounded workflow is insufficient.
+
+The semantic/intelligence model never directly returns the final `RouteDecision`.
+
+## 9. LLM role architecture
+
+Reuse the existing `llm_conn.*` + `llm_role.*` runtime configuration system.
+
+Add:
 
 ```text
 semantic_router
 planner
 ```
 
-### 4.1 Inheritance
-
-When the new role has no explicit assignment:
+Defaults:
 
 ```text
-semantic_router -> inherit effective `thinking`
-planner         -> inherit effective `thinking`
+semantic_router -> inherit effective thinking
+planner         -> inherit effective thinking
 ```
 
-`effective thinking` means the currently resolved thinking role, including a DB override when one exists, not merely `.env` defaults.
+Explicit admin assignment overrides inheritance.
 
-An explicit assignment to `semantic_router` or `planner` wins over inheritance.
+Do not add separate planner/router base-URL/model/API-key stacks.
 
-No new `V2_*_BASE_URL`, `V2_*_MODEL`, or `V2_*_API_KEY` settings are introduced. Feature enablement, timeout, token, and budget settings may remain implementation settings, but provider/connection/model selection belongs to runtime role configuration.
+Existing internal LLM calls used by semantic/document/abbreviation/follow-up logic must receive deliberate role ownership; accidental use of the main answer model must be removed where appropriate.
 
-### 4.2 Provider factories
+## 10. Fast-path parity gate
 
-Refactor/reuse the current provider factory so callers can obtain independently traced providers:
+Before adaptive planner work begins, v2 must meet or exceed `LLM-Optimize` behavior on simple-query semantics and document resolution.
+
+Golden parity coverage must include:
+
+- pure greeting;
+- People by phone/CCCD/BHXH/name;
+- general factual RAG;
+- exact legal document title;
+- approximate/partial document title;
+- full official number;
+- short/bare number;
+- number + agency;
+- year + topic;
+- topic-only document recollection;
+- exact section;
+- nested Khoản/Điều/Điểm references;
+- one-document summarize;
+- KG lookup;
+- greeting prefix + factual query;
+- ambiguous document candidate requiring clarification;
+- low-confidence target that must not be force-bound;
+- multi-turn follow-up/coreference.
+
+For every golden case compare at least:
 
 ```text
-thinking_llm
-semantic_router_llm
-planner_llm
+semantic interpretation
+resolved document identity/candidates
+intent
+V2 QueryAnalysis
+V2 RouteDecision
+expected capability/workflow
 ```
 
-`get_thinking_provider()` remains backward compatible. New wrappers may be `get_semantic_router_provider()` and `get_planner_provider()`, implemented through one shared reasoning-role factory.
+Planner implementation does not begin until this gate passes.
 
-### 4.3 Admin API/UI
+## 11. Governed adaptive planner
 
-The existing `/admin/llm-config/{role}` endpoint and connection catalogue remain authoritative. Add the two roles to backend `ROLES`, frontend `LlmRole`/`LLM_ROLES`, role metadata, and i18n descriptions.
+After fast-path parity passes, complex work uses the Phase-4 planner role.
 
-The API/UI must not misleadingly display `@env` when a new role is inheriting a DB-configured `thinking` assignment. Expose inheritance metadata or resolve assignment presentation so the effective connection/model is truthful.
-
-No database migration is required: `system_settings` already stores open-ended role keys.
-
-## 5. Semantic completion layer
-
-### 5.1 Deterministic-first extraction
-
-Before calling a model, extract high-confidence values deterministically:
-
-- normalized phone forms (`0...`, `+84`, spaces/dashes removed);
-- CCCD/BHXH candidates with collision-aware classification;
-- explicit document references;
-- article/section/chapter/clause references;
-- obvious person cues/names where current preprocessing can validate them;
-- exact discourse references that map unambiguously to one active entity.
-
-Do not add regexes merely to cover every linguistic case. Rules stop when confidence becomes low.
-
-### 5.2 Small-model semantic inference
-
-For unresolved/ambiguous semantic content, a small-model call may produce a strict internal result containing only semantic facts needed to finish `SemanticDraft` and/or classify the query.
-
-This model output is **ephemeral and uncheckpointed**. It may contain confidence/diagnostic values, but those values do not modify frozen `QueryAnalysis`.
-
-The semantic model cannot emit workspace IDs, authorization, capability grants, binding IDs, document revision identities, raw tool instructions, or executable tasks.
-
-### 5.3 Reuse one semantic inference per turn
-
-The frozen design says routing may reuse validated small-model output when Context already called a model. Therefore Phase 4 must avoid the topology:
-
-```text
-Context LLM call -> Router LLM call for the same semantics
-```
-
-Prefer:
-
-```text
-Context deterministic extraction
-    -> optional semantic inference
-    -> validate ephemeral inference
-    -> finalize SemanticContext
-    -> router reuses inference facts when needed
-```
-
-Use a request-scoped runtime-only service/channel in `RuntimeServices` or equivalent ephemeral ownership seam. Do not add model output to `SupervisorV2State` or checkpoints.
-
-If no context-model call was necessary but deterministic routing remains uncertain, the router may invoke the semantic-router provider once.
-
-## 6. Hybrid semantic router
-
-### 6.1 Deterministic high-confidence cases
-
-Keep model-free routing for cases such as:
-
-- pure greeting/conversation;
-- normalized exact People identifier lookup;
-- exact bounded section/document operations whose references are already resolved;
-- explicit deterministic hard-scope behavior;
-- cases with blocking ambiguity that already require clarification.
-
-### 6.2 Uncertain cases
-
-Introduce an internal classifier result, separate from frozen business contracts. Conceptual shape:
-
-```python
-class SemanticRoutingInference:
-    work_type: WorkType
-    domains: tuple[Domain, ...]
-    dependency_hints: tuple[...]
-    confidence: float
-    requires_clarification: bool
-```
-
-Exact implementation shape is internal and may evolve. After validation it is translated into the existing `QueryAnalysis`.
-
-`confidence` is telemetry/policy input only; it is not added to `QueryAnalysis`.
-
-### 6.3 Policy remains deterministic
-
-The model does not return `RouteDecision`. `decide_route(...)` or its successor remains deterministic policy over validated semantic facts, current bindings, request hard scope, and runtime capability availability.
-
-The LLM therefore answers **what the query means**, not **what the system is allowed to execute**.
-
-### 6.4 Known routing defects to eliminate
-
-Regression coverage must include:
-
-- People query with `là ai` must not be stolen by KG semantics when a person identifier/name is present.
-- greeting prefix plus factual remainder must not become direct conversation.
-- conceptual `khác biệt`, `tổng hợp`, `đánh giá` must not automatically imply a multi-document operation without sufficient semantic evidence.
-- raw numeric identifiers must not fall silently into document retrieval.
-- one query spanning multiple domains must distinguish true dependency from incidental lexical overlap.
-
-## 7. Conversation/coreference resolution
-
-Populate and consume `ConversationContext` as the discourse contract intended:
-
-- retain typed active document/person/section entities when they become authoritative;
-- derive `last_focus` from validated turn outcomes rather than leaving it permanently `None`;
-- resolve phrases such as `văn bản này`, `nghị định trên`, `file thứ hai`, `điều này`, `ông ấy` to stable known reference IDs when unambiguous;
-- preserve blocking ambiguity when multiple prior entities are plausible;
-- never revive unauthorized document identity from history; current runtime scope remains authoritative.
-
-A follow-up turn must not need the user to repeat a previously resolved document/person merely because the surface name is absent in the new query.
-
-## 8. Governed adaptive planner
-
-Absorb the existing `2026-09-13-langgraph-v2-p2-adaptive-planner.md` work into this phase rather than implementing a parallel planner stack.
-
-### 8.1 Planner boundary
-
-Planner input is request-scoped, typed, minimized, and redacted. It may see:
-
-- finalized semantic goal/query analysis;
-- current validated bindings/target catalogue in safe projected form;
-- currently available capability catalogue;
-- budget remaining;
-- typed task outcomes;
-- evaluator gaps;
-- redacted model-facing observations.
-
-It must not see ACL internals, service clients, API keys, namespaces, raw governed evidence, unrestricted personal scalar data, or mutable runtime objects.
-
-### 8.2 Planner output
-
-Planner returns proposals only. It does not dispatch.
+Planner input is typed, minimized, request-scoped, and redacted. Planner output is proposal-only:
 
 ```text
 PlannerProposal
-    -> construct proposed TaskPlan/append tasks
-    -> validate_task_plan
+    -> validate
     -> scope/capability/budget checks
-    -> retention lease
+    -> retention lease where needed
     -> checkpoint
-    -> shared TaskScheduler
+    -> TaskScheduler
 ```
 
-Invalid, cyclic, unauthorized, over-budget, unknown-capability, malformed, or scope-widening proposals are rejected.
+The planner cannot widen explicit hard scope, mint trusted document IDs, replace completed tasks, bypass capability authorization, or dispatch tools directly.
 
-### 8.3 Deterministic fallback
+Existing deterministic compare/summarize/retrieve policies remain safe fallback/reference implementations.
 
-Timeout, disabled planner, malformed structured output, or rejected proposal falls back to existing deterministic supported policies where a safe policy exists. Unsupported work remains typed-unavailable or clarification; never fabricate a plan.
+## 12. Evaluator-driven bounded replan
 
-### 8.4 Replanning
+Reuse existing `EvidenceEvaluation`, `MissingRequirement`, `Contradiction`, and task summaries. Do not create a parallel persisted gap contract merely for the planner.
 
-Replanning is append-only, bounded, and evaluator-driven. Typical typed gaps include:
+Project only minimized facts into model-facing replan input. Replans are append-only, bounded by configured budgets, and validated before scheduling.
 
-- missing target coverage;
-- insufficient evidence;
-- dependency unavailable/not found;
-- unresolved supporting/reference discovery;
-- conflicting evidence requiring a bounded additional read.
+## 13. Complex-work expansion order
 
-The planner cannot replace completed tasks or widen explicit hard scope.
+Only after fast-path parity and planner integration:
 
-## 9. Expand complex work types after planner integration
+1. `multi_goal` composed from supported atomic capabilities;
+2. generic `cross_domain` beyond existing People -> Document vertical slices;
+3. `evaluate` / compliance with typed criteria and grounded evidence.
 
-Only after semantic/router/planner gates pass, add governed policy support for currently unsupported complex work types in dependency order:
+Do not replace this with an unconstrained ReAct loop.
 
-1. `multi_goal` composed from already-supported atomic capabilities;
-2. `cross_domain` dependencies beyond the existing People->Document vertical slice;
-3. `evaluate` / compliance using typed semantic completion criteria and grounded evidence.
+## 14. Shadow and rollout
 
-Do not implement one giant unconstrained ReAct loop. Complex work remains a validated DAG executed by the existing scheduler.
+Rollout stages:
 
-## 10. Observability
+1. unit/contract tests;
+2. v1-v2 fast-path golden parity;
+3. semantic/document-intelligence shadow comparison;
+4. planner-proposal shadow;
+5. full read-only document execution shadow where available;
+6. internal workspace enablement;
+7. canary through existing v1/v2 rollout controls;
+8. promotion only after quality/safety gates pass.
 
-Measure the new control-plane LLMs separately:
+V1 remains the rollback arm until the observation window is clean.
 
-Semantic router:
-- call count / bypass count;
-- latency and token usage;
-- deterministic-vs-model disagreement on golden/shadow data;
-- fallback/parse failure rate;
-- confusion matrix by work type/domain.
+## 15. Non-goals
 
-Planner:
-- call count and latency;
-- proposal validation rejection rate and reason;
-- deterministic fallback rate;
-- task count / DAG depth / replan count;
-- budget exhaustion;
-- final sufficiency and grounded-answer rate.
-
-Do not log raw sensitive evidence or secrets in these metrics.
-
-## 11. Golden E2E acceptance set
-
-Phase completion is based on user-query quality, not only contract/unit tests. Maintain a golden matrix covering at least:
-
-- greeting/direct;
-- general factual reference-free RAG;
-- exact document and exact section;
-- People phone/CCCD/BHXH/name lookup;
-- KG lookup;
-- greeting-prefix factual query;
-- follow-up/coreference across turns;
-- one- and multi-document summary;
-- section/document comparison;
-- People->Document dependency;
-- cross-domain dependency;
-- multi-goal request;
-- compliance/evaluate;
-- ambiguous query requiring clarification.
-
-For each case assert as applicable:
-
-```text
-semantic -> route -> plan -> task results -> evidence -> evaluation -> grounded answer
-```
-
-Also record latency, number of semantic-router calls, planner calls, replans, retrieved evidence count, and citations.
-
-## 12. Rollout
-
-1. Unit/contract regression.
-2. Golden replay with deterministic baseline.
-3. Semantic-router shadow telemetry; no user-visible behavior change.
-4. Planner shadow telemetry; no tool side effects beyond existing isolated shadow guarantees.
-5. Internal workspace feature enablement.
-6. Canary using existing v1/v2 rollout control.
-7. Promote only after quality and safety gates pass; preserve v1 rollback until the agreed observation window is clean.
-
-## 13. Non-goals
-
-- Replacing the shared scheduler.
-- Adding a second checkpointer.
-- Letting a model decide authorization/scope.
-- Letting a model execute arbitrary tools.
-- Replacing all deterministic routing with LLM classification.
-- Persisting raw model reasoning/chain-of-thought.
-- Redesigning frozen v2 business contracts merely to carry confidence/telemetry.
-- Creating separate planner/router endpoint configuration outside the existing LLM role system.
+- Rewriting proven v1 document-resolution behavior as a new regex-only implementation.
+- Importing v1 mutable SupervisorState/agent routing into v2.
+- Letting v1/model output decide ACL or trusted workspace scope.
+- Letting a semantic model directly choose v2 capabilities/routes.
+- Replacing `TaskScheduler`, capability registry, evidence, or checkpointer.
+- Adding a second planner/router provider configuration stack.
+- Persisting model reasoning/chain-of-thought.
+- Changing frozen v2 contracts merely to carry confidence/diagnostics.
