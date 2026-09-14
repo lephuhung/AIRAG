@@ -53,15 +53,7 @@ def make_factual_bundle(**overrides: Any):
         "people_directory": dict(PEOPLE_DIRECTORY),
     }
     params.update(overrides)
-    bundle = build_shadow_bundle(**params)
-    # Mirror production ingress: the shared scheduler feeds the
-    # request-scoped resolver before dispatch (round 2 N1 raises on
-    # targeted plans without one). Registry-gating still fails closed for
-    # unregistered document capabilities.
-    from app.services.agent.runtime_selector import PlanBindingResolver
-
-    bundle.runtime_context.services.pinned_target_resolver = PlanBindingResolver()
-    return bundle
+    return build_shadow_bundle(**params)
 
 
 def make_direct_bundle(**overrides: Any):
@@ -993,6 +985,63 @@ async def test_shadow_preserves_refs_read_only() -> None:
     assert len(coerced["semantic"].document_refs) == 1
     assert len(coerced["bindings"].bindings) == 1
     assert coerced["bindings"].bindings[0].document_id == DOCUMENT_ID
+
+
+@pytest.mark.asyncio
+async def test_shadow_targeted_document_read_is_registry_gated() -> None:
+    """I1 (round-2 review): production shadow wires its own pinned resolver.
+
+    Production-shaped (built by ``build_shadow_bundle`` directly, with NO
+    test-only resolver injection): a targeted ``document.read`` fast turn
+    must feed successfully and then fail closed at the registry gate with
+    a typed ``DEPENDENCY_UNAVAILABLE`` task outcome — route
+    ``fast_domain`` preserved — never a ``SchedulerError`` boundary error
+    with the route cleared. Deleting the production shadow wiring must
+    fail this test (route ``None``).
+    """
+    from app.services.agent.shadow_runtime import build_shadow_bundle
+
+    bundle = build_shadow_bundle(
+        raw_query="Đọc tài liệu này",
+        thread_id="shadow-i1-red",
+        user_id=USER_ID,
+        workspace_ids=(WORKSPACE_ID,),
+        can_read_people=True,
+        allowed_capabilities=TEST_ALLOWED,
+        person_names=(),
+        people_directory={},
+        known_documents=(DOCUMENT_ID,),
+        document_view={DOCUMENT_ID: dict(DOCUMENT_VIEW[DOCUMENT_ID])},
+        history=(("user", "trước đó tôi hỏi về định mức"),),
+    )
+    resolver = bundle.runtime_context.services.pinned_target_resolver
+    assert resolver is not None, (
+        "production shadow must wire a request-scoped pinned-target "
+        "resolver (mirror of production ingress)"
+    )
+    assert callable(getattr(resolver, "feed", None))
+    metrics = await bundle.run()
+    assert metrics.route == "fast_domain", metrics.redacted()
+    assert metrics.task_count >= 1, metrics.redacted()
+    state = bundle.graph.get_state(
+        {"configurable": {"thread_id": bundle.thread_id}}
+    )
+    from app.services.agents.supervisor_v2 import normalize_checkpoint_state
+
+    coerced = normalize_checkpoint_state(dict(state.values))
+    results = list(coerced["execution"].task_results)
+    assert len(results) >= 1, metrics.redacted()
+    gated = [
+        r
+        for r in results
+        if getattr(getattr(r, "error", None), "code", None)
+        == "DEPENDENCY_UNAVAILABLE"
+    ]
+    assert gated, (
+        f"targeted document.read must be registry-gated to typed "
+        f"DEPENDENCY_UNAVAILABLE, got: "
+        f"{[(r.task_id, r.status, getattr(getattr(r, 'error', None), 'code', None)) for r in results]}"
+    )
 
 
 @pytest.mark.asyncio

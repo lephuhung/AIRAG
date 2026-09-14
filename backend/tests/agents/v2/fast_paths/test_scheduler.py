@@ -1401,8 +1401,6 @@ def test_plan_binding_feed_is_atomic_and_clears_stale_on_failure() -> None:
     """F4: a mid-feed exception leaves no stale authority behind."""
     from types import SimpleNamespace
 
-    from app.services.agent.runtime_selector import PlanBindingResolver
-
     stack = _retrieve_stack()
     resolver = fresh_plan_binding_resolver()
     resolver.feed(stack["plan"], stack["bindings"])
@@ -1421,7 +1419,6 @@ def test_plan_binding_feed_is_atomic_and_clears_stale_on_failure() -> None:
 
 def test_plan_binding_feed_replaces_mapping_without_stale_leftovers() -> None:
     """F4: a successful re-feed installs the new map whole (no leftovers)."""
-    from app.services.agent.runtime_selector import PlanBindingResolver
     from app.services.agents.v2.contracts.locators import SectionLocator
 
     stack = _retrieve_stack()

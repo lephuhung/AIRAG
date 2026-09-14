@@ -47,6 +47,7 @@ from types import SimpleNamespace
 from typing import Any, Mapping
 from uuid import UUID, uuid4
 
+from app.services.agent.runtime_selector import PlanBindingResolver
 from app.services.agents.supervisor_v2 import (
     V1PeopleLookupService,
     V1ServiceBundle,
@@ -956,14 +957,24 @@ def build_shadow_bundle(
     people_backing = (
         directory if people_directory is not None else people_source
     )
+    # I1 (round-2 review): mirror of production ingress — one
+    # request-scoped resolver shared by the document capabilities (via
+    # the registry) AND ``RuntimeServices.pinned_target_resolver``, so the
+    # shared scheduler's dispatch-time feed succeeds and targeted
+    # document/section turns fail closed at the registry gate with typed
+    # DEPENDENCY_UNAVAILABLE outcomes (route preserved), never a
+    # SchedulerError boundary error. Document/section reads stay gated out
+    # by ``available_services={"v1-people"}``.
+    shadow_resolver = PlanBindingResolver()
     registry = build_v2_capability_registry(
         capability_runtime,
         bundle=V1ServiceBundle(
             people_lookup=people_backing,
             evidence=evidence_builder,
+            resolver=shadow_resolver,
         ),
         evidence=evidence_builder,
-        resolver=None,
+        resolver=shadow_resolver,
         available_services=frozenset({"v1-people"}),
     )
     services = RuntimeServices(
@@ -975,6 +986,7 @@ def build_shadow_bundle(
         authorization=ShadowAuthorization(view),
         evidence_hydrator=hydrator,
         answer_draft_channel=AnswerDraftChannel(),
+        pinned_target_resolver=shadow_resolver,
     )
     runtime_context = GraphRuntimeContext(
         capability_runtime=capability_runtime,
