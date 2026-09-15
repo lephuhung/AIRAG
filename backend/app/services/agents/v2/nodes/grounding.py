@@ -151,21 +151,39 @@ def _mapping_report(
     ambiguous: list[tuple[str, tuple[str, ...]]] = []
     for assertion in split_assertions(draft.content):
         normalized = normalize_assertion(assertion)
-        candidates = tuple(
-            claim.claim_id
-            for claim in draft.claims
-            if normalized
-            and (
-                normalized == normalize_assertion(claim.text)
-                or normalized in normalize_assertion(claim.text)
-            )
-        )
-        if len(candidates) == 1:
-            mapped.append((assertion, candidates[0]))
-        elif len(candidates) > 1:
-            ambiguous.append((assertion, candidates))
-        else:
+        if not normalized:
             unmapped.append(assertion)
+            continue
+        normalized_claims = tuple(
+            (claim.claim_id, normalize_assertion(claim.text))
+            for claim in draft.claims
+        )
+        # Exact normalized matches win first: tiny markers such as '1.'
+        # normalize to a short form that is contained in every longer
+        # claim, so containment-only matching made them spuriously
+        # ambiguous. Containment remains only as a fallback when no claim
+        # states the assertion exactly.
+        exact = tuple(
+            claim_id
+            for claim_id, claim_norm in normalized_claims
+            if normalized == claim_norm
+        )
+        if len(exact) == 1:
+            mapped.append((assertion, exact[0]))
+        elif len(exact) > 1:
+            ambiguous.append((assertion, exact))
+        else:
+            candidates = tuple(
+                claim_id
+                for claim_id, claim_norm in normalized_claims
+                if normalized in claim_norm
+            )
+            if len(candidates) == 1:
+                mapped.append((assertion, candidates[0]))
+            elif len(candidates) > 1:
+                ambiguous.append((assertion, candidates))
+            else:
+                unmapped.append(assertion)
     return GroundingReport(
         mapped=tuple(mapped),
         unmapped_assertions=tuple(unmapped),

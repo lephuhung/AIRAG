@@ -31,12 +31,13 @@ grounded result. On a channel miss (restart between nodes, unwired channel)
 the consumer re-derives deterministically ONCE from checkpointed state —
 never a silent re-run on every node.
 
-Drafting in Phase 2 is deterministic extractive composition (one claim per
-distinct content, duplicate contents merged into a single claim citing every
-supporting use) through the ``DraftBuilder`` seam: a bounded model may supply
-the draft in production, but it receives only ``SynthesisInput`` plus
-``SynthesisEvidence`` — never authorization, plans, or bindings — and its
-output is validated against the admitted set before use.
+Drafting in Phase 2 is deterministic extractive composition: user-visible
+content preserves first-seen whole evidence items, while grounding claims are
+built per distinct normalized assertion and merge every supporting use. A
+bounded model may instead supply a draft through the ``DraftBuilder`` seam,
+but it receives only ``SynthesisInput`` plus ``SynthesisEvidence`` — never
+authorization, plans, or bindings — and its output is validated against the
+admitted set before use.
 """
 from __future__ import annotations
 
@@ -235,38 +236,63 @@ async def hydrate_for_synthesis(
 def build_extractive_draft(
     evidence: tuple[SynthesisEvidence, ...],
 ) -> AnswerDraft:
-    """Deterministic extractive draft: one claim per distinct content.
+    """Deterministic extractive draft: one claim per distinct assertion.
 
-    Items with identical (normalized) content merge into a single claim citing
-    every supporting use, so two uses of one record stay exactly mappable at
-    grounding instead of diverging into ambiguous duplicate claims.
+    User-visible content preserves the prior whole-item composition: duplicate
+    normalized contents merge and first-seen item text/order wins. Claims use
+    the finer ``split_assertions`` granularity that grounding maps over;
+    identical normalized assertions merge every supporting use in first-seen
+    source order. This keeps answer rendering stable while preventing repeated
+    markers and sentences in overlapping chunks from becoming spuriously
+    ambiguous. Deterministic first-seen assertion order owns claim numbering.
     """
     if not evidence:
         raise SynthesisError(
             "no admitted synthesis evidence; a sufficient evaluation whose "
             "uses are all denied at synthesis time cannot be drafted"
         )
-    merged: dict[str, list[SynthesisEvidence]] = {}
+    # Lazy import: grounding imports this module at load time, so a
+    # top-level import would be circular; at call time both are loaded and
+    # the draft builder is guaranteed the exact mapping semantics.
+    from .grounding import normalize_assertion, split_assertions
+
+    texts: dict[str, str] = {}
+    uses: dict[str, list[UUID]] = {}
+    seen: dict[str, set[UUID]] = {}
     order: list[str] = []
+    content_parts: list[str] = []
+    content_seen: set[str] = set()
     for item in evidence:
-        key = " ".join(item.content.split())
-        if key not in merged:
-            merged[key] = []
-            order.append(key)
-        merged[key].append(item)
-    claims: list[AnswerClaim] = []
-    parts: list[str] = []
-    for index, key in enumerate(order):
-        group = merged[key]
-        claims.append(
-            AnswerClaim(
-                claim_id=f"claim-{index + 1}",
-                text=group[0].content,
-                evidence_use_ids=tuple(item.use_id for item in group),
-            )
+        content_key = " ".join(item.content.split())
+        if content_key not in content_seen:
+            content_seen.add(content_key)
+            content_parts.append(item.content)
+        for assertion in split_assertions(item.content):
+            key = normalize_assertion(assertion)
+            if not key:
+                continue
+            if key not in texts:
+                texts[key] = assertion
+                uses[key] = []
+                seen[key] = set()
+                order.append(key)
+            if item.use_id not in seen[key]:
+                seen[key].add(item.use_id)
+                uses[key].append(item.use_id)
+    if not order:
+        raise SynthesisError(
+            "no admitted synthesis evidence; a sufficient evaluation whose "
+            "uses are all denied at synthesis time cannot be drafted"
         )
-        parts.append(group[0].content)
-    return AnswerDraft(content="\n\n".join(parts), claims=tuple(claims))
+    claims = tuple(
+        AnswerClaim(
+            claim_id=f"claim-{index + 1}",
+            text=texts[key],
+            evidence_use_ids=tuple(uses[key]),
+        )
+        for index, key in enumerate(order)
+    )
+    return AnswerDraft(content="\n\n".join(content_parts), claims=claims)
 
 
 async def synthesize_answer(
