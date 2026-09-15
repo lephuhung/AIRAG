@@ -14,8 +14,11 @@ import { defineConfig, devices } from 'playwright/test';
  * environment — see the task report for the exact blocker.
  */
 export default defineConfig({
+  // NOTE: the Playwright specs use the `.e2e.ts` suffix (not `.spec.ts`)
+  // so the Vitest runner (default include `**/*.{test,spec}.*`) never
+  // collects them — the two runners stay disjoint without config coupling.
   testDir: '.',
-  testMatch: '**/*.spec.ts',
+  testMatch: '**/*.e2e.ts',
   fullyParallel: true,
   retries: 0,
   reporter: 'list',

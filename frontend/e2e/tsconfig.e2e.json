@@ -11,5 +11,5 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["./playwright.config.ts", "./chat-stream.spec.ts"]
+  "include": ["./playwright.config.ts", "./chat-stream.e2e.ts"]
 }

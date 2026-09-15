@@ -217,6 +217,14 @@ unavailable, record the exact blocker/commands — never fake success.
 
 ## Operational hand-off (live steps not runnable from a worktree session)
 
+> Executable promotion checklist (install/verify, probes, canary scenarios,
+> telemetry/resume signals, abort criteria, explicit not-run list):
+> [`docs/pre-canary-handoff.md`](../docs/pre-canary-handoff.md).
+> Checkpoint-readiness verdict (Task 3): the `langgraph.checkpoint.postgres`
+> import failure on bare hosts is an uninstalled *declared* requirement
+> (`langgraph-checkpoint-postgres==2.0.25` is pinned), not drift — see the
+> runbook and `tests/agents/v2/persistence/test_checkpoint_readiness.py`.
+
 These require the live Compose stack (`hrag-backend` bind-mounts the main
 repo, so a worktree session cannot execute them) and, for canary, real
 traffic. Run them from a checkout that owns the stack:
