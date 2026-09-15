@@ -126,6 +126,8 @@ export interface LlmTestRequest {
   model?: string;
   api_key?: string;
   is_vllm?: boolean;
+  /** Service kind for non-LLM endpoints (embed_rerank / stt) — mirrors backend LLMConfigTestRequest.kind. */
+  kind?: string;
 }
 
 export interface LlmTestResult {

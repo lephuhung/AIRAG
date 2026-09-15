@@ -18,22 +18,37 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { parseSSEEvents } from '../../../test-utils/mockSSE';
 import { useRAGChatStream } from '../../../hooks/useRAGChatStream';
 import { useAuthStore } from '../../../stores/authStore';
+import type { ChatMessage } from '@/types';
 
 // ---------------------------------------------------------------------------
 // Mock SSE stream response factory
 // ---------------------------------------------------------------------------
 
-function createSSEResponseStream(events: Array<Record<string, unknown>>): ReadableStream<Uint8Array> {
+// NOTE: happy-dom Response has no working body.getReader, so the fetch mock
+// serves a fake reader over pre-encoded SSE frames (the hook only uses
+// ok/body.getReader). Frames below use the real backend wire framing
+// (`event: <type>` + `data: {...}`); data-only frames are ignored by the
+// hook per its SSE dispatch contract.
+function mockFetchWithFrames(frames: string[]): void {
     const encoder = new TextEncoder();
-    return new ReadableStream({
-        start(controller) {
-            for (const event of events) {
-                const sseLine = `data: ${JSON.stringify(event)}\n\n`;
-                controller.enqueue(encoder.encode(sseLine));
-            }
-            controller.close();
-        },
-    });
+    const chunks = frames.map((f) => encoder.encode(f));
+    let readIndex = 0;
+    (global.fetch as unknown) = vi.fn(() =>
+        Promise.resolve({
+            ok: true,
+            body: {
+                getReader: () => ({
+                    read: async () => {
+                        if (readIndex >= chunks.length) {
+                            return { done: true, value: undefined };
+                        }
+                        return { done: false, value: chunks[readIndex++] };
+                    },
+                    cancel: async () => {},
+                }),
+            },
+        })
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -110,20 +125,93 @@ describe('ChatPanel rollback (B5)', () => {
                 potentialAbbreviations = [];
             };
 
-            // Before rollback
+            // Before rollback — every retractable artifact is populated
+            expect(localSources).toHaveLength(1);
+            expect(localImages).toHaveLength(1);
+            expect(localPeople).toHaveLength(1);
             expect(pendingSources).toHaveLength(1);
             expect(pendingImages).toHaveLength(1);
             expect(pendingPeople).toHaveLength(1);
+            expect(peopleData).toEqual({ id: 'p1' });
             expect(potentialAbbreviations).toHaveLength(1);
             expect(tokenBuffer).toBe('draft ');
 
-            // After rollback
+            // After rollback — every retractable artifact is cleared
             handleRollback();
+            expect(localSources).toHaveLength(0);
+            expect(localImages).toHaveLength(0);
+            expect(localPeople).toHaveLength(0);
             expect(pendingSources).toHaveLength(0);
             expect(pendingImages).toHaveLength(0);
             expect(pendingPeople).toHaveLength(0);
+            expect(peopleData).toBeNull();
             expect(potentialAbbreviations).toHaveLength(0);
             expect(tokenBuffer).toBe('');
+        });
+    });
+
+    // --- RED control (Task 2): data-only framing is ignored per the hook's
+    // SSE dispatch contract, so a sources payload without an `event:` line
+    // must NOT populate pendingSources. This fails if the hook ever
+    // misattributes data-only frames, and passes only when framing is real.
+    describe('SSE framing contract', () => {
+        it('control: data-only sources frame does not populate pendingSources', async () => {
+            mockFetchWithFrames([
+                `data: ${JSON.stringify({ sources: [{ document_id: 'doc-A', chunk_id: 'p.1' }] })}\n\n`,
+                `data: ${JSON.stringify({ answer: '' })}\n\n`,
+            ]);
+
+            const queryClient = new QueryClient();
+            const { result } = renderHook(
+                () => useRAGChatStream('test-session-framing'),
+                {
+                    wrapper: ({ children }) => (
+                        <QueryClientProvider client={queryClient}>
+                            {children}
+                        </QueryClientProvider>
+                    ),
+                }
+            );
+
+            await act(async () => {
+                await result.current.sendMessage('test message', [], false);
+            });
+
+            expect(result.current.pendingSources).toHaveLength(0);
+            expect(result.current.error).toBeNull();
+            queryClient.clear();
+        });
+
+        it('control: real event framing populates pendingSources', async () => {
+            mockFetchWithFrames([
+                'event: sources\n' +
+                    `data: ${JSON.stringify({ sources: [{ document_id: 'doc-A', chunk_id: 'p.1' }] })}\n\n`,
+                'event: complete\n' +
+                    `data: ${JSON.stringify({ answer: '' })}\n\n`,
+            ]);
+
+            const queryClient = new QueryClient();
+            const { result } = renderHook(
+                () => useRAGChatStream('test-session-framing-2'),
+                {
+                    wrapper: ({ children }) => (
+                        <QueryClientProvider client={queryClient}>
+                            {children}
+                        </QueryClientProvider>
+                    ),
+                }
+            );
+
+            const out: { message: ChatMessage | null } = { message: null };
+            await act(async () => {
+                out.message = await result.current.sendMessage('test message', [], false);
+            });
+
+            // RED at Task-2 start: data-only helper framing means this fails;
+            // GREEN after the helper emits real `event:` lines.
+            expect(result.current.pendingSources).toHaveLength(1);
+            expect(out.message?.sources).toHaveLength(1);
+            queryClient.clear();
         });
     });
 
@@ -131,19 +219,16 @@ describe('ChatPanel rollback (B5)', () => {
 
     describe('useRAGChatStream token_rollback handler', () => {
         it('pendingSources are cleared after token_rollback event', async () => {
-            // Mock fetch to return SSE stream with pre-rollback artifacts + rollback
-            const mockStream = createSSEResponseStream([
-                { type: 'sources', sources: [{ document_id: 'doc-A', chunk_id: 'p.1' }] },
-                { type: 'token_rollback' },
-                { type: 'complete', completion_status: 'partial', answer: '' },
+            // Genuine wire framing: sources arrive (parsed), rollback clears
+            // them, complete finalizes with the cleared state.
+            mockFetchWithFrames([
+                'event: sources\n' +
+                    `data: ${JSON.stringify({ sources: [{ document_id: 'doc-A', chunk_id: 'p.1' }] })}\n\n`,
+                'event: token_rollback\n' +
+                    `data: ${JSON.stringify({})}\n\n`,
+                'event: complete\n' +
+                    `data: ${JSON.stringify({ completion_status: 'partial', answer: '' })}\n\n`,
             ]);
-
-            (global.fetch as any) = vi.fn(() =>
-                Promise.resolve(new Response(mockStream, {
-                    status: 200,
-                    headers: { 'Content-Type': 'text/event-stream' },
-                }))
-            );
 
             const queryClient = new QueryClient();
 
@@ -158,22 +243,20 @@ describe('ChatPanel rollback (B5)', () => {
                 }
             );
 
-            // Trigger stream
-            act(() => {
-                result.current.sendMessage({
-                    message: 'test message',
-                    history: [],
-                    enableThinking: false,
-                });
+            // Trigger stream with the hook's real typed signature
+            const out: { message: ChatMessage | null } = { message: null };
+            await act(async () => {
+                out.message = await result.current.sendMessage('test message', [], false);
             });
-
-            // Process the SSE stream with fake timers
-            await vi.advanceTimersByTimeAsync(500);
 
             await waitFor(() => {
                 // After rollback, pendingSources should be empty
                 expect(result.current.pendingSources).toHaveLength(0);
             }, { timeout: 3000 });
+            // The rollback cleared the pre-rollback sources end to end:
+            // the finalized message carries no retractable artifacts.
+            expect(out.message?.sources).toHaveLength(0);
+            expect(result.current.error).toBeNull();
 
             queryClient.clear();
         });

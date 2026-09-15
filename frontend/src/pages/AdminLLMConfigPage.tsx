@@ -29,7 +29,6 @@ import {
   ChevronDown,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Select } from "@/components/ui/select";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { cn } from "@/lib/utils";
 import { useTranslation } from "@/hooks/useTranslation";
@@ -914,10 +913,6 @@ function AssignmentRow({
       )}
     </div>
   );
-}
-
-function catalogLoading(entry?: CatalogEntry): boolean {
-  return entry === undefined;
 }
 
 // ── Page ─────────────────────────────────────────────────────────────────────

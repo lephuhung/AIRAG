@@ -1,9 +1,19 @@
-import { defineConfig } from 'vite'
+import { defineConfig, type UserConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import path from 'path'
 
-export default defineConfig({
+/**
+ * Vitest runner options for this workspace. Kept as an explicit named
+ * type (instead of importing `defineConfig` from `vitest/config`, whose
+ * bundled Vite major diverges from this workspace's Vite) so `tsc -b`
+ * checks the `test` key without weakening any compiler option.
+ */
+interface WorkspaceTestConfig {
+  environment: 'happy-dom';
+}
+
+const config: UserConfig & { test: WorkspaceTestConfig } = {
   plugins: [react(), tailwindcss()],
   resolve: {
     alias: {
@@ -42,4 +52,6 @@ export default defineConfig({
       },
     },
   },
-})
+};
+
+export default defineConfig(config);
