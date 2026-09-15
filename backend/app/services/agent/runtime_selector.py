@@ -807,6 +807,32 @@ class V2Ingress:
 MAX_HISTORY_SUMMARIES = 20
 
 
+def _merge_known_documents(
+    current: tuple[Any, ...],
+    conversation_resources: tuple[Any, ...],
+) -> tuple[Any, ...]:
+    """Merge current-turn known resources with conversation candidates (Task 1B).
+
+    Current-turn entries (``attachment``/``ui_selection``/``api_explicit``)
+    keep their order and semantics untouched; conversation survivors follow,
+    renumbered deterministically (``conv-1`` …) after cross-dedupe by
+    document UUID so a re-attached or already-known document never shifts
+    conversation ordinals or creates a duplicate entry.
+    """
+    seen = {known.document_id for known in current}
+    survivors: list[Any] = []
+    for known in conversation_resources or ():
+        if known.document_id in seen:
+            continue
+        seen.add(known.document_id)
+        survivors.append(known)
+    renumbered = tuple(
+        known.model_copy(update={"resource_id": f"conv-{index + 1}"})
+        for index, known in enumerate(survivors)
+    )
+    return tuple(current) + renumbered
+
+
 async def load_conversation_for_thread(
     session_factory: Callable[[], Any],
     thread_id: str,
@@ -819,26 +845,32 @@ async def load_conversation_for_thread(
     ``MAX_HISTORY_SUMMARIES`` ``ExchangeSummary`` rows for the thread
     and projects them through
     ``adapters/conversation.py::context_from_legacy`` (typed entities +
-    derived ``last_focus``). Returns an empty ``ConversationContext`` when
+    derived ``last_focus``). Returns an empty ``ConversationHistory`` when
     the thread is not a persisted session (``standalone-...``), when no
     history exists, or when any load fails (fail-open: a turn without
     history is always safer than a failed turn).
 
-    Confinement: only labels/text cross this boundary. ``document_ids`` /
-    ``sources`` / ``people_data`` columns are never projected into v2
-    contracts, so history can never reauthorize an out-of-scope resource
-    — resolution always re-checks the current runtime scope.
+    Returns a ``ConversationHistory`` bundle: the existing label/text-only
+    ``ConversationContext`` plus server-issued ``KnownDocumentResource``
+    candidates (``source="conversation"``) projected from the
+    ``document_ids``/``citations``/``sources`` columns of the same bounded
+    window — never UUIDs parsed from message text. Malformed identity
+    values are ignored.
+
+    Confinement: only labels/text enter ``ConversationContext``; document
+    UUIDs travel exclusively in the typed ``resources`` (candidates only),
+    so history can never reauthorize an out-of-scope resource — resolution
+    always re-checks the current runtime scope.
     """
     from app.services.agents.v2.adapters.conversation import (
         DEFAULT_RECENT_TURN_LIMIT,
+        ConversationHistory,
         context_from_legacy,
+        conversation_resources_from_legacy,
     )
-    from app.services.agents.v2.contracts.conversation import ConversationContext
 
     limit = max(0, int(max_recent_turns or DEFAULT_RECENT_TURN_LIMIT))
-    empty = ConversationContext(
-        summary="", active_entities=(), last_focus=None, recent_turns=()
-    )
+    empty = ConversationHistory.empty()
     try:
         thread_uuid = UUID(str(thread_id))
     except (ValueError, AttributeError, TypeError):
@@ -860,7 +892,15 @@ async def load_conversation_for_thread(
                 .where(ChatMessage.session_id == thread_uuid)
                 .order_by(ChatMessage.created_at.desc())
                 .limit(limit if limit else DEFAULT_RECENT_TURN_LIMIT)
-                .options(load_only(ChatMessage.role, ChatMessage.content))
+                .options(
+                    load_only(
+                        ChatMessage.role,
+                        ChatMessage.content,
+                        ChatMessage.document_ids,
+                        ChatMessage.citations,
+                        ChatMessage.sources,
+                    )
+                )
             )
             messages = list(reversed(msg_result.scalars().all()))
             sum_result = await db.execute(
@@ -872,13 +912,16 @@ async def load_conversation_for_thread(
             summaries = list(sum_result.scalars().all())
         if not messages and not summaries:
             return empty
-        # Labels/text only: document_ids/sources/people_data columns stay
-        # in the database and never enter v2 contracts.
+        # Labels/text only enter the discourse context; server-issued
+        # document identities project separately onto typed candidates.
         recent = messages[-limit:] if limit else []
-        return context_from_legacy(
-            messages=recent,
-            exchange_summaries=summaries,
-            max_recent_turns=limit,
+        return ConversationHistory(
+            context=context_from_legacy(
+                messages=recent,
+                exchange_summaries=summaries,
+                max_recent_turns=limit,
+            ),
+            resources=conversation_resources_from_legacy(recent),
         )
     except Exception:  # noqa: BLE001 — fail-open to an empty window
         logger.warning(
@@ -1092,17 +1135,22 @@ async def build_v2_ingress(
         # so history cannot reauthorize out-of-scope resources).
         # Fail-open: history load failures yield an empty window.
         conversation = None
+        conversation_resources: tuple[Any, ...] = ()
         if load_history:
-            conversation = await load_conversation_for_thread(
+            history = await load_conversation_for_thread(
                 session_factory, thread_id, max_recent_turns=max_recent_turns
             )
+            conversation = history.context
+            conversation_resources = history.resources
         initial_state = build_initial_v2_state(
             request=RequestContext(
                 contract_version=CONTRACT_VERSION,
                 request_id=request_id,
                 thread_id=thread_id,
                 original_query=raw_query,
-                known_documents=tuple(known_documents or ()),
+                known_documents=_merge_known_documents(
+                    tuple(known_documents or ()), conversation_resources
+                ),
             ),
             conversation=conversation,
         )

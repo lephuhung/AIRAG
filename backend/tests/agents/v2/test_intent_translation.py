@@ -621,3 +621,59 @@ def test_typed_search_preserves_write_boundary() -> None:
     )
     assert decision.route == "complex_research"
     assert decision.reason_code == "simple_write_operation"
+
+
+# ---------------------------------------------------------------------------
+# Task 1A (M11 pin) — generic/dual-sense verbs + bare legal-topic phrase
+# stay non-evaluate; explicit assessment/compliance action stays evaluate.
+# ---------------------------------------------------------------------------
+
+M11_NON_EVALUATE_QUERIES = [
+    # Pure generic verbs (VI).
+    "đọc văn bản pháp lý về thuế",
+    "tìm văn bản pháp lý về đất đai",
+    "cho tôi xem văn bản pháp lý mới nhất",
+    "giải thích quy định pháp lý về thuế",
+    "tóm tắt văn bản pháp lý này",
+    # Pure generic verbs (EN).
+    "read the pháp lý document on tax",
+    "find pháp lý regulations on land",
+    "show me the latest pháp lý documents",
+    "explain the pháp lý framework for tax",
+    "summarize this pháp lý document",
+    # Dual-sense action verbs with a BARE legal-topic phrase (no explicit
+    # compliance/assessment object): lookup/browse/compare senses, not audit.
+    "review văn bản pháp lý mới nhất",
+    "kiểm tra giúp tôi văn bản pháp lý về thuế",
+    "xác định văn bản pháp lý điều chỉnh trường hợp này",
+    "đối chiếu văn bản pháp lý về thuế",
+    "rà soát văn bản pháp lý nội bộ",
+]
+
+
+@pytest.mark.parametrize("query", M11_NON_EVALUATE_QUERIES)
+def test_m11_generic_verb_legal_topic_stays_non_evaluate(query: str) -> None:
+    from app.services.agents.v2.semantic.intent import classify_evaluate
+
+    assert classify_evaluate(query) is None, query
+
+
+M11_POSITIVE_ASSESSMENT_QUERIES = [
+    # Explicit assessment head, even with a bare legal-topic phrase.
+    "đánh giá văn bản pháp lý mới ban hành",
+    # Dual-sense verbs WITH an explicit compliance/assessment object.
+    "kiểm tra tính pháp lý của hợp đồng",
+    "review compliance status of our branch",
+    "rà soát mức độ tuân thủ an toàn thông tin",
+    "xác định mức độ rủi ro tuân thủ của chi nhánh",
+]
+
+
+@pytest.mark.parametrize("query", M11_POSITIVE_ASSESSMENT_QUERIES)
+def test_m11_explicit_assessment_stays_evaluate(query: str) -> None:
+    from app.services.agents.v2.semantic.intent import classify_evaluate
+
+    decision = classify_evaluate(query)
+    assert decision is not None, query
+    assert decision.intent == "evaluate"
+    assert decision.source == "deterministic"

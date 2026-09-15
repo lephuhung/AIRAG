@@ -24,7 +24,9 @@ resource (resolution always re-checks the current runtime scope).
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Protocol
+from uuid import UUID
 
 from ..contracts.base import CONTRACT_VERSION
 from ..contracts.conversation import (
@@ -33,6 +35,7 @@ from ..contracts.conversation import (
     ConversationSnapshot,
     ConversationTurn,
 )
+from ..contracts.request import KnownDocumentResource
 from ..contracts.validation import (
     validate_conversation_context,
     validate_conversation_snapshot,
@@ -136,6 +139,125 @@ def context_from_legacy(
     )
     validate_conversation_context(context)
     return context
+
+
+#: Bound on server-issued conversation resources projected per turn (Task
+#: 1B): the projection reads only the already-bounded history window, and
+#: this cap guards against a single message carrying a huge identity list.
+MAX_CONVERSATION_RESOURCES = 20
+
+
+@dataclass(frozen=True)
+class ConversationHistory:
+    """Typed loader result: labels/text context plus identity resources.
+
+    ``context`` is the existing label/text-only ``ConversationContext``
+    (document UUIDs never enter it); ``resources`` carries the
+    server-issued document identities (``source="conversation"``) the
+    ingress merges into the current request's known documents. Both are
+    empty on standalone threads, missing history, malformed rows, or any
+    load failure (fail-open).
+    """
+
+    context: ConversationContext
+    resources: tuple[KnownDocumentResource, ...] = ()
+
+    @staticmethod
+    def empty() -> "ConversationHistory":
+        """Fail-open bundle: no discourse, no resources."""
+        return ConversationHistory(
+            context=ConversationContext(
+                summary="", active_entities=(), last_focus=None, recent_turns=()
+            ),
+            resources=(),
+        )
+
+
+def _coerce_history_uuid(raw: object) -> UUID | None:
+    """Project one historical identity value onto a UUID, or ``None``.
+
+    Malformed values (non-UUID strings, blanks, wrong types) are ignored —
+    history must never fabricate identity and must never fail the turn.
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, UUID):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        return UUID(raw.strip())
+    except (ValueError, AttributeError):
+        return None
+
+
+def _message_identity_values(message: object) -> list[object]:
+    """Raw identity values of one legacy message, in deterministic order.
+
+    Server-issued only: the ``document_ids`` column, then public citation
+    metadata (``citations[].document_id``), then served sources
+    (``sources[].document_id``). Message text is never parsed for UUIDs.
+    Every access is defensive: unexpected shapes yield nothing.
+    """
+    values: list[object] = []
+    try:
+        document_ids = getattr(message, "document_ids", None)
+    except Exception:  # noqa: BLE001 — malformed row, ignore
+        document_ids = None
+    if isinstance(document_ids, (list, tuple)):
+        values.extend(document_ids)
+    for column in ("citations", "sources"):
+        try:
+            entries = getattr(message, column, None)
+        except Exception:  # noqa: BLE001 — malformed row, ignore
+            continue
+        if not isinstance(entries, (list, tuple)):
+            continue
+        for entry in entries:
+            if isinstance(entry, dict):
+                values.append(entry.get("document_id"))
+            else:
+                try:
+                    values.append(getattr(entry, "document_id", None))
+                except Exception:  # noqa: BLE001 — malformed entry, ignore
+                    continue
+    return values
+
+
+def conversation_resources_from_legacy(
+    messages: Sequence[object],
+) -> tuple[KnownDocumentResource, ...]:
+    """Project server-issued history identities onto conversation resources.
+
+    Chronological order is preserved (callers pass oldest-first), duplicates
+    collapse keeping the first occurrence (stable ordinals: ``file thứ hai``
+    always names the same document), and the projection is capped at
+    ``MAX_CONVERSATION_RESOURCES``. Malformed values are ignored. Resources
+    are candidates only: ``resource_id`` is a deterministic ``conv-N``
+    handle (never a UUID/title leak vector), and binding/ACL stays with
+    the existing request-scoped resolver/binder.
+    """
+    ordered: list[UUID] = []
+    seen: set[UUID] = set()
+    for message in messages or ():
+        for raw in _message_identity_values(message):
+            document_id = _coerce_history_uuid(raw)
+            if document_id is None or document_id in seen:
+                continue
+            seen.add(document_id)
+            ordered.append(document_id)
+            if len(ordered) >= MAX_CONVERSATION_RESOURCES:
+                break
+        if len(ordered) >= MAX_CONVERSATION_RESOURCES:
+            break
+    return tuple(
+        KnownDocumentResource(
+            resource_id=f"conv-{index + 1}",
+            document_id=document_id,
+            source="conversation",
+        )
+        for index, document_id in enumerate(ordered)
+    )
 
 
 def snapshot_from_legacy(

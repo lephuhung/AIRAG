@@ -28,6 +28,7 @@ from ..contracts.semantic import (
 __all__ = [
     "classify_entity_kind",
     "derive_last_focus",
+    "detect_conversation_anaphora",
     "extract_person_refs",
     "merge_ambiguities",
     "merge_coreferences",
@@ -266,6 +267,27 @@ def derive_last_focus(
         return None
     last = ordered[-1]
     return EntityReference(ref_id=last.ref_id, kind=last.kind, label=last.label)
+
+
+def detect_conversation_anaphora(query: str) -> tuple[str, int, str] | None:
+    """Detect a supported conversation-continuation anaphora (Task 1B).
+
+    Returns ``("ordinal", n, span)`` for ``file thứ hai``-style mentions
+    or ``("mention", 0, span)`` for ``văn bản này``-style mentions, else
+    ``None``. Precedence mirrors ``resolve_coreferences`` (ordinal wins
+    over a bare mention). Pure surface cue: it never supplies identity —
+    the caller binds the span to server-issued conversation resources.
+    """
+    text = (query or "").strip()
+    if not text:
+        return None
+    ordinal = _ORDINAL_DOC_RE.search(text)
+    if ordinal is not None:
+        return ("ordinal", _ORDINAL_VALUE.get(ordinal.group(1).lower(), 0), ordinal.group(0))
+    doc_mention = _DOC_MENTION_RE.search(text)
+    if doc_mention is not None:
+        return ("mention", 0, doc_mention.group(0))
+    return None
 
 
 def _in_scope_ids(allowed: Sequence[UUID | str]) -> set[str]:

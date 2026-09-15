@@ -1333,6 +1333,86 @@ class DeterministicSemanticAdapter:
             update={"document_refs": draft.document_refs + tuple(additions)}
         )
 
+    #: Namespace prefix for conversation-continuation reference IDs. Like
+    #: the ``api_explicit:`` prefix it cannot collide with
+    #: preprocessor-generated ``r1``/``r2`` or clarification references.
+    CONVERSATION_REF_PREFIX = "conversation:"
+
+    @staticmethod
+    def project_conversation_targets(
+        draft: SemanticDraft, request: RequestContext
+    ) -> SemanticDraft:
+        """Project server-issued conversation resources into candidate refs.
+
+        Creates deterministic conversation-backed ``DocumentReference``s ONLY
+        when the current query carries a supported anaphora (``văn bản
+        này``/``tài liệu này``/``file thứ hai`` …): an ordinal names the
+        Nth surviving conversation candidate, a bare mention projects every
+        candidate (true ambiguity is owned downstream by the existing
+        coreference/clarification pass, exactly like current-turn refs). An
+        out-of-range ordinal, a query without anaphora, or no conversation
+        resources project nothing (silent zero-local-referent). Refs carry
+        identity only (``resolved`` with the server-issued document id);
+        the existing request-scoped identity/binding boundary rechecks ACL
+        for the current workspace/user and remains the only revision-pin
+        authority — history never binds directly. Rebuild-idempotent: an
+        already-present ref (same ``ref_id`` or same document id) is never
+        duplicated, so repeated per-node draft builds stay equal (D3).
+        """
+        from .v2.semantic.discourse import detect_conversation_anaphora
+
+        conversation = [
+            known
+            for known in request.known_documents
+            if known.source == "conversation"
+        ]
+        if not conversation:
+            return draft
+        anaphora = detect_conversation_anaphora(request.original_query)
+        if anaphora is None:
+            return draft
+        kind, position, span = anaphora
+        if kind == "ordinal":
+            if not 1 <= position <= len(conversation):
+                return draft
+            selected = (conversation[position - 1],)
+        else:
+            selected = tuple(conversation)
+        seen_ids = {reference.ref_id for reference in draft.document_refs}
+        seen_docs = {
+            reference.resolved_document_id
+            for reference in draft.document_refs
+            if reference.resolution_status == "resolved"
+            and reference.resolved_document_id is not None
+        }
+        additions: list[DocumentReference] = []
+        for known in selected:
+            ref_id = (
+                f"{DeterministicSemanticAdapter.CONVERSATION_REF_PREFIX}"
+                f"{known.resource_id}"
+            )
+            if ref_id in seen_ids or known.document_id in seen_docs:
+                continue
+            seen_ids.add(ref_id)
+            seen_docs.add(known.document_id)
+            additions.append(
+                DocumentReference(
+                    ref_id=ref_id,
+                    original_span=span,
+                    normalized_reference=span,
+                    requested_role="target",
+                    revision_requirement=None,
+                    resolution_status="resolved",
+                    resolved_document_id=known.document_id,
+                    candidate_document_ids=(),
+                )
+            )
+        if not additions:
+            return draft
+        return draft.model_copy(
+            update={"document_refs": draft.document_refs + tuple(additions)}
+        )
+
     async def build_draft(
         self, request: RequestContext, conversation: ConversationContext
     ) -> SemanticDraft:
@@ -1356,6 +1436,11 @@ class DeterministicSemanticAdapter:
             ) from exc
         reconciled = self.reconcile_ui_selections(draft, request)
         projected = self.project_api_explicit_targets(reconciled, request)
+        # Task 1B: conversation-continuation candidates. Only materialized
+        # on a supported anaphora; the refs below are identity facts that
+        # still pass the v1 identity resolver untouched (already resolved)
+        # and the v2 binder under the current ACL before any pin exists.
+        projected = self.project_conversation_targets(projected, request)
         # Final review I2: when the request-scoped identity resolver is
         # wired (production ingress), resolve still-unresolved draft refs
         # through the v1 ``resolve_candidates()`` pipeline before the

@@ -86,13 +86,35 @@ _VALID_INTENTS = frozenset(
 #: general-RAG fast path; the bare generic ``đánh giá`` keyword likewise
 #: stays demoted (Task-3). See the plan/spec erratum for the ownership
 #: rationale (final re-review M8).
-_EVALUATE_HEAD_RE = re.compile(
-    r"\b(?:đánh\s*giá|kiểm\s*tra|rà\s*soát|thẩm\s*định|đối\s*chiếu|xác\s*định"
-    r"|review|assess|evaluate|evaluation)\b",
+#: Explicit assessment heads (Task 1A/M11): an unambiguous assessment
+#: action, so a bare legal-topic phrase is enough to form an assessment
+#: request ("đánh giá văn bản pháp lý mới ban hành").
+_EVALUATE_ASSESS_HEAD_RE = re.compile(
+    r"\b(?:đánh\s*giá|thẩm\s*định|assess|evaluate|evaluation)\b",
     re.IGNORECASE | re.UNICODE,
 )
-_EVALUATE_DOMAIN_RE = re.compile(
-    r"\b(?:tuân\s*thủ|compliance|tính\s+pháp\s*lý|pháp\s*lý)\b",
+#: Dual-sense action heads (Task 1A/M11): lookup/browse/compare senses
+#: ("kiểm tra giúp tôi văn bản pháp lý", "review văn bản pháp lý mới
+#: nhất") as well as audit senses, so they form an assessment request
+#: only together with an explicit compliance/assessment object — never
+#: with a bare legal-topic phrase.
+_EVALUATE_ACTION_HEAD_RE = re.compile(
+    r"\b(?:kiểm\s*tra|rà\s*soát|đối\s*chiếu|xác\s*định|review)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+#: Explicit compliance/assessment objects ("tuân thủ", "compliance",
+#: "tính pháp lý"). Checked before the bare topic cue below: "tính
+#: pháp lý" contains "pháp lý" but is an assessment object, not a
+#: topic mention.
+_EVALUATE_COMPLIANCE_RE = re.compile(
+    r"\b(?:tuân\s*thủ|compliance|tính\s+pháp\s*lý)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+#: Bare legal-topic phrase ("văn bản pháp lý", "quy định pháp lý").
+#: Only an assessment request together with an explicit assessment head;
+#: with a dual-sense action head it stays an informational/action query.
+_EVALUATE_TOPIC_RE = re.compile(
+    r"\bpháp\s*lý\b",
     re.IGNORECASE | re.UNICODE,
 )
 #: Explicit degree/level assessment phrase ("mức độ tuân thủ"/"mức độ rủi ro").
@@ -178,22 +200,33 @@ def classify_evaluate(
     compliance/legal *assessment request* to a typed ``evaluate`` decision
     before any model call — exactly like the greeting/personal/people narrow
     scopes above. An assessment request is an explicit assessment head
-    (``đánh giá``/``kiểm tra``/…) combined with a compliance/legal domain cue,
-    an explicit degree/level phrase (``mức độ tuân thủ``), or the yes/no
-    ``…tuân thủ … không?`` form. Bare compliance-topic nouns and the bare
-    generic ``đánh giá`` keyword are NOT assessment requests and stay on the
-    model path (advisory) / general-RAG fast path (deterministic route).
+    (``đánh giá``/``thẩm định``/``assess``/…) combined with a
+    compliance/legal cue, a dual-sense action head (``kiểm tra``/``rà
+    soát``/``đối chiếu``/``xác định``/``review``) combined with an
+    explicit compliance/assessment object (``tuân thủ``/``compliance``/
+    ``tính pháp lý``), an explicit degree/level phrase (``mức độ tuân
+    thủ``), or the yes/no ``…tuân thủ … không?`` form. A dual-sense
+    action verb with only a bare legal-topic phrase (``văn bản pháp
+    lý``), bare compliance-topic nouns, and the bare generic ``đánh
+    giá`` keyword are NOT assessment requests and stay on the model path
+    (advisory) / general-RAG fast path (deterministic route).
     """
     _ = has_doc_ids  # evaluation cue does not depend on attached docs
     text = (query or "").strip()
     if not text:
         raise IntentClassifierError("cannot classify an empty query")
+    has_compliance = _EVALUATE_COMPLIANCE_RE.search(text) is not None
+    has_topic = has_compliance or _EVALUATE_TOPIC_RE.search(text) is not None
     is_assessment = (
         _EVALUATE_LEVEL_RE.search(text) is not None
         or _EVALUATE_YN_RE.search(text) is not None
         or (
-            _EVALUATE_HEAD_RE.search(text) is not None
-            and _EVALUATE_DOMAIN_RE.search(text) is not None
+            _EVALUATE_ASSESS_HEAD_RE.search(text) is not None
+            and has_topic
+        )
+        or (
+            _EVALUATE_ACTION_HEAD_RE.search(text) is not None
+            and has_compliance
         )
     )
     if not is_assessment:
