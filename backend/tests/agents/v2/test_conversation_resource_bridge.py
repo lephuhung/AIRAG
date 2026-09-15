@@ -284,38 +284,41 @@ def test_build_draft_end_to_end_conversation_mention_resolves_coref():
 # ---------------------------------------------------------------------------
 
 
-def test_binder_rechecks_history_identity_against_current_scope():
-    """Out-of-scope historical doc → fail-closed, no binding, no title leak."""
-    from app.services.agents.supervisor_v2 import V1BindingResolver
+# I1 (fix round) — real deny semantics: exact RevisionNotReady, no binding,
+# no surfaced identity. The workspace guard is stubbed (not the DB driver),
+# so both deny shapes exercise production paths. Note: the internal typed
+# error carries the document UUID by frozen contract (RevisionNotReady
+# formats it in); it stays server-side (logged detail) while the
+# user-facing boundary conversion is generic — pinned below.
+_DENY_REASON = (
+    "document does not exist, is not owned by this workspace, or "
+    "is tombstoned"
+)
+_SECRET_TITLE = "Tiêu Đề Tuyệt Mật Không Bao Giờ Lộ"
 
+
+def _conversation_ref(doc_id):
     from app.services.agents.v2.contracts.semantic import DocumentReference
 
-    ref = DocumentReference(
+    return DocumentReference(
         ref_id="conversation:conv-1",
         original_span="văn bản này",
         normalized_reference="văn bản này",
         requested_role="target",
         revision_requirement=None,
         resolution_status="resolved",
-        resolved_document_id=OUT_OF_SCOPE,
+        resolved_document_id=doc_id,
     )
 
-    class _EmptyDB:
-        async def __aenter__(self):
-            return self
 
-        async def __aexit__(self, *args):
-            return False
-
-        async def execute(self, *args, **kwargs):
-            raise AssertionError("no rows")
+def _deny_runtime():
+    from datetime import UTC, datetime
 
     from app.services.agents.v2.contracts.capability import (
         CapabilityRuntimeContext,
     )
-    from datetime import UTC, datetime
 
-    runtime = CapabilityRuntimeContext(
+    return CapabilityRuntimeContext(
         request_id="req-1",
         run_id="run-1",
         user_id=uuid.uuid4(),
@@ -324,11 +327,64 @@ def test_binder_rechecks_history_identity_against_current_scope():
         allowed_capabilities=frozenset(),
         deadline_at=datetime(2030, 1, 1, tzinfo=UTC),
     )
-    resolver = V1BindingResolver(
-        session_factory=lambda: _EmptyDB(), default_role="target"
+
+
+class _UnusedDB:
+    """Session the deny stub never queries (deny happens in the loader)."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+
+def test_history_identity_out_of_scope_denies_with_real_deny_type(monkeypatch):
+    """I1: foreign/tombstoned doc → exact RevisionNotReady, nothing pinned."""
+    from app.services.agents.supervisor_v2 import V1BindingResolver
+    from app.services.agents.v2.persistence import document_views
+    from app.services.agents.v2.persistence.document_views import RevisionNotReady
+
+    async def _deny(db, document_id, workspace_id, **kwargs):
+        raise RevisionNotReady(document_id, _DENY_REASON)
+
+    monkeypatch.setattr(
+        document_views, "load_current_revision_identity_for_workspace", _deny
     )
-    with pytest.raises(Exception):
-        asyncio.run(resolver.resolve((ref,), runtime))
+    resolver = V1BindingResolver(
+        session_factory=lambda: _UnusedDB(), default_role="target"
+    )
+    with pytest.raises(RevisionNotReady) as excinfo:
+        asyncio.run(
+            resolver.resolve((_conversation_ref(OUT_OF_SCOPE),), _deny_runtime())
+        )
+    # Fail-closed: the typed deny (not a driver error), no binding set
+    # escapes, and no title ever enters this path.
+    assert excinfo.value.code == "REVISION_NOT_READY"
+    assert excinfo.value.document_id == str(OUT_OF_SCOPE)
+    assert _SECRET_TITLE not in str(excinfo.value)
+
+
+def test_history_identity_without_current_revision_denies(monkeypatch):
+    """I1: legacy doc (guard returns None) → adapter denies, nothing pinned."""
+    from app.services.agents.supervisor_v2 import V1BindingResolver
+    from app.services.agents.v2.persistence import document_views
+    from app.services.agents.v2.persistence.document_views import RevisionNotReady
+
+    async def _no_current(db, document_id, workspace_id, **kwargs):
+        return None
+
+    monkeypatch.setattr(
+        document_views,
+        "load_current_revision_identity_for_workspace",
+        _no_current,
+    )
+    resolver = V1BindingResolver(
+        session_factory=lambda: _UnusedDB(), default_role="target"
+    )
+    with pytest.raises(RevisionNotReady) as excinfo:
+        asyncio.run(resolver.resolve((_conversation_ref(DOC_A),), _deny_runtime()))
+    assert excinfo.value.code == "REVISION_NOT_READY"
 
 
 # ---------------------------------------------------------------------------
@@ -529,3 +585,116 @@ def test_ingress_standalone_and_failure_stay_fail_open():
     failed = asyncio.run(_run(str(uuid.uuid4()), lambda: _Failing(_FakeDB([], []))))
     assert failed["request"].known_documents == ()
     assert failed["conversation"].recent_turns == ()
+
+
+# ---------------------------------------------------------------------------
+# I2 (fix round) — >=2-candidate downstream: counts-only ambiguity, no
+# identity in clarification text, ordinal recovery. Pins the approved A.3
+# behavior (no production change): a bare mention over several candidates
+# becomes a candidate-free blocking question; restating with an ordinal
+# resolves deterministically.
+# ---------------------------------------------------------------------------
+
+
+def _preprocess_no_refs(raw: str):
+    from app.services.agents.semantic_preprocessor import PreprocessingResult
+
+    async def _run(inner: str):
+        return PreprocessingResult(
+            original_query=inner,
+            normalized_query=inner.strip().lower(),
+            abbreviations=[],
+            document_refs=[],
+            blocking_ambiguities=[],
+            preprocessing_status="ok",
+            preprocessor_trace=[],
+        )
+
+    return _run(raw)
+
+
+def _empty_conversation():
+    from app.services.agents.v2.contracts.conversation import ConversationContext
+
+    return ConversationContext(
+        summary="", active_entities=(), last_focus=None, recent_turns=()
+    )
+
+
+def _draft_for(query, known):
+    from app.services.agents.supervisor_v2 import DeterministicSemanticAdapter
+
+    adapter = DeterministicSemanticAdapter(preprocess=_preprocess_no_refs)
+    return asyncio.run(
+        adapter.build_draft(_request(query, known), _empty_conversation())
+    )
+
+
+def test_two_candidates_mention_yields_count_only_ambiguity():
+    """I2: bare mention over 2 candidates → 1 generic ambiguity, no refs."""
+    draft = _draft_for(
+        "văn bản này quy định gì?",
+        [_conv_known(DOC_A, "conv-1"), _conv_known(DOC_B, "conv-2")],
+    )
+    assert [r.ref_id for r in draft.document_refs] == [
+        "conversation:conv-1",
+        "conversation:conv-2",
+    ]
+    assert draft.coreferences == ()
+    assert len(draft.preliminary_ambiguities) == 1
+    description = draft.preliminary_ambiguities[0].description
+    assert str(DOC_A) not in description
+    assert str(DOC_B) not in description
+    assert _SECRET_TITLE not in description
+
+
+def test_two_candidates_clarification_carries_no_identity():
+    """I2: downstream clarification offers no candidates and names none."""
+    from app.services.agents.v2.adapters.semantic import finalize_semantic_context
+    from app.services.agents.v2.nodes.clarification import build_clarification
+
+    draft = _draft_for(
+        "văn bản này quy định gì?",
+        [_conv_known(DOC_A, "conv-1"), _conv_known(DOC_B, "conv-2")],
+    )
+    semantic = finalize_semantic_context(draft)
+    request = build_clarification(semantic)
+    assert request.reason == "semantic_ambiguity"
+    assert request.candidates == ()
+    assert request.unresolved_ref_ids == ()
+    assert str(DOC_A) not in request.question
+    assert str(DOC_B) not in request.question
+    assert _SECRET_TITLE not in request.question
+
+
+def test_ordinal_recovers_second_candidate_after_ambiguity():
+    """I2: restated ordinal resolves deterministically, ambiguity clears."""
+    draft = _draft_for(
+        "tóm tắt file thứ hai",
+        [_conv_known(DOC_A, "conv-1"), _conv_known(DOC_B, "conv-2")],
+    )
+    assert [r.resolved_document_id for r in draft.document_refs] == [DOC_B]
+    assert draft.preliminary_ambiguities == ()
+    # The ordinal is consumed at projection time (single correct ref), so
+    # the coref pass — which counts positions within resolved refs — stays
+    # silent; binding still uses the projected document_refs below.
+    assert draft.coreferences == ()
+
+
+def test_denied_binding_surfaces_generic_user_facing_error():
+    """I1: UUID/title-laden internal detail → generic boundary text only."""
+    from app.services.agents import supervisor_v2
+    from app.services.agents.v2.persistence.document_views import RevisionNotReady
+
+    try:
+        raise RevisionNotReady(OUT_OF_SCOPE, _DENY_REASON)
+    except RevisionNotReady as exc:
+        detail = f"binding: {exc} ({_SECRET_TITLE})"
+    update = supervisor_v2._typed_boundary_error(detail)
+    content = update["final_response"].content
+    assert str(OUT_OF_SCOPE) not in content
+    assert _SECRET_TITLE not in content
+    assert content == supervisor_v2._BOUNDARY_ERROR_CONTENT
+    # Conversion is sticky: no route survives to resurrect the turn.
+    assert update["route_decision"] is None
+    assert update["query_analysis"] is None
