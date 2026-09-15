@@ -87,6 +87,13 @@ def _recent_turns(
             )
         if not isinstance(message.content, str):
             raise ConversationAdapterError("legacy chat message content must be a string")
+        # Blank/whitespace-only rows (e.g. attachment- or citation-only
+        # history rows with empty content) carry no discourse text: skip
+        # them here so the frozen non-blank validation downstream keeps a
+        # valid window. Identity extraction is unaffected — it reads every
+        # loaded row's server-issued columns, never turn text.
+        if not message.content.strip():
+            continue
         turns.append(ConversationTurn(role=message.role, content=message.content))
     return tuple(turns)
 

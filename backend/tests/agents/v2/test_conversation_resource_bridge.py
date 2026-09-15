@@ -82,6 +82,86 @@ def test_extractor_never_parses_message_text():
     assert conversation_resources_from_legacy(messages) == ()
 
 
+# ---------------------------------------------------------------------------
+# Blank-history fix: blank rows keep resources, leave recent_turns;
+# strict non-string / unsupported-role failures are preserved.
+# ---------------------------------------------------------------------------
+
+
+def _legacy_msg(role="assistant", content="...", **columns):
+    row = SimpleNamespace(role=role, content=content)
+    for key, value in columns.items():
+        setattr(row, key, value)
+    return row
+
+
+def test_mixed_text_and_blank_preserves_chronological_nonblank_turns():
+    from app.services.agents.v2.adapters.conversation import context_from_legacy
+
+    context = context_from_legacy(
+        messages=[
+            _legacy_msg("user", "first question"),
+            _legacy_msg("assistant", ""),
+            _legacy_msg("assistant", "   \n\t  "),
+            _legacy_msg("assistant", "second answer"),
+        ]
+    )
+    assert [t.content for t in context.recent_turns] == [
+        "first question",
+        "second answer",
+    ]
+
+
+def test_whitespace_only_content_skipped():
+    from app.services.agents.v2.adapters.conversation import context_from_legacy
+
+    context = context_from_legacy(
+        messages=[_legacy_msg("user", "q"), _legacy_msg("assistant", "   ")]
+    )
+    assert [t.content for t in context.recent_turns] == ["q"]
+
+
+def test_all_blank_rows_yield_valid_empty_recent_turns():
+    from app.services.agents.v2.adapters.conversation import context_from_legacy
+
+    context = context_from_legacy(
+        messages=[_legacy_msg("user", ""), _legacy_msg("assistant", "  ")]
+    )
+    assert context.recent_turns == ()
+    assert context.summary == ""
+
+
+def test_non_string_content_remains_error():
+    from app.services.agents.v2.adapters.conversation import (
+        ConversationAdapterError,
+        context_from_legacy,
+    )
+
+    with pytest.raises(ConversationAdapterError):
+        context_from_legacy(messages=[_legacy_msg("user", None)])
+
+
+def test_unsupported_role_remains_error():
+    from app.services.agents.v2.adapters.conversation import (
+        ConversationAdapterError,
+        context_from_legacy,
+    )
+
+    with pytest.raises(ConversationAdapterError):
+        context_from_legacy(messages=[_legacy_msg("tool", "some text")])
+    # Role strictness applies even when the content is blank.
+    with pytest.raises(ConversationAdapterError):
+        context_from_legacy(messages=[_legacy_msg("tool", "")])
+
+
+def test_max_recent_turns_bounds_loaded_rows():
+    from app.services.agents.v2.adapters.conversation import context_from_legacy
+
+    messages = [_legacy_msg("user", f"q{i}") for i in range(5)]
+    context = context_from_legacy(messages=messages, max_recent_turns=2)
+    assert [t.content for t in context.recent_turns] == ["q3", "q4"]
+
+
 def test_extractor_is_bounded():
     from app.services.agents.v2.adapters import conversation as conv_mod
     from app.services.agents.v2.adapters.conversation import (
@@ -698,3 +778,101 @@ def test_denied_binding_surfaces_generic_user_facing_error():
     # Conversion is sticky: no route survives to resurrect the turn.
     assert update["route_decision"] is None
     assert update["query_analysis"] is None
+
+
+# ---------------------------------------------------------------------------
+# Blank-history fix at the loader/ingress boundary: blank rows still
+# contribute server-issued resources while recent_turns stays valid.
+# ---------------------------------------------------------------------------
+
+
+def _blank_history_db():
+    from datetime import datetime, timedelta
+
+    from app.models.chat_message import ChatMessage
+
+    thread = uuid.uuid4()
+    base = datetime(2026, 9, 14, 10, 0, 0)
+    messages = [
+        # Blank attachment-only user row (live-DB shape: empty content).
+        ChatMessage(
+            session_id=thread,
+            message_id="m1",
+            role="user",
+            content="",
+            created_at=base,
+            document_ids=[str(DOC_A)],
+        ),
+        # Blank citation-only assistant row.
+        ChatMessage(
+            session_id=thread,
+            message_id="m2",
+            role="assistant",
+            content="   ",
+            created_at=base + timedelta(seconds=30),
+            citations=[
+                {"citation_id": "c1", "label": "Doc B", "document_id": str(DOC_B)}
+            ],
+        ),
+    ]
+    return thread, _FakeDB(messages, [])
+
+
+def test_blank_attachment_only_row_contributes_resource_through_ingress():
+    import app.services.agent.runtime_selector as selector
+
+    thread, db = _blank_history_db()
+
+    async def _run():
+        async with selector.build_v2_ingress(
+            user_id=uuid.uuid4(),
+            authenticated_workspace_ids=[WORKSPACE_ID],
+            requested_workspace_ids=None,
+            raw_query="văn bản này có hiệu lực khi nào?",
+            thread_id=str(thread),
+            can_read_people=False,
+            session_factory=lambda: _FakeSession(db),
+            lease_session_factory=lambda: _FakeSession(db),
+        ) as ingress:
+            return ingress.initial_state
+
+    state = asyncio.run(_run())
+    known = state["request"].known_documents
+    assert [(k.source, k.document_id) for k in known] == [
+        ("conversation", DOC_A),
+        ("conversation", DOC_B),
+    ]
+    # Blank rows leave recent_turns (valid empty), not a failed turn.
+    assert state["conversation"].recent_turns == ()
+
+
+def test_blank_citation_only_row_resolves_through_adapter():
+    from app.services.agents.supervisor_v2 import DeterministicSemanticAdapter
+    from app.services.agents.v2.contracts.conversation import ConversationContext
+
+    async def _preprocess(raw: str):
+        from app.services.agents.semantic_preprocessor import PreprocessingResult
+
+        return PreprocessingResult(
+            original_query=raw,
+            normalized_query=raw.strip().lower(),
+            abbreviations=[],
+            document_refs=[],
+            blocking_ambiguities=[],
+            preprocessing_status="ok",
+            preprocessor_trace=[],
+        )
+
+    adapter = DeterministicSemanticAdapter(preprocess=_preprocess)
+    draft = asyncio.run(
+        adapter.build_draft(
+            _request(
+                "văn bản này quy định gì?",
+                [_conv_known(DOC_B, "conv-1")],
+            ),
+            ConversationContext(
+                summary="", active_entities=(), last_focus=None, recent_turns=()
+            ),
+        )
+    )
+    assert [r.resolved_document_id for r in draft.document_refs] == [DOC_B]
