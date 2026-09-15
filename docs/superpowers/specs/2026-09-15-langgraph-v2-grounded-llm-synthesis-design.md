@@ -40,12 +40,15 @@ sufficient EvidenceEvaluation
 
 The overlap-grounding repair in commit `1d80b62` correctly prevents duplicated legal chunks from becoming spuriously ambiguous, but it intentionally does not add LLM composition. The observed result is grounded enough for the current deterministic contract yet still reads like raw provisions.
 
-There are also four implementation constraints the LLM synthesis design must address explicitly:
+There are also implementation constraints the LLM synthesis design must address explicitly:
 
 1. the current generic main-LLM tracing wrapper captures full prompt and output content;
 2. the current grounding path maps rendered `AnswerDraft.content` back to claims by string matching rather than grounding claims directly;
 3. current synthesis budget splitting is FIFO and may starve one target in compare/multi-target work;
-4. current public citation contracts are document-centric, while People and KG evidence have different or incomplete presentation semantics.
+4. current public citation contracts are document-centric, while People and KG evidence have different or incomplete presentation semantics;
+5. `SupervisorV2State` is `total=True` and currently has no synthesis slot, so checkpoint compatibility must be an explicit contract migration;
+6. `summarize_reduce_node()` currently calls `synthesize_answer()` directly, creating a second synthesis entry path unless refactored;
+7. the outer V2 stream currently chunks answer tokens immediately after `status(generating)` and has no explicit citation-frame producer before the first token.
 
 V1 already provides the target document-citation presentation behavior:
 
@@ -68,13 +71,15 @@ The following decisions are fixed for this design:
 4. **Stable evidence-handle manifest:** `E1..En` are backed by a checkpointed server-owned mapping to exact `EvidenceUseRef` identities before any model call. Handles are never re-numbered to different evidence on resume.
 5. **Target-aware evidence selection:** prompt evidence is selected deterministically across required targets; FIFO truncation cannot silently starve a compare/multi-target branch.
 6. **Claim-first grounding, render-last:** claims are validated and grounded before Markdown/citation rendering. The server never renders prose and then parses it backward to rediscover claim identity.
-7. **Deterministic high-risk factual guards:** quantities, dates, legal locators, official document numbers, and comparable literal anchors in generated claims must be supported by the cited evidence after canonical normalization.
-8. **Validate before stream:** the complete candidate is buffered, parsed, grounded, citation-projected, and rendered before the first answer token is emitted.
-9. **One repair attempt:** at most two model calls are allowed—one initial attempt and one bounded repair attempt.
-10. **No production extractive fallback:** after both attempts fail, the turn fails closed with a safe typed terminal error. Raw chunks are not returned as a fallback answer.
-11. **Document-backed citation scope first:** this phase enables LLM synthesis only where every factual claim can resolve to an authorized document-backed public citation. People remains on its existing presentation path; KG synthesis is deferred until a first-class public KG locator/citation contract exists.
-12. **Single citation projection owner:** one server component resolves governed evidence identities into public locatable citation metadata used by rendering, SSE, persistence, and reload.
-13. **Existing V2 rollout control:** rollback uses the existing V2 canary/arm control; no synthesis-specific traffic flag is introduced.
+7. **Deterministic high-risk factual guards:** quantities, dates, legal locators, official document numbers, and comparable literal anchors in generated claims must be supported by the cited evidence after domain-aware canonicalization.
+8. **Atomicity is partially enforceable, not semantic proof:** the model is instructed to produce one material assertion per claim; the server deterministically rejects obvious multi-sentence/multi-paragraph claims, but does not pretend conjunction heuristics can prove semantic atomicity.
+9. **Validate before stream:** the complete candidate is buffered, parsed, grounded, citation-projected, and rendered before the first answer token is emitted.
+10. **One repair attempt:** at most two model calls are allowed—one initial attempt and one bounded repair attempt.
+11. **No production extractive fallback:** after both attempts fail, the turn fails closed with a safe typed terminal error. Raw chunks are not returned as a fallback answer.
+12. **Document-backed citation scope first:** this phase enables LLM synthesis only where every factual claim can resolve to an authorized document-backed public citation. People remains on its existing presentation path; KG synthesis is deferred until a first-class public KG locator/citation contract exists.
+13. **Single synthesis owner:** all user-visible document-backed LLM synthesis, including summarize final/reduce presentation, passes through the same checkpointed synthesis state machine. No node may call the provider through a second uncheckpointed synthesis path.
+14. **Single citation projection owner:** one server component resolves governed evidence identities into public locatable citation metadata used by rendering, SSE, persistence, and reload.
+15. **Existing V2 rollout control:** rollback uses the existing V2 canary/arm control; no synthesis-specific traffic flag is introduced.
 
 ---
 
@@ -86,6 +91,7 @@ This work does not:
 - introduce KG LLM synthesis before a public KG citation/navigation contract exists;
 - add a second independent LLM judge;
 - claim formal semantic entailment between arbitrary natural-language claims and evidence;
+- claim deterministic detection of every semantically compound sentence;
 - move ACL, binding, revision pinning, planning, routing, scheduling, evidence admission, or public citation ownership into the model;
 - give the model internal evidence UUIDs, document UUIDs, workspace IDs, run IDs, task IDs, binding IDs, revision IDs, or checkpoint IDs;
 - stream speculative text followed by `token_rollback`;
@@ -93,6 +99,7 @@ This work does not:
 - reintroduce V1 supervisor control fields or a second agent graph;
 - change direct greeting, clarification, denied, or evidence-insufficient routes into model calls;
 - treat the current raw-concatenation overflow artifact as a semantic summary merely because it is stored as derived evidence;
+- add a separate model-backed summarize reducer outside the canonical synthesis state machine;
 - repair unrelated OTLP exporter or Telegram configuration;
 - restart or reconfigure vLLM as part of implementation.
 
@@ -146,7 +153,7 @@ checkpoint parsed claim proposal/error code
 resolve E-handles through SAME HandleManifest
         |
         v
-claim schema + high-risk factual validation
+claim schema + deterministic high-risk-anchor validation
         |
         v
 GroundedClaim[]
@@ -162,10 +169,13 @@ server renders Markdown + [a3z9] markers
 checkpoint grounded artifact
         |
         v
-citation SSE -> token SSE -> complete
+outer streaming adapter emits citation SSE
+        |
+        v
+token SSE -> complete
 ```
 
-The graph remains the only orchestration authority. The LLM adapter is a request-scoped runtime service. Evidence selection, handle identity, grounding, citation projection, and rendering remain server-owned.
+The graph remains the only orchestration authority. The LLM adapter is a request-scoped runtime service. Evidence selection, handle identity, grounding, citation projection, rendering, and public event ordering remain server-owned.
 
 ---
 
@@ -187,7 +197,7 @@ PresentationMode
 
 Rules for this phase:
 
-- document retrieval, document section reads, document summarize final/reduce output, and complex final answers whose supporting claims can all resolve to document-backed sources -> `document_grounded_llm`;
+- document retrieval, document section reads, document summarize final output, and complex final answers whose supporting claims can all resolve to document-backed sources -> `document_grounded_llm`;
 - People lookup -> existing `people_card`/public People transport; no synthesis model call;
 - direct/clarification/denied/insufficient -> existing non-LLM presentation;
 - KG-only or mixed evidence that requires a KG claim without a document-backed locatable lineage -> typed unavailable for LLM synthesis in this phase, not a fake document citation;
@@ -195,9 +205,33 @@ Rules for this phase:
 
 A complex workflow may use People internally to discover documents. That does not force People records into the synthesis prompt: only final admitted evidence selected to support user-visible claims crosses the synthesis boundary.
 
-### 6.2 Why this boundary is required
+### 6.2 Summarize reduce is not a second synthesis owner
 
-The supervisor graph currently sends factual fast-path work through `execute -> evaluate -> synthesize -> ground -> finalizer`. The production implementation must therefore branch presentation **inside the owned synthesis/presentation boundary** rather than assuming every sufficient factual result is document-synthesizable.
+`backend/app/services/agents/v2/complex_research_graph.py::summarize_reduce_node()` currently calls `synthesize_answer()` directly and stores a draft in `answer_draft_channel`. That behavior must be removed for production LLM synthesis.
+
+The reduce node may own only deterministic/governed **evidence preparation**, for example:
+
+- verify every required map task has a checkpointed result;
+- deterministically order/collect the map-task `EvidenceUseRef`s;
+- materialize governed derived/supporting evidence only through the existing evidence store rules when required by the accepted ReduceSpec;
+- update the complex subgraph result/evaluation so the outer supervisor sees the final evidence set.
+
+It must **not** call the main synthesis provider, create a user-visible answer draft, reserve synthesis attempts, or own a second handle manifest.
+
+The outer supervisor `synthesize` boundary is the only owner of the user-visible structured LLM call and the only owner of `SynthesisCheckpoint`. Summarize therefore converges back into the same flow:
+
+```text
+map tasks -> summarize_reduce_node (evidence preparation only)
+          -> complex result/evaluation
+          -> outer synthesize state machine
+          -> grounded final summary
+```
+
+If future scale requires a model-backed intermediate compaction/reducer, that is a separate governed derived-evidence design and must not reuse the user-visible synthesis state machine implicitly.
+
+### 6.3 Why this boundary is required
+
+The supervisor graph currently sends factual fast-path work through `execute -> evaluate -> synthesize -> ground -> finalizer`. The production implementation must branch presentation **inside the owned synthesis/presentation boundary** rather than assuming every sufficient factual result is document-synthesizable.
 
 A missing/unsupported presentation strategy is a typed failure or existing specialized presentation—not permission to call `build_extractive_draft()`.
 
@@ -385,7 +419,7 @@ The model does not return:
 - terminal status;
 - sources or URLs.
 
-### 9.2 Parser and limits
+### 9.2 Parser and deterministic limits
 
 The parser must:
 
@@ -398,10 +432,14 @@ The parser must:
 - require every claim to reference one to three evidence handles;
 - reject handles absent from the checkpointed manifest;
 - deduplicate repeated handles while preserving model order;
-- require each claim to represent one material assertion;
+- reject obvious multi-paragraph or multi-sentence claims using the existing sentence/assertion splitter;
 - reject duplicate normalized claim text;
 - construct server-owned `claim-1`, `claim-2`, ... IDs in output order;
 - resolve each accepted handle through the exact manifest entry to an admitted `EvidenceUseRef`.
+
+The server does **not** use conjunctions such as `và`, `đồng thời`, commas, or semicolons as a general-purpose compound-claim detector. Those heuristics are too language/context dependent and would create false rejection. Atomicity beyond obvious multiple sentences is a prompt/model-quality requirement and an offline evaluation concern, not a claimed deterministic guarantee.
+
+Accordingly, there is no generic `claim_compound` runtime failure code. The deterministic structural code is `claim_multi_sentence` (or the implementation's equivalent closed name).
 
 The parser does **not** build user-visible Markdown. It outputs typed claims only.
 
@@ -411,6 +449,7 @@ The synthesis prompt must require the model to:
 
 - answer the current contextualized query in its language, defaulting to Vietnamese;
 - provide a direct short summary followed by only relevant details;
+- produce one material assertion per claim;
 - explain legal rules instead of copying every retrieved provision;
 - state conditions, exceptions, validity warnings, dates, time limits, and differing penalty bands only when present in cited evidence;
 - use only supplied evidence;
@@ -443,7 +482,7 @@ The required flow is:
 ParsedClaim[]
    -> resolve exact EvidenceUseRefs
    -> validate claims
-   -> validate support guards
+   -> validate deterministic support anchors
    -> GroundedClaim[]
    -> CitationProjector
    -> render Markdown + inline markers
@@ -463,34 +502,82 @@ For every grounded claim, the server proves:
 
 This is a server-verifiable **claim-to-evidence traceability guarantee**.
 
-### 10.3 Deterministic high-risk factual guards
+### 10.3 High-risk anchor extraction and matching
 
-Because this phase does not add a second semantic judge, deterministic guards must cover factual anchors where hallucination is especially damaging and literal/canonical validation is feasible.
+Because this phase does not add a second semantic judge, deterministic guards cover factual anchors where hallucination is especially damaging and canonical literal matching is feasible.
 
-At minimum, extract and canonicalize from each generated claim:
+At minimum, extract from generated claims:
 
 - monetary amounts and other numeric quantities;
 - percentages;
-- dates and explicit time periods/deadlines;
+- dates;
+- explicit durations/deadlines;
 - `Điều`, `Khoản`, `Điểm`, `Chương`, `Mục` locators;
 - official document numbers/symbols when stated;
 - other closed literal identifiers configured by the implementation.
 
-Every such anchor in a claim must be found in at least one cited evidence item after domain-aware normalization, for example:
+Matching rule: **extract anchor -> canonicalize the anchor and each cited evidence item -> require the canonical anchor to occur in at least one individually cited evidence item**. Anchors are not satisfied by combining unrelated fragments across multiple evidence items.
+
+Canonicalization is deliberately domain-aware and conservative:
+
+#### Numeric amounts
+
+- Unicode-normalize and case-fold labels.
+- Normalize grouping separators where unambiguous (`20.000.000` -> `20000000`).
+- Normalize Vietnamese scale words to numeric multipliers when the surrounding token is numeric: `nghìn`/`ngàn` = `10^3`, `vạn` = `10^4`, `triệu` = `10^6`, `tỷ` = `10^9`.
+- Equivalent money forms may match: `20.000.000 đồng` <-> `20 triệu đồng`.
+- Currency/unit is part of the anchor where present; a bare `20` does not prove `20 triệu đồng`.
+- Ambiguous decimal/grouping forms are not guessed; failure to canonicalize safely means the anchor is not deterministically proven and enters repair/failure.
+
+#### Percentages
+
+- Normalize surrounding spaces and equivalent decimal typography only when unambiguous.
+- Preserve the percent unit; `20` is not equivalent to `20%`.
+
+#### Dates
+
+- Canonicalize only syntactically equivalent explicit calendar forms (for example zero-padded vs non-zero-padded day/month forms).
+- Do not infer an unstated year, timezone, or relative date.
+
+#### Durations/deadlines
+
+- Normalize leading zeros (`05 ngày` -> `5 ngày`).
+- Preserve semantic qualifiers as part of the anchor.
+- `5 ngày làm việc` and `5 ngày` are **different anchors**.
+- `ngày làm việc`, `ngày dương lịch`, `tháng`, `năm`, and other legally meaningful units/qualifiers are never collapsed into one generic duration.
+
+#### Legal locators and document numbers
+
+- Case-fold and normalize safe punctuation/whitespace around `Điều/Khoản/Điểm/Chương/Mục` and official number symbols.
+- Preserve hierarchy and number identity; `Khoản 2 Điều 5` is not reduced to merely `Điều 5` for an exact locator claim.
+- Do not fuzzy-match a generated official number to a different candidate document.
+
+If a high-risk anchor is unsupported under these conservative rules, the candidate enters the bounded repair path. It never reaches public rendering.
+
+### 10.4 Explicit limitation: anchor presence is not entailment
+
+The anchor guard answers only:
+
+> Does the cited evidence contain the same high-risk literal/canonical fact?
+
+It does **not** answer:
+
+> Does the evidence assert that fact about the same actor, conduct, exception, condition, or legal context as the generated claim?
+
+Example residual risk:
 
 ```text
-20.000.000 đồng <-> 20 triệu đồng
-05 ngày <-> 5 ngày
-Điều 5 <-> điều 5
+Evidence: "Hành vi A bị phạt 20 triệu đồng."
+Claim:    "Hành vi B bị phạt 20 triệu đồng."
 ```
 
-If a high-risk anchor is unsupported, the candidate enters the bounded repair path. It never reaches public rendering.
+The `20 triệu đồng` anchor can pass even though the claim is semantically wrong. This is an acknowledged residual model-quality risk because this phase explicitly does not add a semantic entailment judge.
 
-These guards intentionally do not claim to prove arbitrary semantic entailment. The model remains constrained to supplied evidence, and unsupported semantic claims that contain no deterministically checkable anchor are a residual model-quality risk measured by offline/live evaluation.
+Tests and live evaluation must document this limit rather than treating anchor success as proof of full support.
 
-### 10.4 One material assertion per claim
+### 10.5 Claim atomicity boundary
 
-Each claim must contain one material assertion so evidence mapping and inline citation placement stay unambiguous. Compound claims with independently supportable propositions are schema-invalid/repairable rather than rendered as one citation-bearing sentence.
+Each model claim should contain one material assertion so evidence mapping and inline citation placement remain interpretable. Server enforcement is limited to deterministic structure (for example, rejecting multiple sentences/paragraphs). Semantically compound single sentences may still pass and are part of the same residual model-quality risk described above.
 
 ---
 
@@ -576,6 +663,23 @@ Because rendering occurs **after** grounding, adding bullet prefixes or Markdown
 
 The renderer never groups identifiers as `[a3z9, b2m7]`, never leaves a space before the first marker, and never emits a separate references list unless the public product contract changes later.
 
+### 11.6 Outer streaming adapter owns citation-before-token ordering
+
+The node graph produces/checkpoints the grounded artifact and the `CitationProjector` produces the public citation payload. The **outer V2 streaming adapter** is responsible for public event order.
+
+In the current implementation this is the success branch in `backend/app/services/agent/streaming.py::stream_v2_turn_events` (the branch that emits `status(generating)` and then loops over `_chunk_prose(...)`). It must be changed to:
+
+```text
+status(generating)
+  -> citation(all projector-produced public citations)
+  -> token chunks
+  -> complete
+```
+
+The adapter must emit the citation frame **after** a grounded success is known and **before** the first `_chunk_prose` token is yielded. It must consume the exact citation projection stored/passed with the grounded final artifact; it must not rebuild citation identity independently.
+
+The `complete` payload may repeat the same citation metadata for persistence/backward-compatible hydration, but it cannot introduce a different source set or different indexes.
+
 ---
 
 ## 12. Initial attempt, repair, and failure
@@ -589,6 +693,10 @@ Before attempt one:
 3. Create the stable handle manifest.
 4. Checkpoint the prepared manifest.
 5. Reserve attempt one by incrementing `attempts_started` and checkpoint **before** the provider call.
+
+The first implementation deliberately uses two durable checkpoint transitions before the first provider call (`prepared` then `attempt_reserved`). This adds checkpoint latency, but makes evidence identity and attempt consumption independently recoverable and reviewable. Correctness/restart safety is preferred over one fewer round-trip in this phase.
+
+A later optimization may coalesce these writes only if a single atomic checkpoint can persist both the complete handle manifest and the incremented attempt count **before** any provider side effect. It must not weaken either invariant.
 
 ### 12.2 Initial attempt
 
@@ -614,7 +722,7 @@ One repair call is allowed when the first attempt fails because of:
 - malformed or extra output;
 - schema/size violations;
 - missing, unknown, or excessive evidence handles;
-- duplicate/compound claims;
+- duplicate claims or obvious multi-sentence claims;
 - unsupported deterministic high-risk anchors;
 - citation projection failure that can be corrected by citing another already-supplied handle;
 - a transient first provider failure when enough turn deadline remains.
@@ -648,16 +756,55 @@ There is no same-request fallback to V1 and no production fallback to `build_ext
 
 ---
 
-## 13. Checkpoint and resume semantics
+## 13. Checkpoint contract and resume semantics
 
-### 13.1 Bounded synthesis state machine
+### 13.1 This is an additive V2 checkpoint contract change
+
+The current `SupervisorV2State` is `TypedDict(total=True)` and has no `synthesis` key. Implementation must therefore treat this as an explicit checkpoint-contract change even though no SQL table migration is required.
+
+Add a strict frozen `SynthesisCheckpoint` contract (preferably in `contracts/synthesis.py`) and add the slot:
+
+```python
+class SupervisorV2State(TypedDict, total=True):
+    ...
+    synthesis: SynthesisCheckpoint | None
+    final_response: FinalResponse | None
+```
+
+**Decision:** `synthesis` is a nullable slot. `None` is the canonical idle/not-started value; there is no separate checkpoint object merely to represent idle.
+
+The implementation must update all checkpoint owners together:
+
+- `contracts/state.py`: add `synthesis: SynthesisCheckpoint | None`;
+- `supervisor_v2.py::_SLOT_MODELS`: add `"synthesis": SynthesisCheckpoint`;
+- `supervisor_v2.py::_NULLABLE_SLOTS`: add `"synthesis"`;
+- `contracts/validation.py::_CHECKPOINT_REQUIRED_KEYS`: add `"synthesis"`;
+- `build_initial_v2_state()`: initialize `synthesis=None`;
+- fresh-turn/context hygiene: clear any prior turn's synthesis slot to `None` together with stale terminal response state;
+- checkpoint normalization: recognize legacy V2 checkpoints that predate the slot and insert `synthesis=None` **before** current required-key validation/coercion.
+
+### 13.2 Contract-version compatibility decision
+
+The repository currently has one global `ContractVersion = Literal["2.0"]` shared across many frozen V2 contracts. This synthesis change does **not** bump the global version merely to add one backward-compatible nullable internal checkpoint slot; doing so would unnecessarily require migrating every nested V2 contract.
+
+Instead:
+
+- `SynthesisCheckpoint.contract_version` uses the existing `CONTRACT_VERSION` (`2.0`);
+- pre-synthesis V2 checkpoint payloads with root version `2.0` and no `synthesis` key are a specifically supported legacy shape;
+- `normalize_checkpoint_state()` materializes `synthesis=None` before the current aggregate is validated;
+- once normalized/recheckpointed, the live/current aggregate always contains the key because `SupervisorV2State` remains `total=True` and `_CHECKPOINT_REQUIRED_KEYS` includes it;
+- missing synthesis is accepted only through this explicit legacy normalization branch, not as a general relaxation of required-key validation.
+
+This is the contract-version handling for old checkpoints in this phase: same global version, explicitly normalized additive slot. A future incompatible synthesis schema change must receive its own version/migration decision rather than silently reusing this compatibility rule.
+
+### 13.3 Bounded synthesis state machine
 
 LLM output is not guaranteed deterministic even at temperature zero. Runtime-only `AnswerDraftChannel` cannot be the sole owner because a worker restart could otherwise cause uncontrolled regeneration or extractive re-derivation.
 
-Synthesis therefore runs as a small bounded checkpointed state machine:
+With `None` representing idle, non-null synthesis phases are:
 
 ```text
-idle
+None
   -> prepared(handle_manifest)
   -> attempt_reserved
   -> candidate
@@ -673,18 +820,19 @@ candidate/validation failure
 
 `attempts_started` increments and checkpoints **before** every provider call. A crash during generation consumes that attempt.
 
-### 13.2 SynthesisCheckpoint
+### 13.4 SynthesisCheckpoint contents
 
-Add one additive checkpoint slot, conceptually `synthesis`, backed by a versioned `SynthesisCheckpoint` containing:
+Conceptually:
 
 ```text
 contract_version
-phase: idle | prepared | attempt_reserved | candidate | grounded | failed
+phase: prepared | attempt_reserved | candidate | grounded | failed
 attempts_started: 0 | 1 | 2
 handle_manifest: tuple[handle -> EvidenceUseRef]
 parsed candidate claims + E-handles (phase=candidate)
 grounded claims + exact EvidenceUseRefs (phase=grounded)
 server-rendered final content when grounded
+public citation projection/reference needed for deterministic replay
 presentation kind per claim
 closed failure codes only
 ```
@@ -697,14 +845,15 @@ The checkpoint never contains:
 - hidden reasoning;
 - provider secrets;
 - ACL decisions/state;
-- stack traces;
-- public source excerpts.
+- stack traces.
 
 Internal exact `EvidenceUseRef` identities are permitted in the synthesis checkpoint because they are required to preserve provenance across resume and never cross the model/public boundary.
 
-### 13.3 Resume rules
+Public citation data persisted for reload must be the allowlisted projector output only; raw evidence-store identities remain internal.
 
-- `idle`: prepare normally.
+### 13.5 Resume rules
+
+- `synthesis=None`: prepare normally.
 - `prepared`: reuse the exact manifest; reserve the first attempt if none has started and deadline remains.
 - `attempt_reserved`: the reserved call is considered consumed. Resume records a closed interruption code and may reserve the repair only when `attempts_started < 2` and deadline remains.
 - `candidate`: resolve handles only through the checkpointed manifest and validate/ground without regenerating.
@@ -712,11 +861,11 @@ Internal exact `EvidenceUseRef` identities are permitted in the synthesis checkp
 - `failed`: return the same safe typed failure with zero model calls.
 - If any exact manifest/cited use no longer passes current ACL, revision, expiry, tombstone, lineage, or retention checks, fail closed. Do not substitute another use into the same E-handle.
 - If a grounded artifact no longer passes current authority, fail closed; do not regenerate around changed authority.
-- A fresh turn resets the synthesis checkpoint together with stale terminal state.
-- Old checkpoints with no synthesis slot normalize to `idle`.
+- A fresh turn resets `synthesis=None` together with stale terminal state.
+- Old checkpoints with no synthesis slot normalize to `synthesis=None` under §13.2.
 - A legacy mid-turn checkpoint cannot use extractive production fallback; it enters the bounded state machine only if its authoritative state can be safely normalized, otherwise returns the typed synthesis failure.
 
-The runtime-only `AnswerDraftChannel` may remain as an in-process cache, but `SynthesisCheckpoint` is authoritative for attempts, handles, and recovery.
+The runtime-only `AnswerDraftChannel` may remain as an in-process cache, but `SynthesisCheckpoint` is authoritative for attempts, handles, grounded output, and recovery.
 
 No SQL schema migration is required for the additive LangGraph state slot; compatibility and real Postgres serde tests remain mandatory.
 
@@ -732,10 +881,12 @@ A successful buffered turn has the public order:
 status(generating)
 citation(...all public citations...)
 token(...validated rendered answer chunks...)
-complete(answer + citations + status=success)
+complete(answer + same citations + status=success)
 ```
 
 The first answer token is therefore grounded and citation-resolvable when it arrives.
+
+As specified in §11.6, the current `stream_v2_turn_events` success branch is the outer producer of this ordering. It emits one citation frame from the canonical projector result before starting the `_chunk_prose(...)` loop.
 
 The rendered answer and the same public citation metadata are persisted so an immediate hard reload reconstructs identical clickable badges. Persistence consumes the same `CitationProjector` output; it does not independently rebuild public source identity.
 
@@ -772,7 +923,7 @@ The implementation must preserve these invariants:
 - People data does not cross the synthesis-model boundary in this phase;
 - KG evidence does not cross this document-grounded synthesis boundary unless a future first-class KG public citation contract is added.
 
-This design guarantees governed claim-to-evidence traceability plus deterministic validation of defined high-risk factual anchors. It explicitly does **not** claim formal semantic entailment for arbitrary prose.
+This design guarantees governed claim-to-evidence traceability plus deterministic validation of defined high-risk factual anchors. It explicitly does **not** claim formal semantic entailment for arbitrary prose or context-correct use of every anchor.
 
 ---
 
@@ -804,12 +955,14 @@ schema_invalid
 unknown_evidence_handle
 handle_manifest_mismatch
 claim_limit_exceeded
-claim_compound
+claim_multi_sentence
 claim_anchor_unsupported
 citation_unresolvable
 resume_revalidation_failed
 deadline_exhausted
 ```
+
+No generic `claim_compound` code exists because semantic compoundness is not deterministically proven by this design.
 
 No failure code embeds user/evidence content or internal identifiers.
 
@@ -821,7 +974,17 @@ The synthesis path must use content-suppressed tracing rather than the current g
 
 Implementation follows TDD.
 
-### 17.1 Presentation-policy tests
+### 17.1 Checkpoint-contract compatibility tests
+
+- fresh `SupervisorV2State` contains `synthesis=None`;
+- `_SLOT_MODELS` knows `SynthesisCheckpoint` and `_NULLABLE_SLOTS` includes `synthesis`;
+- `_CHECKPOINT_REQUIRED_KEYS` includes `synthesis` for current normalized state;
+- an old root-`2.0` checkpoint with no `synthesis` key normalizes to `synthesis=None` before required-key validation;
+- a current checkpoint missing `synthesis` outside the explicit legacy-normalization path fails closed;
+- non-null synthesis phases round-trip through JSON serde and real `AsyncPostgresSaver`;
+- fresh-turn hygiene clears prior synthesis state.
+
+### 17.2 Presentation-policy tests
 
 - People lookup does not call the synthesis LLM and preserves existing public People presentation;
 - document-backed factual retrieval selects document synthesis;
@@ -829,7 +992,15 @@ Implementation follows TDD.
 - KG-only synthesis is typed unsupported in this phase rather than fabricated as a document citation;
 - direct/clarify/denied/insufficient paths make zero synthesis model calls.
 
-### 17.2 Evidence-selection tests
+### 17.3 Single-owner summarize tests
+
+- `summarize_reduce_node()` makes zero calls to the main synthesis provider;
+- reduce collects/prepares governed evidence and returns it to the outer supervisor flow;
+- exactly one user-visible synthesis state machine owns the final summarize answer;
+- `answer_draft_channel` is not used by reduce to bypass `SynthesisCheckpoint`;
+- a summarize resume cannot cause one reduce LLM call plus another outer synthesis LLM call.
+
+### 17.4 Evidence-selection tests
 
 - single-target ranking/order remains stable;
 - two-target comparison selects evidence from both targets before filling extra quota;
@@ -838,7 +1009,7 @@ Implementation follows TDD.
 - prompt + evidence + reserved output stay within configured synthesis budget;
 - raw-concatenation derived overflow is not mislabeled/tested as a semantic summary.
 
-### 17.3 Handle-manifest tests
+### 17.5 Handle-manifest tests
 
 - `E1..En` maps to exact expected `EvidenceUseRef` identities;
 - repair preserves the same manifest and numbering;
@@ -846,27 +1017,46 @@ Implementation follows TDD.
 - if `E2` becomes unauthorized, `E2` fails rehydration rather than being rebound to the next surviving use;
 - manifest contains no evidence plaintext and never crosses public/model transport except for opaque E-labels.
 
-### 17.4 Structured adapter tests
+### 17.6 Structured adapter tests
 
 - one valid proposal constructs the expected ordered parsed claims;
 - handles resolve to exact admitted uses through the manifest;
 - unknown/fabricated handles fail;
-- empty claims, duplicate normalized claims, extra fields, oversized claims, excessive handles, and compound claims fail;
+- empty claims, duplicate normalized claims, extra fields, oversized claims, excessive handles, and obvious multi-sentence claims fail;
+- a semantically compound but single-sentence claim is not falsely claimed to be deterministically detected;
 - fenced JSON is accepted; surrounding prose is rejected;
 - evidence prompt injection cannot alter accepted schema or authority;
 - provider/model raw output is never logged/traced on failure;
 - Vietnamese and English output preserves query language.
 
-### 17.5 Support-validation tests
+### 17.7 Anchor canonicalization/support tests
 
-- amount normalization supports equivalent forms such as `20.000.000 đồng` and `20 triệu đồng`;
-- dates/time periods normalize deterministically;
-- legal locators/document numbers in a claim must be present in cited evidence after canonicalization;
-- unsupported high-risk anchors trigger repair/failure;
-- claim grounding does not depend on parsing server-rendered Markdown;
-- adding bullet/list formatting after grounding cannot create an unmapped claim.
+- `20.000.000 đồng` and `20 triệu đồng` canonicalize to an equivalent monetary anchor;
+- `2 tỷ đồng`, `500 nghìn đồng`, and numeric scale variants canonicalize deterministically;
+- ambiguous decimal/grouping typography fails conservative canonicalization rather than guessing;
+- percentages preserve `%` identity;
+- zero-padded dates/durations normalize only when semantically equivalent;
+- `05 ngày` and `5 ngày` may match after normalization;
+- `5 ngày làm việc` and `5 ngày` remain distinct anchors;
+- `Khoản 2 Điều 5` is not weakened to merely `Điều 5` for exact-locator support;
+- official document numbers are exact/canonical, not fuzzy-resolved at claim-validation time;
+- anchors must occur in at least one individually cited evidence item rather than being assembled across sources;
+- unsupported high-risk anchors trigger repair/failure.
 
-### 17.6 Repair tests
+### 17.8 Residual-risk test: anchor presence is not entailment
+
+Include an explicit test/fixture documenting the designed limitation:
+
+```text
+Evidence: Hành vi A bị phạt 20 triệu đồng.
+Claim:    Hành vi B bị phạt 20 triệu đồng.
+```
+
+The anchor layer may report the monetary anchor as present because `20 triệu đồng` is literally supported, while the overall semantic claim is wrong. The test must make clear that this is **not** considered an entailment success guarantee; it documents the residual risk accepted by the no-second-judge decision.
+
+Offline/live quality evaluation should include such contextual-misattribution cases and track them separately from deterministic anchor-validation failures.
+
+### 17.9 Repair tests
 
 - malformed first output followed by valid repair succeeds in exactly two calls;
 - unsupported anchor on first draft followed by valid repair succeeds;
@@ -876,21 +1066,19 @@ Implementation follows TDD.
 - no repair starts after deadline exhaustion;
 - cancellation propagates without repair or late success.
 
-### 17.7 Checkpoint tests
+### 17.10 Checkpoint/restart tests
 
-- every synthesis checkpoint phase round-trips through JSON serde and real `AsyncPostgresSaver`;
 - prepared/candidate checkpoint carries stable handle->use references and no evidence plaintext;
-- checkpoint contains no prompt, unparsed output, reasoning, or public excerpt;
+- checkpoint contains no prompt, unparsed output, reasoning, or raw internal diagnostics;
+- the deliberate `prepared -> attempt_reserved` two-checkpoint sequence is observable before the first provider call;
 - attempt reservation is durable before each provider call;
 - a crash during attempt one can start at most the repair; a crash during attempt two starts no further call;
 - candidate resume performs zero regeneration before validation;
 - grounded resume performs zero model calls;
 - resume rejects revoked/expired/tombstoned exact uses without handle renumbering;
-- old checkpoints missing the slot normalize successfully;
-- a fresh turn clears the prior synthesis artifact;
 - retry/resume cannot exceed the two-attempt budget.
 
-### 17.8 Citation projector/parity tests
+### 17.11 Citation projector/parity tests
 
 - one citation projector owns runtime render, SSE, persistence, and reload projection;
 - public indexes are four-character alphanumeric values containing a letter;
@@ -899,6 +1087,8 @@ Implementation follows TDD.
 - multiple sources render as `[a3z9][b2m7]`, never grouped;
 - fabricated/unmatched markers cannot cross the public boundary;
 - `citation` is emitted before the first token;
+- the current outer V2 streaming success branch emits projector output after `status(generating)` and before `_chunk_prose` token iteration;
+- `complete` repeats the exact same citation indexes/source set rather than rebuilding them;
 - citation payload contains locatable allowlisted metadata and no internal keys;
 - derived evidence expands recursively to authorized document lineage;
 - People/KG cannot be disguised as document citations;
@@ -906,7 +1096,7 @@ Implementation follows TDD.
 - clicking opens the correct document/chunk;
 - hard reload preserves the same answer markers and citation metadata.
 
-### 17.9 Tracing/privacy tests
+### 17.12 Tracing/privacy tests
 
 - synthesis resolves the effective `main` provider/model configuration;
 - Langfuse synthesis observation contains only approved metadata and no query/evidence/answer plaintext;
@@ -914,9 +1104,10 @@ Implementation follows TDD.
 - failure paths do not log raw invalid model output;
 - tracing exporter failure never changes the synthesis result.
 
-### 17.10 API/streaming/persistence tests
+### 17.13 API/streaming/persistence tests
 
 - successful output emits tokens only after grounding/rendering and exactly one `complete` terminal;
+- citation frame is produced before the first answer token;
 - model/validation failure emits no tokens and exactly one typed `error`;
 - the safe failure message persists as nonblank assistant content;
 - cancellation emits no late success;
@@ -924,19 +1115,21 @@ Implementation follows TDD.
 - public contract remains additive/version-stamped;
 - V1 serving remains unchanged.
 
-### 17.11 Live acceptance
+### 17.14 Live acceptance
 
 Against the configured effective main provider and a disposable/test session, the canonical document-backed query must:
 
 - return a concise synthesized Vietnamese explanation;
 - avoid dumping retrieved chunks;
-- state only evidence-backed conduct, sanctions, conditions, dates, amounts, and caveats under the defined validation guarantee;
+- state evidence-backed conduct, sanctions, conditions, dates, amounts, and caveats within the explicitly documented validation limits;
 - place at least one clickable citation after every material factual claim;
 - open the correct document/chunk from each citation;
 - retain citations after hard reload;
 - produce no blank assistant row, raw evidence dump, raw internal citation ID, leaked synthesis evidence in tracing, or multiple terminal event.
 
 A multi-target acceptance case must additionally prove both targets survive prompt selection and appear in the grounded claim set when the answer requires both.
+
+A contextual-misattribution fixture must remain in the quality suite to demonstrate that high-risk-anchor matching is not treated as formal entailment.
 
 ---
 
@@ -951,8 +1144,10 @@ Rollout uses the existing V2 arm controls and pre-canary gates:
 3. run main-provider live smoke tests with content-safe fixtures;
 4. verify trace sinks contain no synthesis prompt/evidence/answer plaintext;
 5. verify People and unsupported KG paths do not enter document synthesis;
-6. promote through existing canary stages while observing synthesis outcomes, target coverage, citation coverage, latency, repair rate, and cancellation;
-7. roll back affected traffic to V1 through existing persisted rollout control if gates fail.
+6. verify summarize reduce cannot bypass the canonical synthesis checkpoint state machine;
+7. verify old V2 checkpoints without the new slot normalize to `synthesis=None` and current checkpoints require the slot;
+8. promote through existing canary stages while observing synthesis outcomes, target coverage, citation coverage, latency, repair rate, checkpoint overhead, and cancellation;
+9. roll back affected traffic to V1 through existing persisted rollout control if gates fail.
 
 A synthesis failure never triggers an implicit same-request V1 or extractive fallback. Rollback is an operator-owned arm decision, preserving attribution and authority boundaries.
 
@@ -964,10 +1159,10 @@ Operational rollout must not restart vLLM engines. Backend/frontend recreation, 
 
 The implementation change must update architecture documentation in the same change:
 
-- `CLAUDE.md`: canonical V2 synthesis ownership, presentation policy, runtime builder, stable handle manifest, checkpoint artifact, claim-first grounding, privacy-safe tracing, and citation flow;
+- `CLAUDE.md`: canonical V2 synthesis ownership, presentation policy, runtime builder, stable handle manifest, additive nullable synthesis slot, checkpoint compatibility rule, claim-first grounding, privacy-safe tracing, summarize single-owner rule, anchor canonicalization, and citation flow;
 - `README.md`: pointer to the canonical architecture section, without duplicating it;
-- `docs/harness.md`: focused selection/handle/checkpoint/tracing/synthesis/citation tests and live acceptance commands;
-- `docs/pre-canary-handoff.md`: synthesis failure, privacy tracing, target coverage, citation, checkpoint, People/KG exclusions, and rollback checks.
+- `docs/harness.md`: focused contract/selection/handle/checkpoint/tracing/synthesis/citation tests and live acceptance commands;
+- `docs/pre-canary-handoff.md`: synthesis failure, privacy tracing, target coverage, checkpoint compatibility/latency, summarize bypass guard, citation ordering, People/KG exclusions, and rollback checks.
 
 No `.env.example` model-role change is expected because the design reuses the effective `main` configuration. Any tracing-policy implementation should reuse existing settings where possible rather than creating a second provider stack.
 
@@ -982,20 +1177,26 @@ The design is complete only when all of the following hold:
 3. People presentation remains outside the synthesis model in this phase; KG-only claims are not synthesized until a first-class public KG citation contract exists.
 4. Only currently admitted evidence selected by a deterministic target-aware selector reaches the model.
 5. Before every model call, the checkpoint owns an exact stable `E-handle -> EvidenceUseRef` manifest; retry/resume never rebinds an existing handle to different evidence.
-6. The model receives only minimized evidence plus opaque E-handles and never receives internal trusted identities.
-7. The backend owns claim IDs, exact use resolution, support guards, public citation indexes, terminal status, and Markdown rendering.
-8. Grounding is claim-first/render-last; production does not parse rendered Markdown back into claim identity.
-9. Every claim references one to three exact admitted uses, and every defined high-risk factual anchor in a claim is present in at least one cited evidence item after canonical normalization.
-10. At most two model calls occur per synthesis operation, including across crash/resume.
-11. No answer token is emitted before complete validation, citation projection, rendering, and grounded-artifact checkpointing.
-12. Every in-scope document-backed material factual claim has one to three V1-compatible clickable inline citations.
-13. One `CitationProjector` owns source-to-public-citation projection for rendering, SSE, persistence, and reload.
-14. Citation metadata opens the correct currently authorized document/chunk and survives hard reload.
-15. Invalid model output or failed support/citation validation after repair fails closed with `synthesis_failed` and a nonblank persisted safe message.
-16. Checkpoint resume with a grounded artifact performs no new model generation; current exact evidence access is rechecked and revoked uses fail closed without handle renumbering.
-17. Synthesis tracing is content-free: query/evidence/prompt/generated-answer plaintext is not exported through Langfuse or the dataset trace collector by this path.
-18. Cancellation cannot produce a late success.
-19. Existing ACL, binding, revision pin, scheduler, evidence governance, checkpoint, and canary authority remain unchanged.
-20. V1 public citation behavior and frontend compatibility are regression-tested.
-21. Multi-target synthesis cannot silently starve a required target under prompt budget.
-22. Independent review reports no Critical or Important blocker before runtime promotion.
+6. `SupervisorV2State` contains a nullable required `synthesis` slot after normalization; old V2 checkpoints without the slot normalize explicitly to `synthesis=None`, while current checkpoints require the key.
+7. The model receives only minimized evidence plus opaque E-handles and never receives internal trusted identities.
+8. The backend owns claim IDs, exact use resolution, support guards, public citation indexes, terminal status, and Markdown rendering.
+9. Grounding is claim-first/render-last; production does not parse rendered Markdown back into claim identity.
+10. Every claim references one to three exact admitted uses, and every defined high-risk factual anchor in a claim is present in at least one individually cited evidence item after conservative domain-aware canonicalization.
+11. Anchor validation is explicitly not treated as semantic entailment; contextual misattribution remains a measured residual risk.
+12. The server rejects obvious multi-sentence/multi-paragraph claims but does not claim deterministic detection of all semantically compound single sentences.
+13. At most two model calls occur per user-visible synthesis operation, including across crash/resume.
+14. `summarize_reduce_node()` does not perform a second user-visible model synthesis; summarize final output converges through the same outer synthesis state machine.
+15. The deliberate prepared + attempt-reserved checkpoint barriers occur before the first provider call; their latency cost is accepted for restart safety unless a future atomic optimization preserves both invariants.
+16. No answer token is emitted before complete validation, citation projection, rendering, and grounded-artifact checkpointing.
+17. Every in-scope document-backed material factual claim has one to three V1-compatible clickable inline citations.
+18. One `CitationProjector` owns source-to-public-citation projection for rendering, SSE, persistence, and reload.
+19. The outer V2 streaming adapter emits the canonical citation frame after `status(generating)` and before the first token chunk; `complete` carries the same citation identity set.
+20. Citation metadata opens the correct currently authorized document/chunk and survives hard reload.
+21. Invalid model output or failed support/citation validation after repair fails closed with `synthesis_failed` and a nonblank persisted safe message.
+22. Checkpoint resume with a grounded artifact performs no new model generation; current exact evidence access is rechecked and revoked uses fail closed without handle renumbering.
+23. Synthesis tracing is content-free: query/evidence/prompt/generated-answer plaintext is not exported through Langfuse or the dataset trace collector by this path.
+24. Cancellation cannot produce a late success.
+25. Existing ACL, binding, revision pin, scheduler, evidence governance, checkpoint, and canary authority remain unchanged.
+26. V1 public citation behavior and frontend compatibility are regression-tested.
+27. Multi-target synthesis cannot silently starve a required target under prompt budget.
+28. Independent review reports no Critical or Important blocker before runtime promotion.
