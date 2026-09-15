@@ -44,6 +44,7 @@ FULL_CAPABILITIES = frozenset(
         "people.lookup",
         "document.search",
         "document.read",
+        "document.retrieve",
         "section.read",
         "knowledge_graph.query",
         "memory.lookup",
@@ -489,6 +490,21 @@ def test_classify_evaluate_deterministic_scope() -> None:
     assert classify_evaluate("chế độ thai sản được quy định thế nào?") is None
 
 
+def test_classify_evaluate_informational_topic_not_assessment() -> None:
+    """Final re-review I5: ordinary informational compliance-topic queries
+    (topic mention, no assessment request) must NOT classify as evaluate."""
+    from app.services.agents.v2.semantic.intent import classify_evaluate
+
+    for query in (
+        "quy định về tuân thủ thuế là gì?",
+        "chế tài xử phạt khi không tuân thủ quy định?",
+        "hồ sơ tuân thủ gồm những giấy tờ gì?",
+        "tuân thủ pháp luật có ý nghĩa gì?",
+        "compliance là gì?",
+    ):
+        assert classify_evaluate(query) is None, query
+
+
 def test_classify_evaluate_short_circuits_model() -> None:
     from app.services.agents.v2.semantic.intent import IntentClassifier
 
@@ -528,6 +544,39 @@ async def test_route_node_compliance_with_classifier_wired() -> None:
     assert update["route_decision"].reason_code == "compliance_evaluation"
     # The deterministic evaluate scope short-circuits before the model.
     assert provider.called is False
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "quy định về tuân thủ thuế là gì?",
+        "chế tài xử phạt khi không tuân thủ quy định?",
+        "hồ sơ tuân thủ gồm những giấy tờ gì?",
+    ],
+)
+@pytest.mark.asyncio
+async def test_route_node_informational_compliance_topic_stays_targetless(
+    query: str,
+) -> None:
+    """Final re-review I5: a compliance-topic question with no assessment
+    request stays the general-RAG targetless fast path; the model is still
+    consulted (advisory) but the deterministic router remains authoritative."""
+    from app.services.agents.v2.semantic.intent import IntentClassifier
+
+    state = make_state(query)
+    provider = _FakeSearchProvider()
+    runtime = make_runtime(
+        intent_classifier=IntentClassifier(provider_factory=lambda: provider)
+    )
+    update = await route_node(state, runtime)
+    assert update["query_analysis"].work_type == "retrieve"
+    assert update["query_analysis"].domains == ("document",)
+    assert update["route_decision"].route == "fast_domain"
+    assert update["route_decision"].reason_code == "targetless_document_retrieval"
+    # Model advisory boundary preserved: informational queries consult the
+    # model (no deterministic short-circuit), but route authority stays
+    # deterministic.
+    assert provider.called is True
 
 
 def test_typed_personal_falls_back_to_legacy_fast_path() -> None:

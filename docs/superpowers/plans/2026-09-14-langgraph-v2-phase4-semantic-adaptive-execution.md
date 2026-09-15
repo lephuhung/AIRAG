@@ -196,6 +196,41 @@ resolve_doc    -> semantic prerequisite, NOT complexity
 - [ ] Pass all Task-1 cases.
 - [ ] Commit: `feat(v2): translate v1 intent into query analysis`.
 
+### Task 3 erratum (final re-review M8): v2-only narrow `evaluate` deterministic scope
+
+The Task-3 ruling above ("Remove generic regex/keywords such as … `đánh giá`
+from being authoritative when typed intent is available") has one explicit,
+v2-only exception. A **compliance/legal assessment request** is recognized
+deterministically before any model call because the v1 taxonomy has no
+`evaluate` intent — without it, a compliance question would be
+model-classified to `search` and silently degrade to the targetless
+document-retrieval fast path (final review I1).
+
+Cue rule (deterministic, v2-only, never added to the shared v1 taxonomy
+prompt):
+
+- an explicit assessment head (`đánh giá`/`kiểm tra`/`rà soát`/`thẩm định`/
+  `đối chiếu`/`xác định`/`review`/`assess`/`evaluate`) **combined with** a
+  compliance/legal domain cue (`tuân thủ`/`compliance`/`tính pháp lý`/
+  `pháp lý`); or
+- an explicit degree/level phrase (`mức độ tuân thủ`/`mức độ rủi ro`); or
+- the yes/no form (`…tuân thủ … không?`).
+
+A bare compliance-topic noun (`quy định về tuân thủ thuế là gì?`, `hồ sơ
+ tuân thủ gồm gì?`, `chế tài khi không tuân thủ`) is **not** an assessment
+request and keeps `retrieve/document → fast_domain/targetless_document_retrieval`.
+The bare `đánh giá` keyword remains demoted.
+
+Why deterministic: route authority stays with `decide_route`; the scope only
+supplies an advisory typed `IntentDecision(intent="evaluate")`, exactly like
+the greeting/personal/people narrow scopes.
+
+Cost if wrong: over-broad cues would hijack ordinary informational
+compliance-topic queries off the general-RAG fast path into the
+compliance-assessment topology (planner model call, or typed-unavailable
+when no binding/planner); over-narrow cues would let a compliance question
+fall back to targetless retrieval (the final-review I1 regression).
+
 ---
 
 ## Task 4 — Restore simple execution topology for general factual RAG

@@ -74,23 +74,35 @@ _VALID_INTENTS = frozenset(
     }
 )
 
-#: Compliance/legal-evaluation cues for the deterministic ``evaluate``
-#: narrow scope (final review I1). The v1 taxonomy has no evaluate intent,
-#: so a compliance question would otherwise be model-classified to
-#: ``search`` and silently degrade to targetless retrieval in the
-#: production-wired arm. This mirrors the v1 conservative narrow-scope
-#: pattern (greeting/personal/people): strong compliance/legal-validity
-#: signals short-circuit the model, while the bare generic ``đánh giá``
-#: keyword stays demoted (the Task-3 ruling keeps it out of typed-search
-#: authority).
-_EVALUATE_SCOPE_RE = re.compile(
-    r"(?:"
-    r"\btuân\s*thủ\b"
-    r"|\bcompliance\b"
-    r"|\btính\s+pháp\s*lý\b"
-    r"|\bevaluate\b|\bevaluation\b"
-    r"|\bđánh\s*giá\s+(?:tuân\s*thủ|tính\s+pháp\s*lý|mức\s*độ\s+(?:tuân\s*thủ|rủi\s*ro))"
-    r")",
+#: Deterministic v2-only ``evaluate`` narrow scope (final review I1,
+#: narrowed by final re-review I5). The v1 taxonomy has no evaluate intent,
+#: so an explicit compliance/legal *assessment request* must be recognized
+#: deterministically or it would be model-classified to ``search`` and
+#: silently degrade to targetless retrieval. An assessment request is one
+#: of: an explicit assessment head combined with a compliance/legal domain
+#: cue; an explicit degree/level phrase; or the yes/no
+#: ``…tuân thủ … không?`` form. A bare compliance-topic noun ("quy định về
+#: tuân thủ thuế là gì?") is NOT an assessment request and stays on the
+#: general-RAG fast path; the bare generic ``đánh giá`` keyword likewise
+#: stays demoted (Task-3). See the plan/spec erratum for the ownership
+#: rationale (final re-review M8).
+_EVALUATE_HEAD_RE = re.compile(
+    r"\b(?:đánh\s*giá|kiểm\s*tra|rà\s*soát|thẩm\s*định|đối\s*chiếu|xác\s*định"
+    r"|review|assess|evaluate|evaluation)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+_EVALUATE_DOMAIN_RE = re.compile(
+    r"\b(?:tuân\s*thủ|compliance|tính\s+pháp\s*lý|pháp\s*lý)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+#: Explicit degree/level assessment phrase ("mức độ tuân thủ"/"mức độ rủi ro").
+_EVALUATE_LEVEL_RE = re.compile(
+    r"\bmức\s*độ\s+(?:tuân\s*thủ|rủi\s*ro)\b",
+    re.IGNORECASE | re.UNICODE,
+)
+#: Yes/no compliance question ("Tôi có tuân thủ … không?").
+_EVALUATE_YN_RE = re.compile(
+    r"\b(?:có\s+)?tuân\s*thủ\b[^.!?\n]{0,80}\bkhông\b\s*\?",
     re.IGNORECASE | re.UNICODE,
 )
 
@@ -162,18 +174,29 @@ def classify_evaluate(
     """Deterministic compliance/evaluate narrow scope (v2-only), or ``None``.
 
     ``evaluate`` has no v1 taxonomy intent, so it cannot come from the shared
-    model prompt. This conservative scope short-circuits strong
-    compliance/legal-evaluation cues to a typed ``evaluate`` decision before
-    any model call — exactly like the greeting/personal/people narrow scopes
-    above. The bare ``đánh giá`` keyword is deliberately absent (it stays a
-    generic lexical pattern under the Task-3 ruling), so a plain
-    "đánh giá chung về …" question still reaches the model path.
+    model prompt. This conservative scope short-circuits an explicit
+    compliance/legal *assessment request* to a typed ``evaluate`` decision
+    before any model call — exactly like the greeting/personal/people narrow
+    scopes above. An assessment request is an explicit assessment head
+    (``đánh giá``/``kiểm tra``/…) combined with a compliance/legal domain cue,
+    an explicit degree/level phrase (``mức độ tuân thủ``), or the yes/no
+    ``…tuân thủ … không?`` form. Bare compliance-topic nouns and the bare
+    generic ``đánh giá`` keyword are NOT assessment requests and stay on the
+    model path (advisory) / general-RAG fast path (deterministic route).
     """
-    _ = has_doc_ids
+    _ = has_doc_ids  # evaluation cue does not depend on attached docs
     text = (query or "").strip()
     if not text:
         raise IntentClassifierError("cannot classify an empty query")
-    if _EVALUATE_SCOPE_RE.search(text) is None:
+    is_assessment = (
+        _EVALUATE_LEVEL_RE.search(text) is not None
+        or _EVALUATE_YN_RE.search(text) is not None
+        or (
+            _EVALUATE_HEAD_RE.search(text) is not None
+            and _EVALUATE_DOMAIN_RE.search(text) is not None
+        )
+    )
+    if not is_assessment:
         return None
     return IntentDecision(
         intent="evaluate",
