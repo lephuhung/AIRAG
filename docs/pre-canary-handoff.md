@@ -3,8 +3,9 @@
 Ownership: this runbook is the executable checklist for promoting the
 `feat/langgraph-v2` stack from a worktree session to a live canary. Stable
 entrypoints stay in `docs/harness.md` (this file links there instead of
-duplicating them). Status of every item below was verified from worktree
-HEAD `13ee0fa` unless marked **[NOT RUN — operational]**.
+duplicating them). Status of every item below was verified from the Task-3
+worktree line (`fe241c8` plus the fix-round commit; exact HEAD in
+`task-3-report.md`) unless marked **[NOT RUN — operational]**.
 
 ## 0. Verdict: checkpoint dependency
 
@@ -15,6 +16,27 @@ and `psycopg[binary]==3.2.3`; `backend/requirements-v2-benchmark.txt` agrees
 on the postgres pin. Guard: `backend/tests/agents/v2/persistence/test_checkpoint_readiness.py`
 (2 passed = pins declared; 2 skipped = extra absent here with the install
 command). Do not churn pins; do not add import fallbacks.
+
+Read-only container evidence (fix round I1, no service action — `hrag-backend`
+was already `Up (healthy)`; only `docker exec` imports and `pip show` ran,
+no writes, no restarts):
+
+```
+docker exec hrag-backend python -c "from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver"
+→ IMPORT OK <class 'langgraph.checkpoint.postgres.aio.AsyncPostgresSaver'>
+docker exec hrag-backend python -c "…assert callable(AsyncPostgresSaver.from_conn_string) and callable(AsyncPostgresSaver.setup)"
+→ SURFACE OK from_conn_string+setup
+docker exec hrag-backend pip show langgraph langgraph-checkpoint langgraph-checkpoint-postgres psycopg
+→ langgraph 1.1.10, langgraph-checkpoint 2.1.2,
+  langgraph-checkpoint-postgres 2.0.25, psycopg(-binary) 3.2.3
+```
+
+So the project image is dependency-complete for the exact declared pins.
+Accurate boundary: image readiness ≠ ability to run worktree suites there —
+the container bind-mounts the deploy snapshot
+`/home/AIRAG/.deploy/langgraph-v2-f766bda/backend → /app/backend` (not this
+worktree, not the main repo), and its database is live, so worktree
+persistence suites and any live-DB writes stay operator steps (§2).
 
 ## 1. Install / verify (dependency-complete environment)
 
@@ -58,7 +80,8 @@ python -m pytest tests/api -q -p no:cacheprovider -k "chat or history or session
 
 ```bash
 cd frontend && npm run build && npx vitest run && npx tsc -p e2e/tsconfig.e2e.json --noEmit
-cd / && npx playwright test --config frontend/e2e/playwright.config.ts   # needs `npx playwright install`
+# From the repository root (NOT / — there is no frontend/ or playwright install there):
+cd frontend && npx playwright test --config e2e/playwright.config.ts   # needs `npx playwright install`
 ```
 
 Static guards (must all pass — empty output) — see `docs/harness.md`
@@ -77,7 +100,7 @@ Per scenario assert the user-visible outcome from
 1. Factual retrieval turn → `token*` → `complete{status:"success"}`; citations rendered; history reload shows persisted `citations`.
 2. Ambiguous follow-up (`văn bản này` over ≥2 prior docs) → `clarification_required` with server-issued options → resume posts `{clarification_id, selected_option_id}` only → `clarification_resolved` → answer.
 3. Ordinal recovery (`file thứ hai`) → single pinned revision (binder only).
-4. Cancel mid-stream → `POST …/stream/cancel` → quiet terminal, clean next turn (mirrors `frontend/e2e/chat-stream.spec.ts` once browsers exist).
+4. Cancel mid-stream → `POST …/stream/cancel` → quiet terminal, clean next turn (mirrors `frontend/e2e/chat-stream.e2e.ts` once browsers exist).
 5. Out-of-scope history identity + anaphora → generic typed error, no UUID/title in any user-facing text.
 
 ## 6. Expected telemetry / checkpoint / resume signals
