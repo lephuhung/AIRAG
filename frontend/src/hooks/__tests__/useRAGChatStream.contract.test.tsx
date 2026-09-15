@@ -383,3 +383,59 @@ describe('validity badges + clarification symmetry (fix round 3)', () => {
     expect(result.current.pendingClarification).toBeNull();
   });
 });
+
+describe('stop-button cancel path (Task 2 fix round I1)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useAuthStore.setState({
+      token: 'test-token',
+      user: { id: 'user-1', email: 'test@test.com' } as any,
+    });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('cancel() posts the server cancel, aborts the socket, and resolves quietly', async () => {
+    // The production stop button calls stream.cancel() directly
+    // (ChatPanel → ChatInputArea onCancel). Pin its exact contract: the
+    // hanging socket aborts, the server cancel POST is issued, and the
+    // aborted turn resolves to null with no error banner.
+    const cancelPosts: string[] = [];
+    let abortObserved = false;
+    (global.fetch as any) = vi.fn((url: string, init?: RequestInit) => {
+      if (url.includes('/stream/cancel')) {
+        cancelPosts.push(url);
+        return Promise.resolve({ ok: true, json: async () => ({}) });
+      }
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          abortObserved = true;
+          reject(Object.assign(new Error('This operation was aborted'), { name: 'AbortError' }));
+        });
+      });
+    });
+
+    const { result, queryClient } = renderStreamHook('test-session-cancel');
+
+    const out: { message: unknown } = { message: 'pending' };
+    await act(async () => {
+      const pending = result.current.sendMessage('hang test', [], false);
+      // Let the stream POST dispatch so abortRef is armed.
+      await Promise.resolve();
+      await Promise.resolve();
+      result.current.cancel();
+      out.message = await pending;
+    });
+
+    expect(out.message).toBeNull();
+    expect(cancelPosts).toHaveLength(1);
+    expect(cancelPosts[0]).toContain('/stream/cancel');
+    expect(abortObserved).toBe(true);
+    expect(result.current.error).toBeNull();
+    expect(result.current.isStreaming).toBe(false);
+    expect(result.current.status).toBe('idle');
+    queryClient.clear();
+  });
+});

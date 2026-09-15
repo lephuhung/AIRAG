@@ -26,11 +26,20 @@ function b64(obj: unknown): string {
 
 interface ApiMocks {
   history: unknown[];
-  /** Static SSE body, or a responder keyed off the posted JSON envelope. */
-  streamBody: string | ((postBody: unknown) => string);
+  /**
+   * Static SSE body, or a responder keyed off the posted JSON envelope.
+   * A responder may return a Promise that resolves later (or never
+   * before the test cancels): the route handler awaits it, so the HTTP
+   * response stays open and the hook keeps `isStreaming === true` — the
+   * only state in which the production stop button is rendered.
+   */
+  streamBody: string | ((postBody: unknown) => string | Promise<string>);
 }
 
-async function installApiMocks(page: Page, mocks: ApiMocks): Promise<void> {
+async function installApiMocks(
+  page: Page,
+  mocks: ApiMocks,
+): Promise<{ cancelPosts: string[] }> {
   const token = `h.${b64({ exp: 9_999_999_999 })}.s`;
   // Production localStorage keys (stores/authStore.ts). The token middle
   // segment is JWT-shaped with a far-future exp so the refresh flow never
@@ -46,23 +55,32 @@ async function installApiMocks(page: Page, mocks: ApiMocks): Promise<void> {
     { t: token },
   );
 
+  const cancelPosts: string[] = [];
   await page.route('**/api/v1/**', async (route) => {
     const url = route.request().url();
     const method = route.request().method();
+    // NOTE: the cancel check comes first — `/stream/cancel` also contains
+    // the `/sessions/<id>/stream` prefix and must not be answered as SSE.
+    if (url.includes('/stream/cancel')) {
+      cancelPosts.push(url);
+      await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+      return;
+    }
     if (url.includes(`/sessions/${SESSION_ID}/stream`) && method === 'POST') {
       const body =
         typeof mocks.streamBody === 'function'
-          ? mocks.streamBody(route.request().postDataJSON())
+          ? await mocks.streamBody(route.request().postDataJSON())
           : mocks.streamBody;
-      await route.fulfill({
-        status: 200,
-        contentType: 'text/event-stream',
-        body,
-      });
-      return;
-    }
-    if (url.includes('/stream/cancel')) {
-      await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
+      try {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/event-stream',
+          body,
+        });
+      } catch {
+        // The test cancelled first: the browser dropped the request, so
+        // there is nothing left to fulfil. Quiet by design.
+      }
       return;
     }
     if (url.includes(`/sessions/${SESSION_ID}/history`)) {
@@ -99,6 +117,7 @@ async function installApiMocks(page: Page, mocks: ApiMocks): Promise<void> {
     }
     await route.fulfill({ status: 200, contentType: 'application/json', body: '{}' });
   });
+  return { cancelPosts };
 }
 
 async function openChat(page: Page): Promise<void> {
@@ -185,28 +204,47 @@ test('citation renders after history reload', async ({ page }) => {
   expect(await page.getByText('[1]').count()).toBeGreaterThanOrEqual(2);
 });
 
-test('cancellation leaves no stale retractable artifacts', async ({ page }) => {
-  await installApiMocks(page, {
+test('cancellation posts the server cancel and leaves no stale artifacts', async ({ page }) => {
+  // Deferred stream: the first POST hangs on a gate the test controls, so
+  // the connection stays open, `isStreaming` stays true, and the
+  // production stop button (rendered only while streaming) is genuinely
+  // reachable. A finite `route.fulfill` body would end the stream
+  // immediately and unmount the button before it could be clicked.
+  let releaseStream!: (body: string) => void;
+  const streamGate = new Promise<string>((resolve) => {
+    releaseStream = resolve;
+  });
+  let streamCalls = 0;
+  const { cancelPosts } = await installApiMocks(page, {
     history: [],
-    // Rollback clears the speculative token; the tail token streams after;
-    // the connection then hangs until the test cancels it.
-    streamBody:
-      sseEvent('token', { text: 'nội dung suy đoán…' }) +
-      sseEvent('token_rollback', {}) +
-      sseEvent('token', { text: 'sau rollback.' }),
+    streamBody: () => {
+      streamCalls += 1;
+      if (streamCalls > 1) {
+        return sseEvent('complete', { answer: 'sau hủy, vẫn ổn.' });
+      }
+      return streamGate;
+    },
   });
   await openChat(page);
   await send(page, 'câu hỏi dài');
-  await expect(page.getByText('sau rollback.').first()).toBeVisible({ timeout: 15_000 });
-  // Pre-rollback speculation was retracted, not kept.
-  await expect(page.getByText('nội dung suy đoán…')).toHaveCount(0);
-  // Stop the hanging run via the production stop button (aria-label
-  // `chat.cancel`, fallback "Stop"); cancel is quiet — no error banner.
-  await page
-    .getByRole('button', { name: /stop|cancel|dừng|hủy/i })
-    .first()
-    .click({ timeout: 15_000 });
+  // The run is in flight: the stop button is rendered and clickable.
+  const stop = page.getByRole('button', { name: /stop|cancel|dừng|hủy/i }).first();
+  await expect(stop).toBeVisible({ timeout: 15_000 });
+  await stop.click();
+  // The hook posts the server-side cancel for the detached run…
+  await expect
+    .poll(() => cancelPosts.length, { timeout: 15_000 })
+    .toBe(1);
+  expect(cancelPosts[0]).toContain('/stream/cancel');
+  // …aborts the socket quietly (no error banner, composer usable)…
   await expect(page.locator('textarea').first()).toBeEnabled({ timeout: 15_000 });
+  // …and leaves no stale retractable UI: no clarification banner, no
+  // error toast, and a fresh turn afterwards starts clean.
+  await expect(page.getByTestId('clarification-options')).toHaveCount(0);
+  releaseStream(sseEvent('complete', { answer: 'late terminal (ignored)' }));
+  await send(page, 'câu hỏi tiếp theo');
+  await expect(page.getByText('sau hủy, vẫn ổn.').first()).toBeVisible({ timeout: 15_000 });
+  expect(streamCalls).toBe(2);
 });
 
 test('public error renders without crashing the panel', async ({ page }) => {
