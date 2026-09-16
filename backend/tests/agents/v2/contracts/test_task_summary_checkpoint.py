@@ -339,6 +339,7 @@ def test_checkpoint_payload_rejects_missing_or_foreign_versions() -> None:
         "query_analysis": None,
         "route_decision": None,
         "clarification": None,
+        "synthesis": None,
         "final_response": None,
     }
     validate_checkpoint_payload(payload)

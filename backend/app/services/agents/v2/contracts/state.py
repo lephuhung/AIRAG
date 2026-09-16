@@ -23,6 +23,7 @@ from .request import RequestContext
 from .response import FinalResponse
 from .routing import QueryAnalysis, RouteDecision
 from .semantic import SemanticContext
+from .synthesis import SynthesisCheckpoint
 
 
 class RuntimeServices(RuntimeModel):
@@ -63,6 +64,15 @@ class RuntimeServices(RuntimeModel):
     deterministically once from checkpointed state on a miss, e.g. after a
     restart between nodes).
 
+    ``answer_draft_builder`` is the runtime-only request-scoped
+    ``StructuredLLMDraftBuilder`` (grounded-LLM synthesis, spec §7.1): the
+    bounded-model seam that turns the checkpointed handle manifest plus
+    selected evidence into a strictly parsed ``ParsedCandidate``. It is
+    constructed once per ingress over the privacy-safe effective-``main``
+    provider, is never checkpointed, and defaults to ``None`` — consumers
+    fail closed when it is absent. Typed ``Any`` for the same
+    framework-free reason as the other slots.
+
     ``pinned_target_resolver`` is the runtime-only request-scoped
     ``PinnedTargetResolver`` (P0 factual-retrieval live-gate fix): the exact
     same instance the document capabilities resolve scoped targets through.
@@ -101,10 +111,23 @@ class RuntimeServices(RuntimeModel):
     can construct. Typed ``Any`` for the same framework-free reason and
     never checkpointed.
 
-    The bag deliberately excludes ``plan_checkpoint`` (plan persistence is
-    LangGraph state plus the supervisor checkpointer — no service) and any
-    ``EvidenceEvaluator`` service (evidence evaluation is the shared
-    ``evaluate_evidence(...)`` function in ``nodes/evaluate.py``).
+    ``citation_resolver`` is the runtime-only request-scoped
+    ``CitationResolver`` (grounded-LLM synthesis, spec §11.1): the
+    server-side dependency boundary the ``CitationProjector`` resolves
+    public citation metadata through. It is never checkpointed and defaults
+    to ``None`` — the synthesis subgraph fails closed
+    (``citation_unresolvable``) when it is absent rather than fabricating
+    citation identity.
+
+    ``people_lookup`` is the runtime-only request-scoped v1-backed People
+    lookup service (the same instance the ``people.lookup`` capability is
+    built over). It exposes ``people_display_snapshot()`` — the raw
+    sanitized person records plus the consolidated v1 display text captured
+    during this run's lookups — so the non-LLM people presentation and the
+    streaming adapter can render the v1 people card without a second Mongo
+    round trip. The snapshot never enters governed evidence, the
+    checkpoint, or the model-facing prompt. Defaults to ``None``; consumers
+    fall back to the governed extractive presentation when it is absent.
     """
 
     retention_leases: Any = None
@@ -115,10 +138,13 @@ class RuntimeServices(RuntimeModel):
     authorization: Any = None
     evidence_hydrator: Any = None
     answer_draft_channel: Any = None
+    answer_draft_builder: Any = None
     pinned_target_resolver: Any = None
     intent_classifier: Any = None
     adaptive_planner: Any = None
     adaptive_replanner: Any = None
+    citation_resolver: Any = None
+    people_lookup: Any = None
 
 
 class GraphRuntimeContext(ContractModel):
@@ -142,7 +168,12 @@ class ExecutionState(ContractModel):
 
 
 class SupervisorV2State(TypedDict, total=True):
-    """Spec §7: the mutable checkpoint aggregate."""
+    """Spec §7: the mutable checkpoint aggregate.
+
+    ``synthesis`` is the additive bounded-synthesis slot (spec §13.1–13.5):
+    ``None`` is the canonical idle value and pre-synthesis root-``2.0``
+    checkpoints normalize to it through the explicit legacy branch.
+    """
 
     contract_version: ContractVersion
     request: RequestContext
@@ -153,4 +184,5 @@ class SupervisorV2State(TypedDict, total=True):
     route_decision: RouteDecision | None
     execution: ExecutionState
     clarification: ClarificationRequest | None
+    synthesis: SynthesisCheckpoint | None
     final_response: FinalResponse | None

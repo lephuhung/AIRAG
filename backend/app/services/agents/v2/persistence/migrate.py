@@ -137,15 +137,17 @@ grow ``pg_relation_size``) but never raises.
 
 Module layout::
 
-    V2_SCHEMA_VERSION = 4
+    V2_SCHEMA_VERSION = 5
     V2_SCHEMA_V1_TABLES = frozenset({...})  # the 12 tables of Release 1A
     V2_ROLLOUT_TABLES = frozenset({...})  # the 2 Task 7A rollout tables
     V2_SCHEMA_V3_TABLES = V2_SCHEMA_V1_TABLES | V2_ROLLOUT_TABLES
     V2_STAGE_TABLES = frozenset({...})  # P1 revision-owned stage state
     V2_SCHEMA_V4_TABLES = V2_SCHEMA_V3_TABLES | V2_STAGE_TABLES
+    V2_TIMING_TABLES = frozenset({...})  # per-turn timing spans
+    V2_SCHEMA_V5_TABLES = V2_SCHEMA_V4_TABLES | V2_TIMING_TABLES
     SchemaCheck = dataclass(frozen=True)
     check_v2_schema(engine) -> SchemaCheck
-    apply_v2_schema(engine) -> None  # fresh create, or stepwise 1 -> 2 -> 3 -> 4
+    apply_v2_schema(engine) -> None  # fresh create, or stepwise 1 -> ... -> 5
     main()  # CLI entrypoint
 """
 
@@ -164,7 +166,7 @@ from sqlalchemy.engine import Engine
 # Public constants
 # ---------------------------------------------------------------------------
 
-V2_SCHEMA_VERSION: int = 4
+V2_SCHEMA_VERSION: int = 5
 # Version history: 1 = Release 1A foundation (lease revision_id NOT NULL);
 # 2 = T3 evidence-only leases (revision_retention_leases.revision_id nullable
 # via the idempotent _LEASE_EVIDENCE_ONLY_ALTER upgrade step). Fresh creates
@@ -177,6 +179,9 @@ V2_SCHEMA_VERSION: int = 4
 # idempotent _STAGE_DDL upgrade step). Fresh creates land directly on 4.
 # Upgrades are stepwise (1 -> 2 -> 3 -> 4) so a database at any older
 # recorded version converges.
+# 5 = per-turn timing spans (agent_timing_spans via the idempotent
+# _TIMING_DDL upgrade step). Fresh creates land directly on 5. Upgrades
+# are stepwise (1 -> 2 -> 3 -> 4 -> 5).
 
 # The exact 12 tables created by Release 1A. Frozen: Task 7A adds the
 # rollout tables as a separate V2_ROLLOUT_TABLES set, never by editing this.
@@ -224,6 +229,18 @@ V2_STAGE_TABLES: frozenset[str] = frozenset(
 )
 
 V2_SCHEMA_V4_TABLES: frozenset[str] = V2_SCHEMA_V3_TABLES | V2_STAGE_TABLES
+
+# Per-turn timing spans (Network-tab-style waterfall data). Metadata only —
+# node/capability/stage names, durations, statuses, counts; never query text
+# or chunk content (v2 content-suppression tracing policy). Separate
+# frozenset — ``V2_SCHEMA_V4_TABLES`` stays frozen.
+V2_TIMING_TABLES: frozenset[str] = frozenset(
+    {
+        "agent_timing_spans",
+    }
+)
+
+V2_SCHEMA_V5_TABLES: frozenset[str] = V2_SCHEMA_V4_TABLES | V2_TIMING_TABLES
 
 # Advisory-lock key for the v2 migration. A unique stable bigint avoids
 # colliding with any other advisory-lock user in the database.
@@ -688,6 +705,38 @@ _STAGE_DDL: tuple[str, ...] = (
     "ON document_revision_stages(revision_id)",
 )
 
+# Per-turn timing spans: one row per measured span (turn / graph node /
+# capability dispatch / retrieval stage), keyed by run_id so a whole turn
+# reads back as a waterfall. Metadata only — no query text, chunk content,
+# or prompts (v2 content-suppression tracing policy). No FKs: spans are
+# observability data that must survive deletion of any referenced entity.
+_TIMING_DDL: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS agent_timing_spans (
+        span_id      UUID        PRIMARY KEY,
+        run_id       TEXT        NOT NULL,
+        thread_id    TEXT        NOT NULL,
+        parent_span  TEXT        NULL,
+        kind         TEXT        NOT NULL
+            CHECK (kind IN ('turn', 'node', 'dispatch', 'stage')),
+        name         TEXT        NOT NULL,
+        started_at   TIMESTAMPTZ NOT NULL,
+        duration_ms  INTEGER     NOT NULL CHECK (duration_ms >= 0),
+        status       TEXT        NOT NULL
+            CHECK (status IN ('ok', 'error', 'cancelled')),
+        meta         JSONB       NULL,
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_timing_spans_run "
+    "ON agent_timing_spans(run_id)",
+    "CREATE INDEX IF NOT EXISTS ix_timing_spans_thread_started "
+    "ON agent_timing_spans(thread_id, started_at)",
+    "CREATE INDEX IF NOT EXISTS ix_timing_spans_name_started "
+    "ON agent_timing_spans(name, started_at)",
+)
+
+
 
 _NULLABILITY_INDEXES: tuple[str, ...] = (
     "CREATE INDEX IF NOT EXISTS ix_documents_source_deleted_at "
@@ -1011,6 +1060,20 @@ _EXPECTED_SHAPE_COLUMNS: dict[str, frozenset[str]] = {
             "failure_class",
         }
     ),
+    # Timing spans: a database that recorded version 5 (or an interrupted
+    # 4 -> 5 upgrade that left the version row behind) without the span
+    # table's columns fails closed instead of reporting clean.
+    "agent_timing_spans": frozenset(
+        {
+            "run_id",
+            "thread_id",
+            "kind",
+            "name",
+            "started_at",
+            "duration_ms",
+            "status",
+        }
+    ),
 }
 
 #: The R1 arbiter must be the full canonical identity, not decomposed keys.
@@ -1246,7 +1309,9 @@ def _shape_errors(conn) -> frozenset[str]:
 
 
 def _expected_tables(version: int) -> frozenset[str]:
-    """Version-aware expected-table set (R7, extended by P1 Task 1)."""
+    """Version-aware expected-table set (R7, P1 Task 1, timing spans)."""
+    if version >= 5:
+        return V2_SCHEMA_V5_TABLES
     if version >= 4:
         return V2_SCHEMA_V4_TABLES
     if version >= 3:
@@ -1264,16 +1329,14 @@ def check_v2_schema(engine: Engine) -> SchemaCheck:
         recorded = _recorded_version(conn)
         if recorded is None:
             return SchemaCheck(
-                applied=False,
-                version=None,
-                missing_tables=V2_SCHEMA_V4_TABLES,
+                missing_tables=V2_SCHEMA_V5_TABLES,
                 extra_tables=frozenset(),
             )
         version_row = recorded
         tables = _table_names(conn)
         missing = _expected_tables(version_row) - tables
         shape_errors = _shape_errors(conn)
-        extra = tables - V2_SCHEMA_V4_TABLES - {
+        extra = tables - V2_SCHEMA_V5_TABLES - {
             # known legacy tables that share the public schema
             "abbreviations",
             "agent_traces",
@@ -1402,7 +1465,8 @@ def apply_v2_schema(engine: Engine) -> None:
         if current == 3:
             # Version-3 -> 4 upgrade: revision-owned stage state (P1 Task 1).
             # Creates document_revision_stages idempotently and advances the
-            # version row. Legacy tables are untouched on this path.
+            # version row. Legacy tables are untouched on this path. Falls
+            # through to the 4 -> 5 step below (stepwise).
             for stmt in _STAGE_DDL:
                 conn.execute(text(stmt))
             conn.execute(
@@ -1412,8 +1476,21 @@ def apply_v2_schema(engine: Engine) -> None:
                 ),
                 {"d": "v2 revision stage state: document_revision_stages"},
             )
-            return
+            current = 4
 
+        if current == 4:
+            # Version-4 -> 5 upgrade: per-turn timing spans. Creates
+            # agent_timing_spans idempotently and advances the version row.
+            for stmt in _TIMING_DDL:
+                conn.execute(text(stmt))
+            conn.execute(
+                text(
+                    "UPDATE v2_schema_version SET version = 5, description = :d "
+                    "WHERE version = 4"
+                ),
+                {"d": "v2 per-turn timing spans: agent_timing_spans"},
+            )
+            return
         # 1. Capture the legacy-row baseline BEFORE any DDL mutates the
         #    legacy tables. Re-verifying at the end (before the
         #    ``v2_schema_version`` row is written) enforces brief item (5).
@@ -1422,13 +1499,16 @@ def apply_v2_schema(engine: Engine) -> None:
         baseline = _capture_legacy_baseline(conn)
 
         # 2. Create the v2 tables in dependency order (Release 1A set),
-        # then the Task 7A rollout tables, then the P1 stage table.
+        # then the Task 7A rollout tables, then the P1 stage table, then
+        # the timing-span table.
         for stmt in _CREATE_DDL:
             conn.execute(text(stmt))
         for stmt in _ROLLOUT_DDL:
             conn.execute(text(stmt))
         conn.execute(text(_ROLLOUT_SEED))
         for stmt in _STAGE_DDL:
+            conn.execute(text(stmt))
+        for stmt in _TIMING_DDL:
             conn.execute(text(stmt))
 
         # 2b. Repair pre-C1 lease tables whose revision_id is still NOT NULL

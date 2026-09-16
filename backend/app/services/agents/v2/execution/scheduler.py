@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -724,10 +725,43 @@ async def _dispatch_one(
     # People→Document invariant: the concrete input was materialized BEFORE
     # this task was checkpointed, so it travels to the capability verbatim.
     assert_scheduler_input_passthrough(task, request)
-    return await asyncio.wait_for(
-        capability.execute(request, runtime.capability_runtime),
-        timeout=_seconds_until_deadline(runtime),
+    # Per-dispatch wall time: capability + task id + outcome only, never
+    # request/result payloads (v2 content-suppression tracing policy).
+    from app.services.agent.timing_recorder import get_recorder
+
+    recorder = get_recorder()
+    started = time.monotonic()
+    try:
+        if recorder is not None:
+            async with recorder.span(
+                "dispatch", task.capability, meta={"task_id": task.task_id}
+            ):
+                result = await asyncio.wait_for(
+                    capability.execute(request, runtime.capability_runtime),
+                    timeout=_seconds_until_deadline(runtime),
+                )
+        else:
+            result = await asyncio.wait_for(
+                capability.execute(request, runtime.capability_runtime),
+                timeout=_seconds_until_deadline(runtime),
+            )
+    except BaseException as exc:
+        logger.info(
+            "[v2dispatch] %s task=%s failed after %dms (%s)",
+            task.capability,
+            task.task_id,
+            int((time.monotonic() - started) * 1000),
+            type(exc).__name__,
+        )
+        raise
+    logger.info(
+        "[v2dispatch] %s task=%s status=%s in %dms",
+        task.capability,
+        task.task_id,
+        getattr(result.status, "value", result.status),
+        int((time.monotonic() - started) * 1000),
     )
+    return result
 
 
 async def _run_pre_dispatch_guards(

@@ -548,17 +548,18 @@ def test_v2_has_no_domain_agent_or_domain_graph_wrappers() -> None:
     # No domain-agent modules and no LangGraph graph/subgraph construction
     # anywhere under v2: only nodes and atomic capabilities may exist.
     # Phase-3 exception (normative amendment §6): `complex_research_graph.py`
-    # is the ONE authorized adaptive planning boundary, implemented as a
-    # checkpointed LangGraph subgraph inheriting the supervisor saver. It
-    # must still contain no domain agent (no *_agent.py module, no *Agent
-    # class, no second scheduler/checkpointer).
-    COMPLEX_SUBGRAPH = "complex_research_graph.py"
+    # is the authorized adaptive planning boundary; Task 5 adds
+    # `synthesis/graph.py` as the bounded grounded-LLM synthesis boundary.
+    # Both are checkpointed LangGraph subgraphs inheriting the supervisor
+    # saver; neither may contain a domain agent (no *_agent.py module, no
+    # *Agent class, no second scheduler/checkpointer).
+    SUBGRAPH_MODULES = {"complex_research_graph.py", "graph.py"}
     for path in sorted(root.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
         assert not path.name.endswith("_agent.py"), path.name
         text = path.read_text()
-        if path.name == COMPLEX_SUBGRAPH:
+        if path.name in SUBGRAPH_MODULES:
             assert not re.search(r"class\s+\w*Agent\b", text), path.name
             for banned in (
                 "people_agent",

@@ -80,7 +80,6 @@ from .contracts.planning import (
 from .contracts.routing import QueryAnalysis, RouteDecision
 from .contracts.semantic import SemanticContext
 from .contracts.state import GraphRuntimeContext, SupervisorV2State
-from .contracts.synthesis import SynthesisInput
 from .contracts.validation import ContractValidationError, validate_task_plan
 from .dependencies.people_document import (
     MaterializationError,
@@ -98,7 +97,6 @@ from .nodes.context import node_context
 from .nodes.evaluate import _EVIDENCE_SUPPLYING_CAPABILITIES, evaluate_evidence
 from .planning import PlannerError
 from .nodes.execute import execution_update
-from .nodes.synthesize import DEFAULT_SYNTHESIS_BUDGET, synthesize_answer
 from .replanning import (
     ReplanRejected,
     append_replan_tasks,
@@ -1583,22 +1581,21 @@ async def summarize_reduce_node(
     state: ComplexResearchState,
     runtime: "Runtime[GraphRuntimeContext]",
 ) -> dict:
-    """Drive the deterministic REDUCE through the EXISTING synthesis path (R47).
+    """Own the deterministic REDUCE ordering — never a second synthesis (R47).
 
     Runs between ``evaluate`` and ``decide``. Active only for a summarize
     map plan whose checkpointed reduce spec survived with a ``sufficient``
-    evaluation. It calls the existing ``synthesize_answer`` boundary with
-    the map-task uses IN SPEC ORDER under the existing synthesis budget —
-    so hydration, budget/overflow governance, drafting (extractive
-    default), claim validation, and fresh-use leasing all run inside the
-    framework's own synthesis path — then stores the validated draft in
-    the existing ``answer_draft_channel`` handoff for the ground node. The
-    agent never owns the reduce; no new capability and no new contract are
-    involved. Dormant (``{}``) for every other plan and for non-sufficient
-    evaluations. Mandatory: a missing channel or synthesis seam fails
-    closed with a typed error instead of silently skipping the reduce.
+    evaluation. Per spec §6.2 the reduce is NOT a synthesis owner: this node
+    makes zero provider calls, writes no draft, reserves no attempt, builds
+    no manifest, and never touches the draft handoff channel. It collects the
+    map-task ``EvidenceUseRef``s in exact ``ReduceSpec`` order and returns
+    the evaluation carrying ``synthesis_use_order`` — the outer supervisor's
+    single synthesis state machine (the ``synthesize`` boundary) owns the
+    final summary. Dormant (``{}``) for every other plan and for
+    non-sufficient evaluations. Mandatory: a missing map-task result fails
+    closed instead of silently skipping the reduce.
     """
-    context = node_context(runtime)
+    node_context(runtime)
     state = normalize_complex_state(state)
     plan = state.get("plan")
     evaluation = state.get("evaluation")
@@ -1615,21 +1612,10 @@ async def summarize_reduce_node(
         raise ComplexResearchError(
             f"unknown reduce mode {spec.mode!r}; refusing to guess a reduction"
         )
-    channel = getattr(context.services, "answer_draft_channel", None)
-    if channel is None:
-        raise ComplexResearchError(
-            "summarize reduce needs the answer_draft_channel handoff; "
-            "refusing to silently skip the mandatory reduce"
-        )
-    store = getattr(channel, "store_draft", None)
-    if store is None:
-        raise ComplexResearchError(
-            "answer_draft_channel exposes no store_draft; refusing to "
-            "reduce without the framework handoff"
-        )
     results = tuple(state.get("task_results", ()))
     result_by_task = {result.task_id: result for result in results}
-    ordered_refs = []
+    ordered_refs: list[EvidenceUseRef] = []
+    seen: set = set()
     for map_task_id in spec.map_task_ids:
         result = result_by_task.get(map_task_id)
         if result is None:
@@ -1637,31 +1623,22 @@ async def summarize_reduce_node(
                 f"reduce spec names map task {map_task_id!r} with no "
                 "checkpointed result; refusing a partial reduction"
             )
-        ordered_refs.extend(result.evidence_uses)
+        for ref in result.evidence_uses:
+            if ref.use_id not in seen:
+                seen.add(ref.use_id)
+                ordered_refs.append(ref)
     if not ordered_refs:
         raise ComplexResearchError(
             "reduce spec names map tasks with no evidence uses; refusing "
             "an empty reduction"
         )
-    # The existing synthesis boundary owns hydration (budget/overflow),
-    # drafting, validation, and leasing from here on.
-    synthesis = await synthesize_answer(
-        synthesis_input=SynthesisInput(
-            semantic=state["semantic"],
-            evaluation=evaluation,
-            evidence_uses=tuple(ordered_refs),
-        ),
-        runtime=context,
-        plan=plan,
-        bindings=state["bindings"],
-        budget=DEFAULT_SYNTHESIS_BUDGET,
+    # The single synthesis state machine owns the summary from here: the
+    # ordered refs ride the merged evaluation back to the supervisor, where
+    # ``_synthesis_input_of`` prefers them over the task-result flatten.
+    updated = evaluation.model_copy(
+        update={"synthesis_use_order": tuple(ordered_refs)}
     )
-    store(
-        context.capability_runtime.run_id,
-        draft=synthesis.draft,
-        evidence=synthesis.evidence,
-    )
-    return {}
+    return {"evaluation": updated}
 
 
 async def complex_evaluate_node(

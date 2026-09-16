@@ -176,6 +176,7 @@ def test_supervisor_state_is_a_mutable_root_versioned_typeddict() -> None:
         "route_decision",
         "execution",
         "clarification",
+        "synthesis",
         "final_response",
     }
     hints = typing.get_type_hints(SupervisorV2State)

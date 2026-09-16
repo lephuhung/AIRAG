@@ -73,6 +73,113 @@ execute pass). `not_found`/`TIMEOUT`/denied/unavailable append no task and
 produce no fabricated input. The planner query is goal-derived (scalar-backed
 search that cannot be extracted stays `DEPENDENCY_UNAVAILABLE`).
 
+
+## V2 grounded answer synthesis (claim-first, checkpointed)
+
+Document-backed factual answers are produced by a **bounded, checkpointed
+grounded-LLM pipeline** — never by the old extractive draft path and never by
+a second synthesis owner:
+
+- **Topology.** The supervisor's `synthesize` node is a compiled subgraph
+  (`agents/v2/synthesis/graph.py`, `build_synthesis_subgraph()` +
+  `make_synthesis_boundary_node`) mounted exactly like `complex_boundary`:
+  compiled **without** its own checkpointer so it inherits the supervisor's
+  saver (including the shadow run's isolated saver), with a pinned child
+  checkpoint namespace. Production edges are `evaluate → synthesize →
+  finalizer`; there is **no `ground` node** in the production topology — the
+  old `synthesize → ground → finalizer` extractive path is gone, and
+  `build_extractive_draft`/`ground_answer` survive only for compat tests and
+  the non-LLM People presentation.
+- **State machine.** `prepare → reserve → generate → validate_ground →
+  finalize_artifact`, with `decide`/`failed` for repair routing. Each durable
+  phase transition is a node boundary; `prepared` and `attempt_reserved` are
+  two deliberate checkpoint barriers written **before** the first provider
+  call (latency accepted for restart safety). At most **two** provider calls
+  per synthesis operation, including across crash/resume; resume from
+  `candidate`/`grounded` makes zero new generation calls.
+- **Presentation policy** (`synthesis/presentation.py`, `decide_presentation`)
+  is a deterministic pure function of the checkpointed route/plan plus
+  admitted evidence kinds — the model never chooses it. Document-backed
+  factual → `document_grounded_llm`; People → `people_card` (the existing
+  card path, **zero** synthesis-model calls); KG-only or derived claims
+  without authorized locatable document lineage → typed unavailable, never a
+  fake document citation.
+- **Evidence selection** (`synthesis/selection.py`,
+  `SynthesisEvidenceSelector`) is target-aware: a coverage pass guarantees ≥1
+  item per required target with admitted evidence, then round-robin fills the
+  budget minus explicit reserves. A required target starved to zero fails
+  closed (`selection_missing_target`) — never a silent one-sided answer.
+- **Handle manifest** (`synthesis/handles.py`): before the first provider
+  call the server binds opaque `E1..En` handles to exact `EvidenceUseRef`s in
+  selected order and checkpoints the manifest inside `SynthesisCheckpoint`.
+  Repair reuses the same manifest; resume never rebinds a handle — a denied
+  `E2` fails rehydration, it never slides onto the next surviving use.
+- **Privacy-safe builder.** `RuntimeServices.answer_draft_builder` is the
+  `StructuredLLMDraftBuilder` (`synthesis/adapter.py`): one `temperature=0`
+  provider call — streamed via `astream` when the provider supports it
+  (`ContentSuppressedLLMProvider.astream` keeps tracing content-free) and
+  always buffered in full for the strict parse — with a minimized prompt (contextualized query +
+  delimited untrusted evidence + opaque handles + strict JSON schema — never
+  plans, bindings, ACL, UUIDs, or runtime identity), strict parse into a
+  `ParsedCandidate`, raw output never logged/traced/checkpointed. The
+  provider comes from `get_main_provider_for_synthesis()`
+  (`services/llm/__init__.py`) — the **effective `main` config, not a new
+  role** — wrapped in `ContentSuppressedLLMProvider`
+  (`agent/synthesis_tracing.py`, `trace_llm_suppressed`): Langfuse and the
+  dataset trace collector see allowlisted operational metadata only, never
+  query/evidence/prompt/answer text.
+- **Nullable `synthesis` slot + compat rule.** `SupervisorV2State.synthesis:
+  SynthesisCheckpoint | None` is a required checkpoint key; `None` is the
+  canonical idle value. Old v2 checkpoints missing the key normalize
+  explicitly to `synthesis=None` before required-key validation; a current
+  payload missing it fails closed. Fresh-turn hygiene clears it with stale
+  terminal state.
+- **Claim-first grounding** (`synthesis/grounding.py`): parsed claims resolve
+  handles through the checkpointed manifest into exact `EvidenceUseRef`s,
+  re-validate, rehydrate cited uses under current authority when a boundary
+  was crossed, and pass anchor guards. Production never parses rendered
+  Markdown back into claim identity.
+- **Anchor canonicalization** (`synthesis/anchors.py`): high-risk literals
+  (quantities, percentages, dates, durations, `Điều`/`Khoản`/… locators,
+  document numbers) are canonicalized conservatively — VN scale words as
+  multipliers, qualifiers never collapsed, hierarchical locators never
+  weakened, doc numbers exact. Support = the canonical anchor occurs in ≥1
+  *individually cited* evidence item, never assembled across sources. This is
+  literal support, **not** semantic entailment — contextual misattribution is
+  a documented residual risk, not a claimed catch.
+- **Single-owner citation flow** (`synthesis/citations.py`): the
+  `CitationProjector` (backed by `RuntimeServices.citation_resolver` =
+  `StoreCitationResolver`) is the only producer of `PublicCitation` —
+  `GroundedClaim → EvidenceUseRef → EvidenceRecord.source → PublicCitation`.
+  Rendering (`render.py`), the SSE `citation` frame, `complete`, persistence,
+  and history reload all consume the same projection; `evidence_id`/`use_id`
+  never cross the wire. The outer streaming adapter emits the citation frame
+  after `status(generating)` and **before the first token**; `complete`
+  repeats the identical citation identity set. People/KG sources are never
+  projected into document citations.
+- **Progress projection.** The outer adapter runs the graph via
+  `astream(stream_mode=["updates","tasks","values"], subgraphs=True)` and
+  projects node starts (`execute`/`replan`→`searching`,
+  `evaluate`/`reduce`→`retrieved`, `synthesize`/`direct`→`generating`,
+  consecutive duplicates suppressed) onto v1 `status` events; nodes never
+  emit SSE events. The final `values` chunk is the terminal state
+  (identical to `ainvoke`, including `__interrupt__`).
+- **Speculative claim streaming.** `generate_node` writes advisory
+  `synthesis.speculative_claim` / `synthesis.speculative_reset` payloads to
+  the LangGraph custom stream through the injected `writer` (a no-op under
+  `ainvoke`: shadow runs, direct node calls). The outer adapter is the only
+  owner of `token`/`token_rollback`: it renders speculative claims without
+  citation markers and always retracts them with `token_rollback` before a
+  repair attempt, before any terminal, and before the final grounded render
+  — only the checkpointed grounded artifact survives. Speculative text is
+  never checkpointed, logged, or traced.
+- **Summarize single-owner rule.** `summarize_reduce_node`
+  (`complex_research_graph.py`) is evidence preparation only: zero provider
+  calls, no draft, no manifest, no channel write. It collects map-task
+  `EvidenceUseRef`s in `ReduceSpec` order into the additive
+  `EvidenceEvaluation.synthesis_use_order` field; the outer synthesis state
+  machine owns the final summary end to end.
+
 ## Shadow isolation (zero production writes)
 
 Side-effect-free shadow v2 runs (`app/services/agent/shadow_runtime.py`,
@@ -129,6 +236,13 @@ shadow's output channel so a late-completing shadow is a no-op.
 - **Staged rollout order:** `shadow 5% → internal workspace canary → 5% →
   25% → 50% → 100%` (of eligible traffic). Each stage needs real
   `agent_rollout_metrics` traffic over the live gate window.
+- **Per-turn timing spans.** `agent_timing_spans` (schema v5) records one
+  row per span per v2 turn — `turn` root, graph `node`, capability
+  `dispatch`, retrieval `stage` — metadata only (names, durations,
+  statuses, counts; never query text or chunk content). Gated by
+  `NEXUSRAG_V2_TIMING` (default true). Read via
+  `GET /api/v1/admin/agent/timings` and `/timings/{run_id}`; the SSE
+  `complete` payload carries `run_id` for correlation.
 
 ## v1 removal criteria (explicitly NOT met)
 

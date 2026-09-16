@@ -159,6 +159,47 @@ class FakeGraph:
         raise AssertionError(f"unknown script action {action[0]!r}")
 
 
+class FakeStreamingGraph(FakeGraph):
+    """FakeGraph with a scripted ``astream`` (langgraph 1.2.x shape).
+
+    ``stream_script`` items are ``(ns, mode, chunk)`` 3-tuples, or
+    ``("raise", exc)`` to fail mid-stream. When ``gate`` is given the
+    stream blocks on it after the first item (cancel test).
+    """
+
+    def __init__(
+        self,
+        script: list,
+        *,
+        stream_script: list | None = None,
+        gate: "asyncio.Event | None" = None,
+        checkpoint: dict | None = None,
+        next_nodes: tuple = (),
+    ) -> None:
+        super().__init__(script, checkpoint=checkpoint, next_nodes=next_nodes)
+        self.stream_script = list(stream_script or [])
+        self.stream_calls: list[tuple] = []
+        self.gate = gate
+        self.stream_started = asyncio.Event()
+
+    async def astream(
+        self,
+        payload,
+        config,
+        context=None,
+        stream_mode=None,
+        subgraphs=False,
+    ):
+        self.stream_calls.append((payload, config, context, stream_mode, subgraphs))
+        self.stream_started.set()
+        if self.gate is not None:
+            await self.gate.wait()
+        for item in self.stream_script:
+            if item[0] == "raise":
+                raise item[1]
+            yield item
+
+
 def _terminal_events(events: list[dict]) -> list[dict]:
     return [ev for ev in events if ev["event"] in ("complete", "error")]
 
@@ -278,6 +319,78 @@ def test_success_emits_exactly_one_complete_terminal():
     assert _terminal_events(events) == [events[-1]]
     assert events[-1]["event"] == "complete"
     assert events[-1]["data"]["answer"] == "ok"
+
+
+def test_people_snapshot_emits_people_data_before_tokens_and_in_complete():
+    """v1 parity: a people lookup surfaces the card records on the wire.
+
+    The request-scoped ``services.people_lookup`` snapshot (raw sanitized
+    v1 records captured during dispatch) produces exactly one
+    ``people_data`` event BEFORE the first ``token``, and the terminal
+    ``complete`` repeats the identical set — the frontend card and the
+    session persistence both read these.
+    """
+    import asyncio
+
+    import app.services.agent.streaming as convert_streaming
+
+    persons = [
+        {"hoTen": "Nguyen Van A", "soDienThoai": "0901234567", "_person_group": 1},
+        {"hoTen": "Nguyen Van A", "maSoBhxh": "7900012345", "_person_group": 1},
+    ]
+
+    class _PeopleLookup:
+        def people_display_snapshot(self):
+            return persons, "display text"
+
+    runtime = _runtime()
+    runtime.services.people_lookup = _PeopleLookup()
+    graph = FakeGraph([("return", {"final_response": _success_response("ok")})])
+    events = asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=graph,
+                runtime_context=runtime,
+                thread_id="thread-people-card",
+                initial_state={"request": "q"},
+            )
+        )
+    )
+    people_events = [ev for ev in events if ev["event"] == "people_data"]
+    assert len(people_events) == 1
+    assert people_events[0]["data"]["people"] == persons
+    first_token = next(i for i, ev in enumerate(events) if ev["event"] == "token")
+    assert events.index(people_events[0]) < first_token
+    complete = events[-1]
+    assert complete["event"] == "complete"
+    assert complete["data"]["people_data"] == persons
+
+
+def test_no_people_snapshot_emits_no_people_data():
+    """A non-people turn (or an empty snapshot) emits no people_data."""
+    import asyncio
+
+    import app.services.agent.streaming as convert_streaming
+
+    class _PeopleLookup:
+        def people_display_snapshot(self):
+            return None
+
+    runtime = _runtime()
+    runtime.services.people_lookup = _PeopleLookup()
+    graph = FakeGraph([("return", {"final_response": _success_response("ok")})])
+    events = asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=graph,
+                runtime_context=runtime,
+                thread_id="thread-no-people",
+                initial_state={"request": "q"},
+            )
+        )
+    )
+    assert not [ev for ev in events if ev["event"] == "people_data"]
+    assert events[-1]["data"]["people_data"] == []
 
 
 def test_clarify_terminal_is_complete_with_question():
@@ -996,10 +1109,12 @@ def test_success_projects_unknown_abbreviations_and_fabricates_nothing():
     assert len(abbrev) == 1
     assert abbrev[0]["data"] == {"abbreviations": ["BMNN"]}
     # No v2 projection exists for these yet (Phase-3-owned) — the adapter
-    # must not fabricate them.
+    # must not fabricate them. ``citation`` is the Task-6 grounded-synthesis
+    # frame emitted before the first token (empty set on citation-free
+    # success); it is part of the pinned public order, not a fabrication.
     assert {
         ev["event"] for ev in events
-    } <= {"status", "token", "potential_abbreviations", "complete"}
+    } <= {"status", "citation", "token", "potential_abbreviations", "complete"}
 
 
 def test_v2_entrypoints_use_production_adapter():
@@ -1954,3 +2069,762 @@ def test_task6_streaming_denied_and_security_sentinel_not_remapped():
     sentinel_row = asyncio.run(_run_sentinel())
     assert sentinel_row is not None
     assert sentinel_row.terminal_status == metrics.SECURITY_UNOBSERVABLE_TERMINAL
+
+
+# ---------------------------------------------------------------------------
+# Round 2 — error-terminal persistence is a v2-only contract (spec §12.4)
+#
+# The v2 typed error terminal carries a SAFE message that must persist as
+# nonblank assistant content (a reload never recreates a blank row). The v1
+# stream emits ``str(exc)`` — internal exception detail (DB errors, file
+# paths, provider messages) — which must NEVER persist as assistant content
+# or feed the memory pipeline. The fill is gated on the serving arm, never
+# on the wire event alone.
+# ---------------------------------------------------------------------------
+
+
+class _ErrPersistResult:
+    """``db.execute`` result: ``_first_obj`` once, then always empty."""
+
+    def __init__(self, first_obj: Any) -> None:
+        self._first_obj = first_obj
+        self._calls = 0
+
+    def scalar_one_or_none(self) -> Any:
+        self._calls += 1
+        if self._calls == 1:
+            return self._first_obj
+        return None
+
+    def scalars(self) -> Any:
+        return SimpleNamespace(all=lambda: [])
+
+    def first(self) -> Any:
+        return None
+
+
+class _ErrPersistDB:
+    """Minimal ``AsyncSession`` stand-in capturing ``db.add`` rows."""
+
+    def __init__(self, first_obj: Any = None, added: list | None = None) -> None:
+        self._first_obj = first_obj
+        self.added = added if added is not None else []
+
+    async def execute(self, *_a: Any, **_k: Any) -> _ErrPersistResult:
+        return _ErrPersistResult(self._first_obj)
+
+    def add(self, obj: Any) -> None:
+        self.added.append(obj)
+
+    async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        return None
+
+    async def __aenter__(self) -> "_ErrPersistDB":
+        return self
+
+    async def __aexit__(self, *_exc: Any) -> None:
+        return None
+
+
+def _err_sse(message: str) -> str:
+    """One raw v1-wire ``error`` SSE frame."""
+    import json as _json
+
+    return f"event: error\ndata: {_json.dumps({'message': message})}\n\n"
+
+
+def _patch_standalone_deps(
+    monkeypatch: pytest.MonkeyPatch, *, arm: str, error_message: str
+) -> None:
+    """Patch every dependency of ``langgraph_chat_stream`` (all fakes)."""
+    import app.api.chat_agent_lg as lg
+    import app.services.agent.runtime_selector as selector
+    import app.services.agent.streaming as streaming
+    import app.services.agent.rollout_metrics as metrics
+    import app.queue.publisher as publisher
+    from app.services.abbreviation_service import AbbreviationService
+
+    async def _v1_stream(_graph: Any, _state: Any):
+        yield _err_sse(error_message)
+
+    async def _v2_stream(**_kwargs: Any):
+        yield _err_sse(error_message)
+
+    async def _noop(*_a: Any, **_k: Any) -> None:
+        return None
+
+    monkeypatch.setattr(lg, "_resolve_system_prompt", _noop)
+    monkeypatch.setattr(selector, "resolve_runtime_scope", lambda **kw: kw["authenticated_ids"])
+    monkeypatch.setattr(selector, "resolve_serving_arm", lambda **kw: asyncio.sleep(0, arm))
+    monkeypatch.setattr(selector, "resolve_agent_graph", lambda _v: asyncio.sleep(0, object()))
+    monkeypatch.setattr(selector, "persist_raw_user_message", _noop)
+    monkeypatch.setattr(streaming, "stream_agent_to_sse", _v1_stream)
+    monkeypatch.setattr(streaming, "build_initial_state", lambda **_kw: {})
+    monkeypatch.setattr(lg, "_stream_v2_standalone", _v2_stream)
+    monkeypatch.setattr(AbbreviationService, "expand_ab_in_text", _noop)
+    monkeypatch.setattr(metrics, "try_emit_terminal_rollout_metric", _noop)
+    monkeypatch.setattr(metrics, "was_cancel_requested", lambda _rid: asyncio.sleep(0, False))
+    monkeypatch.setattr(publisher, "publish_memory_save_task", _noop)
+
+
+def _patch_session_deps(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    arm: str,
+    error_message: str,
+    added: list,
+) -> None:
+    """Patch every dependency of ``chat_stream_session`` (all fakes)."""
+    from contextlib import asynccontextmanager
+
+    import app.api.chat_agent as chat_agent
+    import app.api.chat_session as cs
+    import app.core.database as core_db
+    import app.services.agent.runtime_selector as selector
+    import app.services.agent.streaming as streaming
+    import app.services.agent.rollout_metrics as metrics
+    import app.services.memory.conversation_summary_service as summary_mod
+
+    async def _v1_stream(_graph: Any, _state: Any):
+        yield _err_sse(error_message)
+
+    async def _agen():
+        yield _err_sse(error_message)
+
+    @asynccontextmanager
+    async def _fake_v2_run(**_kwargs: Any):
+        yield None, _agen()
+
+    async def _noop(*_a: Any, **_k: Any) -> None:
+        return None
+
+    class _SummarySvc:
+        async def get_context_for_session(self, *_a: Any, **_k: Any) -> str:
+            return ""
+
+        async def save_exchange_summary(self, **_kw: Any) -> None:
+            return None
+
+    monkeypatch.setattr(cs, "_get_accessible_workspaces", lambda *_a, **_k: asyncio.sleep(0, [uuid4()]))
+    monkeypatch.setattr(cs, "_filter_accessible_document_ids", lambda *_a, **_k: asyncio.sleep(0, []))
+    monkeypatch.setattr(cs, "_maybe_launch_shadow_turn", lambda **_kw: None)
+    monkeypatch.setattr(cs, "_session_v2_run", _fake_v2_run)
+    monkeypatch.setattr(selector, "resolve_runtime_scope", lambda **kw: kw["authenticated_ids"])
+    monkeypatch.setattr(selector, "resolve_serving_arm", lambda **kw: asyncio.sleep(0, arm))
+    monkeypatch.setattr(selector, "resolve_agent_graph", lambda _v: asyncio.sleep(0, object()))
+    monkeypatch.setattr(selector, "persist_raw_user_message", _noop)
+    monkeypatch.setattr(streaming, "stream_agent_to_sse", _v1_stream)
+    monkeypatch.setattr(streaming, "build_initial_state", lambda **_kw: {})
+    monkeypatch.setattr(core_db, "async_session_maker", lambda: _ErrPersistDB(added=added))
+    monkeypatch.setattr(summary_mod, "get_conversation_summary_service", lambda: _SummarySvc())
+    monkeypatch.setattr(chat_agent, "sse_with_heartbeat", lambda agen: agen)
+    monkeypatch.setattr(metrics, "try_emit_terminal_rollout_metric", _noop)
+    monkeypatch.setattr(metrics, "was_cancel_requested", lambda _rid: asyncio.sleep(0, False))
+
+
+def _assistant_rows(added: list) -> list:
+    return [
+        row
+        for row in added
+        if getattr(row, "role", None) == "assistant"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_standalone_v1_error_event_keeps_assistant_blank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """V1 ``str(exc)`` error text must NOT persist as assistant content."""
+    import app.api.chat_agent_lg as lg
+    from app.schemas.rag import ChatRequest
+
+    _patch_standalone_deps(
+        monkeypatch, arm="v1", error_message="psycopg2: relation 'documents' missing at /srv/app/db.py:42"
+    )
+    db = _ErrPersistDB(first_obj=SimpleNamespace(system_prompt=None))
+    frames = [
+        frame
+        async for frame in lg.langgraph_chat_stream(
+            [uuid4()],
+            ChatRequest(message="hello"),
+            db,
+            uuid4(),
+            "u@example.com",
+            False,
+            None,
+        )
+    ]
+    assert any(frame.startswith("event: error") for frame in frames)
+    rows = _assistant_rows(db.added)
+    assert len(rows) == 1
+    assert rows[0].content == ""
+
+
+@pytest.mark.asyncio
+async def test_standalone_v2_typed_error_persists_safe_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """V2 typed error terminal persists its safe message nonblank (§12.4)."""
+    import app.api.chat_agent_lg as lg
+    from app.schemas.rag import ChatRequest
+
+    _patch_standalone_deps(
+        monkeypatch, arm="v2", error_message="The answer could not be completed safely."
+    )
+    db = _ErrPersistDB(first_obj=SimpleNamespace(system_prompt=None))
+    frames = [
+        frame
+        async for frame in lg.langgraph_chat_stream(
+            [uuid4()],
+            ChatRequest(message="hello"),
+            db,
+            uuid4(),
+            "u@example.com",
+            False,
+            None,
+        )
+    ]
+    assert any(frame.startswith("event: error") for frame in frames)
+    rows = _assistant_rows(db.added)
+    assert len(rows) == 1
+    assert rows[0].content == "The answer could not be completed safely."
+
+
+@pytest.mark.asyncio
+async def test_session_v1_error_event_keeps_assistant_blank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session path: v1 ``str(exc)`` never persists as assistant content."""
+    import app.api.chat_session as cs
+    from app.schemas.rag import ChatRequest
+
+    added: list = []
+    _patch_session_deps(
+        monkeypatch,
+        arm="v1",
+        error_message="psycopg2: relation 'documents' missing at /srv/app/db.py:42",
+        added=added,
+    )
+    session_db = _ErrPersistDB(first_obj=SimpleNamespace(id="sess-1"))
+    user = SimpleNamespace(id=uuid4(), is_superadmin=False)
+    response = await cs.chat_stream_session(
+        "sess-1", ChatRequest(message="hello"), session_db, user
+    )
+    frames = [frame async for frame in response.body_iterator]
+    assert any(str(frame).startswith("event: error") for frame in frames)
+    rows = _assistant_rows(added)
+    assert len(rows) == 1
+    assert rows[0].content == ""
+
+
+@pytest.mark.asyncio
+async def test_session_v2_typed_error_persists_safe_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Session path: v2 typed error persists its safe message nonblank."""
+    import app.api.chat_session as cs
+    from app.schemas.rag import ChatRequest
+
+    added: list = []
+    _patch_session_deps(
+        monkeypatch,
+        arm="v2",
+        error_message="The answer could not be completed safely.",
+        added=added,
+    )
+    session_db = _ErrPersistDB(first_obj=SimpleNamespace(id="sess-2"))
+    user = SimpleNamespace(id=uuid4(), is_superadmin=False)
+    response = await cs.chat_stream_session(
+        "sess-2", ChatRequest(message="hello"), session_db, user
+    )
+    frames = [frame async for frame in response.body_iterator]
+    assert any(str(frame).startswith("event: error") for frame in frames)
+    rows = _assistant_rows(added)
+    assert len(rows) == 1
+    assert rows[0].content == "The answer could not be completed safely."
+
+
+# ---------------------------------------------------------------------------
+# 6. In-flight progress: astream node starts -> v1 status steps
+# ---------------------------------------------------------------------------
+
+
+def test_v2_progress_event_mapping():
+    import app.services.agent.streaming as convert_streaming
+
+    assert convert_streaming._v2_progress_event("route", "analyzing") is None
+    assert (
+        convert_streaming._v2_progress_event("evaluate", "retrieved") is None
+    )
+    ev = convert_streaming._v2_progress_event("execute", "analyzing")
+    assert ev == {
+        "event": "status",
+        "data": {"step": "searching", "detail": "Đang tra cứu tài liệu..."},
+    }
+
+
+def test_v2_astream_projects_node_starts_as_status_progress():
+    import asyncio
+
+    import app.services.agent.streaming as convert_streaming
+
+    script = [
+        ((), "tasks", {"name": "route", "input": {}}),
+        ((), "tasks", {"name": "execute", "input": {}}),
+        (("complex_boundary:x",), "tasks", {"name": "execute", "input": {}}),
+        ((), "tasks", {"name": "execute", "result": {}}),
+        ((), "tasks", {"name": "evaluate", "input": {}}),
+        (("complex_boundary:x",), "tasks", {"name": "reduce", "input": {}}),
+        ((), "tasks", {"name": "synthesize", "input": {}}),
+        (("synthesis",), "tasks", {"name": "generate", "input": {}}),
+        ((), "updates", {"synthesize": {}}),
+        ((), "values", {"final_response": _success_response("ok")}),
+    ]
+    graph = FakeStreamingGraph([], stream_script=script)
+    runtime = _runtime()
+    events = asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=graph,
+                runtime_context=runtime,
+                thread_id="thread-astream-progress",
+                initial_state={"request": "q"},
+            )
+        )
+    )
+    steps = [
+        ev["data"]["step"] for ev in events if ev["event"] == "status"
+    ]
+    assert steps == ["analyzing", "searching", "retrieved", "generating"]
+    kinds = [ev["event"] for ev in events]
+    assert "citation" in kinds
+    tokens = [ev for ev in events if ev["event"] == "token"]
+    assert "".join(t["data"]["text"] for t in tokens) == "ok"
+    terminals = _terminal_events(events)
+    assert len(terminals) == 1
+    assert terminals[0]["event"] == "complete"
+    assert terminals[0]["data"]["answer"] == "ok"
+    payload, cfg, ctx, stream_mode, subgraphs = graph.stream_calls[0]
+    assert stream_mode == ["updates", "tasks", "values", "custom"]
+    assert subgraphs is True
+    assert ctx is runtime
+    assert graph.calls == []
+
+
+def test_v2_astream_interrupt_values_chunk_is_suspension():
+    import asyncio
+
+    import app.services.agent.streaming as convert_streaming
+    from app.services.agents.v2.contracts.clarification import ClarificationRequest
+
+    request = ClarificationRequest(
+        contract_version=CONTRACT_VERSION,
+        clarification_id="clr-1",
+        reason="required_document_ambiguous",
+        question="Which document?",
+        unresolved_ref_ids=("r1",),
+        candidates=(),
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    script = [
+        ((), "tasks", {"name": "clarify", "input": {}}),
+        (
+            (),
+            "values",
+            {"__interrupt__": (True,), "clarification": request},
+        ),
+    ]
+    graph = FakeStreamingGraph(
+        [],
+        stream_script=script,
+        checkpoint={"clarification": request},
+        next_nodes=("clarify_wait",),
+    )
+    leases = FakeLeaseRepo()
+    events = asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=graph,
+                runtime_context=_runtime(leases=leases),
+                thread_id="thread-astream-suspend",
+                initial_state={"request": "q"},
+            )
+        )
+    )
+    assert any(ev["event"] == "clarification_required" for ev in events)
+    terminals = _terminal_events(events)
+    assert len(terminals) == 1
+    assert terminals[0]["event"] == "complete"
+    assert terminals[0]["data"]["status"] == "clarify"
+    assert terminals[0]["data"]["answer"] == "Which document?"
+    assert leases.released == []
+
+
+def test_v2_astream_failure_is_terminal_error():
+    import asyncio
+
+    import app.services.agent.streaming as convert_streaming
+
+    script = [
+        ((), "tasks", {"name": "execute", "input": {}}),
+        ("raise", RuntimeError("boom")),
+    ]
+    graph = FakeStreamingGraph([], stream_script=script)
+    leases = FakeLeaseRepo()
+    events = asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=graph,
+                runtime_context=_runtime(leases=leases),
+                thread_id="thread-astream-fail",
+                initial_state={"request": "q"},
+            )
+        )
+    )
+    assert events[-2]["event"] == "token_rollback"
+    assert events[-1]["event"] == "error"
+    assert events[-1]["data"]["message"] == (
+        convert_streaming._V2_UNEXPECTED_ERROR_MESSAGE
+    )
+    assert len(_terminal_events(events)) == 1
+    assert leases.released == [("run-t8-test", "terminal")]
+
+
+def test_v2_astream_cancel_mid_run_releases_cancelled():
+    import asyncio
+
+    import app.services.agent.streaming as convert_streaming
+
+    leases = FakeLeaseRepo()
+
+    async def _driver() -> list[dict]:
+        gate = asyncio.Event()
+        graph = FakeStreamingGraph([], stream_script=[], gate=gate)
+        agen = convert_streaming.stream_v2_turn_events(
+            graph=graph,
+            runtime_context=_runtime(leases=leases),
+            thread_id="thread-astream-cancel",
+            initial_state={"request": "q"},
+        )
+        seen: list[dict] = []
+        # Consume the first status event, resume the generator so the
+        # stream task starts (it then blocks on the gate inside astream),
+        # wait for that, then disconnect (aclose -> GeneratorExit).
+        ev = await agen.__anext__()
+        seen.append(ev)
+        pending = asyncio.ensure_future(agen.__anext__())
+        await asyncio.wait_for(graph.stream_started.wait(), timeout=5)
+        # Cancel the consumer task: CancelledError propagates through the
+        # adapter, the graph task is cancelled, leases release cancelled.
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        return seen
+
+    seen = asyncio.run(_driver())
+    assert _terminal_events(seen) == []
+    assert leases.released == [("run-t8-test", "cancelled")]
+
+
+def test_v2_graph_without_astream_falls_back_to_ainvoke():
+    import asyncio
+
+    import app.services.agent.streaming as convert_streaming
+
+    graph = FakeGraph([("return", {"final_response": _success_response("ok")})])
+    events = asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=graph,
+                runtime_context=_runtime(),
+                thread_id="thread-ainvoke-fallback",
+                initial_state={"request": "q"},
+            )
+        )
+    )
+    assert len(graph.calls) == 1
+    steps = [
+        ev["data"]["step"] for ev in events if ev["event"] == "status"
+    ]
+    assert steps == ["analyzing", "generating"]
+    assert "token_rollback" not in [ev["event"] for ev in events]
+    assert events[-1]["event"] == "complete"
+
+
+# ---------------------------------------------------------------------------
+# 7. Speculative claim streaming: custom chunks -> token/token_rollback
+# ---------------------------------------------------------------------------
+
+
+def _spec_claim(index: int, presentation: str, text: str) -> tuple:
+    return (
+        ("synthesis",),
+        "custom",
+        {
+            "kind": "synthesis.speculative_claim",
+            "index": index,
+            "presentation": presentation,
+            "text": text,
+        },
+    )
+
+
+def _spec_reset() -> tuple:
+    return (("synthesis",), "custom", {"kind": "synthesis.speculative_reset"})
+
+
+def test_v2_speculative_claims_render_then_rollback_before_final():
+    import asyncio
+
+    import app.services.agent.streaming as convert_streaming
+
+    script = [
+        _spec_claim(0, "summary", "Tóm tắt."),
+        _spec_claim(1, "detail", "Chi tiết 1."),
+        _spec_claim(2, "detail", "Chi tiết 2."),
+        _spec_claim(3, "caveat", "Còn thiếu."),
+        ((), "values", {"final_response": _success_response("FINAL")}),
+    ]
+    graph = FakeStreamingGraph([], stream_script=script)
+    events = asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=graph,
+                runtime_context=_runtime(),
+                thread_id="thread-spec-1",
+                initial_state={"request": "q"},
+            )
+        )
+    )
+    kinds = [ev["event"] for ev in events]
+    assert kinds.count("token_rollback") == 1
+    rb = kinds.index("token_rollback")
+    spec = "".join(ev["data"]["text"] for ev in events[:rb] if ev["event"] == "token")
+    assert spec == (
+        "Tóm tắt.\n\n- Chi tiết 1.\n- Chi tiết 2.\n\n- **Lưu ý:** Còn thiếu."
+    )
+    # Rollback sits after the last speculative token and before citation.
+    assert kinds.index("citation") > rb
+    final_tokens = "".join(
+        ev["data"]["text"] for ev in events[rb + 1 :] if ev["event"] == "token"
+    )
+    assert final_tokens == "FINAL"
+    assert events[-1]["data"]["answer"] == "FINAL"
+
+
+def test_v2_speculative_reset_rolls_back_mid_run():
+    import asyncio
+
+    import app.services.agent.streaming as convert_streaming
+
+    script = [
+        _spec_claim(0, "summary", "Nháp một."),
+        _spec_reset(),
+        _spec_claim(0, "summary", "Nháp hai."),
+        _spec_claim(1, "detail", "Chi tiết hai."),
+        ((), "values", {"final_response": _success_response("FINAL")}),
+    ]
+    graph = FakeStreamingGraph([], stream_script=script)
+    events = asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=graph,
+                runtime_context=_runtime(),
+                thread_id="thread-spec-2",
+                initial_state={"request": "q"},
+            )
+        )
+    )
+    kinds = [ev["event"] for ev in events]
+    assert kinds.count("token_rollback") == 2
+    first_rb = kinds.index("token_rollback")
+    second_rb = kinds.index("token_rollback", first_rb + 1)
+    between = "".join(
+        ev["data"]["text"]
+        for ev in events[first_rb + 1 : second_rb]
+        if ev["event"] == "token"
+    )
+    assert between == "Nháp hai.\n\n- Chi tiết hai."
+
+
+def test_v2_speculative_claims_retracted_before_error_terminal():
+    import asyncio
+
+    import app.services.agent.streaming as convert_streaming
+    from app.services.agents.v2.contracts.response import FinalResponse
+
+    denied = FinalResponse(
+        contract_version=CONTRACT_VERSION,
+        status="error",
+        content="Thất bại.",
+        citations=(),
+    )
+    script = [
+        _spec_claim(0, "summary", "Nháp."),
+        ((), "values", {"final_response": denied}),
+    ]
+    graph = FakeStreamingGraph([], stream_script=script)
+    events = asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=graph,
+                runtime_context=_runtime(),
+                thread_id="thread-spec-3",
+                initial_state={"request": "q"},
+            )
+        )
+    )
+    kinds = [ev["event"] for ev in events]
+    assert "citation" not in kinds
+    assert kinds[-2:] == ["token_rollback", "error"]
+
+
+def test_v2_speculative_claims_retracted_before_suspend():
+    import asyncio
+
+    import app.services.agent.streaming as convert_streaming
+    from app.services.agents.v2.contracts.clarification import ClarificationRequest
+
+    request = ClarificationRequest(
+        contract_version=CONTRACT_VERSION,
+        clarification_id="clr-1",
+        reason="required_document_ambiguous",
+        question="Which document?",
+        unresolved_ref_ids=("r1",),
+        candidates=(),
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    script = [
+        _spec_claim(0, "summary", "Nháp."),
+        ((), "values", {"__interrupt__": (True,), "clarification": request}),
+    ]
+    graph = FakeStreamingGraph(
+        [],
+        stream_script=script,
+        checkpoint={"clarification": request},
+        next_nodes=("clarify_wait",),
+    )
+    events = asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=graph,
+                runtime_context=_runtime(),
+                thread_id="thread-spec-4",
+                initial_state={"request": "q"},
+            )
+        )
+    )
+    kinds = [ev["event"] for ev in events]
+    assert "clarification_required" in kinds
+    assert kinds.index("token_rollback") < kinds.index("clarification_required")
+
+
+def test_v2_malformed_custom_chunks_emit_nothing():
+    import asyncio
+
+    import app.services.agent.streaming as convert_streaming
+
+    script = [
+        (("synthesis",), "custom", "not a dict"),
+        (("synthesis",), "custom", {"kind": "other"}),
+        (("synthesis",), "custom", {
+            "kind": "synthesis.speculative_claim",
+            "index": 0, "presentation": "summary", "text": "",
+        }),
+        (("synthesis",), "custom", {
+            "kind": "synthesis.speculative_claim",
+            "index": 1, "presentation": "x", "text": "abc",
+        }),
+        ((), "values", {"final_response": _success_response("ok")}),
+    ]
+    graph = FakeStreamingGraph([], stream_script=script)
+    events = asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=graph,
+                runtime_context=_runtime(),
+                thread_id="thread-spec-5",
+                initial_state={"request": "q"},
+            )
+        )
+    )
+    kinds = [ev["event"] for ev in events]
+    assert "token_rollback" not in kinds
+    # Only the final grounded tokens, no speculative text.
+    assert "".join(ev["data"]["text"] for ev in events if ev["event"] == "token") == "ok"
+
+
+def test_v2_reset_without_speculative_text_emits_no_rollback():
+    import asyncio
+
+    import app.services.agent.streaming as convert_streaming
+
+    script = [
+        _spec_reset(),
+        ((), "values", {"final_response": _success_response("ok")}),
+    ]
+    graph = FakeStreamingGraph([], stream_script=script)
+    events = asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=graph,
+                runtime_context=_runtime(),
+                thread_id="thread-spec-6",
+                initial_state={"request": "q"},
+            )
+        )
+    )
+    assert "token_rollback" not in [ev["event"] for ev in events]
+
+
+def test_speculative_chunk_matches_grounded_render_minus_markers():
+    """Speculative rendering == render_grounded_claims output with the
+    ``[idx]`` markers stripped (canonical summary/detail/caveat order)."""
+    import re
+    from uuid import uuid4
+
+    import app.services.agent.streaming as convert_streaming
+    from app.services.agents.v2.contracts.evidence import EvidenceUseRef
+    from app.services.agents.v2.contracts.synthesis import GroundedClaim
+    from app.services.agents.v2.synthesis import render
+    from app.services.agents.v2.synthesis.citations import CitationProjection
+
+    assert convert_streaming._V2_SPECULATIVE_CAVEAT_PREFIX == render._CAVEAT_PREFIX
+
+    claims = (
+        GroundedClaim(
+            claim_id="claim-1", text="Tóm tắt.",
+            uses=(EvidenceUseRef(use_id=uuid4()),), presentation="summary",
+        ),
+        GroundedClaim(
+            claim_id="claim-2", text="Chi tiết 1.",
+            uses=(EvidenceUseRef(use_id=uuid4()),), presentation="detail",
+        ),
+        GroundedClaim(
+            claim_id="claim-3", text="Chi tiết 2.",
+            uses=(EvidenceUseRef(use_id=uuid4()),), presentation="detail",
+        ),
+        GroundedClaim(
+            claim_id="claim-4", text="Còn thiếu.",
+            uses=(EvidenceUseRef(use_id=uuid4()),), presentation="caveat",
+        ),
+    )
+    projection = CitationProjection(
+        citations=(),
+        claim_indexes={c.claim_id: (f"a{i}b{i}"[:4],) for i, c in enumerate(claims)},
+    )
+    grounded = render.render_grounded_claims(claims, projection)
+    grounded = re.sub(r"\[[a-z0-9]{4}\]", "", grounded)
+
+    prev = None
+    speculative = ""
+    for c in claims:
+        chunk = convert_streaming._speculative_claim_chunk(
+            prev, c.presentation, c.text
+        )
+        speculative += chunk
+        prev = c.presentation
+    assert speculative == grounded

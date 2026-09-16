@@ -130,7 +130,7 @@ def test_rollout_tables_constant_is_the_v3_delta() -> None:
     assert V2_SCHEMA_V3_TABLES == V2_SCHEMA_V1_TABLES | V2_ROLLOUT_TABLES
     assert len(V2_SCHEMA_V1_TABLES) == 12
     assert len(V2_SCHEMA_V3_TABLES) == 14
-    assert V2_SCHEMA_VERSION == 4
+    assert V2_SCHEMA_VERSION == 5
 
 
 def test_version2_fixture_shape(version2_db: Engine) -> None:
@@ -156,7 +156,7 @@ def test_version2_fixture_shape(version2_db: Engine) -> None:
 def test_version2_upgrades_to_version4(version2_db: Engine) -> None:
     apply_v2_schema(version2_db)
     with version2_db.connect() as conn:
-        assert _recorded_version(conn) == 4
+        assert _recorded_version(conn) == V2_SCHEMA_VERSION
         control = _columns(conn, "agent_rollout_control")
         metrics = _columns(conn, "agent_rollout_metrics")
     assert set(control) == set(EXPECTED_CONTROL_COLUMNS), (
@@ -167,7 +167,7 @@ def test_version2_upgrades_to_version4(version2_db: Engine) -> None:
     )
     check = check_v2_schema(version2_db)
     assert check.applied is True
-    assert check.version == 4
+    assert check.version == V2_SCHEMA_VERSION
     assert check.is_clean is True, check
 
 
@@ -202,7 +202,7 @@ def test_rollout_upgrade_is_idempotent(version2_db: Engine) -> None:
         ).scalar()
     apply_v2_schema(version2_db)
     with version2_db.connect() as conn:
-        assert _recorded_version(conn) == 4
+        assert _recorded_version(conn) == V2_SCHEMA_VERSION
         n_after = conn.execute(
             text("SELECT count(*) FROM agent_rollout_control")
         ).scalar()
@@ -371,7 +371,7 @@ def test_check_reports_genuinely_missing_rollout_table(
     try:
         check = check_v2_schema(version2_db)
         assert check.applied is True
-        assert check.version == 4
+        assert check.version == V2_SCHEMA_VERSION
         assert "agent_rollout_metrics" in check.missing_tables, check
         assert check.is_clean is False
     finally:
@@ -397,7 +397,7 @@ def test_stepwise_version1_upgrades_to_version4(version2_db: Engine) -> None:
         conn.execute(text("UPDATE v2_schema_version SET version = 1"))
     apply_v2_schema(version2_db)
     with version2_db.connect() as conn:
-        assert _recorded_version(conn) == 4
+        assert _recorded_version(conn) == V2_SCHEMA_VERSION
         nullable = conn.execute(
             text(
                 "SELECT is_nullable FROM information_schema.columns "

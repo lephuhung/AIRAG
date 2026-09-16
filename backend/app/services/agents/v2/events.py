@@ -34,6 +34,7 @@ from .contracts.response import FinalResponse
 # rollback arm. Import is module-local-safe: ``transport`` depends on no
 # app modules (no cycle risk with the v2 package).
 from .transport import PUBLIC_CHAT_CONTRACT_VERSION as PUBLIC_CHAT_CONTRACT_VERSION
+from .transport import _INTERNAL_KEYS, _PUBLIC_CITATION_FIELDS
 from .transport import normalize_wire_event as _normalize_wire_event
 
 __all__ = [
@@ -53,6 +54,8 @@ __all__ = [
     "format_sse_event",
     "final_response_payload",
     "terminal_event_for_response",
+    "SYNTHESIS_SPECULATIVE_CLAIM",
+    "SYNTHESIS_SPECULATIVE_RESET",
 ]
 
 SSE_STATUS = "status"
@@ -65,6 +68,13 @@ SSE_POTENTIAL_ABBREVIATIONS = "potential_abbreviations"
 SSE_PEOPLE_DATA = "people_data"
 SSE_ERROR = "error"
 SSE_COMPLETE = "complete"
+
+#: Advisory custom-stream payloads written by ``generate_node`` (never
+#: checkpointed, never traced): the outer streaming adapter owns their
+#: presentation as speculative ``token`` events, always retracted by
+#: ``token_rollback`` before a repair attempt or any terminal.
+SYNTHESIS_SPECULATIVE_CLAIM = "synthesis.speculative_claim"
+SYNTHESIS_SPECULATIVE_RESET = "synthesis.speculative_reset"
 
 
 def _json_default(value: Any) -> Any:
@@ -84,6 +94,32 @@ def format_sse_event(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data, default=_json_default, ensure_ascii=False)}\n\n"
 
 
+def _citation_public_dict(citation: Any) -> dict:
+    """Project one checkpointed citation onto the §11.3 wire allowlist.
+
+    ``PublicCitation`` (grounded-LLM synthesis) carries the full projector
+    output; legacy ``RenderedCitation`` contributes ``citation_id``/``label``
+    only. Internal identities (``evidence_id``, ``use_id``, …) are stripped
+    here AND again by ``normalize_v2_citations`` — they never cross.
+    """
+    if isinstance(citation, dict):
+        raw = citation
+    elif hasattr(citation, "model_dump"):
+        raw = citation.model_dump(mode="json", exclude_none=True)
+    else:
+        raw = {
+            "citation_id": getattr(citation, "citation_id", None),
+            "label": getattr(citation, "label", None),
+        }
+    return {
+        key: value
+        for key, value in raw.items()
+        if key in _PUBLIC_CITATION_FIELDS
+        and key not in _INTERNAL_KEYS
+        and value is not None
+    }
+
+
 def final_response_payload(
     response: FinalResponse,
     *,
@@ -95,9 +131,11 @@ def final_response_payload(
 ) -> dict:
     """Render a ``FinalResponse`` into the v1 ``complete`` payload shape.
 
-    Citations are presentation output (``citation_id`` + ``label``); evidence
-    identity internals stay out of the payload. ``clarification`` (Task 9)
-    carries the public clarify-turn resume block built by
+    Citations carry the full §11.3 allowlisted projection (``index``,
+    ``document_id``, ``chunk_id``, locator/validity metadata) so the
+    ``citation`` frame and ``complete`` repeat the identical public set;
+    evidence identity internals stay out of the payload. ``clarification``
+    (Task 9) carries the public clarify-turn resume block built by
     :func:`clarification_public_metadata` — persisted so a reload can
     rebuild the resume instead of minting identity client-side.
     """
@@ -111,8 +149,7 @@ def final_response_payload(
         ),
         "people_data": people_data if people_data is not None else [],
         "citations": [
-            {"citation_id": citation.citation_id, "label": citation.label}
-            for citation in response.citations
+            _citation_public_dict(citation) for citation in response.citations
         ],
     }
     if clarification is not None:

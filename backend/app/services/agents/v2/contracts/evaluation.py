@@ -11,6 +11,7 @@ from typing import Literal
 from uuid import UUID
 
 from .base import ContractModel
+from .evidence import EvidenceUseRef
 from .locators import ContentLocator
 
 CoverageOutcome = Literal["read", "missing", "unreadable", "truncated"]
@@ -63,9 +64,15 @@ class MissingRequirement(ContractModel):
 
 
 class EvidenceEvaluation(ContractModel):
-    """Spec §18: the evaluator's sufficiency verdict."""
+    """Spec §18: the evaluator's sufficiency verdict.
+
+    ``synthesis_use_order`` is the additive optional ReduceSpec-ordered use
+    projection (spec §6.2): when present, the synthesis boundary consumes the
+    refs in exactly this order instead of task-result flatten order.
+    """
 
     status: EvaluationStatus
     coverage: Coverage
     missing: tuple[MissingRequirement, ...]
     contradictions: tuple[Contradiction, ...]
+    synthesis_use_order: tuple[EvidenceUseRef, ...] | None = None

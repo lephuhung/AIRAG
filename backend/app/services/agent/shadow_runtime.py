@@ -84,6 +84,9 @@ from app.services.agents.v2.contracts.state import (
 )
 from app.services.agents.v2.contracts.validation import validate_evidence_use
 from app.services.agents.v2.nodes.evaluate import AnswerDraftChannel, HydratedEvidence
+from app.services.agents.v2.synthesis.adapter import StructuredLLMDraftBuilder
+from app.services.agents.v2.synthesis.citations import StoreCitationResolver
+from app.services.llm import get_main_provider_for_synthesis
 from app.services.agents.v2.persistence.shadow_checkpoint import (
     ShadowCheckpointBundle,
     create_shadow_checkpointer,
@@ -883,6 +886,7 @@ def build_shadow_bundle(
     people_source: Any | None = None,
     history: tuple[tuple[str, str], ...] = (),
     deadline_seconds: float = 120.0,
+    session_factory: Any | None = None,
 ) -> ShadowBundle:
     """Assemble one isolated shadow bundle (R54 ownership chain + R60).
 
@@ -907,6 +911,11 @@ def build_shadow_bundle(
     shadow never hardcodes them. ``people_source`` defaults to the
     production people lookup wrapped read-only; an isolated directory
     (bundle-level/test input) takes precedence when supplied.
+    ``citation_resolver`` is wired exactly like production ingress — a
+    read-only ``StoreCitationResolver`` over ``session_factory`` (default
+    ``async_session_maker``) — so grounded shadow synthesis reaches the
+    single ``CitationProjector`` owner instead of failing closed at
+    ``_require_projector`` after consuming a real provider call.
     """
     saver = create_shadow_checkpointer()
     assert is_shadow_saver(saver)
@@ -977,6 +986,10 @@ def build_shadow_bundle(
         resolver=shadow_resolver,
         available_services=frozenset({"v1-people"}),
     )
+    if session_factory is None:
+        from app.core.database import async_session_maker
+
+        session_factory = async_session_maker
     services = RuntimeServices(
         retention_leases=leases,
         semantic_adapter=semantic_adapter,
@@ -986,7 +999,15 @@ def build_shadow_bundle(
         authorization=ShadowAuthorization(view),
         evidence_hydrator=hydrator,
         answer_draft_channel=AnswerDraftChannel(),
+        answer_draft_builder=StructuredLLMDraftBuilder(
+            get_main_provider_for_synthesis
+        ),
         pinned_target_resolver=shadow_resolver,
+        # Exactly one citation resolver per shadow run (spec §11.1),
+        # mirroring production ingress (runtime_selector.py): the
+        # read-only resolver over the authoritative stores behind the
+        # single CitationProjector owner. Reads only — no write surface.
+        citation_resolver=StoreCitationResolver(session_factory),
     )
     runtime_context = GraphRuntimeContext(
         capability_runtime=capability_runtime,
@@ -1034,6 +1055,7 @@ def build_shadow_bundle(
         route_decision=None,
         execution=ExecutionState(plan=None, task_results=(), evidence_evaluation=None),
         clarification=None,
+        synthesis=None,
         final_response=None,
     )
     return ShadowBundle(

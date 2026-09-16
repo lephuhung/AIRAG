@@ -48,6 +48,8 @@ POST /rag/debug-chat/{workspace_id}      → full agent answer + retrieved_sourc
 POST /rag/query/{workspace_id}           → retrieval only (no answer)
 POST /rag/chat/agent-lg/{ws}/stream      → SSE agent stream (also accepts X-API-Key)
 GET  /workers/overview  /workers/pipeline → pipeline & queue state (workers.md)
+GET  /admin/agent/timings?limit=50       → recent v2 turns with timing spans (superadmin)
+GET  /admin/agent/timings/{run_id}       → per-turn span waterfall (turn/node/dispatch/stage)
 GET  /config/status                      → provider/config snapshot
 GET  /health  /docs                      → liveness + OpenAPI (no auth)
 ```
@@ -172,6 +174,25 @@ target workspace (or an authenticated superadmin `--token` drive through
 `POST /api/v1/admin/agent/evaluate`). Not runnable offline — record the
 reports as gate evidence when run.
 
+## v2 per-turn timing spans
+
+Every v2 turn records one row per measured span into `agent_timing_spans`
+(schema v5): the `turn` root, each graph `node`, each capability `dispatch`
+(with `task_id`), and each retrieval `stage` (`discover`/`embed`/`search`/
+`rerank`). Metadata only — names, durations, statuses, counts; never query
+text or chunk content. Gated by `NEXUSRAG_V2_TIMING` (default true).
+
+```bash
+# list recent turns (run_id also rides the SSE `complete` payload)
+curl -s "$API/admin/agent/timings?limit=20" -H "Authorization: Bearer $TOKEN" | jq
+# waterfall for one turn — spans carry start_offset_ms + duration_ms + parent_span
+curl -s "$API/admin/agent/timings/<run_id>" -H "Authorization: Bearer $TOKEN" | jq
+```
+
+The same data is mirrored in backend logs: `[v2stream] node timings: …`
+(per-node), `[v2dispatch] <capability> task=… in Nms` (per capability),
+`[v2retrieve] discover=… embed=… search=… rerank=…` (retrieval stages).
+
 ## P0 factual-retrieval live gate (v2 `document.retrieve`)
 
 Two authenticated factual probes prove reference-free and hard-scoped v2
@@ -214,6 +235,49 @@ error for rollout gates — `app/services/agent/rollout_metrics.py`,
 `scripts/collect_v2_rollout_report.py`; typed `denied`/unsupported outcomes
 stay typed and are not errors). If credentials or the live stack are
 unavailable, record the exact blocker/commands — never fake success.
+
+## Grounded-LLM synthesis (v2) — focused tests + live acceptance
+
+The bounded synthesis state machine (`agents/v2/synthesis/`, mounted as the
+supervisor's `synthesize` node; canonical ownership in `CLAUDE.md` → "V2
+grounded answer synthesis") has focused offline suites — all runnable here,
+no live stack, no LLM:
+
+```bash
+cd backend
+# contract: SynthesisCheckpoint phases, nullable slot, legacy compat
+python -m pytest tests/agents/v2/test_synthesis_checkpoint_contract.py -q
+# presentation policy + target-aware selection (coverage pass, no starvation)
+python -m pytest tests/agents/v2/test_synthesis_presentation.py \
+  tests/agents/v2/test_synthesis_selection.py -q
+# handle manifest build/resolve + structured adapter parse bounds
+python -m pytest tests/agents/v2/test_synthesis_handles.py \
+  tests/agents/v2/test_synthesis_adapter.py -q
+# content-free tracing (Langfuse + dataset collector suppression)
+python -m pytest tests/agents/v2/test_synthesis_tracing.py -q
+# anchors, claim-first grounding, citation projector, renderer
+python -m pytest tests/agents/v2/test_synthesis_anchors.py \
+  tests/agents/v2/test_synthesis_grounding.py \
+  tests/agents/v2/test_citation_projector.py -q
+# subgraph state machine + crash/resume (≤2 provider calls, no rebind)
+python -m pytest tests/agents/v2/test_synthesis_graph.py \
+  tests/agents/v2/test_synthesis_resume.py -q
+# citation-before-token SSE + finalizer consumption of the grounded artifact
+python -m pytest tests/agents/v2/test_synthesis_streaming.py \
+  tests/agents/v2/test_synthesis_finalizer.py -q
+# summarize reduce: zero provider calls, single synthesis owner
+python -m pytest tests/agents/v2/test_summarize_single_owner.py -q
+```
+
+**Live acceptance** (needs the Compose stack + canary-enabled workspace, same
+auth setup as the P0 gate above): drive `POST /rag/chat/agent-lg/{ws}/stream`
+with a document-backed factual question and assert, in order —
+`status(generating)` → exactly one `citation` frame → `token` chunks → one
+`complete` whose `citations` repeat the identical index set; every in-scope
+claim carries 1–3 `[a3z9]`-style markers; a reload of the session history
+shows the persisted citations. A synthesis failure must yield zero tokens and
+one typed `error` with a nonblank safe message persisted as assistant
+content. Record the transcript as gate evidence; never fake success.
 
 ## Operational hand-off (live steps not runnable from a worktree session)
 

@@ -445,14 +445,44 @@ class _Task5Session:
         return None
 
 
+class _OwnerMapResult:
+    """Minimal execute() result: only .all() is consumed by owner lookups."""
+
+    def __init__(self, rows: list) -> None:
+        self._rows = rows
+
+    def all(self) -> list:
+        return self._rows
+
+
+class _OwnerMapDB:
+    """Stub db: owner-map queries resolve every known doc to its workspace.
+
+    The service batches ``Document.id → Document.workspace_id`` resolution
+    into one ``db.execute``; extra rows are harmless because only queried
+    ids are looked up. TASK5_FOREIGN_DOC maps to the in-scope workspace so
+    the patched scoped loader still rejects it (same probe as before).
+    """
+
+    def __init__(self, rows: list) -> None:
+        self._rows = rows
+
+    async def execute(self, *args: Any, **kwargs: Any) -> _OwnerMapResult:
+        return _OwnerMapResult(self._rows)
+
+
+_TASK5_OWNER_DB = _OwnerMapDB(
+    [(TASK5_DOC, TASK5_WS), (TASK5_FOREIGN_DOC, TASK5_WS)]
+)
+
+
 def _task5_session_factory(db: Any = None) -> Any:
-    sentinel: Any = object() if db is None else db
+    sentinel: Any = _TASK5_OWNER_DB if db is None else db
 
     def _open() -> _Task5Session:
         return _Task5Session(sentinel)
 
     return _open
-
 
 class _Task5Provider:
     """Injectable embed/namespace-query/rerank ports with call recording."""

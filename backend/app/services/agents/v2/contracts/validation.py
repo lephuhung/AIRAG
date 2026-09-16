@@ -13,6 +13,7 @@ cannot be expressed on pure values.
 """
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from typing import TypeVar
 from uuid import UUID
@@ -61,7 +62,13 @@ from .response import FinalResponse
 from .routing import QueryAnalysis, RouteDecision
 from .semantic import CurrentRevisionRequirement, DocumentReference, SemanticContext
 from .state import ExecutionState, SupervisorV2State
-from .synthesis import AnswerDraft, SynthesisInput
+from .synthesis import (
+    AnswerDraft,
+    GroundedArtifact,
+    ParsedCandidate,
+    SynthesisCheckpoint,
+    SynthesisInput,
+)
 
 
 class ContractValidationError(ValueError):
@@ -99,6 +106,7 @@ _CHECKPOINT_REQUIRED_KEYS = (
     "query_analysis",
     "route_decision",
     "clarification",
+    "synthesis",
     "final_response",
 )
 
@@ -970,6 +978,142 @@ def validate_final_response(response: FinalResponse) -> None:
         _require_non_blank(citation.label, "RenderedCitation.label")
 
 
+#: Spec §8.4/§11.4: opaque model-facing handles are ``E1..En``; public citation
+#: indexes are four-character alphanumerics carrying at least one letter.
+_HANDLE_PATTERN = re.compile(r"^E\d+$")
+_PUBLIC_INDEX_PATTERN = re.compile(r"^(?=.*[A-Za-z])[A-Za-z0-9]{4}$")
+
+
+def validate_synthesis_checkpoint(checkpoint: SynthesisCheckpoint) -> None:
+    """Spec §13.3–13.5/§26: the bounded synthesis checkpoint stays consistent.
+
+    The manifest is a gap-free ``E1..En`` sequence bound to distinct uses;
+    phase payloads are present exactly when their phase stands; candidate
+    claims cite only manifest handles and grounded claims cite only manifest
+    uses. Closed failure codes are non-blank and carry no content.
+    """
+
+    _require_contract_version(checkpoint.contract_version, "SynthesisCheckpoint")
+    manifest_handles: list[str] = []
+    for index, entry in enumerate(checkpoint.handle_manifest, start=1):
+        expected = f"E{index}"
+        if entry.handle != expected:
+            _fail(
+                f"handle manifest must be a gap-free E1..En sequence; "
+                f"position {index} declares {entry.handle!r}"
+            )
+        manifest_handles.append(entry.handle)
+    _require_unique(
+        (entry.use.use_id for entry in checkpoint.handle_manifest),
+        "HandleManifestEntry.use.use_id",
+    )
+
+    if checkpoint.phase == "prepared" and checkpoint.attempts_started != 0:
+        _fail("a prepared synthesis checkpoint has no started attempts")
+    if checkpoint.phase == "attempt_reserved" and checkpoint.attempts_started == 0:
+        _fail("an attempt_reserved checkpoint must record a started attempt")
+    if checkpoint.phase in ("candidate", "grounded") and (
+        checkpoint.attempts_started == 0
+    ):
+        _fail(f"phase {checkpoint.phase!r} requires at least one started attempt")
+    # 'failed' may stand with zero attempts: the presentation gate and other
+    # pre-reservation failures never consume an attempt (spec §13.3).
+
+    if checkpoint.phase == "candidate":
+        if checkpoint.candidate is None:
+            _fail("phase 'candidate' requires a parsed candidate")
+    elif checkpoint.candidate is not None:
+        _fail("a parsed candidate may only stand in phase 'candidate'")
+    if checkpoint.phase == "grounded":
+        if checkpoint.grounded is None:
+            _fail("phase 'grounded' requires a grounded artifact")
+    elif checkpoint.grounded is not None:
+        _fail("a grounded artifact may only stand in phase 'grounded'")
+    if checkpoint.phase == "failed":
+        if checkpoint.failure_code is None:
+            _fail("phase 'failed' requires a closed failure code")
+        _require_non_blank(checkpoint.failure_code, "SynthesisCheckpoint.failure_code")
+    elif checkpoint.failure_code is not None:
+        _fail("a failure code may only stand in phase 'failed'")
+
+    if checkpoint.candidate is not None:
+        _validate_parsed_candidate(checkpoint.candidate, frozenset(manifest_handles))
+    if checkpoint.grounded is not None:
+        _validate_grounded_artifact(
+            checkpoint.grounded,
+            frozenset(entry.use.use_id for entry in checkpoint.handle_manifest),
+        )
+
+
+def _validate_parsed_candidate(
+    candidate: ParsedCandidate, manifest_handles: frozenset[str]
+) -> None:
+    if not candidate.claims:
+        _fail("ParsedCandidate must carry at least one claim")
+    for index, claim in enumerate(candidate.claims, start=1):
+        expected = f"claim-{index}"
+        if claim.claim_id != expected:
+            _fail(
+                f"server-assigned claim ids must be sequential claim-N; "
+                f"position {index} declares {claim.claim_id!r}"
+            )
+        _require_non_blank(claim.text, "ParsedClaim.text")
+        if not claim.handles:
+            _fail("every parsed claim cites at least one evidence handle")
+        _require_unique(claim.handles, "ParsedClaim.handles")
+        for handle in claim.handles:
+            if not _HANDLE_PATTERN.match(handle):
+                _fail(f"claim cites malformed evidence handle {handle!r}")
+            if handle not in manifest_handles:
+                _fail(
+                    f"claim cites evidence handle {handle!r} outside the "
+                    "checkpointed manifest"
+                )
+
+
+def _validate_grounded_artifact(
+    artifact: GroundedArtifact, manifest_use_ids: frozenset[UUID]
+) -> None:
+    _require_non_blank(artifact.content, "GroundedArtifact.content")
+    if not artifact.claims:
+        _fail("GroundedArtifact must carry at least one grounded claim")
+    for index, claim in enumerate(artifact.claims, start=1):
+        expected = f"claim-{index}"
+        if claim.claim_id != expected:
+            _fail(
+                f"server-assigned claim ids must be sequential claim-N; "
+                f"position {index} declares {claim.claim_id!r}"
+            )
+        _require_non_blank(claim.text, "GroundedClaim.text")
+        if not claim.uses:
+            _fail("every grounded claim cites at least one resolved use")
+        _require_unique(
+            (ref.use_id for ref in claim.uses), "GroundedClaim.uses.use_id"
+        )
+        for ref in claim.uses:
+            if ref.use_id not in manifest_use_ids:
+                _fail(
+                    f"grounded claim cites use {ref.use_id} outside the "
+                    "checkpointed manifest"
+                )
+    _require_unique(
+        (citation.citation_id for citation in artifact.citations),
+        "PublicCitation.citation_id",
+    )
+    _require_unique(
+        (citation.index for citation in artifact.citations),
+        "PublicCitation.index",
+    )
+    for citation in artifact.citations:
+        _require_non_blank(citation.citation_id, "PublicCitation.citation_id")
+        _require_non_blank(citation.label, "PublicCitation.label")
+        if not _PUBLIC_INDEX_PATTERN.match(citation.index):
+            _fail(
+                f"public citation index {citation.index!r} must be a "
+                "four-character alphanumeric containing a letter"
+            )
+
+
 # ---------------------------------------------------------------------------
 # Spec §20 — clarification
 # ---------------------------------------------------------------------------
@@ -1051,7 +1195,7 @@ def validate_checkpoint_payload(payload: Mapping[str, object]) -> None:
         raise IncompatibleCheckpointError(
             f"checkpoint payload is missing required key(s): {', '.join(missing)}"
         )
-    for slot in ("request", "clarification", "final_response"):
+    for slot in ("request", "clarification", "synthesis", "final_response"):
         value = payload.get(slot)
         if value is not None:
             _require_declared_checkpoint_version(value, boundary=slot)
@@ -1095,6 +1239,7 @@ def validate_supervisor_state(state: SupervisorV2State) -> None:
     query_analysis = _optional_model(state, "query_analysis", QueryAnalysis)
     route_decision = _optional_model(state, "route_decision", RouteDecision)
     clarification = _optional_model(state, "clarification", ClarificationRequest)
+    synthesis = _optional_model(state, "synthesis", SynthesisCheckpoint)
     final_response = _optional_model(state, "final_response", FinalResponse)
 
     validate_request_context(request)
@@ -1114,6 +1259,8 @@ def validate_supervisor_state(state: SupervisorV2State) -> None:
         validate_clarification_request(clarification, semantic)
     if final_response is not None:
         validate_final_response(final_response)
+    if synthesis is not None:
+        validate_synthesis_checkpoint(synthesis)
     _validate_execution_state(execution, bindings)
 
 

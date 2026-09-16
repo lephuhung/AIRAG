@@ -19,8 +19,10 @@ from app.services.agents.v2.persistence.migrate import (
     V2_SCHEMA_V1_TABLES,
     V2_SCHEMA_V3_TABLES,
     V2_SCHEMA_V4_TABLES,
+    V2_SCHEMA_V5_TABLES,
     V2_SCHEMA_VERSION,
     V2_STAGE_TABLES,
+    V2_TIMING_TABLES,
     apply_v2_schema,
     make_engine,
 )
@@ -82,7 +84,9 @@ def test_rollout_tables_extend_but_do_not_alter_v1_set() -> None:
     assert V2_SCHEMA_V3_TABLES == V2_SCHEMA_V1_TABLES | V2_ROLLOUT_TABLES
     assert V2_STAGE_TABLES == frozenset({"document_revision_stages"})
     assert V2_SCHEMA_V4_TABLES == V2_SCHEMA_V3_TABLES | V2_STAGE_TABLES
-    assert V2_SCHEMA_VERSION == 4
+    assert V2_TIMING_TABLES == frozenset({"agent_timing_spans"})
+    assert V2_SCHEMA_V5_TABLES == V2_SCHEMA_V4_TABLES | V2_TIMING_TABLES
+    assert V2_SCHEMA_VERSION == 5
 
 
 def test_schema_delta_is_exactly_v2_tables(db: Engine) -> None:

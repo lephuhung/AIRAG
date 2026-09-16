@@ -1,15 +1,24 @@
-"""Synthesis hydration and one claim-to-EvidenceUse mapping (spec §19).
+"""Synthesis hydration, claim-to-EvidenceUse mapping, and the bounded
+synthesis checkpoint (spec §13.3–13.5, §19).
 
 ``SynthesisInput`` is model-facing and contains only semantic/evaluation facts and
 use references; plans, bindings, and runtime policy stay with the Evidence
 Hydrator. ``SynthesisEvidence`` is an ephemeral hydrator projection, and
 ``AnswerClaim`` is the single authoritative claim-to-EvidenceUse relationship.
+
+``SynthesisCheckpoint`` is the durable owner of the grounded-LLM synthesis
+state machine: the stable ``E``-handle manifest, the parsed candidate, the
+grounded artifact, and the closed failure code. It never carries raw evidence
+plaintext, prompt text, unparsed model output, reasoning, secrets, ACL state,
+or stack traces.
 """
 from __future__ import annotations
 
+from typing import Literal
+
 from uuid import UUID
 
-from .base import ContractModel
+from .base import ContractModel, ContractVersion
 from .binding import DocumentRole
 from .evaluation import EvidenceEvaluation
 from .evidence import EvidenceUseRef
@@ -66,3 +75,111 @@ class AnswerDraft(ContractModel):
 
     content: str
     claims: tuple[AnswerClaim, ...]
+
+
+# ---------------------------------------------------------------------------
+# Grounded LLM synthesis checkpoint (spec §13.3–13.5)
+# ---------------------------------------------------------------------------
+
+SynthesisPhase = Literal[
+    "prepared", "attempt_reserved", "candidate", "grounded", "failed"
+]
+"""Spec §13.3: the durable phases of the bounded synthesis state machine."""
+
+ClaimPresentation = Literal["summary", "detail", "caveat"]
+"""Spec §11.5: the closed per-claim presentation kinds the renderer owns."""
+
+
+class HandleManifestEntry(ContractModel):
+    """Spec §8.4/§13.4: one opaque ``E``-handle bound to an exact use.
+
+    Handles are assigned by the server in selected-evidence order before the
+    first provider call and are never rebound on repair or resume.
+    """
+
+    handle: str
+    use: EvidenceUseRef
+
+
+class ParsedClaim(ContractModel):
+    """Spec §9.1/§13.4: one validated model claim citing opaque handles only."""
+
+    claim_id: str
+    text: str
+    handles: tuple[str, ...]
+    presentation: ClaimPresentation
+
+
+class ParsedCandidate(ContractModel):
+    """Spec §13.4: the parsed, schema-valid claim proposal (phase=candidate).
+
+    Claim ids are server-assigned (``claim-N``); the model's raw output is
+    never persisted.
+    """
+
+    claims: tuple[ParsedClaim, ...]
+
+
+class GroundedClaim(ContractModel):
+    """Spec §10.2/§13.4: one claim grounded to exact resolved uses."""
+
+    claim_id: str
+    text: str
+    uses: tuple[EvidenceUseRef, ...]
+    presentation: ClaimPresentation
+
+
+class PublicCitation(ContractModel):
+    """Spec §11.3: the allowlisted public citation projection.
+
+    Only presentation-safe fields cross this boundary; internal
+    evidence/use/task/run/workspace/binding/revision/checkpoint identities are
+    forbidden. ``index`` is the deterministic four-character public handle.
+    """
+
+    citation_id: str
+    index: str
+    label: str
+    source_type: str
+    score: float | None = None
+    document_id: str | None = None
+    chunk_id: str | None = None
+    content: str | None = None
+    source_file: str | None = None
+    page_no: int | None = None
+    heading_path: tuple[str, ...] | None = None
+    document_number: str | None = None
+    article_label: str | None = None
+    validity_status: str | None = None
+    superseded_by: str | None = None
+
+
+class GroundedArtifact(ContractModel):
+    """Spec §13.4: the grounded, rendered, citation-projected answer.
+
+    ``content`` is the server-rendered Markdown with public markers already
+    inserted; ``citations`` is the allowlisted projector output replayed by
+    SSE, persistence, and reload.
+    """
+
+    claims: tuple[GroundedClaim, ...]
+    content: str
+    citations: tuple[PublicCitation, ...]
+
+
+class SynthesisCheckpoint(ContractModel):
+    """Spec §13.4: the durable bounded-synthesis state machine checkpoint.
+
+    ``None`` on the supervisor aggregate is the canonical idle value; a
+    non-null checkpoint always carries the stable handle manifest plus the
+    phase-appropriate payload. ``attempts_started`` increments and checkpoints
+    before every provider call, so a crash consumes the attempt.
+    """
+
+    contract_version: ContractVersion
+    phase: SynthesisPhase
+    attempts_started: Literal[0, 1, 2]
+    handle_manifest: tuple[HandleManifestEntry, ...]
+    candidate: ParsedCandidate | None = None
+    grounded: GroundedArtifact | None = None
+    failure_code: str | None = None

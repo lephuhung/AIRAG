@@ -23,19 +23,21 @@ Both the record insert (idempotent by content-hash + source identity) and
 the use append (idempotent by run/task/evidence/purpose/target) converge on
 retry, so deterministic re-derivation never duplicates overflow artifacts.
 
-Draft handoff: ``synthesize_node`` synthesizes exactly once per turn and
+Draft handoff (legacy presentation path): the non-LLM People presentation
 stores the validated draft in the runtime-only ``AnswerDraftChannel``
 (``RuntimeServices.answer_draft_channel``, keyed by run id, never
-checkpointed). ``ground_node`` consumes it; the finalizer consumes the
-grounded result. On a channel miss (restart between nodes, unwired channel)
-the consumer re-derives deterministically ONCE from checkpointed state —
-never a silent re-run on every node.
+checkpointed); the finalizer consumes the grounded result. The production
+document path is the bounded synthesis subgraph
+(``synthesis/graph.py``) mounted as the supervisor's ``synthesize`` node —
+it checkpoints a ``SynthesisCheckpoint`` per durable phase and never uses
+the channel.
 
-Drafting in Phase 2 is deterministic extractive composition: user-visible
-content preserves first-seen whole evidence items, while grounding claims are
-built per distinct normalized assertion and merge every supporting use. A
-bounded model may instead supply a draft through the ``DraftBuilder`` seam,
-but it receives only ``SynthesisInput`` plus ``SynthesisEvidence`` — never
+The helpers below are the deterministic extractive composition used by the
+People presentation and compat tests: user-visible content preserves
+first-seen whole evidence items, while grounding claims are built per
+distinct normalized assertion and merge every supporting use. A bounded
+model may instead supply a draft through the ``DraftBuilder`` seam, but it
+receives only ``SynthesisInput`` plus ``SynthesisEvidence`` — never
 authorization, plans, or bindings — and its output is validated against the
 admitted set before use.
 """
@@ -63,14 +65,7 @@ from ..contracts.validation import (
     validate_answer_draft,
     validate_synthesis_input,
 )
-from .context import _context_of
-from .evaluate import (
-    AnswerDraftChannel,
-    EvidenceHydrator,
-    HydratedEvidence,
-    _channel_of,
-)
-from .execute import require_checkpointed_plan
+from .evaluate import EvidenceHydrator, HydratedEvidence
 
 __all__ = [
     "SynthesisError",
@@ -366,6 +361,15 @@ def _synthesis_input_of(state: SupervisorV2State) -> SynthesisInput:
             "factual synthesis requires a sufficient EvidenceEvaluation; "
             f"got {evaluation.status if evaluation is not None else None!r}"
         )
+    # Task 7A: a summarize-reduce pass owns the admitted order — its
+    # deterministic ReduceSpec lineage is the synthesis input when present.
+    ordered = evaluation.synthesis_use_order
+    if ordered is not None:
+        return SynthesisInput(
+            semantic=state["semantic"],
+            evaluation=evaluation,
+            evidence_uses=tuple(ordered),
+        )
     seen: set[UUID] = set()
     refs: list[EvidenceUseRef] = []
     for result in state["execution"].task_results:
@@ -460,41 +464,14 @@ async def synthesize_node(
     state: SupervisorV2State,
     runtime: "Runtime[GraphRuntimeContext]",
 ) -> dict:
-    """Synthesize exactly once: hydrate, draft, validate, lease, store.
+    """Placeholder for the supervisor's ``synthesize`` node name.
 
-    The validated draft plus its admitted evidence is stored in the
-    runtime-only ``AnswerDraftChannel`` (keyed by run id) for the ground
-    node; the finalizer later consumes the grounded result. This node
-    returns no state update — its checkpointable value is the governed side
-    effect (overflow derived evidence persisted and leased before the
-    checkpoint barrier) plus fail-fast validation of the synthesis boundary.
-    Without a wired channel the node still synthesizes and leases (the
-    downstream consumer re-derives once on the miss). A ``SynthesisError``
-    (empty admission, non-sufficient evaluation) never escapes: it is stored
-    as a typed channel failure so the ground node checkpoints its owned
-    ``insufficient`` without re-deriving and the finalizer emits the
-    denied/insufficient/error response from the checkpointed task outcomes.
+    The production path is the bounded synthesis subgraph mounted by
+    ``make_synthesis_boundary_node`` (``synthesis/graph.py``); this symbol
+    only keeps the supervisor's node-name registry honest — the wrapped
+    boundary replaces it at graph construction. The extractive helpers above
+    (``build_extractive_draft``/``synthesize_answer``/``synthesize_and_lease``)
+    remain for compat tests and the non-LLM People presentation.
     """
-    context = _context_of(runtime)
-    plan = require_checkpointed_plan(state)
-    run_id = context.capability_runtime.run_id
-    channel: AnswerDraftChannel | None = _channel_of(context)
-    try:
-        result = await synthesize_and_lease(
-            synthesis_input=_synthesis_input_of(state),
-            runtime=context,
-            plan=plan,
-            bindings=state["bindings"],
-            budget=DEFAULT_SYNTHESIS_BUDGET,
-        )
-    except SynthesisError as exc:
-        if channel is not None:
-            channel.store_failure(run_id, reason=str(exc))
-        return {}
-    if channel is not None:
-        channel.store_draft(
-            run_id,
-            draft=result.draft,
-            evidence=result.evidence,
-        )
+    _ = (state, runtime)
     return {}

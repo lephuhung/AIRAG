@@ -146,7 +146,11 @@ active v2 runs). Staged order: shadow → internal workspace canary →
 5% → 25% → 50% → 100% of *v2-eligible* traffic (Write/evaluate stay on v1;
 global replacement of v1 is out of scope). 📖 **Ownership model, invariants,
 and runbook:** [`CLAUDE.md`](CLAUDE.md) (canonical); live preflight/canary
-commands: [`docs/harness.md`](docs/harness.md). Factual v2 queries execute
+commands: [`docs/harness.md`](docs/harness.md). Document-backed factual
+answers are produced by a bounded, checkpointed **grounded-LLM synthesis**
+pipeline (claim-first grounding, stable `E`-handle evidence manifest,
+single-owner citation projection, citation frame before the first token) —
+canonical ownership: `CLAUDE.md` → "V2 grounded answer synthesis". Factual v2 queries execute
 revision-aware retrieval (`document.retrieve` over the pinned revision
 manifest; `document_ids` are a hard scope) — authenticated unscoped/scoped
 probes and the zero-dispatch rollout gate are documented in

@@ -4,6 +4,11 @@
 grounding. It deliberately omits a claim ID because the current API/frontend has
 no claim-highlighting interaction, and ``FinalResponse`` stores no derivable
 evidence-ID projection.
+
+``FinalResponse.citations`` also accepts ``PublicCitation`` (spec §11.3): the
+grounded-LLM synthesis path stores the CitationProjector's allowlisted public
+projection verbatim — the same set the SSE ``citation`` frame and ``complete``
+payload repeat — while legacy extractive citations keep ``RenderedCitation``.
 """
 from __future__ import annotations
 
@@ -11,6 +16,7 @@ from typing import Literal
 from uuid import UUID
 
 from .base import ContractModel, ContractVersion
+from .synthesis import PublicCitation
 
 ResponseStatus = Literal["success", "clarify", "denied", "insufficient", "error"]
 
@@ -29,4 +35,4 @@ class FinalResponse(ContractModel):
     contract_version: ContractVersion
     status: ResponseStatus
     content: str
-    citations: tuple[RenderedCitation, ...] = ()
+    citations: tuple[RenderedCitation | PublicCitation, ...] = ()

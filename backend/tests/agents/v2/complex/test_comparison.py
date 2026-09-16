@@ -1045,6 +1045,47 @@ async def test_complex_subgraph_resumes_under_supervisor_checkpointer() -> None:
     context.services.semantic_adapter = _Adapter(draft)
     context.services.binding_resolver = _Resolver(pins)
     context.services.answer_draft_channel = AnswerDraftChannel()
+    # Task 5: the document path runs the bounded synthesis subgraph — wire
+    # the bounded builder (two claims, one per manifest handle so both
+    # documents are cited) and the citation resolver.
+    from app.services.agents.v2.contracts.synthesis import (
+        ParsedCandidate,
+        ParsedClaim,
+    )
+    from app.services.agents.v2.synthesis.citations import (
+        ResolvedDocumentCitation,
+    )
+
+    class _Builder:
+        async def build(
+            self, query_text, evidence_items, *, repair_context=None, on_claim=None
+        ):
+            return ParsedCandidate(
+                claims=tuple(
+                    ParsedClaim(
+                        claim_id=f"claim-{index}",
+                        text=item.content,
+                        handles=(item.handle,),
+                        presentation="summary",
+                    )
+                    for index, item in enumerate(evidence_items, start=1)
+                )
+            )
+
+    class _CitationResolver:
+        async def resolve_document(self, source, *, content: str):
+            return ResolvedDocumentCitation(
+                document_id=str(source.document_id),
+                document_revision=str(source.document_revision),
+                content=content[:200],
+                document_title="tai lieu",
+            )
+
+        async def resolve_lineage(self, evidence_id):
+            return None
+
+    context.services.answer_draft_builder = _Builder()
+    context.services.citation_resolver = _CitationResolver()
 
     from app.services.agents.supervisor_v2 import build_initial_v2_state
 

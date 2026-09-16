@@ -71,6 +71,7 @@ import json
 import logging
 import re
 import threading
+import time
 import warnings
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -120,6 +121,7 @@ from .v2.contracts.state import (
     RuntimeServices,
     SupervisorV2State,
 )
+from .v2.contracts.synthesis import SynthesisCheckpoint
 from .v2.contracts.validation import (
     ContractValidationError,
     IncompatibleCheckpointError,
@@ -145,9 +147,12 @@ from .v2.nodes.evaluate import AnswerDraftChannel, evaluate_node
 from .v2.nodes.execute import execute_node
 from .v2.nodes.finalizer import finalizer_node
 from .v2.nodes.fast_plan import fast_plan_node
-from .v2.nodes.grounding import ground_node
 from .v2.nodes.routing import route_node
 from .v2.nodes.synthesize import synthesize_node
+from .v2.synthesis.graph import (
+    build_synthesis_subgraph,
+    make_synthesis_boundary_node,
+)
 
 __all__ = [
     "SUPERVISOR_V2_NODES",
@@ -226,12 +231,13 @@ _SLOT_MODELS: dict[str, type] = {
     "route_decision": RouteDecision,
     "execution": ExecutionState,
     "clarification": ClarificationRequest,
+    "synthesis": SynthesisCheckpoint,
     "final_response": FinalResponse,
 }
 
 #: Slots that may legitimately be ``None`` (everything else must be present).
 _NULLABLE_SLOTS = frozenset(
-    {"query_analysis", "route_decision", "clarification", "final_response"}
+    {"query_analysis", "route_decision", "clarification", "synthesis", "final_response"}
 )
 
 
@@ -293,15 +299,22 @@ def _coerce_slot(value: Any, model: type, *, slot: str) -> Any:
 def normalize_checkpoint_state(state: Mapping[str, Any]) -> SupervisorV2State:
     """Coerce a loaded checkpoint aggregate back into usable contracts.
 
-    Runs the frozen shape gate (``validate_checkpoint_payload``: version +
-    required keys + nested envelope versions) then re-validates every nested
-    slot. Returns a NEW aggregate; the stored checkpoint is never mutated.
-    Full cross-reference validation (``validate_supervisor_state``) is NOT
-    applied here — the route→clarify edge legitimately checkpoints a clarify
-    route before ``clarify_node`` persists its request (T5 D6 gap, owned by
-    the clarify composition below).
+    Materializes the one supported legacy shape first (a root-2.0 payload
+    missing only the additive ``synthesis`` slot gains ``synthesis=None``),
+    then runs the frozen shape gate (``validate_checkpoint_payload``:
+    version + required keys + nested envelope versions) and re-validates
+    every nested slot. Returns a NEW aggregate; the stored checkpoint is
+    never mutated. Full cross-reference validation
+    (``validate_supervisor_state``) is NOT applied here — the route→clarify
+    edge legitimately checkpoints a clarify route before ``clarify_node``
+    persists its request (T5 D6 gap, owned by the clarify composition below).
     """
     values = dict(state)
+    if values.get("contract_version") == CONTRACT_VERSION and "synthesis" not in values:
+        # Spec §13.2: a pre-synthesis root-2.0 checkpoint is the one supported
+        # legacy shape — materialize the additive slot BEFORE required-key
+        # validation. Any other missing key still fails closed below.
+        values["synthesis"] = None
     validate_checkpoint_payload(values)
     coerced: dict[str, Any] = {"contract_version": values["contract_version"]}
     for slot, model in _SLOT_MODELS.items():
@@ -518,13 +531,11 @@ def _wrap_node(name: str, fn: Callable) -> Callable:
             # always clear the route): never re-derive a topology over the
             # failure. The branch below sends marker-states to the finalizer.
             return {}
-        if name in ("direct", "fast_plan", "execute", "evaluate", "synthesize", "ground", "complex_boundary") and _has_terminal_marker(view):
+        if name in ("direct", "fast_plan", "execute", "evaluate", "synthesize", "complex_boundary") and _has_terminal_marker(view):
             # Same stickiness downstream: a conversion marker must reach the
-            # finalizer untouched — running here would overwrite it (ground
-            # re-derives insufficiency over errors; execute could dispatch
-            # after a fail-closed failure) and resurrect the turn. Ground's
-            # own failure marker is set by ground itself, so it is never
-            # skipped into existence: only the finalizer consumes markers.
+            # finalizer untouched — running here would overwrite it (execute
+            # could dispatch after a fail-closed failure) and resurrect the
+            # turn. Only the finalizer consumes markers.
             return {}
         if name not in _UNVALIDATED_ENTRIES and not sme_merge_nodes:
             try:
@@ -540,11 +551,13 @@ def _wrap_node(name: str, fn: Callable) -> Callable:
         except Exception as exc:
             return _typed_boundary_error(f"{name}: {exc}")
         if name == "context" and isinstance(update, dict):
-            # Fresh turn, fresh response: stale terminal markers from a
-            # prior turn must not survive into this turn's flow (they would
-            # trip the route skip + branch-error below and stick the new
-            # turn in the old error). The finalizer recomputes every turn.
-            update = {**update, "final_response": None}
+            # Fresh turn, fresh response: stale terminal markers and any prior
+            # synthesis checkpoint from a previous turn must not survive into
+            # this turn's flow (they would trip the route skip + branch-error
+            # below and stick the new turn in the old error, or resurrect a
+            # consumed synthesis attempt). The finalizer recomputes every
+            # turn; the synthesis state machine re-prepares from None.
+            update = {**update, "final_response": None, "synthesis": None}
         try:
             if isinstance(update, Command):
                 # Navigation-carrying return (clarify_wait resume paths):
@@ -643,6 +656,7 @@ def build_initial_v2_state(
         execution=ExecutionState(plan=None, task_results=(), evidence_evaluation=None),
         clarification=None,
         final_response=None,
+        synthesis=None,
     )
     validate_checkpoint_payload(dict(state))
     return state
@@ -950,7 +964,6 @@ SUPERVISOR_V2_NODES: dict[str, Callable] = {
     "execute": _wrap_node("execute", execute_node),
     "evaluate": _wrap_node("evaluate", evaluate_node),
     "synthesize": _wrap_node("synthesize", synthesize_node),
-    "ground": _wrap_node("ground", ground_node),
     "finalizer": _wrap_node("finalizer", finalizer_node),
     # Phase 3 replaces only this node with the compiled complex-research
     # subgraph. The subgraph is compiled without a checkpointer so it
@@ -999,8 +1012,8 @@ def _route_branch(state: SupervisorV2State) -> str:
 def _complex_branch(state: SupervisorV2State) -> str:
     """Route after the complex subgraph on the MERGED evidence evaluation (R4).
 
-    ``sufficient`` continues into the existing ``synthesize`` node (which then
-    flows ``synthesize -> ground -> finalizer``); every other verdict —
+    ``sufficient`` continues into the ``synthesize`` boundary (which then
+    flows ``synthesize -> finalizer``); every other verdict —
     ``insufficient``, ``contradictory``, ``needs_input``, or a missing
     evaluation (typed unavailable/failure path) — goes straight to the
     ``finalizer``. Synthesis and grounding are never duplicated inside the
@@ -1041,8 +1054,7 @@ def _add_supervisor_edges(graph: StateGraph) -> None:
     graph.add_edge("fast_plan", "execute")
     graph.add_edge("execute", "evaluate")
     graph.add_edge("evaluate", "synthesize")
-    graph.add_edge("synthesize", "ground")
-    graph.add_edge("ground", "finalizer")
+    graph.add_edge("synthesize", "finalizer")
     graph.add_conditional_edges(
         "complex_boundary",
         _complex_branch,
@@ -1062,13 +1074,26 @@ def create_supervisor_v2_graph(checkpointer: BaseCheckpointSaver) -> Any:
     # with the compiled complex-research subgraph. It is compiled WITHOUT
     # its own checkpointer so it inherits `checkpointer` (and therefore the
     # shadow run's isolated saver) rather than opening its own.
-    # SUPERVISOR_V2_NODES keeps the Phase-2 unavailable entry untouched.
     complex_subgraph = build_complex_research_subgraph()
     complex_boundary_fn = _wrap_node(
         "complex_boundary", make_complex_boundary_node(complex_subgraph)
     )
+    # The bounded grounded-LLM synthesis subgraph replaces the Phase-2
+    # `synthesize` placeholder. It is compiled WITHOUT its own checkpointer
+    # so it inherits `checkpointer` (and therefore the shadow run's isolated
+    # saver); the boundary pins a stable child checkpoint namespace so a
+    # crash mid-synthesis resumes the pending child pass.
+    synthesis_subgraph = build_synthesis_subgraph()
+    synthesis_boundary_fn = _wrap_node(
+        "synthesize", make_synthesis_boundary_node(synthesis_subgraph)
+    )
     for name, fn in SUPERVISOR_V2_NODES.items():
-        graph.add_node(name, complex_boundary_fn if name == "complex_boundary" else fn)
+        if name == "complex_boundary":
+            graph.add_node(name, complex_boundary_fn)
+        elif name == "synthesize":
+            graph.add_node(name, synthesis_boundary_fn)
+        else:
+            graph.add_node(name, fn)
     _add_supervisor_edges(graph)
     return graph.compile(checkpointer=checkpointer)
 
@@ -1804,14 +1829,23 @@ async def _invoke_people_search(search: Any, query: str, *, limit: int) -> Any:
     return search(query)
 
 
-async def _collect_search_persons(produced: Any) -> list[Mapping[str, object]]:
-    """Drain one v1 search result (async-gen or single mapping) to persons.
+async def _collect_search_persons(
+    produced: Any,
+) -> tuple[list[Mapping[str, object]], list[str]]:
+    """Drain one v1 search result (async-gen or single mapping).
 
     Shared single reader for every intent (M7): previously duplicated across
     ``_lookup_many``/``_lookup_many_advanced``. Malformed v1 output fails
     closed with :class:`V1ServiceUnavailable`.
+
+    Returns ``(persons, displays)``: the raw sanitized person records (the
+    exact v1 ``people_data`` card payload, ``_person_group`` included) plus
+    the per-batch v1 ``display`` strings (the consolidated profile-block
+    text v1 showed as the answer). Both are captured for the request-scoped
+    presentation snapshot — neither enters governed evidence.
     """
     persons: list[Mapping[str, object]] = []
+    displays: list[str] = []
     if inspect.isasyncgen(produced):
         async for result in produced:
             if not isinstance(result, Mapping):
@@ -1822,6 +1856,9 @@ async def _collect_search_persons(produced: Any) -> list[Mapping[str, object]]:
                 raise V1ServiceUnavailable(
                     f"v1 people lookup is unavailable: {result.get('error')}"
                 )
+            display = result.get("display")
+            if isinstance(display, str) and display.strip():
+                displays.append(display)
             if result.get("found") and result.get("persons"):
                 batch = result["persons"]
                 if not isinstance(batch, (list, tuple)):
@@ -1842,7 +1879,7 @@ async def _collect_search_persons(produced: Any) -> list[Mapping[str, object]]:
                     "v1 people lookup returned a non-mapping"
                 )
             persons.append(single)
-    return persons
+    return persons, displays
 
 
 def _build_people_matches(
@@ -1920,6 +1957,14 @@ class V1PeopleMultiMatchAdapter:
     seam the capability is injected with (M6); :class:`V1PeopleLookupService`
     keeps the frozen ``lookup``-only public surface and reaches this reader
     through its private delegating ``_lookup_many``.
+
+    The adapter is request-scoped (built per ingress inside
+    ``build_v2_capability_registry``), so it also memoizes the raw v1
+    ``persons`` records and ``display`` strings it already fetched —
+    :meth:`people_display_snapshot` hands them to the non-LLM people
+    presentation and the streaming adapter without a second Mongo round
+    trip. The snapshot is runtime-only: it never enters governed evidence,
+    the checkpoint, or the model-facing prompt.
     """
 
     def __init__(
@@ -1943,6 +1988,9 @@ class V1PeopleMultiMatchAdapter:
             self._overrides["search_by_bhxh"] = bhxh_lookup
         if name_lookup is not None:
             self._overrides["search_by_name"] = name_lookup
+        # Request-scoped presentation snapshot (see class docstring).
+        self._snapshot_persons: list[Mapping[str, object]] = []
+        self._snapshot_displays: list[str] = []
 
     def _search_fn(self, search_name: str) -> Any:
         if search_name in self._overrides:
@@ -1960,6 +2008,20 @@ class V1PeopleMultiMatchAdapter:
             intent = "mongo_search_advanced"
         return PEOPLE_INTENT_SEARCH.get(intent, "search_by_name")
 
+    def people_display_snapshot(self) -> tuple[list[dict], str] | None:
+        """Return ``(persons, display)`` captured during this run's lookups.
+
+        ``persons`` are the raw sanitized v1 records (the ``people_data``
+        card payload); ``display`` is the joined v1 profile-block text.
+        ``None`` when no lookup produced records this run — consumers fall
+        back to the governed extractive presentation.
+        """
+        if not self._snapshot_persons:
+            return None
+        persons = [dict(person) for person in self._snapshot_persons]
+        display = "\n".join(self._snapshot_displays).strip()
+        return persons, display
+
     async def lookup_many(self, query: str) -> list[PeopleLookupMatch]:
         """All distinct people behind ``query`` as minimized matches."""
         from app.prompts.agents.supervisor_scope import people_intent_from_query
@@ -1969,7 +2031,10 @@ class V1PeopleMultiMatchAdapter:
         # Advanced (unparsed) queries keep the legacy name-search behavior.
         search = self._search_fn("search_by_name" if advanced else search_name)
         produced = await _invoke_people_search(search, query, limit=self._limit)
-        persons = await _collect_search_persons(produced)
+        persons, displays = await _collect_search_persons(produced)
+        if persons:
+            self._snapshot_persons.extend(persons)
+            self._snapshot_displays.extend(displays)
         if not persons:
             return []
         queried_phone = ""
@@ -1983,6 +2048,7 @@ class V1PeopleMultiMatchAdapter:
             except Exception:
                 queried_phone = ""
         return _build_people_matches(persons, queried_phone=queried_phone)
+
 
 
 class V1PeopleLookupService:
@@ -2024,6 +2090,15 @@ class V1PeopleLookupService:
             name_lookup=name_lookup,
         )
 
+    def people_display_snapshot(self) -> tuple[list[dict], str] | None:
+        """Request-scoped ``(persons, display)`` snapshot for presentation.
+
+        The capability's injected multi-match adapter is the authoritative
+        snapshot owner (production path); the legacy ``lookup`` drain below
+        captures into the same snapshot so either path feeds the card.
+        """
+        return self._multi_match.people_display_snapshot()
+
     async def _lookup_many(self, query: str) -> list[PeopleLookupMatch]:
         """All distinct people behind ``query`` as minimized matches.
 
@@ -2046,6 +2121,9 @@ class V1PeopleLookupService:
                     raise V1ServiceUnavailable(
                         "v1 people lookup yielded a non-mapping result"
                     )
+                display = result.get("display")
+                if isinstance(display, str) and display.strip():
+                    self._multi_match._snapshot_displays.append(display)
                 if result.get("found") and result.get("persons"):
                     persons = result["persons"]
                     if isinstance(persons, (list, tuple)) and persons:
@@ -2054,6 +2132,9 @@ class V1PeopleLookupService:
                             raise V1ServiceUnavailable(
                                 "v1 people lookup yielded a non-mapping person"
                             )
+                        for person in persons:
+                            if isinstance(person, Mapping):
+                                self._multi_match._snapshot_persons.append(person)
                         return first
             return None
         result = await _maybe_await(produced)
@@ -2122,7 +2203,24 @@ class V1DocumentSearchService:
 
         search = self._search
         if search is None:
-            search = _v1_attr("app.services.agent.tools", "search_documents")
+            # Same lightweight discovery as the retrieve path: candidate ids
+            # only, vector probe per pinnable workspace — never the full v1
+            # hybrid pipeline (it serialized ~20s on wide workspace scopes).
+            async def search(
+                found_query: str,
+                found_top_k: int,
+                found_workspaces: list,
+                _existing: Any,
+                found_db: Any,
+            ) -> Any:
+                ids = await _discover_workspace_document_ids(
+                    found_db,
+                    found_query,
+                    found_top_k,
+                    tuple(found_workspaces),
+                    embed=None,
+                )
+                return {"sources": [{"document_id": doc_id} for doc_id in ids]}
         open_session = self._session_factory
         if open_session is None:
 
@@ -2130,6 +2228,7 @@ class V1DocumentSearchService:
                 from app.core.database import async_session_maker
 
                 return async_session_maker()
+
 
         async with open_session() as db:
             found = await search(
@@ -2157,22 +2256,36 @@ class V1DocumentSearchService:
                 document_ids.append(document_id)
         candidates: list[DocumentDiscoveryCandidate] = []
         async with open_session() as db:
+            # Task 5: pin through the workspace-scoped lookup so a
+            # foreign-workspace id or a tombstoned document can never be
+            # pinned even if the search above returned it. Resolve each
+            # candidate's owner in ONE query — only the true owner can
+            # satisfy the workspace join — instead of probing every
+            # workspace per document (hundreds of round-trips on wide
+            # scopes).
+            from app.models.document import Document
+            from sqlalchemy import select as _select
+
+            owner_rows = (
+                await db.execute(
+                    _select(Document.id, Document.workspace_id).where(
+                        Document.id.in_(document_ids),
+                        Document.workspace_id.in_(list(workspace_ids)),
+                        Document.source_deleted_at.is_(None),
+                    )
+                )
+            ).all()
+            owner_map = {doc_id: ws_id for doc_id, ws_id in owner_rows}
             for document_id in document_ids:
-                # Task 5: pin through the workspace-scoped lookup (union over
-                # the trusted runtime scope, first authorized match wins), so
-                # a foreign-workspace id or a tombstoned document can never be
-                # pinned even if the v1 search above returned it. The unscoped
-                # loader is deliberately not used here.
-                identity = None
-                for workspace_id in workspace_ids:
-                    try:
-                        identity = await document_views.load_current_revision_identity_for_workspace(
-                            db, document_id, workspace_id
-                        )
-                    except document_views.RevisionNotReady:
-                        continue
-                    if identity is not None:
-                        break
+                workspace_id = owner_map.get(document_id)
+                if workspace_id is None:
+                    continue
+                try:
+                    identity = await document_views.load_current_revision_identity_for_workspace(
+                        db, document_id, workspace_id
+                    )
+                except document_views.RevisionNotReady:
+                    continue
                 if identity is None:
                     continue
                 candidates.append(
@@ -2266,36 +2379,102 @@ class V1RevisionAwareRetrievalService:
             raise V1ServiceUnavailable(
                 f"revision retrieval got an unusable top_k {top_k!r}"
             ) from exc
-        async with self._open_session() as db:
-            if tuple(allowed_targets or ()):
-                admitted = await self._load_scoped_identities(
-                    db, document_views, tuple(allowed_targets), workspaces
-                )
-            else:
-                admitted = await self._discover_identities(
-                    db, document_views, query.strip(), workspaces
-                )
+        try:
+            limit = max(1, min(int(top_k), 20))
+        except (TypeError, ValueError) as exc:
+            raise V1ServiceUnavailable(
+                f"revision retrieval got an unusable top_k {top_k!r}"
+            ) from exc
+        # Per-stage wall time (metadata only — counts and ms, never query
+        # text or chunk content; v2 content-suppression tracing policy).
+        from app.services.agent.timing_recorder import get_recorder
+
+        recorder = get_recorder()
+        t0 = time.monotonic()
+        if recorder is not None:
+            async with recorder.span("stage", "discover"):
+                async with self._open_session() as db:
+                    if tuple(allowed_targets or ()):
+                        admitted = await self._load_scoped_identities(
+                            db, document_views, tuple(allowed_targets), workspaces
+                        )
+                    else:
+                        admitted = await self._discover_identities(
+                            db, document_views, query.strip(), workspaces
+                        )
+        else:
+            async with self._open_session() as db:
+                if tuple(allowed_targets or ()):
+                    admitted = await self._load_scoped_identities(
+                        db, document_views, tuple(allowed_targets), workspaces
+                    )
+                else:
+                    admitted = await self._discover_identities(
+                        db, document_views, query.strip(), workspaces
+                    )
+        t_discover = time.monotonic()
         if not admitted:
+            logger.info(
+                "[v2retrieve] discover=%dms admitted=0 (empty)",
+                int((t_discover - t0) * 1000),
+            )
             return ()
-        embedding = await self._embed(query.strip())
+        if recorder is not None:
+            async with recorder.span("stage", "embed"):
+                embedding = await self._embed(query.strip())
+        else:
+            embedding = await self._embed(query.strip())
+        t_embed = time.monotonic()
         scored: list[tuple[float, str, Any, str]] = []
         seen: set[tuple[str, str, str]] = set()
-        for identity in admitted:
-            for content, chunk_id, distance in await self._search_identity(
-                identity, embedding, limit, workspaces
-            ):
-                key = (
-                    str(identity.revision_id),
-                    str(identity.document_id),
-                    chunk_id,
-                )
-                if key in seen:
-                    continue
-                seen.add(key)
-                scored.append((distance, content, identity, chunk_id))
+
+        async def _search_all() -> None:
+            for identity in admitted:
+                for content, chunk_id, distance in await self._search_identity(
+                    identity, embedding, limit, workspaces
+                ):
+                    key = (
+                        str(identity.revision_id),
+                        str(identity.document_id),
+                        chunk_id,
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    scored.append((distance, content, identity, chunk_id))
+
+        if recorder is not None:
+            async with recorder.span("stage", "search"):
+                await _search_all()
+        else:
+            await _search_all()
+        t_search = time.monotonic()
         if not scored:
+            logger.info(
+                "[v2retrieve] discover=%dms embed=%dms search=%dms "
+                "admitted=%d hits=0 (empty)",
+                int((t_discover - t0) * 1000),
+                int((t_embed - t_discover) * 1000),
+                int((t_search - t_embed) * 1000),
+                len(admitted),
+            )
             return ()
-        order = await self._rank(query.strip(), [c for _, c, _, _ in scored])
+        if recorder is not None:
+            async with recorder.span("stage", "rerank"):
+                order = await self._rank(query.strip(), [c for _, c, _, _ in scored])
+        else:
+            order = await self._rank(query.strip(), [c for _, c, _, _ in scored])
+        t_rank = time.monotonic()
+        logger.info(
+            "[v2retrieve] discover=%dms embed=%dms search=%dms rerank=%dms "
+            "admitted=%d hits=%d",
+            int((t_discover - t0) * 1000),
+            int((t_embed - t_discover) * 1000),
+            int((t_search - t_embed) * 1000),
+            int((t_rank - t_search) * 1000),
+            len(admitted),
+            len(scored),
+        )
         chunks: list[RevisionRetrievedChunk] = []
         for rank, (distance, content, identity, chunk_id) in enumerate(scored):
             score = order.get(rank, -float(distance))
@@ -2331,6 +2510,25 @@ class V1RevisionAwareRetrievalService:
         workspaces: tuple[UUID, ...],
     ) -> list[Any]:
         """Pin every planned target to its exact manifest; fail closed."""
+        from app.models.document import Document
+        from sqlalchemy import select as _select
+
+        # Resolve each pinned document's owning workspace in ONE query; only
+        # the true owner can satisfy the workspace join inside
+        # load_revision_identity_for_workspace, so probing every workspace
+        # per target (the old loop) wasted hundreds of round-trips on wide
+        # scopes.
+        doc_ids = [target.document.document_id for target in allowed_targets]
+        owner_rows = (
+            await db.execute(
+                _select(Document.id, Document.workspace_id).where(
+                    Document.id.in_(doc_ids),
+                    Document.workspace_id.in_(list(workspaces)),
+                    Document.source_deleted_at.is_(None),
+                )
+            )
+        ).all()
+        owner_map = {doc_id: ws_id for doc_id, ws_id in owner_rows}
         admitted: list[Any] = []
         for target in allowed_targets:
             binding = target.document
@@ -2345,23 +2543,24 @@ class V1RevisionAwareRetrievalService:
                     "pinned target carries an unparsable revision; "
                     "refusing to retrieve"
                 ) from exc
-            identity = None
-            last_error: Exception | None = None
-            for workspace_id in workspaces:
-                try:
-                    identity = await document_views.load_revision_identity_for_workspace(
-                        db, revision_id, workspace_id, require_vectors=True
-                    )
-                except document_views.RevisionNotReady as exc:
-                    last_error = exc
-                    continue
-                break
-            if identity is None:
+            workspace_id = owner_map.get(binding.document_id)
+            if workspace_id is None:
                 raise V1ServiceUnavailable(
                     f"pinned revision {revision_id} has no usable manifest "
-                    f"in this workspace scope ({last_error}); refusing to "
+                    "in this workspace scope (document not owned by an "
+                    "authorized workspace or tombstoned); refusing to "
                     "retrieve"
                 )
+            try:
+                identity = await document_views.load_revision_identity_for_workspace(
+                    db, revision_id, workspace_id, require_vectors=True
+                )
+            except document_views.RevisionNotReady as exc:
+                raise V1ServiceUnavailable(
+                    f"pinned revision {revision_id} has no usable manifest "
+                    f"in this workspace scope ({exc}); refusing to "
+                    "retrieve"
+                ) from exc
             if (
                 identity.document_id != binding.document_id
                 or str(identity.revision_id) != str(revision_id)
@@ -2384,9 +2583,6 @@ class V1RevisionAwareRetrievalService:
         """Workspace-scoped discovery, then the same manifest pin per hit."""
         discover = self._discover
         if discover is None:
-            search_fn = _v1_attr(
-                "app.services.agent.tools", "search_documents"
-            )
 
             async def discover(
                 found_query: str,
@@ -2394,40 +2590,13 @@ class V1RevisionAwareRetrievalService:
                 found_workspaces: list,
                 found_db: Any,
             ) -> list[UUID]:
-                found = await _maybe_await(
-                    search_fn(
-                        found_query,
-                        found_top_k,
-                        list(found_workspaces),
-                        set(),
-                        found_db,
-                    )
+                return await _discover_workspace_document_ids(
+                    found_db,
+                    found_query,
+                    found_top_k,
+                    tuple(found_workspaces),
+                    embed=None,
                 )
-                sources = (
-                    found.get("sources", ())
-                    if isinstance(found, Mapping)
-                    else ()
-                )
-                document_ids: list[UUID] = []
-                seen: set[UUID] = set()
-                for source in sources:
-                    raw_id = (
-                        source.get("document_id")
-                        if isinstance(source, Mapping)
-                        else getattr(source, "document_id", None)
-                    )
-                    try:
-                        document_id = (
-                            raw_id
-                            if isinstance(raw_id, UUID)
-                            else UUID(str(raw_id))
-                        )
-                    except (ValueError, TypeError, AttributeError):
-                        continue
-                    if document_id not in seen:
-                        seen.add(document_id)
-                        document_ids.append(document_id)
-                return document_ids
 
         try:
             document_ids = await _maybe_await(
@@ -2439,7 +2608,16 @@ class V1RevisionAwareRetrievalService:
             raise V1ServiceUnavailable(
                 f"revision discovery is unavailable: {exc}"
             ) from exc
-        admitted: list[Any] = []
+        # Batch-resolve each candidate's owning workspace in ONE query instead
+        # of probing every workspace per document (the old loop issued up to
+        # len(workspaces) sequential queries per id — hundreds of round-trips
+        # on wide scopes). Only the true owner can satisfy the workspace join
+        # inside load_current_revision_identity_for_workspace, so the map is
+        # exact; foreign/tombstoned ids simply have no entry and are skipped.
+        from app.models.document import Document
+        from sqlalchemy import select as _select
+
+        parsed_ids: list[UUID] = []
         seen_docs: set[UUID] = set()
         for raw_id in document_ids or ():
             try:
@@ -2451,16 +2629,30 @@ class V1RevisionAwareRetrievalService:
             if document_id in seen_docs:
                 continue
             seen_docs.add(document_id)
-            identity = None
-            for workspace_id in workspaces:
-                try:
-                    identity = await document_views.load_current_revision_identity_for_workspace(
-                        db, document_id, workspace_id, require_vectors=True
-                    )
-                except document_views.RevisionNotReady:
-                    continue
-                if identity is not None:
-                    break
+            parsed_ids.append(document_id)
+        if not parsed_ids:
+            return []
+        owner_rows = (
+            await db.execute(
+                _select(Document.id, Document.workspace_id).where(
+                    Document.id.in_(parsed_ids),
+                    Document.workspace_id.in_(list(workspaces)),
+                    Document.source_deleted_at.is_(None),
+                )
+            )
+        ).all()
+        owner_map = {doc_id: ws_id for doc_id, ws_id in owner_rows}
+        admitted: list[Any] = []
+        for document_id in parsed_ids:
+            workspace_id = owner_map.get(document_id)
+            if workspace_id is None:
+                continue
+            try:
+                identity = await document_views.load_current_revision_identity_for_workspace(
+                    db, document_id, workspace_id, require_vectors=True
+                )
+            except document_views.RevisionNotReady:
+                continue
             if identity is None:
                 continue
             try:
@@ -2692,6 +2884,123 @@ async def _default_revision_namespace_query(
         )
 
     return await asyncio.to_thread(_run)
+
+# Discovery only needs candidate document ids — the caller re-embeds and
+# re-searches the pinned revision namespaces right after. Running the full
+# v1 hybrid pipeline (KG + vector + BM25 + rerank) per workspace under the
+# GPU search semaphore just to mint ids serialized a wide authorized scope
+# into ~20s of wasted work. This probe is deliberately vector-only: one
+# embed call, one ChromaDB query per workspace that can actually pin a
+# document, no GPU slot, no KG, no rerank.
+_DISCOVERY_FANOUT = 16
+
+
+async def _discover_workspace_document_ids(
+    db: Any,
+    query: str,
+    top_k: int,
+    workspaces: tuple[UUID, ...],
+    *,
+    embed: Any = None,
+) -> list[UUID]:
+    """Vector-only discovery probe over the authorized workspace scope.
+
+    Returns up to ``top_k`` distinct document ids ordered by best vector
+    distance across workspaces. Workspaces that cannot yield a pinnable
+    candidate (no live document with a current revision) are skipped by one
+    DB query up front; a per-workspace vector failure is logged and skipped
+    (degraded), matching the v1 fan-out's non-fatal semantics.
+    """
+    from app.models.document import Document
+    from sqlalchemy import select as _select
+
+    try:
+        limit = max(1, int(top_k))
+    except (TypeError, ValueError):
+        limit = 10
+
+    rows = (
+        await db.execute(
+            _select(Document.workspace_id)
+            .where(
+                Document.workspace_id.in_(list(workspaces)),
+                Document.current_revision_id.is_not(None),
+                Document.source_deleted_at.is_(None),
+            )
+            .distinct()
+        )
+    ).all()
+    pinnable = {row[0] for row in rows}
+    probe_workspaces = [ws for ws in workspaces if ws in pinnable]
+    if not probe_workspaces:
+        return []
+
+    if embed is None:
+        async def embed(text: str) -> list[float]:
+            def _run() -> list[float]:
+                from app.services.embedding.embedder import (
+                    get_embedding_service,
+                )
+
+                return get_embedding_service().embed_query(text)
+
+            return await asyncio.to_thread(_run)
+
+    embedding = await _maybe_await(embed(query))
+
+    fanout = asyncio.Semaphore(_DISCOVERY_FANOUT)
+
+    async def _probe(workspace_id: UUID) -> list[tuple[float, UUID]]:
+        def _run() -> list[tuple[float, UUID]]:
+            from app.services.embedding.vector_store import get_vector_store
+
+            res = get_vector_store(workspace_id).query(
+                query_embedding=embedding,
+                n_results=limit,
+                include=["metadatas", "distances"],
+            )
+            hits: list[tuple[float, UUID]] = []
+            metadatas = res.get("metadatas") or []
+            distances = res.get("distances") or []
+            for i, meta in enumerate(metadatas):
+                if not isinstance(meta, Mapping):
+                    continue
+                try:
+                    doc_id = UUID(str(meta.get("document_id")))
+                    distance = float(
+                        distances[i] if i < len(distances) else 0.0
+                    )
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                hits.append((distance, doc_id))
+            return hits
+
+        async with fanout:
+            try:
+                return await asyncio.to_thread(_run)
+            except Exception as exc:
+                logger.warning(
+                    "[v2retrieve] discovery probe failed for workspace %s: %s",
+                    workspace_id,
+                    exc,
+                )
+                return []
+
+    results = await asyncio.gather(*(_probe(ws) for ws in probe_workspaces))
+    hits = sorted(
+        (hit for ws_hits in results for hit in ws_hits),
+        key=lambda item: item[0],
+    )
+    document_ids: list[UUID] = []
+    seen: set[UUID] = set()
+    for _distance, doc_id in hits:
+        if doc_id in seen:
+            continue
+        seen.add(doc_id)
+        document_ids.append(doc_id)
+        if len(document_ids) >= limit:
+            break
+    return document_ids
 
 
 class V1DocumentContentReader:
@@ -3050,10 +3359,13 @@ def build_runtime_services(
     authorization: Any = None,
     evidence_hydrator: Any = None,
     answer_draft_channel: AnswerDraftChannel | None = None,
+    answer_draft_builder: Any = None,
     pinned_target_resolver: Any = None,
     intent_classifier: Any = None,
     adaptive_planner: Any = None,
     adaptive_replanner: Any = None,
+    citation_resolver: Any = None,
+    people_lookup: Any = None,
 ) -> RuntimeServices:
     """Construct the request-scoped ``RuntimeServices`` (single bag, T7 seam).
 
@@ -3071,10 +3383,13 @@ def build_runtime_services(
         authorization=authorization,
         evidence_hydrator=evidence_hydrator,
         answer_draft_channel=answer_draft_channel,
+        answer_draft_builder=answer_draft_builder,
         pinned_target_resolver=pinned_target_resolver,
         intent_classifier=intent_classifier,
         adaptive_planner=adaptive_planner,
         adaptive_replanner=adaptive_replanner,
+        citation_resolver=citation_resolver,
+        people_lookup=people_lookup,
     )
 
 

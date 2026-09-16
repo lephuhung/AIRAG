@@ -507,10 +507,13 @@ def test_runtime_services_excludes_plan_checkpoint_and_evaluator_service() -> No
         "authorization",
         "evidence_hydrator",
         "answer_draft_channel",
+        "answer_draft_builder",
         "pinned_target_resolver",
         "intent_classifier",
         "adaptive_planner",
         "adaptive_replanner",
+        "citation_resolver",
+        "people_lookup",
     }
     assert "plan_checkpoint" not in RuntimeServices.model_fields
     assert not any("evaluator" in name for name in RuntimeServices.model_fields)

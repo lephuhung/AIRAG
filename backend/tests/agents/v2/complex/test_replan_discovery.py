@@ -2456,18 +2456,28 @@ async def test_large_summarize_map_reduces_over_sections() -> None:
     assert output["evaluation"].status == "sufficient"
     assert len(section_capability.calls) == 2
 
-    # The REDUCE stage executed through the framework handoff: one ordered
-    # extractive draft (s1 before s2), validated against admitted uses.
-    assert len(channel.stored) == 1
-    run_id, draft, evidence = channel.stored[0]
-    assert run_id == "run-summarize-map-1"
-    assert [claim.text for claim in draft.claims] == [
-        "content of s1",
-        "content of s2",
+    # Task 7A (spec §6.2): the reduce is NOT a second synthesis owner — it
+    # writes no draft and makes no provider call. It returns the map-task
+    # uses in exact ReduceSpec order on the merged evaluation; the outer
+    # supervisor's single synthesis state machine owns the summary.
+    assert channel.stored == []
+    ordered = output["evaluation"].synthesis_use_order
+    assert ordered is not None
+    s1_uses = {
+        use_id
+        for use_id, (_, target_id) in section_capability.uses.items()
+        if target_id == "s1"
+    }
+    s2_uses = {
+        use_id
+        for use_id, (_, target_id) in section_capability.uses.items()
+        if target_id == "s2"
+    }
+    assert len(s1_uses) == 1 and len(s2_uses) == 1
+    assert [ref.use_id for ref in ordered] == [
+        next(iter(s1_uses)),
+        next(iter(s2_uses)),
     ]
-    admitted_ids = frozenset(item.use_id for item in evidence)
-    assert len(admitted_ids) == 2
-    validate_answer_draft(draft, admitted_ids)
 
 
 def test_reduce_uses_framework_boundaries_not_agent_or_capability() -> None:
@@ -2477,8 +2487,12 @@ def test_reduce_uses_framework_boundaries_not_agent_or_capability() -> None:
     from app.services.agents.v2.contracts.capability import CapabilityInput
 
     reduce_source = inspect.getsource(graph_module.summarize_reduce_node)
-    assert "synthesize_answer" in reduce_source
-    assert "store_draft" in reduce_source
+    # Task 7A (spec §6.2): the reduce owns ordering only — no provider call,
+    # no draft, no channel write, no second synthesis boundary.
+    assert "synthesis_use_order" in reduce_source
+    assert "synthesize_answer" not in reduce_source
+    assert "store_draft" not in reduce_source
+    assert "answer_draft_channel" not in reduce_source
     assert "hydrate_for_evaluation" not in reduce_source
     assert "build_extractive_draft" not in reduce_source
     assert "capability.execute(" not in reduce_source
@@ -2532,31 +2546,23 @@ class BudgetSpyHydrator(FakeHydrator):
 
 
 @pytest.mark.asyncio
-async def test_reduce_applies_synthesis_budget(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """R47: the reduce exercises the synthesis entry and honors its budget."""
+async def test_reduce_orders_uses_without_provider_or_channel() -> None:
+    """§6.2/§17.3: the reduce makes zero provider calls, writes no draft,
+    and returns the map-task uses in exact ReduceSpec order on the merged
+    evaluation for the single outer synthesis state machine."""
     from langgraph.checkpoint.memory import InMemorySaver
 
-    import app.services.agents.v2.complex_research_graph as graph_module
     from app.services.agents.v2.complex_research_graph import (
         _build_complex_research_graph,
     )
     from app.services.agents.v2.contracts.locators import SectionLocator
-    from app.services.agents.v2.contracts.synthesis import SynthesisRuntimeContext
 
-    tiny_budget = SynthesisRuntimeContext(
-        max_evidence_items=1, max_total_chars=100000, max_total_tokens=10000
-    )
-    monkeypatch.setattr(
-        graph_module, "DEFAULT_SYNTHESIS_BUDGET", tiny_budget
-    )
     locator_for = {
         "s1": SectionLocator(kind="section", structure_node_id="chap-II"),
         "s2": SectionLocator(kind="section", structure_node_id="chap-III"),
     }
     (document_capability, section_capability), leases, context = _harness(
-        run_id="run-reduce-budget-1", locator_for=locator_for
+        run_id="run-reduce-order-1", locator_for=locator_for
     )
     spy = BudgetSpyHydrator((document_capability, section_capability))
     context.services.evidence_hydrator = spy
@@ -2572,15 +2578,15 @@ async def test_reduce_applies_synthesis_budget(
     )
     output = await compiled.ainvoke(
         child,
-        config={"configurable": {"thread_id": "thread-reduce-budget-1"}},
+        config={"configurable": {"thread_id": "thread-reduce-order-1"}},
         context=context,
     )
     assert output["evaluation"].status == "sufficient"
-    # The synthesis entry ran exactly once (the reduce), with the budget,
-    # and the map uses arrived in spec order.
-    assert len(spy.synthesis_calls) == 1
-    call = spy.synthesis_calls[0]
-    assert call["budget"] is tiny_budget
+    # Zero synthesis hydration, zero draft writes: the reduce only orders.
+    assert spy.synthesis_calls == []
+    assert channel.stored == []
+    ordered = output["evaluation"].synthesis_use_order
+    assert ordered is not None
     s1_uses = {
         use_id
         for use_id, (_, target_id) in section_capability.uses.items()
@@ -2592,16 +2598,16 @@ async def test_reduce_applies_synthesis_budget(
         if target_id == "s2"
     }
     assert len(s1_uses) == 1 and len(s2_uses) == 1
-    assert call["ref_ids"] == [next(iter(s1_uses)), next(iter(s2_uses))]
-    # The passed budget bound the draft: one head claim, not two.
-    assert len(channel.stored) == 1
-    _, draft, _ = channel.stored[0]
-    assert [claim.text for claim in draft.claims] == ["content of s1"]
+    assert [ref.use_id for ref in ordered] == [
+        next(iter(s1_uses)),
+        next(iter(s2_uses)),
+    ]
 
 
 @pytest.mark.asyncio
-async def test_reduce_missing_seam_fails_closed() -> None:
-    """R47: a missing channel or hydrator fails the mandatory reduce closed."""
+async def test_reduce_missing_map_result_fails_closed() -> None:
+    """§17.3: a reduce spec naming a map task with no checkpointed result
+    fails closed — never a partial reduction."""
     from langgraph.checkpoint.memory import InMemorySaver
 
     from app.services.agents.v2.complex_research_graph import (
@@ -2610,7 +2616,6 @@ async def test_reduce_missing_seam_fails_closed() -> None:
         summarize_reduce_node,
     )
     from app.services.agents.v2.contracts.locators import SectionLocator
-    from app.services.agents.v2.nodes.synthesize import SynthesisError
 
     locator_for = {
         "s1": SectionLocator(kind="section", structure_node_id="chap-II"),
@@ -2619,8 +2624,6 @@ async def test_reduce_missing_seam_fails_closed() -> None:
     _, _, context = _harness(
         run_id="run-reduce-closed-1", locator_for=locator_for
     )
-    channel = FakeDraftChannel()
-    context.services.answer_draft_channel = channel
     child = _child_input(
         query_analysis=_analysis("summarize"),
         bindings=_single_target_bindings(),
@@ -2635,15 +2638,15 @@ async def test_reduce_missing_seam_fails_closed() -> None:
         context=context,
     )
     assert sufficient["evaluation"].status == "sufficient"
-    assert len(channel.stored) == 1
-
-    context.services.answer_draft_channel = None
+    # Drop one map-task result: the spec lineage is incomplete → closed.
+    broken = dict(sufficient)
+    broken["task_results"] = tuple(
+        result
+        for result in sufficient["task_results"]
+        if result.task_id != "T2"
+    )
     with pytest.raises(ComplexResearchError):
-        await summarize_reduce_node(sufficient, context)
-    context.services.answer_draft_channel = channel
-    context.services.evidence_hydrator = None
-    with pytest.raises(SynthesisError):
-        await summarize_reduce_node(sufficient, context)
+        await summarize_reduce_node(broken, context)
 
 
 def test_bounded_summarize_stays_fast() -> None:

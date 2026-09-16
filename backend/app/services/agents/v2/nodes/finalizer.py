@@ -1,4 +1,4 @@
-"""Terminal response boundary (Phase 2, Task 4).
+"""Terminal response boundary (Phase 2, Task 4; grounded synthesis: Task 6B).
 
 Only direct non-factual paths and grounded factual paths may emit success:
 
@@ -7,30 +7,40 @@ Only direct non-factual paths and grounded factual paths may emit success:
   Phase 2 uses the canned fallback — never a capability, never evidence).
 - ``clarify`` → the persisted clarification question (fail-closed when the
   route promises a question the checkpoint does not hold).
-- ``fast_domain`` factual → the grounded result consumed from the
-  runtime-only channel (this node never synthesizes or grounds on the normal
-  path); ``sufficient`` but ungroundable, and every other evaluation status,
-  emits a typed non-success response. Synthesis failures become typed
-  responses (denied/insufficient/error from the checkpointed task outcomes),
-  never escaping exceptions. User-facing content carries no internal
-  target/criterion identifiers.
+- ``fast_domain`` factual → the ``SynthesisCheckpoint`` on the supervisor
+  aggregate is the single authority for the LLM synthesis path (spec
+  §13.3–13.5): a ``grounded`` phase becomes ``success`` with the
+  server-rendered content and the allowlisted ``PublicCitation``
+  projection replayed verbatim; every other checkpoint outcome —
+  ``failed``, a mid-flight phase, or a corrupt checkpoint — collapses to
+  the §12.4 typed ``error`` terminal with the safe Vietnamese message.
+  When ``synthesis`` is ``None`` the non-LLM presentation path applies:
+  the synthesize boundary ran the existing presentation inline (e.g.
+  people_card) and stored its grounded result in the runtime-only
+  channel, which this node replays; a channel-recorded failure becomes a
+  typed response from the checkpointed task outcomes; a missing entry on
+  a ``sufficient`` verdict fails closed as §12.4. Non-sufficient verdicts
+  keep their typed terminals (denied/error/insufficient). User-facing
+  content carries no internal identifiers.
 - ``complex_research`` → the subgraph's verdict decides: ``sufficient``
-  flowed through ``synthesize``/``ground`` into the shared channel and
-  finalizes factually here (success when grounded); every other verdict
+  runs flow through the same checkpointed synthesis state machine and
+  finalize factually here (success when grounded); every other verdict
   (or a missing evaluation) becomes a typed non-success response, never a
   fabricated answer. Write (``simple_write_operation``) stays typed
   unavailable (``denied``).
 
-On a channel miss (restart between ground and finalizer) the grounded result
-is re-derived deterministically ONCE through the shared
-``synthesize_and_lease`` helper plus ``ground_answer`` — which also leases
-any freshly minted overflow uses — rather than synthesizing on every node.
+There is no re-derivation and no extractive fallback on production paths:
+``SynthesisCheckpoint`` is authoritative for LLM attempts, handles,
+grounded output, and recovery (spec §13.5); the channel only carries the
+non-LLM presentation result within the same process.
 
 Terminal lease release is NOT performed here: the outer runner releases the
 run's leases only after the terminal checkpoint succeeds (T6 ordering).
 """
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from typing import Awaitable, Callable
 
 from langgraph.runtime import Runtime
@@ -40,18 +50,10 @@ from ..contracts.response import FinalResponse
 from ..contracts.routing import RouteDecision
 from ..contracts.semantic import SemanticContext
 from ..contracts.state import GraphRuntimeContext, SupervisorV2State
+from ..contracts.synthesis import SynthesisCheckpoint
 from ..contracts.validation import validate_final_response
 from .context import _context_of
 from .evaluate import _channel_of
-from .execute import require_checkpointed_plan
-from .grounding import GroundingInsufficient
-from .grounding import ground_answer as _ground_answer
-from .synthesize import (
-    DEFAULT_SYNTHESIS_BUDGET,
-    SynthesisError,
-    _synthesis_input_of,
-    synthesize_and_lease,
-)
 
 __all__ = [
     "FinalizerError",
@@ -122,10 +124,67 @@ def _emit(response: FinalResponse) -> dict:
     return {"final_response": response}
 
 
-def _typed_synthesis_failure(state: SupervisorV2State) -> dict:
-    """Translate a synthesis failure into a typed response (never a raise).
+#: Spec §12.4: the single user-safe message for every synthesis failure —
+#: persisted as nonblank assistant content so a reload never recreates a
+#: blank row. Internal failure codes stay telemetry-only.
+_SYNTHESIS_FAILED_CONTENT = (
+    "Không thể tổng hợp câu trả lời đã được kiểm chứng. Vui lòng thử lại."
+)
 
-    A denied task outcome denies the response; an error outcome errors it;
+
+def _synthesis_checkpoint_of(
+    state: SupervisorV2State,
+) -> SynthesisCheckpoint | None:
+    """Coerce the checkpointed synthesis slot (model or serde mapping).
+
+    Post-checkpoint the slot may arrive as a plain mapping whose nested
+    tuples revived as lists; the JSON round-trip mirrors ``_coerce_slot``
+    (supervisor_v2) so strict-mode validation still succeeds. An
+    unparseable value resolves to ``None`` so the caller fails closed with
+    the typed synthesis failure instead of raising on corrupt state.
+    """
+    value = state.get("synthesis")
+    if value is None:
+        return None
+    if isinstance(value, SynthesisCheckpoint):
+        return value
+    if isinstance(value, Mapping):
+        try:
+            return SynthesisCheckpoint.model_validate(value)
+        except Exception:
+            try:
+                return SynthesisCheckpoint.model_validate_json(
+                    json.dumps(value, default=str)
+                )
+            except Exception:
+                return None
+    return None
+
+
+def _typed_synthesis_failure() -> dict:
+    """Spec §12.4: exactly one typed error terminal for synthesis failure.
+
+    Every non-grounded checkpoint outcome — ``failed`` phase, a mid-flight
+    phase that reached the finalizer, or a missing/corrupt checkpoint with
+    no channel entry on a sufficient verdict — collapses to the same safe
+    message. No internal codes, no partial proposal, no extractive
+    re-derivation.
+    """
+    return _emit(
+        FinalResponse(
+            contract_version=CONTRACT_VERSION,
+            status="error",
+            content=_SYNTHESIS_FAILED_CONTENT,
+            citations=(),
+        )
+    )
+
+
+def _typed_outcome_failure(state: SupervisorV2State) -> dict:
+    """Translate a channel-recorded synthesis failure into a typed response.
+
+    Used only for the non-LLM presentation path (``synthesis=None``): a
+    denied task outcome denies the response; an error outcome errors it;
     anything else (``not_found``, decayed hydration, empty admission) is a
     typed ``insufficient``. No internal identifiers reach the content.
     """
@@ -261,6 +320,30 @@ async def _finalize_factual(
                 citations=(),
             )
         )
+    # Sufficient verdict: the checkpointed SynthesisCheckpoint is the single
+    # authority for the LLM synthesis path (spec §13.3–13.5). A grounded
+    # artifact becomes the success response verbatim — the rendered content
+    # and the allowlisted PublicCitation projection are replayed, never
+    # rebuilt. Every other checkpoint outcome (failed phase, mid-flight
+    # phase, corrupt checkpoint) is the §12.4 typed synthesis failure.
+    checkpoint = _synthesis_checkpoint_of(state)
+    if checkpoint is not None:
+        if checkpoint.phase == "grounded" and checkpoint.grounded is not None:
+            return _emit(
+                FinalResponse(
+                    contract_version=CONTRACT_VERSION,
+                    status="success",
+                    content=checkpoint.grounded.content,
+                    citations=checkpoint.grounded.citations,
+                )
+            )
+        return _typed_synthesis_failure()
+    # synthesis=None: the non-LLM presentation path (people_card and other
+    # existing specialized presentations) runs inline at the synthesize
+    # boundary and stores its grounded result in the runtime-only channel —
+    # it never enters the bounded state machine, so no checkpoint exists.
+    # The channel is authoritative ONLY for this path; a missing entry on a
+    # sufficient verdict means the state machine never ran — fail closed.
     run_id = context.capability_runtime.run_id
     channel = _channel_of(context)
     entry = channel.get(run_id) if channel is not None else None
@@ -274,40 +357,8 @@ async def _finalize_factual(
             )
         )
     if entry is not None and entry.synthesis_error is not None:
-        return _typed_synthesis_failure(state)
-    # Channel miss: single deterministic re-derivation (synthesize + lease +
-    # ground, no reviser); failures become typed responses, never raises.
-    plan = require_checkpointed_plan(state)
-    try:
-        derived = await synthesize_and_lease(
-            synthesis_input=_synthesis_input_of(state),
-            runtime=context,
-            plan=plan,
-            bindings=state["bindings"],
-            budget=DEFAULT_SYNTHESIS_BUDGET,
-        )
-        grounded = await _ground_answer(
-            draft=derived.draft, evidence=derived.evidence
-        )
-    except GroundingInsufficient:
-        return _emit(
-            FinalResponse(
-                contract_version=CONTRACT_VERSION,
-                status="insufficient",
-                content=_INSUFFICIENT_CONTENT,
-                citations=(),
-            )
-        )
-    except SynthesisError:
-        return _typed_synthesis_failure(state)
-    return _emit(
-        FinalResponse(
-            contract_version=CONTRACT_VERSION,
-            status="success",
-            content=grounded.draft.content,
-            citations=grounded.citations,
-        )
-    )
+        return _typed_outcome_failure(state)
+    return _typed_synthesis_failure()
 
 
 async def finalizer_node(
@@ -356,11 +407,12 @@ async def finalizer_node(
             )
         )
     if route.route == "complex_research":
-        # Phase 3 (R4): the complex subgraph evaluated; `sufficient` runs
-        # were synthesized + grounded through the shared channel and every
-        # other verdict is typed here. An evaluation-less complex turn
-        # returns the typed missing-verdict reply from `_finalize_factual`
-        # (clarify when a semantic gap remains, else insufficient).
+        # Phase 3 (R4) + Task 6B: the complex subgraph evaluated; sufficient
+        # runs flow through the same checkpointed synthesis state machine
+        # (the outer ``synthesize`` boundary) and finalize factually here.
+        # Every other verdict — or a missing evaluation — returns the typed
+        # missing-verdict reply from `_finalize_factual` (clarify when a
+        # semantic gap remains, else insufficient).
         return await _finalize_factual(state, context)
     return _emit(
         FinalResponse(

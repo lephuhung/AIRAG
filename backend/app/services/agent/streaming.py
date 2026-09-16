@@ -32,8 +32,11 @@ SSE events (format tương thích 100% với legacy chat_agent.py):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import time
+from collections.abc import Mapping
 from contextvars import ContextVar
 from typing import AsyncGenerator, Optional
 
@@ -564,7 +567,18 @@ def build_initial_state(
 #
 # - Only this OUTER adapter streams user-facing prose: the terminal
 #   ``FinalResponse.content`` is chunked into ``token`` events here. v2
-#   nodes never push token events (pinned by test).
+#   nodes never push token events (pinned by test). Nodes MAY write
+#   advisory ``synthesis.speculative_*`` payloads to the LangGraph custom
+#   stream; the adapter renders them as speculative ``token`` events and
+#   always retracts them with ``token_rollback`` before a repair attempt,
+#   before any terminal, and before the final grounded render.
+# - In-flight progress is projected HERE too: the runner drives the graph
+#   via ``astream(stream_mode=["updates","tasks","values","custom"], subgraphs=True)``
+#   and maps node starts onto v1 ``status`` steps (``_V2_NODE_PROGRESS``,
+#   consecutive duplicates suppressed); nodes never emit events, and the
+#   last top-level ``values`` chunk is the terminal state (identical to
+#   ``ainvoke``, including ``__interrupt__``). Graphs without ``astream``
+#   fall back to plain ``ainvoke``.
 # - Exactly ONE terminal event per run: ``complete`` for success/clarify,
 #   ``error`` for denied/insufficient/error AND for unexpected graph
 #   failures (a raw exception never escapes the SSE stream; leases still
@@ -586,6 +600,9 @@ def build_initial_state(
 #       command = await resume_clarification(message_id, request, runtime)
 #       await graph.ainvoke(Command(resume=<resolution>), config,
 #                           context=runtime_context)
+#
+#   (The runner actually drives this payload through ``astream`` — same
+#   payload/config/context, see the progress rule above.)
 #
 #   On resume the runner refreshes existing leases BEFORE continuing, feeds
 #   the plan resolver from the checkpointed plan/bindings, and reinjects the
@@ -645,6 +662,8 @@ class _V2StreamAccumulators:
         self.images: list = []
         self.people_data: list = []
         self.potential_abbreviations: list = []
+        self.speculative_text = ""
+        self.speculative_kind: str | None = None
 
     def on_token(self, text: str) -> None:
         self.answer_text += text or ""
@@ -661,6 +680,14 @@ class _V2StreamAccumulators:
     def on_potential_abbreviations(self, abbreviations: list) -> None:
         self.potential_abbreviations = list(abbreviations or [])
 
+    def on_speculative(self, kind: str, text: str) -> str:
+        """Append one speculative claim; returns the rendered chunk."""
+        chunk = _speculative_claim_chunk(self.speculative_kind, kind, text)
+        self.speculative_text += chunk
+        self.answer_text += chunk
+        self.speculative_kind = kind
+        return chunk
+
     def on_rollback(self) -> dict:
         """Clear every accumulator; returns the ``token_rollback`` event."""
         self.answer_text = ""
@@ -668,6 +695,8 @@ class _V2StreamAccumulators:
         self.images = []
         self.people_data = []
         self.potential_abbreviations = []
+        self.speculative_text = ""
+        self.speculative_kind = None
         return {"event": "token_rollback", "data": {}}
 
 
@@ -685,6 +714,198 @@ def _chunk_prose(text: str, size: int) -> list[str]:
     if not text:
         return []
     return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+
+
+#: Node START -> v1 status step the outer adapter projects while the graph
+#: runs (progress only; nodes never emit events). Steps not listed are silent.
+_V2_NODE_PROGRESS: dict[str, tuple[str, str]] = {
+    "execute": ("searching", "Đang tra cứu tài liệu..."),
+    "replan": ("searching", "Đang tìm bổ sung phần còn thiếu..."),
+    "evaluate": ("retrieved", "Đang đánh giá bằng chứng..."),
+    "reduce": ("retrieved", "Đang tổng hợp bằng chứng..."),
+    "synthesize": ("generating", "Đang soạn câu trả lời..."),
+    "direct": ("generating", "Đang trả lời..."),
+}
+
+
+def _v2_progress_event(node: str, last_step: str | None) -> dict | None:
+    """Project a node start onto a v1 ``status`` event; ``None`` when the node is silent or repeats the last emitted step."""
+    mapped = _V2_NODE_PROGRESS.get(node)
+    if mapped is None or mapped[0] == last_step:
+        return None
+    return {"event": "status", "data": {"step": mapped[0], "detail": mapped[1]}}
+
+
+#: Caveat bullet prefix used when rendering speculative detail — mirrors
+#: ``v2/synthesis/render.py::_CAVEAT_PREFIX`` (pinned equal by test; v2
+#: imports stay function-local in this module).
+_V2_SPECULATIVE_CAVEAT_PREFIX = "**Lưu ý:** "
+
+
+def _speculative_claim_chunk(
+    prev_kind: str | None, kind: str, text: str
+) -> str:
+    """Render one speculative claim like the grounded renderer (no markers).
+
+    Summaries are plain paragraphs, details ``- `` bullets, caveats
+    ``- **Lưu ý:** `` bullets; a kind change (or a new summary) opens a new
+    block, consecutive details join with a single newline.
+    """
+    if kind == "caveat":
+        line = f"- {_V2_SPECULATIVE_CAVEAT_PREFIX}{text}"
+    elif kind == "detail":
+        line = f"- {text}"
+    else:
+        line = text
+    if prev_kind is None:
+        separator = ""
+    elif kind != prev_kind or kind == "summary":
+        separator = "\n\n"
+    else:
+        separator = "\n"
+    return separator + line
+
+
+def _v2_speculative_events(payload, acc: _V2StreamAccumulators) -> list[dict]:
+    """Map a custom-stream chunk onto adapter events (advisory only).
+
+    ``synthesis.speculative_reset`` retracts streamed claims via
+    ``token_rollback``; ``synthesis.speculative_claim`` renders one
+    speculative ``token``. Malformed payloads emit nothing.
+    """
+    from app.services.agents.v2.events import (
+        SYNTHESIS_SPECULATIVE_CLAIM,
+        SYNTHESIS_SPECULATIVE_RESET,
+    )
+
+    if not isinstance(payload, dict):
+        return []
+    kind = payload.get("kind")
+    if kind == SYNTHESIS_SPECULATIVE_RESET:
+        return [acc.on_rollback()] if acc.speculative_text else []
+    if kind != SYNTHESIS_SPECULATIVE_CLAIM:
+        return []
+    text = payload.get("text")
+    presentation = payload.get("presentation")
+    if (
+        not isinstance(text, str)
+        or not text
+        or presentation not in ("summary", "detail", "caveat")
+    ):
+        return []
+    return [
+        {
+            "event": "token",
+            "data": {"text": acc.on_speculative(presentation, text)},
+        }
+    ]
+
+
+async def _v2_run_graph(graph, payload, config, runtime_context, progress: "asyncio.Queue"):
+    """``ainvoke``-equivalent that reports node starts on ``progress``.
+
+    When the graph exposes ``astream`` (langgraph), the run streams with
+    ``stream_mode=["updates", "tasks", "values", "custom"]`` and
+    ``subgraphs=True``; task starts are queued as ``("node", name)`` for
+    status projection and custom chunks as ``("custom", chunk)`` for
+    speculative rendering, and the last top-level ``values`` chunk is
+    the terminal state (identical to ``ainvoke`` output, including
+    ``__interrupt__`` on a top-level suspend). Graphs without ``astream``
+    (test fakes) fall back to a plain ``ainvoke``. ``None`` is always
+    queued last so the consumer loop terminates on success, failure, and
+    cancellation.
+
+    Per-node wall time is measured from the task stream itself: a task
+    chunk carrying ``input`` (no ``result``/``error``) is the start, the
+    later chunk for the same task ``id`` carrying ``result`` or ``error``
+    is the end. Only node names and millisecond durations are logged —
+    never task payloads — matching the v2 content-suppression tracing
+    policy (``synthesis_tracing``).
+    """
+    run_started = time.monotonic()
+    task_starts: dict[str, float] = {}
+    task_labels: dict[str, str] = {}
+    node_timings: list[tuple[str, int | None, bool]] = []
+    from app.services.agent.timing_recorder import get_recorder
+
+    recorder = get_recorder()
+    try:
+        astream = getattr(graph, "astream", None)
+        if not callable(astream):
+            return await graph.ainvoke(payload, config, context=runtime_context)
+        latest = None
+        async with contextlib.aclosing(
+            astream(
+                payload,
+                config,
+                context=runtime_context,
+                stream_mode=["updates", "tasks", "values", "custom"],
+                subgraphs=True,
+            )
+        ) as stream:
+            async for item in stream:
+                if not (isinstance(item, tuple) and len(item) == 3):
+                    continue
+                ns, mode, chunk = item
+                if mode == "tasks" and isinstance(chunk, dict):
+                    name = str(chunk.get("name") or "")
+                    label = (
+                        "/".join(part.split(":", 1)[0] for part in (*ns, name))
+                        if ns
+                        else name
+                    )
+                    task_key = str(chunk.get("id") or name)
+                    if "input" in chunk and "result" not in chunk and "error" not in chunk:
+                        task_starts[task_key] = time.monotonic()
+                        task_labels[task_key] = label
+                        if recorder is not None:
+                            # Push the node label so a capability dispatch
+                            # inside this node parents under ``node:<name>``.
+                            recorder.push_label(f"node:{label}")
+                        progress.put_nowait(("node", name))
+                    elif "result" in chunk or "error" in chunk:
+                        started = task_starts.pop(task_key, None)
+                        ended = time.monotonic()
+                        duration_ms = (
+                            int((ended - started) * 1000)
+                            if started is not None
+                            else None
+                        )
+                        failed = chunk.get("error") is not None
+                        node_timings.append((label, duration_ms, failed))
+                        if recorder is not None:
+                            recorder.pop_label(f"node:{task_labels.pop(task_key, label)}")
+                            if started is not None:
+                                recorder.record_span(
+                                    "node",
+                                    label,
+                                    started_monotonic=started,
+                                    ended_monotonic=ended,
+                                    status="error" if failed else "ok",
+                                )
+                        logger.debug(
+                            "[v2stream] node %s finished in %s%s",
+                            label,
+                            f"{duration_ms}ms" if duration_ms is not None else "?",
+                            " (error)" if failed else "",
+                        )
+                elif mode == "custom":
+                    progress.put_nowait(("custom", chunk))
+                elif mode == "values" and ns == ():
+                    latest = chunk
+        return latest
+    finally:
+        progress.put_nowait(None)
+        if node_timings:
+            wall_ms = int((time.monotonic() - run_started) * 1000)
+            logger.info(
+                "[v2stream] node timings: %s | wall=%dms",
+                ", ".join(
+                    f"{name}={f'{ms}ms' if ms is not None else '?'}{'!' if failed else ''}"
+                    for name, ms, failed in node_timings
+                ),
+                wall_ms,
+            )
 
 
 def _v2_terminal_event(response) -> tuple[str, dict]:
@@ -839,6 +1060,33 @@ def _v2_potential_abbreviations(state: dict) -> list:
         return out
     except Exception:
         logger.warning("[v2stream] abbreviation projection failed", exc_info=True)
+        return []
+
+def _v2_people_records(runtime_context) -> list:
+    """Project this run's people card records from the runtime services.
+
+    The request-scoped people lookup service (``services.people_lookup``)
+    memoizes the raw sanitized v1 person records during the capability
+    dispatch; ``people_display_snapshot()`` returns ``(persons, display)``
+    or ``None`` when no people lookup produced records this run. Runtime-
+    only data — never checkpointed, never model-facing. Any read failure
+    degrades to ``[]`` (no card), never an error.
+    """
+    try:
+        services = getattr(runtime_context, "services", None)
+        people_lookup = getattr(services, "people_lookup", None)
+        snapshot = (
+            people_lookup.people_display_snapshot()
+            if people_lookup is not None
+            and hasattr(people_lookup, "people_display_snapshot")
+            else None
+        )
+        if snapshot is None:
+            return []
+        persons, _display = snapshot
+        return [dict(person) for person in persons if isinstance(person, Mapping)]
+    except Exception:
+        logger.warning("[v2stream] people records projection failed", exc_info=True)
         return []
 
 
@@ -1342,6 +1590,29 @@ async def stream_v2_turn_events(
     invoke_task = None
     released = False
     heartbeat = None
+    # Per-turn timing recorder (Network-tab-style spans). Installed BEFORE
+    # the graph task is created so the task and every downstream tap
+    # (dispatch, retrieval stages) inherit the ContextVar — same
+    # propagation contract as the v1 trace collector. Best-effort: flush
+    # failures never affect the response.
+    from app.services.agent.timing_recorder import (
+        TimingRecorder,
+        reset_recorder,
+        set_recorder,
+        timing_enabled,
+    )
+
+    try:
+        _timing_run_id = str(runtime_context.capability_runtime.run_id or "")
+    except Exception:
+        _timing_run_id = ""
+    recorder = (
+        TimingRecorder(run_id=_timing_run_id, thread_id=thread_id)
+        if _timing_run_id and timing_enabled()
+        else None
+    )
+    recorder_token = set_recorder(recorder) if recorder is not None else None
+    turn_status = "ok"
     try:
         _run_id = str(runtime_context.capability_runtime.run_id or "")
     except Exception:
@@ -1509,6 +1780,8 @@ async def stream_v2_turn_events(
             data["clarification"] = _clarify_public(pending, thread_id=thread_id)
         except Exception:
             logger.warning("[v2stream] clarification metadata failed", exc_info=True)
+        if _run_id:
+            data["run_id"] = _run_id
         yield {"event": event, "data": data}
 
     try:
@@ -1526,9 +1799,25 @@ async def stream_v2_turn_events(
             yield {"event": "status", "data": {"step": "analyzing", "detail": "Running v2 graph..."}}
             checkpoint_state = {}
             payload = initial_state
+        progress: asyncio.Queue = asyncio.Queue()
+        last_step = "analyzing"
         invoke_task = asyncio.create_task(
-            graph.ainvoke(payload, config, context=runtime_context)
+            _v2_run_graph(graph, payload, config, runtime_context, progress)
         )
+        def _speculative_rollback() -> list[dict]:
+            # Speculative tokens never survive into anything the user keeps.
+            return [acc.on_rollback()] if acc.speculative_text else []
+
+        while (item := await progress.get()) is not None:
+            item_kind, item_payload = item
+            if item_kind == "custom":
+                for ev in _v2_speculative_events(item_payload, acc):
+                    yield ev
+                continue
+            ev = _v2_progress_event(item_payload, last_step)
+            if ev is not None:
+                last_step = ev["data"]["step"]
+                yield ev
         try:
             result = await invoke_task
         except GraphInterrupt:
@@ -1550,6 +1839,8 @@ async def stream_v2_turn_events(
                 state=state,
                 response_status="clarify",
             )
+            for ev in _speculative_rollback():
+                yield ev
             async for ev in _emit_suspend_turn(pending):
                 yield ev
             await _stop_heartbeat_only()
@@ -1563,7 +1854,7 @@ async def stream_v2_turn_events(
                 len(remaining),
             )
             yield acc.on_rollback()
-            yield {"event": "error", "data": {"message": _V2_TRUNCATION_MESSAGE}}
+            yield {"event": "error", "data": {"message": _V2_TRUNCATION_MESSAGE, **({"run_id": _run_id} if _run_id else {})}}
             _note_terminal(_terminal_route_of(state), state=state)
             await _release_once("terminal")
             return
@@ -1571,16 +1862,25 @@ async def stream_v2_turn_events(
             final = _coerce_final_response(state.get("final_response"))
         except (TypeError, ValueError):
             logger.error("[v2stream] turn ended without a terminal response")
-            yield {"event": "error", "data": {"message": _V2_MISSING_TERMINAL_MESSAGE}}
+            for ev in _speculative_rollback():
+                yield ev
+            yield {"event": "error", "data": {"message": _V2_MISSING_TERMINAL_MESSAGE, **({"run_id": _run_id} if _run_id else {})}}
             _note_terminal(_terminal_route_of(state), state=state)
             await _release_once("terminal")
             return
         event, data = _v2_terminal_event(final)
+        if _run_id:
+            # Additive: lets the frontend fetch the turn's timing waterfall
+            # via GET /admin/agent/timings/{run_id}. Consumers that do not
+            # know the key ignore it.
+            data["run_id"] = _run_id
         _note_terminal(
             _terminal_route_of(state),
             state=state,
             response_status=_terminal_response_status_of(final),
         )
+        for ev in _speculative_rollback():
+            yield ev
         if event == "complete" and not _v2_terminal_is_error(state):
             # Success only (T7-owned rule): chunk the terminal content into
             # ``token`` events, then emit the single terminal. Clarify
@@ -1608,7 +1908,33 @@ async def stream_v2_turn_events(
                     }
                 except Exception:
                     logger.warning("[v2stream] clarification_resolved frame failed", exc_info=True)
-            yield {"event": "status", "data": {"step": "generating", "detail": "Streaming v2 answer..."}}
+            if last_step != "generating":
+                yield {"event": "status", "data": {"step": "generating", "detail": "Streaming v2 answer..."}}
+            # Spec §11.6/§14.1: the grounded artifact's citation projection
+            # crosses BEFORE the first token so every token is already
+            # citation-resolvable. ``data["citations"]`` is the exact
+            # projector output the finalizer stored on the FinalResponse —
+            # the adapter never rebuilds citation identity, and the
+            # terminal ``complete`` below repeats the identical set.
+            yield {
+                "event": "citation",
+                "data": {"citations": list(data.get("citations") or [])},
+            }
+            # v1 parity: the people card records ride the same
+            # ``people_data`` event v1 emitted (transport normalizes it to
+            # the public ``citation`` frame's ``people`` field, and the
+            # session relay persists it). The records come from the
+            # request-scoped people service's snapshot — the raw sanitized
+            # v1 records captured during this run's dispatch — never from
+            # the minimized governed evidence. Absent snapshot → no event.
+            people_records = _v2_people_records(runtime_context)
+            if people_records:
+                acc.on_people_data(people_records)
+                yield {
+                    "event": "people_data",
+                    "data": {"people": people_records},
+                }
+                data["people_data"] = people_records
             for chunk in _chunk_prose(data.get("answer", ""), token_chunk_size):
                 acc.on_token(chunk)
                 yield {"event": "token", "data": {"text": chunk}}
@@ -1642,6 +1968,7 @@ async def stream_v2_turn_events(
     except asyncio.CancelledError:
         # Cancellation prevents all later dispatch and any factual success:
         # no terminal event, leases released as cancelled, error propagates.
+        turn_status = "cancelled"
         if invoke_task is not None and not invoke_task.done():
             invoke_task.cancel()
         await _release_once("cancelled")
@@ -1651,14 +1978,24 @@ async def stream_v2_turn_events(
         # ``error`` instead of letting a raw exception escape the SSE
         # stream — the frontend would otherwise render a silent partial
         # answer. Leases still release (the run is over), exactly once.
+        turn_status = "error"
         logger.error("[v2stream] unexpected v2 turn failure: %s", exc, exc_info=True)
         if invoke_task is not None and not invoke_task.done():
             invoke_task.cancel()
         yield acc.on_rollback()
-        yield {"event": "error", "data": {"message": _V2_UNEXPECTED_ERROR_MESSAGE}}
+        yield {"event": "error", "data": {"message": _V2_UNEXPECTED_ERROR_MESSAGE, **({"run_id": _run_id} if _run_id else {})}}
         await _release_once("terminal")
         return
-
+    finally:
+        if recorder is not None:
+            try:
+                recorder.close_turn(status=turn_status)
+                await recorder.flush()
+            except Exception:
+                logger.warning("[v2stream] timing flush failed", exc_info=True)
+            finally:
+                if recorder_token is not None:
+                    reset_recorder(recorder_token)
 
 async def stream_v2_turn_to_sse(
     *,

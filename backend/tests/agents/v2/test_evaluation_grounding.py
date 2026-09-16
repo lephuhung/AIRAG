@@ -1629,45 +1629,6 @@ async def test_budget_overflow_persisted_as_validated_derived_evidence() -> None
 
 
 @pytest.mark.asyncio
-async def test_overflow_lease_acquired_and_committed_by_synthesize_node() -> None:
-    # The node passes the generous DEFAULT_SYNTHESIS_BUDGET, so the tail
-    # must exceed it for overflow to trigger on the node path.
-    from app.services.agents.v2.nodes.synthesize import DEFAULT_SYNTHESIS_BUDGET
-
-    plan = read_plan()
-    u1, u2 = uuid4(), uuid4()
-    content1 = "Điều 5 quy định mức phạt."
-    content2 = "Điều 6 quy định. " * (
-        DEFAULT_SYNTHESIS_BUDGET.max_total_chars // len("Điều 6 quy định. ") + 1
-    )
-    hydrator = FakeHydrator(
-        {
-            u1: store_coverage_use(use_id=u1, evidence_id=uuid4(), content=content1),
-            u2: store_coverage_use(use_id=u2, evidence_id=uuid4(), content=content2),
-        },
-    )
-    events: list[str] = []
-    leases = FakeLeaseRepo(events)
-    evaluation = EvidenceEvaluation(
-        status="sufficient", coverage=Coverage(items=()), missing=(), contradictions=()
-    )
-    state = make_state(
-        plan=plan,
-        bindings=binding_set(),
-        results=(read_result(use_id=u1), read_result(use_id=u2)),
-        evaluation=evaluation,
-    )
-    update = await synthesize_node(state, graph_runtime(hydrator, leases))
-    assert update == {}
-    assert len(hydrator.persisted_records) == 1
-    assert "commit" in events
-    assert any(
-        call[0] == "run-1" and call[1] is None and call[2] is not None
-        for call in leases.calls
-    )
-
-
-@pytest.mark.asyncio
 async def test_shared_synthesize_and_lease_leases_overflow() -> None:
     """I3: every path through the shared helper leaves fresh uses leased."""
     from app.services.agents.v2.nodes.synthesize import synthesize_and_lease
@@ -1742,21 +1703,6 @@ async def test_synthesis_reuse_revalidates_current_uses() -> None:
     assert (u2, "expired") in hydrator.denied
     for claim in second.draft.claims:
         assert u2 not in claim.evidence_use_ids
-
-
-@pytest.mark.asyncio
-async def test_synthesize_node_defers_failure_to_finalizer() -> None:
-    """R1: SynthesisError never escapes the node; the failure is channeled."""
-    state = make_state(plan=read_plan(), bindings=binding_set())
-    channel = AnswerDraftChannel()
-    update = await synthesize_node(
-        state, graph_runtime(FakeHydrator({}), FakeLeaseRepo([]), channel)
-    )
-    assert update == {}
-    entry = channel.get("run-1")
-    assert entry is not None
-    assert entry.synthesis_error is not None
-    assert entry.draft is None
 
 
 @pytest.mark.asyncio
@@ -2042,42 +1988,6 @@ async def test_exported_hydrate_for_synthesis_leases_overflow() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ground_node_consumes_channel_without_resynthesis() -> None:
-    """C2: ground consumes the stored draft; the hydrator runs synthesis once."""
-    plan = read_plan()
-    u1 = uuid4()
-    hydrator = FakeHydrator(
-        {
-            u1: store_coverage_use(
-                use_id=u1, evidence_id=uuid4(), content="Điều 5 quy định."
-            )
-        },
-    )
-    channel = AnswerDraftChannel()
-    evaluation = EvidenceEvaluation(
-        status="sufficient", coverage=Coverage(items=()), missing=(), contradictions=()
-    )
-    state = make_state(
-        plan=plan,
-        bindings=binding_set(),
-        results=(read_result(use_id=u1),),
-        evaluation=evaluation,
-    )
-    runtime = graph_runtime(hydrator, FakeLeaseRepo([]), channel)
-    assert await synthesize_node(state, runtime) == {}
-    synth_calls = [
-        call for call in hydrator.hydrate_calls if call[0] == "synthesis"
-    ]
-    assert len(synth_calls) == 1
-    assert await ground_node(state, runtime) == {}
-    assert [
-        call for call in hydrator.hydrate_calls if call[0] == "synthesis"
-    ] == synth_calls
-    assert channel.get("run-1") is not None
-    assert channel.get("run-1").grounded_draft is not None
-
-
-@pytest.mark.asyncio
 async def test_ground_node_miss_rederives_once() -> None:
     """C2: an empty channel re-derives exactly once (no per-node re-run)."""
     plan = read_plan()
@@ -2112,13 +2022,18 @@ def channel_grounded(runtime: GraphRuntimeContext) -> Any:
 
 @pytest.mark.asyncio
 async def test_composed_chain_types_insufficient_without_exception() -> None:
-    """R1: evaluate → synthesize → ground → finalizer as a real graph.
+    """R1: evaluate → synthesize → finalizer as a real graph (Task 5 topology).
 
-    The evaluation is not sufficient and the synthesize node IS entered:
-    no node raises, synthesis never hydrates, and the terminal response is
-    typed (denied for the denied People task).
+    The evaluation is not sufficient and the synthesize boundary IS entered:
+    no node raises, the synthesis state machine never starts, and the
+    terminal response is typed (denied for the denied People task).
     """
     from langgraph.graph import StateGraph
+
+    from app.services.agents.v2.synthesis.graph import (
+        build_synthesis_subgraph,
+        make_synthesis_boundary_node,
+    )
 
     plan = people_plan()
     route = RouteDecision(route="fast_domain", reason_code="simple_people_lookup")
@@ -2132,30 +2047,34 @@ async def test_composed_chain_types_insufficient_without_exception() -> None:
     hydrator = FakeHydrator({})
     channel = AnswerDraftChannel()
     runtime = graph_runtime(hydrator, FakeLeaseRepo([]), channel)
-    graph = StateGraph(SupervisorV2State)
+    graph = StateGraph(SupervisorV2State, context_schema=GraphRuntimeContext)
     graph.add_node("evaluate", evaluate_node)
-    graph.add_node("synthesize", synthesize_node)
-    graph.add_node("ground", ground_node)
+    graph.add_node(
+        "synthesize",
+        make_synthesis_boundary_node(build_synthesis_subgraph()),
+    )
     graph.add_node("finalizer", finalizer_node)
     graph.set_entry_point("evaluate")
     graph.add_edge("evaluate", "synthesize")
-    graph.add_edge("synthesize", "ground")
-    graph.add_edge("ground", "finalizer")
+    graph.add_edge("synthesize", "finalizer")
     graph.set_finish_point("finalizer")
     out = await graph.compile().ainvoke(state, context=runtime)
     assert out["execution"].evidence_evaluation.status == "insufficient"
     assert out["final_response"].status == "denied"
     assert out["final_response"].content.strip() != ""
     assert [call[0] for call in hydrator.hydrate_calls] == ["evaluation"]
-    entry = channel.get("run-1")
-    assert entry is not None
-    assert entry.synthesis_error is not None
-    assert entry.grounded_draft is None
-
+    # The synthesis state machine never ran: no checkpoint, no channel write.
+    assert out.get("synthesis") is None
+    assert channel.get("run-1") is None
 
 @pytest.mark.asyncio
 async def test_finalizer_turns_synthesis_failure_into_typed_response() -> None:
-    """C1: sufficient verdict + empty admission → typed insufficient, no raise."""
+    """C1: sufficient verdict + no grounded checkpoint → typed error, no raise.
+
+    Task 6B: ``SynthesisCheckpoint`` is the single authority — a sufficient
+    verdict without a ``grounded`` artifact (here: ``synthesis=None``) is the
+    §12.4 fail-closed terminal, never an extractive/channel re-derivation.
+    """
     plan = people_plan()
     evaluation = EvidenceEvaluation(
         status="sufficient", coverage=Coverage(items=()), missing=(), contradictions=()
@@ -2171,8 +2090,10 @@ async def test_finalizer_turns_synthesis_failure_into_typed_response() -> None:
     final = await finalizer_node(
         state, graph_runtime(FakeHydrator({}), FakeLeaseRepo([]), AnswerDraftChannel())
     )
-    assert final["final_response"].status == "insufficient"
-    assert "t1" not in final["final_response"].content
+    assert final["final_response"].status == "error"
+    assert final["final_response"].content == (
+        "Không thể tổng hợp câu trả lời đã được kiểm chứng. Vui lòng thử lại."
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -18,7 +18,8 @@
       "document_types": "Document Types",
       "abbreviations": "Abbreviations",
       "llm": "LLM Models",
-      "system_logs": "Activity Log"
+      "system_logs": "Activity Log",
+      "timings": "Agent Timings"
     },
     "my_tenants": "My Tenants",
     "your_chats": "Your chats"
@@ -1152,6 +1153,28 @@
         "deactivated": "Deactivated: {{short}}",
         "error": "Action failed"
       }
+    },
+    "timings": {
+      "title": "Agent Timings",
+      "subtitle": "Per-turn span waterfall for the v2 agent graph",
+      "recent_runs": "Recent turns",
+      "refresh": "Refresh",
+      "run": "Run",
+      "thread": "Thread",
+      "started": "Started",
+      "wall": "Wall",
+      "spans": "spans",
+      "select_run": "Select a turn to inspect its waterfall",
+      "no_runs": "No timing spans recorded yet",
+      "kind_turn": "turn",
+      "kind_node": "node",
+      "kind_dispatch": "dispatch",
+      "kind_stage": "stage",
+      "status_ok": "ok",
+      "status_error": "error",
+      "status_cancelled": "cancelled",
+      "legend": "Legend",
+      "search_placeholder": "Search question or run id…"
     }
   },
   "visual_panel": {

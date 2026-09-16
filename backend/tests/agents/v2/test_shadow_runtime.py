@@ -1267,11 +1267,15 @@ def test_shadow_source_adapters_are_read_only() -> None:
             f"production people wrapper exposes {write_attr!r}"
         )
     # The wrapped production service itself offers no write surface:
-    # lookup is a read, and reads are allowed on the shadow path.
+    # ``lookup`` and ``people_display_snapshot`` are both reads (the latter
+    # only returns the request-scoped memoized snapshot), and reads are
+    # allowed on the shadow path.
     from app.services.agents.supervisor_v2 import V1PeopleLookupService
 
     public = [m for m in dir(V1PeopleLookupService) if not m.startswith("_")]
-    assert public == ["lookup"], f"unexpected V1 people surface: {public}"
+    assert public == ["lookup", "people_display_snapshot"], (
+        f"unexpected V1 people surface: {public}"
+    )
 
 
 def test_shadow_config_defaults_are_safe() -> None:
@@ -1631,3 +1635,61 @@ async def test_cancellation_resistant_shadow_late_success_emits_nothing_after_cl
     assert not any(
         "turn complete" in (record.message or "") for record in caplog.records
     ), "late shadow report escaped after cleanup"
+
+
+# ---------------------------------------------------------------------------
+# Round 3 — citation_resolver wiring (spec §11.1)
+#
+# The shadow replays the same supervisor topology; a grounded shadow
+# synthesis must reach the single CitationProjector owner. Without a
+# resolver the run fails closed at ``_require_projector`` AFTER consuming
+# a real provider call — corrupting the shadow comparison signal.
+# ---------------------------------------------------------------------------
+
+
+def test_shadow_bundle_wires_citation_resolver() -> None:
+    """RuntimeServices carries a real resolver; the projector gate opens."""
+    from app.services.agents.v2.synthesis.citations import StoreCitationResolver
+    from app.services.agents.v2.synthesis.graph import _require_projector
+
+    bundle = make_direct_bundle()
+    resolver = bundle.runtime_context.services.citation_resolver
+    assert isinstance(resolver, StoreCitationResolver)
+    # The exact gate grounded synthesis passes through — previously raised
+    # SynthesisGraphError on every shadow run.
+    projector = _require_projector(bundle.runtime_context)
+    assert projector is not None
+
+
+@pytest.mark.asyncio
+async def test_shadow_citation_resolver_uses_shadow_session_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``session_factory`` threads into the resolver's read sessions."""
+    from app.services.agents.v2.persistence import evidence as evidence_mod
+
+    opened: list = []
+
+    class _DB:
+        async def __aenter__(self) -> "_DB":
+            return self
+
+        async def __aexit__(self, *_exc: Any) -> None:
+            return None
+
+    def _factory() -> _DB:
+        opened.append(_DB())
+        return opened[-1]
+
+    async def _no_record(self: Any, evidence_id: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        evidence_mod.EvidenceRepository, "load_record", _no_record
+    )
+
+    bundle = make_direct_bundle(session_factory=_factory)
+    resolver = bundle.runtime_context.services.citation_resolver
+    result = await resolver.resolve_lineage(UUID(int=7))
+    assert result is None
+    assert len(opened) == 1

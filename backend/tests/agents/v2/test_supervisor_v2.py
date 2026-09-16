@@ -55,7 +55,6 @@ from app.services.agents.v2.nodes.finalizer import finalizer_node
 from app.services.agents.v2.nodes.routing import route_node
 from app.services.agents.v2.nodes.evaluate import AnswerDraftChannel
 from app.services.agents.v2.nodes.fast_plan import fast_plan_node
-from app.services.agents.v2.nodes.grounding import ground_node
 from app.services.agents.v2.nodes.synthesize import synthesize_node
 
 from app.services.agents.supervisor_v2 import (
@@ -107,7 +106,6 @@ EXPECTED_NODES = (
     "execute",
     "evaluate",
     "synthesize",
-    "ground",
     "finalizer",
     "complex_boundary",
 )
@@ -394,7 +392,7 @@ def N(values: Any) -> SupervisorV2State:
 # ---------------------------------------------------------------------------
 
 
-def test_graph_contains_all_fourteen_nodes() -> None:
+def test_graph_contains_all_thirteen_nodes() -> None:
     assert tuple(SUPERVISOR_V2_NODES) == EXPECTED_NODES
     graph = create_supervisor_v2_graph(InMemorySaver())
     node_ids = set(graph.get_graph().nodes)
@@ -414,8 +412,6 @@ def test_graph_nodes_come_from_v2_nodes() -> None:
     assert origins["execute"] is execute_node
     assert origins["evaluate"] is evaluate_node
     assert origins["synthesize"] is synthesize_node
-    assert origins["ground"] is ground_node
-    assert origins["finalizer"] is finalizer_node
     # Thin boundary functions owned by supervisor_v2 (no domain business).
     for name in ("direct", "clarify", "clarify_wait", "complex_boundary"):
         assert origins[name].__module__ == "app.services.agents.supervisor_v2"
@@ -575,6 +571,9 @@ async def test_fast_people_checkpoints_plan_before_dispatch() -> None:
 
     response = N(result)["final_response"]
     assert response.status == "success"
+    # Task 6B: the people_card presentation runs inline at the synthesize
+    # boundary (no LLM, no SynthesisCheckpoint) and stores its grounded
+    # result in the channel — the finalizer replays it with citations.
     assert response.citations, "factual success must carry citations"
 
     # The fast TaskPlan was checkpointed BEFORE any capability dispatched:

@@ -65,7 +65,7 @@ def db() -> Engine:
 def test_stage_table_constants_are_frozen() -> None:
     assert V2_STAGE_TABLES == frozenset({"document_revision_stages"})
     assert V2_SCHEMA_V4_TABLES == V2_SCHEMA_V3_TABLES | V2_STAGE_TABLES
-    assert V2_SCHEMA_VERSION == 4
+    assert V2_SCHEMA_VERSION == 5
 
 
 def test_stage_table_shape_is_exact(db: Engine) -> None:
@@ -248,7 +248,7 @@ def test_v3_to_v4_upgrade_creates_stage_table(db: Engine) -> None:
     try:
         apply_v2_schema(db)
         check = check_v2_schema(db)
-        assert check.version == 4, check
+        assert check.version == V2_SCHEMA_VERSION, check
         assert check.is_clean is True, check
         with db.connect() as conn:
             present = conn.execute(

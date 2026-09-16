@@ -24,7 +24,7 @@ import { useCreateAbbreviation } from "@/hooks/useAbbreviations";
 import { useSTT } from "@/hooks/useSTT";
 import { AbbreviationModal } from "@/components/rag/AbbreviationModal";
 import { STEP_CONFIG } from "@/components/rag/ThinkingTimeline";
-import { formatMentionName } from "@/components/rag/chat/utils";
+import { citationsToSourceChunks, formatMentionName } from "@/components/rag/chat/utils";
 import { SessionIdCtx, DebugCtx, AllSourcesCtx } from "@/components/rag/chat/contexts";
 import type {
   ChatMessage,
@@ -485,7 +485,10 @@ export const ChatPanel = memo(function ChatPanel({
           content: m.content,
           documentIds: m.document_ids ?? undefined,
           attachedDocs: m.attached_docs ?? undefined,
-          sources: m.sources ?? undefined,
+          // v2 grounded synthesis persists `citations` (public projection), not
+          // `sources` — project them so [a3z9] markers resolve to badges after
+          // reload exactly like the live `citation` SSE frame does.
+          sources: m.sources ?? (m.citations?.length ? citationsToSourceChunks(m.citations) : undefined),
           relatedEntities: m.related_entities ?? undefined,
           imageRefs: m.image_refs ?? undefined,
           thinking: m.thinking ?? undefined,
@@ -916,9 +919,15 @@ export const ChatPanel = memo(function ChatPanel({
         // Invalidate sessions list query to fetch generated chat title from backend
         queryClient.invalidateQueries({ queryKey: ["chat-sessions"] });
 
+        // Match by EITHER the local placeholder id or the server id the
+        // ai_message_id effect already renamed it to — matching only the
+        // local id silently drops finalMsg (the authoritative answer).
+        // Captured BEFORE setMessages: the ref is cleared right after, and
+        // the updater runs later.
+        const targetId = streamingMsgIdRef.current ?? assistantId;
         setMessages((prev) => {
           const next = prev.map((m) =>
-            m.id === assistantId
+            (m.id === assistantId || m.id === targetId)
               ? {
                 ...finalMsg,
                 id: finalMsg.id,
@@ -968,8 +977,9 @@ export const ChatPanel = memo(function ChatPanel({
 
           return next;
         });
-        // Only clear streaming ref AFTER setMessages completes and isStreaming is false
-        // This prevents race condition where sync effect could update wrong message
+        // Clear the streaming ref so the sync effect can no longer overwrite
+        // the finalized content with raw streamingContent (stale/rolled-back).
+        streamingMsgIdRef.current = null;
       } else if (stream.error) {
         toast.error(t("chat.failed", { error: stream.error }));
         setMessages((prev) =>
@@ -1088,6 +1098,7 @@ export const ChatPanel = memo(function ChatPanel({
   // When the model doesn't call search_documents but references citation IDs
   // from earlier answers, this allows those citations to still render as links.
   // NOTE: Must be declared before any early returns to satisfy Rules of Hooks.
+  const allSourcesRef = useRef<ChatSourceChunk[]>([]);
   const allSourcesFlat = useMemo(() => {
     const seen = new Set<string>();
     const merged: ChatSourceChunk[] = [];
@@ -1102,6 +1113,15 @@ export const ChatPanel = memo(function ChatPanel({
         }
       }
     }
+    // Reuse the previous array when contents are identical. `messages` gets a
+    // new object every streaming frame, so without this the context value
+    // changes identity each frame and EVERY MarkdownWithCitations consumer
+    // re-renders + re-parses markdown — context bypasses React.memo.
+    const prev = allSourcesRef.current;
+    if (prev.length === merged.length && merged.every((s, i) => s === prev[i])) {
+      return prev;
+    }
+    allSourcesRef.current = merged;
     return merged;
   }, [messages]);
 
@@ -1214,7 +1234,7 @@ export const ChatPanel = memo(function ChatPanel({
               <>
                 {/* Messages List */}
                 <div ref={scrollContainerRef} onScroll={updateScrollState} className="flex-1 min-h-0 overflow-y-auto px-3 py-3 space-y-4 relative scrollbar-none">
-                  <AnimatePresence mode="popLayout">
+                  <AnimatePresence>
                     {messages.map((msg) => (
                       <motion.div
                         key={msg.id}

@@ -18,7 +18,8 @@
       "document_types": "Loại tài liệu",
       "abbreviations": "Từ viết tắt",
       "llm": "Mô hình LLM",
-      "system_logs": "Nhật ký hoạt động"
+      "system_logs": "Nhật ký hoạt động",
+      "timings": "Timing Agent"
     },
     "my_tenants": "Tổ chức của tôi",
     "your_chats": "Lịch sử chat"
@@ -1143,6 +1144,28 @@
         "deactivated": "Đã ngừng kích hoạt: {{short}}",
         "error": "Thao tác thất bại"
       }
+    },
+    "timings": {
+      "title": "Timing Agent",
+      "subtitle": "Waterfall từng span của một lượt chạy graph v2",
+      "recent_runs": "Lượt gần đây",
+      "refresh": "Làm mới",
+      "run": "Run",
+      "thread": "Thread",
+      "started": "Bắt đầu",
+      "wall": "Tổng",
+      "spans": "span",
+      "select_run": "Chọn một lượt để xem waterfall",
+      "no_runs": "Chưa có span timing nào được ghi",
+      "kind_turn": "turn",
+      "kind_node": "node",
+      "kind_dispatch": "dispatch",
+      "kind_stage": "stage",
+      "status_ok": "ok",
+      "status_error": "lỗi",
+      "status_cancelled": "đã huỷ",
+      "legend": "Chú thích",
+      "search_placeholder": "Tìm câu hỏi hoặc run id…"
     }
   },
   "visual_panel": {

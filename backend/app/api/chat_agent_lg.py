@@ -348,11 +348,12 @@ async def langgraph_chat_stream(
     v2_terminal_info: dict = {}
     turn_terminal_status = "success"
     turn_cancelled = False
+    wire_error = False
     metric_emitted = False
 
     def _collect_terminal(sse_str: str) -> None:
         """Parse emitted events to collect data for DB persistence."""
-        nonlocal final_answer, step_counter
+        nonlocal final_answer, step_counter, wire_error
         nonlocal final_sources, final_images, final_people_data
         nonlocal v2_response_status, v2_citations
         try:
@@ -372,6 +373,24 @@ async def langgraph_chat_stream(
                             v2_citations = ev_data["citations"]
                     elif ev_type == "people_data":
                         final_people_data = ev_data.get("people", [])
+                    elif ev_type == "error":
+                        # Spec §12.4: a typed error terminal (e.g.
+                        # synthesis_failed) persists its safe message as
+                        # nonblank assistant content — a reload must never
+                        # recreate a blank row. Only fills a blank answer;
+                        # partial prose is never overwritten.
+                        # V2 SERVING ARM ONLY: the v1 stream emits
+                        # str(exc) — internal exception detail (DB errors,
+                        # paths, provider messages) must never persist as
+                        # assistant content or feed the memory pipeline.
+                        # ``served_arm`` tracks the arm actually serving
+                        # (v2→v1 fallback flips it before the v1 drain).
+                        if served_arm == "v2":
+                            wire_error = True
+                            if not final_answer.strip():
+                                final_answer = str(
+                                    ev_data.get("message") or ""
+                                )
                     elif ev_type == "status":
                         step_counter += 1
                         collected_steps.append({
@@ -519,7 +538,9 @@ async def langgraph_chat_stream(
         turn_terminal_status = "error"
         raise
     finally:
-        if not turn_cancelled and not final_answer.strip():
+        # A persisted safe error message keeps ``final_answer`` nonblank —
+        # the wire ``error`` flag, not the text, decides the metric.
+        if not turn_cancelled and (wire_error or not final_answer.strip()):
             turn_terminal_status = "error"
         await _emit_turn_metric()
 

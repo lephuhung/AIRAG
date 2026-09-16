@@ -935,6 +935,7 @@ def _maybe_launch_shadow_turn(
                 known_documents=tuple(document_ids or ()),
                 document_view=document_view,
                 history=tuple(history or ()),
+                session_factory=session_factory,
             )
             _report(await bundle.run())
         except asyncio.CancelledError:
@@ -1352,6 +1353,10 @@ async def chat_stream_session(
         # The serving arm is resolved canary-aware on run_db below (Task 7B:
         # authenticated scope + persisted request ID, server-owned).
         version = "v1"
+        # Serving-arm mirror read by the event collector below: the error
+        # fill is v2-only, so the closure read must be total even if arm
+        # resolution never runs (fail-closed to the v1 no-fill behavior).
+        served_arm = "v1"
 
         accumulated_text = ""
         accumulated_thinking = ""
@@ -1405,14 +1410,18 @@ async def chat_stream_session(
             finally:
                 await agen.aclose()
 
-        # Task 7B (fix round 2) terminal telemetry: observed signals for
-        # the canary metric row. v2 `status`/`citations` come from the
-        # terminal `complete` payload; the v2 route lands in
+        # Task 7B (fix round 2) terminal telemetry: observed signals for the
+        # canary metric row. v2 `status`/`citations` come from the terminal
+        # `complete` payload; the v2 route lands in
         # `v2_terminal_info` via `_session_v2_run`; v1 conversational turns
         # are observed from the classifier status events in `final_steps`.
+        # ``terminal_error`` records a wire ``error`` terminal so the safe
+        # message persists nonblank (spec §12.4) without mislabeling the
+        # turn metric as success.
         v2_response_status: str | None = None
         v2_citations: list = []
         v2_terminal_info: dict = {}
+        terminal_error = False
         metric_emitted = False
 
         async def _collect_and_relay(sse_str: str) -> None:
@@ -1421,7 +1430,7 @@ async def chat_stream_session(
             nonlocal final_sources, final_images
             nonlocal final_potential_abbreviations, final_people_data
             nonlocal final_citations, final_clarification
-            nonlocal v2_response_status, v2_citations
+            nonlocal v2_response_status, v2_citations, terminal_error
             # Task 9 fix round 1 (C1): the session relay is the runtime
             # producer of the versioned public contract — every raw wire
             # frame is projected through the single funnel before it
@@ -1504,6 +1513,25 @@ async def chat_stream_session(
                             )
                         elif ev_type == "people_data":
                             final_people_data = ev_data.get("people", [])
+                        elif ev_type == "error":
+                            # Spec §12.4: a typed error terminal (e.g.
+                            # synthesis_failed) persists its safe message as
+                            # nonblank assistant content — a reload must
+                            # never recreate a blank row. Only fills a blank
+                            # answer; partial prose is never overwritten.
+                            # V2 SERVING ARM ONLY: the v1 stream emits
+                            # str(exc) — internal exception detail (DB
+                            # errors, paths, provider messages) must never
+                            # persist as assistant content or feed the
+                            # memory pipeline. ``served_arm`` tracks the
+                            # arm actually serving (v2→v1 fallback flips it
+                            # before the v1 drain starts).
+                            if served_arm == "v2":
+                                terminal_error = True
+                                if not accumulated_text.strip():
+                                    accumulated_text = str(
+                                        ev_data.get("message") or ""
+                                    )
             except Exception:
                 pass
 
@@ -1769,10 +1797,15 @@ async def chat_stream_session(
                     )
                     raise _stream_error
                 # Terminal-boundary emission for the serving arm (success,
-                # fallback-served-by-v1, or empty-answer error).
+                # fallback-served-by-v1, wire error terminal, or
+                # empty-answer error). A persisted safe error message keeps
+                # ``accumulated_text`` nonblank — the wire ``error`` flag,
+                # not the text, decides the metric.
                 await _emit_turn_metric(
                     terminal_status=(
-                        "success" if accumulated_text.strip() else "error"
+                        "error"
+                        if terminal_error or not accumulated_text.strip()
+                        else "success"
                     ),
                     cancelled=False,
                 )

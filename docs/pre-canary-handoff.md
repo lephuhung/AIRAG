@@ -110,6 +110,40 @@ Per scenario assert the user-visible outcome from
 - Suspended clarification turns checkpoint the persisted `ClarificationRequest`; resume passes `resume_clarification` output through verbatim with graph-owned navigation.
 - Offline gate: `scripts/collect_v2_rollout_report.py` → `scripts/check_v2_rollout_gate.py` must pass over real gate-window traffic per stage.
 
+## 6A. Grounded-LLM synthesis signals (spec §20)
+
+The v2 `synthesize` node is now the bounded grounded-LLM subgraph
+(`agents/v2/synthesis/`; canonical ownership in `CLAUDE.md` → "V2 grounded
+answer synthesis"). Per-stage checks on top of §5–§6:
+
+- **Synthesis failure.** Invalid model output or failed support/citation
+  validation after the single repair fails closed with `synthesis_failed`:
+  zero tokens, exactly one typed `error`, and the safe Vietnamese message
+  persisted as nonblank assistant content (reload shows it).
+- **Privacy tracing.** Synthesis calls run under `synthesis_llm`
+  (`ContentSuppressedLLMProvider`): Langfuse generations and the dataset
+  trace collector carry allowlisted operational metadata only — never
+  query/evidence/prompt/answer text. Verify a traced turn shows metadata,
+  not content.
+- **Target coverage.** A multi-target (compare) question must cite evidence
+  from every required target; a required target starved to zero under budget
+  fails closed (`selection_missing_target`), never a silent one-sided answer.
+- **Checkpoint compat + latency.** Pre-change v2 checkpoints normalize to
+  `synthesis=None`; current checkpoints missing the key fail closed. The
+  deliberate `prepared` + `attempt_reserved` checkpoint barriers before the
+  first provider call add bounded latency — accepted for restart safety.
+- **Summarize bypass guard.** A summarize map/reduce turn makes zero
+  provider calls inside `summarize_reduce_node`; the final summary flows
+  through the same outer synthesis state machine (one owner, ≤2 calls total).
+- **Citation ordering.** On success: `status(generating)` → one `citation`
+  frame → first `token`; `complete` repeats the identical citation identity
+  set; markers are `[a3z9]`-style, 1–3 per claim, no references list.
+- **People/KG exclusions.** People answers still render the card path with
+  zero synthesis-model calls; KG-only claims terminate typed unavailable —
+  never a fake document citation.
+- **Rollback checks.** Kill switch and v1 default are unchanged; a synthesis
+  regression at any stage → `kill_switch: true` (§7) — no deploy needed.
+
 ## 7. Abort / rollback criteria
 
 - Any stage: `PUT /api/v1/admin/agent/rollout {kill_switch: true}` → all new requests to v1, control revision increments, active v2 runs cancelled without success.

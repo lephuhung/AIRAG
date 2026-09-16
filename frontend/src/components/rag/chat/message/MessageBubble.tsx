@@ -390,6 +390,26 @@ export const MessageBubble = memo(function MessageBubble({
     .join("")
     .slice(0, 2)
     .toUpperCase();
+  const [copiedUser, setCopiedUser] = useState(false);
+
+  // Copy the question back as pasteable input text: resolve <document_id=…>
+  // tags to @DisplayName mentions (unresolvable tags are dropped).
+  const handleCopyUserMessage = useCallback(() => {
+    let text = message.content;
+    const docs = (message.documentIds ?? [])
+      .map((id) => docMetadataMap?.get(id) || message.attachedDocs?.find((d) => d.id === id))
+      .filter(Boolean) as { id: string; filename: string; original_filename?: string }[];
+    for (const doc of docs) {
+      const name = formatMentionName(doc.original_filename || doc.filename);
+      text = text.split(`<document_id=${doc.id}>`).join(`@${name}`);
+    }
+    text = text.replace(/<document_id=[^>]+>\s*/g, "").trim();
+    navigator.clipboard.writeText(text).then(() => {
+      setCopiedUser(true);
+      setTimeout(() => setCopiedUser(false), 2000);
+    });
+  }, [message.content, message.documentIds, message.attachedDocs, docMetadataMap]);
+
 
   const proseClasses = cn(
     "prose max-w-none text-foreground/90 font-chat text-[15px] leading-[1.65]",
@@ -574,15 +594,30 @@ export const MessageBubble = memo(function MessageBubble({
         {!isUser && !message.isStreaming && message.imageRefs && message.imageRefs.length > 0 && (
           <ImageRefsPanel images={message.imageRefs} />
         )}
-
-        <p
-          className={cn(
-            "text-[9px] mt-1",
-            isUser ? "text-muted-foreground/50" : "text-muted-foreground/50"
+        <div className={cn("flex items-center gap-1 mt-1", isUser && "justify-end")}>
+          {isUser && (
+            <button
+              onClick={handleCopyUserMessage}
+              className={cn(
+                "p-1 rounded-md transition-all",
+                copiedUser
+                  ? "text-emerald-500 bg-emerald-500/5"
+                  : "text-muted-foreground/40 hover:text-muted-foreground hover:bg-muted/60",
+              )}
+              aria-label={t("chat.copy_text")}
+              title={t("chat.copy_text")}
+            >
+              {copiedUser ? (
+                <ClipboardCheck className="w-3.5 h-3.5" />
+              ) : (
+                <Copy className="w-3.5 h-3.5" />
+              )}
+            </button>
           )}
-        >
-          {formatTime(message.timestamp)}
-        </p>
+          <p className="text-[9px] text-muted-foreground/50">
+            {formatTime(message.timestamp)}
+          </p>
+        </div>
       </div>
 
       {isUser && (

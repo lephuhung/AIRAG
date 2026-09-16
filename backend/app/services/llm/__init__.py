@@ -129,6 +129,39 @@ def get_llm_provider(role: str = "main") -> LLMProvider:
 
     return _cached_provider(f"role:{role}", _build)
 
+def get_main_provider_for_synthesis() -> LLMProvider:
+    """Effective ``main`` provider for grounded answer synthesis (spec §7.1).
+
+    Resolves the same ``main`` connection/model as ``get_llm_provider("main")``
+    — this is NOT a new role — but wraps it in the content-suppressing tracer
+    (``synthesis_llm``) instead of the generic full-content one: prompts carry
+    hydrated evidence plaintext, so neither Langfuse nor the dataset trace
+    collector may see message/output content on this path.
+    """
+    from app.services.agent.langfuse_tracing import TracedLLMProvider
+    from app.services.agent.synthesis_tracing import trace_llm_suppressed
+    from app.services.runtime_config import _build_from_settings
+
+    def _build():
+        try:
+            cfg = _resolve_role_config("main")
+        except Exception as exc:
+            # Fail-open: broken override resolution must not take chat down.
+            import logging
+
+            logging.getLogger(__name__).warning(
+                f"[llm] resolving main for synthesis failed ({exc}) — using .env defaults"
+            )
+            cfg = _build_from_settings("main")
+        inner = build_provider(cfg)
+        if isinstance(inner, TracedLLMProvider):
+            # Never stack the full-content tracer under the suppressed one.
+            inner = inner._inner
+        return trace_llm_suppressed(inner, label="synthesis_llm")
+
+    return _cached_provider("role:main_synthesis", _build)
+
+
 
 def get_memory_agent() -> LLMProvider:
     """Dedicated LLM provider for internal agent tasks (memory, classification,
@@ -380,6 +413,7 @@ def get_embedding_provider() -> EmbeddingProvider:
 
 
 __all__ = [
+    "get_main_provider_for_synthesis",
     "build_provider",
     "get_llm_provider",
     "get_memory_agent",

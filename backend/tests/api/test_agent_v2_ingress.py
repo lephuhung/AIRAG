@@ -1101,6 +1101,13 @@ def test_fresh_resolver_graph_turn_reaches_provider():
         AnswerDraftChannel,
         HydratedEvidence,
     )
+    from app.services.agents.v2.contracts.synthesis import (
+        ParsedCandidate,
+        ParsedClaim,
+    )
+    from app.services.agents.v2.synthesis.citations import (
+        ResolvedDocumentCitation,
+    )
 
     workspace_id = uuid4()
     document_id = UUID("11111111-1111-1111-1111-111111111111")
@@ -1339,6 +1346,52 @@ def test_fresh_resolver_graph_turn_reaches_provider():
             )
             ingress.runtime_context.services.answer_draft_channel = (
                 AnswerDraftChannel()
+            )
+            # The grounded-LLM synthesis subgraph runs for real (manifest,
+            # claim-first grounding, CitationProjector, renderer); only the
+            # two new runtime seams are deterministic doubles — the live
+            # model and the document store are not part of this test's
+            # contract.
+            class _FakeDraftBuilder:
+                async def build(
+                    self,
+                    query_text,
+                    evidence_items,
+                    *,
+                    repair_context=None,
+                    on_claim=None,
+                ):
+                    return ParsedCandidate(
+                        claims=(
+                            ParsedClaim(
+                                claim_id="claim-1",
+                                text=(
+                                    "Nội dung đã được truy xuất từ tài liệu."
+                                ),
+                                handles=("E1",),
+                                presentation="summary",
+                            ),
+                        )
+                    )
+
+            class _FakeCitationResolver:
+                async def resolve_document(self, source, *, content):
+                    return ResolvedDocumentCitation(
+                        document_id=str(source.document_id),
+                        document_revision=str(source.document_revision),
+                        chunk_id="c1",
+                        content=content,
+                        source_file="a.pdf",
+                    )
+
+                async def resolve_lineage(self, evidence_id):
+                    return None
+
+            ingress.runtime_context.services.answer_draft_builder = (
+                _FakeDraftBuilder()
+            )
+            ingress.runtime_context.services.citation_resolver = (
+                _FakeCitationResolver()
             )
             graph = create_supervisor_v2_graph(InMemorySaver())
             out = await graph.ainvoke(

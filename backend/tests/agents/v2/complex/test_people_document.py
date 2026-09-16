@@ -1180,13 +1180,37 @@ async def test_full_materialization_appends_validated_t2() -> None:
 
 
 class _StubSession:
-    """DB-session stand-in: the v1 search and revision pinning are stubbed."""
+    """DB-session stand-in: the v1 search and revision pinning are stubbed.
+
+    ``db`` may carry an ``execute`` returning owner-map rows for the
+    service's batched ``Document.id → workspace_id`` resolution; the default
+    maps nothing (no candidates pin).
+    """
+
+    def __init__(self, db: object = None) -> None:
+        self._db = db if db is not None else _OwnerDB(())
 
     async def __aenter__(self) -> object:
-        return object()
+        return self._db
 
     async def __aexit__(self, *args: object) -> bool:
         return False
+
+
+class _OwnerDB:
+    """Stub db whose execute() returns fixed (doc_id, workspace_id) rows."""
+
+    def __init__(self, rows: object) -> None:
+        self._rows = list(rows)
+
+    async def execute(self, *args: object, **kwargs: object) -> object:
+        rows = self._rows
+
+        class _Result:
+            def all(self) -> list:
+                return rows
+
+        return _Result()
 
 
 @pytest.mark.asyncio
@@ -1255,7 +1279,10 @@ async def test_r92_scalar_backed_search_end_to_end_through_production_capability
         fake_identity,
     )
     service = V1DocumentSearchService(
-        search=fake_search, session_factory=_StubSession
+        search=fake_search,
+        session_factory=lambda: _StubSession(
+            _OwnerDB([(document_id, WORKSPACE_ID)])
+        ),
     )
     candidates = await service.search(
         task.input.query, task.input.person_identifier, (WORKSPACE_ID,)

@@ -482,6 +482,16 @@ class Settings(BaseSettings):
     # `python -m scripts.export_agent_traces`.
     NEXUSRAG_TRACE_DATASET: bool = Field(default=True)
 
+    # ── v2 per-turn timing spans ─────────────────────────────────────────────
+    # When True, every v2 turn records one row per measured span (turn root,
+    # graph node, capability dispatch, retrieval stage) into
+    # ``agent_timing_spans`` — metadata only (names, durations, statuses,
+    # counts), never query text or chunk content. Read via
+    # ``GET /api/v1/admin/agent/timings`` / ``/timings/{run_id}``; the SSE
+    # ``complete`` payload carries ``run_id`` for correlation. Best-effort:
+    # flush failures never affect the chat response.
+    NEXUSRAG_V2_TIMING: bool = Field(default=True)
+
     # ── ReAct executor for the RAG group (tool-aware planning) ───────────────
     # When True, the supervisor routes RAG-group queries to a single tool-calling
     # ReAct loop (react_executor_node) instead of the static intent→tool nodes.

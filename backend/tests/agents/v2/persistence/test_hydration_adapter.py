@@ -59,7 +59,14 @@ from app.services.agents.v2.contracts.state import (
     RuntimeServices,
     SupervisorV2State,
 )
-from app.services.agents.v2.contracts.synthesis import SynthesisRuntimeContext
+from app.services.agents.v2.contracts.synthesis import (
+    GroundedArtifact,
+    GroundedClaim,
+    HandleManifestEntry,
+    PublicCitation,
+    SynthesisCheckpoint,
+    SynthesisRuntimeContext,
+)
 from app.services.agents.v2.evidence_store.governance import (
     EvidenceGovernor,
     EvidenceKeyring,
@@ -627,6 +634,126 @@ class TestGovernorHydratorDerived:
         coverage = build_coverage(plan, bindings, results, (derived,))
         assert coverage.items[0].status == "missing"
 
+    @pytest.mark.asyncio
+    async def test_overflow_derived_selectable_via_store_lineage(
+        self, async_db: AsyncSession, document_factory: Any
+    ) -> None:
+        """§8.3 regression: the overflow derived item's lineage points at
+        tail evidence that is NOT in the admitted set. Resolving that
+        lineage through the store (the same seam the CitationProjector
+        expands) must make the derived item document-backed and
+        selectable; without resolution it stays unbacked."""
+        from app.services.agents.v2.synthesis.presentation import (
+            document_backed_use_ids,
+            resolve_derived_lineage,
+        )
+        from app.services.agents.v2.synthesis.selection import (
+            SelectionReserves,
+            SynthesisEvidenceSelector,
+        )
+
+        governor = _governor(async_db)
+        adapter = GovernorEvidenceHydrator(governor)
+        document_id, revision_id, workspace_id = await _seed_document(
+            async_db, document_factory
+        )
+        e1 = await _persist_doc(
+            governor, document_id, revision_id, content="A" * 10
+        )
+        e2 = await _persist_doc(
+            governor, document_id, revision_id, content="B" * 10
+        )
+        u1 = await _append_use(async_db, e1)
+        u2 = await _append_use(async_db, e2)
+        plan, bindings = _plan(), _bindings(document_id, str(revision_id))
+        runtime = _graph_runtime(
+            adapter, _runtime(workspace_ids=(workspace_id,))
+        )
+        tight = SynthesisRuntimeContext(
+            max_evidence_items=10, max_total_chars=10, max_total_tokens=10_000
+        )
+        refs = (EvidenceUseRef(use_id=u1.use_id), EvidenceUseRef(use_id=u2.use_id))
+        admitted = await adapter.hydrate_for_synthesis(
+            refs, runtime=runtime, plan=plan, bindings=bindings, budget=tight
+        )
+        assert len(admitted) == 2
+        derived = admitted[1]
+        assert isinstance(derived.source_identity, DerivedSourceIdentity)
+        assert derived.source_identity.source_evidence_ids == (e2,)
+
+        async def resolve_lineage(evidence_id: UUID):
+            row = await EvidenceRepository(async_db).load_record(evidence_id)
+            return row.source if row is not None else None
+
+        # The tail evidence is not co-admitted: without store resolution
+        # the derived item can never prove document backing.
+        assert document_backed_use_ids(admitted) == frozenset({u1.use_id})
+        lineage = await resolve_derived_lineage(admitted, resolve_lineage)
+        assert isinstance(lineage[e2], DocumentSourceIdentity)
+        backed = document_backed_use_ids(admitted, lineage=lineage)
+        assert derived.use_id in backed
+
+        selector = SynthesisEvidenceSelector(
+            reserves=SelectionReserves(
+                system_chars=0,
+                query_chars=0,
+                per_item_overhead_chars=0,
+                output_tokens=0,
+            )
+        )
+        selected = selector.select(
+            admitted,
+            required_target_ids=("t1",),
+            budget=SynthesisRuntimeContext(
+                max_evidence_items=10,
+                max_total_chars=100_000,
+                max_total_tokens=25_000,
+            ),
+            lineage=lineage,
+        )
+        assert selected.failure_code is None
+        assert derived.use_id in {item.use_id for item in selected.selected}
+
+    @pytest.mark.asyncio
+    async def test_overflow_derived_with_unresolvable_lineage_not_backed(
+        self, async_db: AsyncSession, document_factory: Any
+    ) -> None:
+        """A derived item whose lineage cannot be resolved under current
+        authority stays unbacked and is never selected (fail closed)."""
+        from app.services.agents.v2.synthesis.presentation import (
+            document_backed_use_ids,
+            resolve_derived_lineage,
+        )
+
+        governor = _governor(async_db)
+        adapter = GovernorEvidenceHydrator(governor)
+        document_id, revision_id, workspace_id = await _seed_document(
+            async_db, document_factory
+        )
+        plan, bindings = _plan(), _bindings(document_id, str(revision_id))
+        runtime = _graph_runtime(
+            adapter, _runtime(workspace_ids=(workspace_id,))
+        )
+        derived = await adapter.persist_derived_summary(
+            content="orphaned summary",
+            source_evidence_ids=(uuid.uuid4(),),
+            task_id="T-doc",
+            target_id="t1",
+            provenance=_provenance("synthesis.overflow"),
+            classification="normal",
+            run_id=RUN_ID,
+            plan=plan,
+            bindings=bindings,
+        )
+
+        async def resolve_lineage(evidence_id: UUID):
+            row = await EvidenceRepository(async_db).load_record(evidence_id)
+            return row.source if row is not None else None
+
+        lineage = await resolve_derived_lineage((derived,), resolve_lineage)
+        assert lineage == {}
+        assert document_backed_use_ids((derived,), lineage=lineage) == frozenset()
+
 
 class DbEvidenceBuilder:
     """Test EvidenceBuilder that persists real governed records + uses."""
@@ -839,11 +966,50 @@ class TestGovernedNodeChain:
         evaluated = await evaluate_node(state, context)
         assert evaluated["execution"].evidence_evaluation.status == "sufficient"
         state["execution"] = evaluated["execution"]
-        assert await synthesize_node(state, context) == {}
-        assert await ground_node(state, context) == {}
+        # Task 6B: the synthesis subgraph owns synthesis; the finalizer
+        # replays the checkpointed grounded artifact verbatim.
+        use_ids = tuple(
+            ref.use_id
+            for result in report.results
+            for ref in result.evidence_uses
+        )
+        state["synthesis"] = SynthesisCheckpoint(
+            contract_version="2.0",
+            phase="grounded",
+            attempts_started=1,
+            handle_manifest=tuple(
+                HandleManifestEntry(
+                    handle=f"E{i}", use=EvidenceUseRef(use_id=use_id)
+                )
+                for i, use_id in enumerate(use_ids, start=1)
+            ),
+            grounded=GroundedArtifact(
+                claims=(
+                    GroundedClaim(
+                        claim_id="claim-1",
+                        text=content,
+                        uses=tuple(
+                            EvidenceUseRef(use_id=use_id) for use_id in use_ids
+                        ),
+                        presentation="summary",
+                    ),
+                ),
+                content=content,
+                citations=(
+                    PublicCitation(
+                        citation_id="a3z9",
+                        index="a3z9",
+                        label="doc-A",
+                        source_type="vector",
+                        document_id=str(document_id),
+                        chunk_id="chunk-1",
+                    ),
+                ),
+            ),
+        )
         final = await finalizer_node(state, context)
         assert final["final_response"].status == "success"
         assert content in final["final_response"].content
         assert [c.citation_id for c in final["final_response"].citations] == [
-            "cite-1"
+            "a3z9"
         ]

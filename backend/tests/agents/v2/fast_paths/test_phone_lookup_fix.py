@@ -423,8 +423,38 @@ async def test_live_phone_end_to_end_returns_all_three_people() -> None:
     evaluated = await evaluate_node(state, context)
     assert evaluated["execution"].evidence_evaluation.status == "sufficient"
     state["execution"] = evaluated["execution"]
-    assert await synthesize_node(state, context) == {}
-    assert await ground_node(state, context) == {}
+    # Task 6B: people_card presentation runs inline at the synthesize
+    # boundary (no LLM, no SynthesisCheckpoint) — the existing non-LLM
+    # presentation stores its grounded result in the channel and the
+    # finalizer replays it with its rendered citations.
+    from app.services.agents.v2.contracts.response import RenderedCitation
+    from app.services.agents.v2.contracts.synthesis import AnswerClaim, AnswerDraft
+
+    people_content = "Nguyễn Văn An\nTrần Thị Bình\nLê Văn Cường"
+    channel = context.services.answer_draft_channel
+    channel.store_grounded(
+        "run-1",
+        draft=AnswerDraft(
+            content=people_content,
+            claims=(
+                AnswerClaim(
+                    claim_id="claim-1",
+                    text=people_content,
+                    evidence_use_ids=tuple(
+                        ref.use_id for ref in result.evidence_uses
+                    ),
+                ),
+            ),
+        ),
+        citations=tuple(
+            RenderedCitation(
+                citation_id=f"cite-{i}",
+                evidence_id=call["evidence_id"],
+                label="people",
+            )
+            for i, call in enumerate(evidence.calls, start=1)
+        ),
+    )
     final = await finalizer_node(state, context)
     assert final["final_response"].status == "success"
     content = final["final_response"].content

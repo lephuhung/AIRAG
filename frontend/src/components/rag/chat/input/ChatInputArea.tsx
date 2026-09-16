@@ -394,6 +394,26 @@ export function ChatInputArea({
                   onInputChange(e.target.value, e.target.selectionStart || 0);
                 }
               }}
+              onPaste={(e) => {
+                // Enter already sends the message, so pasted newlines only add
+                // stray blank rows — flatten them into spaces.
+                const pasted = e.clipboardData.getData("text");
+                if (!/[\r\n]/.test(pasted)) return;
+                e.preventDefault();
+                const target = e.currentTarget;
+                const cleaned = pasted.replace(/\s*\r?\n\s*/g, " ");
+                const start = target.selectionStart ?? input.length;
+                const end = target.selectionEnd ?? input.length;
+                const next = input.slice(0, start) + cleaned + input.slice(end);
+                setInput(next);
+                const caret = start + cleaned.length;
+                requestAnimationFrame(() => {
+                  target.setSelectionRange(caret, caret);
+                  target.style.height = "auto";
+                  target.style.height = Math.min(target.scrollHeight, 200) + "px";
+                });
+                if (onInputChange) onInputChange(next, caret);
+              }}
               onScroll={(e) => {
                 if (highlightRef.current) {
                   highlightRef.current.scrollTop = e.currentTarget.scrollTop;

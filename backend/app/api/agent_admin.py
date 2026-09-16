@@ -400,3 +400,150 @@ async def _run_v2_eval(
             raise
         await ingress.commit_evidence()
         return events
+
+
+# ---------------------------------------------------------------------------
+# Per-turn timing spans (v2) — Network-tab-style waterfall data
+# ---------------------------------------------------------------------------
+
+
+@router.get("/timings")
+async def list_timing_runs(
+    limit: int = 50,
+    q: str | None = None,
+    user: User = Depends(require_superadmin),
+    db: Any = Depends(get_db),
+) -> dict:
+    """List recent v2 turns that recorded timing spans (newest first).
+
+    Each run is annotated with the user question that triggered it: the
+    latest ``role='user'`` chat message in the same session whose
+    ``created_at`` precedes the turn start (15s skew tolerance).
+    ``turn_idx`` is the run's 1-based position within its thread.
+    """
+    from sqlalchemy import text
+
+    limit = max(1, min(int(limit), 200))
+    rows = (
+        await db.execute(
+            text(
+                "WITH runs AS ("
+                "  SELECT run_id, thread_id, min(started_at) AS started_at, "
+                "         count(*) AS span_count, "
+                "         max(duration_ms) FILTER (WHERE kind = 'turn') AS wall_ms "
+                "  FROM agent_timing_spans GROUP BY run_id, thread_id"
+                "), joined AS ("
+                "  SELECT r.*, left(q.content, 300) AS question, q.user_email, "
+                "         row_number() OVER ("
+                "           PARTITION BY r.thread_id ORDER BY r.started_at"
+                "         ) AS turn_idx "
+                "  FROM runs r "
+                "  LEFT JOIN LATERAL ("
+                "    SELECT m.content, u.email AS user_email "
+                "    FROM chat_messages m "
+                "    LEFT JOIN users u ON u.id = m.user_id "
+                "    WHERE m.session_id::text = r.thread_id AND m.role = 'user' "
+                "      AND m.created_at <= r.started_at + interval '15 seconds' "
+                "    ORDER BY m.created_at DESC LIMIT 1"
+                "  ) q ON true"
+                ") "
+                "SELECT * FROM joined "
+                "WHERE (CAST(:q AS text) IS NULL "
+                "       OR question ILIKE '%' || :q || '%' "
+                "       OR run_id ILIKE '%' || :q || '%') "
+                "ORDER BY started_at DESC LIMIT :limit"
+            ),
+            {"limit": limit, "q": q or None},
+        )
+    ).mappings().all()
+    return {
+        "runs": [
+            {
+                "run_id": r["run_id"],
+                "thread_id": r["thread_id"],
+                "started_at": r["started_at"].isoformat() if r["started_at"] else None,
+                "wall_ms": r["wall_ms"],
+                "span_count": int(r["span_count"]),
+                "question": r["question"],
+                "user_email": r["user_email"],
+                "turn_idx": int(r["turn_idx"]),
+            }
+            for r in rows
+        ]
+    }
+
+
+@router.get("/timings/{run_id}")
+async def get_timing_run(
+    run_id: str,
+    user: User = Depends(require_superadmin),
+    db: Any = Depends(get_db),
+) -> dict:
+    """Return one turn's spans ordered for waterfall rendering."""
+    from sqlalchemy import text
+
+    rows = (
+        await db.execute(
+            text(
+                "SELECT span_id, parent_span, kind, name, started_at, "
+                "duration_ms, status, meta, thread_id "
+                "FROM agent_timing_spans WHERE run_id = :run_id "
+                "ORDER BY started_at, span_id"
+            ),
+            {"run_id": run_id},
+        )
+    ).mappings().all()
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no timing spans recorded for run {run_id!r}",
+        )
+    base = min(r["started_at"] for r in rows)
+    thread_id = rows[0]["thread_id"]
+    from datetime import timedelta
+
+    question_row = (
+        await db.execute(
+            text(
+                "SELECT left(m.content, 300) AS question, u.email AS user_email "
+                "FROM chat_messages m "
+                "LEFT JOIN users u ON u.id = m.user_id "
+                "WHERE m.session_id::text = :tid AND m.role = 'user' "
+                "  AND m.created_at <= :cutoff "
+                "ORDER BY m.created_at DESC LIMIT 1"
+            ),
+            {
+                "tid": thread_id,
+                # chat_messages.created_at is a naive timestamp; strip tzinfo
+                # (both columns are UTC) so asyncpg can encode the param.
+                "cutoff": base.replace(tzinfo=None) + timedelta(seconds=15),
+            },
+        )
+    ).mappings().first()
+    spans = [
+        {
+            "span_id": str(r["span_id"]),
+            "parent_span": r["parent_span"],
+            "kind": r["kind"],
+            "name": r["name"],
+            "start_offset_ms": int(
+                (r["started_at"] - base).total_seconds() * 1000
+            ),
+            "duration_ms": int(r["duration_ms"]),
+            "status": r["status"],
+            "meta": r["meta"],
+        }
+        for r in rows
+    ]
+    wall = next(
+        (s["duration_ms"] for s in spans if s["kind"] == "turn"),
+        max(s["start_offset_ms"] + s["duration_ms"] for s in spans),
+    )
+    return {
+        "run_id": run_id,
+        "thread_id": thread_id,
+        "wall_ms": wall,
+        "question": question_row["question"] if question_row else None,
+        "user_email": question_row["user_email"] if question_row else None,
+        "spans": spans,
+    }

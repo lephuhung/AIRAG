@@ -81,7 +81,7 @@ def test_pre_c1_lease_table_upgrades_to_nullable_and_version_2(db: Engine) -> No
 
     with db.connect() as conn:
         assert _lease_nullable(conn) == "YES"
-        assert _recorded_version(conn) == V2_SCHEMA_VERSION == 4
+        assert _recorded_version(conn) == V2_SCHEMA_VERSION
         # Stepwise fall-through: the 2 -> 3 rollout step also ran.
         control_n = conn.execute(
             text("SELECT count(*) FROM agent_rollout_control WHERE id = 1")

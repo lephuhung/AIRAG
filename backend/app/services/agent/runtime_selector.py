@@ -967,6 +967,7 @@ async def build_v2_ingress(
     from app.services.agents.supervisor_v2 import (
         DeterministicSemanticAdapter,
         V1BindingResolver,
+        V1PeopleLookupService,
         V1ServiceBundle,
         build_graph_runtime_context,
         build_runtime_services,
@@ -980,6 +981,9 @@ async def build_v2_ingress(
         GovernorEvidenceHydrator,
     )
     from app.services.agents.v2.nodes.evaluate import AnswerDraftChannel
+    from app.services.agents.v2.synthesis.adapter import StructuredLLMDraftBuilder
+    from app.services.agents.v2.synthesis.citations import StoreCitationResolver
+    from app.services.llm import get_main_provider_for_synthesis
     from app.services.agents.v2.planning import AdaptivePlanner, AdaptiveReplanner
     from app.services.agents.v2.semantic.document_identity import (
         DocumentIdentityResolver,
@@ -1072,6 +1076,12 @@ async def build_v2_ingress(
         binding_resolver = V1BindingResolver(
             session_factory=session_factory, default_role="target"
         )
+        # One request-scoped people service instance shared by the
+        # capability registry AND the runtime services bag: the capability
+        # fills its raw-record/display snapshot during dispatch, and the
+        # non-LLM people presentation plus the streaming adapter read the
+        # same snapshot for the v1 people card — no second Mongo round trip.
+        people_lookup = V1PeopleLookupService()
         bundle = V1ServiceBundle(
             session_factory=session_factory,
             evidence=evidence_builder,
@@ -1081,6 +1091,7 @@ async def build_v2_ingress(
             abbreviation_lookup=abbreviation_lookup
             if abbreviation_lookup is not None
             else make_abbreviation_lookup(session_factory),
+            people_lookup=people_lookup,
         )
         registry = build_v2_capability_registry(
             capability_runtime,
@@ -1102,6 +1113,13 @@ async def build_v2_ingress(
             authorization=V2AuthorizationService(session_factory),
             evidence_hydrator=hydrator,
             answer_draft_channel=AnswerDraftChannel(),
+            # Exactly one privacy-safe synthesis builder per ingress turn
+            # (spec §7.1): the effective ``main`` provider under
+            # content-suppressed tracing — never the generic full-content
+            # wrapper, since prompts carry hydrated evidence plaintext.
+            answer_draft_builder=StructuredLLMDraftBuilder(
+                get_main_provider_for_synthesis
+            ),
             # Exactly one typed v1 intent adapter per ingress turn (Phase
             # 4A, Task 2): the request-scoped cache behind it means repeated
             # semantic draft builds classify once per turn.
@@ -1126,6 +1144,14 @@ async def build_v2_ingress(
             # capabilities resolve through: the shared TaskScheduler feeds
             # it from the checkpointed plan + bindings before dispatch.
             pinned_target_resolver=plan_resolver,
+            # Exactly one citation resolver per ingress turn (spec §11.1):
+            # the authoritative document/revision/evidence stores behind
+            # the single CitationProjector owner.
+            citation_resolver=StoreCitationResolver(session_factory),
+            # The same request-scoped instance the capability registry
+            # dispatches through: its raw-record/display snapshot feeds the
+            # v1 people card without a second Mongo round trip.
+            people_lookup=people_lookup,
         )
         runtime_context = build_graph_runtime_context(
             capability_runtime, services=services

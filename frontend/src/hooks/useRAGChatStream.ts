@@ -21,6 +21,7 @@ import type {
   ClarificationOption,
   ClarificationSelection,
 } from "@/types";
+import { citationsToSourceChunks } from "@/components/rag/chat/utils";
 
 const BASE_URL = import.meta.env.VITE_API_URL || "/api/v1";
 
@@ -273,10 +274,9 @@ export function useRAGChatStream(
 
   // Buffered thinking text update for the analyzing AgentStep
   const onThinkingToken = useCallback((text: string) => {
-    // Update flat thinkingText state (existing behavior)
-    setThinkingText((prev) => prev + text);
-
-    // Buffer thinking text for AgentStep update
+    // Buffer BOTH the flat thinkingText and the AgentStep copy into one rAF —
+    // a setState per SSE token re-renders ChatPanel (and re-parses the whole
+    // thinking markdown in PremiumThinking) far faster than frames can paint.
     thinkingBufferRef.current += text;
     if (!thinkingRafRef.current) {
       thinkingRafRef.current = requestAnimationFrame(() => {
@@ -284,6 +284,7 @@ export function useRAGChatStream(
         thinkingBufferRef.current = "";
         thinkingRafRef.current = undefined;
 
+        setThinkingText((prev) => prev + chunk);
         setAgentSteps((prev) => {
           // Find the analyzing step regardless of status — thinking can
           // arrive during both the first iteration (analyzing=active) and
@@ -340,6 +341,10 @@ export function useRAGChatStream(
       let localClarification: PublicClarificationRequest | null = null;
       let localAiMessageId: string | null = null;
       let localUserMessageId: string | null = null;
+      // Local answer accumulator — `streamingContent` state is STALE inside
+      // this callback (not in deps), so the complete/fallback paths must read
+      // this instead or the finalized message content silently empties.
+      let localAnswer = "";
       // Accumulate all thinking text in this scope so it can be flushed into
       // localSteps at complete time (onThinkingToken only updates setAgentSteps
       // via RAF, which never syncs back to localSteps)
@@ -492,6 +497,7 @@ export function useRAGChatStream(
                         rafRef.current = undefined;
                       }
                       setStreamingContent("");
+                      localAnswer = "";
                       localSources = [];
                       localImages = [];
                       localPeople = [];
@@ -586,6 +592,7 @@ export function useRAGChatStream(
                   }
 
                   case "token":
+                    localAnswer += data.text || "";
                     onToken(data.text || "");
                     break;
 
@@ -598,22 +605,7 @@ export function useRAGChatStream(
                     // sources presentation model preserving the answer's
                     // citation handle (`index`), provenance (`source_type`)
                     // and rank (`score`) — never synthesize them.
-                    const compat: ChatSourceChunk[] = citations
-                      .filter((c) => c.document_id && c.chunk_id)
-                      .map((c) => ({
-                        index: c.index ?? c.citation_id,
-                        chunk_id: String(c.chunk_id),
-                        content: c.content || "",
-                        document_id: String(c.document_id),
-                        page_no: c.page_no ?? 0,
-                        heading_path: c.heading_path || [],
-                        score: c.score ?? 0,
-                        source_type: (c.source_type ?? "vector") as ChatSourceChunk["source_type"],
-                        document_number: c.document_number ?? null,
-                        article_label: c.article_label ?? null,
-                        validity_status: c.validity_status ?? null,
-                        superseded_by: c.superseded_by ?? null,
-                      }));
+                    const compat: ChatSourceChunk[] = citationsToSourceChunks(citations);
                     if (compat.length > 0) {
                       const seen = new Set(localSources.map((s) => String(s.chunk_id)));
                       const fresh = compat.filter((s) => !seen.has(String(s.chunk_id)));
@@ -721,6 +713,7 @@ export function useRAGChatStream(
                       rafRef.current = undefined;
                     }
                     setStreamingContent("");
+                    localAnswer = "";
                     // Clear all retractable artifacts
                     localSources = [];
                     localImages = [];
@@ -737,8 +730,7 @@ export function useRAGChatStream(
                     break;
 
                   case "complete": {
-                    // Strip  markers from streamed answer (defensive — in case backend didn't strip)
-                    const cleanAnswer = (streamingContent || data.answer || "").replace(/<\/think>\s*/g, "").trim();
+                    const cleanAnswer = (data.answer || localAnswer || "").replace(/<\/think>\s*/g, "").trim();
                     // Flush remaining buffer
                     bufferRef.current = "";
                     if (rafRef.current) {
@@ -830,13 +822,12 @@ export function useRAGChatStream(
         }
 
         // Stream ended — if we never got a 'complete' event (connection dropped),
-        // finalize with whatever content we have to prevent stuck UI state
-        if (!finalMessage && (streamingContent || thinkingAccumulator)) {
+        if (!finalMessage && (localAnswer || thinkingAccumulator)) {
           console.warn("[stream] Stream ended without 'complete' event — finalizing with buffered content");
           finalMessage = {
             id: localAiMessageId || generateId(),
             role: "assistant",
-            content: (streamingContent || "").replace(/<\/think>\s*/g, "").trim(),
+            content: localAnswer.replace(/<\/think>\s*/g, "").trim(),
             sources: localSources,
             relatedEntities: [],
             imageRefs: localImages,

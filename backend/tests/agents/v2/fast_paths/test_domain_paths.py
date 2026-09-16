@@ -51,7 +51,14 @@ from app.services.agents.v2.contracts.state import (
     RuntimeServices,
     SupervisorV2State,
 )
-from app.services.agents.v2.contracts.synthesis import SynthesisRuntimeContext
+from app.services.agents.v2.contracts.synthesis import (
+    GroundedArtifact,
+    GroundedClaim,
+    HandleManifestEntry,
+    PublicCitation,
+    SynthesisCheckpoint,
+    SynthesisRuntimeContext,
+)
 from app.services.agents.v2.execution.scheduler import TaskScheduler
 from app.services.agents.v2.nodes.evaluate import AnswerDraftChannel, HydratedEvidence
 from app.services.agents.v2.nodes.evaluate import evaluate_node
@@ -301,6 +308,39 @@ def make_state(
         final_response=None,
     )
 
+def grounded_checkpoint(
+    *,
+    use_ids: tuple[UUID, ...],
+    content: str,
+    citations: tuple[PublicCitation, ...] = (),
+) -> SynthesisCheckpoint:
+    """Simulate the synthesis subgraph's terminal output (Task 5/6 contract):
+    a ``grounded`` checkpoint carrying the rendered artifact the finalizer
+    replays verbatim. The finalizer never re-derives — this is the only
+    legitimate way a factual success reaches it."""
+    manifest = tuple(
+        HandleManifestEntry(handle=f"E{i}", use=EvidenceUseRef(use_id=use_id))
+        for i, use_id in enumerate(use_ids, start=1)
+    )
+    return SynthesisCheckpoint(
+        contract_version="2.0",
+        phase="grounded",
+        attempts_started=1,
+        handle_manifest=manifest,
+        grounded=GroundedArtifact(
+            claims=(
+                GroundedClaim(
+                    claim_id="claim-1",
+                    text=content,
+                    uses=tuple(entry.use for entry in manifest),
+                    presentation="summary",
+                ),
+            ),
+            content=content,
+            citations=citations,
+        ),
+    )
+
 
 def read_result(task_id: str, use_id: UUID, content: str) -> AgentResult:
     return AgentResult(
@@ -422,21 +462,33 @@ async def test_fast_document_read_uses_shared_capability_registry() -> None:
     evaluated = await evaluate_node(state, context)
     assert evaluated["execution"].evidence_evaluation.status == "sufficient"
     state["execution"] = evaluated["execution"]
-    # C2: one synthesize (channel store), one ground (channel consume).
-    assert await synthesize_node(state, context) == {}
-    assert channel.get("run-1") is not None
-    assert channel.get("run-1").draft is not None
-    assert await ground_node(state, context) == {}
-    assert channel.get("run-1").grounded_draft is not None
+    # Task 6B: the finalizer consumes the checkpointed grounded artifact —
+    # the synthesis subgraph (Task 5) owns synthesis; the channel is gone
+    # from the production path.
+    state["synthesis"] = grounded_checkpoint(
+        use_ids=(use_id,),
+        content=content,
+        citations=(
+            PublicCitation(
+                citation_id="a3z9",
+                index="a3z9",
+                label="doc-A",
+                source_type="vector",
+                document_id=str(DOCUMENT_ID),
+                chunk_id="chunk-1",
+            ),
+        ),
+    )
     final = await finalizer_node(state, context)
     assert final["final_response"].status == "success"
-    # The finalizer emits the grounded outcome verbatim — it grounds nothing.
-    assert final["final_response"].content == channel.get("run-1").grounded_draft.content
-    assert content in final["final_response"].content
-    assert [c.citation_id for c in final["final_response"].citations] == ["cite-1"]
-    assert final["final_response"].citations[0].evidence_id == evidence_id
-    # Exactly one synthesis hydration across synthesize+ground+finalizer.
-    assert hydrator.calls == ["evaluation", "synthesis"]
+    # The finalizer emits the grounded artifact verbatim — it grounds nothing.
+    assert final["final_response"].content == content
+    assert [c.citation_id for c in final["final_response"].citations] == ["a3z9"]
+    # PublicCitation carries no internal evidence identity.
+    assert not hasattr(final["final_response"].citations[0], "evidence_id")
+    # Exactly one hydration: the evaluator's (synthesis hydration is the
+    # subgraph's job, simulated here by the injected checkpoint).
+    assert hydrator.calls == ["evaluation"]
 
 
 @pytest.mark.asyncio
@@ -522,11 +574,35 @@ async def test_fast_people_uses_shared_capability_registry() -> None:
     evaluated = await evaluate_node(state, context)
     assert evaluated["execution"].evidence_evaluation.status == "sufficient"
     state["execution"] = evaluated["execution"]
-    assert await synthesize_node(state, context) == {}
-    assert await ground_node(state, context) == {}
+    # Task 6B: people_card presentation runs inline at the synthesize
+    # boundary (no LLM, no SynthesisCheckpoint) — the existing non-LLM
+    # presentation stores its grounded result in the channel and the
+    # finalizer replays it.
+    from app.services.agents.v2.contracts.response import RenderedCitation
+    from app.services.agents.v2.contracts.synthesis import AnswerClaim, AnswerDraft
+
+    channel.store_grounded(
+        "run-1",
+        draft=AnswerDraft(
+            content='{"name":"Nguyễn Văn A"}',
+            claims=(
+                AnswerClaim(
+                    claim_id="claim-1",
+                    text='{"name":"Nguyễn Văn A"}',
+                    evidence_use_ids=(use_id,),
+                ),
+            ),
+        ),
+        citations=(
+            RenderedCitation(
+                citation_id="cite-1", evidence_id=evidence_id, label="people"
+            ),
+        ),
+    )
     final = await finalizer_node(state, context)
     assert final["final_response"].status == "success"
-    assert hydrator.calls == ["evaluation", "synthesis"]
+    assert [c.citation_id for c in final["final_response"].citations] == ["cite-1"]
+    assert hydrator.calls == ["evaluation"]
 
 
 @pytest.mark.asyncio
@@ -571,13 +647,27 @@ async def test_bounded_summary_is_read_evaluate_synthesize_ground() -> None:
     evaluated = await evaluate_node(state, context)
     assert evaluated["execution"].evidence_evaluation.status == "sufficient"
     state["execution"] = evaluated["execution"]
-    assert await synthesize_node(state, context) == {}
-    assert await ground_node(state, context) == {}
+    # Task 6B: the synthesis subgraph owns synthesis; the finalizer replays
+    # the checkpointed grounded artifact verbatim.
+    state["synthesis"] = grounded_checkpoint(
+        use_ids=(use_id,),
+        content=content,
+        citations=(
+            PublicCitation(
+                citation_id="a3z9",
+                index="a3z9",
+                label="doc-A",
+                source_type="vector",
+                document_id=str(DOCUMENT_ID),
+                chunk_id="chunk-1",
+            ),
+        ),
+    )
     final = await finalizer_node(state, context)
     assert final["final_response"].status == "success"
-    # M3: the ordering asserted is the hydrator's own call log, not a
-    # test-built list: one evaluation hydration, then one synthesis hydration.
-    assert hydrator.calls == ["evaluation", "synthesis"]
+    # M3: the ordering asserted is the hydrator's own call log — synthesis
+    # hydration belongs to the subgraph, simulated by the checkpoint above.
+    assert hydrator.calls == ["evaluation"]
 
 
 def test_summary_is_skill_not_agent_route() -> None:
