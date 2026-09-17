@@ -58,8 +58,59 @@ is protecting against. The A/B harness runs cases **serially** for this reason.
 | `GET /rag/chunks/{document_id}` | inspect stored chunks |
 
 Scripts: `python -m scripts.purge_orphan_vectors` (Chroma vectors with no DB row —
-the "phantom source" bug), `python -m scripts.backfill_heading_path` (metadata-only
-re-derive of heading paths for section-by-Điều retrieval).
+the "phantom source" bug), `python -m scripts.backfill_subdivision_nos`
+(metadata-only backfill of Khoản/Điểm subdivision fields — see below; it is the
+reference pattern for repairing chunk metadata in place without re-embedding).
+
+## Legal subdivision metadata (Khoản/Điểm)
+
+Legal chunks carry four extra Chroma metadata keys, written by the embed worker
+(pipe-separated strings; internal/artifact types keep typed lists):
+
+| Key | Example | Meaning |
+|-----|---------|---------|
+| `khoan_nos` | `"1|2"` | Khoản numbers covering this chunk |
+| `diem_labels` | `"a|b"` | Điểm letters covering this chunk |
+| `subdivision_refs` | `"khoan:1\|khoan:1/diem:a\|khoan:2"` | Atomic parent-aware refs — the only proof a điểm belongs to a khoản |
+| `subdivision_schema_version` | `1` | `0`/absent = pre-backfill chunk |
+
+A continuation chunk inherits the Khoản/Điểm interval open at its first
+character (derived sequence-aware by
+`app/services/parsing/heading_path.py::derive_subdivision_metadata`, never by
+scanning chunks independently).
+
+`search_document_section` resolves composite references against these fields:
+`khoản 2 Điều 8` requires `2` in `khoan_nos`; `điểm a khoản 2 Điều 8` requires
+the single atomic token `khoan:2/diem:a` in `subdivision_refs` (independent
+index intersections are never used to infer parentage). If every Điều
+candidate is schema version `0` the lookup falls back to Điều-level chunks;
+once any candidate declares version `1`, an empty subdivision match is
+authoritative (not-found, never semantic top-k).
+
+Backfill for pre-existing vectors (dry-run by default, `--apply` writes;
+requires at least one scope selector):
+
+```bash
+python -m scripts.backfill_subdivision_nos --workspace <WS_ID>            # dry-run
+python -m scripts.backfill_subdivision_nos --collection kb_<ws> --apply
+python -m scripts.backfill_subdivision_nos --document-id <ID> --apply --batch-size 200
+```
+
+It groups chunks by `(document_id, revision_id|legacy)`, sorts by `ordinal`
+(falling back to `chunk_index`), merges the four keys into the full existing
+metadata dict, and updates via `collection.update` — a malformed group is left
+untouched atomically, and reruns are idempotent. It prints counts only, never
+chunk text.
+
+Observability: the parser emits one counts-only line per legal document,
+
+```text
+[legal-structure] document_id=... khoan_candidates=... khoan_accepted=...
+diem_candidates=... diem_accepted=... ambiguous_rejected=...
+```
+
+Read it as an acceptance/rejection signal for the deterministic detector, not
+a ground-truth miss ratio.
 
 ## Gotchas
 

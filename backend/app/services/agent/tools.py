@@ -1391,6 +1391,70 @@ async def resolve_document_reference(
             "suggestion": None,
         }
 
+
+def _subdivision_schema_version(meta: dict) -> int:
+    """Version schema phân mục trên metadata chunk; thiếu/không hợp lệ → 0."""
+    try:
+        return int(meta.get("subdivision_schema_version") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _metadata_tokens(meta: dict, key: str) -> list[str]:
+    """Tách giá trị metadata pipe-separated thành các token lowercase."""
+    raw = meta.get(key)
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, (list, tuple)):
+        return [str(t).strip().lower() for t in raw if str(t).strip()]
+    return [t for t in str(raw).lower().split("|") if t]
+
+
+def _parse_composite_section_ref(section_reference: str) -> dict:
+    """
+    Phân tích tham chiếu Điều/Khoản/Điểm, độc lập với thứ tự từ và dấu câu.
+
+    Version 1 hỗ trợ MỘT Điều + tối đa MỘT Khoản + tối đa MỘT Điểm. Tham chiếu
+    lặp ("khoản 2 và khoản 3", hai số Điều) đặt ``multi=True`` và không bao giờ
+    được rút gọn âm thầm thành một đích.
+    """
+    ref_lc = section_reference.lower()
+    article_m = re.search(r"(?i)\bđiều\s+(\d+[a-z]?)\b", ref_lc)
+    khoan_m = re.search(r"(?i)\bkhoản\s+(\d{1,2})\b", ref_lc)
+    diem_m = re.search(r"(?i)\bđiểm\s+([a-zđ])\b", ref_lc)
+    multi = (
+        len(re.findall(r"(?i)\bđiều\s+\d+[a-z]?\b", ref_lc)) > 1
+        or len(re.findall(r"(?i)\bkhoản\s+\d{1,2}\b", ref_lc)) > 1
+        or len(re.findall(r"(?i)\bđiểm\s+[a-zđ]\b", ref_lc)) > 1
+    )
+    return {
+        "article": article_m.group(1) if article_m else None,
+        "khoan": khoan_m.group(1) if khoan_m else None,
+        "diem": diem_m.group(1) if diem_m else None,
+        "multi": multi,
+    }
+
+
+def _subdivision_match(meta: dict, khoan: str | None, diem: str | None) -> bool:
+    """
+    True khi chunk chứa đúng phân mục được hỏi.
+
+    ``điểm + khoản`` đòi token nguyên tử ``khoan:{n}/diem:{label}`` trong
+    ``subdivision_refs`` — không suy ra quan hệ cha-con bằng cross-product của
+    hai index độc lập. ``điểm`` không kèm khoản chỉ tra ``diem_labels``, không
+    bịa khoản cha.
+    """
+    if khoan and diem:
+        return f"khoan:{khoan}/diem:{diem}" in _metadata_tokens(
+            meta, "subdivision_refs"
+        )
+    if khoan:
+        return khoan in _metadata_tokens(meta, "khoan_nos")
+    if diem:
+        return diem in _metadata_tokens(meta, "diem_labels")
+    return True
+
+
 async def search_document_section(
     section_reference: str,
     workspace_ids: list[str],
@@ -1480,13 +1544,24 @@ async def search_document_section(
         for ws_id in workspace_ids:
             queries.append((get_vector_store(ws_id), None))
 
+    composite_ref = _parse_composite_section_ref(section_reference)
+    want_khoan = composite_ref["khoan"]
+    want_diem = composite_ref["diem"]
+    if composite_ref["multi"]:
+        logger.info(
+            f"[tool:search_document_section] Multi-reference input "
+            f"'{section_reference}' is unsupported — routing to semantic fallback"
+        )
+
     for vstore, where_filter in queries:
         try:
 
             # 1. Try structural lookup via metadata
             res = vstore.get_by_metadata(where=where_filter) if where_filter else {"documents": [], "metadatas": []}
-            
-            if res.get("documents") and res.get("metadatas"):
+
+            pair_chunks = []
+            structural_miss = False
+            if res.get("documents") and res.get("metadatas") and not composite_ref["multi"]:
                 # Filter in Python for substring match in heading_path
                 ref_norm = section_reference.lower().strip().rstrip(".")
 
@@ -1517,10 +1592,26 @@ async def search_document_section(
                             match = True
 
                     if match:
-                        all_chunks.append({"content": doc, "metadata": meta})
-            
+                        pair_chunks.append({"content": doc, "metadata": meta})
+
+                if pair_chunks and (want_khoan or want_diem):
+                    if any(
+                        _subdivision_schema_version(c["metadata"]) >= 1
+                        for c in pair_chunks
+                    ):
+                        pair_chunks = [
+                            c
+                            for c in pair_chunks
+                            if _subdivision_match(
+                                c["metadata"], want_khoan, want_diem
+                            )
+                        ]
+                        structural_miss = not pair_chunks
+
+            all_chunks.extend(pair_chunks)
+
             # 2. If metadata search found nothing, fallback to semantic search restricted to the document
-            if not all_chunks and document_ids:
+            if not pair_chunks and not structural_miss and document_ids:
                 logger.info(f"[tool:search_document_section] Metadata search failed for '{section_reference}', trying semantic fallback")
                 embedder = get_embedding_service()
                 query_emb = embedder.embed_query(section_reference)

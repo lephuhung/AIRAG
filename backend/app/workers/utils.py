@@ -243,6 +243,10 @@ async def load_revision_chunk_payloads(
             "table_refs": list(record.table_refs),
             "has_table": record.has_table,
             "has_code": record.has_code,
+            "khoan_nos": list(record.khoan_nos),
+            "diem_labels": list(record.diem_labels),
+            "subdivision_refs": list(record.subdivision_refs),
+            "subdivision_schema_version": record.subdivision_schema_version,
         }
         for record in parse_structure_artifact(raw)
     ]

@@ -59,8 +59,12 @@ class Document(Base):
     table_count: Mapped[int] = mapped_column(Integer, default=0)
     parser_version: Mapped[str | None] = mapped_column(
         String(50), nullable=True
-    )  # "docling" | "legacy"
+    )  # "docling" | "ocr" | "legacy"
     processing_time_ms: Mapped[int] = mapped_column(Integer, default=0)
+    # Per-stage wall-clock breakdown of the last parse run (JSONB):
+    # {minio_download_ms, detect_scanned_ms, docling_convert_ms | ocr_render_ms
+    #  + ocr_infer_ms + ocr_page_ms[], chunking_ms, classify_llm_ms, total_ms, …}
+    parse_timing: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     # Sub-task completion flags (set independently by each worker)
     embed_done: Mapped[bool] = mapped_column(default=False)

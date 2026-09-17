@@ -257,8 +257,10 @@ export interface Document {
   page_count?: number;
   image_count?: number;
   table_count?: number;
-  parser_version?: string;           // "docling" | "legacy"
+  parser_version?: string;           // "docling" | "ocr" | "legacy"
   processing_time_ms?: number;
+  // Per-stage parse timing breakdown written by the parse worker (JSONB)
+  parse_timing?: Record<string, unknown> | null;
   // Digital signature metadata (PDF only, null if no signatures found)
   digital_signatures?: Array<{
     field_name?: string;

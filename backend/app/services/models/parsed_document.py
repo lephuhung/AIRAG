@@ -66,6 +66,10 @@ class EnrichedChunk:
     # "" | "unknown" | "effective" | "partially_amended" | "superseded"
     validity_status: str = ""
     superseded_by: str = ""  # số hiệu văn bản thay thế, nếu superseded
+    khoan_nos: list[str] = field(default_factory=list)
+    diem_labels: list[str] = field(default_factory=list)
+    subdivision_refs: list[str] = field(default_factory=list)
+    subdivision_schema_version: int = 0
 
 
 @dataclass
@@ -82,6 +86,9 @@ class ParsedDocument:
     # Which extraction path actually ran: "docling" | "ocr" | "legacy".
     # Surfaced as Document.parser_version (NOT just the file-format capability).
     parser: str = "docling"
+    # Per-stage wall-clock breakdown ({stage_ms: int, ...}) filled by
+    # DeepDocumentParser — persisted to Document.parse_timing by the worker.
+    timing: dict = field(default_factory=dict)
 
 
 @dataclass

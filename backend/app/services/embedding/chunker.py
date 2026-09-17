@@ -188,13 +188,72 @@ class LegalDocumentChunker:
         dieu = [h for h in find_headings(text) if h.title.lower().startswith("điều")]
         return len(dieu) >= cls.MIN_DIEU_HEADINGS
 
+    def _sub_split(
+        self, section: str, base: int, start: int, end: int
+    ) -> list[tuple[str, int]]:
+        """Size-split một khoảng [start, end) của ``section`` — không bao giờ
+        tràn sang khoản/điều kế tiếp. Trả (content, absolute_char_start)."""
+        seg = section[start:end]
+        pieces: list[tuple[str, int]] = []
+        pos = 0
+        for sub in self._sub_splitter.split_text(seg):
+            at = seg.find(sub[:50], pos)
+            if at == -1:
+                at = pos
+            pieces.append((sub, base + start + at))
+            pos = max(at + 1, pos + 1)
+        return pieces
+
+    def _split_oversized_section(self, section: str, base: int) -> list[tuple[str, int]]:
+        """Cắt section quá dài theo KHOẢN trước, size-split chỉ khi một khoản
+        đơn lẻ vượt max_chars. Không có marker khoản nào → fallback cũ."""
+        from app.services.parsing.heading_path import find_subdivisions
+
+        khoans = [sd for sd in find_subdivisions(section) if sd.kind == "khoan"]
+        if not khoans:
+            return self._sub_split(section, base, 0, len(section))
+
+        segments: list[tuple[int, int]] = []
+        if section[: khoans[0].start].strip():
+            segments.append((0, khoans[0].start))
+        for i, k in enumerate(khoans):
+            end = khoans[i + 1].start if i + 1 < len(khoans) else len(section)
+            segments.append((k.start, end))
+
+        pieces: list[tuple[str, int]] = []
+        buf: tuple[int, int] | None = None
+
+        def flush() -> None:
+            nonlocal buf
+            if buf is not None:
+                pieces.append((section[buf[0] : buf[1]], base + buf[0]))
+                buf = None
+
+        for st, en in segments:
+            if en - st > self.max_chars:
+                flush()
+                pieces.extend(self._sub_split(section, base, st, en))
+            elif buf is None:
+                buf = (st, en)
+            elif en - buf[0] <= self.max_chars:
+                buf = (buf[0], en)
+            else:
+                flush()
+                buf = (st, en)
+        flush()
+        return pieces
+
     def split_text(
         self,
         text: str,
         source: str = "",
         extra_metadata: dict | None = None,
     ) -> list[TextChunk]:
-        from app.services.parsing.heading_path import find_headings
+        from app.services.parsing.heading_path import (
+            derive_heading_paths,
+            derive_subdivision_metadata,
+            find_headings,
+        )
 
         if not text.strip():
             return []
@@ -213,17 +272,7 @@ class LegalDocumentChunker:
             if len(section) <= self.max_chars:
                 pieces = [(section, s)]
             else:
-                # Điều/phụ lục quá dài: size-split TRONG section — không bao
-                # giờ tràn sang điều kế tiếp. char_start của sub-chunk dò trong
-                # phạm vi section (offset cục bộ + s).
-                pieces = []
-                pos = 0
-                for sub in self._sub_splitter.split_text(section):
-                    at = section.find(sub[:50], pos)
-                    if at == -1:
-                        at = pos
-                    pieces.append((sub, s + at))
-                    pos = max(at + 1, pos + 1)
+                pieces = self._split_oversized_section(section, s)
             for content, at in pieces:
                 result.append(TextChunk(
                     content=content,
@@ -236,8 +285,19 @@ class LegalDocumentChunker:
                         **(extra_metadata or {}),
                     },
                 ))
+        contents = [c.content for c in result]
+        sub_metas = derive_subdivision_metadata(
+            contents, derive_heading_paths(contents)
+        )
         # total_chunks chỉ biết sau khi duyệt xong
         return [
-            c._replace(metadata={**c.metadata, "total_chunks": len(result)})
-            for c in result
+            c._replace(metadata={
+                **c.metadata,
+                "total_chunks": len(result),
+                "khoan_nos": list(m.khoan_nos),
+                "diem_labels": list(m.diem_labels),
+                "subdivision_refs": list(m.subdivision_refs),
+                "subdivision_schema_version": 1,
+            })
+            for c, m in zip(result, sub_metas)
         ]

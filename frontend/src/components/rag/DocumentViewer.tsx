@@ -11,6 +11,7 @@ import { FileText, List, ChevronRight, Maximize2, Minimize2, AlignLeft, LayoutTe
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
 import type { Document, ChatSourceChunk } from "@/types";
+import { ParseTimingBreakdown } from "./ParseTimingBreakdown";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -884,6 +885,10 @@ export const DocumentViewer = memo(function DocumentViewer({
                   </>
                 )}
               </div>
+              {/* Parse timing breakdown (Docling/OCR stage waterfall) */}
+              {doc.parse_timing && (
+                <ParseTimingBreakdown timing={doc.parse_timing} />
+              )}
             </div>
 
             {/* Rendered markdown */}

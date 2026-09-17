@@ -2346,6 +2346,10 @@ class _FakeParseChunk:
         self.table_refs = []
         self.has_table = False
         self.has_code = False
+        self.khoan_nos = []
+        self.diem_labels = []
+        self.subdivision_refs = []
+        self.subdivision_schema_version = 0
 
 
 class _FakeParsedDoc:
@@ -2583,9 +2587,11 @@ class _FakeVectorStore:
     def __init__(self):
         self.collection_name = "ws_fake_collection"
         self.added = []
+        self.metadatas = []
 
     def add_documents(self, *, ids, embeddings, documents, metadatas):
         self.added.append((list(ids), list(documents)))
+        self.metadatas.append([dict(m) for m in metadatas])
 
 
 _CHUNK = {
@@ -4063,3 +4069,259 @@ def test_fix1_parse_only_fast_path_uses_stage_gate():
     assert "awaitcheck_and_finalize(document,db,revision_id=msg.revision_id)" in flat
     assert "finalize_revision_if_complete" not in func_source
     assert "apply_finalize_outcome" not in func_source
+
+
+class _StructArtifactStore:
+    """Serves one canned structure artifact to ``download_markdown``."""
+
+    def __init__(self, artifact: str):
+        self._artifact = artifact
+        self.downloads = []
+
+    async def download_markdown(self, key):
+        self.downloads.append(key)
+        return self._artifact
+
+
+def _structure_artifact_json(rev_id, doc_id, chunk_entries) -> str:
+    import json as _json
+
+    return _json.dumps(
+        {
+            "artifact_version": "v1",
+            "revision_id": str(rev_id),
+            "document_id": str(doc_id),
+            "chunks": list(chunk_entries),
+        }
+    )
+
+
+def _subdivision_entry(ordinal: int, **overrides) -> dict:
+    entry = {
+        "chunk_id": f"c{ordinal}",
+        "ordinal": ordinal,
+        "content": f"chunk {ordinal}",
+        "page_no": ordinal + 1,
+        "heading_path": ["Điều 8"],
+        "source_file": "doc.pdf",
+        "image_refs": [],
+        "table_refs": [],
+        "has_table": False,
+        "has_code": False,
+    }
+    entry.update(overrides)
+    return entry
+
+
+@pytest.mark.asyncio
+async def test_chunk_payloads_propagate_subdivision_fields(
+    async_engine, document_factory, monkeypatch
+):
+    """``load_revision_chunk_payloads`` surfaces the four subdivision keys.
+
+    The structure artifact is authoritative for the embed stage: new-shape
+    entries carry the keys verbatim, and an old-shape entry (artifact written
+    before the fields existed) loads with the additive defaults — empty lists
+    and schema version 0.
+    """
+    from app.services.agents.v2.persistence import document_views as _views
+    import app.services.storage_service as _storage
+    from app.workers.utils import load_revision_chunk_payloads
+
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="9" * 64)
+    struct_key = _views.revision_structure_key(ws, doc_id, rev_id)
+    artifact = _structure_artifact_json(
+        rev_id,
+        doc_id,
+        [
+            _subdivision_entry(
+                0,
+                khoan_nos=["2"],
+                diem_labels=["a"],
+                subdivision_refs=["khoan:2", "khoan:2/diem:a"],
+                subdivision_schema_version=1,
+            ),
+            _subdivision_entry(1),
+        ],
+    )
+    store = _StructArtifactStore(artifact)
+    monkeypatch.setattr(_storage, "get_storage_service", lambda: store)
+
+    async with maker() as db:
+        await record_parse_artifacts(
+            db,
+            rev_id,
+            FULL,
+            markdown_artifact_key="kb_x/doc.md",
+            structure_artifact_key=struct_key,
+        )
+        await db.commit()
+        payloads = await load_revision_chunk_payloads(db, rev_id)
+
+    assert store.downloads == [struct_key]
+    assert payloads is not None and len(payloads) == 2
+    assert payloads[0]["khoan_nos"] == ["2"]
+    assert payloads[0]["diem_labels"] == ["a"]
+    assert payloads[0]["subdivision_refs"] == ["khoan:2", "khoan:2/diem:a"]
+    assert payloads[0]["subdivision_schema_version"] == 1
+    assert payloads[1]["khoan_nos"] == []
+    assert payloads[1]["diem_labels"] == []
+    assert payloads[1]["subdivision_refs"] == []
+    assert payloads[1]["subdivision_schema_version"] == 0
+
+
+@pytest.mark.asyncio
+async def test_embed_writes_subdivision_chroma_metadata(
+    async_engine, document_factory, monkeypatch
+):
+    """Embed prefers the structure artifact and pipe-joins the typed lists.
+
+    Empty typed lists on a schema-version-1 chunk become empty Chroma strings
+    (present keys, not missing) so retrieval can trust the version signal.
+    """
+    from app.services.agents.v2.persistence import document_views as _views
+    import app.services.storage_service as _storage
+
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="8" * 64)
+    struct_key = _views.revision_structure_key(ws, doc_id, rev_id)
+    artifact = _structure_artifact_json(
+        rev_id,
+        doc_id,
+        [
+            _subdivision_entry(
+                0,
+                content="khoản 1 và 2, điểm a và b",
+                khoan_nos=["1", "2"],
+                diem_labels=["a", "b"],
+                subdivision_refs=[
+                    "khoan:1",
+                    "khoan:1/diem:a",
+                    "khoan:2",
+                    "khoan:2/diem:b",
+                ],
+                subdivision_schema_version=1,
+            ),
+            _subdivision_entry(
+                1,
+                content="điều không có khoản",
+                khoan_nos=[],
+                diem_labels=[],
+                subdivision_refs=[],
+                subdivision_schema_version=1,
+            ),
+        ],
+    )
+    md_store = _StructArtifactStore(artifact)
+    monkeypatch.setattr(_storage, "get_storage_service", lambda: md_store)
+    embedder, store = _FakeEmbedder(), _FakeVectorStore()
+    _patch_embed(monkeypatch, maker, embedder, store)
+    _patch_finalize_recorder(monkeypatch, _embed_worker)
+
+    async with maker() as db:
+        await record_parse_artifacts(
+            db,
+            rev_id,
+            FULL,
+            markdown_artifact_key="kb_x/doc.md",
+            structure_artifact_key=struct_key,
+        )
+        await db.commit()
+
+    await _embed_worker.handle_embed(_embed_payload(doc_id, ws, rev_id))
+
+    assert md_store.downloads == [struct_key]
+    assert len(store.metadatas) == 1 and len(store.metadatas[0]) == 2
+    meta = store.metadatas[0][0]
+    assert meta["khoan_nos"] == "1|2"
+    assert meta["diem_labels"] == "a|b"
+    assert meta["subdivision_refs"] == (
+        "khoan:1|khoan:1/diem:a|khoan:2|khoan:2/diem:b"
+    )
+    assert meta["subdivision_schema_version"] == 1
+    empty_meta = store.metadatas[0][1]
+    assert empty_meta["khoan_nos"] == ""
+    assert empty_meta["diem_labels"] == ""
+    assert empty_meta["subdivision_refs"] == ""
+    assert empty_meta["subdivision_schema_version"] == 1
+
+
+@pytest.mark.asyncio
+async def test_embed_legacy_payload_defaults_subdivision_metadata(
+    async_engine, document_factory, monkeypatch
+):
+    """A pre-subdivision payload (no keys) still embeds: empty strings + v0.
+
+    No build manifest exists, so ``load_revision_chunk_payloads`` returns
+    ``None`` and the worker falls back to the ``raw_chunks_json`` mirror —
+    whose old-shape entries lack the four keys entirely.
+    """
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="7" * 64)
+    await _seed_raw_chunks(maker, doc_id)
+    embedder, store = _FakeEmbedder(), _FakeVectorStore()
+    _patch_embed(monkeypatch, maker, embedder, store)
+    _patch_finalize_recorder(monkeypatch, _embed_worker)
+
+    await _embed_worker.handle_embed(_embed_payload(doc_id, ws, rev_id))
+
+    assert len(store.metadatas) == 1 and len(store.metadatas[0]) == 1
+    meta = store.metadatas[0][0]
+    assert meta["khoan_nos"] == ""
+    assert meta["diem_labels"] == ""
+    assert meta["subdivision_refs"] == ""
+    assert meta["subdivision_schema_version"] == 0
+
+
+@pytest.mark.asyncio
+async def test_parse_persists_subdivision_fields_in_artifacts(
+    async_engine, document_factory, monkeypatch
+):
+    """EnrichedChunk subdivision fields reach the artifact and the mirror."""
+    import json as _json
+
+    from app.services.agents.v2.persistence import document_views as _views
+
+    maker = _handler_maker(async_engine)
+    doc_id = document_factory()
+    ws, rev_id = await _handler_setup_full(maker, doc_id, sha="6" * 64)
+    store = _RecordingParseStore()
+    _patch_parse(monkeypatch, maker, store)
+
+    class _LegalParsedDoc(_FakeParsedDoc):
+        def __init__(self):
+            super().__init__()
+            chunk = _FakeParseChunk()
+            chunk.khoan_nos = ["2"]
+            chunk.diem_labels = ["a"]
+            chunk.subdivision_refs = ["khoan:2", "khoan:2/diem:a"]
+            chunk.subdivision_schema_version = 1
+            self.chunks = [chunk]
+
+    class _LegalParser(_FakeParseParser):
+        async def parse_structure(self, **kwargs):
+            return _LegalParsedDoc()
+
+    monkeypatch.setattr(_parse_worker, "DeepDocumentParser", _LegalParser)
+
+    await _parse_worker.handle_parse(_parse_payload(doc_id, ws, rev_id))
+
+    struct_key = _views.revision_structure_key(ws, doc_id, rev_id)
+    artifact = _json.loads(store.artifacts[struct_key])
+    entry = artifact["chunks"][0]
+    assert entry["khoan_nos"] == ["2"]
+    assert entry["diem_labels"] == ["a"]
+    assert entry["subdivision_refs"] == ["khoan:2", "khoan:2/diem:a"]
+    assert entry["subdivision_schema_version"] == 1
+
+    async with maker() as db:
+        doc = await db.get(Document, doc_id)
+        mirror = _json.loads(doc.raw_chunks_json)
+    assert mirror[0]["khoan_nos"] == ["2"]
+    assert mirror[0]["diem_labels"] == ["a"]
+    assert mirror[0]["subdivision_refs"] == ["khoan:2", "khoan:2/diem:a"]
+    assert mirror[0]["subdivision_schema_version"] == 1

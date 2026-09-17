@@ -603,6 +603,10 @@ class ChunkRecord:
     table_refs: list[str] = field(default_factory=list)
     has_table: bool = False
     has_code: bool = False
+    khoan_nos: list[str] = field(default_factory=list)
+    diem_labels: list[str] = field(default_factory=list)
+    subdivision_refs: list[str] = field(default_factory=list)
+    subdivision_schema_version: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -616,6 +620,10 @@ class ChunkRecord:
             "table_refs": list(self.table_refs),
             "has_table": self.has_table,
             "has_code": self.has_code,
+            "khoan_nos": list(self.khoan_nos),
+            "diem_labels": list(self.diem_labels),
+            "subdivision_refs": list(self.subdivision_refs),
+            "subdivision_schema_version": self.subdivision_schema_version,
         }
 
 
@@ -660,6 +668,12 @@ def parse_structure_artifact(raw: str) -> list[ChunkRecord]:
                 table_refs=list(entry.get("table_refs") or []),
                 has_table=bool(entry.get("has_table")),
                 has_code=bool(entry.get("has_code")),
+                khoan_nos=list(entry.get("khoan_nos") or []),
+                diem_labels=list(entry.get("diem_labels") or []),
+                subdivision_refs=list(entry.get("subdivision_refs") or []),
+                subdivision_schema_version=int(
+                    entry.get("subdivision_schema_version") or 0
+                ),
             )
         )
     return records

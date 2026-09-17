@@ -220,6 +220,73 @@ def test_structure_artifact_round_trips_chunk_locators():
     assert parse_structure_artifact("") == []
 
 
+def test_structure_artifact_round_trips_subdivision_fields():
+    """Khoản/Điểm ownership survives build -> parse unchanged (typed lists)."""
+    rev, doc = uuid.uuid4(), uuid.uuid4()
+    chunks = [
+        ChunkRecord(
+            chunk_id=str(uuid.uuid4()),
+            ordinal=0,
+            content="điểm a khoản 2 Điều 8",
+            khoan_nos=["2"],
+            diem_labels=["a"],
+            subdivision_refs=["khoan:2", "khoan:2/diem:a"],
+            subdivision_schema_version=1,
+        ),
+        ChunkRecord(
+            chunk_id=str(uuid.uuid4()),
+            ordinal=1,
+            content="khoản 1 và khoản 3",
+            khoan_nos=["1", "3"],
+            subdivision_refs=["khoan:1", "khoan:3"],
+            subdivision_schema_version=1,
+        ),
+    ]
+    payload = json.loads(build_structure_artifact(rev, doc, chunks))
+    entry = payload["chunks"][0]
+    assert entry["khoan_nos"] == ["2"]
+    assert entry["diem_labels"] == ["a"]
+    assert entry["subdivision_refs"] == ["khoan:2", "khoan:2/diem:a"]
+    assert entry["subdivision_schema_version"] == 1
+    parsed = parse_structure_artifact(build_structure_artifact(rev, doc, chunks))
+    assert [c.khoan_nos for c in parsed] == [["2"], ["1", "3"]]
+    assert [c.diem_labels for c in parsed] == [["a"], []]
+    assert parsed[0].subdivision_refs == ["khoan:2", "khoan:2/diem:a"]
+    assert parsed[1].subdivision_refs == ["khoan:1", "khoan:3"]
+    assert [c.subdivision_schema_version for c in parsed] == [1, 1]
+
+
+def test_structure_artifact_old_payload_defaults_subdivision_fields():
+    """An artifact written before the fields existed parses to [] / 0."""
+    raw = json.dumps(
+        {
+            "artifact_version": "v1",
+            "revision_id": str(uuid.uuid4()),
+            "document_id": str(uuid.uuid4()),
+            "chunks": [
+                {
+                    "chunk_id": "c0",
+                    "ordinal": 0,
+                    "content": "old-shape chunk",
+                    "page_no": 1,
+                    "heading_path": ["Điều 1"],
+                    "source_file": "old.pdf",
+                    "image_refs": [],
+                    "table_refs": [],
+                    "has_table": False,
+                    "has_code": False,
+                }
+            ],
+        }
+    )
+    parsed = parse_structure_artifact(raw)
+    assert len(parsed) == 1
+    assert parsed[0].khoan_nos == []
+    assert parsed[0].diem_labels == []
+    assert parsed[0].subdivision_refs == []
+    assert parsed[0].subdivision_schema_version == 0
+
+
 # ---------------------------------------------------------------------------
 # Repository-backed artifact identity
 # ---------------------------------------------------------------------------

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from app.core.config import settings
+from app.services.parsing.parse_timing import ParseTimer
 from app.services.models.parsed_document import (
     ExtractedImage,
     ExtractedTable,
@@ -227,6 +228,21 @@ _DOCLING_EXTENSIONS = {".pdf", ".docx", ".pptx", ".html"}
 _LEGACY_EXTENSIONS = {".txt", ".md"}
 _OCR_EXTENSIONS = {".pdf"}  # Only PDFs need scanned-page detection
 
+_DOCLING_CHUNK_PAGE_BREAK = "<!-- hrag-internal-page-break -->"
+
+
+def _contains_markdown_table(text: str) -> bool:
+    """True only for a markdown pipe row immediately followed by a valid
+    separator row (``|---|---|``); a lone pipe-containing sentence is False."""
+    lines = text.splitlines()
+    for row, sep in zip(lines, lines[1:]):
+        if "|" not in row or "|" not in sep:
+            continue
+        cells = [c.strip() for c in sep.strip().strip("|").split("|")]
+        if cells and all(re.fullmatch(r":?-{3,}:?", c) for c in cells):
+            return True
+    return False
+
 
 def _md_table_to_html(md: str) -> str:
     """Minimal markdown-pipe-table → HTML (fallback when Docling lacks
@@ -258,16 +274,15 @@ def _md_table_to_html(md: str) -> str:
 # we pay that cost only ONCE per worker process regardless of how many documents
 # are processed.  Each parse worker is a separate OS process, so there is no
 # cross-process sharing — that is intentional: CUDA contexts are per-process.
-_DOCLING_CONVERTER = None
+# Converters are cached per do_ocr flag. A PDF only reaches the Docling path
+# after pdf-inspector certifies its text layer (0 pages need OCR), so the
+# Docling-path converter runs with do_ocr=False — on a 308-page text-layer PDF
+# Docling's own OCR stage costs ~360s for zero gain. The do_ocr=True variant
+# stays available for HRAG_DOCLING_FORCE_FULL_PAGE_OCR.
+_DOCLING_CONVERTERS: dict[bool, "DocumentConverter"] = {}
 
 
-def _get_global_converter():
-    """Return the process-wide singleton DocumentConverter, creating it once."""
-    global _DOCLING_CONVERTER
-    if _DOCLING_CONVERTER is not None:
-        return _DOCLING_CONVERTER
-
-    from docling.document_converter import DocumentConverter, PdfFormatOption
+def _build_pipeline_options(do_ocr: bool):
     from docling.datamodel.pipeline_options import (
         PdfPipelineOptions,
         OcrAutoOptions,
@@ -277,8 +292,6 @@ def _get_global_converter():
         AcceleratorOptions,
         AcceleratorDevice,
     )
-    from docling.datamodel.base_models import InputFormat
-    from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
 
     # Map the config string to the Docling enum (raw strings are accepted by some
     # Docling versions but not all — map explicitly so "cuda"/"cpu" are honored).
@@ -291,7 +304,7 @@ def _get_global_converter():
         settings.HRAG_DOCLING_DEVICE.lower(), AcceleratorDevice.AUTO
     )
 
-    pipeline_options = PdfPipelineOptions(do_ocr=settings.HRAG_ENABLE_OCR)
+    pipeline_options = PdfPipelineOptions(do_ocr=do_ocr)
     pipeline_options.generate_picture_images = settings.HRAG_ENABLE_IMAGE_EXTRACTION
     pipeline_options.images_scale = settings.HRAG_DOCLING_IMAGES_SCALE
     pipeline_options.do_formula_enrichment = settings.HRAG_ENABLE_FORMULA_ENRICHMENT
@@ -305,7 +318,7 @@ def _get_global_converter():
     import importlib.util
 
     _easyocr_ok = importlib.util.find_spec("easyocr") is not None
-    if settings.HRAG_DOCLING_FORCE_FULL_PAGE_OCR and _easyocr_ok:
+    if do_ocr and settings.HRAG_DOCLING_FORCE_FULL_PAGE_OCR and _easyocr_ok:
         from docling.datamodel.pipeline_options import EasyOcrOptions
 
         pipeline_options.ocr_options = EasyOcrOptions(
@@ -314,7 +327,7 @@ def _get_global_converter():
         logger.info("[Docling] Vietnamese fix: EasyOCR full-page OCR enabled")
     else:
         pipeline_options.ocr_options = OcrAutoOptions(lang=["vi", "en"])
-        if settings.HRAG_DOCLING_FORCE_FULL_PAGE_OCR and not _easyocr_ok:
+        if do_ocr and settings.HRAG_DOCLING_FORCE_FULL_PAGE_OCR and not _easyocr_ok:
             logger.warning(
                 "[Docling] HRAG_DOCLING_FORCE_FULL_PAGE_OCR set but 'easyocr' is "
                 "NOT installed — Vietnamese diacritics from broken text layers "
@@ -331,12 +344,25 @@ def _get_global_converter():
         if settings.HRAG_DOCLING_TABLE_MODE.lower() == "fast"
         else TableFormerMode.ACCURATE
     )
+    return pipeline_options
 
+
+def _get_global_converter(do_ocr: bool = True):
+    """Return the process-wide singleton DocumentConverter for ``do_ocr``."""
+    conv = _DOCLING_CONVERTERS.get(do_ocr)
+    if conv is not None:
+        return conv
+
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.base_models import InputFormat
+    from docling.backend.pypdfium2_backend import PyPdfiumDocumentBackend
+
+    pipeline_options = _build_pipeline_options(do_ocr)
     logger.info(
-        f"[Docling] Initializing DocumentConverter (device={device.value}, "
+        f"[Docling] Initializing DocumentConverter (do_ocr={do_ocr}, "
         f"table_mode={settings.HRAG_DOCLING_TABLE_MODE})"
     )
-    _DOCLING_CONVERTER = DocumentConverter(
+    conv = DocumentConverter(
         format_options={
             InputFormat.PDF: PdfFormatOption(
                 pipeline_options=pipeline_options,
@@ -344,8 +370,9 @@ def _get_global_converter():
             ),
         }
     )
+    _DOCLING_CONVERTERS[do_ocr] = conv
     logger.info("[Docling] DocumentConverter ready (singleton)")
-    return _DOCLING_CONVERTER
+    return conv
 
 
 class DeepDocumentParser:
@@ -364,9 +391,9 @@ class DeepDocumentParser:
             settings.BASE_DIR / "data" / "docling" / f"kb_{workspace_id}"
         )
 
-    def _get_converter(self):
-        """Return the process-wide singleton DocumentConverter."""
-        return _get_global_converter()
+    def _get_converter(self, do_ocr: bool = True):
+        """Return the process-wide singleton DocumentConverter for ``do_ocr``."""
+        return _get_global_converter(do_ocr=do_ocr)
 
     @staticmethod
     def is_docling_supported(file_path: str | Path) -> bool:
@@ -392,29 +419,52 @@ class DeepDocumentParser:
         path = Path(file_path)
         suffix = path.suffix.lower()
         start_time = time.time()
+        timer = ParseTimer()
 
         if suffix in _DOCLING_EXTENSIONS:
             # For PDFs: route to OCR when the page is scanned (no text) OR when
             # the text layer is corrupt Vietnamese (dropped tone marks) — both
             # are cases Docling can't extract correctly.
-            if (
-                suffix in _OCR_EXTENSIONS
-                and settings.HRAG_ENABLE_OCR
-                and (self._is_scanned(path) or self._has_broken_vn_textlayer(path))
-            ):
+            route_ocr = False
+            if suffix in _OCR_EXTENSIONS and settings.HRAG_ENABLE_OCR:
+                with timer.stage("detect_scanned_ms"):
+                    route_ocr = self._is_scanned(path)
+                if not route_ocr:
+                    with timer.stage("detect_broken_vn_ms"):
+                        route_ocr = self._has_broken_vn_textlayer(path)
+            if route_ocr:
                 result = await self._parse_with_ocr(
-                    path, document_id, original_filename
+                    path, document_id, original_filename, timer
                 )
             else:
+                # Keep Docling's own OCR stage only when some pages actually
+                # lack a text layer (mixed PDFs) or the operator forces it —
+                # on a fully text-based 308-page PDF that stage costs ~360s
+                # for zero gain. ``None`` (inspector unavailable) keeps OCR on.
+                do_ocr_in_docling = settings.HRAG_DOCLING_FORCE_FULL_PAGE_OCR
+                if (
+                    not do_ocr_in_docling
+                    and settings.HRAG_ENABLE_OCR
+                    and suffix in _OCR_EXTENSIONS
+                ):
+                    from app.services.parsing.ocr_service import get_ocr_service
+
+                    needs = get_ocr_service().pages_needing_ocr_count(path)
+                    do_ocr_in_docling = needs is None or needs > 0
                 # Docling conversion is CPU-bound and blocking — offload to a
                 # worker thread so the worker's asyncio event loop (RabbitMQ
                 # heartbeats, /health, /ready) stays responsive during long parses.
                 result = await asyncio.to_thread(
-                    self._parse_with_docling, path, document_id, original_filename
+                    self._parse_with_docling,
+                    path,
+                    document_id,
+                    original_filename,
+                    timer,
+                    do_ocr_in_docling,
                 )
         elif suffix in _LEGACY_EXTENSIONS:
             result = await asyncio.to_thread(
-                self._parse_legacy, path, document_id, original_filename
+                self._parse_legacy, path, document_id, original_filename, timer
             )
         else:
             raise ValueError(
@@ -423,10 +473,12 @@ class DeepDocumentParser:
             )
 
         elapsed_ms = int((time.time() - start_time) * 1000)
+        result.timing = timer.summary()
         logger.info(
             f"Parsed document {document_id} ({original_filename}) in {elapsed_ms}ms: "
             f"{result.page_count} pages, {len(result.chunks)} chunks, "
-            f"{len(result.images)} images, {result.tables_count} tables"
+            f"{len(result.images)} images, {result.tables_count} tables "
+            f"| stages={result.timing}"
         )
         return result
 
@@ -493,6 +545,7 @@ class DeepDocumentParser:
         file_path: Path,
         document_id: int,
         original_filename: str,
+        timer: ParseTimer | None = None,
     ) -> ParsedDocument:
         """
         Parse a scanned PDF via HunyuanOCR then convert to ParsedDocument.
@@ -505,6 +558,8 @@ class DeepDocumentParser:
         """
         import tempfile
 
+        timer = timer or ParseTimer()
+
         from app.services.parsing.ocr_service import get_ocr_service
 
         logger.info(
@@ -513,7 +568,10 @@ class DeepDocumentParser:
         )
 
         ocr_service = get_ocr_service()
-        ocr_text = await ocr_service.ocr_pdf(file_path)
+        ocr_stats: dict = {}
+        with timer.stage("ocr_total_ms"):
+            ocr_text = await ocr_service.ocr_pdf(file_path, stats=ocr_stats)
+        timer.merge(ocr_stats)
 
         if not ocr_text.strip():
             logger.warning(
@@ -541,7 +599,10 @@ class DeepDocumentParser:
             tmp_path = Path(tmp.name)
 
         try:
-            result = self._parse_legacy(tmp_path, document_id, original_filename)
+            with timer.stage("ocr_chunk_ms"):
+                result = self._parse_legacy(
+                    tmp_path, document_id, original_filename, timer
+                )
             # Override markdown with OCR output so the viewer shows the right content
             result.markdown = ocr_text
             result.parser = "ocr"
@@ -559,40 +620,47 @@ class DeepDocumentParser:
         file_path: Path,
         document_id: int,
         original_filename: str,
+        timer: ParseTimer | None = None,
+        do_ocr: bool = False,
     ) -> ParsedDocument:
         """Parse with Docling for rich structural extraction."""
-        converter = self._get_converter()
+        timer = timer or ParseTimer()
+        converter = self._get_converter(do_ocr=do_ocr)
 
         # Convert document (CPU-bound, no LLM)
         logger.info(f"Docling converting: {file_path}")
-        conv_result = converter.convert(str(file_path))
+        with timer.stage("docling_convert_ms"):
+            conv_result = converter.convert(str(file_path))
         doc = conv_result.document
 
         # Extract images (file save only — captions added later by caption worker)
-        images, pic_url_list = self._extract_images_with_urls(doc, document_id)
+        with timer.stage("extract_images_ms"):
+            images, pic_url_list = self._extract_images_with_urls(doc, document_id)
 
         # Extract tables (markdown only — captions added later by caption worker)
-        tables = self._extract_tables(doc, document_id)
+        with timer.stage("extract_tables_ms"):
+            tables = self._extract_tables(doc, document_id)
 
         # Export markdown. With layout reconstruction on, rebuild the admin
         # layout from element provenance (images already embedded); otherwise
         # use Docling's flat markdown export + inject image refs.
-        if settings.HRAG_DOCLING_PRESERVE_LAYOUT:
-            try:
-                markdown = self._export_layout_markdown(doc, pic_url_list)
-            except Exception as e:
-                logger.warning(
-                    f"Docling layout reconstruction failed for {document_id} "
-                    f"(falling back to markdown export): {e}",
-                    exc_info=True,
-                )
-                markdown = self._inject_image_references(
-                    self._export_markdown(doc), pic_url_list
-                )
-        else:
-            markdown = self._export_markdown(doc)
-            # Post-process: replace image placeholders with real markdown images
-            markdown = self._inject_image_references(markdown, pic_url_list)
+        with timer.stage("export_markdown_ms"):
+            if settings.HRAG_DOCLING_PRESERVE_LAYOUT:
+                try:
+                    markdown = self._export_layout_markdown(doc, pic_url_list)
+                except Exception as e:
+                    logger.warning(
+                        f"Docling layout reconstruction failed for {document_id} "
+                        f"(falling back to markdown export): {e}",
+                        exc_info=True,
+                    )
+                    markdown = self._inject_image_references(
+                        self._export_markdown(doc), pic_url_list
+                    )
+            else:
+                markdown = self._export_markdown(doc)
+                # Post-process: replace image placeholders with real markdown images
+                markdown = self._inject_image_references(markdown, pic_url_list)
         # Note: table captions NOT injected here — caption worker will update
         # markdown_content in DB once captions are ready
 
@@ -601,11 +669,32 @@ class DeepDocumentParser:
         if hasattr(doc, "pages") and doc.pages:
             page_count = len(doc.pages)
 
-        # Chunk with HybridChunker — images/tables passed for page-ref tracking
-        # but enriched_text will NOT include captions yet (images have caption="")
-        chunks = self._chunk_document(
-            doc, document_id, original_filename, images, tables
-        )
+        with timer.stage("export_chunk_markdown_ms"):
+            chunk_markdown, page_spans = self._export_chunk_markdown(doc)
+        from app.services.embedding.chunker import LegalDocumentChunker
+
+        with timer.stage("chunking_ms"):
+            if (
+                settings.HRAG_LEGAL_CHUNKING
+                and LegalDocumentChunker.has_legal_structure(chunk_markdown)
+            ):
+                chunks = self._chunk_legal_markdown(
+                    chunk_markdown,
+                    page_spans,
+                    document_id,
+                    original_filename,
+                    images,
+                    tables,
+                )
+                logger.info(
+                    f"[legal-chunking] document_id={document_id} chunks={len(chunks)}"
+                )
+            else:
+                # Chunk with HybridChunker — images/tables passed for page-ref tracking
+                # but enriched_text will NOT include captions yet (images have caption="")
+                chunks = self._chunk_document(
+                    doc, document_id, original_filename, images, tables
+                )
 
         tables_count = len(tables)
 
@@ -803,6 +892,166 @@ class DeepDocumentParser:
             md = doc.export_to_markdown()
 
         return _fix_scattered_vietnamese(md)
+
+    def _export_chunk_markdown(
+        self, doc
+    ) -> tuple[str, list[tuple[int, int, int]]]:
+        """Export a dedicated FLAT markdown for structure detection and legal
+        chunking, plus exact ``(page_no, start, end)`` spans.
+
+        Requests a unique internal page-break placeholder and enumerates it
+        into ``<!-- page N -->`` markers. Docling versions rejecting
+        ``page_break_placeholder`` return the plain export with no inferred
+        spans (page_no=0 downstream).
+        """
+        try:
+            raw = doc.export_to_markdown(
+                page_break_placeholder=_DOCLING_CHUNK_PAGE_BREAK
+            )
+        except TypeError:
+            logger.warning(
+                "Docling export_to_markdown lacks page_break_placeholder — "
+                "legal chunking continues without inferred page spans"
+            )
+            return _fix_scattered_vietnamese(doc.export_to_markdown()), []
+        segments = _fix_scattered_vietnamese(raw).split(_DOCLING_CHUNK_PAGE_BREAK)
+        parts = [
+            f"<!-- page {i} -->\n\n{segment.strip()}"
+            for i, segment in enumerate(segments, 1)
+        ]
+        content = "\n\n".join(parts)
+        page_spans: list[tuple[int, int, int]] = []
+        pos = 0
+        for i, part in enumerate(parts, 1):
+            page_spans.append((i, pos, pos + len(part)))
+            pos += len(part) + 2
+        return content, page_spans
+
+    def _chunk_legal_markdown(
+        self,
+        markdown: str,
+        page_spans: list[tuple[int, int, int]],
+        document_id: int,
+        original_filename: str,
+        images: list[ExtractedImage] | None = None,
+        tables: list[ExtractedTable] | None = None,
+    ) -> list[EnrichedChunk]:
+        """Chunk the flat legal export with LegalDocumentChunker and map each
+        chunk to page/assets via exact ``page_spans`` intersection."""
+        from app.services.embedding.chunker import LegalDocumentChunker
+        from app.services.parsing.heading_path import (
+            derive_heading_paths,
+            parse_subdivisions,
+        )
+
+        sub_stats = parse_subdivisions(markdown).stats
+        logger.info(
+            f"[legal-structure] document_id={document_id} "
+            f"khoan_candidates={sub_stats.khoan_candidates} "
+            f"khoan_accepted={sub_stats.khoan_accepted} "
+            f"diem_candidates={sub_stats.diem_candidates} "
+            f"diem_accepted={sub_stats.diem_accepted} "
+            f"ambiguous_rejected={sub_stats.ambiguous_rejected}"
+        )
+
+        text_chunks = LegalDocumentChunker(
+            max_chars=settings.HRAG_LEGAL_CHUNK_MAX_CHARS
+        ).split_text(markdown, source=original_filename)
+        heading_paths = derive_heading_paths([tc.content for tc in text_chunks])
+
+        page_images: dict[int, list[ExtractedImage]] = {}
+        for img in images or []:
+            page_images.setdefault(img.page_no, []).append(img)
+        page_tables: dict[int, list[ExtractedTable]] = {}
+        for tbl in tables or []:
+            page_tables.setdefault(tbl.page_no, []).append(tbl)
+
+        img_by_id = {im.image_id: im for im in images or []}
+        tbl_by_id = {t.table_id: t for t in tables or []}
+        assigned_images: set[str] = set()
+        assigned_tables: set[str] = set()
+
+        chunks: list[EnrichedChunk] = []
+        for i, (tc, hp) in enumerate(zip(text_chunks, heading_paths)):
+            hit_pages = [
+                p
+                for p, st, en in page_spans
+                if st < tc.char_end
+                and tc.char_start < en
+                and re.sub(
+                    r"<!--\s*page\s+\d+\s*-->",
+                    "",
+                    markdown[max(tc.char_start, st) : min(tc.char_end, en)],
+                ).strip()
+            ]
+            page_no = hit_pages[0] if hit_pages else 0
+
+            chunk_image_refs: list[str] = []
+            for p in hit_pages:
+                for img in page_images.get(p, []):
+                    if img.image_id not in assigned_images:
+                        chunk_image_refs.append(img.image_id)
+                        assigned_images.add(img.image_id)
+
+            enriched_text = tc.content
+            if chunk_image_refs:
+                desc_parts = []
+                for img_id in chunk_image_refs:
+                    img = img_by_id.get(img_id)
+                    if img and img.caption:
+                        desc_parts.append(
+                            f"[Image on page {img.page_no}]: {img.caption}"
+                        )
+                if desc_parts:
+                    enriched_text = tc.content + "\n\n" + "\n".join(desc_parts)
+
+            chunk_table_refs: list[str] = []
+            for p in hit_pages:
+                for tbl in page_tables.get(p, []):
+                    if tbl.table_id not in assigned_tables:
+                        chunk_table_refs.append(tbl.table_id)
+                        assigned_tables.add(tbl.table_id)
+
+            if chunk_table_refs:
+                tbl_parts = []
+                for tbl_id in chunk_table_refs:
+                    tbl = tbl_by_id.get(tbl_id)
+                    if tbl and tbl.caption:
+                        tbl_parts.append(
+                            f"[Table on page {tbl.page_no} ({tbl.num_rows}x{tbl.num_cols})]: {tbl.caption}"
+                        )
+                if tbl_parts:
+                    enriched_text = enriched_text + "\n\n" + "\n".join(tbl_parts)
+
+            contextualized = ""
+            if hp:
+                contextualized = " > ".join(hp) + ": " + tc.content[:100]
+
+            chunks.append(
+                EnrichedChunk(
+                    content=enriched_text,
+                    chunk_index=i,
+                    source_file=original_filename,
+                    document_id=document_id,
+                    page_no=page_no,
+                    heading_path=list(hp),
+                    image_refs=chunk_image_refs,
+                    table_refs=chunk_table_refs,
+                    has_table=_contains_markdown_table(tc.content)
+                    or bool(chunk_table_refs),
+                    has_code=False,
+                    contextualized=contextualized,
+                    khoan_nos=list(tc.metadata.get("khoan_nos") or []),
+                    diem_labels=list(tc.metadata.get("diem_labels") or []),
+                    subdivision_refs=list(
+                        tc.metadata.get("subdivision_refs") or []
+                    ),
+                    subdivision_schema_version=int(
+                        tc.metadata.get("subdivision_schema_version") or 0
+                    ),
+                )
+            )
+        return chunks
 
     def _export_layout_markdown(self, doc, pic_url_list) -> str:
         """Rebuild administrative layout HTML from Docling provenance.
@@ -1296,6 +1545,7 @@ class DeepDocumentParser:
         file_path: Path,
         document_id: int,
         original_filename: str,
+        timer: ParseTimer | None = None,
     ) -> ParsedDocument:
         """Fallback: parse TXT/MD with legacy loader + RecursiveCharacterTextSplitter."""
         import re
@@ -1303,7 +1553,9 @@ class DeepDocumentParser:
         from app.services.embedding.chunker import DocumentChunker, LegalDocumentChunker
         from app.services.parsing.layout import strip_layout_html
 
-        loaded = load_document(str(file_path))
+        timer = timer or ParseTimer()
+        with timer.stage("legacy_load_ms"):
+            loaded = load_document(str(file_path))
         content = loaded.content
 
         # OCR admin-layout docs wrap every line in HTML (<p class="ocr-body"
@@ -1351,18 +1603,30 @@ class DeepDocumentParser:
             chunker = LegalDocumentChunker(
                 max_chars=settings.HRAG_LEGAL_CHUNK_MAX_CHARS
             )
+            from app.services.parsing.heading_path import parse_subdivisions
+
+            sub_stats = parse_subdivisions(content).stats
             logger.info(
                 f"[legal-chunking] {original_filename}: legal structure detected "
                 f"— chunking on Phần/Chương/Mục/Điều boundaries"
             )
+            logger.info(
+                f"[legal-structure] document_id={document_id} "
+                f"khoan_candidates={sub_stats.khoan_candidates} "
+                f"khoan_accepted={sub_stats.khoan_accepted} "
+                f"diem_candidates={sub_stats.diem_candidates} "
+                f"diem_accepted={sub_stats.diem_accepted} "
+                f"ambiguous_rejected={sub_stats.ambiguous_rejected}"
+            )
         else:
             chunker = DocumentChunker(chunk_size=500, chunk_overlap=50)
 
-        text_chunks = chunker.split_text(
-            text=content,
-            source=original_filename,
-            extra_metadata={"document_id": document_id, "file_type": loaded.file_type},
-        )
+        with timer.stage("legacy_chunk_ms"):
+            text_chunks = chunker.split_text(
+                text=content,
+                source=original_filename,
+                extra_metadata={"document_id": document_id, "file_type": loaded.file_type},
+            )
 
         # Wrap legacy chunks as EnrichedChunks with correct page_no
         chunks = []
@@ -1381,6 +1645,12 @@ class DeepDocumentParser:
                 source_file=original_filename,
                 document_id=document_id,
                 page_no=chunk_page,
+                khoan_nos=list(tc.metadata.get("khoan_nos") or []),
+                diem_labels=list(tc.metadata.get("diem_labels") or []),
+                subdivision_refs=list(tc.metadata.get("subdivision_refs") or []),
+                subdivision_schema_version=int(
+                    tc.metadata.get("subdivision_schema_version") or 0
+                ),
             ))
 
         # OCR/legacy path has no Docling headings — derive Phần/Chương/Mục/Điều
@@ -1389,10 +1659,13 @@ class DeepDocumentParser:
         # (search_document_section) can never match.
         from app.services.parsing.heading_path import derive_heading_paths
 
-        for c, hp in zip(chunks, derive_heading_paths([c.content for c in chunks])):
-            if hp:
-                c.heading_path = hp
-                c.contextualized = " > ".join(hp) + ": " + c.content[:100]
+        with timer.stage("derive_headings_ms"):
+            for c, hp in zip(
+                chunks, derive_heading_paths([c.content for c in chunks])
+            ):
+                if hp:
+                    c.heading_path = hp
+                    c.contextualized = " > ".join(hp) + ": " + c.content[:100]
 
         return ParsedDocument(
             document_id=document_id,

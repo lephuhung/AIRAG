@@ -353,8 +353,8 @@ class VectorStore:
         metadatas: Sequence[dict],
     ) -> None:
         """Update ONLY the metadata of existing chunks — embeddings and text
-        untouched. Used by scripts/backfill_heading_path.py to repair the
-        heading_path field corpus-wide without re-embedding."""
+        untouched. Used by scripts/backfill_subdivision_nos.py to repair
+        subdivision metadata corpus-wide without re-embedding."""
         if not ids:
             return
         self._run(lambda col: col.update(ids=list(ids), metadatas=list(metadatas)))

@@ -39,6 +39,8 @@ class DocumentResponse(DocumentBase):
     table_count: int = 0
     parser_version: str | None = None
     processing_time_ms: int = 0
+    # Per-stage parse timing breakdown (Docling/OCR bottleneck analysis)
+    parse_timing: dict[str, Any] | None = None
     # Digital signature metadata (None if not a native PDF or no signatures found)
     digital_signatures: list[dict[str, Any]] | None = None
     # Document type classification

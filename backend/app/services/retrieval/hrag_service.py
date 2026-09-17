@@ -226,6 +226,10 @@ class HRAGService:
                         ) if c.image_refs else "",
                         # Recency boost: published date for date-aware scoring
                         "published_date": document.published_date or "",
+                        "khoan_nos": "|".join(c.khoan_nos),
+                        "diem_labels": "|".join(c.diem_labels),
+                        "subdivision_refs": "|".join(c.subdivision_refs),
+                        "subdivision_schema_version": int(c.subdivision_schema_version),
                     }
                     for c in parsed.chunks
                 ]

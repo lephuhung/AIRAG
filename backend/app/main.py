@@ -385,6 +385,12 @@ async def lifespan(app: FastAPI):
                     "ALTER TABLE documents ADD COLUMN IF NOT EXISTS published_date VARCHAR(100)"
                 )
             )
+            # Per-stage parse timing breakdown (Docling/OCR bottleneck analysis)
+            await conn.execute(
+                text(
+                    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS parse_timing JSONB"
+                )
+            )
             # ── Auth & multi-tenant columns ────────────────────────────────────
             # knowledge_bases: visibility, owner_id, tenant_id
             await conn.execute(

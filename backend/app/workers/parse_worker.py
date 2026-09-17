@@ -42,6 +42,7 @@ from app.services.agents.v2.persistence.document_views import (
     revision_structure_key,
 )
 from app.services.parsing.deep_document_parser import DeepDocumentParser
+from app.services.parsing.parse_timing import ParseTimer
 from app.services.storage_service import get_storage_service
 from app.workers.utils import (
     check_and_finalize,
@@ -109,6 +110,7 @@ async def handle_parse(payload: dict) -> None:
         await db.commit()
 
         tmp_path: Path | None = None
+        timer = ParseTimer()
         try:
             document.status = DocumentStatus.PARSING
             await db.commit()
@@ -116,11 +118,13 @@ async def handle_parse(payload: dict) -> None:
             # ── Download raw file from MinIO ────────────────────────────────
             storage = get_storage_service()
             try:
-                file_bytes = await storage.download_file(msg.minio_key)
+                with timer.stage("minio_download_ms"):
+                    file_bytes = await storage.download_file(msg.minio_key)
                 logger.info(
                     f"[parse_worker] doc={msg.document_id} downloaded "
                     f"{len(file_bytes)} bytes from MinIO key={msg.minio_key}"
                 )
+                timer.set("file_bytes", len(file_bytes))
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
                 logger.error(
                     f"[parse_worker] doc={msg.document_id} MINIO DOWNLOAD FAILED "
@@ -142,10 +146,10 @@ async def handle_parse(payload: dict) -> None:
                     from app.services.parsing.digital_signature_service import (
                         extract_digital_signatures,
                     )
-
-                    sigs = await asyncio.to_thread(
-                        extract_digital_signatures, str(tmp_path)
-                    )
+                    with timer.stage("digital_signature_ms"):
+                        sigs = await asyncio.to_thread(
+                            extract_digital_signatures, str(tmp_path)
+                        )
                     if sigs:
                         document.digital_signatures = sigs
                         await db.commit()
@@ -159,27 +163,29 @@ async def handle_parse(payload: dict) -> None:
                         f"digital signature extraction failed (non-fatal): {_sig_err}"
                     )
 
-            # ── Phase: structural parse (ZERO LLM) ─────────────────────────
             parser = DeepDocumentParser(workspace_id=msg.workspace_id)
-            parsed = await parser.parse_structure(
-                file_path=str(tmp_path),
-                document_id=msg.document_id,
-                original_filename=msg.original_filename,
-            )
+            with timer.stage("parse_structure_ms"):
+                parsed = await parser.parse_structure(
+                    file_path=str(tmp_path),
+                    document_id=msg.document_id,
+                    original_filename=msg.original_filename,
+                )
+            timer.merge(parsed.timing)
 
             # ── Persist markdown + counts ───────────────────────────────────
             # The markdown object is keyed by THIS revision (copy-on-write): a
             # reindex uploads a new object and never overwrites a published
             # revision's markdown. ``Document.markdown_s3_key`` is kept as the
             # v1/UI projection only — it never decides v2 retrieval.
-            s3_key = await storage.upload_markdown(
-                workspace_id=msg.workspace_id,
-                document_id=msg.document_id,
-                content=parsed.markdown,
-                key=revision_markdown_key(
-                    msg.workspace_id, msg.document_id, msg.revision_id
-                ),
-            )
+            with timer.stage("upload_markdown_ms"):
+                s3_key = await storage.upload_markdown(
+                    workspace_id=msg.workspace_id,
+                    document_id=msg.document_id,
+                    content=parsed.markdown,
+                    key=revision_markdown_key(
+                        msg.workspace_id, msg.document_id, msg.revision_id
+                    ),
+                )
             document.markdown_s3_key = s3_key
             document.page_count = parsed.page_count
             document.table_count = parsed.tables_count
@@ -207,23 +213,28 @@ async def handle_parse(payload: dict) -> None:
                     table_refs=list(c.table_refs),
                     has_table=c.has_table,
                     has_code=c.has_code,
+                    khoan_nos=list(c.khoan_nos),
+                    diem_labels=list(c.diem_labels),
+                    subdivision_refs=list(c.subdivision_refs),
+                    subdivision_schema_version=c.subdivision_schema_version,
                 )
                 for c in non_empty_chunks
             ]
-            chunk_records = await record_revision_chunk_rows(
-                db, msg.revision_id, chunk_records
-            )
-            structure_key = revision_structure_key(
-                msg.workspace_id, msg.document_id, msg.revision_id
-            )
-            await storage.upload_artifact(
-                structure_key,
-                build_structure_artifact(
-                    msg.revision_id, msg.document_id, chunk_records
-                ),
-                "application/json",
-            )
-            await db.commit()
+            with timer.stage("persist_structure_ms"):
+                chunk_records = await record_revision_chunk_rows(
+                    db, msg.revision_id, chunk_records
+                )
+                structure_key = revision_structure_key(
+                    msg.workspace_id, msg.document_id, msg.revision_id
+                )
+                await storage.upload_artifact(
+                    structure_key,
+                    build_structure_artifact(
+                        msg.revision_id, msg.document_id, chunk_records
+                    ),
+                    "application/json",
+                )
+                await db.commit()
 
             # ── Record the parse-stage artifacts on the REVISION manifest ──
             await record_parse_artifacts(
@@ -260,19 +271,22 @@ async def handle_parse(payload: dict) -> None:
                         logger.info(
                             f"[parse_worker] doc={msg.document_id} extracting page 1 for reliable header OCR"
                         )
-                        doc_fitz = fitz.open(str(tmp_path))
-                        if doc_fitz.page_count > 0:
-                            page_pixmap = doc_fitz[0].get_pixmap(
-                                matrix=fitz.Matrix(150 / 72, 150 / 72), alpha=False
-                            )
-                            img_bytes = page_pixmap.tobytes("png")
-                            doc_fitz.close()
+                        with timer.stage("page1_ocr_ms"):
+                            doc_fitz = fitz.open(str(tmp_path))
+                            if doc_fitz.page_count > 0:
+                                page_pixmap = doc_fitz[0].get_pixmap(
+                                    matrix=fitz.Matrix(150 / 72, 150 / 72), alpha=False
+                                )
+                                img_bytes = page_pixmap.tobytes("png")
+                                doc_fitz.close()
 
-                            ocr_svc = get_ocr_service()
-                            if ocr_svc._local:
-                                page_texts = await ocr_svc._ocr_pages_local([img_bytes])
+                                ocr_svc = get_ocr_service()
+                                if ocr_svc._local:
+                                    page_texts = await ocr_svc._ocr_pages_local([img_bytes])
+                                else:
+                                    page_texts = await ocr_svc._ocr_pages_api([img_bytes])
                             else:
-                                page_texts = await ocr_svc._ocr_pages_api([img_bytes])
+                                page_texts = []
 
                             if page_texts and page_texts[0].strip():
                                 text_for_llm = page_texts[0]
@@ -284,7 +298,8 @@ async def handle_parse(payload: dict) -> None:
                             f"[parse_worker] doc={msg.document_id} page 1 OCR failed, fallback to markdown: {e_pdf}"
                         )
 
-                meta_res = await classify_with_llm(text_for_llm) if text_for_llm else {}
+                with timer.stage("classify_llm_ms"):
+                    meta_res = await classify_with_llm(text_for_llm) if text_for_llm else {}
                 slug = meta_res.get("slug")
 
                 if slug:
@@ -318,7 +333,8 @@ async def handle_parse(payload: dict) -> None:
             try:
                 from app.services.legal.validity_service import apply_validity
 
-                await apply_validity(db, document, parsed.markdown)
+                with timer.stage("validity_ms"):
+                    await apply_validity(db, document, parsed.markdown)
             except Exception as _val_err:
                 logger.warning(
                     f"[parse_worker] doc={msg.document_id} "
@@ -328,48 +344,49 @@ async def handle_parse(payload: dict) -> None:
             # ── Persist images (no captions yet) ───────────────────────────
             # Scope replacement to THIS revision: a prior revision's (or a
             # legacy NULL-revision) image rows stay readable.
-            await delete_stage_children(
-                db,
-                document_id=msg.document_id,
-                revision_id=msg.revision_id,
-                images=True,
-                tables=True,
-            )
-            await db.commit()
-            for img in parsed.images:
-                db.add(
-                    DocumentImage(
-                        document_id=msg.document_id,
-                        revision_id=msg.revision_id,
-                        image_id=img.image_id,
-                        page_no=img.page_no,
-                        file_path=img.file_path,
-                        caption=img.caption,  # empty at this point
-                        width=img.width,
-                        height=img.height,
-                        mime_type=img.mime_type,
-                    )
+            with timer.stage("persist_images_tables_ms"):
+                await delete_stage_children(
+                    db,
+                    document_id=msg.document_id,
+                    revision_id=msg.revision_id,
+                    images=True,
+                    tables=True,
                 )
-            if parsed.images:
-                document.image_count = len(parsed.images)
                 await db.commit()
+                for img in parsed.images:
+                    db.add(
+                        DocumentImage(
+                            document_id=msg.document_id,
+                            revision_id=msg.revision_id,
+                            image_id=img.image_id,
+                            page_no=img.page_no,
+                            file_path=img.file_path,
+                            caption=img.caption,  # empty at this point
+                            width=img.width,
+                            height=img.height,
+                            mime_type=img.mime_type,
+                        )
+                    )
+                if parsed.images:
+                    document.image_count = len(parsed.images)
+                    await db.commit()
 
-            # ── Persist tables (no captions yet) ───────────────────────────
-            for tbl in parsed.tables:
-                db.add(
-                    DocumentTable(
-                        document_id=msg.document_id,
-                        revision_id=msg.revision_id,
-                        table_id=tbl.table_id,
-                        page_no=tbl.page_no,
-                        content_markdown=tbl.content_markdown,
-                        caption="",  # empty at this point
-                        num_rows=tbl.num_rows,
-                        num_cols=tbl.num_cols,
+                # ── Persist tables (no captions yet) ───────────────────────
+                for tbl in parsed.tables:
+                    db.add(
+                        DocumentTable(
+                            document_id=msg.document_id,
+                            revision_id=msg.revision_id,
+                            table_id=tbl.table_id,
+                            page_no=tbl.page_no,
+                            content_markdown=tbl.content_markdown,
+                            caption="",  # empty at this point
+                            num_rows=tbl.num_rows,
+                            num_cols=tbl.num_cols,
+                        )
                     )
-                )
-            if parsed.tables:
-                await db.commit()
+                if parsed.tables:
+                    await db.commit()
 
             # ── Store raw chunks in ChromaDB (via EmbedMessage) ────────────
             # ``raw_chunks_json`` is the document-level v1/UI mirror only; the
@@ -392,6 +409,10 @@ async def handle_parse(payload: dict) -> None:
                         "table_refs": c.table_refs,
                         "has_table": c.has_table,
                         "has_code": c.has_code,
+                        "khoan_nos": list(c.khoan_nos),
+                        "diem_labels": list(c.diem_labels),
+                        "subdivision_refs": list(c.subdivision_refs),
+                        "subdivision_schema_version": c.subdivision_schema_version,
                         "document_number": document.document_number or "",
                     }
                     for c in chunk_records
@@ -400,11 +421,14 @@ async def handle_parse(payload: dict) -> None:
             document.status = DocumentStatus.CHUNKING
             elapsed_ms = int((time.time() - start) * 1000)
             document.processing_time_ms = elapsed_ms
+            timer.set("total_ms", elapsed_ms)
+            document.parse_timing = timer.summary()
             await db.commit()
             logger.info(
                 f"[parse_worker] doc={msg.document_id} parsed in {elapsed_ms}ms "
                 f"— {len(chunk_records)} chunks (filtered {len(parsed.chunks) - len(chunk_records)} empty), "
-                f"{len(parsed.images)} images, {parsed.tables_count} tables"
+                f"{len(parsed.images)} images, {parsed.tables_count} tables "
+                f"| timing={document.parse_timing}"
             )
 
             # ── Dispatch sub-tasks OR publish (parse-only / chat-upload mode) ─────

@@ -10,8 +10,8 @@ trong text chunk ("## Điều 17. Hồ sơ...") — module này khôi phục nó
 Dùng ở 2 chỗ:
 - parse time: ``DeepDocumentParser._parse_legacy`` / ``_chunk_document`` (fallback
   khi Docling không trả headings);
-- backfill kho hiện có: ``scripts/backfill_heading_path.py`` (chỉ update metadata
-  ChromaDB, không re-embed).
+- backfill kho hiện có: ``scripts/backfill_subdivision_nos.py`` (chỉ update
+  metadata ChromaDB, không re-embed).
 
 Quy ước heading_path của một chunk: các cấp trên (Phần > Chương > Mục) theo trạng
 thái carry-forward, cộng MỌI "Điều N." xuất hiện trong chunk (chunk gộp nhiều điều
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Literal, Sequence
 
 # Cấp bậc cấu trúc; số nhỏ = cấp cao. Heading mới ở cấp L xoá state các cấp >= L.
 _LEVELS = {"phần": 1, "chương": 2, "mục": 3, "điều": 4}
@@ -198,3 +199,249 @@ def derive_heading_paths(chunk_texts: list[str]) -> list[list[str]]:
         dieu_comps = [d for d in dieu_comps if not (d in seen or seen.add(d))]
         paths.append(upper + dieu_comps[:_MAX_DIEU_PER_CHUNK])
     return paths
+
+
+# Bullet prefix tuỳ chọn ("- a)", "* 1.") — Docling render điểm/khoản của văn
+# bản luật thành markdown list item; OCR/legacy giữ marker trần ở đầu dòng.
+_BULLET_PREFIX = r"(?:[-*•][ \t]+)?"
+# Heading prefix tuỳ chọn ("## 1.", "## a)") — Docling đôi khi render khoản/điểm
+# in đậm thành markdown heading ("## a) 3 (được bãi bỏ)").
+_HEADING_PREFIX = r"(?:#{1,6}[ \t]*)?"
+# "N. x)" / "N. x )" / "N. x$": superscript chú thích của văn bản hợp nhất dính
+# vào marker Điểm — số N là footnote, chữ cái mới là Điểm; KHÔNG phải Khoản
+# (khoản thật không bao giờ mở đầu bằng marker chữ cái). Khoản candidate phải
+# loại pattern này bằng negative lookahead, điểm thì cứu qua _GLUED_DIEM_RE.
+_GLUED_TAIL = r"[a-zđ](?:[ \t]*\)|[ \t]*$)"
+_GLUED_DIEM_RE = re.compile(
+    r"(?m)^[ \t]{0,3}" + _BULLET_PREFIX + r"\d{1,2}\.[ \t]+([a-zđ])(?:[ \t]*\)|[ \t]*$)"
+)
+_KHOAN_CANDIDATE_RE = re.compile(
+    r"(?m)^[ \t]{0,3}" + _HEADING_PREFIX + _BULLET_PREFIX
+    + r"(\d{1,2})\.[ \t]+(?!" + _GLUED_TAIL + r")\S"
+)
+_DIEM_CANDIDATE_RE = re.compile(
+    r"(?m)^[ \t]{0,3}" + _HEADING_PREFIX + _BULLET_PREFIX + r"([a-zđ])\)[ \t]+\S"
+)
+_DIEM_ORDER = "abcdđeghiklmnopqrstuvxy"
+_KHOAN_MAX = 30
+
+
+@dataclass(frozen=True)
+class Subdivision:
+    """Một marker Khoản/Điểm được chấp nhận, gắn Điều cha và Khoản cha."""
+    kind: Literal["khoan", "diem"]
+    label: str
+    start: int
+    article_no: str
+    parent_khoan: str | None = None
+
+
+@dataclass(frozen=True)
+class SubdivisionMetadata:
+    khoan_nos: tuple[str, ...] = ()
+    diem_labels: tuple[str, ...] = ()
+    subdivision_refs: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SubdivisionParseStats:
+    khoan_candidates: int = 0
+    khoan_accepted: int = 0
+    diem_candidates: int = 0
+    diem_accepted: int = 0
+    ambiguous_rejected: int = 0
+
+
+@dataclass(frozen=True)
+class SubdivisionParseResult:
+    subdivisions: tuple[Subdivision, ...]
+    stats: SubdivisionParseStats
+
+
+def _subdivision_events(text: str) -> list[tuple[int, int, object]]:
+    """Gộp heading + candidate Khoản/Điểm theo thứ tự vị trí (heading trước)."""
+    events: list[tuple[int, int, object]] = []
+    for h in _iter_headings(text):
+        events.append((h.start, 0, h))
+    for m in _KHOAN_CANDIDATE_RE.finditer(text):
+        events.append((m.start(), 1, m))
+    for m in _DIEM_CANDIDATE_RE.finditer(text):
+        events.append((m.start(), 2, m))
+    for m in _GLUED_DIEM_RE.finditer(text):
+        events.append((m.start(), 2, m))
+    events.sort(key=lambda e: (e[0], e[1]))
+    return events
+
+
+def parse_subdivisions(text: str) -> SubdivisionParseResult:
+    """Parse marker Khoản/Điểm trong ``text`` với state machine bảo thủ.
+
+    State chỉ active bên trong một heading Điều được chấp nhận; mọi heading cấu
+    trúc mới (kể cả Phần/Chương/Mục) reset state. Khoản đầu tiên của một Điều
+    phải là 1, sau đó chỉ tăng (nhảy vọt được — OCR rơi dòng); bằng/giảm bị
+    loại. Điểm yêu cầu Khoản đang mở, điểm đầu phải là ``a``, rồi tăng theo
+    ``_DIEM_ORDER``. Mọi candidate syntactic bị loại đếm vào
+    ``ambiguous_rejected``.
+    """
+    text = text or ""
+    article: str | None = None
+    last_k_val: int | None = None
+    last_k_label: str | None = None
+    last_d_idx: int | None = None
+    subs: list[Subdivision] = []
+    kc = ka = dc = da = rej = 0
+    for start, kind, ev in _subdivision_events(text):
+        if kind == 0:
+            h = ev
+            if h.level == _DIEU_LEVEL:
+                m = _DIEU_COMPONENT_RE.match(h.title)
+                article = m.group(1).lower() if m else None
+            else:
+                article = None
+            last_k_val = last_d_idx = None
+            last_k_label = None
+            continue
+        if kind == 1:
+            kc += 1
+            label = ev.group(1)
+            val = int(label)
+            ok = (
+                article is not None
+                and 1 <= val <= _KHOAN_MAX
+                and (val == 1 if last_k_val is None else val > last_k_val)
+            )
+            if ok:
+                ka += 1
+                last_k_val, last_k_label = val, label
+                last_d_idx = None
+                subs.append(Subdivision("khoan", label, start, article))
+            else:
+                rej += 1
+        else:
+            dc += 1
+            label = ev.group(1)
+            idx = _DIEM_ORDER.find(label)
+            ok = (
+                article is not None
+                and last_k_val is not None
+                and idx >= 0
+                and (idx == 0 if last_d_idx is None else idx > last_d_idx)
+            )
+            if ok:
+                da += 1
+                last_d_idx = idx
+                subs.append(
+                    Subdivision("diem", label, start, article, parent_khoan=last_k_label)
+                )
+            else:
+                rej += 1
+    return SubdivisionParseResult(
+        subdivisions=tuple(subs),
+        stats=SubdivisionParseStats(kc, ka, dc, da, rej),
+    )
+
+
+def find_subdivisions(text: str) -> list[Subdivision]:
+    """Convenience wrapper: chỉ trả list Subdivision đã chấp nhận."""
+    return list(parse_subdivisions(text).subdivisions)
+
+
+def derive_subdivision_metadata(
+    chunk_texts: Sequence[str],
+    heading_paths: Sequence[Sequence[str]] | None = None,
+) -> list[SubdivisionMetadata]:
+    """Suy metadata Khoản/Điểm cho TỪNG chunk, sequence-aware.
+
+    Trạng thái Điều/Khoản/Điểm được carry qua ranh giới chunk: continuation
+    chunk không chứa marker nào vẫn thừa hưởng ref đang mở ở ký tự đầu tiên.
+    ``heading_paths`` (tuỳ chọn) cung cấp ngữ cảnh Điều cho chunk cũ không còn
+    lặp lại heading — khi Điều suy ra đổi, state Khoản/Điểm reset.
+    """
+    article: str | None = None
+    cur_k_val: int | None = None
+    cur_k_label: str | None = None
+    cur_d_idx: int | None = None
+    cur_d_label: str | None = None
+    out: list[SubdivisionMetadata] = []
+    for i, raw in enumerate(chunk_texts):
+        text = raw or ""
+        headings = _iter_headings(text)
+        if not any(h.level == _DIEU_LEVEL for h in headings) and heading_paths is not None:
+            nos = extract_article_nos(heading_paths[i] if i < len(heading_paths) else None)
+            if len(nos) > 1:
+                article = None
+                cur_k_val = cur_d_idx = None
+                cur_k_label = cur_d_label = None
+            elif len(nos) == 1 and nos[0] != article:
+                article = nos[0]
+                cur_k_val = cur_d_idx = None
+                cur_k_label = cur_d_label = None
+
+        khoans: list[str] = []
+        diems: list[str] = []
+        refs: list[str] = []
+
+        def _add(k: str | None = None, d: str | None = None) -> None:
+            if k is not None:
+                if k not in khoans:
+                    khoans.append(k)
+                ref = f"khoan:{k}"
+                if ref not in refs:
+                    refs.append(ref)
+            if k is not None and d is not None:
+                if d not in diems:
+                    diems.append(d)
+                ref = f"khoan:{k}/diem:{d}"
+                if ref not in refs:
+                    refs.append(ref)
+
+        def _inherit(upto: int) -> None:
+            if cur_k_label is not None and text[:upto].strip():
+                _add(k=cur_k_label, d=cur_d_label)
+
+        for start, kind, ev in _subdivision_events(text):
+            if kind == 0:
+                _inherit(start)
+                h = ev
+                if h.level == _DIEU_LEVEL:
+                    m = _DIEU_COMPONENT_RE.match(h.title)
+                    article = m.group(1).lower() if m else None
+                else:
+                    article = None
+                cur_k_val = cur_d_idx = None
+                cur_k_label = cur_d_label = None
+                continue
+            if kind == 1:
+                label = ev.group(1)
+                val = int(label)
+                if (
+                    article is not None
+                    and 1 <= val <= _KHOAN_MAX
+                    and (val == 1 if cur_k_val is None else val > cur_k_val)
+                ):
+                    _inherit(start)
+                    cur_k_val, cur_k_label = val, label
+                    cur_d_idx = cur_d_label = None
+                    _add(k=label)
+            else:
+                label = ev.group(1)
+                idx = _DIEM_ORDER.find(label)
+                if (
+                    article is not None
+                    and cur_k_label is not None
+                    and idx >= 0
+                    and (idx == 0 if cur_d_idx is None else idx > cur_d_idx)
+                ):
+                    _inherit(start)
+                    cur_d_idx, cur_d_label = idx, label
+                    _add(k=cur_k_label, d=label)
+        if not refs:
+            _inherit(len(text))
+        out.append(
+            SubdivisionMetadata(
+                khoan_nos=tuple(khoans),
+                diem_labels=tuple(diems),
+                subdivision_refs=tuple(refs),
+            )
+        )
+    return out

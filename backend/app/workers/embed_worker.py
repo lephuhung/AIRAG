@@ -278,6 +278,10 @@ async def handle_embed(payload: dict) -> None:
                         f"{img_url_prefix}/{iid}.png" for iid in c["image_refs"]
                     ) if c["image_refs"] else "",
                     "document_number": c.get("document_number", document.document_number or ""),
+                    "khoan_nos": "|".join(c.get("khoan_nos") or []),
+                    "diem_labels": "|".join(c.get("diem_labels") or []),
+                    "subdivision_refs": "|".join(c.get("subdivision_refs") or []),
+                    "subdivision_schema_version": int(c.get("subdivision_schema_version") or 0),
                 })
 
             try:

@@ -36,6 +36,7 @@ import asyncio
 import base64
 import logging
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -272,6 +273,23 @@ class HunyuanOCRService:
         return scanned
 
     @staticmethod
+    def pages_needing_ocr_count(file_path: str | Path) -> int | None:
+        """Số trang PDF thiếu text layer. ``None`` khi không kiểm tra được
+        (pdf-inspector thiếu/lỗi) — caller nên giữ hành vi bảo thủ."""
+        try:
+            import pdf_inspector
+        except ImportError:
+            return None
+        try:
+            result = pdf_inspector.detect_pdf(str(file_path))
+        except Exception as e:
+            logger.warning(
+                f"pdf-inspector detection failed ({file_path}): {e}"
+            )
+            return None
+        return len(result.pages_needing_ocr)
+
+    @staticmethod
     def _is_scanned_pdf_pymupdf(file_path: str | Path) -> bool:
         """
         PyMuPDF fallback: counts pages with fewer than _MIN_CHARS_PER_PAGE
@@ -312,12 +330,16 @@ class HunyuanOCRService:
             logger.warning(f"Failed to check if PDF is scanned ({file_path}): {e}")
             return False
 
-    async def ocr_pdf(self, file_path: str | Path) -> str:
+    async def ocr_pdf(self, file_path: str | Path, stats: dict | None = None) -> str:
         """
         Run OCR on a scanned PDF and return the full extracted text.
 
         Dispatches to the local vLLM backend or the remote API backend
-        depending on HRAG_OCR_LOCAL.
+        depending on HRAG_OCR_LOCAL.  When ``stats`` (a dict) is passed it is
+        filled with a per-stage timing breakdown — ``ocr_render_ms``,
+        ``ocr_infer_ms``, ``ocr_pages``, ``ocr_backend``, plus per-page
+        ``ocr_page_ms``/``ocr_page_wait_ms`` lists for the API backend — so
+        the parse worker can pinpoint where a slow OCR run spent its time.
         """
         try:
             import fitz  # PyMuPDF
@@ -334,16 +356,34 @@ class HunyuanOCRService:
         )
 
         # Render all pages to PNG bytes (CPU-bound → thread pool)
+        t0 = time.monotonic()
         page_images: list[bytes] = await asyncio.to_thread(
             self._render_pages, doc
         )
         doc.close()
+        render_ms = int((time.monotonic() - t0) * 1000)
 
         preserve_layout = settings.HRAG_OCR_PRESERVE_LAYOUT
+        t0 = time.monotonic()
         if self._local:
-            page_texts = await self._ocr_pages_local(page_images, preserve_layout)
+            page_texts = await self._ocr_pages_local(
+                page_images, preserve_layout, stats=stats
+            )
         else:
-            page_texts = await self._ocr_pages_api(page_images, preserve_layout)
+            page_texts = await self._ocr_pages_api(
+                page_images, preserve_layout, stats=stats
+            )
+        infer_ms = int((time.monotonic() - t0) * 1000)
+
+        if stats is not None:
+            stats.update(
+                {
+                    "ocr_render_ms": render_ms,
+                    "ocr_infer_ms": infer_ms,
+                    "ocr_pages": total_pages,
+                    "ocr_backend": backend.lower(),
+                }
+            )
 
         # Add page number markers that both frontend (insertPageDividers) and
         # backend (_parse_legacy) can parse
@@ -353,7 +393,8 @@ class HunyuanOCRService:
                 marked_pages.append(f"<!-- page {i + 1} -->\n\n{text.strip()}")
         full_text = "\n\n---\n\n".join(marked_pages)
         logger.info(
-            f"[OCR/{backend}] Complete: {len(full_text)} chars from {total_pages} pages"
+            f"[OCR/{backend}] Complete: {len(full_text)} chars from {total_pages} pages "
+            f"(render={render_ms}ms infer={infer_ms}ms)"
         )
         return full_text
 
@@ -393,20 +434,34 @@ class HunyuanOCRService:
         return self._client
 
     async def _ocr_pages_api(
-        self, page_images: list[bytes], preserve_layout: bool = False
+        self,
+        page_images: list[bytes],
+        preserve_layout: bool = False,
+        stats: dict | None = None,
     ) -> list[str]:
         """OCR all pages via remote vLLM API, up to HRAG_OCR_CONCURRENCY pages concurrently."""
         semaphore = asyncio.Semaphore(settings.HRAG_OCR_CONCURRENCY)
+        page_ms: list[int] = [0] * len(page_images)
+        page_wait_ms: list[int] = [0] * len(page_images)
 
         async def ocr_one(idx: int, img_bytes: bytes) -> tuple[int, str]:
+            t_wait = time.monotonic()
             async with semaphore:
+                page_wait_ms[idx] = int((time.monotonic() - t_wait) * 1000)
+                t_req = time.monotonic()
                 text = await self._ocr_image_api(img_bytes, idx + 1, preserve_layout)
+                page_ms[idx] = int((time.monotonic() - t_req) * 1000)
                 return idx, text
 
         results = await asyncio.gather(
             *[ocr_one(i, b) for i, b in enumerate(page_images)],
             return_exceptions=True,
         )
+
+        if stats is not None:
+            stats["ocr_page_ms"] = page_ms
+            stats["ocr_page_wait_ms"] = page_wait_ms
+            stats["ocr_concurrency"] = settings.HRAG_OCR_CONCURRENCY
 
         page_texts = [""] * len(page_images)
         for r in results:
@@ -544,7 +599,10 @@ class HunyuanOCRService:
         return self._llm, self._processor, self._sampling_params
 
     def _ocr_pages_local_sync(
-        self, page_images: list[bytes], preserve_layout: bool = False
+        self,
+        page_images: list[bytes],
+        preserve_layout: bool = False,
+        stats: dict | None = None,
     ) -> list[str]:
         """
         Run OCR on all pages using the local vLLM engine (synchronous).
@@ -555,9 +613,12 @@ class HunyuanOCRService:
         from PIL import Image
         import io
 
+        t0 = time.monotonic()
         llm, processor, sampling_params = self._get_local_llm()
+        model_load_ms = int((time.monotonic() - t0) * 1000)
 
         # Build vLLM inputs for every page in one batch
+        t0 = time.monotonic()
         inputs = []
         for img_bytes in page_images:
             pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
@@ -580,11 +641,19 @@ class HunyuanOCRService:
                 "prompt": prompt,
                 "multi_modal_data": {"image": [pil_img]},
             })
+        prep_ms = int((time.monotonic() - t0) * 1000)
 
         logger.info(
             f"[OCR/local] Submitting {len(inputs)} pages to vLLM (batch inference)"
         )
+        t0 = time.monotonic()
         outputs = llm.generate(inputs, sampling_params)
+        generate_ms = int((time.monotonic() - t0) * 1000)
+
+        if stats is not None:
+            stats["ocr_model_load_ms"] = model_load_ms
+            stats["ocr_prep_ms"] = prep_ms
+            stats["ocr_generate_ms"] = generate_ms
 
         page_texts: list[str] = []
         for i, out in enumerate(outputs):
@@ -601,11 +670,14 @@ class HunyuanOCRService:
         return page_texts
 
     async def _ocr_pages_local(
-        self, page_images: list[bytes], preserve_layout: bool = False
+        self,
+        page_images: list[bytes],
+        preserve_layout: bool = False,
+        stats: dict | None = None,
     ) -> list[str]:
         """Async wrapper: run local vLLM OCR in a thread pool."""
         return await asyncio.to_thread(
-            self._ocr_pages_local_sync, page_images, preserve_layout
+            self._ocr_pages_local_sync, page_images, preserve_layout, stats
         )
 
 
