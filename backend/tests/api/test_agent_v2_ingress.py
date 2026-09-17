@@ -1360,6 +1360,7 @@ def test_fresh_resolver_graph_turn_reaches_provider():
                     *,
                     repair_context=None,
                     on_claim=None,
+                    on_delta=None,
                 ):
                     return ParsedCandidate(
                         claims=(

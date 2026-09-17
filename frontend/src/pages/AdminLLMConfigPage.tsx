@@ -27,6 +27,10 @@ import {
   Trash2,
   KeyRound,
   ChevronDown,
+  ZoomIn,
+  ZoomOut,
+  Maximize2,
+  X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
@@ -633,9 +637,9 @@ function ConnectionCard({
   );
 }
 
-// ── Assignment row (Section 2) ──────────────────────────────────────────────
+// ── Assignment editor (shared by the diagram panel) ────────────────────────
 
-function AssignmentRow({
+function RoleAssignmentEditor({
   meta,
   status,
   connections,
@@ -673,7 +677,6 @@ function AssignmentRow({
     });
   }, [connections, catalog, loadCatalog]);
 
-  const Icon = meta.icon;
   const savedConnId =
     status.conn_id && status.conn_id !== "@env" ? status.conn_id : "";
   const savedModel = status.source === "db" ? status.model : "";
@@ -735,36 +738,10 @@ function AssignmentRow({
     "w-full px-3 py-2 text-sm rounded-lg border bg-background focus:outline-none focus:ring-2 focus:ring-primary/30";
 
   return (
-    <div className="border-b last:border-b-0 px-4 py-3">
+    <div>
       <div className="flex items-center gap-3 flex-wrap lg:flex-nowrap">
-        {/* Role identity */}
-        <div className="flex items-center gap-2.5 min-w-[180px] flex-1">
-          <div
-            className={cn(
-              "w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0",
-              meta.accent,
-            )}
-          >
-            <Icon className="w-4 h-4" />
-          </div>
-          <div className="min-w-0">
-            <h3 className="font-semibold text-xs flex items-center gap-1.5">
-              {t(`admin.llm.role.${meta.key}.title`)}
-              {status.source === "db" ? (
-                <span className="text-[9px] px-1 py-0.5 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-medium">
-                  {t("admin.llm.badge.override")}
-                </span>
-              ) : (
-                <span className="text-[9px] px-1 py-0.5 rounded-full bg-muted text-muted-foreground font-medium">
-                  {t("admin.llm.badge.env")}
-                </span>
-              )}
-            </h3>
-            <p className="text-[11px] text-muted-foreground truncate">
-              {t(`admin.llm.role.${meta.key}.desc`)}
-            </p>
-          </div>
-        </div>
+        {/* Selector + actions — identity is rendered by the diagram panel. */}
+        <div className="flex-1" />
 
         {/* Single selector with a themed dropdown panel (native datalist
             popups can't be styled). Typing filters; picking assigns both the
@@ -915,6 +892,432 @@ function AssignmentRow({
   );
 }
 
+// ── Assignment diagram (Section 2) ──────────────────────────────────────────
+
+/** Canvas geometry — fixed-layout SVG diagram of the live supervisor graph. */
+const NODE_W = 150;
+const NODE_H = 56;
+const CANVAS_W = 1160;
+const CANVAS_H = 1080;
+
+interface DiagramNode {
+  id: string;
+  /** LLM role this component consumes; null = rule-based node (no LLM). */
+  role: LlmRole | null;
+  icon: typeof MessageSquare;
+  accent: string;
+  x: number;
+  y: number;
+  /** Dashed border = optional / flag-gated path (v2, ReAct, …). */
+  dashed?: boolean;
+}
+
+const DIAGRAM_NODES: DiagramNode[] = [
+  // Entry
+  { id: "stt", role: "stt", icon: Mic, accent: "text-cyan-500 bg-cyan-500/10", x: 505, y: 30 },
+  // Analysis
+  { id: "analyzer", role: "memory_agent", icon: Bot, accent: "text-emerald-500 bg-emerald-500/10", x: 505, y: 150 },
+  { id: "semrouter", role: "semantic_router", icon: Route, accent: "text-orange-500 bg-orange-500/10", x: 725, y: 150, dashed: true },
+  // Control
+  { id: "planner", role: "planner", icon: ListChecks, accent: "text-lime-500 bg-lime-500/10", x: 275, y: 270, dashed: true },
+  { id: "supervisor", role: "thinking", icon: Brain, accent: "text-amber-500 bg-amber-500/10", x: 505, y: 270 },
+  // Memory path
+  { id: "memory", role: "graphiti", icon: Layers, accent: "text-teal-500 bg-teal-500/10", x: 310, y: 390 },
+  // Retrieval support + enricher
+  { id: "embed", role: "embedding", icon: Database, accent: "text-indigo-500 bg-indigo-500/10", x: 20, y: 510 },
+  { id: "rerank", role: "rerank", icon: ArrowUpDown, accent: "text-orange-500 bg-orange-500/10", x: 210, y: 510 },
+  { id: "enricher", role: "memory_agent", icon: Bot, accent: "text-emerald-500 bg-emerald-500/10", x: 505, y: 510 },
+  // Agents
+  { id: "rag", role: "main", icon: MessageSquare, accent: "text-sky-500 bg-sky-500/10", x: 20, y: 630 },
+  { id: "resolvedoc", role: "memory_agent", icon: Bot, accent: "text-emerald-500 bg-emerald-500/10", x: 210, y: 630 },
+  { id: "react", role: "main", icon: MessageSquare, accent: "text-sky-500 bg-sky-500/10", x: 400, y: 630, dashed: true },
+  { id: "write", role: "main", icon: MessageSquare, accent: "text-sky-500 bg-sky-500/10", x: 590, y: 630 },
+  { id: "people", role: "main", icon: MessageSquare, accent: "text-sky-500 bg-sky-500/10", x: 780, y: 630 },
+  { id: "direct", role: "main", icon: MessageSquare, accent: "text-sky-500 bg-sky-500/10", x: 970, y: 630 },
+  // Post-processing
+  { id: "evaluator", role: null, icon: CheckCircle2, accent: "text-muted-foreground bg-muted", x: 20, y: 750 },
+  { id: "peopledoc", role: null, icon: Database, accent: "text-muted-foreground bg-muted", x: 780, y: 750 },
+  // Output
+  { id: "answergen", role: "main", icon: MessageSquare, accent: "text-sky-500 bg-sky-500/10", x: 20, y: 870 },
+  { id: "mongo", role: "main", icon: MessageSquare, accent: "text-sky-500 bg-sky-500/10", x: 780, y: 870 },
+  { id: "tts", role: "tts", icon: Volume2, accent: "text-fuchsia-500 bg-fuchsia-500/10", x: 505, y: 870 },
+  // Background services
+  { id: "vision", role: "vision", icon: Eye, accent: "text-violet-500 bg-violet-500/10", x: 310, y: 990, dashed: true },
+  { id: "kg", role: "kg_extract", icon: Network, accent: "text-rose-500 bg-rose-500/10", x: 690, y: 990, dashed: true },
+];
+
+interface DiagramEdge {
+  from: string;
+  to: string;
+  dashed?: boolean;
+  /** Route the edge over the top of the canvas (loop-back). */
+  loop?: boolean;
+}
+
+const DIAGRAM_EDGES: DiagramEdge[] = [
+  { from: "stt", to: "analyzer" },
+  { from: "analyzer", to: "supervisor" },
+  { from: "semrouter", to: "supervisor", dashed: true },
+  { from: "planner", to: "supervisor", dashed: true },
+  { from: "supervisor", to: "memory" },
+  { from: "memory", to: "enricher" },
+  // Fan-out to agents (from supervisor directly and via the enricher path)
+  { from: "supervisor", to: "rag" },
+  { from: "supervisor", to: "resolvedoc" },
+  { from: "supervisor", to: "react" },
+  { from: "supervisor", to: "write" },
+  { from: "supervisor", to: "people" },
+  { from: "supervisor", to: "direct" },
+  { from: "enricher", to: "rag" },
+  { from: "enricher", to: "write" },
+  { from: "enricher", to: "people" },
+  { from: "enricher", to: "direct" },
+  // RAG pipeline
+  { from: "rag", to: "evaluator" },
+  { from: "evaluator", to: "answergen" },
+  { from: "evaluator", to: "supervisor", loop: true },
+  { from: "resolvedoc", to: "rag", dashed: true },
+  { from: "resolvedoc", to: "answergen", dashed: true },
+  // People pipeline
+  { from: "people", to: "peopledoc" },
+  { from: "peopledoc", to: "mongo" },
+  // Retrieval support into RAG
+  { from: "embed", to: "rag", dashed: true },
+  { from: "rerank", to: "rag", dashed: true },
+  // Output
+  { from: "answergen", to: "tts", dashed: true },
+];
+
+function edgePath(e: DiagramEdge, byId: Map<string, DiagramNode>): string {
+  const a = byId.get(e.from)!;
+  const b = byId.get(e.to)!;
+  if (e.loop) {
+    // Loop-back: exit right of `from`, travel along the right margin, enter
+    // right of `to` (evaluator → supervisor retry loop).
+    const sx = a.x + NODE_W;
+    const sy = a.y + NODE_H / 2;
+    const tx = b.x + NODE_W;
+    const ty = b.y + NODE_H / 2;
+    const right = CANVAS_W - 20;
+    return `M ${sx} ${sy} L ${right} ${sy} L ${right} ${ty} L ${tx} ${ty}`;
+  }
+  const acx = a.x + NODE_W / 2;
+  const bcx = b.x + NODE_W / 2;
+  // Same row → horizontal elbow (right of `a` → left of `b`).
+  if (Math.abs(a.y - b.y) < NODE_H) {
+    const sy = a.y + NODE_H / 2;
+    const ty = b.y + NODE_H / 2;
+    const midX = (a.x + NODE_W + b.x) / 2;
+    return `M ${a.x + NODE_W} ${sy} L ${midX} ${sy} L ${midX} ${ty} L ${b.x} ${ty}`;
+  }
+  // Default top-down: exit bottom of `a`, elbow at mid-height, enter top of `b`.
+  const sy = a.y + NODE_H;
+  const ty = b.y;
+  const midY = (sy + ty) / 2;
+  return `M ${acx} ${sy} L ${acx} ${midY} L ${bcx} ${midY} L ${bcx} ${ty}`;
+}
+
+function AssignmentDiagram({
+  roles,
+  connections,
+  catalog,
+  loadCatalog,
+}: {
+  roles: Record<LlmRole, RoleAssignmentStatus>;
+  connections: Record<string, ConnectionInfo>;
+  catalog: Record<string, CatalogEntry>;
+  loadCatalog: (id: string) => void;
+}) {
+  const { t } = useTranslation();
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  // null = auto-fit to container width; a number = manual zoom level.
+  const [zoomOverride, setZoomOverride] = useState<number | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const byId = useMemo(() => new Map(DIAGRAM_NODES.map((n) => [n.id, n])), []);
+  const metaByRole = useMemo(
+    () => new Map(ROLE_META.map((m) => [m.key, m])),
+    [],
+  );
+
+  const fitZoom = useCallback(() => {
+    const w = scrollRef.current?.clientWidth ?? CANVAS_W;
+    return Math.min(1, Math.max(0.3, (w - 24) / CANVAS_W));
+  }, []);
+  const zoom = zoomOverride ?? fitZoom();
+
+  // Ctrl/Cmd + wheel zooms; plain wheel scrolls. Non-passive so preventDefault works.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      const dir = e.deltaY < 0 ? 1 : -1;
+      setZoomOverride((z) => {
+        const cur = z ?? fitZoom();
+        return Math.min(2, Math.max(0.3, +(cur + dir * 0.12).toFixed(2)));
+      });
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [fitZoom]);
+
+  // Escape closes the popup.
+  useEffect(() => {
+    if (!selectedId) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setSelectedId(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selectedId]);
+
+  const selected = selectedId ? byId.get(selectedId) ?? null : null;
+  const selectedMeta = selected?.role ? metaByRole.get(selected.role) : undefined;
+  const selectedStatus: RoleAssignmentStatus | null = selected?.role
+    ? roles[selected.role] ?? {
+        conn_id: "@env",
+        model: "",
+        source: "env",
+        resolved: { provider: "", base_url: "", model: "" },
+      }
+    : null;
+
+  // Popup anchored to the node, in zoomed coordinates, clamped to the canvas.
+  const POPUP_W = 460;
+  const POPUP_EST_H = 250;
+  let popupPos: { left: number; top: number } | null = null;
+  if (selected) {
+    const scaledW = CANVAS_W * zoom;
+    const scaledH = CANVAS_H * zoom;
+    const left = Math.max(
+      8,
+      Math.min(
+        (selected.x + NODE_W / 2) * zoom - POPUP_W / 2,
+        scaledW - POPUP_W - 8,
+      ),
+    );
+    const below = (selected.y + NODE_H) * zoom + 10;
+    const top =
+      below + POPUP_EST_H > scaledH
+        ? Math.max(8, selected.y * zoom - POPUP_EST_H - 10)
+        : below;
+    popupPos = { left, top };
+  }
+
+  const zoomIn = () =>
+    setZoomOverride((z) => Math.min(2, +(((z ?? fitZoom()) + 0.15).toFixed(2))));
+  const zoomOut = () =>
+    setZoomOverride((z) => Math.max(0.3, +(((z ?? fitZoom()) - 0.15).toFixed(2))));
+
+  return (
+    <div className="relative">
+      <div
+        ref={scrollRef}
+        onClick={() => setSelectedId(null)}
+        className="rounded-xl border bg-card overflow-auto max-h-[72vh]"
+      >
+        {/* Zoomed content box — sized so the scroll container gets real extents. */}
+        <div
+          className="relative"
+          style={{ width: CANVAS_W * zoom, height: CANVAS_H * zoom }}
+        >
+          <div
+            className="absolute top-0 left-0 origin-top-left"
+            style={{
+              width: CANVAS_W,
+              height: CANVAS_H,
+              transform: `scale(${zoom})`,
+            }}
+          >
+            <svg
+              className="absolute inset-0 pointer-events-none"
+              width={CANVAS_W}
+              height={CANVAS_H}
+              viewBox={`0 0 ${CANVAS_W} ${CANVAS_H}`}
+            >
+              <defs>
+                <marker
+                  id="llm-arrow"
+                  viewBox="0 0 8 8"
+                  refX="7"
+                  refY="4"
+                  markerWidth="7"
+                  markerHeight="7"
+                  orient="auto-start-reverse"
+                >
+                  <path
+                    d="M 0 0 L 8 4 L 0 8 z"
+                    className="fill-muted-foreground/50"
+                  />
+                </marker>
+              </defs>
+              {DIAGRAM_EDGES.map((e, i) => (
+                <path
+                  key={i}
+                  d={edgePath(e, byId)}
+                  fill="none"
+                  className="stroke-muted-foreground/40"
+                  strokeWidth={1.5}
+                  strokeDasharray={e.dashed ? "5 4" : undefined}
+                  markerEnd="url(#llm-arrow)"
+                />
+              ))}
+            </svg>
+
+            {DIAGRAM_NODES.map((n) => {
+              const status = n.role ? roles[n.role] : null;
+              const isDb = status?.source === "db";
+              const modelLabel = !n.role
+                ? t("admin.llm.v2.node_no_llm")
+                : isDb
+                  ? status!.model || t("admin.llm.v2.pick_model")
+                  : t("admin.llm.v2.env_option");
+              const Icon = n.icon;
+              const active = selectedId === n.id;
+              return (
+                <button
+                  key={n.id}
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setSelectedId(active ? null : n.id);
+                  }}
+                  className={cn(
+                    "absolute rounded-xl border bg-background px-2.5 py-2 text-left",
+                    "flex items-center gap-2 transition-shadow hover:shadow-md hover:border-primary/50",
+                    "focus:outline-none focus:ring-2 focus:ring-primary/40",
+                    n.dashed && "border-dashed",
+                    active && "border-primary ring-2 ring-primary/30 shadow-md",
+                  )}
+                  style={{ left: n.x, top: n.y, width: NODE_W, height: NODE_H }}
+                >
+                  <span
+                    className={cn(
+                      "w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0",
+                      n.accent,
+                    )}
+                  >
+                    <Icon className="w-3.5 h-3.5" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center gap-1">
+                      <span className="block text-[11px] font-semibold leading-tight truncate">
+                        {t(`admin.llm.v2.node.${n.id}`)}
+                      </span>
+                      {isDb && (
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 flex-shrink-0" />
+                      )}
+                    </span>
+                    <span className="block text-[10px] text-muted-foreground leading-tight truncate">
+                      {modelLabel}
+                    </span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+
+
+          {selected && popupPos && (
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="absolute z-20 rounded-xl border bg-card shadow-xl px-4 py-3"
+              style={{ left: popupPos.left, top: popupPos.top, width: POPUP_W }}
+            >
+              <div className="flex items-center gap-2.5 mb-3">
+                <div
+                  className={cn(
+                    "w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0",
+                    selected.accent,
+                  )}
+                >
+                  <selected.icon className="w-4 h-4" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <h3 className="font-semibold text-xs flex items-center gap-1.5">
+                    {t(`admin.llm.v2.node.${selected.id}`)}
+                    {selected.role && selectedStatus && (
+                      selectedStatus.source === "db" ? (
+                        <span className="text-[9px] px-1 py-0.5 rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 font-medium">
+                          {t("admin.llm.badge.override")}
+                        </span>
+                      ) : (
+                        <span className="text-[9px] px-1 py-0.5 rounded-full bg-muted text-muted-foreground font-medium">
+                          {t("admin.llm.badge.env")}
+                        </span>
+                      )
+                    )}
+                  </h3>
+                  {selected.role && (
+                    <p className="text-[11px] text-muted-foreground truncate">
+                      {t(`admin.llm.role.${selected.role}.title`)} —{" "}
+                      {t(`admin.llm.role.${selected.role}.desc`)}
+                    </p>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSelectedId(null)}
+                  className="text-muted-foreground hover:text-foreground flex-shrink-0"
+                  title={t("common.close")}
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+              {selected.role && selectedMeta && selectedStatus ? (
+                <RoleAssignmentEditor
+                  key={`${selected.role}-${selectedStatus.updated_at ?? "env"}`}
+                  meta={selectedMeta}
+                  status={selectedStatus}
+                  connections={connections}
+                  catalog={catalog}
+                  loadCatalog={loadCatalog}
+                />
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  {t("admin.llm.v2.node_no_llm_desc")}
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Zoom controls — pinned to the card corner, outside the scroll area. */}
+      <div className="absolute top-2 right-2 z-30 flex items-center gap-0.5 rounded-lg border bg-background/90 backdrop-blur px-1 py-0.5 shadow-sm">
+        <button
+          type="button"
+          onClick={zoomOut}
+          className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-accent"
+          title={t("admin.llm.v2.zoom_out")}
+        >
+          <ZoomOut className="w-3.5 h-3.5" />
+        </button>
+        <span className="text-[10px] font-mono text-muted-foreground w-9 text-center select-none">
+          {Math.round(zoom * 100)}%
+        </span>
+        <button
+          type="button"
+          onClick={zoomIn}
+          className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-accent"
+          title={t("admin.llm.v2.zoom_in")}
+        >
+          <ZoomIn className="w-3.5 h-3.5" />
+        </button>
+        <button
+          type="button"
+          onClick={() => setZoomOverride(null)}
+          className="p-1 rounded text-muted-foreground hover:text-foreground hover:bg-accent"
+          title={t("admin.llm.v2.zoom_fit")}
+        >
+          <Maximize2 className="w-3.5 h-3.5" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // ── Page ─────────────────────────────────────────────────────────────────────
 
 export function AdminLLMConfigPage() {
@@ -1019,25 +1422,12 @@ export function AdminLLMConfigPage() {
                 {t("admin.llm.v2.assign_desc")}
               </p>
             </div>
-            <div className="rounded-xl border bg-card overflow-hidden">
-              {ROLE_META.map((meta) => (
-                <AssignmentRow
-                  key={`${meta.key}-${data.roles[meta.key]?.updated_at ?? "env"}`}
-                  meta={meta}
-                  status={
-                    data.roles[meta.key] ?? {
-                      conn_id: "@env",
-                      model: "",
-                      source: "env",
-                      resolved: { provider: "", base_url: "", model: "" },
-                    }
-                  }
-                  connections={data.connections}
-                  catalog={catalog}
-                  loadCatalog={load}
-                />
-              ))}
-            </div>
+            <AssignmentDiagram
+              roles={data.roles}
+              connections={data.connections}
+              catalog={catalog}
+              loadCatalog={load}
+            />
           </>
         )}
       </div>

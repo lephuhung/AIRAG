@@ -38,6 +38,41 @@ TEST_ALLOWED = frozenset({"people.lookup", "document.read", "section.read"})
 
 TYPED_STATUSES = ("success", "error", "clarify", "denied", "insufficient", "unavailable")
 
+class _FakeIntentClassifier:
+    """Deterministic stand-in for ``IntentClassifier`` in shadow tests.
+
+    The shadow now wires the REAL request-scoped classifier for production
+    parity; in tests the model path is unavailable (falls back to
+    ``search`` → cross_domain → complex_research), which is correct
+    production-failure parity but non-deterministic for these fixtures.
+    This fake returns the decision the production model is expected to
+    produce for the factual fixture (a CCCD lookup → ``mongo_search_cccd``
+    → people.lookup fast path) and ``None`` otherwise (legacy
+    deterministic path, unchanged).
+    """
+
+    def cached(self, query: str, *, has_doc_ids: bool = False):
+        return None
+
+    async def classify(self, query: str, *, has_doc_ids: bool = False):
+        from app.services.agents.v2.semantic.intent import (
+            IntentDecision,
+            classify_deterministic,
+        )
+
+        deterministic = classify_deterministic(query, has_doc_ids=has_doc_ids)
+        if deterministic is not None:
+            return deterministic
+        if "cccd" in (query or "").casefold():
+            return IntentDecision(
+                intent="mongo_search_cccd",
+                source="model",
+                confidence=None,
+                needs_memory=False,
+                is_legal_query=False,
+            )
+        return None
+
 
 def make_factual_bundle(**overrides: Any):
     from app.services.agent.shadow_runtime import build_shadow_bundle
@@ -51,6 +86,7 @@ def make_factual_bundle(**overrides: Any):
         "allowed_capabilities": TEST_ALLOWED,
         "person_names": (PERSON_NAME,),
         "people_directory": dict(PEOPLE_DIRECTORY),
+        "intent_classifier": _FakeIntentClassifier(),
     }
     params.update(overrides)
     return build_shadow_bundle(**params)

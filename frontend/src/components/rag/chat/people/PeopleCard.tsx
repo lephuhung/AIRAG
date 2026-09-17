@@ -16,7 +16,9 @@ import {
   Copy,
   Loader2,
 } from "lucide-react";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
+import { copyToClipboard } from "@/lib/clipboard";
 import type { PeopleRecord } from "@/types";
 
 /** Field display config: maps schema-agnostic keys to display labels and icon */
@@ -170,7 +172,11 @@ export function PeopleCard({ people, isLoadingMore }: { people: PeopleRecord[], 
       const label = FIELD_CONFIG[key]?.label || key;
       lines.push(`- ${label}: ${vals.join(" · ")}`);
     }
-    navigator.clipboard.writeText(lines.join("\n")).then(() => {
+    copyToClipboard(lines.join("\n")).then((ok) => {
+      if (!ok) {
+        toast.error("Không thể sao chép");
+        return;
+      }
       setCopiedKey(person.groupKey);
       setTimeout(() => setCopiedKey(null), 2000);
     });

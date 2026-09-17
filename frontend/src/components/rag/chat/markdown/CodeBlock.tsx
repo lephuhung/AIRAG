@@ -16,7 +16,9 @@ import cpp from "react-syntax-highlighter/dist/esm/languages/prism/cpp";
 import diff from "react-syntax-highlighter/dist/esm/languages/prism/diff";
 import markdown from "react-syntax-highlighter/dist/esm/languages/prism/markdown";
 import { ClipboardCheck, Copy } from "lucide-react";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
+import { copyToClipboard } from "@/lib/clipboard";
 import { useTranslation } from "@/hooks/useTranslation";
 import { useThemeStore } from "@/stores/useThemeStore";
 
@@ -71,7 +73,11 @@ export function CodeBlock({
   const code = extractText(children).replace(/\n$/, "");
 
   const handleCopy = () => {
-    navigator.clipboard.writeText(code).then(() => {
+    copyToClipboard(code).then((ok) => {
+      if (!ok) {
+        toast.error(t("tools.copy_failed"));
+        return;
+      }
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     });

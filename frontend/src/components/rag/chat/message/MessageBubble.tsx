@@ -23,6 +23,8 @@ import {
   Image as ImageIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { copyToClipboard } from "@/lib/clipboard";
+import { toast } from "sonner";
 import { formatTime } from "@/lib/format";
 import { api, rewritePresignedUrl } from "@/lib/api";
 import { useTranslation } from "@/hooks/useTranslation";
@@ -148,12 +150,16 @@ function AssistantMessageFooter({
         mode === "text"
           ? markdownToPlainText(message.content)
           : stripCitations(message.content);
-      navigator.clipboard.writeText(value).then(() => {
+      copyToClipboard(value).then((ok) => {
+        if (!ok) {
+          toast.error(t("tools.copy_failed"));
+          return;
+        }
         setCopiedMode(mode);
         setTimeout(() => setCopiedMode(null), 2000);
       });
     },
-    [message.content],
+    [message.content, t],
   );
 
   const hasSources = message.sources && message.sources.length > 0;
@@ -392,6 +398,37 @@ export const MessageBubble = memo(function MessageBubble({
     .toUpperCase();
   const [copiedUser, setCopiedUser] = useState(false);
 
+  // Speculative → grounded settle: fires once when a streamed assistant
+  // message flips isStreaming true→false with content (never for messages
+  // that mount already finished, e.g. history reload).
+  const prevStreamingRef = useRef(message.isStreaming);
+  const [finalizing, setFinalizing] = useState(false);
+  const finalizeTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => {
+    const wasStreaming = prevStreamingRef.current;
+    prevStreamingRef.current = message.isStreaming;
+    if (wasStreaming && !message.isStreaming && message.content) {
+      setFinalizing(true);
+      clearTimeout(finalizeTimerRef.current);
+      finalizeTimerRef.current = setTimeout(() => setFinalizing(false), 900);
+    }
+  }, [message.isStreaming, message.content]);
+  useEffect(() => () => clearTimeout(finalizeTimerRef.current), []);
+
+  // Stable renderBlock identity so MemoizedMarkdownBlock's memo actually
+  // hits — completed paragraphs never re-render on each token.
+  const renderAnswerBlock = useCallback(
+    (block: string) => (
+      <MarkdownWithCitations
+        content={block}
+        sources={message.sources || []}
+        relatedEntities={message.relatedEntities || []}
+        imageRefs={message.imageRefs}
+      />
+    ),
+    [message.sources, message.relatedEntities, message.imageRefs],
+  );
+
   // Copy the question back as pasteable input text: resolve <document_id=…>
   // tags to @DisplayName mentions (unresolvable tags are dropped).
   const handleCopyUserMessage = useCallback(() => {
@@ -404,11 +441,15 @@ export const MessageBubble = memo(function MessageBubble({
       text = text.split(`<document_id=${doc.id}>`).join(`@${name}`);
     }
     text = text.replace(/<document_id=[^>]+>\s*/g, "").trim();
-    navigator.clipboard.writeText(text).then(() => {
+    copyToClipboard(text).then((ok) => {
+      if (!ok) {
+        toast.error(t("tools.copy_failed"));
+        return;
+      }
       setCopiedUser(true);
       setTimeout(() => setCopiedUser(false), 2000);
     });
-  }, [message.content, message.documentIds, message.attachedDocs, docMetadataMap]);
+  }, [message.content, message.documentIds, message.attachedDocs, docMetadataMap, t]);
 
 
   const proseClasses = cn(
@@ -532,40 +573,27 @@ export const MessageBubble = memo(function MessageBubble({
               </>
             );
           })()
-        ) : message.isStreaming ? (
-          message.peopleData && message.peopleData.length > 0 ? null : message.content ? (
-            <div
-              className={cn(proseClasses, "relative")}
-              style={{
-                maskImage: "linear-gradient(to bottom, black calc(100% - 80px), transparent 100%)",
-                WebkitMaskImage: "linear-gradient(to bottom, black calc(100% - 80px), transparent 100%)",
-              }}
-            >
-              <StreamingMarkdown
-                content={message.content}
-                isStreaming
-                renderBlock={(block) => (
-                  <MarkdownWithCitations
-                    content={block}
-                    sources={message.sources || []}
-                    relatedEntities={message.relatedEntities || []}
-                    imageRefs={message.imageRefs}
-                  />
-                )}
-              />
-              <span className="streaming-cursor" />
-            </div>
-          ) : null
-        ) : message.peopleData && message.peopleData.length > 0 ? null : (
-          <div className={proseClasses}>
-            <MarkdownWithCitations
+        ) : message.peopleData && message.peopleData.length > 0 ? null : message.content ? (
+          /* ONE container for streaming + finished answers so React does not
+             remount the tree when isStreaming flips — the speculative text
+             settles into the grounded answer in place. StreamingMarkdown keys
+             completed blocks by content hash, so only paragraphs that gained
+             citation markers remount. */
+          <div
+            className={cn(proseClasses, "relative", finalizing && "answer-finalizing")}
+            style={message.isStreaming ? {
+              maskImage: "linear-gradient(to bottom, black calc(100% - 80px), transparent 100%)",
+              WebkitMaskImage: "linear-gradient(to bottom, black calc(100% - 80px), transparent 100%)",
+            } : undefined}
+          >
+            <StreamingMarkdown
               content={message.content}
-              sources={message.sources || []}
-              relatedEntities={message.relatedEntities || []}
-              imageRefs={message.imageRefs}
+              isStreaming={!!message.isStreaming}
+              renderBlock={renderAnswerBlock}
             />
+            {message.isStreaming && <span className="streaming-cursor" />}
           </div>
-        )}
+        ) : null}
 
         {/* People Card — structured display for people search results */}
         {!isUser && message.peopleData && message.peopleData.length > 0 && (

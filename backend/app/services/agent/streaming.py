@@ -569,9 +569,13 @@ def build_initial_state(
 #   ``FinalResponse.content`` is chunked into ``token`` events here. v2
 #   nodes never push token events (pinned by test). Nodes MAY write
 #   advisory ``synthesis.speculative_*`` payloads to the LangGraph custom
-#   stream; the adapter renders them as speculative ``token`` events and
-#   always retracts them with ``token_rollback`` before a repair attempt,
-#   before any terminal, and before the final grounded render.
+#   stream; the adapter renders them as speculative ``token`` events
+#   (word-level deltas with the same summary/bullet/Lưu ý layout, minus
+#   markers). On success NO rollback follows — the grounded artifact
+#   arrives in ``complete.answer`` (authoritative for the frontend and
+#   the session relay) and replaces the speculative text in place.
+#   ``token_rollback`` is emitted only before a repair attempt, before a
+#   non-success terminal, on suspend, truncation, or unexpected failure.
 # - In-flight progress is projected HERE too: the runner drives the graph
 #   via ``astream(stream_mode=["updates","tasks","values","custom"], subgraphs=True)``
 #   and maps node starts onto v1 ``status`` steps (``_V2_NODE_PROGRESS``,
@@ -664,6 +668,7 @@ class _V2StreamAccumulators:
         self.potential_abbreviations: list = []
         self.speculative_text = ""
         self.speculative_kind: str | None = None
+        self.speculative_index: int | None = None
 
     def on_token(self, text: str) -> None:
         self.answer_text += text or ""
@@ -697,6 +702,7 @@ class _V2StreamAccumulators:
         self.potential_abbreviations = []
         self.speculative_text = ""
         self.speculative_kind = None
+        self.speculative_index = None
         return {"event": "token_rollback", "data": {}}
 
 
@@ -770,11 +776,14 @@ def _v2_speculative_events(payload, acc: _V2StreamAccumulators) -> list[dict]:
     """Map a custom-stream chunk onto adapter events (advisory only).
 
     ``synthesis.speculative_reset`` retracts streamed claims via
-    ``token_rollback``; ``synthesis.speculative_claim`` renders one
-    speculative ``token``. Malformed payloads emit nothing.
+    ``token_rollback``; ``synthesis.speculative_delta`` appends a decoded
+    piece of the current claim (opening its line/bullet when the index
+    changes); ``synthesis.speculative_claim`` renders the whole claim when
+    no deltas were streamed for it. Malformed payloads emit nothing.
     """
     from app.services.agents.v2.events import (
         SYNTHESIS_SPECULATIVE_CLAIM,
+        SYNTHESIS_SPECULATIVE_DELTA,
         SYNTHESIS_SPECULATIVE_RESET,
     )
 
@@ -783,8 +792,35 @@ def _v2_speculative_events(payload, acc: _V2StreamAccumulators) -> list[dict]:
     kind = payload.get("kind")
     if kind == SYNTHESIS_SPECULATIVE_RESET:
         return [acc.on_rollback()] if acc.speculative_text else []
+    if kind == SYNTHESIS_SPECULATIVE_DELTA:
+        index = payload.get("index")
+        presentation = payload.get("presentation")
+        text = payload.get("text")
+        if (
+            not isinstance(index, int)
+            or isinstance(index, bool)
+            or index < 0
+            or presentation not in ("summary", "detail", "caveat")
+            or not isinstance(text, str)
+            or not text
+        ):
+            return []
+        if acc.speculative_index != index:
+            # New claim line/bullet: open it with the separator + prefix.
+            chunk = (
+                _speculative_claim_chunk(acc.speculative_kind, presentation, "")
+                + text
+            )
+            acc.speculative_index = index
+            acc.speculative_kind = presentation
+        else:
+            chunk = text
+        acc.speculative_text += chunk
+        acc.answer_text += chunk
+        return [{"event": "token", "data": {"text": chunk}}]
     if kind != SYNTHESIS_SPECULATIVE_CLAIM:
         return []
+    index = payload.get("index")
     text = payload.get("text")
     presentation = payload.get("presentation")
     if (
@@ -793,6 +829,13 @@ def _v2_speculative_events(payload, acc: _V2StreamAccumulators) -> list[dict]:
         or presentation not in ("summary", "detail", "caveat")
     ):
         return []
+    if isinstance(index, int) and not isinstance(index, bool) and (
+        acc.speculative_index == index
+    ):
+        # Already streamed piecewise via deltas; nothing more to render.
+        return []
+    if isinstance(index, int) and not isinstance(index, bool):
+        acc.speculative_index = index
     return [
         {
             "event": "token",
@@ -1831,8 +1874,14 @@ async def stream_v2_turn_events(
             # request AND the active leases (never released here). Surface
             # the question as the turn's single terminal ``complete``.
             if pending is None:
+                # Corrupt/missing clarification request: this turn is
+                # TERMINAL (nothing valid to resume), so it must release
+                # leases + unregister the active run like every other
+                # terminal path — _stop_heartbeat_only() is only for a
+                # VALID suspend that keeps leases for the resume.
                 yield {"event": "error", "data": {"message": _V2_MISSING_CLARIFICATION_MESSAGE}}
-                await _stop_heartbeat_only()
+                _note_terminal(_terminal_route_of(state), state=state)
+                await _release_once("terminal")
                 return
             _note_terminal(
                 _terminal_route_of(state) or "clarify",
@@ -1879,13 +1928,16 @@ async def stream_v2_turn_events(
             state=state,
             response_status=_terminal_response_status_of(final),
         )
-        for ev in _speculative_rollback():
-            yield ev
         if event == "complete" and not _v2_terminal_is_error(state):
-            # Success only (T7-owned rule): chunk the terminal content into
-            # ``token`` events, then emit the single terminal. Clarify
-            # terminals (non-success ``complete``) carry the question in the
-            # payload itself — no speculative prose precedes them.
+            # Success only (T7-owned rule): when speculative claims already
+            # streamed, the terminal ``complete.answer`` (the grounded render
+            # with markers) replaces them in place — the frontend prefers
+            # ``data.answer`` and the session relay persists it, so no
+            # rollback/re-stream. Otherwise chunk the terminal content into
+            # ``token`` events. Clarify terminals (non-success ``complete``)
+            # carry the question in the payload itself — no speculative
+            # prose precedes them.
+            speculative_shown = bool(acc.speculative_text)
             if resume_command is not None:
                 # Task 9 fix round 1 (C1): a resumed turn that reaches
                 # success acknowledges the answered request — the public
@@ -1935,9 +1987,10 @@ async def stream_v2_turn_events(
                     "data": {"people": people_records},
                 }
                 data["people_data"] = people_records
-            for chunk in _chunk_prose(data.get("answer", ""), token_chunk_size):
-                acc.on_token(chunk)
-                yield {"event": "token", "data": {"text": chunk}}
+            if not speculative_shown:
+                for chunk in _chunk_prose(data.get("answer", ""), token_chunk_size):
+                    acc.on_token(chunk)
+                    yield {"event": "token", "data": {"text": chunk}}
             for abbreviation in _v2_potential_abbreviations(state):
                 acc.on_potential_abbreviations([*acc.potential_abbreviations, abbreviation])
             if acc.potential_abbreviations:
@@ -1948,6 +2001,8 @@ async def stream_v2_turn_events(
             await _release_once("terminal")
             yield {"event": event, "data": data}
             return
+        for ev in _speculative_rollback():
+            yield ev
         await _release_once("terminal")
         yield {"event": event, "data": data}
     except GeneratorExit:

@@ -1058,7 +1058,13 @@ async def test_complex_subgraph_resumes_under_supervisor_checkpointer() -> None:
 
     class _Builder:
         async def build(
-            self, query_text, evidence_items, *, repair_context=None, on_claim=None
+            self,
+            query_text,
+            evidence_items,
+            *,
+            repair_context=None,
+            on_claim=None,
+            on_delta=None,
         ):
             return ParsedCandidate(
                 claims=tuple(

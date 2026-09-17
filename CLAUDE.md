@@ -154,7 +154,9 @@ a second synthesis owner:
   Rendering (`render.py`), the SSE `citation` frame, `complete`, persistence,
   and history reload all consume the same projection; `evidence_id`/`use_id`
   never cross the wire. The outer streaming adapter emits the citation frame
-  after `status(generating)` and **before the first token**; `complete`
+  after `status(generating)` and **before the first grounded token**
+  (fallback/non-speculative path) or the `complete` (speculative path —
+  speculative tokens carry no markers); `complete`
   repeats the identical citation identity set. People/KG sources are never
   projected into document citations.
 - **Progress projection.** The outer adapter runs the graph via
@@ -165,14 +167,18 @@ a second synthesis owner:
   emit SSE events. The final `values` chunk is the terminal state
   (identical to `ainvoke`, including `__interrupt__`).
 - **Speculative claim streaming.** `generate_node` writes advisory
-  `synthesis.speculative_claim` / `synthesis.speculative_reset` payloads to
-  the LangGraph custom stream through the injected `writer` (a no-op under
-  `ainvoke`: shadow runs, direct node calls). The outer adapter is the only
-  owner of `token`/`token_rollback`: it renders speculative claims without
-  citation markers and always retracts them with `token_rollback` before a
-  repair attempt, before any terminal, and before the final grounded render
-  — only the checkpointed grounded artifact survives. Speculative text is
-  never checkpointed, logged, or traced.
+  `synthesis.speculative_delta` / `synthesis.speculative_claim` /
+  `synthesis.speculative_reset` payloads to the LangGraph custom stream
+  through the injected `writer` (a no-op under `ainvoke`: shadow runs,
+  direct node calls). The outer adapter is the only owner of
+  `token`/`token_rollback`: it renders speculative claims word-level with
+  the same summary/bullet/`Lưu ý` layout minus citation markers. On success
+  there is no rollback — the grounded artifact arrives in `complete.answer`
+  (which the frontend and the session relay treat as authoritative) and
+  replaces the speculative text in place; `token_rollback` is emitted only
+  before a repair attempt, before a non-success terminal, on suspend,
+  truncation, or unexpected failure. Speculative text is never
+  checkpointed, logged, or traced.
 - **Summarize single-owner rule.** `summarize_reduce_node`
   (`complex_research_graph.py`) is evidence preparation only: zero provider
   calls, no draft, no manifest, no channel write. It collects map-task
@@ -283,7 +289,7 @@ here, and never copy the frozen architecture. A stale doc is a bug.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **AIRAG** (11645 symbols, 23340 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **AIRAG** (13388 symbols, 26328 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 

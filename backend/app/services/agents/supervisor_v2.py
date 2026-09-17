@@ -2146,10 +2146,11 @@ class V1PeopleLookupService:
 
 
 class V1DocumentSearchService:
-    """v1-backed document discovery: hybrid search → pinned candidates (T6).
+    """v1-backed document discovery: vector-only probe → pinned candidates (T6).
 
-    Delegates to ``tools.search_documents`` for retrieval, then pins each
-    distinct document to its CURRENT revision through
+    Default retrieval delegates to ``_discover_workspace_document_ids`` — a
+    lightweight per-workspace vector probe returning distinct document ids —
+    then pins each distinct document to its CURRENT revision through
     ``persistence.document_views`` (the v2-blessed immutable source — the v1
     ``ChatSourceChunk`` carries no revision, so minting a candidate without
     this lookup would invent identity). Documents with no current revision
@@ -2158,8 +2159,8 @@ class V1DocumentSearchService:
 
     The governed People→Document scalar (``person_identifier``, R92) is
     consumed as an authorized query refinement: the server-materialized
-    scalar is appended to the task query and the EXISTING workspace-scoped
-    hybrid search runs unchanged. ``workspace_ids`` are never widened, no
+    scalar is appended to the task query and the workspace-scoped
+    vector-only discovery runs unchanged. ``workspace_ids`` are never widened, no
     graph/supervisor state is read, and a blank/non-string scalar fails
     closed (``V1ServiceUnavailable`` → typed capability error) instead of
     silently running an unrefined search.
@@ -2373,12 +2374,6 @@ class V1RevisionAwareRetrievalService:
             raise V1ServiceUnavailable(
                 "revision retrieval needs an authenticated workspace scope"
             )
-        try:
-            limit = max(1, min(int(top_k), 20))
-        except (TypeError, ValueError) as exc:
-            raise V1ServiceUnavailable(
-                f"revision retrieval got an unusable top_k {top_k!r}"
-            ) from exc
         try:
             limit = max(1, min(int(top_k), 20))
         except (TypeError, ValueError) as exc:
@@ -2893,6 +2888,13 @@ async def _default_revision_namespace_query(
 # embed call, one ChromaDB query per workspace that can actually pin a
 # document, no GPU slot, no KG, no rerank.
 _DISCOVERY_FANOUT = 16
+# Chunk-level over-fetch for document discovery: the caller wants ``top_k``
+# DISTINCT documents, but Chroma returns top_k CHUNKS — a single dominant
+# document can fill the whole window and starve every other candidate.
+# Tombstoned/unpublished hits are dropped post-fetch, so the window grows
+# (bounded) until ``top_k`` pinnable documents are found or hits exhaust.
+_DISCOVERY_OVER_FETCH = 5
+_DISCOVERY_MAX_WINDOW = 500
 
 
 async def _discover_workspace_document_ids(
@@ -2921,17 +2923,18 @@ async def _discover_workspace_document_ids(
 
     rows = (
         await db.execute(
-            _select(Document.workspace_id)
+            _select(Document.id, Document.workspace_id)
             .where(
                 Document.workspace_id.in_(list(workspaces)),
                 Document.current_revision_id.is_not(None),
                 Document.source_deleted_at.is_(None),
             )
-            .distinct()
         )
     ).all()
-    pinnable = {row[0] for row in rows}
-    probe_workspaces = [ws for ws in workspaces if ws in pinnable]
+    pinnable_docs: dict[UUID, set[UUID]] = {}
+    for doc_id, ws_id in rows:
+        pinnable_docs.setdefault(ws_id, set()).add(doc_id)
+    probe_workspaces = [ws for ws in workspaces if pinnable_docs.get(ws)]
     if not probe_workspaces:
         return []
 
@@ -2951,12 +2954,14 @@ async def _discover_workspace_document_ids(
     fanout = asyncio.Semaphore(_DISCOVERY_FANOUT)
 
     async def _probe(workspace_id: UUID) -> list[tuple[float, UUID]]:
-        def _run() -> list[tuple[float, UUID]]:
+        allowed = pinnable_docs[workspace_id]
+
+        def _run(n_results: int) -> list[tuple[float, UUID]]:
             from app.services.embedding.vector_store import get_vector_store
 
             res = get_vector_store(workspace_id).query(
                 query_embedding=embedding,
-                n_results=limit,
+                n_results=n_results,
                 include=["metadatas", "distances"],
             )
             hits: list[tuple[float, UUID]] = []
@@ -2977,7 +2982,33 @@ async def _discover_workspace_document_ids(
 
         async with fanout:
             try:
-                return await asyncio.to_thread(_run)
+                # Over-fetch chunks, dedupe to distinct pinnable documents,
+                # and grow the window (bounded) while the workspace has
+                # more hits to give — a dominant document or tombstoned
+                # hits must not starve valid candidates at rank K+1.
+                window = min(
+                    max(limit * _DISCOVERY_OVER_FETCH, limit),
+                    _DISCOVERY_MAX_WINDOW,
+                )
+                docs: list[tuple[float, UUID]] = []
+                while True:
+                    raw = await asyncio.to_thread(_run, window)
+                    seen_ws: set[UUID] = set()
+                    docs = []
+                    for distance, doc_id in raw:
+                        if doc_id in seen_ws or doc_id not in allowed:
+                            continue
+                        seen_ws.add(doc_id)
+                        docs.append((distance, doc_id))
+                        if len(docs) >= limit:
+                            break
+                    if (
+                        len(docs) >= limit
+                        or len(raw) < window
+                        or window >= _DISCOVERY_MAX_WINDOW
+                    ):
+                        return docs
+                    window = min(window * 4, _DISCOVERY_MAX_WINDOW)
             except Exception as exc:
                 logger.warning(
                     "[v2retrieve] discovery probe failed for workspace %s: %s",

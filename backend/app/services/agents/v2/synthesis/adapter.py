@@ -250,15 +250,27 @@ def parse_candidate(
 
 
 class IncrementalClaimScanner:
-    """Char-level scanner that surfaces completed claim objects mid-stream.
+    """Char-level scanner that surfaces claim text mid-stream.
 
-    Fed provider ``text`` chunks as they arrive; each ``feed`` returns the
-    ``(index, kind, text)`` triples for claim objects whose closing ``}``
-    arrived since the last call. Everything before the first ``{`` (a
-    `````json`` fence, stray prose) is ignored; braces inside JSON strings
-    never count toward depth; a ``json.loads`` failure skips that object
-    without failing. ``index`` counts every completed object (valid or
-    not); emission stops after ``max_claims`` objects. Never raises.
+    Fed provider ``text`` chunks as they arrive; each ``feed`` returns
+    ``(event, index, kind, text)`` 4-tuples with ``event`` in
+    ``{"delta", "claim"}``. ``"delta"`` carries a decoded piece of the
+    claim's ``text`` string value as it streams (emitted only once the
+    claim's ``kind`` is known and while ``index < max_claims``; leading
+    whitespace of the first piece is stripped; total emitted length is
+    capped at ``max_claim_chars``). ``"claim"`` keeps the object-close
+    semantics (``text`` = full stripped text). Text arriving before
+    ``kind`` is buffered and flushed as one delta when ``kind`` closes.
+
+    Everything before the first ``{`` (a `````json`` fence, stray prose)
+    is ignored; braces inside JSON strings never count toward depth; keys
+    and values below the claim-object level (e.g. the ``evidence`` array)
+    are ignored; a ``json.loads`` failure skips that object without
+    failing (deltas already emitted for it stay — the outer adapter's
+    rollback contract covers that). Escapes decode incrementally —
+    ``\\uXXXX`` pairs and escapes split across chunk boundaries included;
+    a lone/invalid surrogate degrades to U+FFFD. Never raises; O(total
+    chars).
     """
 
     def __init__(
@@ -272,14 +284,109 @@ class IncrementalClaimScanner:
         self._buf = ""
         self._pos = 0
         self._in_str = False
-        self._esc = False
+        self._esc_raw: str | None = None
+        self._pending_hi: str | None = None
         self._depth = 0
         self._array_depth: int | None = None
         self._obj_start: int | None = None
         self._count = 0
+        # Per-claim-object state (valid while ``_obj_start`` is not None).
+        self._last_struct: str | None = None
+        self._last_key: str | None = None
+        self._str_raw = ""
+        self._str_role: str | None = None  # "key" | "value" | "nested"
+        self._str_key: str | None = None
+        self._obj_kind: str | None = None
+        self._held: list[str] = []
+        self._emitted = 0
 
-    def feed(self, text: str) -> list[tuple[int, str, str]]:
-        out: list[tuple[int, str, str]] = []
+    # -- decoded-piece emission ----------------------------------------------
+
+    def _emit_text(self, piece: str) -> list[tuple[str, int, str, str]]:
+        """Deliver one decoded piece of the claim ``text`` value."""
+        if not piece:
+            return []
+        if self._obj_kind is None or self._count >= self._max_claims:
+            # Kind not known yet (or object beyond the claim cap): hold.
+            self._held.append(piece)
+            return []
+        return self._delta_event(piece)
+
+    def _delta_event(self, piece: str) -> list[tuple[str, int, str, str]]:
+        if self._emitted == 0:
+            piece = piece.lstrip()
+        remaining = self._max_claim_chars - self._emitted
+        if remaining <= 0:
+            return []
+        piece = piece[:remaining]
+        if not piece:
+            return []
+        self._emitted += len(piece)
+        return [("delta", self._count, self._obj_kind, piece)]
+
+    def _flush_held(self) -> list[tuple[str, int, str, str]]:
+        """Kind just became known (or object closed valid): emit held text."""
+        held = self._held
+        self._held = []
+        if not held or self._count >= self._max_claims:
+            return []
+        return self._delta_event("".join(held))
+
+    def _decode_unit(self, decoded: str) -> list[tuple[str, int, str, str]]:
+        """Handle surrogate pairing for one decoded escape/char unit."""
+        if len(decoded) != 1:
+            return self._emit_text(decoded)
+        code = ord(decoded)
+        if self._pending_hi is not None:
+            hi = self._pending_hi
+            self._pending_hi = None
+            if 0xDC00 <= code <= 0xDFFF:
+                combined = chr(
+                    0x10000 + ((ord(hi) - 0xD800) << 10) + (code - 0xDC00)
+                )
+                return self._emit_text(combined)
+            out = self._emit_text("\ufffd")
+            out.extend(self._decode_unit(decoded))
+            return out
+        if 0xD800 <= code <= 0xDBFF:
+            self._pending_hi = decoded
+            return []
+        if 0xDC00 <= code <= 0xDFFF:
+            return self._emit_text("\ufffd")
+        return self._emit_text(decoded)
+
+    def _decode_escape(self, raw: str) -> str | None:
+        try:
+            decoded = json.loads(f'"{raw}"')
+        except (json.JSONDecodeError, ValueError):
+            return None
+        return decoded if isinstance(decoded, str) else None
+
+    def _close_string(self) -> list[tuple[str, int, str, str]]:
+        out: list[tuple[str, int, str, str]] = []
+        if self._pending_hi is not None:
+            self._pending_hi = None
+            if self._str_role == "value" and self._str_key == "text":
+                out.extend(self._emit_text("\ufffd"))
+        raw = self._str_raw
+        role = self._str_role
+        key = self._str_key
+        self._str_raw = ""
+        self._str_role = None
+        self._str_key = None
+        if role == "key":
+            decoded = self._decode_escape(raw)
+            if decoded is not None:
+                self._last_key = decoded
+        elif role == "value" and key == "kind":
+            decoded = self._decode_escape(raw)
+            if decoded in _CLAIM_KINDS:
+                self._obj_kind = decoded
+                out.extend(self._flush_held())
+        return out
+
+    def feed(self, text: str) -> list[tuple[str, int, str, str]]:
+        out: list[tuple[str, int, str, str]] = []
         try:
             self._buf += text or ""
             buf = self._buf
@@ -288,14 +395,51 @@ class IncrementalClaimScanner:
             while i < n:
                 c = buf[i]
                 if self._in_str:
-                    if self._esc:
-                        self._esc = False
+                    self._str_raw += c
+                    if self._esc_raw is not None:
+                        self._esc_raw += c
+                        esc = self._esc_raw
+                        complete = (
+                            len(esc) == 6 if len(esc) > 1 and esc[1] == "u"
+                            else len(esc) == 2
+                        )
+                        if complete:
+                            self._esc_raw = None
+                            if (
+                                self._str_role == "value"
+                                and self._str_key == "text"
+                            ):
+                                decoded = self._decode_escape(esc)
+                                if decoded is not None:
+                                    out.extend(self._decode_unit(decoded))
+                        # else: partial escape — wait for more chars
                     elif c == "\\":
-                        self._esc = True
+                        self._esc_raw = "\\"
                     elif c == '"':
+                        # The closing quote is not part of the raw value.
+                        self._str_raw = self._str_raw[:-1]
                         self._in_str = False
+                        out.extend(self._close_string())
+                    elif (
+                        self._str_role == "value"
+                        and self._str_key == "text"
+                    ):
+                        out.extend(self._decode_unit(c))
                 elif c == '"':
                     self._in_str = True
+                    self._str_raw = ""
+                    if self._depth == (self._array_depth or -1) + 1 and (
+                        self._obj_start is not None
+                    ):
+                        if self._last_struct in ("{", ","):
+                            self._str_role = "key"
+                        elif self._last_struct == ":":
+                            self._str_role = "value"
+                            self._str_key = self._last_key
+                        else:
+                            self._str_role = "nested"
+                    else:
+                        self._str_role = "nested"
                 elif c == "{" or c == "[":
                     if (
                         c == "{"
@@ -304,6 +448,16 @@ class IncrementalClaimScanner:
                         and self._obj_start is None
                     ):
                         self._obj_start = i
+                        self._last_struct = "{"
+                        self._last_key = None
+                        self._obj_kind = None
+                        self._held = []
+                        self._emitted = 0
+                    elif (
+                        self._obj_start is not None
+                        and self._depth == self._array_depth + 1
+                    ):
+                        self._last_struct = c
                     self._depth += 1
                     if (
                         c == "["
@@ -311,6 +465,12 @@ class IncrementalClaimScanner:
                         and self._depth == 2
                     ):
                         self._array_depth = 2
+                elif c == ":" or c == ",":
+                    if (
+                        self._obj_start is not None
+                        and self._depth == self._array_depth + 1
+                    ):
+                        self._last_struct = c
                 elif c == "}" or c == "]":
                     if (
                         c == "}"
@@ -321,12 +481,19 @@ class IncrementalClaimScanner:
                         index = self._count
                         self._count += 1
                         if index < self._max_claims:
-                            triple = self._parse_object(
+                            parsed = self._parse_object(
                                 buf[self._obj_start : i + 1], index
                             )
-                            if triple is not None:
-                                out.append(triple)
+                            if parsed is not None:
+                                if self._emitted == 0 and self._held:
+                                    # Valid claim whose text value never
+                                    # became emittable (e.g. ``kind``
+                                    # ordering): flush held text first.
+                                    self._obj_kind = parsed[1]
+                                    out.extend(self._flush_held())
+                                out.append(("claim", *parsed))
                         self._obj_start = None
+                        self._held = []
                     self._depth -= 1
                     if self._depth < 0:
                         self._depth = 0
@@ -338,8 +505,32 @@ class IncrementalClaimScanner:
                 i += 1
             self._pos = i
         except Exception:  # pragma: no cover - never break the stream
-            return out
-        return out
+            return self._coalesce(out)
+        return self._coalesce(out)
+
+    @staticmethod
+    def _coalesce(
+        events: list[tuple[str, int, str, str]],
+    ) -> list[tuple[str, int, str, str]]:
+        """Merge adjacent ``"delta"`` events for the same claim into one.
+
+        Plain chars arrive one event per char; without this each provider
+        chunk would fan out into N ``on_delta`` calls / SSE token frames.
+        """
+        merged: list[tuple[str, int, str, str]] = []
+        for event in events:
+            if (
+                merged
+                and event[0] == "delta"
+                and merged[-1][0] == "delta"
+                and merged[-1][1] == event[1]
+                and merged[-1][2] == event[2]
+            ):
+                prev = merged[-1]
+                merged[-1] = ("delta", prev[1], prev[2], prev[3] + event[3])
+            else:
+                merged.append(event)
+        return merged
 
     def _parse_object(
         self, text: str, index: int
@@ -473,6 +664,7 @@ class StructuredLLMDraftBuilder:
         *,
         repair_context: dict | None = None,
         on_claim=None,
+        on_delta=None,
     ) -> ParsedCandidate | DraftBuildFailure:
         """One provider call + strict parse.
 
@@ -526,12 +718,14 @@ class StructuredLLMDraftBuilder:
                             continue
                         text = getattr(chunk, "text", None) or ""
                         parts.append(text)
-                        if on_claim is not None:
-                            for index, kind, claim_text in scanner.feed(text):
-                                try:
-                                    on_claim(index, kind, claim_text)
-                                except Exception:
-                                    pass
+                        for event, index, kind, piece in scanner.feed(text):
+                            callback = on_claim if event == "claim" else on_delta
+                            if callback is None:
+                                continue
+                            try:
+                                callback(index, kind, piece)
+                            except Exception:
+                                pass
                     raw = "".join(parts)
                 else:
                     result = await provider.acomplete(

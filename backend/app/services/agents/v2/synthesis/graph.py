@@ -633,9 +633,11 @@ async def generate_node(
     failure the repair decision evaluates.
 
     Speculative claim streaming: when LangGraph injects a ``writer`` (the
-    parent runs with ``astream`` + ``subgraphs=True``), completed claims are
-    written to the custom stream as advisory ``synthesis.speculative_*``
-    payloads; a repair pass emits ``synthesis.speculative_reset`` first.
+    parent runs with ``astream`` + ``subgraphs=True``), claim text pieces
+    (``synthesis.speculative_delta``) and completed claims
+    (``synthesis.speculative_claim``) are written to the custom stream as
+    advisory payloads; a repair pass emits ``synthesis.speculative_reset``
+    first.
     Under plain ``ainvoke`` the writer is a no-op. Nothing partial is ever
     checkpointed — only the parsed candidate lands on ``synthesis``.
     """
@@ -697,6 +699,7 @@ async def generate_node(
 
     from ..events import (
         SYNTHESIS_SPECULATIVE_CLAIM,
+        SYNTHESIS_SPECULATIVE_DELTA,
         SYNTHESIS_SPECULATIVE_RESET,
     )
 
@@ -704,6 +707,7 @@ async def generate_node(
     if emit is not None and repair_context is not None:
         emit({"kind": SYNTHESIS_SPECULATIVE_RESET})
     on_claim = None
+    on_delta = None
     if emit is not None:
         def on_claim(index: int, presentation: str, text: str) -> None:
             emit(
@@ -715,11 +719,22 @@ async def generate_node(
                 }
             )
 
+        def on_delta(index: int, presentation: str, text: str) -> None:
+            emit(
+                {
+                    "kind": SYNTHESIS_SPECULATIVE_DELTA,
+                    "index": index,
+                    "presentation": presentation,
+                    "text": text,
+                }
+            )
+
     result = await builder.build(
         state["semantic"].contextualized_query,
         tuple(evidence_items),
         repair_context=repair_context,
         on_claim=on_claim,
+        on_delta=on_delta,
     )
     if isinstance(result, DraftBuildFailure):
         return {

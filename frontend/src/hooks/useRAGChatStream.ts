@@ -737,6 +737,11 @@ export function useRAGChatStream(
                       cancelAnimationFrame(rafRef.current);
                       rafRef.current = undefined;
                     }
+                    // Land the grounded answer (with citation markers) in the
+                    // same React commit as setIsStreaming(false) so the
+                    // speculative → grounded swap is one render, not two.
+                    setStreamingContent(cleanAnswer);
+                    localAnswer = cleanAnswer;
                     // Flush accumulated thinking into localSteps so finalMessage.agentSteps has thinkingText
                     if (thinkingAccumulator) {
                       syncUpdateSteps((prev) =>

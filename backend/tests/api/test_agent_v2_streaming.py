@@ -677,6 +677,41 @@ def test_interrupt_emits_structured_clarification_required_before_terminal():
     assert leases.released == []
 
 
+def test_interrupt_with_missing_clarification_releases_leases():
+    """Regression: ``__interrupt__`` present but the checkpoint carries no
+    valid ``ClarificationRequest`` → the turn is terminal (nothing to
+    resume), so it must emit ``error`` AND release leases + unregister the
+    active run like every other terminal path. Previously this branch only
+    stopped the heartbeat and leaked the lease/active-run registration.
+    """
+    import asyncio
+
+    from langgraph.errors import GraphInterrupt
+
+    import app.services.agent.streaming as convert_streaming
+
+    graph = FakeGraph(
+        [("interrupt", GraphInterrupt([]))],
+        checkpoint={},  # no persisted clarification request
+    )
+    leases = FakeLeaseRepo()
+    events = asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=graph,
+                runtime_context=_runtime(leases=leases),
+                thread_id="thread-corrupt-1",
+                initial_state={"request": "q"},
+            )
+        )
+    )
+    terminals = _terminal_events(events)
+    assert len(terminals) == 1
+    assert terminals[0]["event"] == "error"
+    # Terminal-with-nothing-to-resume: leases released, not kept.
+    assert leases.released == [("run-t8-test", "terminal")]
+
+
 def test_resume_uses_command_verbatim_on_stable_thread():
     import asyncio
 
@@ -2576,7 +2611,22 @@ def _spec_reset() -> tuple:
     return (("synthesis",), "custom", {"kind": "synthesis.speculative_reset"})
 
 
-def test_v2_speculative_claims_render_then_rollback_before_final():
+def _spec_delta(index: int, presentation: str, text: str) -> tuple:
+    return (
+        ("synthesis",),
+        "custom",
+        {
+            "kind": "synthesis.speculative_delta",
+            "index": index,
+            "presentation": presentation,
+            "text": text,
+        },
+    )
+
+
+def test_v2_speculative_claims_render_then_complete_replaces_in_place():
+    """Whole-claim path: on success there is NO rollback and no re-stream —
+    ``complete.answer`` swaps the speculative text in place."""
     import asyncio
 
     import app.services.agent.streaming as convert_streaming
@@ -2600,18 +2650,50 @@ def test_v2_speculative_claims_render_then_rollback_before_final():
         )
     )
     kinds = [ev["event"] for ev in events]
-    assert kinds.count("token_rollback") == 1
-    rb = kinds.index("token_rollback")
-    spec = "".join(ev["data"]["text"] for ev in events[:rb] if ev["event"] == "token")
+    assert "token_rollback" not in kinds
+    assert "citation" in kinds and kinds.index("citation") < kinds.index("complete")
+    spec = "".join(ev["data"]["text"] for ev in events if ev["event"] == "token")
     assert spec == (
         "Tóm tắt.\n\n- Chi tiết 1.\n- Chi tiết 2.\n\n- **Lưu ý:** Còn thiếu."
     )
-    # Rollback sits after the last speculative token and before citation.
-    assert kinds.index("citation") > rb
-    final_tokens = "".join(
-        ev["data"]["text"] for ev in events[rb + 1 :] if ev["event"] == "token"
+    assert events[-1]["data"]["answer"] == "FINAL"
+
+
+def test_v2_speculative_deltas_stream_piecewise_then_complete():
+    """Delta path: claim text arrives in pieces; the closing ``claim``
+    frame for an already-streamed index emits nothing; success emits no
+    rollback and no post-citation tokens."""
+    import asyncio
+
+    import app.services.agent.streaming as convert_streaming
+
+    script = [
+        _spec_delta(0, "summary", "Tóm "),
+        _spec_delta(0, "summary", "tắt "),
+        _spec_delta(0, "summary", "xong."),
+        _spec_claim(0, "summary", "Tóm tắt xong."),
+        _spec_delta(1, "detail", "Chi tiết "),
+        _spec_delta(1, "detail", "xong."),
+        _spec_claim(1, "detail", "Chi tiết xong."),
+        ((), "values", {"final_response": _success_response("FINAL")}),
+    ]
+    graph = FakeStreamingGraph([], stream_script=script)
+    events = asyncio.run(
+        _collect(
+            convert_streaming.stream_v2_turn_events(
+                graph=graph,
+                runtime_context=_runtime(),
+                thread_id="thread-spec-delta",
+                initial_state={"request": "q"},
+            )
+        )
     )
-    assert final_tokens == "FINAL"
+    kinds = [ev["event"] for ev in events]
+    assert "token_rollback" not in kinds
+    cit = kinds.index("citation")
+    assert not [ev for ev in events[cit:] if ev["event"] == "token"]
+    spec = "".join(ev["data"]["text"] for ev in events[:cit] if ev["event"] == "token")
+    assert spec == "Tóm tắt xong.\n\n- Chi tiết xong."
     assert events[-1]["data"]["answer"] == "FINAL"
 
 
@@ -2639,15 +2721,15 @@ def test_v2_speculative_reset_rolls_back_mid_run():
         )
     )
     kinds = [ev["event"] for ev in events]
-    assert kinds.count("token_rollback") == 2
-    first_rb = kinds.index("token_rollback")
-    second_rb = kinds.index("token_rollback", first_rb + 1)
-    between = "".join(
+    # Rollback at the repair reset only; the success terminal adds none.
+    assert kinds.count("token_rollback") == 1
+    rb = kinds.index("token_rollback")
+    after = "".join(
         ev["data"]["text"]
-        for ev in events[first_rb + 1 : second_rb]
+        for ev in events[rb + 1 :]
         if ev["event"] == "token"
     )
-    assert between == "Nháp hai.\n\n- Chi tiết hai."
+    assert after == "Nháp hai.\n\n- Chi tiết hai."
 
 
 def test_v2_speculative_claims_retracted_before_error_terminal():
@@ -2738,6 +2820,13 @@ def test_v2_malformed_custom_chunks_emit_nothing():
             "kind": "synthesis.speculative_claim",
             "index": 1, "presentation": "x", "text": "abc",
         }),
+        _spec_delta(True, "summary", "x"),
+        _spec_delta(0, "bad", "x"),
+        _spec_delta(0, "summary", ""),
+        (("synthesis",), "custom", {
+            "kind": "synthesis.speculative_delta",
+            "index": -1, "presentation": "summary", "text": "x",
+        }),
         ((), "values", {"final_response": _success_response("ok")}),
     ]
     graph = FakeStreamingGraph([], stream_script=script)
@@ -2793,6 +2882,12 @@ def test_speculative_chunk_matches_grounded_render_minus_markers():
     from app.services.agents.v2.synthesis.citations import CitationProjection
 
     assert convert_streaming._V2_SPECULATIVE_CAVEAT_PREFIX == render._CAVEAT_PREFIX
+    # Empty text opens a claim line: separator + prefix only.
+    assert convert_streaming._speculative_claim_chunk("summary", "detail", "") == "\n\n- "
+    assert (
+        convert_streaming._speculative_claim_chunk("detail", "caveat", "")
+        == "\n\n- **Lưu ý:** "
+    )
 
     claims = (
         GroundedClaim(

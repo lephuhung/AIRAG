@@ -111,7 +111,8 @@ export const PremiumThinking = memo(({
           "flex items-center gap-2 px-2 py-1.5 rounded-md text-[13.5px] font-bold transition-all duration-200",
           "bg-transparent border-none outline-none select-none",
           "text-slate-700 hover:text-violet-700 hover:bg-violet-600/15",
-          expanded && "text-violet-700 bg-violet-600/20"
+          expanded && "text-violet-700 bg-violet-600/20",
+          isStreaming && "step-sheen"
         )}
       >
         <AnimatePresence mode="popLayout" initial={false}>
@@ -128,7 +129,7 @@ export const PremiumThinking = memo(({
             ) : (
               <Sparkles className="w-3.5 h-3.5 text-violet-400" />
             )}
-            <span>{labelText}</span>
+            <span className={cn(isStreaming && "step-label-shine")}>{labelText}</span>
             <ChevronDown className={cn("w-3.5 h-3.5 transition-transform duration-300", expanded && "rotate-180")} />
           </motion.div>
         </AnimatePresence>
@@ -153,7 +154,7 @@ export const PremiumThinking = memo(({
                     {isStreaming && !hasContent && (
                       <div className="flex items-center gap-1.5 mt-2 text-violet-500/60">
                         <Loader2 className="w-3 h-3 animate-spin" />
-                        <span className="text-[11px] italic font-medium">Đang suy nghĩ...</span>
+                        <span className="text-[11px] italic font-medium step-label-shine">Đang suy nghĩ...</span>
                       </div>
                     )}
                   </div>

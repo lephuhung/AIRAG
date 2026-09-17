@@ -4,6 +4,7 @@ import { Copy, Check, ChevronDown, ChevronUp, FileText } from "lucide-react";
 import { useTranslation } from "@/hooks/useTranslation";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
+import { copyToClipboard } from "@/lib/clipboard";
 import type { RetrievedChunk, Citation } from "@/types";
 
 // ---------------------------------------------------------------------------
@@ -93,10 +94,15 @@ export const ResultCard = memo(function ResultCard({ chunk, index, query }: Resu
   const displayText = expanded || !isLong ? chunk.content : chunk.content.slice(0, 300) + "...";
 
   const handleCopy = useCallback(() => {
-    navigator.clipboard.writeText(chunk.content);
-    setCopied(true);
-    toast.success(t("common.copied"));
-    setTimeout(() => setCopied(false), 2000);
+    copyToClipboard(chunk.content).then((ok) => {
+      if (!ok) {
+        toast.error(t("tools.copy_failed"));
+        return;
+      }
+      setCopied(true);
+      toast.success(t("common.copied"));
+      setTimeout(() => setCopied(false), 2000);
+    });
   }, [chunk.content, t]);
 
   const similarity = Math.max(0, 1 - chunk.score);

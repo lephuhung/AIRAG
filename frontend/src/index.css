@@ -356,6 +356,25 @@ li .katex-display {
   font-size: 0.85em;
 }
 
+/* Answer finalize — speculative text settles into the grounded answer */
+@keyframes answer-settle {
+  from { opacity: 0.55; filter: blur(1.5px); }
+  to   { opacity: 1;    filter: blur(0); }
+}
+@keyframes citation-pop {
+  0%   { opacity: 0; transform: translateY(3px) scale(0.8); }
+  65%  { opacity: 1; transform: translateY(0) scale(1.08); }
+  100% { opacity: 1; transform: none; }
+}
+.answer-finalizing { animation: answer-settle 0.45s ease-out both; }
+.answer-finalizing .citation-chip {
+  animation: citation-pop 0.5s cubic-bezier(0.2, 0.9, 0.3, 1.15) both;
+  animation-delay: calc(0.18s + var(--chip-i, 0) * 45ms);
+}
+@media (prefers-reduced-motion: reduce) {
+  .answer-finalizing, .answer-finalizing .citation-chip { animation: none; }
+}
+
 /* =============================================================================
    ThinkingTextWindow — Gradient mask for streaming thinking text
    Fades bottom edge so streaming text feels continuous, not cut off.
@@ -363,6 +382,68 @@ li .katex-display {
 .streaming-thinking-mask {
   -webkit-mask-image: linear-gradient(to bottom, black 0%, black 60%, rgba(0,0,0,0.2) 100%);
   mask-image: linear-gradient(to bottom, black 0%, black 60%, rgba(0,0,0,0.2) 100%);
+}
+
+/* =============================================================================
+   Thinking Step — Shine / Gradient Sweep
+   While the agent is answering, the step label gets a sweeping gradient
+   (background-clip: text) and the thinking button gets a soft sheen sweep.
+   ============================================================================= */
+@keyframes step-label-shine {
+  from { background-position: 200% center; }
+  to   { background-position: -200% center; }
+}
+
+.step-label-shine {
+  --step-shine-base: oklch(0.78 0.13 305);
+  --step-shine-hi: oklch(0.96 0.03 300);
+  background-image: linear-gradient(
+    100deg,
+    var(--step-shine-base) 40%,
+    var(--step-shine-hi) 50%,
+    var(--step-shine-base) 60%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: step-label-shine 2.2s linear infinite;
+}
+
+html[data-theme="light"] .step-label-shine {
+  --step-shine-base: oklch(0.48 0.2 293);
+  --step-shine-hi: oklch(0.72 0.17 300);
+}
+
+.step-sheen {
+  position: relative;
+  overflow: hidden;
+}
+.step-sheen::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(
+    105deg,
+    transparent 35%,
+    oklch(1 0 0 / 0.16) 50%,
+    transparent 65%
+  );
+  animation: shimmer 2.4s ease-in-out infinite;
+}
+html[data-theme="light"] .step-sheen::after {
+  background: linear-gradient(
+    105deg,
+    transparent 35%,
+    oklch(0.66 0.16 300 / 0.16) 50%,
+    transparent 65%
+  );
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .step-label-shine { animation: none; }
+  .step-sheen::after { animation: none; opacity: 0; }
 }
 
 /* =============================================================================

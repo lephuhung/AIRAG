@@ -87,6 +87,8 @@ from app.services.agents.v2.nodes.evaluate import AnswerDraftChannel, HydratedEv
 from app.services.agents.v2.synthesis.adapter import StructuredLLMDraftBuilder
 from app.services.agents.v2.synthesis.citations import StoreCitationResolver
 from app.services.llm import get_main_provider_for_synthesis
+from app.services.agents.v2.planning import AdaptivePlanner, AdaptiveReplanner
+from app.services.agents.v2.semantic.intent import IntentClassifier
 from app.services.agents.v2.persistence.shadow_checkpoint import (
     ShadowCheckpointBundle,
     create_shadow_checkpointer,
@@ -884,9 +886,12 @@ def build_shadow_bundle(
     document_view: Mapping[Any, Mapping[str, Any]] | None = None,
     people_directory: Mapping[str, Mapping[str, object]] | None = None,
     people_source: Any | None = None,
+    session_factory: Any | None = None,
+    intent_classifier: Any | None = None,
+    adaptive_planner: Any | None = None,
+    adaptive_replanner: Any | None = None,
     history: tuple[tuple[str, str], ...] = (),
     deadline_seconds: float = 120.0,
-    session_factory: Any | None = None,
 ) -> ShadowBundle:
     """Assemble one isolated shadow bundle (R54 ownership chain + R60).
 
@@ -1008,6 +1013,18 @@ def build_shadow_bundle(
         # read-only resolver over the authoritative stores behind the
         # single CitationProjector owner. Reads only — no write surface.
         citation_resolver=StoreCitationResolver(session_factory),
+        # Decision-parity services (same classes production ingress wires
+        # in runtime_selector.py): all three are proposal-only — they own no
+        # checkpointed state, dispatch no capabilities, and their outputs
+        # still pass the frozen validate/lease/checkpoint boundary. Without
+        # them the shadow silently exercises only the deterministic
+        # fallbacks, so adaptive-path turns (uncovered work types, model
+        # replans) would diverge from production semantics. Callers may
+        # inject deterministic stand-ins (tests) — ``None`` means the real
+        # request-scoped service.
+        intent_classifier=intent_classifier or IntentClassifier(),
+        adaptive_planner=adaptive_planner or AdaptivePlanner(),
+        adaptive_replanner=adaptive_replanner or AdaptiveReplanner(),
     )
     runtime_context = GraphRuntimeContext(
         capability_runtime=capability_runtime,

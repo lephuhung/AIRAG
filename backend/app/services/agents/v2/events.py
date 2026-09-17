@@ -55,6 +55,7 @@ __all__ = [
     "final_response_payload",
     "terminal_event_for_response",
     "SYNTHESIS_SPECULATIVE_CLAIM",
+    "SYNTHESIS_SPECULATIVE_DELTA",
     "SYNTHESIS_SPECULATIVE_RESET",
 ]
 
@@ -74,6 +75,7 @@ SSE_COMPLETE = "complete"
 #: presentation as speculative ``token`` events, always retracted by
 #: ``token_rollback`` before a repair attempt or any terminal.
 SYNTHESIS_SPECULATIVE_CLAIM = "synthesis.speculative_claim"
+SYNTHESIS_SPECULATIVE_DELTA = "synthesis.speculative_delta"
 SYNTHESIS_SPECULATIVE_RESET = "synthesis.speculative_reset"
 
 

@@ -384,6 +384,52 @@ describe('validity badges + clarification symmetry (fix round 3)', () => {
   });
 });
 
+describe('speculative → grounded in-place swap (B2)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useAuthStore.setState({
+      token: 'test-token',
+      user: { id: 'user-1', email: 'test@test.com' } as any,
+    });
+  });
+
+  it('lands the grounded answer (with markers) in streamingContent on complete', async () => {
+    mockFetchFrames([
+      'event: token\ndata: {"text":"Mức phạt là 5 triệu."}\n\n',
+      'event: citation\ndata: {"citations":[{"citation_id":"c1","label":"L","index":"a3z9","document_id":"d1","chunk_id":"c1"}]}\n\n',
+      'event: complete\ndata: {"answer":"Mức phạt là 5 triệu [a3z9].","status":"success","citations":[{"citation_id":"c1","label":"L"}]}\n\n',
+    ]);
+    const { result } = renderStreamHook();
+
+    const final = await act(async () =>
+      result.current.sendMessage('Mức phạt?', [], false),
+    );
+
+    // No token_rollback on success: the grounded answer replaces the
+    // speculative text in place, in the same commit as isStreaming=false.
+    expect(result.current.streamingContent).toBe('Mức phạt là 5 triệu [a3z9].');
+    expect(result.current.isStreaming).toBe(false);
+    expect(result.current.status).toBe('idle');
+    expect(final?.content).toBe('Mức phạt là 5 triệu [a3z9].');
+  });
+
+  it('token_rollback still clears streamingContent before an empty complete', async () => {
+    mockFetchFrames([
+      'event: token\ndata: {"text":"speculative draft"}\n\n',
+      'event: token_rollback\ndata: {}\n\n',
+      'event: complete\ndata: {"answer":""}\n\n',
+    ]);
+    const { result } = renderStreamHook();
+
+    await act(async () => {
+      await result.current.sendMessage('q', [], false);
+    });
+
+    expect(result.current.streamingContent).toBe('');
+    expect(result.current.isStreaming).toBe(false);
+  });
+});
+
 describe('stop-button cancel path (Task 2 fix round I1)', () => {
   beforeEach(() => {
     vi.clearAllMocks();

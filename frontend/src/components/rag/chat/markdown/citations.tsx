@@ -1,4 +1,4 @@
-import { useState, Children, isValidElement, type ReactNode } from "react";
+import { useState, Children, isValidElement, type CSSProperties, type ReactNode } from "react";
 import { Brain, FileText, Image as ImageIcon } from "lucide-react";
 import { useTranslation } from "@/hooks/useTranslation";
 import { useDocument } from "@/hooks/useDocuments";
@@ -13,10 +13,12 @@ function CitationLink({
   index,
   source,
   relatedEntities,
+  style,
 }: {
   index: string;
   source: ChatSourceChunk;
   relatedEntities: string[];
+  style?: CSSProperties;
 }) {
   const { t } = useTranslation();
   const { activateCitation, activateCitationKG } =
@@ -42,7 +44,8 @@ function CitationLink({
     return (
       <button
         onClick={handleContentClick}
-        className="inline-flex items-center gap-0.5 h-[18px] px-1.5 mx-0.5 text-[10px] font-medium rounded-full bg-purple-400/15 text-purple-500 dark:text-purple-400 hover:bg-purple-400/25 transition-colors align-middle whitespace-nowrap"
+        style={style}
+        className="citation-chip inline-flex items-center gap-0.5 h-[18px] px-1.5 mx-0.5 text-[10px] font-medium rounded-full bg-purple-400/15 text-purple-500 dark:text-purple-400 hover:bg-purple-400/25 transition-colors align-middle whitespace-nowrap"
         title={t("chat.view_kg")}
       >
         <Brain className="w-2.5 h-2.5 flex-shrink-0" />
@@ -57,7 +60,7 @@ function CitationLink({
   const label = source.page_no ? `${docName}-P.${source.page_no}` : docName;
 
   return (
-    <span className="inline-flex gap-0.5 mx-0.5 align-middle">
+    <span className="citation-chip inline-flex gap-0.5 mx-0.5 align-middle" style={style}>
       <button
         onClick={handleContentClick}
         aria-label={t("chat.view_source", { name: doc?.original_filename || "unknown", page: source.page_no })}
@@ -180,6 +183,20 @@ export function injectCitations(
   imageRefs?: ChatImageRef[],
   fallbackSources?: ChatSourceChunk[],
 ): ReactNode {
+  // Per-call chip counter: assigns each rendered CitationLink a `--chip-i`
+  // CSS var so the answer-finalize pop animation staggers in document order.
+  const chip = { idx: 0 };
+  return injectChildren(children, sources, relatedEntities, imageRefs, fallbackSources, chip);
+}
+
+function injectChildren(
+  children: ReactNode,
+  sources: ChatSourceChunk[],
+  relatedEntities: string[],
+  imageRefs: ChatImageRef[] | undefined,
+  fallbackSources: ChatSourceChunk[] | undefined,
+  chip: { idx: number },
+): ReactNode {
   return Children.map(children, (child) => {
     // Process string nodes — split on citation patterns
     if (typeof child === "string") {
@@ -225,7 +242,13 @@ export function injectCitations(
             (fallbackSources ? fallbackSources.find((s) => String(s.index).toLowerCase() === cleanToken) : undefined);
           if (source) {
             result.push(
-              <CitationLink key={key} index={String(source.index)} source={source} relatedEntities={relatedEntities} />
+              <CitationLink
+                key={key}
+                index={String(source.index)}
+                source={source}
+                relatedEntities={relatedEntities}
+                style={{ "--chip-i": chip.idx++ } as CSSProperties}
+              />
             );
             return;
           }
@@ -241,7 +264,7 @@ export function injectCitations(
       return Object.assign({}, child, {
         props: {
           ...child.props,
-          children: injectCitations(props.children, sources, relatedEntities, imageRefs, fallbackSources),
+          children: injectChildren(props.children, sources, relatedEntities, imageRefs, fallbackSources, chip),
         },
       });
     }
