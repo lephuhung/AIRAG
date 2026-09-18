@@ -2,7 +2,8 @@
 
 **Status:** Proposed  
 **Target branch:** `feat/langgraph-v2`  
-**Scope:** semantic intent classification, entity extraction, fast-path routing, complex research routing
+**Scope:** semantic intent classification, entity extraction, fast-path routing, complex research routing  
+**Supersedes (partial):** deterministic-first intent classification (Phase 4A, `semantic/intent.py` + `nodes/routing.py`) — xem §33
 
 ## 1. Mục tiêu
 
@@ -663,18 +664,21 @@ T1 people.lookup(phone=0989755968)
 T2 document.search(
     query="quy định về hồ sơ cấp độ"
 )
-
-T3 evaluate
-    depends_on=[T1, T2]
 ```
 
 Task graph:
 
 ```text
              ┌── T1 people.lookup ──┐
-START ───────┤                      ├── T3 evaluate
+START ───────┤                      ├── evaluate (pipeline node)
              └── T2 document.search ┘
 ```
+
+> **Lưu ý:** "evaluate" trong các ví dụ của spec này là **governed pipeline
+> node** (`complex_evaluate_node` → `evaluate_evidence`), không phải
+> capability task trong plan. Dependency "evaluate sau T1+T2" được đảm bảo
+> cấu trúc bởi edge `execute → materialize → settle → evaluate` — plan chỉ
+> chứa evidence tasks. Xem §33.4.
 
 T1 và T2 không phụ thuộc nhau nên có thể chạy parallel.
 
@@ -1414,8 +1418,7 @@ T1 people.lookup
 
 T2 document.search
 
-T3 evaluate
-depends_on = [T1, T2]
+(evaluate = pipeline node, chạy sau mọi task — xem §33.4)
 ```
 
 T1 và T2 phải có khả năng chạy parallel.
@@ -1427,7 +1430,7 @@ T1 và T2 phải có khả năng chạy parallel.
 Implementation được coi là hoàn thành khi đáp ứng toàn bộ:
 
 1. Phone/CCCD/BHXH regex không còn trực tiếp quyết định route.
-2. Intent classifier luôn chạy trước deterministic identifier extraction.
+2. Identifier extraction không được là input của intent classification (xem §33.4).
 3. Classifier có thể trả nhiều intent.
 4. Multi-intent luôn vào `complex_research`.
 5. Single atomic intent tiếp tục sử dụng fast-path.
@@ -1518,3 +1521,81 @@ COMPLEX_RESEARCH = True
 ```
 
 Đây là quy tắc execution cốt lõi cần được bảo vệ bằng regression tests.
+
+---
+
+## 33. Supersession — amendment đối với deterministic-first intent (Phase 4A)
+
+Spec này override một phần thiết kế Phase 4A trong `semantic/intent.py` và
+`nodes/routing.py`. Phần này liệt kê chính xác điểm nào thay đổi, điểm nào
+giữ nguyên, để tránh đọc hai spec như hai yêu cầu mâu thuẫn.
+
+### 33.1. Override: deterministic intent scopes → entity extraction
+
+**Spec cũ:** `IntentClassifier.classify()` gọi `classify_deterministic()`
+TRƯỚC model — phone/CCCD/BHXH/name short-circuit thành `mongo_search_*`,
+greeting/personal short-circuit thành `greeting`/`personal`; `classify_evaluate`
+cũng short-circuit trước model.
+
+**Spec này:** identifier-driven scopes (phone/CCCD/BHXH/name/`evaluate`) KHÔNG
+được tạo intent trước LLM — chúng là nguồn gây collapse compound query. Chúng
+được refactor thành entity extraction (§9, §25–§27).
+
+Greeting/personal là non-entity scopes: được phép GIỮ deterministic
+short-circuit, vì không có identifier nào "che" phần còn lại của query. Nếu
+sau này xuất hiện case greeting-prefix + factual phức tạp bị nuốt, đánh giá
+lại riêng.
+
+`classify_supervisor_scope`, `people_intent_from_query`,
+`deterministic_decision_for_scope` là **code shared với v1** — KHÔNG sửa
+semantics. V2 chỉ ngừng gọi chúng trong intent path; chúng vẫn hợp lệ cho
+entity→capability resolution bên trong people service (§26–§27).
+
+### 33.2. Override: fallback direction (uncertain → complex)
+
+**Spec cũ:** model output parse lỗi → `search` (v1 parity, retrieval-backed);
+intent ngoài taxonomy → `search`; classifier exception → legacy deterministic
+path (có thể vẫn ra `simple_people_lookup`).
+
+**Spec này:** mọi trường hợp §19 → `complex_research`. Không còn silent-coerce
+sang `search`, không còn rơi về deterministic people path. Deterministic
+greeting/personal (§33.1) không tính là fallback.
+
+### 33.3. Override: `QueryAnalysis` mở rộng mang intent
+
+**Spec cũ:** `QueryAnalysis` = `work_type + domains + dependency_hints`;
+`IntentDecision` runtime-only, single-intent.
+
+**Spec này:** cần `IntentAnalysis` (§5) làm input routing. Vì route decision
+phụ thuộc `intent_count` và resume phải deterministic, `IntentAnalysis` là
+**checkpointed** — schema revision mới + migration cho checkpoint cũ (theo
+mô hình discovery checkpoint revision 2). Open: slot riêng hay field mới
+trong `QueryAnalysis` — quyết khi viết contract.
+
+### 33.4. Clarifications (KHÔNG phải override)
+
+- **"evaluate" là pipeline node, không phải plan task.** Plan chỉ chứa
+  evidence tasks; `complex_evaluate_node` chạy sau mọi task theo cấu trúc
+  graph — đó chính là "T3 depends_on [T1,T2]" của ví dụ §11.
+- **"parallel" nghĩa là topology**: T1/T2 không `depends_on` nhau. Scheduler
+  hiện dispatch tuần tự theo plan order — đáp ứng đúng spec. Concurrent
+  dispatch (tôn trọng `supports_parallel` + `max_parallel_branches`) là tối
+  ưu sau, không blocking acceptance.
+- **Thứ tự node vật lý giữ nguyên** (`context → binding → semantic_finalizer
+  → route`). Acceptance #2 cấm identifier extraction làm INPUT của intent
+  classification; `extract_person_refs`/`document_refs` trong semantic draft
+  là entity facts hợp lệ — khi `intent_count > 1` gate đứng đầu
+  `decide_route`, domain-derive từ refs không còn khả năng collapse compound
+  query. Điều bị cấm là `classify_supervisor_scope` biến entity → intent
+  trước LLM (§33.1).
+- **`document.search` vs `document.retrieve`** cho intent `document_search`:
+  `document.search` trả discovery candidates (cần `settle` + discovery
+  policy `V2_ALLOW_*` đang default-off); `document.retrieve` trả evidence
+  trực tiếp và đang phục vụ targetless path. Mặc định cho multi-intent
+  document evidence: **`document.retrieve`**, trừ khi kế hoạch phụ thuộc
+  discovery candidates — quyết định này liên quan discovery bootstrap spec
+  (flag-off).
+- **Latency trade-off (ghi nhận, không phải quyết định mới):** bỏ
+  deterministic short-circuit = mọi query trả thêm 1 LLM classify call,
+  kể cả pure phone lookup. §33.1 giữ greeting/personal short-circuit để
+  giảm phần nào.
