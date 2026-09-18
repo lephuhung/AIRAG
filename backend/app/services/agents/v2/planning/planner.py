@@ -8,7 +8,8 @@ still validates, leases, and checkpoints before the shared ``TaskScheduler``
 sees it.
 
 Ordering: deterministic skill policies win whenever they cover the work type
-(compare / retrieve / summarize / multi-goal / cross-domain / evaluate) — a
+(compare / retrieve / summarize / multi-goal / multi-intent / cross-domain /
+evaluate) — a
 covering skill's refusal is final and never falls through to the model; the
 model path runs only for below-intake work no skill covers. The model
 returns an ordered step
@@ -105,6 +106,7 @@ def _skill_covers_work_type(planning_input: ResearchPlanningInput) -> bool:
     from ..skills.cross_domain import policy as cross_domain_policy
     from ..skills.evaluate import policy as evaluate_policy
     from ..skills.multi_goal import policy as multi_goal_policy
+    from ..skills.multi_intent import policy as multi_intent_policy
     from ..skills.retrieve import policy as retrieve_policy
     from ..skills.summarize import policy as summarize_policy
 
@@ -115,6 +117,8 @@ def _skill_covers_work_type(planning_input: ResearchPlanningInput) -> bool:
         or summarize_policy.supports_work_type(work_type)
     ):
         return True
+    if multi_intent_policy.supports_work_type(work_type):
+        return multi_intent_policy.covers_input(planning_input)
     if multi_goal_policy.supports_work_type(work_type):
         return multi_goal_policy.covers_input(planning_input)
     if cross_domain_policy.supports_work_type(work_type):
@@ -143,7 +147,10 @@ _PLANNER_SYSTEM_PROMPT = (
     "(non-blank strings). Rules: document.read/section.read need at least "
     "one target; people.lookup/document.search/knowledge_graph.query/"
     "memory.lookup take no targets; document.retrieve may be targetless; "
-    "document.search only when the discovery policy allows it."
+    "document.search only when the discovery policy allows it. When 'intents' "
+    "is present, an intent with a non-empty depends_on produces its document "
+    "evidence via 'document.retrieve' (targetless) — a person-dependent "
+    "document search is materializer-owned and must never be proposed."
 )
 
 _PLANNER_USER_TEMPLATE = (
@@ -157,6 +164,37 @@ _PLANNER_USER_TEMPLATE = (
 
 def _fail(message: str) -> PlannerError:
     return PlannerError(message)
+
+
+def _resolve_dependent_document_proposals(
+    planning_input: ResearchPlanningInput,
+    steps: tuple[Mapping[str, Any], ...],
+) -> tuple[Mapping[str, Any], ...]:
+    """Enforce §33.4 server-side for dependent document evidence.
+
+    When the checkpointed ``IntentAnalysis`` carries any dependent intent,
+    a model-proposed dependent ``document.search`` is rewritten to
+    ``document.retrieve``: the spec makes retrieve the default multi-intent
+    document-evidence task (direct evidence under the scoped targetless
+    path), while ``document.search`` only yields discovery candidates —
+    dormant unless the deployment opens ``V2_ALLOW_*_DISCOVERY``. The
+    scalar-backed people→document search remains materializer-owned: the
+    materializer appends its own governed ``document.search`` after a
+    successful ``people.lookup`` regardless of the proposal, so the
+    rewrite loses nothing the model was allowed to supply. Ordering
+    (``depends_on``) is preserved; independent ``document.search`` steps
+    still reach ``_build_plan`` and the discovery-policy gate; flag-off
+    and dependency-free analyses are untouched.
+    """
+    analysis = planning_input.intent_analysis
+    if analysis is None or not any(intent.depends_on for intent in analysis.intents):
+        return steps
+    return tuple(
+        {**step, "capability": "document.retrieve"}
+        if step.get("capability") == "document.search" and step.get("depends_on")
+        else step
+        for step in steps
+    )
 
 
 class AdaptivePlanner(RuntimeModel):
@@ -215,6 +253,7 @@ class AdaptivePlanner(RuntimeModel):
                 raise
         model_input = build_planner_model_input(planning_input)
         steps = await self._propose_steps(model_input)
+        steps = _resolve_dependent_document_proposals(planning_input, steps)
         plan = self._build_plan(planning_input, runtime, steps)
         try:
             validate_task_plan(

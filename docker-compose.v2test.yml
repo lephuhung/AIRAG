@@ -8,6 +8,7 @@ services:
       NEXUSRAG_AGENT_V2_ENABLED: "true"
       NEXUSRAG_AGENT_V2_CANARY_PERCENT: "100"
       NEXUSRAG_AGENT_V2_BUCKET_SALT: "cbac0f7c094d5df49bd3980506355cfe"
+      V2_MULTI_INTENT_ROUTING_ENABLED: "true"
   worker-parse:
     image: airag-backend:v2phase2
   worker-embed:

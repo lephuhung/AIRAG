@@ -3020,6 +3020,7 @@ def test_subagent_cannot_append_authoritative_tasks() -> None:
         ("skills/cross_domain/policy.py", "build_cross_domain_plan"),
         ("skills/evaluate/policy.py", "build_evaluate_plan"),
         ("skills/multi_goal/policy.py", "build_multi_goal_plan"),
+        ("skills/multi_intent/policy.py", "build_multi_intent_plan"),
         ("skills/retrieve/policy.py", "build_retrieve_plan"),
         ("skills/retrieve/policy.py", "build_unscoped_retrieve_plan"),
         ("skills/summarize/policy.py", "build_summarize_workflow"),

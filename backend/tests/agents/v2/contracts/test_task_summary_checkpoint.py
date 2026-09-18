@@ -31,7 +31,11 @@ from app.services.agents.v2.contracts.planning import (
 )
 from app.services.agents.v2.contracts.locators import DocumentLocator
 from app.services.agents.v2.contracts.routing import QueryAnalysis, RouteDecision
-from app.services.agents.v2.contracts.state import ExecutionState, SupervisorV2State
+from app.services.agents.v2.contracts.state import (
+    CHECKPOINT_SCHEMA_REVISION,
+    ExecutionState,
+    SupervisorV2State,
+)
 from app.services.agents.v2.contracts.validation import (
     ContractValidationError,
     IncompatibleCheckpointError,
@@ -135,11 +139,12 @@ def _state(**overrides: object) -> SupervisorV2State:
         "clarification": None,
         "final_response": None,
         "synthesis": None,
-        "checkpoint_schema_revision": 2,
+        "checkpoint_schema_revision": CHECKPOINT_SCHEMA_REVISION,
         "discovery_need": None,
         "discovery": None,
         "document_selection_clarification": None,
         "research_target_selection": None,
+        "intent_analysis": None,
     }
     base.update(overrides)
     return cast(SupervisorV2State, base)
@@ -348,11 +353,12 @@ def test_checkpoint_payload_rejects_missing_or_foreign_versions() -> None:
         "synthesis": None,
         "final_response": None,
         "synthesis": None,
-        "checkpoint_schema_revision": 2,
+        "checkpoint_schema_revision": CHECKPOINT_SCHEMA_REVISION,
         "discovery_need": None,
         "discovery": None,
         "document_selection_clarification": None,
         "research_target_selection": None,
+        "intent_analysis": None,
     }
     validate_checkpoint_payload(payload)
 
@@ -382,7 +388,7 @@ def test_checkpoint_payload_rejects_missing_or_foreign_versions() -> None:
         )
     with pytest.raises(IncompatibleCheckpointError, match="missing"):
         validate_checkpoint_payload(
-            {"contract_version": "2.0", "checkpoint_schema_revision": 2}
+            {"contract_version": "2.0", "checkpoint_schema_revision": CHECKPOINT_SCHEMA_REVISION}
         )
 
 

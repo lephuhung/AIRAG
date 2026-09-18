@@ -42,10 +42,11 @@ budget are env-gated (`V2_MAX_TASKS`, `V2_MAX_PARALLEL_BRANCHES`,
 a rollout decision explicitly opens them.
 
 Phase-1 discovery-bootstrap contract groundwork is present but dormant:
-checkpoint schema revision `2` accepts exact revision-1 payloads (missing or
-explicit discriminator `1`, with no revision-2-only keys) and migrates them by
-adding the four nullable root slots `discovery_need`, `discovery`,
-`document_selection_clarification`, and `research_target_selection`.
+checkpoint schema revision `3` accepts exact revision-1 and revision-2
+payloads (each older revision migrates through the chain, rejecting
+partial/newer-only shapes) — revision `2` added the four nullable root slots
+`discovery_need`, `discovery`, `document_selection_clarification`, and
+`research_target_selection`.
 `ResearchTargetSelection` owns the frozen target slots independently of any
 `DiscoveryCheckpoint`; discovery probe/expansion task origins are valid only
 when their checkpointed discovery/selection context is supplied. The separate
@@ -53,6 +54,35 @@ research and discovery budgets are config-bounded (`V2_DISCOVERY_*`,
 `V2_TOTAL_MAX_TASKS` in `.env.example`), and
 `V2_DISCOVERY_BOOTSTRAP_ENABLED=false`. No discovery graph node, route,
 capability dispatch, or production bootstrap behavior exists yet.
+
+Multi-intent routing (spec `docs/multi-intent-routing-spec.md`, amended by
+its §33 supersession) is landed behind `V2_MULTI_INTENT_ROUTING_ENABLED`
+(default `false`; flag-off routing is unchanged). Checkpoint schema revision
+`3` adds the nullable root slot `intent_analysis` (revision-1/2 payloads
+migrate by filling it with `None`; a resumed turn replays the checkpointed
+analysis instead of re-classifying). On the flag-on path the
+`MultiIntentClassifier` (`agents/v2/semantic/multi_intent.py`, request-scoped
+on `RuntimeServices.multi_intent_classifier`, wired by ingress only when the
+flag is on) classifies the **whole** finalized query through the
+`semantic_router` role — one `temperature=0` `acomplete` call, strict
+`IntentAnalysis` validation, `None` on every failure, per-turn cache +
+single-flight. Identifiers (phone/CCCD/document numbers) never determine
+intent: regex/entity extraction stays advisory and no identifier check feeds
+a flag-on routing decision. The deterministic router keeps execution
+authority: `INTENT_REGISTRY` (`semantic/intent_registry.py`) +
+`decide_route` map intents to routes — >1 intent →
+`complex_research/multi_intent`; empty/unknown/failed classification →
+`complex_research/semantic_uncertainty` (never a fast path); a single
+registered atomic intent falls through to the existing fast gates. The
+`multi_intent` skill (`skills/multi_intent/policy.py`) emits one targetless
+evidence task per **independent** evidence-bearing intent
+(`people.lookup`/`document.retrieve`/`knowledge_graph.query`/`memory.lookup`;
+pipeline-owned intents like `evaluate_compliance` emit no task —
+`evaluate`/`synthesize` stay graph nodes); dependent intents
+(`depends_on` non-empty) stay with the governed model planner and the
+people→document materializer. "Parallel" here is plan topology only — the
+shared `TaskScheduler` still dispatches sequentially; provider-native
+structured output and discovery-candidate multi-intent are later plans.
 
 ## Execution invariant (load-bearing)
 

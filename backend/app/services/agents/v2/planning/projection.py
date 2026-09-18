@@ -17,6 +17,7 @@ __all__ = [
     "PlannerBudgetView",
     "PlannerCapabilityRef",
     "PlannerDiscoveryView",
+    "PlannerIntentRef",
     "PlannerModelInput",
     "PlannerPersonRef",
     "PlannerSectionRef",
@@ -70,6 +71,18 @@ class PlannerBudgetView(RuntimeModel):
     max_parallel_branches: int
 
 
+class PlannerIntentRef(RuntimeModel):
+    """One detected intent for the model: name + dependency indexes only.
+
+    ``confidence`` never crosses this boundary (metadata only, minimization
+    rule), and ``description`` stays out too — it is model text that can echo
+    query fragments. ``depends_on`` indexes into the ``intents`` tuple.
+    """
+
+    name: str
+    depends_on: tuple[int, ...]
+
+
 class PlannerModelInput(RuntimeModel):
     """Runtime-only minimized/redacted planner input (never checkpointed)."""
 
@@ -82,6 +95,8 @@ class PlannerModelInput(RuntimeModel):
     capability_catalog: tuple[PlannerCapabilityRef, ...]
     discovery_policy: PlannerDiscoveryView
     budget: PlannerBudgetView
+    primary_intent: str | None
+    intents: tuple[PlannerIntentRef, ...]
 
 
 def build_planner_model_input(planning_input: ResearchPlanningInput) -> PlannerModelInput:
@@ -135,5 +150,21 @@ def build_planner_model_input(planning_input: ResearchPlanningInput) -> PlannerM
             max_tasks_remaining=int(planning_input.budget.max_tasks_remaining),
             max_replans_remaining=int(planning_input.budget.max_replans_remaining),
             max_parallel_branches=int(planning_input.budget.max_parallel_branches),
+        ),
+        primary_intent=(
+            None
+            if planning_input.intent_analysis is None
+            else planning_input.intent_analysis.primary_intent
+        ),
+        intents=tuple(
+            PlannerIntentRef(
+                name=intent.name,
+                depends_on=tuple(intent.depends_on),
+            )
+            for intent in (
+                ()
+                if planning_input.intent_analysis is None
+                else planning_input.intent_analysis.intents
+            )
         ),
     )

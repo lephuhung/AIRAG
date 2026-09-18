@@ -621,6 +621,26 @@ async def reserve_node(
     return {"synthesis": reserved, "resumed": False, "next": "generate"}
 
 
+def _synthesis_query_text(semantic: SemanticContext) -> str:
+    """Model-facing question text for the synthesis builder.
+
+    Person identifiers extracted by the semantic layer are replaced with a
+    generic placeholder before the query reaches the model: a claim's
+    literals must occur verbatim in its cited evidence, and a
+    question-sourced personal identifier copied into a claim can never
+    satisfy that guard (and should never cross the model boundary in the
+    first place). The identifier remains usable — claims may still carry
+    it when the evidence itself contains it. Runtime-only transformation;
+    the checkpointed ``SemanticContext`` is untouched.
+    """
+    text = semantic.contextualized_query
+    for ref in semantic.person_refs:
+        label = (ref.label or "").strip()
+        if label:
+            text = text.replace(label, "[định danh cá nhân]")
+    return text
+
+
 async def generate_node(
     state: SynthesisSubgraphState, runtime: Any, writer: StreamWriter = None
 ) -> dict:
@@ -730,7 +750,7 @@ async def generate_node(
             )
 
     result = await builder.build(
-        state["semantic"].contextualized_query,
+        _synthesis_query_text(state["semantic"]),
         tuple(evidence_items),
         repair_context=repair_context,
         on_claim=on_claim,

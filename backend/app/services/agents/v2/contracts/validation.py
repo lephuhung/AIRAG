@@ -51,6 +51,7 @@ from .evidence import (
     PeopleSourceIdentity,
 )
 from .execution import AgentResult, TaskExecutionSummary
+from .intent import IntentAnalysis
 from .planning import (
     CoverageCriterion,
     DiscoveryExpansionTaskOrigin,
@@ -70,6 +71,7 @@ from .response import FinalResponse
 from .routing import QueryAnalysis, RouteDecision
 from .semantic import CurrentRevisionRequirement, DocumentReference, SemanticContext
 from .state import (
+    _REVISION_THREE_ONLY_KEYS,
     CHECKPOINT_SCHEMA_REVISION,
     ExecutionState,
     SupervisorV2State,
@@ -129,6 +131,7 @@ _CHECKPOINT_REQUIRED_KEYS = (
     "execution",
     "query_analysis",
     "route_decision",
+    "intent_analysis",
     "clarification",
     "synthesis",
     "final_response",
@@ -436,6 +439,67 @@ def validate_query_analysis(analysis: QueryAnalysis) -> None:
     _require_unique(
         (hint.hint_id for hint in analysis.dependency_hints), "SemanticDependencyHint.hint_id"
     )
+
+
+def validate_intent_analysis(analysis: IntentAnalysis) -> None:
+    """Multi-intent spec §5/§33.3: checkpointed intent-analysis invariants.
+
+    Validates the payload shape only: unique position-derived ``i{n}``
+    identifiers, non-blank names, ``confidence`` in [0, 1], ``depends_on``
+    indexes in range and strictly earlier (topological), exact
+    ``is_multi_intent`` consistency, and ``primary_intent`` naming a member
+    intent when present. Registry membership is deliberately NOT a contract
+    rule — an unknown name is a routing outcome (``semantic_uncertainty``),
+    not a malformed payload.
+    """
+    intent_ids: list[str] = []
+    names: list[str] = []
+    total = len(analysis.intents)
+    for index, intent in enumerate(analysis.intents):
+        _require_non_blank(intent.intent_id, "DetectedIntent.intent_id")
+        expected_id = f"i{index + 1}"
+        if intent.intent_id != expected_id:
+            _fail(
+                f"DetectedIntent.intent_id must be server-assigned by "
+                f"position ({expected_id!r}), got {intent.intent_id!r}"
+            )
+        intent_ids.append(intent.intent_id)
+        _require_non_blank(intent.name, "DetectedIntent.name")
+        names.append(intent.name)
+        if intent.confidence is not None and not (
+            0.0 <= intent.confidence <= 1.0
+        ):
+            _fail(
+                f"DetectedIntent.confidence must be within [0, 1], got "
+                f"{intent.confidence!r}"
+            )
+        for dependency in intent.depends_on:
+            if dependency < 0 or dependency >= total:
+                _fail(
+                    f"DetectedIntent {intent.intent_id} depends_on index "
+                    f"{dependency} is out of range"
+                )
+            if dependency >= index:
+                _fail(
+                    f"DetectedIntent {intent.intent_id} depends_on must "
+                    f"reference strictly earlier intents (got {dependency})"
+                )
+    _require_unique(intent_ids, "DetectedIntent.intent_id")
+    if analysis.is_multi_intent != (total > 1):
+        _fail(
+            f"IntentAnalysis.is_multi_intent={analysis.is_multi_intent} is "
+            f"inconsistent with {total} detected intent(s)"
+        )
+    if analysis.primary_intent is not None:
+        _require_non_blank(
+            analysis.primary_intent, "IntentAnalysis.primary_intent"
+        )
+        if analysis.primary_intent not in names:
+            _fail(
+                f"IntentAnalysis.primary_intent {analysis.primary_intent!r} "
+                "does not name a detected intent"
+            )
+
 
 # ---------------------------------------------------------------------------
 # Spec §13 — plans, DAGs, criteria, tasks
@@ -956,6 +1020,8 @@ def validate_research_planning_input(planning_input: ResearchPlanningInput) -> N
             planning_input.discovery_checkpoint,
             planning_input.query_analysis,
         )
+    if planning_input.intent_analysis is not None:
+        validate_intent_analysis(planning_input.intent_analysis)
     if planning_input.current_plan is None:
         if (
             planning_input.task_outcomes
@@ -1568,25 +1634,49 @@ def validate_clarification_slot_exclusion(
 
 
 def migrate_checkpoint_payload(payload: Mapping[str, object]) -> dict[str, object]:
-    """Spec §3.5: exact revision classification; legacy gains the new slots."""
+    """Spec §3.5 + multi-intent §33.3: exact revision classification.
+
+    Revision-1 payloads (missing or explicit discriminator ``1``) take the
+    existing revision-2 migration and then gain ``intent_analysis=None``;
+    revision-2 payloads gain ``intent_analysis=None``. A migrated ``None``
+    means "legacy path": ``route_decision``/``query_analysis`` were already
+    checkpointed when the old run routed, and the slot is only produced and
+    consumed inside ``route_node``, which never re-runs on resume past the
+    route edge. Older discriminators carrying newer-shape keys are partial
+    shapes and are rejected, never migrated.
+    """
 
     values = dict(payload)
     has_revision_key = "checkpoint_schema_revision" in values
     revision = values.get("checkpoint_schema_revision")
-    has_new_shape = any(key in values for key in _REVISION_TWO_ONLY_KEYS)
+    has_revision_two_shape = any(
+        key in values for key in _REVISION_TWO_ONLY_KEYS
+    )
+    has_revision_three_shape = any(
+        key in values for key in _REVISION_THREE_ONLY_KEYS
+    )
 
     if has_revision_key and type(revision) is not int:
         raise IncompatibleCheckpointError(
             f"checkpoint_schema_revision {revision!r} is not an integer"
         )
     if revision in (None, 1):
-        if has_new_shape:
+        if has_revision_two_shape or has_revision_three_shape:
             raise IncompatibleCheckpointError(
-                "legacy checkpoint carries a partial revision-2 shape"
+                "legacy checkpoint carries a partial revision-2/3 shape"
             )
         values.setdefault("synthesis", None)
         values["checkpoint_schema_revision"] = CHECKPOINT_SCHEMA_REVISION
         values.update({key: None for key in _REVISION_TWO_ONLY_KEYS})
+        values.update({key: None for key in _REVISION_THREE_ONLY_KEYS})
+        return values
+    if revision == 2:
+        if has_revision_three_shape:
+            raise IncompatibleCheckpointError(
+                "revision-2 checkpoint carries a partial revision-3 shape"
+            )
+        values["checkpoint_schema_revision"] = CHECKPOINT_SCHEMA_REVISION
+        values.update({key: None for key in _REVISION_THREE_ONLY_KEYS})
         return values
     if revision != CHECKPOINT_SCHEMA_REVISION:
         raise IncompatibleCheckpointError(
@@ -1672,6 +1762,7 @@ def validate_supervisor_state(state: SupervisorV2State) -> None:
     execution = _as_model(state["execution"], "execution", ExecutionState)
     query_analysis = _optional_model(state, "query_analysis", QueryAnalysis)
     route_decision = _optional_model(state, "route_decision", RouteDecision)
+    intent_analysis = _optional_model(state, "intent_analysis", IntentAnalysis)
     clarification = _optional_model(state, "clarification", ClarificationRequest)
     document_selection_clarification = _optional_model(
         state, "document_selection_clarification", DocumentSelectionClarification
@@ -1690,6 +1781,11 @@ def validate_supervisor_state(state: SupervisorV2State) -> None:
     validate_binding_set(bindings, semantic)
     if query_analysis is not None:
         validate_query_analysis(query_analysis)
+    if intent_analysis is not None:
+        # Slot-contract validation only: no cross-check against the route
+        # decision — a ``semantic_uncertainty`` route legitimately pairs
+        # with ``intent_analysis=None`` (multi-intent spec §33.3).
+        validate_intent_analysis(intent_analysis)
     if route_decision is not None:
         if (
             route_decision.route == "clarify"

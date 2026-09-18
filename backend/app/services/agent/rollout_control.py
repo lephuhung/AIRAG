@@ -66,6 +66,7 @@ except Exception:  # pragma: no cover - frozen module always present in app
             "evaluate",
             "cross_domain",
             "multi_goal",
+            "multi_intent",
         }
     )
     _V2_KNOWN_DOMAINS = frozenset(
@@ -80,6 +81,7 @@ except Exception:  # pragma: no cover - frozen module always present in app
             "simple_people_lookup",
             "exact_document_metadata",
             "exact_section_retrieval",
+            "targetless_document_retrieval",
             "simple_write_operation",
             "simple_kg_lookup",
             "multi_document_research",
@@ -89,6 +91,8 @@ except Exception:  # pragma: no cover - frozen module always present in app
             "multi_goal",
             "runtime_dependency",
             "evidence_replanning_required",
+            "multi_intent",
+            "semantic_uncertainty",
         }
     )
 

@@ -20,6 +20,10 @@ WorkType = Literal[
     "evaluate",
     "cross_domain",
     "multi_goal",
+    # Multi-intent routing (spec §33.3): emitted only by the flag-on
+    # semantic path; never produced while V2_MULTI_INTENT_ROUTING_ENABLED
+    # is off, so flag-off wire shapes stay byte-identical.
+    "multi_intent",
 ]
 
 Domain = Literal["people", "document", "section", "write", "knowledge_graph", "memory"]
@@ -48,6 +52,11 @@ RouteReason = Literal[
     "multi_goal",
     "runtime_dependency",
     "evidence_replanning_required",
+    # Multi-intent routing (spec §33.2/§33.3): emitted only by the flag-on
+    # semantic path; never produced while V2_MULTI_INTENT_ROUTING_ENABLED
+    # is off, so flag-off wire shapes stay byte-identical.
+    "multi_intent",
+    "semantic_uncertainty",
 ]
 
 

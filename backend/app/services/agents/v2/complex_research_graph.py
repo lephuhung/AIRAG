@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -68,6 +69,7 @@ from .contracts.capability import (
 from .contracts.evaluation import EvidenceEvaluation
 from .contracts.execution import AgentResult, TaskExecutionSummary
 from .contracts.evidence import EvidenceUseRef
+from .contracts.intent import IntentAnalysis
 from .contracts.locators import SectionLocator
 from .contracts.planning import (
     DiscoveryPolicy,
@@ -112,6 +114,7 @@ from .skills.compare import policy as compare_policy
 from .skills.cross_domain import policy as cross_domain_policy
 from .skills.evaluate import policy as evaluate_policy
 from .skills.multi_goal import policy as multi_goal_policy
+from .skills.multi_intent import policy as multi_intent_policy
 from .skills.retrieve import policy as retrieve_policy
 from .skills.summarize import policy as summarize_policy
 from .skills.summarize.policy import ReduceSpec
@@ -121,6 +124,8 @@ from .tools.discovery_candidates import (
     InvalidCandidateRole,
 )
 from .tools.observations import AgentToolObservation, ObservationProjector
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "COMPLEX_RESEARCH_UNAVAILABLE",
@@ -262,6 +267,10 @@ class ComplexResearchState(TypedDict, total=False):
     discovery_deferred: tuple[str, ...]
     discovery: DiscoveryCheckpoint | None
     research_target_selection: ResearchTargetSelection | None
+    #: Checkpointed whole-request intent analysis (multi-intent spec §33.3),
+    #: threaded parent → child so planning sees every detected intent without
+    #: re-classifying. Read-only inside the subgraph — never merged back.
+    intent_analysis: IntentAnalysis | None
 
 
 def require_query_analysis(state: ComplexResearchState) -> QueryAnalysis:
@@ -424,6 +433,7 @@ def build_planning_input(
         prior_evaluation=state.get("evaluation"),
         target_selection=state.get("research_target_selection"),
         discovery_checkpoint=state.get("discovery"),
+        intent_analysis=state.get("intent_analysis"),
     )
 
 
@@ -522,6 +532,9 @@ def normalize_complex_state(state: ComplexResearchState) -> ComplexResearchState
             state.get("research_target_selection"),
             ResearchTargetSelection,
             slot="research_target_selection",
+        ),
+        intent_analysis=_coerce_slot(
+            state.get("intent_analysis"), IntentAnalysis, slot="intent_analysis"
         ),
     )
 
@@ -891,7 +904,9 @@ def build_initial_proposal(planning_input: ResearchPlanningInput) -> InitialProp
     document; ``evaluate`` (Task 12) routes to the evaluate skill with
     bounded evidence-gathering reads (the compliance judgment itself comes
     from the governed evaluate/replan/synthesis pipeline, never a
-    capability).
+    capability); ``multi_intent`` (multi-intent spec §33.4) routes to the
+    multi-intent skill with one targetless evidence task per independent
+    evidence-bearing intent.
     Bounded summarize never reaches here (the
     deterministic router keeps single-document summaries on the fast path).
     A covering skill's refusal — no plannable binding, wrong arity, or an
@@ -932,7 +947,18 @@ def build_initial_proposal(planning_input: ResearchPlanningInput) -> InitialProp
             return InitialProposal(
                 plan=_people_first_plan(planning_input), reduce_spec=None
             )
+        if work_type == multi_intent_policy.MULTI_INTENT_WORK_TYPE:
+            return InitialProposal(
+                plan=multi_intent_policy.build_multi_intent_plan(planning_input),
+                reduce_spec=None,
+            )
     except ContractValidationError:
+        if work_type == multi_intent_policy.MULTI_INTENT_WORK_TYPE:
+            # A multi-intent request silently degraded to one retrieval
+            # would re-create the routing defect this work type fixes —
+            # fail closed to the governed model path or the unavailable
+            # boundary, never the unscoped-retrieve fallback.
+            raise
         if (
             work_type
             in {
@@ -1264,7 +1290,11 @@ async def validate_checkpoint_node(
             initial = await build_governed_initial_proposal(
                 build_planning_input(state, context), context
             )
-        except (ContractValidationError, PlannerError):
+        except (ContractValidationError, PlannerError) as exc:
+            logger.warning(
+                "[complex] initial proposal refused, returning unavailable "
+                "boundary: %s", exc,
+            )
             return {}
         bindings = state["bindings"]
         validate_task_plan(
@@ -1928,6 +1958,7 @@ def build_complex_research_state(state: SupervisorV2State) -> ComplexResearchSta
         discovery_deferred=(),
         discovery=state.get("discovery"),
         research_target_selection=state.get("research_target_selection"),
+        intent_analysis=state.get("intent_analysis"),
     )
 
 

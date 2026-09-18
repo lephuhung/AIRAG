@@ -1071,6 +1071,7 @@ def build_shadow_bundle(
         bindings=DocumentBindingSet(bindings=(), revision_requirement_refs=()),
         query_analysis=None,
         route_decision=None,
+        intent_analysis=None,
         execution=ExecutionState(plan=None, task_results=(), evidence_evaluation=None),
         clarification=None,
         synthesis=None,

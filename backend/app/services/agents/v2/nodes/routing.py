@@ -62,10 +62,12 @@ from ..contracts.routing import (
     SemanticDependencyHint,
     WorkType,
 )
+from ..contracts.intent import IntentAnalysis
 from ..contracts.semantic import SemanticContext
 from ..contracts.state import GraphRuntimeContext, SupervisorV2State
-from ..contracts.validation import validate_query_analysis
+from ..contracts.validation import validate_intent_analysis, validate_query_analysis
 from ..semantic.intent import IntentDecision
+from ..semantic.intent_registry import INTENT_REGISTRY
 from .context import _context_of
 
 logger = logging.getLogger(__name__)
@@ -257,8 +259,60 @@ def _typed_work_type(
     return base_work_type
 
 
+def _analyze_from_intent_analysis(
+    semantic: SemanticContext, intent_analysis: IntentAnalysis
+) -> QueryAnalysis:
+    """Flag-on analysis: registry-projected facts from ``IntentAnalysis``.
+
+    The model decides WHAT the user wants (spec §31); this projection maps
+    each detected intent name through ``INTENT_REGISTRY`` onto the same
+    ``work_type``/``domains`` facts the deterministic machinery consumes —
+    replacing ``_INTENT_ANALYSIS`` on the flag-on path only. Multi-intent
+    (or empty/unknown) analyses carry ``work_type="multi_intent"`` so the
+    ``decide_route`` intent gate owns the outcome; single known intents
+    keep the registry work type plus the usual ref-arity promotion.
+    Identifier extraction stays entity extraction: only typed reference
+    domains (``_ref_domains``) union in, never identifier-regex verdicts.
+    """
+    intents = intent_analysis.intents
+    specs = [INTENT_REGISTRY.get(intent.name) for intent in intents]
+    domains = _ref_domains(semantic)
+    for spec in specs:
+        if spec is not None:
+            domains.update(spec.get("domains", ()))
+    if not domains:
+        # ``domains`` is a non-empty contract; an all-unknown/empty analysis
+        # still needs a domain tuple. The ref-less factual default
+        # (``document``) matches the legacy branch — routing outcome is
+        # already complex via the intent gate, so this is shape-only.
+        domains = {"document"}
+    text = semantic.normalized_query.casefold()
+    # Same defence-in-depth as the typed path: the v1-owned write
+    # boundary stays enforced even under flag-on semantics.
+    if _write_intent(text):
+        domains.add("write")
+    if len(intents) == 1 and specs[0] is not None:
+        work_type: WorkType = _typed_work_type(
+            specs[0].get("work_type", "retrieve"),  # type: ignore[arg-type]
+            domains,
+            len(semantic.document_refs),
+        )
+    else:
+        work_type = "multi_intent"
+    analysis = QueryAnalysis(
+        work_type=work_type,
+        domains=tuple(sorted(domains)),  # type: ignore[arg-type]
+        dependency_hints=_dependency_hints_for(domains),
+    )
+    validate_query_analysis(analysis)
+    return analysis
+
+
 def analyze_query(
-    semantic: SemanticContext, *, intent: IntentDecision | str | None = None
+    semantic: SemanticContext,
+    *,
+    intent: IntentDecision | str | None = None,
+    intent_analysis: IntentAnalysis | None = None,
 ) -> QueryAnalysis:
     """Deterministic-first analysis of the finalized query meaning.
 
@@ -274,7 +328,17 @@ def analyze_query(
     confidence field. Without typed intent (or for ``resolve_doc`` /
     unknown intents) the legacy deterministic behavior is preserved
     exactly.
+
+    ``intent_analysis`` (flag-on ``IntentAnalysis``) is mutually
+    exclusive with ``intent``: it projects through ``INTENT_REGISTRY``
+    instead of the v1 taxonomy map, and ``work_type="multi_intent"``
+    marks every non-single-known-intent analysis for the ``decide_route``
+    intent gate. Flag-off callers pass neither beyond ``intent``.
     """
+    if intent is not None and intent_analysis is not None:
+        raise ValueError("intent and intent_analysis are mutually exclusive")
+    if intent_analysis is not None:
+        return _analyze_from_intent_analysis(semantic, intent_analysis)
     if intent is not None:
         mapped = _analysis_for_intent(intent)
         if mapped is not None:
@@ -461,6 +525,7 @@ def decide_route(
     allowed_capabilities: frozenset[str] = frozenset(),
     available_capabilities: frozenset[str] | None = None,
     request: RequestContext | None = None,
+    intent_analysis: IntentAnalysis | None = None,
 ) -> RouteDecision:
     """Map deterministic analysis facts to one frozen route (never raises).
 
@@ -481,6 +546,25 @@ def decide_route(
         return RouteDecision(route="clarify", reason_code="essential_ambiguity")
     if _has_open_required_reference(semantic):
         return RouteDecision(route="clarify", reason_code="unresolved_required_binding")
+
+    # Multi-intent gate (spec §33.2/§33.3, flag-on only): after clarify
+    # still wins, before every fast branch. ``len > 1`` always outranks
+    # ``primary_intent`` (§18); empty or registry-unknown single intents
+    # are semantic uncertainty — uncertain → complex, never a fast path.
+    # Single known intents fall through: complex intents keep their
+    # specific reasons via the existing work-type branches, atomic
+    # intents keep the existing fast gates (bound count, section
+    # coordinate, conversational guard still apply).
+    if intent_analysis is not None:
+        intents = intent_analysis.intents
+        if len(intents) > 1:
+            return RouteDecision(
+                route="complex_research", reason_code="multi_intent"
+            )
+        if len(intents) == 0 or intents[0].name not in INTENT_REGISTRY:
+            return RouteDecision(
+                route="complex_research", reason_code="semantic_uncertainty"
+            )
 
     text = semantic.normalized_query.casefold()
     explicit_ids = _api_explicit_ref_ids(request)
@@ -641,6 +725,64 @@ async def _intent_for_route(
         return None
 
 
+def _multi_intent_flag_on() -> bool:
+    """``V2_MULTI_INTENT_ROUTING_ENABLED`` live read (monkeypatchable)."""
+    try:
+        from app.core.config import get_settings
+
+        return bool(
+            getattr(get_settings(), "V2_MULTI_INTENT_ROUTING_ENABLED", False)
+        )
+    except Exception:  # noqa: BLE001 - config unreadable → flag off
+        return False
+
+
+async def _intent_analysis_for_route(
+    state: SupervisorV2State, services: Any
+) -> IntentAnalysis | None:
+    """Fetch the flag-on ``IntentAnalysis`` — checkpoint first, never re-classify.
+
+    Resume determinism: a checkpointed analysis in ``state["intent_analysis"]``
+    replays identically without touching the classifier. Otherwise the
+    request-scoped ``services.multi_intent_classifier`` classifies the
+    finalized ``semantic.contextualized_query`` (post coreference
+    resolution — spec §21). A missing service, a classifier failure, or a
+    ``None`` result returns ``None`` so the caller produces the forced
+    ``semantic_uncertainty`` complex outcome — never the legacy
+    ``_intent_for_route`` path (§33.2).
+    """
+    existing = state.get("intent_analysis")
+    if existing is not None:
+        return existing
+    classifier = getattr(services, "multi_intent_classifier", None)
+    if classifier is None:
+        return None
+    request = state["request"]
+    semantic = state["semantic"]
+    query = semantic.contextualized_query or request.original_query
+    has_doc_ids = bool(request.known_documents)
+    try:
+        cached_fn = getattr(classifier, "cached", None)
+        if cached_fn is not None:
+            cached = cached_fn(query, has_doc_ids=has_doc_ids)
+            if cached is not None:
+                return cached
+        classify = getattr(classifier, "classify", None)
+        if classify is None:
+            return None
+        result = classify(query, has_doc_ids=has_doc_ids)
+        if inspect.isawaitable(result):
+            result = await result
+        if result is not None:
+            validate_intent_analysis(result)
+        return result
+    except Exception as exc:  # noqa: BLE001 - failure → semantic_uncertainty
+        logger.warning(
+            "[route] multi-intent classification failed: %s", type(exc).__name__
+        )
+        return None
+
+
 async def _available_catalog(
     services: Any,
 ) -> frozenset[str] | None:
@@ -678,8 +820,46 @@ async def route_node(
     routing into a path that cannot exist.
     """
     context = _context_of(runtime)
+    services = context.services
+    # Flag-on path (spec §33): LLM-first ``IntentAnalysis`` is the semantic
+    # input; ``INTENT_REGISTRY`` + ``decide_route`` keep execution
+    # authority. Also entered when a checkpointed analysis exists so a
+    # resumed turn replays the identical decision. Flag-off is the
+    # byte-identical deterministic path below — ``decide_route`` never
+    # sees ``intent_analysis``.
+    if _multi_intent_flag_on() or state.get("intent_analysis") is not None:
+        intent_analysis = await _intent_analysis_for_route(state, services)
+        if intent_analysis is None:
+            # Every flag-on failure mode lands on complex, never a fast path.
+            analysis = QueryAnalysis(
+                work_type="multi_intent",
+                domains=("document",),
+                dependency_hints=(),
+            )
+            validate_query_analysis(analysis)
+            decision = RouteDecision(
+                route="complex_research", reason_code="semantic_uncertainty"
+            )
+        else:
+            analysis = analyze_query(
+                state["semantic"], intent_analysis=intent_analysis
+            )
+            decision = decide_route(
+                analysis,
+                state["semantic"],
+                state["bindings"],
+                allowed_capabilities=context.capability_runtime.allowed_capabilities,
+                available_capabilities=await _available_catalog(services),
+                request=state["request"],
+                intent_analysis=intent_analysis,
+            )
+        return {
+            "query_analysis": analysis,
+            "route_decision": decision,
+            "intent_analysis": intent_analysis,
+        }
     intent = await _intent_for_route(
-        context.services.intent_classifier, state["request"]
+        services.intent_classifier, state["request"]
     )
     analysis = analyze_query(state["semantic"], intent=intent)
     decision = decide_route(
@@ -687,7 +867,7 @@ async def route_node(
         state["semantic"],
         state["bindings"],
         allowed_capabilities=context.capability_runtime.allowed_capabilities,
-        available_capabilities=await _available_catalog(context.services),
+        available_capabilities=await _available_catalog(services),
         request=state["request"],
     )
     return {"query_analysis": analysis, "route_decision": decision}

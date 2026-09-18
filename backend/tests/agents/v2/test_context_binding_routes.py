@@ -261,11 +261,12 @@ def make_state(
         clarification=None,
         final_response=None,
         synthesis=None,
-        checkpoint_schema_revision=2,
+        checkpoint_schema_revision=3,
         discovery_need=None,
         discovery=None,
         document_selection_clarification=None,
         research_target_selection=None,
+        intent_analysis=None,
     )
 
 

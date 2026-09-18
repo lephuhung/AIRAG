@@ -114,6 +114,7 @@ from .v2.contracts.clarification import (
 )
 from .v2.contracts.conversation import ConversationContext
 from .v2.contracts.execution import AgentResult
+from .v2.contracts.intent import IntentAnalysis
 from .v2.contracts.planning import TaskPlan
 from .v2.contracts.request import KnownDocumentResource, RequestContext
 from .v2.contracts.response import FinalResponse
@@ -240,6 +241,7 @@ _SLOT_MODELS: dict[str, type] = {
     "bindings": DocumentBindingSet,
     "query_analysis": QueryAnalysis,
     "route_decision": RouteDecision,
+    "intent_analysis": IntentAnalysis,
     "execution": ExecutionState,
     "clarification": ClarificationRequest,
     "synthesis": SynthesisCheckpoint,
@@ -255,6 +257,7 @@ _NULLABLE_SLOTS = frozenset(
     {
         "query_analysis",
         "route_decision",
+        "intent_analysis",
         "clarification",
         "synthesis",
         "final_response",
@@ -589,6 +592,7 @@ def _wrap_node(name: str, fn: Callable) -> Callable:
                 "discovery": None,
                 "document_selection_clarification": None,
                 "research_target_selection": None,
+                "intent_analysis": None,
             }
         try:
             if isinstance(update, Command):
@@ -685,6 +689,7 @@ def build_initial_v2_state(
         else DocumentBindingSet(bindings=(), revision_requirement_refs=()),
         query_analysis=None,
         route_decision=None,
+        intent_analysis=None,
         execution=ExecutionState(plan=None, task_results=(), evidence_evaluation=None),
         clarification=None,
         final_response=None,
@@ -1762,6 +1767,44 @@ def canonicalize_person_record(
     return {"name": name, "phone": phone, "source": source}
 
 
+def _people_national_id(doc: Mapping[str, object]) -> str:
+    """Schema-mapped CCCD/CMND as the governed ``national_id`` scalar.
+
+    Reads the schema's CCCD field name(s) through the v1
+    ``SEARCHABLE_COLLECTION_MAP`` — the same authoritative per-schema map
+    the v1 ``cccd`` lookup uses — then digit-normalizes the first present
+    value exactly like ``mongo_people_service._identity_key`` /
+    ``_people_group_key``. Returns ``""`` when the schema carries no CCCD
+    mapping (e.g. ``vnvc``) or the value is blank: never a guessed scalar.
+    The scalar is persisted ONLY inside governed evidence (encrypted,
+    run-scoped, retention-leased) so the people→document materializer can
+    extract it — it never reaches model-facing projections or the people
+    presentation.
+    """
+    schema = str(doc.get("_source_schema", "") or "").strip()
+    if not schema:
+        return ""
+    try:
+        searchable = _v1_attr(
+            "app.services.people.mongo_searchable_map",
+            "SEARCHABLE_COLLECTION_MAP",
+        )
+    except V1ServiceUnavailable:
+        return ""
+    schema_map = (
+        searchable.get("cccd", {})
+        .get("collections", {})
+        .get(schema, {})
+    )
+    for field in schema_map.get("fields", ()) or ():
+        value = doc.get(field)
+        if value not in (None, "", "None"):
+            digits = re.sub(r"\D", "", str(value))
+            if digits:
+                return digits
+    return ""
+
+
 def stable_people_record_id(
     *, name: str, phone: str, source: str, group: str = "", dob: str = ""
 ) -> str:
@@ -1928,8 +1971,10 @@ def _build_people_matches(
     (``uids`` phone schema) is NEVER dropped (I3): it keeps the placeholder
     :data:`UNKNOWN_PEOPLE_DISPLAY_NAME` with the exact queried phone and
     source, minting a stable non-PII record id salted by ``_person_group``.
-    Only task-required keys (``name``/``phone``/``source``) survive — DOB,
-    address, CCCD/BHXH numbers and ``_person_group`` itself never enter the
+    Only task-required keys (``name``/``phone``/``source``) survive plus —
+    when the schema's mapped CCCD field is populated — the governed
+    ``national_id`` scalar the people→document materializer extracts; DOB,
+    address, BHXH numbers and ``_person_group`` itself never enter the
     persisted mapping.
     """
     matches: list[PeopleLookupMatch] = []
@@ -1968,15 +2013,24 @@ def _build_people_matches(
             group=group_salt,
             dob=dob_salt,
         )
+        fields: dict[str, object] = {
+            "name": name,
+            "phone": canonical["phone"],
+            "source": canonical["source"],
+        }
+        required = ["name", "phone", "source"]
+        national_id = _people_national_id(doc)
+        if national_id:
+            # Only when the schema-mapped CCCD is actually populated —
+            # ``minimize_people_record`` fails closed on a required field
+            # missing from ``fields``, so it is required iff it was kept.
+            fields["national_id"] = national_id
+            required.append("national_id")
         matches.append(
             PeopleLookupMatch(
                 record_id=record_id,
-                fields={
-                    "name": name,
-                    "phone": canonical["phone"],
-                    "source": canonical["source"],
-                },
-                required_fields=("name", "phone", "source"),
+                fields=fields,
+                required_fields=tuple(required),
             )
         )
     return matches
@@ -3430,6 +3484,7 @@ def build_runtime_services(
     answer_draft_builder: Any = None,
     pinned_target_resolver: Any = None,
     intent_classifier: Any = None,
+    multi_intent_classifier: Any = None,
     adaptive_planner: Any = None,
     adaptive_replanner: Any = None,
     citation_resolver: Any = None,
@@ -3454,6 +3509,7 @@ def build_runtime_services(
         answer_draft_builder=answer_draft_builder,
         pinned_target_resolver=pinned_target_resolver,
         intent_classifier=intent_classifier,
+        multi_intent_classifier=multi_intent_classifier,
         adaptive_planner=adaptive_planner,
         adaptive_replanner=adaptive_replanner,
         citation_resolver=citation_resolver,

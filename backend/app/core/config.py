@@ -685,6 +685,16 @@ class Settings(BaseSettings):
     V2_ALLOW_SUPPORTING_DISCOVERY: bool = Field(default=False)
     V2_MAX_DISCOVERED_DOCUMENTS: int = Field(default=0, ge=0)
 
+    # ── LangGraph v2 multi-intent routing (spec §33) ──────────────────────
+    # When False (default) routing is byte-identical to the deterministic
+    # Phase-4A path: classify_deterministic → classify_evaluate →
+    # single-intent model adapter. When True the route node consults the
+    # LLM-first MultiIntentClassifier (full-request IntentAnalysis,
+    # checkpointed under schema revision 3); identifier extraction stays
+    # entity extraction only, and multi-intent/unknown/failed/uncertain
+    # outcomes fail closed to complex_research — never a fast path.
+    V2_MULTI_INTENT_ROUTING_ENABLED: bool = Field(default=False)
+
     # ── LangGraph v2 discovery bootstrap (Phase-1 dormant groundwork) ──────
     # Discovery spec §17: the bootstrap flag stays OFF — no route/node/graph
     # behavior reads it yet; these fields only declare and bound the limits

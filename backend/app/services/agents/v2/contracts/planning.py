@@ -19,6 +19,7 @@ from .capability import CapabilityDescriptor, CapabilityInput, DocumentSearchInp
 from .evaluation import EvidenceEvaluation
 from .evidence import EvidenceUseRef
 from .execution import TaskExecutionSummary
+from .intent import IntentAnalysis
 from .locators import ContentLocator
 from .routing import QueryAnalysis
 from .semantic import SemanticContext
@@ -179,6 +180,11 @@ class ResearchPlanningInput(ContractModel):
     prior_evaluation: EvidenceEvaluation | None = None
     target_selection: ResearchTargetSelection | None = None
     discovery_checkpoint: DiscoveryCheckpoint | None = None
+    #: Checkpointed whole-request intent analysis (multi-intent spec §33.3):
+    #: threaded parent → child so the planner sees every detected intent and
+    #: dependency without re-classifying. ``None`` on the flag-off path and on
+    #: legacy checkpoints; planning behavior without it is unchanged.
+    intent_analysis: IntentAnalysis | None = None
 
 
 # Spec §3: models embedding discriminated-union aliases rebuild explicitly.

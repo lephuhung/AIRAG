@@ -510,6 +510,7 @@ def test_runtime_services_excludes_plan_checkpoint_and_evaluator_service() -> No
         "answer_draft_builder",
         "pinned_target_resolver",
         "intent_classifier",
+        "multi_intent_classifier",
         "adaptive_planner",
         "adaptive_replanner",
         "citation_resolver",
@@ -521,6 +522,7 @@ def test_runtime_services_excludes_plan_checkpoint_and_evaluator_service() -> No
     assert RuntimeServices().pinned_target_resolver is None
     assert RuntimeServices().adaptive_planner is None
     assert RuntimeServices().adaptive_replanner is None
+    assert RuntimeServices().multi_intent_classifier is None
 
 
 # ---------------------------------------------------------------------------

@@ -657,7 +657,7 @@ async def test_alias_normalization_and_grouped_dedupe() -> None:
     for match in matches:
         assert "Nguyễn" not in match.record_id
         assert LIVE_PHONE not in match.record_id
-        assert set(match.fields) <= {"name", "phone", "source"}
+        assert set(match.fields) <= {"name", "phone", "source", "national_id"}
     assert matches[0].record_id != matches[1].record_id
 
 
@@ -1032,6 +1032,68 @@ async def test_dedupe_key_splits_on_dob_without_persisting_it() -> None:
     assert len(matches) == 2
     assert matches[0].record_id != matches[1].record_id
     for match in matches:
-        assert set(match.fields) <= {"name", "phone", "source"}
+        assert set(match.fields) <= {"name", "phone", "source", "national_id"}
         assert "1980" not in str(match.fields)
         assert "1990" not in str(match.fields)
+
+
+@pytest.mark.asyncio
+async def test_cccd_bearing_match_emits_governed_national_id() -> None:
+    """Schema-mapped CCCD survives minimization as ``national_id`` (R23 chain).
+
+    The people→document materializer extracts exactly this field from
+    governed evidence; without it the dependent ``document.search`` can
+    never be appended. A record whose schema has no CCCD mapping (``vnvc``)
+    keeps the minimal ``name/phone/source`` shape — never a guessed scalar.
+    """
+    from app.services.agents.supervisor_v2 import V1PeopleMultiMatchAdapter
+    from app.services.agents.v2.dependencies.people_document import (
+        extract_person_identifier,
+    )
+
+    persons = [
+        {"_id": "n1", "_source_schema": "bhxh", "_person_group": 1,
+         "hoTen": "Nguyễn Thị Hà Anh", "soDienThoai": LIVE_PHONE,
+         "soCmnd": "042 195 016 334"},
+        {"_id": "n2", "_source_schema": "vnvc", "_person_group": 2,
+         "fullName": "Lê Thị Linh An", "mobile": LIVE_PHONE},
+    ]
+    adapter = V1PeopleMultiMatchAdapter(
+        phone_lookup=phone_search_stub([], persons=persons)
+    )
+    matches = await adapter.lookup_many(LIVE_QUERY)
+    assert len(matches) == 2
+    by_name = {m.fields["name"]: m for m in matches}
+
+    cccd_match = by_name["Nguyễn Thị Hà Anh"]
+    assert cccd_match.fields["national_id"] == "042195016334"
+    assert "national_id" in cccd_match.required_fields
+
+    vnvc_match = by_name["Lê Thị Linh An"]
+    assert "national_id" not in vnvc_match.fields
+    assert "national_id" not in vnvc_match.required_fields
+
+    # End-to-end: the capability persists the minimized content and the
+    # materializer's extractor can read the scalar back out of it.
+    from app.services.agents.v2.capabilities import PeopleCapability
+
+    class LegacyService:
+        async def lookup(self, query: str):
+            raise AssertionError("multi-match path must be used")
+
+    evidence = FakeEvidenceBuilder()
+    capability = PeopleCapability(
+        service=LegacyService(), evidence=evidence, multi_match=adapter,
+    )
+    result = await capability.execute(
+        AgentRequest(
+            contract_version="2.0", task_id="T1", objective=LIVE_QUERY,
+            input=PeopleLookupInput(kind="people.lookup", query=LIVE_QUERY),
+        ),
+        capability_runtime(),
+    )
+    assert result.status == "success"
+    persisted = {
+        extract_person_identifier(call["content"]) for call in evidence.calls
+    }
+    assert persisted == {"042195016334", None}

@@ -988,7 +988,9 @@ async def build_v2_ingress(
     from app.services.agents.v2.semantic.document_identity import (
         DocumentIdentityResolver,
     )
+    from app.core.config import settings
     from app.services.agents.v2.semantic.intent import IntentClassifier
+    from app.services.agents.v2.semantic.multi_intent import MultiIntentClassifier
     from app.services.agents.supervisor_v2 import build_initial_v2_state
 
     if session_factory is None:
@@ -1124,6 +1126,18 @@ async def build_v2_ingress(
             # 4A, Task 2): the request-scoped cache behind it means repeated
             # semantic draft builds classify once per turn.
             intent_classifier=IntentClassifier(),
+            # Multi-intent routing (spec §33): exactly one
+            # MultiIntentClassifier per ingress turn, constructed ONLY
+            # when the feature flag is on. Flag-off leaves the slot
+            # ``None`` and never constructs the service, so the
+            # deterministic Phase-4A path stays byte-identical.
+            multi_intent_classifier=(
+                MultiIntentClassifier()
+                if getattr(
+                    settings, "V2_MULTI_INTENT_ROUTING_ENABLED", False
+                )
+                else None
+            ),
             # Exactly one governed planner per ingress turn (Phase 5,
             # Task 10): proposal-only initial planning behind the existing
             # validate/lease/checkpoint/scheduler boundary. Deterministic

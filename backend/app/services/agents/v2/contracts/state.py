@@ -18,6 +18,7 @@ from .clarification import ClarificationRequest, DocumentSelectionClarification
 from .conversation import ConversationContext
 from .evaluation import EvidenceEvaluation
 from .execution import AgentResult
+from .intent import IntentAnalysis
 from .planning import TaskPlan
 from .request import RequestContext
 from .response import FinalResponse
@@ -30,8 +31,13 @@ from ..discovery_bootstrap.contracts import (
     ResearchTargetSelection,
 )
 
-CHECKPOINT_SCHEMA_REVISION: Final[Literal[2]] = 2
-CheckpointSchemaRevision = Literal[1, 2]
+CHECKPOINT_SCHEMA_REVISION: Final[Literal[3]] = 3
+CheckpointSchemaRevision = Literal[1, 2, 3]
+
+#: Root slots that exist only at checkpoint schema revision 3 (multi-intent
+#: routing spec §33.3). An older-discriminated payload carrying any of these
+#: keys is a partial shape and must be rejected, never migrated.
+_REVISION_THREE_ONLY_KEYS = frozenset({"intent_analysis"})
 
 
 class RuntimeServices(RuntimeModel):
@@ -136,6 +142,17 @@ class RuntimeServices(RuntimeModel):
     round trip. The snapshot never enters governed evidence, the
     checkpoint, or the model-facing prompt. Defaults to ``None``; consumers
     fall back to the governed extractive presentation when it is absent.
+
+    ``multi_intent_classifier`` is the runtime-only request-scoped v2
+    ``MultiIntentClassifier`` (multi-intent routing spec §15): the
+    LLM-first semantic authority on the flag-on path
+    (``V2_MULTI_INTENT_ROUTING_ENABLED``). Its ``IntentAnalysis`` results
+    are checkpointed into ``SupervisorV2State.intent_analysis`` by
+    ``route_node`` — the service itself is never checkpointed. The ingress
+    owner constructs exactly one classifier per turn and only when the
+    flag is enabled; flag-off turns leave this slot ``None`` and the
+    service is never constructed. Typed ``Any`` for the same
+    framework-free reason as ``intent_classifier``.
     """
 
     retention_leases: Any = None
@@ -153,6 +170,7 @@ class RuntimeServices(RuntimeModel):
     adaptive_replanner: Any = None
     citation_resolver: Any = None
     people_lookup: Any = None
+    multi_intent_classifier: Any = None
 
 
 class GraphRuntimeContext(ContractModel):
@@ -181,6 +199,12 @@ class SupervisorV2State(TypedDict, total=True):
     ``synthesis`` is the additive bounded-synthesis slot (spec §13.1–13.5):
     ``None`` is the canonical idle value and pre-synthesis root-``2.0``
     checkpoints normalize to it through the explicit legacy branch.
+
+    ``intent_analysis`` is the additive multi-intent slot (multi-intent
+    routing spec §33.3, checkpoint schema revision 3): the checkpointed
+    flag-on semantic analysis ``route_node`` produces; ``None`` is the
+    canonical value for every flag-off turn and for migrated revision-1/2
+    checkpoints.
     """
 
     contract_version: ContractVersion
@@ -190,6 +214,7 @@ class SupervisorV2State(TypedDict, total=True):
     bindings: DocumentBindingSet
     query_analysis: QueryAnalysis | None
     route_decision: RouteDecision | None
+    intent_analysis: IntentAnalysis | None
     execution: ExecutionState
     clarification: ClarificationRequest | None
     synthesis: SynthesisCheckpoint | None

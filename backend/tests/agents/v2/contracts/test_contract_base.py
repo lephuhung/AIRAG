@@ -183,6 +183,7 @@ def test_supervisor_state_is_a_mutable_root_versioned_typeddict() -> None:
         "discovery",
         "document_selection_clarification",
         "research_target_selection",
+        "intent_analysis",
     }
     hints = typing.get_type_hints(SupervisorV2State)
     assert get_args(hints["contract_version"]) == ("2.0",)
