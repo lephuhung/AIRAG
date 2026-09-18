@@ -1,7 +1,7 @@
 # Complex Research Discovery Bootstrap Design
 
 **Date:** 2026-09-17  
-**Status:** Approved design, revision 4 — three independent review rounds, no blocker remaining
+**Status:** Revised design, revision 5 — blocker corrections incorporated; implementation remains pending
 **Scope:** LangGraph v2 complex-research path (`summarize` and `compare` first)
 
 ## 1. Problem
@@ -79,7 +79,7 @@ The route node may still checkpoint an observability-only summary:
 ```python
 class DiscoveryNeed(ContractModel):
     required: bool
-    reason: Literal["unresolved_document_slot"]
+    reason: Literal["unresolved_document_slot"] | None
 ```
 
 `discovery_need` is never a routing input after the route node; on disagreement the child's `determine_missing_slots` wins. Validation requires `required == (reason is not None)`, and the whole slot is `None` with the flag off.
@@ -190,12 +190,13 @@ research_target_selection: ResearchTargetSelection | None
 
 Rules:
 
-- revision 1 is the existing root shape without these slots;
-- a legacy root missing `checkpoint_schema_revision` is interpreted only by the explicit migration path as revision 1;
+- revision 1 is the exact existing root shape without the discriminator and without any of the four revision-2-only slots;
+- an explicitly declared revision `1` is accepted only when the payload has that exact revision-1 shape; a root with no discriminator is interpreted as revision 1 only when all revision-2-only slots are absent;
+- a discriminator-less payload carrying any revision-2-only slot is a corrupt/partial revision-2 payload and fails closed — migration never fills a partially present new shape;
 - revision 1 normalizes to revision 2 with all four new slots set to `None` and preserves the existing synthesis compatibility rule;
 - revision 2 requires `checkpoint_schema_revision` and all four keys; `discovery_need` and `discovery` may be `None` whenever the flag is off or discovery has not started, `document_selection_clarification` may be `None` whenever no document selection is pending, and `research_target_selection` may be `None` until finalized;
 - `clarification` and `document_selection_clarification` are mutually exclusive, and the validator enforces it;
-- an unknown revision or a revision-2 payload missing a required key fails closed;
+- an unknown revision, a revision-2 payload missing a required key, or a partial new shape without a discriminator fails closed;
 - the context node clears all four new slots at the start of a new turn;
 - after normalization, every new checkpoint write uses revision 2.
 
@@ -223,6 +224,7 @@ class TargetSlot(ContractModel):
     slot_id: str
     intended_role: Literal["target", "reference"]
     subject_hint: str
+    requested_locator: ContentLocator
     required: bool
     min_selections: int
     max_selections: int
@@ -234,23 +236,41 @@ class TargetSlot(ContractModel):
     ]
 
 
+class SelectedBindingRef(ContractModel):
+    target_id: str
+    binding_id: str
+    selected_aggregate_id: UUID | None
+    authority: Literal[
+        "explicit_binding",
+        "exact_match_policy",
+        "confidence_policy",
+        "user_choice",
+    ]
+
+
 class SlotBindingSelection(ContractModel):
     slot_id: str
-    binding_ids: tuple[str, ...]
+    selections: tuple[SelectedBindingRef, ...]
 
 
 class ResearchTargetSelection(ContractModel):
+    work_type: Literal["summarize", "compare"]
+    target_slots: tuple[TargetSlot, ...]
     slot_bindings: tuple[SlotBindingSelection, ...]
     context_binding_ids: tuple[str, ...]
 ```
 
 Validation requires:
 
-- unique slot and binding IDs;
-- every selected binding exists in `DocumentBindingSet`;
-- each slot obeys `min_selections <= count <= max_selections`;
-- a required slot meets its minimum;
-- context bindings do not create coverage and are not passed to factual read tasks unless selected into a target/reference slot.
+- `ResearchTargetSelection.work_type` equals the checkpointed `QueryAnalysis.work_type` at aggregate/planner boundaries;
+- when a `DiscoveryCheckpoint` exists, `ResearchTargetSelection.target_slots` exactly equals its checkpointed `target_slots`; when discovery is skipped, the selection's own target slots remain sufficient;
+- unique slot IDs, globally unique non-blank selected `target_id` values, unique context binding IDs, and unique selected binding IDs within each logical slot;
+- every selected/context binding exists in `DocumentBindingSet`;
+- each slot obeys `min_selections <= count <= max_selections`, and a required slot meets its minimum;
+- multi-selection cardinality counts distinct `document_id` values, never binding IDs or revisions;
+- `selected_aggregate_id=None` is permitted only for `authority="explicit_binding"`; every discovery-backed selection names an aggregate in the same `DiscoveryCheckpoint`, in the same slot, with exactly the selected binding's `(document_id, document_revision)`, and repeats the checkpointed `DiscoverySelection.authority`;
+- context bindings do not create coverage and are not passed to factual read tasks unless selected into a target/reference slot;
+- the same binding may fill two comparison slots only for explicit same-document comparison whose checkpointed slot locators are distinct.
 
 Examples:
 
@@ -261,25 +281,31 @@ Examples:
 | Quote A + “so sánh tài liệu này với Nghị định 13” | A fills side 1; discovered B fills side 2. |
 | Thematic summary | One slot selects three documents by default and at most five. |
 
-`SupervisorV2State.research_target_selection` is the durable owner. The complex boundary maps it explicitly into and out of child state, and evaluation/synthesis validate and consume the same checkpointed value. This ownership also applies when discovery is skipped; selection cannot be inferred from `DiscoveryCheckpoint`.
+`SupervisorV2State.research_target_selection` is the durable owner of both the frozen target slots and their selected bindings. The complex boundary maps it explicitly into and out of child state, and evaluation/synthesis validate and consume the same checkpointed value. This ownership also applies when discovery is skipped; final selection never depends on `DiscoveryCheckpoint` for its slot definitions. When discovery did run, the selection validator additionally checks every discovery-backed `SelectedBindingRef` against that checkpoint.
 
-The summarize and compare skills consume `ResearchTargetSelection`, not all binding roles. Add a selection-aware plan validator:
+The summarize and compare skills consume `ResearchTargetSelection`, not all binding roles. `SelectedBindingRef.target_id` is the server-owned logical-unit identity allocated during final selection; skills must reuse it verbatim as `TargetUnit.target_id`. This avoids changing the existing `TargetUnit` wire shape and keeps flag-off plans byte-compatible. Add a selection- and discovery-aware plan validator:
 
 ```text
-validate_task_plan(plan, bindings, target_selection=None)
+validate_task_plan(
+    plan,
+    bindings,
+    *,
+    target_selection=None,
+    discovery_checkpoint=None,
+)
 ```
 
-It requires every `TargetUnit.binding_id` to be authorized by a selected logical slot and verifies the unit's logical target/reference use against that slot. A selected existing binding may retain an immutable `supporting`, `discovered`, `target`, or `reference` provenance role. Calls without `target_selection` retain the current target/reference binding-role restriction.
+With no `target_selection`, the validator retains the current target/reference binding-role restriction and exact legacy plan shape. Discovery-probe plans may still have no target units and are accepted only when `discovery_checkpoint` proves their exact probe ownership; either discovery origin is rejected when that context is absent. With a selection, every `TargetUnit.target_id` must resolve to exactly one `SelectedBindingRef`; the unit's binding must equal that ref's selected binding, and its locator must equal the owning slot's checkpointed `requested_locator`. A selected existing binding may retain an immutable `supporting`, `discovered`, `target`, or `reference` provenance role. Distinct selected target IDs plus locators make same-binding/two-side comparison verifiable without changing `TargetUnit` or inferring slots from binding order.
 
-Threading the selection only into the skill planner is not sufficient, because the plan is validated at three separate points on the bootstrap path. All three must pass the checkpointed selection:
+Threading the selection only into the skill planner is not sufficient, because the plan is validated at three separate points on the bootstrap path. All three must pass the checkpointed selection and, when the plan carries discovery-origin tasks, the checkpointed discovery context:
 
-- `validate_checkpoint_node`'s own `validate_task_plan(initial.plan, bindings)` call in `v2/complex_research_graph.py` — this is the **first** check on the bootstrap path and sits outside any `try/except`, so it fails as a boundary error before the aggregate validator ever runs;
-- `_validate_execution_state(execution, bindings, target_selection)`, reached from `validate_supervisor_state`, which `_wrap_node` runs on the merged `complex_boundary` update and on every later node entry;
+- `validate_checkpoint_node`'s own `validate_task_plan(...)` call in `v2/complex_research_graph.py` — this is the **first** check on the bootstrap path and sits outside any `try/except`, so it fails as a boundary error before the aggregate validator ever runs;
+- `_validate_execution_state(execution, bindings, target_selection, discovery_checkpoint)`, reached from `validate_supervisor_state`, which `_wrap_node` runs on the merged `complex_boundary` update and on every later node entry;
 - the planner entry point `v2/planning/planner.py` and `validate_research_planning_input`.
 
-Plumbing: `ResearchPlanningInput` gains `target_selection: ResearchTargetSelection | None`, populated by `build_planning_input(state, runtime)` from the checkpointed root slot and passed to `build_governed_initial_proposal` and the summarize/compare skill policies, which validate their own plans. Validators therefore do not read state themselves; their callers pass the selection, and every call site defaults to `None` when it is absent, so flag-off and non-bootstrap states keep the strict role check.
+Plumbing: `ResearchPlanningInput` gains `target_selection: ResearchTargetSelection | None` and `discovery_checkpoint: DiscoveryCheckpoint | None`, populated by `build_planning_input(state, runtime)` from the checkpointed root slots and passed to `build_governed_initial_proposal`, the adaptive planner, and the summarize/compare skill policies. Those two skills select bindings from `target_selection.slot_bindings`, reuse each selected ref's `target_id` in the corresponding `TargetUnit`, and validate with the same selection; they never scan every immutable binding role once a selection exists. Every call site defaults to `None` when selection is absent, so flag-off and non-bootstrap states keep the strict role check.
 
-Call sites that stay selection-blind and therefore strict are: `validate_fast_plan`, `validate_replan`/replan append, and every other skill's planning path. `validate_supervisor_state` must additionally validate any non-`None` `research_target_selection` against the current `DocumentBindingSet`. Evaluation and synthesis receive the same selection so primary and reference evidence cannot be misattributed.
+`validate_fast_plan` and every unrelated skill stay selection-blind and strict. `validate_replan` gains optional selection/discovery context with strict defaults: a later replan over a bootstrap-expanded current plan passes the contexts only to revalidate the existing plan, while every newly appended task must still carry `ReplanTaskOrigin` and target units remain immutable. `validate_supervisor_state` additionally validates any non-`None` `research_target_selection` against the current `DocumentBindingSet`, `QueryAnalysis`, and optional discovery checkpoint. Evaluation and synthesis receive the same selection so primary and reference evidence cannot be misattributed.
 
 ### 7.1 Slot cardinality
 
@@ -294,7 +320,7 @@ A document selected as readable reference receives a `TargetUnit`, a partial-rea
 
 ## 8. Discovery Contracts
 
-Create `backend/app/services/agents/v2/discovery/` with the following contracts.
+Create `backend/app/services/agents/v2/discovery_bootstrap/` with the following contracts.
 
 ### 8.1 Search probe
 
@@ -320,8 +346,19 @@ MatchKind = Literal[
 ]
 
 
+class DocumentIdentityMatch(ContractModel):
+    candidate_id: UUID
+    document_id: UUID
+    document_revision: str
+    rank: int
+    confidence: float | None
+    match_kind: MatchKind
+    calibration_version: str | None
+
+
 class ProbeCandidateMatch(ContractModel):
     probe_id: str
+    slot_id: str
     task_id: str
     candidate_id: UUID
     document_id: UUID
@@ -345,11 +382,13 @@ class SlotCandidateAggregate(ContractModel):
     best_rank: int
 ```
 
+`DocumentIdentityMatch` is owned by `contracts/capability.py`, and `DocumentSearchOutput` additively gains `identity_matches: tuple[DocumentIdentityMatch, ...] = ()`. Generic discovery keeps the empty default; a bootstrap identity-search result must populate one match per returned candidate. The output contains only checkpoint-safe identity/rank/calibration metadata, never candidate text. `ProbeCandidateMatch` is a deterministic join of the checkpointed task's probe origin with one `AgentResult.data.identity_matches` member; it is never accepted as an independently invented score record.
+
 Aggregation groups by the authoritative aggregate key `(slot_id, document_id, document_revision)` — one aggregate per document identity per slot — and preserves every probe/candidate/task lineage edge.
 
 A second, finer key is used only for verification: `(task_id, document_id, document_revision)` identifies a candidate match produced by one search task. The expansion validator accepts a selection when any member of the aggregate's `source_task_ids` matches that key.
 
-That separation matters for durability: candidate IDs are minted with `uuid4()` (`v2/discovery.py`, `V1DocumentSearchService`), which is deliberate and stays unchanged. A candidate UUID is therefore **non-authoritative lineage only**. Matches and aggregates are rebuilt on every entry from checkpointed `AgentResult`s plus the live registry. A repeated search attempt that mints new candidate UUIDs still converges to the same per-slot aggregates.
+That separation matters for durability: candidate IDs are minted with `uuid4()` (`v2/discovery.py`, `V1DocumentSearchService`), which is deliberate and stays unchanged. A candidate UUID is therefore **non-authoritative lineage only**. On resume, probe matches are rebuilt from the checkpointed plan origins and `AgentResult.data.identity_matches`; the runtime registry is optional corroboration, never required restart state. Aggregates are then rebuilt exactly from those matches. A repeated uncheckpointed search attempt may mint new candidate UUIDs, but a checkpointed result remains sufficient to reproduce ranking and converges to the same per-slot authoritative document identities.
 
 Deterministic ordering is:
 
@@ -360,7 +399,7 @@ exact_document_number
 > semantic
 ```
 
-`aggregate_id` is a server-owned deterministic UUID derived from the checkpoint namespace, slot ID, document ID, and exact revision — the same tuple as the aggregate key, so it is unique per aggregate. It is derived from checkpointed facts, never minted, so it is stable across a repeated attempt even though candidate UUIDs are not. It is the selectable identity; source candidate IDs remain non-authoritative lineage only.
+Each bootstrap owns a checkpointed `discovery_id: UUID`, derived server-side from the run/checkpoint namespace before the first probe and reused on resume. `aggregate_id` is a server-owned deterministic UUID5 derived from `(discovery_id, slot_id, document_id, exact_revision)`. It is therefore stable across repeated attempts inside one bootstrap but cannot collide with or be replayed as an aggregate from another run. It is the selectable identity; source candidate IDs remain non-authoritative lineage only.
 
 For every non-exact aggregate, including lexical-only, semantic-only, and mixed lexical/semantic matches:
 
@@ -368,7 +407,7 @@ For every non-exact aggregate, including lexical-only, semantic-only, and mixed 
 aggregate_confidence = max(match-kind-calibrated confidence across source matches)
 ```
 
-Lexical and semantic calibrators may use different feature mappings but must produce the same probability-like confidence domain and record their mapping version. A mixed aggregate keeps the strongest match kind for ordering and the maximum calibrated confidence for its gate. Using the maximum avoids inflating confidence merely because the planner emitted more probes. Ties break by best rank, then first accepted probe order, then stable document identity.
+Lexical and semantic calibrators may use different feature mappings but must produce the same probability-like confidence domain and record their mapping version. A mixed aggregate keeps the strongest match kind for ordering and the maximum calibrated confidence for its gate. Using the maximum avoids inflating confidence merely because the planner emitted more probes. Within one non-exact match kind, aggregates order by calibrated confidence descending, then best rank, first accepted-probe order, and stable document identity. Exact matches order by match kind, then best rank, first accepted-probe order, and stable document identity; multiple distinct exact identities remain ambiguous regardless of order.
 
 The confidence margin is defined **at the selection boundary**, not at the top two:
 
@@ -381,7 +420,7 @@ multi-select slot (min_selections > 1):
     margin = confidence(last selected) - confidence(first excluded)
 ```
 
-For a multi-select slot the last selected aggregate is the `min_selections`-th candidate when the slot is filled to its minimum, or the `max_selections`-th once it is saturated. A thematic slot whose top five all clear the confidence gate therefore never clarifies merely because #1 and #2 are close. When a multi-select slot has no excluded aggregate, the margin gate passes.
+For a multi-select slot the selected aggregate IDs must be an exact prefix of the deterministic ranking: the boundary is the actual last selected candidate (`min_selections` when filled to its minimum, `max_selections` once saturated), compared with the immediately following excluded candidate. A thematic slot whose top five all clear the confidence gate therefore never clarifies merely because #1 and #2 are close. When a multi-select slot has no excluded aggregate, the margin gate passes. Single-select margin is computed around the actual selected top candidate; a non-top selection is invalid unless `authority="user_choice"`.
 
 Exact matches ignore confidence; multiple distinct exact matches remain ambiguous rather than being resolved by score.
 
@@ -400,12 +439,13 @@ class DiscoverySelection(ContractModel):
 
 Selection count applies to aggregate IDs and must satisfy slot cardinality. Thematic summary can select multiple aggregates for one slot. Selection settlement resolves each aggregate to its authoritative document identity and retains all source candidate/probe/task IDs as provenance without counting them as separate selections.
 
-Because `aggregate_id` is derived from `(slot_id, document_id, revision)`, settlement never needs a candidate UUID to resolve a selection, and the same selection resolves to the same identity after a repeated search attempt.
+Because `aggregate_id` is derived from `(discovery_id, slot_id, document_id, revision)`, settlement never needs a candidate UUID to resolve a selection, and the same selection resolves to the same identity after a repeated search attempt within that checkpoint lineage.
 
 ### 8.4 Discovery checkpoint
 
 ```python
 class DiscoveryCheckpoint(ContractModel):
+    discovery_id: UUID
     target_slots: tuple[TargetSlot, ...]
     accepted_probes: tuple[SearchProbe, ...]
     candidate_matches: tuple[ProbeCandidateMatch, ...]
@@ -422,6 +462,8 @@ class DiscoveryCheckpoint(ContractModel):
     ]
     clarification_manifest: DocumentSelectionManifest | None
 ```
+
+`validate_discovery_checkpoint` reconstructs and compares all authoritative derived state rather than trusting persisted summaries. It validates: exact target-slot equality; unique and normalized probes; probe/round counters and hard maxima; every candidate's accepted probe/task ownership, positive rank, finite `[0,1]` confidence, and calibration-version coupling; exact aggregate reconstruction from candidate matches; deterministic aggregate ordering; unique per-slot selections with status/cardinality invariants; and clarification-manifest/request ID, expiry, cardinality, non-blank unique digest, aggregate, document, and revision structural integrity. A persisted aggregate or selection that cannot be reproduced from accepted probes plus checkpointed task results fails closed.
 
 `SupervisorV2State.discovery` is a required revision-2 key with canonical idle value `None`. The complex boundary maps it explicitly into and out of child state together with the independently owned `research_target_selection`. `ComplexResearchState` is extended with `discovery`, `research_target_selection`, and `pending_clarification` as nullable members, and `build_complex_research_state` / `normalize_complex_state` / `merge_complex_result_into_supervisor` are explicit change points (see §15.1).
 
@@ -527,7 +569,7 @@ What the design actually guarantees:
 - a crash after the read call but before its result checkpoint may repeat that read;
 - discovery capabilities must remain side-effect free;
 - candidate UUIDs stay `uuid4()` (no determinism is claimed or required);
-- every authoritative identity is re-derivable from checkpointed facts: aggregates partition by `(slot_id, document_id, document_revision)`, candidate matches key on `(task_id, document_id, document_revision)`, `aggregate_id` is derived from the aggregate key, candidate registry is rebuilt per entry, selection settlement and binding resolution deduplicate on `(document_id, revision)`, and plan expansion deduplicates on the aggregate key;
+- every authoritative identity is re-derivable from checkpointed facts: aggregates partition by `(slot_id, document_id, document_revision)`, candidate matches key on `(task_id, document_id, document_revision)`, `aggregate_id` is derived from `discovery_id` plus the aggregate key, candidate registry is rebuilt per entry, selection settlement and binding resolution deduplicate on `(document_id, revision)`, and plan expansion deduplicates on the aggregate key;
 - no duplicate **checkpointed** tasks, results, bindings, or expansion units is committed for the same authoritative key;
 - no lease survives for an un-checkpointed use: leases are DB rows keyed by `(run_id, revision_id, evidence_use_id)`, so a repeated read's fresh use ID yields a separate row that expires by TTL rather than a duplicate for one use;
 
@@ -552,7 +594,7 @@ class ResearchBudgetView(ContractModel):
     max_parallel_branches: int
 ```
 
-Discovery tasks and factual research tasks remain in one plan lineage but have separate counters. `build_research_budget_view` counts only factual tasks, identified by task origin; `DiscoveryProbeTaskOrigin` tasks do not consume research capacity.
+Discovery tasks and factual research tasks remain in one plan lineage but have separate counters. `build_research_budget_view` counts only factual tasks after origin/capability validation. A `DiscoveryProbeTaskOrigin` is budget-exempt only when the task is exactly a checkpoint-owned `document.search`/`DocumentSearchInput` probe whose query, slot, round, and probe ID match one accepted `SearchProbe`; using that origin on any other capability or without a `DiscoveryCheckpoint` is invalid. Origin labels alone never grant free capacity.
 
 Add an absolute safety cap:
 
@@ -617,7 +659,7 @@ class DiscoveryExpansionTaskOrigin(ContractModel):
     selected_aggregate_ids: tuple[UUID, ...]
 ```
 
-`_validate_task_origin` currently assumes every non-`InitialTaskOrigin` carries `reason`, `task_ids`, and `evidence_use_ids`, so a bootstrap plan raises `AttributeError` — which is not `ContractValidationError` and therefore escapes `validate_checkpoint_node`'s `except` clause as a typed error. The validator must dispatch by origin kind: `ReplanTaskOrigin` keeps its existing checks, `DiscoveryProbeTaskOrigin` validates probe/slot/round lineage, and `DiscoveryExpansionTaskOrigin` validates that its search task IDs and target slot IDs exist and that `selected_aggregate_ids` resolve within the checkpoint. Both new members join the `TaskOrigin` discriminated union.
+`_validate_task_origin` currently assumes every non-`InitialTaskOrigin` carries `reason`, `task_ids`, and `evidence_use_ids`, so a bootstrap plan raises `AttributeError` — which is not `ContractValidationError` and therefore escapes `validate_checkpoint_node`'s `except` clause as a typed error. The validator must dispatch by origin kind: `ReplanTaskOrigin` keeps its existing checks; `DiscoveryProbeTaskOrigin` is accepted only with an explicit `DiscoveryCheckpoint` and an exact `document.search` probe match; `DiscoveryExpansionTaskOrigin` is accepted only with both discovery and selection context, and validates its source task IDs, target slot IDs, selected aggregates, and task/target relationship against them. Both new members join the `TaskOrigin` discriminated union. Generic/fast/replan validation without discovery context rejects both discovery origins instead of treating their labels as authority.
 
 These origins make discovery/research budget accounting and audit lineage explicit:
 
@@ -650,17 +692,18 @@ The expansion validator enforces:
 1. plan ID, goal, contract version, and every existing task are unchanged;
 2. existing tasks and target units are exact prefixes;
 3. at least one target unit and factual task are appended;
-4. every new unit maps to a checkpoint-selected slot and existing selected binding;
-5. slot cardinality and required minimums hold;
-6. new target/task IDs are unique and cannot shadow bootstrap IDs;
-7. new tasks reference only selected/appended units and current catalog capabilities;
-8. every new task carries `DiscoveryExpansionTaskOrigin` with valid bootstrap lineage;
-9. discovery outcomes cover every attempted bootstrap task;
-10. selected aggregates belong to those outcomes: at least one member of `source_task_ids` matches the outcome's `(task_id, document_id, document_revision)` key;
-11. discovery, research, and total task budgets all hold;
-12. the complete plan passes selection-aware `validate_task_plan` against current bindings and the checkpointed `ResearchTargetSelection`.
+4. every new unit's `target_id` resolves to one checkpoint-selected `SelectedBindingRef`, uses that exact binding, and uses the owning slot's exact checkpointed locator;
+5. every discovery-backed selected binding resolves through its `selected_aggregate_id` to the same slot and exact `(document_id, document_revision)` as the binding;
+6. slot cardinality, required minimums, distinct-document rules, and the same-document/two-distinct-locator exception hold;
+7. new target/task IDs are unique and cannot shadow bootstrap IDs;
+8. new tasks reference only selected/appended units and current catalog capabilities;
+9. every new task carries `DiscoveryExpansionTaskOrigin`; its target slot IDs equal the slots of the target units it reads, its selected aggregates are exactly those backing the selected bindings, and its source search tasks belong to those aggregates;
+10. typed checkpointed discovery outcomes cover every attempted bootstrap task exactly once, preserve non-success statuses, and match each aggregate member on `(task_id, document_id, document_revision)`;
+11. only aggregates present in `DiscoveryCheckpoint.selections` may authorize expansion;
+12. discovery, research, and total task budgets all hold;
+13. the complete plan passes selection- and discovery-aware `validate_task_plan` against current bindings and the checkpointed contracts.
 
-`expand_discovery_plan` is the single authoritative constructor for this transition. It appends units/tasks, invokes `validate_plan_expansion`, acquires leases, and returns nothing checkpointable before validation and lease commit.
+`expand_discovery_plan` is the single authoritative **append constructor** for this transition: it appends units/tasks, invokes `validate_plan_expansion`, and returns only a validated plan. Lease authority stays at the graph boundary: its only governed caller, `research_expand_node`, must pass the returned plan through the existing `_lease_pinned_state` and commit the lease session before returning any checkpointable update. The constructor never persists or leases by itself.
 
 ### 13.2 Structural ownership guard
 
@@ -757,7 +800,7 @@ class DocumentSelectionManifest(ContractModel):
     status: Literal["pending", "consumed"]
 ```
 
-The manifest is internal checkpoint state inside `DiscoveryCheckpoint`. Choice tokens are random opaque values; only an HMAC digest is persisted. Entries must refer to aggregates in the same checkpoint and exactly reproduce their document identity/revision. The manifest and public request share clarification ID and expiry.
+The manifest is internal checkpoint state inside `DiscoveryCheckpoint`. Choice tokens are random opaque, single-use values. The public `DocumentSelectionClarification` root slot necessarily checkpoints the raw tokens so the exact request can be replayed after restart; the internal manifest checkpoints only HMAC digests and never duplicates raw tokens. The digest protects resume validation against forged runner payloads, not against a compromised checkpoint store, which is already inside the trusted boundary. Pure checkpoint validation checks only digest shape/uniqueness and manifest↔request structure; the `clarify_wait` resume boundary, which has the runtime HMAC key, is the sole owner that recomputes a submitted token digest. Entries must refer to aggregates in the same checkpoint and exactly reproduce their document identity/revision. The manifest and public request share clarification ID and expiry, and consumption is atomic with clearing the public request.
 
 Revision-1 checkpoint migration injects `kind="semantic"` into legacy clarification request mappings. Because the two request shapes are stored in separate slots, the seams that must dispatch are:
 
@@ -800,7 +843,7 @@ The complex child does not call `interrupt()` directly. On ambiguity it terminat
 - `normalize_complex_state` is extended with the three new child slots so a resumed checkpoint keeps them instead of dropping unknown keys;
 - `merge_complex_result_into_supervisor` returns the child's discovery checkpoint, pending document-selection request, and finalized selection in addition to `execution_update(...)`.
 
-A resumed child continues from its own checkpoint under the parent saver, so the root values written by `clarify_wait` are the **authoritative** input on re-entry: `build_complex_research_state` re-injects the root `discovery` (with its consumed manifest and recorded selections) and `research_target_selection`, overriding the child's stale copy. A new deterministic `discovery_entry_branch` selects the child's first node. The plan-present case is checked **first** and keeps today's semantics: a checkpoint that already has a `plan` goes to the existing `validate_checkpoint_node` plan-present arm and bypasses discovery entirely. Only when no plan exists does the branch consider discovery: `status="clarification"` plus recorded selections goes to `selection_settle`; satisfied slots go to `finalize_target_selection`; otherwise `discovery_propose`.
+A resumed child continues from its own checkpoint under the parent saver, so the root values written by `clarify_wait` are the **authoritative** input on re-entry: `build_complex_research_state` re-injects the root `discovery` (with its consumed manifest and recorded selections) and `research_target_selection`, overriding the child's stale copy. A new deterministic `discovery_entry_branch` selects the child's first node. It classifies an existing plan before choosing the old plan-present arm: a plan carrying checkpoint-matched `DiscoveryProbeTaskOrigin` tasks is a bootstrap plan and does **not** bypass discovery merely because `plan is not None`. Precedence is: consumed clarification selections → `selection_settle`; a finalized `research_target_selection` with a probe-only bootstrap plan → `finalize_target_selection` (which chooses governed research expansion); active searching/ranking bootstrap → the matching validate/execute/aggregate continuation; ordinary non-bootstrap plan → today's `validate_checkpoint_node` plan-present arm; no plan with satisfied slots → `finalize_target_selection`; otherwise → `discovery_propose`. A plan with discovery origins but no matching discovery checkpoint fails closed. This ordering lets clarification resume settle the already-checkpointed search plan without re-dispatching a probe.
 
 `complex_boundary` atomically maps the discovery checkpoint, the pending request, and the root `document_selection_clarification` slot in one node update, and never returns a `Command` (navigation stays static). `_complex_branch` gains a `"clarify"` return when that update carries a pending document-selection request, and its edge map gains `"clarify": "clarify"` so the existing `clarify_persist` → `clarify_wait` pair checkpoints the request and manifest before interrupting. `_complex_branch` continues to return `"synthesize"`/`"finalizer"` otherwise. A document-selection suspend deliberately keeps `route_decision.route` at its complex value rather than `"clarify"`, so the existing `route == "clarify" requires clarification` invariant is untouched.
 
@@ -856,7 +899,7 @@ V2_TOTAL_MAX_TASKS=13
 
 The research task cap reuses the existing declared `V2_MAX_TASKS` (currently the live setting consumed by `V2ResearchLimits.from_settings()`); `V2_RESEARCH_MAX_TASKS` is not introduced, to avoid a second name for one limit. `V2_TOTAL_MAX_TASKS` is new and defaults to the discovery plus research maxima.
 
-Validation enforces positive limits, summary minimum no greater than maximum, thresholds in `[0,1]`, total task cap no smaller than discovery plus research defaults, and runtime discovery deadline no later than the outer deadline.
+Validation enforces the design maxima as hard ceilings, not merely defaults: probes `1..5`, rounds `1..2`, top-k `1..5`, discovery deadline `1..15` seconds, summary minimum `3..5`, and summary maximum `3..5` with minimum no greater than maximum. Thresholds stay in `[0,1]`; the total task cap is no smaller than configured discovery plus research maxima; runtime discovery deadline is no later than the outer deadline. Raising any hard ceiling requires a new design revision and rollout gate, not only an environment change.
 
 Enabling semantic auto-selection requires a readable calibration artifact whose model hashes match the effective providers.
 
@@ -878,9 +921,11 @@ Environment values ignored by Pydantic are not configuration support.
 Create:
 
 ```text
-backend/app/services/agents/v2/discovery/
+backend/app/services/agents/v2/contracts/validation_support.py
+backend/app/services/agents/v2/discovery_bootstrap/
   __init__.py
   contracts.py
+  validation.py
   policy.py
   calibration.py
   projection.py
@@ -888,12 +933,15 @@ backend/app/services/agents/v2/discovery/
   plan_expansion.py
 ```
 
+The existing `backend/app/services/agents/v2/discovery.py` generic candidate/binding-handoff module remains unchanged; bootstrap contracts use `discovery_bootstrap/` specifically to avoid module/package shadowing. Dependency direction is strict: `discovery_bootstrap/contracts.py` contains data models only and never imports `contracts/validation.py`; cycle-free error/helper primitives live in `contracts/validation_support.py` and are re-exported from `contracts/validation.py` for compatibility. Discovery validation may import models plus `validation_support`; central aggregate validation may import discovery models/validators. No `validation ↔ discovery_bootstrap.contracts` cycle is permitted. Because `discovery_bootstrap/contracts.py` is data-only and never imports state or validation, `contracts/state.py` imports its concrete models directly; the four TypedDict slots must not be weakened to `Any`.
+
 Integrate with:
 
-- `v2/contracts/base.py` and `state.py` for checkpoint schema revision and the four new root slots;
+- `v2/contracts/base.py`, `validation_support.py`, and `state.py` for checkpoint schema revision, cycle-free validation primitives, and the four new root slots;
 - `v2/contracts/clarification.py` for the concrete `DocumentSelectionClarification`/`DocumentSelectionResolution` pair and the manifest;
-- `v2/contracts/planning.py` for the two new `TaskOrigin` members and budgets;
-- `v2/contracts/validation.py` for `_CHECKPOINT_REQUIRED_KEYS`/revision dispatch, `_validate_task_origin` kind dispatch, `_validate_execution_state`/`validate_research_planning_input` selection threading, and the expansion validator;
+- `v2/contracts/planning.py` for the two new `TaskOrigin` members, the selection-aware planning input, and budgets;
+- `v2/contracts/capability.py` for checkpoint-safe `DocumentIdentityMatch` and additive `DocumentSearchOutput.identity_matches`;
+- `v2/contracts/validation.py` for `_CHECKPOINT_REQUIRED_KEYS`/revision dispatch, `_validate_task_origin` kind dispatch, and `_validate_execution_state`/`validate_research_planning_input` selection threading; `v2/discovery_bootstrap/validation.py` and `plan_expansion.py` own discovery-checkpoint and expansion validation;
 - `supervisor_v2.py` for `_SLOT_MODELS`/`_NULLABLE_SLOTS`/`_coerce_slot`, the migration in `normalize_checkpoint_state`, `build_initial_v2_state`, `_retire_stale_clarification`, `_resolution_from_mapping`, `_complex_branch`, and the `clarify` edge map;
 - `v2/nodes/routing.py` for the flag-gated `decide_route` admission branch;
 - `v2/nodes/clarification.py` for `_live_persisted_request`/`_request_from_mapping`/`clarify_node` and the document-selection resume constructor;
@@ -904,7 +952,8 @@ Integrate with:
 - `agent/streaming.py` and `v2/events.py` for progress and the document-selection suspend/resume frame (`clarification_public_metadata` included);
 - `v2/transport.py` for the additive document-selection public frame and selection validation;
 - `schemas/rag.py` and the runner entry points (`api/chat_session.py`, `api/chat_agent_lg.py`, `services/integrations/telegram_service.py`) for the additive per-slot selection payload;
-- `core/config.py` and `.env.example` for controls.
+- `core/config.py` and `.env.example` for controls;
+- `CLAUDE.md` in the same implementation change for the new checkpoint/selection ownership and configuration contract.
 
 Keep scoring, calibration, selection, role reconciliation, and expansion outside the already large `complex_research_graph.py` except for graph composition and state mapping.
 
@@ -927,7 +976,7 @@ Do not log query text, titles, document numbers, IDs, revisions, prompts, candid
 
 ### Phase 1 — Contract groundwork
 
-Implement checkpoint schema revision/migration with the enumerated seams, the four root slots, target slots/cardinality, research target selection and its validator/planner threading, candidate match/aggregation on the two keys, selections, task-origin members and kind dispatch, budgets, the two concrete clarification slots, and the expansion validator. Graph behavior remains disabled.
+Implement cycle-free validation support; checkpoint schema revision/migration with exact legacy-shape classification; the four root slots; target slots/cardinality and server-owned selected `target_id` mappings; self-contained research target selection and its validator/planner/skill threading; checkpoint-safe `DocumentSearchOutput.identity_matches`; candidate match/aggregation on the two keys; discovery-scoped aggregate IDs; selections; context-required task-origin dispatch; hard budgets including scheduler/replan entry seams; the two concrete clarification slots; and the typed expansion validator. Graph behavior remains disabled.
 
 ### Phase 2 — Identity-search and calibration
 
@@ -953,20 +1002,21 @@ Enable three-to-five target thematic map/reduce only after prior gates pass.
 
 ### 21.1 Contract and unit tests
 
-- revision-1 checkpoint migration, all revision-2 required nullable slots, new-turn clearing, revision-2 missing-key rejection, and `clarification`/`document_selection_clarification` mutual exclusion;
+- exact revision-1 checkpoint migration (missing or explicit discriminator), all revision-2 required nullable slots, new-turn clearing, revision-2 missing-key rejection, partial revision-2 shape without a discriminator rejection, and `clarification`/`document_selection_clarification` mutual exclusion;
 - route precedence proving unresolved summarize/compare document identity reaches complex discovery instead of semantic clarification, with the flag off preserving the clarify result;
-- immutable binding role versus checkpointed research selection, including `_validate_execution_state` and `validate_research_planning_input` threading the selection while fast/replan callers stay strict;
-- `_validate_task_origin` kind dispatch for both new origins (no `AttributeError` escaping as a typed error);
-- slot cardinality for named, compare, optional references, and thematic summary, including that two revisions of one document cannot fill two selections of one multi-select slot;
+- immutable binding role versus self-contained checkpointed research selection, including the discovery-skipped/selection-present case, `_validate_execution_state`, planner/skill threading, and strict fast/replan callers;
+- `_validate_task_origin` kind dispatch for both new origins, including rejection of a discovery-probe origin on `document.read`, rejection without discovery context, and exact probe/task/query/slot/round matching;
+- slot cardinality for named, compare, optional references, and thematic summary, including that two revisions of one document cannot fill two selections of one multi-select slot and that every selection-aware `TargetUnit.target_id`/binding/locator matches one selected ref and its owning slot;
 - conditional discovery admission and flag-off compatibility;
 - exact/lexical/semantic identity search;
-- deterministic derived aggregate IDs over the aggregate key, one aggregate per document identity per slot, multi-probe deduplication, lexical/semantic/mixed confidence aggregation, tie-breaking, and the single-select versus multi-select margin boundary;
+- checkpointed `DocumentSearchOutput.identity_matches` can rebuild probe matches after registry loss, and generic discovery keeps its empty default;
+- deterministic discovery-scoped aggregate IDs, cross-run ID separation, one aggregate per document identity per slot, multi-probe deduplication, lexical/semantic/mixed confidence aggregation, confidence-first ordering, accepted-probe tie-breaking, and actual single-/multi-select boundaries including a saturated five-of-more-than-five case;
 - calibrator artifact/model-hash validation;
-- separate discovery/research/total budgets;
+- separate discovery/research/total budgets, hard configuration ceilings, scheduler plan-entry enforcement, and origin-spoof resistance;
 - derived discovery deadline;
-- `validate_plan_expansion` acceptance and every mutation/rebinding rejection;
+- `validate_plan_expansion` acceptance plus mutation, unselected aggregate, missing outcome, foreign source-task, slot mismatch, and aggregate↔binding identity mismatch rejection;
 - AST ownership guard coverage for task and target-unit appends;
-- concrete clarification slots, manifest integrity, parent/child checkpoint handoff through the three state-mapping seams, resume authority from root slots, `_complex_branch` clarify return, `discovery_entry_branch` resume target, and public redaction;
+- concrete clarification slots, manifest integrity, parent/child checkpoint handoff through the three state-mapping seams, resume authority from root slots, `_complex_branch` clarify return, `discovery_entry_branch` distinguishing a plan-present bootstrap from an ordinary plan and choosing the correct resume target, and public redaction;
 - a `streaming`/`transport` suspend→resume round trip for a document-selection request;
 - at-least-once crash-window convergence without duplicate checkpointed authoritative state.
 

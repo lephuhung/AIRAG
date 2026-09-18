@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
+from .contracts.binding import DocumentBindingSet
 from .contracts.planning import (
     DiscoveryPolicy,
     ResearchBudgetView,
@@ -28,6 +29,10 @@ from .contracts.planning import (
     TaskExecutionSummary,
 )
 from .contracts.state import GraphRuntimeContext
+from .discovery_bootstrap.contracts import (
+    DiscoveryCheckpoint,
+    ResearchTargetSelection,
+)
 from .contracts.validation import ContractValidationError, validate_replan
 
 __all__ = [
@@ -130,6 +135,11 @@ def append_replan_tasks(
     policy: DiscoveryPolicy,
     budget: ResearchBudgetView,
     runtime: GraphRuntimeContext,
+    *,
+    bindings: DocumentBindingSet | None = None,
+    target_selection: ResearchTargetSelection | None = None,
+    discovery_checkpoint: DiscoveryCheckpoint | None = None,
+    total_task_limit: int | None = None,
 ) -> TaskPlan:
     """The single authoritative append + validation construction site (R52).
 
@@ -149,7 +159,16 @@ def append_replan_tasks(
         update={"tasks": current.tasks + tuple(proposed_tasks)}
     )
     return validate_runtime_replan(
-        current, proposed, outcomes, policy, budget, runtime
+        current,
+        proposed,
+        outcomes,
+        policy,
+        budget,
+        runtime,
+        bindings=bindings,
+        target_selection=target_selection,
+        discovery_checkpoint=discovery_checkpoint,
+        total_task_limit=total_task_limit,
     )
 
 
@@ -168,19 +187,42 @@ def validate_runtime_replan(
     policy: DiscoveryPolicy,
     budget: ResearchBudgetView,
     runtime: GraphRuntimeContext,
+    *,
+    bindings: DocumentBindingSet | None = None,
+    target_selection: ResearchTargetSelection | None = None,
+    discovery_checkpoint: DiscoveryCheckpoint | None = None,
+    total_task_limit: int | None = None,
 ) -> TaskPlan:
     """Validate an append-only replan against frozen rules + current runtime.
 
     Order: cancellation/deadline first (no validation past a dead run), then
-    the frozen ``validate_replan`` (append-only, plan_id/goal stability,
-    completed-task prefix, origin/budget/discovery rules), then the
-    runtime-catalog membership and fan-out width the frozen layer cannot see.
+    the optional absolute total-task ceiling (discovery spec §11.3 —
+    defense-in-depth; the pure budget builder already bounds remaining
+    capacity by both factual and total room), then the frozen
+    ``validate_replan`` (append-only, plan_id/goal stability, completed-task
+    prefix, origin/budget/discovery rules), then the runtime-catalog
+    membership and fan-out width the frozen layer cannot see.
     Returns the accepted plan unchanged; raises :class:`ReplanRejected` for
     runtime failures and :class:`ContractValidationError` for frozen-rule
-    failures. Never mutates either plan.
+    failures. Never mutates either plan. ``total_task_limit=None`` (the
+    default) preserves the exact prior behavior.
     """
     check_replan_dispatchable(runtime)
-    accepted = validate_replan(current, proposed, outcomes, policy, budget)
+    if total_task_limit is not None and len(proposed.tasks) > total_task_limit:
+        raise ReplanRejected(
+            f"proposed plan carries {len(proposed.tasks)} task(s), above the "
+            f"total task limit {total_task_limit}"
+        )
+    accepted = validate_replan(
+        current,
+        proposed,
+        outcomes,
+        policy,
+        budget,
+        bindings=bindings,
+        target_selection=target_selection,
+        discovery_checkpoint=discovery_checkpoint,
+    )
     new_tasks = accepted.tasks[len(current.tasks):]
     _require_capabilities_within_current_runtime_catalog(new_tasks, runtime)
     width = entry_fanout_width(new_tasks)

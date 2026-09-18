@@ -330,6 +330,7 @@ def _harness(
 def _child_input(
     bindings: DocumentBindingSet,
     query: str = RETRIEVE_QUERY,
+    work_type: str = "retrieve",
 ) -> dict:
     from app.services.agents.v2.complex_research_graph import ComplexResearchState
 
@@ -337,7 +338,7 @@ def _child_input(
         contract_version="2.0",
         semantic=_semantic(query),
         bindings=bindings,
-        query_analysis=_analysis(),
+        query_analysis=_analysis(work_type),
         route_decision=RouteDecision(
             route="complex_research", reason_code="multi_document_research"
         ),
@@ -509,6 +510,30 @@ async def test_unscoped_retrieve_checkpoints_then_dispatches_once() -> None:
         _child_input(_unscoped_bindings()), context=context
     )
     assert output["plan"] is not None
+    assert len(output["plan"].tasks) == 1
+    assert output["plan"].tasks[0].capability == "document.retrieve"
+    assert len(output["task_results"]) == 1
+    assert len(capability.calls) == 1
+    assert output["evaluation"].status == "sufficient"
+
+
+@pytest.mark.asyncio
+async def test_targetless_summarize_search_first_dispatches_once() -> None:
+    """A covered work type the skill cannot plan (summarize with zero
+    bindings) takes the search-first fallback end to end: validate -> lease
+    -> checkpoint -> a single workspace-scope ``document.retrieve`` dispatch
+    — never the typed unavailable boundary, never ``document_ids``."""
+    from app.services.agents.v2.complex_research_graph import (
+        build_complex_research_subgraph,
+    )
+
+    capability, _, context = _harness(run_id="run-search-first-summarize")
+    output = await build_complex_research_subgraph().ainvoke(
+        _child_input(_unscoped_bindings(), work_type="summarize"),
+        context=context,
+    )
+    assert output["plan"] is not None
+    assert output["plan"].plan_id == "retrieve-unscoped"
     assert len(output["plan"].tasks) == 1
     assert output["plan"].tasks[0].capability == "document.retrieve"
     assert len(output["task_results"]) == 1

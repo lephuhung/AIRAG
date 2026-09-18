@@ -1172,7 +1172,13 @@ def test_complex_boundary_maps_child_result_back_to_execution_state() -> None:
     merged = merge_complex_result_into_supervisor(
         _parent_state(), {**child, "plan": plan, "task_results": ()}
     )
-    assert set(merged.keys()) == {"execution"}
+    assert set(merged.keys()) == {
+        "execution",
+        "discovery",
+        "research_target_selection",
+    }
+    assert merged["discovery"] is None
+    assert merged["research_target_selection"] is None
     execution = merged["execution"]
     assert isinstance(execution, ExecutionState)
     assert execution.plan == plan

@@ -77,6 +77,7 @@ from app.services.agents.v2.contracts.semantic import (
     SemanticDraft,
 )
 from app.services.agents.v2.contracts.state import (
+    CHECKPOINT_SCHEMA_REVISION,
     ExecutionState,
     GraphRuntimeContext,
     RuntimeServices,
@@ -1074,6 +1075,11 @@ def build_shadow_bundle(
         clarification=None,
         synthesis=None,
         final_response=None,
+        checkpoint_schema_revision=CHECKPOINT_SCHEMA_REVISION,
+        discovery_need=None,
+        discovery=None,
+        document_selection_clarification=None,
+        research_target_selection=None,
     )
     return ShadowBundle(
         raw_query=raw_query,

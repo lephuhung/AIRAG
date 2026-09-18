@@ -217,7 +217,12 @@ class AdaptivePlanner(RuntimeModel):
         steps = await self._propose_steps(model_input)
         plan = self._build_plan(planning_input, runtime, steps)
         try:
-            validate_task_plan(plan, planning_input.bindings)
+            validate_task_plan(
+                plan,
+                planning_input.bindings,
+                target_selection=planning_input.target_selection,
+                discovery_checkpoint=planning_input.discovery_checkpoint,
+            )
         except ContractValidationError as exc:
             raise _fail(f"model proposal failed validation: {exc}") from exc
         self._check_runtime_governance(plan, runtime, planning_input)

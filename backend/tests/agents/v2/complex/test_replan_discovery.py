@@ -2718,16 +2718,18 @@ def _scan_append_ownership(
     set[tuple[str, str]],
     set[tuple[str, str]],
 ]:
-    """Scan a v2 tree for append-ownership invariants (R52).
+    """Scan a v2 tree for append-ownership invariants (R52 + discovery §13.2).
 
     Returns ``(constructors, append_sites, in_place_sites,
     append_replan_tasks_callers, plan_returns)`` where each element is the set
     of ``(module_rel, enclosing_function)`` locations. ``append_sites`` is the
-    single governed surface: EVERY append expression -- ``model_copy(update={
-    "tasks": ...})``, ``list(<*.tasks>)`` / ``tuple(<*.tasks>)``,
-    ``<tasks-expr>.append(...)``, ``<tasks> + ...``, and in-place ``.tasks``
-    assignment -- is collected and its ENCLOSING FUNCTION resolved. Callers
-    assert that set is exactly ``append_replan_tasks``.
+    single governed surface: EVERY append expression on either authoritative
+    plan tuple -- ``model_copy(update={"tasks"/"target_units": ...})``,
+    ``list(<*.tasks/.target_units>)`` / ``tuple(<*.tasks/.target_units>)``,
+    ``<tuple-expr>.append(...)``, ``<tasks>/<target_units> + ...``, and
+    in-place ``.tasks``/``.target_units`` assignment -- is collected and its
+    ENCLOSING FUNCTION resolved. Callers assert that set is exactly
+    ``append_replan_tasks`` plus ``expand_discovery_plan``.
     """
     import ast
 
@@ -2763,17 +2765,28 @@ def _scan_append_ownership(
 
             visit_AsyncFunctionDef = visit_FunctionDef
 
-            def reads_tasks(self, node: ast.AST) -> bool:
-                if isinstance(node, ast.Attribute) and node.attr == "tasks":
+            def reads_plan_tuple(self, node: ast.AST) -> bool:
+                """True when ``node`` reads an authoritative plan tuple.
+
+                Covers both appendable tuples: ``.tasks`` and
+                ``.target_units`` (discovery spec §13.2 requires the scanner
+                to cover target-unit appends as well as task appends).
+                """
+                if (
+                    isinstance(node, ast.Attribute)
+                    and node.attr in ("tasks", "target_units")
+                ):
                     return True
                 if isinstance(node, ast.Name) and node.id in self._tainted():
                     return True
                 if isinstance(node, (ast.Tuple, ast.List)):
-                    return any(self.reads_tasks(element) for element in node.elts)
+                    return any(self.reads_plan_tuple(element) for element in node.elts)
                 if isinstance(node, ast.Starred):
-                    return self.reads_tasks(node.value)
+                    return self.reads_plan_tuple(node.value)
                 if isinstance(node, ast.BinOp):
-                    return self.reads_tasks(node.left) or self.reads_tasks(node.right)
+                    return self.reads_plan_tuple(node.left) or self.reads_plan_tuple(
+                        node.right
+                    )
                 return False
 
             @staticmethod
@@ -2785,34 +2798,39 @@ def _scan_append_ownership(
                 return ""
 
             @staticmethod
-            def _is_model_copy_with_tasks(node: ast.Call) -> bool:
+            def _is_model_copy_with_plan_tuple(node: ast.Call) -> bool:
                 if Visitor._call_name(node.func) != "model_copy":
                     return False
                 for keyword in node.keywords:
                     if keyword.arg == "update" and isinstance(keyword.value, ast.Dict):
                         return any(
-                            isinstance(key, ast.Constant) and key.value == "tasks"
+                            isinstance(key, ast.Constant)
+                            and key.value in ("tasks", "target_units")
                             for key in keyword.value.keys
                         )
                 return False
 
-            def _tasks_wrap(self, node: ast.Call) -> bool:
-                """``list(<tasks>)`` / ``tuple(<tasks>)`` call-wrapped forms."""
+            def _plan_tuple_wrap(self, node: ast.Call) -> bool:
+                """``list(<plan tuple>)`` / ``tuple(<plan tuple>)`` call-wrapped forms."""
                 return (
                     self._call_name(node.func) in ("list", "tuple")
                     and bool(node.args)
-                    and self.reads_tasks(node.args[0])
+                    and self.reads_plan_tuple(node.args[0])
                 )
 
             def visit_Assign(self, node: ast.Assign) -> None:
                 for target in node.targets:
                     if isinstance(target, ast.Name):
                         value = node.value
-                        if self.reads_tasks(value) or (
-                            isinstance(value, ast.Call) and self._tasks_wrap(value)
+                        if self.reads_plan_tuple(value) or (
+                            isinstance(value, ast.Call)
+                            and self._plan_tuple_wrap(value)
                         ):
                             self._tainted().add(target.id)
-                    if isinstance(target, ast.Attribute) and target.attr == "tasks":
+                    if isinstance(target, ast.Attribute) and target.attr in (
+                        "tasks",
+                        "target_units",
+                    ):
                         in_place_sites.add((rel, self._func()))
                 self.generic_visit(node)
 
@@ -2820,23 +2838,30 @@ def _scan_append_ownership(
                 if (
                     isinstance(node.target, ast.Name)
                     and node.value is not None
-                    and self.reads_tasks(node.value)
+                    and self.reads_plan_tuple(node.value)
                 ):
                     self._tainted().add(node.target.id)
-                if isinstance(node.target, ast.Attribute) and node.target.attr == "tasks":
+                if isinstance(node.target, ast.Attribute) and node.target.attr in (
+                    "tasks",
+                    "target_units",
+                ):
                     in_place_sites.add((rel, self._func()))
                 self.generic_visit(node)
 
             def visit_AugAssign(self, node: ast.AugAssign) -> None:
-                if isinstance(node.target, ast.Attribute) and node.target.attr == "tasks":
+                if isinstance(node.target, ast.Attribute) and node.target.attr in (
+                    "tasks",
+                    "target_units",
+                ):
                     in_place_sites.add((rel, self._func()))
-                if isinstance(node.op, ast.Add) and self.reads_tasks(node.value):
+                if isinstance(node.op, ast.Add) and self.reads_plan_tuple(node.value):
                     append_sites.add((rel, self._func()))
                 self.generic_visit(node)
 
             def visit_BinOp(self, node: ast.BinOp) -> None:
                 if isinstance(node.op, ast.Add) and (
-                    self.reads_tasks(node.left) or self.reads_tasks(node.right)
+                    self.reads_plan_tuple(node.left)
+                    or self.reads_plan_tuple(node.right)
                 ):
                     append_sites.add((rel, self._func()))
                 self.generic_visit(node)
@@ -2847,14 +2872,14 @@ def _scan_append_ownership(
                     constructors.add((rel, self._func()))
                 elif name == "append_replan_tasks":
                     append_replan_tasks_callers.add((rel, self._func()))
-                elif name == "model_copy" and self._is_model_copy_with_tasks(node):
+                elif name == "model_copy" and self._is_model_copy_with_plan_tuple(node):
                     append_sites.add((rel, self._func()))
-                elif self._tasks_wrap(node):
+                elif self._plan_tuple_wrap(node):
                     append_sites.add((rel, self._func()))
                 elif (
                     name == "append"
                     and isinstance(node.func, ast.Attribute)
-                    and self.reads_tasks(node.func.value)
+                    and self.reads_plan_tuple(node.func.value)
                 ):
                     append_sites.add((rel, self._func()))
                 self.generic_visit(node)
@@ -2922,6 +2947,23 @@ def test_append_guard_flags_call_wrapped_defeat_form(tmp_path: Path) -> None:
     _, append_sites, _, _, _ = _scan_append_ownership(tmp_path)
     assert ("list_append_snippet.py", "rogue_builder") in append_sites
 
+    # Discovery spec §13.2: the same guard covers TARGET-UNIT appends, so a
+    # rogue ``target_units`` expansion outside ``expand_discovery_plan`` is
+    # flagged exactly like a task append.
+    units_defeat = tmp_path / "target_units_snippet.py"
+    units_defeat.write_text(
+        textwrap.dedent(
+            """
+            def rogue_unit_builder(plan, new_unit):
+                return plan.model_copy(
+                    update={"target_units": plan.target_units + (new_unit,)}
+                )
+            """
+        )
+    )
+    _, append_sites, _, _, _ = _scan_append_ownership(tmp_path)
+    assert ("target_units_snippet.py", "rogue_unit_builder") in append_sites
+
 
 def test_subagent_cannot_append_authoritative_tasks() -> None:
     """R52: every authoritative plan-append is single-sourced and governed.
@@ -2933,11 +2975,16 @@ def test_subagent_cannot_append_authoritative_tasks() -> None:
       the same-length model-facing redaction projection, and the governed
       initial planner (which builds fresh from validated model steps and
       still passes frozen ``validate_task_plan`` before lease/checkpoint).
-    * EVERY append expression -- ``model_copy(update={"tasks": ...})``,
-      ``list(<*.tasks>)`` / ``tuple(<*.tasks>)``, ``<tasks-expr>.append(...)``,
-      ``<tasks> + ...``, and in-place ``.tasks`` assignment -- resolves to the
-      ENCLOSING FUNCTION ``replanning.append_replan_tasks``.
-    * no function mutates ``.tasks`` in place.
+    * EVERY append expression on either authoritative plan tuple --
+      ``model_copy(update={"tasks"/"target_units": ...})``,
+      ``list(<*.tasks/.target_units>)`` / ``tuple(<*.tasks/.target_units>)``,
+      ``<tuple-expr>.append(...)``, ``<tasks>/<target_units> + ...``, and
+      in-place ``.tasks``/``.target_units`` assignment -- resolves to the
+      ENCLOSING FUNCTION of one of the two governed append constructors:
+      ``replanning.append_replan_tasks`` (replan appends) or
+      ``discovery_bootstrap/plan_expansion.expand_discovery_plan``
+      (discovery-expansion appends, spec §13.2).
+    * no function mutates ``.tasks`` or ``.target_units`` in place.
     * ``append_replan_tasks`` is called only from the governed owners:
       ``validate_checkpoint_node``, ``people_document_materialize_node`` and
       ``AgentToolGateway.propose`` (call-graph basis).
@@ -2974,13 +3021,21 @@ def test_subagent_cannot_append_authoritative_tasks() -> None:
         ("skills/evaluate/policy.py", "build_evaluate_plan"),
         ("skills/multi_goal/policy.py", "build_multi_goal_plan"),
         ("skills/retrieve/policy.py", "build_retrieve_plan"),
+        ("skills/retrieve/policy.py", "build_unscoped_retrieve_plan"),
         ("skills/summarize/policy.py", "build_summarize_workflow"),
+        ("skills/summarize/policy.py", "_selection_workflow"),
+        ("skills/compare/policy.py", "_selection_plan"),
         ("dependencies/people_document.py", "redact_scalar_for_model"),
         ("planning/planner.py", "_build_plan"),
     }
-    # The single authoritative append expression surface (R52): every append
-    # expression's ENCLOSING FUNCTION is exactly append_replan_tasks.
-    assert append_sites == {("replanning.py", "append_replan_tasks")}
+    # The single authoritative append expression surface (R52 + §13.2): every
+    # append expression on ``.tasks`` or ``.target_units`` resolves to exactly
+    # the two governed append constructors — explicit function allowlist, no
+    # wildcard or directory allowlist.
+    assert append_sites == {
+        ("replanning.py", "append_replan_tasks"),
+        ("discovery_bootstrap/plan_expansion.py", "expand_discovery_plan"),
+    }
     assert in_place_sites == set()
     # Call-graph basis: the single append helper is reached only from the
     # governed owners.

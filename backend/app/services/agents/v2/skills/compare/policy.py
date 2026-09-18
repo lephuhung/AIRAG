@@ -41,6 +41,7 @@ from ...contracts.planning import (
 )
 from ...contracts.semantic import SemanticContext
 from ...contracts.validation import ContractValidationError, validate_task_plan
+from ...discovery_bootstrap.validation import validate_research_target_selection
 
 __all__ = [
     "COMPARE_WORK_TYPE",
@@ -170,6 +171,8 @@ def build_compare_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
             "compare skill cannot plan work type "
             f"{planning_input.query_analysis.work_type!r}; out of pilot scope"
         )
+    if planning_input.target_selection is not None:
+        return _selection_plan(planning_input)
     target, reference = _compare_sides(planning_input.bindings)
     semantic = planning_input.semantic
     target_locator = _locator_for(target, semantic)
@@ -201,4 +204,79 @@ def build_compare_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
         tasks=tasks,
     )
     validate_task_plan(plan, planning_input.bindings)
+    return plan
+
+
+def _selection_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
+    selection = planning_input.target_selection
+    assert selection is not None
+    if selection.work_type != COMPARE_WORK_TYPE:
+        raise ContractValidationError(
+            f"compare skill received a {selection.work_type!r} selection; "
+            "refusing to reinterpret the selection work type"
+        )
+    validate_research_target_selection(
+        selection,
+        planning_input.bindings,
+        planning_input.discovery_checkpoint,
+        planning_input.query_analysis,
+    )
+    if len(selection.target_slots) != MAX_COMPARISON_SIDES:
+        raise ContractValidationError(
+            f"compare selection requires exactly {MAX_COMPARISON_SIDES} "
+            f"slots, got {len(selection.target_slots)}"
+        )
+    slot_selections = {slot.slot_id: slot for slot in selection.slot_bindings}
+    binding_by_id = {
+        binding.binding_id: binding for binding in planning_input.bindings.bindings
+    }
+    units: list[TargetUnit] = []
+    tasks: list[TaskSpec] = []
+    for slot in selection.target_slots:
+        slot_selection = slot_selections.get(slot.slot_id)
+        if slot_selection is None or len(slot_selection.selections) != 1:
+            raise ContractValidationError(
+                f"compare selection slot {slot.slot_id!r} requires exactly "
+                "one selected binding"
+            )
+        ref = slot_selection.selections[0]
+        binding = binding_by_id.get(ref.binding_id)
+        if binding is None:
+            raise ContractValidationError(
+                f"compare selection references unknown binding "
+                f"{ref.binding_id!r}; refusing to fabricate comparison sides"
+            )
+        units.append(
+            TargetUnit(
+                target_id=ref.target_id,
+                binding_id=ref.binding_id,
+                requested_locator=slot.requested_locator,
+                completion_criteria=(CoverageCriterion(kind="coverage"),),
+            )
+        )
+        tasks.append(
+            _read_task(
+                f"T{len(tasks) + 1}",
+                ref.target_id,
+                binding,
+                slot.requested_locator,
+            )
+        )
+    emitted = tuple(tasks)
+    _require_read_capabilities(planning_input, emitted)
+    plan = TaskPlan(
+        contract_version="2.0",
+        plan_id="compare-selection-" + "-".join(
+            unit.target_id for unit in units
+        ),
+        goal=planning_input.semantic.contextualized_query,
+        target_units=tuple(units),
+        tasks=emitted,
+    )
+    validate_task_plan(
+        plan,
+        planning_input.bindings,
+        target_selection=selection,
+        discovery_checkpoint=planning_input.discovery_checkpoint,
+    )
     return plan

@@ -14,7 +14,7 @@ cannot be expressed on pure values.
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from typing import TypeVar
 from uuid import UUID
 
@@ -31,7 +31,13 @@ from .capability import (
     SectionReadInput,
     WriteInput,
 )
-from .clarification import ClarificationRequest, ClarificationResolution
+from .clarification import (
+    MAX_PUBLIC_CHOICES,
+    ClarificationRequest,
+    ClarificationResolution,
+    DocumentSelectionClarification,
+    DocumentSelectionResolution,
+)
 from .conversation import ConversationContext, ConversationSnapshot
 from .evaluation import EvidenceEvaluation
 from .evidence import (
@@ -47,7 +53,9 @@ from .evidence import (
 from .execution import AgentResult, TaskExecutionSummary
 from .planning import (
     CoverageCriterion,
+    DiscoveryExpansionTaskOrigin,
     DiscoveryPolicy,
+    DiscoveryProbeTaskOrigin,
     InitialTaskOrigin,
     ReplanTaskOrigin,
     ResearchBudgetView,
@@ -61,7 +69,11 @@ from .request import RequestContext
 from .response import FinalResponse
 from .routing import QueryAnalysis, RouteDecision
 from .semantic import CurrentRevisionRequirement, DocumentReference, SemanticContext
-from .state import ExecutionState, SupervisorV2State
+from .state import (
+    CHECKPOINT_SCHEMA_REVISION,
+    ExecutionState,
+    SupervisorV2State,
+)
 from .synthesis import (
     AnswerDraft,
     GroundedArtifact,
@@ -69,15 +81,27 @@ from .synthesis import (
     SynthesisCheckpoint,
     SynthesisInput,
 )
-
-
-class ContractValidationError(ValueError):
-    """A canonical contract value violates a frozen v2 invariant."""
-
-
-class IncompatibleCheckpointError(ContractValidationError):
-    """A checkpoint/fixture is not a compatible v2 payload and must not be migrated."""
-
+from .validation_support import (
+    ContractValidationError,
+    IncompatibleCheckpointError,
+    _fail,
+    _require_contract_version,
+    _require_non_blank,
+    _require_unique,
+)
+from ..discovery_bootstrap.contracts import (
+    DiscoveryCheckpoint,
+    DiscoveryNeed,
+    ResearchTargetSelection,
+    SelectedBindingRef,
+    TargetSlot,
+)
+from ..discovery_bootstrap.validation import (
+    _normalize_probe_query,
+    validate_discovery_checkpoint,
+    validate_discovery_need,
+    validate_research_target_selection,
+)
 
 _READ_CAPABILITIES = frozenset({"document.read", "section.read"})
 
@@ -108,7 +132,19 @@ _CHECKPOINT_REQUIRED_KEYS = (
     "clarification",
     "synthesis",
     "final_response",
+    "checkpoint_schema_revision",
+    "discovery_need",
+    "discovery",
+    "document_selection_clarification",
+    "research_target_selection",
 )
+
+_REVISION_TWO_ONLY_KEYS = frozenset({
+    "discovery_need",
+    "discovery",
+    "document_selection_clarification",
+    "research_target_selection",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -116,23 +152,6 @@ _CHECKPOINT_REQUIRED_KEYS = (
 # ---------------------------------------------------------------------------
 
 ModelT = TypeVar("ModelT", bound=ContractModel)
-
-
-def _fail(message: str) -> None:
-    raise ContractValidationError(message)
-
-
-def _require_non_blank(value: object, field: str) -> None:
-    if not isinstance(value, str) or not value.strip():
-        _fail(f"{field} must be a non-blank string")
-
-
-def _require_unique(values: Iterable[object], field: str) -> None:
-    seen: set[object] = set()
-    for value in values:
-        if value in seen:
-            _fail(f"duplicate {field}: {value!r}")
-        seen.add(value)
 
 
 def _input_target_ids(capability_input: object) -> tuple[str, ...]:
@@ -423,21 +442,80 @@ def validate_query_analysis(analysis: QueryAnalysis) -> None:
 # ---------------------------------------------------------------------------
 
 
-def validate_task_plan(plan: TaskPlan, bindings: DocumentBindingSet) -> None:
+def _selected_refs(
+    target_selection: ResearchTargetSelection,
+) -> dict[str, tuple[TargetSlot, SelectedBindingRef]]:
+    slots = {slot.slot_id: slot for slot in target_selection.target_slots}
+    refs: dict[str, tuple[TargetSlot, SelectedBindingRef]] = {}
+    for slot_selection in target_selection.slot_bindings:
+        slot = slots.get(slot_selection.slot_id)
+        if slot is None:
+            continue
+        for ref in slot_selection.selections:
+            refs[ref.target_id] = (slot, ref)
+    return refs
+
+
+def validate_task_plan(
+    plan: TaskPlan,
+    bindings: DocumentBindingSet,
+    *,
+    target_selection: ResearchTargetSelection | None = None,
+    discovery_checkpoint: DiscoveryCheckpoint | None = None,
+) -> None:
     """Spec §13/§26: ID, DAG, binding, target, and criteria integrity for a plan."""
 
-    _validate_plan_structure(plan)
+    _validate_plan_structure(
+        plan,
+        target_selection=target_selection,
+        discovery_checkpoint=discovery_checkpoint,
+    )
     binding_by_id = {binding.binding_id: binding for binding in bindings.bindings}
-    for unit in plan.target_units:
-        binding = binding_by_id.get(unit.binding_id)
-        if binding is None:
+    if target_selection is not None:
+        validate_research_target_selection(
+            target_selection, bindings, discovery_checkpoint
+        )
+        selected_refs = _selected_refs(target_selection)
+        planned_target_ids = {unit.target_id for unit in plan.target_units}
+        missing_targets = set(selected_refs) - planned_target_ids
+        if missing_targets:
             _fail(
-                f"target unit {unit.target_id} references unknown binding {unit.binding_id}"
+                f"selected target(s) {sorted(missing_targets)} have no "
+                "TargetUnit in the plan"
             )
-        if binding.role not in ("target", "reference"):
-            _fail(
-                f"target unit {unit.target_id} cannot bind a {binding.role!r} document: target/reference roles are required"
-            )
+        for unit in plan.target_units:
+            selected = selected_refs.get(unit.target_id)
+            if selected is None:
+                _fail(
+                    f"target unit {unit.target_id} does not resolve to a "
+                    "selected binding"
+                )
+            slot, ref = selected
+            if unit.binding_id != ref.binding_id:
+                _fail(
+                    f"target unit {unit.target_id} binding {unit.binding_id} "
+                    f"does not match selected binding {ref.binding_id}"
+                )
+            if unit.requested_locator != slot.requested_locator:
+                _fail(
+                    f"target unit {unit.target_id} locator does not match the "
+                    f"owning slot {slot.slot_id} locator"
+                )
+            if unit.binding_id not in binding_by_id:
+                _fail(
+                    f"target unit {unit.target_id} references unknown binding {unit.binding_id}"
+                )
+    else:
+        for unit in plan.target_units:
+            binding = binding_by_id.get(unit.binding_id)
+            if binding is None:
+                _fail(
+                    f"target unit {unit.target_id} references unknown binding {unit.binding_id}"
+                )
+            if binding.role not in ("target", "reference"):
+                _fail(
+                    f"target unit {unit.target_id} cannot bind a {binding.role!r} document: target/reference roles are required"
+                )
     referenced = {
         target_id for task in plan.tasks for target_id in _input_target_ids(task.input)
     }
@@ -469,6 +547,10 @@ def validate_replan(
     outcomes: tuple[TaskExecutionSummary, ...],
     policy: DiscoveryPolicy,
     budget: ResearchBudgetView,
+    *,
+    bindings: DocumentBindingSet | None = None,
+    target_selection: ResearchTargetSelection | None = None,
+    discovery_checkpoint: DiscoveryCheckpoint | None = None,
 ) -> TaskPlan:
     """Spec §16/§17/§26: bounded, append-only replanning.
 
@@ -477,7 +559,11 @@ def validate_replan(
     deterministic about the proposal is enforced here.
     """
 
-    _validate_plan_structure(proposed)
+    _validate_plan_structure(
+        proposed,
+        target_selection=target_selection,
+        discovery_checkpoint=discovery_checkpoint,
+    )
     if proposed.plan_id != current.plan_id:
         _fail("replan must keep the plan_id of the current plan")
     if proposed.goal != current.goal:
@@ -509,6 +595,17 @@ def validate_replan(
     if budget.max_parallel_branches < 1:
         _fail("ResearchBudgetView.max_parallel_branches must be at least 1")
     _validate_replan_discovery(new_tasks, policy)
+    if target_selection is not None or discovery_checkpoint is not None:
+        if bindings is None:
+            _fail(
+                "replanning a discovery-expanded plan requires the binding set"
+            )
+        validate_task_plan(
+            proposed,
+            bindings,
+            target_selection=target_selection,
+            discovery_checkpoint=discovery_checkpoint,
+        )
     return proposed
 
 
@@ -543,7 +640,12 @@ def validate_task_outcomes(
             )
 
 
-def _validate_plan_structure(plan: TaskPlan) -> None:
+def _validate_plan_structure(
+    plan: TaskPlan,
+    *,
+    target_selection: ResearchTargetSelection | None = None,
+    discovery_checkpoint: DiscoveryCheckpoint | None = None,
+) -> None:
     _require_non_blank(plan.plan_id, "TaskPlan.plan_id")
     _require_non_blank(plan.goal, "TaskPlan.goal")
     for unit in plan.target_units:
@@ -561,6 +663,8 @@ def _validate_plan_structure(plan: TaskPlan) -> None:
     target_ids = {unit.target_id for unit in plan.target_units}
     task_ids = {task.task_id for task in plan.tasks}
     capability_by_task = {task.task_id: task.capability for task in plan.tasks}
+    task_by_id = {task.task_id: task for task in plan.tasks}
+    probe_owners: set[str] = set()
     for task in plan.tasks:
         if task.capability != task.input.kind:
             _fail(
@@ -575,7 +679,14 @@ def _validate_plan_structure(plan: TaskPlan) -> None:
         for target_id in _input_target_ids(task.input):
             if target_id not in target_ids:
                 _fail(f"task {task.task_id} references unknown target {target_id}")
-        _validate_task_origin(task, task_ids)
+        _validate_task_origin(
+            task,
+            task_ids,
+            task_by_id=task_by_id,
+            target_selection=target_selection,
+            discovery_checkpoint=discovery_checkpoint,
+            probe_owners=probe_owners,
+        )
         _validate_materialized_person_dependency(task, capability_by_task)
     _require_acyclic(plan.tasks)
 
@@ -616,9 +727,31 @@ def _validate_completion_criteria(unit: TargetUnit) -> None:
     )
 
 
-def _validate_task_origin(task: TaskSpec, task_ids: set[str]) -> None:
+def _validate_task_origin(
+    task: TaskSpec,
+    task_ids: set[str],
+    *,
+    task_by_id: Mapping[str, TaskSpec],
+    target_selection: ResearchTargetSelection | None,
+    discovery_checkpoint: DiscoveryCheckpoint | None,
+    probe_owners: set[str],
+) -> None:
     origin = task.origin
     if isinstance(origin, InitialTaskOrigin):
+        return
+    if isinstance(origin, DiscoveryProbeTaskOrigin):
+        _validate_probe_origin(
+            task, origin, discovery_checkpoint, probe_owners
+        )
+        return
+    if isinstance(origin, DiscoveryExpansionTaskOrigin):
+        _validate_expansion_origin(
+            task,
+            origin,
+            task_by_id=task_by_id,
+            target_selection=target_selection,
+            discovery_checkpoint=discovery_checkpoint,
+        )
         return
     _require_non_blank(origin.reason, f"ReplanTaskOrigin.reason for task {task.task_id}")
     _require_unique(origin.task_ids, "ReplanTaskOrigin.task_ids")
@@ -628,6 +761,150 @@ def _validate_task_origin(task: TaskSpec, task_ids: set[str]) -> None:
     for reference in origin.task_ids:
         if reference not in task_ids:
             _fail(f"task {task.task_id} origin references unknown task {reference}")
+
+
+def _validate_probe_origin(
+    task: TaskSpec,
+    origin: DiscoveryProbeTaskOrigin,
+    discovery_checkpoint: DiscoveryCheckpoint | None,
+    probe_owners: set[str],
+) -> None:
+    if discovery_checkpoint is None:
+        _fail(
+            f"task {task.task_id} carries a discovery probe origin but no "
+            "DiscoveryCheckpoint context was supplied"
+        )
+    if task.capability != "document.search" or not isinstance(
+        task.input, DocumentSearchInput
+    ):
+        _fail(
+            f"discovery probe task {task.task_id} must be document.search "
+            "with DocumentSearchInput"
+        )
+    if _input_target_ids(task.input) or _carries_materialized_person_identifier(
+        task.input
+    ):
+        _fail(
+            f"discovery probe task {task.task_id} must not carry target IDs "
+            "or a materialized person scalar"
+        )
+    matches = [
+        probe
+        for probe in discovery_checkpoint.accepted_probes
+        if probe.probe_id == origin.probe_id
+    ]
+    if len(matches) != 1:
+        _fail(
+            f"discovery probe task {task.task_id} must match exactly one "
+            f"accepted probe ({len(matches)} matched {origin.probe_id!r})"
+        )
+    probe = matches[0]
+    if origin.slot_id != probe.slot_id or origin.round != probe.round:
+        _fail(
+            f"discovery probe task {task.task_id} origin does not match "
+            f"probe {probe.probe_id} slot/round"
+        )
+    if _normalize_probe_query(task.input.query) != _normalize_probe_query(
+        probe.query
+    ):
+        _fail(
+            f"discovery probe task {task.task_id} query does not match "
+            f"probe {probe.probe_id}"
+        )
+    if probe.probe_id in probe_owners:
+        _fail(f"probe {probe.probe_id} is owned by multiple plan tasks")
+    probe_owners.add(probe.probe_id)
+
+
+def _validate_expansion_origin(
+    task: TaskSpec,
+    origin: DiscoveryExpansionTaskOrigin,
+    *,
+    task_by_id: Mapping[str, TaskSpec],
+    target_selection: ResearchTargetSelection | None,
+    discovery_checkpoint: DiscoveryCheckpoint | None,
+) -> None:
+    if discovery_checkpoint is None or target_selection is None:
+        _fail(
+            f"task {task.task_id} carries a discovery expansion origin but "
+            "requires both discovery and target-selection context"
+        )
+    _require_unique(
+        origin.source_search_task_ids,
+        f"DiscoveryExpansionTaskOrigin.source_search_task_ids for task {task.task_id}",
+    )
+    _require_unique(
+        origin.target_slot_ids,
+        f"DiscoveryExpansionTaskOrigin.target_slot_ids for task {task.task_id}",
+    )
+    _require_unique(
+        origin.selected_aggregate_ids,
+        f"DiscoveryExpansionTaskOrigin.selected_aggregate_ids for task {task.task_id}",
+    )
+    if task.task_id in origin.source_search_task_ids:
+        _fail(f"task {task.task_id} expansion origin cannot reference itself")
+    for source_id in origin.source_search_task_ids:
+        source = task_by_id.get(source_id)
+        if source is None:
+            _fail(
+                f"task {task.task_id} expansion origin references unknown "
+                f"task {source_id}"
+            )
+        if not isinstance(source.origin, DiscoveryProbeTaskOrigin):
+            _fail(
+                f"task {task.task_id} expansion source {source_id} is not a "
+                "discovery probe task"
+            )
+    selected_refs = _selected_refs(target_selection)
+    input_target_ids = _input_target_ids(task.input)
+    if not input_target_ids:
+        _fail(
+            f"task {task.task_id} discovery expansion must read at least "
+            "one selected target"
+        )
+    slot_ids: list[str] = []
+    aggregate_ids: list = []
+    for target_id in input_target_ids:
+        selected = selected_refs.get(target_id)
+        if selected is None:
+            _fail(
+                f"task {task.task_id} references target {target_id} that does "
+                "not resolve to a selected binding"
+            )
+        slot, ref = selected
+        slot_ids.append(slot.slot_id)
+        if ref.selected_aggregate_id is not None:
+            aggregate_ids.append(ref.selected_aggregate_id)
+    if tuple(slot_ids) != origin.target_slot_ids:
+        _fail(
+            f"task {task.task_id} expansion target_slot_ids do not equal the "
+            "owning slots of its selected input targets"
+        )
+    if tuple(aggregate_ids) != origin.selected_aggregate_ids:
+        _fail(
+            f"task {task.task_id} expansion selected_aggregate_ids do not "
+            "equal its selected refs' aggregates in target order"
+        )
+    aggregates_by_id = {
+        aggregate.aggregate_id: aggregate
+        for aggregate in discovery_checkpoint.slot_aggregates
+    }
+    expected_sources: list[str] = []
+    for aggregate_id in aggregate_ids:
+        aggregate = aggregates_by_id.get(aggregate_id)
+        if aggregate is None:
+            _fail(
+                f"task {task.task_id} expansion references unknown aggregate "
+                f"{aggregate_id}"
+            )
+        for source_id in aggregate.source_task_ids:
+            if source_id not in expected_sources:
+                expected_sources.append(source_id)
+    if tuple(expected_sources) != origin.source_search_task_ids:
+        _fail(
+            f"task {task.task_id} expansion source_search_task_ids do not "
+            "equal the union of its selected aggregates' source tasks"
+        )
 
 
 def _require_acyclic(tasks: tuple[TaskSpec, ...]) -> None:
@@ -672,6 +949,13 @@ def validate_research_planning_input(planning_input: ResearchPlanningInput) -> N
         _fail("ResearchBudgetView.max_replans_remaining must be non-negative")
     if planning_input.budget.max_parallel_branches < 1:
         _fail("ResearchBudgetView.max_parallel_branches must be at least 1")
+    if planning_input.target_selection is not None:
+        validate_research_target_selection(
+            planning_input.target_selection,
+            planning_input.bindings,
+            planning_input.discovery_checkpoint,
+            planning_input.query_analysis,
+        )
     if planning_input.current_plan is None:
         if (
             planning_input.task_outcomes
@@ -684,7 +968,12 @@ def validate_research_planning_input(planning_input: ResearchPlanningInput) -> N
         return
     if planning_input.prior_evaluation is None:
         _fail("replanning requires the latest prior evaluation")
-    validate_task_plan(planning_input.current_plan, planning_input.bindings)
+    validate_task_plan(
+        planning_input.current_plan,
+        planning_input.bindings,
+        target_selection=planning_input.target_selection,
+        discovery_checkpoint=planning_input.discovery_checkpoint,
+    )
     if planning_input.task_outcomes:
         validate_task_outcomes(planning_input.task_outcomes, planning_input.current_plan)
 
@@ -1172,9 +1461,138 @@ def validate_clarification_resolution(
         )
 
 
+def validate_document_selection_clarification(
+    request: DocumentSelectionClarification,
+) -> None:
+    """Discovery spec §15: structural integrity of the public selection frame."""
+
+    _require_contract_version(
+        request.contract_version, "DocumentSelectionClarification"
+    )
+    _require_non_blank(
+        request.clarification_id, "DocumentSelectionClarification.clarification_id"
+    )
+    _require_non_blank(request.question, "DocumentSelectionClarification.question")
+    if request.expires_at.tzinfo is None or request.expires_at.utcoffset() is None:
+        _fail("DocumentSelectionClarification.expires_at must be timezone-aware")
+    if not request.slots:
+        _fail("DocumentSelectionClarification.slots must not be empty")
+    _require_unique(
+        (slot.slot_id for slot in request.slots), "DocumentSelectionSlot.slot_id"
+    )
+    tokens: list[str] = []
+    for slot in request.slots:
+        _require_non_blank(slot.slot_id, "DocumentSelectionSlot.slot_id")
+        _require_non_blank(slot.slot_label, "DocumentSelectionSlot.slot_label")
+        if not slot.choices or len(slot.choices) > MAX_PUBLIC_CHOICES:
+            _fail(
+                f"selection slot {slot.slot_id} must offer 1..{MAX_PUBLIC_CHOICES} choices"
+            )
+        if not 1 <= slot.min_selections <= slot.max_selections <= len(slot.choices):
+            _fail(
+                f"selection slot {slot.slot_id} has invalid cardinality "
+                f"{slot.min_selections}..{slot.max_selections} for "
+                f"{len(slot.choices)} choices"
+            )
+        for choice in slot.choices:
+            _require_non_blank(choice.choice_token, "DocumentSelectionChoice.choice_token")
+            _require_non_blank(choice.title, "DocumentSelectionChoice.title")
+            tokens.append(choice.choice_token)
+    _require_unique(tokens, "DocumentSelectionChoice.choice_token")
+
+
+def validate_document_selection_resolution(
+    request: DocumentSelectionClarification,
+    resolution: DocumentSelectionResolution,
+) -> None:
+    """Discovery spec §15: declined XOR selections; tokens resolve per slot."""
+
+    _require_contract_version(
+        resolution.contract_version, "DocumentSelectionResolution"
+    )
+    if resolution.clarification_id != request.clarification_id:
+        _fail(
+            f"clarification_id mismatch: resolution closes "
+            f"{resolution.clarification_id!r}, expected {request.clarification_id!r}"
+        )
+    if resolution.declined:
+        if resolution.selections:
+            _fail("a declined document selection must not carry selections")
+        return
+    if not resolution.selections:
+        _fail("a non-declined document selection requires selections")
+    slots_by_id = {slot.slot_id: slot for slot in request.slots}
+    _require_unique(
+        (selection.slot_id for selection in resolution.selections),
+        "DocumentSlotResolution.slot_id",
+    )
+    if {selection.slot_id for selection in resolution.selections} != set(slots_by_id):
+        _fail("a non-declined resolution must cover every request slot exactly once")
+    for selection in resolution.selections:
+        slot = slots_by_id.get(selection.slot_id)
+        if slot is None:
+            _fail(f"resolution references unknown slot {selection.slot_id}")
+        _require_unique(
+            selection.choice_tokens, "DocumentSlotResolution.choice_tokens"
+        )
+        if not slot.min_selections <= len(selection.choice_tokens) <= slot.max_selections:
+            _fail(
+                f"resolution for slot {selection.slot_id} selects "
+                f"{len(selection.choice_tokens)} token(s) outside "
+                f"{slot.min_selections}..{slot.max_selections}"
+            )
+        offered = {choice.choice_token for choice in slot.choices}
+        for token in selection.choice_tokens:
+            if token not in offered:
+                _fail(
+                    f"resolution token for slot {selection.slot_id} is not an "
+                    "offered choice"
+                )
+
+
+def validate_clarification_slot_exclusion(
+    clarification: ClarificationRequest | None,
+    document_selection_clarification: DocumentSelectionClarification | None,
+) -> None:
+    """Discovery spec §6: at most one persisted clarification slot is live."""
+
+    if clarification is not None and document_selection_clarification is not None:
+        _fail(
+            "clarification and document_selection_clarification are mutually exclusive"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Spec §7 / §21 / §25 — checkpoint aggregates
 # ---------------------------------------------------------------------------
+
+
+def migrate_checkpoint_payload(payload: Mapping[str, object]) -> dict[str, object]:
+    """Spec §3.5: exact revision classification; legacy gains the new slots."""
+
+    values = dict(payload)
+    has_revision_key = "checkpoint_schema_revision" in values
+    revision = values.get("checkpoint_schema_revision")
+    has_new_shape = any(key in values for key in _REVISION_TWO_ONLY_KEYS)
+
+    if has_revision_key and type(revision) is not int:
+        raise IncompatibleCheckpointError(
+            f"checkpoint_schema_revision {revision!r} is not an integer"
+        )
+    if revision in (None, 1):
+        if has_new_shape:
+            raise IncompatibleCheckpointError(
+                "legacy checkpoint carries a partial revision-2 shape"
+            )
+        values.setdefault("synthesis", None)
+        values["checkpoint_schema_revision"] = CHECKPOINT_SCHEMA_REVISION
+        values.update({key: None for key in _REVISION_TWO_ONLY_KEYS})
+        return values
+    if revision != CHECKPOINT_SCHEMA_REVISION:
+        raise IncompatibleCheckpointError(
+            f"unknown checkpoint_schema_revision {revision!r}"
+        )
+    return values
 
 
 def validate_checkpoint_payload(payload: Mapping[str, object]) -> None:
@@ -1190,12 +1608,23 @@ def validate_checkpoint_payload(payload: Mapping[str, object]) -> None:
         raise IncompatibleCheckpointError(
             f"checkpoint payload declares contract_version {declared!r}, expected {CONTRACT_VERSION!r}"
         )
+    revision = payload.get("checkpoint_schema_revision")
+    if type(revision) is not int or revision != CHECKPOINT_SCHEMA_REVISION:
+        raise IncompatibleCheckpointError(
+            f"checkpoint payload declares checkpoint_schema_revision {revision!r}, expected {CHECKPOINT_SCHEMA_REVISION!r}"
+        )
     missing = [key for key in _CHECKPOINT_REQUIRED_KEYS if key not in payload]
     if missing:
         raise IncompatibleCheckpointError(
             f"checkpoint payload is missing required key(s): {', '.join(missing)}"
         )
-    for slot in ("request", "clarification", "synthesis", "final_response"):
+    for slot in (
+        "request",
+        "clarification",
+        "synthesis",
+        "final_response",
+        "document_selection_clarification",
+    ):
         value = payload.get(slot)
         if value is not None:
             _require_declared_checkpoint_version(value, boundary=slot)
@@ -1231,6 +1660,11 @@ def validate_supervisor_state(state: SupervisorV2State) -> None:
         raise IncompatibleCheckpointError(
             f"SupervisorV2State declares contract_version {declared!r}, expected {CONTRACT_VERSION!r}"
         )
+    revision = state.get("checkpoint_schema_revision")
+    if type(revision) is not int or revision != CHECKPOINT_SCHEMA_REVISION:
+        raise IncompatibleCheckpointError(
+            f"SupervisorV2State declares checkpoint_schema_revision {revision!r}, expected {CHECKPOINT_SCHEMA_REVISION!r}"
+        )
     request = _as_model(state["request"], "request", RequestContext)
     conversation = _as_model(state["conversation"], "conversation", ConversationContext)
     semantic = _as_model(state["semantic"], "semantic", SemanticContext)
@@ -1239,6 +1673,14 @@ def validate_supervisor_state(state: SupervisorV2State) -> None:
     query_analysis = _optional_model(state, "query_analysis", QueryAnalysis)
     route_decision = _optional_model(state, "route_decision", RouteDecision)
     clarification = _optional_model(state, "clarification", ClarificationRequest)
+    document_selection_clarification = _optional_model(
+        state, "document_selection_clarification", DocumentSelectionClarification
+    )
+    discovery_need = _optional_model(state, "discovery_need", DiscoveryNeed)
+    discovery = _optional_model(state, "discovery", DiscoveryCheckpoint)
+    research_target_selection = _optional_model(
+        state, "research_target_selection", ResearchTargetSelection
+    )
     synthesis = _optional_model(state, "synthesis", SynthesisCheckpoint)
     final_response = _optional_model(state, "final_response", FinalResponse)
 
@@ -1249,40 +1691,81 @@ def validate_supervisor_state(state: SupervisorV2State) -> None:
     if query_analysis is not None:
         validate_query_analysis(query_analysis)
     if route_decision is not None:
-        if route_decision.route == "clarify" and clarification is None:
-            _fail("clarify route requires a persisted ClarificationRequest")
+        if (
+            route_decision.route == "clarify"
+            and clarification is None
+            and document_selection_clarification is None
+        ):
+            _fail(
+                "clarify route requires a persisted ClarificationRequest "
+                "or DocumentSelectionClarification"
+            )
         if route_decision.route == "direct" and execution.plan is not None:
             _fail(
                 "direct route executes no capability and must keep ExecutionState.plan=None"
             )
     if clarification is not None:
         validate_clarification_request(clarification, semantic)
+    if document_selection_clarification is not None:
+        validate_document_selection_clarification(document_selection_clarification)
+        if discovery is None:
+            _fail(
+                "document_selection_clarification requires a DiscoveryCheckpoint"
+            )
+    validate_clarification_slot_exclusion(
+        clarification, document_selection_clarification
+    )
+    if discovery_need is not None:
+        validate_discovery_need(discovery_need)
+    if discovery is not None:
+        validate_discovery_checkpoint(
+            discovery,
+            plan=execution.plan,
+            task_results=execution.task_results,
+            clarification=document_selection_clarification,
+        )
+    if research_target_selection is not None:
+        validate_research_target_selection(
+            research_target_selection,
+            bindings,
+            discovery,
+            query_analysis,
+        )
     if final_response is not None:
         validate_final_response(final_response)
     if synthesis is not None:
         validate_synthesis_checkpoint(synthesis)
-    _validate_execution_state(execution, bindings)
+    _validate_execution_state(
+        execution,
+        bindings,
+        target_selection=research_target_selection,
+        discovery_checkpoint=discovery,
+    )
 
 
-def _validate_execution_state(execution: ExecutionState, bindings: DocumentBindingSet) -> None:
+def _validate_execution_state(
+    execution: ExecutionState,
+    bindings: DocumentBindingSet,
+    *,
+    target_selection: ResearchTargetSelection | None = None,
+    discovery_checkpoint: DiscoveryCheckpoint | None = None,
+) -> None:
     if execution.plan is None:
         if execution.task_results:
             _fail("task results require a checkpointed TaskPlan")
         if execution.evidence_evaluation is not None:
             _fail("evidence evaluation requires a checkpointed TaskPlan")
         return
-    validate_task_plan(execution.plan, bindings)
+    validate_task_plan(
+        execution.plan,
+        bindings,
+        target_selection=target_selection,
+        discovery_checkpoint=discovery_checkpoint,
+    )
     for result in execution.task_results:
         validate_agent_result(result, execution.plan)
     if execution.evidence_evaluation is not None:
         validate_evidence_evaluation(execution.evidence_evaluation, execution.plan)
-
-
-def _require_contract_version(declared: object, boundary: str) -> None:
-    if declared != CONTRACT_VERSION:
-        raise IncompatibleCheckpointError(
-            f"{boundary} declares contract_version {declared!r}, expected {CONTRACT_VERSION!r}"
-        )
 
 
 def _require_declared_checkpoint_version(value: object, *, boundary: str) -> None:

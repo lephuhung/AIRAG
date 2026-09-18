@@ -77,6 +77,9 @@ from .contracts.planning import (
     TaskPlan,
     TaskSpec,
 )
+from .contracts.planning import (
+    build_research_budget_view as _plan_budget_view,
+)
 from .contracts.routing import QueryAnalysis, RouteDecision
 from .contracts.semantic import SemanticContext
 from .contracts.state import GraphRuntimeContext, SupervisorV2State
@@ -93,6 +96,10 @@ from .execution.scheduler import (
     shared_scheduler_for,
 )
 from .discovery import DiscoveryDenied, DiscoveryDisabled, request_addition
+from .discovery_bootstrap.contracts import (
+    DiscoveryCheckpoint,
+    ResearchTargetSelection,
+)
 from .nodes.context import node_context
 from .nodes.evaluate import _EVIDENCE_SUPPLYING_CAPABILITIES, evaluate_evidence
 from .planning import PlannerError
@@ -178,6 +185,10 @@ class V2ResearchLimits:
     #: budget is ``V2_MAX_REPLANS`` in implementation settings, read by
     #: :meth:`from_settings`. No hardcoded constant exists anywhere else.
     max_replans: int = 0
+    #: Absolute task-count ceiling for one plan lineage, probes included
+    #: (discovery spec §11.3). Defaults to the discovery plus research
+    #: maxima (5 + 8); read from ``V2_TOTAL_MAX_TASKS``.
+    total_max_tasks: int = 13
 
     @classmethod
     def from_settings(cls, settings: Any = None) -> "V2ResearchLimits":
@@ -192,6 +203,9 @@ class V2ResearchLimits:
                 getattr(settings, "V2_MAX_PARALLEL_BRANCHES", cls.max_parallel_branches)
             ),
             max_replans=int(getattr(settings, "V2_MAX_REPLANS", cls.max_replans)),
+            total_max_tasks=int(
+                getattr(settings, "V2_TOTAL_MAX_TASKS", cls.total_max_tasks)
+            ),
         )
 
 
@@ -246,6 +260,8 @@ class ComplexResearchState(TypedDict, total=False):
     #: never added; a later pass with budget skips already-bound candidates
     #: and settles the rest.
     discovery_deferred: tuple[str, ...]
+    discovery: DiscoveryCheckpoint | None
+    research_target_selection: ResearchTargetSelection | None
 
 
 def require_query_analysis(state: ComplexResearchState) -> QueryAnalysis:
@@ -342,15 +358,36 @@ def build_research_budget_view(
 
     Never persisted; rebuilt on each planner/replanner call. Settings supply
     the deployment limits; the live plan and ``replans_remaining`` supply
-    what is already consumed.
+    what is already consumed. When a checkpointed plan exists this delegates
+    to the pure contract builder (discovery spec §11.3): probe tasks that
+    exactly match an accepted checkpoint probe are budget-exempt, spoofed
+    origins fail closed, and the remaining task budget is bounded by BOTH
+    the factual research budget and the absolute ``V2_TOTAL_MAX_TASKS``
+    capacity.
     """
+    _ = runtime
     limits = V2ResearchLimits.from_settings()
+    effective_replans = max(
+        0, min(state.get("replans_remaining", 0), limits.max_replans)
+    )
     plan = state.get("plan")
-    used_tasks = len(plan.tasks) if plan is not None else 0
-    return ResearchBudgetView(
-        max_tasks_remaining=max(0, limits.max_tasks - used_tasks),
-        max_replans_remaining=max(0, min(state.get("replans_remaining", 0), limits.max_replans)),
+    if plan is None:
+        # Initial planning receives the full research budget, still bounded
+        # by the absolute total-task cap.
+        return ResearchBudgetView(
+            max_tasks_remaining=max(
+                0, min(limits.max_tasks, limits.total_max_tasks)
+            ),
+            max_replans_remaining=effective_replans,
+            max_parallel_branches=limits.max_parallel_branches,
+        )
+    return _plan_budget_view(
+        plan,
+        discovery_checkpoint=state.get("discovery"),
+        max_tasks=limits.max_tasks,
+        max_replans=effective_replans,
         max_parallel_branches=limits.max_parallel_branches,
+        total_task_limit=limits.total_max_tasks,
     )
 
 
@@ -385,6 +422,8 @@ def build_planning_input(
         task_outcomes=build_task_execution_summaries(results),
         prior_evidence_uses=collect_evidence_use_refs(results),
         prior_evaluation=state.get("evaluation"),
+        target_selection=state.get("research_target_selection"),
+        discovery_checkpoint=state.get("discovery"),
     )
 
 
@@ -477,6 +516,12 @@ def normalize_complex_state(state: ComplexResearchState) -> ComplexResearchState
         reduce_spec=_coerce_reduce_spec(state.get("reduce_spec")),
         discovery_deferred=_coerce_deferred_list(
             state.get("discovery_deferred", ())
+        ),
+        discovery=_coerce_slot(state.get("discovery"), DiscoveryCheckpoint, slot="discovery"),
+        research_target_selection=_coerce_slot(
+            state.get("research_target_selection"),
+            ResearchTargetSelection,
+            slot="research_target_selection",
         ),
     )
 
@@ -849,36 +894,57 @@ def build_initial_proposal(planning_input: ResearchPlanningInput) -> InitialProp
     capability).
     Bounded summarize never reaches here (the
     deterministic router keeps single-document summaries on the fast path).
-    Any other work type raises :class:`ContractValidationError` so the
-    caller returns the typed unavailable boundary, never a plan.
+    A covering skill's refusal — no plannable binding, wrong arity, or an
+    unservable read — falls back to the shared targetless workspace
+    retrieval plan (search-first: the deep agent retrieves evidence before
+    summarizing instead of depending on incoming ``document_ids``); the
+    fallback itself fails closed when ``document.retrieve`` is absent from
+    the request-scoped catalog. Only a work type no skill owns still raises
+    :class:`ContractValidationError` so the caller returns the typed
+    unavailable boundary, never a plan.
     """
     work_type = planning_input.query_analysis.work_type
-    if work_type == compare_policy.COMPARE_WORK_TYPE:
+    try:
+        if work_type == compare_policy.COMPARE_WORK_TYPE:
+            return InitialProposal(
+                plan=compare_policy.build_compare_plan(planning_input),
+                reduce_spec=None,
+            )
+        if work_type == summarize_policy.SUMMARIZE_WORK_TYPE:
+            workflow = summarize_policy.build_summarize_workflow(planning_input)
+            return InitialProposal(plan=workflow.plan, reduce_spec=workflow.reduce)
+        if work_type == retrieve_policy.RETRIEVE_WORK_TYPE:
+            return InitialProposal(
+                plan=retrieve_policy.build_retrieve_plan(planning_input),
+                reduce_spec=None,
+            )
+        if work_type == multi_goal_policy.MULTI_GOAL_WORK_TYPE:
+            return InitialProposal(
+                plan=multi_goal_policy.build_multi_goal_plan(planning_input),
+                reduce_spec=None,
+            )
+        if work_type == evaluate_policy.EVALUATE_WORK_TYPE:
+            return InitialProposal(
+                plan=evaluate_policy.build_evaluate_plan(planning_input),
+                reduce_spec=None,
+            )
+        if work_type == "cross_domain":
+            return InitialProposal(
+                plan=_people_first_plan(planning_input), reduce_spec=None
+            )
+    except ContractValidationError:
+        if (
+            work_type
+            in {
+                summarize_policy.SUMMARIZE_WORK_TYPE,
+                compare_policy.COMPARE_WORK_TYPE,
+            }
+            and planning_input.target_selection is not None
+        ):
+            raise
         return InitialProposal(
-            plan=compare_policy.build_compare_plan(planning_input),
+            plan=retrieve_policy.build_unscoped_retrieve_plan(planning_input),
             reduce_spec=None,
-        )
-    if work_type == summarize_policy.SUMMARIZE_WORK_TYPE:
-        workflow = summarize_policy.build_summarize_workflow(planning_input)
-        return InitialProposal(plan=workflow.plan, reduce_spec=workflow.reduce)
-    if work_type == retrieve_policy.RETRIEVE_WORK_TYPE:
-        return InitialProposal(
-            plan=retrieve_policy.build_retrieve_plan(planning_input),
-            reduce_spec=None,
-        )
-    if work_type == multi_goal_policy.MULTI_GOAL_WORK_TYPE:
-        return InitialProposal(
-            plan=multi_goal_policy.build_multi_goal_plan(planning_input),
-            reduce_spec=None,
-        )
-    if work_type == evaluate_policy.EVALUATE_WORK_TYPE:
-        return InitialProposal(
-            plan=evaluate_policy.build_evaluate_plan(planning_input),
-            reduce_spec=None,
-        )
-    if work_type == "cross_domain":
-        return InitialProposal(
-            plan=_people_first_plan(planning_input), reduce_spec=None
         )
     raise ContractValidationError(
         f"work type {work_type!r} has no complex skill policy; out of scope"
@@ -1201,7 +1267,12 @@ async def validate_checkpoint_node(
         except (ContractValidationError, PlannerError):
             return {}
         bindings = state["bindings"]
-        validate_task_plan(initial.plan, bindings)
+        validate_task_plan(
+            initial.plan,
+            bindings,
+            target_selection=state.get("research_target_selection"),
+            discovery_checkpoint=state.get("discovery"),
+        )
         await _lease_pinned_state(
             plan=initial.plan,
             bindings=bindings,
@@ -1229,6 +1300,10 @@ async def validate_checkpoint_node(
     # R52: the single authoritative append + validation happen HERE, inside
     # the governed entry point, on the proposal returned by
     # build_replan_proposal (which never appends or validates itself).
+    # For a discovery-context plan, the absolute total-task cap
+    # (V2_TOTAL_MAX_TASKS, probes included) is enforced here as
+    # defense-in-depth on top of the budget view's own min(factual, total)
+    # accounting; non-bootstrap callers keep the prior uncapped seam.
     try:
         accepted = append_replan_tasks(
             current,
@@ -1237,6 +1312,14 @@ async def validate_checkpoint_node(
             proposal.policy,
             proposal.budget,
             context,
+            bindings=state["bindings"],
+            target_selection=state.get("research_target_selection"),
+            discovery_checkpoint=state.get("discovery"),
+            total_task_limit=(
+                V2ResearchLimits.from_settings().total_max_tasks
+                if state.get("discovery") is not None
+                else None
+            ),
         )
     except (ContractValidationError, ReplanRejected):
         # Deterministically invalid: spend the budget so decide finalizes.
@@ -1320,6 +1403,11 @@ async def complex_execute_node(
         prior_results=prior_results,
         bindings=state.get("bindings"),
         v1_fallback_guard=_production_v1_fallback_guard(state),
+        total_task_limit=(
+            V2ResearchLimits.from_settings().total_max_tasks
+            if state.get("discovery") is not None
+            else None
+        ),
     )
     return {"task_results": report.results}
 
@@ -1405,12 +1493,18 @@ async def people_document_materialize_node(
             allow_supporting_discovery=True,
             max_discovered_documents=1,
         )
-        budget = ResearchBudgetView(
-            max_tasks_remaining=max(0, limits.max_tasks - len(plan.tasks)),
-            max_replans_remaining=1,
-            max_parallel_branches=limits.max_parallel_branches,
-        )
         try:
+            # Total-aware accounting (discovery spec §11.3): probe-exempt
+            # counting plus the absolute V2_TOTAL_MAX_TASKS bound, so the
+            # appended plan can never exceed the configured total cap.
+            budget = _plan_budget_view(
+                plan,
+                discovery_checkpoint=state.get("discovery"),
+                max_tasks=limits.max_tasks,
+                max_replans=1,
+                max_parallel_branches=limits.max_parallel_branches,
+                total_task_limit=limits.total_max_tasks,
+            )
             dependent = append_materialized_dependent(
                 current=plan,
                 outcome=outcome,
@@ -1418,7 +1512,20 @@ async def people_document_materialize_node(
                 next_task_id=f"T{index}",
             )
             accepted = append_replan_tasks(
-                plan, (dependent,), outcomes, policy, budget, context
+                plan,
+                (dependent,),
+                outcomes,
+                policy,
+                budget,
+                context,
+                bindings=bindings,
+                target_selection=state.get("research_target_selection"),
+                discovery_checkpoint=state.get("discovery"),
+                total_task_limit=(
+                    limits.total_max_tasks
+                    if state.get("discovery") is not None
+                    else None
+                ),
             )
         except (MaterializationError, ContractValidationError, ReplanRejected):
             continue
@@ -1819,6 +1926,8 @@ def build_complex_research_state(state: SupervisorV2State) -> ComplexResearchSta
         replans_remaining=V2ResearchLimits.from_settings().max_replans,
         reduce_spec=None,
         discovery_deferred=(),
+        discovery=state.get("discovery"),
+        research_target_selection=state.get("research_target_selection"),
     )
 
 
@@ -1827,12 +1936,15 @@ def merge_complex_result_into_supervisor(
 ) -> dict:
     """Merge only the execution result back (frozen ``evidence_evaluation`` name)."""
     _ = state
-    return execution_update(
+    update = execution_update(
         state,
         plan=child.get("plan"),
         task_results=child.get("task_results", ()),
         evidence_evaluation=child.get("evaluation"),
     )
+    update["discovery"] = child.get("discovery")
+    update["research_target_selection"] = child.get("research_target_selection")
+    return update
 
 
 def make_complex_boundary_node(complex_subgraph: Any) -> Any:

@@ -833,3 +833,116 @@ async def test_unbound_evaluate_stays_typed_unavailable_never_v1() -> None:
     decided = await decide_node(child, runtime)
     assert decided["unavailable"].code == COMPLEX_RESEARCH_UNAVAILABLE
     assert await complex_execute_node(child, runtime) == {}
+
+
+# ---------------------------------------------------------------------------
+# Search-first fallback: a covering skill's refusal plans workspace retrieval
+# ---------------------------------------------------------------------------
+
+
+def test_targetless_covered_work_types_fall_back_to_workspace_retrieve() -> None:
+    """Zero plannable bindings: every covered work type gets the single
+    targetless ``document.retrieve`` plan instead of the typed unavailable
+    boundary — the deep agent searches before answering rather than
+    depending on incoming ``document_ids``."""
+    from app.services.agents.v2.complex_research_graph import build_initial_proposal
+
+    for work_type in ("summarize", "compare", "evaluate", "multi_goal"):
+        proposal = build_initial_proposal(
+            _planning_input(
+                work_type,
+                capability_names=frozenset({"document.read", "document.retrieve"}),
+                bindings=_empty_bindings(),
+            )
+        )
+        assert len(proposal.plan.tasks) == 1
+        task = proposal.plan.tasks[0]
+        assert task.capability == "document.retrieve"
+        assert task.input.target_ids == ()
+        assert proposal.plan.target_units == ()
+        assert proposal.reduce_spec is None
+
+
+def test_wrong_arity_with_bindings_also_falls_back_to_retrieve() -> None:
+    """Bindings exist but the covering skill cannot plan them (``multi_goal``
+    requires at least three): the deep agent still searches first instead of
+    failing closed."""
+    from app.services.agents.v2.complex_research_graph import build_initial_proposal
+
+    proposal = build_initial_proposal(
+        _planning_input(
+            "multi_goal",
+            capability_names=frozenset({"document.read", "document.retrieve"}),
+            bindings=_two_bindings(),
+        )
+    )
+    assert [task.capability for task in proposal.plan.tasks] == ["document.retrieve"]
+    assert proposal.plan.target_units == ()
+
+
+def test_cross_domain_without_person_or_bindings_falls_back() -> None:
+    """The people-first branch needs a named person; with neither a person
+    nor bound documents the cross_domain skill refuses and the fallback
+    plans workspace retrieval."""
+    from app.services.agents.v2.complex_research_graph import build_initial_proposal
+
+    proposal = build_initial_proposal(
+        _cross_domain_input(
+            capability_names=frozenset({"document.retrieve"}),
+            bindings=_empty_bindings(),
+        )
+    )
+    assert [task.capability for task in proposal.plan.tasks] == ["document.retrieve"]
+    assert proposal.plan.target_units == ()
+
+
+def test_bindings_still_take_precedence_over_search_first() -> None:
+    """A request the covering skill can plan keeps its bounded plan — the
+    fallback never replaces bound reads with a workspace search."""
+    from app.services.agents.v2.complex_research_graph import build_initial_proposal
+
+    proposal = build_initial_proposal(
+        _planning_input(
+            "multi_goal",
+            capability_names=frozenset({"document.read", "document.retrieve"}),
+        )
+    )
+    assert proposal.plan.plan_id == "multi-goal-b1-b2-b3"
+    assert [task.capability for task in proposal.plan.tasks] == [
+        "document.read",
+        "document.read",
+        "document.read",
+    ]
+
+
+def test_search_first_fallback_requires_retrieve_capability() -> None:
+    """No ``document.retrieve`` in the request-scoped catalog: the fallback
+    fails closed — the typed unavailable boundary, never a partial plan."""
+    from app.services.agents.v2.complex_research_graph import build_initial_proposal
+    from app.services.agents.v2.contracts.validation import ContractValidationError
+
+    with pytest.raises(ContractValidationError):
+        build_initial_proposal(
+            _planning_input(
+                "summarize",
+                capability_names=frozenset({"document.read"}),
+                bindings=_empty_bindings(),
+            )
+        )
+
+
+def test_uncovered_work_type_still_has_no_skill_policy() -> None:
+    """The fallback covers skill *refusals* only; a work type no skill owns
+    still raises so the caller keeps the typed unavailable boundary (or the
+    wired adaptive planner's model path) — never a forced retrieval."""
+    from app.services.agents.v2.complex_research_graph import build_initial_proposal
+    from app.services.agents.v2.contracts.validation import ContractValidationError
+
+    with pytest.raises(ContractValidationError):
+        build_initial_proposal(
+            _planning_input(
+                "explain",
+                capability_names=frozenset({"document.retrieve"}),
+                bindings=_empty_bindings(),
+            )
+        )

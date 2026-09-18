@@ -28,7 +28,31 @@ There are **no domain agents and no domain subgraphs**: no `people_agent.py`,
 `section_agent.py`, `kg_agent.py`, and no `v2/domain/*_graph.py`. The single
 adaptive planning boundary for complex research is the complex-research
 subgraph (`plan → validate_checkpoint → execute → evaluate → decide`, extended
-with bounded append-only replan).
+with bounded append-only replan). Initial planning is search-first: when the
+covering skill refuses a work type (no plannable binding, wrong arity, an
+unservable read), `build_initial_proposal` falls back to the shared targetless
+`document.retrieve` plan (`build_unscoped_retrieve_plan`) instead of the typed
+unavailable boundary — bound targets still take precedence whenever the skill
+can plan them, and the fallback fails closed when `document.retrieve` is
+absent from the request-scoped catalog. Planner sizing and the replan/discovery
+budget are env-gated (`V2_MAX_TASKS`, `V2_MAX_PARALLEL_BRANCHES`,
+`V2_MAX_REPLANS`, `V2_ALLOW_REFERENCE_DISCOVERY`,
+`V2_ALLOW_SUPPORTING_DISCOVERY`, `V2_MAX_DISCOVERED_DOCUMENTS` — see
+`.env.example`); the defaults keep the replan edge and discovery closed until
+a rollout decision explicitly opens them.
+
+Phase-1 discovery-bootstrap contract groundwork is present but dormant:
+checkpoint schema revision `2` accepts exact revision-1 payloads (missing or
+explicit discriminator `1`, with no revision-2-only keys) and migrates them by
+adding the four nullable root slots `discovery_need`, `discovery`,
+`document_selection_clarification`, and `research_target_selection`.
+`ResearchTargetSelection` owns the frozen target slots independently of any
+`DiscoveryCheckpoint`; discovery probe/expansion task origins are valid only
+when their checkpointed discovery/selection context is supplied. The separate
+research and discovery budgets are config-bounded (`V2_DISCOVERY_*`,
+`V2_TOTAL_MAX_TASKS` in `.env.example`), and
+`V2_DISCOVERY_BOOTSTRAP_ENABLED=false`. No discovery graph node, route,
+capability dispatch, or production bootstrap behavior exists yet.
 
 ## Execution invariant (load-bearing)
 
@@ -289,7 +313,7 @@ here, and never copy the frozen architecture. A stale doc is a bug.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **AIRAG** (13388 symbols, 26328 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **AIRAG** (13838 symbols, 27090 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 

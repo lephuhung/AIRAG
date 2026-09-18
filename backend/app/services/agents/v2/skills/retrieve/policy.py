@@ -47,6 +47,7 @@ __all__ = [
     "RETRIEVE_TOP_K",
     "RETRIEVE_WORK_TYPE",
     "build_retrieve_plan",
+    "build_unscoped_retrieve_plan",
     "supports_work_type",
 ]
 
@@ -99,6 +100,42 @@ def _require_retrieve_capability(planning_input: ResearchPlanningInput) -> None:
         )
 
 
+def build_unscoped_retrieve_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
+    """Propose the targetless workspace-scope retrieval plan.
+
+    Shared construction: the ``retrieve`` skill's unscoped branch and the
+    complex boundary's search-first fallback (a covering skill's refusal —
+    no plannable binding, wrong arity, unservable read — yields this plan
+    instead of an empty boundary). One ``document.retrieve`` task over the
+    authenticated workspace scope, no target units. Fails closed when the
+    capability is absent from the request-scoped catalog.
+    """
+    _require_retrieve_capability(planning_input)
+    query = planning_input.semantic.contextualized_query
+    task = TaskSpec(
+        task_id="T1",
+        capability=RETRIEVE_CAPABILITY,
+        task_objective=f"Retrieve revision-pinned evidence for: {query}",
+        input=DocumentRetrieveInput(
+            kind="document.retrieve",
+            query=query,
+            target_ids=(),
+            top_k=RETRIEVE_TOP_K,
+        ),
+        depends_on=(),
+        origin=InitialTaskOrigin(kind="initial"),
+    )
+    plan = TaskPlan(
+        contract_version="2.0",
+        plan_id="retrieve-unscoped",
+        goal=query,
+        target_units=(),
+        tasks=(task,),
+    )
+    validate_task_plan(plan, planning_input.bindings)
+    return plan
+
+
 def build_retrieve_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
     """Propose the initial deterministic retrieval plan.
 
@@ -112,9 +149,11 @@ def build_retrieve_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
             "retrieve skill cannot plan work type "
             f"{planning_input.query_analysis.work_type!r}; out of pilot scope"
         )
+    targets = _explicit_target_bindings(planning_input.bindings)
+    if not targets:
+        return build_unscoped_retrieve_plan(planning_input)
     _require_retrieve_capability(planning_input)
     query = planning_input.semantic.contextualized_query
-    targets = _explicit_target_bindings(planning_input.bindings)
     units = tuple(
         TargetUnit(
             target_id=f"t{index + 1}",
@@ -146,13 +185,9 @@ def build_retrieve_plan(planning_input: ResearchPlanningInput) -> TaskPlan:
         depends_on=(),
         origin=InitialTaskOrigin(kind="initial"),
     )
-    if targets:
-        plan_id = "retrieve-" + "-".join(binding.binding_id for binding in targets)
-    else:
-        plan_id = "retrieve-unscoped"
     plan = TaskPlan(
         contract_version="2.0",
-        plan_id=plan_id,
+        plan_id="retrieve-" + "-".join(binding.binding_id for binding in targets),
         goal=query,
         target_units=units,
         tasks=(task,),

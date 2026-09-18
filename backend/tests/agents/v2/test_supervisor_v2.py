@@ -301,6 +301,12 @@ def make_state(
         execution=ExecutionState(plan=None, task_results=(), evidence_evaluation=None),
         clarification=None,
         final_response=None,
+        synthesis=None,
+        checkpoint_schema_revision=2,
+        discovery_need=None,
+        discovery=None,
+        document_selection_clarification=None,
+        research_target_selection=None,
     )
 
 

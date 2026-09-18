@@ -181,6 +181,7 @@ def test_semantic_snapshot_only_versions_the_envelope() -> None:
 
 def test_clarification_request_persists_only_question_specific_refs() -> None:
     assert set(ClarificationRequest.model_fields) == {
+        "kind",
         "contract_version",
         "clarification_id",
         "reason",

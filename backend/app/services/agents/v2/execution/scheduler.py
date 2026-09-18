@@ -938,6 +938,7 @@ async def execute_ready_tasks(
     runtime: GraphRuntimeContext,
     bindings: DocumentBindingSet | None = None,
     v1_fallback_guard: Any | None = None,
+    total_task_limit: int | None = None,
 ) -> DispatchReport:
     """Execute every ready plan task in plan order; report all results.
 
@@ -950,7 +951,16 @@ async def execute_ready_tasks(
     become ready (unknown dependency or cycle — the frozen validator should
     have rejected the plan at checkpoint time) raise ``SchedulerError``
     instead of silently returning a partial set.
+
+    ``total_task_limit`` is the optional absolute plan-entry ceiling
+    (discovery spec §11.3): when supplied, a plan already carrying more
+    tasks than the limit is rejected BEFORE any result validation or
+    dispatch. ``None`` (the default) preserves the exact prior behavior —
+    ``validate_task_plan`` stays cap-free so fast/legacy plans are
+    unaffected.
     """
+    if total_task_limit is not None and len(plan.tasks) > total_task_limit:
+        raise SchedulerError("plan exceeds total task limit")
     task_by_id = {task.task_id: task for task in plan.tasks}
     for result in results:
         if result.task_id not in task_by_id:
@@ -1038,6 +1048,7 @@ class TaskScheduler:
         prior_results: tuple[AgentResult, ...] = (),
         bindings: DocumentBindingSet | None = None,
         v1_fallback_guard: Any | None = None,
+        total_task_limit: int | None = None,
     ) -> DispatchReport:
         """Execute the plan's ready tasks; report prior plus new results.
 
@@ -1047,7 +1058,9 @@ class TaskScheduler:
         stop dispatch without fabricating success; a deadline stop is
         recorded on the returned ``DispatchReport.truncated`` flag.
         ``v1_fallback_guard`` is the Task 7B pre-dispatch hook (see
-        ``execute_ready_tasks``); ``None`` preserves prior behavior.
+        ``execute_ready_tasks``); ``total_task_limit`` is the optional
+        absolute plan-entry ceiling threaded to ``execute_ready_tasks``.
+        ``None`` defaults preserve prior behavior.
         """
         return await execute_ready_tasks(
             plan=plan,
@@ -1056,6 +1069,7 @@ class TaskScheduler:
             runtime=runtime,
             bindings=bindings,
             v1_fallback_guard=v1_fallback_guard,
+            total_task_limit=total_task_limit,
         )
 
 

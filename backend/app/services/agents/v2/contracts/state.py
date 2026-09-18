@@ -9,12 +9,12 @@ historical values on resume.
 """
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import Any, Final, Literal, TypedDict
 
 from .base import ContractModel, ContractVersion, RuntimeModel
 from .binding import DocumentBindingSet
 from .capability import CapabilityRuntimeContext
-from .clarification import ClarificationRequest
+from .clarification import ClarificationRequest, DocumentSelectionClarification
 from .conversation import ConversationContext
 from .evaluation import EvidenceEvaluation
 from .execution import AgentResult
@@ -24,6 +24,14 @@ from .response import FinalResponse
 from .routing import QueryAnalysis, RouteDecision
 from .semantic import SemanticContext
 from .synthesis import SynthesisCheckpoint
+from ..discovery_bootstrap.contracts import (
+    DiscoveryCheckpoint,
+    DiscoveryNeed,
+    ResearchTargetSelection,
+)
+
+CHECKPOINT_SCHEMA_REVISION: Final[Literal[2]] = 2
+CheckpointSchemaRevision = Literal[1, 2]
 
 
 class RuntimeServices(RuntimeModel):
@@ -186,3 +194,8 @@ class SupervisorV2State(TypedDict, total=True):
     clarification: ClarificationRequest | None
     synthesis: SynthesisCheckpoint | None
     final_response: FinalResponse | None
+    checkpoint_schema_revision: CheckpointSchemaRevision
+    discovery_need: DiscoveryNeed | None
+    discovery: DiscoveryCheckpoint | None
+    document_selection_clarification: DocumentSelectionClarification | None
+    research_target_selection: ResearchTargetSelection | None

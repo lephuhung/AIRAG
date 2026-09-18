@@ -134,6 +134,12 @@ def _state(**overrides: object) -> SupervisorV2State:
         "execution": ExecutionState(plan=read_plan(), task_results=(), evidence_evaluation=None),
         "clarification": None,
         "final_response": None,
+        "synthesis": None,
+        "checkpoint_schema_revision": 2,
+        "discovery_need": None,
+        "discovery": None,
+        "document_selection_clarification": None,
+        "research_target_selection": None,
     }
     base.update(overrides)
     return cast(SupervisorV2State, base)
@@ -341,6 +347,12 @@ def test_checkpoint_payload_rejects_missing_or_foreign_versions() -> None:
         "clarification": None,
         "synthesis": None,
         "final_response": None,
+        "synthesis": None,
+        "checkpoint_schema_revision": 2,
+        "discovery_need": None,
+        "discovery": None,
+        "document_selection_clarification": None,
+        "research_target_selection": None,
     }
     validate_checkpoint_payload(payload)
 
@@ -369,7 +381,9 @@ def test_checkpoint_payload_rejects_missing_or_foreign_versions() -> None:
             {**payload, "request": {"request_id": "req-1"}}
         )
     with pytest.raises(IncompatibleCheckpointError, match="missing"):
-        validate_checkpoint_payload({"contract_version": "2.0"})
+        validate_checkpoint_payload(
+            {"contract_version": "2.0", "checkpoint_schema_revision": 2}
+        )
 
 
 def test_typed_checkpoint_state_validates_when_consistent() -> None:

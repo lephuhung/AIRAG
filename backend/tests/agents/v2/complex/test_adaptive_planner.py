@@ -609,13 +609,23 @@ async def test_end_to_end_model_planned_reads_dispatch_once() -> None:
 
 @pytest.mark.asyncio
 async def test_summarize_arity_refusal_never_reaches_model() -> None:
-    from app.services.agents.v2.contracts.validation import ContractValidationError
-
+    """A covering skill's refusal is final for the model path — but it now
+    deterministically falls back to the search-first workspace retrieval
+    plan instead of raising. Zero provider calls either way; when
+    ``document.retrieve`` is also absent the fallback itself fails closed
+    (see ``test_retrieve_catalog_refusal_never_reaches_model``)."""
     provider = FakePlannerProvider(_two_read_proposal())
     planner = AdaptivePlanner(provider_factory=lambda: provider)
     _, _, context = _harness("run-planner-sumref", planner=planner)
-    with pytest.raises(ContractValidationError, match="summarize requires"):
-        await planner.propose_initial(_planning_input(work_type="summarize"), context)
+    proposal = await planner.propose_initial(
+        _planning_input(
+            work_type="summarize",
+            capability_names=frozenset({"document.read", "document.retrieve"}),
+        ),
+        context,
+    )
+    assert proposal.plan.plan_id == "retrieve-unscoped"
+    assert [task.capability for task in proposal.plan.tasks] == ["document.retrieve"]
     assert provider.calls == []
 
 
@@ -654,16 +664,23 @@ async def test_compare_arity_refusal_never_reaches_model() -> None:
 
 @pytest.mark.asyncio
 async def test_people_first_catalog_refusal_never_reaches_model() -> None:
-    from app.services.agents.v2.contracts.validation import ContractValidationError
-
+    """Same fallback contract: a named-person ``cross_domain`` whose
+    ``people.lookup`` capability is missing refuses in the skill, then the
+    search-first retrieval plan serves the request — the model is never
+    consulted."""
     provider = FakePlannerProvider(_two_read_proposal())
     planner = AdaptivePlanner(provider_factory=lambda: provider)
     _, _, context = _harness("run-planner-p1ref", planner=planner)
-    with pytest.raises(ContractValidationError, match="people.lookup"):
-        await planner.propose_initial(
-            _planning_input(work_type="cross_domain", semantic=_person_semantic()),
-            context,
-        )
+    proposal = await planner.propose_initial(
+        _planning_input(
+            work_type="cross_domain",
+            semantic=_person_semantic(),
+            capability_names=frozenset({"document.read", "document.retrieve"}),
+        ),
+        context,
+    )
+    assert proposal.plan.plan_id == "retrieve-unscoped"
+    assert [task.capability for task in proposal.plan.tasks] == ["document.retrieve"]
     assert provider.calls == []
 
 

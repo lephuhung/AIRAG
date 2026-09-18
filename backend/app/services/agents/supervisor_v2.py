@@ -107,7 +107,11 @@ from .v2.capabilities import (
 from .v2.capabilities.document import RevisionRetrievedChunk
 from .v2.contracts.base import CONTRACT_VERSION
 from .v2.contracts.binding import DocumentBindingSet, DocumentDiscoveryCandidate
-from .v2.contracts.clarification import ClarificationRequest, ClarificationResolution
+from .v2.contracts.clarification import (
+    ClarificationRequest,
+    ClarificationResolution,
+    DocumentSelectionClarification,
+)
 from .v2.contracts.conversation import ConversationContext
 from .v2.contracts.execution import AgentResult
 from .v2.contracts.planning import TaskPlan
@@ -116,6 +120,7 @@ from .v2.contracts.response import FinalResponse
 from .v2.contracts.routing import QueryAnalysis, RouteDecision
 from .v2.contracts.semantic import DocumentReference, SemanticContext, SemanticDraft
 from .v2.contracts.state import (
+    CHECKPOINT_SCHEMA_REVISION,
     ExecutionState,
     GraphRuntimeContext,
     RuntimeServices,
@@ -125,8 +130,14 @@ from .v2.contracts.synthesis import SynthesisCheckpoint
 from .v2.contracts.validation import (
     ContractValidationError,
     IncompatibleCheckpointError,
+    migrate_checkpoint_payload,
     validate_checkpoint_payload,
     validate_supervisor_state,
+)
+from .v2.discovery_bootstrap.contracts import (
+    DiscoveryCheckpoint,
+    DiscoveryNeed,
+    ResearchTargetSelection,
 )
 from .v2.complex_research_graph import (
     build_complex_research_subgraph,
@@ -233,11 +244,25 @@ _SLOT_MODELS: dict[str, type] = {
     "clarification": ClarificationRequest,
     "synthesis": SynthesisCheckpoint,
     "final_response": FinalResponse,
+    "discovery_need": DiscoveryNeed,
+    "discovery": DiscoveryCheckpoint,
+    "document_selection_clarification": DocumentSelectionClarification,
+    "research_target_selection": ResearchTargetSelection,
 }
 
 #: Slots that may legitimately be ``None`` (everything else must be present).
 _NULLABLE_SLOTS = frozenset(
-    {"query_analysis", "route_decision", "clarification", "synthesis", "final_response"}
+    {
+        "query_analysis",
+        "route_decision",
+        "clarification",
+        "synthesis",
+        "final_response",
+        "discovery_need",
+        "discovery",
+        "document_selection_clarification",
+        "research_target_selection",
+    }
 )
 
 
@@ -309,14 +334,12 @@ def normalize_checkpoint_state(state: Mapping[str, Any]) -> SupervisorV2State:
     edge legitimately checkpoints a clarify route before ``clarify_node``
     persists its request (T5 D6 gap, owned by the clarify composition below).
     """
-    values = dict(state)
-    if values.get("contract_version") == CONTRACT_VERSION and "synthesis" not in values:
-        # Spec §13.2: a pre-synthesis root-2.0 checkpoint is the one supported
-        # legacy shape — materialize the additive slot BEFORE required-key
-        # validation. Any other missing key still fails closed below.
-        values["synthesis"] = None
+    values = migrate_checkpoint_payload(dict(state))
     validate_checkpoint_payload(values)
-    coerced: dict[str, Any] = {"contract_version": values["contract_version"]}
+    coerced: dict[str, Any] = {
+        "contract_version": values["contract_version"],
+        "checkpoint_schema_revision": values["checkpoint_schema_revision"],
+    }
     for slot, model in _SLOT_MODELS.items():
         value = values.get(slot)
         if value is None and slot not in _NULLABLE_SLOTS:
@@ -557,7 +580,16 @@ def _wrap_node(name: str, fn: Callable) -> Callable:
             # below and stick the new turn in the old error, or resurrect a
             # consumed synthesis attempt). The finalizer recomputes every
             # turn; the synthesis state machine re-prepares from None.
-            update = {**update, "final_response": None, "synthesis": None}
+            update = {
+                **update,
+                "final_response": None,
+                "synthesis": None,
+                "checkpoint_schema_revision": CHECKPOINT_SCHEMA_REVISION,
+                "discovery_need": None,
+                "discovery": None,
+                "document_selection_clarification": None,
+                "research_target_selection": None,
+            }
         try:
             if isinstance(update, Command):
                 # Navigation-carrying return (clarify_wait resume paths):
@@ -657,6 +689,11 @@ def build_initial_v2_state(
         clarification=None,
         final_response=None,
         synthesis=None,
+        checkpoint_schema_revision=CHECKPOINT_SCHEMA_REVISION,
+        discovery_need=None,
+        discovery=None,
+        document_selection_clarification=None,
+        research_target_selection=None,
     )
     validate_checkpoint_payload(dict(state))
     return state

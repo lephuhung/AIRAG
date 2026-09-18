@@ -148,11 +148,35 @@ class PeopleLookupOutput(ContractModel):
     matched: bool
 
 
+MatchKind = Literal[
+    "exact_document_number",
+    "exact_normalized_title",
+    "lexical_title",
+    "semantic",
+]
+
+
+class DocumentIdentityMatch(ContractModel):
+    """Discovery spec §8.2: checkpoint-safe identity/rank/calibration metadata.
+
+    One record per returned candidate; no candidate text enters this contract.
+    """
+
+    candidate_id: UUID
+    document_id: UUID
+    document_revision: str
+    rank: int
+    confidence: float | None
+    match_kind: MatchKind
+    calibration_version: str | None
+
+
 class DocumentSearchOutput(ContractModel):
     """Spec §13.4: discovery returns candidates; it never reports read coverage."""
 
     kind: Literal["document.search"]
     candidates: tuple[DocumentDiscoveryCandidate, ...]
+    identity_matches: tuple[DocumentIdentityMatch, ...] = ()
 
 
 class DocumentRetrieveOutput(ContractModel):

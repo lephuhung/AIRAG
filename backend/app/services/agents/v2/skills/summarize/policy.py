@@ -54,6 +54,8 @@ from ...contracts.planning import (
 )
 from ...contracts.semantic import SemanticContext
 from ...contracts.validation import ContractValidationError, validate_task_plan
+from ...discovery_bootstrap.contracts import ResearchTargetSelection
+from ...discovery_bootstrap.validation import validate_research_target_selection
 
 __all__ = [
     "SUMMARIZE_WORK_TYPE",
@@ -217,6 +219,8 @@ def build_summarize_workflow(planning_input: ResearchPlanningInput) -> Summarize
             "summarize skill cannot plan work type "
             f"{planning_input.query_analysis.work_type!r}; out of pilot scope"
         )
+    if planning_input.target_selection is not None:
+        return _selection_workflow(planning_input, planning_input.target_selection)
     target = _summary_target(planning_input.bindings)
     chunks = _map_chunks(planning_input.semantic)
     if chunks:
@@ -271,6 +275,121 @@ def build_summarize_workflow(planning_input: ResearchPlanningInput) -> Summarize
         plan=plan,
         reduce=ReduceSpec(
             map_task_ids=tuple(task.task_id for task in tasks),
+            mode="extractive",
+        ),
+    )
+
+
+def _selection_workflow(
+    planning_input: ResearchPlanningInput,
+    selection: ResearchTargetSelection,
+) -> SummarizeWorkflow:
+    if selection.work_type != SUMMARIZE_WORK_TYPE:
+        raise ContractValidationError(
+            f"summarize skill received a {selection.work_type!r} selection; "
+            "refusing to reinterpret the selection work type"
+        )
+    validate_research_target_selection(
+        selection,
+        planning_input.bindings,
+        planning_input.discovery_checkpoint,
+        planning_input.query_analysis,
+    )
+    binding_by_id = {
+        binding.binding_id: binding for binding in planning_input.bindings.bindings
+    }
+    slot_selections = {slot.slot_id: slot for slot in selection.slot_bindings}
+    units: list[TargetUnit] = []
+    tasks: list[TaskSpec] = []
+    for slot in selection.target_slots:
+        slot_selection = slot_selections.get(slot.slot_id)
+        if slot_selection is None:
+            continue
+        criterion = (
+            CoverageCriterion(kind="coverage")
+            if slot.intended_role == "target"
+            else CoverageCriterion(
+                kind="coverage",
+                minimum_status="read_partial",
+                allow_partial_reason="reference context",
+            )
+        )
+        for ref in slot_selection.selections:
+            binding = binding_by_id.get(ref.binding_id)
+            if binding is None:
+                raise ContractValidationError(
+                    f"summarize selection references unknown binding "
+                    f"{ref.binding_id!r}; refusing to fabricate targets"
+                )
+            units.append(
+                TargetUnit(
+                    target_id=ref.target_id,
+                    binding_id=ref.binding_id,
+                    requested_locator=slot.requested_locator,
+                    completion_criteria=(criterion,),
+                )
+            )
+            task_id = f"T{len(tasks) + 1}"
+            if isinstance(slot.requested_locator, SectionLocator):
+                tasks.append(
+                    TaskSpec(
+                        task_id=task_id,
+                        capability="section.read",
+                        task_objective=(
+                            "Read section "
+                            f"{slot.requested_locator.structure_node_id} for "
+                            f"summary (document {binding.document_id})"
+                        ),
+                        input=SectionReadInput(
+                            kind="section.read", target_ids=(ref.target_id,)
+                        ),
+                        depends_on=(),
+                        origin=InitialTaskOrigin(kind="initial"),
+                    )
+                )
+            else:
+                tasks.append(
+                    TaskSpec(
+                        task_id=task_id,
+                        capability="document.read",
+                        task_objective=(
+                            "Read the summary target "
+                            f"(document {binding.document_id})"
+                        ),
+                        input=DocumentReadInput(
+                            kind="document.read", target_ids=(ref.target_id,)
+                        ),
+                        depends_on=(),
+                        origin=InitialTaskOrigin(kind="initial"),
+                    )
+                )
+    if len(tasks) > planning_input.budget.max_tasks_remaining:
+        raise ContractValidationError(
+            f"summarize selection emits {len(tasks)} read task(s) but the "
+            f"task budget allows {planning_input.budget.max_tasks_remaining}; "
+            "refusing a partial map"
+        )
+    emitted = tuple(tasks)
+    _require_read_capabilities(planning_input, emitted)
+    plan = TaskPlan(
+        contract_version="2.0",
+        plan_id="summarize-selection-" + "-".join(
+            unit.target_id for unit in units
+        ),
+        goal=planning_input.semantic.contextualized_query,
+        target_units=tuple(units),
+        tasks=emitted,
+    )
+    validate_task_plan(
+        plan,
+        planning_input.bindings,
+        target_selection=selection,
+        discovery_checkpoint=planning_input.discovery_checkpoint,
+    )
+    return SummarizeWorkflow(
+        plan=plan,
+        reduce=ReduceSpec(
+            map_task_ids=tuple(task.task_id for task in emitted),
             mode="extractive",
         ),
     )

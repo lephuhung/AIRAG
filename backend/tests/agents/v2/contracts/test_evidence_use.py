@@ -211,7 +211,11 @@ def test_derived_record_carries_no_document_coordinates() -> None:
 
 def test_search_output_structurally_cannot_report_read_coverage() -> None:
     assert "coverage_observations" not in DocumentSearchOutput.model_fields
-    assert set(DocumentSearchOutput.model_fields) == {"kind", "candidates"}
+    assert set(DocumentSearchOutput.model_fields) == {
+        "kind",
+        "candidates",
+        "identity_matches",
+    }
 
 
 def test_record_identity_and_use_identity_are_distinct() -> None:

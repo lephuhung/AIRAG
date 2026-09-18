@@ -303,6 +303,12 @@ def make_state(
         execution=ExecutionState(plan=None, task_results=(), evidence_evaluation=None),
         clarification=clarification,
         final_response=None,
+        synthesis=None,
+        checkpoint_schema_revision=2,
+        discovery_need=None,
+        discovery=None,
+        document_selection_clarification=None,
+        research_target_selection=None,
     )
 
 
@@ -348,6 +354,7 @@ def test_build_is_checkpoint_safe_and_valid() -> None:
     dumped = request.model_dump(mode="json")
     # No runtime secrets or trusted identity may enter the checkpoint.
     assert set(dumped) == {
+        "kind",
         "contract_version",
         "clarification_id",
         "reason",
@@ -430,7 +437,7 @@ async def test_resume_restarts_resolved_flow_at_binding() -> None:
     # The raw reply is loaded by ChatMessage.id and stays authoritative there:
     # the resolution stores only the deterministic selection, no user text.
     assert handle.chat.calls == [handle.message_id]
-    assert set(command.resume) == {"contract_version", "clarification_id", "selected_candidate_id"}
+    assert set(command.resume) == {"kind", "contract_version", "clarification_id", "selected_candidate_id"}
     # The resolution envelope carries no ChatMessage field and only an
     # offered candidate id — the raw reply never enters the checkpoint.
     assert "content" not in command.resume

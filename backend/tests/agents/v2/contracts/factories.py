@@ -30,8 +30,17 @@ from app.services.agents.v2.contracts.planning import (
     TaskPlan,
     TaskSpec,
 )
-from app.services.agents.v2.contracts.request import KnownDocumentResource, RequestContext
+from app.services.agents.v2.contracts.request import (
+    KnownDocumentResource,
+    RequestContext,
+)
 from app.services.agents.v2.contracts.semantic import DocumentReference, SemanticContext
+from app.services.agents.v2.discovery_bootstrap.contracts import (
+    ResearchTargetSelection,
+    SelectedBindingRef,
+    SlotBindingSelection,
+    TargetSlot,
+)
 
 DOCUMENT_ID = UUID("11111111-1111-1111-1111-111111111111")
 OTHER_DOCUMENT_ID = UUID("22222222-2222-2222-2222-222222222222")
@@ -248,4 +257,70 @@ def evidence_record(
             fetcher="document.read",
             fetched_at=datetime(2026, 9, 11, tzinfo=UTC),
         ),
+    )
+
+
+def target_slot(
+    *,
+    slot_id: str = "slot-1",
+    intended_role: str = "target",
+    subject_hint: str = "nghị định A",
+    requested_locator: ContentLocator | None = None,
+    required: bool = True,
+    min_selections: int = 1,
+    max_selections: int = 1,
+    explicit_binding_ids: tuple[str, ...] = ("b1",),
+    source: str = "semantic_reference",
+) -> TargetSlot:
+    if requested_locator is None:
+        requested_locator = DocumentLocator(kind="document")
+    return TargetSlot(
+        slot_id=slot_id,
+        intended_role=intended_role,  # type: ignore[arg-type]
+        subject_hint=subject_hint,
+        requested_locator=requested_locator,
+        required=required,
+        min_selections=min_selections,
+        max_selections=max_selections,
+        explicit_binding_ids=explicit_binding_ids,
+        source=source,  # type: ignore[arg-type]
+    )
+
+
+def selected_binding_ref(
+    *,
+    target_id: str = "t1",
+    binding_id: str = "b1",
+    selected_aggregate_id: UUID | None = None,
+    authority: str = "explicit_binding",
+) -> SelectedBindingRef:
+    return SelectedBindingRef(
+        target_id=target_id,
+        binding_id=binding_id,
+        selected_aggregate_id=selected_aggregate_id,
+        authority=authority,  # type: ignore[arg-type]
+    )
+
+
+def target_selection(
+    *,
+    work_type: str = "summarize",
+    target_slots: tuple[TargetSlot, ...] | None = None,
+    slot_bindings: tuple[SlotBindingSelection, ...] | None = None,
+    context_binding_ids: tuple[str, ...] = (),
+) -> ResearchTargetSelection:
+    if target_slots is None:
+        target_slots = (target_slot(),)
+    if slot_bindings is None:
+        slot_bindings = (
+            SlotBindingSelection(
+                slot_id="slot-1",
+                selections=(selected_binding_ref(),),
+            ),
+        )
+    return ResearchTargetSelection(
+        work_type=work_type,  # type: ignore[arg-type]
+        target_slots=target_slots,
+        slot_bindings=slot_bindings,
+        context_binding_ids=context_binding_ids,
     )

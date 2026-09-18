@@ -670,6 +670,45 @@ class Settings(BaseSettings):
     NEXUSRAG_AGENT_V2_CANARY_WORKSPACES: str = Field(default="")
     NEXUSRAG_AGENT_V2_BUCKET_SALT: str = Field(default="")
 
+    # ── LangGraph v2 complex-research planner limits ───────────────────────
+    # Sizing inputs read by V2ResearchLimits.from_settings() and
+    # build_discovery_policy() in agents/v2/complex_research_graph.py. Safe
+    # defaults keep the pilot closed — the replan budget is 0 (the
+    # decide→replan edge never fires) and document discovery is fully closed —
+    # so deploying this alone changes no planner behavior. Raise
+    # V2_MAX_REPLANS deliberately to let bounded append-only replans run;
+    # enable discovery only with an explicit rollout decision.
+    V2_MAX_TASKS: int = Field(default=8, gt=0)
+    V2_MAX_PARALLEL_BRANCHES: int = Field(default=2, gt=0)
+    V2_MAX_REPLANS: int = Field(default=0, ge=0)
+    V2_ALLOW_REFERENCE_DISCOVERY: bool = Field(default=False)
+    V2_ALLOW_SUPPORTING_DISCOVERY: bool = Field(default=False)
+    V2_MAX_DISCOVERED_DOCUMENTS: int = Field(default=0, ge=0)
+
+    # ── LangGraph v2 discovery bootstrap (Phase-1 dormant groundwork) ──────
+    # Discovery spec §17: the bootstrap flag stays OFF — no route/node/graph
+    # behavior reads it yet; these fields only declare and bound the limits
+    # the later phases will consume. The design maxima are HARD ceilings,
+    # not merely defaults: raising any of them requires a new design
+    # revision, not just an environment change. V2_TOTAL_MAX_TASKS is the
+    # absolute plan-entry ceiling (probes + research tasks share one plan
+    # lineage) and must cover configured probes + V2_MAX_TASKS (validated
+    # below). Calibration-artifact readability/model-hash enforcement is
+    # deliberately deferred to Phase 2.
+    V2_DISCOVERY_BOOTSTRAP_ENABLED: bool = Field(default=False)
+    V2_DISCOVERY_MAX_PROBES: int = Field(default=5, ge=1, le=5)
+    V2_DISCOVERY_MAX_ROUNDS: int = Field(default=2, ge=1, le=2)
+    V2_DISCOVERY_TOP_K: int = Field(default=5, ge=1, le=5)
+    V2_DISCOVERY_DEADLINE_SECONDS: int = Field(default=15, ge=1, le=15)
+    V2_DISCOVERY_SUMMARY_TARGETS: int = Field(default=3, ge=3, le=5)
+    V2_DISCOVERY_MAX_SUMMARY_TARGETS: int = Field(default=5, ge=3, le=5)
+    V2_DISCOVERY_CONFIDENCE_THRESHOLD: float = Field(default=0.82, ge=0.0, le=1.0)
+    V2_DISCOVERY_MARGIN_THRESHOLD: float = Field(default=0.12, ge=0.0, le=1.0)
+    V2_DISCOVERY_CALIBRATION_ARTIFACT: str = Field(
+        default="/app/config/discovery-calibration.json"
+    )
+    V2_TOTAL_MAX_TASKS: int = Field(default=13, gt=0)
+
     # ── Phase 1A: Semantic preprocessor atomic enable (B.11 0.5) ─────────────
     # When True, semantic_preprocessor_node runs before supervisor_node;
     # legacy abbreviation expansion is suppressed via _preprocessor_marker.
@@ -717,6 +756,30 @@ class Settings(BaseSettings):
             raise ValueError(
                 "NEXUSRAG_AGENT_V2_CANARY_PERCENT must be within 0..100; "
                 f"got {self.NEXUSRAG_AGENT_V2_CANARY_PERCENT!r}"
+            )
+        # Discovery spec §17 cross-field rules (Phase-1 dormant groundwork):
+        # the summary-target minimum can never exceed its maximum, and the
+        # absolute total-task cap must cover the configured discovery probe
+        # budget plus the research task budget on the shared plan lineage.
+        if (
+            self.V2_DISCOVERY_SUMMARY_TARGETS
+            > self.V2_DISCOVERY_MAX_SUMMARY_TARGETS
+        ):
+            raise ValueError(
+                "V2_DISCOVERY_SUMMARY_TARGETS must be <= "
+                "V2_DISCOVERY_MAX_SUMMARY_TARGETS; got "
+                f"{self.V2_DISCOVERY_SUMMARY_TARGETS} > "
+                f"{self.V2_DISCOVERY_MAX_SUMMARY_TARGETS}"
+            )
+        if (
+            self.V2_TOTAL_MAX_TASKS
+            < self.V2_DISCOVERY_MAX_PROBES + self.V2_MAX_TASKS
+        ):
+            raise ValueError(
+                "V2_TOTAL_MAX_TASKS must be >= V2_DISCOVERY_MAX_PROBES + "
+                "V2_MAX_TASKS; got "
+                f"{self.V2_TOTAL_MAX_TASKS} < "
+                f"{self.V2_DISCOVERY_MAX_PROBES} + {self.V2_MAX_TASKS}"
             )
         return self
 
